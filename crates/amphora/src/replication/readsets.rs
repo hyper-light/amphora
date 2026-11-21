@@ -214,11 +214,11 @@ mod tests {
         }
     }
 
-    /// AC-T1.8.D1 (Kung and Robinson's backward validation over pages): do entries that wrote a
+    /// AC-T1.8.R1 (Kung and Robinson's backward validation over pages): do entries that wrote a
     /// page the write read, one it wrote, the marker page, nothing it touched, and an opaque
     /// entry. Expect: only the entry that touched nothing of it leaves it admitted.
     #[test]
-    fn d1_a_write_is_untouched_only_by_entries_that_wrote_nothing_it_read_or_wrote() {
+    fn r1_a_write_is_untouched_only_by_entries_that_wrote_nothing_it_read_or_wrote() {
         let w = write(&[1, 3, 5], &[5, 9], Page1::Unwritten);
         let marker = 2;
         assert!(w.untouched_by(&pages(&[7, 11], Page1::Unwritten), marker));
@@ -229,11 +229,11 @@ mod tests {
         assert!(!reads_marker.untouched_by(&pages(&[], Page1::Unwritten), marker), "every apply writes the marker");
     }
 
-    /// AC-T1.8.D2 (research f9): do an entry that changed page 1 only in its size, and one that
+    /// AC-T1.8.R1 (research f9): do an entry that changed page 1 only in its size, and one that
     /// changed more of it. Expect: a write that only read page 1 merges with the size change and
     /// conflicts with the other; a write that allocated too (wrote page 1) conflicts with both.
     #[test]
-    fn d2_page_ones_size_merges_with_readers_and_conflicts_with_another_allocation() {
+    fn r2_page_ones_size_merges_with_readers_and_conflicts_with_another_allocation() {
         let marker = 2;
         let reader = write(&[1, 3], &[3], Page1::Unwritten);
         assert!(reader.untouched_by(&pages(&[40], Page1::Size), marker));
@@ -243,12 +243,12 @@ mod tests {
         assert!(!allocates.untouched_by(&pages(&[], Page1::Other), marker));
     }
 
-    /// AC-T1.8.D3 (the append-only wire change): do a `Prepared` with a read set encoded, then read
+    /// AC-T1.8.R3 (the append-only wire change): do a `Prepared` with a read set encoded, then read
     /// it as the leader does, rebase it, and decode it as a binary from before read sets does.
     /// Expect: the leader reads its base, pages and read set; the rebased encoding carries the new
     /// base, the same pages and the read set; the old decoding ignores the trailer.
     #[test]
-    fn d3_a_read_set_rides_after_the_prepared_encoding_and_the_base_moves_alone() {
+    fn r3_a_read_set_rides_after_the_prepared_encoding_and_the_base_moves_alone() {
         let prepared = super::super::Prepared::for_test(
             Point { index: 4, term: 2 },
             vec![(1, vec![0; 8]), (6, vec![1; 8])],
@@ -282,10 +282,10 @@ mod tests {
         assert_eq!(wrote(&bare), pages(&[], Page1::Other));
     }
 
-    /// AC-T1.8.D2: do page 1 images that differ in the size, the checksum trailer, and the
+    /// AC-T1.8.R1: do page 1 images that differ in the size, the checksum trailer, and the
     /// schema cookie. Expect: the first two are an allocation; the third is not.
     #[test]
-    fn d2_only_the_size_and_checksum_changed_is_an_allocation() {
+    fn r2_only_the_size_and_checksum_changed_is_an_allocation() {
         let mut before = vec![0u8; 4096];
         before[20] = 8;
         let mut after = before.clone();

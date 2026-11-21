@@ -389,6 +389,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   - the owner's identity naming its durability (transport version 4), so an attachment in another class is refused,
     typed;
   - a write made at a follower answered on its group's commit, before its own log write, kept until it applies;
+  - read sets on top of the write slot (goal ceea4e0a; replication.md, "read sets"): the pager records a session's
+    reads, which ride after its write (append-only); the leader moves a stale base to its last entry when nothing its
+    log holds since wrote a page the write read or wrote, page 1's size merging. Release A/B against G: the coordinator's;
   - the leader's quorum patience (replication.md, "The leader's quorum patience"): on fedora's own load its own
     checks stepped members down 5-8 times in 1,800 s against 43-63 at fixed ticks (docs/research/owner-stalls.md).
 

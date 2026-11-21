@@ -14302,14 +14302,14 @@ mod tests {
         }
     }
 
-    /// T-T1.8.D4 (AC-T1.8.D1; goal ceea4e0a): a follower's write that read nothing written since
+    /// T-T1.8.R4 (AC-T1.8.R1; goal ceea4e0a): a follower's write that read nothing written since
     /// its base lands on its first try. Do, with the write slot off so read sets act alone: the
     /// follower's write to table `u` forwarded and held in transit while the leader appends a
     /// write of its own to table `t` on the same base, then let through; then the same with both
     /// writing `t`. Expect, with read sets on: the first applied (its base moved, counted), the
     /// second refused, stale, as its page changed. With read sets off: both refused.
     #[test]
-    fn d4_a_follower_write_on_pages_nothing_since_wrote_lands_on_its_first_try() {
+    fn r4_a_follower_write_on_pages_nothing_since_wrote_lands_on_its_first_try() {
         for off in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let mut driven = Driven::new();
@@ -14414,14 +14414,14 @@ mod tests {
         }
     }
 
-    /// T-T1.8.D5 (AC-T1.8.D2; Elle's list-append): read sets keep every history serializable,
+    /// T-T1.8.R5 (AC-T1.8.R2; Elle's list-append): read sets keep every history serializable,
     /// alone and under the write slot. Do: the leader and two followers each append 15 times to
     /// 32 lists spread over pages, then to two hot lists, every record delayed up to three relay
     /// rounds, three seeds each, with the slot off and on. Expect: replicas equal, each list its
     /// serial replay, no G0, G1c or G2 cycle, none unknown; some base moved (non-vacuity). The
     /// mutant that moves every stale base unchecked is caught: some run of it breaks the history.
     #[test]
-    fn d5_read_sets_keep_every_list_append_history_serializable() {
+    fn r5_read_sets_keep_every_list_append_history_serializable() {
         let mut moved = 0;
         for slot_off in [true, false] {
             for keys in [32, 2] {
