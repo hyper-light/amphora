@@ -397,6 +397,22 @@ pub struct GroupFindData {
     pub target_pc_full: BranchOffset,
 }
 
+/// Amphora: data for [Insn::MorselAggregate] (QT.6).
+#[derive(Debug, Clone)]
+pub struct MorselAggregateData {
+    pub root_page: i64,
+    /// The table's stored columns, and the one its rowid stands in for (an INTEGER PRIMARY KEY).
+    pub columns: usize,
+    pub rowid_alias: Option<usize>,
+    pub filter: Vec<crate::vdbe::morsel::Predicate>,
+    pub group_by: Vec<usize>,
+    pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
+    /// For each result column, its place in the pipeline's row (the GROUP BY values, then the
+    /// aggregates).
+    pub result_map: Vec<usize>,
+    pub target_pc_serial: BranchOffset,
+}
+
 /// Amphora: data for [Insn::GroupSort].
 #[derive(Debug, Clone)]
 pub struct GroupSortData {
@@ -2232,6 +2248,22 @@ pub enum Insn {
         version: crate::CdcVersion,
         cdc_mode: String,
     },
+
+    /// Amphora (QT.6): runs a scan's filter and aggregates over the table's leaf pages in morsels,
+    /// a cursor per worker (`vdbe/morsel_scan.rs`), keeping the answer's rows for [Insn::MorselNext];
+    /// jumps to `target_pc_serial`, the statement's serial loop, when a value is one the parallel
+    /// aggregates don't take.
+    MorselAggregate {
+        data: Box<MorselAggregateData>,
+    },
+
+    /// Amphora (QT.6): writes the next row [Insn::MorselAggregate] kept into `dest_start..` or,
+    /// when none is left, jumps to `target_pc_done`.
+    MorselNext {
+        dest_start: usize,
+        count: usize,
+        target_pc_done: BranchOffset,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2479,6 +2511,8 @@ impl InsnVariants {
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
+            InsnVariants::MorselAggregate => execute::op_morsel_aggregate,
+            InsnVariants::MorselNext => execute::op_morsel_next,
         }
     }
 }

@@ -472,6 +472,11 @@ tests = [
   { id = "T-T1.12.P11", text = "A log started again twice with no write between keeps its link whole; a restart forced before its frames were shipped, or one the fence wasn't told of, breaks it" },
   { id = "T-T1.12.P12", text = "A through mark makes the seconds after the last segment's whole through its time; one that doesn't end at a segment says nothing" },
   { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
+  # lane pitr-7
+  { id = "AMPHORA-BLOBS-8", text = "The folder store passes AMPHORA-BLOBS-1 to 7, keeps keys apart under case folding and path names, and answers random operations as SimBlobs does" },
+  { id = "T-T1.12.C1", text = "Restore-and-check on a folder passes at the newest whole second against the source's rows and fails naming the rows against rows that differ" },
+  { id = "T-T1.12.C2", text = "A check is due at the first, at each new base, and once the log since the last check outweighs what it replayed" },
+  { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
@@ -887,6 +892,11 @@ tests = [
   { id = "T-QT.6.4", text = "A statement whose workers together pass its memory budget — passes when refused with the typed error at every worker count and the budget never passed" },
   { id = "T-QT.6.5", text = "The degree from stated costs — passes when off and short statements are serial, a long one uses more than one worker and no more than the cores, and morsels grow as dispatch grows against a row's cost" },
   { id = "T-QT.6.6", text = "Every JOB and TPC-H query at 1, 2, 4, 8, 16 and 32 workers (the coordinator's) — passes when identical answers at every count" },
+  # lane qs6-2
+  { id = "T-QT.6.7", text = "Random filters, groupings and aggregates over random tables of many leaf pages, each worker reading its leaves with its own cursor in one snapshot, at 1, 2, 3, 4 and 8 workers, several morsel sizes and ParallelMode On and Off (vdbe/morsel_scan_tests.rs) — passes when every answer equals the VDBE's serial SQL answer" },
+  { id = "T-QT.6.8", text = "One- and two-column equi-joins whose probe side workers read over the probe table's leaves (vdbe/morsel_scan_tests.rs) — passes when the matches equal the VDBE's join, match for match and in its order" },
+  { id = "T-QT.6.9", text = "A table whose INTEGER PRIMARY KEY is its rowid, and an empty table, read in leaf morsels (vdbe/morsel_scan_tests.rs) — passes when the rowid reads into its column, the aggregates equal the VDBE's, and the empty table is one leaf with no rows" },
+  { id = "T-QT.6.10", text = "Random filters, groupings and aggregates in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook ran for most of them" },
 ]
 
 # lane g3s2
