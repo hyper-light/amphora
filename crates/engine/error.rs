@@ -139,7 +139,9 @@ pub enum LimboError {
     /// (docs/design/engine.md decision 10, G8 step 2): `held` of `limit` are taken. The change is
     /// refused whole and nothing is kept; its caller rolls back, and may run it again once the
     /// oldest snapshot closes and collection gives the memory back.
-    #[error("versioned storage memory budget full: {what} asked {asked} bytes, {held} of {limit} held")]
+    #[error(
+        "versioned storage memory budget full: {what} asked {asked} bytes, {held} of {limit} held"
+    )]
     MemoryBudget {
         what: &'static str,
         asked: u64,

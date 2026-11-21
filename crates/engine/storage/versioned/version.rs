@@ -320,7 +320,11 @@ fn point_bytes(key: &[u8]) -> u64 {
 impl Span {
     /// The bytes a span read keeps.
     fn bytes(&self) -> u64 {
-        let ends = self.from.as_ref().map_or(0, Vec::len).saturating_add(self.to.as_ref().map_or(0, Vec::len));
+        let ends = self
+            .from
+            .as_ref()
+            .map_or(0, Vec::len)
+            .saturating_add(self.to.as_ref().map_or(0, Vec::len));
         u64::try_from(size_of::<Span>().saturating_add(ends)).unwrap_or(u64::MAX)
     }
 }
@@ -783,7 +787,13 @@ impl VTree {
                     clock
                         .budget
                         .reserve("a row's version", older.bytes().saturating_add(noted))?;
-                    head.older.insert(0, Older { written: ts, ..older });
+                    head.older.insert(
+                        0,
+                        Older {
+                            written: ts,
+                            ..older
+                        },
+                    );
                     head.writer = txn.id;
                     txn.changed.push((self.id, key.to_vec()));
                     txn.charged = txn.charged.saturating_add(noted_bytes);
@@ -971,7 +981,9 @@ impl VTree {
             let held = head.bytes(key.len());
             let prior = head.older.remove(0);
             head.writer = prior.written;
-            clock.budget.release(held.saturating_sub(head.bytes(key.len())));
+            clock
+                .budget
+                .release(held.saturating_sub(head.bytes(key.len())));
             let change = if head.older.is_empty() && prior.written == 0 {
                 // No snapshot needs anything older: the row is as it was before any.
                 if let Some(gone) = heads.remove(key) {
@@ -1340,11 +1352,18 @@ impl Versioned {
         if !keep {
             return Ok(None);
         }
-        let size = txn.changed.iter().fold(size_of::<Committed>(), |n, (_, k)| {
-            n.saturating_add(size_of::<(u64, Vec<u8>)>())
-                .saturating_add(k.len())
-        });
-        let writes = match self.clock.budget.reserve("a commit kept for validation", size) {
+        let size = txn
+            .changed
+            .iter()
+            .fold(size_of::<Committed>(), |n, (_, k)| {
+                n.saturating_add(size_of::<(u64, Vec<u8>)>())
+                    .saturating_add(k.len())
+            });
+        let writes = match self
+            .clock
+            .budget
+            .reserve("a commit kept for validation", size)
+        {
             Ok(n) => n,
             Err(e) => {
                 self.clock.budget.release(read_bytes);
@@ -2112,7 +2131,14 @@ mod tests {
             }
             let reader = v.clock.snapshot().unwrap();
             let seen = t
-                .scan(&v.pool, &mut d, &v.clock, &reader, None, usize::from(rows) + 1)
+                .scan(
+                    &v.pool,
+                    &mut d,
+                    &v.clock,
+                    &reader,
+                    None,
+                    usize::from(rows) + 1,
+                )
                 .unwrap();
             assert_eq!(seen.len(), usize::from(rows));
             let done = Arc::new(AtomicBool::new(false));
@@ -2148,7 +2174,14 @@ mod tests {
                             let step = (|| {
                                 for r in [a, b] {
                                     t.read(&v.pool, &mut d, &v.clock, &mut txn, &row(r))?;
-                                    t.put(&v.pool, &mut d, &v.clock, &mut txn, &row(r), &value(who, n))?;
+                                    t.put(
+                                        &v.pool,
+                                        &mut d,
+                                        &v.clock,
+                                        &mut txn,
+                                        &row(r),
+                                        &value(who, n),
+                                    )?;
                                 }
                                 Ok::<_, LimboError>(())
                             })();
@@ -2197,7 +2230,14 @@ mod tests {
                     let mut scans = 0u64;
                     while !done.load(Ordering::Acquire) {
                         let now = t
-                            .scan(&v.pool, &mut d, &v.clock, &reader, None, usize::from(rows) + 1)
+                            .scan(
+                                &v.pool,
+                                &mut d,
+                                &v.clock,
+                                &reader,
+                                None,
+                                usize::from(rows) + 1,
+                            )
                             .unwrap();
                         assert!(now == seen, "the reader's rows moved");
                         scans += 1;
@@ -2211,8 +2251,14 @@ mod tests {
             done.store(true, Ordering::Release);
             let rounds = collector.join().unwrap();
             let scans = reads.join().unwrap();
-            assert!(commits.load(Ordering::Relaxed) > 0, "{validation:?}: nothing committed");
-            assert!(rounds > 0 && scans > 0, "{validation:?}: {rounds} collections, {scans} scans");
+            assert!(
+                commits.load(Ordering::Relaxed) > 0,
+                "{validation:?}: nothing committed"
+            );
+            assert!(
+                rounds > 0 && scans > 0,
+                "{validation:?}: {rounds} collections, {scans} scans"
+            );
             v.collect(&mut d).unwrap();
             assert!(
                 older_versions(&v) <= usize::from(rows),
@@ -2225,7 +2271,8 @@ mod tests {
             let mut all = v.clock.begin().unwrap();
             let mut refusal = None;
             for r in 0..rows {
-                if let Err(e) = t.put(&v.pool, &mut d, &v.clock, &mut all, &row(r), &value(999, 0)) {
+                if let Err(e) = t.put(&v.pool, &mut d, &v.clock, &mut all, &row(r), &value(999, 0))
+                {
                     refusal = Some(e);
                     break;
                 }
@@ -2238,7 +2285,14 @@ mod tests {
             v.collect(&mut d).unwrap();
             assert_eq!(v.clock.budget().held(), held, "{validation:?}");
             let now = t
-                .scan(&v.pool, &mut d, &v.clock, &reader, None, usize::from(rows) + 1)
+                .scan(
+                    &v.pool,
+                    &mut d,
+                    &v.clock,
+                    &reader,
+                    None,
+                    usize::from(rows) + 1,
+                )
                 .unwrap();
             assert!(now == seen, "{validation:?}: the reader's rows moved");
 
