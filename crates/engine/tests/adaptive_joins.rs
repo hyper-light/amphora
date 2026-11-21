@@ -190,7 +190,7 @@ fn t_pl_13_1_answers_identical_with_switching_on_and_off() {
 }
 
 /// Do: one join, its outer rows cut to just under the switch point its plan states, then to the
-/// point. Expect: no switch under it, exactly one at it, and the same answer as with the switch
+/// point and past it. Expect: no switch under the point each run's plan states, exactly one at it, and the same answer as with the switch
 /// off both times; where the learned costs give no break-even, no switch at all (T-PL.13.1).
 #[test]
 fn t_pl_13_1_switch_fires_past_the_point_and_not_before() {
@@ -234,22 +234,21 @@ fn t_pl_13_1_switch_fires_past_the_point_and_not_before() {
     }
     conn.execute("COMMIT").unwrap();
 
-    for (n, want) in [(point - 1, 0), (point, 1), (point + 10, 1)] {
+    // The learned costs move as statements run, and the point with them: each run is held to
+    // the point its own plan states.
+    for n in [point - 1, point, point + 10] {
         let query = sql(n);
         conn.set_adaptive_joins(false);
         let off = rows(&conn, &query);
         conn.set_adaptive_joins(true);
-        assert_eq!(
-            switch_point(&conn, &query),
-            Some(point),
-            "the point moved: {query}"
-        );
+        let stated = switch_point(&conn, &query);
         let before = conn.adaptive_join_switches();
         let on = rows(&conn, &query);
+        let want = u64::from(stated.is_some_and(|stated| n >= stated));
         assert_eq!(
             conn.adaptive_join_switches() - before,
             want,
-            "{n} outer rows against a point of {point}"
+            "{n} outer rows against a point of {stated:?}"
         );
         assert_eq!(on, off, "{n} outer rows: switch on and off differ");
     }

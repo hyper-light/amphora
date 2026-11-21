@@ -113,7 +113,8 @@ impl<'a> AdaptiveSeek<'a> {
         let other_columns = &self.index.columns[num_keys..];
         let num_payload = other_columns.len();
         let entry_len = num_keys + num_payload + 1;
-        let hash_table_id: usize = table.internal_id.into();
+        // Its own id: a hash join the plan chose keys its table by its build table's id.
+        let hash_table_id = program.alloc_hash_table_id();
         let switch_id = hash_table_id;
         let affinities = super::seek::index_seek_affinities(self.seek_def, &self.seek_def.start);
         let collations: Vec<CollationSeq> = key_columns

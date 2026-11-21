@@ -19,11 +19,8 @@
 //! passes (the statement's hash-table share, `vdbe::hash_table::table_share`): past it they refuse
 //! with an [`AdaptiveError`] and the plan goes on as it was, which is always a correct answer.
 //!
-//! The executor's shell that drives them (a join emitted with both inner loops and the switch
-//! between them; a materialization point that hands its rows to a second prepare) is PL.13's next
-//! piece; until it lands only the tests reach these cores, so the dead-code allowance below stands
-//! for PL.13 (T-PL.13.1) and goes when the shell lands.
-#![cfg_attr(not(test), allow(dead_code))]
+//! The executor drives the join switch: `translate/main_loop/adaptive.rs` emits an index join with
+//! its hash join beside it, and `JoinSwitchStep` (`vdbe/execute.rs`) steps the switch per outer row.
 
 use std::fmt;
 
