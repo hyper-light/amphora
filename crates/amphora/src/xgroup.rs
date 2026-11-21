@@ -36,6 +36,10 @@ pub use sql::{Cluster, Route};
 /// A group's number among the fixed groups a cluster has.
 pub type GroupId = u32;
 
+/// One page of [`Tablet::open`]: each transaction with its anchor (`None`: this group is the anchor),
+/// and whether there are more.
+pub type OpenPage = (Vec<(TxnId, Option<GroupId>)>, bool);
+
 /// A place in one coordinator's order of transactions: its incarnation, then its count there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Mark {
@@ -213,7 +217,7 @@ pub trait Tablet {
         below: u64,
         after: Option<TxnId>,
         limit: usize,
-    ) -> anyhow::Result<(Vec<(TxnId, Option<GroupId>)>, bool)>;
+    ) -> anyhow::Result<OpenPage>;
 }
 
 /// Group `here`'s part of a step: what it does to `tablet` and answers. An error leaves the step
@@ -532,7 +536,7 @@ impl Tablet for Memory {
         below: u64,
         after: Option<TxnId>,
         limit: usize,
-    ) -> anyhow::Result<(Vec<(TxnId, Option<GroupId>)>, bool)> {
+    ) -> anyhow::Result<OpenPage> {
         let wanted = |txn: &TxnId| {
             txn.coordinator == coordinator && txn.epoch < below && after.is_none_or(|a| *txn > a)
         };

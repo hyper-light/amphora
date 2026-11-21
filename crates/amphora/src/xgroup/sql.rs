@@ -13,7 +13,9 @@ use amphora_api::Refusal;
 use amphora_engine::Value;
 
 use super::coordinator::{Answer, Config, Coordinator, Event, Lost, Protocol, Txn};
-use super::{GroupId, Guard, Intent, Lock, Mark, Outcome, Record, Reply, Tablet, TxnId, apply};
+use super::{
+    GroupId, Guard, Intent, Lock, Mark, OpenPage, Outcome, Record, Reply, Tablet, TxnId, apply,
+};
 use crate::database::Database;
 use crate::db::Db;
 
@@ -70,16 +72,14 @@ fn participants_bytes(groups: &[GroupId]) -> Vec<u8> {
 }
 
 fn participants_of(bytes: &[u8]) -> anyhow::Result<Vec<GroupId>> {
-    let chunks = bytes.chunks_exact(4);
-    if !chunks.remainder().is_empty() {
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    if !rest.is_empty() {
         anyhow::bail!(
             "a record's participants are {} bytes, not a multiple of 4",
             bytes.len()
         );
     }
-    chunks
-        .map(|c| Ok(GroupId::from_be_bytes(c.try_into()?)))
-        .collect()
+    Ok(chunks.iter().map(|c| GroupId::from_be_bytes(*c)).collect())
 }
 
 fn u64_at(row: &amphora_engine::Row, i: usize) -> anyhow::Result<u64> {
@@ -346,7 +346,7 @@ impl Tablet for SqlTablet<'_> {
         below: u64,
         after: Option<TxnId>,
         limit: usize,
-    ) -> anyhow::Result<(Vec<(TxnId, Option<GroupId>)>, bool)> {
+    ) -> anyhow::Result<OpenPage> {
         // No transaction precedes (-1, -1): every epoch and count is at least 0.
         let (after_epoch, after_seq) = match after {
             Some(txn) => (i64::try_from(txn.epoch)?, i64::try_from(txn.seq)?),
@@ -449,7 +449,10 @@ impl StepTimes {
             .deviation
             .saturating_sub(quarter(self.deviation))
             .saturating_add(quarter(off));
-        self.mean = Some(mean.saturating_sub(eighth(mean)).saturating_add(eighth(took)));
+        self.mean = Some(
+            mean.saturating_sub(eighth(mean))
+                .saturating_add(eighth(took)),
+        );
     }
 
     /// The time a step is given before its reply counts as lost, doubled for each time the
@@ -619,7 +622,8 @@ impl Driver {
                     match self.coordinator.begin(txn, |key| (self.route)(key)) {
                         Ok((id, events)) => {
                             self.waiters.insert(id, answer);
-                            self.deadlines.insert(id, Deadline::Caller { until, lost: 0 });
+                            self.deadlines
+                                .insert(id, Deadline::Caller { until, lost: 0 });
                             events
                         }
                         Err(refusal) => {

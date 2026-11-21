@@ -293,6 +293,9 @@ enum Msg {
     },
 }
 
+/// The keys a transaction read and the values it saw (`None`: absent).
+type Reads = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 struct Sim {
     rng: Rng,
     groups: Vec<Memory>,
@@ -305,7 +308,7 @@ struct Sim {
     /// Per mille of steps lost, their reply lost, or landing late.
     faults: u64,
     inputs: u64,
-    applied_reads: BTreeMap<TxnId, Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+    applied_reads: BTreeMap<TxnId, Reads>,
     finished: BTreeMap<TxnId, Outcome>,
     answers: BTreeMap<TxnId, (Answer, u64, u32)>,
     rounds: Vec<u32>,
@@ -841,8 +844,8 @@ fn run_seed(seed: u64, protocol: Protocol) -> Ran {
             }
         }
         if sim.ready() && ops.len() < total {
-            for c in 0..clients {
-                if busy[c].is_some() || ops.len() >= total {
+            for slot in &mut busy {
+                if slot.is_some() || ops.len() >= total {
                     continue;
                 }
                 let picked: BTreeSet<u8> = (0..1 + rng.below(3))
@@ -861,7 +864,7 @@ fn run_seed(seed: u64, protocol: Protocol) -> Ran {
                 }
                 let invoke = sim.now;
                 if let Some(id) = sim.begin(t) {
-                    busy[c] = Some(id);
+                    *slot = Some(id);
                     ops.push(Op { id, invoke, writes });
                 }
             }
