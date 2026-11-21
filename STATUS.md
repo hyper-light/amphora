@@ -24,6 +24,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   pass it, and a seeded differential test holds the simulator's answers to Amphora's
   (`crates/amphora/tests/records_conformance.rs`).
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
+- **The design's index and the README** (AC-T1.2.3, T-T1.13.2; lane docs): `docs/design.md` gives every
+  decision of `docs/design/` one line and a link, held to the records by
+  `crates/amphora/tests/design_index.rs` (a decision without a line, or a line that points nowhere,
+  fails it); it compares the client protocol with PostgreSQL's, MySQL's, SQLite's API and Hrana from
+  `docs/research/client-protocol.md`, and `docs/design/client-protocol.md` proposes the decision
+  (embedded first; the network listener open). `README.md` takes a fresh clone to a build, a working
+  database (`cargo run -p amphora --example quickstart`) and the gates. Built and merged; a fresh
+  agent following it on a clean machine (T-T1.13.2's run) is still to do.
 - **The store's commit pipeline** (CP-T1.1, `crates/amphora/src/store.rs`, docs/design/store.md): one
   writer with a group commit and no timer; durable beside it by a flusher (a write is durable once a
   flush begun after its commit ends, `Store::durable` by its batch's ticket); readers of their own on
