@@ -1,0 +1,77 @@
+hash-threshold 8
+
+# written for rule.expression-affinity:otherwise no affinity: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE r(n INTEGER, t TEXT)
+
+statement ok
+INSERT INTO r VALUES (1, '1')
+
+statement ok
+CREATE VIEW v AS SELECT n AS v_n, t AS v_t, n + 1 AS v_e FROM r
+
+statement ok
+CREATE VIEW c AS SELECT n AS c_n, t AS c_t FROM r UNION ALL SELECT n, t FROM r
+
+query I rowsort
+SELECT 1 = '1' FROM r
+----
+0
+
+query I rowsort
+SELECT '1' = 1 FROM r
+----
+0
+
+query I rowsort
+SELECT 1.0 = '1.0' FROM r
+----
+0
+
+query I rowsort
+SELECT x'31' = '1' FROM r
+----
+0
+
+query I rowsort
+SELECT 'a' > 1 FROM r
+----
+1
+
+query T rowsort
+SELECT NULL = '1' FROM r
+----
+NULL
+
+query I rowsort
+SELECT 2 > '10' FROM r
+----
+0
+
+query I rowsort
+SELECT '2' > 10 FROM r
+----
+1
+
+query I rowsort
+SELECT 1 IS '1' FROM r
+----
+0
+
+query I rowsort
+SELECT (1) = ('1') FROM r
+----
+0

@@ -1,0 +1,191 @@
+hash-threshold 8
+
+# written for rule.affinity:CHAR, CLOB or TEXT gives TEXT: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE r0(x CHARACTER(20))
+
+statement ok
+INSERT INTO r0 VALUES ('12')
+
+statement ok
+INSERT INTO r0 VALUES ('12.0')
+
+statement ok
+INSERT INTO r0 VALUES ('1.5')
+
+statement ok
+INSERT INTO r0 VALUES ('abc')
+
+statement ok
+INSERT INTO r0 VALUES (12)
+
+statement ok
+INSERT INTO r0 VALUES (12.5)
+
+statement ok
+INSERT INTO r0 VALUES (x'3132')
+
+statement ok
+INSERT INTO r0 VALUES (NULL)
+
+statement ok
+INSERT INTO r0 VALUES ('0x10')
+
+statement ok
+INSERT INTO r0 VALUES (' 7 ')
+
+statement ok
+INSERT INTO r0 VALUES ('1e3')
+
+statement ok
+INSERT INTO r0 VALUES (-0.0)
+
+query TT nosort
+SELECT typeof(x), quote(x) FROM r0 ORDER BY rowid
+----
+24 values hashing to ade5aabb2b7a0f71da164c19a3828555
+
+statement ok
+CREATE TABLE r1(x VARCHAR(255))
+
+statement ok
+INSERT INTO r1 VALUES ('12')
+
+statement ok
+INSERT INTO r1 VALUES ('12.0')
+
+statement ok
+INSERT INTO r1 VALUES ('1.5')
+
+statement ok
+INSERT INTO r1 VALUES ('abc')
+
+statement ok
+INSERT INTO r1 VALUES (12)
+
+statement ok
+INSERT INTO r1 VALUES (12.5)
+
+statement ok
+INSERT INTO r1 VALUES (x'3132')
+
+statement ok
+INSERT INTO r1 VALUES (NULL)
+
+statement ok
+INSERT INTO r1 VALUES ('0x10')
+
+statement ok
+INSERT INTO r1 VALUES (' 7 ')
+
+statement ok
+INSERT INTO r1 VALUES ('1e3')
+
+statement ok
+INSERT INTO r1 VALUES (-0.0)
+
+query TT nosort
+SELECT typeof(x), quote(x) FROM r1 ORDER BY rowid
+----
+24 values hashing to ade5aabb2b7a0f71da164c19a3828555
+
+statement ok
+CREATE TABLE r2(x NCHAR(55))
+
+statement ok
+INSERT INTO r2 VALUES ('12')
+
+statement ok
+INSERT INTO r2 VALUES ('12.0')
+
+statement ok
+INSERT INTO r2 VALUES ('1.5')
+
+statement ok
+INSERT INTO r2 VALUES ('abc')
+
+statement ok
+INSERT INTO r2 VALUES (12)
+
+statement ok
+INSERT INTO r2 VALUES (12.5)
+
+statement ok
+INSERT INTO r2 VALUES (x'3132')
+
+statement ok
+INSERT INTO r2 VALUES (NULL)
+
+statement ok
+INSERT INTO r2 VALUES ('0x10')
+
+statement ok
+INSERT INTO r2 VALUES (' 7 ')
+
+statement ok
+INSERT INTO r2 VALUES ('1e3')
+
+statement ok
+INSERT INTO r2 VALUES (-0.0)
+
+query TT nosort
+SELECT typeof(x), quote(x) FROM r2 ORDER BY rowid
+----
+24 values hashing to ade5aabb2b7a0f71da164c19a3828555
+
+statement ok
+CREATE TABLE r3(x TEXT)
+
+statement ok
+INSERT INTO r3 VALUES ('12')
+
+statement ok
+INSERT INTO r3 VALUES ('12.0')
+
+statement ok
+INSERT INTO r3 VALUES ('1.5')
+
+statement ok
+INSERT INTO r3 VALUES ('abc')
+
+statement ok
+INSERT INTO r3 VALUES (12)
+
+statement ok
+INSERT INTO r3 VALUES (12.5)
+
+statement ok
+INSERT INTO r3 VALUES (x'3132')
+
+statement ok
+INSERT INTO r3 VALUES (NULL)
+
+statement ok
+INSERT INTO r3 VALUES ('0x10')
+
+statement ok
+INSERT INTO r3 VALUES (' 7 ')
+
+statement ok
+INSERT INTO r3 VALUES ('1e3')
+
+statement ok
+INSERT INTO r3 VALUES (-0.0)
+
+query TT nosort
+SELECT typeof(x), quote(x) FROM r3 ORDER BY rowid
+----
+24 values hashing to ade5aabb2b7a0f71da164c19a3828555

@@ -1,0 +1,126 @@
+hash-threshold 8
+
+# written for word:STRICT: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE st(i INTEGER, r REAL, t TEXT, b BLOB, a ANY, n INT) STRICT
+
+statement ok
+INSERT INTO st VALUES (1, 1.5, 'x', x'00', 1, 2)
+
+statement ok
+INSERT INTO st(i) VALUES ('12')
+
+statement ok
+INSERT INTO st(i) VALUES ('12.0')
+
+statement error
+INSERT INTO st(i) VALUES ('abc')
+
+statement error
+INSERT INTO st(i) VALUES (1.5)
+
+statement ok
+INSERT INTO st(r) VALUES (3)
+
+statement ok
+INSERT INTO st(r) VALUES ('4.5')
+
+statement error
+INSERT INTO st(r) VALUES (x'01')
+
+statement ok
+INSERT INTO st(t) VALUES (5)
+
+statement error
+INSERT INTO st(b) VALUES ('text')
+
+statement ok
+INSERT INTO st(a) VALUES ('1')
+
+statement ok
+INSERT INTO st(n) VALUES (NULL)
+
+query TTTTT nosort
+SELECT typeof(i), typeof(r), typeof(t), typeof(b), typeof(a) FROM st ORDER BY rowid
+----
+40 values hashing to 66dbe1f9e255823e2e792a7b81c7b9e6
+
+statement error
+UPDATE st SET i = 'nope' WHERE rowid = 1
+
+statement error
+CREATE TABLE st2(x VARCHAR(10)) STRICT
+
+statement error
+CREATE TABLE st3(x) STRICT
+
+statement ok
+CREATE TABLE st4(k INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT
+
+statement ok
+INSERT INTO st4(v) VALUES ('a')
+
+statement error
+INSERT INTO st4 VALUES ('1', 'b')
+
+statement error
+INSERT INTO st4 VALUES ('one', 'c')
+
+query IT nosort
+SELECT k, v FROM st4 ORDER BY k
+----
+1
+a
+
+query I rowsort
+SELECT strict FROM pragma_table_list WHERE name = 'st'
+----
+1
+
+statement ok
+ALTER TABLE st ADD COLUMN z TEXT
+
+statement error
+ALTER TABLE st ADD COLUMN y FLOAT
+
+statement ok
+INSERT INTO st(i) VALUES (9223372036854775807)
+
+statement error
+INSERT INTO st(i) VALUES ('9223372036854775808')
+
+statement ok
+INSERT INTO st(a) VALUES (x'ff'), (2.5), (NULL)
+
+query T nosort
+SELECT typeof(a) FROM st WHERE a IS NOT NULL ORDER BY rowid
+----
+integer
+text
+blob
+real
+
+statement error
+INSERT INTO st(t) VALUES (x'41')
+
+statement ok
+INSERT INTO st(r) VALUES (9223372036854775807)
+
+query TT rowsort
+SELECT r, typeof(r) FROM st WHERE r > 1e18
+----
+9.2233720368547758e+18
+real

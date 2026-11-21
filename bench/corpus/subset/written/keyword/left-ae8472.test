@@ -1,0 +1,80 @@
+hash-threshold 8
+
+# written for keyword:LEFT: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query IT nosort
+SELECT t1.a, t2.b FROM t1 LEFT JOIN t2 ON t1.a = t2.a ORDER BY 1
+----
+14 values hashing to 37777dde4aebca81c19a4f246c61d8ce
+
+query I nosort
+SELECT t1.a FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.a IS NULL ORDER BY 1
+----
+NULL
+4
+5
+
+query I rowsort
+SELECT count(t2.a) FROM t1 LEFT OUTER JOIN t2 USING (a)
+----
+4
+
+query II nosort
+SELECT t1.a, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t2.c > 15 ORDER BY 1
+----
+14 values hashing to 9bbd688882a2deae16539e3e5ee3ac25
+
+query IT nosort
+SELECT t2.a, t1.b FROM t2 LEFT JOIN t1 ON t1.a = t2.a ORDER BY 1
+----
+10 values hashing to 1db703789384cdecec286346b64d316b
+
+query I rowsort
+SELECT count(*) FROM t1 LEFT JOIN t2 ON 0
+----
+7
+
+query IT nosort
+SELECT t1.a, coalesce(t2.b, '-') FROM t1 LEFT JOIN t2 USING (a) ORDER BY 1
+----
+14 values hashing to f5d2c4c84ad63835a88457575b826ea5
+
+query I nosort
+SELECT a FROM t1 NATURAL LEFT JOIN t2 ORDER BY 1
+----
+NULL
+1
+2
+3
+4
+5
+6
+
+query II nosort
+SELECT t1.a, x.a FROM t1 LEFT JOIN t1 AS x ON x.a = t1.a + 1 ORDER BY 1
+----
+14 values hashing to 4e9d46fea58f07b45ee4393e9af08d5a
+
+query III nosort
+SELECT t1.a, t2.a, t3.a FROM t1 LEFT JOIN t2 ON t2.a = t1.a LEFT JOIN t2 AS t3 ON t3.a = t2.a + 1 ORDER BY 1
+----
+21 values hashing to e59bf1db0bd2c83332bbcafea50b8439
+
+query I nosort
+SELECT t1.a FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.c IS NOT NULL ORDER BY 1
+----
+1
+2
+3
