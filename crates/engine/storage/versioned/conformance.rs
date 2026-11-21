@@ -291,7 +291,7 @@ fn run(kind: Kind, seed: u64, ops: usize) {
     let mut rng = Rng(seed);
     let (mut b, mut v, pager, _keep) = pair(kind, seed);
     let (b, v) = (b.as_mut(), v.as_mut());
-    // Whether a step may follow: the cursor is on a row, or has just written.
+    // Whether a step may follow: the cursor is on a row, or has just deleted one.
     let mut may_step = false;
     let mut next_rowid = 1i64;
     for step in 0..ops {
@@ -331,7 +331,10 @@ fn run(kind: Kind, seed: u64, ops: usize) {
             };
             pager.io.block(|| b.insert(&bkey)).unwrap();
             pager.io.block(|| v.insert(&bkey)).unwrap();
-            may_step = true;
+            // sqlite3BtreeInsert leaves the cursor at an arbitrary place unless told to save its
+            // position (BTREE_SAVEPOSITION), and the executor seeks before it reads or steps
+            // again: no position is compared until the next placing move (T-NS.1.1).
+            may_step = false;
         } else if roll < 43 {
             if !(b.has_record() && may_step) {
                 continue;
@@ -535,9 +538,9 @@ fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
     let mut reader = VersionedCursor::new(
         vdb.clone(),
         0,
-        order.clone(),
+        order,
         Access::Read(snap),
-        pager.clone(),
+        pager,
     )
     .unwrap();
     let writers: Vec<_> = (0..4i64)
@@ -605,11 +608,11 @@ fn ns_1_1_a_cursor_sees_writes_through_another_cursor_of_its_transaction() {
     )
     .unwrap();
     let mut r = VersionedCursor::new(
-        vdb.clone(),
+        vdb,
         0,
-        order.clone(),
-        Access::Write(txn.clone()),
-        pager.clone(),
+        order,
+        Access::Write(txn),
+        pager,
     )
     .unwrap();
     let old = record(&[Value::from_text("old".repeat(30))]);
@@ -649,7 +652,7 @@ fn ns_1_1_a_reading_cursor_refuses_writes() {
     let (pager, _db, _conn) = engine();
     let snap = vdb.snapshot().unwrap();
     let mut c =
-        VersionedCursor::new(vdb.clone(), 0, order.clone(), Access::Read(snap), pager).unwrap();
+        VersionedCursor::new(vdb, 0, order, Access::Read(snap), pager).unwrap();
     let rec = record(&[Value::from_i64(1)]);
     let refused = c.insert(&BTreeKey::new_table_rowid(1, Some(&rec)));
     assert!(matches!(
