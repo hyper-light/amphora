@@ -1994,6 +1994,9 @@ impl ProgramBuilder {
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::GroupFind { data } => resolve(&mut data.target_pc_full, "GroupFind")?,
                 Insn::GroupDrain { data } => resolve(&mut data.target_pc_done, "GroupDrain")?,
+                Insn::HashMarkFirstMatch { target_pc, .. } => {
+                    resolve(target_pc, "HashMarkFirstMatch")?
+                }
                 Insn::HashScanUnmatched { target_pc, .. } => {
                     resolve(target_pc, "HashScanUnmatched")?
                 }

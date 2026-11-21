@@ -22,6 +22,8 @@
 //!   by copy, catch-up and a brief cutover (CP-T1.9).
 //! - [`db`]: stores on Amphora's engine (`crates/engine`).
 //! - [`meter`]: what a store counts.
+//! - [`regions`]: region-local groups under a global root (CP-T1.11): region labels, placement
+//!   rules, routing that tries the reader's region first, and the simulated region lab.
 //! - [`xgroup`]: transactions across groups (CP-T1.10): two-phase commit and Parallel Commits.
 //! - [`memory`]: the memory this process may use, as the system says (the process's page pool is a
 //!   part of it).
@@ -36,6 +38,7 @@ mod descriptors;
 pub mod groups;
 pub mod memory;
 pub mod meter;
+pub mod regions;
 pub mod replication;
 pub mod reshard;
 pub mod search;

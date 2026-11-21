@@ -993,7 +993,11 @@ fn emit_update_column_values<'a>(
 
                     // don't emit null for pkey of virtual tables. they require first two args
                     // before the 'record' to be explicitly non-null
-                    if table_column.is_rowid_alias() && !column_ctx.is_virtual_table {
+                    // Amphora: every write stores NULL in a column an online DROP COLUMN
+                    // dropped, so an update clears the row's old value (CP-T1.12).
+                    if (table_column.is_rowid_alias() || table_column.dropped())
+                        && !column_ctx.is_virtual_table
+                    {
                         program.emit_null(target_reg, None);
                     } else if column_ctx.is_virtual_table {
                         program.emit_insn(Insn::VColumn {
