@@ -20332,6 +20332,123 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     }
 }
 
+/// Amphora (QT.6): [Insn::MorselAggregate]. The statement's read transaction is open, so every
+/// worker's cursor reads its one snapshot through `pager`.
+pub fn op_morsel_aggregate(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::vdbe::morsel::{MachineCosts, MemoryBudget, MorselError, ScanAggregate};
+    use crate::vdbe::morsel_scan::{TableAggregate, TableSource};
+    load_insn!(MorselAggregate { data }, insn);
+    let refused = |error: MorselError| -> Box<LimboError> {
+        Box::new(LimboError::InternalError(format!(
+            "parallel aggregate: {error}"
+        )))
+    };
+    let connection = &program.connection;
+    // The costs are taken for the run and put back after, so a statement learns from the last.
+    let taken = connection.morsel_costs.lock().take();
+    let mut costs = match taken {
+        Some(costs) => costs,
+        None => MachineCosts::measure().map_err(refused)?,
+    };
+    let answered = (|| {
+        let table = TableSource::open(
+            pager.clone(),
+            data.root_page,
+            data.columns,
+            data.rowid_alias,
+        )?;
+        let shape = ScanAggregate {
+            rows: &[],
+            filter: &data.filter,
+            group_by: &data.group_by,
+            aggregates: &data.aggregates,
+        };
+        let pipeline = TableAggregate {
+            table: &table,
+            shape: &shape,
+        };
+        let budget = MemoryBudget::new(pager.statement_memory_budget());
+        pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget)
+    })();
+    *connection.morsel_costs.lock() = Some(costs);
+    let mut rows = match answered {
+        Ok((rows, _)) => rows,
+        // A value the parallel aggregates don't take (a SUM over text), or groups past the
+        // statement's memory that the serial loop's spilling GROUP BY can hold: it answers.
+        Err(MorselError::Unsupported { .. } | MorselError::MemoryBudget { .. }) => {
+            state.pc = data.target_pc_serial.as_offset_int();
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        Err(error) => return Err(refused(error)),
+    };
+    // Groups in the order the serial GROUP BY gives them: by their key values as SQLite orders
+    // them (the pipeline's own key order puts kinds apart).
+    let keys = data.group_by.len();
+    rows.sort_by(|a, b| a.iter().take(keys).cmp(b.iter().take(keys)));
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows.len())
+        .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+    for row in rows {
+        let mut mapped = Vec::new();
+        mapped
+            .try_reserve_exact(data.result_map.len())
+            .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+        for at in &data.result_map {
+            let value = row.get(*at).ok_or_else(|| {
+                refused(MorselError::NoColumn {
+                    column: *at,
+                    width: row.len(),
+                })
+            })?;
+            mapped.push(value.clone());
+        }
+        out.push(mapped);
+    }
+    state.morsel_rows = Some(out.into_iter());
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (QT.6): [Insn::MorselNext].
+pub fn op_morsel_next(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        MorselNext {
+            dest_start,
+            count,
+            target_pc_done
+        },
+        insn
+    );
+    let next = state.morsel_rows.as_mut().and_then(Iterator::next);
+    let Some(row) = next else {
+        state.morsel_rows = None;
+        state.pc = target_pc_done.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let end = dest_start
+        .checked_add(*count)
+        .ok_or(LimboError::IntegerOverflow)?;
+    let registers = state
+        .registers
+        .get_mut(*dest_start..end)
+        .ok_or_else(|| LimboError::InternalError("parallel rows' registers out of range".into()))?;
+    for (register, value) in registers.iter_mut().zip(row) {
+        *register = Register::Value(value);
+    }
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
