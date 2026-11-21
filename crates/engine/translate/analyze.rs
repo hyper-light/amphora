@@ -378,7 +378,11 @@ pub fn translate_analyze(
         if !is_specific_index_target {
             emit_column_stats(program, column_stats_cursor, &target_table, database_id)?;
         }
-        let degrees_cursor = (!is_specific_index_target).then_some(column_stats_cursor);
+        let degrees_cursor = if is_specific_index_target {
+            None
+        } else {
+            Some(column_stats_cursor)
+        };
         for index in indexes {
             emit_index_stats(
                 program,
