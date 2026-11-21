@@ -233,3 +233,36 @@ fn t_ns_2_6_ddl_rolls_back_with_its_transaction() {
     let q = "SELECT c FROM v";
     assert_eq!(rows(&versioned, q), rows(&pager, q));
 }
+
+/// Do: SAVEPOINTs nested in a transaction, ROLLBACK TO the inner one twice, RELEASE the outer one,
+/// COMMIT; and a SAVEPOINT that starts a transaction, rolled back to and released. Expect: the
+/// same rows on both storages.
+#[test]
+fn t_ns_2_6_named_savepoints_answer_alike() {
+    let (_pdb, pager) = connect(false);
+    let (_vdb, versioned) = connect(true);
+    for conn in [&pager, &versioned] {
+        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)");
+        run(conn, "BEGIN");
+        run(conn, "INSERT INTO t VALUES (1, 'kept')");
+        run(conn, "SAVEPOINT outer_sp");
+        run(conn, "INSERT INTO t VALUES (2, 'kept too')");
+        run(conn, "SAVEPOINT inner_sp");
+        run(conn, "INSERT INTO t VALUES (3, 'undone')");
+        run(conn, "UPDATE t SET b = 'undone' WHERE a = 1");
+        run(conn, "ROLLBACK TO inner_sp");
+        run(conn, "INSERT INTO t VALUES (4, 'undone again')");
+        run(conn, "ROLLBACK TO inner_sp");
+        run(conn, "RELEASE outer_sp");
+        run(conn, "COMMIT");
+        run(conn, "SAVEPOINT alone");
+        run(conn, "DELETE FROM t WHERE a = 2");
+        run(conn, "ROLLBACK TO alone");
+        run(conn, "INSERT INTO t VALUES (5, 'last')");
+        run(conn, "RELEASE alone");
+    }
+    let q = "SELECT a, b FROM t ORDER BY a";
+    let want = rows(&pager, q);
+    assert_eq!(want.len(), 3);
+    assert_eq!(rows(&versioned, q), want);
+}
