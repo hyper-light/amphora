@@ -58,6 +58,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub allow_automatic_index: bool,
     /// Amphora: the join methods the connection allows (`Connection::set_join_methods`).
     pub join_methods: crate::JoinMethods,
+    /// Amphora: whether a sorted fetch may be planned (`Connection::set_sorted_fetches`).
+    pub sorted_fetches: bool,
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
     /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
     pub row_goal: Option<RowGoal>,
@@ -72,6 +74,7 @@ impl<'a> JoinPlanningContext<'a> {
             cost_limit: None,
             allow_automatic_index: true,
             join_methods: crate::JoinMethods::ByCost,
+            sorted_fetches: false,
             row_goal: None,
         }
     }
@@ -1037,7 +1040,9 @@ fn join_lhs_and_rhs<'a>(
                                 // Materialize build-side rowids so the hash build only includes
                                 // rows that already match prior join constraints.
                                 *materialize_build_input = true;
-                                let materialize_cost = effective_build_cardinality * 0.003;
+                                // A row's visit each, at the row's learned cost (QT.5).
+                                let materialize_cost =
+                                    effective_build_cardinality * params.cpu_cost_per_row;
                                 hash_join_method.cost =
                                     hash_join_method.cost + Cost(materialize_cost);
                                 // When two materialized hash-join plans have equal cost,
@@ -3987,41 +3992,17 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // Put the table with no filter first. The two inner tables can then
-        // build an automatic index once instead of scanning once per outer row.
-        assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![2, 1, 0]);
+        // Amphora (QT.5): an automatic index on a table of the fallback's million rows outgrows
+        // its cache, so it pays for the pages it writes and reads again; building two of them under
+        // the unfiltered table costs more than reading the table the equality filter keeps fewest
+        // rows of first, the range filter's next, and the unfiltered one last.
+        assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![1, 0, 2]);
 
         let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
-
-        let access_method = &access_methods_arena[best_plan.data[1].1];
-        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
-        assert!(constraint_refs.is_empty());
-        assert!(iter_dir == IterationDirection::Forwards);
-        assert!(index.is_none());
-        assert!(matches!(
-            access_method.params,
-            AccessMethodParams::BTreeTable {
-                build_index: true,
-                ..
-            }
-        ));
-
-        let access_method = &access_methods_arena[best_plan.data[2].1];
-        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
-        assert!(constraint_refs.is_empty());
-        assert!(iter_dir == IterationDirection::Forwards);
-        assert!(index.is_none());
-        assert!(matches!(
-            access_method.params,
-            AccessMethodParams::BTreeTable {
-                build_index: true,
-                ..
-            }
-        ));
     }
 
     #[test]

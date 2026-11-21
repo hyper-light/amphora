@@ -52,6 +52,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::Hash;
 
+use crate::storage::sqlite3_ondisk::PageContent;
+
 /// A leaf as a read of it leaves it: its page, its first and last key, and its cell count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafSpan<K> {
@@ -688,6 +690,25 @@ impl LeafLocator {
     }
 }
 
+/// A table leaf's span as its bytes say: the proof a named page must give before its answer is
+/// taken. `None` for any other page (interior, an index's, an empty leaf) or one that doesn't decode.
+pub fn table_leaf_span(contents: &PageContent, page: u64) -> Option<LeafSpan<i64>> {
+    if !contents.is_table() || !contents.is_leaf() {
+        return None;
+    }
+    let cells = contents.cell_count();
+    let last = contents
+        .cell_table_leaf_read_rowid(cells.checked_sub(1)?)
+        .ok()?;
+    let first = contents.cell_table_leaf_read_rowid(0).ok()?;
+    Some(LeafSpan {
+        page,
+        first,
+        last,
+        cells,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{Rng, SeedableRng};
@@ -1264,6 +1285,325 @@ mod tests {
                 )
             });
             println!("descent_skip_bench {mode} mixed: {ns:.1} ns/op{upkeep}");
+        }
+    }
+
+    /// The engine's side: a real rowid table, its pages read through the pager.
+    mod engine {
+        use std::num::NonZero;
+        use std::sync::Arc;
+
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        use super::super::{table_leaf_span, AdaptiveHash, LeafLocator, LeafSpan};
+        use super::bits;
+        use crate::io::{MemoryIO, IO};
+        use crate::storage::btree::{BTreeCursor, CursorTrait};
+        use crate::storage::pager::Pager;
+        use crate::types::{SeekKey, SeekOp, SeekResult, Value};
+        use crate::util::IOExt;
+        use crate::{ConnectOpts, Database, SqliteDialect};
+
+        fn open() -> (Arc<Database>, Arc<crate::Connection>) {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v)")
+                .unwrap();
+            (db, conn)
+        }
+
+        fn insert(conn: &Arc<crate::Connection>, rowid: i64, value: i64) {
+            let mut stmt = conn
+                .prepare("INSERT OR REPLACE INTO t (id, v) VALUES (?, ?)")
+                .unwrap();
+            stmt.bind_at(NonZero::new(1).unwrap(), Value::from_i64(rowid))
+                .unwrap();
+            stmt.bind_at(NonZero::new(2).unwrap(), Value::from_i64(value))
+                .unwrap();
+            stmt.run_ignore_rows().unwrap();
+        }
+
+        fn root(conn: &Arc<crate::Connection>) -> i64 {
+            let rows = conn
+                .prepare("SELECT rootpage FROM sqlite_schema WHERE name = 't'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            rows[0][0].as_int().unwrap()
+        }
+
+        fn span(pager: &Arc<Pager>, page: u64) -> Option<LeafSpan<i64>> {
+            let (page_ref, _) = pager.io.block(|| pager.read_page(page as i64)).ok()?;
+            while page_ref.is_locked() {
+                pager.io.step().unwrap();
+            }
+            table_leaf_span(page_ref.get_contents(), page)
+        }
+
+        /// The row a lookup finds in a proven leaf: the cell holding `rowid`, if any.
+        fn cell_in(pager: &Arc<Pager>, leaf: &LeafSpan<i64>, rowid: i64) -> Option<usize> {
+            let (page_ref, _) = pager
+                .io
+                .block(|| pager.read_page(leaf.page as i64))
+                .unwrap();
+            let contents = page_ref.get_contents();
+            let (mut low, mut high) = (0usize, leaf.cells);
+            while low < high {
+                let mid = (low + high) / 2;
+                let at = contents.cell_table_leaf_read_rowid(mid).unwrap();
+                match at.cmp(&rowid) {
+                    std::cmp::Ordering::Less => low = mid + 1,
+                    std::cmp::Ordering::Greater => high = mid,
+                    std::cmp::Ordering::Equal => return Some(mid),
+                }
+            }
+            None
+        }
+
+        /// The plain descent: the leaf and cell the cursor stands on when it found `rowid`, the
+        /// probes it made above the leaf, and the leaf's span.
+        fn descend(
+            pager: &Arc<Pager>,
+            cursor: &mut BTreeCursor,
+            rowid: i64,
+        ) -> (Option<(u64, usize)>, u64, Option<LeafSpan<i64>>) {
+            let found = pager
+                .io
+                .block(|| cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }))
+                .unwrap();
+            let levels = cursor.position();
+            let (leaf, cell) = *levels.last().unwrap();
+            let mut above = 0;
+            for (page, _) in &levels[..levels.len() - 1] {
+                let (page_ref, _) = pager.io.block(|| pager.read_page(*page as i64)).unwrap();
+                above += bits(page_ref.get_contents().cell_count());
+            }
+            let at = matches!(found, SeekResult::Found).then(|| (leaf as u64, cell as usize));
+            (at, above, span(pager, leaf as u64))
+        }
+
+        enum Mode<'a> {
+            Hash(&'a mut AdaptiveHash<i64>),
+            Locator(&'a mut LeafLocator),
+        }
+
+        /// A lookup through a prototype on the engine's pages: the page it names, proven by its
+        /// bytes, else the descent, reported to it. The leaf and cell found, if any.
+        fn skip(
+            pager: &Arc<Pager>,
+            cursor: &mut BTreeCursor,
+            mode: &mut Mode<'_>,
+            rowid: i64,
+            stamp: u64,
+        ) -> Option<(u64, usize)> {
+            let named = match mode {
+                Mode::Hash(hash) => hash.lookup(&rowid, stamp),
+                Mode::Locator(locator) => locator.lookup(rowid, stamp),
+            };
+            if let Some(page) = named {
+                match span(pager, page) {
+                    Some(leaf) if leaf.covers(&rowid) => {
+                        match mode {
+                            Mode::Hash(hash) => hash.confirm(),
+                            Mode::Locator(locator) => locator.confirm(),
+                        }
+                        return cell_in(pager, &leaf, rowid).map(|cell| (page, cell));
+                    }
+                    _ => match mode {
+                        Mode::Hash(hash) => hash.refute(page),
+                        Mode::Locator(locator) => locator.refute(page),
+                    },
+                }
+            }
+            let (at, above, leaf) = descend(pager, cursor, rowid);
+            if let Some(leaf) = leaf {
+                match mode {
+                    Mode::Hash(hash) => {
+                        hash.descended(&rowid, &leaf, above, stamp, || {
+                            let (page_ref, _) = pager
+                                .io
+                                .block(|| pager.read_page(leaf.page as i64))
+                                .unwrap();
+                            let contents = page_ref.get_contents();
+                            (0..leaf.cells)
+                                .map(|i| contents.cell_table_leaf_read_rowid(i).unwrap())
+                                .collect()
+                        });
+                    }
+                    Mode::Locator(locator) => {
+                        locator.learn(&leaf, stamp);
+                    }
+                }
+            }
+            at
+        }
+
+        /// A mode's lookups, warm, then timed: nanoseconds a lookup.
+        fn timed(
+            pager: &Arc<Pager>,
+            cursor: &mut BTreeCursor,
+            mode: &mut Mode<'_>,
+            keys: &[i64],
+            want: &[Option<(u64, usize)>],
+        ) -> f64 {
+            for &rowid in keys {
+                skip(pager, cursor, mode, rowid, 0);
+            }
+            let started = std::time::Instant::now();
+            for (&rowid, want) in keys.iter().zip(want) {
+                assert_eq!(skip(pager, cursor, mode, rowid, 0), *want);
+            }
+            started.elapsed().as_nanos() as f64 / keys.len() as f64
+        }
+
+        /// T-G3.5.3: the same on the engine's own pages: a rowid table through committed rounds of
+        /// inserts (splits) and range deletes (merges, freed pages), then lookups of present and
+        /// absent rowids; each prototype's page, proven by its bytes (`table_leaf_span`), gives the
+        /// leaf and cell a cursor's descent stands on, or none when the descent finds none. The
+        /// stamp is the round: pages are freed only by a round's writes (the cursor hook's
+        /// freed-page count stands in for it there).
+        #[test]
+        fn t_g3_5_3_skips_on_engine_pages_match_the_cursor() {
+            let (_db, conn) = open();
+            let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5235_0003);
+            let mut hash = AdaptiveHash::new(4096, 0);
+            let mut locator = LeafLocator::new(4096, 0);
+            let mut next = 0i64;
+            for round in 1..=6u64 {
+                conn.execute("BEGIN").unwrap();
+                for _ in 0..1500 {
+                    let rowid = if rng.random_range(0..2) == 0 {
+                        next += rng.random_range(1..4);
+                        next
+                    } else {
+                        rng.random_range(0..next + 1)
+                    };
+                    insert(&conn, rowid, rng.random());
+                }
+                let from = rng.random_range(0..next + 1);
+                conn.execute(format!(
+                    "DELETE FROM t WHERE id BETWEEN {from} AND {}",
+                    from + 400
+                ))
+                .unwrap();
+                conn.execute("COMMIT").unwrap();
+                let root = root(&conn);
+                let pager = conn.pager.load().clone();
+                pager.begin_read_tx().unwrap();
+                let mut cursor = BTreeCursor::new_table(pager.clone(), root, 2);
+                let mut plain = BTreeCursor::new_table(pager.clone(), root, 2);
+                for _ in 0..3000 {
+                    let rowid = rng.random_range(-3..next + 3);
+                    let (want, _, _) = descend(&pager, &mut plain, rowid);
+                    let got = skip(
+                        &pager,
+                        &mut cursor,
+                        &mut Mode::Hash(&mut hash),
+                        rowid,
+                        round,
+                    );
+                    assert_eq!(got, want, "round {round} hash {rowid}");
+                    let got = skip(
+                        &pager,
+                        &mut cursor,
+                        &mut Mode::Locator(&mut locator),
+                        rowid,
+                        round,
+                    );
+                    assert_eq!(got, want, "round {round} locator {rowid}");
+                }
+                pager.end_read_tx();
+            }
+            let (h, l) = (hash.counts(), locator.counts());
+            assert!(h.hits > 0 && h.built > 0, "hash vacuous: {h:?}");
+            assert!(l.hits > 0 && l.built > 0, "locator vacuous: {l:?}");
+        }
+
+        /// The lookup costs on the engine's pages, behind AC-G3.5.1: nanoseconds a point lookup by
+        /// a cursor's descent, by the adaptive hash and by the learned locator (each naming a page
+        /// read through the pager and proven by its bytes), warm, over a table of
+        /// `AMPHORA_SKIP_BENCH_ROWS` rows; and E's rebuild, nanoseconds a leaf. Release, quiet:
+        /// `cargo test -p amphora-engine --release --lib descent_skip_engine_bench -- --ignored --nocapture`.
+        /// It asserts nothing about time (answers are checked equal to the descent's).
+        #[test]
+        #[ignore = "micro-benchmark: run on a quiet machine, release"]
+        fn descent_skip_engine_bench() {
+            use std::time::Instant;
+
+            let size = |name: &str, default: usize| -> usize {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(default)
+            };
+            let rows = size("AMPHORA_SKIP_BENCH_ROWS", 200_000);
+            let lookups = size("AMPHORA_SKIP_BENCH_LOOKUPS", 200_000);
+            let (_db, conn) = open();
+            conn.execute("BEGIN").unwrap();
+            for rowid in 0..rows as i64 {
+                insert(&conn, rowid, rowid);
+            }
+            conn.execute("COMMIT").unwrap();
+            let root = root(&conn);
+            let pager = conn.pager.load().clone();
+            pager.begin_read_tx().unwrap();
+            let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5235_4246);
+            let keys: Vec<i64> = (0..lookups)
+                .map(|_| rng.random_range(0..rows as i64))
+                .collect();
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root, 2);
+            let mut want = Vec::with_capacity(keys.len());
+            for &rowid in &keys {
+                want.push(descend(&pager, &mut cursor, rowid).0);
+            }
+            let started = Instant::now();
+            for &rowid in &keys {
+                pager
+                    .io
+                    .block(|| cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }))
+                    .unwrap();
+            }
+            let descent_ns = started.elapsed().as_nanos() as f64 / keys.len() as f64;
+
+            let mut hash = AdaptiveHash::new(rows.saturating_mul(2), 0);
+            let mut locator = LeafLocator::new(rows, 0);
+            let mut leaves: Vec<LeafSpan<i64>> = want
+                .iter()
+                .flatten()
+                .filter_map(|(page, _)| span(&pager, *page))
+                .collect();
+            leaves.sort_unstable_by_key(|leaf| leaf.first);
+            leaves.dedup_by_key(|leaf| leaf.page);
+            let started = Instant::now();
+            locator.rebuild(leaves.iter().cloned(), 0);
+            let rebuild_ns = started.elapsed().as_nanos() as f64 / leaves.len().max(1) as f64;
+            let hash_ns = timed(
+                &pager,
+                &mut cursor,
+                &mut Mode::Hash(&mut hash),
+                &keys,
+                &want,
+            );
+            let locator_ns = timed(
+                &pager,
+                &mut cursor,
+                &mut Mode::Locator(&mut locator),
+                &keys,
+                &want,
+            );
+            println!(
+                "descent_skip_engine_bench rows {rows} lookups {lookups}: descent {descent_ns:.1} ns/lookup \
+                 | hash {hash_ns:.1} ns/lookup ({:?}) | locator {locator_ns:.1} ns/lookup, {} fences \
+                 {} segments max err {}, rebuild {rebuild_ns:.1} ns/leaf ({:?})",
+                hash.counts(),
+                locator.fences(),
+                locator.segments(),
+                locator.max_err(),
+                locator.counts(),
+            );
+            pager.end_read_tx();
         }
     }
 }

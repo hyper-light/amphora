@@ -841,6 +841,7 @@ criteria = [
 tests = [
   { id = "T-G3.5.1", text = "storage::descent_skip::tests::t_g3_5_1_* — passes when every lookup through the adaptive hash and the learned locator, under random inserts, deletes, splits and merges over pages two tables share, returns the row a plain descent returns" },
   { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
+  { id = "T-G3.5.3", text = "storage::descent_skip::tests::engine::t_g3_5_3_* — passes when, on a real rowid table through committed rounds of inserts and range deletes, each prototype's page proven by its bytes gives the leaf and cell a cursor's descent stands on, or none when it finds none" },
 ]
 
 # lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4
