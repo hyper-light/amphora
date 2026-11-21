@@ -163,21 +163,6 @@ impl Budget {
         let mut held = self.held.lock();
         *held = held.saturating_sub(n);
     }
-
-    /// Moves what is held from `before` bytes to `after`: a growth reserved (refused past the
-    /// limit), a shrink released.
-    fn charge(&self, what: &'static str, before: u64, after: u64) -> Result<()> {
-        match after.checked_sub(before) {
-            Some(0) => Ok(()),
-            Some(more) => self
-                .reserve(what, usize::try_from(more).map_err(|_| LimboError::IntegerOverflow)?)
-                .map(|_| ()),
-            None => {
-                self.release(before.saturating_sub(after));
-                Ok(())
-            }
-        }
-    }
 }
 
 /// A read's view: the commits at or before `start`, and its own transaction's changes.
@@ -2099,7 +2084,7 @@ mod tests {
             .and_then(|s| s.parse::<u64>().ok())
             .map(std::time::Duration::from_secs);
         let row = |r: u16| r.to_be_bytes().to_vec();
-        let value = |who: u16, n: u32| {
+        let value = move |who: u16, n: u32| {
             let mut out = Vec::with_capacity(width);
             while out.len() < width {
                 out.extend_from_slice(&who.to_be_bytes());

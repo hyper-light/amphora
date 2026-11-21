@@ -230,6 +230,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
   (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
   throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
+- **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
+  `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
+  open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
+  commits kept for validation are charged to one budget (by default the pool's bytes, or the shell's
+  `with_budget`) and refused past it with a typed `MemoryBudget`; commits are kept only while a
+  transaction begun before them is open; reads past the budget escalate to the whole tree. Tested by
+  a short soak (one reader, 32 writers). Not yet: versions moved out of memory for long readers
+  (LeanStore's graveyard), the hour-long soak (`AMPHORA_G8_SOAK_SECONDS=3600`, the batch's), and the
+  shell passing a budget learned from the process's memory once it opens this storage.
 - **Ephemeral tables kept between runs** (docs/design/executor.md decision 1,
   `crates/engine/tests/ephemeral_reuse.rs`): a statement keeps each ephemeral table of at most 16
   pages (an IN list's keys, an IN subquery's rows) and empties it on its next run, where building

@@ -468,6 +468,21 @@ tests = [
   { id = "T-G8.1.2", text = "Each validation on hand-made schedules (write skew, a phantom closing a cycle, a lone antidependency, the read-only anomaly, an open writer of a row read) — passes when each refuses exactly what its scheme says" },
 ]
 
+# lane g8-gc
+# Amphora's own IDs for G8 step 2 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, step 2, under
+# CP-T1.3): versions collected, memory bounded, typed refusals.
+[[own]]
+id = "G8.2"
+title = "Versions collected, memory bounded, robust out of memory (G8 step 2)"
+criteria = [
+  { id = "AC-G8.2.1", text = "a reader held open an hour under 32 writers keeps the versioned storage's memory within its budget, refusing typed (MemoryBudget) past it, and its answers stay its snapshot's" },
+]
+tests = [
+  { id = "T-G8.2.1", text = "Soak: one long snapshot, 32 writers, a collector (AMPHORA_G8_SOAK_SECONDS for the hour) — passes when the budget never holds past its limit, every refusal is typed, every scan is the snapshot's, each row keeps at most one older version once collected, and every byte comes back" },
+  { id = "T-G8.2.2", text = "Commits kept for validation only while a transaction begun before them is open, not for a read-only snapshot" },
+  { id = "T-G8.2.3", text = "A transaction's reads past the budget escalate to its whole tree, and its commit is refused at least where the finer record would be" },
+]
+
 # lane split-merge: groups that split, merge and move themselves (kiln goal 49477403, G13 step 2;
 # docs/design/reshard.md). Criteria are CP-T1.9's AC-T1.9.1 to AC-T1.9.3.
 [[own]]
