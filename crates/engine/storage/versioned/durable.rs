@@ -334,13 +334,17 @@ impl Database {
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
         let all = trees.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
-        let v = Versioned::new(frames, all, |i| {
-            if i == trees {
-                bytes_order()
-            } else {
-                cmp()
-            }
-        })?;
+        let v = Versioned::new(
+            frames,
+            all,
+            |i| {
+                if i == trees {
+                    bytes_order()
+                } else {
+                    cmp()
+                }
+            },
+        )?;
         let journal = Journal {
             stamp: Stamp {
                 seq: 0,
@@ -506,7 +510,9 @@ impl Database {
                 None => return Ok(()),
             }
         }
-        Err(corrupt("a row with more chunks than its longest value takes"))
+        Err(corrupt(
+            "a row with more chunks than its longest value takes",
+        ))
     }
 
     /// Up to `most` rows of `tree` from `from` on as `snap` sees them, in key order, each with its
@@ -589,7 +595,9 @@ impl Database {
                 None => return Ok(()),
             }
         }
-        Err(corrupt("a row with more chunks than its longest value takes"))
+        Err(corrupt(
+            "a row with more chunks than its longest value takes",
+        ))
     }
 
     /// `txn` removes the row under `key` in `tree` and its chunks (`NS.2.2`): the row it saw
@@ -1128,7 +1136,8 @@ mod tests {
             for (t, n) in [(a, 1u8), (b, 2)] {
                 let mut txn = db.begin().unwrap();
                 db.put(&mut d, &mut txn, t, b"k", &[n; 3]).unwrap();
-                db.put(&mut d, &mut txn, t, b"long", &vec![n; 3 * PAGE_SIZE]).unwrap();
+                db.put(&mut d, &mut txn, t, b"long", &vec![n; 3 * PAGE_SIZE])
+                    .unwrap();
                 db.commit(txn, &mut d, true).unwrap();
             }
             let mut open = db.begin().unwrap();
@@ -1181,7 +1190,9 @@ mod tests {
                 let mut live: Vec<u64> = Vec::new();
                 let mut state: BTreeMap<u64, BTreeMap<Vec<u8>, Vec<u8>>> = BTreeMap::new();
                 let snapshot = |state: &BTreeMap<u64, BTreeMap<Vec<u8>, Vec<u8>>>| {
-                    (2..40u64).map(|t| state.get(&t).cloned()).collect::<Vec<_>>()
+                    (2..40u64)
+                        .map(|t| state.get(&t).cloned())
+                        .collect::<Vec<_>>()
                 };
                 'run: for i in 0..18u64 {
                     let Ok(t) = db.make_tree(&mut d, cmp()) else {
@@ -1262,10 +1273,18 @@ mod tests {
     fn lengths(key: &[u8], fill: u8) -> Vec<Vec<u8>> {
         let room = overflow::inline_len(key).unwrap();
         let per = overflow::chunk_len(key).unwrap();
-        [5, room - 1, room, room + 1, room + per, 5 * PAGE_SIZE + 3, 20_000]
-            .into_iter()
-            .map(|n| (0..n).map(|i| fill.wrapping_add(i as u8)).collect())
-            .collect()
+        [
+            5,
+            room - 1,
+            room,
+            room + 1,
+            room + per,
+            5 * PAGE_SIZE + 3,
+            20_000,
+        ]
+        .into_iter()
+        .map(|n| (0..n).map(|i| fill.wrapping_add(i as u8)).collect())
+        .collect()
     }
 
     /// Do: commit a row's value at every length that matters, from a few bytes to several pages
@@ -1294,12 +1313,19 @@ mod tests {
             assert_eq!((&all[0].0, &all[0].1), (&key, v));
         }
         let last = seen.last().unwrap();
-        assert_eq!(chunk_rows(&db, &last.0), 0, "a short value leaves no chunks");
+        assert_eq!(
+            chunk_rows(&db, &last.0),
+            0,
+            "a short value leaves no chunks"
+        );
         let long = &seen[5];
         assert!(chunk_rows(&db, &long.0) > 2);
         let mut t = db.begin().unwrap();
         db.put(&mut d, &mut t, 0, &key, &long.1).unwrap();
-        assert_eq!(db.remove(&mut d, &mut t, 0, &key).unwrap(), Some(long.1.clone()));
+        assert_eq!(
+            db.remove(&mut d, &mut t, 0, &key).unwrap(),
+            Some(long.1.clone())
+        );
         db.commit(t, &mut d, false).unwrap();
         let snap = db.snapshot().unwrap();
         assert_eq!(db.get(&mut d, &snap, 0, &key).unwrap(), None);
@@ -1324,17 +1350,32 @@ mod tests {
         db.commit(t, &mut d, false).unwrap();
         let before = chunk_rows(&db, &db.snapshot().unwrap());
         let mut t = db.begin().unwrap();
-        assert_eq!(db.put(&mut d, &mut t, 0, &key, longer).unwrap().as_ref(), Some(first));
+        assert_eq!(
+            db.put(&mut d, &mut t, 0, &key, longer).unwrap().as_ref(),
+            Some(first)
+        );
         let sp = t.savepoint();
-        assert_eq!(db.put(&mut d, &mut t, 0, &key, b"tiny").unwrap().as_ref(), Some(longer));
-        assert_eq!(db.put(&mut d, &mut t, 0, &key, other).unwrap().as_deref(), Some(&b"tiny"[..]));
+        assert_eq!(
+            db.put(&mut d, &mut t, 0, &key, b"tiny").unwrap().as_ref(),
+            Some(longer)
+        );
+        assert_eq!(
+            db.put(&mut d, &mut t, 0, &key, other).unwrap().as_deref(),
+            Some(&b"tiny"[..])
+        );
         db.rollback_to(&mut d, &mut t, sp).unwrap();
         let mine = t.snapshot();
-        assert_eq!(db.get(&mut d, &mine, 0, &key).unwrap().as_ref(), Some(longer));
+        assert_eq!(
+            db.get(&mut d, &mine, 0, &key).unwrap().as_ref(),
+            Some(longer)
+        );
         db.put(&mut d, &mut t, 0, &key, other).unwrap();
         db.abort(t, &mut d).unwrap();
         let snap = db.snapshot().unwrap();
-        assert_eq!(db.get(&mut d, &snap, 0, &key).unwrap().as_ref(), Some(first));
+        assert_eq!(
+            db.get(&mut d, &snap, 0, &key).unwrap().as_ref(),
+            Some(first)
+        );
         assert_eq!(chunk_rows(&db, &snap), before);
     }
 
@@ -1356,7 +1397,8 @@ mod tests {
                 want.insert(k, v);
             }
             let mut open = db.begin().unwrap();
-            db.put(&mut d, &mut open, 0, &[b'a', 5], &lengths(b"a", 9)[6]).unwrap();
+            db.put(&mut d, &mut open, 0, &[b'a', 5], &lengths(b"a", 9)[6])
+                .unwrap();
             db.checkpoint().unwrap();
             for (i, v) in lengths(b"b", 4).into_iter().enumerate() {
                 let mut t = db.begin().unwrap();

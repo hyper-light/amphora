@@ -1247,7 +1247,10 @@ impl Versioned {
     pub fn make_tree(&self, cmp: super::blink::Comparator) -> Result<u64> {
         let mut trees = self.trees.write();
         let id = u64::try_from(trees.len()).map_err(|_| LimboError::IntegerOverflow)?;
-        trees.push(Some(Arc::new(VTree::new(id, Tree::create(&self.pool, cmp)?))));
+        trees.push(Some(Arc::new(VTree::new(
+            id,
+            Tree::create(&self.pool, cmp)?,
+        ))));
         Ok(id)
     }
 
@@ -1271,7 +1274,10 @@ impl Versioned {
             )));
         }
         trees.resize(at, None);
-        trees.push(Some(Arc::new(VTree::new(id, Tree::create(&self.pool, cmp)?))));
+        trees.push(Some(Arc::new(VTree::new(
+            id,
+            Tree::create(&self.pool, cmp)?,
+        ))));
         Ok(())
     }
 

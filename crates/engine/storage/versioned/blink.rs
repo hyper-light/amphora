@@ -323,7 +323,13 @@ impl Tree {
         let cmp = self.compare();
         let right_no = pool.allocate()?;
         let mut right = pool.write(right_no)?;
-        let separator = page::split(w, &mut right, right_no, (key, Tail::Value(value), flags), cmp)?;
+        let separator = page::split(
+            w,
+            &mut right,
+            right_no,
+            (key, Tail::Value(value), flags),
+            cmp,
+        )?;
         let level = page::level(w)?;
         Ok(Split {
             left: no,
@@ -383,7 +389,11 @@ impl Tree {
             w,
             &mut right,
             right_no,
-            (&child.separator, Tail::Child(child.right), page::Flags::default()),
+            (
+                &child.separator,
+                Tail::Child(child.right),
+                page::Flags::default(),
+            ),
             cmp,
         )?;
         let level = page::level(w)?;

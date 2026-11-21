@@ -548,7 +548,9 @@ pub fn split(
     let mut mid = 0usize;
     let mut before = 0usize;
     for &size in &sizes {
-        let next = before.checked_add(size).ok_or(LimboError::IntegerOverflow)?;
+        let next = before
+            .checked_add(size)
+            .ok_or(LimboError::IntegerOverflow)?;
         if next > total / 2 {
             break;
         }
@@ -562,7 +564,9 @@ pub fn split(
     let separator = sep.key.to_vec();
     let (right_first, from) = match (kind, sep.tail) {
         (Kind::Leaf, _) => (0, mid),
-        (Kind::Inner, Tail::Child(c)) => (c, mid.checked_add(1).ok_or(LimboError::IntegerOverflow)?),
+        (Kind::Inner, Tail::Child(c)) => {
+            (c, mid.checked_add(1).ok_or(LimboError::IntegerOverflow)?)
+        }
         (Kind::Inner, _) => return Err(corrupt("an inner page's cell without a child")),
     };
     let full = || corrupt("half a split page without room for its cell");
@@ -671,10 +675,20 @@ mod tests {
         let mut all = cells(&p);
         all.push((b"k9999".to_vec(), vec![1; 30]));
         let mut r = vec![0u8; PAGE_SIZE];
-        let sep = split(&mut p, &mut r, 5, (b"k9999", Tail::Value(&[1; 30]), Flags::default()), cmp).unwrap();
+        let sep = split(
+            &mut p,
+            &mut r,
+            5,
+            (b"k9999", Tail::Value(&[1; 30]), Flags::default()),
+            cmp,
+        )
+        .unwrap();
         let (left, right_cells) = (cells(&p), cells(&r));
         assert_eq!([left.clone(), right_cells.clone()].concat(), all);
-        assert!(left.len().abs_diff(right_cells.len()) <= 1, "equal cells split evenly");
+        assert!(
+            left.len().abs_diff(right_cells.len()) <= 1,
+            "equal cells split evenly"
+        );
         assert_eq!(sep, right_cells[0].0);
         assert_eq!(high(&p).unwrap(), Some(sep.as_slice()));
         assert_eq!(right(&p).unwrap(), Some(5));
@@ -695,7 +709,14 @@ mod tests {
             .unwrap();
         }
         let mut r = vec![0u8; PAGE_SIZE];
-        let sep = split(&mut inner, &mut r, 6, (b"s10", Tail::Child(20), Flags::default()), cmp).unwrap();
+        let sep = split(
+            &mut inner,
+            &mut r,
+            6,
+            (b"s10", Tail::Child(20), Flags::default()),
+            cmp,
+        )
+        .unwrap();
         assert_eq!(sep, b"s05");
         assert_eq!(first(&r).unwrap(), 15);
         assert_eq!(count(&inner).unwrap() + count(&r).unwrap(), 10);
@@ -739,7 +760,14 @@ mod tests {
         check(&p);
         let mut r = vec![0u8; PAGE_SIZE];
         let new = format!("k{:04}", 9998);
-        split(&mut p, &mut r, 2, (new.as_bytes(), Tail::Value(&[2; 20]), flag(9998)), &bytes).unwrap();
+        split(
+            &mut p,
+            &mut r,
+            2,
+            (new.as_bytes(), Tail::Value(&[2; 20]), flag(9998)),
+            &bytes,
+        )
+        .unwrap();
         check(&p);
         check(&r);
         set_flags(&mut r, 0, Flags::default()).unwrap();
@@ -777,11 +805,22 @@ mod tests {
                 let mut q = p.clone();
                 let mut r = vec![0u8; PAGE_SIZE];
                 let v = big(new.as_bytes());
-                let sep = split(&mut q, &mut r, 3, (new.as_bytes(), Tail::Value(&v), Flags::default()), cmp).unwrap();
+                let sep = split(
+                    &mut q,
+                    &mut r,
+                    3,
+                    (new.as_bytes(), Tail::Value(&v), Flags::default()),
+                    cmp,
+                )
+                .unwrap();
                 let mut want = cells(&p);
                 want.push((new.as_bytes().to_vec(), v.clone()));
                 want.sort();
-                assert_eq!([cells(&q), cells(&r)].concat(), want, "{small} small, {new}");
+                assert_eq!(
+                    [cells(&q), cells(&r)].concat(),
+                    want,
+                    "{small} small, {new}"
+                );
                 assert_eq!(sep, cells(&r)[0].0);
             }
         }

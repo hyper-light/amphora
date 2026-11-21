@@ -38,9 +38,7 @@ pub fn max_value() -> usize {
 /// The value bytes a cell of `key` holds: the most that fits [`MAX_CELL`] beside the key (None: the
 /// key leaves no room, refused as `TooBig`).
 pub fn inline_len(key: &[u8]) -> Option<usize> {
-    MAX_CELL
-        .checked_sub(CELL_LENGTHS)?
-        .checked_sub(key.len())
+    MAX_CELL.checked_sub(CELL_LENGTHS)?.checked_sub(key.len())
 }
 
 /// The value bytes a chunk of a row of `key` holds: the most that fits [`MAX_CELL`] beside its
@@ -110,7 +108,10 @@ mod tests {
         let long = vec![3u8; room + 2 * per + 1];
         let (head, chunks) = split(&key, &long).unwrap();
         assert_eq!(head.len(), room);
-        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), vec![per, per, 1]);
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            vec![per, per, 1]
+        );
         assert!(fits(&key, Tail::Value(head)).unwrap());
         let ck = chunk_key(7, &key, 0);
         assert!(fits(&ck, Tail::Value(chunks[0])).unwrap());
@@ -123,7 +124,10 @@ mod tests {
         let wide = vec![0u8; MAX_CELL - CELL_LENGTHS - CHUNK_KEY_EXTRA];
         assert!(chunk_len(&wide).is_none());
         let room = inline_len(&wide).unwrap();
-        assert!(matches!(split(&wide, &vec![0u8; room + 1]), Err(LimboError::TooBig)));
+        assert!(matches!(
+            split(&wide, &vec![0u8; room + 1]),
+            Err(LimboError::TooBig)
+        ));
     }
 
     /// NS.2.2: chunk keys of different rows never collide: a key that ends like another's chunk
