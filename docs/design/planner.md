@@ -1336,6 +1336,45 @@ parent is the batch's bench.
   beyond the passes' spread (research rank 6's falsifier).
 - An answer that changes (`answers.py`), or an oracle finding where the forced materialization
   of a hash join's build input is planned.
+## Decision (lane pl8): a RIGHT JOIN led by one table is planned as its mirrored LEFT JOIN
+
+**Decision.** PL.8's first rule (docs/research/planner.md section 9, rank 8; audit row 4). Before
+the join search, `t0 RIGHT JOIN t1 ON p`, where t0 is the FROM list's first table alone and both
+are B-tree tables, becomes `t1 LEFT JOIN t0 ON p` (`optimizer/mod.rs`,
+`commute_leading_right_join`): the two tables swap places, t0 takes the join's information as a
+LEFT JOIN, and the ON terms' origin names t0. Columns, `*` and USING are bound by table ID before
+the swap, and what reads a table's place in the FROM list (`outer_join_may_null_extend`,
+`is_left_of_right_or_full_join`) reads it live, so each table is null-extended where it was.
+
+**Why.** A RIGHT JOIN's unmatched rows of its right table are read after every loop, so
+`required_lhs_by_table` holds every later table behind it. The audit's
+`03-right-full-barrier.out`: `(big RIGHT JOIN mid ON mid.k = big.k) JOIN tiny ON tiny.id = mid.id
+WHERE tiny.id = 5` read big and mid ahead of tiny, total_cost 328,300,039,000.3, where the same
+query written `mid JOIN tiny LEFT JOIN big` read tiny first at 23,007.0. As a LEFT JOIN only t0
+must follow t1, and tiny, whose term reads only mid, moves first.
+
+**Sources.** Moerkotte, Fender and Eich, "On the correct and complete enumeration of the core
+search space", SIGMOD 2013 (f25): a right outer join is the left outer join of its operands
+swapped, and CD-C reorders outer joins by such rules, correct and complete. Its left-asscom rule,
+`(e1 LEFT JOIN e2) JOIN e3 = (e1 JOIN e3) LEFT JOIN e2` when e3's term doesn't read e2, is what
+lets tiny move ahead of the LEFT JOIN, which the search already allowed.
+
+**Evidence.** `crates/engine/tests/join_search.rs`: `t_pl_8_1_the_right_join_reads_tiny_first`
+(T-PL.8.1) plans tiny first and mid before big; `t_pl_8_2_a_right_join_turned_left_keeps_its_answers`
+(T-PL.8.2) answers eight RIGHT JOINs (`*`, a WHERE on the null-extended table, USING, a later inner,
+LEFT and RIGHT JOIN, an aggregate, an ON term on the left table) as SQLite does, worked by hand
+from the rows.
+
+**Not yet built.** The rest of rank 8: bushy plans over connected complement pairs (DPccp, DPhyp
+for terms over more than two tables) on rank 3's explicit stack and budget, a join's result built
+into a hash join through `MaterializedBuildInput`, and CD-C's conflict rules in place of
+`required_lhs_by_table` for outer, semi and anti joins and for RIGHT JOINs whose left side is a
+join (those need a bushy plan: `(a JOIN b) RIGHT JOIN c` is `c LEFT JOIN (a JOIN b)`).
+
+**Falsified by.** An answer that changes against SQLite (the oracles' DQP, TLP and NoREC, and
+`answers.py`) for a RIGHT JOIN led by one table; or such a plan slower than its parent's on the
+bench suite beyond the passes' spread.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
