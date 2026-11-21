@@ -39,8 +39,7 @@ fn value(i: u64, round: u64) -> Vec<u8> {
 /// Do: in a pool of 24 frames, commit 2,000 rows of 200 to 500 bytes, checkpoint halfway, rewrite
 /// a third of them; read them all; reopen in a pool as small and read them again. Expect: every
 /// row as last committed both times; the database's pages at least ten times the pool's frames,
-/// pages spilled and read back (AC-T1.3.4-evict: a database ten times the pool, read and written
-/// correctly).
+/// pages spilled and read back (T-NS.4.2, AC-NS.4.1).
 #[test]
 fn g7s4_a_database_ten_times_its_pool_reads_and_writes_correctly() {
     let disk = Arc::new(Simulated::new(5, 1).unwrap());
@@ -135,7 +134,7 @@ fn crash_workload(disk: &Arc<Simulated>, crash: Option<u64>) -> (Vec<BTreeMap<Ve
 /// them), then again on a fresh disk crashing at each operation in turn: each write of an
 /// eviction and of a checkpoint; cut the power and reopen. Expect: the rows after each reopen
 /// exactly a prefix of the commits, at least as long as the last acknowledged durable: no
-/// acknowledged write lost (T-T1.3.4-evict, T-T1.3.1).
+/// acknowledged write lost (T-NS.4.1, T-T1.3.1).
 #[test]
 fn g7s4_a_crash_at_each_write_of_evictions_and_checkpoints_loses_no_acknowledged_write() {
     let probe = Arc::new(Simulated::new(1, 1).unwrap());
@@ -182,7 +181,7 @@ fn pattern(page: u64, round: u64, j: usize) -> u8 {
 /// with its round's pattern and reads back, and reading others' pages; a refusal because every
 /// frame was latched is retried. Expect: an owner always reads its last round; every page read
 /// is whole, one round's pattern from end to end (no stale or torn page, no read of a frame
-/// after its page left); evictions happened (the model test with eviction).
+/// after its page left); evictions happened (T-NS.4.3).
 #[test]
 fn g7s4_the_pool_model_test_with_eviction_under_32_threads() {
     let disk: Arc<dyn Disk> = Arc::new(Simulated::new(9, 1).unwrap());

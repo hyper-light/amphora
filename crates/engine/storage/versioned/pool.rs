@@ -745,7 +745,7 @@ mod tests {
     /// Do: a pool of 4 frames over a disk; hand out 40 pages, write each, then read and rewrite
     /// them all twice over. Expect: every page reads as last written; pages went out to the spill
     /// file and came back (evictions, spills and misses counted), and no more than 4 frames
-    /// (AC-T1.3.4-evict: a database ten times the pool).
+    /// (T-NS.4.2).
     #[test]
     fn g7s4_a_database_ten_times_the_pool_reads_back_what_was_written() {
         let disk: Arc<dyn Disk> = Arc::new(Simulated::new(3, 1).unwrap());
@@ -769,7 +769,7 @@ mod tests {
 
     /// Do: write a page, push it out to the spill file, damage its bytes there, read it. Expect:
     /// the read refused as corrupt (its checksum checked as it enters the pool); an undamaged page
-    /// reads back.
+    /// reads back (T-NS.4.2).
     #[test]
     fn g7s4_a_page_read_in_is_verified_against_its_checksum() {
         let sim = Arc::new(Simulated::new(3, 1).unwrap());
@@ -787,7 +787,7 @@ mod tests {
     }
 
     /// Do: a pool of 2 frames; hold both latched, then ask for a third page. Expect: a typed
-    /// refusal (`MemoryBudget`), and the page reads once a latch is let go.
+    /// refusal (`MemoryBudget`), and the page reads once a latch is let go (AC-NS.4.2's bound).
     #[test]
     fn g7s4_every_frame_latched_is_refused_with_a_typed_error() {
         let disk: Arc<dyn Disk> = Arc::new(Simulated::new(3, 1).unwrap());

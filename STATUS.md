@@ -305,6 +305,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   near the largest size gathered on one side). Trees made and dropped while running (`AC-NS.2.5`): a
   redo record each, a dropped tree's root listed as 0 in the checkpoint, both replayed; dropped
   trees' pages stay unreferenced (the pool has no free list yet).
+- **Eviction on the versioned storage** (G7 step 4, `NS.4`, docs/design/engine.md decision 14,
+  `crates/engine/storage/versioned/{pool,evict}.rs`): a database's pool holds the frames its byte
+  budget pays for and evicts by CLOCK; dirty pages go to a spill file recovery never reads (the data
+  file still changes only by checkpoints), pages read in are checked once against a checksum, and a
+  pool whose every frame is latched refuses typed (`MemoryBudget`). Tests: a database over ten times
+  its pool across a checkpoint and a reopen, a crash at every disk operation of a spilling,
+  checkpointing workload losing no acknowledged commit, and the pool's model test with eviction
+  under 32 threads. Not yet: the 10M-row corpus run and its resident memory (the coordinator's);
+  checkpoints still build their journal in memory; the shell passes the budget once the switch
+  takes it from `amphora::memory::limit`.
 - **The switch: SQL on the versioned storage** (G7 step 2, `AC-NS.2.1`, docs/design/engine.md
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's

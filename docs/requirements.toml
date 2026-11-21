@@ -521,6 +521,20 @@ tests = [
   { id = "T-NS.3.1", text = "The model test with eviction under 32 threads (crates/engine/storage/reach/model.rs) — passes when no stale or torn page read and no use after eviction, every page equal to the reference map" },
 ]
 
+# lane g7s4
+[[own]]
+id = "NS.4"
+title = "Eviction and a bound (G7 step 4)"
+criteria = [
+  { id = "AC-NS.4.1", text = "a 10M-row corpus run within a pool a tenth of the data's size" },
+  { id = "AC-NS.4.2", text = "resident memory over the pool's budget is at most 10%" },
+]
+tests = [
+  { id = "T-NS.4.1", text = "Crash injection through eviction and checkpoints (crates/engine/storage/versioned/evict.rs) — passes when no acknowledged write is lost" },
+  { id = "T-NS.4.2", text = "A database ten times its pool read and written correctly, across a checkpoint and a reopen" },
+  { id = "T-NS.4.3", text = "The pool's model test with eviction under 32 threads — every read whole, every owner reads its last write" },
+]
+
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
 # closed time" and "Search over partitions"). AC-T1.10.3 and AC-T1.10.4 are the measures; these are what they
 # rest on.
