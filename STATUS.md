@@ -379,7 +379,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   old schema or the new; rows that break a unique index undo the change. The 10M-row cutover p99
   (AC-T1.12.2) is not yet measured. A column (`ALTER TABLE … ADD COLUMN`) is added in one catalog
   change, its states run together, as no row is rewritten or read; one whose addition reads every
-  row is refused. Constraints on existing columns and DROP COLUMN are not yet built.
+  row is refused. NOT NULL and CHECK are added to an existing column (`ALTER COLUMN c TO` its own
+definition plus the constraint) write-only, then validated in learned rowid batches, then public by
+a catalog change; the planner doesn't rely on an unvalidated NOT NULL, a breaking row undoes the
+change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet built.
 
 ## Measured
 

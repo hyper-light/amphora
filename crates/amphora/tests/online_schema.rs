@@ -365,3 +365,247 @@ fn t_t1_12_1_a_column_is_added_in_one_catalog_change_and_its_constraints_hold_fr
         "the table's columns: id, a, c"
     );
 }
+
+fn sql_of_t(db: &Db) -> String {
+    let mut sql = String::new();
+    db.query_owned("SELECT sql FROM sqlite_schema WHERE name = 't'", [], |r| {
+        sql = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(false)
+    })
+    .unwrap();
+    sql
+}
+
+#[test]
+fn t_t1_12_1_a_constraint_is_enforced_on_writes_while_rows_are_validated_then_public() {
+    // CP-T1.12: add NOT NULL and CHECK (a >= 0) to a of 1,000 rows in batches of 7 while each
+    // step's gap inserts, updates and deletes rows. Expect: from the first step a write breaking
+    // either is refused; the batches visit the rows before it; a NULL count reads the truth on the
+    // writer and a reader throughout; after the cutover the mark is gone, the migration recorded,
+    // the integrity check passes, and the same migration again is already applied.
+    let (_dir, mut db) = table(1000);
+    let reader = db.reader().unwrap();
+    let nn = plan("ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL CHECK (a >= 0)");
+    assert_eq!(
+        db.transaction(|db| online::step(db, &nn, 7)).unwrap(),
+        Stepped::WriteOnly
+    );
+    assert!(sql_of_t(&db).contains("NOT NULL"));
+    assert!(db.exec("INSERT INTO t (a, b) VALUES (NULL, 'x')").is_err());
+    assert!(db.exec("INSERT INTO t (a, b) VALUES (-1, 'x')").is_err());
+    assert!(db.exec("UPDATE t SET a = NULL WHERE id = 3").is_err());
+    db.exec("INSERT INTO t (a, b) VALUES (5, 'x')").unwrap();
+    let mut steps = 0;
+    let mut visited = 0;
+    loop {
+        let stepped = db.transaction(|db| online::step(db, &nn, 7)).unwrap();
+        steps += 1;
+        match stepped {
+            Stepped::Public { .. } => break,
+            Stepped::Batch { visited: v, .. } => visited += v,
+            other => panic!("stepped {other:?}"),
+        }
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM t WHERE a IS NULL", vec![]).unwrap(),
+            0
+        );
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM __amphora_migrations", vec![]).unwrap(),
+            0,
+            "migrated before public"
+        );
+        write(&mut db, steps);
+        assert!(steps < 1000, "the change never ended");
+    }
+    // Each step's write deletes at most one row, perhaps before its batch reached it.
+    assert!(
+        visited >= 1000 - u64::try_from(steps).unwrap(),
+        "the batches visited {visited} rows in {steps} steps"
+    );
+    assert!(steps > 100, "validated in {steps} steps, not batches of 7");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM __amphora_constraint_states",
+            vec![]
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM __amphora_migrations WHERE name = 'ix'",
+            vec![]
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(integrity(&db), "ok");
+    assert_eq!(integrity(&reader), "ok");
+    assert!(db.exec("INSERT INTO t (a, b) VALUES (NULL, 'x')").is_err());
+    assert_eq!(
+        db.transaction(|db| online::step(db, &nn, 7)).unwrap(),
+        Stepped::Already
+    );
+}
+
+#[test]
+fn t_t1_12_1_an_unvalidated_not_null_is_not_relied_on_and_a_breaking_row_undoes_the_change() {
+    // CP-T1.12: 50 rows, one with a NULL a and one with a = -3. Expect: while the constraint is
+    // write-only the planner reads the NULL and negative rows (it doesn't trust a NOT NULL not yet
+    // validated), on the writer and a reader, and the integrity check doesn't call them corrupt;
+    // validation then stops at a breaking row, refused as BROKEN, and undoing the change gives a
+    // its old definition back, the mark and record gone, NULL writable again.
+    let (_dir, mut db) = table(50);
+    db.exec("UPDATE t SET a = NULL WHERE id = 20; UPDATE t SET a = -3 WHERE id = 30")
+        .unwrap();
+    let reader = db.reader().unwrap();
+    let nn = plan("ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL CHECK (a >= 0)");
+    assert_eq!(
+        db.transaction(|db| online::step(db, &nn, 7)).unwrap(),
+        Stepped::WriteOnly
+    );
+    for d in [&db, &reader] {
+        assert_eq!(
+            count(d, "SELECT count(*) FROM t WHERE a IS NULL", vec![]).unwrap(),
+            1
+        );
+        assert_eq!(
+            count(d, "SELECT count(*) FROM t WHERE a IS NOT NULL", vec![]).unwrap(),
+            49
+        );
+        assert_eq!(integrity(d), "ok");
+    }
+    let broken = loop {
+        match db.transaction(|db| online::step(db, &nn, 7)) {
+            Ok(Stepped::Batch { .. }) => {}
+            Ok(other) => panic!("stepped {other:?} past a breaking row"),
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(broken.downcast_ref::<Refusal>(), Some(Refusal::Invalid { what, .. }) if what == online::BROKEN),
+        "{broken:?}"
+    );
+    db.transaction(|db| online::abandon(db, &nn)).unwrap();
+    assert!(!sql_of_t(&db).contains("NOT NULL"), "{}", sql_of_t(&db));
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM __amphora_constraint_states",
+            vec![]
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM __amphora_schema_changes", vec![]).unwrap(),
+        0
+    );
+    db.exec("INSERT INTO t (a, b) VALUES (NULL, 'x')").unwrap();
+    assert_eq!(integrity(&db), "ok");
+}
+
+#[test]
+fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint() {
+    // CP-T1.12: the new definition must be the column's own plus NOT NULL or CHECK, so the change
+    // can be undone. Expect: a rename, a definition adding neither, a changed type, a dropped
+    // CHECK and NOT NULL added twice are refused, leaving the table as it was; through
+    // change_schema a breaking row undoes the change (BROKEN) and a clean column takes it.
+    let refused = |sql: &str| {
+        Plan::parse(&Migration {
+            name: "c".into(),
+            sql: sql.into(),
+        })
+        .is_err()
+    };
+    assert!(refused(
+        "ALTER TABLE t ALTER COLUMN a TO z INTEGER NOT NULL"
+    ));
+    assert!(refused("ALTER TABLE t ALTER COLUMN a TO a TEXT"));
+    let dir = tempfile::tempdir().unwrap();
+    let until = || Instant::now() + Duration::from_secs(60);
+    let database = Database::open(&dir.path().join("d.db"), until()).unwrap();
+    database
+        .migrate(
+            Migration {
+                name: "t".into(),
+                sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT CHECK (length(b) > 0), c INTEGER NOT NULL DEFAULT 0); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) INSERT INTO t (a, b) SELECT i % 50, 'r' FROM n".into(),
+            },
+            until(),
+        )
+        .unwrap();
+    let change = |name: &str, sql: &str| {
+        database.change_schema(
+            Migration {
+                name: name.into(),
+                sql: sql.into(),
+            },
+            until(),
+        )
+    };
+    let table_sql = || {
+        database
+            .call(until(), |c| {
+                let sql: String =
+                    c.query_row("SELECT sql FROM sqlite_schema WHERE name = 't'", [], |r| {
+                        r.get(0usize)
+                    })?;
+                Ok(sql)
+            })
+            .unwrap()
+    };
+    let before = table_sql();
+    for (name, sql) in [
+        ("ty", "ALTER TABLE t ALTER COLUMN a TO a TEXT NOT NULL"),
+        ("dr", "ALTER TABLE t ALTER COLUMN b TO b TEXT NOT NULL"),
+        (
+            "tw",
+            "ALTER TABLE t ALTER COLUMN c TO c INTEGER NOT NULL DEFAULT 0 NOT NULL",
+        ),
+    ] {
+        let refusal = change(name, sql).unwrap_err();
+        assert!(
+            matches!(&refusal, Refusal::Invalid { what, .. } if what != online::BROKEN),
+            "{name}: {refusal:?}"
+        );
+        assert_eq!(table_sql(), before, "{name} changed the table");
+    }
+    database
+        .call(until(), |c| {
+            c.execute("UPDATE t SET a = NULL WHERE id = 150", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let broken = change("nn", "ALTER TABLE t ALTER COLUMN a TO a INTEGER NOT NULL").unwrap_err();
+    assert!(
+        matches!(&broken, Refusal::Invalid { what, .. } if what == online::BROKEN),
+        "{broken:?}"
+    );
+    let a_not_null = database
+        .call(until(), |c| {
+            let n: i64 = c.query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('t') WHERE name = 'a'",
+                [],
+                |r| r.get(0usize),
+            )?;
+            Ok(n)
+        })
+        .unwrap();
+    assert_eq!(a_not_null, 0, "a breaking row left the constraint");
+    let added = change(
+        "bc",
+        "ALTER TABLE t ALTER COLUMN b TO b TEXT CHECK (length(b) > 0) NOT NULL CHECK (b <> '')",
+    )
+    .unwrap();
+    assert!(
+        added.applied && added.cutover.is_some() && added.rows >= 300,
+        "{added:?}"
+    );
+    let refused_write = database.call(until(), |c| {
+        c.execute("INSERT INTO t (a, b) VALUES (1, NULL)", [])?;
+        Ok(())
+    });
+    assert!(refused_write.is_err());
+}

@@ -1785,6 +1785,13 @@ impl Database {
                         })?;
                         db.with_schema_mut(|schema| schema.set_index_states(states))?;
                     }
+                    let columns = conn.query_constraint_states()?;
+                    if !columns.is_empty() {
+                        let db = state.db.as_ref().ok_or_else(|| {
+                            LimboError::InternalError("open: no database past Init".into())
+                        })?;
+                        db.with_schema_mut(|schema| schema.set_constraint_states(&columns))?;
+                    }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
                 }

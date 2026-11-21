@@ -147,6 +147,16 @@ pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
 /// cookie. Its name is in Amphora's reserved `__amphora_` space, which its public SQL refuses.
 pub const INDEX_STATES_TABLE: &str = "__amphora_index_states";
 
+/// Amphora: the table that holds each column an online schema change is adding NOT NULL or CHECK
+/// to while it validates the rows written before it (CP-T1.12, F1's write-only state for a
+/// constraint; Amphora's `docs/design/online-schema.md`). A row names a table and a column: the
+/// column's definition already carries the constraint, so writes are checked against it, but the
+/// rows before it are not yet known to pass, so the planner must not rely on its NOT NULL, the
+/// integrity check doesn't hold rows to it, and `ALTER COLUMN` on it doesn't scan the table (the
+/// change's own batches do). Read whenever a connection parses its schema, as
+/// [`INDEX_STATES_TABLE`] is. A column without a row is validated.
+pub const CONSTRAINT_STATES_TABLE: &str = "__amphora_constraint_states";
+
 /// Amphora: where an index stands in an online schema change, by Rae et al., "Online, Asynchronous
 /// Schema Change in F1" (PVLDB 6(11), 2013), section 4: an index goes absent, delete-only,
 /// write-only, then public once a backfill has given every row its entry. Only a public index is
@@ -1596,6 +1606,30 @@ impl Schema {
                 staged.push_back(self.staged(index)?);
             }
             self.indexes.insert(name, staged);
+        }
+        Ok(())
+    }
+
+    /// Amphora: marks each column a row of [`CONSTRAINT_STATES_TABLE`] names (its table and
+    /// column, read as the schema is parsed) unvalidated, on a copy of its table (CP-T1.12). A row
+    /// naming no table or column of this schema marks nothing: its change is undone or moved on.
+    pub fn set_constraint_states(&mut self, columns: &[(String, String)]) -> Result<()> {
+        for (table, column) in columns {
+            let Some(entry) = self.tables.get(table) else {
+                continue;
+            };
+            let Table::BTree(btree) = entry.as_ref() else {
+                continue;
+            };
+            let Some((at, _)) = btree.get_column(column) else {
+                continue;
+            };
+            let mut staged = btree.as_ref().try_clone()?;
+            if let Some(column) = staged.columns_mut().get_mut(at) {
+                column.set_unvalidated(true);
+            }
+            self.tables
+                .insert(table.clone(), Arc::new(Table::BTree(Arc::new(staged))));
         }
         Ok(())
     }
@@ -5925,6 +5959,23 @@ impl Column {
     pub fn set_notnull(&mut self, v: bool) {
         self.info.set_notnull(v)
     }
+    /// Amphora: whether an online schema change is still validating this column's NOT NULL and
+    /// CHECK against the rows written before them ([`CONSTRAINT_STATES_TABLE`], CP-T1.12).
+    #[inline]
+    pub fn unvalidated(&self) -> bool {
+        self.info.unvalidated()
+    }
+    #[inline]
+    pub fn set_unvalidated(&mut self, v: bool) {
+        self.info.set_unvalidated(v)
+    }
+    /// Amphora: NOT NULL that every row is known to keep: declared, and not still being
+    /// validated by an online schema change (CP-T1.12). What the planner and the integrity check
+    /// may rely on; writes check [`Self::notnull`].
+    #[inline]
+    pub fn trusted_notnull(&self) -> bool {
+        self.notnull() && !self.unvalidated()
+    }
     #[inline]
     pub fn unique(&self) -> bool {
         self.info.unique()
@@ -8108,6 +8159,9 @@ mod column_info {
     const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
     const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
+    // Bit 26, Amphora: the column's constraints are still being validated (CP-T1.12).
+    const F_UNVALIDATED: u32 = 1 << (ARRAY_DIM_SHIFT + 3);
+
     /// ColumnInfo packs information on a [Column] into a single `u32`.
     #[derive(Clone, Debug)]
     pub struct ColumnInfo(u32);
@@ -8169,6 +8223,16 @@ mod column_info {
         #[inline]
         pub fn set_notnull(&mut self, v: bool) {
             self.set_flag(F_NOTNULL, v);
+        }
+
+        #[inline]
+        pub fn unvalidated(&self) -> bool {
+            self.0 & F_UNVALIDATED != 0
+        }
+
+        #[inline]
+        pub fn set_unvalidated(&mut self, v: bool) {
+            self.set_flag(F_UNVALIDATED, v);
         }
 
         #[inline]
