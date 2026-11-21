@@ -37,6 +37,7 @@ use super::version::{Savepoint, Snapshot, Ts, Txn, Versioned};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, RwLock};
 use crate::Result;
+use std::collections::HashMap;
 
 const HEADER_MAGIC: u64 = 0x4144_4548_4f52_5041;
 const JOURNAL_MAGIC: u64 = 0x4c4e_524a_4f52_5041;
@@ -158,7 +159,7 @@ fn partition(op: &Op, parts: usize) -> usize {
             key.hash(&mut h);
         }
         // Replayed alone, between the row changes ([`Database::apply`]).
-        Op::Made { tree } | Op::Dropped { tree } => tree.hash(&mut h),
+        Op::Made { tree } | Op::Dropped { tree } | Op::Ordered { tree, .. } => tree.hash(&mut h),
     }
     usize::try_from(h.finish())
         .unwrap_or(usize::MAX)
@@ -230,6 +231,9 @@ pub struct Database {
     /// The tree that holds large values' chunks ([`overflow`], `AC-NS.2.4`): the one after the
     /// `trees` the database was made with, ordered by bytes.
     overflow: u64,
+    /// Each tree's recorded order (G7 step 2, `AC-NS.2.1`), as its opener encoded it, by tree: one
+    /// a tree ordered, gone when the tree is dropped. Each checkpoint's list names them all.
+    orders: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
 /// Orders the overflow tree's keys: by bytes, whatever the database's comparison.
@@ -246,6 +250,21 @@ impl Database {
         frames: usize,
         trees: usize,
         cmp: impl Fn() -> Comparator,
+    ) -> Result<Self> {
+        Self::open_ordered(disk, frames, trees, cmp, |_, _| {
+            Err(corrupt("a tree's recorded order, which this opener doesn't read"))
+        })
+    }
+
+    /// [`Database::open`], each tree whose order was recorded ([`Database::order_tree`]) ordered
+    /// by `order` of its id and record, read ahead of the replay (G7 step 2, `AC-NS.2.1`); the others by
+    /// `cmp`.
+    pub fn open_ordered(
+        disk: Arc<dyn Disk>,
+        frames: usize,
+        trees: usize,
+        cmp: impl Fn() -> Comparator,
+        order: impl Fn(u64, &[u8]) -> Result<Comparator>,
     ) -> Result<Self> {
         let mut first = vec![0u8; PAGE_SIZE];
         let n = disk.read_at(File::Data, 0, &mut first)?;
@@ -292,17 +311,41 @@ impl Database {
         if stamp.roots.len() <= trees {
             return Err(corrupt("fewer trees than the database was opened with"));
         }
+        // Each tree's order, read ahead of the replay: the checkpoint's list names the orders
+        // recorded before it, the records after it the rest.
+        let mut orders: HashMap<u64, Vec<u8>> = HashMap::new();
+        for op in list
+            .iter()
+            .chain(replay.records.iter().flat_map(|r| r.ops.iter()))
+        {
+            match op {
+                Op::Ordered { tree, order } => {
+                    orders.insert(*tree, order.clone());
+                }
+                Op::Dropped { tree } => {
+                    orders.remove(tree);
+                }
+                Op::Put { .. } | Op::Remove { .. } | Op::Made { .. } => {}
+            }
+        }
+        let mut ordered: HashMap<u64, Comparator> = HashMap::with_capacity(orders.len());
+        for (tree, bytes) in &orders {
+            ordered.insert(*tree, order(*tree, bytes)?);
+        }
+        let ordered = Mutex::new(ordered);
+        let comparator = |tree: u64| ordered.lock().remove(&tree).unwrap_or_else(&cmp);
+        let overflow = u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?;
         let v = Versioned::open(pool, &stamp.roots, |i| {
             if i == trees {
                 bytes_order()
             } else {
-                cmp()
+                comparator(u64::try_from(i).unwrap_or(overflow))
             }
         })?;
         let changes = list
             .iter()
             .chain(replay.records.iter().flat_map(|r| r.ops.iter()));
-        Self::apply(&v, changes, &cmp)?;
+        Self::apply(&v, changes, &comparator)?;
         v.clear_versions(&mut Descender::new())?;
         v.clock.recovered(replay.newest);
         // Each checkpoint switches the turn appends go to: after checkpoint `seq`, turn `seq % 2`.
@@ -314,30 +357,33 @@ impl Database {
             gate: RwLock::new(()),
             last: Mutex::new(stamp.seq),
             columns: std::sync::OnceLock::new(),
-            overflow: u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?,
+            overflow,
+            orders: Mutex::new(orders),
         })
     }
 
     /// Makes `changes` directly, with no versions (recovery): the row changes between two trees
     /// made or dropped side by side ([`Database::apply_rows`]), each tree made or dropped
-    /// (`AC-NS.2.5`) once every change before it is made, a made tree ordered by `cmp`.
+    /// (`AC-NS.2.5`) once every change before it is made, a made tree ordered by `cmp` of its id.
+    /// Orders were read ahead of the replay.
     fn apply<'a>(
         v: &Versioned,
         changes: impl Iterator<Item = &'a Op>,
-        cmp: &dyn Fn() -> Comparator,
+        cmp: &dyn Fn(u64) -> Comparator,
     ) -> Result<()> {
         let mut rows = Vec::new();
         for op in changes {
             match op {
                 Op::Made { tree } => {
                     Self::apply_rows(v, std::mem::take(&mut rows))?;
-                    v.remake_tree(*tree, cmp())?;
+                    v.remake_tree(*tree, cmp(*tree))?;
                 }
                 Op::Dropped { tree } => {
                     Self::apply_rows(v, std::mem::take(&mut rows))?;
                     v.drop_tree(*tree)?;
                 }
                 Op::Put { .. } | Op::Remove { .. } => rows.push(op),
+                Op::Ordered { .. } => {}
             }
         }
         Self::apply_rows(v, rows)
@@ -426,6 +472,7 @@ impl Database {
             last: Mutex::new(0),
             columns: std::sync::OnceLock::new(),
             overflow: u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?,
+            orders: Mutex::new(HashMap::new()),
         })
     }
 
@@ -433,8 +480,8 @@ impl Database {
     fn tree_of(op: &Op) -> Result<u64> {
         match op {
             Op::Put { tree, .. } | Op::Remove { tree, .. } => Ok(*tree),
-            Op::Made { .. } | Op::Dropped { .. } => {
-                Err(corrupt("a checkpoint's list naming a tree made or dropped"))
+            Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => {
+                Err(corrupt("a row change naming a tree made, dropped or ordered"))
             }
         }
     }
@@ -466,7 +513,24 @@ impl Database {
             return Err(LimboError::Busy);
         }
         self.log_alone(d, Op::Dropped { tree })?;
+        self.orders.lock().remove(&tree);
         self.v.drop_tree(tree)
+    }
+
+    /// Records tree `tree`'s order, `order` as the opener encodes it (G7 step 2, `AC-NS.2.1`),
+    /// logged as a record of its own, durable before it returns: given before any row of the tree
+    /// is written, so recovery orders the tree by it (`open_ordered`'s `order`) before it replays
+    /// one. Row changes and checkpoints wait for it.
+    pub fn order_tree(&self, d: &mut Descender, tree: u64, order: Vec<u8>) -> Result<()> {
+        let tree = self.user_tree(tree)?;
+        let _alone = self.gate.write();
+        self.redo.usable()?;
+        let op = Op::Ordered { tree, order };
+        self.log_alone(d, op.clone())?;
+        if let Op::Ordered { tree, order } = op {
+            self.orders.lock().insert(tree, order);
+        }
+        Ok(())
     }
 
     /// Logs `op` alone at the next timestamp, durable, under the gate held exclusive.
@@ -744,7 +808,7 @@ impl Database {
                     open.remove(&prefix);
                     out.push(op.clone());
                 }
-                Op::Made { .. } | Op::Dropped { .. } => out.push(op.clone()),
+                Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => out.push(op.clone()),
             }
         }
         Ok(out)
@@ -826,12 +890,19 @@ impl Database {
                 allocated: self.v.pool.allocated(),
                 roots: self.v.roots(),
             };
-            (
-                stamp,
-                self.v.corrections(ts)?,
-                self.v.pool.begin_copy()?,
-                from,
-            )
+            // The trees' orders go in the list beside the corrections: the redo records naming
+            // them are cut once the checkpoint is written.
+            let mut list = self.v.corrections(ts)?;
+            list.extend(
+                self.orders
+                    .lock()
+                    .iter()
+                    .map(|(tree, order)| Op::Ordered {
+                        tree: *tree,
+                        order: order.clone(),
+                    }),
+            );
+            (stamp, list, self.v.pool.begin_copy()?, from)
         };
         // Off the commit path: writers go on, each keeping a page's bytes at the pause before its
         // first change of it.
@@ -1312,6 +1383,78 @@ mod tests {
         assert_eq!(made_trees(&db, 6), want);
         let mut d = Descender::new();
         assert_eq!(db.make_tree(&mut d, cmp()).unwrap(), 5);
+    }
+
+    fn reversed() -> Comparator {
+        Box::new(|a: &[u8], b: &[u8]| b.cmp(a))
+    }
+
+    /// The comparison of a recorded order: `rev` orders keys from the last to the first.
+    fn recorded(_tree: u64, order: &[u8]) -> Result<Comparator> {
+        if order == b"rev" {
+            Ok(reversed())
+        } else {
+            Err(LimboError::Corrupt("an order this test doesn't know".into()))
+        }
+    }
+
+    fn keys(db: &Database, tree: u64) -> Vec<Vec<u8>> {
+        let mut d = Descender::new();
+        let snap = db.snapshot().unwrap();
+        let all = db.scan(&mut d, &snap, tree, None, usize::MAX).unwrap();
+        db.close_snapshot(snap);
+        all.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// Do (`AC-NS.2.1`, G7 step 2): make two trees ordered from the last key to the first, record
+    /// each one's order, one before a checkpoint (which cuts the record from the redo log) and one
+    /// after; write rows to both; reopen, write a key between, and reopen after a power cut. Expect:
+    /// each tree's keys read back in its recorded order after each reopen, the key written after a
+    /// reopen in its place; an order the opener doesn't read refused (`Corrupt`), not taken as the
+    /// default.
+    #[test]
+    fn ns2_1_a_trees_recorded_order_survives_checkpoints_and_reopens() {
+        let disk = Arc::new(Simulated::new(37, 1).unwrap());
+        let (a, b);
+        {
+            let db = Database::open_ordered(disk.clone(), 2_000, 1, cmp, recorded).unwrap();
+            let mut d = Descender::new();
+            a = db.make_tree(&mut d, reversed()).unwrap();
+            db.order_tree(&mut d, a, b"rev".to_vec()).unwrap();
+            let mut txn = db.begin().unwrap();
+            for k in [b"k1", b"k5", b"k3"] {
+                db.put(&mut d, &mut txn, a, k, b"v").unwrap();
+            }
+            db.commit(txn, &mut d, db.lane(), true).unwrap();
+            db.checkpoint().unwrap();
+            b = db.make_tree(&mut d, reversed()).unwrap();
+            db.order_tree(&mut d, b, b"rev".to_vec()).unwrap();
+            let mut txn = db.begin().unwrap();
+            for (t, k) in [(a, b"k7"), (b, b"k2"), (b, b"k9"), (b, b"k4")] {
+                db.put(&mut d, &mut txn, t, k, b"v").unwrap();
+            }
+            db.commit(txn, &mut d, db.lane(), true).unwrap();
+        }
+        let want_a: Vec<Vec<u8>> = [b"k7", b"k5", b"k3", b"k1"].iter().map(|k| k.to_vec()).collect();
+        let db = Database::open_ordered(disk.clone(), 2_000, 1, cmp, recorded).unwrap();
+        assert_eq!(keys(&db, a), want_a);
+        let mut d = Descender::new();
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, b, b"k6", b"v").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+        let want_b: Vec<Vec<u8>> = [b"k9", b"k6", b"k4", b"k2"].iter().map(|k| k.to_vec()).collect();
+        assert_eq!(keys(&db, b), want_b);
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open_ordered(disk.clone(), 2_000, 1, cmp, recorded).unwrap();
+        assert_eq!(keys(&db, a), want_a);
+        assert_eq!(keys(&db, b), want_b);
+        db.checkpoint().unwrap();
+        drop(db);
+        assert!(matches!(
+            Database::open(disk, 2_000, 1, cmp),
+            Err(LimboError::Corrupt(_))
+        ));
     }
 
     /// Do: for many crash points, a workload that makes trees, writes long and short rows to them
