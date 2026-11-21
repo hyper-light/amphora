@@ -1972,4 +1972,8 @@ I/O completion 2.7-3.6%, together 23.0-30.3%; SQLite's page cache and pager are 
   refused with a checksum error through a fresh connection on each path. T-G3.3.4
   (`storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do`). T-G3.3.5
   (`g3s3_plain_misses_read_into_the_pages_evictions_leave`): a table four times a 200-page cache
-  read twice on each path: the same rows, the plain path's misses in recycled pages.
+  read twice on each path: the same rows, the plain path's misses in recycled pages. T-G3.3.6
+  (`crates/engine/tests/page_path_allocs.rs`, a counting allocator): allocations per point lookup
+  by a prepared statement, one small run on adacachy (debug build, 2026-11-21, f046bc1, one run, a
+  smoke check, not a benchmark): misses without shared pages 15.98 today against 6.00 plain, with
+  shared pages 7.99 against 7.00; hits 5.00 on both (the statement's own: its row vectors).

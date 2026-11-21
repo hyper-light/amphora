@@ -199,7 +199,7 @@ impl Amphora {
         let pack_log = env("AMPHORA_PACK_LOG") == Some(1);
         // How the groups share pages (decisions 20 and 26): one pool for them all either way.
         let sharing = crate::suite_db::amphora_sharing()?;
-        let groups = Groups::start(groups, config, |g| {
+        let groups = Groups::start(groups, config, &dir.join("bench.retired"), |g| {
             let db = Db::open_sharing(&dir.join(format!("bench-{g}.db")), &sharing)?;
             if pack_log {
                 db.log_format(amphora::db::LogFormat::Packed)?;

@@ -215,6 +215,8 @@ mod amphora_target {
         readers: usize,
         reader_pages: Option<i64>,
         commit_rows: Option<usize>,
+        /// Where its groups keep the groups retired (CP-T1.9).
+        retired: PathBuf,
         /// The pages its connections share, if they do: their counts go into the run's stats.
         pool: Option<Arc<amphora::db::SharedPages>>,
     }
@@ -250,7 +252,8 @@ mod amphora_target {
             }
             let reader_pages = std::env::var("AMPHORA_READER_PAGES").ok().and_then(|v| v.parse().ok());
             let commit_rows = std::env::var("AMPHORA_COMMIT_ROWS").ok().and_then(|v| v.parse().ok());
-            Ok(Self { loader: Mutex::new(Some(db)), groups: OnceLock::new(), sql: Arc::new(Mutex::new(HashMap::new())), readers: clients.max(1), reader_pages, commit_rows, pool })
+            let retired = path.with_file_name("suite.retired");
+            Ok(Self { loader: Mutex::new(Some(db)), groups: OnceLock::new(), sql: Arc::new(Mutex::new(HashMap::new())), readers: clients.max(1), reader_pages, commit_rows, retired, pool })
         }
     }
 
@@ -288,7 +291,7 @@ mod amphora_target {
             // As many readers as clients: a read never waits for another's reader.
             let defaults = Config::default();
             let config = Config { readers: self.readers, commit_rows: self.commit_rows.unwrap_or(defaults.commit_rows), ..defaults };
-            let groups = Groups::start(1, config, |_| slot.take().ok_or_else(|| anyhow::anyhow!("one group")))?;
+            let groups = Groups::start(1, config, &self.retired, |_| slot.take().ok_or_else(|| anyhow::anyhow!("one group")))?;
             self.groups.set(Arc::new(groups)).map_err(|_| anyhow::anyhow!("started twice"))?;
             Ok(())
         }
