@@ -330,6 +330,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   path; Elle's list-append and register histories checked for G0, G1a, G1b, G1c, G-single and G2
   (snapshot isolation the control, showing G2). Not yet: the 10,000-seed runs and the three schemes'
   throughput, refusals and p99 on the suite's write classes and K0 (the batch's), then the choice.
+- **Many writers through SQL, the harnesses** (G7 step 5, G8 steps 4-5, `crates/engine/storage/versioned/{many_writers,elle_sql}.rs`):
+  N connections run the suite's write classes at once and every committed transaction answers as a
+  serial replay in commit order does (`T-G7.5.1`), passing on the pager's storage and the versioned
+  one; Elle's list-append and register histories are recorded through SQL and checked (`T-G8.4.1`),
+  clean on the pager's storage. On the versioned storage they show G2: its SQL cursor keeps no reads
+  for the commit's validation, so SQL there is snapshot isolation (that test is ignored until it
+  holds). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the coordinator's.
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and

@@ -873,3 +873,20 @@ tests = [
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
   { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
 ]
+
+# lane many-writers
+# Amphora's own IDs for G7 step 5 and G8 steps 4-5 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, under
+# CP-T1.3 stage 3 and CP-T1.4): the harnesses that verify many writers through SQL. Their full runs
+# (the suite's sizes, 10,000 seeds) and the commit p99 bar (G8 step 5: p99 at most 5 ms, p99.9 at most
+# 15 ms at 32 writers) are the coordinator's.
+[[own]]
+id = "G7.5"
+title = "Many writers through SQL answer as a serial replay, and Elle finds no anomaly through SQL (G7 step 5, G8 steps 4-5)"
+criteria = [
+  { id = "AC-G7.5.1", text = "every committed transaction of every write class, run by N connections at once, answers statement for statement as a serial replay in commit order, on each storage" },
+  { id = "AC-G7.5.2", text = "anomalies over 10,000 Elle seeds recorded through SQL at the claimed isolation (serializable) is exactly 0, on each storage" },
+]
+tests = [
+  { id = "T-G7.5.1", text = "storage::versioned::many_writers::g7_5_many_writers_answer_as_a_serial_replay — passes when every answer and the ending rows and index match the serial replay's, on the pager's storage and the versioned one, ids from writers' own slices and from every row" },
+  { id = "T-G8.4.1", text = "storage::versioned::elle_sql::g8_4_sql_histories_have_no_anomaly_on_* — passes when list-append and register histories recorded from N SQL connections show no G0, G1a, G1b, G1c, G-single or G2 (the versioned storage's is ignored until its SQL cursor keeps reads for validation)" },
+]
