@@ -89,7 +89,13 @@ pub fn restore(
     let mut index = 0usize;
     while let Some(first) = plan.segments.get(index) {
         let generation = segments.get(*first).map_or(0, |s| s.generation);
-        let mut log = std::fs::File::create_new(wal_path(path))?;
+        // The first generation's log is new (checked above); each later one takes the place of the
+        // log the fold before it emptied but left (a truncating checkpoint keeps its file).
+        let mut log = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(wal_path(path))?;
         let mut written = 0u64;
         let mut header_written = false;
         while let Some(i) = plan.segments.get(index) {

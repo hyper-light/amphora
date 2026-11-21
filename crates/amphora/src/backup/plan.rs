@@ -16,7 +16,7 @@
 //!
 //! Numbers are zero-padded to 20 digits so that the store's key order is their order.
 
-use super::SECOND_NS;
+use super::{SECOND_NS, second_of};
 
 /// What a second can't be restored for.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -220,17 +220,31 @@ pub fn locate(segments: &[SegmentKey], second: u64) -> Result<usize, Unrestorabl
     };
     let last = segment.marks.map_or(0, |(_, last)| last);
     if t >= last {
-        if segment.through < t {
-            return Err(Unrestorable::NotYetArchived {
-                asked: second,
-                through: segment.through,
-            });
-        }
         // The cut is this segment's last mark: the next mark is the next segment's first.
         let next = segments
             .iter()
             .skip(at.saturating_add(1))
             .find(|s| s.marks.is_some());
+        // A segment knows the archive whole only through when it was shipped; the next one's first
+        // mark says no commit came between then and the start of that mark's second, as the
+        // shipper says of a mark still pending ([`super::Shipper::ship`]); where that mark's
+        // commits weren't stamped one by one, the check below refuses. A second in that quiet
+        // stretch restores at this segment's last mark (T-T1.12.D1, T-T1.12.D2).
+        let through = next
+            .and_then(|n| n.marks)
+            .map_or(segment.through, |(first, _)| {
+                segment.through.max(
+                    second_of(first)
+                        .saturating_sub(1)
+                        .saturating_mul(SECOND_NS),
+                )
+            });
+        if through < t {
+            return Err(Unrestorable::NotYetArchived {
+                asked: second,
+                through,
+            });
+        }
         if let Some(from) = next.and_then(|s| s.unknown)
             && from < t
         {
@@ -499,8 +513,9 @@ mod tests {
         assert!(SegmentKey::parse("p", "p/log/1/2").is_err());
     }
 
-    /// T-T1.12.P5: a second is found in the segment whose marks reach it; before the first mark,
-    /// past what is whole, and in an unstamped stretch it is refused.
+    /// T-T1.12.P5: a second is found in the segment whose marks reach it, or in the quiet stretch
+    /// before the next segment's first mark; before the first mark, past what is whole, and in an
+    /// unstamped stretch it is refused.
     #[test]
     fn t_t1_12_p5_locate() {
         let segments = vec![
@@ -526,6 +541,27 @@ mod tests {
         ));
         // Within segment 1's marks the cut is the marks' to say (cut_in).
         assert_eq!(locate(&unknown, 5), Ok(1));
+        // Segment 0 was shipped at 3 s; the next commit came at 7.2 s: seconds 4 to 7 held no
+        // commit, so they restore at segment 0's last mark; second 8 is segment 1's.
+        let quiet = vec![
+            seg(1, 1, 10, Some((2 * S, 3 * S)), 3 * S + 5),
+            seg(1, 11, 20, Some((7 * S + 2, 8 * S)), 8 * S + 5),
+        ];
+        assert_eq!(locate(&quiet, 4), Ok(0));
+        assert_eq!(locate(&quiet, 7), Ok(0));
+        assert_eq!(locate(&quiet, 8), Ok(1));
+        assert!(matches!(
+            locate(&quiet, 9),
+            Err(Unrestorable::NotYetArchived { .. })
+        ));
+        // Unless segment 1's first commits weren't stamped one by one after 4.5 s.
+        let mut quiet_unknown = quiet.clone();
+        quiet_unknown[1].unknown = Some(4 * S + S / 2);
+        assert_eq!(locate(&quiet_unknown, 4), Ok(0));
+        assert!(matches!(
+            locate(&quiet_unknown, 5),
+            Err(Unrestorable::Inexact { asked: 5, .. })
+        ));
     }
 
     /// T-T1.12.P6: the cut is the last mark at or before the second; an unstamped stretch after
