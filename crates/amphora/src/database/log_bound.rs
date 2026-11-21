@@ -6,17 +6,17 @@
 //! - a restart holds the owner, and with it every entry the owner applies until the backlog it
 //!   made is gone: until a step begins with no more input queued than it found (held). One is
 //!   due only while the entries held by restarts, the entries the owner's own long steps already
-//!   delayed past AC-T1.3.4's p99.9 (over), and the most one restart held (next, for the restart
-//!   about to come) stay strictly below the p99.9's tail of the entries applied, over patience's
-//!   window of two generations;
+//!   delayed past AC-T1.3.4's p99.9 (over), and the most one of the last thousand restarts held
+//!   (next, for the restart about to come) stay strictly below the p99.9's tail of the entries
+//!   applied in the current generation. A generation ends at the restart made once it alone
+//!   covers its own spend at the quantile, so what it forgets never made a restart due;
 //! - the log may hold what its own file and an equal share, among the replica logs on its
 //!   filesystem, of what is free there less one snapshot's image, hold: each frame its own bytes
 //!   and the page its copy may add to the database's file ([`log_room`]).
 
 use amphora_api::Refusal;
+use std::collections::VecDeque;
 use std::time::Duration;
-
-use super::patience::GENERATION;
 
 /// The quantile the registry holds a commit's latency to, as a fraction: AC-T1.3.4's p99.9, the
 /// highest of docs/requirements.toml (AC-T1.4.3 holds the same quantile).
@@ -30,7 +30,9 @@ const COMMIT_TAIL: Duration = Duration::from_millis(15);
 /// Format").
 pub(super) const FRAME_BYTES: u64 = 4096 + 24;
 
-/// What one generation of the window counted, in entries applied.
+/// What one generation counted, in entries applied: from the restart that began it to the
+/// restart made once it covered its own spend at the quantile (replication.md, "Decision (lane
+/// constants): a generation of restarts ends once it covers its spend").
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Window {
     applied: u64,
@@ -38,8 +40,47 @@ struct Window {
     held: u64,
     /// Applied, not held, by a step longer than [`COMMIT_TAIL`].
     over: u64,
-    /// The most one restart held that ended its hold in this generation.
-    most: u64,
+}
+
+/// The most one restart held among the last `of / (of - quantile)` ended holds (a thousand at the
+/// p99.9): the worst of n holds estimates their 1 - 1/n quantile, so the next restart is guessed at
+/// the quantile the rule holds the tail to. A monotonic queue of (restart, held): each entry holds
+/// more than every later one, so the front is the most, and it holds at most that many entries.
+#[derive(Debug, Default)]
+struct Worst {
+    /// Holds ended so far.
+    ended: u64,
+    holds: VecDeque<(u64, u64)>,
+}
+
+impl Worst {
+    fn most(&self) -> u64 {
+        self.holds.front().map_or(0, |&(_, held)| held)
+    }
+
+    fn ended(&mut self, held: u64) -> Result<(), Refusal> {
+        let (quantile, of) = QUANTILE;
+        let last = of
+            .checked_sub(quantile)
+            .and_then(|tail| of.checked_div(tail))
+            .ok_or_else(|| overflowed("the holds kept"))?;
+        self.ended = self
+            .ended
+            .checked_add(1)
+            .ok_or_else(|| overflowed("restarts"))?;
+        while self.holds.back().is_some_and(|&(_, most)| most <= held) {
+            self.holds.pop_back();
+        }
+        self.holds.push_back((self.ended, held));
+        while self
+            .holds
+            .front()
+            .is_some_and(|&(restart, _)| restart.saturating_add(last) <= self.ended)
+        {
+            self.holds.pop_front();
+        }
+        Ok(())
+    }
 }
 
 /// A restart's hold on what the owner applies.
@@ -57,10 +98,8 @@ struct Holding {
 /// An owner's count of what its restarts of the database's log held.
 #[derive(Debug, Default)]
 pub(super) struct Spacing {
-    ticks: u64,
-    generation: u64,
     current: Window,
-    before: Window,
+    worst: Worst,
     holding: Option<Holding>,
 }
 
@@ -69,29 +108,24 @@ fn overflowed(what: &str) -> Refusal {
 }
 
 impl Spacing {
-    /// One tick of the owner: past a generation, the generation before is forgotten.
-    pub(super) fn tick(&mut self) -> Result<(), Refusal> {
-        self.ticks = self
-            .ticks
-            .checked_add(1)
-            .ok_or_else(|| overflowed("ticks"))?;
-        if self.ticks.saturating_sub(self.generation) >= GENERATION {
-            self.generation = self.ticks;
-            self.before = std::mem::take(&mut self.current);
-        }
-        Ok(())
-    }
-
     /// The owner started the log again with `queued` bytes of input admitted and not yet taken:
     /// what it applies from now until a step begins with no more queued is held. A restart within
-    /// another's hold goes on counting into it, its backlog measured from the first.
-    pub(super) fn restarted(&mut self, queued: u64) {
+    /// another's hold goes on counting into it, its backlog measured from the first. A restart made
+    /// once the generation alone covered its own spend at the quantile begins the next, and the
+    /// one that ended is forgotten: it paid for itself, so forgetting it never makes a restart due.
+    /// One made before (past the log's room, disk before latency) counts into the same generation,
+    /// so its spend is paid before the next is due.
+    pub(super) fn restarted(&mut self, queued: u64) -> Result<(), Refusal> {
+        if self.holding.is_none() && self.due()? {
+            self.current = Window::default();
+        }
         let holding = self.holding.get_or_insert(Holding {
             held: 0,
             found: queued,
             fresh: true,
         });
         holding.fresh = true;
+        Ok(())
     }
 
     /// A step of the owner that began with `queued` bytes of input admitted and not yet taken,
@@ -104,14 +138,14 @@ impl Spacing {
         took: Duration,
         queued: u64,
     ) -> Result<(), Refusal> {
-        let window = &mut self.current;
         if let Some(holding) = self.holding
             && !holding.fresh
             && queued <= holding.found
         {
             self.holding = None;
-            window.most = window.most.max(holding.held);
+            self.worst.ended(holding.held)?;
         }
+        let window = &mut self.current;
         window.applied = window
             .applied
             .checked_add(entries)
@@ -141,26 +175,27 @@ impl Spacing {
         self.holding.is_some()
     }
 
-    /// Whether a restart is due by its share: the held, the over and the next restart's worst
-    /// guess, against the entries applied over the window, strictly below the quantile's tail.
+    /// The most one restart held, the next one's guess: the worst of the last holds that ended,
+    /// or the hold under way if it already held more.
+    fn next(&self) -> u64 {
+        self.worst
+            .most()
+            .max(self.holding.map_or(0, |holding| holding.held))
+    }
+
+    /// Whether a restart is due by its share: the generation's held and over and the next
+    /// restart's worst guess, against the entries the generation applied, strictly below the
+    /// quantile's tail: the generation alone covers its own spend.
     pub(super) fn due(&self) -> Result<bool, Refusal> {
         let (quantile, of) = QUANTILE;
         let tail = of
             .checked_sub(quantile)
             .ok_or_else(|| overflowed("the tail"))?;
-        let (current, before) = (&self.current, &self.before);
+        let current = &self.current;
         let sum = |a: u64, b: u64, what| a.checked_add(b).ok_or_else(|| overflowed(what));
-        let applied = sum(current.applied, before.applied, "entries applied")?;
-        let next = current
-            .most
-            .max(before.most)
-            .max(self.holding.map_or(0, |holding| holding.held));
-        let spent = sum(
-            sum(current.held, before.held, "entries held")?,
-            sum(current.over, before.over, "entries over the tail")?,
-            "entries spent",
-        )?;
-        let spent = sum(spent, next, "entries spent")?;
+        let applied = current.applied;
+        let spent = sum(current.held, current.over, "entries spent")?;
+        let spent = sum(spent, self.next(), "entries spent")?;
         let spent = spent
             .checked_mul(of)
             .ok_or_else(|| overflowed("entries spent"))?;
@@ -213,7 +248,7 @@ mod tests {
     #[test]
     fn a_restart_spends_what_it_held_and_spaces_the_next() {
         let mut spacing = Spacing::default();
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(5, QUICK, 1).unwrap();
         spacing.stepped(0, QUICK, 0).unwrap();
         spacing.stepped(9_995, QUICK, 0).unwrap();
@@ -224,7 +259,8 @@ mod tests {
 
     /// AC-T1.8.D1, T-T1.8.D3: do a step longer than AC-T1.3.4's 15 ms applying 3 entries; expect
     /// them spent as the base tail (a restart due at 3,001 applied, not 3,000), and a restart's
-    /// hold not counted twice: entries a long step applies while held count as held only.
+    /// hold not counted twice: entries a long step applies while held count as held only, in the
+    /// generation the restart began (the one before covered its spend, and is forgotten).
     #[test]
     fn long_steps_spend_the_tail_before_any_restart() {
         let mut spacing = Spacing::default();
@@ -234,9 +270,9 @@ mod tests {
         spacing.stepped(1, QUICK, 0).unwrap();
         assert!(spacing.due().unwrap());
         assert_eq!(spacing.current.over, 3);
-        spacing.restarted(0);
+        spacing.restarted(0).unwrap();
         spacing.stepped(4, Duration::from_millis(16), 0).unwrap();
-        assert_eq!((spacing.current.over, spacing.current.held), (3, 4));
+        assert_eq!((spacing.current.over, spacing.current.held), (0, 4));
     }
 
     /// AC-T1.8.D1, T-T1.8.D3 (amphora-owner-t1-log-bound-4a274ec-20261111, point 1): an owner under
@@ -248,13 +284,13 @@ mod tests {
     #[test]
     fn a_restart_due_again_by_its_share_on_an_owner_never_idle() {
         let mut spacing = Spacing::default();
-        spacing.restarted(3);
+        spacing.restarted(3).unwrap();
         spacing.stepped(5, QUICK, 3).unwrap();
         spacing.stepped(2, QUICK, 9).unwrap();
         for _ in 0..1_000_000 {
             spacing.stepped(1, QUICK, 3).unwrap();
         }
-        assert_eq!((spacing.current.held, spacing.current.most), (7, 7));
+        assert_eq!((spacing.current.held, spacing.worst.most()), (7, 7));
         assert!(
             spacing.due().unwrap(),
             "held for good: {:?}",
@@ -262,32 +298,67 @@ mod tests {
         );
     }
 
-    /// AC-T1.8.D1, T-T1.8.D3: do a restart that held 50 entries, then two generations of ticks;
-    /// expect it forgotten: a restart due again after one entry.
+    /// AC-T1.8.D1, T-T1.8.D3 (GN.2): do a restart that held 50 entries, 99,950 more applied
+    /// (not yet covering its 50 and the next's guess of 50 at the p99.9), one more, then a
+    /// restart; expect it due only at 100,001 applied, and the generation it ended forgotten: the
+    /// next due once the new generation alone covers its own hold of 1 and the guess, 50 (at
+    /// 51,001 applied, not 51,000), however many the one before applied.
     #[test]
-    fn the_window_forgets_after_two_generations() {
+    fn a_generation_ends_once_it_covers_its_spend_and_is_forgotten() {
         let mut spacing = Spacing::default();
-        spacing.restarted(0);
-        spacing.stepped(50, QUICK, 0).unwrap();
+        spacing.restarted(0).unwrap();
+        spacing.stepped(50, QUICK, 1).unwrap();
+        spacing.stepped(0, QUICK, 0).unwrap();
+        spacing.stepped(99_950, QUICK, 0).unwrap();
+        assert!(!spacing.due().unwrap(), "due at 100,000 applied");
         spacing.stepped(1, QUICK, 0).unwrap();
-        assert!(!spacing.due().unwrap());
-        for _ in 0..GENERATION {
-            spacing.tick().unwrap();
-        }
-        assert!(!spacing.due().unwrap(), "forgotten after one generation");
-        for _ in 0..GENERATION {
-            spacing.tick().unwrap();
-        }
+        assert!(spacing.due().unwrap(), "not due at 100,001 applied");
+        spacing.restarted(0).unwrap();
+        assert_eq!(
+            spacing.current,
+            Window::default(),
+            "the generation not forgotten"
+        );
+        spacing.stepped(1, QUICK, 1).unwrap();
+        spacing.stepped(0, QUICK, 0).unwrap();
+        spacing.stepped(50_999, QUICK, 0).unwrap();
+        assert!(!spacing.due().unwrap(), "due at 51,000 applied");
         spacing.stepped(1, QUICK, 0).unwrap();
-        assert!(spacing.due().unwrap());
+        assert!(spacing.due().unwrap(), "not due at 51,001 applied");
+    }
+
+    /// AC-T1.8.D1, T-T1.8.D3 (GN.2): do 1,000 restarts each holding 1 after one that held 9;
+    /// expect the guess the 9 through the 999th of them, and 1 once the 9 is past the last
+    /// thousand holds; a restart made before its generation covered its spend (past the log's
+    /// room) counted into the same generation.
+    #[test]
+    fn the_guess_is_the_worst_of_the_last_thousand_holds() {
+        let mut spacing = Spacing::default();
+        let hold = |spacing: &mut Spacing, held| {
+            spacing.restarted(0).unwrap();
+            spacing.stepped(held, QUICK, 1).unwrap();
+            spacing.stepped(0, QUICK, 0).unwrap();
+        };
+        hold(&mut spacing, 9);
+        for _ in 0..999 {
+            hold(&mut spacing, 1);
+        }
+        assert_eq!(spacing.worst.most(), 9);
+        hold(&mut spacing, 1);
+        assert_eq!(spacing.worst.most(), 1);
+        assert!(spacing.worst.holds.len() <= 1_000);
+        assert_eq!(
+            spacing.current.held, 1_009,
+            "a restart not due began a generation"
+        );
     }
 
     /// AC-T1.8.D1, T-T1.8.D3 (the share): do an owner applying entries in steps of 1 to 7, a step in
-    /// 20,011 a long one (a base tail well within the p99.9's), each restart made as soon as due
-    /// and holding 1 to 9 entries; expect, after
-    /// the hold of every restart that held no more than the worst before it, the held and the
-    /// base tail strictly below a thousandth of the entries applied over the window, through four
-    /// generations; and such restarts made.
+    /// 20,011 a long one (a base tail well within the p99.9's), 240,000 steps, each restart made as
+    /// soon as due and holding 1 to 9 entries; expect, after the hold of every restart that held
+    /// no more than the worst before it, the held and the base tail strictly below a thousandth of
+    /// the entries applied over the window (the generation the restart ended and the one it
+    /// began); and such restarts made.
     #[test]
     fn restarts_made_when_due_keep_their_share_below_the_tail() {
         let mut spacing = Spacing::default();
@@ -296,10 +367,7 @@ mod tests {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             seed >> 33
         };
-        for step in 0..4 * GENERATION * 20 {
-            if step % 20 == 0 {
-                spacing.tick().unwrap();
-            }
+        for _ in 0..240_000 {
             let took = if next() % 20_011 == 0 {
                 Duration::from_millis(20)
             } else {
@@ -307,7 +375,8 @@ mod tests {
             };
             spacing.stepped(1 + next() % 7, took, 0).unwrap();
             if spacing.due().unwrap() {
-                spacing.restarted(0);
+                let ended = spacing.current;
+                spacing.restarted(0).unwrap();
                 let held = 1 + next() % 9;
                 spacing.stepped(held, QUICK, 1).unwrap();
                 spacing.stepped(0, QUICK, 0).unwrap();
@@ -317,12 +386,12 @@ mod tests {
                     continue;
                 }
                 checked += 1;
-                let (c, b) = (&spacing.current, &spacing.before);
-                let spent = (c.held + b.held + c.over + b.over) * 1_000;
+                let c = &spacing.current;
+                let spent = (c.held + ended.held + c.over + ended.over) * 1_000;
                 assert!(
-                    spent < c.applied + b.applied,
+                    spent < c.applied + ended.applied,
                     "restart {restarts}: {spent} against {} applied",
-                    c.applied + b.applied
+                    c.applied + ended.applied
                 );
             }
         }

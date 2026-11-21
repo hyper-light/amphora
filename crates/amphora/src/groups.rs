@@ -8,7 +8,10 @@
 //! routes by the directory it was last given ([`Groups::route`], from the directory group's
 //! replicated state, [`crate::reshard::replicated`]), and each group answers only from its own
 //! holding ([`Holding`]), checked on every write and read: a router with a stale directory is
-//! refused ([`Refused::Away`]), never let write to a group that doesn't hold the key.
+//! refused ([`Refused::Away`]), never let write to a group that doesn't hold the key. The holding
+//! is kept by the group's own engine with its rows ([`Engine::keep_holding`]), durable before it
+//! is acted on, and a group started again answers from what it kept, whatever directory it is
+//! started by: never from a router's memory.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -17,7 +20,7 @@ use std::time::Instant;
 use crate::meter::Counters;
 use crate::reshard::directory::{Change, Directory, Proposal};
 use crate::reshard::holding::{Away, Holding};
-use crate::reshard::{self, GroupId, NodeId, Pos, position};
+use crate::reshard::{self, GroupId, NodeId, Pos, Span, position};
 use crate::store::{Config, Engine, Refused, Store, Ticket};
 
 /// A group: its store and what it holds.
@@ -111,6 +114,23 @@ pub fn even(node: NodeId, n: usize) -> Result<Directory, reshard::Refused> {
     Ok(directory)
 }
 
+/// `holding` as an engine keeps it.
+fn encode(holding: &Holding) -> anyhow::Result<Vec<u8>> {
+    postcard::to_allocvec(holding).map_err(|_| anyhow::anyhow!("a holding that doesn't encode"))
+}
+
+/// The holding `engine` keeps, or, if it keeps none (a group made now), one holding `first`, kept
+/// before the group takes anything.
+fn kept<E: Engine>(engine: &mut E, first: Option<Span>) -> anyhow::Result<Holding> {
+    if let Some(bytes) = engine.holding()? {
+        return postcard::from_bytes(&bytes)
+            .map_err(|_| anyhow::anyhow!("a kept holding that doesn't decode"));
+    }
+    let holding = Holding::owning(first);
+    engine.keep_holding(&encode(&holding)?)?;
+    Ok(holding)
+}
+
 impl<E: Engine> Groups<E> {
     /// `groups` stores (at least one) over equal runs of positions ([`even`]), the `i`th started
     /// on `engine(i)` with `config`.
@@ -125,8 +145,8 @@ impl<E: Engine> Groups<E> {
         })
     }
 
-    /// A store for each group `directory` places, each holding its span, started on
-    /// `engine(group)` with `config`.
+    /// A store for each group `directory` places, started on `engine(group)` with `config`,
+    /// each holding what its engine kept, or, if it kept nothing (a group made now), its span.
     pub fn on(
         directory: &Directory,
         config: Config,
@@ -135,8 +155,9 @@ impl<E: Engine> Groups<E> {
         directory.check()?;
         let mut groups = BTreeMap::new();
         for (group, _) in directory.groups() {
-            let store = Store::start(engine(group)?, config)?;
-            let holding = Holding::owning(directory.span_of(group));
+            let mut engine = engine(group)?;
+            let holding = kept(&mut engine, directory.span_of(group))?;
+            let store = Store::start(engine, config)?;
             groups.insert(group, Group { store, holding });
         }
         let route = Route {
@@ -171,7 +192,8 @@ impl<E: Engine> Groups<E> {
     }
 
     /// A new group (the driver's `Do::Create`), holding nothing until an operation hands it a
-    /// span, its store started on `engine`. Making one that is here already does nothing.
+    /// span (or what its engine kept, if it is made again after a restart), its store started on
+    /// `engine`. Making one that is here already does nothing.
     pub fn create(
         &self,
         group: GroupId,
@@ -181,31 +203,39 @@ impl<E: Engine> Groups<E> {
         if route.groups.contains_key(&group) {
             return Ok(());
         }
-        let store = Store::start(engine()?, self.config)?;
-        route.groups.insert(
-            group,
-            Group {
-                store,
-                holding: Holding::owning(None),
-            },
-        );
+        let mut engine = engine()?;
+        let holding = kept(&mut engine, None)?;
+        let store = Store::start(engine, self.config)?;
+        route.groups.insert(group, Group { store, holding });
         Ok(())
     }
 
     /// `f` on `group`'s holding: how the shell carries out a driver's action at the group (its
-    /// receive, fence, activate, release, unfence or discard). Under the route's write lock, so
-    /// every batch let in before is in the group's writer's queue before what `f` changes.
+    /// receive, copy and catch-up progress, fence, activate, release, unfence or discard). What
+    /// `f` changes is kept by the group's engine, after every batch let in before it and durable
+    /// with them, before the group acts on it; if it can't be kept (or not by `until`), the group
+    /// holds what it held, and the driver asks again (each action is idempotent at its group).
+    /// Under the route's write lock, so no batch is let in between. A refusal of `f` is a
+    /// [`reshard::Refused`] in the error.
     pub fn hold<T>(
         &self,
         group: GroupId,
+        until: Instant,
         f: impl FnOnce(&mut Holding) -> Result<T, reshard::Refused>,
-    ) -> Result<T, reshard::Refused> {
+    ) -> anyhow::Result<T> {
         let mut route = self.route.write().unwrap_or_else(PoisonError::into_inner);
         let held = route
             .groups
             .get_mut(&group)
             .ok_or(reshard::Refused::NoGroup(group))?;
-        f(&mut held.holding)
+        let mut next = held.holding;
+        let out = f(&mut next)?;
+        if next != held.holding {
+            let bytes = encode(&next)?;
+            held.store.run(until, move |e| e.keep_holding(&bytes))?;
+            held.holding = next;
+        }
+        Ok(out)
     }
 
     /// How many groups are on this node.

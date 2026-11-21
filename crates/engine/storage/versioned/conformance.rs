@@ -164,7 +164,7 @@ fn pair(
         }
     };
     let vdb = Arc::new(
-        VDatabase::open(Arc::new(Simulated::new(seed)), 4_000, 1, || {
+        VDatabase::open(Arc::new(Simulated::new(seed, 1).unwrap()), 4_000, 1, || {
             order.comparator()
         })
         .unwrap(),
@@ -706,7 +706,10 @@ fn backward(c: &mut VersionedCursor) -> Vec<i64> {
 fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
     let order = KeyOrder::rowid();
     let vdb = Arc::new(
-        VDatabase::open(Arc::new(Simulated::new(9)), 8_000, 1, || order.comparator()).unwrap(),
+        VDatabase::open(Arc::new(Simulated::new(9, 1).unwrap()), 8_000, 1, || {
+            order.comparator()
+        })
+        .unwrap(),
     );
     let (pager, _db, _conn) = engine();
     let mut d = super::blink::Descender::new();
@@ -723,7 +726,7 @@ fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
         )
         .unwrap();
     }
-    vdb.commit(txn, &mut d, false).unwrap();
+    vdb.commit(txn, &mut d, vdb.lane(), false).unwrap();
     let snap = vdb.snapshot().unwrap();
     let mut reader =
         VersionedCursor::new(vdb.clone(), 0, order, Access::Read(snap), pager).unwrap();
@@ -742,7 +745,7 @@ fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
                     let gone = (w + 4 * batch) * 2;
                     vdb.remove(&mut d, &mut txn, 0, &super::cursor::rowid_key(gone))
                         .unwrap();
-                    vdb.commit(txn, &mut d, false).unwrap();
+                    vdb.commit(txn, &mut d, vdb.lane(), false).unwrap();
                 }
             })
         })
@@ -779,7 +782,10 @@ fn ns_1_1_a_reading_cursor_sees_its_snapshot_while_writers_split_leaves() {
 fn ns_1_1_a_cursor_sees_writes_through_another_cursor_of_its_transaction() {
     let order = KeyOrder::rowid();
     let vdb = Arc::new(
-        VDatabase::open(Arc::new(Simulated::new(3)), 2_000, 1, || order.comparator()).unwrap(),
+        VDatabase::open(Arc::new(Simulated::new(3, 1).unwrap()), 2_000, 1, || {
+            order.comparator()
+        })
+        .unwrap(),
     );
     let (pager, _db, _conn) = engine();
     let txn = Arc::new(Mutex::new(vdb.begin().unwrap()));
@@ -824,7 +830,10 @@ fn ns_1_1_a_cursor_sees_writes_through_another_cursor_of_its_transaction() {
 fn ns_1_1_a_reading_cursor_refuses_writes() {
     let order = KeyOrder::rowid();
     let vdb = Arc::new(
-        VDatabase::open(Arc::new(Simulated::new(4)), 100, 1, || order.comparator()).unwrap(),
+        VDatabase::open(Arc::new(Simulated::new(4, 1).unwrap()), 100, 1, || {
+            order.comparator()
+        })
+        .unwrap(),
     );
     let (pager, _db, _conn) = engine();
     let snap = vdb.snapshot().unwrap();

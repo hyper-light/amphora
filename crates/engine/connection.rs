@@ -267,6 +267,12 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         states: crate::alloc::HashMap<String, crate::schema::IndexState>,
     },
+    /// Amphora: reading each column whose constraints an online schema change is validating
+    /// (CP-T1.12).
+    LoadConstraintStates {
+        stmt: Box<Statement>,
+        columns: Vec<(String, String)>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -1767,6 +1773,13 @@ impl Connection {
                     );
                     let states = std::mem::take(states);
                     inner.fresh.set_index_states(states)?;
+                    inner.phase = self.constraint_states_phase(&inner.fresh)?;
+                }
+                ReparsePhase::LoadConstraintStates { stmt, columns } => {
+                    crate::return_if_io!(stmt
+                        .run_with_row_callback_nonblock(|row| constraint_state_row(row, columns)));
+                    let columns = std::mem::take(columns);
+                    inner.fresh.set_constraint_states(&columns)?;
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1824,9 +1837,7 @@ impl Connection {
     /// statement runs against `fresh`, installed for it as the types' statement is.
     fn index_states_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
         if !fresh.tables.contains_key(crate::schema::INDEX_STATES_TABLE) {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
+            return self.constraint_states_phase(fresh);
         }
         self.with_schema_mut(|schema| {
             *schema = fresh.try_clone()?;
@@ -1840,6 +1851,54 @@ impl Connection {
             stmt: Box::new(stmt),
             states: Default::default(),
         })
+    }
+
+    /// Amphora: the phase after the index states: read the columns whose constraints an online
+    /// schema change is validating if their table exists (CP-T1.12), else go on to the
+    /// statistics. The statement runs against `fresh`, installed for it as the types' is.
+    fn constraint_states_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !fresh
+            .tables
+            .contains_key(crate::schema::CONSTRAINT_STATES_TABLE)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_internal(format!(
+            "SELECT tbl, col FROM {}",
+            crate::schema::CONSTRAINT_STATES_TABLE
+        ))?;
+        Ok(ReparsePhase::LoadConstraintStates {
+            stmt: Box::new(stmt),
+            columns: Vec::new(),
+        })
+    }
+
+    /// Amphora: the columns [`crate::schema::CONSTRAINT_STATES_TABLE`] names, for the open path,
+    /// as [`Self::query_index_states`] reads the index states (CP-T1.12): a database reopened
+    /// mid-change must not let the planner rely on a NOT NULL not yet validated. Empty without the
+    /// table.
+    pub(crate) fn query_constraint_states(self: &Arc<Connection>) -> Result<Vec<(String, String)>> {
+        let mut columns = Vec::new();
+        if !self
+            .schema
+            .read()
+            .tables
+            .contains_key(crate::schema::CONSTRAINT_STATES_TABLE)
+        {
+            return Ok(columns);
+        }
+        let mut stmt = self.prepare_internal(format!(
+            "SELECT tbl, col FROM {}",
+            crate::schema::CONSTRAINT_STATES_TABLE
+        ))?;
+        stmt.run_with_row_callback(|row| constraint_state_row(row, &mut columns))?;
+        Ok(columns)
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -4120,6 +4179,18 @@ impl Connection {
         self.plan_cache_mode.store(mode.to_u8(), Ordering::Relaxed);
     }
 
+    /// Amphora (PL.9): rows inserted less rows deleted in `table` (its schema name) since ANALYZE
+    /// last counted it, as the planner's row count adds them.
+    pub fn changes_since_analyze(&self, table: &str) -> i64 {
+        self.db.row_changes.changed_since_analyze(table)
+    }
+
+    /// Amphora (PL.9, T-PL.9.2): how many finished writes have added their rows to a table's count
+    /// since the database opened: the write path's whole overhead, one atomic add each.
+    pub fn row_change_folds(&self) -> u64 {
+        self.db.row_changes.folds()
+    }
+
     pub fn plan_cache_mode(&self) -> crate::PlanCacheMode {
         crate::PlanCacheMode::from_u8(self.plan_cache_mode.load(Ordering::Relaxed))
     }
@@ -5643,6 +5714,16 @@ fn index_state_row(
     })?;
     states.try_reserve(1)?;
     states.insert(name, state);
+    Ok(())
+}
+
+/// Amphora: one row of [`crate::schema::CONSTRAINT_STATES_TABLE`]: a table and a column, as the
+/// schema keys them.
+fn constraint_state_row(row: &Row, columns: &mut Vec<(String, String)>) -> Result<()> {
+    let table = crate::util::normalize_ident(row.get::<&str>(0)?);
+    let column = crate::util::normalize_ident(row.get::<&str>(1)?);
+    columns.try_reserve(1)?;
+    columns.push((table, column));
     Ok(())
 }
 

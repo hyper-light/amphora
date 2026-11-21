@@ -18,6 +18,7 @@ pub mod database;
 pub(crate) mod encryption;
 pub(crate) mod journal_mode;
 pub mod log_index;
+pub(crate) mod key_heads;
 pub(crate) mod packed;
 #[cfg(feature = "aristo-instr")]
 pub mod page_cache;

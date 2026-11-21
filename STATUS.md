@@ -57,6 +57,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   flight so commits land during flushes. 10,000 seeds: no acknowledged batch lost, no refused batch
   kept, no batch torn, the integrity check passing (2026-10-20). Every gate runs 200. A test holds a
   flush and commits during it: no checkpoint copies that commit before a later flush (decision 15).
+- **The versioned storage's log in lanes** (CP-T1.3's log, `crates/engine/storage/versioned`,
+  docs/design/engine.md decision 11): one group-committed log or a log a writer, merged by commit
+  timestamp; a commit acknowledged once every lane is durable through it; recovery replays to the
+  first missing commit, reading and replaying side by side (SiloR), and cuts each lane there; on Linux
+  a flush is one io_uring submission (the engine's `io_uring` feature). Checkpoints copy pages by
+  copy-on-update after a pause that only lists rows with versions (decision 7). T-T1.3.1, a crash at
+  every disk operation of each seed's workload: 200 seeds in every gate; the 10,000 and
+  `amphora-bench --vlog` (AC-T1.4.2, AC-T1.4.3) not yet run.
 - **Stores on the engine** (`crates/amphora/src/db.rs`): a database opened for the pipeline, its
   readers, its flusher, its checkpoints and its log's restart.
 - **Amphora's engine** (`crates/engine*`, its `ORIGIN.md`): Turso's four crates (core, sqlite/parser,
@@ -134,6 +142,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   was unnested into a scan of all 200,000 entries of `items_grp_created`: 227 → 26,895 statements a
   second at 1 client and 1,231 → 225,470 at 32, best of 3 in turns on adas-mac-studio-2, the controls
   within 2% (`bench/records/2026-10-25-adas-mac-studio-2-output-subquery-calls.md`).
+- **Correlated subqueries unnested in general** (docs/design/planner.md decision 22, PL.10,
+  `crates/engine/tests/unnesting.rs`): beside the fixed patterns, `NOT IN` becomes a NULL-aware
+  anti-join, an `EXISTS`/`IN` of several tables a semi- or anti-join with a derived table, an
+  `EXISTS` under `OR` or in the `SELECT` list a grouped left join, and nested subqueries unnest level
+  by level from a worklist with no recursion; the cheapest of the written, patterns' and general
+  forms is kept. Answers equal nested ones on 39 classes and 24 levels of nesting (T-PL.10.1); a
+  subquery reading a semi-joined table stays nested, and Q20's `0.5 * total()` isn't unnested yet. Open:
+  q21 at SF 10 and TPC-DS's ten queries measured (AC-PL.10.1, AC-PL.10.2).
 - **A one-row lookup orders its table** (docs/design/planner.md decision 10,
   `crates/engine/tests/records_plans.rs`): a loop that gives at most one row for each row before it
   (a unique key's whole lookup by `=`, or the rowid's) takes its table's ORDER BY columns as ordered
@@ -197,6 +213,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 - **A reader's snapshot takes no lock** (docs/design/store.md decision 28): the log's generation is
   read from a copy every header guard refreshes, and spin locks test before they take. Point reads
   at 32 clients, ten million rows, no pool: 701,613 → 1,572,331 a second.
+- **Key heads for in-page search** (docs/design/store.md decision 38, `crates/engine/storage/key_heads.rs`;
+  G3 step 4, PR.4), a prototype behind `AMPHORA_KEY_HEADS=1`: a directory of 4-byte key heads
+  beside a cached page, built once the page's searches have paid for it, replaces a probe's decode
+  and compare when the heads order the cell. Built and model-tested (T-PR.4.1); not yet measured
+  (AC-PR.4.1, AC-PR.4.2).
 - **A shared page found in one lookup** (docs/design/store.md decision 22): the pool keeps each image
   in its map's entry and counts lookups in each shard, under the lock it holds anyway, where one
   count for the pool moved between 32 readers' cores at every lookup. Sharing 256 MiB at 32 clients:
@@ -257,6 +278,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the current engine's B-tree cursor through the same random operation sequences on a table and two
   indexes (one descending and NOCASE) and compares every step. Not yet: overflow rows (refused,
   `TooBig`), dropping a tree, a comparison per tree in one database, the connection's wiring (step 2).
+- **Savepoints on the versioned storage** (G7 step 2 in part, `NS.2`;
+  `crates/engine/storage/versioned/{version,txn_model}.rs`): a transaction rolls back to a savepoint
+  from its versions (rows first changed after it as before the transaction, rows changed before and
+  after as it found them, later changes out of the redo record). The shared model test of
+  transactions (`txn_model.rs`, `T-NS.2.1`) runs the same random transactions with savepoints on the
+  current engine through SQL and on the versioned storage, every read and scan compared, and checks
+  each snapshot sees exactly what was committed when it opened (300 seeds pass; the 10,000 are the
+  batch's). Not yet: overflow rows, the catalog (`sqlite_schema`, DDL, trees made and dropped at run
+  time) and ANALYZE, the connection's wiring, so the engine's suites don't yet run on it.
 - **Serializable validation, three prototypes behind one switch** (G8 step 1, docs/design/engine.md
   decision 5, `crates/engine/storage/versioned/{version,elle}.rs`, `amphora-bench --cc`): precision
   locking (the default), SSI and Silo-style OCC validate commits on the versioned storage's commit
@@ -317,6 +347,21 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   whose write is refused at the leader's append gets a slot for its next try, its length learned per member from
   its retries' gaps (cold start: the core's election timeout). A gap over which the host's detector suspected the
   member is not learned; no number bounds a gap (lane g-slot-close, 2026-11-21).
+- **The raft log as the WAL** (G12 step 2, AC-T1.8.L1 and L2; replication.md, "The raft log as the WAL"): the engine
+  applies committed entries without flushing its log per commit; compaction asks nothing of the owner's thread and
+  moves the raft log's start no further than what the flushing thread made durable (T-T1.8.L1). The Records suite
+  and seeded histories run on one harness at one voter and three, with identical transcripts (T-T1.8.L2; lane
+  g12s2, 2026-11-21).
+
+- **Backups and point-in-time recovery to Mantle, the mechanism** (CP-T1.12, lane pitr,
+  `crates/amphora/src/backup*`, docs/design/backup.md): the object-store seam (`amphora_api::blobs`,
+  its simulator and conformance suite); commits stamped by the writer (one mark a second); the log's
+  durable frames shipped as segments with no timer; bases copied chunk by chunk without a reader;
+  log restarts held until shipped; restore to any second by the engine's own recovery, refusing
+  seconds the archive can't say exactly. Restore drills at random seconds on the simulator: every row
+  equal (T-T1.12.D1). `Database::open_backed_up` backs a local writer up: its commits stamped and a
+  thread that ships and copies bases as it commits, across a close and a reopen (T-T1.12.D2). Not
+  yet: kiln's adapter to Mantle, and the 100 GB restore measurement (AC-T1.12.3).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -333,9 +378,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (local-owner-transport.md, "Decision (lane constants): one descriptor budget"; FD.1), with a replica's local
   readers following it; the replicated owner drives once a step, in turn with its inputs (replication.md, "Decision
   (lane constants): one drive a step"; DQ.1); and each owner charges its lease, or a client its socket, to the same
-  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4). Left: an owner's other descriptors (endpoint, engine
-  files, a replica's log) charged by kind, the replicated owner's tick and poll, and the rest of the list
-  (handoff/amphora-constants-list.md).
+  budget, no count of owners (`OWNERS_MAX` gone; AC-FD.1.4); the owner wakes on its inputs, not a poll (WK.1); the
+  quorum patience's and the write slot's generations are learned from their own events (GN.1); and a generation of
+  the database log's restarts ends once it alone covers its own spend at the p99.9, the next restart guessed by the
+  worst of the last thousand holds (`log_bound::GENERATION` gone; replication.md, "Decision (lane constants): a
+  generation of restarts ends once it covers its spend"; GN.2). Left: an owner's other descriptors (endpoint, engine
+  files, a replica's log) charged by kind, the replicated owner's tick (`TICK`, twenty ticks an election), its queue
+  and outgoing bounds and the log's compaction trigger, and the rest of the list (handoff/amphora-constants-list.md).
 - **Groups that split, merge and move themselves** (CP-T1.9, lane split-merge; `crates/amphora/src/reshard/`,
   docs/design/reshard.md): a pure core: a directory of hash spans with every position in exactly one group,
   each group's own holding (fenced, stale actions refused), a planner deciding from measured load, bytes and
@@ -344,10 +393,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`reshard::replicated::DirectoryMachine`, a hyper-durable state machine of directory changes; its
   leader runs the driver under its term), and `Groups` routes by the directory instead of `fnv % n`, each
   group checking every write and read against its holding (`store::Refused::Away`) (T-T1.9.R1, R2).
-  Left: each group's holding kept durable in its own state with its rows (it is in the router's memory
-  now), rows indexed by position for copy and sweep, the old group's log held through the operation,
-  the shell carrying the driver's actions to groups, `bench reshard` (AC-T1.9.2) and the three-machine
-  lab (AC-T1.9.3).
+  Kept (lane split-merge-5): each group's holding is kept by its own engine with its rows
+  (`Engine::holding`/`keep_holding`), durable before the group acts on it, and a group started again
+  answers from it whatever directory it is started by; a directory member keeps the image it installed
+  (`DirectoryMachine::open`), so a restart needs no catch-up (T-T1.9.R1 to R3). Left: rows indexed by
+  position for copy and sweep, the change feed by log position, the old group's log held through the
+  operation, a split copying the range's rows, the shell carrying the driver's actions to groups,
+  `bench reshard` (AC-T1.9.2) and the three-machine lab (AC-T1.9.3).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -357,7 +409,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   old schema or the new; rows that break a unique index undo the change. The 10M-row cutover p99
   (AC-T1.12.2) is not yet measured. A column (`ALTER TABLE … ADD COLUMN`) is added in one catalog
   change, its states run together, as no row is rewritten or read; one whose addition reads every
-  row is refused. Constraints on existing columns and DROP COLUMN are not yet built.
+  row is refused. NOT NULL and CHECK are added to an existing column (`ALTER COLUMN c TO` its own
+definition plus the constraint) write-only, then validated in learned rowid batches, then public by
+a catalog change; the planner doesn't rely on an unvalidated NOT NULL, a breaking row undoes the
+change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet built.
 
 ## Measured
 
@@ -511,6 +566,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   - the owner's identity naming its durability (transport version 4), so an attachment in another class is refused,
     typed;
   - a write made at a follower answered on its group's commit, before its own log write, kept until it applies;
+  - read sets on top of the write slot (goal ceea4e0a; replication.md, "read sets"): the pager records a session's
+    reads, which ride after its write (append-only); the leader moves a stale base to its last entry when nothing its
+    log holds since wrote a page the write read or wrote, page 1's size merging. Release A/B against G: the coordinator's;
   - the leader's quorum patience (replication.md, "The leader's quorum patience"): on fedora's own load its own
     checks stepped members down 5-8 times in 1,800 s against 43-63 at fixed ticks (docs/research/owner-stalls.md).
 
@@ -574,11 +632,28 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
+  PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
+  table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
+  longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
+  an outer join's ON term that reads only earlier tables now counts in its join's estimate.
+  Not built: bushy plans over connected complement pairs with a composite hash-join build, and CD-C's
+  rules for outer, semi and anti joins in place of `required_lhs_by_table`; JOB's AC-PL.8.1 is open.
+  PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
+  rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
+  the planner's row count follows them, and a prepared statement plans again once a table it counted
+  has moved past its statistics' own error. CH-benCHmark (AC-PL.9.1) and the suite's writes
+  (AC-PL.9.2) are open.
 - **G11, analytics at column-store speed** (docs/design/columnar.md, decision 1; sources in
   docs/research/columnar.md; CS.1): decided, not built. Columns are a copy derived from the rows, fed
   by each commit's redo record after the commit, exact at every snapshot by a journal of changed keys
   read from the rows, never logged, every size and time learned where it runs. Next: step 2
   prototypes it in memory and as persistent blocks, on CP-T1.3's storage once that runs under SQL.
+  Step 2 (CS.2), built, not measured: `crates/engine/storage/versioned/columns.rs` keeps a tree's
+  copy fed by the versioned storage's commits (`Database::keep_columns`), with prototype A (`Plain`,
+  in memory) and B (`Packed`, front-coded blocks and positional deltas in a file, reused at open when
+  current) behind one core; a scan at any snapshot equals the rows there under concurrent writes and
+  a full queue (T-CS.2.1 to T-CS.2.3). Block size and rebuilds follow measured scan and rebuild cost.
+  Open: the numbers (`amphora-bench --columns`, T-CS.2.4) and the choice they make.
   Step 3's two codecs are built (CS.3, crates/columnar, lane g11-compress): BtrBlocks' cascade
   (one value, run lengths, dictionary, decimal doubles, frame of reference with horizontal packing)
   and FastLanes' layouts (its interleaved 1,024-value packing, lane-wise DELTA, dictionary,

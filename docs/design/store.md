@@ -1626,6 +1626,43 @@ holding more frames past its last commit than the pages it dirtied (`spilled_log
 log); the audit's 1, 4 and 8 MiB legs or the comprehensive bench's bulk statements slower than
 page-a-frame at 13e385d.
 
+## 38. A page is searched by key heads once its searches have paid for them (prototype, behind a switch)
+
+G3 step 4 (PR.4, kiln plan 01a16b0f464172dc80c7a3b9a14acbce), read-path.md fix 6: B-tree search is
+11.9-23.0% of a point read's user cycles at one client (`point_text` 23.0%), 43.7% of
+`count_range`'s (bench/records/2026-10-23-adacachy-read-path.md).
+
+- **What.** A directory beside a cached page, never in the file (`crates/engine/storage/key_heads.rs`):
+  for each cell, 4 bytes of its first key's normalized form after the prefix every cell on the page
+  shares, as LeanStore's nodes keep heads and truncate prefixes (`BTreeNode.hpp:204`, `:357`, at
+  fcb64bf3; research point-reads.md §3). The cursor's binary search is today's, probe for probe; a
+  head replaces a probe's decode and compare only when it orders the cell strictly, so positions and
+  equal keys seen are today's. Table pages (rowids) and index pages (BINARY, NOCASE, RTRIM, either
+  direction) get one; other collations and explicit NULLS FIRST/LAST don't.
+- **When it is built.** Not on entry to the cache, as the plan said: a point read of a table larger
+  than the cache would decode a whole leaf once to save a dozen probes. A deterministic ski rental
+  (Karlin, Manasse, Rudolph, Sleator, Algorithmica 3, 1988: at most twice the offline cost): each
+  search of a page without one is charged the decodes it would have saved (the bit length of the
+  cell count, times the share of probes the page's last directory decided, learned as it runs);
+  built when the charges reach the cell count, the decodes a build makes. Rent and price are
+  counted in the same operation, so the rule holds on any machine.
+- **When it is dropped.** Whenever the page's bytes may change: made dirty, buffer replaced or
+  taken, renumbered, a frame written over it in place. Never built or used while dirty.
+- **Its memory.** At most 4 * (page size - 8) / 6 bytes a page (SQLite's `MX_CELL`: a cell takes at
+  least 6 bytes with its pointer), plus a fixed header, for each page the connection caches; the
+  prefix is read from the page, not copied.
+- **Hints.** LeanStore's hint array narrows a search over slots that interleave heads with offsets
+  and lengths. Here the heads are a dense array of their own, 16 to a cache line, and the probe
+  sequence must stay today's for identical positions; hints are not built.
+- **Switch.** `AMPHORA_KEY_HEADS=1`; off, every search is today's.
+- **Falsified if** cycles per in-page search on the corpus's index lookups fall by less than 30%
+  against the cell-pointer search (AC-PR.4.1), or B-tree search's share of `point_text`'s user
+  cycles falls by less than 30% against step 1 (AC-PR.4.2); or a build costs more than twice the
+  decodes it is charged.
+- **Tested.** T-PR.4.1 (`key_heads::tests`): random keys of every class, splits and deletes,
+  committed rounds, seeks of every kind through a cursor with heads and one without on the same
+  pages: the same results and positions always, with probes decided.
+
 ## 39. A page read past the cache reads its own frames: pages new to a chain are page frames, a chain's entries records of one slot
 
 **Decision.** A mixed generation begun now (its header's file format
