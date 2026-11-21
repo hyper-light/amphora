@@ -120,6 +120,7 @@ fn index_def(desc: bool, nocase: bool) -> Index {
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        state: crate::schema::IndexState::Public,
     }
 }
 
@@ -595,7 +596,10 @@ fn run(kind: Kind, seed: u64, ops: usize) {
         .filter_map(|s| s.row.as_ref().map(|(_, r)| r.as_slice()))
         .collect();
     let modelled: Vec<&[u8]> = model.rows.iter().map(|(_, r)| r.as_slice()).collect();
-    assert_eq!(records, modelled, "{kind:?} seed {seed}: the model's rows at the end");
+    assert_eq!(
+        records, modelled,
+        "{kind:?} seed {seed}: the model's rows at the end"
+    );
     if reference_diverged > 0 {
         eprintln!(
             "{kind:?} seed {seed}: the reference's step left the ordered model \
