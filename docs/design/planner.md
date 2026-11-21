@@ -1597,3 +1597,68 @@ outermost query, unnests every level. The measurements (AC-PL.10.1, q21 at SF 10
 T-PL.10.1 that differs between the forms; TPC-DS's ten queries no faster unnested; a query of the
 bench whose plan the general form made costlier than the patterns' (the three-way choice should
 make that impossible by estimate; the measurement says whether the estimate holds).
+
+## Decision (lane pl11): degree-sequence upper bounds guard each joined set's estimate
+
+**Decision.** PL.11 (docs/research/planner.md section 9, rank 11). ANALYZE's ordered scan of each
+index without a WHERE, which counts its distinct prefixes for `sqlite_stat1`, also keeps each
+prefix's degree sequence (the rows each distinct value holds) compressed to two norms as the scan
+closes each value's run: the largest degree (ℓ∞) and the sum of squared degrees (ℓ2 squared). ℓ1 is
+the table's rows, already counted. They go in `__turso_internal_column_stats` beside decision 20's
+sketches, `(tbl, index, 'degrees', data)`, 24 bytes a prefix (a u64 and a u128, little-endian: a
+format width), and load into `IndexStat::degrees` (`stats.rs`).
+
+`cardinality.rs`'s `DegreeBound` gives each joined set a proven upper bound: start from one
+table's rows, or from two tables joined on one column with the product of their columns' ℓ2 norms
+(Cauchy-Schwarz, the (2, 2) Hölder pair), then attach each other inner table by the largest degree
+of an index prefix whose every column is in an equivalence class with a table already attached, or
+by its rows where none is. Every order gives a bound; the least of those a greedy search finds from
+each start is kept. `JoinedSetRows::rows` cuts an estimate above it to it; an estimate below it is
+left as it is (the plan step: step 3's 791 underestimates stay).
+
+What the bound will not follow, so as never to claim a bound it hasn't proven:
+- an outer join's table (it keeps rows that match nothing): a set holding one has no bound;
+- a term whose columns differ in affinity or aren't BINARY, or an index column of another
+  collation or an expression: there the index's groups are not the term's;
+- a table without an ANALYZE count (a derived table, a table never analyzed).
+
+A semi or anti join's table never adds rows and counts as one. The rowid is one row a value. Rows
+added since ANALYZE (PL.9's live count) raise each count and each norm by their number:
+‖d + e‖p ≤ ‖d‖p + ‖e‖1.
+
+Of the norms, these three are the ones whose Hölder pairs (1, ∞), (2, 2) and (∞, 1) the kept set
+closes; LpBound keeps more and solves a linear program over them. That is the step to take if the
+coordinator's JOB and TPC-H counts show the bound too loose to matter.
+
+**Why.** At step 3, every prefix the estimates put above their true count is a plan chosen on rows
+that can't exist. An upper bound computed from statistics can't be exceeded by the truth, so a cut
+to it only moves an estimate towards the truth. Underestimates, step 3's majority, are untouched.
+
+**Sources.**
+- Zhang, Mayer, Khamis, Olteanu, Suciu, "LpBound: Pessimistic Cardinality Estimation Using
+  ℓp-Norms of Degree Sequences", SIGMOD 2025 (arXiv:2502.05912): a guaranteed upper bound from ℓp
+  norms of degree sequences, more accurate than mainstream estimators on JOB and STATS (f19, A).
+- Deeds, Suciu, Balazinska, "SafeBound", SIGMOD 2023: compressed degree sequences as bounds, "By
+  never underestimating, this approach allows the optimizer to avoid potentially inefficient plans"
+  (f40, C), and its open problem, updates without recomputing the sequences.
+- Hölder's inequality, Σ_v d_R(v)·d_S(v) ≤ ‖d_R‖p·‖d_S‖q for 1/p + 1/q = 1: the two-table case.
+
+**Evidence.** `cardinality.rs`'s `degree_bound_tests`:
+- `pl11_no_counted_join_exceeds_its_bound` (T-PL.11.1): 400 seeds of two to four random skewed
+  tables with NULLs, joined by chains, stars, cycles and repeated terms; every subset's counted
+  join at or below its bound, every bound finite.
+- `pl11_an_estimate_above_its_bound_is_capped_and_one_below_is_unchanged` (AC-PL.11.1).
+- `pl11_the_accumulator_keeps_each_prefixs_degree_norms`.
+
+`crates/engine/tests/column_stats.rs`'s `pl11_analyze_keeps_each_index_prefixs_degree_norms`:
+ANALYZE's norms equal a GROUP BY's counts on random data; a partial index keeps none.
+
+**Falsified by.**
+- A prefix of any query counted above its bound (the property test, or the coordinator's JOB and
+  TPC-H runs: AC-PL.11.1, prefixes estimated above their bound exactly 0).
+- An underestimate changed by the cut.
+
+**Open.** PL.9 counts rows inserted less rows deleted. An UPDATE that moves rows between values,
+or inserts that deletes cancel, aren't in it, so between ANALYZE runs the bound is proven for the
+net change only. Making it hold through every write takes a count of rows written, PL.9's call. A
+WITHOUT ROWID table's primary key keeps its norms but the bound doesn't yet read them.

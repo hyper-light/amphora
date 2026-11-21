@@ -34,6 +34,9 @@ pub struct IndexStat {
     /// To compute number of distinct values (NDV) for prefix i:
     ///   ndv = total_rows / avg_rows_per_distinct_prefix[i]
     pub avg_rows_per_distinct_prefix: Vec<u64>,
+    /// Amphora (PL.11): each leftmost prefix's degree norms, where ANALYZE kept them (an index
+    /// without a WHERE, read whole); empty otherwise.
+    pub degrees: Vec<Degrees>,
 }
 
 /// A column's values as its sketch counted them (decision 20).
@@ -339,6 +342,26 @@ fn load_column_stats_row(
                 },
             );
         }
+        "degrees" => {
+            // PL.11: an index's degree norms, kept only while the index (or the WITHOUT ROWID
+            // key named after its table) is still the schema's, as `load_sqlite_stat1_row` keeps
+            // its `sqlite_stat1` row.
+            let Value::Text(index) = row.get::<&Value>(2)? else {
+                return Ok(());
+            };
+            let index_name = normalize_ident(index.as_str());
+            let names_primary_key = index_name.eq_ignore_ascii_case(table_name) && !table.has_rowid;
+            if !names_primary_key && schema.get_index(table_name, &index_name).is_none() {
+                return Ok(());
+            }
+            let Some(degrees) = Degrees::decode_all(data) else {
+                return Ok(());
+            };
+            stats
+                .table_stats_mut(table_name)
+                .index_stats_mut(&index_name)
+                .degrees = degrees;
+        }
         "sample" => {
             // The samples loaded stay within their budget (CLAUDE.md §2): a table whose sample
             // would pass it keeps none, its estimates the distinct counts', and says so.
@@ -467,6 +490,70 @@ pub struct StatAccum {
     /// Distinct counts for each column prefix.
     /// distinct[i] = number of distinct values for columns 0..=i
     pub distinct: Vec<u64>,
+    /// Amphora (PL.11, docs/design/planner.md decision (lane pl11)): each prefix's degree sequence,
+    /// the rows each of its distinct values holds, compressed to the norms the bound reads as
+    /// the ordered scan passes each value's run: the run under way, and the closed runs' largest
+    /// (the ℓ∞ norm) and sum of squares (the ℓ2 norm squared).
+    pub run: Vec<u64>,
+    pub degrees: Vec<Degrees>,
+}
+
+/// One index prefix's degree sequence, compressed to two of its ℓp norms as LpBound keeps them
+/// (Zhang et al., SIGMOD 2025): `max`, the most rows one value holds (ℓ∞), and `sum_sq`, the sum
+/// of each value's rows squared (ℓ2 squared). ℓ1 is the table's rows, `sqlite_stat1`'s count. Of
+/// the norms, these are the ones whose Hölder pairs (1, ∞), (2, 2) and (∞, 1) the stored set
+/// closes: `max` bounds a join attached through a key prefix, `sum_sq` a pair of tables joined on
+/// one column (decision (lane pl11)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Degrees {
+    pub max: u64,
+    /// At most the rows squared, which a u64 count keeps below 2^128: it never saturates.
+    pub sum_sq: u128,
+}
+
+impl Degrees {
+    /// The bytes of one prefix's norms in [Degrees::encode_all]: `max` and `sum_sq`,
+    /// little-endian, 8 and 16 bytes (a format width).
+    const BYTES: usize = 24;
+
+    /// A run of `rows` rows of one value closed.
+    fn close(&mut self, rows: u64) {
+        self.max = self.max.max(rows);
+        let square = u128::from(rows).saturating_mul(u128::from(rows));
+        self.sum_sq = self.sum_sq.saturating_add(square);
+    }
+
+    /// The ℓ2 norm.
+    pub fn l2(&self) -> f64 {
+        (self.sum_sq as f64).sqrt()
+    }
+
+    /// Each prefix's norms, as ANALYZE keeps them in `__turso_internal_column_stats` (kind
+    /// `degrees`, its column the index's name).
+    pub fn encode_all(degrees: &[Degrees]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(degrees.len().saturating_mul(Self::BYTES));
+        for d in degrees {
+            bytes.extend_from_slice(&d.max.to_le_bytes());
+            bytes.extend_from_slice(&d.sum_sq.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// [Degrees::encode_all]'s bytes back, `None` where their length isn't whole prefixes.
+    pub fn decode_all(bytes: &[u8]) -> Option<Vec<Degrees>> {
+        let (chunks, rest) = bytes.as_chunks::<{ Self::BYTES }>();
+        if !rest.is_empty() {
+            return None;
+        }
+        chunks
+            .iter()
+            .map(|chunk| {
+                let max = u64::from_le_bytes(chunk.get(..8)?.try_into().ok()?);
+                let sum_sq = u128::from_le_bytes(chunk.get(8..)?.try_into().ok()?);
+                Some(Degrees { max, sum_sq })
+            })
+            .collect()
+    }
 }
 
 impl StatAccum {
@@ -475,6 +562,8 @@ impl StatAccum {
             n_col,
             n_row: 0,
             distinct: vec![0; n_col],
+            run: vec![0; n_col],
+            degrees: vec![Degrees::default(); n_col],
         }
     }
 
@@ -492,6 +581,28 @@ impl StatAccum {
         for i in i_chng..self.n_col {
             self.distinct[i] += 1;
         }
+        // PL.11: a prefix whose value changed closes its run (none before the first row, a run
+        // of zero rows that changes nothing); every prefix's run then holds this row.
+        for (at, (run, degrees)) in self.run.iter_mut().zip(&mut self.degrees).enumerate() {
+            if at >= i_chng {
+                degrees.close(*run);
+                *run = 0;
+            }
+            *run = run.saturating_add(1);
+        }
+    }
+
+    /// Each prefix's degree norms, the run under way closed (PL.11).
+    pub fn get_degrees(&self) -> Vec<Degrees> {
+        self.run
+            .iter()
+            .zip(&self.degrees)
+            .map(|(run, degrees)| {
+                let mut degrees = *degrees;
+                degrees.close(*run);
+                degrees
+            })
+            .collect()
     }
 
     /// Get the stat1 string: "total avg1 avg2 ..."
@@ -513,39 +624,55 @@ impl StatAccum {
         parts.join(" ")
     }
 
-    /// Serialize to bytes for storage in a blob register.
+    /// Serialize to bytes for storage in a blob register: the counts, then each prefix's run
+    /// and norms (PL.11).
     pub fn to_bytes(&self) -> crate::ValueBlob {
-        let mut bytes =
-            <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(8 + 8 + 8 * self.n_col);
+        let mut bytes = <crate::ValueBlob as TursoVecExt<u8>>::with_capacity(
+            self.n_col
+                .saturating_mul(Degrees::BYTES.saturating_add(16))
+                .saturating_add(16),
+        );
         bytes.extend_from_slice(&(self.n_col as u64).to_le_bytes());
         bytes.extend_from_slice(&self.n_row.to_le_bytes());
         for &d in &self.distinct {
             bytes.extend_from_slice(&d.to_le_bytes());
         }
+        for &r in &self.run {
+            bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        bytes.extend_from_slice(&Degrees::encode_all(&self.degrees));
         bytes
     }
 
     /// Deserialize from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 16 {
+        let word = |at: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(
+                bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+            ))
+        };
+        let n_col = usize::try_from(word(0)?).ok()?;
+        let n_row = word(8)?;
+        let runs_at = n_col.checked_mul(8)?.checked_add(16)?;
+        let degrees_at = n_col.checked_mul(8)?.checked_add(runs_at)?;
+        let end = n_col.checked_mul(Degrees::BYTES)?.checked_add(degrees_at)?;
+        if bytes.len() != end {
             return None;
         }
-        let n_col = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
-        let n_row = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
-
-        if bytes.len() < 16 + 8 * n_col {
-            return None;
-        }
-        let mut distinct = Vec::with_capacity(n_col);
-        for i in 0..n_col {
-            let start = 16 + i * 8;
-            let d = u64::from_le_bytes(bytes[start..start + 8].try_into().ok()?);
-            distinct.push(d);
-        }
+        let words = |from: usize| -> Option<Vec<u64>> {
+            (0..n_col)
+                .map(|i| word(i.checked_mul(8)?.checked_add(from)?))
+                .collect()
+        };
+        let distinct = words(16)?;
+        let run = words(runs_at)?;
+        let degrees = Degrees::decode_all(bytes.get(degrees_at..)?)?;
         Some(Self {
             n_col,
             n_row,
             distinct,
+            run,
+            degrees,
         })
     }
 }
