@@ -569,6 +569,11 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is not yet
   cache turnovers) times the part of the tree the cache has room for; reads past what the cache can keep are charged
   whatever (`cost::file_reads`). `index_bonus` (a picked half page) is removed. `records_plans`' one-row-lookup join
   now picks the scan and index searches it measured faster (1.75 ms against the hash join's 3.05 ms, jupiter, release).
+  Lane qs5-7: an automatic index, and a subquery's probe index, past its own cache (the default page cache its pager
+  gets) pays for the leaves it writes out and reads again, as a hash join's spill already paid; a search of an index
+  bigger than the cache keeps its inner pages held while they fit. Before, the automatic index cost CPU only and,
+  against a measured page read, beat a unique key's search and a hash join on tables the cache can't hold.
+  Left: `cache_reuse_factor` (a picked 0.2) and multi-index table fetches through `file_reads`; sampled operator times.
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
