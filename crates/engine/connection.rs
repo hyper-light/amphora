@@ -517,6 +517,8 @@ pub struct Connection {
     pub(super) join_methods: AtomicJoinMethods,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
+    /// Amphora: see [`Connection::set_vectorized_scans`].
+    pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -979,6 +981,19 @@ impl Connection {
 
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches.load(Ordering::Acquire)
+    }
+
+    /// Amphora (query speed step 7, QT.7; a prototype behind this switch, off by default): newly
+    /// prepared read-only statements scan tables by decoding each leaf once into column batches
+    /// (`vdbe/leaf_batch.rs`) instead of each row's columns as they are read. Off until its
+    /// measurement against the row-at-a-time scan (the coordinator's) says otherwise.
+    pub fn set_vectorized_scans(&self, on: bool) {
+        self.vectorized_scans.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn vectorized_scans(&self) -> bool {
+        self.vectorized_scans.load(Ordering::Acquire)
     }
 
     /// Choose how correlated subqueries are planned in newly prepared statements.

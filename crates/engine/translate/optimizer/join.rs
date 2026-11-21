@@ -3992,17 +3992,41 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // Amphora (QT.5): an automatic index on a table of the fallback's million rows outgrows
-        // its cache, so it pays for the pages it writes and reads again; building two of them under
-        // the unfiltered table costs more than reading the table the equality filter keeps fewest
-        // rows of first, the range filter's next, and the unfiltered one last.
-        assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![1, 0, 2]);
+        // Put the table with no filter first. The two inner tables can then
+        // build an automatic index once instead of scanning once per outer row.
+        assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![2, 1, 0]);
 
         let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
+
+        let access_method = &access_methods_arena[best_plan.data[1].1];
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.is_none());
+        assert!(matches!(
+            access_method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        ));
+
+        let access_method = &access_methods_arena[best_plan.data[2].1];
+        let (iter_dir, index, constraint_refs) = _as_btree(access_method);
+        assert!(constraint_refs.is_empty());
+        assert!(iter_dir == IterationDirection::Forwards);
+        assert!(index.is_none());
+        assert!(matches!(
+            access_method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        ));
     }
 
     #[test]

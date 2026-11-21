@@ -854,7 +854,7 @@ criteria = [
   { id = "AC-CS.4.2", text = "table_count at 32 clients against ClickHouse's is at least 1.0x (measured by the coordinator)" },
 ]
 tests = [
-  { id = "T-CS.4.1", text = "cs4_vectors_equal_rows_every_class_{plain,packed} (crates/engine/storage/versioned/columns/scan.rs) — passes when, with writes between scans, some applied and some queued, rebuilds and held snapshots, every analytic class (filters of each comparison, aggregates, group-by, count) over the copy's granules equals the same statement row by row over the row B-tree, serially and split into partials merged in order, and the summaries skipped granules" },
+  { id = "T-CS.4.1", text = "cs4_vectors_equal_rows_every_class_{plain,packed} (crates/engine/storage/versioned/columns/scan.rs) — passes when, with writes between scans, some applied and some queued, rebuilds and held snapshots, every analytic class (filters of each comparison, aggregates, group-by, count) over the copy's granules equals the same statement row by row over the row B-tree, serially, split into partials merged in order, and on the morsel executor's four workers, and the summaries skipped granules" },
   { id = "T-CS.4.2", text = "cs4_min_max_summaries_skip_granules — passes when a filter outside granules' min/max skips them unread and the answer equals the rows'" },
   { id = "T-CS.4.3", text = "cs4_vectors_equal_rows_every_class_{plain,packed}, over key ranges — passes when a range scan skips blocks outside the range undecoded (by the blocks' key bounds), its granules hold every key of the range, and each class over the range equals the rows'" },
 ]
@@ -937,4 +937,19 @@ tests = [
   { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
   { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
+]
+
+# lane qs7
+[[own]]
+id = "QT.7"
+title = "Vectorized scans on the row store: a leaf decoded once into column batches (query-time step 7; with G5 step 2)"
+criteria = [
+  { id = "AC-QT.7.1", text = "q06 at SF 1 in cache on one thread is at most 41 ns a lineitem row, by q06's best time over 6,001,215 rows, bench/planner/record.sh on jupiter" },
+  { id = "AC-QT.7.2", text = "TPC-H SF 10 median best time on one thread is at most 2,329 ms, by bench/planner/record.sh on jupiter, workers off" },
+  { id = "AC-QT.7.3", text = "JOB median best time over the parent's is at most 1.05, by bench/planner/record.sh on jupiter, change and parent" },
+]
+tests = [
+  { id = "T-QT.7.1", text = "Batched against row-at-a-time on random tables and predicates: NULLs, every storage class, affinities, a collation, overflow pages, deleted rows, columns added after rows were written, ascending and descending scans — passes when identical results and rows were read from batches" },
+  { id = "T-QT.7.2", text = "A batch budget smaller than one page's cells, and one below a single row's charge — passes when the scan decodes several windows a leaf, or falls back to row-at-a-time by its stated rule, with identical results and nothing batched past the budget" },
+  { id = "T-QT.7.3", text = "A program that writes the table it scans, and a statement prepared before the switch turns on — passes when the writing program reads row-at-a-time and the statement is prepared again with batches" },
 ]
