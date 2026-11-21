@@ -192,6 +192,8 @@ criteria = [
 ]
 tests = [
   { id = "T-T1.10.1", text = "A coordinator crash at every step of a cross-group transaction, then recovery — passes when it ends committed or aborted everywhere" },
+  # lane xgroup-txn: transactions across groups (docs/design/xgroup.md).
+  { id = "T-T1.10.C", text = "A group's steps of a cross-group transaction on the simulator's tablet and on a group's database — passes when both answer the same: locks conflict and share, staging, prevention, decisions that stand, fencing and the floor" },
   # Amphora's own: a local read on a replica (docs/design/replication.md, "A local read on a replica").
   { id = "T-T1.10.L1", text = "A learner of a voter that is then gone reads locally — passes when it answers what was written and caught up, while a call waits for the leader" },
   { id = "T-T1.10.L2", text = "Local reads within a preparation and while a write is proposed and uncommitted — passes when each sees only what was committed, and the write once applied" },
@@ -437,6 +439,10 @@ tests = [
   { id = "T-T1.10.C2", text = "A follower read asked past its replica's closed time, then a write — passes when it is answered once the write applies, at a time at least the one asked, with the write; and one asked an hour ahead is refused Timeout at its deadline" },
   { id = "T-T1.10.S1", text = "Partitions' answers merged — passes when the merge equals the sorted union cut to the limit over 500 random shapes, and every partition is asked while every other is (each ask waits for all to begin)" },
 ]
+
+# lane online-schema: online schema changes (CP-T1.12, kiln goal 496de8d5, G14 step 3); the tests
+# are T-T1.12.1's, by name in crates/amphora/tests/online_schema.rs and crash.rs
+# (t_t1_12_1_a_power_cut_at_every_step_of_an_online_index_leaves_old_or_new).
 
 # lane audit-log: Amphora's own IDs for G10 step 3 (kiln plan 01a16b0f47577325bcd9e51383067e04),
 # serving AC-T1.7.4 (docs/design/audit.md).
