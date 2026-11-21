@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use amphora::reshard::directory::{Directory, Kind};
+use amphora::reshard::directory::{Directory, Kind, Proposal};
 use amphora::reshard::driver::{Action, Answer, Do, Driver, Failure, Out, Reply};
 use amphora::reshard::holding::{Fenced, Holding, replays};
 use amphora::reshard::plan::{GroupLoad, NodeRoom, cut, plan};
@@ -469,8 +469,11 @@ impl Sim {
                     );
                     assert!(g.rows.is_empty(), "a group retired with rows");
                     self.groups.remove(&group);
-                    self.queues.remove(&group);
                 }
+                // Its queue stays: a retired group still answers what was asked of it (above), and
+                // a driver that restarted after asking this retire may have queued its own asks
+                // behind it (the release again). Dropping them would leave that driver waiting
+                // on an answer that never comes.
                 self.retired.insert(group);
                 Reply::Retired
             }
@@ -489,14 +492,19 @@ impl Sim {
             return false;
         }
         let g = busy[self.rng.below(busy.len() as u64) as usize];
-        let a = self.queues.get_mut(&g).unwrap().pop_front().unwrap();
+        self.deliver_at(g).is_some()
+    }
+
+    /// The next action queued at `g` carried out, if any; its answer goes to the inbox.
+    fn deliver_at(&mut self, g: GroupId) -> Option<Do> {
+        let a = self.queues.get_mut(&g)?.pop_front()?;
         let reply = self.execute(a);
         self.inbox.push(Answer {
             ask: a.ask,
             op: a.op,
             reply,
         });
-        true
+        Some(a.what)
     }
 
     /// One answer taken by the driver, picked at random.
@@ -788,4 +796,46 @@ fn t_t1_9_s1_every_key_in_exactly_one_group_through_automatic_operations() {
     for seed in first..first + seeds {
         run(seed, ops);
     }
+}
+
+/// T-T1.9.S1, the hang it found: the driver restarts after asking the old group's retire, and asks
+/// the release again; the old retire is carried out first, with the new release queued behind it.
+/// The retired group must still answer that release (done), so the operation ends.
+#[test]
+fn t_t1_9_s1_a_release_queued_behind_a_retire_is_still_answered() {
+    let mut sim = Sim::new(7);
+    for _ in 0..64 {
+        sim.write();
+    }
+    let out = sim
+        .driver
+        .begin(&Proposal::Move {
+            group: GroupId(0),
+            to: NodeId(2),
+        })
+        .unwrap();
+    sim.carry(out, false);
+    let retiring = |sim: &Sim| {
+        sim.queues
+            .get(&GroupId(0))
+            .is_some_and(|q| q.iter().any(|a| matches!(a.what, Do::Retire { .. })))
+    };
+    while !retiring(&sim) {
+        assert!(sim.deliver_action() || sim.deliver_answer(false), "the move stalled");
+        sim.check(true);
+    }
+    // The driver restarts before the retire is carried out; past the flip it asks the new group to
+    // take the span up again, then the old one to release it, behind the old retire.
+    let out = sim.crash_driver();
+    sim.carry(out, false);
+    let to = sim.driver.directory().owner(0).unwrap();
+    assert!(matches!(sim.deliver_at(to), Some(Do::Activate { .. })));
+    assert!(sim.deliver_answer(false));
+    assert_eq!(sim.queues[&GroupId(0)].len(), 2, "the old retire, then the release");
+    assert!(matches!(sim.deliver_at(GroupId(0)), Some(Do::Retire { .. })));
+    assert!(matches!(sim.deliver_at(GroupId(0)), Some(Do::Release { .. })));
+    assert_eq!(sim.quiesce(), 0);
+    assert!(sim.driver.idle());
+    assert_eq!(sim.ended, 1);
+    assert_eq!(sim.flipped.get("move"), Some(&1));
 }
