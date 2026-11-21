@@ -2861,6 +2861,11 @@ pub struct HashJoinOp {
     pub use_bloom_filter: bool,
     /// Join semantics.
     pub join_type: HashJoinType,
+    /// PL.8: the tables of a bushy plan's inner join whose result is the build side, joined among
+    /// themselves in the materialized build input and read from its payload; the build table is
+    /// one of them. Empty for a left-deep plan, whose build input is the tables before the probe.
+    /// The loops before the probe that aren't in the group stay loops of the main plan.
+    pub build_group: crate::translate::planner::TableMask,
 }
 
 /// Distinguishes union (OR) from intersection (AND) operations for multi-index scans.
@@ -4728,7 +4733,13 @@ fn resolve_outer_ref_loop(
         let probe_table = &tables.joined_tables()[member.original_idx];
         if let Operation::HashJoin(ref hj) = probe_table.op {
             let build_table = &tables.joined_tables()[hj.build_table_idx];
-            if build_table.internal_id == table_id {
+            // PL.8: a bushy plan's build group is read from the payload at the probe too.
+            let in_build_group = tables
+                .joined_tables()
+                .iter()
+                .position(|table| table.internal_id == table_id)
+                .is_some_and(|table_idx| hj.build_group.get(table_idx));
+            if build_table.internal_id == table_id || in_build_group {
                 return Some(probe_idx);
             }
         }

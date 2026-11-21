@@ -2948,7 +2948,13 @@ fn loop_index_for_table_row(
                 let Operation::HashJoin(hash_join) = &probe_table.op else {
                     return false;
                 };
+                // PL.8: a bushy plan's build group is read from the payload at the probe too.
                 tables.joined_tables()[hash_join.build_table_idx].internal_id == table_id
+                    || tables
+                        .joined_tables()
+                        .iter()
+                        .position(|table| table.internal_id == table_id)
+                        .is_some_and(|table_idx| hash_join.build_group.get(table_idx))
             })
         })
 }

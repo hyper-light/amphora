@@ -370,6 +370,45 @@ pub(crate) fn emit_materialized_build_inputs(
         }
     }
 
+    // PL.8: a term between a bushy plan's build group and the loops outside it, consumed by a
+    // group table's read in the left-deep order, runs in the main plan at the probe, which reads
+    // the group's rows from the payload; the probe's own keys stay consumed.
+    let mut group_terms: Vec<usize> = Vec::new();
+    for table in plan.table_references.joined_tables().iter() {
+        let Operation::HashJoin(hash_join_op) = &table.op else {
+            continue;
+        };
+        if hash_join_op.build_group.is_empty() {
+            continue;
+        }
+        for (term_idx, term) in plan.where_clause.iter().enumerate() {
+            if !term.consumed
+                || term.origin.is_outer_join()
+                || hash_join_op
+                    .join_keys
+                    .iter()
+                    .any(|key| key.where_clause_idx == term_idx)
+            {
+                continue;
+            }
+            let mask = table_mask_from_expr(
+                &term.expr,
+                &plan.table_references,
+                &plan.non_from_clause_subqueries,
+            )?;
+            if mask.iter().any(|table_idx| hash_join_op.build_group.get(table_idx))
+                && !hash_join_op.build_group.contains_all_set_bits_of(&mask)
+            {
+                group_terms.push(term_idx);
+            }
+        }
+    }
+    for term_idx in group_terms {
+        if let Some(term) = plan.where_clause.get_mut(term_idx) {
+            term.consumed = false;
+        }
+    }
+
     let mut seen_build_tables: TableMask = TableMask::default();
 
     // decide per-hash-join materialization mode (rowid-only vs key+payload).
@@ -428,8 +467,12 @@ pub(crate) fn emit_materialized_build_inputs(
             // Therefore: if the prefix has other tables, we must store key+payload
             // rows so each prefix match stays distinct and the main plan can drop
             // the prefix loops.
-            let (_, included_tables) =
-                materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
+            let (_, included_tables) = materialization_prefix(
+                plan,
+                hash_join_op.build_table_idx,
+                probe_table_idx,
+                &hash_join_op.build_group,
+            )?;
             let prefix_has_other_tables = included_tables
                 .iter()
                 .any(|table_idx| table_idx != hash_join_op.build_table_idx);
@@ -671,12 +714,39 @@ fn prune_join_order_for_materialized_inputs(
 /// table itself (if not already present). The returned `included_tables`
 /// list also includes build tables of earlier hash joins so payload collection
 /// can capture all referenced columns.
+///
+/// PL.8: a bushy plan's hash join names its build group instead (`HashJoinOp::build_group`): the
+/// prefix is the group's tables in the plan's order, wherever they stand before the probe, and the
+/// loops before the probe outside the group stay loops of the main plan.
 fn materialization_prefix(
     plan: &SelectPlan,
     build_table_idx: usize,
     probe_table_idx: usize,
+    build_group: &TableMask,
 ) -> Result<(Vec<JoinOrderMember>, TableMask)> {
     let mut join_order = plan.join_order.clone();
+    if !build_group.is_empty() {
+        join_order.retain(|member| build_group.get(member.original_idx));
+        if join_order
+            .iter()
+            .all(|member| member.original_idx != build_table_idx)
+        {
+            let build_table = &plan.table_references.joined_tables()[build_table_idx];
+            join_order.push(JoinOrderMember {
+                table_id: build_table.internal_id,
+                original_idx: build_table_idx,
+                is_outer: false,
+            });
+        }
+        let mut included_tables = build_group.clone();
+        for member in join_order.iter() {
+            let table_ref = &plan.table_references.joined_tables()[member.original_idx];
+            if let Operation::HashJoin(hash_join_op) = &table_ref.op {
+                included_tables.set(hash_join_op.build_table_idx)?;
+            }
+        }
+        return Ok((join_order, included_tables));
+    }
     if join_order
         .iter()
         .all(|member| member.original_idx != probe_table_idx)
@@ -813,8 +883,17 @@ fn build_materialized_build_input_plan(
     // (all tables prior to the probe + the build table). The resulting plan
     // is smaller than the original select plan, so any access methods or
     // predicates that depend on tables outside this prefix must be dropped.
+    let build_group = plan
+        .table_references
+        .joined_tables()
+        .get(probe_table_idx)
+        .and_then(|probe| match &probe.op {
+            Operation::HashJoin(hash_join_op) => Some(hash_join_op.build_group.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
     let (join_order, included_tables) =
-        materialization_prefix(plan, build_table_idx, probe_table_idx)?;
+        materialization_prefix(plan, build_table_idx, probe_table_idx, &build_group)?;
     // Bitmask of tables that are actually in the prefix join order for
     // this materialization subplan. Anything that depends on other tables
     // cannot be evaluated during those table scans.
@@ -862,6 +941,9 @@ fn build_materialized_build_input_plan(
             } else if hash_join_op.probe_table_idx == probe_table_idx {
                 // The probe table is not part of the materialization prefix, so
                 // disable hash joins anchored on it.
+                joined_table.op = Operation::default_scan_for(&joined_table.table);
+            } else if !build_group.is_empty() && !build_group.get(hash_join_op.build_table_idx) {
+                // PL.8: a build group is joined among itself only.
                 joined_table.op = Operation::default_scan_for(&joined_table.table);
             }
         }

@@ -2,7 +2,7 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
+        DeletePlan, GroupBy, HashJoinType, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
         JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
         Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
         TablePlanEstimate, TableReferences, UnmatchedRightRowsPlan, UpdatePlan, WhereTerm,
@@ -3512,6 +3512,235 @@ fn change_join_origin_to_inner(where_clause: &mut [WhereTerm], table_id: ast::Ta
 }
 
 /// Write chosen table reads into the query plan.
+/// PL.8: the build group of each inner join of a bushy plan, by the position of its probe in
+/// `JoinN::data`. A run `data[start..end]` is joined among itself in the materialized input of the
+/// hash join at `data[end]`, whose build table is the run's last table; the loops before the run
+/// stay loops, and the probe reads the run's rows from the payload. For inner joins this is the
+/// tree `((before run) probe)`, the same rows as any order of them. What the emitter can't run is
+/// refused with a typed error: nested runs, a run not followed by such a hash join, a run or probe
+/// whose join keeps its position (outer, semi, anti, lateral), a RIGHT or FULL JOIN anywhere, and a
+/// plan whose order removed a sort (the run's loops no longer run in the plan's order).
+fn bushy_build_groups(
+    plan: &JoinN,
+    access_methods_arena: &[AccessMethod],
+    table_references: &TableReferences,
+    sort_eliminated: bool,
+) -> Result<Vec<(usize, TableMask)>> {
+    let mut groups = Vec::new();
+    if plan.is_left_deep() {
+        return Ok(groups);
+    }
+    let refuse = |why: &str| -> Result<Vec<(usize, TableMask)>> {
+        Err(LimboError::InternalError(format!(
+            "PL.8: the bushy join plan {} can't be run: {why}",
+            plan.tree_text()?
+        )))
+    };
+    // The tree's own checks: runs nest or stay apart, at least two tables each.
+    plan.tree()?;
+    if sort_eliminated {
+        return refuse("its order removed a sort");
+    }
+    if table_references.has_right_or_full_join() {
+        return refuse("it has a RIGHT or FULL JOIN");
+    }
+    for run in plan.inner_joins.iter() {
+        let nested = plan.inner_joins.iter().any(|other| {
+            other != run && other.start <= run.start && run.end <= other.end
+        });
+        if nested {
+            return refuse("a run nests in another");
+        }
+        let Some(&(probe_table, probe_method)) = plan.data.get(run.end) else {
+            return refuse("a run has no probe after it");
+        };
+        let Some(&(last_table, _)) = run.end.checked_sub(1).and_then(|last| plan.data.get(last))
+        else {
+            return refuse("a run is empty");
+        };
+        let probe_is_group_hash_join = access_methods_arena.get(probe_method).is_some_and(|method| {
+            matches!(
+                method.params,
+                AccessMethodParams::HashJoin {
+                    build_table_idx,
+                    probe_table_idx,
+                    materialize_build_input: true,
+                    join_type: HashJoinType::Inner,
+                    ..
+                } if build_table_idx == last_table && probe_table_idx == probe_table
+            )
+        });
+        if !probe_is_group_hash_join {
+            return refuse("a run's probe is not an inner hash join built from its last table");
+        }
+        let mut group = TableMask::default();
+        for &(table, _) in plan.data.get(run.start..run.end).unwrap_or_default() {
+            group.set(table)?;
+        }
+        // A run's table that probes a hash table built outside the run would join that table
+        // inside the build input; the run is joined among itself only.
+        let probes_outside = plan
+            .data
+            .get(run.start..run.end)
+            .unwrap_or_default()
+            .iter()
+            .any(|&(_, method)| {
+                matches!(
+                    access_methods_arena.get(method).map(|method| &method.params),
+                    Some(AccessMethodParams::HashJoin { build_table_idx, materialize_build_input, .. })
+                        if !group.get(*build_table_idx) || *materialize_build_input
+                )
+            });
+        if probes_outside {
+            return refuse(
+                "a run's table probes a hash table built outside the run or from a materialized input",
+            );
+        }
+        let constrained = group.iter().chain([probe_table]).any(|table| {
+            table_references
+                .joined_tables()
+                .get(table)
+                .and_then(|table| table.join_info.as_ref())
+                .is_some_and(JoinInfo::is_ordering_constrained)
+        });
+        if constrained {
+            return refuse("a table of a run or its probe keeps its place in the join");
+        }
+        groups.push((run.end, group));
+    }
+    Ok(groups)
+}
+
+#[cfg(test)]
+pub(crate) mod bushy_test_hook {
+    //! PL.8: a hand-built bushy plan for the emitter's tests, before the search makes them.
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The position at which the build side of the plan's first materialized hash join is
+        /// split: the tables before it stay loops, the rest up to the probe form the build group.
+        pub(crate) static SPLIT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    thread_local! {
+        /// How many plans `split_build_side` made bushy.
+        pub(crate) static APPLIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The plan with the first run `data[split..probe]` the emitter can run as the build group of
+    /// the hash join at `probe`, the split from `SPLIT` on: a bushy plan of the same tables.
+    pub(crate) fn split_build_side(
+        plan: JoinN,
+        access_methods_arena: &[AccessMethod],
+        table_references: &TableReferences,
+        sort_eliminated: bool,
+    ) -> JoinN {
+        let Some(first_split) = SPLIT.with(Cell::get) else {
+            return plan;
+        };
+        if !plan.is_left_deep() {
+            return plan;
+        }
+        for probe in 0..plan.data.len() {
+            for split in first_split.max(1)..probe.saturating_sub(1) {
+                let mut bushy = plan.clone();
+                bushy.inner_joins.push(join::InnerJoin {
+                    start: split,
+                    end: probe,
+                });
+                if bushy_build_groups(&bushy, access_methods_arena, table_references, sort_eliminated)
+                    .is_ok()
+                {
+                    APPLIED.with(|applied| applied.set(applied.get() + 1));
+                    return bushy;
+                }
+            }
+        }
+        plan
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+        use super::{APPLIED, SPLIT};
+        use crate::io::MemoryIO;
+        use crate::sync::Arc;
+        use crate::{ConnectOpts, Database, JoinMethods, SqliteDialect};
+        use std::cell::Cell;
+
+        fn rows(conn: &Arc<crate::Connection>, sql: &str) -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let mut rows: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(","))
+                .collect();
+            rows.sort();
+            rows
+        }
+
+        /// PL.8 piece 1 (T-PL.8.2): a hand-built bushy plan, a run of the left-deep plan's tables
+        /// joined among themselves into the build input of the hash join after them while the
+        /// tables before the run stay loops, answers as the left-deep plan does.
+        #[test]
+        fn t_pl_8_2_a_bushy_build_group_answers_as_the_left_deep_plan() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE a(id INTEGER PRIMARY KEY, x INT)",
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, y INT, z INT)",
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, z INT, w INT)",
+                "CREATE INDEX c_y ON c(y)",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            for id in 1..=6 {
+                conn.execute(format!("INSERT INTO a VALUES ({id}, {id})")).unwrap();
+            }
+            for id in 1..=12 {
+                conn.execute(format!("INSERT INTO b VALUES ({id}, {}, {})", id % 5, id % 3)).unwrap();
+            }
+            for id in 1..=15 {
+                conn.execute(format!("INSERT INTO c VALUES ({id}, {}, {})", id % 3, id % 4)).unwrap();
+            }
+            for id in 1..=20 {
+                conn.execute(format!("INSERT INTO p VALUES ({id}, {}, {id})", id % 4)).unwrap();
+            }
+            let queries = [
+                "SELECT a.id, b.id, c.id, p.id FROM a JOIN b ON b.x > a.x JOIN c ON c.y = b.y \
+                 JOIN p ON p.z = c.z",
+                "SELECT a.id, b.id, c.id, p.id, p.w FROM a JOIN b ON b.x > a.x JOIN c ON c.y = b.y \
+                 JOIN p ON p.z = c.z WHERE a.x + c.z < 7 AND b.id <> p.w",
+                "SELECT count(*), sum(p.w) FROM a, b, c, p WHERE b.x = a.x AND c.y = b.y AND p.z = c.z",
+                "SELECT a.id, b.id, c.id, p.id FROM a JOIN b ON b.x = a.x JOIN c ON c.y = b.y \
+                 JOIN p ON p.z = c.z AND p.w > a.x",
+            ];
+            APPLIED.with(|applied| applied.set(0));
+            let mut compared = 0;
+            for methods in [JoinMethods::ByCost, JoinMethods::HashJoinsOnly] {
+                conn.set_join_methods(methods);
+                for sql in queries {
+                    SPLIT.with(|split| split.set(None));
+                    let left_deep = rows(&conn, sql);
+                    SPLIT.with(|split| split.set(Some(1)));
+                    let bushy = rows(&conn, sql);
+                    SPLIT.with(|split| split.set(None));
+                    assert!(!left_deep.is_empty(), "{sql}");
+                    assert_eq!(bushy, left_deep, "{methods:?}: {sql}");
+                    compared += 1;
+                }
+            }
+            assert_eq!(compared, 8);
+            // Non-vacuity: some of the plans were run bushy.
+            assert!(APPLIED.with(Cell::get) > 0, "no plan was made bushy");
+        }
+    }
+}
+
 fn apply_table_access_plan(
     resolver: &Resolver,
     table_references: &mut TableReferences,
@@ -3558,14 +3787,20 @@ fn apply_table_access_plan(
         }
     }
 
-    // PL.8: the loops below run a left-deep plan; a bushy one's inner joins are built by the
-    // emitter's hash-join build inputs, which the search doesn't choose yet.
-    if !best_plan.is_left_deep() {
-        return Err(LimboError::InternalError(format!(
-            "PL.8: the bushy join plan {} reached the left-deep emitter",
-            best_plan.tree_text()?
-        )));
-    }
+    #[cfg(test)]
+    let best_plan = bushy_test_hook::split_build_side(
+        best_plan,
+        &access_methods_arena,
+        table_references,
+        sort_eliminated,
+    );
+    // PL.8: a bushy plan's inner joins are hash joins whose build side is the run's tables.
+    let build_groups = bushy_build_groups(
+        &best_plan,
+        &access_methods_arena,
+        table_references,
+        sort_eliminated,
+    )?;
     let (best_access_methods, best_table_numbers) = (
         best_plan.best_access_methods().collect::<Vec<_>>(),
         best_plan.table_numbers().collect::<Vec<_>>(),
@@ -3875,6 +4110,11 @@ fn apply_table_access_plan(
                         materialize_build_input: *materialize_build_input,
                         use_bloom_filter: *use_bloom_filter,
                         join_type: *join_type,
+                        build_group: build_groups
+                            .iter()
+                            .find(|(probe_position, _)| *probe_position == i)
+                            .map(|(_, group)| group.clone())
+                            .unwrap_or_default(),
                     });
             }
             AccessMethodParams::IndexMethod {
