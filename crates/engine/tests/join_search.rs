@@ -84,3 +84,112 @@ fn a_join_past_the_budget_is_ordered_by_the_fewest_rows() {
     assert_eq!(steps.len(), 40, "{steps:?}");
     assert!(step_of(&steps, "d39") <= 1, "{steps:?}");
 }
+
+/// The audit's row 3 tables, `big`, `mid` and `tiny` (bench/planner/audit/03-right-full-barrier.sql),
+/// with a few rows each: mid 6's key matches no big row, and big 3's no mid row.
+fn barrier(dir: &Path) -> Arc<Connection> {
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.join("barrier.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    for sql in [
+        "CREATE TABLE big(id INTEGER PRIMARY KEY, k INT)",
+        "CREATE TABLE mid(id INTEGER PRIMARY KEY, k INT)",
+        "CREATE TABLE tiny(id INTEGER PRIMARY KEY, k INT)",
+        "INSERT INTO big VALUES (1, 10), (2, 20), (3, 99)",
+        "INSERT INTO mid VALUES (5, 10), (6, 30), (7, 20)",
+        "INSERT INTO tiny VALUES (5, 0), (6, 0), (8, 0)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn
+}
+
+/// The rows of `sql`, columns joined by `|`, NULL as `NULL`.
+fn answers(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    stmt.run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| match value {
+                    amphora_engine::Value::Null => "NULL".to_owned(),
+                    value => value.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+/// Do: plan the audit's row 3 query, `(big RIGHT JOIN mid ON mid.k = big.k) JOIN tiny ON tiny.id =
+/// mid.id WHERE tiny.id = 5`. Expect: tiny's one row read first, as the inner join of the same
+/// tables reads it, where the RIGHT JOIN's barrier read big and mid ahead of tiny at
+/// 328,300,039,000.3 against 23,007.0 (bench/planner/audit/03-right-full-barrier.out; T-PL.8.1).
+#[test]
+fn t_pl_8_1_the_right_join_reads_tiny_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = barrier(dir.path());
+    let sql = "SELECT count(*) FROM big RIGHT JOIN mid ON mid.k = big.k \
+               JOIN tiny ON tiny.id = mid.id WHERE tiny.id = 5";
+    let steps = plan(&conn, sql);
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    assert_eq!(step_of(&steps, "tiny"), 0, "{steps:?}");
+    assert!(
+        step_of(&steps, "mid") < step_of(&steps, "big"),
+        "{steps:?}"
+    );
+    assert_eq!(answers(&conn, sql), ["1"]);
+}
+
+/// Do: run RIGHT JOINs led by one table, which the planner turns into the mirrored LEFT JOIN, with
+/// the columns of `*`, a WHERE term on the null-extended table, USING, a later inner join, a later
+/// RIGHT JOIN and an aggregate. Expect: SQLite's answers, worked by hand from the rows: mid's rows
+/// all kept, big's NULL where no key matches, `*`'s columns in the written order (T-PL.8.2).
+#[test]
+fn t_pl_8_2_a_right_join_turned_left_keeps_its_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = barrier(dir.path());
+    let cases: [(&str, &[&str]); 8] = [
+        (
+            "SELECT * FROM big RIGHT JOIN mid ON mid.k = big.k ORDER BY mid.id",
+            &["1|10|5|10", "NULL|NULL|6|30", "2|20|7|20"],
+        ),
+        (
+            "SELECT mid.id FROM big RIGHT JOIN mid ON mid.k = big.k WHERE big.id IS NULL",
+            &["6"],
+        ),
+        (
+            "SELECT big.id, mid.id FROM big RIGHT JOIN mid USING (k) ORDER BY mid.id",
+            &["1|5", "NULL|6", "2|7"],
+        ),
+        (
+            "SELECT big.id, mid.id, tiny.id FROM big RIGHT JOIN mid ON mid.k = big.k \
+             JOIN tiny ON tiny.id = mid.id ORDER BY tiny.id",
+            &["1|5|5", "NULL|6|6"],
+        ),
+        (
+            "SELECT big.id, mid.id, tiny.id FROM big RIGHT JOIN mid ON mid.k = big.k \
+             RIGHT JOIN tiny ON tiny.id = mid.id ORDER BY tiny.id",
+            &["1|5|5", "NULL|6|6", "NULL|NULL|8"],
+        ),
+        (
+            "SELECT big.id, mid.id, tiny.id FROM big RIGHT JOIN mid ON mid.k = big.k \
+             LEFT JOIN tiny ON tiny.id = mid.id ORDER BY mid.id",
+            &["1|5|5", "NULL|6|6", "2|7|NULL"],
+        ),
+        (
+            "SELECT count(*), sum(big.id), count(big.id) FROM big RIGHT JOIN mid ON mid.k = big.k",
+            &["3|3|2"],
+        ),
+        (
+            "SELECT big.id, mid.id FROM big RIGHT JOIN mid ON mid.k = big.k AND big.id > 1 \
+             ORDER BY mid.id",
+            &["NULL|5", "NULL|6", "2|7"],
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(answers(&conn, sql), expected, "{sql}");
+    }
+}
