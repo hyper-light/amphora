@@ -184,8 +184,8 @@ mod tests {
 
     // The row path's rates, as a database would have learned them.
     const RATES: RowRates = RowRates {
-        row: 50.0,
-        seek: 1_000.0,
+        row: 1_000.0,
+        seek: 2_000.0,
     };
 
     /// A copy with rows in blocks, applied deltas, and queued keys not applied yet.
@@ -208,51 +208,41 @@ mod tests {
             snap: &snap,
         };
         let truth = at.all().unwrap();
-        // A seek dearer than every row's scan makes the copy win even a point read.
-        let seek_dear = RowRates {
-            row: RATES.row,
-            seek: 1e12,
-        };
         let tick = clock(1);
-        for rates in [RATES, seek_dear] {
+        // Every read by both switch settings; the paths each took, by shape.
+        let check = |rates: RowRates| {
+            let mut paths = Vec::new();
             for on in [false, true] {
                 let whole = read(&copy, &at, snap.start, Ask::Whole, rates, on, &tick).unwrap();
                 assert_eq!(whole.rows, truth, "{:?}", whole.choice);
+                paths.push((Shape::Whole, whole.choice.path));
                 for k in [0u16, 1, 7, 11, 44, N - 1, N + 5, N + 39] {
                     let key = k.to_be_bytes();
                     let want: Rowset = truth.iter().filter(|(kk, _)| kk == &key).cloned().collect();
                     let p =
                         read(&copy, &at, snap.start, Ask::Point(&key), rates, on, &tick).unwrap();
                     assert_eq!(p.rows, want, "key {k} {:?}", p.choice);
+                    paths.push((Shape::Point, p.choice.path));
                 }
             }
-        }
-        // Both paths were taken, for both shapes.
-        let whole_copy = read(&copy, &at, snap.start, Ask::Whole, RATES, true, &tick).unwrap();
-        assert_eq!(whole_copy.choice.path, Path::Copy);
-        let key = 7u16.to_be_bytes();
-        let p = read(
-            &copy,
-            &at,
-            snap.start,
-            Ask::Point(&key),
-            seek_dear,
-            true,
-            &tick,
-        )
-        .unwrap();
-        assert_eq!(p.choice.path, Path::Copy);
-        let p = read(
-            &copy,
-            &at,
-            snap.start,
-            Ask::Point(&key),
-            RATES,
-            false,
-            &tick,
-        )
-        .unwrap();
-        assert_eq!(p.choice.path, Path::Rows);
+            paths
+        };
+        // Keys queued and not applied: the whole table by the copy, merged with them, and by the
+        // rows; single rows by the rows (a queued key costs a seek of its own).
+        let paths = check(RATES);
+        assert!(paths.contains(&(Shape::Whole, Path::Copy)));
+        assert!(paths.contains(&(Shape::Whole, Path::Rows)));
+        assert!(!paths.contains(&(Shape::Point, Path::Copy)));
+        // Applied, and a seek dearer than every row's scan: single rows by the copy too.
+        copy.catch_up(0).unwrap();
+        assert_eq!(copy.plan_view(snap.start).queued, 0);
+        let seek_dear = RowRates {
+            row: RATES.row,
+            seek: 1e12,
+        };
+        let paths = check(seek_dear);
+        assert!(paths.contains(&(Shape::Point, Path::Copy)));
+        assert!(paths.contains(&(Shape::Point, Path::Rows)));
         db.close_snapshot(snap);
     }
 
@@ -283,7 +273,7 @@ mod tests {
         let truth = at.all().unwrap();
         // The copy's first scan at its block size is tried, and measured: one reading step for
         // its rows, a tenth of a row's visit each.
-        let step = (truth.len() as u128).saturating_mul(5);
+        let step = (truth.len() as u128).saturating_mul(100);
         let tick = clock(step);
         let first = read(&copy, &at, snap.start, Ask::Whole, RATES, true, &tick).unwrap();
         assert_eq!(first.choice.path, Path::Copy);
