@@ -24,6 +24,7 @@ use crate::db::Db;
 pub use crate::database::replicated::{ReceiveReceipt, ReplicaHandle};
 pub mod bootstrap;
 pub(crate) mod class;
+pub(crate) mod closed;
 pub(crate) mod floor;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
@@ -119,6 +120,7 @@ fn on_base(base_index: u64, base_term: u64, point: Point) -> Result<(), Refusal>
 /// group's commit (replication.md, "A write made at a follower is answered on the leader's
 /// commit"). The outer error is a malformed entry, whose apply fences.
 pub(crate) fn verdict(data: &[u8], before: Point) -> Result<Result<(), Refusal>, Refusal> {
+    let (_, data) = closed::open(data)?;
     api::bound(
         "replicated command",
         data.len(),
@@ -157,6 +159,12 @@ pub struct Machine {
     replicated: bool,
     configuration: ConfState,
     baseline: bootstrap::Baseline,
+    /// The group's time at the last entry applied (replication.md, "Follower reads at a closed
+    /// time"): none before its first stamped entry.
+    time: Option<u64>,
+    // A test's count of the entries whose stamp was lifted past the time before them.
+    #[cfg(test)]
+    lifted: u64,
     /// The group's class as its log recorded it last (replication.md, "The class stated once per
     /// group"), and the class this member's owner stated: the two must stay compatible.
     class: Option<api::replication::Durability>,
@@ -442,6 +450,7 @@ impl Machine {
         }
         let (point, configuration) = state.unwrap_or((Point::default(), initial));
         let recorded = class::recorded(&db).map_err(unavailable)?;
+        let time = closed::recorded(&db).map_err(unavailable)?;
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
         db.flusher()().map_err(unavailable)?;
@@ -452,6 +461,9 @@ impl Machine {
             replicated,
             configuration,
             baseline,
+            time,
+            #[cfg(test)]
+            lifted: 0,
             class: recorded,
             stated: None,
             #[cfg(test)]
@@ -819,6 +831,27 @@ impl Machine {
         self.point
     }
 
+    /// The group's time at the last entry applied: this replica's closed time (replication.md,
+    /// "Follower reads at a closed time"), none before its group's first stamped entry.
+    pub(crate) fn closed(&self) -> Option<u64> {
+        self.time
+    }
+    /// An entry applied: its time is the machine's.
+    fn timed(&mut self, next: closed::Next) {
+        self.time = next.time;
+        #[cfg(test)]
+        if next.lifted {
+            self.lifted = self.lifted.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        let _ = next.lifted;
+    }
+    /// The entries applied whose stamp was lifted past the time before them.
+    #[cfg(test)]
+    pub(crate) fn lifted(&self) -> u64 {
+        self.lifted
+    }
+
     /// The last entry applied that no finished flush covers yet.
     pub(crate) fn unflushed(&self) -> Option<Point> {
         if self.point.index > self.flushed.index {
@@ -944,18 +977,27 @@ impl StateMachine for Machine {
             index: entry.index,
             term: entry.term,
         };
-        if !entry.data.is_empty()
+        // The entry inside its stamp, and the group's time once it is applied, written in the
+        // entry's own transaction (replication.md, "Follower reads at a closed time").
+        let (stamp, data) = closed::open(entry.data).map_err(failed)?;
+        let before = self.time;
+        let next = closed::next(before, stamp, !data.is_empty()).map_err(failed)?;
+        if !data.is_empty()
             && self
                 .baseline
-                .apply_seed(&mut self.db, entry.data, |db| {
+                .apply_seed(&mut self.db, data, |db| {
                     crate::database::bootstrap_db(db)?;
                     db.exec(META)?;
-                    marker(db, at, &self.configuration)
+                    marker(db, at, &self.configuration)?;
+                    // The seed's last chunk installs an image from before any time: its table is
+                    // made again whatever the machine held.
+                    closed::record(db, None, next.time)
                 })
                 .map_err(failed)?
         {
             self.point = at;
             self.flushed = at;
+            self.timed(next);
             answers.push(Applied {
                 index: entry.index,
                 context: entry.context.to_vec(),
@@ -963,10 +1005,10 @@ impl StateMachine for Machine {
             });
             return Ok(());
         }
-        if class::is_class(entry.data) {
+        if class::is_class(data) {
             // The last compatible entry is the record; one that isn't changes nothing, on every
             // member alike, as it depends on the log alone.
-            let stated = class::decode(entry.data).map_err(failed)?;
+            let stated = class::decode(data).map_err(failed)?;
             let supersedes = self
                 .class
                 .as_ref()
@@ -974,6 +1016,7 @@ impl StateMachine for Machine {
             let configuration = self.configuration.clone();
             if supersedes {
                 self.advance_with(at, &[], &configuration, !self.replicated, |db| {
+                    closed::record(db, before, next.time)?;
                     class::record(db, &stated)
                 })?;
                 #[cfg(test)]
@@ -982,15 +1025,18 @@ impl StateMachine for Machine {
                 }
                 self.class = Some(stated);
             } else {
-                self.advance(at, &[], &configuration, !self.replicated)?;
+                self.advance_with(at, &[], &configuration, !self.replicated, |db| {
+                    closed::record(db, before, next.time)
+                })?;
             }
+            self.timed(next);
             return self.hold_to_class();
         }
         let mut result = Ok(());
         let mut pages = Vec::new();
-        if !entry.data.is_empty() {
+        if !data.is_empty() {
             self.require_baseline().map_err(failed)?;
-            let prepared = Prepared::decode(entry.data).map_err(failed)?;
+            let prepared = Prepared::decode(data).map_err(failed)?;
             if prepared.baseline.as_ref() != self.baseline.declaration() {
                 return Err(failed("resolved delta baseline identity differs"));
             }
@@ -1000,9 +1046,14 @@ impl StateMachine for Machine {
             }
         }
         // Its flush is the owner's flushing thread's, in every class (replication.md, "A
-        // replica's database log"): durable() stays at what a finished flush covers.
-        self.advance(at, &pages, &self.configuration.clone(), false)?;
-        if !entry.data.is_empty() {
+        // replica's database log"): durable() stays at what a finished flush covers. A refused
+        // transaction changes nothing but still takes its time: the time counts entries, and every
+        // member refuses it alike.
+        self.advance_with(at, &pages, &self.configuration.clone(), false, |db| {
+            closed::record(db, before, next.time)
+        })?;
+        self.timed(next);
+        if !data.is_empty() {
             answers.push(Applied {
                 index: entry.index,
                 context: entry.context.to_vec(),
@@ -1041,7 +1092,8 @@ impl StateMachine for Machine {
     /// commit, held or classic, and a restart that finds it past the member's log opens the log at
     /// the machine's point (durable.md §4.3).
     fn acts_at_start(&self, entry: &EntryRef<'_>) -> bool {
-        !self.replicated || bootstrap::is_seed(entry.data)
+        !self.replicated
+            || closed::open(entry.data).is_ok_and(|(_, data)| bootstrap::is_seed(data))
     }
 
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
@@ -1112,6 +1164,9 @@ impl StateMachine for Machine {
         self.configuration_at = at.index;
         self.baseline.completed();
         self.class = class::recorded(&self.db).map_err(failed)?;
+        // The image's time is the group's at its point: an image never goes back in time, as
+        // it is taken past what this member applied.
+        self.time = closed::recorded(&self.db).map_err(failed)?;
         self.hold_to_class()?;
         #[cfg(test)]
         self.record_digest(at.index)?;

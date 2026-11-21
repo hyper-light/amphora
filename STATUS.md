@@ -359,6 +359,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Next
 
+- **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
+  closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
+  entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
+  so times rise along the log whoever leads. `Database::query_closed` answers at the replica's closed time once it is
+  at least the time asked; `follower_read_micros` is now less the replica's measured p99 lag. `amphora::search` asks
+  partitions at once and merges newest first. Closes with: AC-T1.10.3 and AC-T1.10.4 measured (`amphora-bench
+  --cluster`), an idle group's time closed on demand, and the attached client's request on the wire.
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates

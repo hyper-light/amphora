@@ -30,6 +30,7 @@ pub mod groups;
 pub mod memory;
 pub mod meter;
 pub mod replication;
+pub mod search;
 pub mod sql;
 pub mod store;
 pub mod transport;
