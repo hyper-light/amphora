@@ -419,7 +419,7 @@ fn t_t1_12_1_a_constraint_is_enforced_on_writes_while_rows_are_validated_then_pu
     }
     // Each step's write deletes at most one row, perhaps before its batch reached it.
     assert!(
-        visited >= 1000 - steps as u64,
+        visited >= 1000 - u64::try_from(steps).unwrap(),
         "the batches visited {visited} rows in {steps} steps"
     );
     assert!(steps > 100, "validated in {steps} steps, not batches of 7");
