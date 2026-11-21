@@ -1496,7 +1496,13 @@ pub fn constraints_from_where_clause(
             }
         }
 
-        apply_column_stats(&mut cs.constraints, table_reference, where_clause, schema, params);
+        apply_column_stats(
+            &mut cs.constraints,
+            table_reference,
+            where_clause,
+            schema,
+            params,
+        );
         for candidate in cs.candidates.iter_mut() {
             // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
             candidate.refs.sort_by_key(|cref| cref.index_col_pos);
@@ -2853,4 +2859,3 @@ fn common_kept(common: &[(u64, usize)], n: f64, total: f64, distinct: f64, nulls
     }
     kept
 }
-
