@@ -1,0 +1,65 @@
+hash-threshold 8
+
+# written for operator:EXISTS: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE a = 3)
+----
+1
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE a = 99)
+----
+0
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE b IS NULL)
+----
+1
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE c > 4)
+----
+1
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE 1)
+----
+1
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE 0)
+----
+0
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE e = 'x')
+----
+1
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE a IN (1, 2))
+----
+1
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE d IS NULL)
+----
+1
+
+query I rowsort
+SELECT EXISTS (SELECT 1 FROM t1 WHERE b LIKE 'f%')
+----
+1

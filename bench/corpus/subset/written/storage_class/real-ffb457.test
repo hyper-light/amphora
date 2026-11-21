@@ -1,0 +1,75 @@
+hash-threshold 8
+
+# written for storage_class:REAL: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query TT rowsort
+SELECT typeof(1.5), quote(1.5)
+----
+real
+1.5
+
+query TT rowsort
+SELECT typeof(-0.0), quote(-0.0)
+----
+real
+0.0
+
+query TT rowsort
+SELECT typeof(1e3), quote(1e3)
+----
+real
+1000.0
+
+query TT rowsort
+SELECT typeof(2.0), quote(2.0)
+----
+real
+2.0
+
+query TT rowsort
+SELECT typeof(CAST(1 AS REAL)), quote(CAST(1 AS REAL))
+----
+real
+1.0
+
+query TT rowsort
+SELECT typeof(7.0 / 2), quote(7.0 / 2)
+----
+real
+3.5
+
+query TT rowsort
+SELECT typeof(1e308 * 10), quote(1e308 * 10)
+----
+real
+9.0e+999
+
+query TT rowsort
+SELECT typeof(pi()), quote(pi())
+----
+real
+3.1415926535897931
+
+query TT rowsort
+SELECT typeof(avg(1)), quote(avg(1))
+----
+real
+1.0
+
+query TT rowsort
+SELECT typeof(0.1 + 0.2), quote(0.1 + 0.2)
+----
+real
+0.30000000000000004

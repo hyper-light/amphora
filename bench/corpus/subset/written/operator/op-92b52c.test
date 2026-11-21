@@ -1,0 +1,75 @@
+hash-threshold 8
+
+# written for operator:>>: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query I rowsort
+SELECT 1 >> 2
+----
+0
+
+query I rowsort
+SELECT 2 >> 1
+----
+1
+
+query I rowsort
+SELECT 'a' >> 'b'
+----
+0
+
+query T rowsort
+SELECT NULL >> 1
+----
+NULL
+
+query I rowsort
+SELECT 2.5 >> 2
+----
+0
+
+query I rowsort
+SELECT '10' >> 9
+----
+0
+
+query I rowsort
+SELECT x'01' >> x'02'
+----
+0
+
+query I rowsort
+SELECT -3 >> 4
+----
+-1
+
+query I rowsort
+SELECT 'abc' >> 'ABC'
+----
+0
+
+query I rowsort
+SELECT 7 >> 7
+----
+0
+
+query I rowsort
+SELECT 0 >> '0'
+----
+0
+
+query T rowsort
+SELECT 9223372036854775807 >> 1
+----
+4611686018427387903

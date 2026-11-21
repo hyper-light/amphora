@@ -1,4 +1,4 @@
-//! The versioned storage's log (Amphora's docs/design/engine.md, decision 10; CP-T1.4's AC-T1.4.2
+//! The versioned storage's log (Amphora's docs/design/engine.md, decision 11; CP-T1.4's AC-T1.4.2
 //! and AC-T1.4.3): durable single-row commits from many writers, each on disjoint keys, through one
 //! group-committed log (`--lanes 1`) and through per-thread logs (a lane a writer), on the portable
 //! files or, on Linux, io_uring (`--uring`). Each variant runs twice: with no checkpoint, then with

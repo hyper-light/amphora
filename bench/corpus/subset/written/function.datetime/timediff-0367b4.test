@@ -1,0 +1,75 @@
+hash-threshold 8
+
+# written for function.datetime:timediff: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+query T rowsort
+SELECT timediff('2024-01-31', '2024-01-01')
+----
++0000-00-30 00:00:00.000
+
+query T rowsort
+SELECT timediff('2024-02-29 12:30:00', '2024-01-01')
+----
++0000-01-28 12:30:00.000
+
+query T rowsort
+SELECT timediff('2023-12-31 23:59:59', '2024-01-01')
+----
+-0000-00-00 00:00:01.000
+
+query T rowsort
+SELECT timediff('2000-01-01', '2024-01-01')
+----
+-0024-00-00 00:00:00.000
+
+query T rowsort
+SELECT timediff('1970-01-01 00:00:00', '2024-01-01')
+----
+-0054-00-00 00:00:00.000
+
+query T rowsort
+SELECT timediff('2024-03-15 08:05:00.123', '2024-01-01')
+----
++0000-02-14 08:05:00.123
+
+query T rowsort
+SELECT timediff('2038-01-19 03:14:07', '2024-01-01')
+----
++0014-00-18 03:14:07.000
+
+query T rowsort
+SELECT timediff('1999-12-31T23:00:00', '2024-01-01')
+----
+-0024-00-00 01:00:00.000
+
+query T rowsort
+SELECT timediff('2024-06-30', '2024-01-01')
+----
++0000-05-29 00:00:00.000
+
+query T rowsort
+SELECT timediff(2460385.5, '2024-01-01')
+----
++0000-02-15 00:00:00.000
+
+query T rowsort
+SELECT timediff(1710460800, '2024-01-01')
+----
+NULL
+
+query T rowsort
+SELECT typeof(timediff('now', '2024-01-01'))
+----
+text

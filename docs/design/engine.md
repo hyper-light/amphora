@@ -245,7 +245,7 @@ at commit.
 
 **Built** (`storage/versioned/redo.rs`): one record a commit (its changes, its timestamp, each
 record's length and XXH3), appended under the clock's publish lock to the pending bytes of the
-writer's lane (decision 10; one lane is the one log this decision describes); whoever next needs a
+writer's lane (decision 11; one lane is the one log this decision describes); whoever next needs a
 commit durable takes a lane's flush lock and writes and flushes everything pending in it at once, so
 one flush serves every commit appended to the lane before it began, with no timer. A flush that
 fails stops the log: nothing more is logged or made durable until the database is reopened
@@ -300,7 +300,7 @@ header names (a damaged header, any complete journal) and writes its pages and h
 data file again: a power cut may keep a checkpoint's header and not every page it wrote. It then
 applies the journal's list (each row back to its version as of T), replays every redo record
 committed after T, in timestamp order across every lane's files up to the first timestamp none holds
-(decision 10), and clears the versions' flags (no snapshot outlives the process), removing the cells
+(decision 11), and clears the versions' flags (no snapshot outlives the process), removing the cells
 of removed rows. The lanes' files are read side by side and the list and records replayed side by
 side, each row's changes in their order on one thread of as many as the machine runs (SiloR: Zheng,
 Tu, Liskov, Madden, "Fast Databases with Fast Durability and Recovery Through Multicore
@@ -347,7 +347,44 @@ without rewriting the newest journal, making a database whenever the header is u
 checkpoints that don't stop the log when they fail, redo tails left uncut, and versions left on
 recovered cells (which fails five).
 
-## 10. The log in lanes: one group-committed log, or a log a writer
+## 10. Memory: versions pruned between snapshots, one budget, typed refusals
+
+**Decision.** Collection keeps, of a row's older versions, only those an open snapshot sees: for
+each open snapshot the newest version at or before it unless it sees the row's newest, every
+version after the last commit read with the snapshots and the newest at or before it (what a
+snapshot opened meanwhile may see), and the version an open writer replaced (its rollback's). A
+long reader so holds one version a row, not one an update. Every byte kept beside the pages (row
+versions and their heads, each transaction's write and read records, the commits kept for
+validation) is charged to one budget, reserved before anything changes and refused past it with a
+typed `MemoryBudget`, the change refused whole. Commits are kept for validation only while a
+transaction begun before them is open: a read-only snapshot never validates. A transaction's reads
+that the budget can't take become its whole tree, one span. The budget is the shell's
+(`Versioned::with_budget`, the process's memory as `crates/amphora/src/memory.rs` learns it where
+it runs); until the shell opens this storage, the pool's own bytes.
+
+**Why.** The low watermark alone bounds versions by the oldest snapshot: one reader held an hour
+keeps every version written since, which no budget survives. Pruning between snapshots bounds them
+by rows times open snapshots; the budget turns what is left into a refusal a caller can handle
+instead of the process running out of memory. Escalation keeps a long serializable reader running:
+a coarser record refuses more, never fewer.
+
+**Sources.** Böttcher, Leis, Neumann, Kemper, "Scalable Garbage Collection for In-Memory MVCC
+Systems", PVLDB 12(6), 2019 (Steam: eager pruning of versions no active snapshot sees). Lee et al.,
+"Hybrid Garbage Collection for Multi-Version Concurrency Control in SAP HANA", SIGMOD 2016
+(interval collection). Alhomssi, Leis, PVLDB 2023 (LeanStore: version records in the buffer
+manager, bounded by it). Ports, Grittner, PVLDB 5(12), 2012 (PostgreSQL SSI: predicate locks
+promoted to coarser grains when memory runs short). The MySQL reference manual, "InnoDB
+Multi-Versioning" (undo in buffer-pool pages).
+
+**Evidence.** `version.rs`'s T-G8.2.1 soak (one reader, 32 writers, a collector; precision locking
+and SSI), T-G8.2.2 and T-G8.2.3.
+
+**Falsified by.** The hour-long soak (`AMPHORA_G8_SOAK_SECONDS=3600`) finding the budget held past
+its limit, an untyped failure, a scan that isn't its snapshot's, or bytes not given back; or a
+workload whose refusals under the budget a version store out of memory (LeanStore's graveyard)
+would have avoided at a cost the suite accepts (the step this leaves open).
+
+## 11. The log in lanes: one group-committed log, or a log a writer
 
 **Decision.** The redo log is in lanes, each its own pair of files; a writer takes a lane
 (`Database::lane`) and appends its commits' records to it. One lane is one group-committed log (decision

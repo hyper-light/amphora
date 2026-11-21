@@ -1,0 +1,88 @@
+hash-threshold 8
+
+# written for keyword:CHECK: the shared tables, the group's own setup, then its cases
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL, d BLOB, e)
+
+statement ok
+INSERT INTO t1 VALUES (1, 'one', 1.5, x'01', 1), (2, 'two', 2.5, x'02', 'two'), (3, 'three', NULL, NULL, 3.5), (4, NULL, 4.5, x'0405', NULL), (5, 'Five', -5.5, x'', 'x'), (6, '', 0.0, x'ff', 6), (NULL, 'null-a', 7.25, x'07', x'07')
+
+statement ok
+CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 10), (2, 'Y', 20), (3, 'y', 20), (6, 'z', NULL), (7, 'X', 70)
+
+statement ok
+CREATE TABLE kc1(a INTEGER CHECK (a > 0), b TEXT CHECK (length(b) < 5))
+
+statement ok
+INSERT INTO kc1 VALUES (1, 'ok')
+
+statement error
+INSERT INTO kc1 VALUES (0, 'ok')
+
+statement error
+INSERT INTO kc1 VALUES (2, 'too long')
+
+statement ok
+INSERT INTO kc1 VALUES (NULL, NULL)
+
+statement error
+UPDATE kc1 SET a = -1 WHERE a = 1
+
+statement ok
+CREATE TABLE kc2(a, b, CHECK (a <> b), CHECK (a IS NOT NULL))
+
+statement error
+INSERT INTO kc2 VALUES (1, 1)
+
+statement error
+INSERT INTO kc2 VALUES (NULL, 1)
+
+statement ok
+INSERT INTO kc2 VALUES (1, 2)
+
+statement ok
+PRAGMA ignore_check_constraints = ON
+
+statement ok
+INSERT INTO kc1 VALUES (-5, 'x')
+
+statement ok
+PRAGMA ignore_check_constraints = OFF
+
+query IT nosort
+SELECT a, b FROM kc1 ORDER BY rowid
+----
+1
+ok
+NULL
+NULL
+-5
+x
+
+statement error
+CREATE TABLE kc3(a CHECK (a > (SELECT 1)))
+
+statement ok
+CREATE TABLE kc4(a CHECK (random() IS NOT NULL))
+
+statement ok
+INSERT INTO kc4 VALUES (1)
+
+statement ok
+CREATE TABLE kc5(a INTEGER CHECK (typeof(a) = 'integer'))
+
+statement ok
+INSERT INTO kc5 VALUES ('12')
+
+statement error
+INSERT INTO kc5 VALUES ('x')
+
+query IT rowsort
+SELECT a, typeof(a) FROM kc5
+----
+12
+integer

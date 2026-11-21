@@ -486,6 +486,21 @@ tests = [
   { id = "T-G8.1.2", text = "Each validation on hand-made schedules (write skew, a phantom closing a cycle, a lone antidependency, the read-only anomaly, an open writer of a row read) — passes when each refuses exactly what its scheme says" },
 ]
 
+# lane g8-gc
+# Amphora's own IDs for G8 step 2 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, step 2, under
+# CP-T1.3): versions collected, memory bounded, typed refusals.
+[[own]]
+id = "G8.2"
+title = "Versions collected, memory bounded, robust out of memory (G8 step 2)"
+criteria = [
+  { id = "AC-G8.2.1", text = "a reader held open an hour under 32 writers keeps the versioned storage's memory within its budget, refusing typed (MemoryBudget) past it, and its answers stay its snapshot's" },
+]
+tests = [
+  { id = "T-G8.2.1", text = "Soak: one long snapshot, 32 writers, a collector (AMPHORA_G8_SOAK_SECONDS for the hour) — passes when the budget never holds past its limit, every refusal is typed, every scan is the snapshot's, each row keeps at most one older version once collected, and every byte comes back" },
+  { id = "T-G8.2.2", text = "Commits kept for validation only while a transaction begun before them is open, not for a read-only snapshot" },
+  { id = "T-G8.2.3", text = "A transaction's reads past the budget escalate to its whole tree, and its commit is refused at least where the finer record would be" },
+]
+
 # lane split-merge: groups that split, merge and move themselves (kiln goal 49477403, G13 step 2;
 # docs/design/reshard.md). Criteria are CP-T1.9's AC-T1.9.1 to AC-T1.9.3.
 [[own]]
@@ -497,6 +512,8 @@ criteria = [
 ]
 tests = [
   { id = "T-T1.9.S1", text = "Automatic splits, merges and moves in the simulator under writes, driver and group restarts and lost logs — passes when every key is in exactly one group, the directory's, and writes lost is 0" },
+  { id = "T-T1.9.R1", text = "A split carried through the directory group's replicated log while groups route by it — passes when every member holds the same directory, a write to the fenced range is refused typed, a router on the old directory is refused by the old group's holding after the flip, and once routed by the new directory the range is written to and read from the new group" },
+  { id = "T-T1.9.R2", text = "A refused directory change and a directory image — passes when the refusal is alike on every member and changes nothing, an image installs the same directory, and an image that doesn't decode is refused" },
 ]
 
 # lane qs5
@@ -547,6 +564,34 @@ tests = [
   { id = "T-CS.1.1", text = "A doc-truth check of its claims (crates/amphora/tests/columnar_decision.rs) — passes when every claim cited: each citation resolves to a quoted, located claim from a graded source, and each number the decision states is in a quote it cites" },
 ]
 
+# lane corpus-ci
+# Amphora's own IDs for G2, the competition corpus (kiln plan 01a16b0f461b7065a845f678893846ec):
+# G2.n for its step n.
+
+[[own]]
+id = "G2.4"
+title = "One harness for every engine, each in its steady state (G2 step 4)"
+criteria = [
+  { id = "AC-G2.4.1", text = "every disagreement classified: Amphora bug, competitor bug, dialect difference, or translation gap" },
+  { id = "AC-G2.4.2", text = "competitors the corpus runs against: at least 8" },
+]
+tests = [
+  { id = "T-G2.4.1", text = "a known dialect difference (integer division, NULL ordering) — passes when classified as a dialect difference, not a bug" },
+]
+
+[[own]]
+id = "G2.7"
+title = "In the gate and nightly (G2 step 7)"
+criteria = [
+  { id = "AC-G2.7.1", text = "the subset runs in the gate in under 2 minutes" },
+  { id = "AC-G2.7.2", text = "the nightly run records results every night" },
+]
+tests = [
+  { id = "T-G2.7.1", text = "the pool chosen from measured times (bench/corpus/subset.py) and run with them kept (crates/corpus/tests/times.rs) — passes when each record and each file has its time and fill files stop at the deadline" },
+  { id = "T-G2.7.2", text = "a corpus file run on Amphora through the gate's code path (crates/corpus/tests/amphora_runs.rs) — passes when the wrong answer, and only it, disagrees" },
+  { id = "T-G2.7.3", text = "the whole corpus nightly (.kiln/corpus.yaml, bench/corpus/nightly.sh) — passes when its record, times and re-ranked pool are kept as the run's artifacts" },
+]
+
 # lane g11-compress
 [[own]]
 id = "CS.3"
@@ -559,6 +604,6 @@ tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
 
-# lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 10): no new
+# lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
 # IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
 # (crates/engine/tests/versioned_crash.rs).

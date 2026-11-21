@@ -1,5 +1,5 @@
 //! Amphora: the versioned storage's files on Linux through io_uring (Amphora's
-//! `docs/design/engine.md`, decision 10): a log's flush is its write and a data flush linked in one
+//! `docs/design/engine.md`, decision 11): a log's flush is its write and a data flush linked in one
 //! submission (`IOSQE_IO_LINK`; the flush runs once the write has ended, and only if it wrote it
 //! all), one system call where the portable path ([`Files`]) makes two. Each file has a ring of its
 //! own, so lanes flushing side by side never wait on each other's ring (Haas and Leis, "What Modern
@@ -189,7 +189,7 @@ mod tests {
     use super::*;
 
     /// Do: write and flush a lane's record through the ring, then through the portable path at
-    /// its end, and read the file back. Expect: both writes, in place (decision 10).
+    /// its end, and read the file back. Expect: both writes, in place (decision 11).
     #[test]
     fn a_write_and_its_flush_in_one_submission_land_in_place() {
         let dir = tempfile::tempdir().unwrap();
