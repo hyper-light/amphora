@@ -297,8 +297,9 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
 ///
 /// The first read is not the rate: it pays for the IO's first use (on jupiter, Windows, the
 /// process's first read took 121.7 us, the reads after it 24.7 to 38.9 us; lane qs5-5's probe,
-/// kiln run r558), and a single read anchored on it flipped `tests/records_plans.rs`'s key joins
-/// to hash joins (kiln run r546). So the reads after it are timed, doubling in number, until
+/// kiln run r558), and a single read anchored on it flipped the key joins of
+/// `tests/records_plans.rs`'s `a_join_on_a_whole_key_searches_it_without_statistics` (kiln run
+/// r546; it passes with this, run r649). So the reads after it are timed, doubling in number, until
 /// their time reaches the first's or they number `most_reads`, as calibration times each kind of
 /// work until its time reaches the slowest single run (`measure`).
 pub(crate) fn time_page_read(
