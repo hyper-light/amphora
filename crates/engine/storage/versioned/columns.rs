@@ -584,8 +584,11 @@ struct State<B> {
     /// The generation before, for snapshots older than the current one (decision 1, part 3).
     previous: Option<Generation<B>>,
     /// Commits from the first to the last were refused by a full queue and no rebuild covers the
-    /// last yet: scans at or after the first read rows.
+    /// last yet: scans of the current generation at or after the first read rows.
     behind: Option<(Ts, Ts)>,
+    /// The same for the previous generation, as it stood when it was replaced: the commits it
+    /// lacks are as much its own as they were when it was current.
+    previous_behind: Option<(Ts, Ts)>,
     sizer: Sizer,
     rebuilds: Rebuilds,
     /// The freshness lag of each record applied, in the caller's ticks, since last taken.
@@ -626,6 +629,7 @@ impl<B: Block> Columns<B> {
                 current: None,
                 previous: None,
                 behind: None,
+                previous_behind: None,
                 sizer: Sizer::default(),
                 rebuilds: Rebuilds::default(),
                 lags: Vec::new(),
@@ -698,6 +702,7 @@ impl<B: Block> Columns<B> {
                 }
             }
             st.previous = Some(old);
+            st.previous_behind = st.behind;
         }
         st.current = Some(g);
         // Commits lost after `made` are missing from the new generation too: it answers no
@@ -720,15 +725,16 @@ impl<B: Block> Columns<B> {
     pub fn scan(&self, s: Ts, rows: &dyn Rows) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, ScanCounts)> {
         let st = self.state.read();
         let mut counts = ScanCounts::default();
-        let behind = st.behind.is_some_and(|(first, _)| first <= s);
         let queue = self.feed.queue.lock();
         let lost = queue.lost.is_some_and(|(first, _)| first <= s);
         // The current generation answers every snapshot from its making on; the previous one,
-        // those before the current's making (it was caught up to it before it was replaced).
-        let g = match usable(&st.current, s) {
-            Some(g) => Some(g),
-            None => usable(&st.previous, s),
+        // those before the current's making (it was caught up to it before it was replaced), each
+        // but for the commits it lacks.
+        let (g, behind) = match usable(&st.current, s) {
+            Some(g) => (Some(g), st.behind),
+            None => (usable(&st.previous, s), st.previous_behind),
         };
+        let behind = behind.is_some_and(|(first, _)| first <= s);
         let g = match g {
             Some(g) if !behind && !lost => g,
             _ => {
@@ -824,6 +830,7 @@ impl<B: Block> Columns<B> {
         let mut st = self.state.write();
         if st.current.as_ref().is_some_and(|g| g.made <= oldest) {
             st.previous = None;
+            st.previous_behind = None;
         }
     }
 }
@@ -1023,6 +1030,16 @@ mod tests {
         copy.rebuilt(t.elapsed().as_nanos());
     }
 
+    /// Runs `f` when dropped, so a thread that fails still lets the others end (a failed assert
+    /// ends the test instead of leaving it waiting).
+    struct OnDrop<F: FnMut()>(F);
+
+    impl<F: FnMut()> Drop for OnDrop<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+
     /// What the scans counted across a run.
     #[derive(Default, Debug)]
     struct Seen {
@@ -1064,6 +1081,9 @@ mod tests {
                 let db = &db;
                 let writers_left = &writers_left;
                 sc.spawn(move || {
+                    let _left = OnDrop(|| {
+                        writers_left.fetch_sub(1, Ordering::AcqRel);
+                    });
                     let mut x = seed.wrapping_mul(31).wrapping_add(w) | 1;
                     let mut d = Descender::new();
                     for _ in 0..300 {
@@ -1088,7 +1108,6 @@ mod tests {
                             db.abort(t, &mut d).unwrap();
                         }
                     }
-                    writers_left.fetch_sub(1, Ordering::AcqRel);
                 });
             }
             let (db, copy, stop, ticks) = (&db, &copy, &stop, &ticks);
@@ -1103,6 +1122,7 @@ mod tests {
                     std::thread::yield_now();
                 }
             });
+            let _stop = OnDrop(|| stop.store(true, Ordering::Release));
             let mut held: Vec<Snapshot> = Vec::new();
             let mut x = seed | 1;
             loop {
@@ -1140,7 +1160,6 @@ mod tests {
             for s in held {
                 db.close_snapshot(s);
             }
-            stop.store(true, Ordering::Release);
         });
         seen
     }
