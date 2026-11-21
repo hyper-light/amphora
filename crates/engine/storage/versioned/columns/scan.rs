@@ -2139,7 +2139,8 @@ mod tests {
                 .unwrap();
             assert_eq!((src.cached, src.uncached), (0, src.decoded));
             assert!(src.decoded > 0);
-            let q = &queries()[1];
+            let qs = queries();
+            let q = &qs[1];
             let (got, _) = Plan {
                 granules: placed,
                 query: q,
