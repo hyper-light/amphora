@@ -132,6 +132,9 @@ criteria = [
   { id = "AC-T1.8.R2", text = "Read sets keep every history serializable, alone and under the write slot" },
   { id = "AC-T1.8.R3", text = "The read set travels with the write as an append-only change: a binary from before it decodes the write and ignores the read set" },
   { id = "AC-T1.8.D2", text = "No class's owner flushes an ordinary entry's database log on its own thread: a flush that stands still stands no owner step still" },
+  # lane g12s2: the raft log as the WAL (G12 step 2; docs/design/replication.md, "The raft log as the WAL").
+  { id = "AC-T1.8.L1", text = "Writes are durable once a quorum's raft logs are flushed; the engine applies committed entries without its log fsyncing per commit, and the raft log is compacted no further than what the engine's log made durable" },
+  { id = "AC-T1.8.L2", text = "The store's tests give identical results at one voter and at three, from one harness whose only parameter is the group's size" },
 ]
 tests = [
   { id = "T-T1.8.1", text = "A laptop offline writes to its outbox, then reconnects — passes when every write commits, in order, with no duplicate" },
@@ -652,6 +655,9 @@ tests = [
   { id = "T-G2.7.1", text = "the pool chosen from measured times (bench/corpus/subset.py) and run with them kept (crates/corpus/tests/times.rs) — passes when each record and each file has its time and fill files stop at the deadline" },
   { id = "T-G2.7.2", text = "a corpus file run on Amphora through the gate's code path (crates/corpus/tests/amphora_runs.rs) — passes when the wrong answer, and only it, disagrees" },
   { id = "T-G2.7.3", text = "the whole corpus nightly (.kiln/corpus.yaml, bench/corpus/nightly.sh) — passes when its record, times and re-ranked pool are kept as the run's artifacts" },
+  # lane g12s2: the raft log as the WAL.
+  { id = "T-T1.8.L1", text = "A voter's flushes held, 1 flushed and 2 to 5 applied, its raft log compacted - passes when the start stops at the flushed point, the compaction flushed nothing, and after the flush a compaction reaches the last entry applied" },
+  { id = "T-T1.8.L2", text = "The Records suite and seeded histories on a group of one voter and of three - passes when every case passes, every answer equals the simulator's, and the two transcripts are identical" },
   # lane corpus-ci-4
   { id = "T-G2.7.4", text = "a record that can't finish (a 10-way join of 100 rows) bounded by the run's budget (crates/corpus/tests/amphora_runs.rs, times.rs) — passes when the engine stops it and it is classified past the budget, the next record still runs, and a required record past it fails the run" },
 ]

@@ -378,7 +378,7 @@ fn said_at(voters: u64) -> Vec<String> {
     said
 }
 
-/// AC-T1.8.W2, T-T1.8.W2 (CP-T1.8, G12 step 2: the store's tests at 1 voter and 3): one harness,
+/// AC-T1.8.L2, T-T1.8.L2 (CP-T1.8, G12 step 2: the store's tests at 1 voter and 3): one harness,
 /// the group's size its only parameter. Do: the Records suite and seeded histories on a group of
 /// one voter, then on a group of three, each at its leader. Expect: every case passes at both,
 /// every answer equal to the simulator's, and the two transcripts identical.

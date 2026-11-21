@@ -13288,7 +13288,7 @@ mod tests {
         pump.finish();
     }
 
-    /// AC-T1.8.W1, T-T1.8.W1 (CP-T1.8, G12 step 2; replication.md, "The raft log as the WAL"):
+    /// AC-T1.8.L1, T-T1.8.L1 (CP-T1.8, G12 step 2; replication.md, "The raft log as the WAL"):
     /// compaction waits for the engine's flush. Do: a voter and its learner, the voter's flushes
     /// held; 1 written and the voter's log flushed; 2 to 5 written, applied unflushed; the voter's
     /// raft log compacted, keeping nothing; then its log flushed and compacted again. Expect: the
