@@ -7,8 +7,9 @@
 //!   made is gone: until a step begins with no more input queued than it found (held). One is
 //!   due only while the entries held by restarts, the entries the owner's own long steps already
 //!   delayed past AC-T1.3.4's p99.9 (over), and the most one restart held (next, for the restart
-//!   about to come) stay strictly below the p99.9's tail of the entries applied, over patience's
-//!   window of two generations;
+//!   about to come) stay strictly below the p99.9's tail of the entries applied, over a window of
+//!   two generations, each as long as the owner went between its last two restarts
+//!   (`patience::Recurrence`);
 //! - the log may hold what its own file and an equal share, among the replica logs on its
 //!   filesystem, of what is free there less one snapshot's image, hold: each frame its own bytes
 //!   and the page its copy may add to the database's file ([`log_room`]).
@@ -16,7 +17,7 @@
 use amphora_api::Refusal;
 use std::time::Duration;
 
-use super::patience::GENERATION;
+use super::patience::Recurrence;
 
 /// The quantile the registry holds a commit's latency to, as a fraction: AC-T1.3.4's p99.9, the
 /// highest of docs/requirements.toml (AC-T1.4.3 holds the same quantile).
@@ -59,6 +60,9 @@ struct Holding {
 pub(super) struct Spacing {
     ticks: u64,
     generation: u64,
+    /// How often the owner restarts its log: a generation lasts as long as its last two were
+    /// apart, the first counted from the owner's start.
+    restarts: Recurrence,
     current: Window,
     before: Window,
     holding: Option<Holding>,
@@ -69,13 +73,14 @@ fn overflowed(what: &str) -> Refusal {
 }
 
 impl Spacing {
-    /// One tick of the owner: past a generation, the generation before is forgotten.
+    /// One tick of the owner: past a generation (as long as its last two restarts were apart),
+    /// the generation before is forgotten.
     pub(super) fn tick(&mut self) -> Result<(), Refusal> {
         self.ticks = self
             .ticks
             .checked_add(1)
             .ok_or_else(|| overflowed("ticks"))?;
-        if self.ticks.saturating_sub(self.generation) >= GENERATION {
+        if self.restarts.ended(self.generation, self.ticks) {
             self.generation = self.ticks;
             self.before = std::mem::take(&mut self.current);
         }
@@ -86,6 +91,9 @@ impl Spacing {
     /// what it applies from now until a step begins with no more queued is held. A restart within
     /// another's hold goes on counting into it, its backlog measured from the first.
     pub(super) fn restarted(&mut self, queued: u64) {
+        if self.holding.is_none() {
+            self.restarts.seen(self.ticks);
+        }
         let holding = self.holding.get_or_insert(Holding {
             held: 0,
             found: queued,
@@ -133,6 +141,12 @@ impl Spacing {
                 .ok_or_else(|| overflowed("entries over the tail"))?;
         }
         Ok(())
+    }
+
+    /// How long a generation of the window lasts now, in ticks: none before a second restart.
+    #[cfg(test)]
+    pub(super) fn generation(&self) -> Option<u64> {
+        self.restarts.length()
     }
 
     /// Whether a restart's hold is under way.
@@ -262,24 +276,26 @@ mod tests {
         );
     }
 
-    /// AC-T1.8.D1, T-T1.8.D3: do a restart that held 50 entries, then two generations of ticks;
-    /// expect it forgotten: a restart due again after one entry.
+    /// AC-T1.8.D1, T-T1.8.D3, T-GN.1.3: do a restart that held 50 entries 10 ticks after the
+    /// owner's start (a generation of 10 ticks), then ticks; expect it kept through the next
+    /// generation and forgotten after it: a restart due again after one entry.
     #[test]
-    fn the_window_forgets_after_two_generations() {
+    fn the_window_forgets_after_two_of_its_own_generations() {
         let mut spacing = Spacing::default();
+        for _ in 0..10 {
+            spacing.tick().unwrap();
+        }
         spacing.restarted(0);
         spacing.stepped(50, QUICK, 0).unwrap();
         spacing.stepped(1, QUICK, 0).unwrap();
         assert!(!spacing.due().unwrap());
-        for _ in 0..GENERATION {
+        for _ in 0..10 {
             spacing.tick().unwrap();
         }
-        assert!(!spacing.due().unwrap(), "forgotten after one generation");
-        for _ in 0..GENERATION {
-            spacing.tick().unwrap();
-        }
+        assert!(!spacing.due().unwrap(), "kept through the next generation");
+        spacing.tick().unwrap();
         spacing.stepped(1, QUICK, 0).unwrap();
-        assert!(spacing.due().unwrap());
+        assert!(spacing.due().unwrap(), "forgotten after it");
     }
 
     /// AC-T1.8.D1, T-T1.8.D3 (the share): do an owner applying entries in steps of 1 to 7, a step in
@@ -296,7 +312,9 @@ mod tests {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             seed >> 33
         };
-        for step in 0..4 * GENERATION * 20 {
+        // The size this test ran at when its window was a fixed 3,000 ticks: four of them, twenty
+        // steps a tick.
+        for step in 0..240_000u64 {
             if step % 20 == 0 {
                 spacing.tick().unwrap();
             }

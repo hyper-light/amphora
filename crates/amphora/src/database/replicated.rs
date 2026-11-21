@@ -1349,19 +1349,16 @@ fn open(
     )
 }
 
-/// The write slot's bounds, stated from the core's and the quorum patience's (`patience`), so the
-/// slot adds no number of its own: a member's first slot is the core's election timeout in this
-/// owner's ticks, and a learned gap is believed for the patience's generations. A retry is not
-/// learned when the host's detector suspected its member meanwhile (`slot::Slots::keep`).
+/// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
+/// member's first slot is the core's election timeout in this owner's ticks; a learned gap is
+/// believed for one to two of its member's own recurrences (`slot`). A retry is not learned when
+/// the host's detector suspected its member meanwhile (`slot::Slots::keep`).
 fn slot_bounds(election_tick: usize) -> Result<super::slot::Bounds, Refusal> {
-    let ticks = |count: Option<u32>| {
-        count
-            .and_then(|count| TICK.checked_mul(count))
-            .ok_or_else(|| fenced("the write slot's bounds overflowed"))
-    };
     Ok(super::slot::Bounds {
-        election: ticks(u32::try_from(election_tick).ok())?,
-        generation: ticks(u32::try_from(super::patience::GENERATION).ok())?,
+        election: u32::try_from(election_tick)
+            .ok()
+            .and_then(|count| TICK.checked_mul(count))
+            .ok_or_else(|| fenced("the write slot's bounds overflowed"))?,
     })
 }
 
@@ -1434,7 +1431,8 @@ fn open_on<F: BlockFile + 'static>(
         local,
         bell: Arc::clone(&bell),
     });
-    let slots = super::slot::Slots::new(slot_bounds(replica.core().raft.config().election_tick)?);
+    let election = replica.core().raft.config().election_tick;
+    let slots = super::slot::Slots::new(slot_bounds(election)?);
     let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
     let mut actor = Actor {
@@ -1471,7 +1469,7 @@ fn open_on<F: BlockFile + 'static>(
         spacing: log_bound::Spacing::default(),
         log_full: None,
         step_queued: 0,
-        answers: patience::Answers::default(),
+        answers: patience::Answers::new(election),
         #[cfg(test)]
         stalls: None,
         #[cfg(test)]
@@ -1876,6 +1874,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             let configuration = self.replica.core().raft.configuration();
             let (voters, outgoing) = (configuration.voters(), configuration.outgoing());
             self.answers.tick(leading, voters, outgoing)?;
+            // A voter the host's detector suspects is gone, not slow: its gap isn't learned.
+            for voter in &self.detected {
+                self.answers.suspected(*voter);
+            }
             self.spacing.tick()?;
             let election = self.replica.core().raft.config().election_tick;
             let patience = self
@@ -2714,7 +2716,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             && self.replica.core().raft.configuration().votes(from)
             && let Err(unmeasured) = self.answers.heard(from, message.term)
         {
-            if matches!(unmeasured, patience::Unmeasured::PastCeiling { .. }) {
+            if matches!(unmeasured, patience::Unmeasured::Suspected { .. }) {
                 self.control.meter.refused();
             }
             tracing::warn!(target: "amphora.replica", event = "quorum_patience_refused", error = %unmeasured, "an answer gap was not learned for the leader's quorum patience");
@@ -7454,8 +7456,8 @@ mod tests {
     /// CP-T1.8, kiln goals 6b112f14 and 867fa589 (replication.md, "The leader's quorum patience",
     /// its metrics; CLAUDE.md section 10): the patience and its refusals as the host reads them.
     /// Do: the leader measures a gap of `HELD` ticks in its followers' answers (`measured_lead`)
-    /// and ticks on; then one follower's answers are held past the ceiling while the other's flow,
-    /// and let go. Expect: the leader's `amphora_replica_quorum_patience_seconds` is its core's
+    /// and ticks on; then the host's detector suspects one follower, whose answers are held while
+    /// the other's flow, then trusts it again, and its answers are let go (T-GN.1.1). Expect: the leader's `amphora_replica_quorum_patience_seconds` is its core's
     /// patience in ticks of `TICK`, its followers' zero, and nothing refused; then the leader still
     /// leads and has refused that one gap.
     #[test]
@@ -7482,10 +7484,13 @@ mod tests {
         }
 
         let late = (leader + 1) % 3;
+        let late_id = u64::try_from(late + 1).unwrap();
+        tell(&mut driven, &clients, leader, Verdict::Suspected(late_id)).unwrap();
         pump.held = vec![late];
-        for _ in 0..=patience::QUORUM_CEILING {
+        for _ in 0..HELD {
             driven.tick(&mut pump, leader);
         }
+        tell(&mut driven, &clients, leader, Verdict::Trusted(late_id)).unwrap();
         pump.held.clear();
         driven.tick(&mut pump, leader);
         assert!(
@@ -7519,10 +7524,7 @@ mod tests {
         driven.tick(&mut pump, leader);
         let raft = &driven.owner(leader).replica.core().raft;
         let (election, patience) = (raft.config().election_tick, raft.quorum_patience());
-        assert!(
-            patience <= patience::QUORUM_CEILING - election,
-            "{patience}"
-        );
+        assert!(patience <= HELD + 1 - election, "{patience}");
         let due = election + patience;
         for _ in 1..due - 1 {
             driven.tick(&mut pump, leader);
@@ -7533,7 +7535,7 @@ mod tests {
             Ok(vec![1])
         });
         let mut after = None;
-        for count in due - 1..=due + election + patience::QUORUM_CEILING {
+        for count in due - 1..=due + election + patience {
             if clients
                 .get(leader)
                 .unwrap()
@@ -7600,28 +7602,14 @@ mod tests {
             .unwrap()
             .core
             .election_tick;
-        let ceiling = patience::QUORUM_CEILING;
         let tick = TICK.as_millis();
-        let seconds = |ticks: usize| {
-            let ms = u128::try_from(ticks).unwrap() * tick;
-            format!("{}", f64::from(u32::try_from(ms).unwrap()) / 1000.0)
-        };
-        let generation = usize::try_from(patience::GENERATION).unwrap();
         let own = [
             tick.to_string(),
-            ceiling.to_string(),
-            (ceiling - election).to_string(),
-            seconds(ceiling),
-            (2 * ceiling).to_string(),
-            seconds(2 * ceiling),
             (2 * election).to_string(),
             (2 * u128::try_from(election).unwrap() * tick).to_string(),
-            format!("{},{:03}", generation / 1000, generation % 1000),
-            seconds(generation),
-            seconds(2 * generation),
         ];
         assert!(requirements.contains("failover p99 is at most 1000 ms"));
-        let cited = ["1000", "2014", "2017", "2018", "2026-11-06"];
+        let cited = ["1000", "2014", "2017", "2018", "2026-11-06", "2026-11-21"];
         let stray: Vec<&str> = numbers(decision)
             .into_iter()
             .filter(|n| !record.contains(n) && !own.iter().any(|o| o == n) && !cited.contains(n))
@@ -13443,8 +13431,16 @@ mod tests {
             driven.round(&mut pump);
         }
         assert_eq!(handle.counters().database_log_restarts, restarts);
-        for _ in 0..2 * patience::GENERATION {
-            driven.owner_mut(1).spacing.tick().unwrap();
+        // The window's generations are its restarts' own spacing: one restart a tick on, which
+        // held nothing, gives it one, and two of them pass.
+        let spacing = &mut driven.owner_mut(1).spacing;
+        spacing.tick().unwrap();
+        spacing.restarted(0);
+        spacing.stepped(0, Duration::ZERO, 0).unwrap();
+        spacing.stepped(0, Duration::ZERO, 0).unwrap();
+        let generation = spacing.generation().unwrap();
+        for _ in 0..=2 * generation {
+            spacing.tick().unwrap();
         }
         write(&mut driven, &mut pump, &clients[0], 22);
         settle_log(&mut driven, &mut pump, &clients);

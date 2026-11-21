@@ -15,15 +15,16 @@ use std::time::{Duration, Instant};
 use crate::meter::SlotEnd;
 
 /// What a slot's length is learned against: the core's election timeout, a member's slot before
-/// any of its retries is measured; and the generation a learned gap is believed for one to two of
-/// (the quorum patience's, `patience`). No ceiling bounds a gap by a number: a member is gone, not
-/// slow, when the host's detector suspects it while its retry is awaited (`keep`), a verdict
-/// learned where it runs (Ada's word, 2026-11-21: a value measured once on one host and frozen is
-/// picked). So the slot adds no number.
+/// any of its retries is measured. A learned gap is believed for one to two of its member's
+/// generations, each as long as the member went between its last two learned gaps, the first
+/// counted from its first slot (replication.md, "Decision (lane constants): generations learned
+/// where they run"). No ceiling bounds a gap by a number: a member is gone, not slow, when the
+/// host's detector suspects it while its retry is awaited (`keep`), a verdict learned where it
+/// runs (Ada's word, 2026-11-21: a value measured once on one host and frozen is picked). So the
+/// slot adds no number.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Bounds {
     pub(super) election: Duration,
-    pub(super) generation: Duration,
 }
 
 /// A retry's gap the slot does not learn, and why.
@@ -70,6 +71,11 @@ struct Gap {
     before: Option<Duration>,
     from: Option<Instant>,
     suspected: bool,
+    /// The start of its generation; its last learned gap's end (its first slot's start before
+    /// one); and how long a generation lasts: the time between its last two learned gaps.
+    began: Instant,
+    learned: Instant,
+    generation: Option<Duration>,
 }
 
 /// One leader's slots, in the term it leads. The queue, the barriers waiting, the gaps and the
@@ -91,7 +97,6 @@ pub(super) struct Slots<T> {
     read: Option<(u64, T)>,
     ready: VecDeque<(u64, T)>,
     gaps: Vec<Gap>,
-    generation: Option<Instant>,
 }
 
 impl<T> Slots<T> {
@@ -107,7 +112,6 @@ impl<T> Slots<T> {
             read: None,
             ready: VecDeque::new(),
             gaps: Vec::new(),
-            generation: None,
         }
     }
 
@@ -268,6 +272,9 @@ impl<T> Slots<T> {
                 before: None,
                 from: Some(at),
                 suspected: false,
+                began: at,
+                learned: at,
+                generation: None,
             }),
         }
         Some((member, length))
@@ -315,17 +322,17 @@ impl<T> Slots<T> {
         ended
     }
 
-    /// At `at`: a generation of learned gaps ages, and a slot past its length ends expired.
+    /// At `at`: each member's generation of learned gaps ages once it has lasted as long as the
+    /// member's last two learned gaps were apart, and a slot past its length ends expired.
     pub(super) fn expire(&mut self, at: Instant) -> Option<Ended> {
-        match self.generation {
-            Some(began) if at.saturating_duration_since(began) < self.bounds.generation => {}
-            Some(_) => {
-                self.generation = Some(at);
-                for gap in &mut self.gaps {
-                    gap.before = gap.current.take();
-                }
+        for gap in &mut self.gaps {
+            if gap
+                .generation
+                .is_some_and(|length| at.saturating_duration_since(gap.began) >= length)
+            {
+                gap.began = at;
+                gap.before = gap.current.take();
             }
-            None => self.generation = Some(at),
         }
         if self
             .holding
@@ -434,6 +441,10 @@ impl<T> Slots<T> {
             gap.current
                 .map_or(measured, |longest| longest.max(measured)),
         );
+        if at > gap.learned {
+            gap.generation = Some(at.saturating_duration_since(gap.learned));
+        }
+        gap.learned = at;
         Ok(())
     }
 
@@ -459,7 +470,6 @@ mod tests {
     const MS: Duration = Duration::from_millis(1);
     const BOUNDS: Bounds = Bounds {
         election: Duration::from_millis(200),
-        generation: Duration::from_secs(30),
     };
 
     fn leading(at: Instant) -> Slots<&'static str> {
@@ -688,10 +698,11 @@ mod tests {
         assert_eq!(slots.length(2), 5 * BOUNDS.election);
     }
 
-    /// T-T1.8.W4 (Q3): do learn a gap, then two generations with none; expect it believed through
-    /// the next generation and forgotten after it, back to the election timeout.
+    /// T-T1.8.W4 (Q3), T-GN.1.2: do learn a gap 40 ms after the member's first slot began, then
+    /// let time pass with none; expect it believed through the next generation, as long as the
+    /// member took to its first gap (40 ms), and forgotten after it, back to the election timeout.
     #[test]
-    fn a_learned_gap_is_believed_for_one_to_two_generations() {
+    fn a_learned_gap_is_believed_for_one_to_two_of_its_members_generations() {
         let t = Instant::now();
         let mut slots = leading(t);
         slots.expire(t);
@@ -700,9 +711,11 @@ mod tests {
         slots.start(t, 1, 1, false);
         slots.forward(2, t + 40 * MS, "two");
         assert_eq!(slots.length(2), 40 * MS);
-        slots.expire(t + BOUNDS.generation);
+        slots.expire(t + 40 * MS);
         assert_eq!(slots.length(2), 40 * MS, "believed in the next generation");
-        slots.expire(t + 2 * BOUNDS.generation);
+        slots.expire(t + 79 * MS);
+        assert_eq!(slots.length(2), 40 * MS, "believed through it");
+        slots.expire(t + 80 * MS);
         assert_eq!(slots.length(2), BOUNDS.election, "forgotten after it");
     }
 

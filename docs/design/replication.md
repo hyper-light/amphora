@@ -565,7 +565,7 @@ in its Grafana overview (deploy/grafana/dashboards/kiln-overview.json):
 | Flush seconds p50 / p99 | `histogram_quantile(0.5 / 0.99, sum by (le, db) (rate(amphora_replica_flush_seconds_bucket[5m])))` | `p50:` and `p99:amphora_replica_flush_seconds{$host} by {db}` |
 | Commits by quorum, stacked: the held share is the bars' proportion | `sum by (quorum) (rate(amphora_replica_commits_total[5m]))` | `sum:amphora_replica_commits_total{$host} by {quorum}.as_count()` |
 | Quorum patience (seconds), the leader's ("The leader's quorum patience") | `max by (instance, db) (amphora_replica_quorum_patience_seconds)` | `max:amphora_replica_quorum_patience_seconds{$host} by {host,db}` |
-| Answer gaps refused past the patience's ceiling | `sum by (db) (rate(amphora_replica_quorum_patience_refused_total[5m]))` | `sum:amphora_replica_quorum_patience_refused_total{$host} by {db}.as_count()` |
+| Answer gaps refused for the patience, their voter suspected | `sum by (db) (rate(amphora_replica_quorum_patience_refused_total[5m]))` | `sum:amphora_replica_quorum_patience_refused_total{$host} by {db}.as_count()` |
 
 Its tests: the counts a host reads, through a held flush and the flushing thread's, and in the persisted class its
 own thread's flushes and no held commit (`the_replicated_class_counts_its_backlog_flushes_and_commits`); the buckets
@@ -806,10 +806,13 @@ leader, so a dead leader is replaced as fast as before.
 - **Measured**: each other voter's answer gaps as the leader sees them, in the leader's own ticks:
   the ticks between two messages of that voter in a term the owner leads, the first counted from
   the tick it began to lead. In ticks, so the leader's own stalls are not counted.
-- **Window**: two generations of 3,000 ticks (30 s). A voter's tail is the longest gap it ended in
-  the current generation or the one before, so a gap is believed for 30 to 60 s, longer than the
-  record's loaded runs went between gaps over 200 ms on average (at fewest, 84 in 1,800 s). Where
-  stalls are rare the patience lapses between them.
+- **Window**: two of the voter's own generations. A voter's tail is the longest gap it ended in
+  the current generation or the one before; a generation lasts as long as the voter went between
+  its last two gaps past the election timeout, its first counted from the tick the leader began to
+  measure it, so a gap is believed for one to two of its own recurrences: through each while its
+  stalls recur, and it lapses once they stop. The window was a fixed one first, measured once on
+  one host: a picked number by Ada's word (2026-11-21; "Decision (lane constants): generations
+  learned where they run").
 - **Quantile**: the window's maximum. A leader patient for less than the longest gap it measured is
   deposed by the gaps above its quantile; the window bounds how long one gap is believed.
 - **Quorum**: the k-th smallest of the other voters' tails, k being half the voters rounded down
@@ -825,17 +828,15 @@ leader, so a dead leader is replaced as fast as before.
 - **Patience**: that tail less the election timeout, never below zero. A leader whose check is due
   after as many ticks as the gap is never deposed by a silence that long wherever it falls, since
   its check counts every answer since the last (`docs/raft.md` §3.6).
-- **Ceiling**: a gap of 165 ticks, so a patience of at most 145 beyond the election timeout. It is
-  the largest quorum tail the record shows: in loaded run 2, member 2's answers from 1 and 3 had a
-  p99.9 of 1642.788 and 2286.190 ms, the smaller 1642.788 ms, in whole ticks rounded up; every
-  other run's smaller p99.9 is below it, jupiter's at most 331.339 ms. These are clock gaps, which
-  overstate the tick gaps. A gap past the ceiling is refused, typed (`PastCeiling`, naming the gap
-  and the ceiling), logged (`amphora.replica`, event `quorum_patience_refused`) and not learned: a
-  voter silent that long is gone, not slow. The patience is never clamped.
+- **Gone, not slow**: a gap over which the host's detector suspected the voter (`Verdict::Suspected`,
+  told to the owner) is refused, typed (`Suspected`, naming the gap), logged (`amphora.replica`,
+  event `quorum_patience_refused`) and not learned, the write slot's rule. No number bounds a gap:
+  the ceiling first taken here, the largest quorum tail of step 1's record, was measured once on
+  one host, a picked number by Ada's word (2026-11-21). The patience is never clamped.
 - **A cut-off leader's cost**: it steps down at the first check that finds no answer in its
   window, within the election timeout and the patience in force of the first check after the cut:
-  at the ceiling 165 ticks (1.65 s), and at most twice that, 330 ticks (3.3 s), after the cut,
-  against 40 ticks (400 ms) at fixed ticks, and only while its window holds gaps that long. Its
+  the longest gap its window believes, and at most twice that after the cut, against 40 ticks
+  (400 ms) at fixed ticks, and only while its window holds gaps that long. Its
   proposals in flight answer UnknownOutcome then, as they do now.
 - **A member's own patience** (`Raft::set_patience`) stays zero: its own stalls already count one
   tick, so they never run its election timer, and a patience for its leader's stalls would delay
@@ -858,11 +859,12 @@ leader, so a dead leader is replaced as fast as before.
     waits beyond its election timeout before its quorum check, in seconds; zero while it follows
     or has measured no answer gap.";
   - `amphora_replica_quorum_patience_refused_total`, a counter: "Answer gaps a leading replica
-    refused to learn for its quorum patience, because they passed its ceiling."
+    refused to learn for its quorum patience, because the host's detector suspected the voter
+    meanwhile." (until 2026-11-21: "because they passed its ceiling")
   No labels from Amphora (it may add only small closed sets); kiln adds its own. They are in the
   replica meter (`meter::REPLICA_METRICS`, read through `ReplicaHandle::counters`, Amphora goal
   867fa589): the owner sets the gauge where it sets the patience, the patience in ticks of `TICK`
-  while it leads and zero while it follows, and counts a gap refused past the ceiling where
+  while it leads and zero while it follows, and counts a gap refused for its suspected voter where
   `heard` refuses it; the event above stays beside the count. A gap refused because the leader
   measures as many voters as it can (`Unmeasured::Full`) is the event alone, outside the
   counter's help line. Tested by `the_quorum_patience_and_its_refusals_are_counted_for_the_host`.
@@ -891,7 +893,7 @@ Falsified by:
 - a leader whose followers' answers are held as long as a gap it measured that steps down
   (`a_leader_whose_followers_answer_as_late_as_it_measured_keeps_its_lead`);
 - a leader cut off from every follower that still leads past the election timeout and the patience
-  in force after the first check following the cut, or past the ceiling
+  in force after the first check following the cut
   (`a_leader_cut_off_from_its_followers_steps_down_within_its_patience`);
 - a read answered or an entry committed by a leader without a quorum;
 - step 1's measurement re-run with the patience in force, on loaded adacachy or a Mac Studio under
@@ -1805,8 +1807,9 @@ applies every commit once, on a leader, a follower and a learner alike):
   quorum and network time aren't the owner's to see, and don't change with restarts;
 - *next*: the most one restart held, the restart about to come guessed by the worst seen.
 
-A restart is due when (held + over + next) / applied < 1 - q, all over patience's window (the current and previous
-generation of `patience::GENERATION` ticks, 30 to 60 s; its derivation is there). Here q = 0.999 is the highest
+A restart is due when (held + over + next) / applied < 1 - q, all over a window of the current and previous
+generation, each as long as the owner's last two restarts were apart ("Decision (lane constants): generations
+learned where they run"). Here q = 0.999 is the highest
 quantile the registry holds a commit's latency to (AC-T1.3.4's p99.9, and AC-T1.4.3's). The code keeps q as the
 fraction 999/1,000 and compares cross-multiplied, with checked arithmetic. The comparison is strict, net of the
 measured base tail, and counts the coming restart, so a restart that holds no more than the worst seen leaves the
@@ -2037,7 +2040,8 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
 **The slot's length is learned, not picked** (Q3; Ada's rule, 2026-11-11). It is learned the way the quorum patience
 learns quorum gaps (`patience`), and adds no number. For each member, the leader measures the gap from the start of
 that member's slot to its next forward, and keeps the longest gap of this generation and of the one before
-(`patience::GENERATION`, 30 s). A member's slot is the larger of those two. A retry that arrives after its slot expired
+(each generation as long as the member's last two learned gaps were apart: "Decision (lane constants): generations
+learned where they run"). A member's slot is the larger of those two. A retry that arrives after its slot expired
 is still measured, so an expiry teaches the next slot rather than censoring it. Before a member's first measured gap,
 its slot is the core's election timeout in the owner's ticks (`election_tick × TICK`), the derived first value. No
 number bounds a gap: a gap over which the host's detector suspected its member is refused, typed
@@ -2174,3 +2178,41 @@ bell: the owner sees them at its next step, at the latest its next tick, as it d
 
 **Falsified by:** a write, flush or input that waits for the owner's next tick to be seen (the replicated benches'
 commit latency worse than at 954ee1d beyond their noise); an idle owner's thread waking more often than its ticks.
+
+## Decision (lane constants): generations learned where they run (2026-11-21)
+
+Ada's word (2026-11-21): a value measured once on one host and frozen into the code is picked. Two such values were
+left in the quorum patience (`patience.rs`), and the write slot and the database log's restarts borrowed one of them:
+- `QUORUM_CEILING` (165 ticks), the largest quorum tail of step 1's record on adacachy: a gap past it was refused as
+  a voter gone, not slow;
+- `GENERATION` (3,000 ticks), how long a learned gap was believed (one to two generations), chosen longer than step
+  1's loaded runs went between gaps past the election timeout; the write slot believed its learned gaps for the same
+  generations, and the log's restarts counted over a window of two of them.
+
+**The decision.** Each window's generation is learned from its own events where it runs (`patience::Recurrence`): it
+lasts as long as the last two of its events were apart, the first counted from the tick the window began to watch,
+so what it learned is believed for one to two of its own recurrences: through each while the events recur, and it
+lapses once they stop. Whose events:
+- the quorum patience: each voter's own gaps past the election timeout, the gaps its patience covers, so each voter
+  ages on its own (`Answers`, a generation a voter);
+- the write slot: each member's own learned retry gaps (`slot::Slots::expire`), on the owner's clock;
+- the log's restarts: the owner's own restarts, a restart within another's hold the same one (`log_bound::Spacing`).
+Gone, not slow, is the host's detector's verdict, as the write slot already ruled: a gap over which the detector
+suspected its voter is refused (`patience::Unmeasured::Suspected`) and counted in
+`amphora_replica_quorum_patience_refused_total`, its help line now saying so.
+
+**What it costs.** A lone stall after a long calm is believed for as long as the calm was; its size, not its
+belief's length, bounds what a cut-off leader waits (the patience is the gap less the election timeout). A host
+whose detector never suspects a voter that was cut off, under pre-vote (no term moved), teaches the gap the cut
+lasted; the detector's verdict is the owner's only word on that.
+
+**Tests.** `a_recurrence_is_the_time_between_its_last_two_events`,
+`a_gap_is_believed_for_one_to_two_of_its_voters_own_recurrences`, `a_suspected_voters_gap_is_refused_and_not_learned`
+(T-GN.1.1); `a_learned_gap_is_believed_for_one_to_two_of_its_members_generations` (T-GN.1.2);
+`the_window_forgets_after_two_of_its_own_generations` (T-GN.1.3); the driven patience tests,
+`the_quorum_patience_and_its_refusals_are_counted_for_the_host` now refusing a suspected voter's gap.
+
+**Falsified by:** step 1's measurement re-run with the learned windows in force, with more quorum-check step-downs
+than with the fixed window; a leader that keeps a patience after its voters' stalls stopped for two of their own
+recurrences.
+
