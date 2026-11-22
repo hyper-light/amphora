@@ -1613,7 +1613,8 @@ by up to 30%; a plan boundary 5% above the true cost) and reports plan flips and
 takes to follow a cost that quadruples at batch 1, 2, 4, 16 or 64. A Python mirror of both rules on
 the same series (lane pl8-16, `~/.cache/amphora-t1/pl8-16/ab_sim.py`) gives: `Blend` 353 to 452
 flips in 200 batches, `BatchMeans` 1 to 26; `Blend` follows every change within one batch,
-`BatchMeans` takes 10 to 14 after a change in the first two batches and one batch from batch 4 on.
+`BatchMeans` takes 10 to 13 after a change at batch 1, up to 14 after one at batch 2 (one seed of
+four followed it in one), and one batch from batch 4 on.
 `join::tests::t_pl_8_a_carried_join_order_stands_within_its_margin`: the five-table chain keeps its
 order at no margin and at a margin just under the reversed order's extra cost, takes the reversed
 order just past it, and ignores a carried order that isn't each table once.
