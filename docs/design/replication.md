@@ -2555,10 +2555,16 @@ wire records queued beside them (`Control::called`).
   stays one, since one command at a time crosses ReadIndex.
 - `COMMANDS` (64) is the command queue's slots. Its bytes are the memory room and its calls are counted by the
   learned message rate (QB.1, lane constants-19). The slots are what the owner takes in an election timeout, counted in
-  messages (`Drain::bound(..).messages`), at most the budget's room over the smallest input's charge.
+  messages (`Drain::bound(..).messages`), at most the budget's room over the smallest input's charge. Not built yet:
+  the command queue is a `std::sync::mpsc::sync_channel(COMMANDS)`, whose bounded flavour allocates its slots when it
+  is made, so a bound of the room over a heartbeat's bytes would allocate the room up front. The derivation needs an
+  unbounded channel whose admission `Control` holds by count, as it already holds bytes and calls; the test arrays
+  sized by `COMMANDS` (`Pump::receipts`) go with it.
 - `MEMBERS` (64) is the most members a configuration names. A leader holds up to a message's payload of votes and
   progress for each member (`Limits::vote_bytes = payload × members`), so `MEMBERS` is the budget's room for queues over
-  a message's payload, at most what a `ConfState` in one wire record can name.
+  a message's payload, at most what a `ConfState` in one wire record can name. Not built yet: `MEMBERS` is a constant
+  of `IMAGE_FRAMING_BYTES`, `patience::PEERS` and the class record's bound (`replication/class.rs`), so a learned
+  `MEMBERS` makes each of those a value read at open.
 
 **To remove: event-driven (Ada, 2026-11-22).** `TICK`, `POLL` and `DRIVE_QUANTUM`, and any driver that wakes on a timer,
 are to be removed, with that work driven from events, not given better intervals. The election and heartbeat
