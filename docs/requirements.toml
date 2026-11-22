@@ -1134,3 +1134,5 @@ tests = [
   { id = "T-G6.3.2", text = "translate::optimizer::plan_hints::tests::t_g6_3_2_* — passes when the guard admits a faster hint, drops it once its held-out runs are slower, and never admits one no faster" },
   { id = "T-G6.3.3", text = "translate::optimizer::plan_hints::tests::t_g6_3_3_memory_stays_bounded — passes when the model's size is constant over 10,000 runs and the guard holds no more classes than it was given" },
 ]
+
+# lane pl8-9: no new IDs. T-PL.8.2 gains the search test of docs/design/planner.md "Decision (lane pl8-9)".

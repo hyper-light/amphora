@@ -870,8 +870,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lane pl8-4 (docs/design/planner.md "Decision (lane pl8-4)"): a hash join's build side can be a
   run of tables joined among themselves while the loops before the probe stay loops; the emitter
   runs such bushy plans and refuses other shapes with a typed error.
-  Not built: the search over connected complement pairs (DPccp) that would choose bushy plans, and
-  semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
+  Lanes pl8-7 to pl8-9 (docs/design/planner.md "Decision (lane pl8-9)"): the search pairs connected
+  subsets with their connected complements (DPccp) and picks the bushy plan where it costs less; a
+  test's data shows it picked and answering as nested loops do (T-PL.8.2).
+  Not built: the search budget derived from a plan-time target, and semi and anti joins placed
+  before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted
