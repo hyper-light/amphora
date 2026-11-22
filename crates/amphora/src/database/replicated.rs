@@ -15297,8 +15297,13 @@ mod tests {
                 // The owner is inside this capture: nothing admitted now can be processed yet.
                 // The capture was taken from the channel, so the records fill it but for the
                 // legacy record's place (lane constants-20). The owner is inside the capture, so
-                // the bound stands still.
-                let commands = handle.command_bound();
+                // no rebound moves the bound; before any intake is measured it is the room's
+                // envelopes, millions, so the test holds it to the 64 inputs it fills.
+                let commands = handle.command_bound().min(64);
+                handle
+                    .shared
+                    .command_bound
+                    .store(commands, Ordering::Release);
                 let mut receipts = Vec::new();
                 for _ in 0..commands - 1 {
                     receipts.push(handle.admit_receive(2, vec![0xff], until).unwrap());
