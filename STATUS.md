@@ -1094,7 +1094,12 @@ every row matched, nearly none), with each statement's memory; a join's table th
 by a seek (onto a primary key or an indexed column) runs on morsels behind
 `set_parallel_searched_links` (`Off` until measured): as a hash link read whole (`Hash`), or for an
 inner join onto a primary key, by a seek per joined row in each worker (`Seek`) (T-QT.6.27); the
-audit of what still runs serially is in docs/design/executor.md.
+audit of what still runs serially is in docs/design/executor.md. Lane qs6-17 took the audit's cheap
+and common items: a table with a DEFAULT (short rows read their defaults, T-QT.6.29); AVG and TOTAL
+over integers (T-QT.6.30); aggregates with a FILTER (T-QT.6.31); a HAVING over the aggregates
+(T-QT.6.32); a rowid range, cut into morsels from the leaves that hold it, in scans and inner joins
+(T-QT.6.33, T-QT.6.35); and a scan's rows under ORDER BY, sorted per worker and merged (T-QT.6.34).
+Not yet compiled (kiln down).
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.
