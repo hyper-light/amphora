@@ -266,3 +266,24 @@ fn t_pl_8_2_outer_semi_and_anti_joins_keep_their_answers() {
         assert_eq!(answers(&conn, sql), expected, "{sql}");
     }
 }
+
+/// Do: read `join_search_ns` around the prepare of a star of three dimensions (goal 63c98840, the
+/// baselines' JOB search time, bench/baselines/README.md). Expect: the count grew across it, and a
+/// prepare on another thread leaves this thread's count as it was.
+#[test]
+fn t_bl_1_the_join_search_time_is_counted_per_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = star(dir.path(), 3);
+    let before = amphora_engine::join_search_ns();
+    drop(conn.prepare(star_query(3)).unwrap());
+    let after = amphora_engine::join_search_ns();
+    assert!(
+        after > before,
+        "the join search's time was not counted: {before} then {after}"
+    );
+    let other = conn.clone();
+    std::thread::spawn(move || drop(other.prepare(star_query(3)).unwrap()))
+        .join()
+        .unwrap();
+    assert_eq!(amphora_engine::join_search_ns(), after);
+}

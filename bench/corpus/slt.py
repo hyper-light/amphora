@@ -345,11 +345,12 @@ def record_sql(sql):
     return text
 
 
-def run_file(path, keep=None, fixture=None):
+def run_file(path, keep=None, fixture=None, refused=None):
     """Runs one file on a fresh SQLite database (after `fixture`'s statements, a file of the base
     tables a suite's files share, when given). Returns counts and, for each record that doesn't
     answer as the file says, (line, kind, sql, what the file says, what SQLite says); `keep` (a
-    callable) sees every query run with SQLite's answer."""
+    callable) sees every query run with SQLite's answer, and `refused` every statement SQLite
+    refuses, with its error (sqlite3.Error)."""
     fd, db = tempfile.mkstemp(prefix="slt-", suffix=".db", dir=os.path.expanduser("~/.cache"))
     os.close(fd)
     con = connect(db)
@@ -384,6 +385,8 @@ def run_file(path, keep=None, fixture=None):
                 except (sqlite3.Error, OverBudget) as e:
                     ok = rec.expect == "error" and not spent()
                     got = "over budget" if spent() else f"error: {e}"
+                    if refused and isinstance(e, sqlite3.Error) and not spent():
+                        refused(rec, e)
                 counts["agree" if ok else "disagree"] += 1
                 if not ok:
                     off.append((rec.line, "statement", rec.sql, rec.expect, got))

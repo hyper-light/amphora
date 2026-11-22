@@ -1,0 +1,1 @@
+{"batch":1,"bench":"scale_write","class":"persisted","commit":"d55a704e7365a72425fc6874429e916bf7d4df62","cpus":32,"groups":4,"host":"JUPITER","latency_ms":{"max":614.462,"n":52,"p50":385.024,"p90":520.192,"p99":614.4,"p999":614.4},"load1":null,"nodes":3,"ops_per_s":10.4,"seconds":5.0,"system":"amphora","text_bytes":64,"unix_s":1795330061,"warmup_s":2.0,"writers":4}

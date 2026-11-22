@@ -29,6 +29,9 @@ pub struct Run {
     pub prepare_ms: f64,
     /// Running the prepared statement to its last row.
     pub exec_ms: f64,
+    /// Amphora's join search within `prepare_ms` (`amphora_engine::join_search_ns`); none for
+    /// the other engines, or where the run's planning is elsewhere.
+    pub search_ms: Option<f64>,
 }
 
 /// Which column types the schema gets: SQLite's affinities (Amphora, SQLite) or the SQL types
@@ -206,11 +209,13 @@ impl Amphora {
         let conn = if counted { self.counted.clone() } else { self.conn.clone() };
         conn.set_query_timeout(deadline);
         let began = Instant::now();
+        let searched = amphora_engine::join_search_ns();
         let mut stmt = match conn.prepare(sql) {
             Ok(stmt) => stmt,
             Err(e) => return (Outcome::Failed(e.to_string()), Vec::new()),
         };
         let prepared = Instant::now();
+        let search_ms = amphora_engine::join_search_ns().saturating_sub(searched) as f64 / 1e6;
         let (mut rows, mut first) = (0u64, None);
         let ended = self.drive(&mut stmt, Some(began + deadline), |row| {
             if rows == 0 {
@@ -239,7 +244,7 @@ impl Amphora {
             })
             .collect();
         let outcome = match ended {
-            Ok(true) => Outcome::Done(Run { rows, first, prepare_ms: ms(prepared - began), exec_ms: ms(done - prepared) }),
+            Ok(true) => Outcome::Done(Run { rows, first, prepare_ms: ms(prepared - began), exec_ms: ms(done - prepared), search_ms: Some(search_ms) }),
             Ok(false) => Outcome::TimedOut,
             Err(e) => Outcome::Failed(e.to_string()),
         };
@@ -284,7 +289,7 @@ impl Amphora {
         conn.set_query_timeout(Duration::ZERO);
         let reset = stmt.reset().map_err(|e| anyhow::anyhow!("{e}"));
         match (ended, reset) {
-            (Ok(true), Ok(())) => Outcome::Done(Run { rows, first, prepare_ms: ms(bound - began), exec_ms: ms(done - bound) }),
+            (Ok(true), Ok(())) => Outcome::Done(Run { rows, first, prepare_ms: ms(bound - began), exec_ms: ms(done - bound), search_ms: None }),
             (Ok(false), _) => Outcome::TimedOut,
             (Err(e), _) | (_, Err(e)) => Outcome::Failed(e.to_string()),
         }
@@ -502,7 +507,7 @@ impl Sqlite {
                 n += 1;
                 each(r);
             }
-            Ok(Run { rows: n, first, prepare_ms: ms(prepared - began), exec_ms: ms(prepared.elapsed()) })
+            Ok(Run { rows: n, first, prepare_ms: ms(prepared - began), exec_ms: ms(prepared.elapsed()), search_ms: None })
         })();
         let _ = stop.send(());
         let _ = watchdog.join();
@@ -607,7 +612,7 @@ impl Duck {
                 n += 1;
                 each(r);
             }
-            Ok(Run { rows: n, first, prepare_ms: ms(prepared - began), exec_ms: ms(prepared.elapsed()) })
+            Ok(Run { rows: n, first, prepare_ms: ms(prepared - began), exec_ms: ms(prepared.elapsed()), search_ms: None })
         })();
         let late = began.elapsed() >= deadline;
         let _ = stop.send(());
@@ -804,7 +809,7 @@ impl Target for Postgres {
                     }
                 }
                 // The simple protocol plans and runs in one message: its time is all run.
-                Outcome::Done(Run { rows: n, first, prepare_ms: 0.0, exec_ms: ms(took) })
+                Outcome::Done(Run { rows: n, first, prepare_ms: 0.0, exec_ms: ms(took), search_ms: None })
             }
             Err(e) if e.code() == Some(&postgres::error::SqlState::QUERY_CANCELED) => Outcome::TimedOut,
             // The client's own words are "db error" for whatever the server said: its message too.

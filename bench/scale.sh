@@ -48,10 +48,11 @@ for m in $MEASURES; do
     out="$RECORDS/$s-$m.jsonl"
     echo "== $s $m" >&2
     if [[ $s == amphora ]]; then flags=("${amphora[@]}"); else flags=("${others[@]}"); fi
-    before=$(wc -l <"$out" 2>/dev/null || echo 0)
+    before=0
+    [[ -f $out ]] && before=$(wc -l <"$out")
     if "$BIN" --scale "$m" --system "$s" --shell "$SHELL_PATH" --record "$out" "${flags[@]}"; then
       echo "ok $s $m" >&2
-    elif [[ $(wc -l <"$out" 2>/dev/null || echo 0) -gt $before ]] && tail -n 1 "$out" | grep -q '"refused"'; then
+    elif [[ -f $out && $(wc -l <"$out") -gt $before ]] && tail -n 1 "$out" | grep -q '"refused"'; then
       echo "refused $s $m: $(tail -n 1 "$out" | sed -n 's/.*"why":"\([^"]*\)".*/\1/p')" >&2
     else
       echo "FAILED $s $m" >&2

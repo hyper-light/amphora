@@ -272,6 +272,10 @@ pub fn postgres(engine: &'static str, program: String, dsn: String) -> ShellSpec
             format!("null={NULL_MARK}"),
             "-v".into(),
             "ON_ERROR_STOP=0".into(),
+            // Its errors with their SQLSTATE ("ERROR:  42601: syntax error ..."), which
+            // crate::refusal reads for the error's kind (psql's documentation of VERBOSITY).
+            "-v".into(),
+            "VERBOSITY=verbose".into(),
             // Its statements from `-f -` (standard input) rather than from standard input as such:
             // only a file's errors are written `psql:<file>:<line>: ERROR:`, which is how a refusal
             // is told from a row (psql's documentation of -f; its log_locus_callback).
