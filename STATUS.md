@@ -523,8 +523,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (T-T1.9.R10). Over the transport (lane split-merge-10): a pull and its answer are appended variants of
   the owner transport (version 7), a node's endpoint answers them (`transport::Node`) and its peers
   ask through it (`transport::Nodes`); a move through loss and partition keeps every acknowledged
-  write (T-T1.9.R12). Left: that transport off loopback (between machines), a `Database` over
-  `Groups<Local>`, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
+  write (T-T1.9.R12). Routing key in bytes (lane split-merge-11): an engine says the keys a row
+  routes by (`Engine::routes`); a local database's Records transaction routes by every key it names
+  and stays within one group, and local databases as groups split and merge under Records writes
+  (T-T1.9.R13). Load from the store's meter (lane split-merge-12): the shell measures each
+  group's load (its writer's commit time) and where its writes fall, and the machine's cores, and
+  the planner decides from them (T-T1.9.R14, T-T1.9.R15). Left: that transport off loopback
+  (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
+  full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
+  them (T-T1.9.R16).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -613,6 +620,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   disagreement; `CORPUS_BIN_<ENGINE>` may be a command (a client in its server's container). The five
   server engines ran a pool through the harness on jupiter's Docker (2026-11-21). Left: kiln's queries
   in the pool (kiln_queries.py needs sqlglot).
+  Lane corpus-dialects-2 (`bench/corpus/dialects.py`, `test_dialects.py`): the translator says SQLite's
+  blob literals in PostgreSQL's and ClickHouse's spelling and its collations in MySQL's; leaves out the
+  clauses that state what every engine does unasked (`OR ABORT`, `ON CONFLICT ABORT`, `NOT DEFERRABLE`,
+  `MATCH` on REFERENCES, `EXCLUDE NO OTHERS`), each by SQLite's documentation; and gives a record SQLite
+  refuses that sqlglot can't read as SQLite holds it. On the gate's pool (26,980 records) the records
+  sqlglot can't say fall from 43, 40, 237 and 234 (DuckDB, PostgreSQL, MySQL, ClickHouse) to 37, 34,
+  183 and 180 before the refused records given as written. Left: frame EXCLUDE other than NO OTHERS
+  on MySQL and ClickHouse (146, no spelling there), conflict clauses other than ABORT, GROUPS frames,
+  multi-word type names, RELEASE SAVEPOINT and REINDEX, which sqlglot's SQLite reader refuses.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -707,6 +723,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   chosen only where it costs less than the probes it saves; its hashes and bits stay within the join's memory budget
   (`docs/design/planner.md`, "Decision (lane qs5-9)"). LIP and predicate transfer, a measured filter-lookup weight,
   removing `rhs_has_selective_seek` and deriving `cpu_cost_per_where_step` are left.
+- **Calibration that holds under load; the filter's lookup and a WHERE step measured** (lane qs5-10): calibration
+  samples each kind of work in rounds and takes medians, stopping once each median's order-statistic standard error
+  is within the timer's cost; it also times a Bloom filter's lookup and a WHERE step, which now price the filter and
+  `cpu_cost_per_where_step` (`docs/design/planner.md`, "Decision (lane qs5-10)"). Left: `hash_bytes_per_row`, the
+  `rhs_has_selective_seek` gate, LIP and predicate transfer, sort-merge and prefetched index joins.
+- **A chained hash join's materialized prefix leaves the main plan** (lane qs5-12): where a hash join's build table
+  was an earlier join's probe, the build input is materialized from the join prefix, and the main plan no longer
+  opens or lists the earlier join's build table (`main_loop/init.rs`, `subquery.rs` walk the join order).
+  `nested_loops::a_chain_of_hash_joins_reads_each_table_once` failed whenever calibration chose the chained plan.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
@@ -923,9 +948,20 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Aggregates run on the copy through one
   hook, `CopyScan`: step 4's vectorized scan as main has it (`Vectorized`, granules and `Plan`),
   which a later scan replaces by implementing the trait, the choice unchanged; on the rows row by
-  row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
-  SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
-  coordinator's.
+  row, with the same answer (T-CS.5.5, T-CS.5.6). SQL reaches the copy (lane g11s5c): with the
+  switch on, a SQL table on the versioned storage keeps a copy once analytic statements use it,
+  by renting before buying (Karlin et al. 1988): the first aggregate on a table reads the rows,
+  paying a whole-table read, what a copy costs to build; the second makes the copy, fed from the
+  commit stream (`Database::commit` now feeds one copy a tree). An aggregate the executor's scan
+  hook takes (`translate/parallel.rs`) reads the copy when the planner chooses it, on as many
+  cores as the morsel executor finds pay (`Plan::run_on_cores`), else its own serial loop; a
+  copy behind its snapshot is rebuilt after the statement's choice, never read
+  (`storage/versioned/columns_sql.rs`, T-CS.5.7 to T-CS.5.9). A copy's queue, decoded
+  blocks and blocks take their bytes from the storage's memory source as they grow and give them
+  back as they go (lane g11s5e, AC-CS.5.5); a copy the source refuses is let go with the source's
+  typed refusal kept, and the rows answer. A SUM over a column holding text or blobs is declined to
+  the rows, which sum them as SQLite does (T-CS.5.10, T-CS.5.11). Open: the classes against
+  CedarDB and ClickHouse (AC-CS.5.2) are the coordinator's.
 - **G5 step 4, skipping rows** (docs/design/executor.md decision 11; AC-G5.4.1, T-G5.4.1; lanes
   g5s4, g5s4b): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf
   runs and database cracking behind one switch, each kept from the write path through one hook;
