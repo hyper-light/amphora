@@ -108,6 +108,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl13): a nested loop that turns into a hash join at the learned costs' break-even, and a plan made again past its estimate's error | [planner.md](design/planner.md#decision-lane-pl13-a-nested-loop-that-turns-into-a-hash-join-at-the-learned-costs-break-even-and-a-plan-made-again-past-its-estimates-error) |
 | planner | – | Decision (lane pl11): degree-sequence upper bounds guard each joined set's estimate | [planner.md](design/planner.md#decision-lane-pl11-degree-sequence-upper-bounds-guard-each-joined-sets-estimate) |
 | planner | – | Decision (lane pl7): cost weights fitted to measured statement times, behind a switch | [planner.md](design/planner.md#decision-lane-pl7-cost-weights-fitted-to-measured-statement-times-behind-a-switch) |
+| planner | – | Decision (lane qs5-9): a hash join's Bloom filter sized from its build's measured keys, chosen by the learned weights | [planner.md](design/planner.md#decision-lane-qs5-9-a-hash-joins-bloom-filter-sized-from-its-builds-measured-keys-chosen-by-the-learned-weights) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
@@ -206,6 +207,8 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | backup | – | Decision (lane pitr): backups and point-in-time recovery to Mantle (CP-T1.12, G14 step 4) | [backup.md](design/backup.md) |
 | backup | – | The folder store: keys as paths, create once by link(2), listing in key order | [backup.md](design/backup.md#the-folder-store) |
 | backup | – | Restore-and-check: the newest whole second restored and checked, on the archive's cadence | [backup.md](design/backup.md#restore-and-check) |
+| backup | – | The source's own rows at a quiet second: the shipping thread checks itself against a snapshot lined up with a second's stamps | [backup.md](design/backup.md#the-sources-own-rows-at-a-quiet-second) |
+| backup | – | A base begins just after a restart, so the next base copies least | [backup.md](design/backup.md#a-base-begins-just-after-a-restart) |
 | backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
 | backup | – | Incremental bases: a new base keeps the latest's chunks the log left unchanged | [backup.md](design/backup.md#incremental-bases) |
 

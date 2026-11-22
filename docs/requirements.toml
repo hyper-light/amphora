@@ -321,6 +321,9 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.5.1", text = "A star join whose dimension filters keep no fact row — passes when the answer is unchanged and the filters' memory stays within their stated bound" },
+  # lane qs5-9
+  { id = "T-PL.5.2", text = "pl_5_star_join_filters_fire_and_answers_hold (crates/engine/tests/join_methods.rs) — passes when a star join, its filters keeping some fact rows and none, gives the model's answer with hash joins only, nested loops only and by cost, and the hash-join plans probe a Bloom filter" },
+  { id = "T-PL.5.3", text = "pl_5_sized_filter_* (crates/engine/vdbe/bloom_filter.rs) — passes when a filter sized from its build's distinct keys has no false negative and about its derived rate, and one past its memory bound or not worth its bits passes every key" },
 ]
 
 [[own]]
@@ -482,6 +485,9 @@ tests = [
   { id = "T-T1.12.I2", text = "Manifests of format 1 still read; format 2's runs give each chunk's base and are refused when they don't add up" },
   { id = "T-T1.12.I3", text = "An incremental base is due once the log since the latest base outweighs what it would copy" },
   { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
+  # lane pitr-8
+  { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
+  { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.

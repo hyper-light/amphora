@@ -1795,6 +1795,18 @@ impl ProgramState {
         self.bloom_filters.entry(cursor_id).or_default()
     }
 
+    /// Amphora (PL.5): gets or creates the cursor's bloom filter, sized when its build ends
+    /// where `sizing` is given, of the default fixed size where not.
+    pub fn get_or_create_bloom_filter_for(
+        &mut self,
+        cursor_id: usize,
+        sizing: Option<crate::vdbe::bloom_filter::FilterSizing>,
+    ) -> &mut BloomFilter {
+        self.bloom_filters
+            .entry(cursor_id)
+            .or_insert_with(|| sizing.map_or_else(BloomFilter::new, BloomFilter::sized))
+    }
+
     /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
     pub fn get_or_create_bloom_filter_with_capacity(
         &mut self,

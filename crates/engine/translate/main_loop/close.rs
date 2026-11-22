@@ -1160,6 +1160,7 @@ pub(super) fn emit_autoindex(
             cursor_id: index_cursor_id,
             key_reg: ephemeral_cols_start_reg,
             num_keys: num_seek_keys,
+            sizing: None,
         });
     }
     program.emit_insn(Insn::IdxInsert {
