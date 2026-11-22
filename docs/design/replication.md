@@ -2470,12 +2470,45 @@ free on its filesystem (`log_bound::log_room` takes it as an argument). A machin
 (`Machine::set_snapshot_bytes`): the replicated owner's command queue holds back room for one wire record's image
 (`WIRE_IMAGE_BYTES`), so that owner's image is the smaller of the two.
 
-**What is left.** `WIRE_IMAGE_BYTES` (256 MiB) is the owner's queue's split, picked with `QUEUED_BYTES`, and goes
-with it when the queue is sized from the budget and its measured drain.
+**What was left.** `WIRE_IMAGE_BYTES` (256 MiB), the owner's queue's split, went with `QUEUED_BYTES` ("Decision
+(lane constants): the queue bounds by drain rate"; QB.1).
 
 **Tests.** `image_room_tests::sb1_an_image_is_bounded_by_the_memory_budgets_room_for_one` (T-SB.1.1);
 `log_bound::tests::a_log_takes_its_file_and_an_equal_share_of_what_is_free_past_one_image`, the image's room passed in
 (T-SB.1.2).
+
+## Decision (lane constants): the queue bounds by drain rate (2026-11-22)
+
+The replicated owner's queues were bounded by picked numbers: the command queue at 512 MiB (`QUEUED_BYTES`, with a
+second copy for the local writer's queue in `database.rs`), the outgoing queue at 512 MiB and 4096 messages
+(`OUTGOING_BYTES`, `OUTGOING_MESSAGES`), and the image one wire record carries at 256 MiB (`WIRE_IMAGE_BYTES`).
+
+**The decision (QB.1).** A queue holds what its reader takes in an election timeout: what waits longer is older than
+the time in which the group elects another leader, so holding more serves no one. Each queue's drain rate is measured
+in bytes and messages a second, the outgoing queue's in `ReplicaHandle::drain` (its reader the host) and the command
+queue's at the owner's intake, each a decaying ratio of sums with RFC 6298's gain of 1/8, as the compaction's costs are
+(CT.1; `database/drain.rs`). An interval counts when the queue held work at its start or its reader took some in it.
+The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). Each bound is the
+lesser of the rate times that timeout and the memory budget's room for queues (MB.1), read again at each tick of the
+pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`). Before anything is
+measured each bound is one record: the command queue, one image's wire record; the application calls in it, one
+call; the outgoing queue, one message. A wire record's image is the budget's room for one (SB.1), held inside the
+command queue's bound. Application calls hold no more than the owner takes of them in an election timeout, so that
+calls waiting for a leader leave the rest of the queue to the wire records that find one. The local writer's queue has no election: each request it admits is charged to the
+budget's room for queues, refused `Full` at that room.
+
+**A bound that starts small grows before it fences.** A full outgoing queue fenced the owner. Now a queue past the
+budget's room fences at once, since memory can't be lent; one past what its host drains in an election timeout fences
+only once it has stayed past it for a whole election timeout, so that a burst at start, before any drain is measured,
+waits for the host's drain to be measured and the bound to grow.
+
+**What is left.** The framing a wire record adds (`FRAMING_BYTES`, 2 MiB, in `WIRE_BYTES` and `MESSAGE_BYTES` before)
+and `COMMANDS` and `MEMBERS` (64), to be derived from the budget and the measured message sizes. The image cap set on
+the owner's machine is the wire record's room at open; the room read later bounds images through `image_room`.
+
+**Tests.** `drain::tests::drain_nothing_measured_bounds_one_record` (T-QB.1.1),
+`drain_bound_is_rate_times_election_timeout_within_room` (T-QB.1.2), `drain_bound_follows_the_reader_and_ignores_no_time`
+(T-QB.1.3), and `replicated::tests::queue_bound_a_burst_at_start_grows_before_it_fences` (T-QB.1.4).
 
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 

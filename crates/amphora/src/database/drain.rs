@@ -1,0 +1,180 @@
+//! The replicated owner's queue bounds, learned from how fast each queue drains where it runs
+//! (replication.md, "Decision (lane constants): the queue bounds by drain rate"; QB.1). A queue
+//! holds what its reader takes in an election timeout: what waits longer than that is older than
+//! the time in which the group elects another leader, so holding more serves no one. The outgoing
+//! queue's reader is the host (`ReplicaHandle::drain`), the command queue's the owner's intake.
+//!
+//! The rate is a decaying ratio of sums, bytes and messages over the nanoseconds the queue held
+//! work, each sum kept at seven eighths of itself before a sample is added: RFC 6298 §2's gain of
+//! 1/8 (Jacobson, "Congestion Avoidance and Control", SIGCOMM 1988), as the compaction's costs are
+//! (CT.1), the eighth taken rounded up so that a sum no sample feeds decays to nothing. An
+//! interval counts when the queue held work at its start or its reader took some in it: one with
+//! nothing to read and nothing read tells nothing of how fast it reads. The election timeout is
+//! learned too: `election_tick` periods of the owner's measured pace (TP.1). Each bound is the lesser of the rate times that
+//! timeout and the memory budget's room for queues (MB.1); before anything is measured it is one
+//! record, the least a queue can carry and still work.
+//!
+//! A pure core: the owner tells it what was drained and reads its own clock; nothing here reads a
+//! clock, the disk or the memory.
+
+use std::time::Duration;
+
+/// A queue's bound: its bytes and its messages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Bound {
+    pub(super) bytes: u64,
+    pub(super) messages: u64,
+}
+
+/// What a queue's reader drained, and the rate learned from it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Drain {
+    bytes: u64,
+    messages: u64,
+    nanos: u64,
+    /// Bytes and messages drained since the last sample, not yet weighed.
+    pending: (u64, u64),
+    /// The clock reading the interval under way began at, and whether the queue held work then.
+    since: Option<(u64, bool)>,
+}
+
+impl Drain {
+    /// The reader took `messages` holding `bytes`.
+    pub(super) fn drained(&mut self, bytes: u64, messages: u64) {
+        self.pending = (
+            self.pending.0.saturating_add(bytes),
+            self.pending.1.saturating_add(messages),
+        );
+    }
+
+    /// The owner's clock reads `now`, the queue holding work (`busy`) or not: the interval since
+    /// the last sample is weighed if the queue held work at its start or some was drained in it,
+    /// and a new one begins.
+    pub(super) fn sample(&mut self, now: u64, busy: bool) {
+        match self.since {
+            Some((at, held)) if now > at => {
+                if held || self.pending.1 > 0 {
+                    // RFC 6298 §2's gain: the old sums keep seven eighths, the eighth rounded up.
+                    let decay = |sum: u64| sum.saturating_sub(sum.div_ceil(8));
+                    self.nanos = decay(self.nanos).saturating_add(now.saturating_sub(at));
+                    self.bytes = decay(self.bytes).saturating_add(self.pending.0);
+                    self.messages = decay(self.messages).saturating_add(self.pending.1);
+                }
+                self.pending = (0, 0);
+                self.since = Some((now, busy));
+            }
+            // No time passed on the clock: below its resolution, the interval goes on.
+            Some((at, held)) => self.since = Some((at, held || busy)),
+            None => {
+                self.pending = (0, 0);
+                self.since = Some((now, busy));
+            }
+        }
+    }
+
+    /// The bound in force: what the reader drains in `timeout` at its measured rate, no less than
+    /// `least` (one record), its bytes no more than `room` (the memory budget's room for queues).
+    pub(super) fn bound(&self, timeout: Duration, least: Bound, room: u64) -> Bound {
+        let timeout = timeout.as_nanos();
+        // sum × timeout / nanos, in u128: no product of a u64 and a u64-sized duration overflows.
+        let within = |sum: u64| -> u64 {
+            u128::from(sum)
+                .saturating_mul(timeout)
+                .checked_div(u128::from(self.nanos))
+                .and_then(|over| u64::try_from(over).ok())
+                .unwrap_or(if self.nanos == 0 { 0 } else { u64::MAX })
+        };
+        Bound {
+            bytes: within(self.bytes).max(least.bytes).min(room),
+            messages: within(self.messages).max(least.messages),
+        }
+    }
+}
+
+/// The learned election timeout: `election_tick` periods of the owner's pace.
+pub(super) fn election_timeout(election_tick: usize, period: Duration) -> Duration {
+    period.saturating_mul(u32::try_from(election_tick).unwrap_or(u32::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEAST: Bound = Bound {
+        bytes: 100,
+        messages: 1,
+    };
+    const MS: u64 = 1_000_000;
+
+    /// T-QB.1.1: nothing measured, then an interval with nothing queued and nothing read: passes
+    /// when the bound is one record (`least`), the room no matter how large.
+    #[test]
+    fn drain_nothing_measured_bounds_one_record() {
+        let mut drain = Drain::default();
+        let timeout = Duration::from_secs(1);
+        assert_eq!(drain.bound(timeout, LEAST, u64::MAX), LEAST);
+        drain.sample(0, false);
+        drain.sample(10 * MS, false);
+        assert_eq!(
+            drain.bound(timeout, LEAST, u64::MAX),
+            LEAST,
+            "an idle start tells nothing"
+        );
+    }
+
+    /// T-QB.1.2: a reader that drains 1000 bytes in 10 messages every 10 ms while the queue holds
+    /// work, under a 100 ms election timeout: passes when the bound is ten intervals' worth, then
+    /// the budget's room when that is less, and messages beyond the room's reach.
+    #[test]
+    fn drain_bound_is_rate_times_election_timeout_within_room() {
+        let mut drain = Drain::default();
+        drain.sample(0, true);
+        for step in 1..=40u64 {
+            drain.drained(1000, 10);
+            drain.sample(step * 10 * MS, true);
+        }
+        let timeout = election_timeout(10, Duration::from_millis(10));
+        assert_eq!(timeout, Duration::from_millis(100));
+        let bound = drain.bound(timeout, LEAST, u64::MAX);
+        assert!((9_000..=11_000).contains(&bound.bytes), "{bound:?}");
+        assert!((90..=110).contains(&bound.messages), "{bound:?}");
+        assert_eq!(drain.bound(timeout, LEAST, 4000).bytes, 4000);
+    }
+
+    /// T-QB.1.3: the reader slows to a tenth: passes when the bound follows it down as the old
+    /// samples decay, never below one record; and an interval with no time on the clock adds none.
+    #[test]
+    fn drain_bound_follows_the_reader_and_ignores_no_time() {
+        let mut drain = Drain::default();
+        drain.sample(0, true);
+        let mut now = 0;
+        for _ in 0..40 {
+            now += 10 * MS;
+            drain.drained(1000, 10);
+            drain.sample(now, true);
+        }
+        let timeout = Duration::from_millis(100);
+        let fast = drain.bound(timeout, LEAST, u64::MAX);
+        for _ in 0..80 {
+            now += 10 * MS;
+            drain.drained(100, 1);
+            drain.sample(now, true);
+        }
+        let slow = drain.bound(timeout, LEAST, u64::MAX);
+        assert!(slow.bytes < fast.bytes / 5, "{slow:?} after {fast:?}");
+        assert!(slow.bytes >= 900 && slow.messages >= 9, "{slow:?}");
+        let before = drain;
+        drain.drained(5, 1);
+        drain.sample(now, true);
+        assert_eq!(
+            drain.bound(timeout, LEAST, u64::MAX),
+            before.bound(timeout, LEAST, u64::MAX)
+        );
+        // A reader that stops while work waits: the bound falls to one record.
+        for _ in 0..400 {
+            now += 10 * MS;
+            drain.sample(now, true);
+        }
+        assert_eq!(drain.bound(timeout, LEAST, u64::MAX), LEAST);
+    }
+}

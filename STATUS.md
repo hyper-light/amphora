@@ -464,10 +464,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Linux, the platform's readings on macOS and Windows, a typed refusal where none can be read) and shared out by
   measured use (store.md, "Decision (lane constants): one process memory budget"; MB.1), an image bounded by its room
   for one in place of `SNAPSHOT_BYTES` (replication.md, "Decision (lane constants): an image is bounded by the memory
-  budget's room for one"; SB.1).
+  budget's room for one"; SB.1); and the owner's command and outgoing queues hold what their readers drain in a
+  learned election timeout, within the budget's room for queues, one record before anything is measured, and a burst
+  past the bound fences only once it has stayed past it a whole election timeout (replication.md, "Decision (lane
+  constants): the queue bounds by drain rate"; QB.1).
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
-  counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
-  and outgoing bounds, and the rest of the list (handoff/amphora-constants-list.md).
+  counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), a wire record's 2 MiB
+  framing, `COMMANDS` and `MEMBERS`, and the rest of the list (handoff/amphora-constants-list.md).
 - **Region-local groups under a global root** (CP-T1.11, G14 step 1, lane regions; `crates/amphora/src/regions.rs`,
   docs/design/regions.md): members carry a region label; a regional group's voters and lead stay in its home
   region, and the root spreads its voters so losing the regions it survives leaves a quorum (CockroachDB's

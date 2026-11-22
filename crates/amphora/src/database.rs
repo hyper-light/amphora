@@ -37,6 +37,7 @@ pub use application::WriterBoundary;
 
 mod compacting;
 pub(crate) mod compaction;
+mod drain;
 mod group;
 mod guards;
 mod import;
@@ -64,24 +65,40 @@ CREATE TABLE IF NOT EXISTS __amphora_families (namespace TEXT NOT NULL, family T
 CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS __amphora_holding (one INTEGER PRIMARY KEY CHECK (one = 0), holding BLOB NOT NULL);";
 const LIVE_MAX: u64 = 10_000_000;
-const QUEUED_BYTES: usize = 512 << 20;
-struct Admission(Arc<AtomicUsize>);
+/// A request admitted to the writer's queue: a full API request's bytes, charged to the memory
+/// budget's room for queues (MB.1; replication.md, "Decision (lane constants): the queue bounds by
+/// drain rate"; QB.1), refused `Full` at that room.
+struct Admission {
+    bytes: Arc<AtomicUsize>,
+    _charge: crate::memory::Charge,
+}
 impl Admission {
     fn reserve(bytes: &Arc<AtomicUsize>) -> Result<Self, Refusal> {
-        bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(api::REQUEST_MAX)
-                    .filter(|next| *next <= QUEUED_BYTES)
-            })
-            .map_err(|_| Refusal::Full {
-                limit: QUEUED_BYTES,
+        let request = u64::try_from(api::REQUEST_MAX).unwrap_or(u64::MAX);
+        let charge = crate::memory::process()
+            .take(crate::memory::Use::Queues, request)
+            .map_err(|refusal| match refusal {
+                Refusal::TooLarge { limit, .. } => Refusal::Full { limit },
+                other => other,
             })?;
-        Ok(Self(Arc::clone(bytes)))
+        bytes.fetch_add(api::REQUEST_MAX, Ordering::AcqRel);
+        Ok(Self {
+            bytes: Arc::clone(bytes),
+            _charge: charge,
+        })
     }
+}
+/// The memory budget's room for queues now, what a full writer queue was refused at.
+fn queue_room() -> usize {
+    crate::memory::process()
+        .room(crate::memory::Use::Queues)
+        .ok()
+        .and_then(|room| usize::try_from(room).ok())
+        .unwrap_or(0)
 }
 impl Drop for Admission {
     fn drop(&mut self) {
-        self.0.fetch_sub(api::REQUEST_MAX, Ordering::AcqRel);
+        self.bytes.fetch_sub(api::REQUEST_MAX, Ordering::AcqRel);
     }
 }
 
@@ -213,7 +230,7 @@ fn unavailable(e: impl std::fmt::Display) -> Refusal {
 fn admission_refusal(error: store::Refused) -> Refusal {
     match error {
         store::Refused::Full => Refusal::Full {
-            limit: QUEUED_BYTES,
+            limit: queue_room(),
         },
         store::Refused::Timeout => Refusal::Timeout,
         store::Refused::Disk => Refusal::Fenced("writer disk failed; reopen after recovery".into()),

@@ -1062,3 +1062,20 @@ tests = [
   { id = "T-CS.5.5", text = "cs5_vectorized_aggregates_identical_and_chosen_by_cost (crates/engine/storage/versioned/columns_path.rs) — passes when whole-table, grouped and key-range aggregates equal the rows' at the snapshot by either path, with the switch on the copy is read by step 4's vectorized scan (granules read, only queued keys from the rows), off every row is read, and a copy behind its snapshot reads no granule" },
   { id = "T-CS.5.6", text = "cs5_scan_hook_runs_only_when_the_copy_is_chosen — passes when a scan given to the CopyScan hook runs once per aggregate the copy is chosen for and answers it, never with the switch off or on a stale copy" },
 ]
+
+# lane constants-11 (2026-11-22): QB.1, the queue bounds by drain rate (replication.md, "Decision (lane constants): the
+# queue bounds by drain rate").
+[[own]]
+id = "QB.1"
+title = "The owner's queues hold what their readers drain in a learned election timeout, within the memory budget, not picked bounds"
+criteria = [
+  { id = "AC-QB.1.1", text = "Each queue's drain rate is measured in bytes and messages over the owner's clock, the outgoing queue's in ReplicaHandle::drain and the command queue's at the owner's intake, each a decaying ratio of sums at RFC 6298's gain" },
+  { id = "AC-QB.1.2", text = "Each bound is the lesser of the rate times the learned election timeout (election_tick times the pace's period) and the memory budget's room for queues, the queues' bytes charged through Budget::take; one record before anything is measured (one call for application calls); a wire record's image is the budget's room for one, held inside the command queue's bound" },
+  { id = "AC-QB.1.3", text = "An outgoing queue past the budget's room fences at once; one past its learned bound fences only once it has stayed past it for an election timeout, so a bound that starts small grows before it fences" },
+]
+tests = [
+  { id = "T-QB.1.1", text = "Nothing measured, then an interval with nothing queued or read: passes when the bound is one record" },
+  { id = "T-QB.1.2", text = "A reader draining 1000 bytes in 10 messages every 10 ms under a 100 ms timeout: passes when the bound is about 10,000 bytes and 100 messages, then the room when that is less" },
+  { id = "T-QB.1.3", text = "The reader slows to a tenth, then stops: passes when the bound follows it down to one record, and no time on the clock adds nothing" },
+  { id = "T-QB.1.4", text = "A lone member of three campaigning, its vote requests a burst past one message, its host draining each tick: passes when it is never fenced and the bound grows past one message" },
+]
