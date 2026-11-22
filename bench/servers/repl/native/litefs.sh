@@ -78,7 +78,9 @@ lease:
 exec:
   - cmd: "$BIN/shim -backend sqlite -name litefs-$n -path $d/mnt/bench.db -listen 127.0.0.1:$(port "$n")"
 YML
-  spawn "$n" "$BIN/litefs" mount -config "$d/litefs.yml"
+  # The shim links libdqlite, which setup.sh may have built under $BIN/lib; LiteFS hands its own
+  # environment to what it runs (cmd/litefs/mount_linux.go:621), as dqlite.sh's nodes have it.
+  spawn "$n" env LD_LIBRARY_PATH="$BIN/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$BIN/litefs" mount -config "$d/litefs.yml"
 }
 
 leader() {
