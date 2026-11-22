@@ -198,6 +198,18 @@ pub fn set_skipping(
     column: &str,
     kind: Option<SkipKind>,
 ) -> Result<(), LeafBuildError> {
+    set_skipping_with(conn, table, column, kind, super::BuildMode::default())
+}
+
+/// Lane skip-9 (T-SKU.11): [`set_skipping`], a measured summary's dropped method built again by
+/// `build` (inline, void-on-write or replay).
+pub fn set_skipping_with(
+    conn: &Arc<Connection>,
+    table: &str,
+    column: &str,
+    kind: Option<SkipKind>,
+    build: super::BuildMode,
+) -> Result<(), LeafBuildError> {
     if conn.mvcc_enabled() {
         return Err(LeafBuildError::Refused(super::SkipRefusal::Mvcc));
     }
@@ -237,7 +249,9 @@ pub fn set_skipping(
     };
     match built {
         Ok(skipping) => {
-            conn.db.skipping.set(root, index, skipping);
+            conn.db
+                .skipping
+                .set_with_build(root, index, skipping, build);
             conn.execute("COMMIT")?;
             Ok(())
         }
@@ -273,6 +287,15 @@ pub fn skipping_candidates(
     conn.db
         .skipping
         .candidates(root, conn.skipping_id(), reader_pos, committed, lo, hi)
+}
+
+/// Lane skip-11 (T-SKU.14): how scans of `table` ask its summary for an IN list's rows (span or
+/// value by value); `false` when no summary is kept.
+pub fn set_list_probe(conn: &Arc<Connection>, table: &str, probe: super::ListProbe) -> bool {
+    conn.with_schema_mut(|schema| schema.get_btree_table(table))
+        .ok()
+        .flatten()
+        .is_some_and(|btree| conn.db.skipping.set_list_probe(btree.root_page, probe))
 }
 
 /// Amphora (G5 step 4): what `table`'s summary has done, if one is kept.

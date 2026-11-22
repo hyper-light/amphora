@@ -163,7 +163,8 @@ impl OpenLoop {
                     .iter()
                     .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_outer()));
                 if btree.has_rowid && !outer {
-                    let terms = crate::skipping::bound_terms(
+                    let hint = crate::skipping::SkipHint::of(
+                        cursor_id,
                         predicates
                             .iter()
                             .filter(|t| {
@@ -176,11 +177,7 @@ impl OpenLoop {
                             .map(|t| &t.expr),
                         table.internal_id,
                     );
-                    if !terms.is_empty() {
-                        program
-                            .skip_hints
-                            .push(crate::skipping::SkipHint { cursor_id, terms });
-                    }
+                    program.skip_hints.extend(hint);
                 }
             }
 

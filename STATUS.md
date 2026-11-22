@@ -1289,4 +1289,22 @@ method not leading once its write upkeep passes its measured build cost (ski ren
 building it again when its doubling-schedule trial comes due; `measured` (keep both) is the
 control (T-SKU.5). The setting now acts when its statement runs, by its own instruction, so a
 statement prepared before the data loads still skips it (T-SKU.6).
-Open: the benchmark against DuckDB and ClickHouse.
+Lane skip-7: under the cap the leader is chosen by total cost, its latest scan plus the write
+upkeep of the latest stretch between filters (`Lead::Total`; keeping both stays on the scan alone,
+as both upkeeps are paid either way) (T-SKU.7); a cracker built again is cut at the dropped one's
+cut points, middle first (T-SKU.8); and a skipping scan's batches stop decoding at its candidate
+run's end (T-SKU.9). Decision record: executor.md decision 11.
+Lane skip-8: a dropped kind is built again off the scan's path, on a thread and connection of its
+own, one build per summary at a time, and not installed if a write came in during it (T-SKU.10).
+Lane skip-9: how a dropped kind is built is a per-summary switch, inline (the control), void-on-write
+or replay (the default: the writes during the build are applied before it installs, up to the
+rows the summary holds, then void) (T-SKU.11); the build's own connection opens an encrypted
+database with the scan's key (T-SKU.12). The bench runs each mode up a write-rate ladder.
+Lane skip-10: an IN list bounds a skipping scan by its smallest and largest value, read from its
+parameters on each run (T-SKU.13); each bound shape (BETWEEN ? AND ?, >= ?, <= ?, IN (?, ?), = ?)
+is tested prepared once and re-bound.
+Lane skip-11: an IN list can be asked for value by value, the candidates unioned, behind a
+per-summary switch with the span as the control (T-SKU.14); the chooser counts either as one
+filter with one cost. Tests and bench forms force each one's failure mode (a huge gap, a long
+clustered list).
+Open: the benchmark against DuckDB and ClickHouse; which build mode leads at which write rate.

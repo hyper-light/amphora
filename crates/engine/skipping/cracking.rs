@@ -81,6 +81,34 @@ impl CrackerColumn {
         self.cracks.len()
     }
 
+    /// The bounds it is cut at, ascending (lane skip-7, T-SKU.8: a cracker built again is cut at
+    /// the dropped one's).
+    pub fn bounds(&self) -> Vec<i64> {
+        self.cracks.keys().copied().collect()
+    }
+
+    /// Cuts the copy at each of `bounds` (lane skip-7, T-SKU.8), the middle bound of each stretch
+    /// first, so each cut partitions only the piece between two cuts already made: a copy of n
+    /// entries cut at k bounds moves about n log k entries, not the n k of cutting in ascending
+    /// order. Iterative: the stretches wait on a stack of at most k entries.
+    pub fn crack_at(&mut self, bounds: &[i64]) -> Result<(), SkipError> {
+        let mut sorted = bounds.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut stretches = vec![(0usize, sorted.len())];
+        while let Some((from, to)) = stretches.pop() {
+            if from >= to {
+                continue;
+            }
+            let middle = from.midpoint(to);
+            let bound = *sorted.get(middle).ok_or(SkipError::Inconsistent)?;
+            self.crack(bound)?;
+            stretches.push((from, middle));
+            stretches.push((middle.checked_add(1).ok_or(SkipError::Overflow)?, to));
+        }
+        Ok(())
+    }
+
     /// The piece that holds (or would hold) `value`: from the crack at the largest bound at or
     /// below it to the crack at the smallest bound above it.
     fn piece_of(&self, value: i64) -> (usize, usize) {
@@ -158,6 +186,27 @@ impl CrackerColumn {
         Ok((from, to))
     }
 
+    /// Lane skip-11 (T-SKU.14): the rowids a filter whose rows lie in any of `spans` (each
+    /// `(lo, hi)`, inclusive) may need, ascending: each span's piece (cracking at its bounds, one
+    /// query each), and every row whose value isn't an integer, once.
+    pub fn candidate_rowids_each(&mut self, spans: &[(i64, i64)]) -> Result<Vec<i64>, SkipError> {
+        if let [(lo, hi)] = spans {
+            return self.candidate_rowids(*lo, *hi);
+        }
+        count(&mut self.stats.queries, spans.len());
+        let mut rowids: Vec<i64> = self.others.iter().copied().collect();
+        for (lo, hi) in spans {
+            let (from, to) = self.cracked(*lo, *hi)?;
+            let piece = self.entries.get(from..to).ok_or(SkipError::Inconsistent)?;
+            count(&mut self.stats.entries_returned, piece.len());
+            rowids.extend(piece.iter().map(|(_, rowid)| *rowid));
+        }
+        rowids.sort_unstable();
+        // Overlapping spans name a row twice.
+        rowids.dedup();
+        Ok(rowids)
+    }
+
     /// The (value, rowid) entries a filter `lo <= value <= hi` matches among the integers, as the
     /// cracker holds them (T-G5.4.1 checks each against the table: none stale).
     pub fn matching_entries(&mut self, lo: i64, hi: i64) -> Result<Vec<(i64, i64)>, SkipError> {
@@ -167,6 +216,12 @@ impl CrackerColumn {
             .get(from..to)
             .ok_or(SkipError::Inconsistent)?
             .to_vec())
+    }
+
+    /// Lane skip-9 (T-SKU.11): the rows the copy holds, integers and others.
+    pub fn row_count(&self) -> u64 {
+        let rows = self.entries.len().saturating_add(self.others.len());
+        u64::try_from(rows).unwrap_or(u64::MAX)
     }
 
     /// The rowids whose value isn't an integer.

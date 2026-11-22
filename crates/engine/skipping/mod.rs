@@ -27,6 +27,7 @@
 //!
 //! The switch is per table and per column: a connection that turns neither on pays nothing.
 
+mod build;
 mod choose;
 mod cracking;
 mod leaves;
@@ -34,15 +35,19 @@ mod registry;
 mod scan;
 mod zone_map;
 
-pub use choose::{Chooser, ChooserStats, MethodStats, SkipMethod, Upkeep};
+pub(crate) use build::{build_inline, start_build};
+pub use choose::{Chooser, ChooserStats, Lead, MethodStats, SkipMethod, Upkeep};
 pub use cracking::{CrackerColumn, CrackerStats};
 pub(crate) use leaves::{cracker_of_table, nanos_since};
 pub use leaves::{
-    set_skipping, skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,
+    set_list_probe, set_skipping, set_skipping_with, skipping_candidates, skipping_counts,
+    zone_map_of_table, LeafBuildError, SkipKind,
 };
-pub use registry::{SkipCounts, SkipRefusal, SkipRegistry, WalPos};
+pub use registry::{
+    BuildClaim, BuildEnd, BuildMode, ListProbe, SkipCounts, SkipRefusal, SkipRegistry, WalPos,
+};
 pub use scan::{
-    bound_terms, BoundOp, BoundTerm, BoundValue, ColumnBounds, SkipHint, SkipWalk, SkipWalks,
+    BoundOp, BoundTerm, BoundValue, ColumnBounds, ListTerm, SkipHint, SkipWalk, SkipWalks,
     WalkMeasure, WalkPhase, WalkTarget,
 };
 pub use zone_map::{RowidRange, ZoneMap, ZoneMapBuilder, ZoneStats};
@@ -147,14 +152,27 @@ impl Skipping {
         lo: i64,
         hi: i64,
     ) -> Result<(Candidates, Option<SkipMethod>), SkipError> {
+        self.candidates_spans(&[(lo, hi)])
+    }
+
+    /// Lane skip-11 (T-SKU.14): [`Skipping::candidates_by`] for a filter whose rows lie in any of
+    /// `spans` (each `(lo, hi)`, inclusive), each probed and the candidates unioned; a measured
+    /// summary counts it as one filter. No span: the rows whose value isn't an integer.
+    pub fn candidates_spans(
+        &mut self,
+        spans: &[(i64, i64)],
+    ) -> Result<(Candidates, Option<SkipMethod>), SkipError> {
         Ok(match self {
             Skipping::Off => (Candidates::All, None),
-            Skipping::ZoneMaps(zones) => (Candidates::Ranges(zones.candidate_ranges(lo, hi)), None),
-            Skipping::Cracking(cracker) => {
-                (Candidates::Rowids(cracker.candidate_rowids(lo, hi)?), None)
+            Skipping::ZoneMaps(zones) => {
+                (Candidates::Ranges(zones.candidate_ranges_each(spans)), None)
             }
+            Skipping::Cracking(cracker) => (
+                Candidates::Rowids(cracker.candidate_rowids_each(spans)?),
+                None,
+            ),
             Skipping::Measured(chooser) => {
-                let (candidates, method) = chooser.candidates(lo, hi)?;
+                let (candidates, method) = chooser.candidates_spans(spans)?;
                 (candidates, Some(method))
             }
         })

@@ -714,6 +714,29 @@ anything but an integer (NULL, a real, a text, a blob) gives its term no bound: 
 the same rule as the summaries' (a bound parameter has no affinity, as a numeric literal has none,
 so the comparison it makes is the constant's).
 
+Lane skip-10 (T-SKU.13): an `IN` list bounds its column too (`a IN (?, ?)`, `a IN (1, :v)`). Each of
+its values is a constant or a parameter (`ListTerm`), read as the scan starts like a term's, and
+the list bounds its column by its smallest and largest value: a row it matches equals one of them,
+so lies between the two. One value that isn't an integer on this run leaves the whole list
+unbounded, as a row could match that value; `NOT IN` and a list holding any other expression give
+no bound. The hull is loose for values far apart (it reads the rows between them): asking the
+summary once per value and joining the candidates is tighter, at one summary call per value and
+one measured cost per filter split across them; the hull keeps one call and one cost.
+
+Lane skip-11 (T-SKU.14): both, behind a per-summary switch (`ListProbe`, `PRAGMA skipping = 't.a
+<kind> [span|values]'`); the span is the control and the default until the bench decides. Under
+`values` the scan asks the summary once for each value of the column's shortest list whose values
+are all integers on this run, keeping only the values within the column's bounds (its terms and
+every list's span), and unions the candidates: a zone map checks each zone against every value
+in one pass, a cracker cracks at each value and returns each piece, the rows whose value isn't an
+integer once. No list, or no value within the bounds, asks for the bounds' one span. The chooser
+counts a filter alike under both: it is one filter however many values it asks for (one method
+answers every probe, one trial or choice is counted), and its one measured cost runs from before
+the first probe to the scan's end, so it covers every probe and every row read. `SkipCounts`
+counts the probes. Each failure mode has a test and a bench form: `gap` (two values half the
+table apart: the span reads the whole gap) and `cluster` (64 neighbouring values: 64 probes for the
+rows one span names).
+
 ### Choosing a kind by measured cost (lanes skip-3 and skip-4, T-SKU.2)
 
 `SkipKind::Measured` keeps both a zone map and a cracked copy of the column, each fed every write
@@ -736,20 +759,203 @@ both, the other kind is measured a logarithmic number of times, and the chooser'
 within twice the better kind alone, plus the kept kind's write upkeep.
 
 **Cost of keeping both.** Both summaries take every write, so the losing kind's write upkeep is paid
-for as long as the column is measured; the doubling bound covers scans, not that upkeep. Dropping
-the loser once its excess cost passes a rebuild's (ski rental again) would bound it; not built.
+for as long as the column is measured; the doubling bound covers scans, not that upkeep. The cap
+below bounds it.
+
+### The losing kind's upkeep capped (lane skip-5, T-SKU.5)
+
+**Decision.** Behind a switch, `Upkeep` (`choose.rs`): `KeepBoth`, the control (`PRAGMA skipping =
+'t.a measured'`), and `Capped` (`'t.a capped'`). Capped drops the kind not leading once the write
+upkeep it has cost since it last answered a filter passes its latest measured cost to build: ski
+rental's break-even rule (Karlin, Manasse, Rudolph and Sleator, Algorithmica 1988: rent until the
+rent paid equals the price, then buy, within twice the best choice in hindsight). The kind leading
+is never dropped. A dropped kind is still measured on the doubling schedule; its trial's budget
+adds its build cost, and when the trial is due it is built again: zone maps from the cracker's
+own copy of the column, in the dropped map's zones; the cracker from the table, refused if a write
+came in during the build. Lane skip-8 moved the build off the scan's path (T-SKU.10, below).
+The upkeep is timed per write by the executor's clock and handed in (`SkipRegistry::on_write`'s
+`now`); a build's cost is its own time. No number is picked: the threshold is the kind's own
+measured build cost.
+
+**Why.** Keeping both makes every write pay both kinds' upkeep for as long as the column is
+summarized, so on a write-heavy table the kind that answers nothing still costs the most (a
+cracker's moves under churn). Dropping it outright would lose the chance to notice the workload
+shift back; the doubling trial keeps that, at a cost bounded by its build.
+
+**Instruments.** `MethodStats::{upkeep, last_upkeep, dropped, rebuilt}` per kind, and debug events
+on `amphora.skipping` with the upkeep and build cost when a kind is dropped or built again.
+
+**Evidence.** `skipping::tests::chooser::t_sku_5_*`: a write-heavy table whose filters zone maps
+answer best drops the cracker and pays less upkeep than keeping both, which drops nothing; a
+workload that shifts from cracking's ground to zone maps' drops zone maps and builds them again
+when their trial is due. Every candidate set holds every row the plain scan finds.
+
+### What the leader is chosen by (lane skip-7, T-SKU.7)
+
+**Decision.** Behind a second switch, `Lead`: `Scan` compares the kinds' latest measured scans
+(T-SKU.2's rule, the control); `Total` compares each kind's latest scan plus the write upkeep it
+cost over the latest stretch of writes between two filters (lane skip-5's call: the leader counts
+total cost). Each upkeep rule goes with its own lead rule (`Lead::for_upkeep`): `KeepBoth` with
+`Scan`, `Capped` with `Total`. A kind's upkeep is measured only over a stretch it was kept for
+whole; a kind dropped or built again during a stretch keeps the measure it had. Under `Total` the
+leader's upkeep also counts toward what it has spent before the other is measured again, and the
+other's trial budget is its own total. When the kept kind's cost passes a dropped kind's last
+measure, the dropped kind is due a build and a trial at once (before, the dropped kind could be
+named leader and the filter read every row), and the last kind kept is never dropped.
+
+**Why.** Kept both, every write is applied to both kinds whichever leads, so their upkeep is paid
+either way and only the scan differs: counting upkeep there could pick the slower scan for no
+saving. Capped, the kind not leading is the one whose upkeep is shed, so the choice decides which
+upkeep goes on being paid: a cracker under write churn whose scans are cheap can cost far more in
+moves than zone maps cost in rows read.
+
+**Evidence.** `t_sku_7_total_cost_leader_counts_the_write_upkeep` (costs handed in: the leader
+changes on total cost, not on the scan alone); `t_sku_7_capped_total_cost_lead_pays_less_under_write_churn`
+(zone maps' scan failure mode under 256 writes a filter: on scan cost cracking leads and its moves
+go on being paid; on total cost zone maps lead, the cracker is dropped, and the run's whole cost of
+scans, builds and upkeep is lower); `t_sku_7_shifting_workload_ends_led_by_zone_maps_on_total_cost`.
+The live comparison at the extremes (a laptop's table and many connections writing at once) is the
+coordinator's, with `skipping_bench`.
+
+**Falsified by.** A workload where `Capped` with `Total` costs more in scans, builds and upkeep
+together than `Capped` with `Scan`.
+
+### A cracker built again keeps its cut points (lane skip-7, T-SKU.8)
+
+When the cap drops a cracker it keeps the bounds it was cut at (`CrackerColumn::bounds`), and the
+cracker built again is cut at them before it answers (`CrackerColumn::crack_at`), so the filters
+that cut it find their pieces as before instead of paying to cut the whole copy again. The bounds
+are cut middle first (each stretch of the sorted bounds cuts at its middle, then each half), so
+each cut partitions only the piece between two cuts already made: about n log k entries moved for a
+copy of n entries and k bounds, not the n k of cutting in ascending order. The cut is timed and
+added to the build's cost. Evidence: `t_sku_8_*` (the same cut points, the same rowids for each
+filter with nothing partitioned again, at most n entries moved per halving of the bounds).
+
+### Builds off the scan's path, one per summary at a time (lane skip-8, T-SKU.10)
+
+**Decision.** The scan that finds a dropped kind's trial due no longer builds it: it claims the
+build (`SkipRegistry::claim_build`) and goes on with the leader, and the build runs on a thread of
+its own (`skipping/build.rs`). A summary has at most one claim at a time, so connections that find
+the same build due at once start one build between them. Zone maps are built from the cracker's
+copy in memory under the registry's lock. The cracker is read from the table on the build's own
+connection, in a read transaction whose snapshot must be the state the summary holds (the reader's
+rule: no other writer open, the newest commit; `pin_build`), or nothing is read. Each write the
+hook takes while the build is claimed marks it invalidated, and an invalidated build is not
+installed (`BuildEnd::Invalidated`); the next scan that finds the trial due claims a new one. A
+claim that ends without being handed back (an error, a thread that could not start) is handed back
+by its holder's drop. Nothing waits on a clock or a poll: the build starts on the scan that finds
+it due, a write voids it, and its own end hands the claim back.
+
+**Why.** Inside the scan, the cracker's build read every row of the table on the path of one
+filter, which paid for it in latency, and every connection that found the trial due at once built
+its own copy. Comparing a count of writes before and after (skip-5) caught a write during the build
+but not the duplicate builds.
+
+**Bound.** One build, so one thread and one connection, per summary at a time; builds come only at
+a dropped kind's trials, which the doubling schedule spaces geometrically.
+
+**Evidence.** `skipping::tests::builds::t_sku_10_*`: sixteen threads asking for the same due build
+at once get one claim; a write between a build's pin and its install voids it, and a build pinned
+after the writer committed installs; a build beside another connection's open write reads nothing,
+a summary set again ignores the old claim, and a stale summary hands out none; on a real table,
+eight threads that find the cracker due at once start one build, which installs a cracker holding
+every row.
+
+**Falsified by.** A due build that, under writes, is voided at every trial: the dropped kind is
+never measured again. Under steady write churn that would show as `rebuilt` staying at 0 while
+trials come due.
+
+### Three ways to build behind one switch: inline, void-on-write, replay (lane skip-9, T-SKU.11)
+
+**Decision.** How a dropped kind is built again is a per-summary switch (`BuildMode`, set by
+`PRAGMA skipping = 'table.column capped [inline|void|replay]'`):
+
+- `inline`: skip-7's build, the control. The scan that finds the trial due builds on its own path,
+  on its own connection and read, its time left out of the scan's measured cost.
+- `void`: skip-8's build above. Off the scan's path, voided by any write during it.
+- `replay`, the default: off the scan's path. From the pin on, the build records each write the
+  hook takes, and applies them to its copy in order before installing it, so it installs however
+  many writes arrive. A write that the copy refuses (it disagrees with the summary) drops the copy
+  and keeps the summary (`BuildEnd::ReplayRefused`). A rollback still makes the summary stale, and
+  the build is superseded.
+
+**Bound.** A replaying build's record holds at most as many writes as the summary held rows at the
+pin. Past that, replaying costs more than reading the table again, and the record would outweigh
+the copy it feeds, so the build drops its record and falls back to void (`replay_overflows`). That
+bound is the summary's own row count, not a picked number. So a build holds at most twice the
+copy's rows, and the claim keeps one build per summary.
+
+**Why.** Each mode has its own failure mode, and the tests force each one. Inline makes the scan
+that finds the trial due read every row of the table (`inline_rows_read`). Void is starved under
+steady writes: with a write during every build, no build installs and the dropped kind never comes
+back. Replay's cost is memory under a burst of writes, which the bound caps. Which mode leads at
+which write rate is the bench's to say (`amphora-bench --skipping`, its write-rate ladder, under
+`capped:inline`, `capped:void` and `capped:replay`). Replay is the default until that data is in.
+
+**Evidence.** `skipping::tests::builds::t_sku_11_*`:
+
+- With a write during each of eight trials, void installs none and replay installs the first. Its
+  copy holds the table and the write.
+- A burst as large as the bound replays in order: an update, a delete and inserts. One write more
+  never holds more than the bound, and falls back to void.
+- On a real table, an inline build reads all 500 rows on the scan's path, and the other two modes
+  read none there. Answers are equal across the modes.
+- The PRAGMA sets each mode and refuses one after a kind that never builds again.
+
+**Falsified by.** At some write rate on the ladder, replay costs more in filter latency or memory
+than void or inline, or a replaying build installs a copy that answers differently from a plain
+scan.
+
+### The build's own connection opens with the database's key (lane skip-9, T-SKU.12)
+
+**Decision.** The build's own connection opens the database with what the scan's connection holds
+when the build is claimed: its encryption key, or its external page codec. The key stays an
+`EncryptionKey`, held the way the scan's connection holds it. It is zeroed when dropped, its
+`Debug` is redacted, and it is moved into the build's connection. The holder (`BuildKeys`) has no
+`Debug`, and nothing logs it. The key is taken only once a build is claimed, so a scan pays nothing
+for it otherwise.
+
+**Why.** Without the key, the build's connection on an encrypted database could not read page 1.
+The build failed every time, and the dropped kind never came back.
+
+**Evidence.** `skipping::tests::builds::t_sku_12_*`: on an aes256gcm database, the build started
+from the keyed connection installs a cracker holding every row, under void and under replay.
+
+### Fused batches (lane skip-5, T-SKU.4) that decode only the candidate run (lane skip-7, T-SKU.9)
+
+A skipping scan's Next, on a candidate row, runs the fused loop (decision 10) over the leaf's batch
+up to the last rowid of the candidate run it stands in, instead of row by row. A batch's window
+going forward now also stops decoding at that rowid (`leaf_batch::window`'s `until`, from
+`SkipWalks::run_end`), for the fused loop and for a `Column` or `ColumnRange` served from a batch,
+so rows the scan seeks past are never decoded; before, each window ran on to its leaf's end.
+Evidence: `t_sku_4_*` (four databases, batches on and off by skipping on and off, answer alike
+under random writes; skipping rows ran fused) and `t_sku_9_*` (a scattered column, cracking and the
+measured choice: answers as without skipping, and the rows decoded are at most the rows read).
+
+### The setting acts when its statement runs (lane skip-5, T-SKU.6)
+
+**Decision.** `PRAGMA skipping` compiles to its own instruction, `SetSkipping`, which builds the
+summary when the statement runs, not while it is prepared. **Why.** A setting prepared before the
+table holds its rows (a migration script, a prepared statement kept by a pool) built its summary
+from the empty table and so skipped nothing: chosen by a test, `t_sku_6_*`, where the setting
+prepared on an empty table and run once 64,000 rows were in read all 64,000 before and now skips,
+and running it again after `'off'` turns skipping back on.
 
 ### A SQL setting (lane skip-4, T-SKU.3)
 
 `PRAGMA skipping = 'table.column'` keeps a measured summary of the column; `'table.column
 zone_maps'`, `'table.column cracking'` and `'table.column off'` pick one kind or drop the summary.
-The summary is built when the statement is prepared, as the other connection settings take effect,
-and as `skipping::set_skipping` builds it: holding the write lock, refused inside an open
+The summary is built when the statement runs (lane skip-5, below), as `skipping::set_skipping`
+builds it: holding the write lock, refused inside an open
 transaction, under MVCC, or for a column the record doesn't hold, with the reason. `PRAGMA skipping`
 with no value is refused: the setting is set, not read.
 
-**Not yet.** A walking scan runs its body row by row, not in fused column batches; rows read and
-latency against DuckDB and ClickHouse are not measured.
+**Not yet.** Rows read and latency against DuckDB and ClickHouse are not measured. The driver for
+DuckDB is `amphora-bench --skipping` (lane skip-7: both engines in this process, the same prepared
+statements and bound values, one timing method); ClickHouse needs both engines behind one server
+client, which it doesn't have yet. A dropped kind
+is built again inside the scan whose trial is due, so that scan waits for the build (its measured
+cost leaves the build out, lane skip-7: the leader isn't charged for it).
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's

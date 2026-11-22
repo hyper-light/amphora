@@ -214,14 +214,22 @@ fn emit_table_list_rows_for_schema(
 
 /// Amphora (lane skip-4, T-SKU.3): `PRAGMA skipping`'s value, `table.column` and an optional
 /// method: `measured` (the default: zone maps or cracking, whichever measures cheaper on the
-/// column's filters), `zone_maps`, `cracking`, or `off` (drop the summary).
+/// column's filters), `zone_maps`, `cracking`, or `off` (drop the summary). Lane skip-9
+/// (T-SKU.11): after `measured` or `capped`, an optional build mode for a dropped method:
+/// `inline`, `void` or `replay` (the default).
 fn parse_skipping_setting(
     value: &str,
-) -> crate::Result<(String, String, Option<crate::skipping::SkipKind>)> {
-    use crate::skipping::SkipKind;
+) -> crate::Result<(
+    String,
+    String,
+    Option<crate::skipping::SkipKind>,
+    crate::skipping::BuildMode,
+    crate::skipping::ListProbe,
+)> {
+    use crate::skipping::{BuildMode, ListProbe, SkipKind};
     let refuse = || {
         LimboError::InvalidArgument(format!(
-            "PRAGMA skipping expects 'table.column [measured|capped|zone_maps|cracking|off]', got '{value}'"
+            "PRAGMA skipping expects 'table.column [measured|capped [inline|void|replay]|zone_maps|cracking|off] [span|values]', got '{value}'"
         ))
     };
     let mut words = value.split_whitespace();
@@ -238,10 +246,35 @@ fn parse_skipping_setting(
         Some("off") => None,
         Some(_) => return Err(refuse()),
     };
+    let measured = matches!(kind, Some(SkipKind::Measured | SkipKind::MeasuredCapped));
+    // A measured summary's build mode, then (lane skip-11, T-SKU.14) how an IN list is asked
+    // for: each word optional, in that order.
+    let mut word = words.next().map(str::to_ascii_lowercase);
+    let build = match word.as_deref() {
+        Some("inline") if measured => Some(BuildMode::Inline),
+        Some("void") if measured => Some(BuildMode::VoidOnWrite),
+        Some("replay") if measured => Some(BuildMode::Replay),
+        _ => None,
+    };
+    if build.is_some() {
+        word = words.next().map(str::to_ascii_lowercase);
+    }
+    let lists = match word.as_deref() {
+        None => ListProbe::default(),
+        Some("span") if kind.is_some() => ListProbe::Span,
+        Some("values") if kind.is_some() => ListProbe::PerValue,
+        Some(_) => return Err(refuse()),
+    };
     if words.next().is_some() {
         return Err(refuse());
     }
-    Ok((table.to_owned(), column.to_owned(), kind))
+    Ok((
+        table.to_owned(),
+        column.to_owned(),
+        kind,
+        build.unwrap_or_default(),
+        lists,
+    ))
 }
 
 /// SQLite matches PRAGMA names without regard to case.
@@ -775,11 +808,14 @@ fn update_pragma(
             // acted on when the statement runs, by its own instruction: the summary is built
             // from the rows the table holds then, holding the write lock, as `set_skipping`
             // builds it.
-            let (table, column, kind) = parse_skipping_setting(&parse_string(&value)?)?;
+            let (table, column, kind, build, lists) =
+                parse_skipping_setting(&parse_string(&value)?)?;
             program.emit_insn(Insn::SetSkipping {
                 table,
                 column,
                 kind,
+                build,
+                lists,
             });
             Ok(TransactionMode::None)
         }

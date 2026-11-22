@@ -34,7 +34,8 @@ pub(super) fn note_decoded(rows: usize) {
     DECODED.with(|decoded| decoded.set(decoded.get() + rows));
 }
 
-fn decoded() -> usize {
+/// Rows decoded into batches on this thread so far (the skipping tests read it: lane skip-7).
+pub(crate) fn decoded() -> usize {
     DECODED.with(Cell::get)
 }
 

@@ -1988,28 +1988,48 @@ fn skip_walk_for(
     let column = registry.column_of(root)?;
     // Lane skip-usable (T-SKU.1): a parameter's bound value is read as the scan starts.
     let parameters = &state.parameters;
-    let bounds = hint.bounds(column, |index| match parameters.get(index.get() - 1) {
+    let parameter = |index: std::num::NonZeroUsize| match parameters.get(index.get() - 1) {
         Some(Value::Numeric(Numeric::Integer(value))) => Some(*value),
         _ => None,
-    })?;
+    };
+    let bounds = hint.bounds(column, parameter)?;
+    // Lane skip-11 (T-SKU.14): an IN list asked value by value, behind the summary's switch
+    // (the span, skip-10's, is the control).
+    let values = match registry.list_probe(root) {
+        Some(crate::skipping::ListProbe::PerValue) => hint.spans(column, parameter),
+        _ => None,
+    };
+    let span = [(bounds.lo, bounds.hi)];
+    let spans: &[(i64, i64)] = values.as_deref().unwrap_or(&span);
     let (reader_pos, committed) = conn.skipping_positions()?;
-    let writes = registry.counts(root).map(|counts| counts.writes);
-    // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
-    let started = std::time::Instant::now();
+    // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end (lane
+    // skip-11: every probe of an IN list's values included).
+    let mut started = std::time::Instant::now();
     let (candidates, method) = registry
-        .candidates_by(
-            root,
-            conn.skipping_id(),
-            reader_pos,
-            committed,
-            bounds.lo,
-            bounds.hi,
-        )
+        .candidates_spans(root, conn.skipping_id(), reader_pos, committed, spans)
         .ok()?;
-    // Lane skip-5 (T-SKU.5): a method dropped for its upkeep whose trial is due is built again
-    // now, at the snapshot the summary just answered (so it holds what the summary holds).
-    if let Some(method) = registry.rebuild_due(root) {
-        skipping_rebuild(program, cursor_id, root, column, method, writes);
+    // Lane skip-8 (T-SKU.10): a method dropped for its upkeep whose trial is due is built again
+    // off this scan's path, one build per summary at a time; this scan goes on with the leader.
+    // Lane skip-9 (T-SKU.11): or on it, under the inline control, at this scan's snapshot, the
+    // build's time left out of this scan's measured cost (skip-7's).
+    if let Some((_, super::builder::CursorType::BTreeTable(table))) =
+        program.cursor_ref.get(cursor_id)
+    {
+        let columns = table.columns().len();
+        match registry.build_mode(root) {
+            Some(crate::skipping::BuildMode::Inline) => {
+                let building = std::time::Instant::now();
+                if crate::skipping::build_inline(conn, root, column, columns).is_some() {
+                    started = started
+                        .checked_add(building.elapsed())
+                        .unwrap_or_else(std::time::Instant::now);
+                }
+            }
+            Some(_) => {
+                let _detached = crate::skipping::start_build(conn, root, column, columns);
+            }
+            None => {}
+        }
     }
     let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
     walk.measure = method.map(|method| crate::skipping::WalkMeasure {
@@ -2018,51 +2038,6 @@ fn skip_walk_for(
         started,
     });
     Some(walk)
-}
-
-/// Lane skip-5 (T-SKU.5): builds a measured summary's dropped method again for its trial: zone
-/// maps from the cracker in memory, the cracker from the table's B-tree (a read of every row,
-/// timed: its cost to build). A build that fails, or a write that came in during it, leaves the
-/// method dropped: the leader keeps answering, and the next trial tries again.
-fn skipping_rebuild(
-    program: &Program,
-    cursor_id: crate::vdbe::CursorID,
-    root: i64,
-    column: usize,
-    method: crate::skipping::SkipMethod,
-    writes: Option<u64>,
-) {
-    let registry = &program.connection.db.skipping;
-    let origin = std::time::Instant::now();
-    match method {
-        crate::skipping::SkipMethod::ZoneMaps => {
-            registry.rebuild_zones(root, &mut || crate::skipping::nanos_since(origin))
-        }
-        crate::skipping::SkipMethod::Cracking => {
-            let (Some(writes), Some((_, super::builder::CursorType::BTreeTable(table)))) =
-                (writes, program.cursor_ref.get(cursor_id))
-            else {
-                return;
-            };
-            let built = crate::skipping::cracker_of_table(
-                program.connection.get_pager(),
-                root,
-                column,
-                table.columns().len(),
-            );
-            match built {
-                Ok(cracker) => {
-                    let cost = crate::skipping::nanos_since(origin);
-                    if !registry.install_cracker(root, writes, cracker, cost) {
-                        tracing::debug!(target: "amphora.skipping", root, "cracker built again was refused: a write came in during the build");
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not be built again")
-                }
-            }
-        }
-    }
 }
 
 /// Lane skip-3 (T-SKU.2): a measured scan's end hands its cost (nanoseconds from asking for its
@@ -2429,6 +2404,7 @@ fn op_column_fetch(
                     super::leaf_batch::ScanCursor::Versioned(versioned),
                     column,
                     dest_reg,
+                    None,
                 )? {
                     super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
                     super::leaf_batch::Served::PastEnd => {
@@ -2450,6 +2426,8 @@ fn op_column_fetch(
     // Amphora (QT.7): a scanned table's column comes from its leaf's batch when the program has
     // one (`leaf_batch.rs`); otherwise, and for a row the batch left out, the row is read here.
     if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        // Lane skip-7 (T-SKU.9): a skipping scan's window ends with its candidate run.
+        let until = state.skip_walks.run_end(cursor_id);
         match super::leaf_batch::serve_column(
             &mut state.leaf_batches,
             plan,
@@ -2457,6 +2435,7 @@ fn op_column_fetch(
             super::leaf_batch::ScanCursor::Pager(cursor),
             column,
             dest_reg,
+            until,
         )? {
             super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
             super::leaf_batch::Served::PastEnd => {
@@ -2692,6 +2671,8 @@ fn op_column_range_fetch(
     // whole below.
     if let Some(plan) = program.leaf_batch_plan.as_deref() {
         let mut served = true;
+        // Lane skip-7 (T-SKU.9): a skipping scan's window ends with its candidate run.
+        let until = state.skip_walks.run_end(cursor_id);
         for (offset, (default, reg)) in defaults.iter().zip(dest_regs.iter_mut()).enumerate() {
             let column = start_column
                 .checked_add(offset)
@@ -2703,6 +2684,7 @@ fn op_column_range_fetch(
                 super::leaf_batch::ScanCursor::Pager(cursor),
                 column,
                 reg,
+                until,
             )? {
                 super::leaf_batch::Served::Value => {}
                 super::leaf_batch::Served::PastEnd => apply_column_default(default, reg)?,
@@ -17358,11 +17340,16 @@ pub fn op_set_skipping(
             table,
             column,
             kind,
+            build,
+            lists,
         },
         insn
     );
-    crate::skipping::set_skipping(&program.connection, table, column, *kind)
+    crate::skipping::set_skipping_with(&program.connection, table, column, *kind, *build)
         .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
+    // Lane skip-11 (T-SKU.14): the summary just set asks for IN lists as `lists` says (none is
+    // kept when `kind` dropped it).
+    let _kept = crate::skipping::set_list_probe(&program.connection, table, *lists);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

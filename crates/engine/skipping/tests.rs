@@ -1113,6 +1113,408 @@ mod scans {
         );
     }
 
+    /// Lane skip-10 (T-SKU.13, kiln goal 623adc1c). Do: one prepared statement for each bound
+    /// shape on the skipping column (`BETWEEN ? AND ?`, `>= ?`, `<= ?`, `IN (?, ?)`, `= ?`), each
+    /// prepared once; each round, random writes, then the round's statement bound and run, then
+    /// re-bound to other values and run again with no write between (the summary is the same,
+    /// only the parameters moved); some IN runs bind one value to a real far from the other.
+    /// Expect: every run answers as the database without a summary (a bound kept from the earlier
+    /// binding would leave out rows the new one matches), every run bound by integers consulted
+    /// the summary and none with a real did, and each shape read fewer rows in all than the plain
+    /// scan.
+    fn every_bound_shape_reads_its_parameters(kind: SkipKind) {
+        use crate::Value;
+        let rows = 4000i64;
+        let (_db, on) = open();
+        let (_off_db, off) = open();
+        fill([&on, &off], rows);
+        set_skipping(&on, "t", "a", Some(kind)).unwrap();
+        let sqls = [
+            "SELECT rowid, a, b FROM t WHERE a BETWEEN ? AND ? ORDER BY rowid",
+            "SELECT count(*), sum(b) FROM t WHERE a >= ?",
+            "SELECT count(*), sum(b) FROM t WHERE a <= ?",
+            "SELECT rowid, a, b FROM t WHERE a IN (?, ?) ORDER BY rowid",
+            "SELECT rowid, a, b FROM t WHERE a = ? ORDER BY rowid",
+        ];
+        let mut stmts: Vec<_> = sqls
+            .iter()
+            .map(|sql| (on.prepare(sql).unwrap(), off.prepare(sql).unwrap()))
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(13);
+        let mut read = [(0u64, 0u64); 5];
+        let (mut runs, mut unbounded) = (0u64, 0u64);
+        for round in 0..40u64 {
+            for _ in 0..rng.random_range(0..15) {
+                let sql = random_write(&mut rng, rows);
+                on.execute(&sql).unwrap();
+                off.execute(&sql).unwrap();
+            }
+            let at = usize::try_from(round).unwrap() % sqls.len();
+            for bind in 0..2u64 {
+                let lo = rng.random_range(0..rows);
+                let near = lo.saturating_add(rng.random_range(0..rows / 40));
+                let values = match at {
+                    0 => vec![Value::from_i64(lo), Value::from_i64(near)],
+                    // A tail and a head of the values: up to a twentieth of the rows each.
+                    1 => vec![Value::from_i64(rows - rng.random_range(0..rows / 20))],
+                    2 => vec![Value::from_i64(rng.random_range(0..rows / 20))],
+                    3 if (round / 5 + bind) % 3 == 2 => {
+                        unbounded += 1;
+                        vec![Value::from_i64(lo), Value::from_f64((rows - 1 - lo) as f64)]
+                    }
+                    3 => vec![Value::from_i64(lo), Value::from_i64(near)],
+                    _ => vec![Value::from_i64(lo)],
+                };
+                let (stmt_on, stmt_off) = &mut stmts[at];
+                let (answer_on, r_on) = run_bound(stmt_on, &values);
+                let (answer_off, r_off) = run_bound(stmt_off, &values);
+                assert_eq!(
+                    answer_on, answer_off,
+                    "{kind:?} round {round} bind {bind}: {} {values:?}",
+                    sqls[at]
+                );
+                runs += 1;
+                read[at].0 += r_on;
+                read[at].1 += r_off;
+            }
+        }
+        let counts = skipping_counts(&on, "t").unwrap();
+        assert!(unbounded > 0, "no run bound an IN value to a real");
+        assert_eq!(counts.consulted, runs - unbounded, "{kind:?}: {counts:?}");
+        for (at, (r_on, r_off)) in read.iter().enumerate() {
+            assert!(
+                r_on < r_off,
+                "{kind:?} {}: read {r_on} rows skipping, {r_off} without",
+                sqls[at]
+            );
+        }
+    }
+
+    /// Lane skip-10 (T-SKU.13). Do: a hint with an IN list of a constant and two parameters,
+    /// and a `>=` term on the same column, read under three bindings. Expect: the list bounds its
+    /// column by its smallest and largest value, intersected with the term; a parameter bound to
+    /// anything but an integer leaves the list unbounded (the term alone bounds); another column
+    /// is unbounded.
+    #[test]
+    fn t_sku_13_an_in_list_bounds_by_its_values_as_bound() {
+        use super::super::{BoundOp, BoundTerm, BoundValue, ColumnBounds, ListTerm, SkipHint};
+        let p = |index: usize| BoundValue::Parameter(std::num::NonZeroUsize::new(index).unwrap());
+        let hint = SkipHint {
+            cursor_id: 0,
+            terms: vec![BoundTerm {
+                column: 1,
+                op: BoundOp::GreaterEquals,
+                value: BoundValue::Integer(20),
+            }],
+            lists: vec![ListTerm {
+                column: 1,
+                values: vec![BoundValue::Integer(50), p(1), p(2)],
+            }],
+        };
+        let bound = |lo, hi| Some(ColumnBounds { column: 1, lo, hi });
+        // Parameters ?1 and ?2 bound to `values` (`None`: not an integer).
+        let bound_to = |values: [Option<i64>; 2]| {
+            move |index: std::num::NonZeroUsize| values.get(index.get() - 1).copied().flatten()
+        };
+        assert_eq!(
+            hint.bounds(1, bound_to([Some(10), Some(90)])),
+            bound(20, 90)
+        );
+        assert_eq!(
+            hint.bounds(1, bound_to([Some(70), Some(60)])),
+            bound(50, 70)
+        );
+        assert_eq!(
+            hint.bounds(1, bound_to([Some(70), None])),
+            bound(20, i64::MAX)
+        );
+        assert_eq!(hint.bounds(0, |_| Some(1)), None);
+    }
+
+    #[test]
+    fn t_sku_13_zone_maps_every_bound_shape_reads_its_parameters() {
+        every_bound_shape_reads_its_parameters(SkipKind::ZoneMaps);
+    }
+
+    #[test]
+    fn t_sku_13_cracking_every_bound_shape_reads_its_parameters() {
+        every_bound_shape_reads_its_parameters(SkipKind::Cracking);
+    }
+
+    #[test]
+    fn t_sku_13_measured_every_bound_shape_reads_its_parameters() {
+        every_bound_shape_reads_its_parameters(SkipKind::Measured);
+    }
+
+    /// Lane skip-11 (T-SKU.14). Do: a hint with a `>= 20` term and two IN lists on one column
+    /// (three values, and a constant and two parameters), read under several bindings. Expect:
+    /// the shortest list whose values are all integers on this run is asked value by value, only
+    /// the values within the column's bounds (the term and every list's span) kept, ascending and
+    /// distinct; a list holding a value that isn't an integer is passed over; no list, or no value
+    /// within the bounds, asks for the bounds' one span instead (`None`).
+    #[test]
+    fn t_sku_14_spans_ask_each_value_within_the_bounds() {
+        use super::super::{BoundOp, BoundTerm, BoundValue, ListTerm, SkipHint};
+        let p = |index: usize| BoundValue::Parameter(std::num::NonZeroUsize::new(index).unwrap());
+        let int = BoundValue::Integer;
+        let hint = |lists: Vec<Vec<BoundValue>>| SkipHint {
+            cursor_id: 0,
+            terms: vec![BoundTerm {
+                column: 1,
+                op: BoundOp::GreaterEquals,
+                value: int(20),
+            }],
+            lists: lists
+                .into_iter()
+                .map(|values| ListTerm { column: 1, values })
+                .collect(),
+        };
+        let bound_to = |values: [Option<i64>; 2]| {
+            move |index: std::num::NonZeroUsize| values.get(index.get() - 1).copied().flatten()
+        };
+        let one = hint(vec![vec![int(50), p(1), p(2)]]);
+        // 10 is below the term's 20; the parameters' 90 repeats.
+        assert_eq!(
+            one.spans(1, bound_to([Some(10), Some(90)])),
+            Some(vec![(50, 50), (90, 90)])
+        );
+        assert_eq!(
+            one.spans(1, bound_to([Some(90), Some(90)])),
+            Some(vec![(50, 50), (90, 90)])
+        );
+        assert_eq!(one.spans(1, bound_to([Some(70), None])), None);
+        assert_eq!(one.spans(0, bound_to([Some(70), Some(80)])), None);
+        // Every value below the term: the bounds alone (a contradiction) say more.
+        let below = hint(vec![vec![int(1), int(2)]]);
+        assert_eq!(below.spans(1, |_| None), None);
+        // Two lists: the shorter is asked for, bounded by the longer's span (40 to 300).
+        let two = hint(vec![vec![int(40), int(300), int(100)], vec![p(1), p(2)]]);
+        assert_eq!(
+            two.spans(1, bound_to([Some(500), Some(60)])),
+            Some(vec![(60, 60)])
+        );
+        // The shorter holds a value that isn't an integer: the longer is asked for.
+        assert_eq!(
+            two.spans(1, bound_to([Some(500), None])),
+            Some(vec![(40, 40), (100, 100), (300, 300)])
+        );
+        // No list: no spans.
+        assert_eq!(hint(Vec::new()).spans(1, |_| Some(1)), None);
+    }
+
+    /// Lane skip-11 (T-SKU.14, kiln goal 623adc1c): each way of asking for an IN list, forced
+    /// into its failure mode. Do: three databases with the same rows and the same writes between
+    /// rounds (deletes, and inserts whose values lie past every filter's), one asking for an IN
+    /// list's span (the control), one asking value by value (`PRAGMA skipping = 't.a <kind>
+    /// values'`), one keeping no summary; two prepared statements, each re-bound every round:
+    /// `a IN (?1, ?2)` bound to two values far apart (the span's failure mode: it reads the
+    /// whole gap), and `a IN (?1, ..., ?64)` bound to 64 neighbouring values (asking by value's:
+    /// 64 probes for the rows one span names). Expect: every answer as without a summary; on the
+    /// gap, asking by value read under a tenth of the rows the span read; on the clustered list,
+    /// a single kind (zone maps or cracking) read the same rows both ways; the span probed once a
+    /// run, by value twice a gap run and 64 times a clustered run.
+    fn in_lists_by_span_and_by_value(kind: &str) {
+        use super::super::{ListProbe, SkipCounts};
+        use crate::Value;
+        const CLUSTER: i64 = 64;
+        let rows = 4000i64;
+        let (_span_db, span) = open();
+        let (_values_db, values) = open();
+        let (_off_db, off) = open();
+        fill([&span, &values], rows);
+        {
+            // `fill` takes two: `off` is filled alike here.
+            off.execute("CREATE TABLE t (a INTEGER, b INTEGER, pad TEXT)")
+                .unwrap();
+            off.execute("BEGIN").unwrap();
+            for i in 0..rows {
+                off.execute(format!(
+                    "INSERT INTO t VALUES ({i}, {}, '{}')",
+                    i % 7,
+                    "x".repeat(40)
+                ))
+                .unwrap();
+            }
+            off.execute("COMMIT").unwrap();
+        }
+        span.execute(format!("PRAGMA skipping = 't.a {kind} span'"))
+            .unwrap();
+        values
+            .execute(format!("PRAGMA skipping = 't.a {kind} values'"))
+            .unwrap();
+        let root = root_of(&values);
+        assert_eq!(
+            values.db.skipping.list_probe(root),
+            Some(ListProbe::PerValue),
+            "'{kind} values'"
+        );
+        assert_eq!(
+            span.db.skipping.list_probe(root_of(&span)),
+            Some(ListProbe::Span),
+            "'{kind} span'"
+        );
+        let cluster_sql = format!(
+            "SELECT rowid, a, b FROM t WHERE a IN ({}) ORDER BY rowid",
+            (1..=CLUSTER)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let sqls = [
+            "SELECT rowid, a, b FROM t WHERE a IN (?1, ?2) ORDER BY rowid".to_string(),
+            cluster_sql,
+        ];
+        let mut stmts: Vec<_> = sqls
+            .iter()
+            .map(|sql| {
+                [
+                    span.prepare(sql).unwrap(),
+                    values.prepare(sql).unwrap(),
+                    off.prepare(sql).unwrap(),
+                ]
+            })
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(14);
+        // Rows read (span, by value), per statement; runs per statement.
+        let mut read = [[0u64; 2]; 2];
+        let mut runs = [0u64; 2];
+        let mut appended = rows;
+        for round in 0..30u64 {
+            for _ in 0..rng.random_range(0..6) {
+                let sql = if rng.random_bool(0.5) {
+                    format!("DELETE FROM t WHERE rowid = {}", rng.random_range(1..rows))
+                } else {
+                    // Past every value a filter asks for: the zones stay as tight as they were.
+                    appended += 1;
+                    format!("INSERT INTO t VALUES ({appended}, 1, 'new')")
+                };
+                for conn in [&span, &values, &off] {
+                    conn.execute(&sql).unwrap();
+                }
+            }
+            for bind in 0..2u64 {
+                let at = usize::try_from((round + bind) % 2).unwrap();
+                let bound: Vec<Value> = if at == 0 {
+                    let lo = rng.random_range(0..rows / 10);
+                    let hi = rows - 1 - rng.random_range(0..rows / 10);
+                    vec![Value::from_i64(lo), Value::from_i64(hi)]
+                } else {
+                    let base = rng.random_range(0..rows - CLUSTER);
+                    (0..CLUSTER).map(|i| Value::from_i64(base + i)).collect()
+                };
+                let [stmt_span, stmt_values, stmt_off] = &mut stmts[at];
+                let (answer_span, r_span) = run_bound(stmt_span, &bound);
+                let (answer_values, r_values) = run_bound(stmt_values, &bound);
+                let (answer_off, _) = run_bound(stmt_off, &bound);
+                assert_eq!(
+                    answer_span, answer_off,
+                    "'{kind} span' round {round}: {}",
+                    sqls[at]
+                );
+                assert_eq!(
+                    answer_values, answer_off,
+                    "'{kind} values' round {round}: {}",
+                    sqls[at]
+                );
+                if at == 1 && kind != "measured" && kind != "capped" {
+                    assert_eq!(
+                        r_values, r_span,
+                        "'{kind}' round {round}: the clustered list's values read other rows than its span"
+                    );
+                }
+                read[at][0] += r_span;
+                read[at][1] += r_values;
+                runs[at] += 1;
+            }
+        }
+        let [gap, _] = read;
+        assert!(
+            gap[1].saturating_mul(10) < gap[0],
+            "'{kind}': on the gap, by value read {} rows, the span {}",
+            gap[1],
+            gap[0]
+        );
+        let counts = |conn: &Arc<Connection>| -> SkipCounts { skipping_counts(conn, "t").unwrap() };
+        let (by_span, by_value) = (counts(&span), counts(&values));
+        let all = runs[0] + runs[1];
+        assert_eq!(by_span.consulted, all, "'{kind} span': {by_span:?}");
+        assert_eq!(by_span.probes, all, "'{kind} span': {by_span:?}");
+        assert_eq!(by_value.consulted, all, "'{kind} values': {by_value:?}");
+        assert_eq!(
+            by_value.probes,
+            2 * runs[0] + u64::try_from(CLUSTER).unwrap() * runs[1],
+            "'{kind} values': {by_value:?}"
+        );
+    }
+
+    #[test]
+    fn t_sku_14_zone_maps_in_lists_by_span_and_by_value() {
+        in_lists_by_span_and_by_value("zone_maps");
+    }
+
+    #[test]
+    fn t_sku_14_cracking_in_lists_by_span_and_by_value() {
+        in_lists_by_span_and_by_value("cracking");
+    }
+
+    #[test]
+    fn t_sku_14_measured_in_lists_by_span_and_by_value() {
+        in_lists_by_span_and_by_value("measured");
+    }
+
+    #[test]
+    fn t_sku_14_capped_in_lists_by_span_and_by_value() {
+        in_lists_by_span_and_by_value("capped");
+    }
+
+    /// Lane skip-11 (T-SKU.14): `PRAGMA skipping` takes how an IN list is asked for after the
+    /// kind (and a measured kind's build mode), the span by default, and refuses it with `off`.
+    #[test]
+    fn t_sku_14_pragma_sets_how_in_lists_are_asked_for() {
+        use super::super::{BuildMode, ListProbe};
+        let (db, on) = open();
+        let (_other_db, other) = open();
+        fill([&on, &other], 10);
+        let root = root_of(&on);
+        for (setting, probe, build) in [
+            ("t.a", ListProbe::Span, BuildMode::Replay),
+            (
+                "t.a zone_maps values",
+                ListProbe::PerValue,
+                BuildMode::Replay,
+            ),
+            ("t.a cracking SPAN", ListProbe::Span, BuildMode::Replay),
+            (
+                "t.a capped inline values",
+                ListProbe::PerValue,
+                BuildMode::Inline,
+            ),
+            (
+                "t.a measured values",
+                ListProbe::PerValue,
+                BuildMode::Replay,
+            ),
+            ("t.a capped void", ListProbe::Span, BuildMode::VoidOnWrite),
+        ] {
+            on.execute(format!("PRAGMA skipping = '{setting}'"))
+                .unwrap();
+            assert_eq!(db.skipping.list_probe(root), Some(probe), "'{setting}'");
+            assert_eq!(db.skipping.build_mode(root), Some(build), "'{setting}'");
+        }
+        for bad in [
+            "t.a off values",
+            "t.a values capped",
+            "t.a capped values inline",
+            "t.a zone_maps values again",
+            "t.a capped each",
+        ] {
+            assert!(
+                on.execute(format!("PRAGMA skipping = '{bad}'")).is_err(),
+                "'{bad}' was taken"
+            );
+        }
+    }
+
     /// Lane skip-5 (T-SKU.4): a skipping scan runs its body over column batches (QT.7's fused
     /// loops) up to each candidate run's end. Four databases, batches on and off by skipping on and
     /// off, take the same random writes and answer every filtered aggregate and row query alike;
@@ -1186,6 +1588,77 @@ mod scans {
                 read[3]
             );
         }
+    }
+
+    /// Lane skip-7 (T-SKU.9). Do: a column scattered over the rowids (each filter's candidates
+    /// are short runs spread over many leaves), column batches on, skipping on and off, filtered
+    /// aggregates and row queries with writes between. Expect: answers as without skipping; with
+    /// skipping, the rows decoded into batches are at most the rows the scan read, so no batch
+    /// decodes past its candidate run's end (before, each window ran to its leaf's end).
+    fn batches_decode_only_candidate_runs(kind: SkipKind) {
+        let rows = 4000i64;
+        for seed in 0..2u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let (_db_skip, skip) = open();
+            let (_db_plain, plain) = open();
+            for conn in [&skip, &plain] {
+                conn.set_vectorized_scans(true);
+                conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, pad TEXT)")
+                    .unwrap();
+                conn.execute("BEGIN").unwrap();
+                for i in 0..rows {
+                    let a = i * 7919 % rows;
+                    conn.execute(format!(
+                        "INSERT INTO t VALUES ({a}, {}, '{}')",
+                        i % 7,
+                        "x".repeat(40)
+                    ))
+                    .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
+            }
+            set_skipping(&skip, "t", "a", Some(kind)).unwrap();
+            let (mut decoded, mut read) = (0usize, 0u64);
+            for round in 0..24 {
+                for _ in 0..rng.random_range(0..6) {
+                    let a = rng.random_range(0..rows);
+                    let rowid = rng.random_range(1..rows);
+                    let sql = format!("UPDATE t SET a = {a} WHERE rowid = {rowid}");
+                    skip.execute(&sql).unwrap();
+                    plain.execute(&sql).unwrap();
+                }
+                let lo = rng.random_range(0..rows);
+                let hi = lo + rng.random_range(0..rows / 40);
+                let sql = match round % 2 {
+                    0 => format!("SELECT count(*), sum(b), min(a), max(a) FROM t WHERE a BETWEEN {lo} AND {hi}"),
+                    _ => format!("SELECT rowid, a, b FROM t WHERE a BETWEEN {lo} AND {hi} ORDER BY rowid"),
+                };
+                let before = crate::vdbe::leaf_batch::tests::decoded();
+                let (answer, r) = query(&skip, &sql);
+                decoded += crate::vdbe::leaf_batch::tests::decoded() - before;
+                read += r;
+                let (expected, _) = query(&plain, &sql);
+                assert_eq!(answer, expected, "seed {seed} {kind:?}: {sql}");
+            }
+            assert!(
+                decoded > 0,
+                "seed {seed} {kind:?}: no skipping row was batched"
+            );
+            assert!(
+                u64::try_from(decoded).unwrap() <= read,
+                "seed {seed} {kind:?}: {decoded} rows decoded, {read} read"
+            );
+        }
+    }
+
+    #[test]
+    fn t_sku_9_cracking_batches_decode_only_candidate_runs() {
+        batches_decode_only_candidate_runs(SkipKind::Cracking);
+    }
+
+    #[test]
+    fn t_sku_9_measured_batches_decode_only_candidate_runs() {
+        batches_decode_only_candidate_runs(SkipKind::Measured);
     }
 
     #[test]
@@ -1491,6 +1964,10 @@ mod chooser {
         stats: ChooserStats,
         /// The write upkeep both methods cost over the run.
         upkeep: u64,
+        /// The scans' costs and the builds' over the run (lane skip-7: with `upkeep`, the run's
+        /// whole cost).
+        scans: u64,
+        leader: Option<SkipMethod>,
     }
 
     /// The work a method's writes do: zone maps' zone updates and splits, the cracker's entries
@@ -1514,6 +1991,11 @@ mod chooser {
     /// method built again when its trial is due. Every candidate set is checked against the plain
     /// scan.
     fn upkeep_run(seed: u64, upkeep: Upkeep, phases: &[Phase]) -> UpkeepRun {
+        upkeep_run_led(seed, upkeep, Lead::for_upkeep(upkeep), phases)
+    }
+
+    /// [`upkeep_run`] under a lead rule of the test's (lane skip-7, T-SKU.7).
+    fn upkeep_run_led(seed: u64, upkeep: Upkeep, lead: Lead, phases: &[Phase]) -> UpkeepRun {
         let rows = 4096i64;
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut table = Table::new();
@@ -1532,8 +2014,9 @@ mod chooser {
         let copy = |table: &Table| CrackerColumn::new(table.iter().map(|(r, v)| (*r, *v)));
         let build = Some(n(table.len()));
         let mut chooser =
-            Chooser::with_upkeep(builder.finish(), copy(&table), upkeep, [build, build]);
+            Chooser::with_rules(builder.finish(), copy(&table), upkeep, lead, [build, build]);
         let mut total = 0u64;
+        let mut scans = 0u64;
         let top = rows / 4 + 10;
         for phase in phases {
             for _ in 0..phase.filters {
@@ -1561,9 +2044,22 @@ mod chooser {
                                 clock
                             })
                             .unwrap();
+                        scans += size;
                     }
                     Some(SkipMethod::Cracking) => {
-                        chooser.install_cracker(copy(&table), n(table.len()));
+                        let before = chooser.method_stats(SkipMethod::Cracking).rebuilt;
+                        chooser
+                            .install_cracker(copy(&table), n(table.len()), &mut || 0)
+                            .unwrap();
+                        assert_eq!(
+                            chooser.method_stats(SkipMethod::Cracking).rebuilt,
+                            before + 1
+                        );
+                        // The build, and the cut points it was cut at again (T-SKU.8).
+                        scans += n(table.len());
+                        scans += chooser
+                            .cracker()
+                            .map_or(0, |c| c.stats().entries_partitioned);
                     }
                     None => {}
                 }
@@ -1579,11 +2075,14 @@ mod chooser {
                 let cost =
                     work_of(&chooser, method).saturating_sub(before[at]) + rows_read(&table, &c);
                 chooser.record(method, cost);
+                scans += cost;
             }
         }
         UpkeepRun {
             stats: chooser.stats(),
             upkeep: total,
+            scans,
+            leader: chooser.leader(),
         }
     }
 
@@ -1627,7 +2126,10 @@ mod chooser {
     /// filters, no writes), so cracking leads; then heavy writes make the column follow the rowid
     /// and filters widen, where zone maps win, while their upkeep passes their build cost.
     /// Expect: capped, zone maps are dropped and built again (from the cracker) when their trial
-    /// comes due; kept both, nothing is dropped; every answer is sound.
+    /// comes due; kept both, nothing is dropped; every answer is sound. Lane skip-7: run on the
+    /// scan-only lead rule, as the mechanism under test is the drop and rebuild of the method not
+    /// leading; under total cost (`Upkeep::Capped`'s own rule) the cracker's moves let zone maps
+    /// lead as soon as the writes start, which `t_sku_7_*` checks.
     #[test]
     fn t_sku_5_shifting_workload_rebuilds_the_dropped_method() {
         for seed in 0..2 {
@@ -1645,8 +2147,14 @@ mod chooser {
                     filters: 1024,
                 },
             ];
-            let capped = upkeep_run(seed, Upkeep::Capped, &phases);
+            let capped = upkeep_run_led(seed, Upkeep::Capped, Lead::Scan, &phases);
             let kept = upkeep_run(seed, Upkeep::KeepBoth, &phases);
+            // Lane skip-8: which kind each ends led by is reported, not asserted (T-SKU.5's text
+            // claims none; skip-7's model had keeping both end led by cracking).
+            eprintln!(
+                "t_sku_5 seed {seed}: capped ends led by {:?}, kept both by {:?}",
+                capped.leader, kept.leader
+            );
             assert!(
                 capped.stats.zone_maps.dropped > 0,
                 "seed {seed}: {:?}",
@@ -1662,6 +2170,270 @@ mod chooser {
                 0
             );
         }
+    }
+
+    /// Lane skip-7 (T-SKU.7). Do: costs handed in directly: cracking's scan a little cheaper than
+    /// zone maps', then a stretch of writes costs the cracker five times what it costs zone maps.
+    /// Expect: on the total-cost rule the next filter goes to zone maps and the leader changes
+    /// (11 against 13); on the scan rule (the control) cracking keeps leading (8 against 10).
+    #[test]
+    fn t_sku_7_total_cost_leader_counts_the_write_upkeep() {
+        for (lead, expect) in [
+            (Lead::Total, SkipMethod::ZoneMaps),
+            (Lead::Scan, SkipMethod::Cracking),
+        ] {
+            let mut chooser = Chooser::with_rules(
+                ZoneMapBuilder::new().finish(),
+                CrackerColumn::new([]),
+                Upkeep::Capped,
+                lead,
+                [None, None],
+            );
+            let (_, first) = chooser.candidates(0, 0).unwrap();
+            assert_eq!(first, SkipMethod::ZoneMaps);
+            chooser.record(first, 10);
+            let (_, second) = chooser.candidates(0, 0).unwrap();
+            assert_eq!(second, SkipMethod::Cracking);
+            chooser.record(second, 8);
+            assert_eq!(chooser.leader(), Some(SkipMethod::Cracking), "{lead:?}");
+            chooser.record_upkeep(SkipMethod::Cracking, 5);
+            chooser.record_upkeep(SkipMethod::ZoneMaps, 1);
+            let (_, third) = chooser.candidates(0, 0).unwrap();
+            assert_eq!(third, expect, "{lead:?}: {:?}", chooser.stats());
+            chooser.record(third, if third == SkipMethod::ZoneMaps { 10 } else { 8 });
+            assert_eq!(chooser.leader(), Some(expect), "{lead:?}");
+            assert_eq!(
+                chooser.stats().switches,
+                u64::from(expect == SkipMethod::ZoneMaps),
+                "{lead:?}"
+            );
+            assert_eq!(
+                chooser.method_stats(SkipMethod::Cracking).last_upkeep,
+                Some(5)
+            );
+            assert_eq!(
+                chooser.method_stats(SkipMethod::ZoneMaps).last_upkeep,
+                Some(1)
+            );
+        }
+    }
+
+    /// Lane skip-7 (T-SKU.7), the A/B of the lead rule under the cap. Do: zone maps' scan failure
+    /// mode (scattered values, narrow filters: zone maps read every row) under write churn (256
+    /// writes a filter), where the cracker's moves cost far more than the rows zone maps read.
+    /// Expect: on the scan rule cracking leads and its upkeep goes on being paid; on the total
+    /// rule zone maps lead, the cracker is dropped, and the run's whole cost (scans, builds and
+    /// write upkeep) is lower. Every answer is sound.
+    #[test]
+    fn t_sku_7_capped_total_cost_lead_pays_less_under_write_churn() {
+        for seed in 0..2 {
+            let phases = [Phase {
+                writes: 256,
+                value: scattered,
+                width: (0, 8),
+                filters: 160,
+            }];
+            let total = upkeep_run_led(seed, Upkeep::Capped, Lead::Total, &phases);
+            let scan = upkeep_run_led(seed, Upkeep::Capped, Lead::Scan, &phases);
+            assert_eq!(
+                total.leader,
+                Some(SkipMethod::ZoneMaps),
+                "seed {seed}: {:?}",
+                total.stats
+            );
+            assert_eq!(
+                scan.leader,
+                Some(SkipMethod::Cracking),
+                "seed {seed}: {:?}",
+                scan.stats
+            );
+            assert!(
+                total.stats.cracking.dropped > 0,
+                "seed {seed}: {:?}",
+                total.stats
+            );
+            assert!(
+                total.scans + total.upkeep < scan.scans + scan.upkeep,
+                "seed {seed}: total-cost lead {} + {}, scan lead {} + {}",
+                total.scans,
+                total.upkeep,
+                scan.scans,
+                scan.upkeep
+            );
+        }
+    }
+
+    /// Lane skip-7 (T-SKU.7). Do: T-SKU.5's shifting workload on the cap's own rule (total cost).
+    /// Expect: it ends led by zone maps with the cracker dropped for its upkeep, paying less
+    /// upkeep than keeping both; every answer is sound.
+    #[test]
+    fn t_sku_7_shifting_workload_ends_led_by_zone_maps_on_total_cost() {
+        for seed in 0..2 {
+            let phases = [
+                Phase {
+                    writes: 0,
+                    value: scattered,
+                    width: (0, 8),
+                    filters: 160,
+                },
+                Phase {
+                    writes: 64,
+                    value: following,
+                    width: (512, 1024),
+                    filters: 1024,
+                },
+            ];
+            let capped = upkeep_run(seed, Upkeep::Capped, &phases);
+            let kept = upkeep_run(seed, Upkeep::KeepBoth, &phases);
+            assert_eq!(
+                capped.leader,
+                Some(SkipMethod::ZoneMaps),
+                "seed {seed}: {:?}",
+                capped.stats
+            );
+            assert!(
+                capped.stats.cracking.dropped > 0,
+                "seed {seed}: {:?}",
+                capped.stats
+            );
+            assert!(
+                capped.upkeep < kept.upkeep,
+                "seed {seed}: {} capped, {} kept",
+                capped.upkeep,
+                kept.upkeep
+            );
+        }
+    }
+
+    /// Lane skip-7 (T-SKU.7). Do: capped, the cracker dropped for its upkeep while zone maps
+    /// lead; then zone maps' own scans cost more than the cracker's last measure. Expect: the
+    /// cracker is due a build and a trial at once (`rebuild_due`), zone maps answer until it is
+    /// built, and zone maps, the last kind kept, are never dropped however much upkeep they cost.
+    #[test]
+    fn t_sku_7_a_dropped_kind_measured_cheaper_is_built_again_and_the_last_kept_stays() {
+        let mut chooser = Chooser::with_rules(
+            ZoneMapBuilder::new().finish(),
+            CrackerColumn::new([]),
+            Upkeep::Capped,
+            Lead::Scan,
+            [Some(10), Some(10)],
+        );
+        let (_, first) = chooser.candidates(0, 0).unwrap();
+        chooser.record(first, 1);
+        let (_, second) = chooser.candidates(0, 0).unwrap();
+        chooser.record(second, 100);
+        assert_eq!(chooser.leader(), Some(SkipMethod::ZoneMaps));
+        chooser.record_upkeep(SkipMethod::Cracking, 11);
+        assert!(!chooser.keeps(SkipMethod::Cracking));
+        chooser.record(SkipMethod::ZoneMaps, 200);
+        assert_eq!(chooser.next_method(), (SkipMethod::Cracking, true));
+        assert_eq!(chooser.rebuild_due(), Some(SkipMethod::Cracking));
+        let (candidates, method) = chooser.candidates(0, 0).unwrap();
+        assert_eq!(method, SkipMethod::ZoneMaps);
+        assert_ne!(candidates, Candidates::All);
+        chooser.record_upkeep(SkipMethod::ZoneMaps, 1_000_000);
+        assert!(chooser.keeps(SkipMethod::ZoneMaps), "{:?}", chooser.stats());
+        assert_eq!(chooser.method_stats(SkipMethod::ZoneMaps).dropped, 0);
+    }
+
+    /// Lane skip-7 (T-SKU.8). Do: a cracker cut by a few filters, and a fresh copy of the same
+    /// rows cut at its cut points. Expect: the copy holds the same cut points, answers each of the
+    /// filters with the same rowids without partitioning anything more, and its cutting moved at
+    /// most a copy's entries per halving of the cut points (n log k, not n k).
+    #[test]
+    fn t_sku_8_cracker_cut_again_at_its_cut_points_answers_without_cutting() {
+        let rows: Vec<(i64, Option<i64>)> = (1..=2000i64)
+            .map(|rowid| {
+                (
+                    rowid,
+                    if rowid % 97 == 0 {
+                        None
+                    } else {
+                        Some(rowid * 7919 % 1000)
+                    },
+                )
+            })
+            .collect();
+        let filters = [
+            (10, 50),
+            (400, 420),
+            (700, 900),
+            (0, 5),
+            (990, 999),
+            (300, 300),
+        ];
+        let mut cut = CrackerColumn::new(rows.clone());
+        for (lo, hi) in filters {
+            cut.candidate_rowids(lo, hi).unwrap();
+        }
+        let bounds = cut.bounds();
+        assert!(bounds.len() >= filters.len(), "{bounds:?}");
+        let mut again = CrackerColumn::new(rows.clone());
+        again.crack_at(&bounds).unwrap();
+        assert_eq!(again.bounds(), bounds);
+        let k = u64::try_from(bounds.len()).unwrap();
+        let levels = u64::from(u64::BITS - k.leading_zeros());
+        let entries = u64::try_from(rows.len()).unwrap();
+        assert!(
+            again.stats().entries_partitioned <= entries * levels,
+            "{} partitioned for {k} cut points over {entries} rows",
+            again.stats().entries_partitioned
+        );
+        for (lo, hi) in filters {
+            let before = again.stats().entries_partitioned;
+            assert_eq!(
+                again.candidate_rowids(lo, hi).unwrap(),
+                cut.candidate_rowids(lo, hi).unwrap()
+            );
+            assert_eq!(
+                again.stats().entries_partitioned,
+                before,
+                "{lo}..={hi} was cut again"
+            );
+        }
+    }
+
+    /// Lane skip-7 (T-SKU.8). Do: a capped chooser whose cracker, cut by its trial, is dropped for
+    /// its upkeep, then built again from the table. Expect: the cracker built again holds the
+    /// dropped one's cut points, and its build counts once.
+    #[test]
+    fn t_sku_8_rebuilt_cracker_keeps_its_cut_points() {
+        let rows: Vec<(i64, Option<i64>)> = (1..=500i64)
+            .map(|rowid| (rowid, Some(rowid * 31 % 250)))
+            .collect();
+        let mut builder = ZoneMapBuilder::new();
+        builder.end_run();
+        for (rowid, value) in &rows {
+            builder.row(*rowid, *value).unwrap();
+        }
+        let mut chooser = Chooser::with_rules(
+            builder.finish(),
+            CrackerColumn::new(rows.clone()),
+            Upkeep::Capped,
+            Lead::Scan,
+            [Some(10), Some(10)],
+        );
+        let (_, first) = chooser.candidates(5, 20).unwrap();
+        assert_eq!(first, SkipMethod::ZoneMaps);
+        chooser.record(first, 1);
+        let (_, second) = chooser.candidates(30, 40).unwrap();
+        assert_eq!(second, SkipMethod::Cracking);
+        chooser.record(second, 100);
+        assert_eq!(chooser.leader(), Some(SkipMethod::ZoneMaps));
+        let bounds = chooser.cracker().unwrap().bounds();
+        assert_eq!(bounds, vec![30, 41]);
+        chooser.record_upkeep(SkipMethod::Cracking, 11);
+        assert!(
+            !chooser.keeps(SkipMethod::Cracking),
+            "{:?}",
+            chooser.stats()
+        );
+        chooser
+            .install_cracker(CrackerColumn::new(rows.clone()), 10, &mut || 0)
+            .unwrap();
+        assert_eq!(chooser.cracker().unwrap().bounds(), bounds);
+        assert_eq!(chooser.method_stats(SkipMethod::Cracking).rebuilt, 1);
+        assert_eq!(chooser.method_stats(SkipMethod::Cracking).dropped, 1);
     }
 
     fn empty_chooser() -> Chooser {
@@ -1726,5 +2498,721 @@ mod chooser {
             trials += usize::from(method == SkipMethod::Cracking);
         }
         assert_eq!(trials, 1, "{:?}", chooser.stats());
+    }
+}
+
+/// Lane skip-8 (T-SKU.10): a measured summary's dropped method built again off the scan's path,
+/// one build per summary at a time, installed only when no write came in during it.
+mod builds {
+    use super::super::{
+        start_build, zone_map_of_table, BuildEnd, BuildMode, Chooser, CrackerColumn, Lead,
+        RowWrite, SkipMethod, SkipRegistry, Skipping, Upkeep, ZoneMap, ZoneMapBuilder,
+    };
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+    use crate::{Connection, Database, SqliteDialect};
+    use std::sync::Barrier;
+
+    const ROOT: i64 = 2;
+    const AT: (u32, u64) = (0, 1);
+
+    /// T-SKU.7's scenario: capped, the cracker dropped for its upkeep while zone maps led, then
+    /// zone maps measured costlier than the cracker's last scan, so the cracker's build is due.
+    fn cracker_due() -> Chooser {
+        due_over(ZoneMapBuilder::new().finish(), CrackerColumn::new([]))
+    }
+
+    /// [`cracker_due`]'s scenario over a summary holding rows: `zones` and `cracker` as built.
+    fn due_over(zones: ZoneMap, cracker: CrackerColumn) -> Chooser {
+        let mut chooser = Chooser::with_rules(
+            zones,
+            cracker,
+            Upkeep::Capped,
+            Lead::Scan,
+            [Some(10), Some(10)],
+        );
+        let (_, first) = chooser.candidates(0, 0).unwrap();
+        chooser.record(first, 1);
+        let (_, second) = chooser.candidates(0, 0).unwrap();
+        chooser.record(second, 100);
+        chooser.record_upkeep(SkipMethod::Cracking, 11);
+        chooser.record(SkipMethod::ZoneMaps, 200);
+        assert_eq!(chooser.rebuild_due(), Some(SkipMethod::Cracking));
+        chooser
+    }
+
+    fn registry_due() -> SkipRegistry {
+        let registry = SkipRegistry::default();
+        registry.set(ROOT, 0, Skipping::Measured(Box::new(cracker_due())));
+        registry
+    }
+
+    /// Rows `1..=n`, each row's value its rowid.
+    fn table_rows(n: i64) -> Vec<(i64, Option<i64>)> {
+        (1..=n).map(|rowid| (rowid, Some(rowid))).collect()
+    }
+
+    /// A registry whose summary holds `rows`, its cracker due a build, built by `mode`.
+    fn registry_over(rows: &[(i64, Option<i64>)], mode: BuildMode) -> SkipRegistry {
+        let mut zones = ZoneMapBuilder::new();
+        for (rowid, value) in rows {
+            zones.row(*rowid, *value).unwrap();
+        }
+        let chooser = due_over(zones.finish(), CrackerColumn::new(rows.iter().copied()));
+        let registry = SkipRegistry::default();
+        registry.set_with_build(ROOT, 0, Skipping::Measured(Box::new(chooser)), mode);
+        registry
+    }
+
+    /// The rows the summary's cracker holds, by rowid; `None` while it is dropped.
+    fn cracker_rows(registry: &SkipRegistry, root: i64) -> Option<Vec<(i64, Option<i64>)>> {
+        registry
+            .with_summary(root, |s| match s {
+                Skipping::Measured(chooser) => chooser.cracker().map(|c| {
+                    let mut rows = c.rows();
+                    rows.sort_unstable();
+                    rows
+                }),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    /// A writer's insert of `rowid` (value `rowid`) at the newest commit `at`.
+    fn insert(registry: &SkipRegistry, at: (u32, u64), rowid: i64) {
+        registry.on_write(
+            ROOT,
+            9,
+            at,
+            RowWrite::Insert {
+                rowid,
+                value: Some(rowid),
+            },
+            &mut || 0,
+        );
+    }
+
+    fn copy() -> CrackerColumn {
+        CrackerColumn::new([(1, Some(5)), (2, Some(7))])
+    }
+
+    fn keeps_cracker(registry: &SkipRegistry, root: i64) -> bool {
+        registry.with_summary(
+            root,
+            |s| matches!(s, Skipping::Measured(chooser) if chooser.keeps(SkipMethod::Cracking)),
+        ) == Some(true)
+    }
+
+    /// Do: sixteen connections find the same build due at once. Expect: exactly one claims it;
+    /// while it holds the claim no other gets one; handed back, the still-due build can be
+    /// claimed again.
+    #[test]
+    fn t_sku_10_connections_asking_at_once_claim_one_build() {
+        let registry = std::sync::Arc::new(registry_due());
+        let askers = 16;
+        let barrier = std::sync::Arc::new(Barrier::new(askers));
+        let handles: Vec<_> = (0..askers)
+            .map(|_| {
+                let registry = std::sync::Arc::clone(&registry);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.claim_build(ROOT)
+                })
+            })
+            .collect();
+        let mut claims: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(claims.len(), 1, "{askers} askers: {claims:?}");
+        let claim = claims.pop().unwrap();
+        assert_eq!(claim.method, SkipMethod::Cracking);
+        assert!(registry.building(ROOT));
+        assert_eq!(registry.claim_build(ROOT), None);
+        registry.abandon_build(claim);
+        assert!(!registry.building(ROOT));
+        let again = registry.claim_build(ROOT).expect("the trial is still due");
+        registry.abandon_build(again);
+    }
+
+    /// Do: a build pinned at the newest commit, then a write reaches the summary before it hands
+    /// its copy back. Expect: nothing installed (the copy would miss the write), the cracker stays
+    /// dropped and the claim is free; a build pinned after the writer committed installs, and no
+    /// build is due after it.
+    #[test]
+    fn t_sku_10_a_write_during_the_build_voids_it() {
+        let registry = registry_over(&[], BuildMode::VoidOnWrite);
+        let claim = registry.claim_build(ROOT).unwrap();
+        assert!(registry.pin_build(&claim, 1, AT, AT));
+        registry.on_write(
+            ROOT,
+            9,
+            AT,
+            RowWrite::Insert {
+                rowid: 3,
+                value: Some(1),
+            },
+            &mut || 0,
+        );
+        assert_eq!(
+            registry.install_cracker(claim, copy(), 10, &mut || 0),
+            BuildEnd::Invalidated
+        );
+        assert!(!keeps_cracker(&registry, ROOT));
+        assert!(!registry.building(ROOT));
+        let committed = (0, 2);
+        let claim = registry.claim_build(ROOT).expect("the trial is still due");
+        assert!(registry.pin_build(&claim, 1, committed, committed));
+        assert_eq!(
+            registry.install_cracker(claim, copy(), 10, &mut || 0),
+            BuildEnd::Installed
+        );
+        assert!(keeps_cracker(&registry, ROOT));
+        assert_eq!(registry.claim_build(ROOT), None, "built: none is due");
+    }
+
+    /// Do: a build asked for while another connection's write is open, one whose summary is
+    /// set again during it, and one on a summary made stale. Expect: the first reads nothing (its
+    /// snapshot misses the open write); the second installs nothing and leaves the new summary's
+    /// own claim alone; a stale summary hands out no claim.
+    #[test]
+    fn t_sku_10_a_build_installs_only_on_the_state_it_read() {
+        let registry = registry_due();
+        registry.on_write(
+            ROOT,
+            9,
+            AT,
+            RowWrite::Insert {
+                rowid: 3,
+                value: Some(1),
+            },
+            &mut || 0,
+        );
+        let claim = registry.claim_build(ROOT).unwrap();
+        assert!(!registry.pin_build(&claim, 1, AT, AT));
+        registry.abandon_build(claim);
+        assert!(!registry.building(ROOT));
+
+        let old = registry.claim_build(ROOT).unwrap();
+        registry.set(ROOT, 0, Skipping::Measured(Box::new(cracker_due())));
+        let fresh = registry
+            .claim_build(ROOT)
+            .expect("the new summary's own build");
+        assert_eq!(
+            registry.install_cracker(old, copy(), 10, &mut || 0),
+            BuildEnd::Superseded
+        );
+        assert!(registry.building(ROOT), "the old claim freed the new one");
+        registry.abandon_build(fresh);
+
+        registry.on_write(
+            ROOT,
+            9,
+            AT,
+            RowWrite::Insert {
+                rowid: 4,
+                value: Some(2),
+            },
+            &mut || 0,
+        );
+        registry.rolled_back(9);
+        assert_eq!(registry.claim_build(ROOT), None);
+    }
+
+    /// Do: a real table whose summary's cracker is due a build, and eight connections that find
+    /// it due at once start the build. Expect: one build starts, on its own thread and
+    /// connection, and installs a cracker holding every row of the table; none is due after.
+    #[test]
+    fn t_sku_10_a_due_cracker_is_built_once_from_the_table_off_the_scan() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let rows = 500;
+        conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..rows {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'x')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        let root = conn
+            .with_schema_mut(|s| s.get_btree_table("t"))
+            .unwrap()
+            .unwrap()
+            .root_page;
+        db.skipping
+            .set(root, 0, Skipping::Measured(Box::new(cracker_due())));
+        let askers = 8;
+        let barrier = std::sync::Arc::new(Barrier::new(askers));
+        let handles: Vec<_> = (0..askers)
+            .map(|_| {
+                let asker = db.connect(crate::ConnectOpts::new()).unwrap();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    start_build(&asker, root, 0, 2)
+                })
+            })
+            .collect();
+        let builds: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(builds.len(), 1, "{askers} askers started {}", builds.len());
+        let ends: Vec<BuildEnd> = builds
+            .into_iter()
+            .map(|build| build.join().unwrap())
+            .collect();
+        assert_eq!(ends, vec![BuildEnd::Installed]);
+        let held = db
+            .skipping
+            .with_summary(root, |s| match s {
+                Skipping::Measured(chooser) => chooser.cracker().map(|c| c.rows().len()),
+                _ => None,
+            })
+            .flatten();
+        assert_eq!(held, Some(500));
+        assert!(!db.skipping.building(root));
+        assert_eq!(db.skipping.claim_build(root), None);
+    }
+
+    /// A table `t (a INTEGER, pad TEXT)` of `rows` rows (`a` = 0, 1, ...) on `conn`, and its root.
+    fn fill_table(conn: &Arc<Connection>, rows: i64) -> i64 {
+        conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..rows {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'x')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.with_schema_mut(|s| s.get_btree_table("t"))
+            .unwrap()
+            .unwrap()
+            .root_page
+    }
+
+    /// `t`'s summary on `conn`'s database, its cracker due a build, built by `mode`.
+    fn set_due(conn: &Arc<Connection>, root: i64, rows: i64, mode: BuildMode) {
+        let zones = zone_map_of_table(conn, "t", "a").unwrap();
+        let cracker = CrackerColumn::new((0..rows).map(|i| (i.saturating_add(1), Some(i))));
+        conn.db.skipping.set_with_build(
+            root,
+            0,
+            Skipping::Measured(Box::new(due_over(zones, cracker))),
+            mode,
+        );
+    }
+
+    /// Lane skip-9 (T-SKU.11), void's failure mode. Do: a write reaches the summary during every
+    /// build, eight trials in a row (a steady write rate), once void-on-write and once replaying.
+    /// Expect: void-on-write installs none (each build voided, the cracker never comes back);
+    /// replay installs the first, its copy holding the table's rows and the write that came in
+    /// during it, and no build is due after.
+    #[test]
+    fn t_sku_11_steady_writes_starve_void_but_replay_installs() {
+        let rows = table_rows(64);
+        let trials = 8u64;
+        for mode in [BuildMode::VoidOnWrite, BuildMode::Replay] {
+            let registry = registry_over(&rows, mode);
+            let mut ends = Vec::new();
+            for trial in 1..=trials {
+                let Some(claim) = registry.claim_build(ROOT) else {
+                    break;
+                };
+                let committed = (0, trial);
+                assert!(
+                    registry.pin_build(&claim, 1, committed, committed),
+                    "{mode:?} trial {trial}"
+                );
+                insert(&registry, committed, 1000 + i64::try_from(trial).unwrap());
+                ends.push(registry.install_cracker(
+                    claim,
+                    CrackerColumn::new(rows.iter().copied()),
+                    10,
+                    &mut || 0,
+                ));
+            }
+            let counts = registry.counts(ROOT).unwrap();
+            match mode {
+                BuildMode::VoidOnWrite => {
+                    assert_eq!(ends, vec![BuildEnd::Invalidated; 8], "void: {ends:?}");
+                    assert_eq!(counts.builds_invalidated, trials);
+                    assert_eq!(counts.builds_installed, 0);
+                    assert!(
+                        !keeps_cracker(&registry, ROOT),
+                        "void: starved, the cracker never came back"
+                    );
+                }
+                _ => {
+                    assert_eq!(ends, vec![BuildEnd::Installed], "replay: {ends:?}");
+                    assert_eq!(counts.builds_installed, 1);
+                    assert_eq!(counts.replayed_writes, 1);
+                    let mut want = rows.clone();
+                    want.push((1001, Some(1001)));
+                    assert_eq!(cracker_rows(&registry, ROOT), Some(want));
+                    assert_eq!(registry.claim_build(ROOT), None, "built: none is due");
+                }
+            }
+        }
+    }
+
+    /// Lane skip-9 (T-SKU.11), replay's failure mode: its memory under a burst. Do: a build on a
+    /// summary of 64 rows, then a burst of writes during it: an update, a delete and inserts, as
+    /// many as the rows (the bound), and once one more. Expect: within the bound, the record
+    /// holds the whole burst and the copy installed is the table after the burst, in order; one
+    /// past it, the record never holds more than the bound, is dropped, and the build falls back
+    /// to void (nothing installed, one overflow counted).
+    #[test]
+    fn t_sku_11_a_burst_past_the_replay_bound_falls_back_to_void() {
+        let rows = table_rows(64);
+        let bound = u64::try_from(rows.len()).unwrap();
+        for burst in [bound, bound + 1] {
+            let registry = registry_over(&rows, BuildMode::Replay);
+            let claim = registry.claim_build(ROOT).unwrap();
+            assert!(registry.pin_build(&claim, 1, AT, AT));
+            let mut writes = vec![
+                RowWrite::Update {
+                    rowid: 1,
+                    old: Some(1),
+                    new: Some(500),
+                },
+                RowWrite::Delete {
+                    rowid: 2,
+                    old: Some(2),
+                },
+            ];
+            let inserts = burst - 2;
+            writes.extend(
+                (0..i64::try_from(inserts).unwrap()).map(|i| RowWrite::Insert {
+                    rowid: 100 + i,
+                    value: Some(i),
+                }),
+            );
+            for write in &writes {
+                registry.on_write(ROOT, 9, AT, *write, &mut || 0);
+            }
+            let end = registry.install_cracker(
+                claim,
+                CrackerColumn::new(rows.iter().copied()),
+                10,
+                &mut || 0,
+            );
+            let counts = registry.counts(ROOT).unwrap();
+            assert!(
+                counts.replay_peak <= bound,
+                "burst {burst}: the record held {} past its bound {bound}",
+                counts.replay_peak
+            );
+            if burst <= bound {
+                assert_eq!(end, BuildEnd::Installed, "burst {burst}");
+                assert_eq!(counts.replay_peak, burst);
+                assert_eq!(counts.replay_overflows, 0);
+                assert_eq!(counts.replayed_writes, burst);
+                let mut want: Vec<_> = rows
+                    .iter()
+                    .copied()
+                    .filter(|(rowid, _)| *rowid > 2)
+                    .collect();
+                want.push((1, Some(500)));
+                want.extend((0..i64::try_from(inserts).unwrap()).map(|i| (100 + i, Some(i))));
+                want.sort_unstable();
+                assert_eq!(
+                    cracker_rows(&registry, ROOT),
+                    Some(want),
+                    "burst {burst}: replayed in order"
+                );
+            } else {
+                assert_eq!(
+                    end,
+                    BuildEnd::Invalidated,
+                    "burst {burst}: fell back to void"
+                );
+                assert_eq!(counts.replay_overflows, 1);
+                assert_eq!(counts.replayed_writes, 0);
+                assert!(!keeps_cracker(&registry, ROOT));
+                assert!(!registry.building(ROOT));
+                assert!(
+                    registry.claim_build(ROOT).is_some(),
+                    "the next trial claims again"
+                );
+            }
+        }
+    }
+
+    /// Lane skip-9 (T-SKU.11), inline's failure mode: the scan that finds the trial due pays the
+    /// build. Do: a real table of 500 rows whose cracker is due, and one filter through SQL,
+    /// under each build mode. Expect: inline, the filter's own statement read every row of the
+    /// table for the build and the cracker is kept when it returns; void-on-write and replay read
+    /// none on the scan's path. Answers equal across modes.
+    #[test]
+    fn t_sku_11_inline_builds_on_the_scans_path_the_others_off_it() {
+        let rows = 500;
+        let mut answers = Vec::new();
+        for mode in [BuildMode::Inline, BuildMode::VoidOnWrite, BuildMode::Replay] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+            let root = fill_table(&conn, rows);
+            set_due(&conn, root, rows, mode);
+            let mut stmt = conn
+                .prepare("SELECT a FROM t WHERE a BETWEEN 10 AND 20")
+                .unwrap();
+            let answer: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| format!("{row:?}"))
+                .collect();
+            answers.push(answer);
+            let counts = db.skipping.counts(root).unwrap();
+            assert_eq!(
+                counts.consulted, 1,
+                "{mode:?}: the filter skipped with the summary"
+            );
+            match mode {
+                BuildMode::Inline => {
+                    assert_eq!(
+                        counts.inline_rows_read, 500,
+                        "inline: the scan read the table for the build"
+                    );
+                    assert_eq!(counts.builds_installed, 1);
+                    assert!(keeps_cracker(&db.skipping, root));
+                }
+                _ => assert_eq!(
+                    counts.inline_rows_read, 0,
+                    "{mode:?}: nothing read on the scan's path"
+                ),
+            }
+        }
+        assert!(
+            answers.windows(2).all(|pair| pair.first() == pair.last()),
+            "{answers:?}"
+        );
+        assert_eq!(answers.first().map(Vec::len), Some(11));
+    }
+
+    /// Lane skip-9 (T-SKU.11): `PRAGMA skipping` takes a measured summary's build mode, replay by
+    /// default, and refuses one after a kind that never builds again.
+    #[test]
+    fn t_sku_11_pragma_sets_the_build_mode() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let root = fill_table(&conn, 10);
+        for (setting, mode) in [
+            ("t.a capped", BuildMode::Replay),
+            ("t.a capped inline", BuildMode::Inline),
+            ("t.a CAPPED void", BuildMode::VoidOnWrite),
+            ("t.a measured replay", BuildMode::Replay),
+        ] {
+            conn.execute(format!("PRAGMA skipping = '{setting}'"))
+                .unwrap();
+            assert_eq!(db.skipping.build_mode(root), Some(mode), "'{setting}'");
+        }
+        for bad in [
+            "t.a zone_maps replay",
+            "t.a cracking void",
+            "t.a off inline",
+            "t.a capped sideways",
+            "t.a capped void again",
+        ] {
+            assert!(
+                conn.execute(format!("PRAGMA skipping = '{bad}'")).is_err(),
+                "'{bad}' was taken"
+            );
+        }
+    }
+
+    /// Lane skip-9 (T-SKU.12). Do: an encrypted database (aes256gcm), its connection opened with
+    /// the key, a table whose cracker is due, and the build started from that connection.
+    /// Expect: the build's own connection opens with the same key, reads every row and installs.
+    #[cfg(all(feature = "encryption", feature = "fs"))]
+    #[test]
+    fn t_sku_12_an_encrypted_databases_build_reads_with_its_key() {
+        // A test key: 32 bytes, as aes256gcm takes (the cipher's key size).
+        let hexkey = "5a".repeat(32);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skip-encrypted.db");
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_encryption(true),
+            Some(crate::EncryptionOpts {
+                cipher: "aes256gcm".to_string(),
+                hexkey: hexkey.clone(),
+            }),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let key = crate::EncryptionKey::from_hex_string(&hexkey).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new().with_encryption_key(Some(key)))
+            .unwrap();
+        let rows = 300;
+        let root = fill_table(&conn, rows);
+        for mode in [BuildMode::VoidOnWrite, BuildMode::Replay] {
+            set_due(&conn, root, rows, mode);
+            let build = start_build(&conn, root, 0, 2).expect("the cracker's build is due");
+            assert_eq!(build.join().unwrap(), BuildEnd::Installed, "{mode:?}");
+            let held = cracker_rows(&db.skipping, root).map(|rows| rows.len());
+            assert_eq!(held, Some(300), "{mode:?}");
+        }
+    }
+
+    /// One run of a prepared statement bound to `values`: its rows, printed.
+    fn run_bound(stmt: &mut crate::Statement, values: &[crate::Value]) -> Vec<String> {
+        stmt.reset().unwrap();
+        for (i, value) in values.iter().enumerate() {
+            stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), value.clone())
+                .unwrap();
+        }
+        let rows = stmt.run_collect_rows().unwrap();
+        rows.into_iter().map(|row| format!("{row:?}")).collect()
+    }
+
+    /// Lane skip-11 (T-SKU.15, kiln goal 623adc1c): every piece the goal names, end to end
+    /// through SQL. Do: for each build mode (inline, void-on-write, replay) and each way of
+    /// asking for an IN list (span, value by value), an encrypted (aes256gcm) file database whose
+    /// capped summary has a cracker build due under that mode, and an in-memory database with the
+    /// same rows and no summary; one statement prepared once for each bound shape (`BETWEEN ? AND
+    /// ?`, `>= ?`, `<= ?`, `= ?`, `IN (?, ?)` with its values half the table apart, `IN` of 16
+    /// neighbouring parameters, and `IN (?, ?)` with one value bound to a real), each bound and
+    /// run, then re-bound and run again, every round, with random SQL writes (inserts, NULL and
+    /// text values, updates, deletes) between rounds. Expect: every run answers as the database
+    /// without a summary; every run bound by integers consulted the summary and none with a real
+    /// did; the summary probed once a run for the span, and once a value by value.
+    #[cfg(all(feature = "encryption", feature = "fs"))]
+    #[test]
+    fn t_sku_15_every_piece_end_to_end_through_sql() {
+        use super::super::{skipping_counts, ListProbe};
+        use crate::Value;
+        use rand::{Rng, SeedableRng};
+        const CLUSTER: i64 = 16;
+        // A test key: 32 bytes, as aes256gcm takes (the cipher's key size).
+        let hexkey = "5a".repeat(32);
+        let rows = 2000i64;
+        let cluster = (1..=CLUSTER)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sqls = [
+            "SELECT rowid, a FROM t WHERE a BETWEEN ? AND ? ORDER BY rowid".to_string(),
+            "SELECT count(*), sum(rowid) FROM t WHERE a >= ?".to_string(),
+            "SELECT count(*), sum(rowid) FROM t WHERE a <= ?".to_string(),
+            "SELECT rowid, a FROM t WHERE a = ? ORDER BY rowid".to_string(),
+            "SELECT rowid, a FROM t WHERE a IN (?, ?) ORDER BY rowid".to_string(),
+            format!("SELECT rowid, a FROM t WHERE a IN ({cluster}) ORDER BY rowid"),
+            "SELECT rowid, a FROM t WHERE a IN (?1, ?2) ORDER BY rowid".to_string(),
+        ];
+        let mut seed = 15u64;
+        for mode in [BuildMode::Inline, BuildMode::VoidOnWrite, BuildMode::Replay] {
+            for probe in [ListProbe::Span, ListProbe::PerValue] {
+                seed += 1;
+                let case = format!("{mode:?} {probe:?}");
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("skip-end-to-end.db");
+                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+                let db = Database::open_file_with_flags(
+                    io,
+                    path.to_str().unwrap(),
+                    crate::OpenFlags::default(),
+                    crate::DatabaseOpts::new().with_encryption(true),
+                    Some(crate::EncryptionOpts {
+                        cipher: "aes256gcm".to_string(),
+                        hexkey: hexkey.clone(),
+                    }),
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let key = crate::EncryptionKey::from_hex_string(&hexkey).unwrap();
+                let on = db
+                    .connect(crate::ConnectOpts::new().with_encryption_key(Some(key)))
+                    .unwrap();
+                let off_db = Database::open_file(
+                    Arc::new(MemoryIO::new()),
+                    ":memory:",
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let off = off_db.connect(crate::ConnectOpts::new()).unwrap();
+                let root = fill_table(&on, rows);
+                fill_table(&off, rows);
+                set_due(&on, root, rows, mode);
+                assert!(db.skipping.set_list_probe(root, probe), "{case}");
+                let mut stmts: Vec<_> = sqls
+                    .iter()
+                    .map(|sql| (on.prepare(sql).unwrap(), off.prepare(sql).unwrap()))
+                    .collect();
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                let (mut integer_runs, mut probes) = (0u64, 0u64);
+                for round in 0..12u64 {
+                    for _ in 0..rng.random_range(0..8) {
+                        let a = rng.random_range(0..rows);
+                        let rowid = rng.random_range(1..rows);
+                        let sql = match rng.random_range(0..6) {
+                            0 => format!("INSERT INTO t VALUES ({a}, 'new')"),
+                            1 => "INSERT INTO t VALUES (NULL, 'null')".to_string(),
+                            2 => format!("UPDATE t SET a = {a} WHERE rowid = {rowid}"),
+                            3 => format!("UPDATE t SET a = 'text' WHERE rowid = {rowid}"),
+                            4 => format!("UPDATE t SET a = {}.5 WHERE rowid = {rowid}", a),
+                            _ => format!("DELETE FROM t WHERE rowid = {rowid}"),
+                        };
+                        on.execute(&sql).unwrap();
+                        off.execute(&sql).unwrap();
+                    }
+                    for (at, (stmt_on, stmt_off)) in stmts.iter_mut().enumerate() {
+                        for bind in 0..2u64 {
+                            let lo = rng.random_range(0..rows);
+                            let (values, asked): (Vec<Value>, u64) = match at {
+                                0 => {
+                                    let hi = lo + rng.random_range(0..rows / 20);
+                                    (vec![Value::from_i64(lo), Value::from_i64(hi)], 1)
+                                }
+                                1 => (
+                                    vec![Value::from_i64(rows - rng.random_range(0..rows / 20))],
+                                    1,
+                                ),
+                                2 => (vec![Value::from_i64(rng.random_range(0..rows / 20))], 1),
+                                3 => (vec![Value::from_i64(lo)], 1),
+                                4 => {
+                                    let far = (lo + rows / 2) % rows;
+                                    (vec![Value::from_i64(lo), Value::from_i64(far)], 2)
+                                }
+                                5 => (
+                                    (0..CLUSTER).map(|i| Value::from_i64(lo + i)).collect(),
+                                    u64::try_from(CLUSTER).unwrap(),
+                                ),
+                                _ => (
+                                    vec![Value::from_i64(lo), Value::from_f64(lo as f64 + 0.5)],
+                                    0,
+                                ),
+                            };
+                            let answer_on = run_bound(stmt_on, &values);
+                            let answer_off = run_bound(stmt_off, &values);
+                            assert_eq!(
+                                answer_on, answer_off,
+                                "{case} round {round} bind {bind}: {} {values:?}",
+                                sqls[at]
+                            );
+                            if asked > 0 {
+                                integer_runs += 1;
+                                probes += match probe {
+                                    ListProbe::Span => 1,
+                                    ListProbe::PerValue => asked,
+                                };
+                            }
+                        }
+                    }
+                }
+                let counts = skipping_counts(&on, "t").unwrap();
+                assert_eq!(counts.consulted, integer_runs, "{case}: {counts:?}");
+                assert_eq!(counts.probes, probes, "{case}: {counts:?}");
+            }
+        }
     }
 }
