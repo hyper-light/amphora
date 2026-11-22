@@ -5326,6 +5326,11 @@ pub fn op_transaction_inner(
                                 OpTransactionState::CheckSchemaCookie;
                             continue;
                         }
+                        // Amphora (lane g7s2-19, `AC-NS.2.1`): the limit of the schema checks
+                        // made in this read, read before it begins (`Switch::pager_read_begins`).
+                        if let Some(switch) = conn.versioned_for(*db) {
+                            switch.pager_read_begins();
+                        }
                         pager.begin_read_tx()?;
                         started_secondary_tx = true;
                         if matches!(tx_mode, TransactionMode::Write) {
@@ -5346,6 +5351,11 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new read transaction"
                         );
+                        // Amphora (lane g7s2-19, `AC-NS.2.1`): the limit of the schema checks
+                        // made in this read, read before it begins (`Switch::pager_read_begins`).
+                        if let Some(switch) = conn.versioned_for(*db) {
+                            switch.pager_read_begins();
+                        }
                         pager.begin_read_tx()?;
                         // https://github.com/tursodatabase/turso/issues/7106 : If auto-commit is turned off,
                         // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
@@ -5909,6 +5919,11 @@ pub fn op_savepoint(
                         // materializes at write upgrade and db_size could
                         // move there the same way.
                         if !pager.holds_read_lock() {
+                            // Amphora (lane g7s2-19, `AC-NS.2.1`): the transaction's schema
+                            // checks are made in this read (`Switch::pager_read_begins`).
+                            if let Some(switch) = conn.versioned_for(crate::MAIN_DB_ID) {
+                                switch.pager_read_begins();
+                            }
                             pager.begin_read_tx()?;
                         }
                         if matches!(conn.get_tx_state(), TransactionState::None) {

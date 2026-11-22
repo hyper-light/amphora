@@ -1224,6 +1224,37 @@ mod tests {
         assert_eq!(tree_rows(&db, 0), want);
     }
 
+    /// AC-NS.2.1 (lane g7s2-19): a writer's limit is the newest commit published as its pager's
+    /// read began (`Txn::schema_seen_by`), not its snapshot's start. Do: read the newest commit,
+    /// commit a change of the catalog (tree 1), then begin two writers of tree 0, after it: one
+    /// limited to the commit read before the change, one not. Expect: the limited one refused
+    /// (`SchemaConflict`), its row nowhere; the other's commit standing.
+    #[test]
+    fn ac_ns_2_1_a_writer_limited_before_a_catalog_change_is_refused_though_begun_after() {
+        let disk = Arc::new(Simulated::new(12, 1).unwrap());
+        let db = Database::open(disk, 2_000, 2, cmp).unwrap();
+        db.v.keep_catalog(1);
+        let mut d = Descender::new();
+        let seen = db.v.clock.published();
+        let mut schema = db.begin().unwrap();
+        db.put(&mut d, &mut schema, 1, b"index", b"1").unwrap();
+        db.commit(schema, &mut d, db.lane(), true).unwrap();
+        let mut limited = db.begin().unwrap();
+        limited.schema_seen_by(seen);
+        db.put(&mut d, &mut limited, 0, b"limited", b"1").unwrap();
+        let refused = db.commit(limited, &mut d, db.lane(), true);
+        assert!(
+            matches!(refused, Err(LimboError::SchemaConflict)),
+            "the writer checked before the catalog's change: {refused:?}"
+        );
+        assert!(tree_rows(&db, 0).is_empty());
+        let mut after = db.begin().unwrap();
+        db.put(&mut d, &mut after, 0, b"after", b"1").unwrap();
+        db.commit(after, &mut d, db.lane(), true).unwrap();
+        let want: BTreeMap<_, _> = [(b"after".to_vec(), b"1".to_vec())].into_iter().collect();
+        assert_eq!(tree_rows(&db, 0), want);
+    }
+
     /// Do: a transaction left open across a checkpoint, then committed after it; another open
     /// across one and rolled back; reopen. Expect: the committed one's rows, not the rolled-back
     /// one's: the checkpoint's list put them back to their versions as of its timestamp and the

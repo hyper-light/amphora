@@ -21,7 +21,7 @@ use super::disk::{Disk, Files, Simulated};
 use super::durable::Database as VDatabase;
 use super::memory::Source;
 use super::pool::Room;
-use super::version::{Savepoint, UnwrittenRefusal};
+use super::version::{Savepoint, Ts, UnwrittenRefusal};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, OnceLock};
 use crate::translate::collate::CollationSeq;
@@ -69,7 +69,18 @@ pub struct Storage {
     /// told when the build paused, and what lets it go on.
     #[cfg(test)]
     build_pause: Mutex<Option<BuildPause>>,
+    /// A test's pause of the next commit with the pager's part ([`Switch::pause_next_commit_with`]):
+    /// told when it paused, and what lets it go on.
+    #[cfg(test)]
+    commit_pause: Mutex<Option<CommitPause>>,
+    /// A test's word of the next schema read's wait for the commits it may have seen
+    /// ([`Switch::tell_next_publish_wait`]).
+    #[cfg(test)]
+    publish_wait: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
+
+#[cfg(test)]
+type CommitPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 #[cfg(test)]
 type BuildPause = (
@@ -126,6 +137,10 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
         ),
         #[cfg(test)]
         build_pause: Mutex::new(None),
+        #[cfg(test)]
+        commit_pause: Mutex::new(None),
+        #[cfg(test)]
+        publish_wait: Mutex::new(None),
     }))
 }
 
@@ -352,6 +367,10 @@ pub struct Switch {
     /// `rollback_tx`, ending an aborted statement): the next transaction begun on this
     /// connection is refused with it, once (G7 step 2, `AC-NS.2.1`: not only logged).
     failed: Mutex<Option<LimboError>>,
+    /// The storage's newest commit as the connection's pager last began a read
+    /// ([`Switch::pager_read_begins`], lane g7s2-19, `AC-NS.2.1`): the schema checks of the
+    /// transaction begun in that read are as old as it.
+    header_at: Mutex<Option<Ts>>,
 }
 
 /// How many trees the transaction had made and dropped when a savepoint was taken: rolling back
@@ -394,6 +413,88 @@ impl Switch {
             named: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
             failed: Mutex::new(None),
+            header_at: Mutex::new(None),
+        }
+    }
+
+    /// The connection's pager is about to begin a read (lane g7s2-19, `AC-NS.2.1`): the
+    /// statements run in it check the schema cookie in the header that read sees, and a schema
+    /// change commits the pager's part (the cookie) before it publishes its rows. So the storage's
+    /// newest commit is read here, before the read begins, and kept as the limit of the
+    /// transaction begun in it ([`super::version::Txn::schema_seen_by`]): a commit that changed
+    /// the catalog after it may be missing from the header its statements were checked against,
+    /// though the transaction's snapshot, begun later, holds it, so its writes are refused. Read
+    /// after the pager's read began, a schema change could be published between, its pager part
+    /// unseen and its timestamp inside the limit. Kept until the next read begins: an older limit
+    /// only refuses more.
+    pub fn pager_read_begins(&self) {
+        *self.header_at.lock() = Some(self.db.v.clock.published());
+    }
+
+    /// Returns once every commit whose pager part a read of the header may have seen is
+    /// published (lane g7s2-19, `AC-NS.2.1`): the pager's part of a schema change commits under
+    /// the storage's publish lock, before its rows are published, so passing that lock closes the
+    /// gap. A schema read after this reads the rows of the cookie it read; before, it could read
+    /// the older rows, keep them under the newer cookie, and give them to every connection. What
+    /// holds the publish lock never waits on a pager reader (a commit's checkpoint is passive), so
+    /// a reader that waits here holds nothing it waits for.
+    pub fn await_published(&self) {
+        #[cfg(test)]
+        self.told_publish_wait();
+        self.db.v.clock.at_publish(|_| ());
+    }
+
+    /// A test's pause of the next commit with the pager's part ([`Switch::commit_with`]), once
+    /// that part committed and before the storage publishes its rows, under the publish lock (lane
+    /// g7s2-19, `AC-NS.2.1`): a receiver told when it has paused, and a sender that lets it go on
+    /// (or is dropped).
+    #[cfg(test)]
+    pub(crate) fn pause_next_commit_with(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *self.storage.commit_pause.lock() = Some((entered, release));
+        (entered_rx, release_tx)
+    }
+
+    /// Drops a pause no commit took: its test hears the commit ended without pausing.
+    #[cfg(test)]
+    pub(crate) fn clear_commit_pause(&self) {
+        *self.storage.commit_pause.lock() = None;
+    }
+
+    /// The commit's pager part has committed: paused here if a test asked
+    /// ([`Switch::pause_next_commit_with`]).
+    #[cfg(test)]
+    fn committed_with(&self) {
+        let pause = self.storage.commit_pause.lock().take();
+        if let Some((entered, release)) = pause {
+            entered.send(()).ok();
+            release.recv().ok();
+        }
+    }
+
+    /// A receiver told when the next schema read on this storage is about to wait for the commits
+    /// it may have seen ([`Switch::await_published`], lane g7s2-19, `AC-NS.2.1`).
+    #[cfg(test)]
+    pub(crate) fn tell_next_publish_wait(&self) -> std::sync::mpsc::Receiver<()> {
+        let (tell, told) = std::sync::mpsc::channel();
+        *self.storage.publish_wait.lock() = Some(tell);
+        told
+    }
+
+    /// Drops a word no schema read took: its test hears no read waited.
+    #[cfg(test)]
+    pub(crate) fn clear_publish_wait(&self) {
+        *self.storage.publish_wait.lock() = None;
+    }
+
+    #[cfg(test)]
+    fn told_publish_wait(&self) {
+        let tell = self.storage.publish_wait.lock().take();
+        if let Some(tell) = tell {
+            tell.send(()).ok();
         }
     }
 
@@ -551,7 +652,13 @@ impl Switch {
         if let Some(error) = self.failed.lock().take() {
             return Err(error);
         }
-        let txn = Arc::new(Mutex::new(Some(self.db.begin()?)));
+        let mut began = self.db.begin()?;
+        // Its statements' schema checks are as old as the pager's read they ran in (lane
+        // g7s2-19, `AC-NS.2.1`).
+        if let Some(at) = *self.header_at.lock() {
+            began.schema_seen_by(at);
+        }
+        let txn = Arc::new(Mutex::new(Some(began)));
         *slot = Some(txn.clone());
         Ok(txn)
     }
@@ -801,7 +908,12 @@ impl Switch {
     /// back, and a failure of `with` rolls the storage's back. With no transaction open here,
     /// `with` alone runs.
     pub fn commit_with(&self, with: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.end(false, with)
+        self.end(false, || {
+            with()?;
+            #[cfg(test)]
+            self.committed_with();
+            Ok(())
+        })
     }
 
     /// [`Switch::finish`] and [`Switch::commit_with`]: `with` runs only on a commit.

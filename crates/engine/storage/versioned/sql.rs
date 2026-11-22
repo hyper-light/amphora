@@ -710,3 +710,105 @@ fn ac_ns_2_1_a_schema_change_the_storage_refuses_leaves_nothing() {
         assert_eq!(by_table, all, "{who} connection, through the table");
     }
 }
+
+/// AC-NS.2.1 (lane g7s2-19): a writer's schema checks read the header its pager's read sees, and
+/// that read can begin before its storage snapshot does. Do open a transaction whose first
+/// statement reads only the header (`PRAGMA schema_version`: its pager's read begins, no row of
+/// the storage read), let another connection's CREATE INDEX on `t` commit, then insert a row of
+/// `t` (compiled against the schema without the index, its cookie check against the older header
+/// passing, its storage snapshot begun only now, after the index) and commit. Expect the header
+/// still the older one, the commit refused with `SchemaConflict` and nothing of it in the table or
+/// the index; run again, its row in both. Limited by its snapshot's start (lane g7s2-17), the
+/// writer was let through and its row was in the table alone.
+#[test]
+fn ac_ns_2_1_a_writer_checked_before_a_schema_change_and_begun_after_is_refused() {
+    let (_db, a, b) = two_writers();
+    run(&a, "BEGIN");
+    let before = cookie(&a);
+    run(&b, "CREATE INDEX tv ON t (v)");
+    assert_eq!(
+        cookie(&a),
+        before,
+        "the writer's header is its pager read's"
+    );
+    run(&a, "INSERT INTO t VALUES (3, 30)");
+    let e = a
+        .execute("COMMIT")
+        .expect_err("a writer checked against the schema before an index commits");
+    assert!(
+        matches!(e, crate::LimboError::SchemaConflict),
+        "the writer's refusal: {e:?}"
+    );
+    if !a.get_auto_commit() {
+        run(&a, "ROLLBACK");
+    }
+    assert_eq!(by_index(&b, 30), (vec![], vec![]));
+    run(&a, "INSERT INTO t VALUES (3, 30)");
+    let three = vec![vec![Value::from_i64(3)]];
+    assert_eq!(by_index(&b, 30), (three.clone(), three));
+}
+
+/// AC-NS.2.1 (lane g7s2-19): a schema change's cookie can be read a moment before its rows are
+/// published (the pager's part commits under the storage's publish lock, before the rows). Do
+/// pause another connection's CREATE INDEX there (`Switch::pause_next_commit_with`), then run a
+/// statement on a connection whose schema is the older one: it reads the newer cookie, so it
+/// reloads the schema; the index's commit goes on only once that reload is about to wait for it
+/// (`Switch::tell_next_publish_wait`). Expect the reload to have read the index's row: that
+/// connection, another made before the index and a new one all read the same cookie and find the
+/// rows through the index. Without the wait, the reload read the older rows, kept them under the
+/// newer cookie and gave them to the database, so no connection after knew the index.
+#[test]
+fn ac_ns_2_1_a_schema_read_beside_a_schema_change_waits_for_its_rows() {
+    let (db, a, c) = two_writers();
+    let switch = a.versioned_for(crate::MAIN_DB_ID).unwrap();
+    let (paused, go_on) = switch.pause_next_commit_with();
+    let maker = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let b = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            let made = b.execute("CREATE INDEX tv ON t (v)");
+            // A commit that never paused (it failed first) lets the test hear it.
+            if let Some(switch) = b.versioned_for(crate::MAIN_DB_ID) {
+                switch.clear_commit_pause();
+            }
+            made
+        })
+    };
+    // The index's cookie is committed, its rows not yet published.
+    paused
+        .recv()
+        .unwrap_or_else(|_| panic!("the index's commit ended without its pause"));
+    let told = switch.tell_next_publish_wait();
+    let releaser = std::thread::spawn(move || {
+        // Told, or the word dropped unheard: either way the index's commit goes on.
+        told.recv().ok();
+        go_on.send(()).ok();
+    });
+    assert_eq!(
+        rows(&c, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    switch.clear_publish_wait();
+    releaser.join().unwrap();
+    maker.join().unwrap().unwrap();
+    let d = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    let now = cookie(&d);
+    let both = vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]];
+    for (who, conn) in [("the reloaded", &c), ("another", &a), ("a new", &d)] {
+        assert_eq!(cookie(conn), now, "{who} connection's cookie");
+        assert!(
+            conn.prepare("SELECT id FROM t INDEXED BY tv WHERE v = 0")
+                .is_ok(),
+            "{who} connection doesn't know the index"
+        );
+        assert_eq!(
+            by_index(conn, 0),
+            (both.clone(), both.clone()),
+            "{who} connection"
+        );
+    }
+}

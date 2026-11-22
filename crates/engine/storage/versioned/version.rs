@@ -291,6 +291,11 @@ pub struct Snapshot {
 pub struct Txn {
     pub id: u64,
     pub start: Ts,
+    /// The newest commit the schema its statements were checked against can hold (lane
+    /// g7s2-19, `AC-NS.2.1`): its start, or earlier, the newest commit published before its
+    /// connection's pager began the read whose header its schema checks read
+    /// ([`Txn::schema_seen_by`]). A commit that changed the catalog after it refuses its writes.
+    schema_seen: Ts,
     changed: Vec<(u64, Vec<u8>)>,
     /// The trees it has changed a row of, each once, counted in [`Clock`]'s `writing` until it
     /// ends (G7 step 2, `AC-NS.2.1`). A rollback to a savepoint keeps them: counted a little
@@ -492,6 +497,14 @@ impl Txn {
         self.trees.contains(&tree)
     }
 
+    /// Its statements checked the schema against a header read in a pager snapshot begun when
+    /// `ts` was the newest commit published ([`Clock::published`], read before that snapshot
+    /// began), so a catalog change after `ts` may be missing from what they were compiled
+    /// against, though its snapshot, begun later, holds it (lane g7s2-19, `AC-NS.2.1`).
+    pub fn schema_seen_by(&mut self, ts: Ts) {
+        self.schema_seen = self.schema_seen.min(ts);
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             start: self.start,
@@ -595,6 +608,14 @@ impl Clock {
         Ok(start)
     }
 
+    /// The newest commit published now (lane g7s2-19, `AC-NS.2.1`). A commit's work under the
+    /// publish lock (the pager's header among it, `durable::Database::commit_with`) happens
+    /// before its timestamp is published, so whatever begins after this read sees the work of
+    /// every commit up to it.
+    pub fn published(&self) -> Ts {
+        self.visible.load(Ordering::Acquire)
+    }
+
     /// Ends a read-only snapshot that began at `start` ([`Clock::snapshot`]).
     pub fn close(&self, start: Ts) {
         count_out(&mut self.open.lock().all, start);
@@ -618,6 +639,7 @@ impl Clock {
         Ok(Txn {
             id,
             start,
+            schema_seen: start,
             changed: Vec::new(),
             trees: Vec::new(),
             writer: None,
@@ -1671,10 +1693,11 @@ impl Versioned {
         let mut reached = false;
         let published = self.clock.commit(&txn, |ts, ops| {
             reached = true;
-            // A writer begun before the catalog's newest change wrote against an older one (lane
-            // g7s2-17): checked and moved under this lock, so none slips between.
+            // A writer whose schema checks came before the catalog's newest change wrote against
+            // an older one (lane g7s2-17; its limit, lane g7s2-19, `Txn::schema_seen_by`):
+            // checked and moved under this lock, so none slips between.
             if !txn.changed.is_empty()
-                && self.catalog.changed_at.load(Ordering::Acquire) > txn.start
+                && self.catalog.changed_at.load(Ordering::Acquire) > txn.schema_seen
             {
                 self.clock.budget.release(read_bytes);
                 return Err(LimboError::SchemaConflict);

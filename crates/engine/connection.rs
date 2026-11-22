@@ -1808,6 +1808,13 @@ impl Connection {
             // read cookie before consuming statement program - otherwise we can
             // end up reading cookie with closed transaction state
             let cookie = crate::return_if_io!(self.read_current_schema_cookie_nonblock());
+            // Amphora (lane g7s2-19, `AC-NS.2.1`): on the versioned storage a schema change's
+            // cookie can be read a moment before its rows are published; the rows are read only
+            // once every commit the cookie's read may have seen is (`Switch::await_published`),
+            // else the older rows would be kept under the newer cookie, and shared.
+            if let Some(switch) = self.versioned.as_ref() {
+                switch.await_published();
+            }
             *state =
                 ReparseSchemaState::Building(Box::new(self.init_reparse_building(cookie, None)?));
         }
