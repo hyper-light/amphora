@@ -903,6 +903,88 @@ mod scans {
     }
 
     /// One run of a prepared statement bound to `values`: its rows, printed, and the rows it read.
+    /// Lane skip-4 (T-SKU.3): a SQL statement turns skipping on; answers equal the unskipped
+    /// scan's under random writes, rows are skipped, and `off` drops the summary.
+    #[test]
+    fn t_sku_3_pragma_turns_skipping_on_and_answers_as_unswitched() {
+        let rows = 4000;
+        let queries = 24;
+        for (seed, setting) in [
+            (0u64, "t.a"),
+            (1, "t.a measured"),
+            (2, "t.a ZONE_MAPS"),
+            (3, "t.a cracking"),
+        ] {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let (db, on) = open();
+            let (_off_db, off) = open();
+            fill([&on, &off], rows);
+            on.execute(format!("PRAGMA skipping = '{setting}'"))
+                .unwrap();
+            let (mut read_on, mut read_off) = (0u64, 0u64);
+            for _ in 0..queries {
+                for _ in 0..rng.random_range(0..15) {
+                    let sql = random_write(&mut rng, rows);
+                    on.execute(&sql).unwrap();
+                    off.execute(&sql).unwrap();
+                }
+                let lo = rng.random_range(-10..rows);
+                let hi = lo.saturating_add(rng.random_range(0..rows / 20));
+                let sql = format!(
+                    "SELECT rowid, a, b FROM t WHERE a BETWEEN {lo} AND {hi} ORDER BY rowid"
+                );
+                let (answer_on, r_on) = query(&on, &sql);
+                let (answer_off, r_off) = query(&off, &sql);
+                assert_eq!(answer_on, answer_off, "seed {seed} '{setting}': {sql}");
+                read_on += r_on;
+                read_off += r_off;
+            }
+            assert!(
+                read_on < read_off,
+                "seed {seed} '{setting}': read {read_on} skipping, {read_off} without"
+            );
+            assert_eq!(
+                skipping_counts(&on, "t").unwrap().consulted,
+                queries,
+                "seed {seed} '{setting}'"
+            );
+            on.execute("PRAGMA skipping = 't.a off'").unwrap();
+            let dropped = db
+                .skipping
+                .with_summary(root_of(&on), |s| matches!(s, Skipping::Off));
+            assert_ne!(dropped, Some(false), "seed {seed}: 'off' kept a summary");
+        }
+    }
+
+    /// Lane skip-4 (T-SKU.3): a setting that names no stored column, or no method kiln knows, is
+    /// refused with why, and nothing is kept.
+    #[test]
+    fn t_sku_3_pragma_refuses_what_it_cant_summarize() {
+        let (_db, on) = open();
+        let (_other_db, other) = open();
+        fill([&on, &other], 10);
+        for bad in [
+            "t",
+            "t.",
+            ".a",
+            "t.nope",
+            "nope.a",
+            "t.a sideways",
+            "t.a measured again",
+        ] {
+            let err = on.execute(format!("PRAGMA skipping = '{bad}'"));
+            assert!(err.is_err(), "'{bad}' was taken");
+        }
+        assert!(
+            on.execute("PRAGMA skipping").is_err(),
+            "skipping is set, not read"
+        );
+        assert!(
+            skipping_counts(&on, "t").is_none(),
+            "a refused setting kept a summary"
+        );
+    }
+
     fn run_bound(stmt: &mut crate::Statement, values: &[crate::Value]) -> (Vec<String>, u64) {
         stmt.reset().unwrap();
         stmt.reset_metrics();

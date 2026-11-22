@@ -1047,9 +1047,13 @@ G5 step 4 wired (lanes g5s4c, g5s4d): the engine's Insert and Delete opcodes kee
 registry of skipping summaries (zone maps or cracking), and a SELECT's scan with integer bounds on
 a summarized column seeks past the rows the summary leaves out, consulting it only at the snapshot
 it holds (an older reader, or a rolled-back summary, is refused, counted, and reads every row).
-Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). Open: choosing a kind
-by measured cost and a SQL switch (executor.md decision 11, "Not yet").
+Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). A kind chosen by measured
+cost and a SQL setting followed (T-SKU.2, T-SKU.3).
 
 Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
 11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
 skip (T-SKU.1).
+Lanes skip-3 and skip-4 (kiln goal 623adc1c): `PRAGMA skipping = 'table.column'` turns skipping
+on (T-SKU.3), and by default it keeps both kinds and answers each filter with whichever measured
+cheaper on that column's own scans, measuring the other again on a doubling schedule (T-SKU.2).
+Open: skipping scans in the fused column batches; the benchmark against DuckDB and ClickHouse.
