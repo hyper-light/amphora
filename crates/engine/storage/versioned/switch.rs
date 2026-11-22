@@ -1088,7 +1088,7 @@ mod tests {
     fn ns_2_7_a_scan_paused_at_a_steps_start_resumes_whole() {
         let (conn, _) = many_leaves(300);
         let injector = Arc::new(PauseOnce::default());
-        conn.set_yield_injector(Some(injector.clone()));
+        conn.set_yield_injector(Some(injector));
         let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
         let (mut rows, mut paused) = (0i64, 0);
         loop {

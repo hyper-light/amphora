@@ -1927,7 +1927,7 @@ fn t_t1_12_m5_chunks_kept_or_grown() {
     );
     assert_eq!(keep.restore_gets, keep.chunks, "kept: a request per chunk");
 
-    assert!(grow.chunk > grow.first_chunk && grow.chunk % grow.first_chunk == 0);
+    assert!(grow.chunk > grow.first_chunk && grow.chunk.is_multiple_of(grow.first_chunk));
     assert!(grow.chunk >= grow.file, "grown: one chunk holds the file");
     assert_eq!(grow.reused, 0, "grown: the whole file copied again");
     assert_eq!(grow.restore_gets, 1, "grown: one request");

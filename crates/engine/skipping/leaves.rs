@@ -256,7 +256,14 @@ pub fn set_skipping(
             conn.get_pager().io.current_time_monotonic() + std::time::Duration::from_millis(millis),
         ),
     };
-    set_skipping_with_until(conn, table, column, kind, super::BuildMode::default(), deadline)
+    set_skipping_with_until(
+        conn,
+        table,
+        column,
+        kind,
+        super::BuildMode::default(),
+        deadline,
+    )
 }
 
 /// Lane skip-9 (T-SKU.11): [`set_skipping`], a measured summary's dropped method built again by
@@ -286,7 +293,14 @@ pub fn set_skipping_until(
     kind: Option<SkipKind>,
     deadline: Option<crate::MonotonicInstant>,
 ) -> Result<(), LeafBuildError> {
-    set_skipping_with_until(conn, table, column, kind, super::BuildMode::default(), deadline)
+    set_skipping_with_until(
+        conn,
+        table,
+        column,
+        kind,
+        super::BuildMode::default(),
+        deadline,
+    )
 }
 
 /// [`set_skipping_with`]'s build mode and [`set_skipping_until`]'s deadline together: what
@@ -344,7 +358,9 @@ pub fn set_skipping_with_until(
             Ok(skipping) => {
                 let missed = match switch.as_ref() {
                     None => {
-                        conn.db.skipping.set_with_build(root, index, skipping, build);
+                        conn.db
+                            .skipping
+                            .set_with_build(root, index, skipping, build);
                         None
                     }
                     // The build there held no lock against writers. One that changed the table

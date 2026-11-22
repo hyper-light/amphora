@@ -20886,12 +20886,7 @@ pub fn op_star_probes(
         let most = u64::try_from(most).unwrap_or(u64::MAX);
         state.metrics.star_filter_bytes = state.metrics.star_filter_bytes.max(most);
     }
-    if !state.star_orders.contains_key(&pc) {
-        state.star_orders.insert(
-            pc,
-            super::star_order::StarOrder::new(data.probes.len(), data.order),
-        );
-    }
+    state.star_orders.entry(pc).or_insert_with(|| super::star_order::StarOrder::new(data.probes.len(), data.order));
     let Some(order) = state.star_orders.get_mut(&pc) else {
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);

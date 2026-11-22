@@ -378,7 +378,8 @@ impl Copies {
     }
 
     /// Nanoseconds copies have been absent, from being let go to being built again, those still
-    /// absent counted to now.
+    /// absent counted to now (the A/B's records).
+    #[cfg(test)]
     pub(crate) fn absent_nanos(&self) -> u64 {
         let now = tick(self.base);
         let open = self.absent.lock().values().fold(0u64, |n, since| {

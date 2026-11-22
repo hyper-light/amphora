@@ -491,9 +491,10 @@ fn in_subquery_values(
                 })
         })
         .and_then(|pos| column_distinct(schema, table_reference, pos))
-        .map_or((row_count.max(1.0), 1.0), |(distinct, non_null)| {
-            (distinct.min(row_count).max(1.0), non_null)
-        });
+        .map_or_else(
+            || (row_count.max(1.0), 1.0),
+            |(distinct, non_null)| (distinct.min(row_count).max(1.0), non_null),
+        );
     let Some(inner) = inner_plan else {
         return (
             params.in_subquery_rows.min(lhs_distinct),

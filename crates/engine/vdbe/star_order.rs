@@ -256,7 +256,7 @@ mod tests {
     fn t_qt_5_11_the_order_follows_a_change_in_the_rows() {
         let passes = |filter: usize, row: u64| match filter {
             0 => row < 500,
-            _ => row % 2 == 0,
+            _ => row.is_multiple_of(2),
         };
         let mut order = StarOrder::new(2, StarFilterOrder::Measured);
         run(&mut order, 500, passes);
@@ -291,7 +291,7 @@ mod tests {
     fn t_qt_5_11_fading_counts_follow_rows_that_shift_halfway() {
         let passes = |filter: usize, row: u64| match filter {
             0 => row < 5_000,
-            _ => row % 2 == 0,
+            _ => row.is_multiple_of(2),
         };
         let mut whole = StarOrder::new(2, StarFilterOrder::Measured);
         let mut fading = StarOrder::new(2, StarFilterOrder::MeasuredFading);

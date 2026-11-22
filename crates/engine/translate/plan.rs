@@ -3261,6 +3261,7 @@ impl JoinedTable {
     /// be materialized regardless of reference count.
     /// `identity` is the subquery's syntax's fingerprint (PL.13, lane replan-6), where its stored
     /// result may be counted against its estimate.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,

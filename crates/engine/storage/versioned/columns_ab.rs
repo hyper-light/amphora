@@ -80,7 +80,7 @@ impl Scenario {
         let base = self.free(need)?;
         let round = k / self.tables.max(1);
         Some(match self.press {
-            Press::Bursty { piece } if k % 2 == 0 => base.saturating_add(share(need, piece)),
+            Press::Bursty { piece } if k.is_multiple_of(2) => base.saturating_add(share(need, piece)),
             Press::Grows if k >= self.statements / 2 => base.saturating_add(share(need, 1.0)),
             Press::Waves if round % 2 == 1 => {
                 base.saturating_add(share(need, self.tables as f64 * 2.0))

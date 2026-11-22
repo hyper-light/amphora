@@ -281,7 +281,7 @@ fn t_bl_1_the_join_search_time_is_counted_per_thread() {
         after > before,
         "the join search's time was not counted: {before} then {after}"
     );
-    let other = conn.clone();
+    let other = conn;
     std::thread::spawn(move || drop(other.prepare(star_query(3)).unwrap()))
         .join()
         .unwrap();

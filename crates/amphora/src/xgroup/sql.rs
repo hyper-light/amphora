@@ -1145,7 +1145,7 @@ impl Cluster {
     pub fn transact(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
         conditioned(&txn)?;
         let began = Instant::now();
-        let touched = self.touched(&txn);
+        let _touched = self.touched(&txn);
         let (answer, answered) = mpsc::sync_channel(1);
         self.inputs
             .send(Input::Begin { txn, until, answer })
@@ -2798,10 +2798,7 @@ mod sessions {
             let local = Database::open(&dir.path().join("group0.db"), until()).unwrap();
             let cluster = across_nodes(&local, &replicas, leader, protocol);
             let token = commit_records(&cluster, "ns", &puts(5), until()).unwrap();
-            let after = replicas.dbs[leader]
-                .closed_token(until())
-                .unwrap()
-                .unwrap();
+            let after = replicas.dbs[leader].closed_token(until()).unwrap().unwrap();
             assert!(
                 token.micros > 0 && token.micros <= after.micros,
                 "{protocol:?}: {token:?} after {after:?}"

@@ -2429,7 +2429,7 @@ mod chooser {
             chooser.stats()
         );
         chooser
-            .install_cracker(CrackerColumn::new(rows.clone()), 10, &mut || 0)
+            .install_cracker(CrackerColumn::new(rows), 10, &mut || 0)
             .unwrap();
         assert_eq!(chooser.cracker().unwrap().bounds(), bounds);
         assert_eq!(chooser.method_stats(SkipMethod::Cracking).rebuilt, 1);

@@ -1807,20 +1807,23 @@ fn read_in_key_order(table: &JoinedTable, read: Option<&AccessMethod>, key: &ast
         None => rowid_order,
         Some(AccessMethodParams::BTreeTable {
             iter_dir: IterationDirection::Forwards,
-            index,
+            index: None,
             build_index: false,
             constraint_refs,
-        }) if constraint_refs.is_empty() => match index {
-            None => rowid_order,
-            Some(index) => column.is_some_and(|column| {
-                index.columns.first().is_some_and(|first| {
-                    first.expr.is_none()
-                        && first.pos_in_table == column
-                        && matches!(first.order, SortOrder::Asc)
-                        && first.collation.is_none()
-                })
-            }),
-        },
+        }) if constraint_refs.is_empty() => rowid_order,
+        Some(AccessMethodParams::BTreeTable {
+            iter_dir: IterationDirection::Forwards,
+            index: Some(index),
+            build_index: false,
+            constraint_refs,
+        }) if constraint_refs.is_empty() => column.is_some_and(|column| {
+            index.columns.first().is_some_and(|first| {
+                first.expr.is_none()
+                    && first.pos_in_table == column
+                    && matches!(first.order, SortOrder::Asc)
+                    && first.collation.is_none()
+            })
+        }),
         Some(_) => false,
     }
 }

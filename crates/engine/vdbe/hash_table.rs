@@ -1220,10 +1220,10 @@ impl HashTable {
             let forward = start
                 .checked_sub(1)
                 .and_then(|before| order.get(before))
-                .is_none_or(|position| below_probe(position));
+                .is_none_or(below_probe);
             if forward {
                 let mut pos = start;
-                while order.get(pos).is_some_and(|position| below_probe(position)) {
+                while order.get(pos).is_some_and(below_probe) {
                     pos += 1;
                 }
                 (pos, u64::try_from(pos - start).unwrap_or(u64::MAX), false)
@@ -2036,7 +2036,7 @@ impl HashTable {
             && self.num_entries > 0
             && (self.spill_state.is_some() || !self.build_merge_order()?)
         {
-            if let Some(metrics) = metrics.as_deref_mut() {
+            if let Some(metrics) = metrics {
                 metrics.merge_tables_hashed = metrics.merge_tables_hashed.saturating_add(1);
             }
         }
@@ -3793,7 +3793,7 @@ mod hashtests {
                 ht.mark_current_matched();
                 found = ht.next_match().unwrap().map(|e| e.rowid);
             }
-            rowids.sort();
+            rowids.sort_unstable();
             rowids
         };
         let ordered = [
@@ -3839,7 +3839,7 @@ mod hashtests {
             while let Some(entry) = ht.next_unmatched() {
                 rowids.push(entry.rowid);
             }
-            rowids.sort();
+            rowids.sort_unstable();
             rowids
         };
         assert_eq!(unmatched(&mut merge), unmatched(&mut hash));

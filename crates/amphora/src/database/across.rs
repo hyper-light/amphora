@@ -1654,7 +1654,7 @@ mod tests {
             let commit = |writes: &[&[u8]], conds: Vec<(Vec<u8>, Option<u64>)>| {
                 let txn = Txn {
                     reads: vec![],
-                    writes: writes.iter().map(|k| (key(*k), Some(vec![1]))).collect(),
+                    writes: writes.iter().map(|k| (key(k), Some(vec![1]))).collect(),
                     conds,
                 };
                 cluster.commit(txn, until())
