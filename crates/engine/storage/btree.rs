@@ -1182,7 +1182,7 @@ enum BlobSpan {
 /// `hpos0` the offset of the first serial type, i.e. the width of the header-size
 /// varint. Returns the value's payload-relative byte offset, its byte length, and
 /// its serial type, after checking the range lies inside `payload_size`.
-fn blob_locate_column_in_header(
+pub(crate) fn blob_locate_column_in_header(
     header: &[u8],
     hpos0: usize,
     payload_size: usize,
@@ -1215,6 +1215,22 @@ fn blob_locate_column_in_header(
         body = end;
         col += 1;
     }
+}
+
+/// Error unless a value of serial type `serial` is byte-addressable, stored as TEXT or BLOB: SQLite
+/// refuses incremental I/O on NULL, integer and real values, whose bytes are an encoding.
+pub(crate) fn blob_text_or_blob(serial: u64) -> Result<()> {
+    if serial >= 12 {
+        return Ok(());
+    }
+    let type_name = match serial {
+        0 => "null",
+        7 => "real",
+        _ => "integer",
+    };
+    Err(LimboError::InternalError(format!(
+        "cannot open value of type {type_name}"
+    )))
 }
 
 crate::assert::assert_send!(BTreeCursor);
@@ -6370,18 +6386,7 @@ impl BTreeCursor {
             self.blob_cache.col_valid,
             "column tier must be cached before the type check"
         );
-        let serial = self.blob_cache.col_serial;
-        if serial >= 12 {
-            return Ok(());
-        }
-        let type_name = match serial {
-            0 => "null",
-            7 => "real",
-            _ => "integer",
-        };
-        Err(LimboError::InternalError(format!(
-            "cannot open value of type {type_name}"
-        )))
+        blob_text_or_blob(self.blob_cache.col_serial)
     }
 
     /// Ensure `blob_cache.overflow_pages` holds at least `upto + 1` entries, extending
