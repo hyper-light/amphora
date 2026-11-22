@@ -463,14 +463,17 @@ class Table:
     """A table as a file defines it: its columns in order (upper-cased: SQLite's names are
     case-insensitive), each one's declared type (a sqlglot DataType; None for a column without a
     type, or an ANY column of a STRICT table: no affinity, values kept as written) and default, and,
-    for each column without a type, the storage classes of the values the file writes to it."""
+    for each column without a type, the storage classes of the values the file writes to it (for
+    each column with one, in `held`)."""
 
     def __init__(self, name):
-        self.name, self.columns, self.kinds, self.defaults, self.written = name, [], {}, {}, {}
+        self.name, self.columns, self.kinds, self.defaults, self.written, self.held = name, [], {}, {}, {}, {}
 
     def write(self, column, cls):
         if column in self.written and cls is not None:
             self.written[column].add(cls)
+        elif column in self.kinds and cls is not None:
+            self.held.setdefault(column, set()).add(cls)
 
     def storage(self, column):
         """The storage class every value of `column` has, as far as the file has written it, else UNKNOWN."""
@@ -480,7 +483,15 @@ class Table:
         if kind is None:
             classes = self.written.get(column, set())
             return next(iter(classes)) if len(classes) == 1 else UNKNOWN
-        return _declared_class(kind)
+        # A column's affinity converts a value to its class only when it can: "a column with
+        # INTEGER affinity ... a REAL value ... that cannot be represented exactly as an integer
+        # is kept as REAL", text that isn't a well-formed number stays TEXT, and a BLOB is kept as
+        # it is in every column (datatype3.html, section 3, "Type Affinity"). So the declared class
+        # is every value's only when every value the file writes is one the affinity takes whole:
+        # INTEGERs into INTEGER, INTEGERs and REALs into REAL, anything but a BLOB into TEXT.
+        c = _declared_class(kind)
+        takes = {"INTEGER": {"INTEGER"}, "REAL": {"INTEGER", "REAL"}, "TEXT": {"INTEGER", "REAL", "TEXT"}}.get(c, set())
+        return c if self.held.get(column, set()) <= takes else UNKNOWN
 
 
 def _declared_class(kind):

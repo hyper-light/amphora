@@ -925,3 +925,40 @@ class BlobCasts(unittest.TestCase):
                 out, why = dialects.translate("SELECT typeof(CAST(a AS BLOB)) FROM t", d, dialects.contexts([FileRecord(0, "CREATE TABLE t(a TEXT)")])[0])
                 self.assertIsNone(why)
                 self.assertIn("ELSE 'blob' END", out)
+
+
+class DeclaredColumnClasses(unittest.TestCase):
+    """Do: typeof() and `/` of columns declared INTEGER, REAL and TEXT, written values their
+    affinity takes whole, and an INTEGER column written a REAL and a text (datatype3.html, section 3:
+    those are kept as written). Expect: the first said as their class's (typeof() a CASE, `/` integer
+    division of the INTEGER column), the second not expressible: its values' classes only running
+    it shows; DuckDB (when its Python module is here) gives what SQLite gives for the first."""
+
+    FILE = ["CREATE TABLE r0(x INTEGER)", "INSERT INTO r0 VALUES (12), (1.5), ('abc')", ("SELECT typeof(x) FROM r0", "query"),
+            "CREATE TABLE r1(x INTEGER, y REAL, z TEXT)", "INSERT INTO r1 VALUES (7, 2, 3)", ("SELECT typeof(x), typeof(y), typeof(z), x / 2 FROM r1", "query")]
+
+    def records(self):
+        return [FileRecord(i, q[0], q[1], None) if isinstance(q, tuple) else FileRecord(i, q) for i, q in enumerate(self.FILE)]
+
+    def test_each_dialect(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = dialects.records_in(self.records(), d)
+                self.assertIsNone(out[2][0])
+                self.assertIn("typeof() of a value whose storage class only running it shows", out[2][1])
+                self.assertIsNone(out[5][1])
+                self.assertIn("ELSE 'integer' END", out[5][0])
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db, con = sqlite3.connect(":memory:"), duckdb.connect()
+        for r, (sql, why) in list(zip(self.records(), dialects.records_in(self.records(), "duckdb")))[3:]:
+            want = db.execute(r.sql).fetchall()
+            got = con.execute(sql).fetchall()
+            if r.kind == "query":
+                self.assertEqual([tuple(float(v) if isinstance(v, (int, float)) else v for v in row) for row in got], [tuple(float(v) if isinstance(v, (int, float)) else v for v in row) for row in want])
