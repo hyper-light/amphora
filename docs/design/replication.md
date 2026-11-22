@@ -2584,8 +2584,9 @@ wire records queued beside them (`Control::called`).
   it states its class (replication.md, "The class stated once per group"), from what its founding members can all
   hold, and every member reads it at open; `IMAGE_FRAMING_BYTES` is then sized by the configuration an image carries.
   This needs Ada's word. Meanwhile the voters a leader measures are the members its core was opened for
-  (`patience::Answers::new(election, members)`, from `Limits::members`; T-QB.1.7), so `MEMBERS` is read in one place
-  on the owner's side.
+  (`patience::Answers::new(election, members)`, from `Limits::members`; T-QB.1.7), and a class entry is bounded by
+  the members the machine was opened for (`Machine::set_members`, `class::entry(.., members)`), so `MEMBERS` is read
+  where the core's limits are stated and in `IMAGE_FRAMING_BYTES`, nowhere else on the owner's side.
 
 **To remove: event-driven (Ada, 2026-11-22).** `TICK`, `POLL` and `DRIVE_QUANTUM`, and any driver that wakes on a timer,
 are to be removed, with that work driven from events, not given better intervals. The election and heartbeat
