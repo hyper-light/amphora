@@ -573,23 +573,12 @@ fn join_lhs_and_rhs<'a>(
     // table reads it whole, and the loops before it can give more than one row, so it would be
     // read again for each of them. Any read that seeks by a key replaces it (an index, an IN seek,
     // an automatic index), and so does a hash join below, at any cost; it stays only where none
-    // of them can read this table. A seek kept from the start keeps its preference over a hash
-    // join (`rhs_has_selective_seek`); one taken only because the whole read was refused doesn't.
+    // of them can read this table. A seek and a hash join are weighed by cost alone (QT.5,
+    // T-QT.5.8).
     let whole_read_refused = lhs.is_some_and(|lhs| {
         reads_whole_table(&best_access_method)
             && !loops_give_at_most_one_row(lhs, access_methods_arena, None)
     });
-    let rhs_has_selective_seek = matches!(
-        best_access_method.params,
-        AccessMethodParams::BTreeTable {
-            ref index,
-            build_index,
-            ref constraint_refs,
-            ..
-        } if !constraint_refs.is_empty()
-            && !build_index
-            && index.as_ref().is_none_or(|index| !index.ephemeral)
-    );
     if whole_read_refused {
         if let Some(mut keyed) = find_best_access_method_for_join_order(
             rhs_table_reference,
@@ -838,8 +827,6 @@ fn join_lhs_and_rhs<'a>(
             } else {
                 *build_base_rows
             };
-            let hash_can_replace_build_index =
-                can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
 
             // The unmatched-right pass can set every earlier table cursor to NULL.
             // Hash materialization makes these values independent of that cursor state.
@@ -888,9 +875,7 @@ fn join_lhs_and_rhs<'a>(
                 pinned_hash_here
             } else {
                 match planning_context.join_methods {
-                    crate::JoinMethods::ByCost => {
-                        !rhs_has_selective_seek && !build_unique_key_search_without_statistics
-                    }
+                    crate::JoinMethods::ByCost => !build_unique_key_search_without_statistics,
                     crate::JoinMethods::NestedLoopsOnly => false,
                     crate::JoinMethods::HashJoinsOnly => true,
                 }
@@ -905,10 +890,8 @@ fn join_lhs_and_rhs<'a>(
                 lhs_table = build_table.table.get_name(),
                 rhs_table = rhs_table_reference.table.get_name(),
                 allow_hash_join,
-                rhs_has_selective_seek,
                 build_unique_key_search_without_statistics,
                 rhs_builds_index,
-                hash_can_replace_build_index,
                 build_read_is_unique_seek,
                 probe_table_is_prior_build,
                 build_table_is_prior_probe,
@@ -932,7 +915,6 @@ fn join_lhs_and_rhs<'a>(
                     rhs_table_idx,
                     lhs_constraints,
                     rhs_constraints,
-                    &lhs_mask,
                     where_clause,
                     where_terms.iter().enumerate().filter_map(|(index, term)| {
                         let (left, right, owner) = term.equal_tables?;
@@ -945,12 +927,9 @@ fn join_lhs_and_rhs<'a>(
                     build_cardinality,
                     probe_cardinality,
                     probe_multiplier,
-                    hash_can_replace_build_index,
                     subqueries,
                     joined_tables,
                     &hash_params,
-                    !pinned_hash_here
-                        && planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -1234,17 +1213,6 @@ fn materialized_build_input_reads_an_outer_query(
         }
     }
     Ok(false)
-}
-
-fn can_replace_build_index_with_hash(
-    probe_constraints: &TableConstraints,
-    build_read_is_in_seek: bool,
-) -> bool {
-    build_read_is_in_seek
-        || !probe_constraints
-            .constraints
-            .iter()
-            .any(|constraint| constraint.lhs_mask.is_empty())
 }
 
 /// Returns true when build-side constraints reference prior tables in ways that
@@ -5375,7 +5343,6 @@ mod tests {
             &DEFAULT_PARAMS,
         )
         .unwrap();
-        let joined_before_probe_mask: TableMask = [0].into_iter().try_collect().unwrap();
         let method = try_hash_join_access_method(
             &table_references.joined_tables()[0],
             &table_references.joined_tables()[1],
@@ -5383,7 +5350,6 @@ mod tests {
             1,
             &constraints[0],
             &constraints[1],
-            &joined_before_probe_mask,
             &mut where_clause,
             std::iter::once((
                 0,
@@ -5394,34 +5360,14 @@ mod tests {
             1_000.0,
             1_000.0,
             1.0,
-            true,
             &[],
             table_references.joined_tables(),
             &DEFAULT_PARAMS,
-            true,
         )
         .unwrap()
         .unwrap();
 
         assert_eq!(method.estimated_rows_per_outer_row, 1.0);
-        assert!(can_replace_build_index_with_hash(&constraints[1], false));
-
-        where_clause.push(_create_binary_expr(
-            _create_column_expr(table_references.joined_tables()[1].internal_id, 0, false),
-            Operator::Greater,
-            _create_numeric_literal("500"),
-        ));
-        let constraints = constraints_from_where_clause(
-            &where_clause,
-            &table_references,
-            &available_indexes,
-            &[],
-            &empty_schema(),
-            &DEFAULT_PARAMS,
-        )
-        .unwrap();
-        assert!(!can_replace_build_index_with_hash(&constraints[1], false));
-        assert!(can_replace_build_index_with_hash(&constraints[1], true));
     }
 
     /// Do: ask for the greedy search's starting table when every table must follow another (an

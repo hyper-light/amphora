@@ -1653,18 +1653,15 @@ pub fn try_hash_join_access_method(
     probe_table_idx: usize,
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
-    joined_before_probe_mask: &TableMask,
     where_clause: &mut [WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
     max_distinct_build_keys: f64,
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
-    hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
     joined_tables: &[JoinedTable],
     params: &CostModelParams,
-    prefer_seeks: bool,
 ) -> Result<Option<AccessMethod>> {
     if probe_table
         .join_info
@@ -1709,53 +1706,6 @@ pub fn try_hash_join_access_method(
             || expr_uses_custom_collation(join_key.get_probe_expr(where_clause))
     }) {
         return Ok(None);
-    }
-
-    // Prefer nested loops when an index can read the join columns, unless the connection asks for
-    // hash joins only (`prefer_seeks` false; Amphora's QT.5).
-    for join_key in join_keys.iter().filter(|_| prefer_seeks) {
-        let probe_expr = join_key.get_probe_expr(where_clause);
-        if expr_is_simple_column_from_table(probe_expr, probe_table.internal_id)
-            && probe_index_can_seek_join_key(
-                probe_constraints,
-                join_key,
-                joined_before_probe_mask,
-                probe_table_idx,
-            )
-        {
-            return Ok(None);
-        }
-
-        let build_expr = join_key.get_build_expr(where_clause);
-        let build_is_simple_column =
-            expr_is_simple_column_from_table(build_expr, build_table.internal_id);
-
-        if build_is_simple_column && !hash_can_replace_build_index {
-            if let Some(constraint) = build_constraints
-                .constraints
-                .iter()
-                .find(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
-            {
-                if let Some(column_position) = constraint.table_col_pos {
-                    if build_table
-                        .columns()
-                        .get(column_position)
-                        .is_some_and(|column| column.is_rowid_alias())
-                    {
-                        return Ok(None);
-                    }
-                    if build_constraints.candidates.iter().any(|candidate| {
-                        candidate.index.as_ref().is_some_and(|index| {
-                            index
-                                .column_table_pos_to_index_pos(column_position)
-                                .is_some()
-                        })
-                    }) {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
     }
 
     let probe_join_key_selectivity = join_keys
@@ -1938,37 +1888,6 @@ fn hash_join_type(probe_table: &JoinedTable) -> HashJoinType {
     }
 }
 
-fn probe_index_can_seek_join_key(
-    probe_constraints: &TableConstraints,
-    join_key: &HashJoinKey,
-    joined_before_probe_mask: &TableMask,
-    probe_table_idx: usize,
-) -> bool {
-    let Some(join_constraint_idx) = probe_constraints
-        .constraints
-        .iter()
-        .position(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
-    else {
-        return false;
-    };
-
-    probe_constraints.candidates.iter().any(|candidate| {
-        usable_constraints_for_lhs_mask(
-            &probe_constraints.constraints,
-            &candidate.refs,
-            joined_before_probe_mask,
-            probe_table_idx,
-        )
-        .iter()
-        .any(|constraint_ref| {
-            constraint_ref
-                .eq
-                .as_ref()
-                .is_some_and(|equality| equality.constraint_pos == join_constraint_idx)
-        })
-    })
-}
-
 /// Return true when the hash keys contain one complete unique key from the build table.
 fn hash_keys_cover_unique_build_key(
     build_table: &JoinedTable,
@@ -2017,15 +1936,6 @@ fn hash_keys_cover_unique_build_key(
                     })
         })
     })
-}
-
-/// Returns true when the expression is a simple column/rowid reference to the table.
-/// Used to decide if an index seek could replace a hash join.
-fn expr_is_simple_column_from_table(expr: &ast::Expr, table_id: TableInternalId) -> bool {
-    matches!(
-        expr,
-        ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } if *table == table_id
-    )
 }
 
 /// Check whether a subquery's intrinsic row order (from its ORDER BY or
