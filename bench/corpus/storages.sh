@@ -13,8 +13,9 @@
 #   e.g. bench/corpus/storages.sh target/release/amphora-corpus bench/corpus/subset ~/.cache/storages /mnt/nvme/storages
 # The disk's runs keep one file's database at a time there (amphora-corpus removes each as the
 # next file opens its own), in a folder of their own removed at the end.
-# Exits 0 when the answers are the same, 1 when they differ, 2 when a run itself failed or the
-# runs name another client or platform (storages.py refuses to compare them).
+# Exits 0 when the answers are the same, 1 when they differ or a record of the pool was left out
+# (storages.py counts the pool's records before the runs), 2 when the pool holds none, a run itself
+# failed, or the runs name another client or platform (storages.py refuses to compare them).
 set -uo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 bin=$(realpath -- "$1")
@@ -33,9 +34,13 @@ case "$(uname -s)" in
 esac
 trap 'rm -rf "$disk"' EXIT
 mkdir -p "$out"
+# The pool's own records, counted before the runs: the verdict's SAME needs both storages to reach
+# every one (T-T1.4.1), and a pool of none is refused here, not after four runs.
+counted=$(python3 -I "$here/storages.py" count "$pool") || { echo "$counted"; exit 2; }
 {
   echo "host $(uname -n), $(uname -srm), binary $bin, pool $pool, flags: $*"
   echo "disk under test: $disk, file system $fs, device $dev"
+  echo "$counted"
 } > "$out/platform.txt"
 for where in memory disk; do
   for storage in pager versioned; do

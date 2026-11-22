@@ -87,6 +87,8 @@ class Storages(unittest.TestCase):
         client = client or (CLIENT if where == "memory" else DISK_CLIENT)
         vkw = {k[2:]: v for k, v in kw.items() if k.startswith("v_")}
         both = {"outcome": kw["outcome_all"]} if "outcome_all" in kw else {}
+        if "missing_all" in kw:
+            both["missing"] = kw["missing_all"]
         vkw = {**both, **vkw}
         return (run_dir(self.root, f"{where}-pager", pager_ns, client=client, **both),
                 run_dir(self.root, f"{where}-versioned", versioned_ns, client=client, **vkw))
@@ -147,7 +149,7 @@ class Storages(unittest.TestCase):
         rc, out = verdict(self.pool, memory, disk)
         self.assertEqual(rc, 1, out)
         self.assertIn("answers: SAME: 0 of 5", out)
-        self.assertIn("answers on disk: PARTIAL: 0 of 4 records reached by both differ (1 records in one run only, 0 unreached)", out)
+        self.assertIn("answers on disk: PARTIAL: 0 of 4 records reached by both differ (1 records in one run only, 0 unreached, 0 of the pool's 5 in neither run)", out)
 
     def test_an_unreached_record_is_partial(self):
         """T-T1.4.1. Do: both in-memory runs leave one record unreached (a budget). Expect: exit 1,
@@ -156,8 +158,110 @@ class Storages(unittest.TestCase):
         disk = self.pair("disk", SAME, SAME)
         rc, out = verdict(self.pool, memory, disk)
         self.assertEqual(rc, 1, out)
-        self.assertIn("answers: PARTIAL: 0 of 4 records reached by both differ (0 records in one run only, 1 unreached)", out)
+        self.assertIn("answers: PARTIAL: 0 of 4 records reached by both differ (0 records in one run only, 1 unreached, 0 of the pool's 5 in neither run)", out)
         self.assertIn("answers on disk: SAME", out)
+
+    def test_both_stopped_at_the_same_record_is_partial(self):
+        """T-T1.4.1. Do: both disk runs stop before the last query (no line for it in either), so
+        every line they wrote agrees. Expect: exit 1, the pool counted at 5 records up front, answers
+        on disk PARTIAL with the record in neither run: SAME needs every one of the pool's records."""
+        memory = self.pair("memory", SAME, SAME)
+        disk = self.pair("disk", SAME, SAME, missing_all=("q2",))
+        rc, out = verdict(self.pool, memory, disk)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("pool: 5 records in 1 files", out)
+        self.assertIn("answers: SAME: 0 of 5", out)
+        self.assertIn("answers on disk: PARTIAL: 0 of 4 records reached by both differ (0 records in one run only, 0 unreached, 1 of the pool's 5 in neither run)", out)
+
+    def test_a_file_neither_run_reached_is_partial(self):
+        """T-T1.4.1. Do: the pool holds a second file that no run wrote a line for (every run
+        stopped before it). Expect: exit 1, the pool counted at 7 records in 2 files, both answers
+        PARTIAL with its 2 records in neither run."""
+        with open(os.path.join(self.pool, "b.test"), "w", encoding="utf-8") as f:
+            f.write("statement ok\nCREATE TABLE u(b)\n\nquery I nosort\nSELECT 1\n----\n1\n")
+        memory = self.pair("memory", SAME, SAME)
+        disk = self.pair("disk", SAME, SAME)
+        rc, out = verdict(self.pool, memory, disk)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("pool: 7 records in 2 files", out)
+        self.assertIn("answers: PARTIAL: 0 of 5 records reached by both differ (0 records in one run only, 0 unreached, 2 of the pool's 7 in neither run)", out)
+        self.assertIn("answers on disk: PARTIAL", out)
+
+    def test_the_pool_is_counted_as_the_run_reads_it(self):
+        """T-T1.4.1. Do: the pool's file also holds a record SQLite skips and, after a halt SQLite
+        obeys, one more; a halt under `onlyif mysql` before them is passed over; a base.test fixture
+        and a file order.tsv leaves out sit beside it. Expect: still 5 records in 1 file, answers SAME:
+        the count holds what `amphora-corpus run` reaches, no more."""
+        with open(os.path.join(self.pool, "a.test"), "a", encoding="utf-8") as f:
+            f.write("\nonlyif mysql\nhalt\n\nskipif sqlite\nstatement ok\nSELECT 1\n\nhalt\n\nstatement ok\nSELECT 2\n")
+        os.makedirs(os.path.join(self.pool, "x"))
+        for name in ("x/base.test", "x/left-out.test"):
+            with open(os.path.join(self.pool, name), "w", encoding="utf-8") as f:
+                f.write("statement ok\nSELECT 3\n")
+        with open(os.path.join(self.pool, "order.tsv"), "w", encoding="utf-8") as f:
+            f.write("required\ta.test\n")
+        memory = self.pair("memory", SAME, SAME)
+        disk = self.pair("disk", SAME, SAME)
+        rc, out = verdict(self.pool, memory, disk)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("pool: 5 records in 1 files", out)
+        self.assertIn("answers: SAME: 0 of 5 records reached by both differ (0 records in one run only, 0 unreached, 0 of the pool's 5 in neither run)", out)
+
+    def test_without_order_every_test_file_but_base_is_the_pools(self):
+        """T-T1.4.1. Do: no order.tsv; the pool holds a fixture x/base.test and x/c.test besides
+        a.test. Expect: 6 records in 2 files (the fixture isn't one), x/c.test's in neither run."""
+        os.makedirs(os.path.join(self.pool, "x"))
+        for name in ("x/base.test", "x/c.test"):
+            with open(os.path.join(self.pool, name), "w", encoding="utf-8") as f:
+                f.write("statement ok\nSELECT 3\n")
+        memory = self.pair("memory", SAME, SAME)
+        disk = self.pair("disk", SAME, SAME)
+        rc, out = verdict(self.pool, memory, disk)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("pool: 6 records in 2 files", out)
+        self.assertIn("1 of the pool's 6 in neither run", out)
+
+    def test_an_empty_pool_is_refused(self):
+        """T-T1.4.1. Do: the pool holds no file, the runs no record. Expect: exit 2, refused, not SAME."""
+        os.remove(os.path.join(self.pool, "a.test"))
+        empty = {k: v for k, v in SAME.items()}
+        memory = (run_dir(self.root, "memory-pager", empty, missing=tuple(LINES)), run_dir(self.root, "memory-versioned", empty, missing=tuple(LINES)))
+        disk = (run_dir(self.root, "disk-pager", empty, client=DISK_CLIENT, missing=tuple(LINES)),
+                run_dir(self.root, "disk-versioned", empty, client=DISK_CLIENT, missing=tuple(LINES)))
+        rc, out = verdict(self.pool, memory, disk)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("holds no record SQLite runs", out)
+        self.assertNotIn("answers:", out)
+
+    def test_the_count_alone_comes_before_the_runs(self):
+        """T-T1.4.1. Do: `storages.py count` on the pool, then on an empty one (what storages.sh
+        asks before its four runs). Expect: exit 0 with the pool's line, then exit 2, refused."""
+        out = io.StringIO()
+        argv = sys.argv
+        try:
+            with contextlib.redirect_stdout(out):
+                sys.argv = ["storages.py", "count", self.pool]
+                self.assertEqual(storages.main(), 0)
+                empty = os.path.join(self.root, "empty")
+                os.makedirs(empty)
+                sys.argv = ["storages.py", "count", empty]
+                self.assertEqual(storages.main(), 2)
+        finally:
+            sys.argv = argv
+        self.assertIn("pool: 5 records in 1 files", out.getvalue())
+        self.assertIn("pool: 0 records in 0 files\nrefused:", out.getvalue())
+
+    def test_runs_of_another_pool_are_refused(self):
+        """T-T1.4.1. Do: the pool given holds only a.test's first three records; the runs hold all
+        five. Expect: exit 2, refused as another pool's runs, nothing compared."""
+        with open(os.path.join(self.pool, "a.test"), "w", encoding="utf-8") as f:
+            f.write(POOL.split("\nquery")[0])
+        memory = self.pair("memory", SAME, SAME)
+        disk = self.pair("disk", SAME, SAME)
+        rc, out = verdict(self.pool, memory, disk)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("refused: the memory runs hold 2 records the pool doesn't (a.test:10 first)", out)
+        self.assertNotIn("answers:", out)
 
     def test_writes_no_faster_miss(self):
         """Do: on the disk versioned's writes take what the pager's take. Expect: writes MISSES (the bar is 3x)."""
