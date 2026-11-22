@@ -37,6 +37,9 @@ pub struct IndexStat {
     /// Amphora (PL.11): each leftmost prefix's degree norms, where ANALYZE kept them (an index
     /// without a WHERE, read whole); empty otherwise.
     pub degrees: Vec<Degrees>,
+    /// Amphora (PL.7, T-PL.7.1): the index tree's pages, interior and leaf, as ANALYZE's walk of
+    /// it counted them; `None` where ANALYZE kept none.
+    pub pages: Option<u64>,
 }
 
 /// A column's values as its sketch counted them (decision 20).
@@ -100,6 +103,15 @@ pub struct TableStat {
     pub columns: HashMap<String, ColumnStat>,
     /// The table's sample; `None` where ANALYZE kept none, or its rows passed the sample's budget.
     pub sample: Option<Arc<Sample>>,
+    /// Amphora (PL.7, T-PL.7.1): the table tree's pages, interior and leaf, as ANALYZE's walk of
+    /// it counted them; `None` where ANALYZE kept none.
+    pub pages: Option<u64>,
+    /// Amphora (PL.7): the average bytes of the sample's records, measured as ANALYZE kept them;
+    /// `None` where no sample was loaded.
+    pub record_bytes: Option<f64>,
+    /// Amphora (PL.7, T-PL.7.1): each index's rows a page, its rows over its tree's pages as
+    /// ANALYZE counted them, keyed by normalized name; set once the statistics are loaded.
+    pub index_rows_per_page: Arc<HashMap<String, f64>>,
 }
 
 impl TableStat {
@@ -121,6 +133,23 @@ pub struct AnalyzeStats {
 }
 
 impl AnalyzeStats {
+    /// Amphora (PL.7, T-PL.7.1): each table's indexes' rows a page, from the rows and pages
+    /// ANALYZE counted: a loop over the tables and their indexes.
+    fn count_index_rows_per_page(&mut self) {
+        for table in self.tables.values_mut() {
+            let measured: HashMap<String, f64> = table
+                .index_stats
+                .iter()
+                .filter_map(|(name, s)| {
+                    let rows = s.total_rows.filter(|r| *r > 0)?;
+                    let pages = s.pages?;
+                    Some((name.clone(), (rows as f64 / pages as f64).max(1.0)))
+                })
+                .collect();
+            table.index_rows_per_page = Arc::new(measured);
+        }
+    }
+
     pub fn needs_refresh(&self) -> bool {
         self.tables.is_empty()
     }
@@ -247,7 +276,8 @@ pub fn refresh_analyze_stats_nonblock(
                 match scan {
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
-                        let stats = std::mem::take(stats);
+                        let mut stats = std::mem::take(stats);
+                        stats.count_index_rows_per_page();
                         if let Err(e) = install_analyze_stats(conn, stats) {
                             tracing::warn!("Failed to refresh analyze stats: {e}");
                         }
@@ -318,8 +348,13 @@ fn load_column_stats_row(
     let Some(table) = schema.get_btree_table(table_name) else {
         return Ok(());
     };
-    let (Value::Text(kind), Value::Blob(data)) = (row.get::<&Value>(3)?, row.get::<&Value>(4)?)
-    else {
+    let Value::Text(kind) = row.get::<&Value>(3)? else {
+        return Ok(());
+    };
+    if kind.as_str() == "pages" {
+        return load_tree_pages_row(row, schema, table_name, stats);
+    }
+    let Value::Blob(data) = row.get::<&Value>(4)? else {
         return Ok(());
     };
     match kind.as_str() {
@@ -389,6 +424,7 @@ fn load_column_stats_row(
                 .filter(|c| !c.is_generated())
                 .filter_map(|c| c.name.as_deref().map(normalize_ident))
                 .collect();
+            let records_bytes: Vec<usize> = records.iter().map(|r| r.len()).collect();
             let mut rows = Vec::with_capacity(records.len());
             for record in records {
                 let values =
@@ -400,11 +436,57 @@ fn load_column_stats_row(
                 rows.push(values);
             }
             stats.sample_bytes = charged;
-            stats.table_stats_mut(table_name).sample = Some(Arc::new(Sample::new(columns, rows)));
+            let table_stats = stats.table_stats_mut(table_name);
+            table_stats.record_bytes = average_record_bytes(&records_bytes);
+            table_stats.sample = Some(Arc::new(Sample::new(columns, rows)));
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Amphora (PL.7, T-PL.7.1): apply a row `(1, tbl, index or NULL, 'pages', the count)`, a tree's
+/// pages as ANALYZE's walk counted them, kept while the table, and the index it names, are still
+/// the schema's.
+fn load_tree_pages_row(
+    row: &crate::vdbe::Row,
+    schema: &Schema,
+    table_name: &str,
+    stats: &mut AnalyzeStats,
+) -> Result<()> {
+    let Some(pages) = row
+        .get::<&Value>(4)?
+        .as_int()
+        .and_then(|p| u64::try_from(p).ok())
+        .filter(|p| *p > 0)
+    else {
+        return Ok(());
+    };
+    match row.get::<&Value>(2)? {
+        Value::Null => stats.table_stats_mut(table_name).pages = Some(pages),
+        Value::Text(index) => {
+            let index_name = normalize_ident(index.as_str());
+            let names_primary_key = index_name.eq_ignore_ascii_case(table_name)
+                && schema
+                    .get_btree_table(table_name)
+                    .is_some_and(|table| !table.has_rowid);
+            if !names_primary_key && schema.get_index(table_name, &index_name).is_none() {
+                return Ok(());
+            }
+            stats
+                .table_stats_mut(table_name)
+                .index_stats_mut(&index_name)
+                .pages = Some(pages);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The average of records of `bytes` each, `None` for none.
+fn average_record_bytes(bytes: &[usize]) -> Option<f64> {
+    let total: f64 = bytes.iter().map(|b| *b as f64).sum();
+    (!bytes.is_empty()).then(|| total / bytes.len() as f64)
 }
 
 /// Apply a single `sqlite_stat1` row to the accumulating [`AnalyzeStats`].

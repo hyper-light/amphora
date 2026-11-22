@@ -345,6 +345,8 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.7.1", text = "The audit's 09-cost-model — passes when its tables of 8 and 1,011 pages no longer both scan at one cost" },
+  # lane pl7c: T-PL.7.1's focused tests are tests/column_stats.rs t_pl_7_1_* (ANALYZE keeps each
+  # tree's real pages; a full read of a table of more pages costs more) and cost::tests::t_pl_7_1_*.
   # lane pl7
   { id = "T-PL.7.2", text = "cost_fit::tests::t_pl_7_2_* — passes when the fit of synthetic samples from known weights with 5% noise lands within four standard errors and 5% of each, and a tenfold stall one sample in ten still leaves each within 5%" },
   { id = "T-PL.7.3", text = "cost_fit::tests::t_pl_7_3_* — passes when terms never sampled have no fitted weight and the planner keeps their learned value, and the fit follows weights that move" },
@@ -1098,3 +1100,29 @@ tests = [
 # every system with one command; LiteFS fails over on Consul's lease (servers/repl/litefs.sh); dqlite's
 # shim builds and its cluster comes up. libSQL's failover and dqlite's member catch-up stay refused,
 # typed: sqld has no election, and dqlite reads only through its leader.
+
+# lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
+[[own]]
+id = "G5.4"
+title = "Skipping rows: zone maps over leaf runs against cracking (G5 step 4; executor.md decision 11)"
+criteria = [
+  { id = "AC-G5.4.1", text = "both prototypes' scan and write costs recorded on filter_no_index-like classes with writes interleaved (crates/engine/tests/skipping_bench.rs; measured by the coordinator)" },
+  { id = "AC-G5.4.2", text = "filter_no_index at 1 client with the winner rises at least 1000% against step 3 (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G5.4.1", text = "skipping::tests::t_g5_4_1_* — passes when, with writes between scans, each prototype's candidates hold exactly a plain scan's rows, no row missed and none stale; zone maps built from a real table's leaves (one zone a leaf) with SQL writes between scans read exactly the plain scan's rows through the engine" },
+]
+
+# lane g6s3
+
+[[own]]
+id = "G6.3"
+title = "Learned plan hints against the cost model (G6 step 3; planner.md, decision of lane g6s3)"
+criteria = [
+  { id = "AC-G6.3.1", text = "hinted and unhinted plans' times on held-out JOB and corpus queries recorded (bench/plan_hints); no held-out query slower by more than 10% with hints on (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G6.3.1", text = "crates/engine/tests/plan_hints.rs t_g6_3_1_* — passes when every hint set's answers equal the unhinted plan's and a computed nested loop's, and the planner obeys each mask; bench/plan_hints compares hinted answers with SQLite's" },
+  { id = "T-G6.3.2", text = "translate::optimizer::plan_hints::tests::t_g6_3_2_* — passes when the guard admits a faster hint, drops it once its held-out runs are slower, and never admits one no faster" },
+  { id = "T-G6.3.3", text = "translate::optimizer::plan_hints::tests::t_g6_3_3_memory_stays_bounded — passes when the model's size is constant over 10,000 runs and the guard holds no more classes than it was given" },
+]

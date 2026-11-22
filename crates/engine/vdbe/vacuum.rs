@@ -2470,6 +2470,12 @@ mod tests {
     }
 
     impl IO for SyncCountingIo {
+        // Its files are its inner MemoryIO's: kept in memory, the versioned storage's too (G7 step
+        // 2: none left on disk beside the crate).
+        fn is_memory(&self) -> bool {
+            self.inner.is_memory()
+        }
+
         fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
             let inner = self.inner.open_file(path, flags, direct)?;
             Ok(Arc::new(SyncCountingFile {

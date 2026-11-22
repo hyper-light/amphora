@@ -377,6 +377,16 @@ pub fn translate_analyze(
         // other indexes' `sqlite_stat1` rows.
         if !is_specific_index_target {
             emit_column_stats(program, column_stats_cursor, &target_table, database_id)?;
+            let cursor = program.alloc_cursor_id(CursorType::BTreeTable(target_table.clone()));
+            emit_tree_pages(
+                program,
+                column_stats_cursor,
+                cursor,
+                target_table.root_page,
+                &target_table.name,
+                None,
+                database_id,
+            )?;
         }
         let degrees_cursor = if is_specific_index_target {
             None
@@ -653,6 +663,72 @@ fn emit_column_stats(
     Ok(())
 }
 
+/// Amphora (PL.7, T-PL.7.1): emits a walk of the B-tree at `root`, opened at `tree`, that counts
+/// its pages ([Insn::TreePages]), and keeps them at `stats_cursor`, `(tbl, index or NULL, 'pages',
+/// the count)`: the table's tree where `index` is `None`. The planner reads a tree's rows a page
+/// from them (`cost::TreeShape`). The walk reads each interior and leaf page once and no record.
+fn emit_tree_pages(
+    program: &mut ProgramBuilder,
+    stats_cursor: usize,
+    tree: usize,
+    root: i64,
+    table: &str,
+    index: Option<&str>,
+    database_id: usize,
+) -> Result<()> {
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: tree,
+        root_page: root,
+        db: database_id,
+    });
+    let row = program.alloc_registers(4);
+    let (tbl, idx, kind, data) = (row, register(row, 1)?, register(row, 2)?, register(row, 3)?);
+    program.emit_insn(Insn::String8 {
+        value: table.to_string(),
+        dest: tbl,
+    });
+    match index {
+        Some(index) => program.emit_insn(Insn::String8 {
+            value: index.to_string(),
+            dest: idx,
+        }),
+        None => program.emit_insn(Insn::Null {
+            dest: idx,
+            dest_end: None,
+        }),
+    }
+    program.emit_insn(Insn::String8 {
+        value: "pages".to_string(),
+        dest: kind,
+    });
+    program.emit_insn(Insn::TreePages {
+        cursor_id: tree,
+        target_reg: data,
+    });
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(row),
+        count: to_u32(4),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: None,
+    });
+    let rowid = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: stats_cursor,
+        rowid_reg: rowid,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: stats_cursor,
+        key_reg: rowid,
+        record_reg: record,
+        flag: Default::default(),
+        table_name: COLUMN_STATS_TABLE.to_string(),
+    });
+    Ok(())
+}
+
 /// Emits a pass over the statistics table at `cursor` that deletes each row whose first column
 /// is `table`.
 fn emit_delete_rows_of(program: &mut ProgramBuilder, cursor: usize, table: &str) {
@@ -918,6 +994,19 @@ fn emit_index_stats(
         flag: Default::default(),
         table_name: "sqlite_stat1".to_string(),
     });
+
+    if let Some(cursor) = degrees_cursor {
+        let tree = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        emit_tree_pages(
+            program,
+            cursor,
+            tree,
+            index.root_page,
+            &table.name,
+            Some(&index.name),
+            database_id,
+        )?;
+    }
 
     if let Some(cursor) = degrees_cursor.filter(|_| index.where_clause.is_none()) {
         let row = program.alloc_registers(4);

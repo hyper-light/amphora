@@ -338,6 +338,11 @@ fn multiprocess_wal_rejects_journal_mode_mvcc_pragma() {
 
 #[test]
 fn multiprocess_wal_rejects_opening_mvcc_database() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("multiprocess-rejects-mvcc-open.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -588,6 +593,11 @@ fn database_open_selects_shm_wal_backend() {
 
 #[test]
 fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-stale-reopen.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -699,6 +709,11 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
 
 #[test]
 fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfill_proof() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
         .path()
@@ -775,6 +790,11 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
 
 #[test]
 fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_proof() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
         .path()
@@ -845,6 +865,11 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
 
 #[test]
 fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_backfill_proof() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
         .path()
@@ -1014,6 +1039,11 @@ fn multiprocess_shm_count_child_process() {
 
 #[test]
 fn multiprocess_shm_hold_read_tx_child_process() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
         return;
     };
@@ -1064,6 +1094,11 @@ fn multiprocess_shm_hold_read_tx_child_process() {
 /// checkpointed that table.
 #[test]
 fn multiprocess_shm_db_file_reader_child_process() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
         return;
     };
@@ -1205,6 +1240,11 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
 
 #[test]
 fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("close-skip-shutdown-checkpoint.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -1254,6 +1294,11 @@ fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
 
 #[test]
 fn subprocess_database_open_survives_truncate_rewrite_cycles() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-truncate-rewrite.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -1317,6 +1362,11 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
 
 #[test]
 fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-peer-schema-refresh.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -1380,6 +1430,11 @@ fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
 
 #[test]
 fn subprocess_database_open_parent_directly_uses_child_created_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-direct-child-table-use.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -1417,6 +1472,11 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
 
 #[test]
 fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
         .path()
@@ -1461,6 +1521,11 @@ fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
 
 #[test]
 fn subprocess_database_open_parent_execute_uses_child_created_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-execute-child-table-use.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -1590,6 +1655,11 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
 
 #[test]
 fn subprocess_db_file_reader_stops_checkpoint_in_other_process() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-db-file-reader.db");
     let ready_file = dir.path().join("child-ready");
@@ -1795,6 +1865,11 @@ fn write_after_full_checkpoint_restarts_wal() {
 
 #[test]
 fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
         .path()
@@ -2028,6 +2103,11 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
 
 #[test]
 fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-live-reader-reopen.db");
     let ready_file = dir.path().join("child-ready");
@@ -2400,6 +2480,11 @@ fn spawn_concurrent_nextval_children(db_path: &str, n: usize) -> Vec<i64> {
 
 #[test]
 fn test_multiprocess_concurrent_nextval_returns_distinct_values() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("mp-seq-nextval.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -2427,6 +2512,11 @@ fn test_multiprocess_concurrent_nextval_returns_distinct_values() {
 
 #[test]
 fn test_multiprocess_nextval_after_other_process_committed_is_monotonic() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("mp-seq-monotonic.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -2481,6 +2571,11 @@ fn test_multiprocess_nextval_after_other_process_committed_is_monotonic() {
 
 #[test]
 fn test_multiprocess_setval_visible_to_other_process_nextval() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("mp-seq-setval.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -2642,6 +2737,11 @@ fn multiprocess_sequence_nextval_burst_child_process() {
 /// processes naturally observe each other's commits and never collide.
 #[test]
 fn test_multiprocess_nextval_burst_no_duplicates() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     const PROCESSES: usize = 4;
     const PER_PROCESS: usize = 25;
 
@@ -2860,6 +2960,11 @@ fn multiprocess_autoinc_burst_child_process() {
 /// be invisible to the nextval burst test.
 #[test]
 fn test_multiprocess_autoinc_burst_no_duplicates() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     const PROCESSES: usize = 4;
     const PER_PROCESS: usize = 25;
 
@@ -3025,6 +3130,11 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
 
 #[test]
 fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let io = multiprocess_test_io();
     let db = open_multiprocess_db(io, dir.path().join("late-reader.db").to_str().unwrap()).unwrap();
