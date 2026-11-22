@@ -1577,6 +1577,54 @@ starts, with few batches, Student's t is large, so the weights move slowly until
 weight that moves on a batch within the spread between batch means; a semi or anti join's answer
 after a bushy plan that differs from the nested loops'.
 
+## Decision (lane pl8-16): the weight rules A/B; a statement planned again keeps its join order within the weights' error
+
+**Decision.** PL.8, two pieces (lane pl8-16).
+
+- *The weight rule behind a switch* (`optimizer/learned_costs.rs`, `WeightRule`,
+  `Connection::set_weight_rule`, T-PL.8.6). Lane pl8-14 replaced the rule that moves a learned
+  weight outright. The old one is back as the control: `Blend`, every read blended into the rate at
+  once (the running mean of the batch under way and the one before it, the rule before lane
+  pl8-13). `BatchMeans` (decision pl8-15) is the candidate and the default. The switch moves the
+  database's weights from the rates as they stand.
+- *The carried join order* (`optimizer/join.rs`, `JoinOrders`, `keep_carried`). The search notes
+  each query block's chosen left-deep order, keyed by the block's tables in FROM order; the
+  `Program` keeps them; `Statement::reprepare` hands them to its next plan through `PrepareOptions`
+  and the resolver. The new search prices the carried order as the block now stands, where the
+  conflict rules still allow it, and keeps it unless its own best costs less than the carried
+  order's cost over `1 + margin`. The margin is the weights' error, `exp(MOVE_Z * s) - 1`, with `s`
+  the worst kind's spread between batch means in page reads (`sqrt(s_kind^2 + s_page^2)`); it is 0
+  under `Blend` and before any spread is measured, so only a tie keeps the order then. A custom
+  plan (decision pl12) carries nothing.
+
+**Why.** Ada's method is A/B for every design decision: today's rule stays as the control, and each
+candidate is forced into its own failure. A plan made again on the same facts should be the same
+plan: two orders whose costs differ by less than the weights' own error are not told apart by the
+evidence, so the order that ran stands.
+
+**Evidence.** `learned_costs::ab_tests::t_pl_8_6_ab_plan_flips_and_batches_to_follow_a_change`
+runs both rules on one seeded series (reads scattered 30%, a quarter of the batches slowed together
+by up to 30%; a plan boundary 5% above the true cost) and reports plan flips and the batches each
+takes to follow a cost that quadruples at batch 1, 2, 4, 16 or 64. A Python mirror of both rules on
+the same series (lane pl8-16, `~/.cache/amphora-t1/pl8-16/ab_sim.py`) gives: `Blend` 353 to 452
+flips in 200 batches, `BatchMeans` 1 to 26; `Blend` follows every change within one batch,
+`BatchMeans` takes 10 to 14 after a change in the first two batches and one batch from batch 4 on.
+`join::tests::t_pl_8_a_carried_join_order_stands_within_its_margin`: the five-table chain keeps its
+order at no margin and at a margin just under the reversed order's extra cost, takes the reversed
+order just past it, and ignores a carried order that isn't each table once.
+`learned_costs::ab_tests::t_pl_8_cost_margin_is_the_weights_error` pins the margin's formula. The
+runs of record are the coordinator's: `cargo test -p amphora-engine --lib learned_costs::ab_tests
+-- --nocapture`, with more seeds and batches.
+
+**Not yet built.** The fast plan first with the exact search in the background: a statement would
+run the greedy plan at once and take the search's plan when the search completes (an event, not a
+timer). A bushy plan's carried shape (only left-deep orders are carried). Two query blocks with the
+same tables in the same FROM order share one key.
+
+**Falsified by.** A statement planned again on unchanged statistics and weights that picks another
+join order; `BatchMeans` flipping a plan as often as `Blend` on the same series; a carried order
+kept where the new best is cheaper past the margin.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).

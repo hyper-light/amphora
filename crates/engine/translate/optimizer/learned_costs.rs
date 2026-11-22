@@ -1487,7 +1487,7 @@ mod ab_tests {
     /// Do: both rules over the same eight seeded runs of 200 batches, then a quadrupled cost at
     /// batch 1, 2, 4, 16 and 64 over four. Expect: the control flips the plan at every few reads
     /// (over ten times the candidate's flips); the candidate follows a change late in the run in
-    /// one batch as the control does, but one right after start only after several (T-PL.8.6:
+    /// one batch as the control does, but one right after start only after several (T-PL.8.8:
     /// each rule's failure, measured; the numbers are the report).
     #[test]
     fn t_pl_8_6_ab_plan_flips_and_batches_to_follow_a_change() {
@@ -1517,7 +1517,7 @@ mod ab_tests {
 
     /// Do: a rate's batches 10% either way of their mean, then the same under the blend. Expect: no
     /// margin before a spread is measured, then `exp(MOVE_Z * s) - 1` for the batches' spread `s`,
-    /// and none under the blend, which measures no spread (PL.8, lane pl8-16).
+    /// and none under the blend, which measures no spread (T-PL.8.9, lane pl8-16).
     #[test]
     fn t_pl_8_cost_margin_is_the_weights_error() {
         let costs = LearnedCosts::from_rates(&Rates {

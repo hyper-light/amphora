@@ -976,6 +976,9 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lanes pl8-14 and pl8-15 (docs/design/planner.md "Decision (lane pl8-15)"): learned weights move
   only past the spread between batch means (Student's t, T-PL.8.6), so a burst of load no longer
   flips a plan; semi and anti joins after the inner joins follow a bushy plan (T-PL.8.2).
+  Lane pl8-16 (docs/design/planner.md "Decision (lane pl8-16)"): the old blend rule is back behind
+  `WeightRule` as the control for the A/B with batch means (T-PL.8.8), and a statement planned
+  again keeps its join order unless the new best is cheaper past the weights' error (T-PL.8.9).
   Not built: the search budget derived from a plan-time target, outer joins inside a bushy plan,
   and semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1
   is open.

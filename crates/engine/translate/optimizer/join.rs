@@ -4815,7 +4815,7 @@ mod tests {
     /// and at margins just under and just past the reverse's extra cost, then an order that is not
     /// one of the tables each once. Expect: the chain's order wherever the reverse costs more than
     /// the margin allows, the reverse where it costs no more, and a carried order that isn't a
-    /// permutation ignored (PL.8, lane pl8-16: a statement planned again keeps its plan unless
+    /// permutation ignored (T-PL.8.9, lane pl8-16: a statement planned again keeps its plan unless
     /// the new best is cheaper past the weights' error).
     #[test]
     fn t_pl_8_a_carried_join_order_stands_within_its_margin() {
@@ -4841,7 +4841,7 @@ mod tests {
     }
 
     /// Do: note two blocks' orders, one twice. Expect: each block's latest order, under its own
-    /// tables only (PL.8, lane pl8-16).
+    /// tables only (T-PL.8.9, lane pl8-16).
     #[test]
     fn t_pl_8_join_orders_keep_each_blocks_latest() {
         let orders = JoinOrders::default();
