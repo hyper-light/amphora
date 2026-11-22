@@ -318,6 +318,8 @@ pub(super) fn apply_page(db: &Db, namespace: &str, page: &ImportPage) -> anyhow:
             }
         }
         db.query("INSERT INTO __amphora_versions(namespace,family,key,rev,seq,value) VALUES (?1,?2,?3,?4,?5,?6)",[text(namespace),text(&version.family),blob(&version.key)?,integer(version.rev)?,integer(version.seq)?,version.value.as_ref().map(|v|blob(v)).transpose()?.unwrap_or(EValue::Null)],|_|Ok(true))?;
+        // A group's database indexes the key by position and feeds it to a held log (CP-T1.9).
+        group::wrote(db, namespace, &version.family, &version.key)?;
         db.query("INSERT INTO __amphora_families(namespace,family,newest) VALUES (?1,?2,?3) ON CONFLICT(namespace,family) DO UPDATE SET newest=MAX(__amphora_families.newest,excluded.newest)",[text(namespace),text(&version.family),integer(version.rev)?],|_|Ok(true))?;
     }
     for (family, newest) in &page.state.newest {
