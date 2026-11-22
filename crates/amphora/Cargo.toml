@@ -41,6 +41,9 @@ hyper-block = "0.1.0"
 # The filesystem's free bytes a replica's database log may grow into (statvfs, GetDiskFreeSpaceExW):
 # the version tantivy already brings.
 fs4 = { version = "=0.13.1", default-features = false, features = ["sync"] }
+# The process's resident bytes on Linux, macOS and Windows, for its memory budget (memory.rs, MB.1):
+# the version the engine's tests already bring.
+memory-stats = "=1.2.0"
 
 [target.'cfg(unix)'.dependencies]
 # Safe filesystem identity and process access (also used by private filesystem validation).

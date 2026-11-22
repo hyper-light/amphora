@@ -37,6 +37,7 @@ pub mod insn;
 pub mod leaf_batch;
 pub mod metrics;
 pub mod morsel;
+pub mod morsel_scan;
 #[cfg(test)]
 mod native_extension_tests;
 pub mod row_counts;
@@ -973,6 +974,8 @@ pub struct ProgramState {
     hash_tables: HashMap<usize, HashTable>,
     /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
     group_tables: HashMap<usize, group_table::GroupTable>,
+    /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
+    morsel_rows: Option<std::vec::IntoIter<Vec<Value>>>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
@@ -1122,6 +1125,7 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             group_tables: HashMap::default(),
+            morsel_rows: None,
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
@@ -1314,6 +1318,7 @@ impl ProgramState {
         if !self.group_tables.is_empty() {
             self.group_tables.clear();
         }
+        self.morsel_rows = None;
         if !self.ephemeral_temp_files.is_empty() {
             let kept = &self.ephemeral_kept;
             self.ephemeral_temp_files
@@ -1781,6 +1786,18 @@ impl ProgramState {
     /// Gets or creates a bloom filter for the given cursor ID.
     pub fn get_or_create_bloom_filter(&mut self, cursor_id: usize) -> &mut BloomFilter {
         self.bloom_filters.entry(cursor_id).or_default()
+    }
+
+    /// Amphora (PL.5): gets or creates the cursor's bloom filter, sized when its build ends
+    /// where `sizing` is given, of the default fixed size where not.
+    pub fn get_or_create_bloom_filter_for(
+        &mut self,
+        cursor_id: usize,
+        sizing: Option<crate::vdbe::bloom_filter::FilterSizing>,
+    ) -> &mut BloomFilter {
+        self.bloom_filters
+            .entry(cursor_id)
+            .or_insert_with(|| sizing.map_or_else(BloomFilter::new, BloomFilter::sized))
     }
 
     /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.

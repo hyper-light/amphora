@@ -208,14 +208,13 @@ impl Spacing {
 
 /// The frames a replica's database log may hold: the bytes its file already takes (`kept` frames,
 /// reused, store.md decision 13) and an equal share among the `logs` replica logs on its
-/// filesystem of the `available` bytes there, less one snapshot's image
-/// ([`crate::replication::SNAPSHOT_BYTES`], so an install has room), each frame taking its own
+/// filesystem of the `available` bytes there, less one image's `image` bytes (the most an image
+/// may take now, its memory budget's room for one: SB.1; so an install has room), each frame taking its own
 /// bytes and the page its copy may add to the database's file. Counted in bytes, a frame the log
 /// grows by moves bytes from `available` to its file, so the room holds still for one log and
 /// grows by less than half a frame a frame for more, the others' growth seen at the next pass. The
 /// process's disk budget, once it exists, passes its room for replica logs as `available`.
-pub(super) fn log_room(available: u64, logs: u64, kept: u64) -> u64 {
-    let image = u64::try_from(crate::replication::SNAPSHOT_BYTES).unwrap_or(u64::MAX);
+pub(super) fn log_room(available: u64, image: u64, logs: u64, kept: u64) -> u64 {
     // Saturating, each: nothing free past the image, and a length past u64's bytes the most it can.
     let free = available.saturating_sub(image);
     let share = free.checked_div(logs.max(1)).unwrap_or(0);
@@ -405,16 +404,16 @@ mod tests {
     /// from free bytes into the file leaves one log's room where it was.
     #[test]
     fn a_log_takes_its_file_and_an_equal_share_of_what_is_free_past_one_image() {
-        let image = u64::try_from(crate::replication::SNAPSHOT_BYTES).unwrap();
+        let image = 256u64 << 20;
         let each = FRAME_BYTES + crate::db::PAGE_BYTES;
-        assert_eq!(log_room(image, 1, 40), 20);
-        assert_eq!(log_room(image / 2, 1, 40), 20);
-        assert_eq!(log_room(image + 100 * each, 1, 40), 120);
-        assert_eq!(log_room(image + 100 * each, 2, 40), 70);
+        assert_eq!(log_room(image, image, 1, 40), 20);
+        assert_eq!(log_room(image / 2, image, 1, 40), 20);
+        assert_eq!(log_room(image + 100 * each, image, 1, 40), 120);
+        assert_eq!(log_room(image + 100 * each, image, 2, 40), 70);
         assert_eq!(
-            log_room(image + 100 * each - FRAME_BYTES, 1, 41),
-            log_room(image + 100 * each, 1, 40)
+            log_room(image + 100 * each - FRAME_BYTES, image, 1, 41),
+            log_room(image + 100 * each, image, 1, 40)
         );
-        assert_eq!(log_room(u64::MAX, 0, u64::MAX), u64::MAX / each);
+        assert_eq!(log_room(u64::MAX, image, 0, u64::MAX), u64::MAX / each);
     }
 }

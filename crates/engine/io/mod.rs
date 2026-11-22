@@ -55,6 +55,7 @@ cfg_block! {
 mod memory;
 #[cfg(feature = "io_memory_yield")]
 mod memory_yield;
+pub mod system_memory;
 #[cfg(feature = "fs")]
 mod vfs;
 pub use memory::MemoryIO;
