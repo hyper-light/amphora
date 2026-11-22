@@ -870,6 +870,8 @@ class DateFunctions(unittest.TestCase):
         self.assertEqual(dialects.translate("SELECT date('2024-02-29', 'start of month', '-2 days')", "clickhouse")[0],
                          "SELECT formatDateTime(addDays(toDateTime64(toStartOfMonth(toDateTime64('2024-02-29 00:00:00.000', 3, 'UTC')), 3, 'UTC'), -2), '%Y-%m-%d', 'UTC')")
         self.assertIn("outside the years 1900 to 2299", dialects.translate("SELECT date('2299-12-31', '+1 day')", "clickhouse")[1])
+        for d in ("mysql", "clickhouse"):
+            self.assertIsNone(dialects.translate("SELECT datetime(0, 'unixepoch', '+1 day')", d)[1])
 
     def test_not_exact_is_not_expressible(self):
         for case, reason in self.REFUSED:

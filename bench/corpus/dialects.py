@@ -1623,10 +1623,14 @@ def _in_years(args, dialect, name):
     if dialect not in _YEARS:
         return
     first, last = _YEARS[dialect]
+    from sqlglot import exp
+
     shown = [a.sql(dialect="sqlite") for a in args]
+    # The moment as read: the time value with its reading modifier (_READING_MODIFIERS), if any.
+    read = 2 if len(args) > 1 and isinstance(args[1], exp.Literal) and args[1].is_string and args[1].this.strip().lower() in _READING_MODIFIERS else 1
     db = sqlite3.connect(":memory:")
     try:
-        years = [db.execute(f"SELECT strftime('%Y', {', '.join(shown[:k])})").fetchone()[0] for k in (1, len(shown))]
+        years = [db.execute(f"SELECT strftime('%Y', {', '.join(shown[:k])})").fetchone()[0] for k in (read, len(shown))]
     finally:
         db.close()
     for y in years:
