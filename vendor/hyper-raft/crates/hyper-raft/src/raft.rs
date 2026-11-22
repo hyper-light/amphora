@@ -799,7 +799,11 @@ pub struct Raft<S> {
     /// member opens, a quarter kilobyte inline in every member a host holds (focal's session,
     /// whose inline size its debug stacks on Windows bound).
     pub(crate) config: Box<Config>,
+    /// How an owner's entry states its group's member bound, if it does ([`Raft::state_members`]).
+    stated_members: Option<StatedMembers>,
 }
+/// Reads the member bound an owner's normal entry states, if it states one.
+pub type StatedMembers = fn(&[u8]) -> Option<usize>;
 
 /// The messages that wait to be taken, and what they hold, by capacity,
 /// kept as they are queued so that asking costs nothing.
@@ -1435,6 +1439,7 @@ impl<S: Storage> Raft<S> {
                 Elections::Suspicion => Some(Box::default()),
             },
             config: Box::new(config.clone()),
+            stated_members: None,
         };
         raft.conf_before = conf_before;
         raft.applied_conf = applied_conf;
@@ -1492,6 +1497,29 @@ impl<S: Storage> Raft<S> {
     /// The configuration the core runs under.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+    /// Raises the most members a configuration may name to `members`, never lowers it: the
+    /// bound an owner's group states in its log and raised there before a configuration that
+    /// passes it (Amphora's QB.1, lane constants-21), so a group's members, each opened for the
+    /// bound its log named then, take every configuration the group commits. Each of the core's
+    /// parts bounded by it (the tracker, the fast votes and the pending reads) takes the new
+    /// bound with it. Returns whether it rose.
+    /// The owner's entries state the group's member bound, read by `stated`: as the core takes
+    /// entries into its log, before the configurations they change take effect, it raises its
+    /// bound to the most one of them states ([`Raft::grow_members`]). A configuration follows
+    /// the bound that admits it in the log, so a member that takes both at once is raised first.
+    pub fn state_members(&mut self, stated: StatedMembers) {
+        self.stated_members = Some(stated);
+    }
+    pub fn grow_members(&mut self, members: usize) -> bool {
+        if members <= self.config.limits.members {
+            return false;
+        }
+        self.config.limits.members = members;
+        self.tracker.grow_members(members);
+        self.votes.grow_members(members);
+        self.read_only.grow_members(members);
+        true
     }
     /// This member's identity.
     pub fn id(&self) -> NodeId {
@@ -4645,10 +4673,18 @@ impl<S: Storage> Raft<S> {
             renewed: Vec::new(),
             error: None,
         };
+        let mut bound = 0usize;
         if low <= last {
             // Read where the entries are, none copied: the walk stops only at an error.
             let start = self.tracker.configuration();
+            let stated = self.stated_members;
             self.log.any_entry(low, last.saturating_add(1), |entry| {
+                if let Some(stated) = stated
+                    && entry.entry_type == EntryType::EntryNormal
+                    && let Some(members) = stated(&entry.data)
+                {
+                    bound = bound.max(members);
+                }
                 fold.entry(start, entry).is_err_and(|error| {
                     fold.error = Some(error);
                     true
@@ -4658,6 +4694,7 @@ impl<S: Storage> Raft<S> {
         if let Some(error) = fold.error {
             return Err(error);
         }
+        self.grow_members(bound);
         if let Some(before) = fold.before {
             self.conf_before = before;
         }

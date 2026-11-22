@@ -26,6 +26,7 @@ pub mod bootstrap;
 pub(crate) mod class;
 pub(crate) mod closed;
 pub(crate) mod floor;
+pub(crate) mod members;
 pub(crate) mod readsets;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
@@ -251,8 +252,13 @@ pub struct Machine {
     #[cfg(test)]
     class_changes: u64,
     // The most members a configuration of this machine's group names, as its core's settings state
-    // them (`Limits::members`): what a class entry is bounded by (lane constants-20).
-    members: usize,
+    // them (`Limits::members`): what a class entry is bounded by (lane constants-20). Shared with
+    // the owner's flushing thread, whose image room frames a configuration of that many (lane
+    // constants-21).
+    members: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    // The member bound the group's log stated last, if any (`members`; lane constants-21): what
+    // the core opens with and raises to.
+    bound: Option<usize>,
     // The most an image of this machine's carrier holds (its owner's transport, or a test's lower
     // bound): usize::MAX where nothing carries it but memory. The image's room is the memory
     // budget's room for one, no more than this (SB.1).
@@ -546,6 +552,7 @@ impl Machine {
         }
         let (point, configuration) = state.unwrap_or((Point::default(), initial));
         let recorded = class::recorded(&db).map_err(unavailable)?;
+        let bound = members::recorded(&db).map_err(unavailable)?;
         let time = closed::recorded(&db).map_err(unavailable)?;
         db.transaction(|db| marker(db, point, &configuration))
             .map_err(unavailable)?;
@@ -566,7 +573,9 @@ impl Machine {
             stated: None,
             #[cfg(test)]
             class_changes: 0,
-            members: crate::database::replicated::MEMBERS,
+            // Until the core's settings: the bound its log stated, if any.
+            members: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(bound.unwrap_or(0))),
+            bound,
             image_cap: usize::MAX,
             image_disk: usize::MAX,
             #[cfg(test)]
@@ -625,11 +634,20 @@ impl Machine {
     /// The most members a configuration of this machine's group names: its core's
     /// `Limits::members`, set before the replica opens (lane constants-20).
     pub(crate) fn set_members(&mut self, members: usize) {
-        self.members = members;
+        self.members
+            .store(members, std::sync::atomic::Ordering::Release);
     }
     /// The most members a configuration of this machine's group names.
     pub(crate) fn members(&self) -> usize {
-        self.members
+        self.members.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// The members bound as it rises, for a thread beside the machine's.
+    pub(crate) fn members_shared(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.members)
+    }
+    /// The member bound the group's log stated last, if it stated one (lane constants-21).
+    pub(crate) fn member_bound(&self) -> Option<usize> {
+        self.bound
     }
     pub(crate) fn set_snapshot_bytes(&mut self, bytes: usize) {
         self.image_cap = bytes;
@@ -1157,10 +1175,31 @@ impl StateMachine for Machine {
             });
             return Ok(());
         }
+        if members::is_bound(data) {
+            // A bound only rises: one at or below the record changes nothing, on every member
+            // alike, as it depends on the log alone. The core rose already, as it took the entry.
+            let stated = members::decode(data).map_err(failed)?;
+            let rises = self.bound.is_none_or(|bound| stated > bound);
+            let configuration = self.configuration.clone();
+            self.advance_with(at, &[], &configuration, !self.replicated, |db| {
+                closed::record(db, before, next.time)?;
+                if rises {
+                    members::record(db, stated)?;
+                }
+                Ok(())
+            })?;
+            if rises {
+                self.bound = Some(stated);
+                self.members
+                    .fetch_max(stated, std::sync::atomic::Ordering::AcqRel);
+            }
+            self.timed(next);
+            return Ok(());
+        }
         if class::is_class(data) {
             // The last compatible entry is the record; one that isn't changes nothing, on every
             // member alike, as it depends on the log alone.
-            let stated = class::decode(data, self.members).map_err(failed)?;
+            let stated = class::decode(data, self.members()).map_err(failed)?;
             let supersedes = self
                 .class
                 .as_ref()
@@ -1321,6 +1360,11 @@ impl StateMachine for Machine {
         self.configuration_at = at.index;
         self.baseline.completed();
         self.class = class::recorded(&self.db).map_err(failed)?;
+        self.bound = members::recorded(&self.db).map_err(failed)?;
+        if let Some(bound) = self.bound {
+            self.members
+                .fetch_max(bound, std::sync::atomic::Ordering::AcqRel);
+        }
         // The image's time is the group's at its point: an image never goes back in time, as
         // it is taken past what this member applied.
         self.time = closed::recorded(&self.db).map_err(failed)?;

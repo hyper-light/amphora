@@ -1150,6 +1150,9 @@ tests = [
   # lane constants-20
   { id = "T-QB.1.6", text = "The command queue's inputs counted with nothing measured, then for an intake of 10 inputs every 10 ms under a 100 ms timeout, then in a room of one envelope: passes when they are the room's envelopes, then about 100, never fewer than two, the calls always one fewer" },
   { id = "T-QB.1.7", text = "A leader's measure opened for two members hears a third voter: passes when the third is refused Full naming two" },
+  # lane constants-21
+  { id = "T-QB.1.8", text = "A bound entry, stamped, read back; a one-member group's first bound raised as it grows to nine: passes when the entry states its bound and nothing else does, and the bound goes 2, 4, 8, 16, each admitting the configuration that raised it" },
+  { id = "T-QB.1.9", text = "A driven one-voter group, a learner running beside it, grows to five members, then nine, then the voter reopens from its first configuration: passes when every change is answered, the bound is 8 at five and 16 at nine at the voter and the learner, and the voter reopens with 16" },
 ]
 
 # lane many-writers

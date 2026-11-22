@@ -29,7 +29,8 @@ use hyper_raft::wire::Record;
 // what the owner takes in an election timeout; the outgoing queue holds what its host drains in
 // one (`queue_bounds`; QB.1). The queue's inputs are counted too, no more than the owner takes in
 // an election timeout and the room holds of an input's least, its envelope (`Bounds::commands`).
-pub(crate) const MEMBERS: usize = 64;
+// The most members a configuration names is the group's, stated in its log (`replication::
+// members`; lane constants-21), no constant.
 /// Format (hyper-raft `wire.rs`): what a message record adds past its entries or image, at the
 /// most: its header, fixed body, classic commit and checksum, and an incarnation and end
 /// (`MESSAGE_TOLD_BYTES`), which a leader's records don't carry but are counted for any record.
@@ -49,31 +50,34 @@ const FRAMING_BYTES: usize = RECORD_BYTES
 const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(FRAMING_BYTES);
 /// Format (hyper-raft `wire.rs`, `Snapshot` and `ConfState`): what a wire record adds past an
 /// image's data, at the most: the record's; the snapshot's presence, data length, index and term;
-/// and its configuration's auto-leave flag, four set lengths and at most `MEMBERS` ids of eight
-/// bytes in each of its four sets.
-const IMAGE_FRAMING_BYTES: usize = RECORD_BYTES
-    // The snapshot's presence byte, its data's length, and its index and term.
-    .saturating_add(1)
-    .saturating_add(4)
-    .saturating_add(16)
-    // Its configuration's auto-leave byte, four set lengths, and four sets of eight-byte ids.
-    .saturating_add(1)
-    .saturating_add(16)
-    .saturating_add(MEMBERS.saturating_mul(32));
+/// and its configuration's auto-leave flag, four set lengths and at most `members` ids of eight
+/// bytes in each of its four sets, `members` the group's bound (lane constants-21).
+const fn image_framing(members: usize) -> usize {
+    RECORD_BYTES
+        // The snapshot's presence byte, its data's length, and its index and term.
+        .saturating_add(1)
+        .saturating_add(4)
+        .saturating_add(16)
+        // Its configuration's auto-leave byte, four set lengths, and four sets of eight-byte ids.
+        .saturating_add(1)
+        .saturating_add(16)
+        .saturating_add(members.saturating_mul(32))
+}
 /// The wire record of an image of `image` bytes of pages, at the most: its data, the pages'
-/// encoding (`replication::image_envelope`) and the record's framing.
-fn image_record(image: u64) -> u64 {
+/// encoding (`replication::image_envelope`) and the record's framing, in a group of at most
+/// `members`.
+fn image_record(image: u64, members: usize) -> u64 {
     let pages = usize::try_from(image).unwrap_or(usize::MAX);
     let framed = pages
         .saturating_add(crate::replication::image_envelope(pages))
-        .saturating_add(IMAGE_FRAMING_BYTES);
+        .saturating_add(image_framing(members));
     u64::try_from(framed).unwrap_or(u64::MAX)
 }
 /// The most bytes of pages an image may take whose wire record fits `wire`: the record's room less
 /// its framing, less the pages' encoding of that room (an encoding grows with its pages, so that
 /// of the larger room is at least that of the image's).
-fn image_within(wire: usize) -> usize {
-    let room = wire.saturating_sub(IMAGE_FRAMING_BYTES);
+fn image_within(wire: usize, members: usize) -> usize {
+    let room = wire.saturating_sub(image_framing(members));
     room.saturating_sub(crate::replication::image_envelope(room))
 }
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
@@ -801,6 +805,10 @@ struct Changing {
 enum Stage {
     /// Waiting for the ReadIndex that shows this leader current and its configuration applied.
     Barrier,
+    /// Past its barrier, its configuration past the group's member bound, waiting for the write
+    /// under way to end before the entry that raises the bound moves the point under it (lane
+    /// constants-21).
+    Raising,
     /// Proposed at `index`, in this leader's term.
     Proposed { index: u64 },
     /// Applied: the group is in the joint configuration, or has left it.
@@ -943,7 +951,7 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // The replicated class's gate on held answers (replication.md, "The class stated once per
     // group"): the members the host's detector suspects, and those this owner holds suspected
     // only until its group's recorded class is its own. A member is counted held when neither
-    // suspects it. Each is at most the members a configuration names (`MEMBERS`).
+    // suspects it. Each is at most the members a configuration names (the group's member bound).
     detected: std::collections::BTreeSet<u64>,
     gated: std::collections::BTreeSet<u64>,
     // The term this owner proposed its class entry in, once taken: one a term.
@@ -1051,8 +1059,9 @@ impl Flushing {
         let mut copier = machine.reader()().map_err(|error| refused(&error))?;
         let mut free = machine.free_space();
         let share = LogShare::join(account, machine.filesystem().map_err(unavailable)?)?;
+        let members = machine.members_shared();
         // The room before any pass, read as each pass reads it.
-        let first = room(&copier, &mut free, &share).map_err(fenced)?;
+        let first = room(&copier, &mut free, &share, &members).map_err(fenced)?;
         let (ask, asked) = mpsc::sync_channel::<Ask>(1);
         let (finished, done) = mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -1087,7 +1096,7 @@ impl Flushing {
                             Err(e) => Err(format!("a checkpoint failed: {e:#}")),
                         };
                         match said.and_then(|copied| {
-                            let (room, image, unread) = room(&copier, &mut free, &share)?;
+                            let (room, image, unread) = room(&copier, &mut free, &share, &members)?;
                             let through = copier.durable_frame();
                             let caught_up = copied.is_some_and(|c| {
                                 c.left == 0
@@ -1144,12 +1153,12 @@ impl Flushing {
 /// one (SB.1), held inside its command queue's bound too (`queue_bounds`). On disk it takes no more
 /// than its share beside the replica logs there (`log_bound::image_disk_room`; QB.1), read on the
 /// flushing thread and set on the machine (`Machine::set_image_disk`).
-fn owner_image_room() -> Result<usize, Refusal> {
+fn owner_image_room(members: usize) -> Result<usize, Refusal> {
     let room = crate::memory::process().room(crate::memory::Use::Queues)?;
     let room = usize::try_from(room).unwrap_or(usize::MAX);
     // The command queue holds the image's wire record beside one application call (`queue_bounds`).
     let wire = room.saturating_sub(api::REQUEST_MAX);
-    Ok(crate::replication::image_room()?.min(image_within(wire)))
+    Ok(crate::replication::image_room()?.min(image_within(wire, members)))
 }
 
 /// The owner's queue bounds now (QB.1).
@@ -1191,6 +1200,7 @@ fn queue_bounds(
     outgoing: &super::drain::Drain,
     timeout: Duration,
     peers: u64,
+    members: usize,
 ) -> Result<Bounds, Refusal> {
     let room = crate::memory::process().room(crate::memory::Use::Queues)?;
     let image = u64::try_from(crate::replication::image_room()?).unwrap_or(u64::MAX);
@@ -1201,7 +1211,7 @@ fn queue_bounds(
     // whole room: held back whole, it would leave the calls one call's room. The equal share among
     // a queue's holders is the rule the logs and the image share the disk by
     // (`log_bound::image_disk_room`; QB.1).
-    let record = image_record(image)
+    let record = image_record(image, members)
         .min(room.checked_div(2).unwrap_or(0))
         .min(room.saturating_sub(request));
     // The command queue's bytes: the room, which holds one wire record beside one call.
@@ -1270,6 +1280,7 @@ fn room(
     copier: &Db,
     free: &mut crate::replication::FreeSpace,
     share: &LogShare,
+    members: &AtomicUsize,
 ) -> Result<(u64, u64, Option<String>), String> {
     let kept = copier
         .log_frames()
@@ -1278,7 +1289,8 @@ fn room(
     Ok(match free() {
         Ok(available) => {
             let disk = log_bound::image_disk_room(available, logs);
-            let image = owner_image_room().map_err(|e| e.to_string())?;
+            let image =
+                owner_image_room(members.load(Ordering::Acquire)).map_err(|e| e.to_string())?;
             let image = u64::try_from(image).unwrap_or(u64::MAX).min(disk);
             (
                 log_bound::log_room(available, image, logs, kept),
@@ -1834,13 +1846,15 @@ fn open(
     )?;
     // Nothing drained yet: the room (QB.1), which bounds no peers' least; an image held inside the
     // command queue's bound.
+    let bound = member_bound(&machine, &config);
     let first = queue_bounds(
         &super::drain::Drain::default(),
         &super::drain::Drain::default(),
         Duration::ZERO,
         0,
+        bound,
     )?;
-    machine.set_snapshot_bytes(image_within(first.wire));
+    machine.set_snapshot_bytes(image_within(first.wire, bound));
     let file = DeviceFile::open(
         log_path,
         true,
@@ -1851,6 +1865,19 @@ fn open(
     open_on(
         machine, log_owner, file, config, durability, changed, lease, until, clock,
     )
+}
+
+/// The most members a configuration of this member's group names, which its core opens with: the
+/// bound its group's log stated last, and before any, the first bound from the configuration it
+/// was opened with (`replication::members::first`), the same at every first member of a group, as
+/// they open with one configuration (lane constants-21). A member opened with more than the log
+/// recorded (a joiner told the group's members now) takes the larger: a bound only rises.
+fn member_bound(machine: &crate::replication::Machine, config: &ReplicaConfig) -> usize {
+    let configured = config.voters.len().saturating_add(config.learners.len());
+    let first = crate::replication::members::first(configured);
+    machine
+        .member_bound()
+        .map_or(first, |bound| bound.max(first))
 }
 
 /// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
@@ -1883,7 +1910,7 @@ fn open_on<F: BlockFile + 'static>(
 ) -> Result<(Client, Actor<F>, mpsc::Receiver<Envelope>), Refusal> {
     let mut machine = machine;
     machine.state_class(&durability)?;
-    let settings = settings(config.node_id, &durability)?;
+    let settings = settings(config.node_id, &durability, member_bound(&machine, &config))?;
     // A class entry is bounded by the members the core is opened for (lane constants-20).
     machine.set_members(settings.core.limits.members);
     let meter = Arc::new(ReplicaMeter::default());
@@ -1923,8 +1950,11 @@ fn open_on<F: BlockFile + 'static>(
     // room for queues, the memory its core's limits are derived from (lane constants-20; was a
     // picked 512 MiB).
     let resident = crate::memory::process().room(crate::memory::Use::Queues)?;
-    let replica =
+    let mut replica =
         Replica::open(&settings, group, machine, Bytes::new(resident)).map_err(unavailable)?;
+    // The core raises its bound as it takes an entry that states one, before the change behind it
+    // takes effect (lane constants-21).
+    replica.state_members(crate::replication::members::stated);
     let local = Local::new(
         reader,
         Arc::clone(&meter),
@@ -1937,6 +1967,7 @@ fn open_on<F: BlockFile + 'static>(
         &super::drain::Drain::default(),
         Duration::ZERO,
         0,
+        replica.core().raft.config().limits.members,
     )?;
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
@@ -2066,12 +2097,13 @@ fn open_on<F: BlockFile + 'static>(
 }
 
 pub(super) fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
-    let count = config
+    // The members are bounded by the group's bound, from its log or its first configuration
+    // (`member_bound`), which the core's settings are derived within the memory room for.
+    config
         .voters
         .len()
         .checked_add(config.learners.len())
         .ok_or_else(|| api::invalid("replica configuration", "member count overflow"))?;
-    api::bound("replica members", count, MEMBERS)?;
     if config.node_id == 0 || config.voters.is_empty() {
         return Err(api::invalid(
             "replica configuration",
@@ -2163,7 +2195,11 @@ pub(super) fn validate_durability(
     }
     Ok(())
 }
-fn settings(id: u64, durability: &Durability) -> Result<hyper_durable::Settings, Refusal> {
+fn settings(
+    id: u64,
+    durability: &Durability,
+    members: usize,
+) -> Result<hyper_durable::Settings, Refusal> {
     // The core's memory is the memory budget's room for queues (MB.1), where its messages and
     // unstable entries wait: `Limits::derive` takes its unstable entries, pending messages and
     // entries a message carries from it and from a message's bytes, no picked counts (QB.1, lane
@@ -2173,7 +2209,7 @@ fn settings(id: u64, durability: &Durability) -> Result<hyper_durable::Settings,
     let memory = crate::memory::process().room(crate::memory::Use::Queues)?;
     let mut limits = hyper_raft::Limits::derive(hyper_raft::Stated {
         message: MESSAGE_BYTES,
-        members: MEMBERS,
+        members,
         memory: usize::try_from(memory).unwrap_or(usize::MAX),
         depth: 1,
     })
@@ -2331,7 +2367,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         if let Some(changing) = self.changing.take() {
             let result = match changing.stage {
-                Stage::Barrier => Err(reason.clone()),
+                Stage::Barrier | Stage::Raising => Err(reason.clone()),
                 Stage::Proposed { .. } | Stage::Applied => Err(unknown()),
             };
             answer(changing.response, result);
@@ -2594,6 +2630,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.settle_transfer();
         self.bootstrap()?;
         self.propose_class()?;
+        self.raise_waiting();
+        self.keep_member_bound();
         self.keep_class_gate()?;
         self.keep_slots()?;
         if self.tail.is_some() || self.slot_deferred {
@@ -2850,7 +2888,13 @@ impl<F: BlockFile + 'static> Actor<F> {
         let (bytes, messages) = std::mem::take(&mut outgoing.drained);
         self.outgo.drained(bytes, messages);
         self.outgo.sample(now, !outgoing.messages.is_empty());
-        let bounds = queue_bounds(&self.intake, &self.outgo, timeout, self.peers())?;
+        let bounds = queue_bounds(
+            &self.intake,
+            &self.outgo,
+            timeout,
+            self.peers(),
+            self.replica.core().raft.config().limits.members,
+        )?;
         outgoing.bound = bounds.outgoing;
         outgoing.room = bounds.room;
         let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
@@ -2988,7 +3032,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some(mut changing) = self.changing.take() else {
             return;
         };
-        if !matches!(changing.stage, Stage::Barrier) {
+        if !matches!(changing.stage, Stage::Barrier | Stage::Raising) {
             self.changing = Some(changing);
             return;
         }
@@ -2999,9 +3043,23 @@ impl<F: BlockFile + 'static> Actor<F> {
         } else {
             match self.member_change(changing.change) {
                 Ok(None) => Ok(status(&self.replica)),
-                Ok(Some(proposal)) => {
+                Ok(Some((_, members)))
+                    if members > self.replica.core().raft.config().limits.members
+                        && (self.pending.is_some() || self.slots.holds()) =>
+                {
+                    // The write ends, an event that wakes this owner, and the change goes on
+                    // from here then (`raise_waiting`).
+                    changing.stage = Stage::Raising;
+                    self.changing = Some(changing);
+                    return;
+                }
+                Ok(Some((proposal, members))) => {
                     let before = self.replica.core().raft.pending_conf_index();
-                    match self.replica.change(changing.context.clone(), &proposal) {
+                    match self.raise_members(members).and_then(|()| {
+                        self.replica
+                            .change(changing.context.clone(), &proposal)
+                            .map_err(raft_error)
+                    }) {
                         // The core marks the entry it took as its pending change. One it can't
                         // take it keeps in place stating nothing, and leaves that mark.
                         Ok(()) if self.replica.core().raft.pending_conf_index() > before => {
@@ -3013,13 +3071,54 @@ impl<F: BlockFile + 'static> Actor<F> {
                         Ok(()) => Err(unavailable(
                             "the leader did not take the change of members; try again",
                         )),
-                        Err(error) => Err(raft_error(error)),
+                        Err(refusal) => Err(refusal),
                     }
                 }
                 Err(refusal) => Err(refusal),
             }
         };
         answer(changing.response, result);
+    }
+    /// The core's member bound at least what its machine recorded: an image installed brings the
+    /// bound its group's log stated before it, which the core took no entry of (lane constants-21).
+    fn keep_member_bound(&mut self) {
+        if let Some(bound) = self.replica.machine().member_bound()
+            && self.replica.grow_members(bound)
+        {
+            tracing::info!(target: "amphora.replication", event = "member_bound_taken", bound);
+        }
+    }
+    /// A change waiting to raise the member bound, once no write is under way (lane constants-21).
+    fn raise_waiting(&mut self) {
+        if self.pending.is_none()
+            && !self.slots.holds()
+            && self
+                .changing
+                .as_ref()
+                .is_some_and(|changing| matches!(changing.stage, Stage::Raising))
+        {
+            self.propose_change();
+        }
+    }
+    /// A configuration of `members` past the group's bound: the bound raised first, by an entry
+    /// stating twice it, or `members` if more (`replication::members::grown`), in the log ahead of
+    /// the change. The core raises its own as it takes the entry, so the change behind it is in
+    /// bound at every member that takes both, in log order (lane constants-21).
+    fn raise_members(&mut self, members: usize) -> Result<(), Refusal> {
+        let bound = self.replica.core().raft.config().limits.members;
+        if members <= bound {
+            return Ok(());
+        }
+        let raised = crate::replication::members::grown(bound, members);
+        let context = self.context()?;
+        self.propose(&context, crate::replication::members::entry(raised))?;
+        tracing::info!(target: "amphora.replication", event = "member_bound_raised", from = bound, to = raised, members);
+        if self.replica.core().raft.config().limits.members < members {
+            return Err(unavailable(
+                "the leader did not take the raised member bound; try again",
+            ));
+        }
+        Ok(())
     }
     /// The change under way, once applied, and once the group has left the joint configuration it
     /// made: answered with the status. It runs after `expire_change`, so a change still proposed
@@ -3052,8 +3151,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             || changing.leader != self.replica.leader()
             || self.replica.leader() == 0;
         let result = match changing.stage {
-            Stage::Barrier if expired => Err(Refusal::Timeout),
-            Stage::Barrier if moved => Err(not_leader(self.replica.leader())),
+            Stage::Barrier | Stage::Raising if expired => Err(Refusal::Timeout),
+            Stage::Barrier | Stage::Raising if moved => Err(not_leader(self.replica.leader())),
             Stage::Proposed { .. } if expired || moved => Err(unknown()),
             // Committed. The leader leaves the joint configuration by itself, this one or the
             // next, so a new lead waits for that; a deadline answers what is applied.
@@ -3340,8 +3439,12 @@ impl<F: BlockFile + 'static> Actor<F> {
         Ok(())
     }
     /// What `change` asks of the group as this leader leads it now: the joint change that makes
-    /// it, none when the group is so already, or why the group can't take it.
-    fn member_change(&mut self, change: MemberChange) -> Result<Option<ConfChangeV2>, Refusal> {
+    /// it, with the members it leaves the group with, none when the group is so already, or why
+    /// the group can't take it.
+    fn member_change(
+        &mut self,
+        change: MemberChange,
+    ) -> Result<Option<(ConfChangeV2, usize)>, Refusal> {
         let raft = &self.replica.core().raft;
         let configuration = raft.configuration();
         if configuration.is_joint() || raft.has_pending_conf() {
@@ -3349,7 +3452,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 "a change of members is under way; try again once it is applied",
             ));
         }
-        let invalid = |why: &str| -> Result<Option<ConfChangeV2>, Refusal> {
+        let invalid = |why: &str| -> Result<Option<(ConfChangeV2, usize)>, Refusal> {
             Err(api::invalid("member change", why))
         };
         let (MemberChange::AddLearner(member)
@@ -3395,11 +3498,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         let changed = Plan::of(&proposal)
             .and_then(|plan| plan.apply(configuration))
             .map_err(|error| api::invalid("member change", &error.to_string()))?;
-        api::bound(
-            "replica members",
-            changed.configuration.members().count(),
-            raft.config().limits.members.min(MEMBERS),
-        )?;
+        // The members it leaves the group with: past the group's bound, the bound is raised first
+        // (`propose_change`; lane constants-21).
+        let members = changed.configuration.members().count();
         // A joiner catches up by the leader's image once the log no longer reaches back: past
         // the image's ceiling it never could, so it is refused here, not added to fall behind.
         match change {
@@ -3407,7 +3508,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             MemberChange::Promote(member) => self.admits_voter(member)?,
             MemberChange::Demote(_) | MemberChange::Remove(_) => (),
         }
-        Ok(Some(proposal))
+        Ok(Some((proposal, members)))
     }
     /// A learner becomes a voter only on its attestation of the floor in force, under its current
     /// join, at or above it (replication.md, "How it composes with membership changes"). It is read
@@ -4779,7 +4880,7 @@ mod tests {
     /// compared: other tests hold memory meanwhile.)
     #[test]
     fn qb_1_held_bytes_are_the_queues_room() {
-        let core = settings(1, &Durability::Persisted).unwrap().core;
+        let core = settings(1, &Durability::Persisted, 2).unwrap().core;
         assert_eq!(core.max_uncommitted_size, core.max_committed_size_per_ready);
         assert!(core.max_uncommitted_size >= core.max_size_per_msg);
         assert_eq!(core.max_size_per_msg, u64::try_from(MESSAGE_BYTES).unwrap());
@@ -5089,7 +5190,7 @@ mod tests {
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
-            assert!(!clients.is_empty() && clients.len() <= MEMBERS);
+            assert!(!clients.is_empty());
             Self {
                 clients,
                 receipts: Vec::new(),
@@ -8980,7 +9081,7 @@ mod tests {
             .unwrap();
         let record = numbers(include_str!("../../../../docs/research/owner-stalls.md"));
         let requirements = include_str!("../../../../docs/requirements.toml");
-        let election = settings(1, &Durability::Persisted)
+        let election = settings(1, &Durability::Persisted, 2)
             .unwrap()
             .core
             .election_tick;
@@ -9503,11 +9604,10 @@ mod tests {
     /// AC-T1.8.M1, T-T1.8.M2 (CP-T1.8) on driven time (replication.md, "Membership"): only the
     /// leader changes members, one change at a time, and only as the configuration can take it. Do,
     /// in a group of three voters: ask a follower; ask the leader for two changes at once; promote
-    /// a non-member, add a voter as a learner, demote and remove the leader; add a learner to a
-    /// group of the most members. Expect: NotLeader naming the leader; the first of the two
-    /// answered and the second Unavailable; Invalid for each the configuration can't take and
-    /// TooLarge past the members, each proposing nothing; a change the configuration already shows
-    /// answered with it.
+    /// a non-member, add a voter as a learner, demote and remove the leader. Expect: NotLeader
+    /// naming the leader; the first of the two answered and the second Unavailable; Invalid for
+    /// each the configuration can't take, each proposing nothing; a change the configuration
+    /// already shows answered with it.
     #[test]
     fn member_changes_are_refused_off_the_leader_at_once_or_when_impossible() {
         let dir = tempfile::tempdir().unwrap();
@@ -9556,39 +9656,71 @@ mod tests {
         assert_eq!(led.handle().status().unwrap().applied, before.applied);
         driven.drain(&mut pump);
         pump.finish();
-
-        // A group of the most members: one voter and 63 learners, none of them running, so no
-        // relay; time stands still.
+    }
+    /// T-QB.1.9 (QB.1, lane constants-21; replication.md, "The member bound stated once per group"):
+    /// a group's member bound is its log's, so growth always works. Do: open one voter, and a
+    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running), and catch
+    /// member 2 up; restart the voter from the configuration it first opened with. Expect: the
+    /// voter opened for 2 (twice its first configuration); each change past the bound raised it
+    /// first, to 4, then 8 by the fifth member, then 16 by the ninth, every change answered;
+    /// member 2, which took the raising entries with the changes behind them, applied the nine
+    /// members and its core rose to 16; the voter reopened for the 16 its log recorded.
+    #[test]
+    fn t_qb_1_9_a_one_voter_group_grows_to_five_then_nine_members() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
-        let full = driven.open_member(dir.path(), 1, vec![1], (2..=64).collect(), None);
-        driven.owner_mut(0).replica.campaign().unwrap();
-        // Its lead and the change's barrier each wait on its disk: each step yields to it, and
-        // the change is asked only once the voter leads.
-        let led = (0..ROUNDS).any(|_| {
-            driven.step();
-            std::thread::park_timeout(POLL);
-            full.handle().status().unwrap().leader == 1
-        });
-        assert!(led, "the voter did not lead in {ROUNDS} driven steps");
-        let asked = change(&full, driven.until(), MemberChange::AddLearner(65));
-        let refused = (0..ROUNDS)
-            .find_map(|_| {
-                driven.step();
-                std::thread::park_timeout(POLL);
-                asked.try_recv().ok()
-            })
-            .unwrap();
+        let clients = vec![
+            driven.open(dir.path(), 1, vec![1], None),
+            driven.open_member(dir.path(), 2, vec![1], vec![2], None),
+        ];
+        let bound = |driven: &Driven, owner: usize| {
+            driven
+                .owner(owner)
+                .replica
+                .core()
+                .raft
+                .config()
+                .limits
+                .members
+        };
+        assert_eq!(bound(&driven, 0), 2);
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients[..1], 0, 1);
+        for member in 2..=9 {
+            let until = driven.until();
+            let status = driven
+                .answer(
+                    &mut pump,
+                    &change(&clients[0], until, MemberChange::AddLearner(member)),
+                )
+                .unwrap();
+            assert_eq!(status.learners.len(), usize::try_from(member - 1).unwrap());
+            if member == 2 {
+                write(&mut driven, &mut pump, &clients[0], 1);
+                catch_up(&mut driven, &mut pump, &clients, 0, 1);
+            }
+            if member == 5 {
+                assert_eq!(bound(&driven, 0), 8);
+            }
+        }
+        assert_eq!(bound(&driven, 0), 16);
+        assert_eq!(driven.owner(0).replica.machine().member_bound(), Some(16));
+        write(&mut driven, &mut pump, &clients[0], 2);
+        catch_up(&mut driven, &mut pump, &clients, 0, 1);
+        let follower = applied_configuration(&driven, 1);
+        assert_eq!(follower.voters.len() + follower.learners.len(), 9);
+        assert_eq!(bound(&driven, 1), 16);
+        driven.drain(&mut pump);
+        pump.finish();
+        drop(clients);
+        drop(driven);
+
+        let mut driven = Driven::new();
+        let _reopened = driven.open(dir.path(), 1, vec![1], None);
         assert_eq!(
-            refused,
-            Err(Refusal::TooLarge {
-                what: "replica members".into(),
-                size: 65,
-                limit: MEMBERS,
-            })
+            driven.owner(0).replica.core().raft.config().limits.members,
+            16
         );
-        let status = full.handle().status().unwrap();
-        assert_eq!((status.voters.len(), status.learners.len()), (1, 63));
     }
     /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): the members a
     /// group changed to are what it reopens with, whatever its config first named. Do: add member 2
@@ -14730,7 +14862,9 @@ mod tests {
     /// room's own frames, the free bytes are the logs' frames and that room; below it, the image
     /// takes one log's share.
     fn free_for(frames: u64, logs: u64) -> u64 {
-        let memory = u64::try_from(owner_image_room().unwrap()).unwrap();
+        // A voter and a learner (`voter_and_learner`): the bound of their first configuration.
+        let members = crate::replication::members::first(2);
+        let memory = u64::try_from(owner_image_room(members).unwrap()).unwrap();
         let each = log_bound::FRAME_BYTES + crate::db::PAGE_BYTES;
         let past = memory + frames * logs * each;
         if memory <= log_bound::image_disk_room(past, logs) {
@@ -15491,7 +15625,9 @@ mod tests {
         }
         assert_eq!(logs(), 1);
         let free = free_for(64, 2);
-        let memory = u64::try_from(owner_image_room().unwrap()).unwrap();
+        // A voter and a learner (`voter_and_learner`): the bound of their first configuration.
+        let members = crate::replication::members::first(2);
+        let memory = u64::try_from(owner_image_room(members).unwrap()).unwrap();
         let image = |logs| memory.min(log_bound::image_disk_room(free, logs));
         assert!(
             log_bound::log_room(free, image(1), 1, 0) > log_bound::log_room(free, image(2), 2, 0)

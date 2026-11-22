@@ -183,8 +183,9 @@ fn unavailable(error: impl std::fmt::Display) -> Refusal {
 mod tests {
     use super::*;
     use amphora_api::replication::Fates;
-    /// The members the tests' groups are opened for: the owner's stated bound.
-    const MOST: usize = crate::database::replicated::MEMBERS;
+    /// A member bound for these tests: an entry is held to the bound it is given, the group's
+    /// from its log (`members`; lane constants-21), whatever that is.
+    const MOST: usize = 64;
 
     fn class(of: Vec<(u64, u64)>, spanning: u32) -> Durability {
         Durability::Replicated(Fates { of, spanning })
