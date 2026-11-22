@@ -122,10 +122,16 @@ pub(super) fn read_segment(
             frames_at = frames_at.saturating_add(u64::try_from(body.len())?);
             continue;
         }
-        // The head, until it decodes: kept across parts, and charged while it's kept.
-        pending_held.push(memory.take(Use::Chunks, u64::try_from(body.len())?)?);
-        pending.extend_from_slice(body);
-        match postcard::take_from_bytes::<SegmentHead>(&pending) {
+        // The head: decoded from the part where it ends there, else kept across parts, and
+        // charged while it's kept, until it decodes.
+        let decoded = if pending.is_empty() {
+            postcard::take_from_bytes::<SegmentHead>(body)
+        } else {
+            pending_held.push(memory.take(Use::Chunks, u64::try_from(body.len())?)?);
+            pending.extend_from_slice(body);
+            postcard::take_from_bytes::<SegmentHead>(&pending)
+        };
+        match decoded {
             Ok((h, rest)) => {
                 if h.format != object::FORMAT {
                     return Err(malformed(format!("a segment of format {}", h.format)).into());
@@ -135,12 +141,18 @@ pub(super) fn read_segment(
                 }
                 frames_at = u64::try_from(rest.len())?;
                 head = Some(h);
-                pending = Vec::new();
-                pending_held.clear();
             }
-            Err(postcard::Error::DeserializeUnexpectedEnd) => {}
+            Err(postcard::Error::DeserializeUnexpectedEnd) => {
+                if pending.is_empty() {
+                    pending_held.push(memory.take(Use::Chunks, u64::try_from(body.len())?)?);
+                    pending.extend_from_slice(body);
+                }
+                continue;
+            }
             Err(e) => return Err(malformed(format!("its head doesn't decode: {e}")).into()),
         }
+        pending = Vec::new();
+        pending_held.clear();
     }
     opening.finish(key)?;
     let head = head.ok_or_else(|| malformed("it ends within its head".into()))?;
