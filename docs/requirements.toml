@@ -487,6 +487,7 @@ tests = [
   { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
   # lane pitr-8
   { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
+  { id = "T-T1.12.X2", text = "Cuts across two groups whose clocks differ by 5 seconds, under both protocols: both keys or neither at every cut, the carried clock taken out failing it" },
   { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
 ]
 

@@ -184,6 +184,22 @@ impl Marks {
         })
     }
 
+    /// Takes in a stamp another group made before a step it sent here (T-T1.12.X2): every commit
+    /// stamped here from now on is later, a hybrid logical clock's receive rule (Kulkarni et al.,
+    /// "Logical Physical Clocks", OPODIS 2014): a stamp is the larger of the clock's reading and
+    /// one past the latest stamp seen, so a commit made after another, by any path of steps, is
+    /// stamped after it whatever the two clocks read.
+    pub fn observe(&self, ns: u64) -> anyhow::Result<()> {
+        let mut state = self.state()?;
+        state.last = state.last.max(ns);
+        Ok(())
+    }
+
+    /// The latest stamp made or seen here: every commit stamped so far is at or before it.
+    pub fn latest(&self) -> anyhow::Result<u64> {
+        Ok(self.state()?.last)
+    }
+
     /// Lines a reader's snapshot up with the commits' stamps (T-T1.12.C3): under the lock commits
     /// are stamped by, `snapshot` begins a read and says where the log ends. When that is the
     /// newest commit stamped, no commit lies between the snapshot and its stamp, so the snapshot
@@ -457,6 +473,21 @@ mod tests {
         hooks.marks.committed(1, 8).unwrap();
         now.fetch_add(SECOND_NS, Ordering::SeqCst);
         assert_eq!(hooks.marks.settled(12).unwrap(), Some(false));
+    }
+
+    /// T-T1.12.X2: a stamp observed from another group makes every later commit here later than
+    /// it, though this group's clock reads earlier.
+    #[test]
+    fn t_t1_12_x2_observed_stamps_order_later_commits() {
+        let (_, clock) = clock();
+        let hooks = Hooks::new(clock, 100);
+        hooks.marks.committed(1, 1).unwrap();
+        let ahead = 15 * SECOND_NS;
+        hooks.marks.observe(ahead).unwrap();
+        hooks.marks.committed(1, 2).unwrap();
+        let drained = hooks.marks.drain().unwrap();
+        assert!(drained.marks.last().unwrap().ns > ahead);
+        assert!(hooks.marks.latest().unwrap() >= drained.through);
     }
 
     /// T-T1.12.P11: a log started again twice with no write between keeps its link whole; a
