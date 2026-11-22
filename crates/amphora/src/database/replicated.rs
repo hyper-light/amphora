@@ -1933,6 +1933,8 @@ fn open_on<F: BlockFile + 'static>(
         moved: std::sync::Condvar::new(),
     });
     let election = replica.core().raft.config().election_tick;
+    // The members its core was opened for: the voters a leader measures (lane constants-20).
+    let members = replica.core().raft.config().limits.members;
     let slots = super::slot::Slots::new(slot_bounds(election, TICK)?);
     let (sender, receiver) = mpsc::channel();
     let at = clock();
@@ -1971,7 +1973,7 @@ fn open_on<F: BlockFile + 'static>(
         compacting: super::compacting::Costs::default(),
         log_full: None,
         step_queued: 0,
-        answers: patience::Answers::new(election),
+        answers: patience::Answers::new(election, members),
         pace: super::pace::Pace::new(TICK, 0),
         paced: 0,
         intake: super::drain::Drain::default(),
