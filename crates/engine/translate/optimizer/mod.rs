@@ -3961,6 +3961,103 @@ pub(crate) mod bushy_test_hook {
             }
             assert_eq!(compared, 16);
         }
+
+        /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
+        /// holds a LEFT JOIN of `q` (as `l`) on `b`, the run's table its ON reads, matching some
+        /// of `b`'s rows and not others; with an ON term no index reads, and WHERE terms on the
+        /// padded side alone and with the probe's table, which must stay above the join. Expect:
+        /// the run built (`APPLIED`, and the LEFT JOIN counted in a group), and every answer, NULL
+        /// rows counted, the left-deep plans' and the nested loops' (the hook needs the LEFT JOIN
+        /// read by a loop, so only `ByCost`).
+        #[test]
+        fn t_pl_8_13_a_left_join_in_a_hand_built_run_answers_as_the_left_deep_plan() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE a(id INTEGER PRIMARY KEY, x INT)",
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT, qid INT)",
+                "CREATE TABLE q(id INTEGER PRIMARY KEY, y INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, y INT, z INT)",
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, z INT, w INT)",
+                "CREATE INDEX c_y ON c(y)",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            for id in 1..=6 {
+                conn.execute(format!("INSERT INTO a VALUES ({id}, {id})"))
+                    .unwrap();
+            }
+            for id in 1..=12 {
+                conn.execute(format!(
+                    "INSERT INTO b VALUES ({id}, {}, {}, {})",
+                    id % 5,
+                    id % 3,
+                    id % 4 + 1
+                ))
+                .unwrap();
+            }
+            for id in 1..=4 {
+                conn.execute(format!("INSERT INTO q VALUES ({id}, {})", id % 3))
+                    .unwrap();
+            }
+            for id in 1..=15 {
+                conn.execute(format!(
+                    "INSERT INTO c VALUES ({id}, {}, {})",
+                    id % 3,
+                    id % 4
+                ))
+                .unwrap();
+            }
+            for id in 1..=20 {
+                conn.execute(format!("INSERT INTO p VALUES ({id}, {}, {id})", id % 4))
+                    .unwrap();
+            }
+            // Statistics, so the pinned plan's build input is estimated at its few rows.
+            conn.execute("ANALYZE").unwrap();
+            let from = "FROM a JOIN b ON b.x > a.x LEFT JOIN q l ON l.id = b.qid + 2";
+            let rest = "JOIN c ON c.y = b.y JOIN p ON p.z = c.z";
+            let select = "SELECT a.id, b.id, l.id, l.y, c.id, p.id";
+            for (on_extra, filter) in [
+                ("", ""),
+                (" AND l.y <> 1", ""),
+                ("", " WHERE l.id IS NULL"),
+                ("", " WHERE l.y IS NULL OR l.y + p.w > 9"),
+            ] {
+                let sql = format!("{select} {from}{on_extra} {rest}{filter}");
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, &sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                PIN.with(|pin| pin.set(false));
+                SPLIT.with(|split| split.set(None));
+                let left_deep = rows(&conn, &sql);
+                PIN.with(|pin| pin.set(true));
+                let pinned = rows(&conn, &sql);
+                let pinned_plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                APPLIED.with(|applied| applied.set(0));
+                super::super::bushy_search_tests::LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                SPLIT.with(|split| split.set(Some(1)));
+                let bushy = rows(&conn, &sql);
+                let made_bushy = APPLIED.with(Cell::get);
+                let in_runs = super::super::bushy_search_tests::LEFT_JOINS_IN_RUNS.with(Cell::get);
+                SPLIT.with(|split| split.set(None));
+                PIN.with(|pin| pin.set(false));
+                assert!(!nested_loops.is_empty(), "{sql}");
+                assert!(
+                    made_bushy > 0,
+                    "no plan was made bushy: {sql}: {pinned_plan:?}"
+                );
+                assert!(
+                    in_runs > 0,
+                    "no LEFT JOIN in the run: {sql}: {pinned_plan:?}"
+                );
+                assert_eq!(left_deep, nested_loops, "left-deep: {sql}");
+                assert_eq!(bushy, nested_loops, "bushy: {sql}: {pinned_plan:?}");
+                // The pinned left-deep plan materializes every table before the probe, the LEFT
+                // JOIN's with them: today's path, checked last so a failure here is told apart.
+                assert_eq!(pinned, nested_loops, "pinned: {sql}: {pinned_plan:?}");
+            }
+        }
     }
 }
 

@@ -1821,6 +1821,9 @@ That is new emitter work, not taken here.
 
 - `join::tests::t_pl_8_13_a_left_join_stands_in_a_bushy_run_only_with_its_on_tables`: the conflict
   rules on a hand-built join.
+- `bushy_test_hook::tests::t_pl_8_13_a_left_join_in_a_hand_built_run_answers_as_the_left_deep_plan`:
+  the tree `(a ((b l c) p))` built by hand around a LEFT JOIN, whatever the search would pick. It
+  is checked against nested loops, with the same ON and WHERE cases as the next test.
 - `bushy_search_tests::t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`: differential
   against nested loops, on the fact tables, with a LEFT JOIN hung on either dimension. It covers
   matched and NULL-extended rows, an ON term no index reads, a WHERE `IS NULL` on the padded side,
