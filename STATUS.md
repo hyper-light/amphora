@@ -23,6 +23,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Amphora's own cases. Amphora (in memory, on a file, through the local owner) and the simulator
   pass it, and a seeded differential test holds the simulator's answers to Amphora's
   (`crates/amphora/tests/records_conformance.rs`).
+- **The Records suite past 200 cases** (CP-T1.5, AC-T1.5.3; kiln goal 0d717247, lanes kiln-records-2
+  and -3): `amphora_api::conformance` holds 209 cases, each id once: kiln-seams' RECORDS-1 to 14,
+  Amphora's three, and one case per row of `crates/api/src/conformance/table.rs` (key and value
+  shapes, each request with each refused family name and key, scan, snapshot and feed paging at each
+  page size, limits, transaction bounds, conditions, snapshots at each step of a history, `Ahead`,
+  waits). Amphora's Namespace (in memory, on a file, through the local owner, one voter and three)
+  and `SimRecords` pass every case with no answer different. kiln's side: `docs/records-inventory.md`
+  (kiln main) lists every SQLite table and JSON file kiln keeps, held to its code by a test. Open:
+  goals, plans and deploys moved onto Records and compared field by field; the production copy.
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
 - **The design's index and the README** (AC-T1.2.3, T-T1.13.2; lane docs): `docs/design.md` gives every
   decision of `docs/design/` one line and a link, held to the records by
