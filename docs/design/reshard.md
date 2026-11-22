@@ -382,7 +382,8 @@ the second node by the driver while a row is written before every action, each p
 carried as postcard bytes. The move ends flipped; the first node keeps one group and has retired the
 other; the second holds the moved span; every key's acknowledged rows read back at its group's node,
 and every key is in exactly one group's file. The tests within one node (T-T1.9.R4 to R6) pass
-unchanged through the same path.
+unchanged through the same path. T-T1.9.R11: the same move with every third pull's answer lost on the way
+back, after the old group's node acted on it, each loss asked again by the driver: the same outcome.
 
 **Left.** `Peers` over a socket between machines: the owner transport (`crate::transport`) speaks to
 one database owner, and its authenticated frames are where the pull goes, as appended request
