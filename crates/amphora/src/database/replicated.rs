@@ -2276,14 +2276,12 @@ fn settings(
     let message = u64::try_from(MESSAGE_BYTES).map_err(unavailable)?;
     let held = memory.max(message);
     // The window to each member (lane constants-21): under `Carried`, no count of its own and,
-    // before its path is measured, twice a record's own bytes (a window that holds nothing sends
-    // one entry, however large: hyper-raft's `Inflights::full`), which `Actor::carry` follows to
-    // twice what the path carries in a round trip; under `Picked`, the control, four messages and
-    // 64 MiB.
-    let record = u64::try_from(RECORD_BYTES).map_err(unavailable)?;
+    // before its path is measured, the memory room, the only bound known before a path has
+    // drained, as the queues' bounds start (QB.1); `Actor::carry` then follows twice what the path
+    // carries in a round trip. Under `Picked`, the control, four messages and 64 MiB.
     let (max_inflight_msgs, max_inflight_bytes) = match window {
         super::drain::Window::Picked => (4, 64 << 20),
-        super::drain::Window::Carried => (usize::MAX, hyper_timing::inflight_window(record)),
+        super::drain::Window::Carried => (usize::MAX, held),
     };
     let core = hyper_raft::Config {
         fates,

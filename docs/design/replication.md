@@ -2660,14 +2660,16 @@ switch (`drain::Window`) with two candidates, the picked one kept as the control
   trip as `pace` measures it from heartbeats' and votes' answers (`Pace::round_trip`), at least a record's own bytes
   (`RECORD_BYTES`, a format value). A window that holds nothing still sends one entry, however large (hyper-raft's
   `Inflights::full`), so a path drained of nothing still carries an append; one whole message (32 MiB) as the floor
-  would be about the picked 64 MiB again. Before a path is measured, the window is twice a record's bytes. A path carries only what its window let out, so the window doubles each rebound while the path
+  would be about the picked 64 MiB again. Before a path is measured, the window is the memory room for queues (at
+  least one message), the only bound known before a path has drained, as the queues' bounds start (QB.1): a test whose
+  time stands still, and so never measures a path, sends as before. A path carries only what its window let out, so the window doubles each rebound while the path
   keeps up, and holds where it doesn't, as TCP's slow start grows its window by what is acknowledged (RFC 5681 §3.1).
   `Actor::carry` sets it at each rebound, from events the owner already counts, no timer of its own.
 
 Each candidate's failure mode, forced by one driven scenario (`window_slow_flooded_fast_starved`): five voters, members
 2 and 3 cut off while the leader commits with 4 and 5, then both reconnected, member 3 slow (its answers held for most
 rounds) and member 2 fast. `Picked` floods the slow member: up to 64 MiB in flight to a path that drains a little a
-round. `Carried` may starve the fast member: its window starts at one entry an append and doubles only as the path proves it
+round. `Carried` may starve the fast member: once measured, its window is what it carried, and doubles only as the path proves it
 carries more. The scenario prints the most bytes and messages in flight to the slow member and the rounds each member
 took to catch up; its run of record, and the choice of the default, are the coordinator's
 (`WINDOW_WRITES=512 WINDOW_SLOW=16 cargo test -p amphora --locked --lib -- --nocapture window_slow_flooded_fast_starved`).

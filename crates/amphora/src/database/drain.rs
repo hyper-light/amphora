@@ -126,8 +126,8 @@ pub(super) enum Window {
     Picked,
     /// hyper-raft's own rule (mantle note 32 R16): no count of its own, and twice what the path
     /// carries in a round trip (`hyper_timing::inflight_window`), the path's drain over its round
-    /// trip as `pace` measures it, at least a record's own bytes; before a path is measured, twice
-    /// those.
+    /// trip as `pace` measures it, at least a record's own bytes; before a path is measured, the
+    /// memory room, as the queues' bounds start.
     Carried,
 }
 
