@@ -29,6 +29,7 @@ mod pool;
 mod probe;
 mod query;
 mod reach;
+mod repl;
 mod schema;
 mod sqlapi;
 mod store;
@@ -531,6 +532,11 @@ fn main() -> anyhow::Result<()> {
     // G7 step 3's three ways to reach a cached page (`reach.rs`).
     if std::env::args().any(|a| a == "--reach") {
         return reach::main();
+    }
+    // Replication measured: commit classes, failover and catch-up on Amphora and the other
+    // replicated SQLites (`repl.rs`; CP-T1.8, G12 steps 1 and 3).
+    if std::env::args().any(|a| a == "--repl") {
+        return repl::main();
     }
     // G11 step 2's column copies, A and B, against none (`columns.rs`).
     if std::env::args().any(|a| a == "--columns") {
