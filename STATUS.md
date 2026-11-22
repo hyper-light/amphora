@@ -872,9 +872,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Aggregates run on the copy through one
   hook, `CopyScan`: step 4's vectorized scan as main has it (`Vectorized`, granules and `Plan`),
   which a later scan replaces by implementing the trait, the choice unchanged; on the rows row by
-  row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
-  SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
-  coordinator's.
+  row, with the same answer (T-CS.5.5, T-CS.5.6). SQL reaches the copy (lane g11s5c): with the
+  switch on, a SQL table on the versioned storage keeps a copy once analytic statements use it,
+  by renting before buying (Karlin et al. 1988): the first aggregate on a table reads the rows,
+  paying a whole-table read, what a copy costs to build; the second makes the copy, fed from the
+  commit stream (`Database::commit` now feeds one copy a tree). An aggregate the executor's scan
+  hook takes (`translate/parallel.rs`) reads the copy when the planner chooses it, on as many
+  cores as the morsel executor finds pay (`Plan::run_on_cores`), else its own serial loop; a
+  copy behind its snapshot is rebuilt after the statement's choice, never read
+  (`storage/versioned/columns_sql.rs`, T-CS.5.7 to T-CS.5.9). Open: the classes against CedarDB
+  and ClickHouse (AC-CS.5.2) are the coordinator's.
 
 ## Open
 

@@ -140,6 +140,11 @@ impl Feed {
         *self.counts.lock()
     }
 
+    /// The tree whose commits it takes.
+    pub fn tree(&self) -> u64 {
+        self.tree
+    }
+
     /// The bytes queued now.
     pub fn queued_bytes(&self) -> usize {
         self.queue.lock().bytes
@@ -675,10 +680,15 @@ impl<B: Block> Columns<B> {
     }
 
     /// Applies every queued record to the current generation, in timestamp order, at tick `now`;
-    /// how many. The queue is drained under the copy's write lock, so a scan sees each record in
+    /// how many (none before the first generation, which keeps them queued). The queue is drained under the copy's write lock, so a scan sees each record in
     /// the queue or in the copy.
     pub fn catch_up(&self, now: u64) -> Result<usize> {
         let mut st = self.state.write();
+        // No generation yet: the queue is kept for the first, which applies what came after the
+        // snapshot it is made from (CS.5: a copy made while commits run misses none of them).
+        if st.current.is_none() {
+            return Ok(0);
+        }
         let mut q = self.feed.queue.lock();
         let records: Vec<Queued> = q.records.drain(..).collect();
         q.bytes = 0;
@@ -741,6 +751,17 @@ impl<B: Block> Columns<B> {
             st.previous_behind = st.behind;
         }
         st.current = Some(g);
+        // Records the generation already holds (queued before its first, at or before `made`)
+        // leave the queue: only later ones are read from the rows or applied.
+        {
+            let mut q = self.feed.queue.lock();
+            q.records.retain(|r| r.ts > made);
+            q.bytes = q.records.iter().fold(0usize, |n, r| {
+                r.changes
+                    .iter()
+                    .fold(n, |n, c| n.saturating_add(change_bytes(c)))
+            });
+        }
         // Commits lost after `made` are missing from the new generation too: it answers no
         // snapshot after `made` until the next rebuild.
         st.behind = st

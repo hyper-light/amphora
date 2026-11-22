@@ -167,10 +167,17 @@ pub fn translate(
     resolver.set_sorted_fetches(connection.sorted_fetches());
     // Amphora (QT.6): leaf-page morsels read the pager's b-trees, which MVCC and the versioned
     // storage don't keep a table's rows in.
+    // On the versioned storage the hook reads a table's column copy instead (G11 step 5, CS.5),
+    // behind the planner's switch.
+    let copy_path = connection
+        .versioned
+        .as_ref()
+        .is_some_and(|v| v.storage().copies.on());
     resolver.set_parallel(
-        connection.parallel_mode() == crate::vdbe::morsel::ParallelMode::On
-            && connection.versioned.is_none()
-            && !connection.mvcc_enabled(),
+        !connection.mvcc_enabled()
+            && ((connection.parallel_mode() == crate::vdbe::morsel::ParallelMode::On
+                && connection.versioned.is_none())
+                || copy_path),
     );
     // Amphora: what a seek, a hash table and a sort cost, as this database has timed them (QT.5).
     // A page is priced by how often the connection's recent fetches read a file (QT.5).

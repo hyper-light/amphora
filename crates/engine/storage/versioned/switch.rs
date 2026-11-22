@@ -46,6 +46,8 @@ const TREES: usize = 2;
 pub struct Storage {
     db: Arc<VDatabase>,
     orders: Mutex<HashMap<u64, Arc<OnceLock<KeyOrder>>>>,
+    /// The SQL tables' column copies (G11 step 5, CS.5; [`super::columns_sql`]).
+    pub(crate) copies: super::columns_sql::Copies,
 }
 
 /// The versioned storage of the database at `path`: in memory for a memory database or one whose
@@ -90,10 +92,21 @@ pub fn open(path: &str, memory: bool, budget: Option<u64>) -> Result<Arc<Storage
     Ok(Arc::new(Storage {
         db,
         orders: Mutex::new(recovered.into_inner()),
+        // The copies' queues and decoded blocks are charged to the half of the budget the row
+        // versions and records beside the pool's pages take (above).
+        copies: super::columns_sql::Copies::new(
+            crate::translate::optimizer::column_path::asked(),
+            usize::try_from(budget / 2).unwrap_or(usize::MAX),
+        ),
     }))
 }
 
 impl Storage {
+    /// The versioned database under it.
+    pub(crate) fn db(&self) -> &Arc<VDatabase> {
+        &self.db
+    }
+
     /// The trees the storage holds now, dropped ones not counted.
     #[cfg(test)]
     pub fn live_trees(&self) -> usize {
@@ -247,7 +260,7 @@ fn late(slot: Arc<OnceLock<KeyOrder>>) -> Comparator {
     })
 }
 
-fn tree_of(root_page: i64) -> Result<u64> {
+pub(crate) fn tree_of(root_page: i64) -> Result<u64> {
     u64::try_from(root_page).map_err(|_| {
         LimboError::InternalError(format!(
             "versioned storage: no tree at root page {root_page}"
@@ -315,6 +328,19 @@ impl Switch {
             named: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
         }
+    }
+
+    /// The storage the connection shares.
+    pub(crate) fn storage(&self) -> &Arc<Storage> {
+        &self.storage
+    }
+
+    /// Whether the connection's open transaction has changed a row.
+    pub(crate) fn wrote(&self) -> bool {
+        self.txn
+            .lock()
+            .as_ref()
+            .is_some_and(|t| t.lock().as_ref().is_some_and(|t| t.wrote()))
     }
 
     /// The connection's transaction, begun if none is open.
@@ -394,6 +420,7 @@ impl Switch {
         for tree in trees {
             self.db.drop_tree(&mut self.d.lock(), tree)?;
             self.storage.orders.lock().remove(&tree);
+            self.storage.copies.forget(&self.db, tree);
         }
         Ok(())
     }

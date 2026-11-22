@@ -15,11 +15,12 @@
 //! granules its summaries skip already lower the copy's learned cost per row; on the rows it runs
 //! row by row ([`evaluate_rows`]), with the same answer.
 //!
-//! Behind the planner's switch (`column_path::asked`): no SQL table keeps a copy yet.
+//! Behind the planner's switch (`column_path::asked`); SQL's aggregates reach it through
+//! [`super::columns_sql`].
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::columns::scan::{evaluate_rows, Cache, Cell, Counts, Decode, Plan, Query, Sources};
-use super::columns::{Block, Columns, Rows, Rowset, ScanCounts};
+use super::columns::{Block, Columns, PlanView, Rows, Rowset, ScanCounts};
 use super::version::Ts;
 use crate::translate::optimizer::column_path::{self, Choice, CopyView, Path, RowRates, Shape};
 use crate::translate::optimizer::learned_costs::LearnedCosts;
@@ -219,24 +220,18 @@ pub(crate) struct Aggregated {
     pub(crate) row_reads: u64,
 }
 
-/// Runs aggregate `q` at snapshot `s` by the path the planner chooses: on the copy by `scan`, or
-/// row by row over `rows` (the row B-tree at `s`), each row's columns decoded by `dec`. A whole-table statement is priced as one; a key range by
-/// the rows the copy holds, the most it can read (no estimate of the range's rows is made here).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn aggregate<B: Block>(
+/// The planner's choice for aggregate `q` at snapshot `s`, and the copy's view it was made on. A
+/// whole-table statement is priced as one; a key range by the rows the copy holds, the most it can
+/// read (no estimate of the range's rows is made here).
+pub(crate) fn aggregate_choice<B: Block>(
     copy: &Columns<B>,
-    rows: &dyn Rows,
     s: Ts,
     q: &Query,
-    dec: &dyn Decode,
-    scan: &dyn CopyScan<B>,
     rates: RowRates,
     on: bool,
-    clock: &dyn Fn() -> u128,
-) -> Result<Aggregated> {
+) -> (Choice, PlanView) {
     let view = copy.plan_view(s);
-    let table = view.rows.saturating_add(view.queued);
-    let table_rows = table as f64;
+    let table_rows = view.rows.saturating_add(view.queued) as f64;
     let whole = matches!(
         (&q.keys.lo, &q.keys.hi),
         (Bound::Unbounded, Bound::Unbounded)
@@ -252,7 +247,72 @@ pub(crate) fn aggregate<B: Block>(
         queued: view.queued as f64,
         nanos_per_row: view.nanos_per_row,
     };
-    let choice = column_path::choose(on, shape, table_rows, rates, cv);
+    (column_path::choose(on, shape, table_rows, rates, cv), view)
+}
+
+/// What [`aggregate_on_copy`] answers: the scan's answer and counts, and the rows it read from
+/// the row B-tree (for queued keys, or every row on a fallback).
+pub(crate) struct OnCopy {
+    pub(crate) answer: Vec<Vec<Cell>>,
+    pub(crate) counts: Counts,
+    pub(crate) sources: Sources,
+    pub(crate) row_reads: u64,
+}
+
+/// Runs aggregate `q` at snapshot `s` on the copy by `scan`, `view` being the copy's view the
+/// choice was made on: timed by `clock` and charged to the copy per row of the table, unless a
+/// fallback read the rows instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aggregate_on_copy<B: Block>(
+    copy: &Columns<B>,
+    rows: &dyn Rows,
+    s: Ts,
+    q: &Query,
+    dec: &dyn Decode,
+    scan: &dyn CopyScan<B>,
+    view: PlanView,
+    clock: &dyn Fn() -> u128,
+) -> Result<OnCopy> {
+    let start = clock();
+    let Scanned {
+        answer,
+        counts,
+        sources,
+        built,
+    } = scan.scan(copy, s, rows, dec, q)?;
+    // A fallback's granules were built from every row; else the queued keys were looked up.
+    let row_reads = if sources.fallbacks > 0 {
+        count(built)
+    } else {
+        copy.measured_scan(
+            clock().saturating_sub(start),
+            view.rows.saturating_add(view.queued),
+        );
+        count(view.queued)
+    };
+    Ok(OnCopy {
+        answer,
+        counts,
+        sources,
+        row_reads,
+    })
+}
+
+/// Runs aggregate `q` at snapshot `s` by the path the planner chooses: on the copy by `scan`, or
+/// row by row over `rows` (the row B-tree at `s`), each row's columns decoded by `dec`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aggregate<B: Block>(
+    copy: &Columns<B>,
+    rows: &dyn Rows,
+    s: Ts,
+    q: &Query,
+    dec: &dyn Decode,
+    scan: &dyn CopyScan<B>,
+    rates: RowRates,
+    on: bool,
+    clock: &dyn Fn() -> u128,
+) -> Result<Aggregated> {
+    let (choice, view) = aggregate_choice(copy, s, q, rates, on);
     match choice.path {
         Path::Rows => {
             let all = rows.all()?;
@@ -271,20 +331,12 @@ pub(crate) fn aggregate<B: Block>(
             })
         }
         Path::Copy => {
-            let start = clock();
-            let Scanned {
+            let OnCopy {
                 answer,
                 counts,
                 sources,
-                built,
-            } = scan.scan(copy, s, rows, dec, q)?;
-            // A fallback's granules were built from every row; else the queued keys were looked up.
-            let row_reads = if sources.fallbacks > 0 {
-                count(built)
-            } else {
-                copy.measured_scan(clock().saturating_sub(start), table);
-                count(view.queued)
-            };
+                row_reads,
+            } = aggregate_on_copy(copy, rows, s, q, dec, scan, view, clock)?;
             Ok(Aggregated {
                 answer,
                 choice,
