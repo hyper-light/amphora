@@ -385,8 +385,36 @@ unmeasured.
 statement whose workers together pass its budget; a statement the model sends to more workers that
 runs slower than on one, measured class for class.
 
-**Left.** The pipelines run over rows already read; the VDBE's own loops (cursors over one
-snapshot per worker), a hash table built by all workers, the page cache's miss path sharded, loom
+**Reading the table in morsels.** `vdbe/morsel_scan.rs` gives the pipelines a table's own pages
+as their input. A morsel is a run of leaf pages, so the unit the pilot measures and
+`choose_degree` sizes is a page. The leaves come from the table's interior pages, read level by
+level in key order (no recursion; the walk is refused past the database's page count), each leaf
+keeping its parent's divider as its greatest rowid. A worker opens its own cursor through the
+statement's pager, so every worker reads the statement's one snapshot; it seeks past the divider
+below its first leaf and reads until a rowid passes the divider above its last, so every row is
+read by exactly one morsel. A row's position, by which MIN, MAX and a group's key values break
+ties, is its rowid's place in rowid order. Evidence: random filters, groupings and aggregates over
+tables of many leaves, sparse and negative rowids among them, at 1 to 8 workers and several morsel
+sizes equal the VDBE's serial SQL answers (T-QT.6.7); a probe read in leaf morsels equals the
+VDBE's join in its order (T-QT.6.8); an INTEGER PRIMARY KEY reads its rowid (T-QT.6.9).
+
+**The VDBE's hook.** With `Connection::set_parallel_mode` on (off by default), a top-level SELECT
+whose whole work is one rowid table read whole with its filter and aggregates is emitted as
+`Insn::MorselAggregate` and a row loop over `Insn::MorselNext`, ahead of the statement's serial
+loop (`translate/parallel.rs`). Only shapes whose answers equal the serial loop's qualify: columns
+stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no defaults, no generated
+columns), terms comparing a column with a literal of its own kind or testing it for NULL,
+plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX, and no HAVING, ORDER BY,
+LIMIT, DISTINCT, window or subquery; MVCC and the versioned storage, whose rows are not in the
+pager's b-trees, never qualify. When the run meets a value its aggregates don't take (a SUM over
+text) it jumps to the serial loop, so the answer never depends on the switch. Groups come out in
+their keys' SQLite order, as the serial GROUP BY gives them. The machine's costs are measured by a
+connection's first parallel statement and learned by each after. Evidence: random queries answer
+the same row for row and in order with the switch off and on at 2, 3, 4 and 8 cores (T-QT.6.10).
+
+**Left.** The hash join's probe loop handed over the same way; expressions beyond a column against
+a literal (each worker running its own copy of the program's loop body), a hash table built by all
+workers, the page cache's miss path sharded, loom
 or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch

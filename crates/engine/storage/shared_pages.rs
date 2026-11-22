@@ -18,9 +18,11 @@
 //! file's pages leave with it when its database closes.
 
 use crate::io::Buffer;
+use crate::storage::optimistic_pages::{Frames, SharedPageReads};
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, RwLock};
 use rustc_hash::FxHashMap;
+use std::sync::OnceLock;
 
 /// Shards: a lock each, so readers of different pages seldom meet.
 const SHARDS: usize = 64;
@@ -91,6 +93,10 @@ pub struct SharedPages {
     files: AtomicU64,
     /// Pages charged to this pool's budget by memory kept outside it ([`SharedPages::charge`]).
     charged: AtomicUsize,
+    /// G3 step 6 (prototype F, `SharedPageReads::Optimistic`): frames read without a lock, in
+    /// front of the shards (`optimistic_pages.rs`), made with the first image offered them; None
+    /// in it when their pages couldn't be charged to the budget. Unset under `Locked`.
+    front: Option<OnceLock<Option<Frames>>>,
 }
 
 /// Pages charged to a pool's budget while it is held ([`SharedPages::charge`]), given back when
@@ -109,13 +115,43 @@ impl Drop for Charge {
 impl SharedPages {
     /// Shares at most `pages` pages (at least one a shard).
     pub fn new(pages: usize) -> Self {
+        Self::with_reads(pages, SharedPageReads::process_default())
+    }
+
+    /// `new`, its lookups taken as `reads` says.
+    pub fn with_reads(pages: usize, reads: SharedPageReads) -> Self {
         let per_shard = pages.checked_div(SHARDS).unwrap_or(0).max(1);
         Self {
             shards: (0..SHARDS).map(|_| ShardCell::default()).collect(),
             per_shard,
             files: AtomicU64::new(0),
             charged: AtomicUsize::new(0),
+            front: (reads == SharedPageReads::Optimistic).then(OnceLock::new),
         }
+    }
+
+    /// The frames read without a lock, made for images of `page_bytes` with the first offered:
+    /// a shard's share of the budget (`per_shard` frames, a frame a page), charged to the budget
+    /// so the shards keep that many fewer. None under `Locked`, or when the charge is refused.
+    #[allow(deprecated)] // `fetch_update`: shuttle's atomics (`--cfg shuttle`) have no `try_update`
+    fn front(&self, page_bytes: usize) -> Option<&Frames> {
+        let front = self.front.as_ref()?.get_or_init(|| {
+            let most = self.capacity().saturating_sub(SHARDS);
+            self.charged
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                    charged
+                        .checked_add(self.per_shard)
+                        .filter(|after| *after <= most)
+                })
+                .ok()?;
+            Frames::new(self.per_shard, page_bytes, SHARDS)
+        });
+        front.as_ref().filter(|f| f.page_bytes() == page_bytes)
+    }
+
+    /// The frames, if made.
+    pub(crate) fn front_made(&self) -> Option<&Frames> {
+        self.front.as_ref()?.get()?.as_ref()
     }
 
     /// Charges `pages` to this pool's budget, for memory kept beside it (Amphora's
@@ -154,6 +190,9 @@ impl SharedPages {
 
     /// Copies the image of `key` into `dest`, if one is kept and is `dest`'s size: whether it was.
     pub fn copy_into(&self, key: &Key, dest: &mut [u8]) -> bool {
+        if self.front_made().is_some_and(|front| front.read(key, dest)) {
+            return true;
+        }
         let Some(cell) = self.shard(key.page) else {
             return false;
         };
@@ -165,6 +204,11 @@ impl SharedPages {
                         entry.visited.store(true, Ordering::Relaxed);
                     }
                     dest.copy_from_slice(entry.buffer.as_slice());
+                    // Offered under the shard's lock, while the pool keeps it (a forget clears
+                    // the frame after taking the lock).
+                    if let Some(front) = self.front(dest.len()) {
+                        front.offer(key, entry.buffer.as_slice());
+                    }
                     true
                 }
                 _ => false,
@@ -298,6 +342,9 @@ impl SharedPages {
                     *place = None;
                 }
             }
+            if let Some(front) = self.front_made() {
+                front.forget(&key);
+            }
         }
     }
 
@@ -329,6 +376,9 @@ impl SharedPages {
                 }
             }
         }
+        if let Some(front) = self.front_made() {
+            front.forget_where(&matches);
+        }
     }
 
     /// Pages it keeps at most.
@@ -350,13 +400,15 @@ impl SharedPages {
 
     /// Lookups and additions so far, the shards' summed.
     pub fn counts(&self) -> Counts {
-        self.shards
-            .iter()
-            .fold(Counts::default(), |sum, cell| Counts {
-                hits: sum.hits.wrapping_add(cell.hits.load(Ordering::Relaxed)),
-                misses: sum.misses.wrapping_add(cell.misses.load(Ordering::Relaxed)),
-                added: sum.added.wrapping_add(cell.shard.read().added),
-            })
+        let front = Counts {
+            hits: self.front_made().map_or(0, Frames::hits),
+            ..Counts::default()
+        };
+        self.shards.iter().fold(front, |sum, cell| Counts {
+            hits: sum.hits.wrapping_add(cell.hits.load(Ordering::Relaxed)),
+            misses: sum.misses.wrapping_add(cell.misses.load(Ordering::Relaxed)),
+            added: sum.added.wrapping_add(cell.shard.read().added),
+        })
     }
 }
 

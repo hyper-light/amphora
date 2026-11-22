@@ -63,6 +63,13 @@ fn emit_program_for_select_with_inputs(
     mut plan: SelectPlan,
     materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
 ) -> Result<()> {
+    // Amphora (QT.6): a qualifying scan's aggregates run in leaf-page morsels first; the serial
+    // loop below answers only when that run declines.
+    let morsel_hook = if resolver.parallel() {
+        crate::translate::parallel::emit_morsel_hook(program, &plan)
+    } else {
+        None
+    };
     let result_cols_start = program.with_scoped_result_cols_start(|program| {
         // Boxed to keep ~960 B off the prepare-path stack; see TranslateCtx size.
         let mut t_ctx = Box::new(TranslateCtx::new(
@@ -74,6 +81,9 @@ fn emit_program_for_select_with_inputs(
         t_ctx.materialized_build_inputs = materialized_build_inputs;
         emit_query(program, &mut plan, &mut t_ctx)
     })?;
+    if let Some(hook) = morsel_hook {
+        program.preassign_label_to_next_insn(hook.end);
+    }
 
     program.plan_cost = plan.estimated_cost;
     program.output_rows = select_output_rows(&plan).or_else(|| {
