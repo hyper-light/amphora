@@ -530,9 +530,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   learned election timeout, within the budget's room for queues, one record before anything is measured, and a burst
   past the bound fences only once it has stayed past it a whole election timeout (replication.md, "Decision (lane
   constants): the queue bounds by drain rate"; QB.1).
+  Lane constants-21 (not yet built or landed): the member bound is the group's, stated once in its log and raised
+  ahead of a change that passes it (replication.md, "The member bound stated once per group"); each queued input is
+  charged its envelope; the window to each member is twice what its path carries in a round trip, the picked 4
+  messages and 64 MiB kept as the A/B's control ("The window to each member"); and `quiet` is the learned election
+  timeout.
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
-  counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), a wire record's 2 MiB
-  framing, `COMMANDS` and `MEMBERS`, and the rest of the list (handoff/amphora-constants-list.md).
+  counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), and the rest of the list
+  (handoff/amphora-constants-list.md).
 - **Region-local groups under a global root** (CP-T1.11, G14 step 1, lane regions; `crates/amphora/src/regions.rs`,
   docs/design/regions.md): members carry a region label; a regional group's voters and lead stay in its home
   region, and the root spreads its voters so losing the regions it survives leaves a quorum (CockroachDB's
