@@ -36,7 +36,7 @@ pub(crate) const MEMBERS: usize = 64;
 const RECORD_BYTES: usize = hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES
     .saturating_add(hyper_raft::wire::MESSAGE_TOLD_BYTES);
 /// Format: an entry's context, the request identity `Actor::context` writes: four `u64`s.
-const CONTEXT_BYTES: usize = 4 * 8;
+const CONTEXT_BYTES: usize = std::mem::size_of::<u64>().saturating_mul(4);
 /// Format: the framing a wire record adds past the command its one entry carries (QB.1, lane
 /// constants-19): the record's, the entry's fixed bytes (hyper-raft `ENTRY_FIXED_BYTES`), its
 /// context, and what a prepared transaction's encoding adds to its pages
@@ -52,9 +52,14 @@ const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(FR
 /// and its configuration's auto-leave flag, four set lengths and at most `MEMBERS` ids of eight
 /// bytes in each of its four sets.
 const IMAGE_FRAMING_BYTES: usize = RECORD_BYTES
-    .saturating_add(1 + 4 + 2 * 8)
-    .saturating_add(1 + 4 * 4)
-    .saturating_add(MEMBERS.saturating_mul(4 * 8));
+    // The snapshot's presence byte, its data's length, and its index and term.
+    .saturating_add(1)
+    .saturating_add(4)
+    .saturating_add(16)
+    // Its configuration's auto-leave byte, four set lengths, and four sets of eight-byte ids.
+    .saturating_add(1)
+    .saturating_add(16)
+    .saturating_add(MEMBERS.saturating_mul(32));
 /// The wire record of an image of `image` bytes of pages, at the most: its data, the pages'
 /// encoding (`replication::image_envelope`) and the record's framing.
 fn image_record(image: u64) -> u64 {
