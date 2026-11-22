@@ -1109,6 +1109,11 @@ tests = [
 # shim builds and its cluster comes up. libSQL's failover and dqlite's member catch-up stay refused,
 # typed: sqld has no election, and dqlite reads only through its leader.
 
+# lane repl-measure-4 (CP-T1.8, AC-T1.8.5): no new IDs. bench/power_nemesis.sh shards the 10,000-seed
+# power-cut nemesis by seed range in both classes, a record a shard, merged with a coverage check;
+# records under bench/records/power-nemesis/<run>/. bench/repl_lab.sh runs the seeds and the
+# comparison set on three machines named as its arguments. The runs of record are the coordinator's.
+
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]
 id = "G5.4"
