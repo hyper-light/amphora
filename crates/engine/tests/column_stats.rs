@@ -320,10 +320,114 @@ fn pl11_analyze_keeps_each_index_prefixs_degree_norms() {
     );
     assert_eq!(degrees(&conn, "t_b"), vec![counted_degrees(&conn, "b")]);
     let mut stmt = conn
-        .prepare("SELECT count(*) FROM __turso_internal_column_stats WHERE col = 't_part'")
+        .prepare("SELECT count(*) FROM __turso_internal_column_stats WHERE col = 't_part' AND kind = 'degrees'")
         .unwrap();
     assert_eq!(stmt.run_collect_rows().unwrap()[0][0].as_int(), Some(0));
     // ANALYZE again keeps one row an index, not two.
     conn.execute("ANALYZE").unwrap();
     assert_eq!(degrees(&conn, "t_b"), vec![counted_degrees(&conn, "b")]);
+}
+
+/// The pages ANALYZE kept for `table`'s tree (`index` NULL) or for `index`'s.
+fn kept_pages(conn: &Arc<Connection>, table: &str, index: Option<&str>) -> i64 {
+    let filter = match index {
+        Some(index) => format!("col = '{index}'"),
+        None => "col IS NULL".to_string(),
+    };
+    let mut stmt = conn
+        .prepare(format!(
+            "SELECT data FROM __turso_internal_column_stats WHERE kind = 'pages' AND tbl = '{table}' AND {filter}"
+        ))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1, "{table} {index:?}: {rows:?}");
+    rows[0][0].as_int().unwrap()
+}
+
+fn pragma(conn: &Arc<Connection>, name: &str) -> i64 {
+    let mut stmt = conn.prepare(format!("PRAGMA {name}")).unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    rows[0][0].as_int().unwrap()
+}
+
+/// Do: fill a table, then build an index on it, reading the file's page count before and after
+/// each (no page is free), then ANALYZE. Expect: the pages ANALYZE kept for the table and for the
+/// index are the pages each added to the file, their trees' real pages (T-PL.7.1).
+#[test]
+fn t_pl_7_1_analyze_keeps_each_trees_real_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, w INTEGER)")
+        .unwrap();
+    let rows: Vec<String> = (1..=6_000)
+        .map(|i| format!("({i}, 'value-{i}-{}', {})", "p".repeat(i % 40), i % 97))
+        .collect();
+    insert(&conn, "t", &rows);
+    // The file holds the schema's page and the table's tree.
+    assert_eq!(pragma(&conn, "freelist_count"), 0);
+    let with_table = pragma(&conn, "page_count");
+    conn.execute("CREATE INDEX t_v ON t (v)").unwrap();
+    assert_eq!(pragma(&conn, "freelist_count"), 0);
+    let with_index = pragma(&conn, "page_count");
+    let table_pages = with_table - 1;
+    let index_pages = with_index - with_table;
+    assert!(
+        table_pages > 20 && index_pages > 10,
+        "{table_pages} {index_pages}"
+    );
+    conn.execute("ANALYZE").unwrap();
+    assert_eq!(kept_pages(&conn, "t", None), table_pages);
+    assert_eq!(kept_pages(&conn, "t", Some("t_v")), index_pages);
+}
+
+/// The cost the plan of `sql` gives its first table's access.
+fn access_cost(conn: &Arc<Connection>, sql: &str) -> f64 {
+    let mut stmt = conn
+        .prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    let text = rows[0][0].to_string();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    json["nodes"]
+        .as_array()
+        .and_then(|nodes| {
+            nodes.iter().find_map(|n| {
+                n["op"]["estimate"]["access_cost"]
+                    .as_f64()
+                    .or_else(|| n["estimate"]["access_cost"].as_f64())
+            })
+        })
+        .unwrap_or_else(|| panic!("{sql}: no access_cost in {text}"))
+}
+
+/// Do: two tables of the same rows, one's records a hundred times the other's bytes, ANALYZEd,
+/// then plan a full read of each from a fresh connection. Expect: the wide table's read costs
+/// more by about the pages it has more of, where both were rows / 50 pages before (T-PL.7.1).
+#[test]
+fn t_pl_7_1_plans_read_the_pages_analyze_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let conn = open(dir.path());
+        conn.execute("CREATE TABLE wide (id INTEGER PRIMARY KEY, pad TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE narrow (id INTEGER PRIMARY KEY, pad TEXT)")
+            .unwrap();
+        let wide: Vec<String> = (1..=3_000)
+            .map(|i| format!("({i}, '{}')", "w".repeat(1_000)))
+            .collect();
+        let narrow: Vec<String> = (1..=3_000).map(|i| format!("({i}, 'n')")).collect();
+        insert(&conn, "wide", &wide);
+        insert(&conn, "narrow", &narrow);
+        conn.execute("ANALYZE").unwrap();
+    }
+    let conn = open(dir.path());
+    let wide_pages = kept_pages(&conn, "wide", None) as f64;
+    let narrow_pages = kept_pages(&conn, "narrow", None) as f64;
+    assert!(
+        wide_pages > 20.0 * narrow_pages,
+        "{wide_pages} {narrow_pages}"
+    );
+    let wide = access_cost(&conn, "SELECT * FROM wide");
+    let narrow = access_cost(&conn, "SELECT * FROM narrow");
+    assert!(wide > narrow * 10.0, "wide {wide}, narrow {narrow}");
 }

@@ -474,6 +474,10 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 cursor_id: config.bloom_filter_cursor_id,
                 key_reg: build_key_start_reg,
                 num_keys,
+                sizing: Some(crate::vdbe::bloom_filter::FilterSizing {
+                    fp_per_key: planner.hash_join_op.bloom_fp_per_key,
+                    max_bytes: planner.hash_join_op.mem_budget,
+                }),
             });
             payload_info.use_bloom_filter = true;
         }

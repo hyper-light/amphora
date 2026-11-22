@@ -31,7 +31,7 @@ mod shipping;
 
 pub use check::{
     CHECK_METRIC, Check, CheckCounters, CheckFailure, RowDigest, check_due, digest, newest_second,
-    restore_and_check,
+    restore_and_check, restore_and_check_at,
 };
 pub use cut::restore_cut;
 pub use folder::FolderBlobs;
@@ -77,6 +77,11 @@ struct MarkState {
     merged: u64,
     /// The newest mark drained: a statement that commits nothing after it makes none.
     drained: Option<(u32, u64)>,
+    /// The newest commit stamped: its generation, last frame and stamp.
+    stamped: Option<(u32, u64, u64)>,
+    /// The second a quiet snapshot holds ([`Marks::quiet_second`]), and whether a commit was
+    /// stamped in it since.
+    watch: Option<(u64, bool)>,
 }
 
 /// When each commit was made: the last commit of each second, in commit order, until the shipper
@@ -131,14 +136,22 @@ impl Marks {
             return Ok(());
         }
         let ns = self.stamp(&mut state);
+        if let Some((second, moved)) = state.watch.as_mut()
+            && *second == second_of(ns)
+        {
+            *moved = true;
+        }
         if let Some(last) = state.marks.back_mut()
             && last.seq == seq
             && second_of(last.ns) == second_of(ns)
         {
             last.frame = last.frame.max(frame);
             last.ns = ns;
+            let stamped = (seq, last.frame, ns);
+            state.stamped = Some(stamped);
             return Ok(());
         }
+        state.stamped = Some((seq, frame, ns));
         if state.marks.len() >= self.capacity
             && let Some(oldest) = state.marks.pop_front()
             && let Some(next) = state.marks.front_mut()
@@ -169,6 +182,63 @@ impl Marks {
             marks: state.marks.drain(..).collect(),
             through,
         })
+    }
+
+    /// Takes in a stamp another group made before a step it sent here (T-T1.12.X2): every commit
+    /// stamped here from now on is later, a hybrid logical clock's receive rule (Kulkarni et al.,
+    /// "Logical Physical Clocks", OPODIS 2014): a stamp is the larger of the clock's reading and
+    /// one past the latest stamp seen, so a commit made after another, by any path of steps, is
+    /// stamped after it whatever the two clocks read.
+    pub fn observe(&self, ns: u64) -> anyhow::Result<()> {
+        let mut state = self.state()?;
+        state.last = state.last.max(ns);
+        Ok(())
+    }
+
+    /// The latest stamp made or seen here: every commit stamped so far is at or before it.
+    pub fn latest(&self) -> anyhow::Result<u64> {
+        Ok(self.state()?.last)
+    }
+
+    /// Lines a reader's snapshot up with the commits' stamps (T-T1.12.C3): under the lock commits
+    /// are stamped by, `snapshot` begins a read and says where the log ends. When that is the
+    /// newest commit stamped, no commit lies between the snapshot and its stamp, so the snapshot
+    /// holds every commit stamped at or before it and none after: the rows of its second, once no
+    /// commit is stamped later in that second ([`Marks::settled`]). Which second, if it does: none
+    /// when the log moved past the newest stamp (a commit not stamped yet, a log started again).
+    pub fn quiet_second(
+        &self,
+        snapshot: impl FnOnce() -> anyhow::Result<(u32, u64)>,
+    ) -> anyhow::Result<Option<u64>> {
+        let mut state = self.state()?;
+        let Some((seq, frame, ns)) = state.stamped else {
+            return Ok(None);
+        };
+        if snapshot()? != (seq, frame) {
+            return Ok(None);
+        }
+        let second = second_of(ns);
+        state.watch = Some((second, false));
+        Ok(Some(second))
+    }
+
+    /// Whether the snapshot [`Marks::quiet_second`] last lined up holds the rows of `second`: yes
+    /// once the clock is past the second's end with no commit stamped in it since (every later
+    /// commit is stamped later still), no once one was (or a later snapshot took its place), not
+    /// yet while the second runs.
+    pub fn settled(&self, second: u64) -> anyhow::Result<Option<bool>> {
+        let mut state = self.state()?;
+        match state.watch {
+            Some((s, false)) if s == second => {
+                let now = self.stamp(&mut state);
+                Ok(if now / SECOND_NS >= second {
+                    Some(true)
+                } else {
+                    None
+                })
+            }
+            _ => Ok(Some(false)),
+        }
     }
 
     /// How often the clock stepped back and was held, and how many marks were merged.
@@ -353,6 +423,71 @@ mod tests {
         assert_eq!(drained.marks[0].frame, 2);
         assert_eq!(drained.marks[0].unknown_from, Some(10 * SECOND_NS + 1));
         assert_eq!(hooks.marks.counts().unwrap().1, 1);
+    }
+
+    /// T-T1.12.C3: a snapshot lines up with the stamps only when the log ends at the newest commit
+    /// stamped; its second settles once the clock passes the second's end with no commit in it
+    /// since, and never once one is stamped in it.
+    #[test]
+    fn t_t1_12_c3_quiet_second_lines_a_snapshot_up() {
+        let (now, clock) = clock();
+        let hooks = Hooks::new(clock, 100);
+        assert_eq!(
+            hooks.marks.quiet_second(|| Ok((1, 0))).unwrap(),
+            None,
+            "nothing stamped"
+        );
+        hooks.marks.committed(1, 4).unwrap();
+        assert_eq!(
+            hooks.marks.quiet_second(|| Ok((1, 5))).unwrap(),
+            None,
+            "a commit not stamped yet"
+        );
+        assert_eq!(
+            hooks.marks.quiet_second(|| Ok((2, 0))).unwrap(),
+            None,
+            "the log started again"
+        );
+        assert_eq!(hooks.marks.quiet_second(|| Ok((1, 4))).unwrap(), Some(11));
+        assert_eq!(
+            hooks.marks.settled(11).unwrap(),
+            None,
+            "second 11 still runs"
+        );
+        assert_eq!(
+            hooks.marks.settled(10).unwrap(),
+            Some(false),
+            "not the second lined up"
+        );
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        assert_eq!(hooks.marks.settled(11).unwrap(), Some(true));
+        hooks.marks.committed(1, 6).unwrap();
+        assert_eq!(
+            hooks.marks.settled(11).unwrap(),
+            Some(true),
+            "a commit in a later second"
+        );
+
+        // A commit stamped within the second lined up: the snapshot isn't that second's rows.
+        assert_eq!(hooks.marks.quiet_second(|| Ok((1, 6))).unwrap(), Some(12));
+        hooks.marks.committed(1, 8).unwrap();
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        assert_eq!(hooks.marks.settled(12).unwrap(), Some(false));
+    }
+
+    /// T-T1.12.X2: a stamp observed from another group makes every later commit here later than
+    /// it, though this group's clock reads earlier.
+    #[test]
+    fn t_t1_12_x2_observed_stamps_order_later_commits() {
+        let (_, clock) = clock();
+        let hooks = Hooks::new(clock, 100);
+        hooks.marks.committed(1, 1).unwrap();
+        let ahead = 15 * SECOND_NS;
+        hooks.marks.observe(ahead).unwrap();
+        hooks.marks.committed(1, 2).unwrap();
+        let drained = hooks.marks.drain().unwrap();
+        assert!(drained.marks.last().unwrap().ns > ahead);
+        assert!(hooks.marks.latest().unwrap() >= drained.through);
     }
 
     /// T-T1.12.P11: a log started again twice with no write between keeps its link whole; a

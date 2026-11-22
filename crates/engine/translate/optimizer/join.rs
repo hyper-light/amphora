@@ -30,8 +30,8 @@ use crate::{
             },
             cost::{
                 constraints_selectivity, estimate_rows_per_seek,
-                index_access_is_unique_point_lookup, rows_per_leaf_page_for_index,
-                where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate, RowGoal,
+                index_access_is_unique_point_lookup, index_rows_per_page, where_expr_steps,
+                AnalyzeCtx, Cost, IndexInfo, RowCountEstimate, RowGoal,
             },
             order::{access_method_is_one_row, plan_satisfies_order_target},
         },
@@ -876,12 +876,24 @@ fn join_lhs_and_rhs<'a>(
             // build input is materialized from the join prefix.
             // Amphora: one method only when the connection asks (QT.5);
             // the structural conditions below hold whichever it asks for.
-            let preferred_over_seek = match planning_context.join_methods {
-                crate::JoinMethods::ByCost => {
-                    !rhs_has_selective_seek && !build_unique_key_search_without_statistics
+            // PL.8's test hook pins the plan: loops in the FROM order and one hash join, at the last
+            // table (`bushy_test_hook::PIN`).
+            #[cfg(test)]
+            let pinned = super::bushy_test_hook::PIN.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let pinned = false;
+            let pinned_hash_here =
+                pinned && joined_tables.len().checked_sub(1) == Some(rhs_table_idx);
+            let preferred_over_seek = if pinned {
+                pinned_hash_here
+            } else {
+                match planning_context.join_methods {
+                    crate::JoinMethods::ByCost => {
+                        !rhs_has_selective_seek && !build_unique_key_search_without_statistics
+                    }
+                    crate::JoinMethods::NestedLoopsOnly => false,
+                    crate::JoinMethods::HashJoinsOnly => true,
                 }
-                crate::JoinMethods::NestedLoopsOnly => false,
-                crate::JoinMethods::HashJoinsOnly => true,
             };
             let allow_hash_join = preferred_over_seek
                 && !probe_table_is_prior_build
@@ -931,8 +943,10 @@ fn join_lhs_and_rhs<'a>(
                     hash_can_replace_build_index,
                     subqueries,
                     joined_tables,
-                    params,
-                    planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
+                    // Amphora (PL.7): the probe table's scan costs its own pages.
+                    &params.for_table(rhs_table_reference, analyze_stats),
+                    !pinned_hash_here
+                        && planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -945,6 +959,7 @@ fn join_lhs_and_rhs<'a>(
                     if let AccessMethodParams::HashJoin {
                         materialize_build_input,
                         use_bloom_filter,
+                        bloom_fp_per_key,
                         join_keys,
                         join_type,
                         ..
@@ -1012,18 +1027,27 @@ fn join_lhs_and_rhs<'a>(
                                 .product::<f64>();
                             let probe_filtered_rows =
                                 (*rhs_base_rows) * probe_self_selectivity.clamp(0.0, 1.0);
-                            if probe_filtered_rows > 0.0 {
-                                let build_filtered_rows = if build_is_eligible {
-                                    effective_build_cardinality
-                                } else {
-                                    build_cardinality
-                                };
-                                // Bloom filters help when the probe side is much larger than the build.
-                                *use_bloom_filter = build_filtered_rows > 0.0
-                                    && probe_filtered_rows / build_filtered_rows >= 2.0;
+                            // Amphora (PL.5): a filter where it costs less than the probes
+                            // it saves, at the rate the learned weights give
+                            // (`bloom_filter_rate_per_key`). The probe rows that match are at
+                            // most the rows the join visits.
+                            let build_filtered_rows = if build_is_eligible {
+                                effective_build_cardinality
                             } else {
-                                *use_bloom_filter = false;
-                            }
+                                build_cardinality
+                            };
+                            let probe_rows = probe_filtered_rows * hash_probe_multiplier;
+                            let matched_probe_rows = (build_filtered_rows
+                                * hash_join_method.estimated_rows_per_outer_row)
+                                .min(probe_rows);
+                            let rate_per_key = super::access_method::bloom_filter_rate_per_key(
+                                build_filtered_rows,
+                                probe_rows,
+                                matched_probe_rows,
+                                params,
+                            );
+                            *use_bloom_filter = rate_per_key.is_some();
+                            *bloom_fp_per_key = rate_per_key.unwrap_or(0.0);
                             if should_materialize {
                                 hash_join_method.cost = estimate_hash_join_cost(
                                     effective_build_cardinality,
@@ -1033,7 +1057,7 @@ fn join_lhs_and_rhs<'a>(
                                     *join_type,
                                     mem_budget,
                                     hash_probe_multiplier,
-                                    params,
+                                    &params.for_table(rhs_table_reference, analyze_stats),
                                 );
                             }
                             if should_materialize {
@@ -1083,7 +1107,9 @@ fn join_lhs_and_rhs<'a>(
                         input_cardinality,
                         params,
                     );
-                    let forced = planning_context.join_methods == crate::JoinMethods::HashJoinsOnly;
+                    let forced = pinned_hash_here
+                        || (!pinned
+                            && planning_context.join_methods == crate::JoinMethods::HashJoinsOnly);
                     if hash_join_allowed
                         && (forced
                             || hash_join_method.cost < best_access_method.cost
@@ -1475,6 +1501,17 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             ),
             _ => false,
         };
+
+    // PL.8's test hook pins the plan to the FROM order (`bushy_test_hook::PIN`).
+    #[cfg(test)]
+    if super::bushy_test_hook::PIN.with(std::cell::Cell::get) {
+        if let Some(plan) = naive_plan {
+            return Ok(Some(BestJoinOrderResult {
+                best_plan: plan,
+                best_ordered_plan: None,
+            }));
+        }
+    }
 
     // If we have one table, then the "naive left-to-right plan" is always the best.
     if joined_tables.len() == 1 {
@@ -2366,6 +2403,8 @@ fn get_best_seek_score(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> f64 {
+    // Amphora (PL.7, T-PL.7.1): the table's reads cost its own pages.
+    let params = &params.for_table(rhs_table, analyze_stats);
     let mut best_score = 0.0;
     for candidate in &rhs_constraints.candidates {
         let usable_constraint_refs = usable_constraints_for_lhs_mask(
@@ -2383,11 +2422,7 @@ fn get_best_seek_score(
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
+                rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,
@@ -2717,7 +2752,11 @@ mod tests {
             + 1_000.0 * params.cpu_cost_per_row
             + 1_000.0 * (params.hash_cpu_cost + params.hash_lookup_cost)
             + 250.0 * params.cpu_cost_per_row;
-        assert!((cost.0 - expected).abs() < f64::EPSILON);
+        assert!(
+            (cost.0 - expected).abs() < 1e-9 * expected,
+            "{} {expected}",
+            cost.0
+        );
     }
 
     fn default_base_rows(n: usize) -> Vec<RowCountEstimate> {
@@ -4940,13 +4979,16 @@ mod tests {
 
     /// Do: join t1 to the whole composite unique key of t2 (t1.a = t2.a AND t1.b = t2.b), the
     /// tables on root pages of their own, first without statistics (each at the fallback's million
-    /// rows), then with ANALYZE's million rows each. Expect: without statistics, t1 scanned and t2
+    /// rows), then with ANALYZE's million rows each, fifty to a counted page (PL.7). Expect: without statistics, t1 scanned and t2
     /// searched by its unique key, not a hash join whose cost rests on the fallback (decision 11);
     /// with statistics the costs decide, and a hash join of a million rows each beats a million
     /// searches of pages the cache can't hold (AC-T1.5.4, AC-T1.13.4).
     #[test]
     fn a_unique_key_join_is_searched_without_statistics() {
-        fn best_plan(base_table_rows: &[RowCountEstimate]) -> (Vec<usize>, Vec<String>) {
+        fn best_plan(
+            base_table_rows: &[RowCountEstimate],
+            stats: &AnalyzeStats,
+        ) -> (Vec<usize>, Vec<String>) {
             let table = |name: &str, root_page: i64| {
                 Arc::new(BTreeTable::new(
                     root_page,
@@ -5022,7 +5064,7 @@ mod tests {
                 &[],
                 &[],
                 &DEFAULT_PARAMS,
-                &AnalyzeStats::default(),
+                stats,
                 &available_indexes,
                 &table_references,
                 &schema,
@@ -5049,16 +5091,27 @@ mod tests {
         }
 
         assert_eq!(
-            best_plan(&default_base_rows(2)),
+            best_plan(&default_base_rows(2), &AnalyzeStats::default()),
             (
                 vec![0, 1],
                 vec!["scan".to_owned(), "search t2_ab".to_owned()]
             )
         );
-        let (_, loops) = best_plan(&[
-            RowCountEstimate::AnalyzeStats(1_000_000.0),
-            RowCountEstimate::AnalyzeStats(1_000_000.0),
-        ]);
+        // PL.7: the trees' pages as ANALYZE would count them, fifty rows a page, so their index
+        // passes the cache.
+        let mut stats = AnalyzeStats::default();
+        for name in ["t1", "t2"] {
+            let table = stats.table_stats_mut(name);
+            table.row_count = Some(1_000_000);
+            table.pages = Some(20_000);
+        }
+        let (_, loops) = best_plan(
+            &[
+                RowCountEstimate::AnalyzeStats(1_000_000.0),
+                RowCountEstimate::AnalyzeStats(1_000_000.0),
+            ],
+            &stats,
+        );
         assert!(loops.iter().any(|step| step == "hash join"), "{loops:?}");
     }
 

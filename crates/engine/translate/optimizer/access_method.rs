@@ -15,7 +15,9 @@ use crate::translate::optimizer::constraints::{
     partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
     ConstraintRef, RangeConstraintRef,
 };
-use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
+use crate::translate::optimizer::cost::{
+    index_rows_per_page, rows_per_leaf_page_for_index, RowCountEstimate,
+};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
     plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, JoinInfo, JoinOrigin,
@@ -126,6 +128,9 @@ pub enum AccessMethodParams {
         materialize_build_input: bool,
         /// Whether to use a bloom filter on the probe side.
         use_bloom_filter: bool,
+        /// Amphora (PL.5): the filter's false-positive rate per distinct build key
+        /// (`bloom_filter_rate_per_key`).
+        bloom_fp_per_key: f64,
         /// Join semantics: Inner, LeftOuter, or FullOuter.
         join_type: HashJoinType,
     },
@@ -414,11 +419,7 @@ pub(super) fn choose_best_btree_candidate(
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
+                rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             // The table's own B-tree holds every column: read in rowid order, a page is read
             // once, never once as an index page and again as a table page.
@@ -754,11 +755,7 @@ pub(super) fn choose_best_in_seek_candidate(
                 unique: index.unique,
                 covering: rowid_only || rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
+                rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,
@@ -996,7 +993,8 @@ pub fn find_best_access_method_for_join_order(
             analyze_stats,
             input_cardinality,
             base_row_count,
-            params,
+            // Amphora (PL.7, T-PL.7.1): a table's reads cost its own pages.
+            &params.for_table(rhs_table, analyze_stats),
             whole_reads,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
@@ -1101,11 +1099,7 @@ fn find_best_access_method_for_btree(
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
+                rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,
@@ -1550,6 +1544,48 @@ fn find_hash_join_keys(
     join_keys
 }
 
+/// Amphora (PL.5, `docs/design/planner.md`, "Decision (lane qs5-9)"): the false-positive rate
+/// per distinct build key of a hash join's Bloom filter, or none where a filter costs more than
+/// it saves. Every weight is the cost model's, learned per database:
+/// - a probe row the filter passes is hashed and probed (`hash_cpu_cost + hash_lookup_cost`);
+/// - a filter lookup hashes the key once (`hash_cpu_cost`), for every probe row;
+/// - a filter bit is priced at the hash table's own memory: a build row's cost over its bits
+///   (`(hash_cpu_cost + hash_insert_cost) / (8 · hash_bytes_per_row)`).
+///
+/// For `n` keys at rate `p` a filter holds `n·(-ln p)/ln²2` bits, and the probe rows that find no
+/// match, `misses`, pay `p` of the probe; the total is least at `p = bit_cost·n / (ln²2 · misses
+/// · probe_cost)`. The rate per key is that over `n`, so the filter is sized from the build's
+/// measured keys when it ends (`FilterSizing`). The filter is chosen when the total with it,
+/// lookups included, is below the misses' probes without it.
+pub fn bloom_filter_rate_per_key(
+    build_keys: f64,
+    probe_rows: f64,
+    matched_probe_rows: f64,
+    params: &CostModelParams,
+) -> Option<f64> {
+    let misses = (probe_rows - matched_probe_rows.max(0.0)).max(0.0);
+    let probe_cost = params.hash_cpu_cost + params.hash_lookup_cost;
+    let lookup_cost = params.hash_cpu_cost;
+    let bit_cost =
+        (params.hash_cpu_cost + params.hash_insert_cost) / (8.0 * params.hash_bytes_per_row);
+    let measured = [build_keys, misses, probe_cost, bit_cost]
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0);
+    if !measured || !lookup_cost.is_finite() {
+        return None;
+    }
+    let ln2_squared = std::f64::consts::LN_2 * std::f64::consts::LN_2;
+    let rate_per_key = bit_cost / (ln2_squared * misses * probe_cost);
+    let rate = rate_per_key * build_keys;
+    if rate >= 1.0 {
+        return None;
+    }
+    let bits = build_keys * -rate.ln() / ln2_squared;
+    let with_filter = probe_rows * lookup_cost + misses * rate * probe_cost + bits * bit_cost;
+    let without = misses * probe_cost;
+    (with_filter < without).then_some(rate_per_key)
+}
+
 /// Estimate the cost of a hash join between two tables.
 ///
 /// The cost model accounts for:
@@ -1780,6 +1816,7 @@ pub fn try_hash_join_access_method(
             mem_budget: params.statement_memory,
             materialize_build_input: false,
             use_bloom_filter: false,
+            bloom_fp_per_key: 0.0,
             join_type: hash_join_type,
         },
     }))
