@@ -23,7 +23,7 @@
 //! machines bench/repl_members.sh is given, over TCP (`procs`), a kill the same cut. The competitors run as containers through their scripts,
 //! `bench/servers/repl/<system>.sh up|down|kill N|start N|leader|endpoint N` (a kill is
 //! `docker kill`, SIGKILL); `--scripts bench/servers/repl/native` runs the same systems as processes
-//! on this host instead (a kill is kill -9 of the recorded PID), from the release binaries
+//! on this host instead (a kill is kill -9 of the node's recorded process group), from the release binaries
 //! `native/setup.sh` fetched: every system on one platform, as Ada's fair-comparison rule asks
 //! (bench/repl_ladder.sh runs the commit ladder that way). Every record carries `about` (the system's
 //! version, its platform, what its acknowledgement means, and the client: driver, transport, pool)
@@ -333,7 +333,6 @@ fn send(c: &dyn Cluster, down: &[AtomicBool; NODES], via: usize, s: &[(String, V
     Err(anyhow::anyhow!("no live node acknowledged a write within --deadline-s: {last:?}"))
 }
 
-/// The record's common fields: what ran, where, when, at which commit.
 /// The commit this bench was built from (Amphora's version in a record).
 fn record_commit() -> String {
     std::process::Command::new("git")
@@ -346,6 +345,7 @@ fn record_commit() -> String {
         .unwrap_or_default()
 }
 
+/// The record's common fields: what ran, where, when, at which commit.
 fn record_head(o: &Opts, c: &str) -> serde_json::Value {
     let host = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_default();
     let commit = record_commit();
