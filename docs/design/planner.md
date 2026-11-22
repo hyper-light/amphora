@@ -1708,6 +1708,69 @@ that ends in no outcome or two; a search run while its connection is busy under 
 asks for one. A bushy fast plan's shape isn't carried (only left-deep orders are), so the exact
 search weighs it by cost alone. The planner worker's thread count is one per database.
 
+## Decision (lane pl8-18): the exact search plans on what the fast plan was made on, one search an idle
+
+**Decision.** PL.8, T-PL.8.11 and T-PL.8.12 (`crates/engine/background_search.rs`,
+`Statement::hand_off_exact_search`, `Statement::take_exact_plan`). Decision pl8-17's worker planned
+on the statement's own connection from its own thread while that connection ran. What a plan reads
+of the connection, read for this decision:
+
+- *The schema and its statistics.* `plan_sql` read `Connection::schema` as the search started; the
+  statistics live in it (`Schema::analyze_stats`). While the connection runs, a schema change, a
+  rollback that restores a snapshot or ANALYZE swaps it, so the search could plan on a schema the
+  fast plan never saw. Now the request takes the schema (an `Arc`, never changed after) at hand-off,
+  on the statement's thread, as the fast plan was made, and plans on it (`plan_sql_on`).
+- *The settings.* Join methods, budgets, star filters, column names and the rest are read live as
+  the search runs, so a setting changed mid-search (`PlanHints::apply` sets three at once) gave a
+  plan of some old and some new values. Each setting that shapes a plan moves the
+  connection's generation as it changes (`bump_prepare_context_generation`, the contract
+  `PrepareContext` already states), and the program records the generation as it is built, at the
+  end of the search, so the existing staleness check could pass such a plan. Now the request takes
+  the generation at hand-off, and the statement takes a plan only while the generation is still
+  that one; otherwise it counts it stale (`BackgroundSearchStats::stale`), keeps the fast plan, and
+  the existing check plans it again on the settings as they are.
+- *A write's connection state.* A write's plan reads whether the connection is inside a nested
+  statement (`is_nested_stmt`: count_changes rows, foreign-key and schema paths) and pushes and pops
+  the connection's stack of triggers compiling (`trigger_exec.rs`), which also guards against a
+  trigger firing itself. Read and changed from another thread while the connection runs, a trigger
+  could be skipped. Now only a SELECT takes the fast plan with a search to follow
+  (`translate::translate`); a write is planned in full at prepare, as under `Off`.
+- *The pager and the plan cache.* A SELECT's plan reads no page (only PRAGMA's translation blocks on
+  the pager's header), and the plan cache is the statement's own (PL.12), not the connection's.
+- *Shared estimators.* The learned weights and row counters are the database's, shared by its
+  connections and synchronised for that; the search reads them as any connection's prepare does.
+
+Placement `Idle` now runs one search each time the connection goes idle, the oldest, so the step or
+reset that ended the connection's last statement returns late by one search at most; the rest wait
+for the next time it goes idle. One is the least work that still moves the queue on, not a tuned
+count.
+
+**Why.** A snapshot taken where the fast plan was made means the exact plan answers the same
+question on the same facts, and whatever would make the fast plan stale makes the exact one stale by
+the same checks. Settings copied into a planner connection of the worker's own were the other way:
+it lacks the connection's temporary tables, attached databases and loaded functions, so a name could
+resolve to another table. The generation is the connection's own signal for settings and already
+covers attach, detach and temporary-schema restores. Shuttle's `Weak` is std's (shuttle 0.8.1
+re-exports `std::sync::{Arc, Weak}`), so `Weak::strong_count` builds there.
+
+**Evidence.** Written while kiln's server was down, not run yet (lane pl8-18):
+`statement::tests::t_pl_8_11_a_plan_read_past_a_moved_setting_is_never_taken`,
+`t_pl_8_11_only_a_select_hands_its_search_off`,
+`t_pl_8_11_statements_run_on_the_connection_while_the_worker_plans_for_it` (32 rounds of a
+transaction firing a trigger, a schema change, a setting and the star run on the connection while
+the worker plans for it: answers, trigger firings and outcomes checked; the crate's shuttle build
+doesn't drive std threads, so it is a threaded stress test), and
+`t_pl_8_12_each_idle_runs_one_search`. The harness of record now also reports the time of the
+calls that end the statement, whose difference from `Off` is what `Idle` adds.
+
+**Falsified by.** A plan taken whose generation differs from the one at hand-off; a write handed
+off; a lost trigger firing or a changed answer while the worker plans; an idle that runs two
+searches.
+
+**Not yet built.** The last strong reference to a connection the worker upgraded can drop on the
+worker's thread (its statement and connection closed mid-search), so the connection's close then
+runs there.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).

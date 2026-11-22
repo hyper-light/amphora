@@ -16,8 +16,19 @@
 //!   the database, one pending search each on average: past that the oldest request is dropped,
 //!   its statement keeping its fast plan, and counted (`BackgroundSearchStats::dropped`).
 //! - `Idle`: the connection itself, when its last statement in progress ends
-//!   (`Statement::release_active_root_if_counted`). Its queue holds one request a statement. A
-//!   connection that never goes idle never runs its searches; they stay pending and counted.
+//!   (`Statement::release_active_root_if_counted`), one search each time it goes idle, so the
+//!   step or reset that ended the statement is late by one search at most (lane pl8-18). Its
+//!   queue holds one request a statement. A connection that never goes idle never runs its
+//!   searches; they stay pending and counted.
+//!
+//! What a search plans on (lane pl8-18, decision pl8-18): only a SELECT is planned this way
+//! (`translate::translate`), whose plan reads nothing of what the connection is doing (a write's
+//! reads its nesting and its stack of triggers compiling). Its schema and statistics are the ones
+//! the fast plan was made on, taken at hand-off on the statement's thread and immutable after
+//! (`SearchRequest::schema`). The connection's settings are read as the search runs, and checked
+//! as the statement takes the plan: every setting that shapes a plan moves the connection's
+//! generation as it changes, so a plan is taken only while the generation is the one taken at
+//! hand-off (`Statement::take_exact_plan`); otherwise it is counted stale and the fast plan stays.
 //!
 //! Every request ends in exactly one outcome, counted: dropped, abandoned (its statement or
 //! connection gone), kept (the fast plan stands), replaced (the exact plan handed back) or failed.
@@ -47,6 +58,9 @@ pub struct BackgroundSearchStats {
     pub kept: u64,
     /// Searches whose plan was cheaper past the margin, handed to the statement.
     pub replaced: u64,
+    /// Of the replaced, plans the statement didn't take because the connection's settings changed
+    /// after hand-off: the search may have read some of them as they were and some as they are.
+    pub stale: u64,
     /// Searches that ended in an error: the fast plan stands.
     pub failed: u64,
     /// The longest the worker's queue has been.
@@ -60,6 +74,7 @@ pub(crate) struct SearchCounters {
     abandoned: AtomicU64,
     kept: AtomicU64,
     replaced: AtomicU64,
+    stale: AtomicU64,
     failed: AtomicU64,
     longest_queue: AtomicU64,
 }
@@ -69,6 +84,11 @@ impl SearchCounters {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A replaced plan the statement didn't take: the settings moved after hand-off.
+    pub(crate) fn note_stale(&self) {
+        Self::add(&self.stale);
+    }
+
     pub(crate) fn stats(&self) -> BackgroundSearchStats {
         BackgroundSearchStats {
             requested: self.requested.load(Ordering::Relaxed),
@@ -76,6 +96,7 @@ impl SearchCounters {
             abandoned: self.abandoned.load(Ordering::Relaxed),
             kept: self.kept.load(Ordering::Relaxed),
             replaced: self.replaced.load(Ordering::Relaxed),
+            stale: self.stale.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             longest_queue: self.longest_queue.load(Ordering::Relaxed),
         }
@@ -87,8 +108,12 @@ pub(crate) enum Found {
     /// The fast plan stands: the search's plan was not cheaper past the margin, it failed, or the
     /// request was dropped.
     Kept,
-    /// The exact search's plan, cheaper than the fast plan past the margin.
-    Better(vdbe::Program),
+    /// The exact search's plan, cheaper than the fast plan past the margin, and the generation of
+    /// the connection's settings its request was handed off at (`SearchRequest::generation`).
+    Better {
+        program: vdbe::Program,
+        generation: u64,
+    },
 }
 
 /// Where a statement's exact search hands back what it came to; the statement takes it as its
@@ -107,7 +132,9 @@ struct SlotState {
 }
 
 impl SearchSlot {
-    fn fill(&self, found: Found) {
+    /// Hands back what the search came to; `pub(crate)` for the statement's tests, which fill a
+    /// slot themselves to take a plan at a chosen generation.
+    pub(crate) fn fill(&self, found: Found) {
         {
             let mut state = self.state.lock();
             state.found = Some(found);
@@ -143,6 +170,11 @@ impl SearchSlot {
 /// A statement's exact search, to be run by the placement the switch names.
 pub(crate) struct SearchRequest {
     pub(crate) conn: Weak<Connection>,
+    /// The schema and its statistics the fast plan was made on, taken at hand-off: the search plans
+    /// on these, never on the connection's schema as it moves while the connection runs.
+    pub(crate) schema: Arc<crate::schema::Schema>,
+    /// The connection's settings' generation at hand-off (`Connection::prepare_context_generation`).
+    pub(crate) generation: u64,
     pub(crate) pager: Arc<Pager>,
     pub(crate) sql: String,
     pub(crate) mode: QueryMode,
@@ -182,19 +214,23 @@ impl SearchRequest {
             carried_join_orders: self.fast_orders.clone(),
             ..PrepareOptions::default()
         };
-        let planned = crate::statement::plan_sql(
+        let planned = crate::statement::plan_sql_on(
             &conn,
             self.pager.clone(),
             &self.sql,
             self.mode,
             self.origin,
             &options,
+            self.schema.clone(),
         );
         let margin = conn.db.learned_costs.cost_margin();
         let found = match planned {
             Ok(program) if cheaper_past(program.plan_cost, self.fast_cost, margin) => {
                 SearchCounters::add(&counters.replaced);
-                Found::Better(program)
+                Found::Better {
+                    program,
+                    generation: self.generation,
+                }
             }
             Ok(_) => {
                 SearchCounters::add(&counters.kept);
@@ -421,17 +457,17 @@ impl IdleSearches {
         counters.end(gone);
     }
 
-    /// The connection went idle: runs its searches, oldest first, until none is left. A search
-    /// that makes the connection idle again (none does) doesn't start another round inside it.
+    /// The connection went idle: runs its oldest search, one, so the call that ended the
+    /// connection's last statement returns late by one search at most; the rest wait for the next
+    /// time it goes idle (lane pl8-18). One is the least work that still moves the queue on: the
+    /// bound is the search, never a count or a time of ours. A search that makes the connection
+    /// idle again (none does) doesn't start another inside it.
     pub(crate) fn run(&self, counters: &SearchCounters) {
         if self.running.swap(true, Ordering::AcqRel) {
             return;
         }
-        loop {
-            let next = self.queue.lock().pop_front();
-            let Some(request) = next else {
-                break;
-            };
+        let next = self.queue.lock().pop_front();
+        if let Some(request) = next {
             request.run(counters);
         }
         self.running.store(false, Ordering::Release);

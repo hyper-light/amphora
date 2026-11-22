@@ -95,6 +95,13 @@ pub fn translate(
             | ast::Stmt::Update { .. }
     );
 
+    // Amphora (PL.8, T-PL.8.11, lane pl8-18): only a SELECT takes the fast plan with an exact search
+    // to follow, because only a SELECT's plan reads nothing of what the connection is doing: a
+    // write's reads whether the connection is inside a nested statement and pushes onto its stack
+    // of triggers compiling (`trigger_exec.rs`), state a search made off the connection's thread
+    // would read and change while the connection runs (docs/design/planner.md, decision pl8-18).
+    let fast_search = prepare_options.fast_search && matches!(stmt, ast::Stmt::Select { .. });
+
     let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
         None
     } else {
@@ -185,7 +192,7 @@ pub fn translate(
             &connection.db.learned_costs,
             prepare_options.expected_runs,
         )
-        .fast(prepare_options.fast_search),
+        .fast(fast_search),
     );
     // Amphora (PL.8, lane pl8-16): where this plan notes its join orders, the last plan's, and the
     // share of a plan's cost the weights' error could explain, which a carried order keeps its
@@ -260,7 +267,7 @@ pub fn translate(
     connection.db.learned_costs.search().add(searches);
     // Amphora (PL.8, lane pl8-17): a fast plan the greedy search ordered has an exact search to
     // follow; one the exact search planned within the fast budget is already exact.
-    program.fast_planned = prepare_options.fast_search && searches.greedy_searches > 0;
+    program.fast_planned = fast_search && searches.greedy_searches > 0;
     program.reads_parameter_values = plan_values.asked();
     program.planned_tables = plan_values.take_planned();
     program.join_orders = Some(join_orders);

@@ -379,6 +379,9 @@ tests = [
   { id = "T-PL.8.9", text = "join::tests::t_pl_8_a_carried_join_order_stands_within_its_margin and learned_costs::ab_tests::t_pl_8_cost_margin_is_the_weights_error — passes when a carried join order stands while the search's best is not cheaper past the margin, is replaced past it, is ignored when not each table once, and the margin is exp(MOVE_Z * s) - 1 of the weights' spread between batch means; statement::tests::t_pl_8_9_* (simulator feature) — a statement planned again carries its order, and under weights pinned 10% either way it flips its order no more often with CarriedJoinOrders::WithinMargin than Off (the counts are the report)" },
   # lane pl8-17
   { id = "T-PL.8.10", text = "background_search::tests::t_pl_8_10_* and statement::tests::t_pl_8_10_* — passes when, behind BackgroundSearch (Off the control and the default), a root statement takes the fast plan and runs at once, its exact search runs on the database's planner worker (woken by each request, its queue bounded by the connections open, oldest dropped and counted) or on its connection when the connection goes idle (and never while it is busy), the exact plan replaces the fast one only where cheaper past the weights' margin, and every request ends in exactly one counted outcome" },
+  # lane pl8-18
+  { id = "T-PL.8.11", text = "statement::tests::t_pl_8_11_* — passes when the exact search plans on the schema and statistics taken at hand-off, a plan whose settings' generation moved after hand-off is counted stale and never taken, only a SELECT hands its search off, and statements (a transaction firing a trigger, a schema change, a setting) run on the connection while the worker plans for it with every answer and trigger firing unchanged" },
+  { id = "T-PL.8.12", text = "statement::tests::t_pl_8_12_each_idle_runs_one_search — passes when, under BackgroundSearch::Idle, each time the connection goes idle it runs one waiting search, the oldest first" },
 ]
 
 [[own]]

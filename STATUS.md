@@ -985,6 +985,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   search after it on a planner worker or the idle connection, behind `BackgroundSearch` (off by
   default) for the A/B, with a harness of the time to the first row and to the exact plan
   (T-PL.8.10).
+  Lane pl8-18 (docs/design/planner.md "Decision (lane pl8-18)"): the exact search plans on the
+  schema and statistics taken at hand-off, a plan is taken only while the connection's settings'
+  generation is the one at hand-off, only a SELECT hands its search off (T-PL.8.11), and `Idle`
+  runs one search each time the connection goes idle (T-PL.8.12).
   Not built: the search budget derived from a plan-time target, outer joins inside a bushy plan,
   and semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1
   is open.
