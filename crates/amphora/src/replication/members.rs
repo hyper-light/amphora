@@ -13,7 +13,7 @@ use amphora_api::{self as api, Refusal};
 const PREFIX: &[u8] = b"amphora.members.v1\0";
 const TABLE: &str = "CREATE TABLE IF NOT EXISTS __amphora_member_bound (id INTEGER PRIMARY KEY CHECK(id = 1), bound BLOB NOT NULL)";
 /// Format: a bound entry is its prefix and the bound, a little-endian `u64`.
-const ENTRY_BYTES: usize = PREFIX.len() + std::mem::size_of::<u64>();
+const ENTRY_BYTES: usize = PREFIX.len().saturating_add(std::mem::size_of::<u64>());
 
 /// The bound a group starts with, from the members its first configuration names: twice them,
 /// and two at least, room for a member to join a one-member group. Doubling is the geometric

@@ -337,7 +337,10 @@ pub struct Config {
 /// Reads the member bound an owner's normal entry states, if it states one
 /// ([`Config::stated_members`]).
 #[derive(Clone, Copy)]
-pub struct StatedMembers(pub fn(&[u8]) -> Option<usize>);
+pub struct StatedMembers(
+    /// The reader: an entry's data, and the bound it states.
+    pub fn(&[u8]) -> Option<usize>,
+);
 impl PartialEq for StatedMembers {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::fn_addr_eq(self.0, other.0)
