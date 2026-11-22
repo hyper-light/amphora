@@ -311,7 +311,7 @@ impl Database {
             .ok_or_else(|| api::invalid("replica path", "not UTF-8"))?;
         let durability = canonical(durability);
         let expected = Some((log.as_path(), &config, &durability));
-        let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
+        let mut owners = owners_unreserved(&path, until)?;
         forget_drained(&mut owners)?;
         let identity = file_identity(&path)?;
         if let Some(owner) = owners.get(&path).or_else(|| {

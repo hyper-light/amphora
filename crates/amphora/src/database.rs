@@ -125,6 +125,14 @@ struct Owner {
     key: Option<[u8; 32]>,
 }
 static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Owner>>> = OnceLock::new();
+/// The paths an open of this process has reserved: it took their lease under [`OWNERS`] and makes
+/// their database outside it, so opens of other databases run beside it (CP-T1.13). An open of a
+/// reserved path waits on [`OPENED`] until the reservation ends, then looks again: two opens of
+/// one database still take turns.
+static OPENING: Mutex<std::collections::BTreeSet<PathBuf>> =
+    Mutex::new(std::collections::BTreeSet::new());
+/// Signalled each time a reservation in [`OPENING`] ends.
+static OPENED: Condvar = Condvar::new();
 /// The paths whose owner this process drained, the latest last. A lease there may still read held
 /// for a moment: a child this process forked shares it until its exec (local-owner-transport.md,
 /// "Owner guards", J1). A mark names a lease this process held, one descriptor of the process's
@@ -580,6 +588,54 @@ fn locked<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     m.lock()
         .map_err(|_| unavailable("a database response lock was poisoned"))
 }
+/// The owner table, locked once no open of this process has `path` reserved: an open in flight
+/// there is waited for, woken when it ends, to the deadline (CP-T1.13).
+fn owners_unreserved(
+    path: &Path,
+    until: Instant,
+) -> Result<std::sync::MutexGuard<'static, BTreeMap<PathBuf, Owner>>, Refusal> {
+    loop {
+        let owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
+        let mut opening = locked(&OPENING)?;
+        if !opening.contains(path) {
+            return Ok(owners);
+        }
+        drop(owners);
+        while opening.contains(path) {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Refusal::Timeout);
+            }
+            opening = OPENED
+                .wait_timeout(opening, left)
+                .map_err(|_| unavailable("a database response lock was poisoned"))?
+                .0;
+        }
+    }
+}
+
+/// A path reserved in [`OPENING`] while its database is made; dropping it ends the reservation
+/// and wakes the opens waiting for it.
+struct Reserved(PathBuf);
+
+impl Reserved {
+    /// Reserves `path`; the caller holds the owner table and found the path unreserved.
+    fn take(path: &Path) -> Result<Self, Refusal> {
+        locked(&OPENING)?.insert(path.to_path_buf());
+        Ok(Self(path.to_path_buf()))
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        OPENING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+        OPENED.notify_all();
+    }
+}
+
 fn locked_until<T>(m: &Mutex<T>, until: Instant) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     loop {
         if Instant::now() >= until {
@@ -745,7 +801,7 @@ impl Database {
                 }
                 return Err(Refusal::Timeout);
             }
-            let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
+            let mut owners = owners_unreserved(&path, until)?;
             forget_drained(&mut owners)?;
             let identity = file_identity(&path)?;
             if let Some(owner) = owners.get(&path).or_else(|| {
@@ -881,9 +937,14 @@ impl Database {
             }
             let key = guards.as_ref().map(Guards::key);
             let owner = Owned::new(Arc::new(lease), descriptor, guards);
+            // The lease is this open's: reserve the path and make the database outside the owner
+            // table, so other databases' opens go on meanwhile (CP-T1.13).
+            let reserved = Reserved::take(&path)?;
+            drop(owners);
             let database = create(&path, owner.clone())?;
             remote::publish(&database, &path)?;
             let identity = file_identity(&path)?;
+            let mut owners = locked(OWNERS.get_or_init(Mutex::default))?;
             owners.insert(
                 path,
                 Owner {
@@ -893,6 +954,7 @@ impl Database {
                     key,
                 },
             );
+            drop(reserved);
             return Ok(database);
         }
     }
@@ -2554,6 +2616,65 @@ pub(crate) fn in_child(test: &str) -> bool {
         .unwrap();
     assert!(status.success(), "{test} in a child process: {status}");
     false
+}
+
+#[cfg(test)]
+mod owner_table {
+    use super::*;
+
+    /// The opens in flight that have reached their database's making, and the event of one more.
+    #[derive(Default)]
+    struct Meeting {
+        arrived: Mutex<usize>,
+        event: Condvar,
+    }
+
+    impl Meeting {
+        /// Counts this open in, then waits, to `until`, for `all` opens to be making their
+        /// databases at once: whether they all were.
+        fn meet(&self, all: usize, until: Instant) -> bool {
+            let mut arrived = self.arrived.lock().unwrap();
+            *arrived += 1;
+            self.event.notify_all();
+            while *arrived < all {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                arrived = self.event.wait_timeout(arrived, left).unwrap().0;
+            }
+            true
+        }
+    }
+
+    /// Do: open N databases at once in one process, each open waiting, while it makes its
+    /// database, for every other to be making its own. Expect: they all meet, so the opens ran
+    /// at the same time; with the owner table held through an open, the first would wait alone
+    /// (CP-T1.13: one process's opens no longer take turns).
+    #[test]
+    fn cp_t1_13_opens_of_different_databases_overlap() {
+        const N: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let meeting = Arc::new(Meeting::default());
+        let until = Instant::now() + crate::transport::HANG;
+        let opens: Vec<_> = (0..N)
+            .map(|i| {
+                let path = dir.path().join(format!("db-{i}"));
+                let meeting = Arc::clone(&meeting);
+                std::thread::spawn(move || {
+                    let mut met = false;
+                    let database = Database::open_owned(&path, until, false, None, |_| {
+                        met = meeting.meet(N, until);
+                        Ok(())
+                    });
+                    (database.is_ok(), met)
+                })
+            })
+            .collect();
+        for open in opens {
+            assert_eq!(open.join().unwrap(), (true, true));
+        }
+    }
 }
 
 #[cfg(test)]
