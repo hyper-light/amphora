@@ -101,6 +101,7 @@ pub(crate) mod order;
 pub mod plan_hints;
 mod row_value;
 mod sample_filter;
+pub(crate) mod search_budget;
 pub(crate) mod unnest;
 
 #[derive(Debug, Default)]
@@ -3087,6 +3088,7 @@ fn find_table_access_plan(
         allow_automatic_index: resolver.automatic_indexes()
             && resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
         join_methods: resolver.join_methods(),
+        search_budget: resolver.join_search(),
         sorted_fetches: resolver.sorted_fetches(),
         row_goal,
     };
@@ -3305,6 +3307,7 @@ fn plan_unmatched_right_rows(
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
                 join_methods: resolver.join_methods(),
+                search_budget: resolver.join_search(),
                 sorted_fetches: false,
                 row_goal: None,
             },

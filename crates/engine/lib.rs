@@ -138,9 +138,11 @@ pub use cdc::{
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
-    resolve_ext_path, Connection, JoinMethods, PrepareOptions, Row, StepResult, SymbolTable,
+    resolve_ext_path, Connection, JoinMethods, JoinSearchBudget, PrepareOptions, Row, StepResult,
+    SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+pub use translate::optimizer::search_budget::JoinSearchStats;
 // Amphora (G6 step 3): learned plan hints, a prototype behind `HintSet::apply`.
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};

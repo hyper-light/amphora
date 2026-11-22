@@ -63,6 +63,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
     /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
     pub row_goal: Option<RowGoal>,
+    /// Amphora (PL.8): what sizes the exact search before the greedy one takes the join.
+    pub search_budget: super::search_budget::SearchBudget,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -76,6 +78,7 @@ impl<'a> JoinPlanningContext<'a> {
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
             row_goal: None,
+            search_budget: super::search_budget::SearchBudget::FIXED,
         }
     }
 }
@@ -573,23 +576,12 @@ fn join_lhs_and_rhs<'a>(
     // table reads it whole, and the loops before it can give more than one row, so it would be
     // read again for each of them. Any read that seeks by a key replaces it (an index, an IN seek,
     // an automatic index), and so does a hash join below, at any cost; it stays only where none
-    // of them can read this table. A seek kept from the start keeps its preference over a hash
-    // join (`rhs_has_selective_seek`); one taken only because the whole read was refused doesn't.
+    // of them can read this table. A seek and a hash join are weighed by cost alone (QT.5,
+    // T-QT.5.8).
     let whole_read_refused = lhs.is_some_and(|lhs| {
         reads_whole_table(&best_access_method)
             && !loops_give_at_most_one_row(lhs, access_methods_arena, None)
     });
-    let rhs_has_selective_seek = matches!(
-        best_access_method.params,
-        AccessMethodParams::BTreeTable {
-            ref index,
-            build_index,
-            ref constraint_refs,
-            ..
-        } if !constraint_refs.is_empty()
-            && !build_index
-            && index.as_ref().is_none_or(|index| !index.ephemeral)
-    );
     if whole_read_refused {
         if let Some(mut keyed) = find_best_access_method_for_join_order(
             rhs_table_reference,
@@ -838,8 +830,6 @@ fn join_lhs_and_rhs<'a>(
             } else {
                 *build_base_rows
             };
-            let hash_can_replace_build_index =
-                can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
 
             // The unmatched-right pass can set every earlier table cursor to NULL.
             // Hash materialization makes these values independent of that cursor state.
@@ -888,9 +878,7 @@ fn join_lhs_and_rhs<'a>(
                 pinned_hash_here
             } else {
                 match planning_context.join_methods {
-                    crate::JoinMethods::ByCost => {
-                        !rhs_has_selective_seek && !build_unique_key_search_without_statistics
-                    }
+                    crate::JoinMethods::ByCost => !build_unique_key_search_without_statistics,
                     crate::JoinMethods::NestedLoopsOnly => false,
                     crate::JoinMethods::HashJoinsOnly => true,
                 }
@@ -905,10 +893,8 @@ fn join_lhs_and_rhs<'a>(
                 lhs_table = build_table.table.get_name(),
                 rhs_table = rhs_table_reference.table.get_name(),
                 allow_hash_join,
-                rhs_has_selective_seek,
                 build_unique_key_search_without_statistics,
                 rhs_builds_index,
-                hash_can_replace_build_index,
                 build_read_is_unique_seek,
                 probe_table_is_prior_build,
                 build_table_is_prior_probe,
@@ -932,7 +918,6 @@ fn join_lhs_and_rhs<'a>(
                     rhs_table_idx,
                     lhs_constraints,
                     rhs_constraints,
-                    &lhs_mask,
                     where_clause,
                     where_terms.iter().enumerate().filter_map(|(index, term)| {
                         let (left, right, owner) = term.equal_tables?;
@@ -945,12 +930,9 @@ fn join_lhs_and_rhs<'a>(
                     build_cardinality,
                     probe_cardinality,
                     probe_multiplier,
-                    hash_can_replace_build_index,
                     subqueries,
                     joined_tables,
                     &hash_params,
-                    !pinned_hash_here
-                        && planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -1236,17 +1218,6 @@ fn materialized_build_input_reads_an_outer_query(
     Ok(false)
 }
 
-fn can_replace_build_index_with_hash(
-    probe_constraints: &TableConstraints,
-    build_read_is_in_seek: bool,
-) -> bool {
-    build_read_is_in_seek
-        || !probe_constraints
-            .constraints
-            .iter()
-            .any(|constraint| constraint.lhs_mask.is_empty())
-}
-
 /// Returns true when build-side constraints reference prior tables in ways that
 /// are not already consumed by hash-join keys.
 fn build_has_uncovered_prior_constraints(
@@ -1439,37 +1410,9 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         }
     };
 
-    // The subsets the search builds plans for, by size; past the budget, none, and the greedy
-    // search orders the join instead (docs/design/planner.md decision 19).
-    let Some(subsets) = searchable_subsets(
-        num_tables,
-        &where_terms,
-        required_lhs_by_table.as_deref(),
-        left_join_illegal_map.as_ref(),
-        JOIN_SEARCH_BUDGET,
-    )?
-    else {
-        return compute_greedy_join_order(
-            set_rows,
-            joined_tables,
-            initial_input_cardinality,
-            planning_context,
-            constraints,
-            base_table_rows,
-            access_methods_arena,
-            where_clause,
-            &where_terms,
-            subqueries,
-            index_method_candidates,
-            params,
-            analyze_stats,
-            available_indexes,
-            table_references,
-            schema,
-        );
-    };
-
-    // Compute naive left-to-right plan to use as pruning threshold
+    // The left-to-right plan: the search's pruning threshold, and (PL.8, decision 19) the bound on
+    // the best plan's estimated cost that sizes the search's budget (`search_budget`).
+    let search_started = std::time::Instant::now();
     let naive_plan = compute_naive_left_deep_plan(
         set_rows,
         joined_tables,
@@ -1488,6 +1431,56 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         table_references,
         schema,
     )?;
+    let budget = planning_context
+        .search_budget
+        .subsets(naive_plan.as_ref().map(|plan| plan.cost.0), num_tables);
+    tracing::debug!(
+        target: "amphora::join_search",
+        rule = ?planning_context.search_budget.rule,
+        budget,
+        bound = ?naive_plan.as_ref().map(|plan| plan.cost.0),
+        executions = planning_context.search_budget.executions,
+        tables = num_tables,
+        "join search budget"
+    );
+
+    // The subsets the search builds plans for, by size; past the budget, none, and the greedy
+    // search orders the join instead (docs/design/planner.md decision 19).
+    let Some(subsets) = searchable_subsets(
+        num_tables,
+        &where_terms,
+        required_lhs_by_table.as_deref(),
+        left_join_illegal_map.as_ref(),
+        budget,
+    )?
+    else {
+        let greedy = compute_greedy_join_order(
+            set_rows,
+            joined_tables,
+            initial_input_cardinality,
+            planning_context,
+            constraints,
+            base_table_rows,
+            access_methods_arena,
+            where_clause,
+            &where_terms,
+            subqueries,
+            index_method_candidates,
+            params,
+            analyze_stats,
+            available_indexes,
+            table_references,
+            schema,
+        );
+        super::search_budget::note_search(
+            super::search_budget::Algorithm::Greedy,
+            0,
+            search_started.elapsed(),
+        );
+        return greedy;
+    };
+    let subsets_built: usize = subsets.iter().map(Vec::len).sum();
+    let mut pairs_tried = 0usize;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
     // We assign Some Cost (tm) to any required sort operation, so the best ordered plan may end up being
@@ -1806,8 +1799,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         planning_context,
         required_lhs_by_table.as_deref(),
     ) {
-        let mut pairs_left =
-            JOIN_SEARCH_BUDGET.saturating_sub(subsets.iter().map(Vec::len).sum::<usize>());
+        let mut pairs_left = budget.saturating_sub(subsets_built);
         let all: TableMask = (0..num_tables).try_collect()?;
         'pairs: for build_mask in subsets.iter().skip(1).flatten() {
             if build_mask.count().saturating_add(2) > num_tables {
@@ -1850,6 +1842,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         break 'pairs;
                     };
                     pairs_left = budget_left;
+                    pairs_tried = pairs_tried.saturating_add(1);
                     let (Some(probe_table), Some(probe_constraints)) =
                         (joined_tables.get(probe), constraints.get(probe))
                     else {
@@ -1992,6 +1985,11 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         }
     }
 
+    super::search_budget::note_search(
+        super::search_budget::Algorithm::Exact,
+        subsets_built.saturating_add(pairs_tried),
+        search_started.elapsed(),
+    );
     match best_plan {
         Some(best_plan) => Ok(Some(BestJoinOrderResult {
             best_plan,
@@ -5375,7 +5373,6 @@ mod tests {
             &DEFAULT_PARAMS,
         )
         .unwrap();
-        let joined_before_probe_mask: TableMask = [0].into_iter().try_collect().unwrap();
         let method = try_hash_join_access_method(
             &table_references.joined_tables()[0],
             &table_references.joined_tables()[1],
@@ -5383,7 +5380,6 @@ mod tests {
             1,
             &constraints[0],
             &constraints[1],
-            &joined_before_probe_mask,
             &mut where_clause,
             std::iter::once((
                 0,
@@ -5394,34 +5390,14 @@ mod tests {
             1_000.0,
             1_000.0,
             1.0,
-            true,
             &[],
             table_references.joined_tables(),
             &DEFAULT_PARAMS,
-            true,
         )
         .unwrap()
         .unwrap();
 
         assert_eq!(method.estimated_rows_per_outer_row, 1.0);
-        assert!(can_replace_build_index_with_hash(&constraints[1], false));
-
-        where_clause.push(_create_binary_expr(
-            _create_column_expr(table_references.joined_tables()[1].internal_id, 0, false),
-            Operator::Greater,
-            _create_numeric_literal("500"),
-        ));
-        let constraints = constraints_from_where_clause(
-            &where_clause,
-            &table_references,
-            &available_indexes,
-            &[],
-            &empty_schema(),
-            &DEFAULT_PARAMS,
-        )
-        .unwrap();
-        assert!(!can_replace_build_index_with_hash(&constraints[1], false));
-        assert!(can_replace_build_index_with_hash(&constraints[1], true));
     }
 
     /// Do: ask for the greedy search's starting table when every table must follow another (an

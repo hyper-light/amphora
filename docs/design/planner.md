@@ -2020,9 +2020,10 @@ under load). It now samples:
 - **A WHERE step** (`Work::WhereStep`, `cpu_cost_per_where_step`). Two of the engine's values
   compared, timed per key; the planner's step cost is that weight times the row's, in place of
   0.003. The defaults of both stand only where the clock never moved.
-- **Open.** `hash_bytes_per_row` (100) and the `rhs_has_selective_seek` gate are still to remove;
-  LIP and predicate transfer across star joins (T-QT.5.3), sort-merge and prefetched index joins
-  are not built.
+- **Open.** `hash_bytes_per_row` is now the build table's row (lane qs5-13, T-QT.5.7), and the
+  `rhs_has_selective_seek` gate is gone (lane qs5-15, T-QT.5.8): a seek kept from the start and a
+  hash join are weighed by cost alone. LIP and predicate transfer across star joins (T-QT.5.3),
+  sort-merge and prefetched index joins are not built.
 
 ## Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model
 

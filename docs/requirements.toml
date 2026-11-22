@@ -845,6 +845,8 @@ tests = [
   { id = "T-QT.5.6", text = "t_qt_5_5_calibration_weights_hold_through_preempted_samples and t_qt_5_5_a_median_settles_once_its_spread_is_within_the_resolution (crates/engine/translate/optimizer/learned_costs.rs) — passes when calibration with a clock that jumps a millisecond every eleventh reading gives the steady clock's weights, and a kind's samples stop once their median's order-statistic standard error is within the timer's cost" },
   # lane qs5-13
   { id = "T-QT.5.7", text = "t_qt_5_7_hash_entry_bytes_are_the_build_tables_row (crates/engine/translate/optimizer/cost_params.rs) — passes when a hash join's entry bytes are its build table's page over its rows a page plus the entry's fixed bytes, the build's and not the probe's" },
+  # lane qs5-15
+  { id = "T-QT.5.8", text = "crates/engine/tests/join_methods.rs, nested_loops.rs and hash_semi_join.rs, with the rhs_has_selective_seek gate gone (crates/engine/translate/optimizer/join.rs) — passes when a seek and a hash join are weighed by cost alone and each query answers as with nested loops forced" },
 ]
 
 # lane records-api: Amphora's own IDs for CP-T1.5's Records API (kiln goal a1f386fe, G9 step 1;

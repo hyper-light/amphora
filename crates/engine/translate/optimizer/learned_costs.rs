@@ -171,6 +171,8 @@ pub(crate) struct LearnedCosts {
     hash_probe: Sampling,
     /// What timing one run costs: two clock reads, as calibration timed them.
     timing_nanos: f64,
+    /// PL.8: the join search's measured time a candidate, and what it chose.
+    search: super::search_budget::SearchRate,
 }
 
 /// Amphora (QT.5, step 3a): which runs of one operation are timed, one in `every`, and the spread
@@ -268,7 +270,13 @@ impl LearnedCosts {
             hash_build: Sampling::new(),
             hash_probe: Sampling::new(),
             timing_nanos: rates.timing_nanos,
+            search: super::search_budget::SearchRate::default(),
         }
+    }
+
+    /// PL.8: the join search's measured rate and counts.
+    pub(crate) fn search(&self) -> &super::search_budget::SearchRate {
+        &self.search
     }
 
     fn sampling(&self, work: Work) -> Option<&Sampling> {
