@@ -16,8 +16,9 @@
 #   page), set per database through the admin API: POST /v1/namespaces/<ns>/config with
 #   durability_mode (http/admin/mod.rs:145-148, 296-345; block_reads and block_writes are required
 #   fields of that body). Here: Strong on the default namespace, set before the first measured
-#   connection exists (the primary is restarted after setting it, so every connection is opened
-#   under it), and `up` refuses unless the primary answers PRAGMA synchronous = 2.
+#   connection exists (sqld keeps it in its metastore database, namespace/meta_store.rs:113 and 366,
+#   and the primary is restarted after setting it, so every connection is opened under it), and `up`
+#   refuses unless the primary answers PRAGMA synchronous = 2.
 # - Replicas pull the primary's replication log; a commit only notifies them
 #   (replication/primary/replication_logger_wal.rs:60 and 113-116, send_replace) and returns. No
 #   flag makes the primary wait for a replica (src/main.rs's options), so no synchronous replica
