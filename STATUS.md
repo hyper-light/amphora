@@ -706,6 +706,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   is within the timer's cost; it also times a Bloom filter's lookup and a WHERE step, which now price the filter and
   `cpu_cost_per_where_step` (`docs/design/planner.md`, "Decision (lane qs5-10)"). Left: `hash_bytes_per_row`, the
   `rhs_has_selective_seek` gate, LIP and predicate transfer, sort-merge and prefetched index joins.
+- **A chained hash join's materialized prefix leaves the main plan** (lane qs5-12): where a hash join's build table
+  was an earlier join's probe, the build input is materialized from the join prefix, and the main plan no longer
+  opens or lists the earlier join's build table (`main_loop/init.rs`, `subquery.rs` walk the join order).
+  `nested_loops::a_chain_of_hash_joins_reads_each_table_once` failed whenever calibration chose the chained plan.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
