@@ -75,6 +75,25 @@ pub fn process_pages() -> Arc<SharedPages> {
         .clone()
 }
 
+/// The settings every connection of a store is made with: the engine's versioned storage held to
+/// its share of the memory this process may use (G7 step 2, `AC-NS.2.1`), read from the system
+/// once. Where the system doesn't say ([`crate::memory::limit`]), the engine takes its share of the
+/// machine's memory.
+fn connect_opts() -> ConnectOpts {
+    static BUDGET: OnceLock<Option<u64>> = OnceLock::new();
+    let budget = *BUDGET.get_or_init(|| {
+        crate::memory::limit().map(|bytes| {
+            bytes
+                .checked_div(amphora_engine::storage::versioned::memory::SHARE_DIVISOR)
+                .unwrap_or(0)
+        })
+    });
+    match budget {
+        Some(bytes) => ConnectOpts::new().with_memory_budget(bytes),
+        None => ConnectOpts::new(),
+    }
+}
+
 /// The pages a process's pool keeps at most, given the bytes of memory the process may use: a
 /// [`MEMORY_SHARE_DIVISOR`]th of them, at least [`MIN_PROCESS_PAGES`]; [`UNKNOWN_MEMORY_PAGES`]
 /// when the system doesn't say.
@@ -210,7 +229,7 @@ impl Db {
                 .db_opts(DatabaseOpts::new().with_without_rowid(true)),
         )
         .map_err(fail)?;
-        let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
+        let conn = db.connect(connect_opts()).map_err(fail)?;
         conn.set_statement_journals(false);
         Ok(Self {
             io,
@@ -305,7 +324,7 @@ impl Db {
             }
         };
         let conn = db
-            .connect(ConnectOpts::new())
+            .connect(connect_opts())
             .map_err(|e| anyhow::anyhow!("connecting to {name}: {e}"))?;
         conn.set_statement_journals(false);
         let d = Self {
@@ -349,7 +368,7 @@ impl Db {
         let r = Self {
             io: self.io.clone(),
             db: self.db.clone(),
-            conn: self.db.connect(ConnectOpts::new()).map_err(fail)?,
+            conn: self.db.connect(connect_opts()).map_err(fail)?,
             path: self.path.clone(),
             statements: cache::Cache::default(),
             owner: self.owner.clone(),
@@ -379,7 +398,7 @@ impl Db {
             let r = Self {
                 io: held.io.clone(),
                 db: held.db.clone(),
-                conn: held.db.connect(ConnectOpts::new()).map_err(fail)?,
+                conn: held.db.connect(connect_opts()).map_err(fail)?,
                 path: path.clone(),
                 statements: cache::Cache::default(),
                 owner: held.owner.clone(),

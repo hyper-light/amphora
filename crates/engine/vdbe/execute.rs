@@ -1095,7 +1095,7 @@ pub fn op_not_null(
 }
 
 macro_rules! comparison_opcode {
-    ($name:ident, $variant:ident, $op:expr, $jumps:expr) => {
+    ($name:ident, $variant:ident, $op:expr) => {
         #[inline(always)]
         pub fn $name(
             program: &Program,
@@ -1116,55 +1116,50 @@ macro_rules! comparison_opcode {
             let crate::vdbe::BranchOffset::Offset(target_pc) = *target_pc else {
                 return Err(unresolved_branch_target(*target_pc));
             };
-
-            // Two integers compare directly: no NULL handling, affinity or collation.
-            if let (
-                Register::Value(Value::Numeric(Numeric::Integer(l))),
-                Register::Value(Value::Numeric(Numeric::Integer(r))),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
-                let jumps = $jumps;
-                state.pc = if jumps(*l, *r) {
-                    target_pc
-                } else {
-                    state.pc + 1
-                };
-                return Ok(InsnFunctionStepResult::Step);
-            }
-            if let (
-                Register::Value(lhs_value @ Value::Text(l)),
-                Register::Value(rhs_value @ Value::Text(r)),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
-                if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
-                    state.pc = if comparison_matches_order($op, l.as_str().cmp(r.as_str())) {
-                        target_pc
-                    } else {
-                        state.pc + 1
-                    };
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-            }
-            op_comparison_slow(
+            let jumps = comparison_jumps(
                 program,
-                state,
-                *lhs,
-                *rhs,
-                target_pc,
+                state.registers[*lhs].get_value(),
+                state.registers[*rhs].get_value(),
                 *flags,
-                collation.unwrap_or_default(),
+                *collation,
                 $op,
-            )
+            )?;
+            state.pc = if jumps { target_pc } else { state.pc + 1 };
+            Ok(InsnFunctionStepResult::Step)
         }
     };
 }
 
-comparison_opcode!(op_eq, Eq, ComparisonOp::Eq, |l: i64, r: i64| l == r);
-comparison_opcode!(op_ne, Ne, ComparisonOp::Ne, |l: i64, r: i64| l != r);
-comparison_opcode!(op_lt, Lt, ComparisonOp::Lt, |l: i64, r: i64| l < r);
-comparison_opcode!(op_le, Le, ComparisonOp::Le, |l: i64, r: i64| l <= r);
-comparison_opcode!(op_gt, Gt, ComparisonOp::Gt, |l: i64, r: i64| l > r);
-comparison_opcode!(op_ge, Ge, ComparisonOp::Ge, |l: i64, r: i64| l >= r);
+comparison_opcode!(op_eq, Eq, ComparisonOp::Eq);
+comparison_opcode!(op_ne, Ne, ComparisonOp::Ne);
+comparison_opcode!(op_lt, Lt, ComparisonOp::Lt);
+comparison_opcode!(op_le, Le, ComparisonOp::Le);
+comparison_opcode!(op_gt, Gt, ComparisonOp::Gt);
+comparison_opcode!(op_ge, Ge, ComparisonOp::Ge);
+
+/// Whether a comparison opcode jumps for these operands. Amphora (QT.7): the one place a
+/// comparison's rules live (NULLs, affinity, collation, arrays), read by the opcodes and by the
+/// batched filters over a leaf's column vectors (`leaf_batch/fused.rs`).
+#[inline(always)]
+pub(super) fn comparison_jumps(
+    program: &Program,
+    lhs: &Value,
+    rhs: &Value,
+    flags: crate::vdbe::insn::CmpInsFlags,
+    collation: Option<CollationSeq>,
+    op: ComparisonOp,
+) -> Result<bool> {
+    // Two integers compare directly: no NULL handling, affinity or collation.
+    if let (Value::Numeric(Numeric::Integer(l)), Value::Numeric(Numeric::Integer(r))) = (lhs, rhs) {
+        return Ok(comparison_matches_order(op, l.cmp(r)));
+    }
+    if let (Value::Text(l), Value::Text(r)) = (lhs, rhs) {
+        if texts_compare_as_bytes(lhs, rhs, flags, collation) {
+            return Ok(comparison_matches_order(op, l.as_str().cmp(r.as_str())));
+        }
+    }
+    comparison_slow(program, lhs, rhs, flags, collation.unwrap_or_default(), op)
+}
 
 #[inline(always)]
 fn texts_compare_as_bytes(
@@ -1184,42 +1179,24 @@ fn texts_compare_as_bytes(
             && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
 }
 
-/// The comparison opcodes for every operand pair that is not two integers or
-/// two texts compared by their bytes: NULLs, affinity conversions, text
-/// collations and array comparison.
+/// The comparison for every operand pair that is not two integers or two texts compared by
+/// their bytes: NULLs, affinity conversions, text collations and array comparison.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn op_comparison_slow(
+fn comparison_slow(
     program: &Program,
-    state: &mut ProgramState,
-    lhs: usize,
-    rhs: usize,
-    target_pc: crate::vdbe::InsnReference,
+    lhs_value: &Value,
+    rhs_value: &Value,
     flags: crate::vdbe::insn::CmpInsFlags,
     collation: CollationSeq,
     op: ComparisonOp,
-) -> InsnResult {
+) -> Result<bool> {
     let null_eq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
 
-    let lhs_value = state.registers[lhs].get_value();
-    let rhs_value = state.registers[rhs].get_value();
-
-    macro_rules! take_jump_if {
-        ($should_take_jump:expr) => {
-            if $should_take_jump {
-                state.pc = target_pc;
-            } else {
-                state.pc += 1;
-            }
-            return Ok(InsnFunctionStepResult::Step);
-        };
-    }
-
     match (lhs_value, rhs_value) {
         (Value::Null, _) | (_, Value::Null) => {
-            let should_jump = if null_eq {
+            return Ok(if null_eq {
                 // SQLITE_NULLEQ makes comparison two-valued and orders a
                 // single NULL below every non-NULL value. Although normal
                 // expression translation only uses it with Eq/Ne, RANGE
@@ -1229,21 +1206,19 @@ fn op_comparison_slow(
                 comparison_matches_order(op, order)
             } else {
                 jump_if_null
-            };
-            take_jump_if!(should_jump);
+            });
         }
         (Value::Blob(lb), Value::Blob(rb)) if flags.has_array_cmp() => {
             // Element-wise array comparison
             if let Ok(ord) = compare_arrays(lb, rb) {
-                let should_jump = match op {
+                return Ok(match op {
                     ComparisonOp::Eq => ord.is_eq(),
                     ComparisonOp::Ne => !ord.is_eq(),
                     ComparisonOp::Lt => ord.is_lt(),
                     ComparisonOp::Le => ord.is_le(),
                     ComparisonOp::Gt => ord.is_gt(),
                     ComparisonOp::Ge => ord.is_ge(),
-                };
-                take_jump_if!(should_jump);
+                });
             }
         }
         (_, _) => {}
@@ -1261,18 +1236,16 @@ fn op_comparison_slow(
     let rhs_for_compare = new_rhs
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
-    let should_jump = if collation.is_custom() {
-        let order =
-            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
-        comparison_matches_order(op, order)
-    } else {
-        op.compare(lhs_for_compare, rhs_for_compare, collation)
-    };
-
     // The conversion is the comparison's own: the registers keep their values, as SQLite's
     // OP_Eq undoes what applyAffinity() did to them, so a CASE base, a BETWEEN's left side or a
     // constant compared again reads as it was.
-    take_jump_if!(should_jump);
+    if collation.is_custom() {
+        let order =
+            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
+        Ok(comparison_matches_order(op, order))
+    } else {
+        Ok(op.compare(lhs_for_compare, rhs_for_compare, collation))
+    }
 }
 
 #[inline(always)]
@@ -3635,7 +3608,7 @@ pub fn op_result_row(
 // pointer-identity check.
 #[cfg_attr(not(test), inline(always))]
 pub fn op_next(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -3673,7 +3646,35 @@ pub fn op_next(
         // Added as 0 or 1 so neither counter costs a branch per row.
         state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(*fullscan as u64);
         state.metrics.index_steps = state.metrics.index_steps.wrapping_add(*is_index as u64);
+        let next_pc = state.pc;
         state.pc = pc_if_next.as_offset_int();
+        // Amphora (QT.7): a fused scan loop runs its body over the rest of the leaf's batch at
+        // once, leaves the cursor on the last row it ran, and steps this Next again.
+        if let Some(fused) = program
+            .leaf_batch_plan
+            .as_deref()
+            .and_then(|plan| plan.fused_loop(next_pc as usize))
+        {
+            let rows = super::leaf_batch::fused::run(program, state, fused)?;
+            if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
+                let skipped = skipped as u64;
+                state.record_rows_read(skipped);
+                state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
+                state.metrics.search_count =
+                    state.metrics.search_count.wrapping_add(skipped as i64);
+                state.metrics.fullscan_steps = state
+                    .metrics
+                    .fullscan_steps
+                    .wrapping_add(*fullscan as u64 * skipped);
+                state.metrics.index_steps = state
+                    .metrics
+                    .index_steps
+                    .wrapping_add(*is_index as u64 * skipped);
+            }
+            if rows > 0 {
+                state.pc = next_pc;
+            }
+        }
     } else {
         state.pc += 1;
     }
@@ -6174,14 +6175,20 @@ pub fn op_real_affinity(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(RealAffinity { register }, insn);
-    if let Value::Numeric(Numeric::Integer(i)) = &state.registers[*register].get_value() {
-        state.registers[*register].set_float(
+    apply_real_affinity(&mut state.registers[*register]);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// A REAL column's affinity: an integer read from it becomes a real. Amphora (QT.7): shared by
+/// the opcode and the batched filters (`leaf_batch/fused.rs`).
+pub(crate) fn apply_real_affinity(register: &mut Register) {
+    if let Value::Numeric(Numeric::Integer(i)) = &register.get_value() {
+        register.set_float(
             NonNan::new(*i as f64)
                 .expect("i64 passed to op_real_affinity should be a valid NonNan"),
         );
     };
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_string8(
@@ -9002,6 +9009,24 @@ pub fn op_agg_step(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
+    let arg = match &state.registers[data.col] {
+        Register::Value(Value::Numeric(arg)) => Some(*arg),
+        _ => None,
+    };
+    if agg_step_fast(data, arg, &mut state.registers[data.acc_reg]) {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    op_agg_step_slow(program, state, data)
+}
+
+/// The fast paths of an aggregate step: the common numeric cases of count, sum, avg and
+/// min/max over an initialized accumulator, given the argument when it is a number. Returns
+/// false when the step needs the slow path (every other function and value type, the first-row
+/// initialization and the error cases). Amphora (QT.7): shared by the opcode and the batched
+/// aggregates over a selection (`leaf_batch/fused.rs`).
+#[inline(always)]
+pub(crate) fn agg_step_fast(data: &AggStepData, arg: Option<Numeric>, acc: &mut Register) -> bool {
     // Fast paths for the common numeric cases of count, sum, avg and min/max
     // over an initialized accumulator. The slow path keeps every other
     // function and value type, the first-row initialization and the error
@@ -9009,10 +9034,8 @@ pub fn op_agg_step(
     if let AccumulatorFunc::Agg(agg) = &data.func {
         match agg {
             AggFunc::Sum | AggFunc::Total => {
-                if let Register::Value(Value::Numeric(arg)) = state.registers[data.col] {
-                    if let Register::Aggregate(AggContext::Builtin(payload)) =
-                        &mut state.registers[data.acc_reg]
-                    {
+                if let Some(arg) = arg {
+                    if let Register::Aggregate(AggContext::Builtin(payload)) = &mut *acc {
                         // payload[2] is the approx flag and payload[3] the overflow flag.
                         match (arg, payload.as_mut_slice()) {
                             (
@@ -9024,8 +9047,7 @@ pub fn op_agg_step(
                                 {
                                     *acc = sum;
                                     *count = rows;
-                                    state.pc += 1;
-                                    return Ok(InsnFunctionStepResult::Step);
+                                    return true;
                                 }
                             }
                             (
@@ -9040,8 +9062,7 @@ pub fn op_agg_step(
                                     *r_err = err;
                                     *ovrfl = 0;
                                     *count = rows;
-                                    state.pc += 1;
-                                    return Ok(InsnFunctionStepResult::Step);
+                                    return true;
                                 }
                             }
                             (
@@ -9055,8 +9076,7 @@ pub fn op_agg_step(
                                     *acc = sum;
                                     *r_err = err;
                                     *count = rows;
-                                    state.pc += 1;
-                                    return Ok(InsnFunctionStepResult::Step);
+                                    return true;
                                 }
                             }
                             _ => {}
@@ -9065,7 +9085,7 @@ pub fn op_agg_step(
                 }
             }
             AggFunc::Avg => {
-                if let Register::Value(Value::Numeric(arg)) = state.registers[data.col] {
+                if let Some(arg) = arg {
                     let arg = match arg {
                         Numeric::Float(f) => Some(f64::from(f)),
                         Numeric::Integer(i) if i.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
@@ -9074,7 +9094,7 @@ pub fn op_agg_step(
                         Numeric::Integer(_) => None,
                     };
                     if let (Some(arg), Register::Aggregate(AggContext::Builtin(payload))) =
-                        (arg, &mut state.registers[data.acc_reg])
+                        (arg, &mut *acc)
                     {
                         if let [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(count)), ..] =
                             payload.as_mut_slice()
@@ -9085,27 +9105,21 @@ pub fn op_agg_step(
                                 *acc = sum;
                                 *r_err = err;
                                 *count = rows;
-                                state.pc += 1;
-                                return Ok(InsnFunctionStepResult::Step);
+                                return true;
                             }
                         }
                     }
                 }
             }
             AggFunc::Count | AggFunc::Count0 => {
-                let counts = matches!(agg, AggFunc::Count0)
-                    || matches!(
-                        state.registers[data.col],
-                        Register::Value(Value::Numeric(_))
-                    );
+                let counts = matches!(agg, AggFunc::Count0) || arg.is_some();
                 if let (true, Register::Aggregate(AggContext::Builtin(payload))) =
-                    (counts, &mut state.registers[data.acc_reg])
+                    (counts, &mut *acc)
                 {
                     if let [Value::Numeric(Numeric::Integer(count))] = payload.as_mut_slice() {
                         if let Some(rows) = count.checked_add(1) {
                             *count = rows;
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
+                            return true;
                         }
                     }
                 }
@@ -9113,12 +9127,8 @@ pub fn op_agg_step(
             AggFunc::Min | AggFunc::Max
                 if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
             {
-                if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
-                    state.registers[data.col]
-                {
-                    if let Register::Aggregate(AggContext::Builtin(payload)) =
-                        &mut state.registers[data.acc_reg]
-                    {
+                if let Some(Numeric::Integer(arg)) = arg {
+                    if let Register::Aggregate(AggContext::Builtin(payload)) = &mut *acc {
                         if let Some(Value::Numeric(Numeric::Integer(best))) = payload.first_mut() {
                             let better = match agg {
                                 AggFunc::Max => arg > *best,
@@ -9127,8 +9137,7 @@ pub fn op_agg_step(
                             if better {
                                 *best = arg;
                             }
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
+                            return true;
                         }
                     }
                 }
@@ -9136,11 +9145,15 @@ pub fn op_agg_step(
             _ => {}
         }
     }
-    op_agg_step_slow(program, state, data)
+    false
 }
 
 #[inline(never)]
-fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
+pub(crate) fn op_agg_step_slow(
+    program: &Program,
+    state: &mut ProgramState,
+    data: &AggStepData,
+) -> InsnResult {
     let AggStepData {
         acc_reg,
         col,
@@ -16938,6 +16951,24 @@ pub fn op_integrity_check(
         message_register,
     } = data.as_ref();
 
+    // Amphora (G7 step 2, `AC-NS.2.1`): the main database's trees on the versioned storage are
+    // checked there; the pager's pages hold none of them.
+    if *db == MAIN_DB_ID {
+        if let Some(switch) = program.connection.versioned.as_ref() {
+            let found = switch.check(roots, *max_errors)?;
+            let register = state
+                .registers
+                .get_mut(*message_register)
+                .ok_or_else(|| LimboError::InternalError("integrity_check: no register".into()))?;
+            if found.is_empty() {
+                register.set_null();
+            } else {
+                register.set_text(Text::new(found.join("\n")))?;
+            }
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
     let target_pager = if *db == MAIN_DB_ID {
