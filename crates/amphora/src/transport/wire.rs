@@ -19,8 +19,10 @@ pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
 /// 5: Request gained Application, the client's claim before its ordinary request. 6: Request gained
 /// LocalSession, a local read. 7: Request gained Pull and Answer Pulled, a node's half of a copy
 /// or catch-up batch for another node's new group (CP-T1.9; reshard.md, "Moves across nodes"). 8: Request gained
-/// Step and Answer Stepped, one step of a transaction across groups (CP-T1.10; xgroup.md, "Over the transport").
-pub(super) const VERSION: u32 = 8;
+/// Step and Answer Stepped, one step of a transaction across groups (CP-T1.10; xgroup.md, "Over the transport"). 9: Answer
+/// Stepped gained closed, the group's closed time after the step (AC-T1.10.1, T-T1.10.W4; xgroup.md, "Reading its own
+/// writes across groups").
+pub(super) const VERSION: u32 = 9;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Hello {
@@ -143,10 +145,12 @@ pub(super) enum Answer {
     // Appended: a Pull's answer.
     Pulled(crate::groups::Pulled),
     // Appended: a Step's answer, with the group's newest commit stamp after it (none: the group
-    // makes no stamps).
+    // makes no stamps) and, since version 9, its closed time after it, the microseconds of its
+    // session token (none: the group keeps no closed time, its reads see every write).
     Stepped {
         reply: crate::xgroup::Reply,
         latest: Option<u64>,
+        closed: Option<u64>,
     },
 }
 pub(super) type Response = Result<Answer, Refusal>;

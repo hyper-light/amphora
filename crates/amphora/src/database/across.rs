@@ -2028,7 +2028,7 @@ mod tests {
                 writes: vec![(record_key("n", "f", &key(g)).unwrap(), Some(vec![1]))],
                 stage: None,
             };
-            let (reply, latest) = serve(g, carried, lock);
+            let (reply, latest, _) = serve(g, carried, lock);
             assert!(matches!(reply, Reply::Locked { .. }), "{reply:?}");
             carried = carried.max(latest.unwrap());
         }

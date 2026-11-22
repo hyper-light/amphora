@@ -532,8 +532,11 @@ pub(super) fn submit(
         Operation::Mutation(Mutation::CompactStep { before, .. }) => {
             records.compact_step(before, until).map(Answer::Compacted)
         }
-        Operation::Get(family, key, at) => records.get(&family, &key, at, until).map(Answer::Row),
-        Operation::Scan(family, scan) => records.scan(&family, scan, until).map(Answer::Page),
+        // The owner's own switch says what its get does with a locked row.
+        Operation::Get(family, key, at, _) => {
+            records.get(&family, &key, at, until).map(Answer::Row)
+        }
+        Operation::Scan(family, scan, _) => records.scan(&family, scan, until).map(Answer::Page),
         Operation::Changes(family, after, limit) => records
             .changes(&family, after, limit, until)
             .map(Answer::Changes),

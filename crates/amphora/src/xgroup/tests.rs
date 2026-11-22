@@ -648,7 +648,8 @@ impl Sim {
                 if life == self.life
                     && let Some(coordinator) = self.coordinator.as_mut()
                 {
-                    let events = coordinator.reply(id, reply).unwrap();
+                    // The simulator's groups keep no clock.
+                    let events = coordinator.reply(id, reply, None).unwrap();
                     self.inputs += 1;
                     self.dispatch(events);
                 }
@@ -931,7 +932,7 @@ fn check(sim: &Sim, ops: &[Op]) -> Vec<String> {
         }
         if outcome(&op.id) == Outcome::Committed {
             let seen = match answered {
-                Some(Answer::Committed { reads }) => reads.iter().cloned().collect(),
+                Some(Answer::Committed { reads, .. }) => reads.iter().cloned().collect(),
                 _ => sim
                     .applied_reads
                     .get(&op.id)
@@ -1293,5 +1294,61 @@ fn ac_t1_10_5_a_crash_after_every_resolution_landed_leaves_it_committed() {
             writes: writes.into_iter().collect(),
         }];
         assert_eq!(check(&sim, &ops), Vec::<String>::new(), "{protocol:?}");
+    }
+}
+
+/// AC-T1.10.1 (lane xgroup-sql-11; Ada's decision: the commit's revision across groups is the
+/// cross-group HLC timestamp): a committed answer's `at` is the latest clock its lock replies
+/// carried, fixed before the decision, and no other step's clock moves it. Do: three groups in
+/// memory, both protocols; each group's lock reply carries its own clock (30, 50, 40), every
+/// other reply a later one (999); a transaction writing a key in each group. Expect: committed,
+/// `at` 50.
+#[test]
+fn ac_t1_10_1_the_commit_stamp_is_the_latest_lock_replys_clock() {
+    use std::collections::VecDeque;
+    let lock_clocks = [30u64, 50, 40];
+    for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+        let mut groups: Vec<Memory> = (0..3).map(|_| Memory::default()).collect();
+        let config = Config {
+            id: 7,
+            protocol,
+            registry: 0,
+            groups: vec![0, 1, 2],
+            in_flight: 1,
+        };
+        let (mut coordinator, first) = Coordinator::start(config).unwrap();
+        let mut queue: VecDeque<Event> = first.into();
+        let mut answer = None;
+        let mut begun = false;
+        let txn = Txn {
+            reads: Vec::new(),
+            writes: (0..3u8).map(|g| (vec![g], Some(vec![g]))).collect(),
+            conds: Vec::new(),
+        };
+        let route = |key: &[u8]| key.first().map_or(0, |g| GroupId::from(*g));
+        while let Some(event) = queue.pop_front() {
+            match event {
+                Event::Send(send) => {
+                    let at = usize::try_from(send.group).unwrap();
+                    let reply = apply(send.group, &mut groups[at], &send.envelope).unwrap();
+                    let clock = match send.envelope.step {
+                        Step::Lock { .. } => lock_clocks[at],
+                        _ => 999,
+                    };
+                    queue.extend(coordinator.reply(send.id, Ok(reply), Some(clock)).unwrap());
+                }
+                Event::Ready if !begun => {
+                    begun = true;
+                    let (_, events) = coordinator.begin(txn.clone(), route).unwrap();
+                    queue.extend(events);
+                }
+                Event::Answer { answer: a, .. } => answer = Some(a),
+                _ => {}
+            }
+        }
+        assert!(
+            matches!(answer, Some(Answer::Committed { at: Some(50), .. })),
+            "{protocol:?}: {answer:?}"
+        );
     }
 }

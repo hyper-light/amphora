@@ -1291,6 +1291,66 @@ tests = [
   { id = "T-T1.10.R2", text = "xgroup::sql::sessions::ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing — passes when a group failing at each of a session transaction's steps leaves its rows all written or none after recovery, equal to one group's, both protocols, both ends reached" },
 ]
 
+# lane xgroup-sql-8: a SQL session reads its own writes across groups (kiln goal e25ba5fe; xgroup.md, "Reading its
+# own writes across groups"). Built behind Options::answer_at, today's answer at the decision the control.
+[[own]]
+id = "T1.10.W"
+title = "A transaction across groups answers once every group resolved it, behind a switch whose control is today's answer at the decision"
+criteria = [
+  { id = "AC-T1.10.W1", text = "Under AnswerAt::Resolved each answer, aborts included, is held until every group the transaction touched has resolved it, counted (answers held now and at most); a stop while one is held answers UnknownOutcome; under Decided (the control) it answers at the decision" },
+  { id = "AC-T1.10.W2", text = "commit_records answers Token::at the newest closed time any touched group published after the commit answered: the cross-group hybrid-logical-clock timestamp the session tokens use" },
+]
+tests = [
+  { id = "T-T1.10.W1", text = "xgroup::sql::sessions::ac_t1_10_1_a_read_straight_after_the_answer_in_a_group_behind — passes when, with group 1's resolution held back, the control answers first and a read of group 1 misses the row, while Resolved holds the answer (counted) until group 1 resolves and the read finds it, both protocols" },
+  { id = "T-T1.10.W2", text = "xgroup::sql::sessions::ac_t1_10_1_a_retry_straight_after_an_abort_meets_no_lock_of_its_own — passes when a two-phase transaction aborted with every lock held and group 0's resolution held back is retried at once with room for a second caller: the control's retry meets a lock of the first try's, Resolved's commits" },
+  { id = "T-T1.10.W3", text = "xgroup::sql::sessions::ac_t1_10_1_commit_records_writes_rows_in_every_group — passes when a Records transaction over three groups through commit_records, answered once resolved, reads back in every group straight after its answer, both protocols" },
+]
+
+# lane xgroup-sql-9: a group on another node adds its closed time to a cross-group commit's token, and a session
+# reads at a follower behind the commit (kiln goal e25ba5fe; xgroup.md, "Reading its own writes across groups").
+[[own]]
+id = "T1.10.WN"
+title = "A cross-group commit's token covers groups on other nodes, and a session reading at a follower behind it waits or is redirected"
+criteria = [
+  { id = "AC-T1.10.W3", text = "A step's answer from a group on a node carries the group's closed time after the step (Answer::Stepped's closed, wire version 9; none for a group that keeps none), and commit_records folds the newest heard from each touched group on a node into its token" },
+  { id = "AC-T1.10.W4", text = "A session read carrying a cross-group commit's token at a follower behind it never answers without the commit: it waits on the follower's publication until it has applied the token's time, or is redirected to the leader" },
+]
+tests = [
+  { id = "T-T1.10.W4", text = "xgroup::sql::sessions::t_t1_10_w4_a_group_on_a_second_node_adds_its_closed_time_to_the_token — passes when a Records transaction across a local standalone group and a replicated group reached only over the transport answers a token past 0 and no later than that group's own token after it, and a read carrying it there sees the commit, both protocols" },
+  { id = "T-T1.10.W5", text = "xgroup::sql::sessions::t_t1_10_w5_a_token_read_at_a_follower_behind_waits_or_is_redirected — passes when, with one of group 1's three members cut off before a cross-group commit, a read with no token there misses it and a read carrying the token, begun while it is cut off, either sees the commit once it is reached again or is redirected to the leader, where the token sees it, both protocols" },
+]
+
+# lane xgroup-sql-10: a cross-group commit's answer carries its commit stamp, for lane split-merge-20's
+# conditional commits across groups (kiln goal e25ba5fe; xgroup.md, "Reading its own writes across groups").
+[[own]]
+id = "T1.10.WS"
+title = "A committed answer across groups carries its commit stamp, the cross-group hybrid-logical-clock timestamp"
+criteria = [
+  { id = "AC-T1.10.W5", text = "Answer::Committed carries at, an Option<u64> of microseconds on the groups' hybrid logical clock (Token::at's): stamped by the coordinator's shell, through the coordinator and the one-group fast path alike, from the newest closed time of the groups it touched read once it answered; none when none of them keeps one; a stamp unread by the deadline answers UnknownOutcome, counted" },
+]
+tests = [
+  { id = "T-T1.10.W6", text = "xgroup::sql::sessions::t_t1_10_w6_a_committed_answer_carries_its_commit_stamp — passes when commits across a standalone group and a replicated one, reached over the transport and in process, and one in the replicated group alone, each answer a stamp past 0, no later than that group's token after it and no earlier than the stamp before; two standalone groups' answer none; both protocols" },
+]
+
+# lane xgroup-sql-10: reads that wait on a held lock, option 2 of xgroup-sql-7's, as a sibling switch of AnswerAt
+# (xgroup.md, "Reading its own writes across groups"); today's read the control.
+[[own]]
+id = "T1.10.WL"
+title = "A Records get of a row under a cross-group lock waits for its resolution, behind a switch whose control is today's read"
+criteria = [
+  { id = "AC-T1.10.W6", text = "Under LockedReads::Wait a Records get of a latest row a cross-group transaction holds a lock on answers nothing until the lock is gone, woken by the group's change event (no timer, no missed wake), then reads the row as it stands; refused Timeout at its deadline; counted (locked_waits); under Committed (the control) it answers the row as last committed; a read at an older revision never waits" },
+]
+tests = [
+  { id = "T-T1.10.W7", text = "xgroup::sql::sessions::t_t1_10_w7_a_read_during_the_resolve_waits_on_the_lock_or_the_answer_does — passes when, with group 1's resolution held back, the control's read of group 1 straight after the answer misses the row; under Resolved the answer doesn't come before group 1 resolves and the read finds the row with no wait; under Decided with Wait the answer comes first and the read waits (counted once) until group 1 resolves, then finds the row; both protocols; each setting's commit and read times printed" },
+  { id = "T-T1.10.W8", text = "xgroup::sql::sessions::t_t1_10_w8_a_read_waiting_on_an_aborted_lock_answers_the_row_before — passes when, under Wait and under WaitOnLock, a read of a row a two-phase transaction aborted with every lock held still locks in group 0 waits (counted once) until group 0 resolves the abort, then answers the row as it was before the transaction" },
+  # lane xgroup-sql-11: WaitOnLock, a waiting read woken by its own row's resolution, against Wait's group-change wake.
+  { id = "T-T1.10.W9", text = "xgroup::sql::sessions::t_t1_10_w9_a_read_waiting_on_its_lock_is_woken_by_its_own_resolution_only — passes when, with group 1's resolution held back and a read of row 1 there waiting, eight commits of another row in group 1 then the resolution wake the read under WaitOnLock exactly once (locked_wakes 1) and under Wait at least once; both find the transaction's row; each setting's wakes printed" },
+  { id = "T-T1.10.W10", text = "xgroup::sql::sessions::t_t1_10_w10_a_scan_waits_on_a_held_lock_in_its_range_only — passes when, under Wait and under WaitOnLock, with group 1's resolution held back and rows 0 and 2 there, a scan of prefix 9 and a one-row page stopping at row 0 answer unwaited, and a scan of the whole family waits (counted once) until group 1 resolves, then answers rows 0, 1 (the transaction's) and 2" },
+  { id = "T-T1.10.W11", text = "xgroup::sql::sessions::t_t1_10_w11_a_sql_read_of_a_held_lock_runs_again_once_it_resolves — passes when, under Wait and under WaitOnLock, with group 1's resolution held back, a SQL session reading row 1 there through Database::query reads no row unwaited, and one through Database::query_waiting waits (counted once) until group 1 resolves, then reads the transaction's row, its session run at least twice" },
+  # lane xgroup-sql-11 (coordinator's 12:31Z ask): the one commit stamp, fixed before the decision.
+  { id = "T-T1.10.W12", text = "xgroup::tests::ac_t1_10_1_the_commit_stamp_is_the_latest_lock_replys_clock — passes when, under both protocols, three in-memory groups whose lock replies carry clocks 30, 50 and 40 and every other reply 999 commit a transaction writing in each, answered Committed with at 50" },
+]
+
 # lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session
 # tokens"). Ada's order 2026-11-22: built behind ReadMode, today's read the control.
 [[own]]
