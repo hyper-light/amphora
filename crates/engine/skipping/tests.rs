@@ -3063,4 +3063,156 @@ mod builds {
             assert_eq!(held, Some(300), "{mode:?}");
         }
     }
+
+    /// One run of a prepared statement bound to `values`: its rows, printed.
+    fn run_bound(stmt: &mut crate::Statement, values: &[crate::Value]) -> Vec<String> {
+        stmt.reset().unwrap();
+        for (i, value) in values.iter().enumerate() {
+            stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), value.clone())
+                .unwrap();
+        }
+        let rows = stmt.run_collect_rows().unwrap();
+        rows.into_iter().map(|row| format!("{row:?}")).collect()
+    }
+
+    /// Lane skip-11 (T-SKU.15, kiln goal 623adc1c): every piece the goal names, end to end
+    /// through SQL. Do: for each build mode (inline, void-on-write, replay) and each way of
+    /// asking for an IN list (span, value by value), an encrypted (aes256gcm) file database whose
+    /// capped summary has a cracker build due under that mode, and an in-memory database with the
+    /// same rows and no summary; one statement prepared once for each bound shape (`BETWEEN ? AND
+    /// ?`, `>= ?`, `<= ?`, `= ?`, `IN (?, ?)` with its values half the table apart, `IN` of 16
+    /// neighbouring parameters, and `IN (?, ?)` with one value bound to a real), each bound and
+    /// run, then re-bound and run again, every round, with random SQL writes (inserts, NULL and
+    /// text values, updates, deletes) between rounds. Expect: every run answers as the database
+    /// without a summary; every run bound by integers consulted the summary and none with a real
+    /// did; the summary probed once a run for the span, and once a value by value.
+    #[cfg(all(feature = "encryption", feature = "fs"))]
+    #[test]
+    fn t_sku_15_every_piece_end_to_end_through_sql() {
+        use super::super::{skipping_counts, ListProbe};
+        use crate::Value;
+        use rand::{Rng, SeedableRng};
+        const CLUSTER: i64 = 16;
+        // A test key: 32 bytes, as aes256gcm takes (the cipher's key size).
+        let hexkey = "5a".repeat(32);
+        let rows = 2000i64;
+        let cluster = (1..=CLUSTER)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sqls = [
+            "SELECT rowid, a FROM t WHERE a BETWEEN ? AND ? ORDER BY rowid".to_string(),
+            "SELECT count(*), sum(rowid) FROM t WHERE a >= ?".to_string(),
+            "SELECT count(*), sum(rowid) FROM t WHERE a <= ?".to_string(),
+            "SELECT rowid, a FROM t WHERE a = ? ORDER BY rowid".to_string(),
+            "SELECT rowid, a FROM t WHERE a IN (?, ?) ORDER BY rowid".to_string(),
+            format!("SELECT rowid, a FROM t WHERE a IN ({cluster}) ORDER BY rowid"),
+            "SELECT rowid, a FROM t WHERE a IN (?1, ?2) ORDER BY rowid".to_string(),
+        ];
+        let mut seed = 15u64;
+        for mode in [BuildMode::Inline, BuildMode::VoidOnWrite, BuildMode::Replay] {
+            for probe in [ListProbe::Span, ListProbe::PerValue] {
+                seed += 1;
+                let case = format!("{mode:?} {probe:?}");
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("skip-end-to-end.db");
+                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+                let db = Database::open_file_with_flags(
+                    io,
+                    path.to_str().unwrap(),
+                    crate::OpenFlags::default(),
+                    crate::DatabaseOpts::new().with_encryption(true),
+                    Some(crate::EncryptionOpts {
+                        cipher: "aes256gcm".to_string(),
+                        hexkey: hexkey.clone(),
+                    }),
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let key = crate::EncryptionKey::from_hex_string(&hexkey).unwrap();
+                let on = db
+                    .connect(crate::ConnectOpts::new().with_encryption_key(Some(key)))
+                    .unwrap();
+                let off_db = Database::open_file(
+                    Arc::new(MemoryIO::new()),
+                    ":memory:",
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let off = off_db.connect(crate::ConnectOpts::new()).unwrap();
+                let root = fill_table(&on, rows);
+                fill_table(&off, rows);
+                set_due(&on, root, rows, mode);
+                assert!(db.skipping.set_list_probe(root, probe), "{case}");
+                let mut stmts: Vec<_> = sqls
+                    .iter()
+                    .map(|sql| (on.prepare(sql).unwrap(), off.prepare(sql).unwrap()))
+                    .collect();
+                let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+                let (mut integer_runs, mut probes) = (0u64, 0u64);
+                for round in 0..12u64 {
+                    for _ in 0..rng.random_range(0..8) {
+                        let a = rng.random_range(0..rows);
+                        let rowid = rng.random_range(1..rows);
+                        let sql = match rng.random_range(0..6) {
+                            0 => format!("INSERT INTO t VALUES ({a}, 'new')"),
+                            1 => "INSERT INTO t VALUES (NULL, 'null')".to_string(),
+                            2 => format!("UPDATE t SET a = {a} WHERE rowid = {rowid}"),
+                            3 => format!("UPDATE t SET a = 'text' WHERE rowid = {rowid}"),
+                            4 => format!("UPDATE t SET a = {}.5 WHERE rowid = {rowid}", a),
+                            _ => format!("DELETE FROM t WHERE rowid = {rowid}"),
+                        };
+                        on.execute(&sql).unwrap();
+                        off.execute(&sql).unwrap();
+                    }
+                    for (at, (stmt_on, stmt_off)) in stmts.iter_mut().enumerate() {
+                        for bind in 0..2u64 {
+                            let lo = rng.random_range(0..rows);
+                            let (values, asked): (Vec<Value>, u64) = match at {
+                                0 => {
+                                    let hi = lo + rng.random_range(0..rows / 20);
+                                    (vec![Value::from_i64(lo), Value::from_i64(hi)], 1)
+                                }
+                                1 => (
+                                    vec![Value::from_i64(rows - rng.random_range(0..rows / 20))],
+                                    1,
+                                ),
+                                2 => (vec![Value::from_i64(rng.random_range(0..rows / 20))], 1),
+                                3 => (vec![Value::from_i64(lo)], 1),
+                                4 => {
+                                    let far = (lo + rows / 2) % rows;
+                                    (vec![Value::from_i64(lo), Value::from_i64(far)], 2)
+                                }
+                                5 => (
+                                    (0..CLUSTER).map(|i| Value::from_i64(lo + i)).collect(),
+                                    u64::try_from(CLUSTER).unwrap(),
+                                ),
+                                _ => (
+                                    vec![Value::from_i64(lo), Value::from_f64(lo as f64 + 0.5)],
+                                    0,
+                                ),
+                            };
+                            let answer_on = run_bound(stmt_on, &values);
+                            let answer_off = run_bound(stmt_off, &values);
+                            assert_eq!(
+                                answer_on, answer_off,
+                                "{case} round {round} bind {bind}: {} {values:?}",
+                                sqls[at]
+                            );
+                            if asked > 0 {
+                                integer_runs += 1;
+                                probes += match probe {
+                                    ListProbe::Span => 1,
+                                    ListProbe::PerValue => asked,
+                                };
+                            }
+                        }
+                    }
+                }
+                let counts = skipping_counts(&on, "t").unwrap();
+                assert_eq!(counts.consulted, integer_runs, "{case}: {counts:?}");
+                assert_eq!(counts.probes, probes, "{case}: {counts:?}");
+            }
+        }
+    }
 }
