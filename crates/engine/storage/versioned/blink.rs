@@ -24,6 +24,10 @@ use std::cmp::Ordering as Order;
 /// Levels a tree may have: past it an insert is refused (a typed error, never a stack).
 pub const MAX_LEVELS: usize = 32;
 
+/// Latches one writer holds at once at most: a page and the new page it splits into, and, while a
+/// root splits, the new root (the module's comment). What a pool's frames bound the writers by.
+pub const WRITER_LATCHES: usize = 3;
+
 /// Copies of inner pages a descender keeps at most; past it, it forgets them all.
 const COPIES: usize = 1024;
 

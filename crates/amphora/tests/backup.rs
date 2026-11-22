@@ -252,9 +252,9 @@ fn drill(seed: u64) {
 }
 
 /// Opens `path` backed up to `blobs` under "db", stamped by `now`.
-fn open_backed_up(
+fn open_backed_up<B: Blobs + 'static>(
     path: &std::path::Path,
-    blobs: &Arc<SimBlobs>,
+    blobs: &Arc<B>,
     now: &Arc<AtomicU64>,
 ) -> (Database, backup::Shipping) {
     let read = Arc::clone(now);
@@ -351,4 +351,372 @@ fn t_t1_12_d2_a_database_backed_up_ships_as_it_commits() {
             "second {second}"
         );
     }
+}
+
+/// The digest of a database holding `rows` in table `t`: the source's rows at a second, as the
+/// model kept them, in a database opened as the source was (Amphora's own tables beside them).
+fn oracle_digest(dir: &std::path::Path, name: &str, rows: &Rows) -> backup::RowDigest {
+    let path = dir.join(name);
+    let mut sql = String::from("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);");
+    for (id, v) in rows {
+        sql.push_str(&format!("INSERT INTO t (id, v) VALUES ({id}, '{v}');"));
+    }
+    let database = Database::open(&path, until()).unwrap();
+    database
+        .call(until(), move |c| {
+            c.execute_batch(&sql)?;
+            Ok(())
+        })
+        .unwrap();
+    drop(database);
+    backup::digest(&Db::open(&path).unwrap()).unwrap()
+}
+
+/// T-T1.12.C1 (AC-T1.12.4): restore-and-check on the folder store. Do: back a database up to a
+/// folder (AMPHORA-BLOBS-8), write a row a second, close it; restore-and-check the newest second
+/// against the model's rows, then against rows that differ. Expect: the newest second is the last
+/// one written, the first check passes, the second fails naming the rows, and the counters say so.
+#[test]
+fn t_t1_12_c1_restore_and_check_on_a_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = Vec::new();
+    let (database, shipping) = open_backed_up(&path, &blobs, &now);
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    history.push((now.load(Ordering::SeqCst), model.clone()));
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    write_seconds(&database, &now, 1..12, &mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+
+    let last = history.last().unwrap().0.div_ceil(SECOND_NS);
+    let newest = backup::newest_second(blobs.as_ref(), "db", until())
+        .unwrap()
+        .unwrap();
+    assert!(
+        newest >= last,
+        "newest {newest} before the last write's {last}"
+    );
+    let counters = backup::CheckCounters::default();
+    let oracle_dir = tempfile::tempdir().unwrap();
+    let source = |second: u64| -> anyhow::Result<Option<backup::RowDigest>> {
+        let rows = at(&history, second).cloned().unwrap_or_default();
+        Ok(Some(oracle_digest(
+            oracle_dir.path(),
+            &format!("o{second}.db"),
+            &rows,
+        )))
+    };
+    let check = backup::restore_and_check(
+        blobs.as_ref(),
+        "db",
+        &dir.path().join("check-1.db"),
+        &source,
+        &counters,
+        until(),
+    )
+    .unwrap();
+    assert!(
+        matches!(check, backup::Check::Passed { second, .. } if second == newest),
+        "{check:?}"
+    );
+
+    let mut wrong = model.clone();
+    wrong.insert(1, "changed".into());
+    let wrong_source = |_second: u64| -> anyhow::Result<Option<backup::RowDigest>> {
+        Ok(Some(oracle_digest(oracle_dir.path(), "wrong.db", &wrong)))
+    };
+    let check = backup::restore_and_check(
+        blobs.as_ref(),
+        "db",
+        &dir.path().join("check-2.db"),
+        &wrong_source,
+        &counters,
+        until(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            check,
+            backup::Check::Failed {
+                why: backup::CheckFailure::Rows { .. },
+                ..
+            }
+        ),
+        "{check:?}"
+    );
+    assert_eq!(counters.passed.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.failed.load(Ordering::Relaxed), 1);
+}
+
+/// T-T1.12.X1 (AC-T1.12.4): one cut across groups. Do: back two groups up to one folder under a
+/// clock that moves a second at every reading, so every commit in either group has a second of its
+/// own; run a cross-group transaction writing a key in each group, then a second one changing both;
+/// then restore both groups to every second from their first bases to the end, each cut finishing
+/// what it left half-done by the coordinator's records. Expect: at every cut the two keys are both
+/// absent, both the first transaction's, or both the second's; never one without the other; never
+/// back once forward; and the last cut holds the second's. Under both protocols.
+#[test]
+fn t_t1_12_x1_cross_group_cut_at_every_second() {
+    for protocol in [
+        amphora::xgroup::Protocol::TwoPhase,
+        amphora::xgroup::Protocol::Parallel,
+    ] {
+        cross_group_cut(protocol);
+    }
+}
+
+fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
+    use amphora::xgroup::{Answer, Cluster, Txn};
+    let dir = tempfile::tempdir().unwrap();
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let open = |group: usize| {
+        let read = Arc::clone(&now);
+        let archive = Archive {
+            blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+            prefix: format!("g{group}"),
+            clock: Arc::new(move || read.fetch_add(SECOND_NS, Ordering::SeqCst) + SECOND_NS),
+            memory: 32 * 1024,
+            patience: Duration::from_secs(60),
+        };
+        Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
+            .unwrap()
+    };
+    let route: amphora::xgroup::Route = Arc::new(|k: &[u8]| u32::from(k == b"b"));
+    // The coordinator over both groups, backed up. A step past its learned timeout stops an
+    // incarnation as a crash would (docs/design/xgroup.md); then the groups close, and open again
+    // with the coordinator's next incarnation, which finishes what the last left.
+    let start = || {
+        let (g0, s0) = open(0);
+        let (g1, s1) = open(1);
+        let cluster =
+            Cluster::open(vec![g0, g1], Arc::clone(&route), 7, protocol, 1, until()).unwrap();
+        (cluster, vec![s0, s1])
+    };
+    let (mut cluster, mut shippings) = start();
+    for shipping in &shippings {
+        shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    }
+    let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    let mut ended = Vec::new();
+    for v in [b"1", b"2"] {
+        let txn = Txn {
+            reads: vec![],
+            writes: vec![
+                (b"a".to_vec(), Some(v.to_vec())),
+                (b"b".to_vec(), Some(v.to_vec())),
+            ],
+        };
+        // The first transaction's resolution may still hold the coordinator's one place. A stopped
+        // coordinator is opened again and the transaction sent again: its writes are the same
+        // values, so a second run changes nothing.
+        let answer = loop {
+            match cluster.transact(txn.clone(), until()) {
+                Err(amphora_api::Refusal::Full { .. }) => std::thread::yield_now(),
+                Err(amphora_api::Refusal::Unavailable(_)) => {
+                    drop(cluster);
+                    for shipping in &shippings {
+                        shipping.wait(until(), |s| s.ended).unwrap();
+                    }
+                    ended.append(&mut shippings);
+                    (cluster, shippings) = start();
+                }
+                other => break other.unwrap(),
+            }
+        };
+        assert!(matches!(answer, Answer::Committed { .. }), "{answer:?}");
+    }
+    drop(cluster);
+    ended.append(&mut shippings);
+    for shipping in &ended {
+        let status = shipping.wait(until(), |s| s.ended).unwrap();
+        assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    }
+    let newest = [0, 1]
+        .iter()
+        .map(|g| {
+            backup::newest_second(blobs.as_ref(), &format!("g{g}"), until())
+                .unwrap()
+                .unwrap()
+        })
+        .min()
+        .unwrap();
+    let mut seen: Vec<Option<Vec<u8>>> = Vec::new();
+    for second in based + 1..=newest {
+        let groups: Vec<(String, std::path::PathBuf)> = (0..2)
+            .map(|g| {
+                (
+                    format!("g{g}"),
+                    dir.path().join(format!("cut-{second}-g{g}.db")),
+                )
+            })
+            .collect();
+        backup::restore_cut(blobs.as_ref(), &groups, second, 7, protocol, until())
+            .unwrap_or_else(|e| panic!("second {second}: {e:#}"));
+        let restored: Vec<Database> = groups
+            .iter()
+            .map(|(_, p)| Database::open(p, until()).unwrap())
+            .collect();
+        let reader = Cluster::open(restored, Arc::clone(&route), 7, protocol, 1, until()).unwrap();
+        let read = Txn {
+            reads: vec![b"a".to_vec(), b"b".to_vec()],
+            writes: vec![],
+        };
+        let Answer::Committed { reads } = reader.transact(read, until()).unwrap() else {
+            panic!("second {second}: the read didn't commit");
+        };
+        drop(reader);
+        let (a, b) = (reads[0].1.clone(), reads[1].1.clone());
+        assert_eq!(a, b, "second {second}: one group without the other");
+        seen.push(a);
+    }
+    let order = |v: &Option<Vec<u8>>| match v.as_deref() {
+        None => 0,
+        Some(b"1") => 1,
+        Some(_) => 2,
+    };
+    assert!(
+        seen.windows(2).all(|w| order(&w[0]) <= order(&w[1])),
+        "{seen:?}"
+    );
+    assert_eq!(seen.last().cloned().flatten(), Some(b"2".to_vec()));
+    assert!(
+        seen.iter().any(|v| v.as_deref() == Some(b"1")),
+        "non-vacuous: a cut between the two"
+    );
+}
+
+/// Writes rows `ids` with `tag`, one commit a second, each one's rows kept in `history`.
+fn put(
+    db: &mut Db,
+    now: &AtomicU64,
+    ids: impl Iterator<Item = i64>,
+    tag: &str,
+    model: &mut Rows,
+    history: &mut Vec<(u64, Rows)>,
+) {
+    for id in ids {
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        let v = format!("{tag}{id}:{}", "z".repeat(500));
+        let written = v.clone();
+        db.transaction(|db| {
+            db.query_owned(
+                "INSERT OR REPLACE INTO t (id, v) VALUES (?1, ?2)",
+                [Value::from_i64(id), Value::from_text(written.clone())],
+                |_| Ok(true),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        model.insert(id, v);
+        history.push((now.load(Ordering::SeqCst), model.clone()));
+    }
+}
+
+/// T-T1.12.I1 (AC-T1.12.3, AC-T1.12.4): an incremental base. Do: write 400 rows, start the log
+/// again and copy a base;
+/// change 5 rows over two generations of the log; copy a second base; write on; restore seconds
+/// across both; then let the first base expire and restore again. Expect: the second base keeps
+/// most of the first's chunks and copies the changed ones; every second restored has every row
+/// equal, from both bases; once the first base expires, the chunks the second keeps of it stay and
+/// the newest second still restores equal.
+#[test]
+fn t_t1_12_i1_incremental_bases_keep_unchanged_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
+    let read = Arc::clone(&now);
+    let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
+    let mut db = Db::open(&path).unwrap();
+    db.back_up(Arc::clone(&hooks));
+    let blobs = backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = vec![(now.load(Ordering::SeqCst), model.clone())];
+    let mut shipper = Shipper::open("db", Arc::clone(&hooks), &blobs, &db, until()).unwrap();
+    put(&mut db, &now, 0..400, "a", &mut model, &mut history);
+    // The base begins just after the log starts again: a restore replays its generation whole, so
+    // what that generation wrote before the base began counts as changed for the next.
+    shipper.ship(&db, &blobs, until()).unwrap();
+    assert!(db.restart_log().unwrap());
+    put(&mut db, &now, 400..401, "c", &mut model, &mut history);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let copy_all = |shipper: &mut Shipper, db: &Db| {
+        let mut copy = shipper.begin_base(db, &blobs, 32 * 1024).unwrap();
+        while shipper.copy_base(db, &blobs, &mut copy, until()).unwrap() {}
+        let reused = copy.reused();
+        shipper.end_base(db, &blobs, copy, until()).unwrap();
+        reused
+    };
+    assert_eq!(
+        copy_all(&mut shipper, &db),
+        0,
+        "the first base copies everything"
+    );
+    let first_base = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+
+    // Five rows changed in one generation of the log, then the log started again.
+    put(&mut db, &now, 0..5, "b", &mut model, &mut history);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    assert!(db.restart_log().unwrap());
+    put(&mut db, &now, 401..402, "c", &mut model, &mut history);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let chunks = std::fs::metadata(&path).unwrap().len().div_ceil(32 * 1024) as usize;
+    let reused = copy_all(&mut shipper, &db);
+    assert!(
+        reused > 0 && reused < chunks,
+        "the second base keeps {reused} of {chunks} chunks"
+    );
+    let second_base = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    put(&mut db, &now, 402..420, "d", &mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    shipper.ship(&db, &blobs, until()).unwrap();
+
+    let last = history.last().unwrap().0.div_ceil(SECOND_NS);
+    let check = |second: u64, name: &str| {
+        let target = dir.path().join(name);
+        let restored = backup::restore(&blobs, "db", second, &target, until())
+            .unwrap_or_else(|e| panic!("second {second} refused: {e:#}"));
+        let expected = at(&history, second).cloned().unwrap_or_default();
+        assert_eq!(
+            rows(&Db::open(&target).unwrap()),
+            expected,
+            "second {second}"
+        );
+        restored.base
+    };
+    let mut bases = std::collections::BTreeSet::new();
+    let mut second = first_base + 1;
+    while second <= last {
+        bases.insert(check(second, &format!("r{second}.db")));
+        second += 13;
+    }
+    bases.insert(check(last, "last.db"));
+    assert!(bases.len() >= 2, "restores used both bases: {bases:?}");
+
+    // The first base expires; what the second keeps of it stays.
+    let now_ns = now.load(Ordering::SeqCst);
+    let retention = now_ns - (second_base + 1) * SECOND_NS;
+    let gone = backup::expire(&blobs, "db", now_ns, retention, until()).unwrap();
+    assert!(
+        gone > 0,
+        "the first base and the log before the second expire"
+    );
+    check(last, "after-expiry.db");
+    check(second_base + 1, "after-expiry-oldest.db");
 }
