@@ -723,6 +723,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   repeated search for its path below the root; multi-index fetches go through `file_reads`. Seeks, hash builds and
   hash probes time sampled runs into the learned rates, one run in k with k set by each one's spread against the
   timing's own cost (step 3a). Left: SQLite's skip-scan factor 1.375 (Ada's call), the row visit's own observed time.
+- **Query speed step 2 (QT.2), started** (lane qs2; engine.md decision 15): behind `AMPHORA_READ_AHEAD=runs` (off by
+  default), the versioned storage's pool reads a sequential walk's next pages in one `preadv`, the run's length from
+  the line it fits through its own measured reads (`ceil(fixed / each)`), bounded by its frames (cold frames only, at
+  most the frames less one). Misses already allocate nothing and check their checksum once. Tests T-QT.2.1 to .5.
+  Open: a cursor's own hint, reads in flight, Windows' scatter read; the TPC-H and JOB measurements are the
+  coordinator's.
 - **Query speed step 7 (QT.7), started** (lane qs7; also G5 step 2): behind `Connection::set_vectorized_scans`
   (off by default), a read-only statement's scanned tables decode each leaf once into column batches
   (`vdbe/leaf_batch.rs`, executor.md decision 9): one header parse a row, only the columns the statement reads, the

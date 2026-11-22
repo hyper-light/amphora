@@ -104,6 +104,14 @@ impl Disk for Uring {
         self.files.write_at(file, offset, data)
     }
 
+    fn reads_runs(&self) -> bool {
+        self.files.reads_runs()
+    }
+
+    fn read_run(&self, file: File, offset: u64, bufs: &mut [&mut [u8]]) -> Result<usize> {
+        self.files.read_run(file, offset, bufs)
+    }
+
     fn sync(&self, file: File) -> Result<()> {
         self.files.sync(file)
     }

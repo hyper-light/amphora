@@ -59,6 +59,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 12 | Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own | [engine.md](design/engine.md#12-large-rows-as-chunk-rows-of-an-overflow-tree-trees-made-and-dropped-as-records-of-their-own) |
 | engine | 13 | The switch: a connection's B-trees on the versioned storage, the pager beside it | [engine.md](design/engine.md#13-the-switch-a-connections-b-trees-on-the-versioned-storage-the-pager-beside-it) |
 | engine | 14 | Eviction: CLOCK to a spill file, slots by page number, reads verified once, a typed bound | [engine.md](design/engine.md#14-eviction-clock-to-a-spill-file-slots-by-page-number-reads-verified-once-a-typed-bound) |
+| engine | 15 | Read-ahead runs: one read for a sequential walk's next pages, sized by the measured cost | [engine.md](design/engine.md#15-read-ahead-runs-one-read-for-a-sequential-walks-next-pages-sized-by-the-measured-cost) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |

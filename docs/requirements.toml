@@ -1134,3 +1134,20 @@ tests = [
   { id = "T-G6.3.2", text = "translate::optimizer::plan_hints::tests::t_g6_3_2_* — passes when the guard admits a faster hint, drops it once its held-out runs are slower, and never admits one no faster" },
   { id = "T-G6.3.3", text = "translate::optimizer::plan_hints::tests::t_g6_3_3_memory_stays_bounded — passes when the model's size is constant over 10,000 runs and the guard holds no more classes than it was given" },
 ]
+
+# lane qs2
+[[own]]
+id = "QT.2"
+title = "The page-miss path: read-ahead runs and cheaper misses in the versioned storage's pool (query-time step 2; engine.md decision 15)"
+criteria = [
+  { id = "AC-QT.2.1", text = "Behind AMPHORA_READ_AHEAD=runs, a miss on the page after the last read in reads a run of pages in one read (preadv on Unix), its length ceil(fixed / each) from the least-squares line through the pool's measured reads, bounded by the pool's frames (cold frames only, at most the frames less one)" },
+  { id = "AC-QT.2.2", text = "A miss allocates nothing, checks its checksum once and ends inline with no completion callback" },
+  { id = "AC-QT.2.3", text = "TPC-H SF 10 median best time, 2 GiB cache, one thread, at most 8,385 ms and JOB's median at most 1.05x the parent's, by bench/planner/record.sh on jupiter (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-QT.2.1", text = "qs2_answers_are_identical_with_read_ahead_on_and_off (crates/engine/storage/versioned/pool.rs) — passes when every walk reads the same bytes with the switch on and off, and on reads fewer times than pages" },
+  { id = "T-QT.2.2", text = "qs2_read_ahead_never_reads_past_the_budget — passes when no run is longer than the frames less one and no frame is made past the pool's" },
+  { id = "T-QT.2.3", text = "qs2_a_page_read_ahead_that_fails_its_checksum_is_not_served — passes when the damaged page is refused as corrupt and the pages around it read as written" },
+  { id = "T-QT.2.4", text = "qs2_runs_over_files_read_each_page_as_written and qs2_a_run_is_the_measured_fixed_cost_over_the_cost_of_a_page — passes when preadv's runs read as written and the run follows the fit" },
+  { id = "T-QT.2.5", text = "versioned_crash with AMPHORA_READ_AHEAD=runs and without — passes when both pass" },
+]

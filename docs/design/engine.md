@@ -609,6 +609,65 @@ during a checkpoint's copy keeps its old bytes in memory until the copy takes th
 bytes a page of the database (0.4% of it, 3.9% of a pool a tenth of it, up to twice that in a bucket
 just made).
 
+## 15. Read-ahead runs: one read for a sequential walk's next pages, sized by the measured cost
+
+(Query speed step 2, `QT.2`; `crates/engine/storage/versioned/pool.rs`, `disk.rs`; behind
+`AMPHORA_READ_AHEAD=runs`, or `Pool::set_read_ahead`, off by default.)
+
+**Decision.** A miss on the page after the last page the pool read in is a sequential walk's: the
+pool reads that page and the pages after it in one read (`Disk::read_run`: one `preadv` on Unix, the
+kernel scattering the run straight into the frames, no staging copy; one operation in the
+simulator), as many as the run the measured costs give. The pool fits a least-squares line through
+every read it made with read-ahead on, its time against its pages: `fixed`, what an I/O costs
+whatever it carries, and `each`, what a page more costs (the sequential bandwidth's inverse), each
+read with the same weight, nothing picked. The run is `ceil(fixed / each)` pages: there a page costs
+twice what an endless run's would, and past it each page more saves less than it costs to read, a
+page the walk may never reach (the break-even between an access's fixed cost and its transfer: Gray
+and Graefe, "The Five-Minute Rule Ten Years Later", SIGMOD Record 26(4), 1997). Until two sizes are
+measured, or while noise hides the slope, the run is twice the largest read so far, so each run
+measures a size not measured yet. The pool's budget bounds it by a stated rule: a page read ahead
+takes only a frame never used, or one whose reference bit is clear and which no one latches (one
+sweep at most, the bits left as they are), and a run holds at most the pool's frames less one; so a
+run never evicts a page CLOCK hasn't found cold, never latches every frame, and holds no memory past
+the frames but the list of its buffers. A full budget shrinks a run, down to the page asked for
+alone. A page joins a run only while it isn't resident, comes from the same file as the page asked
+for (the data file, or the spill file at the same offsets), has bytes there, and its loading stripe
+can be had without waiting; the run stops at the first that can't. Each page is checked against its
+checksum once as it comes in (decision 14's check): the page asked for failing is refused as a
+plain miss's is, a page after it failing or past a short read is left out and its own read meets
+it. Pages read ahead come in with their reference bits clear, CLOCK's first to go if the walk
+doesn't reach them (the cold end PostgreSQL's ring gives a large scan, `src/backend/storage/buffer/README`).
+A miss allocates nothing (the page is read into its frame), checks its checksum once, and ends
+inline, with no completion to call back; a run allocates the list of its buffers, once a run.
+Read-ahead runs only where the disk reads a run in one I/O (`Disk::reads_runs`): Unix's files and
+io_uring's (through the same `preadv`) and the simulator; Windows reads a page at a time until a
+scatter read there is built (`ReadFileScatter` needs unbuffered, page-aligned handles).
+
+**Why.** Out of cache Amphora grew 19.4x from TPC-H SF 1 to SF 10 where PostgreSQL grew 11.3x, with
+one synchronous 4 KiB read a miss and no read-ahead (the query-speed plan's research, f17, f18, f35).
+PostgreSQL 17 combines up to 128 kB of adjacent blocks into one read by default (`io_combine_limit`,
+f34); here the run comes from this machine's own costs instead of a stated size, since NVMe's fixed
+cost against its transfer differs by device and by whether the page cache answers (Haas and Leis,
+"What Modern NVMe Storage Can Do, And How To Exploit It", PVLDB 16(9), 2023). Detecting the walk in
+the pool, from the page numbers it reads in, keeps the change to the pool and the I/O path while the
+cursor's own walk is reworked beside it (G7 step 2 to 6).
+
+**Evidence.** `pool.rs`: `qs2_answers_are_identical_with_read_ahead_on_and_off` (sequential,
+backwards, strided and repeated walks over data-file, spilled and newly handed-out pages: the same
+bytes, one read a page off, fewer reads than pages on); `qs2_read_ahead_never_reads_past_the_budget`
+(runs asked for 1,000 pages in a pool of 6 frames, one latched: none longer than 5, no frame past 6,
+a pool of one frame reads none); `qs2_a_page_read_ahead_that_fails_its_checksum_is_not_served`;
+`qs2_runs_over_files_read_each_page_as_written` (`preadv` over a directory's files);
+`qs2_a_run_is_the_measured_fixed_cost_over_the_cost_of_a_page`. `tests/versioned_crash.rs` passes
+with the switch off and on. The run's length and the time saved are the coordinator's to measure.
+
+**Falsified by.** TPC-H SF 10 on the versioned storage with `AMPHORA_READ_AHEAD=runs` no faster
+than without, or JOB more than 5% slower (runs read for walks that don't go on). Known limits: the
+walk is detected pool-wide from the last page read in, so two scans interleaving misses read no
+runs (a cursor's own hint is the next step, in `cursor.rs`); runs are read synchronously, one in
+flight at a time; the B-tree's leaves are sequential in the file only as far as they were written
+in order.
+
 ## Stages, each measured
 
 1. The buffer pool and the B-link tree, versioned rows, in memory: concurrent inserts and reads
