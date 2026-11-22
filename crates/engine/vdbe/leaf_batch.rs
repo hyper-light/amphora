@@ -41,6 +41,9 @@ pub struct BatchPlan {
     columns: Vec<Option<Box<[usize]>>>,
     /// How many cursors share the statement's memory budget.
     batched_cursors: usize,
+    /// The scan loops whose bodies run over a whole batch, by their Next's address
+    /// (`leaf_batch/fused.rs`), ascending.
+    fused: Vec<fused::FusedLoop>,
 }
 
 impl BatchPlan {
@@ -129,7 +132,17 @@ impl BatchPlan {
         if plan.batched_cursors == 0 {
             return None;
         }
+        plan.fused = fused::loops(insns, &plan)?;
         Some(plan)
+    }
+
+    /// The fused scan loop whose Next is at `next_pc`.
+    pub(crate) fn fused_loop(&self, next_pc: usize) -> Option<&fused::FusedLoop> {
+        let at = self
+            .fused
+            .binary_search_by_key(&next_pc, fused::FusedLoop::next_pc)
+            .ok()?;
+        self.fused.get(at)
     }
 
     fn columns(&self, cursor_id: usize) -> Option<&[usize]> {
@@ -230,8 +243,36 @@ pub(crate) fn serve_column(
     let Ok(column_slot) = columns.binary_search(&column) else {
         return Ok(Served::RowAtATime);
     };
-    let Some(leaf) = cursor.table_leaf_under_cursor() else {
+    let Some(cell) = window(batches, plan, cursor_id, cursor)? else {
         return Ok(Served::RowAtATime);
+    };
+    let batch = batches
+        .by_cursor
+        .get(cursor_id)
+        .ok_or_else(|| LimboError::InternalError(format!("batch {cursor_id} out of range")))?;
+    match batch.slot(column_slot, cell) {
+        Some(Slot::Value(value)) => {
+            dest.set_value(value.try_clone().map_err(alloc_error)?);
+            Ok(Served::Value)
+        }
+        Some(Slot::PastEnd) => Ok(Served::PastEnd),
+        Some(Slot::Unbatched) | None => Ok(Served::RowAtATime),
+    }
+}
+
+/// The cell under `cursor`, its leaf's batch decoded around it (a new window when the cursor
+/// has moved past the last one), or None when the row is read row-at-a-time.
+fn window(
+    batches: &mut LeafBatches,
+    plan: &BatchPlan,
+    cursor_id: usize,
+    cursor: &BTreeCursor,
+) -> Result<Option<usize>> {
+    let Some(columns) = plan.columns(cursor_id) else {
+        return Ok(None);
+    };
+    let Some(leaf) = cursor.table_leaf_under_cursor() else {
+        return Ok(None);
     };
     if batches.by_cursor.len() <= cursor_id {
         let slots = cursor_id
@@ -249,28 +290,17 @@ pub(crate) fn serve_column(
         .ok_or_else(|| LimboError::InternalError(format!("batch {cursor_id} out of range")))?;
     if !batch.covers(&leaf) {
         let Ok(budget) = budget_bytes(cursor, plan.batched_cursors) else {
-            return Ok(Served::RowAtATime);
+            return Ok(None);
         };
         let backward = batch.live && batch.page_id == leaf.contents.id() && leaf.cell < batch.first;
         let rows = decode_window(batch, &leaf, columns, budget, backward)?;
         #[cfg(test)]
         tests::note_decoded(rows);
         if rows == 0 {
-            return Ok(Served::RowAtATime);
+            return Ok(None);
         }
     }
-    let batch = batches
-        .by_cursor
-        .get(cursor_id)
-        .ok_or_else(|| LimboError::InternalError(format!("batch {cursor_id} out of range")))?;
-    match batch.slot(column_slot, leaf.cell) {
-        Some(Slot::Value(value)) => {
-            dest.set_value(value.try_clone().map_err(alloc_error)?);
-            Ok(Served::Value)
-        }
-        Some(Slot::PastEnd) => Ok(Served::PastEnd),
-        Some(Slot::Unbatched) | None => Ok(Served::RowAtATime),
-    }
+    Ok(Some(leaf.cell))
 }
 
 /// Decodes the window of the leaf that starts at the cursor's cell (ends at it, `backward`),
@@ -479,6 +509,8 @@ mod cache {
             .filter(|bytes| *bytes > 0)
     }
 }
+
+pub(crate) mod fused;
 
 #[cfg(test)]
 mod tests;

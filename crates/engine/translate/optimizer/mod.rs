@@ -4206,6 +4206,7 @@ fn apply_table_access_plan(
                 mem_budget,
                 materialize_build_input,
                 use_bloom_filter,
+                bloom_fp_per_key,
                 join_type,
             } => {
                 // Mark WHERE clause terms as consumed since we're using hash join
@@ -4221,6 +4222,7 @@ fn apply_table_access_plan(
                         mem_budget: *mem_budget,
                         materialize_build_input: *materialize_build_input,
                         use_bloom_filter: *use_bloom_filter,
+                        bloom_fp_per_key: *bloom_fp_per_key,
                         join_type: *join_type,
                         build_group: build_groups
                             .iter()

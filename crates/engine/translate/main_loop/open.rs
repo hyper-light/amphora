@@ -759,6 +759,7 @@ fn emit_right_join_match(
         cursor_id: right_join.matched_rows_cursor_id,
         key_reg: right_join.key_start_reg,
         num_keys: key_len,
+        sizing: None,
     });
     program.preassign_label_to_next_insn(already_recorded);
 }

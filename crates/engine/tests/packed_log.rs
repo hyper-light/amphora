@@ -18,6 +18,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// These tests exercise the pager's log format (its page frames, records and deltas), which the
+/// versioned storage doesn't write: with its switch on (`AMPHORA_STORAGE=versioned`, G7 step 2,
+/// `AC-NS.2.1`) they say so and pass over, and aren't ported. The versioned storage's redo log is
+/// tested in `storage::versioned`.
+fn pager_only() -> bool {
+    let on = amphora_engine::storage::versioned::switch::asked();
+    if on {
+        eprintln!("pager-only: this test exercises the pager's log format (its page frames, records and deltas); the versioned storage writes none");
+    }
+    on
+}
+
 /// The log header's file format for a packed generation begun now (chains ended by their bytes,
 /// decision 17), a mixed one begun now (decision 39, its chains ended so too), a mixed one begun
 /// under decision 37 and SQLite's one page a frame.
@@ -152,12 +164,18 @@ fn truncate(conn: &Arc<Connection>) {
 /// written each time, and a database that checks whole.
 #[test]
 fn what_a_packed_log_holds_reads_back_through_every_path() {
+    if pager_only() {
+        return;
+    }
     reads_back_through_every_path(LogFormat::Packed, PACKED_FORMAT);
 }
 
 /// The same of a mixed log (decision 37), whose commits are records too.
 #[test]
 fn what_a_mixed_log_holds_reads_back_through_every_path() {
+    if pager_only() {
+        return;
+    }
     reads_back_through_every_path(LogFormat::Mixed, MIXED_FORMAT);
 }
 
@@ -224,6 +242,9 @@ fn reads_back_through_every_path(format: LogFormat, file_format: u32) {
 /// (decisions 20 and 26: a process's databases share pages by default, a packed log's don't).
 #[test]
 fn a_database_opened_on_a_packed_log_doesnt_share_its_pages() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("packed.db");
     let want = {
@@ -285,12 +306,18 @@ fn entries(wal: &[u8]) -> Vec<(u32, u8, u8, usize)> {
 /// image's, no count of deltas), and every row as last written each time (AC-T1.4.4).
 #[test]
 fn pages_changed_again_and_again_are_logged_as_deltas_and_read_back() {
+    if pager_only() {
+        return;
+    }
     deltas_read_back(LogFormat::Packed);
 }
 
 /// The same in a mixed log (decision 37).
 #[test]
 fn pages_changed_again_and_again_in_a_mixed_log_are_logged_as_deltas() {
+    if pager_only() {
+        return;
+    }
     deltas_read_back(LogFormat::Mixed);
 }
 
@@ -410,6 +437,9 @@ fn run(conn: &Arc<Connection>, sql: &str, params: Vec<Value>) {
 /// delta).
 #[test]
 fn savepoints_rolled_back_amid_spills_keep_exactly_what_was_kept() {
+    if pager_only() {
+        return;
+    }
     for format in [LogFormat::Pages, LogFormat::Packed, LogFormat::Mixed] {
         for seed in 1..=8u64 {
             savepoints_amid_spills(format, seed);
@@ -506,6 +536,9 @@ fn savepoints_amid_spills(format: LogFormat, seed: u64) {
 /// rows read back, on a fresh connection and after opening the database again.
 #[test]
 fn a_transaction_spilled_into_a_packed_log_commits_or_rolls_back_whole() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("spill.db");
     let mut want = Vec::new();
@@ -544,6 +577,9 @@ fn a_transaction_spilled_into_a_packed_log_commits_or_rolls_back_whole() {
 /// again, the next is packed, and every row reads back after each step.
 #[test]
 fn a_log_keeps_the_format_its_generation_began_with() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("formats.db");
     let mut want = Vec::new();
@@ -663,6 +699,9 @@ fn restamp(path: &Path, format: u32) {
 /// it; every row as last written (decisions 16 and 17, 2026-11-11; AC-T1.4.4).
 #[test]
 fn a_generation_keeps_the_chain_bound_of_the_format_it_began_with() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("eight.db");
     let mut want;
@@ -718,6 +757,9 @@ fn a_generation_keeps_the_chain_bound_of_the_format_it_began_with() {
 /// opened with that commit (or any) quietly dropped.
 #[test]
 fn a_record_whose_checksums_hold_but_that_doesnt_decode_is_refused() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("damaged.db");
     {
@@ -774,6 +816,9 @@ fn a_record_whose_checksums_hold_but_that_doesnt_decode_is_refused() {
 /// write leaves it. Expect: the database opens with every commit before it, and none of that one.
 #[test]
 fn a_record_cut_short_takes_only_its_own_commit() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("torn.db");
     let kept;
@@ -809,6 +854,9 @@ fn a_record_cut_short_takes_only_its_own_commit() {
 /// 20 and 26).
 #[test]
 fn a_mixed_log_holds_its_spills_as_pages_and_its_commits_as_records() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mixed.db");
     let mut want;
@@ -900,6 +948,9 @@ fn a_mixed_log_holds_its_spills_as_pages_and_its_commits_as_records() {
 /// that aren't there).
 #[test]
 fn a_log_of_a_format_not_known_is_refused() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unknown.db");
     {
@@ -1076,6 +1127,9 @@ const FRAME: u64 = (FRAME_HEADER + PAGE) as u64;
 /// row as written; and the lookups read the log (the test isn't vacuous).
 #[test]
 fn a_page_new_to_the_log_is_read_in_one_frame() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cold.db");
     let reads = Arc::new(LogReads::default());
@@ -1112,6 +1166,9 @@ fn a_page_new_to_the_log_is_read_in_one_frame() {
 /// a page's chain; every row as last written; deltas in the log, and reads of it.
 #[test]
 fn a_pages_chain_is_read_one_frame_an_entry() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hot.db");
     let reads = Arc::new(LogReads::default());
@@ -1180,6 +1237,9 @@ fn a_pages_chain_is_read_one_frame_an_entry() {
 /// the next generation begins 0x414d_5007.
 #[test]
 fn a_mixed_generation_begun_before_keeps_its_records() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("before.db");
     {

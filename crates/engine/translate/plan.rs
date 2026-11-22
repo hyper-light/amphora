@@ -2859,6 +2859,9 @@ pub struct HashJoinOp {
     pub materialize_build_input: bool,
     /// Whether to use a bloom filter on the probe side.
     pub use_bloom_filter: bool,
+    /// Amphora (PL.5): the filter's false-positive rate per distinct build key
+    /// (`bloom_filter_rate_per_key`).
+    pub bloom_fp_per_key: f64,
     /// Join semantics.
     pub join_type: HashJoinType,
     /// PL.8: the tables of a bushy plan's inner join whose result is the build side, joined among

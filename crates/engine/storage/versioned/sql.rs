@@ -234,6 +234,61 @@ fn t_ns_2_6_ddl_rolls_back_with_its_transaction() {
     assert_eq!(rows(&versioned, q), rows(&pager, q));
 }
 
+/// T-NS.2.11: in a transaction, a table and index made under a savepoint rolled back to and a DROP
+/// under a savepoint rolled back to, then COMMIT, on both storages; then a CREATE TABLE ... AS that
+/// fails after its tree is made, in a transaction committed after it. Expect: the storage holds the trees it held before (no tree no schema row names), and
+/// the table whose DROP was undone keeps its rows.
+#[test]
+fn ns_2_1_undone_ddl_leaves_no_orphan_tree() {
+    let (_pdb, pager) = connect(false);
+    let (db, versioned) = connect(true);
+    let live = || {
+        db.versioned_storage(false, None)
+            .unwrap()
+            .unwrap()
+            .live_trees()
+    };
+    let mut before = 0;
+    for conn in [&pager, &versioned] {
+        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY)");
+        run(conn, "INSERT INTO t VALUES (1)");
+        if std::ptr::eq(conn, &versioned) {
+            before = live();
+        }
+        for sql in [
+            "BEGIN",
+            "SAVEPOINT s",
+            "CREATE TABLE w (c)",
+            "CREATE INDEX wi ON w (c)",
+            "INSERT INTO w VALUES (1)",
+            "ROLLBACK TO s",
+            "RELEASE s",
+            "SAVEPOINT s2",
+            "DROP TABLE t",
+            "ROLLBACK TO s2",
+            "RELEASE s2",
+            "COMMIT",
+        ] {
+            let done = conn.execute(sql);
+            assert!(
+                done.is_ok(),
+                "{}: {sql}: {done:?}",
+                std::ptr::eq(conn, &versioned)
+            );
+        }
+        assert_eq!(rows(conn, "SELECT a FROM t").len(), 1);
+    }
+    assert_eq!(live(), before);
+    // A failed statement in a transaction, then COMMIT: on the versioned storage alone, as the
+    // pager's next statement after it is refused `SchemaUpdated` (the pager's, noted in STATUS).
+    run(&versioned, "BEGIN");
+    let failed = versioned.execute("CREATE TABLE u AS SELECT abs(-9223372036854775807 - 1) AS x");
+    assert!(failed.is_err(), "{failed:?}");
+    let done = versioned.execute("COMMIT");
+    assert!(done.is_ok(), "{done:?}");
+    assert_eq!(live(), before);
+}
+
 /// Do: SAVEPOINTs nested in a transaction, ROLLBACK TO the inner one twice, RELEASE the outer one,
 /// COMMIT; and a SAVEPOINT that starts a transaction, rolled back to and released. Expect: the
 /// same rows on both storages.
@@ -265,4 +320,118 @@ fn t_ns_2_6_named_savepoints_answer_alike() {
     let want = rows(&pager, q);
     assert_eq!(want.len(), 3);
     assert_eq!(rows(&versioned, q), want);
+}
+
+fn open_file(path: &std::path::Path) -> (Arc<Database>, Arc<Connection>) {
+    let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    (db, conn)
+}
+
+/// Copies `from` (a file or a directory of files) to `to`, as a crash leaves them.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    if from.is_dir() {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    } else if from.exists() {
+        std::fs::copy(from, to).unwrap();
+    }
+}
+
+/// Do (`AC-NS.2.1`, G7 step 2): on a file database on the versioned storage, tables with indexes
+/// (a descending NOCASE one, a UNIQUE autoindex, one of two columns), rows written and
+/// committed, then the database closed and opened again; and the same database's files copied
+/// while it was still open, as a crash leaves them, and the copy opened. Expect: both open with
+/// every table and index, read the committed rows through each index in its order, and refuse a
+/// duplicate through the UNIQUE index, and check whole (`PRAGMA integrity_check` reads each tree
+/// in its order): each tree's order was recorded and the schema read from the storage's
+/// `sqlite_schema`.
+#[test]
+fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reopen.db");
+    let queries = [
+        "SELECT a, b, c FROM t ORDER BY a",
+        "SELECT b FROM t INDEXED BY tb ORDER BY b COLLATE NOCASE DESC",
+        "SELECT c, a FROM t INDEXED BY tc WHERE c >= 20 ORDER BY c",
+        "SELECT k, v FROM w INDEXED BY wkv WHERE k > 'k8' ORDER BY k, v DESC",
+        "SELECT name FROM sqlite_schema ORDER BY name",
+    ];
+    let want = {
+        let (db, conn) = open_file(&path);
+        for sql in [
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT UNIQUE, c INTEGER)",
+            "CREATE INDEX tc ON t (c)",
+            "CREATE INDEX tb ON t (b COLLATE NOCASE DESC)",
+            "CREATE TABLE w (k TEXT, v INTEGER)",
+            "CREATE INDEX wkv ON w (k, v DESC)",
+        ] {
+            run(&conn, sql);
+        }
+        for i in 0..300 {
+            run(
+                &conn,
+                &format!(
+                    "INSERT INTO t VALUES ({i}, '{}{i}', {})",
+                    if i % 2 == 0 { "Pear" } else { "apple" },
+                    (i * 37) % 101
+                ),
+            );
+            run(
+                &conn,
+                &format!("INSERT INTO w VALUES ('k{}', {i})", 999 - i),
+            );
+        }
+        run(&conn, "BEGIN");
+        run(&conn, "DELETE FROM t WHERE a % 3 = 0");
+        run(&conn, "UPDATE w SET v = -v WHERE v % 5 = 0");
+        run(&conn, "COMMIT");
+        let want: Vec<_> = queries.iter().map(|q| rows(&conn, q)).collect();
+        for w in &want {
+            assert!(!w.is_empty());
+        }
+        drop(conn);
+        drop(db);
+        want
+    };
+    let (db, conn) = open_file(&path);
+    for (q, w) in queries.iter().zip(&want) {
+        assert_eq!(&rows(&conn, q), w, "after a reopen: {q}");
+    }
+    assert!(conn
+        .execute("INSERT INTO t VALUES (1000, 'apple1', 0)")
+        .is_err());
+    run(&conn, "INSERT INTO t VALUES (1000, 'fig', 50)");
+    let want: Vec<_> = queries.iter().map(|q| rows(&conn, q)).collect();
+    // The crash: the files copied while the database is open, its close never run.
+    let copy = dir.path().join("crashed.db");
+    for (from, to) in [
+        (path.clone(), copy.clone()),
+        (
+            std::path::PathBuf::from(format!("{}-wal", path.display())),
+            std::path::PathBuf::from(format!("{}-wal", copy.display())),
+        ),
+        (
+            std::path::PathBuf::from(format!("{}-versioned", path.display())),
+            std::path::PathBuf::from(format!("{}-versioned", copy.display())),
+        ),
+    ] {
+        copy_tree(&from, &to);
+    }
+    std::mem::forget(conn);
+    std::mem::forget(db);
+    let (_db, conn) = open_file(&copy);
+    for (q, w) in queries.iter().zip(&want) {
+        assert_eq!(&rows(&conn, q), w, "after a crash: {q}");
+    }
+    assert_eq!(
+        rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
 }
