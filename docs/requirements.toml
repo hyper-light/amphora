@@ -321,6 +321,9 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.5.1", text = "A star join whose dimension filters keep no fact row — passes when the answer is unchanged and the filters' memory stays within their stated bound" },
+  # lane qs5-9
+  { id = "T-PL.5.2", text = "pl_5_star_join_filters_fire_and_answers_hold (crates/engine/tests/join_methods.rs) — passes when a star join, its filters keeping some fact rows and none, gives the model's answer with hash joins only, nested loops only and by cost, and the hash-join plans probe a Bloom filter" },
+  { id = "T-PL.5.3", text = "pl_5_sized_filter_* (crates/engine/vdbe/bloom_filter.rs) — passes when a filter sized from its build's distinct keys has no false negative and about its derived rate, and one past its memory bound or not worth its bits passes every key" },
 ]
 
 [[own]]
@@ -342,6 +345,13 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.7.1", text = "The audit's 09-cost-model — passes when its tables of 8 and 1,011 pages no longer both scan at one cost" },
+  # lane pl7
+  { id = "T-PL.7.2", text = "cost_fit::tests::t_pl_7_2_* — passes when the fit of synthetic samples from known weights with 5% noise lands within four standard errors and 5% of each, and a tenfold stall one sample in ten still leaves each within 5%" },
+  { id = "T-PL.7.3", text = "cost_fit::tests::t_pl_7_3_* — passes when terms never sampled have no fitted weight and the planner keeps their learned value, and the fit follows weights that move" },
+  { id = "T-PL.7.4", text = "cost_fit::tests::t_pl_7_4_* — passes when two hundred thousand samples leave the fit's size unchanged and its window longer than its least" },
+  { id = "T-PL.7.5", text = "cost_fit::tests::t_pl_7_5_* and tests/planner.rs, records_plans.rs, join_methods.rs with AMPHORA_FITTED_COSTS=1 — passes when the sample rate follows the timer's cost and the spread, a planner run with the switch on fits weights, and the planner suites pass with the switch on and off" },
+  # lane pl7b
+  { id = "T-PL.7.6", text = "cost_fit::tests::t_pl_7_6_* — passes when a fitted weight within its standard error times the 95% Bonferroni quantile of zero, or with an unbounded error, is not given to the planner and its learned value stands" },
 ]
 
 [[own]]
@@ -416,6 +426,9 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.13.1", text = "A join whose build side outgrows its estimate mid-query — passes when it switches method within its memory bound and its answer is unchanged" },
+  # lane pl13
+  { id = "T-PL.13.2", text = "The switch fires once, at the first outer row whose count reaches the learned-cost switch point, never at the planner's estimate below it; its cost stays under twice the cheaper method in hindsight; over its memory budget it is refused with a typed error and the join stays a nested loop" },
+  { id = "T-PL.13.3", text = "A materialization point asks for a new plan only when its counted rows fall outside the estimate's band, estimate / (1 + error) to estimate x (1 + error); the rows it holds stay within their budget or are refused with a typed error" },
 ]
 
 # Amphora's own IDs for its query time (Amphora goal 7788ef29, kiln plan
@@ -464,6 +477,17 @@ tests = [
   { id = "T-T1.12.P11", text = "A log started again twice with no write between keeps its link whole; a restart forced before its frames were shipped, or one the fence wasn't told of, breaks it" },
   { id = "T-T1.12.P12", text = "A through mark makes the seconds after the last segment's whole through its time; one that doesn't end at a segment says nothing" },
   { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
+  # lane pitr-7
+  { id = "AMPHORA-BLOBS-8", text = "The folder store passes AMPHORA-BLOBS-1 to 7, keeps keys apart under case folding and path names, and answers random operations as SimBlobs does" },
+  { id = "T-T1.12.C1", text = "Restore-and-check on a folder passes at the newest whole second against the source's rows and fails naming the rows against rows that differ" },
+  { id = "T-T1.12.C2", text = "A check is due at the first, at each new base, and once the log since the last check outweighs what it replayed" },
+  { id = "T-T1.12.I1", text = "A second base keeps the first's unchanged chunks and copies the changed; seconds across both restore equal, and after the first expires too" },
+  { id = "T-T1.12.I2", text = "Manifests of format 1 still read; format 2's runs give each chunk's base and are refused when they don't add up" },
+  { id = "T-T1.12.I3", text = "An incremental base is due once the log since the latest base outweighs what it would copy" },
+  { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
+  # lane pitr-8
+  { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
+  { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
@@ -510,6 +534,9 @@ tests = [
   { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
   # lane g7s2-3
   { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
+  # lane g7s2-5
+  { id = "T-NS.2.10", text = "The versioned storage holds the shell's budget, else a quarter of the machine's memory, its pages and versions together; its pool's frames are made as pages are handed out" },
+  { id = "T-NS.2.11", text = "DDL undone by a failed statement, a savepoint rolled back to or a failed commit leaves no tree that no schema row names; a DROP undone keeps its tree" },
 ]
 
 # lane g7s3
@@ -522,6 +549,20 @@ criteria = [
 ]
 tests = [
   { id = "T-NS.3.1", text = "The model test with eviction under 32 threads (crates/engine/storage/reach/model.rs) — passes when no stale or torn page read and no use after eviction, every page equal to the reference map" },
+]
+
+# lane g7s4
+[[own]]
+id = "NS.4"
+title = "Eviction and a bound (G7 step 4)"
+criteria = [
+  { id = "AC-NS.4.1", text = "a 10M-row corpus run within a pool a tenth of the data's size" },
+  { id = "AC-NS.4.2", text = "resident memory over the pool's budget is at most 10%" },
+]
+tests = [
+  { id = "T-NS.4.1", text = "Crash injection through eviction and checkpoints (crates/engine/storage/versioned/evict.rs) — passes when no acknowledged write is lost" },
+  { id = "T-NS.4.2", text = "A database ten times its pool read and written correctly, across a checkpoint and a reopen" },
+  { id = "T-NS.4.3", text = "The pool's model test with eviction under 32 threads — every read whole, every owner reads its last write" },
 ]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
@@ -615,6 +656,61 @@ tests = [
 ]
 
 [[own]]
+id = "CT.1"
+title = "The raft log's compaction due at an expansion learned where it runs, not a picked 128 MiB"
+criteria = [
+  { id = "AC-CT.1.1", text = "The replicated machine reports its image's bytes, so hyper-durable's compaction_due (Ongaro's thesis §5.1.2) weighs the log against the image it opened with, then the image it last made" },
+  { id = "AC-CT.1.2", text = "The owner times each image and each drive that applied entries on its own clock, per byte, with RFC 6298's decaying sums; the expansion is the image's cost over the replay's, raised to a whole factor (ski rental's break-even), one before both are measured; a stall compacts at once" },
+]
+tests = [
+  { id = "T-CT.1.1", text = "Nothing measured, one cost, samples of no time — passes when the factor is one" },
+  { id = "T-CT.1.2", text = "Images four times dearer a byte than replay, a third as dear, then dearer — passes when the factor is four, one, then follows the images up" },
+  { id = "T-CT.1.3", text = "A large and a tiny sample — passes when each weighs by its bytes" },
+  { id = "T-CT.1.4", text = "The driven compaction tests of database::replicated — passes when each compacts by the learned rule" },
+]
+
+[[own]]
+id = "EN.1"
+title = "A replicated command's and an image's envelope is what their encoding adds, not a picked mebibyte"
+criteria = [
+  { id = "AC-EN.1.1", text = "The bound past a command's or an image's page budget is postcard's most for its baseline prefix and declaration, its base, its page list's length and each page's id and length at the one page size admitted" },
+]
+tests = [
+  { id = "T-EN.1.1", text = "The widest prepared transaction at its whole budget — passes when it encodes within its bound, short only by the list length's unused varint bytes" },
+  { id = "T-EN.1.2", text = "The widest image at a lowered budget, and the full budget's arithmetic — passes the same" },
+  { id = "T-EN.1.3", text = "Postcard's varint widths and the declaration's — passes when each matches the encoder" },
+]
+
+# lane constants-10 (2026-11-21): MB.1, the process memory budget (store.md, "Decision (lane constants): one process
+# memory budget"); SB.1, an image bounded by its room for one (replication.md, "Decision (lane constants): an image is
+# bounded by the memory budget's room for one").
+[[own]]
+id = "MB.1"
+title = "One process memory budget, learned where it runs and shared out by measured use, not picked bounds"
+criteria = [
+  { id = "AC-MB.1.1", text = "The limit is the smallest the platform states (Linux: cgroup v2 or v1 limits and MemTotal; macOS: hw.memsize; Windows: GlobalMemoryStatusEx; Unix: soft RLIMIT_AS, RLIMIT_DATA, RLIMIT_RSS), read again at every ask; where none can be read the budget refuses Unavailable naming the platform, with no fallback" },
+  { id = "AC-MB.1.2", text = "A use's room is the limit less what the rest of the process holds: the larger of its resident bytes and every charge counted, its own charge given back; a take past it is refused TooLarge naming the use and its room; a charge is given back when it drops" },
+]
+tests = [
+  { id = "T-MB.1.1", text = "A 1 GiB limit, 100 MiB resident, queue then image bytes taken and the queue's dropped: passes when each room is the limit less the rest's hold, a take past it is refused TooLarge at that room, and a dropped charge is given back" },
+  { id = "T-MB.1.2", text = "A limit unread, then read, then lowered, then below the resident bytes: passes when unread is Unavailable naming the platform, the room follows the limit, and is zero, never negative" },
+  { id = "T-MB.1.3", text = "Resident bytes unread: passes when the charges counted stand for the rest's use" },
+  { id = "T-MB.1.4", text = "This process on Linux, macOS and Windows: passes when its limit and resident bytes are both read and the image's room is not refused" },
+]
+
+[[own]]
+id = "SB.1"
+title = "An image is bounded by the memory budget's room for one, not a picked 256 MiB"
+criteria = [
+  { id = "AC-SB.1.1", text = "Every image made, fitted, installed, captured or received as a baseline, or kept by the reshard directory, is bounded by the memory budget's room for an image read at that moment, no more than its carrier's bound; unread, it is refused Unavailable" },
+  { id = "AC-SB.1.2", text = "A replica's database log leaves the image's room free on its filesystem, passed to log_room" },
+]
+tests = [
+  { id = "T-SB.1.1", text = "A machine over a 128 KiB row, its budget fed room to spare, 64 KiB of room, an unread limit, then a 32 KiB carrier: passes when the image fits and a joiner is admitted, then refused TooLarge at 64 KiB, then Unavailable, then refused at 32 KiB" },
+  { id = "T-SB.1.2", text = "log_room with the image's room passed: passes when each log has its file and an equal share of what is free past one image" },
+]
+
+[[own]]
 id = "WK.1"
 title = "The replicated owner wakes on its events and its next deadline, not a picked 1 ms poll"
 criteria = [
@@ -703,6 +799,12 @@ tests = [
   # lane split-merge-7
   { id = "T-T1.9.R6", text = "A split and a merge back through the shell, the node started again by the directory from before both and the split's Create asked again — passes when the retired group is neither started nor made again but the Create is refused as of an ended operation, and every acknowledged row is in the one group left" },
   { id = "T-T1.9.R7", text = "A local database as a group's engine, its holding fenced through the shell, then the group started again on the same file — passes when the fenced holding is answered after the restart, kept in the file as the Holding command left it" },
+  # lane split-merge-8
+  { id = "T-T1.9.R8", text = "Copy-path batches on a node with no commit measured, and batches learned from time with large units — passes when no batch holds more units than the process's memory budget takes at the most bytes a unit has held, and at least one" },
+  { id = "T-T1.9.R9", text = "A local database holding Records rows made a group's, its keys copied by position in batches into another local database, changed and caught up from its log, then swept — passes when the second answers every key as the first, with the same live count and a head no older than every revision moved, a catch-up from before the log was held is refused, and the sweep leaves the first with no key" },
+  # lane split-merge-9
+  { id = "T-T1.9.R10", text = "Two nodes, the second of two groups on the first moved to the second by the driver while a row is written before every action, each pull of its copy and catch-up and its answer carried as bytes — passes when the move ends flipped, the first node keeps one group and has retired the moved one, the second holds its span, every key's acknowledged rows read back at its group's node, and every key is in exactly one group's file" },
+  { id = "T-T1.9.R11", text = "The move of T-T1.9.R10 with every third pull's answer lost on the way back after the old group's node acted on it, each loss asked again by the driver — passes when some answers were lost and the move still ends flipped with every acknowledged write at its group's node and every key in exactly one group's file" },
 ]
 
 # lane qs5
@@ -816,9 +918,52 @@ tests = [
   { id = "T-CS.3.1", text = "crates/columnar/tests/round_trip.rs — passes when every random and real-like column, of every size around the group and vector edges, decodes equal to the input in both codecs, every bit width packs and unpacks in both layouts, the schemes follow the data, and damaged encodings are refused" },
 ]
 
+# lane g11s4
+[[own]]
+id = "CS.4"
+title = "Vectorized scans with summaries on every core: granules sized by measurement, min/max and positional summaries, morsel-parallel scans (G11 step 4)"
+criteria = [
+  { id = "AC-CS.4.1", text = "filter_no_index at 1 client against CedarDB's is at least 1.0x (measured by the coordinator)" },
+  { id = "AC-CS.4.2", text = "table_count at 32 clients against ClickHouse's is at least 1.0x (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-CS.4.1", text = "cs4_vectors_equal_rows_every_class_{plain,packed} (crates/engine/storage/versioned/columns/scan.rs) — passes when, with writes between scans, some applied and some queued, rebuilds and held snapshots, every analytic class (filters of each comparison, aggregates, group-by, count) over the copy's granules equals the same statement row by row over the row B-tree, serially, split into partials merged in order, and on the morsel executor's four workers, and the summaries skipped granules" },
+  { id = "T-CS.4.2", text = "cs4_min_max_summaries_skip_granules — passes when a filter outside granules' min/max skips them unread and the answer equals the rows'" },
+  { id = "T-CS.4.4", text = "cs4_granule_cache_keeps_to_its_bound — passes when a cache whose bound holds no granule keeps none, every untouched granule is decoded again and counted, and answers still equal the rows'" },
+  { id = "T-CS.4.3", text = "cs4_vectors_equal_rows_every_class_{plain,packed}, over key ranges — passes when a range scan skips blocks outside the range undecoded (by the blocks' key bounds), its granules hold every key of the range, and each class over the range equals the rows'" },
+  { id = "T-CS.4.5", text = "cs4_grouped_aggregates_fold_whole_vectors (crates/engine/storage/versioned/columns/scan.rs) — passes when grouped aggregates, folded column vector by column vector by each row's group slot, over keys mixing integers with equal reals, nulls and text, at every granule size from one row to all and merged one granule at a time from the last, equal the statement row by row, each group showing its earliest row's key" },
+]
+
 # lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
 # IDs. It serves AC-T1.4.2 and AC-T1.4.3 (`amphora-bench --vlog`) and T-T1.3.1
 # (crates/engine/tests/versioned_crash.rs).
+
+# lane qs6: query speed step 6 (G5 step 3), parallel execution in morsels (docs/design/executor.md
+# section 8).
+[[own]]
+id = "QT.6"
+title = "Parallel execution across cores: morsel-driven scans, hash joins, index lookups and aggregates"
+criteria = [
+  { id = "AC-QT.6.1", text = "TPC-H SF 10 median best time, the threads used stated, is at most 2,328.8 ms, by bench/planner/record.sh on jupiter, best of 3, each run begun at a load under 2" },
+  { id = "AC-QT.6.2", text = "JOB median best time over the parent's (step 5's end) is at most 0.42" },
+  { id = "AC-QT.6.3", text = "JOB's queries that ran in under 20 ms at the parent take at most 1.05 times as long, each query's best of 3" },
+  { id = "AC-QT.6.4", text = "Answers identical at every worker count; the threads used and the class-for-class comparison in the record" },
+]
+tests = [
+  { id = "T-QT.6.1", text = "Random filters, groupings and aggregates over random tables at 2, 3, 4 and 8 workers and random morsel sizes (vdbe/morsel.rs) — passes when every answer equals the serial one value for value" },
+  { id = "T-QT.6.2", text = "Random equi-joins probed in parallel (vdbe/morsel.rs) — passes when the matches equal the serial probe's in order and a nested loop's" },
+  { id = "T-QT.6.3", text = "A REAL sum's terms in several orders and split across partials — passes when one value, bit for bit" },
+  { id = "T-QT.6.4", text = "A statement whose workers together pass its memory budget — passes when refused with the typed error at every worker count and the budget never passed" },
+  { id = "T-QT.6.5", text = "The degree from stated costs — passes when off and short statements are serial, a long one uses more than one worker and no more than the cores, and morsels grow as dispatch grows against a row's cost" },
+  { id = "T-QT.6.6", text = "Every JOB and TPC-H query at 1, 2, 4, 8, 16 and 32 workers (the coordinator's) — passes when identical answers at every count" },
+  # lane qs6-2
+  { id = "T-QT.6.7", text = "Random filters, groupings and aggregates over random tables of many leaf pages, each worker reading its leaves with its own cursor in one snapshot, at 1, 2, 3, 4 and 8 workers, several morsel sizes and ParallelMode On and Off (vdbe/morsel_scan_tests.rs) — passes when every answer equals the VDBE's serial SQL answer" },
+  { id = "T-QT.6.8", text = "One- and two-column equi-joins whose probe side workers read over the probe table's leaves (vdbe/morsel_scan_tests.rs) — passes when the matches equal the VDBE's join, match for match and in its order" },
+  { id = "T-QT.6.9", text = "A table whose INTEGER PRIMARY KEY is its rowid, and an empty table, read in leaf morsels (vdbe/morsel_scan_tests.rs) — passes when the rowid reads into its column, the aggregates equal the VDBE's, and the empty table is one leaf with no rows" },
+  { id = "T-QT.6.10", text = "Random filters, groupings and aggregates in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook ran for most of them" },
+  # lane qs6-3
+  { id = "T-QT.6.11", text = "Random inner equi-joins of two tables of many leaf pages on one or two columns, with filters on either table and groupings and aggregates over both, in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores and the planner held to hash joins (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook probed for most of them" },
+]
 
 # lane g3s2
 # Amphora's own IDs for G3, point reads (kiln plan 01a16b0f464172dc80c7a3b9a14acbce): G3.n for its step n.
@@ -848,6 +993,8 @@ tests = [
   { id = "T-G3.5.1", text = "storage::descent_skip::tests::t_g3_5_1_* — passes when every lookup through the adaptive hash and the learned locator, under random inserts, deletes, splits and merges over pages two tables share, returns the row a plain descent returns" },
   { id = "T-G3.5.2", text = "storage::descent_skip::tests::t_g3_5_2_* — passes when, over a table's complete fences, the locator names the leaf a descent finds for every covered rowid" },
   { id = "T-G3.5.3", text = "storage::descent_skip::tests::engine::t_g3_5_3_* — passes when, on a real rowid table through committed rounds of inserts and range deletes, each prototype's page proven by its bytes gives the leaf and cell a cursor's descent stands on, or none when it finds none" },
+  # lane g3s5-2: the cursor hook.
+  { id = "T-G3.5.4", text = "storage::descent_skip::tests::engine::t_g3_5_4_* — passes when, through the real cursor on two connections writing in turns at different snapshots (inserts, splits, range deletes), every seek with each AMPHORA_DESCENT_SKIP setting stands on the leaf and cell, and returns the row, the plain descent does, every step after it reaches the same row, and the hook counts seeks that stood on a named leaf under both prototypes" },
 ]
 
 # lane regions (G14 step 1, CP-T1.11; docs/design/regions.md): no new IDs. It serves AC-T1.11.4
@@ -872,6 +1019,56 @@ tests = [
   { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
   { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
+]
+
+# lane g3s6
+
+[[own]]
+id = "G3.6"
+title = "Point reads scale to 32 clients without shared writes (G3 step 6, prototype F; store.md decision 43)"
+criteria = [
+  { id = "AC-G3.6.1", text = "point_pk at 32 clients over 1 client is at least 12x, with AMPHORA_READ_CHECKOUT=slots and AMPHORA_SHARED_PAGE_READS=optimistic (the suite; measured by the coordinator)" },
+  { id = "AC-G3.6.2", text = "contended cache lines on the read path at 32 clients are at most 1, by perf c2c HITM records per million lookups (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G3.6.1", text = "storage::optimistic_pages::tests::g3_s6_32_readers_and_a_writer_see_no_unsnapshotted_version_and_no_torn_page — passes when 32 readers beside a writer and a checkpoint's nemesis get only whole images of the versions their snapshots asked for, some of them without a lock (AMPHORA_G3S6_SECONDS=60 for the 60 s run)" },
+  { id = "T-G3.6.2", text = "storage::optimistic_pages::tests::g3_s6_frames_give_back_what_was_offered_until_forgotten and g3_s6_only_the_optimistic_pool_reads_without_its_lock — pass when the frames return what they were offered until it is forgotten, and only the optimistic pool makes them, charged to its budget" },
+  { id = "T-G3.6.3", text = "store::checkout::tests::g3_s6_* — pass when slot readers never serve two reads at once, a reader waiting for a slot is woken when one is given back or when the log's restart gives every slot back, and a release lets every slot reader go" },
+]
+
+# lane qs7
+[[own]]
+id = "QT.7"
+title = "Vectorized scans on the row store: a leaf decoded once into column batches (query-time step 7; with G5 step 2)"
+criteria = [
+  { id = "AC-QT.7.1", text = "q06 at SF 1 in cache on one thread is at most 41 ns a lineitem row, by q06's best time over 6,001,215 rows, bench/planner/record.sh on jupiter" },
+  { id = "AC-QT.7.2", text = "TPC-H SF 10 median best time on one thread is at most 2,329 ms, by bench/planner/record.sh on jupiter, workers off" },
+  { id = "AC-QT.7.3", text = "JOB median best time over the parent's is at most 1.05, by bench/planner/record.sh on jupiter, change and parent" },
+]
+tests = [
+  { id = "T-QT.7.1", text = "Batched against row-at-a-time on random tables and predicates: NULLs, every storage class, affinities, a collation, overflow pages, deleted rows, columns added after rows were written, ascending and descending scans — passes when identical results and rows were read from batches" },
+  { id = "T-QT.7.2", text = "A batch budget smaller than one page's cells, and one below a single row's charge — passes when the scan decodes several windows a leaf, or falls back to row-at-a-time by its stated rule, with identical results and nothing batched past the budget" },
+  { id = "T-QT.7.3", text = "A program that writes the table it scans, and a statement prepared before the switch turns on — passes when the writing program reads row-at-a-time and the statement is prepared again with batches" },
+  # lane qs7-3
+  { id = "T-QT.7.4", text = "Filters (comparisons, ranges, IN, IS NULL, AND, OR) and aggregates (COUNT, SUM with its overflow error, TOTAL, AVG, MIN, MAX, with and without GROUP BY) over random tables of every storage class, NULLs, a collation, overflow rows and added columns, switch on against off — passes when answers and errors are identical and the fused loops ran rows" },
+  { id = "T-QT.7.5", text = "A fused loop over rows with overflow records amid the batch and the scan's end — passes when its answer is exact and matches row-at-a-time, and the fused loop ran" },
+]
+
+# lane g11s5
+[[own]]
+id = "CS.5"
+title = "The planner chooses the column copy or the rows for each scan by measured cost: whole-table and wide-range statements to the copy, point reads to the rows (G11 step 5)"
+criteria = [
+  { id = "AC-CS.5.1", text = "An access path 'scan the column copy' costed from the copy's measured scan cost per row and its freshness (queued keys merged from the rows), chosen against the row path's learned rates; a copy that can't answer the snapshot exactly is no path (translate/optimizer/column_path.rs, storage/versioned/columns_path.rs; behind AMPHORA_COLUMN_PATH=on until step 4's scan lands)" },
+  { id = "AC-CS.5.2", text = "Each analytic class against the best of CedarDB and ClickHouse is at least 1.0x (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-CS.5.1", text = "cs5_answers_identical_whichever_path_{plain,packed} (crates/engine/storage/versioned/columns_path.rs) — passes when every whole-table and point read, by either path, from a copy with deltas and queued keys, equals the rows at its snapshot" },
+  { id = "T-CS.5.2", text = "cs5_wide_aggregate_reads_the_copy_point_read_the_rows — passes when, by counts, the whole table comes from the copy (only queued keys from the rows) and a point read from one row read with the copy untouched" },
+  { id = "T-CS.5.3", text = "cs5_stale_copy_never_read_past_its_snapshot — passes when, at snapshots after commits a full queue dropped and before the copy's only generation, the rows are chosen, the copy is not read, and the answers equal the rows" },
+  { id = "T-CS.5.4", text = "cs5_* in translate/optimizer/column_path.rs — passes when the choice follows the costs: copy for wide shapes, rows for point reads and short ranges, no path when off or stale, queued keys priced, an unmeasured copy tried only for whole tables" },
+  { id = "T-CS.5.5", text = "cs5_vectorized_aggregates_identical_and_chosen_by_cost (crates/engine/storage/versioned/columns_path.rs) — passes when whole-table, grouped and key-range aggregates equal the rows' at the snapshot by either path, with the switch on the copy is read by step 4's vectorized scan (granules read, only queued keys from the rows), off every row is read, and a copy behind its snapshot reads no granule" },
+  { id = "T-CS.5.6", text = "cs5_scan_hook_runs_only_when_the_copy_is_chosen — passes when a scan given to the CopyScan hook runs once per aggregate the copy is chosen for and answers it, never with the switch off or on a stale copy" },
 ]
 
 # lane repl-measure (G12 steps 1 and 3, CP-T1.8): no new IDs. `amphora-bench --repl` is the harness

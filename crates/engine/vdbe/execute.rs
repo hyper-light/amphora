@@ -1095,7 +1095,7 @@ pub fn op_not_null(
 }
 
 macro_rules! comparison_opcode {
-    ($name:ident, $variant:ident, $op:expr, $jumps:expr) => {
+    ($name:ident, $variant:ident, $op:expr) => {
         #[inline(always)]
         pub fn $name(
             program: &Program,
@@ -1116,55 +1116,50 @@ macro_rules! comparison_opcode {
             let crate::vdbe::BranchOffset::Offset(target_pc) = *target_pc else {
                 return Err(unresolved_branch_target(*target_pc));
             };
-
-            // Two integers compare directly: no NULL handling, affinity or collation.
-            if let (
-                Register::Value(Value::Numeric(Numeric::Integer(l))),
-                Register::Value(Value::Numeric(Numeric::Integer(r))),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
-                let jumps = $jumps;
-                state.pc = if jumps(*l, *r) {
-                    target_pc
-                } else {
-                    state.pc + 1
-                };
-                return Ok(InsnFunctionStepResult::Step);
-            }
-            if let (
-                Register::Value(lhs_value @ Value::Text(l)),
-                Register::Value(rhs_value @ Value::Text(r)),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
-                if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
-                    state.pc = if comparison_matches_order($op, l.as_str().cmp(r.as_str())) {
-                        target_pc
-                    } else {
-                        state.pc + 1
-                    };
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-            }
-            op_comparison_slow(
+            let jumps = comparison_jumps(
                 program,
-                state,
-                *lhs,
-                *rhs,
-                target_pc,
+                state.registers[*lhs].get_value(),
+                state.registers[*rhs].get_value(),
                 *flags,
-                collation.unwrap_or_default(),
+                *collation,
                 $op,
-            )
+            )?;
+            state.pc = if jumps { target_pc } else { state.pc + 1 };
+            Ok(InsnFunctionStepResult::Step)
         }
     };
 }
 
-comparison_opcode!(op_eq, Eq, ComparisonOp::Eq, |l: i64, r: i64| l == r);
-comparison_opcode!(op_ne, Ne, ComparisonOp::Ne, |l: i64, r: i64| l != r);
-comparison_opcode!(op_lt, Lt, ComparisonOp::Lt, |l: i64, r: i64| l < r);
-comparison_opcode!(op_le, Le, ComparisonOp::Le, |l: i64, r: i64| l <= r);
-comparison_opcode!(op_gt, Gt, ComparisonOp::Gt, |l: i64, r: i64| l > r);
-comparison_opcode!(op_ge, Ge, ComparisonOp::Ge, |l: i64, r: i64| l >= r);
+comparison_opcode!(op_eq, Eq, ComparisonOp::Eq);
+comparison_opcode!(op_ne, Ne, ComparisonOp::Ne);
+comparison_opcode!(op_lt, Lt, ComparisonOp::Lt);
+comparison_opcode!(op_le, Le, ComparisonOp::Le);
+comparison_opcode!(op_gt, Gt, ComparisonOp::Gt);
+comparison_opcode!(op_ge, Ge, ComparisonOp::Ge);
+
+/// Whether a comparison opcode jumps for these operands. Amphora (QT.7): the one place a
+/// comparison's rules live (NULLs, affinity, collation, arrays), read by the opcodes and by the
+/// batched filters over a leaf's column vectors (`leaf_batch/fused.rs`).
+#[inline(always)]
+pub(super) fn comparison_jumps(
+    program: &Program,
+    lhs: &Value,
+    rhs: &Value,
+    flags: crate::vdbe::insn::CmpInsFlags,
+    collation: Option<CollationSeq>,
+    op: ComparisonOp,
+) -> Result<bool> {
+    // Two integers compare directly: no NULL handling, affinity or collation.
+    if let (Value::Numeric(Numeric::Integer(l)), Value::Numeric(Numeric::Integer(r))) = (lhs, rhs) {
+        return Ok(comparison_matches_order(op, l.cmp(r)));
+    }
+    if let (Value::Text(l), Value::Text(r)) = (lhs, rhs) {
+        if texts_compare_as_bytes(lhs, rhs, flags, collation) {
+            return Ok(comparison_matches_order(op, l.as_str().cmp(r.as_str())));
+        }
+    }
+    comparison_slow(program, lhs, rhs, flags, collation.unwrap_or_default(), op)
+}
 
 #[inline(always)]
 fn texts_compare_as_bytes(
@@ -1184,42 +1179,24 @@ fn texts_compare_as_bytes(
             && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
 }
 
-/// The comparison opcodes for every operand pair that is not two integers or
-/// two texts compared by their bytes: NULLs, affinity conversions, text
-/// collations and array comparison.
+/// The comparison for every operand pair that is not two integers or two texts compared by
+/// their bytes: NULLs, affinity conversions, text collations and array comparison.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn op_comparison_slow(
+fn comparison_slow(
     program: &Program,
-    state: &mut ProgramState,
-    lhs: usize,
-    rhs: usize,
-    target_pc: crate::vdbe::InsnReference,
+    lhs_value: &Value,
+    rhs_value: &Value,
     flags: crate::vdbe::insn::CmpInsFlags,
     collation: CollationSeq,
     op: ComparisonOp,
-) -> InsnResult {
+) -> Result<bool> {
     let null_eq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
 
-    let lhs_value = state.registers[lhs].get_value();
-    let rhs_value = state.registers[rhs].get_value();
-
-    macro_rules! take_jump_if {
-        ($should_take_jump:expr) => {
-            if $should_take_jump {
-                state.pc = target_pc;
-            } else {
-                state.pc += 1;
-            }
-            return Ok(InsnFunctionStepResult::Step);
-        };
-    }
-
     match (lhs_value, rhs_value) {
         (Value::Null, _) | (_, Value::Null) => {
-            let should_jump = if null_eq {
+            return Ok(if null_eq {
                 // SQLITE_NULLEQ makes comparison two-valued and orders a
                 // single NULL below every non-NULL value. Although normal
                 // expression translation only uses it with Eq/Ne, RANGE
@@ -1229,21 +1206,19 @@ fn op_comparison_slow(
                 comparison_matches_order(op, order)
             } else {
                 jump_if_null
-            };
-            take_jump_if!(should_jump);
+            });
         }
         (Value::Blob(lb), Value::Blob(rb)) if flags.has_array_cmp() => {
             // Element-wise array comparison
             if let Ok(ord) = compare_arrays(lb, rb) {
-                let should_jump = match op {
+                return Ok(match op {
                     ComparisonOp::Eq => ord.is_eq(),
                     ComparisonOp::Ne => !ord.is_eq(),
                     ComparisonOp::Lt => ord.is_lt(),
                     ComparisonOp::Le => ord.is_le(),
                     ComparisonOp::Gt => ord.is_gt(),
                     ComparisonOp::Ge => ord.is_ge(),
-                };
-                take_jump_if!(should_jump);
+                });
             }
         }
         (_, _) => {}
@@ -1261,18 +1236,16 @@ fn op_comparison_slow(
     let rhs_for_compare = new_rhs
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
-    let should_jump = if collation.is_custom() {
-        let order =
-            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
-        comparison_matches_order(op, order)
-    } else {
-        op.compare(lhs_for_compare, rhs_for_compare, collation)
-    };
-
     // The conversion is the comparison's own: the registers keep their values, as SQLite's
     // OP_Eq undoes what applyAffinity() did to them, so a CASE base, a BETWEEN's left side or a
     // constant compared again reads as it was.
-    take_jump_if!(should_jump);
+    if collation.is_custom() {
+        let order =
+            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
+        Ok(comparison_matches_order(op, order))
+    } else {
+        Ok(op.compare(lhs_for_compare, rhs_for_compare, collation))
+    }
 }
 
 #[inline(always)]
@@ -1483,11 +1456,13 @@ pub fn op_open_read(
                 .into());
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
+                // Amphora (G3.5): a cursor opened to read may stand on a named leaf.
                 BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
                 )
+                .open_read()
                 .into_boxed()
             } else {
                 BTreeCursor::new_without_rowid_table(
@@ -2187,6 +2162,25 @@ fn op_column_fetch(
         .registers
         .get_mut(dest)
         .ok_or_else(|| register_out_of_range("Column", dest))?;
+    // Amphora (QT.7): a scanned table's column comes from its leaf's batch when the program has
+    // one (`leaf_batch.rs`); otherwise, and for a row the batch left out, the row is read here.
+    if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        match super::leaf_batch::serve_column(
+            &mut state.leaf_batches,
+            plan,
+            cursor_id,
+            cursor,
+            column,
+            dest_reg,
+        )? {
+            super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
+            super::leaf_batch::Served::PastEnd => {
+                apply_column_default(default, dest_reg)?;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            super::leaf_batch::Served::RowAtATime => {}
+        }
+    }
     let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
@@ -2409,6 +2403,34 @@ fn op_column_range_fetch(
         .checked_add(defaults.len())
         .and_then(|end| state.registers.get_mut(dest..end))
         .ok_or_else(|| register_out_of_range("ColumnRange", dest))?;
+    // Amphora (QT.7): as Column does, from the leaf's batch; a row the batch left out is read
+    // whole below.
+    if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        let mut served = true;
+        for (offset, (default, reg)) in defaults.iter().zip(dest_regs.iter_mut()).enumerate() {
+            let column = start_column
+                .checked_add(offset)
+                .ok_or(LimboError::IntegerOverflow)?;
+            match super::leaf_batch::serve_column(
+                &mut state.leaf_batches,
+                plan,
+                cursor_id,
+                cursor,
+                column,
+                reg,
+            )? {
+                super::leaf_batch::Served::Value => {}
+                super::leaf_batch::Served::PastEnd => apply_column_default(default, reg)?,
+                super::leaf_batch::Served::RowAtATime => {
+                    served = false;
+                    break;
+                }
+            }
+        }
+        if served {
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         dest_regs.iter_mut().for_each(Register::set_null);
         return Ok(InsnFunctionStepResult::Step);
@@ -3586,7 +3608,7 @@ pub fn op_result_row(
 // pointer-identity check.
 #[cfg_attr(not(test), inline(always))]
 pub fn op_next(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -3624,7 +3646,35 @@ pub fn op_next(
         // Added as 0 or 1 so neither counter costs a branch per row.
         state.metrics.fullscan_steps = state.metrics.fullscan_steps.wrapping_add(*fullscan as u64);
         state.metrics.index_steps = state.metrics.index_steps.wrapping_add(*is_index as u64);
+        let next_pc = state.pc;
         state.pc = pc_if_next.as_offset_int();
+        // Amphora (QT.7): a fused scan loop runs its body over the rest of the leaf's batch at
+        // once, leaves the cursor on the last row it ran, and steps this Next again.
+        if let Some(fused) = program
+            .leaf_batch_plan
+            .as_deref()
+            .and_then(|plan| plan.fused_loop(next_pc as usize))
+        {
+            let rows = super::leaf_batch::fused::run(program, state, fused)?;
+            if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
+                let skipped = skipped as u64;
+                state.record_rows_read(skipped);
+                state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
+                state.metrics.search_count =
+                    state.metrics.search_count.wrapping_add(skipped as i64);
+                state.metrics.fullscan_steps = state
+                    .metrics
+                    .fullscan_steps
+                    .wrapping_add(*fullscan as u64 * skipped);
+                state.metrics.index_steps = state
+                    .metrics
+                    .index_steps
+                    .wrapping_add(*is_index as u64 * skipped);
+            }
+            if rows > 0 {
+                state.pc = next_pc;
+            }
+        }
     } else {
         state.pc += 1;
     }
@@ -5577,6 +5627,9 @@ pub fn op_savepoint(
                         return Err(mirror_err);
                     }
                     conn.push_named_savepoint(frame);
+                    if let Some(switch) = conn.versioned.as_ref() {
+                        switch.push_named(name)?;
+                    }
                     if starts_transaction {
                         turso_assert!(
                             !conn.tx_is_poisoned(),
@@ -5613,6 +5666,9 @@ pub fn op_savepoint(
                 }
                 SavepointResult::Release => {
                     let _ = conn.release_named_savepoint_frame(name);
+                    if let Some(switch) = conn.versioned.as_ref() {
+                        switch.release_named(name);
+                    }
                     mirror_named_savepoint_to_active_non_main_databases(
                         &conn,
                         SavepointMirror::Release(name),
@@ -5647,6 +5703,9 @@ pub fn op_savepoint(
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
             };
             let frame_info = conn.rollback_named_savepoint_frame(name);
+            if let Some(switch) = conn.versioned.as_ref() {
+                switch.rollback_named(name)?;
+            }
             mirror_named_savepoint_to_active_non_main_databases(
                 &conn,
                 SavepointMirror::Rollback(name),
@@ -6116,14 +6175,20 @@ pub fn op_real_affinity(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(RealAffinity { register }, insn);
-    if let Value::Numeric(Numeric::Integer(i)) = &state.registers[*register].get_value() {
-        state.registers[*register].set_float(
+    apply_real_affinity(&mut state.registers[*register]);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// A REAL column's affinity: an integer read from it becomes a real. Amphora (QT.7): shared by
+/// the opcode and the batched filters (`leaf_batch/fused.rs`).
+pub(crate) fn apply_real_affinity(register: &mut Register) {
+    if let Value::Numeric(Numeric::Integer(i)) = &register.get_value() {
+        register.set_float(
             NonNan::new(*i as f64)
                 .expect("i64 passed to op_real_affinity should be a valid NonNan"),
         );
     };
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_string8(
@@ -6492,6 +6557,40 @@ pub enum OpSeekState {
 }
 
 pub fn op_seek(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::Seek,
+        || seek_run(program, state, insn, pager),
+    )
+}
+
+/// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
+/// estimator samples this one (`LearnedCosts::sampled`). A run that waits on IO is not timed:
+/// its time is its page reads', which the pager times (`Work::PageRead`), and its resumption's
+/// would be part of the work.
+fn timed_run(
+    program: &Program,
+    work: crate::translate::optimizer::learned_costs::Work,
+    run: impl FnOnce() -> InsnResult,
+) -> InsnResult {
+    let costs = &program.connection.db.learned_costs;
+    if !costs.sampled(work) {
+        return run();
+    }
+    let started = std::time::Instant::now();
+    let result = run();
+    if matches!(result, Ok(InsnFunctionStepResult::Step)) {
+        costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
+    }
+    result
+}
+
+fn seek_run(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -8910,6 +9009,24 @@ pub fn op_agg_step(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
+    let arg = match &state.registers[data.col] {
+        Register::Value(Value::Numeric(arg)) => Some(*arg),
+        _ => None,
+    };
+    if agg_step_fast(data, arg, &mut state.registers[data.acc_reg]) {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    op_agg_step_slow(program, state, data)
+}
+
+/// The fast paths of an aggregate step: the common numeric cases of count, sum, avg and
+/// min/max over an initialized accumulator, given the argument when it is a number. Returns
+/// false when the step needs the slow path (every other function and value type, the first-row
+/// initialization and the error cases). Amphora (QT.7): shared by the opcode and the batched
+/// aggregates over a selection (`leaf_batch/fused.rs`).
+#[inline(always)]
+pub(crate) fn agg_step_fast(data: &AggStepData, arg: Option<Numeric>, acc: &mut Register) -> bool {
     // Fast paths for the common numeric cases of count, sum, avg and min/max
     // over an initialized accumulator. The slow path keeps every other
     // function and value type, the first-row initialization and the error
@@ -8917,10 +9034,8 @@ pub fn op_agg_step(
     if let AccumulatorFunc::Agg(agg) = &data.func {
         match agg {
             AggFunc::Sum | AggFunc::Total => {
-                if let Register::Value(Value::Numeric(arg)) = state.registers[data.col] {
-                    if let Register::Aggregate(AggContext::Builtin(payload)) =
-                        &mut state.registers[data.acc_reg]
-                    {
+                if let Some(arg) = arg {
+                    if let Register::Aggregate(AggContext::Builtin(payload)) = &mut *acc {
                         // payload[2] is the approx flag and payload[3] the overflow flag.
                         match (arg, payload.as_mut_slice()) {
                             (
@@ -8932,8 +9047,7 @@ pub fn op_agg_step(
                                 {
                                     *acc = sum;
                                     *count = rows;
-                                    state.pc += 1;
-                                    return Ok(InsnFunctionStepResult::Step);
+                                    return true;
                                 }
                             }
                             (
@@ -8948,8 +9062,7 @@ pub fn op_agg_step(
                                     *r_err = err;
                                     *ovrfl = 0;
                                     *count = rows;
-                                    state.pc += 1;
-                                    return Ok(InsnFunctionStepResult::Step);
+                                    return true;
                                 }
                             }
                             (
@@ -8963,8 +9076,7 @@ pub fn op_agg_step(
                                     *acc = sum;
                                     *r_err = err;
                                     *count = rows;
-                                    state.pc += 1;
-                                    return Ok(InsnFunctionStepResult::Step);
+                                    return true;
                                 }
                             }
                             _ => {}
@@ -8973,7 +9085,7 @@ pub fn op_agg_step(
                 }
             }
             AggFunc::Avg => {
-                if let Register::Value(Value::Numeric(arg)) = state.registers[data.col] {
+                if let Some(arg) = arg {
                     let arg = match arg {
                         Numeric::Float(f) => Some(f64::from(f)),
                         Numeric::Integer(i) if i.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
@@ -8982,7 +9094,7 @@ pub fn op_agg_step(
                         Numeric::Integer(_) => None,
                     };
                     if let (Some(arg), Register::Aggregate(AggContext::Builtin(payload))) =
-                        (arg, &mut state.registers[data.acc_reg])
+                        (arg, &mut *acc)
                     {
                         if let [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(count)), ..] =
                             payload.as_mut_slice()
@@ -8993,27 +9105,21 @@ pub fn op_agg_step(
                                 *acc = sum;
                                 *r_err = err;
                                 *count = rows;
-                                state.pc += 1;
-                                return Ok(InsnFunctionStepResult::Step);
+                                return true;
                             }
                         }
                     }
                 }
             }
             AggFunc::Count | AggFunc::Count0 => {
-                let counts = matches!(agg, AggFunc::Count0)
-                    || matches!(
-                        state.registers[data.col],
-                        Register::Value(Value::Numeric(_))
-                    );
+                let counts = matches!(agg, AggFunc::Count0) || arg.is_some();
                 if let (true, Register::Aggregate(AggContext::Builtin(payload))) =
-                    (counts, &mut state.registers[data.acc_reg])
+                    (counts, &mut *acc)
                 {
                     if let [Value::Numeric(Numeric::Integer(count))] = payload.as_mut_slice() {
                         if let Some(rows) = count.checked_add(1) {
                             *count = rows;
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
+                            return true;
                         }
                     }
                 }
@@ -9021,12 +9127,8 @@ pub fn op_agg_step(
             AggFunc::Min | AggFunc::Max
                 if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
             {
-                if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
-                    state.registers[data.col]
-                {
-                    if let Register::Aggregate(AggContext::Builtin(payload)) =
-                        &mut state.registers[data.acc_reg]
-                    {
+                if let Some(Numeric::Integer(arg)) = arg {
+                    if let Register::Aggregate(AggContext::Builtin(payload)) = &mut *acc {
                         if let Some(Value::Numeric(Numeric::Integer(best))) = payload.first_mut() {
                             let better = match agg {
                                 AggFunc::Max => arg > *best,
@@ -9035,8 +9137,7 @@ pub fn op_agg_step(
                             if better {
                                 *best = arg;
                             }
-                            state.pc += 1;
-                            return Ok(InsnFunctionStepResult::Step);
+                            return true;
                         }
                     }
                 }
@@ -9044,11 +9145,15 @@ pub fn op_agg_step(
             _ => {}
         }
     }
-    op_agg_step_slow(program, state, data)
+    false
 }
 
 #[inline(never)]
-fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
+pub(crate) fn op_agg_step_slow(
+    program: &Program,
+    state: &mut ProgramState,
+    data: &AggStepData,
+) -> InsnResult {
     let AggStepData {
         acc_reg,
         col,
@@ -9477,11 +9582,14 @@ pub fn op_sorter_sort(
     // unit, rows times log2 rows (`cost::estimate_sort_cpu_cost`).
     if let Some((rows, nanos)) = timed {
         let rows = rows as f64;
+        let units = rows * rows.max(1.0).log2();
         program.connection.db.learned_costs.observe(
             crate::translate::optimizer::learned_costs::Work::Sort,
-            rows * rows.max(1.0).log2(),
+            units,
             nanos,
         );
+        // Amphora (PL.7): the statement's sort work, a term of the fitted cost model.
+        state.metrics.sort_units += units;
     }
     // Increment metrics for sort operation after cursor is dropped
     if did_sort {
@@ -16843,6 +16951,24 @@ pub fn op_integrity_check(
         message_register,
     } = data.as_ref();
 
+    // Amphora (G7 step 2, `AC-NS.2.1`): the main database's trees on the versioned storage are
+    // checked there; the pager's pages hold none of them.
+    if *db == MAIN_DB_ID {
+        if let Some(switch) = program.connection.versioned.as_ref() {
+            let found = switch.check(roots, *max_errors)?;
+            let register = state
+                .registers
+                .get_mut(*message_register)
+                .ok_or_else(|| LimboError::InternalError("integrity_check: no register".into()))?;
+            if found.is_empty() {
+                register.set_null();
+            } else {
+                register.set_text(Text::new(found.join("\n")))?;
+            }
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
     let target_pager = if *db == MAIN_DB_ID {
@@ -17955,6 +18081,19 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::HashBuild,
+        || hash_build_run(program, state, insn, pager),
+    )
+}
+
+fn hash_build_run(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
     load_insn!(HashBuild { data }, insn);
 
     let mut op_state = match state.active_op_state.hash_build().take().filter(|s| {
@@ -18065,7 +18204,10 @@ pub fn op_hash_build(
             payload_values: std::mem::replace(&mut op_state.payload_values, crate::alloc::vec![]),
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
-            HashInsertResult::Done => {}
+            HashInsertResult::Done => {
+                state.metrics.hash_join.build_rows =
+                    state.metrics.hash_join.build_rows.saturating_add(1);
+            }
             HashInsertResult::IO { io, pending } => {
                 op_state.key_values = pending.key_values;
                 op_state.payload_values = pending.payload_values;
@@ -18385,6 +18527,19 @@ fn write_hash_payload_to_registers(
 }
 
 pub fn op_hash_probe(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::HashProbe,
+        || hash_probe_run(program, state, insn, pager),
+    )
+}
+
+fn hash_probe_run(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -19657,6 +19812,10 @@ pub fn op_filter(
         },
         insn
     );
+    // Amphora (PL.5): the first probe ends a sized filter's build.
+    if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
+        filter.seal();
+    }
     let Some(filter) = state.get_bloom_filter(*cursor_id) else {
         // always safe to fall though, no filter present
         state.pc += 1;
@@ -19702,21 +19861,23 @@ pub fn op_filter_add(
         FilterAdd {
             cursor_id,
             key_reg,
-            num_keys
+            num_keys,
+            sizing
         },
         insn
     );
+    let sizing = *sizing;
 
     if *num_keys == 1 {
         let reg: *const Register = &state.registers[*key_reg];
         let value = unsafe { &*reg }.get_value();
-        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        let filter = state.get_or_create_bloom_filter_for(*cursor_id, sizing);
         filter.insert_value(value);
     } else {
         let values: Vec<Value> = (0..*num_keys)
             .map(|i| state.registers[*key_reg + i].get_value().clone())
             .collect();
-        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        let filter = state.get_or_create_bloom_filter_for(*cursor_id, sizing);
         let value_refs: Vec<&Value> = values.iter().collect();
         filter.insert_values(&value_refs);
     }
@@ -20206,6 +20367,150 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     } else {
         root_page
     }
+}
+
+/// Amphora (QT.6): [Insn::MorselAggregate]. The statement's read transaction is open, so every
+/// worker's cursor reads its one snapshot through `pager`.
+pub fn op_morsel_aggregate(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::vdbe::morsel::HashProbe;
+    use crate::vdbe::morsel::{MachineCosts, MemoryBudget, MorselError, ScanAggregate};
+    use crate::vdbe::morsel_scan::{TableAggregate, TableJoinAggregate, TableSource};
+    load_insn!(MorselAggregate { data }, insn);
+    let refused = |error: MorselError| -> Box<LimboError> {
+        Box::new(LimboError::InternalError(format!(
+            "parallel aggregate: {error}"
+        )))
+    };
+    let connection = &program.connection;
+    // The costs are taken for the run and put back after, so a statement learns from the last.
+    let taken = connection.morsel_costs.lock().take();
+    let mut costs = match taken {
+        Some(costs) => costs,
+        None => MachineCosts::measure().map_err(refused)?,
+    };
+    let answered = (|| {
+        let table = TableSource::open(
+            pager.clone(),
+            data.root_page,
+            data.columns,
+            data.rowid_alias,
+        )?;
+        let budget = MemoryBudget::new(pager.statement_memory_budget());
+        let Some(join) = &data.join else {
+            let shape = ScanAggregate {
+                rows: &[],
+                filter: &data.filter,
+                group_by: &data.group_by,
+                aggregates: &data.aggregates,
+            };
+            let pipeline = TableAggregate {
+                table: &table,
+                shape: &shape,
+            };
+            return pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget);
+        };
+        // A hash join's probe: the build side read and its table built once, on this thread,
+        // charged to the statement's one budget; the joined rows' filter is the probe's.
+        let build_table = TableSource::open(
+            pager.clone(),
+            join.root_page,
+            join.columns,
+            join.rowid_alias,
+        )?;
+        let build = build_table.filtered_rows(&join.filter, &budget)?;
+        let probe = HashProbe::build(&build, &join.build_key, &[], &join.probe_key, &budget)?;
+        let shape = ScanAggregate {
+            rows: &[],
+            filter: &[],
+            group_by: &data.group_by,
+            aggregates: &data.aggregates,
+        };
+        let pipeline = TableJoinAggregate {
+            table: &table,
+            probe_filter: &data.filter,
+            probe: &probe,
+            build: &build,
+            shape: &shape,
+        };
+        pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget)
+    })();
+    *connection.morsel_costs.lock() = Some(costs);
+    let mut rows = match answered {
+        Ok((rows, _)) => rows,
+        // A value the parallel aggregates don't take (a SUM over text), or groups past the
+        // statement's memory that the serial loop's spilling GROUP BY can hold: it answers.
+        Err(MorselError::Unsupported { .. } | MorselError::MemoryBudget { .. }) => {
+            state.pc = data.target_pc_serial.as_offset_int();
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        Err(error) => return Err(refused(error)),
+    };
+    // Groups in the order the serial GROUP BY gives them: by their key values as SQLite orders
+    // them (the pipeline's own key order puts kinds apart).
+    let keys = data.group_by.len();
+    rows.sort_by(|a, b| a.iter().take(keys).cmp(b.iter().take(keys)));
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows.len())
+        .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+    for row in rows {
+        let mut mapped = Vec::new();
+        mapped
+            .try_reserve_exact(data.result_map.len())
+            .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+        for at in &data.result_map {
+            let value = row.get(*at).ok_or_else(|| {
+                refused(MorselError::NoColumn {
+                    column: *at,
+                    width: row.len(),
+                })
+            })?;
+            mapped.push(value.clone());
+        }
+        out.push(mapped);
+    }
+    state.morsel_rows = Some(out.into_iter());
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (QT.6): [Insn::MorselNext].
+pub fn op_morsel_next(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        MorselNext {
+            dest_start,
+            count,
+            target_pc_done
+        },
+        insn
+    );
+    let next = state.morsel_rows.as_mut().and_then(Iterator::next);
+    let Some(row) = next else {
+        state.morsel_rows = None;
+        state.pc = target_pc_done.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let end = dest_start
+        .checked_add(*count)
+        .ok_or(LimboError::IntegerOverflow)?;
+    let registers = state
+        .registers
+        .get_mut(*dest_start..end)
+        .ok_or_else(|| LimboError::InternalError("parallel rows' registers out of range".into()))?;
+    for (register, value) in registers.iter_mut().zip(row) {
+        *register = Register::Value(value);
+    }
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 #[cfg(test)]

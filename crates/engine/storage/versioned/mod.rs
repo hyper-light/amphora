@@ -15,6 +15,7 @@
 
 pub mod blink;
 pub mod columns;
+pub(crate) mod columns_path;
 #[cfg(test)]
 mod conformance;
 pub mod cursor;
@@ -22,6 +23,9 @@ pub mod disk;
 pub mod durable;
 #[cfg(test)]
 mod elle;
+#[cfg(test)]
+mod evict;
+pub mod memory;
 pub mod overflow;
 pub mod page;
 pub mod pool;

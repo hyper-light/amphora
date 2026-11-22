@@ -397,6 +397,38 @@ pub struct GroupFindData {
     pub target_pc_full: BranchOffset,
 }
 
+/// Amphora: data for [Insn::MorselAggregate] (QT.6).
+#[derive(Debug, Clone)]
+pub struct MorselAggregateData {
+    pub root_page: i64,
+    /// The table's stored columns, and the one its rowid stands in for (an INTEGER PRIMARY KEY).
+    pub columns: usize,
+    pub rowid_alias: Option<usize>,
+    pub filter: Vec<crate::vdbe::morsel::Predicate>,
+    pub group_by: Vec<usize>,
+    pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
+    /// For each result column, its place in the pipeline's row (the GROUP BY values, then the
+    /// aggregates).
+    pub result_map: Vec<usize>,
+    /// A hash join's build side when the scan is the join's probe: the pipeline's row is the probe
+    /// table's columns, then the build's; `filter` is then over the probe table's alone.
+    pub join: Option<MorselJoinData>,
+    pub target_pc_serial: BranchOffset,
+}
+
+/// Amphora: the build side of [MorselAggregateData]'s hash join (QT.6).
+#[derive(Debug, Clone)]
+pub struct MorselJoinData {
+    pub root_page: i64,
+    pub columns: usize,
+    pub rowid_alias: Option<usize>,
+    /// Terms over the build table's columns, tested before a row goes into the hash table.
+    pub filter: Vec<crate::vdbe::morsel::Predicate>,
+    /// The key's columns, pair by pair, in the probe table and in the build table.
+    pub probe_key: Vec<usize>,
+    pub build_key: Vec<usize>,
+}
+
 /// Amphora: data for [Insn::GroupSort].
 #[derive(Debug, Clone)]
 pub struct GroupSortData {
@@ -724,6 +756,9 @@ pub enum Insn {
         cursor_id: CursorID,
         key_reg: usize,
         num_keys: usize,
+        /// Amphora (PL.5): a hash join's filter, sized when its build ends; none for a filter
+        /// of fixed size.
+        sizing: Option<crate::vdbe::bloom_filter::FilterSizing>,
     },
     // Compare two registers and jump to the given PC if the left-hand side is less than or equal to the right-hand side.
     /// Open a cursor for reading.
@@ -2232,6 +2267,22 @@ pub enum Insn {
         version: crate::CdcVersion,
         cdc_mode: String,
     },
+
+    /// Amphora (QT.6): runs a scan's filter and aggregates over the table's leaf pages in morsels,
+    /// a cursor per worker (`vdbe/morsel_scan.rs`), keeping the answer's rows for [Insn::MorselNext];
+    /// jumps to `target_pc_serial`, the statement's serial loop, when a value is one the parallel
+    /// aggregates don't take.
+    MorselAggregate {
+        data: Box<MorselAggregateData>,
+    },
+
+    /// Amphora (QT.6): writes the next row [Insn::MorselAggregate] kept into `dest_start..` or,
+    /// when none is left, jumps to `target_pc_done`.
+    MorselNext {
+        dest_start: usize,
+        count: usize,
+        target_pc_done: BranchOffset,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2479,6 +2530,8 @@ impl InsnVariants {
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
+            InsnVariants::MorselAggregate => execute::op_morsel_aggregate,
+            InsnVariants::MorselNext => execute::op_morsel_next,
         }
     }
 }

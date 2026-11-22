@@ -517,6 +517,13 @@ pub struct Connection {
     pub(super) join_methods: AtomicJoinMethods,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_mode`].
+    pub(super) parallel_mode: AtomicBool,
+    /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
+    /// first parallel statement and learned by every one after.
+    pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
+    /// Amphora: see [`Connection::set_vectorized_scans`].
+    pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
     pub(super) enable_load_extension: AtomicBool,
     /// Cumulative count of autonomous sequence inner-tx retries (each
@@ -977,8 +984,50 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// Amphora (QT.6, a prototype behind this switch, off by default): lets newly prepared
+    /// statements run a qualifying scan with its filter and aggregates in morsels of leaf pages,
+    /// a cursor per worker (`vdbe/morsel_scan.rs`, docs/design/executor.md section 8).
+    pub fn set_parallel_mode(&self, mode: crate::vdbe::morsel::ParallelMode) {
+        self.parallel_mode.store(
+            mode == crate::vdbe::morsel::ParallelMode::On,
+            Ordering::Release,
+        );
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn parallel_mode(&self) -> crate::vdbe::morsel::ParallelMode {
+        if self.parallel_mode.load(Ordering::Acquire) {
+            crate::vdbe::morsel::ParallelMode::On
+        } else {
+            crate::vdbe::morsel::ParallelMode::Off
+        }
+    }
+
+    /// Amphora (PL.7, a prototype behind this switch, off by default; `AMPHORA_FITTED_COSTS=1`
+    /// turns it on at open): has the database time its statements and newly prepared statements
+    /// plan with the cost weights fitted to those times (`optimizer::cost_fit`). The switch and
+    /// the fit are the database's, shared by its connections. Off until the coordinator's JOB
+    /// measurement of AC-PL.7.1 says otherwise.
+    pub fn set_fitted_costs(&self, on: bool) {
+        self.db.cost_fit.set_on(on);
+        self.bump_prepare_context_generation();
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches.load(Ordering::Acquire)
+    }
+
+    /// Amphora (query speed step 7, QT.7; a prototype behind this switch, off by default): newly
+    /// prepared read-only statements scan tables by decoding each leaf once into column batches
+    /// (`vdbe/leaf_batch.rs`) instead of each row's columns as they are read. Off until its
+    /// measurement against the row-at-a-time scan (the coordinator's) says otherwise.
+    pub fn set_vectorized_scans(&self, on: bool) {
+        self.vectorized_scans.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn vectorized_scans(&self) -> bool {
+        self.vectorized_scans.load(Ordering::Acquire)
     }
 
     /// Choose how correlated subqueries are planned in newly prepared statements.
@@ -1415,6 +1464,21 @@ impl Connection {
     /// visible to other connections.
     pub fn force_reparse_schema_without_publish(self: &Arc<Connection>) -> Result<()> {
         self.force_reparse_schema_inner(false)
+    }
+
+    /// Amphora (G7 step 2, `AC-NS.2.1`): reads the schema from the versioned storage's
+    /// `sqlite_schema` (its tree 1) and makes it the database's, so every connection made after
+    /// sees the tables a reopened database holds. Its read ends the storage's transaction it began.
+    pub(crate) fn load_versioned_schema(self: &Arc<Connection>) -> Result<()> {
+        let read = self.force_reparse_schema_inner(false);
+        let ended = self
+            .versioned
+            .as_ref()
+            .map_or(Ok(()), |switch| switch.finish(true));
+        read?;
+        ended?;
+        self.db.replace_schema(self.schema.read().clone());
+        Ok(())
     }
 
     /// Amphora: rebuild this writer's schema after importing unresolved-commit page images.

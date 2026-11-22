@@ -25,6 +25,9 @@ pub enum File {
         lane: usize,
         turn: usize,
     },
+    /// Pages the buffer pool evicted dirty between checkpoints, page `n` at `n` pages in: emptied
+    /// as the pool opens and never read by recovery (G7 step 4).
+    Spill,
 }
 
 /// The files ahead of the redo files.
@@ -45,6 +48,11 @@ impl File {
             File::Redo { lane, .. } => Err(LimboError::InternalError(format!(
                 "versioned storage: no redo lane {lane} among {lanes}"
             ))),
+            // After every lane's redo files.
+            File::Spill => lanes
+                .checked_mul(2)
+                .and_then(|l| l.checked_add(FIXED))
+                .ok_or(LimboError::IntegerOverflow),
         }
     }
 
@@ -53,6 +61,7 @@ impl File {
         lanes
             .checked_mul(2)
             .and_then(|n| n.checked_add(FIXED))
+            .and_then(|n| n.checked_add(1))
             .ok_or(LimboError::IntegerOverflow)
     }
 }
@@ -105,8 +114,8 @@ fn lane_of(name: &str) -> Option<usize> {
     }
 }
 
-/// The files in a directory: `data`, `journal`, `journal-next`, and each lane's `redo-<lane>-0`
-/// and `redo-<lane>-1`.
+/// The files in a directory: `data`, `journal`, `journal-next`, each lane's `redo-<lane>-0`
+/// and `redo-<lane>-1`, and `spill`.
 pub struct Files {
     files: Vec<std::fs::File>,
     lanes: usize,
@@ -142,6 +151,7 @@ impl Files {
                 files.push(open(&redo_name(lane, turn))?);
             }
         }
+        files.push(open("spill")?);
         Ok(Self { files, lanes: held })
     }
 

@@ -1430,6 +1430,22 @@ placed before other loops (the emitter's no-match path first).
 `answers.py`) for a query with a LEFT JOIN; or such a plan slower than its parent's on the bench
 suite beyond the passes' spread.
 
+## Decision (lane pl8-4): an outer join's ON terms on an earlier table count given its filters
+
+**Decision.** PL.8's estimate (decision 21, CERT). An outer join's ON terms that read only an
+earlier table (lane pl8's `on_elsewhere`) were run over that table's sample apart from its filters,
+so a pair correlated on the sample counted as independent. Their share is now the earlier table's
+sample run with its filters and them together, over its filters alone (`cardinality.rs`,
+`JoinedSetRows::new`): the share of the rows its filters keep that the ON terms match, as the inner
+join reads the same terms together on the same sample.
+
+**Evidence.** `crates/engine/tests/sample_filters.rs`'s
+`an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join`: `t0 AS a0 RIGHT JOIN t0 AS
+a1 ON NOT (a1.c0 GLOB 'a%') WHERE a1.c1 >= 3` was estimated at 0.684 against its inner join's 1 on
+main; it passes with the change.
+
+**Falsified by.** A CERT finding where an outer join's ON terms read only an earlier table.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
@@ -1536,6 +1552,65 @@ are the coordinator's.
 - The bench suite's writes more than 2% slower than the parent (AC-PL.9.2).
 - A statement planned again many times as its table grows slowly, each plan the same: the error
   too tight to say when a plan could change.
+
+## Decision (lane pl13): a nested loop that turns into a hash join at the learned costs' break-even, and a plan made again past its estimate's error
+
+**Decision.** PL.13 (docs/research/planner.md section 9, rank 13; `crates/engine/translate/optimizer/adaptive.rs`).
+Two run-time checks, each a pure core the executor drives, each with a fixed few counters:
+- **The join switch.** A nested-loop or index join counts its outer rows. It turns into a hash join
+  at the first outer row whose count reaches the switch point `B x (1 + hash_build) / (seek - hash_probe)`:
+  `B` the inner side's rows, the three weights the learned costs' (decision QT.5,
+  `learned_costs.rs`), in rows' visits. That is the row at which the seeks' extra cost over probes
+  so far equals the cost of reading and building the inner side. Where a probe costs no less than a
+  seek there is no point: the join never switches. A planner that chose the nested loop did so for
+  an estimate below the point, so the switch fires only when the rows outgrow the estimate.
+  Switching there is the ski-rental rule: whatever the outer side's true size, the join costs less
+  than twice the cheaper of the two methods chosen in hindsight. Rows already joined by seeks are
+  not joined again: the probes take the rows after them, so the answer is the same rows.
+- **Re-optimization at a materialization point.** Where a plan holds an intermediate result whole
+  (a hash join's build side, a sorter, a materialized subquery), its rows are counted against the
+  estimate. Outside `estimate / (1 + error)` to `estimate x (1 + error)`, `error` the relative
+  standard error of the statistics the estimate came from (`1 / sqrt(n)` for a sample of `n`, as
+  decision "lane pl9" uses it), the rest of the statement is due to be planned again on the counted
+  rows. Within it, the estimate could not be told apart from its own noise, and nothing changes.
+- **Memory.** The switch's hash table is held to the hash table's share of the statement's budget
+  (`vdbe::hash_table::table_share`), measured before the switch by an upper bound known without
+  reading it (the inner table's pages). A materialization point counts the bytes it holds against
+  its budget. Past either, a typed refusal (`AdaptiveError`): the join stays a nested loop, the
+  plan under way goes on, both always correct answers.
+- Nothing is picked: the point moves with the learned weights and the inner side's rows, the band
+  with the statistics' own sample size.
+
+**Built so far.** The two cores and their tests. The executor's shell is the next piece: a join
+emitted with both inner loops (the seek and the hash probe, `main_loop/hash.rs`'s build emitted
+behind the switch's jump) and an instruction that steps the switch; and a materialization point
+that hands its counted rows to a second prepare of the statement's rest. Until it lands no plan
+switches.
+
+**Why.** Audit row 13 (`bench/planner/audit/10-no-adaptive.sql`): a nested loop chosen for an
+estimate ran on however many rows came, and an estimate wrong by orders of magnitude was never
+corrected within the statement.
+
+**Sources.** SQL Server's batch-mode adaptive joins (Microsoft Learn, intelligent query processing
+details; f32, A): a hash or nested-loop join chosen at run time within one plan, against a threshold
+SQL Server picks, which the learned costs replace here. Perron et al., "How I Learned to Stop
+Worrying and Love Re-optimization", ICDE 2019 (f34, A): re-optimizing at materialization points on
+observed cardinalities cut JOB's 20 longest queries by 27%. Karlin, Manasse, Rudolph and Sleator,
+"Competitive snoopy caching", Algorithmica 3, 1988: the ski-rental rule's bound of 2.
+
+**Evidence.** `adaptive.rs`'s unit tests: answers identical with the switch on and off over 300
+random joins with NULL and repeated keys (T-PL.13.1, against the cores' model join; the engine's
+own differential waits on the shell); the switch fires once past the point and never at an
+estimate below it, its cost under twice the best, refused over budget (T-PL.13.2); a new plan asked
+only outside the band, the bytes held bounded (T-PL.13.3). JOB's 20 slowest queries against the
+parent (AC-PL.13.1) are the coordinator's, once the shell lands.
+
+**Falsified by.**
+- JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).
+- A join that switched and ran slower than the nested loop it left, on the same rows: the learned
+  weights wrong for the inner side's access (its pages not cached as the seek weight assumes).
+- A statement planned again whose new plan is the old one, many times over: the band too tight to
+  say when a plan could change.
 
 ## 22. Correlated subqueries unnested by dependent joins taken apart, from a worklist (PL.10)
 
@@ -1662,3 +1737,112 @@ ANALYZE's norms equal a GROUP BY's counts on random data; a partial index keeps 
 or inserts that deletes cancel, aren't in it, so between ANALYZE runs the bound is proven for the
 net change only. Making it hold through every write takes a count of rows written, PL.9's call. A
 WITHOUT ROWID table's primary key keeps its norms but the bound doesn't yet read them.
+
+## Decision (lane pl7): cost weights fitted to measured statement times, behind a switch
+
+**Decision.** PL.7 (docs/research/planner.md section 9, rank 7). With the database's switch on
+(`Connection::set_fitted_costs`, or `AMPHORA_FITTED_COSTS=1` at open; off by default), the database
+times a share of its statements and fits the planner's weights to those times
+(`crates/engine/translate/optimizer/cost_fit.rs`). The planner reads them through one hook,
+`CostModelParams::with_fitted`, after the learned calibration's (`with_learned`, QT.5): each weight
+the fit determines replaces the learned one, in page reads; a weight no sample determines keeps the
+learned value. Nothing is picked.
+
+- **Terms.** A timed statement gives the work it counted as it ran: rows its cursors stepped
+  through, b-tree seeks, rows added to hash tables, hash lookups, in-memory sort work in rows times
+  log2 rows, and pages read from the file. Counted, not estimated: the fit is of the cost model,
+  and estimates would fold cardinality errors into the weights.
+- **Time.** A statement's time is its steps' time and its waits on IO between them; the caller's
+  time between a row and the next step, and a busy handler's sleep, are not its work. Each step's
+  timing window holds about one clock read, subtracted.
+- **Fit.** Time is regressed on the counts, relative to each statement's time (statement times
+  span orders of magnitude): non-negative least squares by Lawson and Hanson's active-set method
+  on the normal equations, each sample weighted by Huber's function of its residual against the fit
+  as it stood (constant 1.345 scales; scale from the residuals' mean absolute value). Terms whose
+  columns the others explain to within the arithmetic's precision, and terms the fit holds at zero
+  (the constraint, not a measurement), are not determined, and keep the learned value. Nor does a
+  weight the samples can't tell from nothing: the planner reads a fitted weight only when it
+  stands above zero by more than its standard error times the same 95% Bonferroni quantile the
+  epochs are compared by (T-PL.7.6). Without this, a few samples timed on a loaded host moved
+  plans at the margin: `tests/planner.rs` failed one run in seven with the switch on.
+- **Memory.** The fit keeps two epochs' normal equations, never samples: fixed-size arrays. An
+  epoch closes once it alone determines what the previous one did and holds its length; the length
+  doubles while consecutive epochs' fits agree within their standard errors (a 95% test,
+  Bonferroni-corrected over the weights compared) and halves when they don't. An epoch that no
+  longer sees a term closes once it holds as many samples as the previous one: the term goes back
+  to its learned weight.
+- **Sampling.** A statement is timed as often as what timing it adds (two clock reads a step,
+  measured where the engine runs, and the fit's update, timed) stays within the measurement's own
+  spread: `rate = min(1, spread × statement time / timing's time)`, every statement until the fit
+  has a spread. Deterministic: a running credit, no random draw.
+
+**Why.** Step 3's JOB costs ranked measured times at a Spearman correlation of 0.20. QT.5's
+calibration times each kind of work alone, on a page of keys; a statement's work runs beside the
+rest of the engine (cursor bookkeeping, record decoding, the page cache), which no isolated
+calibration sees. Fitting to the statements' own times weighs the terms as they cost there, on the
+hardware and data in use, and follows them as conditions move.
+
+**Sources.**
+- Leis, Gubichev, Mirchev, Boncz, Kemper, Neumann, "How Good Are Query Optimizers, Really?",
+  PVLDB 9(3), 2015: on JOB, cost-model errors are dwarfed by cardinality errors; the cost model is
+  tuned and judged on true cardinalities (f12).
+- Lawson and Hanson, "Solving Least Squares Problems", Prentice-Hall 1974, chapter 23 (NNLS); Bro
+  and De Jong, "A fast non-negativity-constrained least squares algorithm", J. Chemometrics 11(5),
+  1997 (the normal-equation form). The outer loop's bound, three passes a term, is MATLAB
+  `lsqnonneg`'s documented default.
+- Huber, "Robust Estimation of a Location Parameter", Ann. Math. Statist. 35(1), 1964; Holland and
+  Welsch, "Robust regression using iteratively reweighted least-squares", Comm. Statist. A6(9),
+  1977 (1.345: 95% efficiency at the normal).
+- Bifet and Gavaldà, "Learning from Time-Changing Data with Adaptive Windowing", SDM 2007 (a
+  window that grows while the data hold and shrinks when they move); Dunn, "Multiple Comparisons
+  Among Means", JASA 56(293), 1961 (the correction).
+
+**Evidence.** `cost_fit`'s unit tests (T-PL.7.2 to T-PL.7.5): on synthetic samples from known
+weights with 5% noise the fit lands within four standard errors and 5% of each; one sample in ten a
+tenfold stall still leaves every weight within 5%; terms never sampled have no fitted weight and the
+planner's value stands; two hundred thousand samples leave the fit's size unchanged; doubled weights
+are followed. The planner suites (`tests/planner.rs`, `records_plans.rs`, `join_methods.rs`) pass
+with the switch on and off.
+
+**Falsified by.** The coordinator's JOB run (AC-PL.7.1): the rank correlation of estimated cost
+with time, counted rows in place of estimates, no higher with the switch on than off.
+
+**Open.** The other parts of PL.7's row: a table's pages from its file rather than its rows over 50
+(T-PL.7.1, the audit's 09-cost-model; `cost.rs`, lane qs5-7's), and the P-error harness
+(AC-PL.7.2), the coordinator's. External sorts and hash spills give no term yet: their work is
+folded into the others'.
+
+## Decision (lane qs5-9): a hash join's Bloom filter sized from its build's measured keys, chosen by the learned weights
+
+**Decision.** PL.5 (and QT.5, query speed step 5), first part. A hash join's Bloom filter, built
+from the build side's keys and probed before each probe row reaches the hash table, is sized when
+its build ends, from the distinct keys the build measured, at a false-positive rate the planner
+derives from the cost model's weights; whether a join gets a filter at all is the same derivation's
+answer. It replaces a filter of fixed size (1,024 keys at 1%, Turso's default, which a large build
+filled until it passed nearly everything) and the rule "a filter where the probe side has at least
+twice the build's rows".
+
+- **The rate** (`bloom_filter_rate_per_key`, `translate/optimizer/access_method.rs`). For `n` keys at
+  rate `p` a Bloom filter holds `n·(-ln p)/ln²2` bits (Broder and Mitzenmacher, "Network
+  Applications of Bloom Filters: A Survey", 2004, section 2.1). The probe rows that find no match,
+  `misses`, still pay the probe for the share `p` that passes. A filter bit is priced at the hash
+  table's own memory: a build row's cost over its bits. The total is least at
+  `p = bit_cost·n / (ln²2 · misses · probe_cost)`; the plan carries that over `n`, the rate per key,
+  so the runtime multiplies it by the keys it measured. The planner chooses the filter when the
+  total with it (every probe row's lookup, the passing misses' probes and the bits) is below the
+  misses' probes without it; a join whose probe rows all match gets none.
+- **Sizing** (`FilterSizing`, `vdbe/bloom_filter.rs`). While the build runs the filter keeps its
+  keys' 64-bit hashes; the first probe seals it: distinct hashes counted, the filter built for them.
+  A build without keys gives a filter that rejects every key; a rate of one or more, none.
+- **Bound.** The hashes and the filter stay within the hash join's memory budget (the statement's,
+  derived, executor decision 8): the hashes grow within it and the filter is dropped past it (every
+  probe row then passes, as without one), and the rate is never below what the budget's bits allow,
+  `exp(-(m/n)·ln²2)`.
+- **Answers.** A filter never rejects a key it was given, a NULL key matches nothing, and a full
+  outer join probes none, as before.
+- **Open.** The filter's own lookup is priced as one key hash (`hash_cpu_cost`); with the learned
+  weights, whose build and probe times include hashing, that price is zero, so a measured
+  filter-lookup weight (Filter ops timed like the hash probes of QT.5 step 3a) is next.
+  LIP (filters from several dimensions applied to the fact scan in their measured order) and
+  predicate transfer across the join graph are not built yet.
+

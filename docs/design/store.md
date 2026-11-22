@@ -1881,7 +1881,7 @@ settle `point_pk`'s instructions per statement at one client fall by less than 1
 `table_count` at 32 clients rises less than 3x. The step's own bars: the log's and locks' share of
 point reads at 32 clients is at most 5%, and `point_pk` at 32 clients is at least 4x one client.
 
-## 41. Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, not yet wired)
+## 41. Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, behind a switch)
 
 G3 step 5 (G3.5, kiln plan 01a16b0f464172dc80c7a3b9a14acbce): the descent is within B-tree search's
 11.9-23.0% of a point read's user cycles (bench/records/2026-10-23-adacachy-read-path.md), so with it
@@ -1914,9 +1914,23 @@ gone a point read gains at most 1.14-1.30x (Amdahl's bound).
 - **Memory.** D holds at most its budget of entries (keys plus leaves tracked), evicting the least
   recently used leaves and refusing a leaf larger than the budget; E at most its budget of fences,
   refusing past it. The caller derives both from the memory it grants.
-- **Not yet.** The hook into `BTreeCursor`'s seek, behind a switch: a freed-page count every
-  connection sees, and a cursor that stands on a leaf it didn't descend to (SQLite's leaves have no
-  sibling links, so a step past the leaf must descend first). Until then the costs are the model's.
+- **The hook.** `AMPHORA_DESCENT_SKIP` = `off` | `hash` | `locator`, default `off`. Each
+  connection's pager holds the hook: hash and locators learned by its read cursors' descents, and
+  the stamp they are valid under: the connection's own count of pages that left their tree (every
+  free, every rollback to a savepoint or of a transaction) with its snapshot's identity (its WAL
+  position). A pager-wide count isn't sound: another connection's free happens at a snapshot this
+  one doesn't see, and a page learned under one snapshot proves nothing under another. When the
+  stamp moves, everything learned is dropped. Only a cursor opened to read consults it, and only
+  for a point seek; the named page is used only if it is loaded, clean and unlocked in the
+  connection's own cache (no I/O, nothing a write is changing), and only after `table_leaf_span`
+  proves the rowid in range; anything else descends. The cursor then stands on that leaf alone:
+  SQLite's leaves have no sibling links and the stack has no ancestors, so every other move (next,
+  prev, insert, delete, the current-leaf fast path) first descends again, to the row it stands on
+  or, with none, to the rowid its seek sought, which is where the plain descent would have put it;
+  a move to the root rebuilds the stack anyway. Bounds come from the connection's page cache, as
+  only cached pages are used: the locators together hold at most a fence a cached page, the hash
+  at most as many keys as the cached pages hold cells (SQLite's `MX_CELL`, btreeInt.h). Tested
+  through the real cursor by T-G3.5.4; AC-G3.5.2's measurement is `bench/descent_skip.sh`.
 - **Falsified if** point_pk at one client with the winner rises less than 20% against steps 2-4
   (AC-G3.5.2), or the winner's upkeep on the corpus's writes costs more than its lookups save.
 - **Tested.** T-G3.5.1: two tables sharing pages under random inserts, deletes, splits and merges,
@@ -1977,3 +1991,84 @@ I/O completion 2.7-3.6%, together 23.0-30.3%; SQLite's page cache and pager are 
   by a prepared statement, one small run on adacachy (debug build, 2026-11-21, f046bc1, one run, a
   smoke check, not a benchmark): misses without shared pages 15.98 today against 6.00 plain, with
   shared pages 7.99 against 7.00; hits 5.00 on both (the statement's own: its row vectors).
+
+## 43. Point readers write no line another reader writes: the reader taken from a slot of its own, shared pages read under a version check (prototype, behind a switch)
+
+G3 step 6 (kiln plan "G3 Point reads", step 6, prototype F; docs/research/read-path.md; engine.md
+decision 3). At 32 clients `point_pk` scaled 3.8x over one client (1,315,252 against 343,467 a
+second in the v6 matrix), the log 66.0% and locks 14.6% of its user cycles. Step 2 (decision 40)
+takes the log's locks out. Two shared writes per read are left that this step removes, each behind
+its own switch:
+
+- **The reader checkout** (`crates/amphora/src/store/checkout.rs`, `ReadCheckout`;
+  `AMPHORA_READ_CHECKOUT` = `pool`, the default, or `slots`). The pool took its mutex to take a
+  reader and again to give it back, woke the waiters, and held the read side of one `RwLock` (the
+  gate) through the read: four writes to lines every reader writes. With `slots`, each reader
+  lives in a slot of its own, on a 128-byte line pair of its own, and a thread takes the slot its
+  number names (a number taken once per thread). With no more threads than slots, a read writes only
+  its own slot's lock. A thread whose slot is busy tries the others, then waits on a condition
+  variable; a read that ends wakes waiters only when its read of the waiters' count says there are
+  some. Holding a slot stands for holding the gate: the log's restart and the readers' release take
+  every slot, and giving them back wakes the reads that came meanwhile (no read ends to wake them
+  while every slot is held).
+- **Shared page lookups** (`crates/engine/storage/optimistic_pages.rs`, `SharedPageReads`;
+  `AMPHORA_SHARED_PAGE_READS` = `locked`, the default, or `optimistic`). A lookup took its shard's
+  read lock, a write to the lock's word. With `optimistic`, frames sit in front of the shards, each
+  image held as atomic 64-bit words under a sequence that is odd while a writer changes it
+  (LeanStore's optimistic latch: Leis et al., ICDE 2018; Leis et al., DaMoN 2016). A reader reads
+  the sequence, the key and the words, then the sequence again; equal and even, it has the whole
+  image of the key it asked for, else it asks the shard under its lock, once, never retrying. Safe
+  Rust: the words are atomics read relaxed, ordered by an acquire fence before the second read of
+  the sequence (Boehm, "Can Seqlocks Get Along with Programming Language Memory Models?", MSPC
+  2012). A key's bytes never change (a frame's image is committed; a file version is forgotten
+  before the file's page is written), so a whole image read here is what the shard would give; a
+  forget clears the frame before it returns. An image found under its shard's lock is copied into
+  its frame (direct-mapped by the key's hash) by a writer that takes the frame by turning its
+  sequence odd with a compare-and-swap (LeanStore's exclusive latch, on the word readers check), so
+  writers of different frames share no line and no lock spans the frames; an offer that finds its
+  frame taken leaves the image out, and a forget waits for the frame's writer (one image's stores). Lookups answered here are counted on a stripe per
+  thread, so the count writes no shared line.
+- **The frames' budget.** The pool gives the frames one shard's share of its budget (`per_shard`
+  frames of a page each) and charges it, so the shards keep that many fewer pages: the memory stays
+  the pool's. The share is derived from the pool, not picked, but whether one shard's share is the
+  right split is for the 32-client runs to say: c2c's HITM records and the frames' hit share
+  against the shards' decide it (and a frame count learned from the lookups' spread, if they show
+  one share is wrong).
+- Not taken: the plain page path's `take_count` (decision 42's, lane g3s3's) still looks up under
+  the shard's lock; a lock-free form of it needs a counted buffer the frames don't hold.
+
+Tests: `store::checkout::tests::g3_s6_*` (slot readers never share a reader, a waiter is woken,
+release lets every reader go) and `storage::optimistic_pages::tests::g3_s6_*`, among them the
+step's model: 32 readers and a writer, the writer committing frames into a pool too small to keep
+them, with a checkpoint's nemesis of file versions forgotten and written again; every image a
+reader gets is whole and the version its snapshot asked for. Its short instance runs in the unit
+tests; `AMPHORA_G3S6_SECONDS=60` runs it for 60 s. The measurements are the coordinator's: the
+60 s run, `perf c2c` at 32 clients with both switches on, and the suite's `point_pk` at 1 and 32
+clients. Falsified if `point_pk` at 32 clients stays under 12x one client with both on, or c2c
+finds more than one contended line per million lookups on the read path.
+
+## Decision (lane constants): one process memory budget (2026-11-21)
+
+Ada's rule: no picked numbers. The process's memory bounds (an image's 256 MiB, the owners' queues' 512 MiB each)
+were each picked, and nothing knew what the process may hold where it runs: decision 26 read the limit on Linux
+only, and a caller fell back to a number of its own elsewhere.
+
+**The decision (MB.1).** `memory::limit` is the smallest limit the platform states: on Linux the limits of the
+control groups the process runs in (v2, else v1) and `/proc/meminfo`'s `MemTotal`; on macOS `hw.memsize` and on
+Windows `GlobalMemoryStatusEx`'s physical memory (the engine makes those two calls, `io::system_memory`, since
+Amphora's crate denies `unsafe`); and on Unix the process's own soft `RLIMIT_AS`, `RLIMIT_DATA` and `RLIMIT_RSS`.
+`memory::resident` is the bytes the process holds resident (memory-stats: `/proc/self/statm`, `task_info`,
+`GetProcessMemoryInfo`). `memory::Budget` shares the limit out by measured use, no share picked: a use (the owners'
+queues, images, caches) charges what it holds as it takes it and gives it back when the charge drops; its room is the
+limit less what the rest of the process holds, the larger of the resident bytes and every charge counted, its own
+given back. Both readings are taken again at every ask, so a limit moved while the process runs is followed. Where
+the limit can't be read the budget refuses, `Unavailable`, naming the platform: there is no fallback.
+
+**What is left.** A Windows job object's memory limit isn't read (`QueryInformationJobObject`): the machine's memory
+bounds such a process from above. The owners' queues don't charge the budget yet (their piece, next in the goal's
+list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
+
+**Tests.** In `memory::tests`: `mb1_a_uses_room_is_what_the_rest_of_the_process_leaves` (T-MB.1.1),
+`mb1_no_limit_read_is_a_typed_refusal_and_the_limit_is_read_again` (T-MB.1.2),
+`mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
+(T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.

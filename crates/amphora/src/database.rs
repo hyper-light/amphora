@@ -23,6 +23,7 @@ use amphora_engine_parser::{
 };
 
 use crate::db::Db;
+use crate::reshard;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
 mod application;
@@ -34,7 +35,9 @@ pub(crate) fn installed_floor(db: &Db) -> anyhow::Result<Option<Application>> {
 }
 pub use application::WriterBoundary;
 
+mod compacting;
 pub(crate) mod compaction;
+mod group;
 mod guards;
 mod import;
 mod log_bound;
@@ -618,6 +621,7 @@ pub(crate) fn bootstrap_db(db: &Db) -> Result<(), Refusal> {
     db.exec(SCHEMA).map_err(unavailable)?;
     db.exec(restore::SCHEMA).map_err(unavailable)?;
     db.exec(import::SCHEMA).map_err(unavailable)?;
+    db.exec(group::SCHEMA).map_err(unavailable)?;
     Ok(())
 }
 
@@ -1787,6 +1791,7 @@ impl Engine for Local {
                         if result.is_err() && Instant::now() >= row.until {
                             return Err(Refusal::Timeout.into());
                         }
+                        group::entry(db)?;
                         result
                     })
                     .unwrap_or_else(|e| Err(refused(&e)));
@@ -1798,7 +1803,8 @@ impl Engine for Local {
             if !restoring && restore::incomplete(db)? {
                 return Err(api::invalid("database", "restore is incomplete").into());
             }
-            rows.iter()
+            let answers = rows
+                .iter()
                 .map(|r| {
                     if Instant::now() >= r.until {
                         return Err(Refusal::Timeout.into());
@@ -1811,7 +1817,10 @@ impl Engine for Local {
                     }
                     result
                 })
-                .collect::<anyhow::Result<Vec<_>>>()
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            // The commit's entry in a group's log (CP-T1.9).
+            group::entry(db)?;
+            Ok(answers)
         });
         match done {
             Ok(answers) => {
@@ -1862,13 +1871,67 @@ impl Engine for Local {
     /// The holding kept through [`Mutation::Holding`], the command a replicated owner's log
     /// carries, applied as one commit of its own after every commit before it, and flushed with
     /// them before it returns (CP-T1.9).
+    /// The first holding kept makes the database a group's: its log starts and its Records keys
+    /// are indexed by position, in the same commit ([`group`]). Each holding kept is one entry of
+    /// the log, a fence's.
     fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
         let operation = Operation::Mutation(Mutation::Holding(holding.to_vec()));
         self.db
-            .transaction(|db| apply(db, "", &operation))?
+            .transaction(|db| {
+                group::begin(db)?;
+                let kept = apply(db, "", &operation)?;
+                group::entry(db)?;
+                Ok(kept)
+            })?
             .map_err(|refusal| anyhow::anyhow!("a holding not kept: {refusal:?}"))?;
         (self.db.flusher())()?;
         Ok(())
+    }
+
+    // The copy path (CP-T1.9; database/group.rs): over the Records rows, indexed by the position
+    // of their namespace, family and key.
+
+    fn head(&mut self) -> anyhow::Result<reshard::Seq> {
+        group::head(&self.db)
+    }
+
+    fn export(&mut self, span: reshard::Span, positions: usize) -> anyhow::Result<store::Exported> {
+        group::export(&self.db, span, positions)
+    }
+
+    fn changed(
+        &mut self,
+        after: reshard::Seq,
+        upto: reshard::Seq,
+        span: reshard::Span,
+        entries: u64,
+    ) -> anyhow::Result<Option<store::Changed>> {
+        group::changed(&self.db, after, upto, span, entries)
+    }
+
+    fn import(&mut self, moved: &[store::Moved]) -> anyhow::Result<()> {
+        self.db.transaction(|db| group::import(db, moved))?;
+        (self.db.flusher())()?;
+        Ok(())
+    }
+
+    fn keep_log(&mut self, from: Option<reshard::Seq>) -> anyhow::Result<()> {
+        self.db.transaction(|db| group::keep_log(db, from))?;
+        (self.db.flusher())()?;
+        Ok(())
+    }
+
+    fn sweep(
+        &mut self,
+        span: reshard::Span,
+        positions: usize,
+        garbage: &dyn Fn(reshard::Pos) -> bool,
+    ) -> anyhow::Result<bool> {
+        let done = self
+            .db
+            .transaction(|db| group::sweep(db, span, positions, garbage))?;
+        (self.db.flusher())()?;
+        Ok(done)
     }
 }
 
@@ -2234,6 +2297,7 @@ fn commit(
             Write::Delete { .. } => EValue::Null,
         };
         db.query("INSERT INTO __amphora_versions(namespace, family, key, rev, seq, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", [text(ns), text(family), blob(key)?, integer(at)?, integer(u64::try_from(seq)?)?, value], |_| Ok(true))?;
+        group::wrote(db, ns, family, key)?;
         db.query("INSERT INTO __amphora_families(namespace, family, newest) VALUES (?1, ?2, ?3) ON CONFLICT(namespace, family) DO UPDATE SET newest = excluded.newest", [text(ns), text(family), integer(at)?], |_| Ok(true))?;
     }
     db.query(
@@ -2339,7 +2403,7 @@ mod group_holding {
     use super::*;
     use crate::groups::Groups;
     use crate::reshard::directory::Directory;
-    use crate::reshard::holding::Fenced;
+    use crate::reshard::holding::{Fenced, Holding};
     use crate::reshard::{GroupId, NodeId, OpId, Span, position};
 
     fn local(path: &Path) -> anyhow::Result<Local> {
@@ -2349,6 +2413,150 @@ mod group_holding {
             db,
             restoring: false,
         })
+    }
+
+    /// One Records write of `key` in namespace `ns`, family `f` (a value, or none: a delete),
+    /// committed through the engine's own `apply`: the revision it made.
+    fn write(local: &mut Local, key: &str, value: Option<&[u8]>) -> Rev {
+        let (family, key) = ("f".to_owned(), key.as_bytes().to_vec());
+        let write = match value {
+            Some(v) => Write::Put {
+                family,
+                key,
+                value: v.to_vec(),
+            },
+            None => Write::Delete { family, key },
+        };
+        let answer: Reply = Arc::new(Mutex::new(None));
+        let command = Command {
+            namespace: "ns".into(),
+            application: None,
+            operation: Operation::Mutation(Mutation::Records {
+                namespace: "ns".into(),
+                tx: Tx {
+                    conds: Vec::new(),
+                    writes: vec![write],
+                },
+            }),
+            answer: Arc::clone(&answer),
+            publication: Arc::new(Mutex::new(None)),
+            until: Instant::now() + Duration::from_secs(60),
+        };
+        local.apply(&[command]).unwrap();
+        match answer.lock().unwrap().take() {
+            Some(Ok(Answer::Rev(at))) => at,
+            _ => panic!("a Records write not committed"),
+        }
+    }
+
+    /// Each key of `keys` as `local` answers it now, and its namespace's live keys and head.
+    fn state(local: &Local, keys: &[String]) -> (Vec<Option<Vec<u8>>>, u64, u64) {
+        let rows = keys
+            .iter()
+            .map(|k| {
+                get(
+                    &local.db,
+                    "ns",
+                    "f",
+                    k.as_bytes(),
+                    u64::try_from(i64::MAX).unwrap(),
+                )
+                .unwrap()
+                .map(|r| r.value)
+            })
+            .collect();
+        let (mut live, mut head) = (0, 0);
+        local
+            .db
+            .query(
+                "SELECT live, head FROM __amphora_namespaces WHERE name = 'ns'",
+                [],
+                |r| {
+                    live = rev(r, 0)?;
+                    head = rev(r, 1)?;
+                    Ok(false)
+                },
+            )
+            .unwrap();
+        (rows, live, head)
+    }
+
+    /// T-T1.9.R9 (CP-T1.9; docs/design/reshard.md, "A row routes by its namespace, family and
+    /// key"): a local database that already holds Records rows becomes a group's (its first
+    /// holding kept), its log held, its keys copied by position in batches of seven positions
+    /// into a second group's database, then changed (updates, deletes, new keys) and caught up
+    /// from its log, then swept. Expect: the second answers every key as the first does, with
+    /// the same live count and a head no older than every revision moved; a catch-up asked from
+    /// before the log was held is answered "gone"; the sweep leaves the first with no key; and
+    /// the log's head moved one entry a commit.
+    #[test]
+    fn t_t1_9_r9_a_local_databases_records_move_by_position_through_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = local(&dir.path().join("old.db")).unwrap();
+        let mut new = local(&dir.path().join("new.db")).unwrap();
+        let mut keys: Vec<String> = (0..40).map(|i| format!("k{i}")).collect();
+        for (i, k) in keys.iter().enumerate().take(10) {
+            write(&mut old, k, Some(format!("before-{i}").as_bytes()));
+        }
+        let holding = postcard::to_allocvec(&Holding::owning(Some(Span::ALL))).unwrap();
+        old.keep_holding(&holding).unwrap();
+        new.keep_holding(&postcard::to_allocvec(&Holding::owning(None)).unwrap())
+            .unwrap();
+        assert_eq!(old.head().unwrap(), 1);
+        for (i, k) in keys.iter().enumerate().skip(10).take(20) {
+            write(&mut old, k, Some(format!("v-{i}").as_bytes()));
+        }
+        assert_eq!(old.head().unwrap(), 21);
+
+        let first = old.head().unwrap();
+        old.keep_log(Some(first)).unwrap();
+        let mut from = Some(Span::ALL);
+        let mut at = first;
+        while let Some(rest) = from {
+            let batch = old.export(rest, 7).unwrap();
+            assert!(batch.keys.len() <= 7);
+            new.import(&batch.keys).unwrap();
+            at = batch.at;
+            from = match (batch.done, batch.last) {
+                (true, _) | (_, None) => None,
+                (false, Some(last)) => Span::new(last + 1, Span::ALL.hi()),
+            };
+        }
+        // Writes go on after the copy read: updates, deletes and new keys.
+        for k in keys.iter().take(5) {
+            write(&mut old, k, Some(b"after"));
+        }
+        for k in keys.iter().skip(5).take(5) {
+            write(&mut old, k, None);
+        }
+        for k in keys.iter().skip(30) {
+            write(&mut old, k, Some(b"new"));
+        }
+        let mut after = at;
+        loop {
+            let changed = old.changed(after, u64::MAX, Span::ALL, 3).unwrap().unwrap();
+            new.import(&changed.keys).unwrap();
+            after = changed.through;
+            if after == changed.head {
+                break;
+            }
+        }
+        keys.push("never".into());
+        let (want, live, head) = state(&old, &keys);
+        let (got, new_live, new_head) = state(&new, &keys);
+        assert_eq!(got, want);
+        assert_eq!(new_live, live);
+        assert_eq!(live, 35);
+        assert!(new_head >= head);
+        // A catch-up from before the log was held is refused: the log doesn't reach back.
+        assert!(old.changed(0, first, Span::ALL, 10).unwrap().is_none());
+
+        old.keep_log(None).unwrap();
+        while !old.sweep(Span::ALL, 7, &|_| true).unwrap() {}
+        let (gone, gone_live, _) = state(&old, &keys);
+        assert!(gone.iter().all(Option::is_none));
+        assert_eq!(gone_live, 0);
+        assert!(old.export(Span::ALL, usize::MAX).unwrap().keys.is_empty());
     }
 
     /// T-T1.9.R7 (CP-T1.9; docs/design/reshard.md, "A local database keeps its holding through
@@ -2362,9 +2570,13 @@ mod group_holding {
         let retired = dir.path().join("retired");
         let directory = Directory::new(NodeId(0));
         let until = Instant::now() + Duration::from_secs(60);
-        let groups = Groups::on(&directory, store::Config::default(), &retired, |_| {
-            local(&path)
-        })
+        let groups = Groups::on(
+            NodeId(0),
+            &directory,
+            store::Config::default(),
+            &retired,
+            |_| local(&path),
+        )
         .unwrap();
         assert_eq!(
             groups.holding_of(GroupId(0)).unwrap().owned(),
@@ -2379,9 +2591,13 @@ mod group_holding {
         let held = groups.holding_of(GroupId(0)).unwrap();
         drop(groups);
 
-        let again = Groups::on(&directory, store::Config::default(), &retired, |_| {
-            local(&path)
-        })
+        let again = Groups::on(
+            NodeId(0),
+            &directory,
+            store::Config::default(),
+            &retired,
+            |_| local(&path),
+        )
         .unwrap();
         assert_eq!(again.holding_of(GroupId(0)), Some(held));
         drop(again);

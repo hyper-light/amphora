@@ -34,7 +34,10 @@ pub mod group_table;
 #[allow(dead_code)]
 pub mod hash_table;
 pub mod insn;
+pub mod leaf_batch;
 pub mod metrics;
+pub mod morsel;
+pub mod morsel_scan;
 #[cfg(test)]
 mod native_extension_tests;
 pub mod row_counts;
@@ -957,6 +960,8 @@ pub struct ProgramState {
     /// Amphora: the rows each of the program's counters counted this run, by its slot
     /// (`row_counts.rs`); empty unless the program has counters.
     pub(crate) row_counts: Vec<u64>,
+    /// Amphora (QT.7): this run's column batches (`leaf_batch.rs`).
+    pub(crate) leaf_batches: leaf_batch::LeafBatches,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -969,6 +974,8 @@ pub struct ProgramState {
     hash_tables: HashMap<usize, HashTable>,
     /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
     group_tables: HashMap<usize, group_table::GroupTable>,
+    /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
+    morsel_rows: Option<std::vec::IntoIter<Vec<Value>>>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
@@ -1106,6 +1113,7 @@ impl ProgramState {
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             row_counts: Vec::new(),
+            leaf_batches: leaf_batch::LeafBatches::default(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
@@ -1117,6 +1125,7 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             group_tables: HashMap::default(),
+            morsel_rows: None,
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
@@ -1268,6 +1277,7 @@ impl ProgramState {
         } else {
             self.row_counts.fill(0);
         }
+        self.leaf_batches.clear();
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
         self.once.clear();
@@ -1308,6 +1318,7 @@ impl ProgramState {
         if !self.group_tables.is_empty() {
             self.group_tables.clear();
         }
+        self.morsel_rows = None;
         if !self.ephemeral_temp_files.is_empty() {
             let kept = &self.ephemeral_kept;
             self.ephemeral_temp_files
@@ -1777,6 +1788,18 @@ impl ProgramState {
         self.bloom_filters.entry(cursor_id).or_default()
     }
 
+    /// Amphora (PL.5): gets or creates the cursor's bloom filter, sized when its build ends
+    /// where `sizing` is given, of the default fixed size where not.
+    pub fn get_or_create_bloom_filter_for(
+        &mut self,
+        cursor_id: usize,
+        sizing: Option<crate::vdbe::bloom_filter::FilterSizing>,
+    ) -> &mut BloomFilter {
+        self.bloom_filters
+            .entry(cursor_id)
+            .or_insert_with(|| sizing.map_or_else(BloomFilter::new, BloomFilter::sized))
+    }
+
     /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
     pub fn get_or_create_bloom_filter_with_capacity(
         &mut self,
@@ -1970,6 +1993,9 @@ pub struct PreparedProgram {
     /// Amphora: the program's row counters, by slot (`row_counts.rs`); empty unless the
     /// connection asked for them when it prepared the program.
     pub row_count_sites: Vec<row_counts::RowCountSite>,
+    /// Amphora (query speed step 7, QT.7): the scanned table cursors whose leaves are decoded
+    /// into column batches, when the connection's switch was on as the program was built.
+    pub leaf_batch_plan: Option<Arc<leaf_batch::BatchPlan>>,
 }
 
 #[derive(Clone)]

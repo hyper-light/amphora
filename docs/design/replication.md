@@ -2401,6 +2401,82 @@ patience and lease tests, which read each owner's pace instead of assuming 10 ms
 **Falsified by:** a multi-node group on real clocks whose leader steps down or whose followers campaign more often
 with the learned pace than with 10 ms; a failover p99 past the requirement's 1000 ms where 10 ms met it.
 
+## Decision (lane constants): the compaction's expansion learned where it runs (2026-11-21)
+
+Ada's rule: no picked numbers. The replicated owner compacted its raft log once it held 128 MiB of applied entries,
+on every host and for every database, whatever an image or a replay cost there. No measurement made 128 MiB, and the
+machine reported no image size (`image_bytes` was none), so hyper-durable's own rule could not run.
+
+**The decision (CT.1).** The log is due by Ongaro's rule (thesis §5.1.2, "When to snapshot": once the log exceeds
+the previous snapshot times an expansion factor), as hyper-durable's `Replica::compaction_due` weighs it, with its
+wait for a member still taking what was applied. The factor is the owner's (`database/compacting.rs`):
+- the machine reports its image's bytes: the pages it opened with (`StateMachine::image_bytes`), and after the first
+  compaction hyper-durable weighs the image it made;
+- the owner times each image it makes (`Replica::compact`, the image's bytes from the machine) and each drive that
+  applied entries (the applied entries' bytes as the core counts them, `EntryRef::encoded_bytes`), on its own clock;
+- each cost is a ratio of decaying sums, nanoseconds over bytes, the sums kept at seven eighths at every sample: RFC
+  6298 §2's gain (Jacobson 1988), weighted by each sample's bytes, so it follows the host and its load;
+- the factor is the image's cost a byte over the replay's, raised to the whole factor the rule takes. The log is the
+  rent and the image the price: compacting once replaying the log would cost as much as making a fresh image is ski
+  rental's break-even (Karlin, Manasse, McGeoch and Owicki, SODA 1990), within twice the best in hindsight. Raised,
+  never rounded down, so no compaction comes before the break-even.
+A compaction still runs at once while the log stalls admission for room: it is what frees it.
+
+**The start state.** Before both costs are measured, and for a sample below the clock's resolution, the factor is
+one: with nothing measured a byte of log costs a byte of image, whose break-even is the log at its image's size.
+
+**What is left.** The image's bytes at open are its pages' (page count times page size); postcard's few bytes of
+framing a page are not counted. A configuration change's entry is not counted in the replay's bytes (it is applied
+by `apply_change`, rarely).
+
+**Tests.** `compaction_the_factor_is_one_until_both_costs_are_measured` (T-CT.1.1),
+`compaction_the_factor_is_the_image_cost_over_the_replay_cost` (T-CT.1.2), `compaction_samples_weigh_by_their_bytes`
+(T-CT.1.3), all in `database::compacting`; the driven compaction tests of `database::replicated` (T-CT.1.4).
+
+## Decision (lane constants): an envelope is what its encoding adds (2026-11-21)
+
+Ada's rule: no picked numbers. A replicated command and an image were each bounded by their pages' budget plus
+`ENVELOPE_BYTES`, a mebibyte for what their encoding adds, which nothing measured or derived.
+
+**The decision (EN.1).** The envelope is what postcard's encoding adds to the pages, at the most, from its wire format
+(`replication.rs`): a declared baseline's prefix and its declaration (a varint node and a 32-byte identity), a
+prepared transaction's base index and term (varints, ten bytes at the most), the page list's length (a varint) and
+each page's id (a `u32` varint, five bytes at the most) and length (the page size's varint), for as many pages as the
+budget holds at the one page size `validate_pages` admits. So a command's envelope is a few bytes a page (57 KiB over
+its 32 MiB), an image's the same over its budget, a test's lowered budget included. A read set still rides in what
+a command's entry leaves of its bound, or the write goes without one, as before: a write near its whole budget now
+goes without one sooner.
+
+**What is left.** `SNAPSHOT_BYTES`, the image's own budget (256 MiB), is the seam owner's ruling (c): a memory bound
+from the process memory budget's room for one image (done: "Decision (lane constants): an image is bounded by the
+memory budget's room for one", below; SB.1). The transport's own framing past
+an entry (`replicated.rs`'s `MESSAGE_BYTES` and `WIRE_BYTES`, two mebibytes each) is the owner's queue piece's.
+
+**Tests.** `envelope_a_command_at_its_widest_fits_its_bound_exactly` (T-EN.1.1),
+`envelope_an_image_at_its_widest_fits_its_bound_exactly` (T-EN.1.2), `envelope_varints_take_seven_bits_a_byte`
+(T-EN.1.3), in `replication::envelope_tests`.
+
+## Decision (lane constants): an image is bounded by the memory budget's room for one (2026-11-21)
+
+`SNAPSHOT_BYTES`, a picked 256 MiB, bounded every image a replica made, fitted, installed or took as a baseline, and
+the reshard directory's images. The seam owner's ruling (c): an image is held whole in memory until snapshots
+stream, so the memory it may take bounds it.
+
+**The decision (SB.1).** `replication::image_room` is the process memory budget's room for an image (store.md,
+"Decision (lane constants): one process memory budget"; MB.1), read again at every image made, fitted, installed,
+captured or received as a baseline, and kept by the directory. Where the budget can't be read the image is refused
+typed (`Unavailable`), or the directory's machine fails, never a fallback. A replica's database log leaves that room
+free on its filesystem (`log_bound::log_room` takes it as an argument). A machine's carrier may bound it lower
+(`Machine::set_snapshot_bytes`): the replicated owner's command queue holds back room for one wire record's image
+(`WIRE_IMAGE_BYTES`), so that owner's image is the smaller of the two.
+
+**What is left.** `WIRE_IMAGE_BYTES` (256 MiB) is the owner's queue's split, picked with `QUEUED_BYTES`, and goes
+with it when the queue is sized from the budget and its measured drain.
+
+**Tests.** `image_room_tests::sb1_an_image_is_bounded_by_the_memory_budgets_room_for_one` (T-SB.1.1);
+`log_bound::tests::a_log_takes_its_file_and_an_equal_share_of_what_is_free_past_one_image`, the image's room passed in
+(T-SB.1.2).
+
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 
 D of goal 9c63f7d4, on top of the write slot (above). In the release A/B, D halved G's write gaps
@@ -2487,7 +2563,8 @@ The raft log is the write-ahead log; the database's log is a cache of it that th
 its own time. Still flushed inline, all rare and as before: a membership change (its join rows), an install, the
 seed, a persisted class entry, and `open`.
 
-The owner compacts when the raft log holds 128 MiB of applied entries or is stalled for room. A stall waits on the
+The owner compacts when the raft log is due by Ongaro's rule at the expansion it learned ("Decision (lane constants):
+the compaction's expansion learned where it runs") or is stalled for room. A stall waits on the
 flushing thread, which is always asked to flush what was applied (`Actor::flush`), so it frees room once that flush
 ends, not on a flush of the owner's own.
 

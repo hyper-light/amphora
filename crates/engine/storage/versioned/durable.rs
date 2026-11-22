@@ -22,8 +22,9 @@
 //!
 //! Journal and header: `magic` (`u64`), the body's length (`u64`) and XXH3 (`u64`), then the body:
 //! the checkpoint's sequence number (`u64`), T (`u64`), the pages handed out (`u64`), the tree count
-//! (`u64`) and each tree's root (`u64`); a journal's body then holds its page count (`u64`), each
-//! page's number (`u64`) and bytes, and its list as one redo record at T. Journals take turns by
+//! (`u64`) and each tree's root (`u64`); a journal's body then holds its list's length (`u64`), its
+//! list as one redo record at T, and each page's number (`u64`) and bytes to the end, written and
+//! read a page at a time (G7 step 4). Journals take turns by
 //! sequence number's parity, so a checkpoint never writes over the journal recovery may need.
 
 use super::blink::{Comparator, Descender};
@@ -37,6 +38,7 @@ use super::version::{Savepoint, Snapshot, Ts, Txn, Versioned};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, RwLock};
 use crate::Result;
+use std::collections::HashMap;
 
 const HEADER_MAGIC: u64 = 0x4144_4548_4f52_5041;
 const JOURNAL_MAGIC: u64 = 0x4c4e_524a_4f52_5041;
@@ -126,15 +128,6 @@ fn unseal(magic: u64, bytes: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// Reads a whole file.
-fn read_all(disk: &dyn Disk, file: File) -> Result<Vec<u8>> {
-    let len = usize::try_from(disk.len(file)?).map_err(|_| LimboError::IntegerOverflow)?;
-    let mut bytes = vec![0u8; len];
-    let n = disk.read_at(file, 0, &mut bytes)?;
-    bytes.truncate(n);
-    Ok(bytes)
-}
-
 fn journal_file(seq: u64) -> File {
     if seq.is_multiple_of(2) {
         File::Journal
@@ -158,7 +151,7 @@ fn partition(op: &Op, parts: usize) -> usize {
             key.hash(&mut h);
         }
         // Replayed alone, between the row changes ([`Database::apply`]).
-        Op::Made { tree } | Op::Dropped { tree } => tree.hash(&mut h),
+        Op::Made { tree } | Op::Dropped { tree } | Op::Ordered { tree, .. } => tree.hash(&mut h),
     }
     usize::try_from(h.finish())
         .unwrap_or(usize::MAX)
@@ -166,51 +159,214 @@ fn partition(op: &Op, parts: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// A journal's contents: its stamp, its pages and its list.
+/// A seal's own bytes ahead of its body: magic, length and hash (`seal`'s format).
+const SEAL_BYTES: u64 = 24;
+
+/// A journal page: its number (`u64`) and its bytes (the journal's format).
+const ENTRY_BYTES: usize = 8 + PAGE_SIZE;
+
+/// Where a journal's pages lie: `count` of them, `ENTRY_BYTES` each, from `at` in `file`.
+struct JournalPages {
+    file: File,
+    at: u64,
+    count: u64,
+}
+
+/// A journal's stamp and list, and where its pages lie. Its body is the stamp, the list's length
+/// (`u64`) and the list (one redo record), then its pages to the end, sealed like a header. It is
+/// written and read a page at a time, so a checkpoint and recovery hold one page of it in memory
+/// however many it copies (G7 step 4, `NS.4`: the pool's budget bounds what a checkpoint holds).
 struct Journal {
     stamp: Stamp,
-    pages: Vec<(u64, Vec<u8>)>,
     list: Vec<Op>,
+    pages: JournalPages,
+}
+
+/// `len` bytes of `file` at `offset`; None if the file ends first.
+fn read_exact(disk: &dyn Disk, file: File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> {
+    let mut buf = vec![0u8; len];
+    let n = disk.read_at(file, offset, &mut buf)?;
+    Ok(if n == len { Some(buf) } else { None })
+}
+
+fn to_u64(n: usize) -> Result<u64> {
+    u64::try_from(n).map_err(|_| LimboError::IntegerOverflow)
 }
 
 impl Journal {
-    fn encode(&self) -> Result<Vec<u8>> {
-        let mut body = Vec::new();
-        self.stamp.encode(&mut body)?;
-        body.extend_from_slice(
-            &u64::try_from(self.pages.len())
-                .map_err(|_| LimboError::IntegerOverflow)?
-                .to_le_bytes(),
-        );
-        for (no, bytes) in &self.pages {
-            body.extend_from_slice(&no.to_le_bytes());
-            body.extend_from_slice(bytes);
+    /// Writes a journal over `stamp`'s file, flushed: the stamp, `list`, and each page `copy`
+    /// hands its callback, written as it comes; the seal last, over the body's hash, so a journal
+    /// cut short never checks out.
+    fn write(
+        disk: &dyn Disk,
+        stamp: &Stamp,
+        list: &[Op],
+        copy: impl FnOnce(&mut dyn FnMut(u64, &[u8]) -> Result<()>) -> Result<()>,
+    ) -> Result<JournalPages> {
+        use std::hash::Hasher;
+        let file = journal_file(stamp.seq);
+        disk.truncate(file, 0)?;
+        let mut head = Vec::new();
+        stamp.encode(&mut head)?;
+        let list = redo::encode(stamp.ts, list)?;
+        head.extend_from_slice(&to_u64(list.len())?.to_le_bytes());
+        head.extend_from_slice(&list);
+        let mut hash = twox_hash::XxHash3_64::with_seed(0);
+        hash.write(&head);
+        disk.write_at(file, SEAL_BYTES, &head)?;
+        let at = SEAL_BYTES
+            .checked_add(to_u64(head.len())?)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let entry_len = to_u64(ENTRY_BYTES)?;
+        let (mut end, mut count) = (at, 0u64);
+        let mut entry = Vec::with_capacity(ENTRY_BYTES);
+        copy(&mut |no, bytes| {
+            if bytes.len() != PAGE_SIZE {
+                return Err(LimboError::InternalError(
+                    "versioned storage: a checkpoint's page of the wrong size".into(),
+                ));
+            }
+            entry.clear();
+            entry.extend_from_slice(&no.to_le_bytes());
+            entry.extend_from_slice(bytes);
+            hash.write(&entry);
+            disk.write_at(file, end, &entry)?;
+            end = end
+                .checked_add(entry_len)
+                .ok_or(LimboError::IntegerOverflow)?;
+            count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            Ok(())
+        })?;
+        let len = end
+            .checked_sub(SEAL_BYTES)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let mut seal = Vec::with_capacity(24);
+        for word in [JOURNAL_MAGIC, len, hash.finish()] {
+            seal.extend_from_slice(&word.to_le_bytes());
         }
-        body.extend_from_slice(&redo::encode(self.stamp.ts, &self.list)?);
-        seal(JOURNAL_MAGIC, &body)
+        disk.write_at(file, 0, &seal)?;
+        disk.sync(file)?;
+        Ok(JournalPages { file, at, count })
     }
 
-    fn decode(bytes: &[u8]) -> Option<Self> {
-        let body = unseal(JOURNAL_MAGIC, bytes)?;
+    /// The journal in `file` if it is whole: its body hashed a page at a time, then its stamp and
+    /// list read; its pages left in the file.
+    fn read(disk: &dyn Disk, file: File) -> Result<Option<Self>> {
+        use std::hash::Hasher;
+        let size = disk.len(file)?;
+        let Some(seal) = read_exact(disk, file, 0, 24)? else {
+            return Ok(None);
+        };
         let mut at = 0;
-        let stamp = Stamp::decode(body, &mut at)?;
-        let n = usize::try_from(take_u64(body, &mut at)?).ok()?;
-        if n > body.len() / PAGE_SIZE {
-            return None;
+        let magic = take_u64(&seal, &mut at);
+        let len = take_u64(&seal, &mut at);
+        let sum = take_u64(&seal, &mut at);
+        let (Some(JOURNAL_MAGIC), Some(len), Some(sum)) = (magic, len, sum) else {
+            return Ok(None);
+        };
+        if SEAL_BYTES.checked_add(len).is_none_or(|end| end > size) {
+            return Ok(None);
         }
-        let mut pages = Vec::with_capacity(n);
-        for _ in 0..n {
-            let no = take_u64(body, &mut at)?;
-            let end = at.checked_add(PAGE_SIZE)?;
-            pages.push((no, body.get(at..end)?.to_vec()));
-            at = end;
+        let mut hash = twox_hash::XxHash3_64::with_seed(0);
+        let mut buf = vec![0u8; ENTRY_BYTES];
+        let mut done = 0u64;
+        while done < len {
+            let n = usize::try_from(len.saturating_sub(done))
+                .unwrap_or(usize::MAX)
+                .min(ENTRY_BYTES);
+            let Some(chunk) = buf.get_mut(..n) else {
+                return Ok(None);
+            };
+            if disk.read_at(file, SEAL_BYTES.saturating_add(done), chunk)? != n {
+                return Ok(None);
+            }
+            hash.write(chunk);
+            done = done.saturating_add(to_u64(n)?);
         }
-        let (records, valid) = redo::decode_all(body.get(at..)?);
-        if valid != body.len().saturating_sub(at) || records.len() != 1 {
-            return None;
+        if hash.finish() != sum {
+            return Ok(None);
         }
-        let list = records.into_iter().next()?.ops;
-        Some(Self { stamp, pages, list })
+        // The stamp's four words, the last its roots' count; then the roots and the list's length.
+        let Some(words) = read_exact(disk, file, SEAL_BYTES, 32)? else {
+            return Ok(None);
+        };
+        let mut at = 24;
+        let Some(head_len) = take_u64(&words, &mut at)
+            .and_then(|roots| roots.checked_mul(8))
+            .and_then(|r| r.checked_add(40))
+            .filter(|&h| h <= len)
+        else {
+            return Ok(None);
+        };
+        let head_len = usize::try_from(head_len).map_err(|_| LimboError::IntegerOverflow)?;
+        let Some(head) = read_exact(disk, file, SEAL_BYTES, head_len)? else {
+            return Ok(None);
+        };
+        let mut at = 0;
+        let (Some(stamp), Some(list_len)) =
+            (Stamp::decode(&head, &mut at), take_u64(&head, &mut at))
+        else {
+            return Ok(None);
+        };
+        let list_at = SEAL_BYTES.saturating_add(to_u64(at)?);
+        let Some(pages_at) = list_at
+            .checked_add(list_len)
+            .filter(|&p| p <= SEAL_BYTES.saturating_add(len))
+        else {
+            return Ok(None);
+        };
+        let list_len = usize::try_from(list_len).map_err(|_| LimboError::IntegerOverflow)?;
+        let Some(list) = read_exact(disk, file, list_at, list_len)? else {
+            return Ok(None);
+        };
+        let (records, valid) = redo::decode_all(&list);
+        if valid != list.len() || records.len() != 1 {
+            return Ok(None);
+        }
+        let Some(list) = records.into_iter().next().map(|r| r.ops) else {
+            return Ok(None);
+        };
+        let rest = SEAL_BYTES.saturating_add(len).saturating_sub(pages_at);
+        let entry_len = to_u64(ENTRY_BYTES)?;
+        if !rest.is_multiple_of(entry_len) {
+            return Ok(None);
+        }
+        let count = rest.checked_div(entry_len).unwrap_or(0);
+        Ok(Some(Self {
+            stamp,
+            list,
+            pages: JournalPages {
+                file,
+                at: pages_at,
+                count,
+            },
+        }))
+    }
+
+    /// Writes a journal's pages, then `stamp` as the header, over the data file a page at a time,
+    /// flushed: a checkpoint's second half, and recovery's finishing of it.
+    fn apply(disk: &dyn Disk, stamp: &Stamp, pages: &JournalPages) -> Result<()> {
+        let entry_len = to_u64(ENTRY_BYTES)?;
+        let mut buf = vec![0u8; ENTRY_BYTES];
+        for i in 0..pages.count {
+            let at = i
+                .checked_mul(entry_len)
+                .and_then(|o| o.checked_add(pages.at))
+                .ok_or(LimboError::IntegerOverflow)?;
+            if disk.read_at(pages.file, at, &mut buf)? != ENTRY_BYTES {
+                return Err(corrupt("a checkpoint journal's page past its file's end"));
+            }
+            let mut head = 0;
+            let no = take_u64(&buf, &mut head)
+                .filter(|no| (1..=stamp.allocated).contains(no))
+                .ok_or_else(|| corrupt("a checkpoint journal's page past the pages handed out"))?;
+            let page = buf
+                .get(head..)
+                .ok_or_else(|| corrupt("a checkpoint journal's page cut short"))?;
+            disk.write_at(File::Data, page_offset(no)?, page)?;
+        }
+        Database::write_header(disk, stamp)?;
+        disk.sync(File::Data)
     }
 }
 
@@ -230,6 +386,9 @@ pub struct Database {
     /// The tree that holds large values' chunks ([`overflow`], `AC-NS.2.4`): the one after the
     /// `trees` the database was made with, ordered by bytes.
     overflow: u64,
+    /// Each tree's recorded order (G7 step 2, `AC-NS.2.1`), as its opener encoded it, by tree: one
+    /// a tree ordered, gone when the tree is dropped. Each checkpoint's list names them all.
+    orders: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
 /// Orders the overflow tree's keys: by bytes, whatever the database's comparison.
@@ -239,13 +398,31 @@ fn bytes_order() -> Comparator {
 
 impl Database {
     /// The database `disk` holds, recovered (or made, with `trees` empty trees, if it holds
-    /// none), in a pool of `frames` pages; its trees ordered by `cmp`, and after them the
+    /// none), in a pool of `frames` pages resident at most (the shell's budget,
+    /// [`super::pool::frames_within`]), the rest evicted to the file; its trees ordered by `cmp`, and after them the
     /// overflow tree (`AC-NS.2.4`). Reopened with the `trees` it was made with.
     pub fn open(
         disk: Arc<dyn Disk>,
         frames: usize,
         trees: usize,
         cmp: impl Fn() -> Comparator,
+    ) -> Result<Self> {
+        Self::open_ordered(disk, frames, trees, cmp, |_, _| {
+            Err(corrupt(
+                "a tree's recorded order, which this opener doesn't read",
+            ))
+        })
+    }
+
+    /// [`Database::open`], each tree whose order was recorded ([`Database::order_tree`]) ordered
+    /// by `order` of its id and record, read ahead of the replay (G7 step 2, `AC-NS.2.1`); the others by
+    /// `cmp`.
+    pub fn open_ordered(
+        disk: Arc<dyn Disk>,
+        frames: usize,
+        trees: usize,
+        cmp: impl Fn() -> Comparator,
+        order: impl Fn(u64, &[u8]) -> Result<Comparator>,
     ) -> Result<Self> {
         let mut first = vec![0u8; PAGE_SIZE];
         let n = disk.read_at(File::Data, 0, &mut first)?;
@@ -257,7 +434,7 @@ impl Database {
         // went; with the header damaged, the newer of the two.
         let mut newest: Option<Journal> = None;
         for file in [File::Journal, File::JournalNext] {
-            let Some(j) = Journal::decode(&read_all(&*disk, file)?) else {
+            let Some(j) = Journal::read(&*disk, file)? else {
                 continue;
             };
             let current = header.as_ref().is_none_or(|h| j.stamp.seq >= h.seq);
@@ -276,33 +453,51 @@ impl Database {
                 "no complete checkpoint journal at or after the data file's header",
             ));
         };
-        Self::write_journal_pages(&*disk, &journal)?;
+        Journal::apply(&*disk, &journal.stamp, &journal.pages)?;
         let Journal { stamp, list, .. } = journal;
         // A checkpoint that switched turns and never finished leaves commits after T in both.
         let replay = redo::merge(redo::read(&*disk)?, disk.lanes(), stamp.ts)?;
         redo::trim(&*disk, &replay.ends)?;
-        let pool = Pool::new(frames);
-        let mut buf = vec![0u8; PAGE_SIZE];
-        for page in 1..=stamp.allocated {
-            if disk.read_at(File::Data, page_offset(page)?, &mut buf)? != PAGE_SIZE {
-                return Err(corrupt("a page past the data file's end"));
-            }
-            pool.load(page, &buf)?;
-        }
+        // Pages are read in as they are asked for, evicted past the frames (G7 step 4).
+        let pool = Pool::backed(frames, disk.clone(), stamp.allocated)?;
         if stamp.roots.len() <= trees {
             return Err(corrupt("fewer trees than the database was opened with"));
         }
+        // Each tree's order, read ahead of the replay: the checkpoint's list names the orders
+        // recorded before it, the records after it the rest.
+        let mut orders: HashMap<u64, Vec<u8>> = HashMap::new();
+        for op in list
+            .iter()
+            .chain(replay.records.iter().flat_map(|r| r.ops.iter()))
+        {
+            match op {
+                Op::Ordered { tree, order } => {
+                    orders.insert(*tree, order.clone());
+                }
+                Op::Dropped { tree } => {
+                    orders.remove(tree);
+                }
+                Op::Put { .. } | Op::Remove { .. } | Op::Made { .. } => {}
+            }
+        }
+        let mut ordered: HashMap<u64, Comparator> = HashMap::with_capacity(orders.len());
+        for (tree, bytes) in &orders {
+            ordered.insert(*tree, order(*tree, bytes)?);
+        }
+        let ordered = Mutex::new(ordered);
+        let comparator = |tree: u64| ordered.lock().remove(&tree).unwrap_or_else(&cmp);
+        let overflow = u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?;
         let v = Versioned::open(pool, &stamp.roots, |i| {
             if i == trees {
                 bytes_order()
             } else {
-                cmp()
+                comparator(u64::try_from(i).unwrap_or(overflow))
             }
         })?;
         let changes = list
             .iter()
             .chain(replay.records.iter().flat_map(|r| r.ops.iter()));
-        Self::apply(&v, changes, &cmp)?;
+        Self::apply(&v, changes, &comparator)?;
         v.clear_versions(&mut Descender::new())?;
         v.clock.recovered(replay.newest);
         // Each checkpoint switches the turn appends go to: after checkpoint `seq`, turn `seq % 2`.
@@ -314,30 +509,33 @@ impl Database {
             gate: RwLock::new(()),
             last: Mutex::new(stamp.seq),
             columns: std::sync::OnceLock::new(),
-            overflow: u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?,
+            overflow,
+            orders: Mutex::new(orders),
         })
     }
 
     /// Makes `changes` directly, with no versions (recovery): the row changes between two trees
     /// made or dropped side by side ([`Database::apply_rows`]), each tree made or dropped
-    /// (`AC-NS.2.5`) once every change before it is made, a made tree ordered by `cmp`.
+    /// (`AC-NS.2.5`) once every change before it is made, a made tree ordered by `cmp` of its id.
+    /// Orders were read ahead of the replay.
     fn apply<'a>(
         v: &Versioned,
         changes: impl Iterator<Item = &'a Op>,
-        cmp: &dyn Fn() -> Comparator,
+        cmp: &dyn Fn(u64) -> Comparator,
     ) -> Result<()> {
         let mut rows = Vec::new();
         for op in changes {
             match op {
                 Op::Made { tree } => {
                     Self::apply_rows(v, std::mem::take(&mut rows))?;
-                    v.remake_tree(*tree, cmp())?;
+                    v.remake_tree(*tree, cmp(*tree))?;
                 }
                 Op::Dropped { tree } => {
                     Self::apply_rows(v, std::mem::take(&mut rows))?;
                     v.drop_tree(*tree)?;
                 }
                 Op::Put { .. } | Op::Remove { .. } => rows.push(op),
+                Op::Ordered { .. } => {}
             }
         }
         Self::apply_rows(v, rows)
@@ -351,7 +549,17 @@ impl Database {
         if changes.is_empty() {
             return Ok(());
         }
-        let parts = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        // No more replayers than the pool's frames can hold latched at once (G7 step 4): past
+        // that, a pool whose every frame is latched refuses.
+        let parts = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(
+                v.pool
+                    .capacity()
+                    .checked_div(super::blink::WRITER_LATCHES)
+                    .unwrap_or(1),
+            )
+            .max(1);
         let mut by: Vec<Vec<&Op>> = vec![Vec::new(); parts];
         for op in changes {
             by.get_mut(partition(op, parts))
@@ -390,34 +598,28 @@ impl Database {
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
         let all = trees.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
-        let v = Versioned::new(
-            frames,
-            all,
-            |i| {
-                if i == trees {
-                    bytes_order()
-                } else {
-                    cmp()
-                }
-            },
-        )?;
+        let v = Versioned::new_in(Pool::backed(frames, disk.clone(), 0)?, all, |i| {
+            if i == trees {
+                bytes_order()
+            } else {
+                cmp()
+            }
+        })?;
         let allocated = v.pool.allocated();
         let epoch = v.pool.begin_copy()?;
-        let journal = Journal {
-            stamp: Stamp {
-                seq: 0,
-                ts: 0,
-                allocated,
-                roots: v.roots(),
-            },
-            pages: v.pool.copy_owed(epoch, allocated)?,
-            list: Vec::new(),
+        let stamp = Stamp {
+            seq: 0,
+            ts: 0,
+            allocated,
+            roots: v.roots(),
         };
         // What the redo files hold is no record (the caller found none) of this database.
         let ends = vec![[0, 0]; disk.lanes()];
         redo::trim(&*disk, &ends)?;
-        Self::write_journal(&*disk, &journal)?;
-        Self::write_journal_pages(&*disk, &journal)?;
+        let pages = Journal::write(&*disk, &stamp, &[], |each| {
+            v.pool.copy_owed(epoch, allocated, each)
+        })?;
+        Journal::apply(&*disk, &stamp, &pages)?;
         Ok(Self {
             disk,
             v,
@@ -426,6 +628,7 @@ impl Database {
             last: Mutex::new(0),
             columns: std::sync::OnceLock::new(),
             overflow: u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?,
+            orders: Mutex::new(HashMap::new()),
         })
     }
 
@@ -433,9 +636,9 @@ impl Database {
     fn tree_of(op: &Op) -> Result<u64> {
         match op {
             Op::Put { tree, .. } | Op::Remove { tree, .. } => Ok(*tree),
-            Op::Made { .. } | Op::Dropped { .. } => {
-                Err(corrupt("a checkpoint's list naming a tree made or dropped"))
-            }
+            Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => Err(corrupt(
+                "a row change naming a tree made, dropped or ordered",
+            )),
         }
     }
 
@@ -466,7 +669,24 @@ impl Database {
             return Err(LimboError::Busy);
         }
         self.log_alone(d, Op::Dropped { tree })?;
+        self.orders.lock().remove(&tree);
         self.v.drop_tree(tree)
+    }
+
+    /// Records tree `tree`'s order, `order` as the opener encodes it (G7 step 2, `AC-NS.2.1`),
+    /// logged as a record of its own, durable before it returns: given before any row of the tree
+    /// is written, so recovery orders the tree by it (`open_ordered`'s `order`) before it replays
+    /// one. Row changes and checkpoints wait for it.
+    pub fn order_tree(&self, d: &mut Descender, tree: u64, order: Vec<u8>) -> Result<()> {
+        let tree = self.user_tree(tree)?;
+        let _alone = self.gate.write();
+        self.redo.usable()?;
+        let op = Op::Ordered { tree, order };
+        self.log_alone(d, op.clone())?;
+        if let Op::Ordered { tree, order } = op {
+            self.orders.lock().insert(tree, order);
+        }
+        Ok(())
     }
 
     /// Logs `op` alone at the next timestamp, durable, under the gate held exclusive.
@@ -488,24 +708,6 @@ impl Database {
         }
         page.resize(PAGE_SIZE, 0);
         disk.write_at(File::Data, 0, &page)
-    }
-
-    /// Writes `j` over its journal file, flushed.
-    fn write_journal(disk: &dyn Disk, j: &Journal) -> Result<()> {
-        let file = journal_file(j.stamp.seq);
-        let bytes = j.encode()?;
-        disk.truncate(file, 0)?;
-        disk.write_at(file, 0, &bytes)?;
-        disk.sync(file)
-    }
-
-    /// Writes `j`'s pages and header over the data file, flushed.
-    fn write_journal_pages(disk: &dyn Disk, j: &Journal) -> Result<()> {
-        for (no, bytes) in &j.pages {
-            disk.write_at(File::Data, page_offset(*no)?, bytes)?;
-        }
-        Self::write_header(disk, &j.stamp)?;
-        disk.sync(File::Data)
     }
 
     pub fn begin(&self) -> Result<Txn> {
@@ -744,7 +946,7 @@ impl Database {
                     open.remove(&prefix);
                     out.push(op.clone());
                 }
-                Op::Made { .. } | Op::Dropped { .. } => out.push(op.clone()),
+                Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => out.push(op.clone()),
             }
         }
         Ok(out)
@@ -826,25 +1028,25 @@ impl Database {
                 allocated: self.v.pool.allocated(),
                 roots: self.v.roots(),
             };
-            (
-                stamp,
-                self.v.corrections(ts)?,
-                self.v.pool.begin_copy()?,
-                from,
-            )
+            // The trees' orders go in the list beside the corrections: the redo records naming
+            // them are cut once the checkpoint is written.
+            let mut list = self.v.corrections(ts)?;
+            list.extend(self.orders.lock().iter().map(|(tree, order)| Op::Ordered {
+                tree: *tree,
+                order: order.clone(),
+            }));
+            (stamp, list, self.v.pool.begin_copy()?, from)
         };
         // Off the commit path: writers go on, each keeping a page's bytes at the pause before its
         // first change of it.
-        let journal = Journal {
-            pages: self.v.pool.copy_owed(epoch, stamp.allocated)?,
-            stamp,
-            list,
-        };
-        Self::write_journal(&*self.disk, &journal)?;
-        Self::write_journal_pages(&*self.disk, &journal)?;
+        // Copied a page at a time into the journal: what it holds is a page, not the pages written.
+        let pages = Journal::write(&*self.disk, &stamp, &list, |each| {
+            self.v.pool.copy_owed(epoch, stamp.allocated, each)
+        })?;
+        Journal::apply(&*self.disk, &stamp, &pages)?;
         // Commits up to T are in the file now; the redo file switched from holds no others.
-        self.redo.cut(&*self.disk, from, journal.stamp.ts)?;
-        Ok(journal.stamp.ts)
+        self.redo.cut(&*self.disk, from, stamp.ts)?;
+        Ok(stamp.ts)
     }
 }
 
@@ -1019,7 +1221,7 @@ mod tests {
         db.commit(t, &mut d, db.lane(), true).unwrap();
         let mut t = db.begin().unwrap();
         db.put(&mut d, &mut t, 0, b"b", b"1").unwrap();
-        // The journal's cut, write and flush, then the first page's write: the next fails.
+        // The journal's cut, its head and its first pages: the next write fails.
         disk.crash_after(4);
         assert!(db.checkpoint().is_err());
         assert!(db.commit(t, &mut d, db.lane(), false).is_err());
@@ -1312,6 +1514,86 @@ mod tests {
         assert_eq!(made_trees(&db, 6), want);
         let mut d = Descender::new();
         assert_eq!(db.make_tree(&mut d, cmp()).unwrap(), 5);
+    }
+
+    fn reversed() -> Comparator {
+        Box::new(|a: &[u8], b: &[u8]| b.cmp(a))
+    }
+
+    /// The comparison of a recorded order: `rev` orders keys from the last to the first.
+    fn recorded(_tree: u64, order: &[u8]) -> Result<Comparator> {
+        if order == b"rev" {
+            Ok(reversed())
+        } else {
+            Err(LimboError::Corrupt(
+                "an order this test doesn't know".into(),
+            ))
+        }
+    }
+
+    fn keys(db: &Database, tree: u64) -> Vec<Vec<u8>> {
+        let mut d = Descender::new();
+        let snap = db.snapshot().unwrap();
+        let all = db.scan(&mut d, &snap, tree, None, usize::MAX).unwrap();
+        db.close_snapshot(snap);
+        all.into_iter().map(|(k, _)| k).collect()
+    }
+
+    /// Do (`AC-NS.2.1`, G7 step 2): make two trees ordered from the last key to the first, record
+    /// each one's order, one before a checkpoint (which cuts the record from the redo log) and one
+    /// after; write rows to both; reopen, write a key between, and reopen after a power cut. Expect:
+    /// each tree's keys read back in its recorded order after each reopen, the key written after a
+    /// reopen in its place; an order the opener doesn't read refused (`Corrupt`), not taken as the
+    /// default.
+    #[test]
+    fn ns2_1_a_trees_recorded_order_survives_checkpoints_and_reopens() {
+        let disk = Arc::new(Simulated::new(37, 1).unwrap());
+        let (a, b);
+        {
+            let db = Database::open_ordered(disk.clone(), 2_000, 1, cmp, recorded).unwrap();
+            let mut d = Descender::new();
+            a = db.make_tree(&mut d, reversed()).unwrap();
+            db.order_tree(&mut d, a, b"rev".to_vec()).unwrap();
+            let mut txn = db.begin().unwrap();
+            for k in [b"k1", b"k5", b"k3"] {
+                db.put(&mut d, &mut txn, a, k, b"v").unwrap();
+            }
+            db.commit(txn, &mut d, db.lane(), true).unwrap();
+            db.checkpoint().unwrap();
+            b = db.make_tree(&mut d, reversed()).unwrap();
+            db.order_tree(&mut d, b, b"rev".to_vec()).unwrap();
+            let mut txn = db.begin().unwrap();
+            for (t, k) in [(a, b"k7"), (b, b"k2"), (b, b"k9"), (b, b"k4")] {
+                db.put(&mut d, &mut txn, t, k, b"v").unwrap();
+            }
+            db.commit(txn, &mut d, db.lane(), true).unwrap();
+        }
+        let want_a: Vec<Vec<u8>> = [b"k7", b"k5", b"k3", b"k1"]
+            .iter()
+            .map(|k| k.to_vec())
+            .collect();
+        let db = Database::open_ordered(disk.clone(), 2_000, 1, cmp, recorded).unwrap();
+        assert_eq!(keys(&db, a), want_a);
+        let mut d = Descender::new();
+        let mut txn = db.begin().unwrap();
+        db.put(&mut d, &mut txn, b, b"k6", b"v").unwrap();
+        db.commit(txn, &mut d, db.lane(), true).unwrap();
+        let want_b: Vec<Vec<u8>> = [b"k9", b"k6", b"k4", b"k2"]
+            .iter()
+            .map(|k| k.to_vec())
+            .collect();
+        assert_eq!(keys(&db, b), want_b);
+        drop(db);
+        disk.power_cut().unwrap();
+        let db = Database::open_ordered(disk.clone(), 2_000, 1, cmp, recorded).unwrap();
+        assert_eq!(keys(&db, a), want_a);
+        assert_eq!(keys(&db, b), want_b);
+        db.checkpoint().unwrap();
+        drop(db);
+        assert!(matches!(
+            Database::open(disk, 2_000, 1, cmp),
+            Err(LimboError::Corrupt(_))
+        ));
     }
 
     /// Do: for many crash points, a workload that makes trees, writes long and short rows to them

@@ -9,7 +9,7 @@ use std::time::Instant;
 use amphora_api::blobs::Blobs;
 
 use super::Mark;
-use super::object::{self, Manifest, Segment};
+use super::object::{self, Segment};
 use super::plan::{self, BaseKey, SegmentKey, ThroughKey};
 use super::ship::{FRAME_BYTES, list_all};
 use crate::db::Db;
@@ -21,6 +21,8 @@ pub struct Restored {
     pub cut: (u64, u64),
     pub base: u64,
     pub bytes: u64,
+    /// The bytes of log it fetched ([`super::check_due`]'s measure).
+    pub log_bytes: u64,
 }
 
 fn wal_path(path: &Path) -> std::path::PathBuf {
@@ -87,14 +89,17 @@ pub fn restore(
     let frame = plan::cut_in(&marks, second)?;
     let plan = plan::chain(&segments, &bases, at, frame, second)?;
     let mut bytes = 0u64;
+    let mut log_bytes = 0u64;
 
     // The base's pages, as the file.
     let manifest_key = plan.base.key(prefix);
-    let manifest: Manifest = object::decode(&manifest_key, &blobs.get(&manifest_key, until)?)?;
+    let manifest = object::manifest(&manifest_key, &blobs.get(&manifest_key, until)?)?;
     {
         let mut file = std::fs::File::create_new(path)?;
-        for chunk in 0..manifest.chunks {
-            let key = plan::chunk_key(prefix, manifest.id, chunk);
+        // An incremental base keeps an earlier base's chunks where the log changed none of their
+        // pages (docs/design/backup.md, "Incremental bases").
+        for (chunk, base) in (0u64..).zip(manifest.chunk_bases()?) {
+            let key = plan::chunk_key(prefix, base, chunk);
             let sealed = blobs.get(&key, until)?;
             let pages = object::opened(&key, &sealed)?;
             file.write_all(pages)?;
@@ -125,10 +130,12 @@ pub fn restore(
             }
             index = index.saturating_add(1);
             let body: Segment = if *i == at {
+                log_bytes = log_bytes.saturating_add(u64::try_from(located.frames.len())?);
                 located.clone()
             } else {
                 let got = blobs.get(name, until)?;
                 bytes = bytes.saturating_add(u64::try_from(got.len())?);
+                log_bytes = log_bytes.saturating_add(u64::try_from(got.len())?);
                 object::decode(name, &got)?
             };
             if body.first != written.saturating_add(1) {
@@ -173,6 +180,7 @@ pub fn restore(
         cut: plan.cut,
         base: plan.base.id,
         bytes,
+        log_bytes,
     })
 }
 
@@ -202,7 +210,22 @@ pub fn expire(
     for (key, _) in list_all(blobs, &format!("{prefix}/pages/"), until)? {
         chunks.push((plan::chunk_id(prefix, &key)?, key));
     }
-    let gone = plan::expired(prefix, &segments, &bases, &chunks, now_ns, retention_ns);
+    let mut gone = plan::expired(prefix, &segments, &bases, &chunks, now_ns, retention_ns);
+    // A chunk a kept base reuses stays, whichever base first stored it.
+    let mut reused = std::collections::BTreeSet::new();
+    for base in &bases {
+        let key = base.key(prefix);
+        if gone.contains(&key) {
+            continue;
+        }
+        let manifest = object::manifest(&key, &blobs.get(&key, until)?)?;
+        for (chunk, from) in (0u64..).zip(manifest.chunk_bases()?) {
+            if from != manifest.id {
+                reused.insert(plan::chunk_key(prefix, from, chunk));
+            }
+        }
+    }
+    gone.retain(|key| !reused.contains(key));
     for key in &gone {
         blobs.delete(key, until)?;
     }
