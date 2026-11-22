@@ -816,6 +816,7 @@ tests = [
   # lane split-merge-12
   { id = "T-T1.9.R14", text = "A thousand weights added at positions, kept to eight entries — passes when no more than eight are ever kept, their total is exact, the cut leaves weight on each side, and four single weights cut exactly at the middle" },
   { id = "T-T1.9.R15", text = "One group measured by the shell with nothing written, after sixty-four keys are written, and again after — passes when the first has no load cut, the second has load above zero and a cut that counts each key on the side its position falls, the plan on two cores splits the group at that cut, and the third has no load" },
+  { id = "T-T1.9.R16", text = "A split and a merge back, then a restart, the groups whose files are found asked of the node before and after — passes when only the retired group is named both times, never the group held nor an id never given out, and once its files are deleted every key still reads back from its group" },
 ]
 
 # lane qs5

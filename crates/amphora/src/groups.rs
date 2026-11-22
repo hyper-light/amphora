@@ -561,6 +561,21 @@ impl<E: Engine> Groups<E> {
         route.groups.get(&group).map(|g| g.store.clone())
     }
 
+    /// Of `found`, the groups whose files the caller found on this node, those retired: retired
+    /// here, or shown retired by the directory routed by, and not held here (CP-T1.9;
+    /// docs/design/reshard.md, decision "A retired group's files"). This node never opens one of
+    /// them again (a restart doesn't start it, and a create asked of it again is refused), so the
+    /// caller, who knows where a group's files are, deletes theirs. A group of `found` that is
+    /// held here, being made, or never given out isn't named.
+    #[must_use]
+    pub fn retired_of(&self, found: impl IntoIterator<Item = GroupId>) -> Vec<GroupId> {
+        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        found
+            .into_iter()
+            .filter(|g| !route.groups.contains_key(g) && route.was_retired(*g))
+            .collect()
+    }
+
     /// The holding `group` answers from now, if it is on this node.
     #[must_use]
     pub fn holding_of(&self, group: GroupId) -> Option<Holding> {

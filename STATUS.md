@@ -529,8 +529,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (T-T1.9.R13). Load from the store's meter (lane split-merge-12): the shell measures each
   group's load (its writer's commit time) and where its writes fall, and the machine's cores, and
   the planner decides from them (T-T1.9.R14, T-T1.9.R15). Left: that transport off loopback
-  (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, deleting
-  a retired group's files, and the full AC-T1.9.2 and AC-T1.9.3 runs.
+  (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
+  full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
+  them (T-T1.9.R16).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
