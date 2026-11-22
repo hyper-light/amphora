@@ -4539,12 +4539,15 @@ pub(crate) mod bushy_search_tests {
         /// counted, the plan of nested loops gives; each query planned bushy; and the LEFT JOIN
         /// read inside a build group (`LEFT_JOINS_IN_RUNS`) in every query.
         ///
-        /// Lane pl8-20: the filters force the LEFT JOIN into the run rather than leave it to
-        /// which mirror of the plan the search picks. The LEFT JOIN's dimension keeps six rows
-        /// (`cat < 3`), the other one (`id = 7` or `id = 3`); the mirror with the LEFT JOIN's side
-        /// as the outer loops scans the probe's 12,000 rows once for each of six outer rows, where
-        /// the plan with that side in the run scans them once, for the one outer row: six times
-        /// the probe's reads and hash lookups for the same rows visited.
+        /// Lane pl8-22: the filters make the plan with the LEFT JOIN in the run the cheaper
+        /// mirror. Each side reaches its fact through an index made for the join (no side scans
+        /// the 12,000 rows, as lane pl8-20 had it), so the mirrors differ by which side is built:
+        /// a row built costs more than a row probed, and the search builds the side with fewer
+        /// rows (kiln run r124: with the LEFT JOIN's dimension at six rows and the other at one,
+        /// it built the other side, 240 fact rows, and probed with the LEFT JOIN's 1,440). So
+        /// the LEFT JOIN's dimension keeps two rows (`cat = 1`: ids 1 and 26, one with a match
+        /// and one without), 480 fact rows to build, and the other six (`cat < 3`), 1,440 to
+        /// probe with. The plan's shape is checked before the answers.
         #[test]
         fn t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows() {
             let (_db, conn) = facts();
@@ -4562,7 +4565,7 @@ pub(crate) mod bushy_search_tests {
                              JOIN f1 ON f1.d1 = d1.id JOIN f2 ON f2.k = f1.k \
                              JOIN d2 ON f2.d2 = d2.id"
                         ),
-                        "WHERE d1.cat < 3 AND d2.id = 7",
+                        "WHERE d1.cat = 1 AND d2.cat < 3",
                     ),
                     (
                         format!(
@@ -4570,12 +4573,10 @@ pub(crate) mod bushy_search_tests {
                              JOIN f2 ON f2.d2 = d2.id JOIN f1 ON f2.k = f1.k \
                              JOIN d1 ON f1.d1 = d1.id"
                         ),
-                        "WHERE d2.cat < 3 AND d1.id = 3",
+                        "WHERE d2.cat = 1 AND d1.cat < 3",
                     ),
                 ] {
                     let sql = format!("{select} {from} {filter}{above}");
-                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
-                    let nested_loops = rows(&conn, &sql);
                     conn.set_join_methods(JoinMethods::ByCost);
                     BUSHY_PLANS.with(|plans| plans.set(0));
                     LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
@@ -4584,10 +4585,12 @@ pub(crate) mod bushy_search_tests {
                     let in_runs = LEFT_JOINS_IN_RUNS.with(Cell::get);
                     let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
                     eprintln!("bushy={made_bushy} in_runs={in_runs}: {sql}: {plan:?}");
-                    assert!(!nested_loops.is_empty(), "{sql}");
-                    assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
                     assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
                     assert!(in_runs > 0, "no LEFT JOIN inside a run: {sql}: {plan:?}");
+                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                    let nested_loops = rows(&conn, &sql);
+                    assert!(!nested_loops.is_empty(), "{sql}");
+                    assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
                 }
             }
         }
