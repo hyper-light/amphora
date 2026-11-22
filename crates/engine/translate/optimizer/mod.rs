@@ -3700,14 +3700,14 @@ pub(crate) mod bushy_search_tests {
                 "CREATE TABLE d2(id INTEGER PRIMARY KEY, cat INT)",
                 "CREATE TABLE f1(id INTEGER PRIMARY KEY, d1 INT, k INT)",
                 "CREATE TABLE f2(id INTEGER PRIMARY KEY, d2 INT, k INT)",
-                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 200) \
-                 INSERT INTO d1 SELECT x, x % 20 FROM n",
-                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 200) \
-                 INSERT INTO d2 SELECT x, x % 20 FROM n",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+                 INSERT INTO d1 SELECT x, x % 25 FROM n",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+                 INSERT INTO d2 SELECT x, x % 25 FROM n",
                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
-                 INSERT INTO f1 SELECT x, x % 200 + 1, x % 4 FROM n",
+                 INSERT INTO f1 SELECT x, x % 50 + 1, x % 2 FROM n",
                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
-                 INSERT INTO f2 SELECT x, x % 200 + 1, x % 4 FROM n",
+                 INSERT INTO f2 SELECT x, x % 50 + 1, x % 2 FROM n",
                 "ANALYZE",
             ] {
                 conn.execute(sql).unwrap();
@@ -3720,7 +3720,6 @@ pub(crate) mod bushy_search_tests {
                 "SELECT count(*), sum(f1.id - f2.id) FROM d1, f1, f2, d2 \
                  WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.cat = 7",
             ];
-            let mut bushy = 0;
             for sql in queries {
                 conn.set_join_methods(JoinMethods::NestedLoopsOnly);
                 let nested_loops = rows(&conn, sql);
@@ -3730,11 +3729,10 @@ pub(crate) mod bushy_search_tests {
                 let made_bushy = BUSHY_PLANS.with(Cell::get);
                 let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
                 eprintln!("bushy={made_bushy}: {sql}: {plan:?}");
-                bushy += made_bushy.min(1);
+                assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
                 assert!(!nested_loops.is_empty(), "{sql}");
                 assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
             }
-            assert!(bushy > 0, "no query was planned bushy");
         }
     }
 }

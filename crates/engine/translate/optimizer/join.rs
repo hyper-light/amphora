@@ -1932,7 +1932,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     let Some(method) = access_methods_arena.get_mut(probe_method) else {
                         continue;
                     };
-                    eprintln!("DBG bushy outer={:?} build={:?} probe={probe} cost={cost:?} (outer {:?} build {:?} probe {probe_cost:?}) best={:?} best_order={:?}", outer.table_numbers().collect::<Vec<_>>(), build.table_numbers().collect::<Vec<_>>(), outer.cost, build.cost, best_plan.as_ref().map(|p| p.cost), best_plan.as_ref().map(|p| p.table_numbers().collect::<Vec<_>>()));
                     if !cheaper {
                         access_methods_arena.truncate(arena_len);
                         continue;
