@@ -109,6 +109,12 @@ impl Answers {
         }
     }
 
+    /// The voters it measures at most rise to `members`, never fall: the group's member bound as
+    /// its log raised it (lane constants-21).
+    pub(super) fn grow(&mut self, members: usize) {
+        self.members = self.members.max(members);
+    }
+
     /// One tick of the owner, leading the term `leading` if it leads, among `voters` and, in a
     /// joint configuration, the `outgoing` voters. A voter that left both is forgotten.
     pub(super) fn tick(

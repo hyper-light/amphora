@@ -3199,13 +3199,16 @@ impl<F: BlockFile + 'static> Actor<F> {
         answer(changing.response, result);
     }
     /// The core's member bound at least what its machine recorded: an image installed brings the
-    /// bound its group's log stated before it, which the core took no entry of (lane constants-21).
+    /// bound its group's log stated before it, which the core took no entry of. The voters the
+    /// leader's quorum patience measures follow the core's bound (lane constants-21).
     fn keep_member_bound(&mut self) {
         if let Some(bound) = self.replica.machine().member_bound()
             && self.replica.grow_members(bound)
         {
             tracing::info!(target: "amphora.replication", event = "member_bound_taken", bound);
         }
+        self.answers
+            .grow(self.replica.core().raft.config().limits.members);
     }
     /// A change waiting to raise the member bound, once no write is under way (lane constants-21).
     fn raise_waiting(&mut self) {

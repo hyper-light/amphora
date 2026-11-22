@@ -2636,7 +2636,8 @@ format bound (about 1.6 million) would take megabytes of every image record. The
   change behind it taken and neither applied opens in bound; and `Raft::grow_members` raises the tracker's, the fast votes' and the pending reads' bounds
   with it. The fast votes' bytes stay what the core opened with: a vote past them is dropped, and the leader commits
   by the classic track. An image installed brings the bound recorded before it, which the core then takes
-  (`Actor::keep_member_bound`).
+  (`Actor::keep_member_bound`), and the voters the leader's quorum patience measures follow the core's bound
+  (`patience::Answers::grow`), so a voter added past the old bound is measured.
 - **What is still open.** A joiner that installs an image whose configuration names more members than its own opening
   bound fails in hyper-raft before the machine sees the image's bound. A joiner opened with the group's members today
   is in bound. Carrying the bound in the snapshot itself would close this; it needs a hyper-raft wire change.
