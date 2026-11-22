@@ -2589,7 +2589,8 @@ ends, not on a flush of the owner's own.
 ## Decision (lane ryw-1): read-your-writes by session tokens (2026-11-22, kiln goal 8119f25d)
 
 Ada's order (2026-11-22): read-your-writes on any replica, built behind a switch with today's read as the control,
-decided from live runs. Requirements AC-T1.10.R1 to R3, tests T-T1.10.R1 to R3 (docs/requirements.toml, lane ryw-1).
+decided from live runs. Requirements AC-T1.10.R1 to R4, tests T-T1.10.R1 to R4 (docs/requirements.toml, lanes ryw-1
+and ryw-3).
 
 ### What was already there
 
@@ -2608,12 +2609,15 @@ decided from live runs. Requirements AC-T1.10.R1 to R3, tests T-T1.10.R1 to R3 (
 - **(a) `ReadMode::Latest`, the control and today's read.** `Database::query_session(Latest, ..)` is `Database::query`:
   every read crosses the leader's ReadIndex and waits for applied to reach the latest commit, token or not.
 - **(b) `ReadMode::Session`, session tokens.** Built in this change:
-  - *Tokens.* `Database::session_token` after a write's answer gives `Token { micros, index }`. `micros` is the group's
-    time, `index` the commit index. The owner publishes both before it answers, at the leader's apply and at a follower's
-    commit answer (`Actor::publish_point`). Within one group the two rise together. `micros` is in the same domain as the
+  - *Tokens.* Each write's answer carries its own `Token { micros, index }` (`Database::call_session`,
+    `Database::execute_session`; lane ryw-3). `index` is the log position of the write's own entry. `micros` is the
+    group's time once that entry is applied, at the leader's apply, or the entry's stamp, at a follower's commit
+    answer. A call that wrote nothing has no token. The leader publishes its applied point before it answers
+    (`Actor::publish_closed`). Within one group the two rise together. `micros` is in the same domain as the
     cross-group coordinator's timestamps (microseconds since the Unix epoch), so a single-group commit and a cross-group
-    one compare in one order, time first (Ada's decision: a cross-group commit answers with its timestamp,
-    `Token::at`; lane xgroup-sql-6 stamps it). A session keeps the latest of its tokens (`Token::after`).
+    one compare in one order, time first. Ada's decision (2026-11-22): a cross-partition commit's revision is its
+    HLC timestamp, the same time as the tokens', so it answers with `Token::at` of that timestamp (lane xgroup-sql-6
+    stamps it). A session keeps the latest of its tokens (`Token::after`).
   - *Reads.* `query_session(Session, Some(token), ..)` is served by the replica it asks once that replica's published
     applied index and closed time are at or past the token. The check is repeated inside the read's own transaction
     (`run_closed`), so the state read is never older than the token. The read waits on that replica alone, only while
@@ -2640,9 +2644,54 @@ decided from live runs. Requirements AC-T1.10.R1 to R3, tests T-T1.10.R1 to R3 (
 ### Instruments
 
 `Database::session_counters` on each replica: reads served at once, reads that waited and their total wait, redirects,
-and the apply lag that bounds the wait. `amphora-bench --cluster --shapes ryw` gives, at each count of sessions: read
-latency straight after a write (p50, p99, p99.9), write p99, write-read pairs a second, reads that missed their own
-write (must be 0), each follower's counters, and the process's CPU seconds and peak memory.
+and the apply lag that bounds the wait. `amphora-bench --cluster --shapes ryw` gives, at each count of sessions on Ada's
+ladder (1, 8, 32, 128, 512, 2048, 4096): read latency straight after a write (p50, p99, p99.9), write p99, write-read
+pairs a second, reads that missed their own write (must be 0), each follower's counters, and the process's CPU
+seconds, its share of the host's cores and its peak memory, so a rung where the client is the bottleneck shows as one.
+Each session reads with the token its own write's answer carried (`call_session`). Both read modes run through this
+one client, on one platform, with the same settings, and each record names its client and platform.
+
+Run of record (the coordinator's), once per read mode, on one host:
+`amphora-bench --cluster --dir <dir> --shapes ryw --partitions 1 --events 100000 --reads 100000 --read-mode latest`,
+then the same with `--read-mode session`. The tiny instance is
+`--events 100 --batch 100 --reads 64 --ladder 1,8,32,128`.
+
+### The bench's relay wakes on records
+
+The bench's members run in one process, and one relay thread moves every member's outgoing records to the member they
+name (the host's part: Amphora carries no network of its own). It used to wait, after a pass that moved nothing, on a
+100µs `park_timeout`: a record queued just after a pass waited for the timer, and an idle relay woke 10,000 times a
+second for nothing (Ada's rule, 2026-11-21: wake on events, never on timers). Lane ryw-4 (2026-11-22) makes it wait on
+one bell instead. `ReplicaHandle::listen` gives a member's handle a waker. The owner wakes it each time records join
+its outgoing queue, as it already rings `drain_wait`'s condition, and when it ends or is dropped, so a relay hears a
+member that went. The bench gives every member the same bell, and `stop` rings it too. Lane scaleout-harness-9 wrote
+the same hook for `scale.rs`'s relay; lane ryw-5 made the two one (`listen`, which `on_sent` had been). The bell
+keeps a ring given while the relay is moving records, so no record waits for a later ring. A member's records have
+one host to take them, so a waker given again replaces the one before.
+`amphora_ryw`'s records now carry `relay`: its kind (`Bell` or `Park`), its passes, records moved, waits and the
+wakes that found nothing to move.
+
+`--relay park` keeps the timer only as the control of the A/B run, at 1, 128 and 4096 sessions: p50, p99 and p99.9
+of read-after-write and write latency, pairs a second, and the relay's counts, per relay on one host, through this one
+client. Once that run decides, the loser is removed. Tested by
+`a_members_listener_wakes_for_its_records_and_its_owners_end` (crates/amphora/src/database/replicated.rs): every
+member's election records wake its listener, a write's records wake the listener that replaced it and not the one
+before, and each listener in place is woken again as its owner goes.
+
+### A host waits for a leader on the owner's word
+
+Before its first write the bench needs its group's leader, and it used to find one by trying the schema every 10ms
+until a call went through. Lane ryw-5 (2026-11-22) makes it wait instead on what the member's owner publishes.
+`ReplicaHandle::wait_leader(past, until)` answers the member's status once it names a leader in a term past `past`
+(0 for any leader). The owner tells that wait whenever a step publishes another leader or term, and when it ends or
+its owner is dropped, so nothing waits on a timer and an owner that's gone is never waited on to the deadline. The
+bench's `schema_on` waits for any leader and calls. If the lead's move refused the call (`NotLeader`,
+`UnknownOutcome`, `Unavailable`), it waits for a leader of a later term than the one it called under and calls
+again. That is safe because the schema is `IF NOT EXISTS`. Any other refusal, or the deadline, ends the bench and
+names the refusal. Tested by `a_host_waits_for_a_leader_on_the_owners_word` (crates/amphora/src/database/replicated.rs):
+with no leader and no time left the wait is refused Timeout. A waiter for any leader gets the one elected, with its
+term, and with no later term and no time left the wait is refused Timeout again. A waiter past that term gets the
+member the lead moved to, in a later term. A waiter on an owner dropped mid-run is refused Fenced.
 
 ### Evidence
 
@@ -2654,17 +2703,22 @@ write (must be 0), each follower's counters, and the process's CPU seconds and p
 - T-T1.10.R3 `t_t1_10_r3_a_session_reads_its_writes_across_leader_changes`: clocks an hour apart and the lead passed
   1, 2, 3, 1. Each new write's token orders after the last, every token read served sees all of the session's writes,
   and once caught up every member's answer equals the leader's state (the control's answer).
+- T-T1.10.R4 `t_t1_10_r4_each_session_waits_only_for_its_own_writes`: sessions A and B write at once through the
+  leader, and each answer names its own write (A's before B's). With a follower cut off after it holds A's write, B
+  writes again. A's read on that follower is served at once, with no wait or redirect, though B wrote since. B's read
+  is answered with its newer write once the follower rejoins.
 
 ### Limits stated
 
-- A token taken after an answer names the highest index this owner has answered, so with concurrent writers it can name
-  a later write than the caller's. A read then waits for more than it needs, but it never misses its own write. The
-  exact token per answer needs the answer to carry it (a change of `Answer`).
+- Each token names its own write's entry, so with concurrent writers a session waits for its own writes and for no
+  one else's (AC-T1.10.R4). A session that keeps the latest of its tokens (`Token::after`) waits for its latest write,
+  and so for every earlier one of its own in that group.
 - A token's `index` belongs to its group. A session that writes to several groups keeps one token per database, plus
   `Token::at` for a cross-group commit. Mixing two groups' indexes in one token stays correct, through redirects, but
   waits.
-- A follower's commit answer carries its closed time as of that answer, which is a lower bound. That replica's own
-  reads check `index`, but a cross-group comparison of such a token by time alone is weaker until it applies.
+- A follower's commit answer carries its entry's stamp, which is a lower bound of the entry's time (the apply takes
+  the larger of the stamp and one past the time before it, `closed::next`). Reads check `index` too, so no replica
+  serves it early, but a cross-group comparison of such a token by time alone is weaker until it applies.
 - The power-cut case (the nemesis with held flushes) waits on lane repl-measure-8's fix of
   `a_member_power_cut_loses_no_acknowledged_replicated_write`. It is not built on here.
 

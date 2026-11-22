@@ -1825,18 +1825,18 @@ mod inproc {
                 .unwrap_or(0)
         }
 
-        /// `rows` on group `g`'s leader, returning the leader that took them.
-        fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<&Database> {
-            let leader = self.leader(g)?;
-            leader
-                .call(Instant::now() + self.deadline, move |c| {
+        /// `rows` on group `g`'s leader, answered with the write's own session token
+        /// (Database::call_session).
+        fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<Mark> {
+            self.leader(g)?
+                .call_session(Instant::now() + self.deadline, move |c| {
                     for (sql, args) in rows {
                         c.prepare_cached(&sql)?.execute(args)?;
                     }
                     Ok(())
                 })
-                .map_err(|e| anyhow::anyhow!("group {g} refused a write: {e:?}"))?;
-            Ok(leader)
+                .map(|((), token)| token)
+                .map_err(|e| anyhow::anyhow!("group {g} refused a write: {e:?}"))
         }
 
         /// A live member of group `g` that doesn't lead it, for a follower read.
@@ -1906,8 +1906,7 @@ mod inproc {
             self.write_marked(regional, rows).map(drop)
         }
 
-        /// The write, and the session token the leader that took it gives (taken after the
-        /// write's answer, so at or past it: Database::session_token).
+        /// The write, and its own session token from the write's answer.
         fn write_marked(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<Mark> {
             anyhow::ensure!(!self.a.is_cut(self.node), "node {} is down", self.node);
             let Some(first) = rows.first() else {
@@ -1925,10 +1924,7 @@ mod inproc {
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let leader = self.a.exec(g, stmts)?;
-            leader
-                .session_token(Instant::now() + self.a.deadline)
-                .map_err(|e| anyhow::anyhow!("group {g}'s leader gave no session token: {e:?}"))
+            self.a.exec(g, stmts)
         }
 
         fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {

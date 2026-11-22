@@ -220,6 +220,9 @@ pub(crate) fn verdict(data: &[u8], before: Point) -> Result<Result<(), Refusal>,
 #[derive(Debug)]
 pub struct Applied {
     pub index: u64,
+    /// The group's time once the entry is applied (replication.md, "Follower reads at a closed
+    /// time"): the time a session's token for its write takes. None before the first stamped entry.
+    pub time: Option<u64>,
     pub context: Vec<u8>,
     pub result: Result<(), Refusal>,
 }
@@ -1129,6 +1132,7 @@ impl StateMachine for Machine {
             self.timed(next);
             answers.push(Applied {
                 index: entry.index,
+                time: next.time,
                 context: entry.context.to_vec(),
                 result: Ok(()),
             });
@@ -1185,6 +1189,7 @@ impl StateMachine for Machine {
         if !data.is_empty() {
             answers.push(Applied {
                 index: entry.index,
+                time: next.time,
                 context: entry.context.to_vec(),
                 result,
             });

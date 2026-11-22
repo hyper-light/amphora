@@ -5,8 +5,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
-- **Read-your-writes by session tokens** (CP-T1.10, AC-T1.10.R1-R3, lane ryw-1; docs/design/replication.md):
-  `Database::session_token` after a write, and `Database::query_session(ReadMode, token, ..)`. `Latest` is today's read
+- **Read-your-writes by session tokens** (CP-T1.10, AC-T1.10.R1-R4, lanes ryw-1 and ryw-3; docs/design/replication.md):
+  each write's answer carries its own token (`Database::call_session`, `execute_session`), so a session waits for its
+  own writes and no one else's, and `Database::query_session(ReadMode, token, ..)` reads with it. `Latest` is today's read
   (the control). `Session` serves a token read on any replica that has applied the token, waits only while that replica
   is behind, and redirects past its measured apply lag. A read without a token never waits. `session_counters` holds the
   instruments, and `amphora-bench --cluster --shapes ryw` runs the ladder. Waits on the coordinator: the A/B on
