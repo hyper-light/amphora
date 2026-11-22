@@ -189,7 +189,7 @@ format 1 manifests still read, every chunk their own).
   spares every later restore; the restore-rate rule stands.
 - **Retention.** A chunk a kept base reuses stays when the base that stored it expires.
 
-**Evidence.** T-T1.12.I1: 400 rows, the log started again, and a base; 5 rows changed over two generations of the log; the
+**Evidence.** T-T1.12.I1 (the shipper opened again midway): 400 rows, the log started again, and a base; 5 rows changed over two generations of the log; the
 second base keeps most of the first's chunks and copies the changed ones; seconds across both
 restore with every row equal, from both bases; after the first base expires, the newest and the
 oldest kept seconds still restore equal. T-T1.12.D1's random drills (log restarts between bases)
@@ -199,5 +199,6 @@ now take incremental bases. T-T1.12.I2: manifest formats; T-T1.12.I3: the due ru
 chunk whose pages a frame in the traced generations wrote; a chunk deleted while a kept base
 reuses it.
 
-**Open.** After the shipper opens on an archive, the first base is whole: reading the shipped
-segments since the latest base to rebuild the bitmap is not built.
+**After an open.** The shipper reads the archived segments since the latest base began back
+and marks their pages, so the next base is incremental after a restart of the process too (the log
+since a base is bounded by `base_due`); a gap since leaves it whole.
