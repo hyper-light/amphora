@@ -316,7 +316,7 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   its pool across a checkpoint and a reopen, a crash at every disk operation of a spilling,
   checkpointing workload losing no acknowledged commit, and the pool's model test with eviction
   under 32 threads. Not yet: the 10M-row corpus run and its resident memory (the coordinator's);
-  checkpoints still build their journal in memory; the shell passes the budget once the switch
+  checkpoints write and recovery reads their journal a page at a time; the shell passes the budget once the switch
   takes it from `amphora::memory::limit`.
 - **The switch: SQL on the versioned storage** (G7 step 2, `AC-NS.2.1`, docs/design/engine.md
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
