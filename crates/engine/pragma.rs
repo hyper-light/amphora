@@ -192,6 +192,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_group_commit"],
         ),
+        PragmaName::Skipping => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["skipping"],
+        ),
         PragmaName::FtsMergeThreshold => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["fts_merge_threshold"],

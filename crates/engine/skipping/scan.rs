@@ -16,7 +16,7 @@
 //! text constant, a parameter bound to anything but an integer, a COLLATE, an IN list, NOT BETWEEN)
 //! gives no bound: loose, never wrong.
 
-use super::{Candidates, RowidRange};
+use super::{Candidates, RowidRange, SkipMethod};
 use amphora_engine_parser::ast::{Expr, Literal, Operator, TableInternalId, UnaryOperator};
 use std::num::NonZeroUsize;
 
@@ -237,6 +237,15 @@ pub enum WalkPhase {
     Advancing,
 }
 
+/// A walk whose cost goes back to a measured summary's chooser when it ends (lane skip-3,
+/// T-SKU.2): the table, the method that named its candidates, and when it asked for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkMeasure {
+    pub root: i64,
+    pub method: SkipMethod,
+    pub started: std::time::Instant,
+}
+
 /// One scan cursor's walk over its candidates' rowid runs (ascending, disjoint).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkipWalk {
@@ -244,6 +253,8 @@ pub struct SkipWalk {
     ranges: Vec<RowidRange>,
     at: usize,
     pub phase: WalkPhase,
+    /// Taken (once) when the walk ends; `None` unless a measured summary answered.
+    pub measure: Option<WalkMeasure>,
 }
 
 impl SkipWalk {
@@ -271,6 +282,7 @@ impl SkipWalk {
             ranges,
             at: 0,
             phase: WalkPhase::Settle,
+            measure: None,
         })
     }
 

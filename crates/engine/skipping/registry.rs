@@ -13,7 +13,7 @@
 //!
 //! The registry is pure: the caller passes each connection's identity and WAL positions.
 
-use super::{Candidates, RowWrite, SkipError, Skipping};
+use super::{Candidates, RowWrite, SkipError, SkipMethod, Skipping};
 use crate::sync::Mutex;
 
 /// A WAL position: `(checkpoint_seq, max_frame)`, as the pager reports a connection's snapshot
@@ -159,6 +159,21 @@ impl SkipRegistry {
         lo: i64,
         hi: i64,
     ) -> Result<Candidates, SkipRefusal> {
+        self.candidates_by(root_page, reader, reader_pos, committed, lo, hi)
+            .map(|(candidates, _)| candidates)
+    }
+
+    /// [`SkipRegistry::candidates`], with the method a measured summary answered by: hand the
+    /// scan's cost back with [`SkipRegistry::record_cost`] (lane skip-3, T-SKU.2).
+    pub fn candidates_by(
+        &self,
+        root_page: i64,
+        reader: usize,
+        reader_pos: WalPos,
+        committed: WalPos,
+        lo: i64,
+        hi: i64,
+    ) -> Result<(Candidates, Option<SkipMethod>), SkipRefusal> {
         let mut entries = self.entries.lock();
         let entry = entries
             .iter_mut()
@@ -185,7 +200,7 @@ impl SkipRegistry {
             entry.counts.refused_older = entry.counts.refused_older.saturating_add(1);
             return Err(SkipRefusal::OlderSnapshot);
         }
-        match entry.skipping.candidates(lo, hi) {
+        match entry.skipping.candidates_by(lo, hi) {
             Ok(candidates) => {
                 entry.counts.consulted = entry.counts.consulted.saturating_add(1);
                 Ok(candidates)
@@ -198,6 +213,20 @@ impl SkipRegistry {
                 entry.counts.refused_stale = entry.counts.refused_stale.saturating_add(1);
                 Err(SkipRefusal::Stale)
             }
+        }
+    }
+
+    /// A scan of the table at `root_page` answered by `method` cost `cost` (nanoseconds, from
+    /// asking for its candidates to its end): the measured summary's chooser takes it. A summary
+    /// replaced since (or not measured) ignores it.
+    pub fn record_cost(&self, root_page: i64, method: SkipMethod, cost: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(Skipping::Measured(chooser)) = entries
+            .iter_mut()
+            .find(|entry| entry.root_page == root_page)
+            .map(|entry| &mut entry.skipping)
+        {
+            chooser.record(method, cost);
         }
     }
 
