@@ -95,36 +95,47 @@ pub(crate) enum Found {
 /// next run starts. Filled once.
 #[derive(Default)]
 pub(crate) struct SearchSlot {
-    found: parking_lot::Mutex<Option<(Found, Instant)>>,
+    state: parking_lot::Mutex<SlotState>,
     filled: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct SlotState {
+    found: Option<Found>,
+    /// When the search came to something, kept after the statement takes it.
+    filled_at: Option<Instant>,
 }
 
 impl SearchSlot {
     fn fill(&self, found: Found) {
-        *self.found.lock() = Some((found, Instant::now()));
+        {
+            let mut state = self.state.lock();
+            state.found = Some(found);
+            state.filled_at = Some(Instant::now());
+        }
         self.filled.notify_all();
     }
 
-    /// What the search came to, once it has.
+    /// What the search came to, once it has and until it is taken.
     pub(crate) fn take(&self) -> Option<Found> {
-        self.found.lock().take().map(|(found, _)| found)
+        self.state.lock().found.take()
     }
 
-    /// Whether the search has come to something not taken yet.
+    /// Whether the search has come to something.
     pub(crate) fn is_filled(&self) -> bool {
-        self.found.lock().is_some()
+        self.state.lock().filled_at.is_some()
     }
 
-    /// Waits for the search to come to something and returns when it did, for the harness that
-    /// times the exact plan (`tests::harness`): woken by `fill`, never by a timer.
+    /// Waits for the search to come to something and returns when it did, for the tests and the
+    /// harness that times the exact plan: woken by `fill`, never by a timer.
     #[cfg(test)]
     pub(crate) fn wait_filled(&self) -> Instant {
-        let mut found = self.found.lock();
+        let mut state = self.state.lock();
         loop {
-            if let Some((_, at)) = found.as_ref() {
-                return *at;
+            if let Some(at) = state.filled_at {
+                return at;
             }
-            self.filled.wait(&mut found);
+            self.filled.wait(&mut state);
         }
     }
 }

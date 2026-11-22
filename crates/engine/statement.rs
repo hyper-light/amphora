@@ -2400,11 +2400,11 @@ mod tests {
         conn.set_background_search(crate::BackgroundSearch::Worker);
         let mut stmt = conn.prepare(star_sql()).unwrap();
         assert!(stmt.program.fast_planned);
-        assert_eq!(count_of(&mut stmt), expected);
         let slot = stmt
             .exact_search
             .clone()
             .expect("the fast plan handed its search off");
+        assert_eq!(count_of(&mut stmt), expected);
         slot.wait_filled();
         let stats = conn.background_search_stats();
         assert_eq!(stats.requested, 1);
@@ -2446,7 +2446,7 @@ mod tests {
         assert!(stats.longest_queue <= 65, "{stats:?}");
         // The last round's searches are all done; earlier ones may still be leaving the queue.
         let ended = stats.dropped + stats.abandoned + stats.kept + stats.replaced + stats.failed;
-        assert!(ended >= 64 && ended <= stats.requested, "{stats:?}");
+        assert!((64..=stats.requested).contains(&ended), "{stats:?}");
     }
 
     /// The harness of record (T-PL.8.10, lane pl8-17): `n` connections to one database, each on its
@@ -2469,6 +2469,7 @@ mod tests {
                         let started = std::time::Instant::now();
                         let mut stmt = other.prepare(star_sql()).unwrap();
                         let prepared = started.elapsed();
+                        let slot = stmt.exact_search.clone();
                         assert!(stmt
                             .run_one_step_blocking(|| Ok(()), || Ok(()))
                             .unwrap()
@@ -2476,7 +2477,7 @@ mod tests {
                         let first_row = started.elapsed();
                         stmt.run_ignore_rows().unwrap();
                         stmt.reset().unwrap();
-                        let exact = match stmt.exact_search.clone() {
+                        let exact = match slot {
                             Some(slot) => slot.wait_filled().duration_since(started),
                             None => prepared,
                         };
