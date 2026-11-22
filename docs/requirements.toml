@@ -1266,3 +1266,8 @@ tests = [
 
 # lane many-writers-7 (CP-T1.4, AC-T1.4.4): no new IDs. T-T1.4.1's harness: bench/powercut/{linux,macos}.sh,
 # amphora-bench --powercut write|check|span, and their verdict through bench/power_nemesis.sh tally.
+
+# lane many-writers-10 (kiln goal db83b2fa, under G7.5 and CP-T1.4): no new IDs. The goal's two checks:
+# the corpus on both storages (bench/corpus/storages.sh, storages.py; its tests bench/corpus/test_storages.py)
+# and durable commits from the writers' ladder on one driver (amphora-bench --powercut bench, bench/commits.sh:
+# Amphora on both storages, SQLite in WAL with synchronous = FULL, PostgreSQL). The runs of record: the coordinator's.

@@ -1,5 +1,5 @@
 """storages.py's verdicts on the corpus run on both storages (goal "Many clients write through SQL at
-once, safely", T-T1.4.1): what it says of two runs made up here, as `amphora-corpus run --times`
+once, safely"; G7.5): what it says of two runs made up here, as `amphora-corpus run --times`
 writes them. Run: python3 -m unittest bench/corpus/test_storages.py"""
 import contextlib
 import io

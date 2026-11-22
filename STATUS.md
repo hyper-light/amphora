@@ -397,6 +397,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   checkpoint cycles by the engine's own `wal_autocheckpoint`, so cuts fall before, across and after a
   checkpoint. dm-flakey's down interval is 1 s, the least it takes (up 0 s is down at every moment).
   The 1,000 cuts on each storage and the macOS VM: the coordinator's.
+- **Many writers, verified** (kiln goal db83b2fa; `bench/corpus/storages.sh`, `bench/commits.sh`): the corpus
+  runs on both storages and `storages.py` gives one verdict each for answers, reads and writes, refusing two
+  runs from another client or platform; `amphora-bench --powercut bench` drives Amphora on both storages,
+  SQLite (WAL, `synchronous = FULL`, no busy wait) and PostgreSQL through one commit loop up the writers'
+  ladder, each record with its client's resources and platform. Not yet compiled or run: the coordinator's.
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
