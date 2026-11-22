@@ -16,7 +16,13 @@ pub(crate) fn records_get(
     api::family(namespace)?;
     api::family(family)?;
     api::key(key)?;
-    let operation = Operation::Get(family.to_owned(), key.to_vec(), Consistency::Linearizable);
+    // Inside the writer's own transaction a get can't wait for another step: it reads as today.
+    let operation = Operation::Get(
+        family.to_owned(),
+        key.to_vec(),
+        Consistency::Linearizable,
+        LockedReads::Committed,
+    );
     match apply(db, namespace, &operation).map_err(sql_error)?? {
         Answer::Row(row) => Ok(row),
         _ => Err(crate::sql::Error::Refusal(unavailable(

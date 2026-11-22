@@ -135,9 +135,30 @@ retried at once by a second caller (`ac_t1_10_1_a_retry_straight_after_an_abort_
 At scale, `xgroup_lan ryw` runs both modes under both protocols, callers writing only their own rows
 so every conflict met is their own earlier transaction's lock. It reports read-your-writes misses,
 conflicts met, the commit's p50, p99 and p99.9 (its tries again included), the answers held at most,
-and throughput. Which mode stays is decided from those numbers, not yet measured. The alternative of
-reads waiting on a held lock (a lock lookup on every Records read, single-group ones included) is not
-built.
+and throughput. Which mode stays is decided from those numbers, not yet measured.
+
+The alternative, reads that wait on a held lock (lane xgroup-sql-10, option 2 of xgroup-sql-7's), is
+built as a sibling switch on each group's database, `Database::set_locked_reads`:
+- `LockedReads::Committed`, the control and today's: a Records get of a row a cross-group transaction
+  holds a lock on answers the row as last committed there.
+- `LockedReads::Wait`: the get looks the lock up first (one indexed lookup in `__amphora_xg_lock` on
+  every read of a latest row, single-group reads included; a read at an older revision never waits).
+  Under a lock it answers nothing and waits on the group's change event, which each step and each
+  commit there moves, never a timer, then reads again; the transaction's write once it committed, the
+  row before it once it aborted. The change counter is read before each try, so a resolution landing
+  between a try and the wait can't be missed. It is refused `Timeout` at the read's deadline. Reads
+  that waited are counted (`Database::locked_waits`).
+
+With `AnswerAt::Decided` this moves the wait from the commit to the read that needs it: the caller
+hears at the decision, and only a read of a row still under the lock waits. It does nothing for a
+retry straight after an abort, which still meets the transaction's own locks in its commit; nor, yet,
+for scans, SQL reads or a session's reads inside the writer. Its failure mode at scale is the change
+event: every waiting read tries again on every change in its group, its own resolution or not.
+`t_t1_10_w7_*` forces the three settings against one held resolution (the control misses the row,
+`Resolved` holds the answer, `Wait` holds the read) and prints what each adds; `t_t1_10_w8_*` holds
+a read on an aborted transaction's lock and finds the row as it was before; `xgroup_lan ryw` runs
+`locked-wait` beside `decided` and `resolved`, with the reads' p50, p99 and p99.9 and the reads that
+waited.
 
 ## A refusal before the step (lane xgroup-sql-4, AC-T1.10.6)
 

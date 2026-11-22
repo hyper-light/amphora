@@ -2573,4 +2573,139 @@ mod sessions {
             assert_eq!(at, None, "{protocol:?}");
         }
     }
+
+    /// T-T1.10.W7 (AC-T1.10.1, lane xgroup-sql-10): xgroup-sql-7's option 2, reads that wait on a
+    /// held lock ([`LockedReads::Wait`]), against [`AnswerAt::Resolved`], forced: group 1's
+    /// resolution held back while a read of the row the commit writes there comes. Do: three
+    /// standalone groups, both protocols, each of (Decided, Committed), the control, (Resolved,
+    /// Committed), option 1, and (Decided, Wait), option 2: a commit across all three, group 1's
+    /// resolve held; a read of group 1 once the answer came, under Wait begun before group 1 is
+    /// let go and let go only once the read waits on the lock. Expect: the control's read misses
+    /// the row; Resolved's answer doesn't come before group 1 resolves, and its read finds the
+    /// row with no wait; Wait's answer comes while group 1 still holds the lock, its read waits
+    /// (counted once) and answers the row once group 1 resolves. What each adds, Resolved's to
+    /// the commit and Wait's to the read, is printed, never asserted.
+    ///
+    /// [`LockedReads::Wait`]: crate::database::LockedReads::Wait
+    #[test]
+    fn t_t1_10_w7_a_read_during_the_resolve_waits_on_the_lock_or_the_answer_does() {
+        use crate::database::LockedReads;
+        use amphora_api::{Consistency, Records};
+        let read = |db: &Database| {
+            db.namespace("ns")
+                .unwrap()
+                .get("rows", &[1], Consistency::Linearizable, until())
+                .unwrap()
+                .map(|r| r.value)
+        };
+        let modes = [
+            (AnswerAt::Decided, LockedReads::Committed),
+            (AnswerAt::Resolved, LockedReads::Committed),
+            (AnswerAt::Decided, LockedReads::Wait),
+        ];
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            for (answer_at, reads) in modes {
+                let mode = format!("{protocol:?} {answer_at:?} {reads:?}");
+                let dir = tempfile::tempdir().unwrap();
+                let dbs = databases(dir.path(), 3);
+                for db in &dbs {
+                    db.set_locked_reads(reads);
+                }
+                let gate = gate(&dbs, 1, false);
+                let cluster = open_gated(&dbs, protocol, &gate, answer_at, 1);
+                std::thread::scope(|scope| {
+                    let (done, answered) = mpsc::sync_channel(1);
+                    let cluster = &cluster;
+                    let began = Instant::now();
+                    scope.spawn(move || {
+                        let answer = cluster.commit(across(4), until());
+                        done.send((answer, began.elapsed())).unwrap();
+                    });
+                    gate.reached.recv().unwrap();
+                    if answer_at == AnswerAt::Resolved {
+                        assert!(
+                            matches!(answered.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                            "{mode}: answered before group 1 resolved"
+                        );
+                        gate.open.send(()).unwrap();
+                    }
+                    let (answer, committed_in) = answered.recv().unwrap();
+                    assert!(
+                        matches!(answer, Ok(Answer::Committed { .. })),
+                        "{mode}: {answer:?}"
+                    );
+                    let reader = &dbs[1];
+                    let (seen, read_in) = match reads {
+                        LockedReads::Committed => {
+                            let began = Instant::now();
+                            (read(reader), began.elapsed())
+                        }
+                        LockedReads::Wait => {
+                            let waiting = scope.spawn(move || {
+                                let began = Instant::now();
+                                (read(reader), began.elapsed())
+                            });
+                            reader.locked_waits_reach(1, until()).unwrap();
+                            gate.open.send(()).unwrap();
+                            waiting.join().unwrap()
+                        }
+                    };
+                    if (answer_at, reads) == (AnswerAt::Decided, LockedReads::Committed) {
+                        assert_eq!(seen, None, "{mode}: group 1 wasn't behind");
+                        gate.open.send(()).unwrap();
+                    } else {
+                        assert_eq!(seen, Some(vec![4]), "{mode}");
+                    }
+                    let waits = reader.locked_waits();
+                    assert_eq!(waits, u64::from(reads == LockedReads::Wait), "{mode}");
+                    eprintln!("{mode}: committed in {committed_in:?}, read in {read_in:?}");
+                });
+            }
+        }
+    }
+
+    /// T-T1.10.W8 (AC-T1.10.1, lane xgroup-sql-10): a read waiting on a held lock
+    /// ([`LockedReads::Wait`]) of a transaction that aborts answers the row as it was before it.
+    /// Do: three standalone groups reading under Wait, the control's answer at the decision; a
+    /// two-phase transaction a recovery decides aborted first, so it aborts with every lock held,
+    /// its resolution in group 0 held back; a read of its row in group 0 once the abort answered,
+    /// group 0 let go once that read waits. Expect: the read waits (counted once) and answers no
+    /// row, the one before the transaction.
+    ///
+    /// [`LockedReads::Wait`]: crate::database::LockedReads::Wait
+    #[test]
+    fn t_t1_10_w8_a_read_waiting_on_an_aborted_lock_answers_the_row_before() {
+        use crate::database::LockedReads;
+        use amphora_api::{Consistency, Records};
+        let dir = tempfile::tempdir().unwrap();
+        let dbs = databases(dir.path(), 3);
+        for db in &dbs {
+            db.set_locked_reads(LockedReads::Wait);
+        }
+        let gate = gate(&dbs, 0, true);
+        let cluster = open_gated(&dbs, Protocol::TwoPhase, &gate, AnswerAt::Decided, 1);
+        std::thread::scope(|scope| {
+            let answer = {
+                let cluster = &cluster;
+                scope.spawn(move || cluster.commit(across(5), until()))
+            };
+            gate.reached.recv().unwrap();
+            let answer = answer.join().unwrap();
+            assert!(matches!(answer, Ok(Answer::Aborted(_))), "{answer:?}");
+            let reader = &dbs[0];
+            let read = scope.spawn(move || {
+                reader.namespace("ns").unwrap().get(
+                    "rows",
+                    &[0],
+                    Consistency::Linearizable,
+                    until(),
+                )
+            });
+            reader.locked_waits_reach(1, until()).unwrap();
+            gate.open.send(()).unwrap();
+            let seen = read.join().unwrap();
+            assert!(matches!(seen, Ok(None)), "{seen:?}");
+            assert_eq!(reader.locked_waits(), 1);
+        });
+    }
 }

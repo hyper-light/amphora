@@ -1317,6 +1317,19 @@ tests = [
   { id = "T-T1.10.W6", text = "xgroup::sql::sessions::t_t1_10_w6_a_committed_answer_carries_its_commit_stamp — passes when commits across a standalone group and a replicated one, reached over the transport and in process, and one in the replicated group alone, each answer a stamp past 0, no later than that group's token after it and no earlier than the stamp before; two standalone groups' answer none; both protocols" },
 ]
 
+# lane xgroup-sql-10: reads that wait on a held lock, option 2 of xgroup-sql-7's, as a sibling switch of AnswerAt
+# (xgroup.md, "Reading its own writes across groups"); today's read the control.
+[[own]]
+id = "T1.10.WL"
+title = "A Records get of a row under a cross-group lock waits for its resolution, behind a switch whose control is today's read"
+criteria = [
+  { id = "AC-T1.10.W6", text = "Under LockedReads::Wait a Records get of a latest row a cross-group transaction holds a lock on answers nothing until the lock is gone, woken by the group's change event (no timer, no missed wake), then reads the row as it stands; refused Timeout at its deadline; counted (locked_waits); under Committed (the control) it answers the row as last committed; a read at an older revision never waits" },
+]
+tests = [
+  { id = "T-T1.10.W7", text = "xgroup::sql::sessions::t_t1_10_w7_a_read_during_the_resolve_waits_on_the_lock_or_the_answer_does — passes when, with group 1's resolution held back, the control's read of group 1 straight after the answer misses the row; under Resolved the answer doesn't come before group 1 resolves and the read finds the row with no wait; under Decided with Wait the answer comes first and the read waits (counted once) until group 1 resolves, then finds the row; both protocols; each setting's commit and read times printed" },
+  { id = "T-T1.10.W8", text = "xgroup::sql::sessions::t_t1_10_w8_a_read_waiting_on_an_aborted_lock_answers_the_row_before — passes when, under Wait, a read of a row a two-phase transaction aborted with every lock held still locks in group 0 waits (counted once) until group 0 resolves the abort, then answers the row as it was before the transaction" },
+]
+
 # lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session
 # tokens"). Ada's order 2026-11-22: built behind ReadMode, today's read the control.
 [[own]]

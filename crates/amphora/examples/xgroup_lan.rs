@@ -521,22 +521,28 @@ struct RywTally {
     conflicts: u64,
     misses: u64,
     latencies: lan::Latencies,
+    /// The reads straight after each answer, each row's own (lane xgroup-sql-10: what a read
+    /// waiting on a held lock adds).
+    reads: lan::Latencies,
 }
 
 /// `ryw` (AC-T1.10.1, lane xgroup-sql-8): the switch `Options::answer_at` at scale, `Decided`
-/// (the control) against `Resolved`, under both protocols, forcing each one's failure mode.
+/// (the control) against `Resolved`, and (lane xgroup-sql-10) `Decided` with each group's reads
+/// waiting on a held lock (`LockedReads::Wait`, setting `locked-wait`), under both protocols,
+/// forcing each one's failure mode.
 /// `--clients` callers each commit `--txns` Records transactions through `commit_records`, each
 /// writing one row in every one of `--groups` local groups under `--dir`, drawn from the caller's
 /// own `--keys` rows. No other caller writes them, so every conflict a caller meets is a lock of
 /// its own earlier transaction not yet resolved; it tries again at once, as a session retries a
 /// conflict, until `--secs`. Straight after each answer it reads every row it wrote, in its group:
 /// one that doesn't hold the write is a read-your-writes miss. One JSON line a run: the misses, the
-/// conflicts met, the commit's time (its tries again included) at p50, p99 and p99.9, the answers
-/// held at most, and committed per second.
+/// conflicts met, the commit's time (its tries again included) at p50, p99 and p99.9, the reads'
+/// at p50, p99 and p99.9, the reads that waited on a lock, the answers held at most, and committed
+/// per second.
 fn ryw(args: &Args) -> anyhow::Result<()> {
     use std::sync::{Mutex, PoisonError};
 
-    use amphora::database::Database;
+    use amphora::database::{Database, LockedReads};
     use amphora::xgroup::sql::{AnswerAt, Options, commit_records, prepare, record_of};
     use amphora::xgroup::{Cluster, Route};
     use amphora_api::{Consistency, Records, Refusal, Tx, Write};
@@ -552,9 +558,10 @@ fn ryw(args: &Args) -> anyhow::Result<()> {
     }
     let mut run = 0u64;
     for protocol in args.protocols()? {
-        for (setting, answer_at) in [
-            ("decided", AnswerAt::Decided),
-            ("resolved", AnswerAt::Resolved),
+        for (setting, answer_at, reads) in [
+            ("decided", AnswerAt::Decided, LockedReads::Committed),
+            ("resolved", AnswerAt::Resolved, LockedReads::Committed),
+            ("locked-wait", AnswerAt::Decided, LockedReads::Wait),
         ] {
             let id = id.wrapping_add(run);
             run = run.wrapping_add(1);
@@ -566,6 +573,7 @@ fn ryw(args: &Args) -> anyhow::Result<()> {
                     let database =
                         Database::open(&dir.join(format!("group{g}.db")), later(deadline))?;
                     prepare(&database, later(deadline))?;
+                    database.set_locked_reads(reads);
                     Ok(database)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -635,11 +643,14 @@ fn ryw(args: &Args) -> anyhow::Result<()> {
                                 };
                                 let took = asked.elapsed();
                                 let mut misses = 0u64;
+                                let mut read_times = Vec::new();
                                 if answer.is_ok() {
                                     for (row, ns) in rows.iter().zip(&namespaces) {
+                                        let read_at = Instant::now();
                                         let got = ns
                                             .get("rows", row, Consistency::Linearizable, until)?
                                             .map(|r| r.value);
+                                        read_times.push(read_at.elapsed());
                                         misses = misses.saturating_add(u64::from(
                                             got.as_ref() != Some(&value),
                                         ));
@@ -649,6 +660,9 @@ fn ryw(args: &Args) -> anyhow::Result<()> {
                                     tally.lock().unwrap_or_else(PoisonError::into_inner);
                                 tally.conflicts = tally.conflicts.saturating_add(conflicts);
                                 tally.misses = tally.misses.saturating_add(misses);
+                                for read in read_times {
+                                    tally.reads.record(read);
+                                }
                                 if answer.is_ok() {
                                     tally.committed = tally.committed.saturating_add(1);
                                     tally.latencies.record(took);
@@ -671,9 +685,11 @@ fn ryw(args: &Args) -> anyhow::Result<()> {
             let counted = cluster.counted();
             let tally = tally.into_inner().unwrap_or_else(PoisonError::into_inner);
             let [p50, p99, p999] = [500, 990, 999].map(|m| tally.latencies.quantile(m).as_micros());
+            let [r50, r99, r999] = [500, 990, 999].map(|m| tally.reads.quantile(m).as_micros());
+            let locked_waits: u64 = databases.iter().map(Database::locked_waits).sum();
             let total = u64::try_from(clients)?.saturating_mul(txns);
             out!(
-                "{{\"bench\":\"xgroup_ryw\",\"protocol\":\"{}\",\"answer_at\":\"{setting}\",\"groups\":{groups},\"clients\":{clients},\"txns\":{total},\"keys\":{keys},\"committed\":{},\"failed\":{},\"misses\":{},\"conflicts\":{},\"answers_held_most\":{},\"stops\":{},\"p50_us\":{p50},\"p99_us\":{p99},\"p999_us\":{p999},\"secs\":{secs:.3},\"committed_per_s\":{:.1}}}",
+                "{{\"bench\":\"xgroup_ryw\",\"protocol\":\"{}\",\"answer_at\":\"{setting}\",\"groups\":{groups},\"clients\":{clients},\"txns\":{total},\"keys\":{keys},\"committed\":{},\"failed\":{},\"misses\":{},\"conflicts\":{},\"answers_held_most\":{},\"stops\":{},\"p50_us\":{p50},\"p99_us\":{p99},\"p999_us\":{p999},\"read_p50_us\":{r50},\"read_p99_us\":{r99},\"read_p999_us\":{r999},\"locked_waits\":{locked_waits},\"secs\":{secs:.3},\"committed_per_s\":{:.1}}}",
                 lan::protocol_name(protocol),
                 tally.committed,
                 tally.failed,
