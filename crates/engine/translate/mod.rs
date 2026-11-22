@@ -175,6 +175,7 @@ pub fn translate(
         crate::translate::optimizer::search_budget::SearchBudget::new(
             connection.join_search_budget(),
             &connection.db.learned_costs,
+            prepare_options.expected_runs,
         ),
     );
     resolver.set_sorted_fetches(connection.sorted_fetches());

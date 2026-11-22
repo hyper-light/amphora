@@ -16,7 +16,11 @@
 //!   measured nanoseconds a row visit (`learned_costs`). The budget is that time over the measured
 //!   nanoseconds a candidate (a subset or a bushy pair) takes (`SearchRate`).
 //! - `RunShareByExecutions`: `RunShare` times the runs the plan is expected to serve, so a
-//!   template that runs often may plan longer.
+//!   template that runs often may plan longer. A prepared statement planned again after r runs is
+//!   expected to serve r more (Gott, "Implications of the Copernican principle for our future
+//!   prospects", Nature 363, 1993: seen at a random point of a run of unknown length, the median of
+//!   what remains is what has passed); a statement planned for the first time, or a custom plan
+//!   made for one run's values, serves one.
 //!
 //! Every rule allows at least the tables' count squared: the greedy search tries that many joins,
 //! so the exact search costs no more wherever its subsets fit that. Until the database has timed a
@@ -59,12 +63,16 @@ impl SearchBudget {
     };
 
     /// The budget `rule` takes with `costs`' measured rates.
-    pub(crate) fn new(rule: JoinSearchBudget, costs: &LearnedCosts) -> Self {
+    pub(crate) fn new(
+        rule: JoinSearchBudget,
+        costs: &LearnedCosts,
+        expected_runs: Option<u64>,
+    ) -> Self {
         Self {
             rule,
             nanos_per_row: costs.nanos_per(Work::Row),
             nanos_per_candidate: costs.search().nanos_per_candidate(),
-            executions: 1.0,
+            executions: expected_runs.map_or(1.0, |runs| runs as f64).max(1.0),
         }
     }
 
@@ -128,6 +136,18 @@ fn nanos(elapsed: Duration) -> u64 {
 /// Notes a join's search: which algorithm planned it, its candidates and its time.
 pub(crate) fn note_search(algorithm: Algorithm, candidates: usize, elapsed: Duration) {
     let candidates = u64::try_from(candidates).unwrap_or(u64::MAX);
+    let reason = match algorithm {
+        Algorithm::Exact => "the connected subsets fit the budget",
+        Algorithm::Greedy => "the connected subsets passed the budget",
+    };
+    tracing::debug!(
+        target: "amphora::join_search",
+        ?algorithm,
+        candidates,
+        nanos = nanos(elapsed),
+        reason,
+        "join planned"
+    );
     STATEMENT.with(|cell| {
         let mut stats = cell.get();
         match algorithm {

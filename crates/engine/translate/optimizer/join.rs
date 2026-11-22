@@ -1462,6 +1462,15 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     let budget = planning_context
         .search_budget
         .subsets(naive_plan.as_ref().map(|plan| plan.cost.0), num_tables);
+    tracing::debug!(
+        target: "amphora::join_search",
+        rule = ?planning_context.search_budget.rule,
+        budget,
+        bound = ?naive_plan.as_ref().map(|plan| plan.cost.0),
+        executions = planning_context.search_budget.executions,
+        tables = num_tables,
+        "join search budget"
+    );
 
     // The subsets the search builds plans for, by size; past the budget, none, and the greedy
     // search orders the join instead (docs/design/planner.md decision 19).

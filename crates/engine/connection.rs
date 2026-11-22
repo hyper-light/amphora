@@ -178,6 +178,9 @@ pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
     /// Amphora (PL.12): a run's bound values, for a custom plan; `None` plans the generic one.
     pub(crate) plan_values: Option<Arc<crate::plan_cache::PlanValues>>,
+    /// Amphora (PL.8): the runs the plan is expected to serve, which size its join search under
+    /// `JoinSearchBudget::RunShareByExecutions` (`search_budget`); `None` is one run.
+    pub(crate) expected_runs: Option<u64>,
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
