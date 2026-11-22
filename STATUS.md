@@ -99,6 +99,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (Unix), the checksum checked once as a page enters the process. Built and tested (the shared-pages
   model on the plain path; each path reads today's rows; a flipped byte refused on each path); not
   yet measured. The miss still allocates the page and its buffer's `Arc`.
+- **Point readers that write no shared line** (G3 step 6, docs/design/store.md decision 43), two
+  prototypes, each behind its switch and off by default: `AMPHORA_READ_CHECKOUT=slots` takes a
+  store's reader from a slot of its own, with no pool mutex or shared gate per read;
+  `AMPHORA_SHARED_PAGE_READS=optimistic` reads shared pages from frames of atomic words under a
+  version check, without the shard's lock. Built and tested (slot readers, and 32 readers and a
+  writer under the model: no image past a reader's snapshot, none torn); not yet measured (60 s
+  run, perf c2c and the 32-client suite are the coordinator's).
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
@@ -766,13 +773,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   attached table's largest degree, or two tables' ℓ2 norms); underestimates are left as they are
   (docs/design/planner.md, "Decision (lane pl11)"). Open: the bound holds for PL.9's net row
   change, not for updates or cancelled inserts between ANALYZE runs.
-- **PL.7** (b6a2313e, built and tested on t1/lane-pl7, behind a switch, its JOB measurement
+- **PL.7** (b6a2313e, built and tested on main, behind a switch, its JOB measurement
   open): with `Connection::set_fitted_costs` (or `AMPHORA_FITTED_COSTS=1`) on, the database times a
   share of its statements, the share learned against the timer's cost and the measurement's spread,
   and fits the planner's weights to their counted work (rows, seeks, hash rows added and looked up,
   sort work, file page reads) by non-negative least squares with Huber weights, in bounded memory;
-  weights no sample determines keep the learned calibration's (docs/design/planner.md, "Decision
-  (lane pl7)"). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
+  weights no sample determines, or none tells from nothing at 95%, keep the learned calibration's
+  (docs/design/planner.md, "Decision (lane pl7)"; lane pl7b, T-PL.7.6, after a loaded run's noisy
+  weights flipped a plan in `tests/planner.rs`). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
   AC-PL.7.1's JOB rank correlation with the switch on and off.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
@@ -829,7 +837,8 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   size the sizer learns, now charged per row of the table so skipped granules count. Each carries
   min/max and null counts per column and its key range and position; filters skip granules their
   summaries exclude and run on whole vectors, as do COUNT, SUM (exact for reals), MIN, MAX and
-  group-by. A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
+  group-by (each row given its group's slot in one pass, each aggregate's vector folded by slot,
+  T-CS.4.5). A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
   key bounds, and filters its boundary granules by their key column. Blocks no change touches are
   decoded once a generation. Every class equals the row store's answer, whole-table and over key
   ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
