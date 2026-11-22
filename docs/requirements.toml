@@ -1296,6 +1296,8 @@ criteria = [
   { id = "AC-SH.8", text = "Schema setup asks each node in the configured order, from node 0, the next only once the one before failed, and gives up at --deadline-s or once every node failed, naming each failure" },
   { id = "AC-SH.9", text = "In-process, a write or read that finds no live member naming a live leader (none elected yet, or the one named cut off, as after regionloss's kill) waits on a live member for the leader change (ReplicaHandle::wait_leader, a leader of a later term), up to --deadline-s, never a retry" },
   { id = "AC-SH.10", text = "regionloss's and cutover's phases (--settle-s, --after-s) last their length, a condition variable's wait for a duration that a spurious wake can't cut short, or end as soon as a worker fails, woken by that failure" },
+  # lane scaleout-harness-11
+  { id = "AC-SH.11", text = "TiDB's waits on PD's background work (the region measure's placement, cutover's leader and replica moves) read PD's state every schedule.patrol-region-interval, PD's own period for checking each Region against its rules, read from the cluster by SHOW CONFIG (PD offers no watch or long-poll for Region or placement changes); --poll-us isn't taken by any scale measure; each such record's waits says what was read, how often, and that the period is PD's" },
 ]
 tests = [
   { id = "T-SH.1", text = "scale::tests::g13_scale_inputs_are_required_not_picked — passes when the served amphora system is refused without --hosts or --class, as the others are, refused --spanning under the persisted class, and amphora-inproc keeps the in-process flags" },
@@ -1311,6 +1313,8 @@ tests = [
   { id = "T-SH.9", text = "scale::tests::scaleout_harness_10_warmup_and_catch_up_read_once_by_each_systems_rule — passes when a system with no wait control gets one read for the warm-up and one own-copy count for the catch-up, regionloss parses without --poll-us, and each system's warm-up and catch-up rules are stated" },
   { id = "T-SH.11", text = "scale::tests::scaleout_harness_10_a_phase_ends_on_a_workers_failure — passes when a phase with no failure runs its length, a failure from another thread ends a long phase at once, and the first failure is the measure's error" },
   { id = "T-SH.10", text = "scale::inproc::tests::scaleout_harness_10_a_token_read_waits_for_its_write — passes when a replicated write gives a session token, one leader read and one follower read carrying it find the row, and a member cut off then put back holds both rows at its first count" },
+  # lane scaleout-harness-11
+  { id = "T-SH.12", text = "scale::tests::scaleout_harness_11_pd_waits_read_at_pds_own_period — passes when PD's printed durations (10ms, 1m30s, 1.5s, 500µs) read exactly and malformed ones are refused, region and cutover parse without --poll-us and refuse it, and the waits record names PD's schedule.patrol-region-interval as the period" },
 ]
 
 # lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,

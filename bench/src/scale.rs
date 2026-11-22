@@ -65,17 +65,23 @@
 //! without a measure's concept, or whose cluster can't be brought up here, is refused, typed (the
 //! same record as `repl.rs`'s: `"refused": "no-concept" | "unavailable"`, with why).
 //!
+//! TiDB's placement (the region measure) and PD's operators (cutover's leader and replica moves) are
+//! applied in the background, and PD offers no watch or long-poll for Region or placement changes:
+//! those waits read PD's state every `schedule.patrol-region-interval`, PD's own period for checking
+//! each Region against its rules, read from the cluster (`SHOW CONFIG`), never a picked interval;
+//! each record says so (`waits`; lane scaleout-harness-11).
+//!
 //! `amphora-inproc`'s groups run in this process, each `--nodes` members relayed as `repl.rs` relays
 //! them (member `n` of every group is node `n`, in region `n`). The others are brought up through
 //! `bench/servers/scale/<system>.sh up N|down|kill N|start N|endpoint N|delay MS|rmi`.
 //!
 //! usage: amphora-bench --scale <write|read|follower|xgroup|region|regionloss|cutover>
 //!        --system <amphora|amphora-inproc|cockroach|tidb> --nodes N --groups N --writers N --deadline-s N [--record FILE]
-//!        write, region: --batch N --text-bytes N --warmup-s N --seconds N (region: --between-ms N --poll-us N)
+//!        write, region: --batch N --text-bytes N --warmup-s N --seconds N (region: --between-ms N)
 //!        read, follower: --rows N --batch N --text-bytes N --warmup-s N --seconds N
 //!        xgroup:     --keys N --span N --warmup-s N --seconds N (amphora: --protocol 2pc|parallel)
 //!        regionloss: --batch N --text-bytes N --lose N --settle-s N --after-s N
-//!        cutover:    --batch N --text-bytes N --ops N --concurrent-ops N --settle-s N --poll-us N
+//!        cutover:    --batch N --text-bytes N --ops N --concurrent-ops N --settle-s N
 //!        amphora:    --class persisted|replicated [--spanning N]
 //!        amphora-inproc: --dir DIR --class persisted|replicated [--spanning N] --relay-records N --relay-pending N
 //!        all but amphora-inproc: --hosts ENDPOINT=ADDR,... [--scripts DIR (bench/servers/scale)] [--shell PROGRAM (bash)]
@@ -227,6 +233,11 @@ pub trait System: Sync {
     fn reshard(&self, op: usize, o: &Opts) -> anyhow::Result<()>;
     /// The system's own count, summed over its nodes, of requests it sent on a stale route.
     fn stale_routes(&self) -> anyhow::Result<u64>;
+    /// What the measure's waits on the system's background work woke on, for the record, when
+    /// any read its state at the system's own period (TiDB's: PD has no watch).
+    fn waits(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 pub struct Opts {
@@ -248,7 +259,6 @@ pub struct Opts {
     pub lose: Option<usize>,
     pub settle: Option<Duration>,
     pub after: Option<Duration>,
-    pub poll: Option<Duration>,
     pub protocol: Option<String>,
     pub dir: Option<PathBuf>,
     pub class: Option<String>,
@@ -298,7 +308,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
         lose: None,
         settle: None,
         after: None,
-        poll: None,
         protocol: None,
         dir: None,
         class: None,
@@ -342,7 +351,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--lose" => o.lose = Some(v()?.parse()?),
             "--settle-s" => o.settle = Some(secs(&v()?)?),
             "--after-s" => o.after = Some(secs(&v()?)?),
-            "--poll-us" => o.poll = Some(Duration::from_micros(v()?.parse()?)),
             "--protocol" => o.protocol = Some(v()?),
             "--dir" => o.dir = Some(PathBuf::from(v()?)),
             "--class" => o.class = Some(v()?),
@@ -417,7 +425,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             rows(&o)?;
             timed(&o)?;
             need(o.between, "--between-ms", &m)?;
-            need(o.poll, "--poll-us", &m)?;
         }
         "cutover" => {
             rows(&o)?;
@@ -427,7 +434,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
                 "--concurrent-ops takes at least 1"
             );
             need(o.settle, "--settle-s", &m)?;
-            need(o.poll, "--poll-us", &m)?;
         }
         _ => {
             rows(&o)?;
@@ -1467,7 +1473,7 @@ pub fn main() -> anyhow::Result<()> {
     let o = parse(&args)?;
     let ran = open(&o).and_then(|sys| {
         sys.prepare(&o)?;
-        match o.measure.as_str() {
+        let mut body = match o.measure.as_str() {
             "write" => write(sys.as_ref(), &o, false),
             "read" => read(sys.as_ref(), &o, false),
             "follower" => read(sys.as_ref(), &o, true),
@@ -1475,7 +1481,11 @@ pub fn main() -> anyhow::Result<()> {
             "region" => write(sys.as_ref(), &o, true),
             "cutover" => cutover(sys.as_ref(), &o),
             _ => region_loss(sys.as_ref(), &o),
+        }?;
+        if let (Some(b), Some(w)) = (body.as_object_mut(), sys.waits()) {
+            b.insert("waits".into(), w);
         }
+        Ok(body)
     });
     let head = record_head(&o);
     match ran {
@@ -2507,6 +2517,8 @@ pub mod sql {
         s: Scripted,
         endpoints: Vec<String>,
         deadline: Duration,
+        /// PD's `schedule.patrol-region-interval`, read once, when a wait first needs it.
+        patrol: std::sync::OnceLock<Duration>,
     }
 
     /// The statements that make a measure's tables, splits and regions, in the system's dialect.
@@ -2607,6 +2619,7 @@ pub mod sql {
                 s: Scripted::up(o, Vec::new())?,
                 endpoints: Vec::new(),
                 deadline: o.deadline,
+                patrol: std::sync::OnceLock::new(),
             };
             for n in 0..o.nodes {
                 c.endpoints
@@ -2625,6 +2638,97 @@ pub mod sql {
                 .map(String::as_str)
                 .ok_or_else(|| anyhow::anyhow!("no node {n}"))
         }
+
+        /// How often a wait on PD's background work reads its state: PD's own
+        /// `schedule.patrol-region-interval`, the period at which its checker inspects each
+        /// Region against its placement rules (docs.pingcap.com/tidb/stable/pd-configuration-file).
+        /// PD has no watch or long-poll for Region, operator or placement changes (its HTTP API
+        /// and pd-ctl answer each request with the state then; the gRPC `SyncRegions` stream is
+        /// PD's own leader-to-follower copy), so the cluster's own period is the wait's, never a
+        /// picked one. The slowest PD's, should they differ (lane scaleout-harness-11).
+        fn pd_patrol(&self, c: &mut mysql::Conn) -> anyhow::Result<Duration> {
+            use mysql::prelude::Queryable;
+            if let Some(d) = self.patrol.get() {
+                return Ok(*d);
+            }
+            let rows: Vec<(String, String, String, String)> = c.query(
+                "SHOW CONFIG WHERE type = 'pd' AND name = 'schedule.patrol-region-interval'",
+            )?;
+            let mut slowest: Option<Duration> = None;
+            for (_, instance, _, value) in &rows {
+                let d = go_duration(value).map_err(|e| {
+                    anyhow::anyhow!(
+                        "PD {instance}'s schedule.patrol-region-interval {value:?}: {e}"
+                    )
+                })?;
+                slowest = Some(slowest.map_or(d, |s| s.max(d)));
+            }
+            let d = slowest.ok_or_else(|| {
+                anyhow::anyhow!("SHOW CONFIG names no PD's schedule.patrol-region-interval")
+            })?;
+            anyhow::ensure!(!d.is_zero(), "PD's schedule.patrol-region-interval is zero");
+            Ok(*self.patrol.get_or_init(|| d))
+        }
+    }
+
+    /// A Go duration as PD's configuration prints it (Go's `time.Duration` text: decimal numbers,
+    /// each with a unit of ns, us, µs, ms, s, m or h, as `10ms` or `1m30s`).
+    pub fn go_duration(text: &str) -> anyhow::Result<Duration> {
+        let mut total = Duration::ZERO;
+        let mut rest = text.trim();
+        anyhow::ensure!(!rest.is_empty(), "no duration");
+        if rest == "0" {
+            return Ok(total);
+        }
+        while !rest.is_empty() {
+            let digits = rest
+                .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+                .ok_or_else(|| anyhow::anyhow!("{text:?}: a number without a unit"))?;
+            let (number, after) = rest.split_at(digits);
+            let unit_len = after
+                .find(|ch: char| ch.is_ascii_digit() || ch == '.')
+                .unwrap_or(after.len());
+            let (unit, next) = after.split_at(unit_len);
+            let unit_ns: u128 = match unit {
+                "ns" => 1,
+                "us" | "µs" | "μs" => 1_000,
+                "ms" => 1_000_000,
+                "s" => 1_000_000_000,
+                "m" => 60_000_000_000,
+                "h" => 3_600_000_000_000,
+                _ => anyhow::bail!("{text:?}: unknown unit {unit:?}"),
+            };
+            // Whole and fractional parts in integers, so `10ms` is exactly 10 ms.
+            let (whole, frac) = number.split_once('.').unwrap_or((number, ""));
+            anyhow::ensure!(
+                !(whole.is_empty() && frac.is_empty()) && !frac.contains('.'),
+                "{text:?}: no number before {unit:?}"
+            );
+            let digits_of = |d: &str| -> anyhow::Result<u128> {
+                if d.is_empty() {
+                    Ok(0)
+                } else {
+                    d.parse::<u128>()
+                        .map_err(|e| anyhow::anyhow!("{text:?}: {e}"))
+                }
+            };
+            let scale = u32::try_from(frac.len())
+                .ok()
+                .and_then(|n| 10u128.checked_pow(n))
+                .ok_or_else(|| anyhow::anyhow!("{text:?}: too many decimals"))?;
+            let (whole, frac) = (digits_of(whole)?, digits_of(frac)?);
+            let ns = whole
+                .checked_mul(unit_ns)
+                .zip(frac.checked_mul(unit_ns))
+                .and_then(|(w, f)| w.checked_add(f / scale))
+                .ok_or_else(|| anyhow::anyhow!("{text:?}: too long"))?;
+            let ns = u64::try_from(ns).map_err(|_| anyhow::anyhow!("{text:?}: too long"))?;
+            total = total
+                .checked_add(Duration::from_nanos(ns))
+                .ok_or_else(|| anyhow::anyhow!("{text:?}: too long"))?;
+            rest = next;
+        }
+        Ok(total)
     }
 
     struct Pg {
@@ -2772,7 +2876,9 @@ pub mod sql {
                         c.query_drop(q).map_err(|e| anyhow::anyhow!("{q}: {e}"))?;
                     }
                     if o.measure == "region" {
-                        // Placement is applied in the background: wait until every policy is.
+                        // Placement is applied in the background: wait until every policy is,
+                        // reading it at PD's own period (no watch: Self::pd_patrol).
+                        let patrol = self.pd_patrol(&mut c)?;
                         let until = Instant::now() + o.deadline;
                         loop {
                             let states: Vec<(String, String, String)> =
@@ -2786,7 +2892,7 @@ pub mod sql {
                                 Instant::now() < until,
                                 "TiDB's placement wasn't scheduled within --deadline-s: {states:?}"
                             );
-                            std::thread::park_timeout(need(o.poll, "--poll-us", &o.measure)?);
+                            std::thread::sleep(patrol);
                         }
                     }
                 }
@@ -2849,6 +2955,19 @@ pub mod sql {
                 Kind::Tidb => self.reshard_tidb(what, &session, op, o),
             }
         }
+
+        fn waits(&self) -> Option<serde_json::Value> {
+            self.patrol.get().map(|d| waits_record(*d))
+        }
+    }
+
+    /// The record's `waits` for TiDB: what its waits on PD's background work read, and how often.
+    pub fn waits_record(patrol: Duration) -> serde_json::Value {
+        serde_json::json!({
+            "on": "TiDB's placement (SHOW PLACEMENT) and PD's operators (the Region's peers and leader), read until applied",
+            "every_us": u64::try_from(patrol.as_micros()).unwrap_or(u64::MAX),
+            "every_is": "PD's schedule.patrol-region-interval, read from the cluster by SHOW CONFIG: PD's own period for checking each Region against its rules; PD has no watch or long-poll for Region or placement changes",
+        })
     }
 
     /// The sum of the samples of metrics `names` in a Prometheus text exposition (every label set).
@@ -3063,7 +3182,9 @@ pub mod sql {
                 ])?;
                 Box::new(move |peers, _| peers.contains(&to) && !peers.contains(&from))
             };
-            // PD's operators run in the background: the operation has taken effect once the Region shows it.
+            // PD's operators run in the background: the operation has taken effect once the Region
+            // shows it, read at PD's own period (no watch: Self::pd_patrol).
+            let patrol = self.pd_patrol(&mut c)?;
             let until = Instant::now() + o.deadline;
             loop {
                 let now = Self::tidb_regions(&mut c)?;
@@ -3077,7 +3198,7 @@ pub mod sql {
                     Instant::now() < until,
                     "Region {region}'s {what:?} operation didn't take effect within --deadline-s"
                 );
-                std::thread::park_timeout(need(o.poll, "--poll-us", &o.measure)?);
+                std::thread::sleep(patrol);
             }
         }
     }
@@ -3136,7 +3257,7 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(e.contains("--spanning"), "{e}");
-        let e = parse(&args("--scale regionloss --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --lose 3 --settle-s 1 --after-s 1 --poll-us 10")).err().unwrap().to_string();
+        let e = parse(&args("--scale regionloss --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --lose 3 --settle-s 1 --after-s 1")).err().unwrap().to_string();
         assert!(e.contains("--lose"), "{e}");
         let e = parse(&args("--scale xgroup --system tidb --nodes 3 --groups 2 --writers 2 --deadline-s 5 --keys 30 --span 3 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
         assert!(e.contains("--span"), "{e}");
@@ -3344,7 +3465,7 @@ mod tests {
     // region (CockroachDB's REGIONAL BY ROW, TiDB's partition a placement policy each).
     #[test]
     fn g13_scale_setup_dialects() {
-        let o = parse(&args("--scale region --system cockroach --nodes 3 --groups 2 --writers 4 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1 --between-ms 30 --poll-us 1000 --hosts local=127.0.0.1")).unwrap();
+        let o = parse(&args("--scale region --system cockroach --nodes 3 --groups 2 --writers 4 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1 --between-ms 30 --hosts local=127.0.0.1")).unwrap();
         let c = sql::setup(sql::Kind::Cockroach, &o);
         assert!(
             c.iter()
@@ -3377,7 +3498,7 @@ mod tests {
     // takes its operations' count.
     #[test]
     fn g13_scale_machines_are_arguments() {
-        let base = "--scale cutover --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --ops 4 --concurrent-ops 1 --settle-s 1 --poll-us 1000";
+        let base = "--scale cutover --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --ops 4 --concurrent-ops 1 --settle-s 1";
         let e = parse(&args(base)).err().unwrap().to_string();
         assert!(e.contains("--hosts"), "{e}");
         let e = parse(&args(&format!("{base} --hosts local")))
@@ -3397,8 +3518,44 @@ mod tests {
             record_head(&o)["machines"],
             serde_json::json!(["10.0.0.1", "10.0.0.2"])
         );
-        let e = parse(&args("--scale cutover --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --settle-s 1 --poll-us 1 --hosts local=a")).err().unwrap().to_string();
+        let e = parse(&args("--scale cutover --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --settle-s 1 --hosts local=a")).err().unwrap().to_string();
         assert!(e.contains("--ops"), "{e}");
+    }
+
+    // Lane scaleout-harness-11 (T-SH.12): TiDB's waits on PD's background work read its state at
+    // PD's own schedule.patrol-region-interval, as PD prints it; --poll-us isn't taken by region or
+    // cutover, and the record says what the waits read and at which of the system's own periods.
+    #[test]
+    fn scaleout_harness_11_pd_waits_read_at_pds_own_period() {
+        let d = |t: &str| sql::go_duration(t);
+        assert_eq!(d("10ms").unwrap(), Duration::from_millis(10));
+        assert_eq!(d("1m30s").unwrap(), Duration::from_secs(90));
+        assert_eq!(d("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(d("500µs").unwrap(), Duration::from_micros(500));
+        assert_eq!(d("2h0m0s").unwrap(), Duration::from_secs(7200));
+        assert_eq!(d("0").unwrap(), Duration::ZERO);
+        for bad in ["", "10", "ms", "10x", "1..5s", "99999999999999999999h"] {
+            assert!(d(bad).is_err(), "{bad:?} was taken");
+        }
+        let region = "--scale region --system tidb --nodes 3 --groups 2 --writers 4 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1 --between-ms 30 --hosts local=127.0.0.1";
+        let cutover = "--scale cutover --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --ops 4 --concurrent-ops 1 --settle-s 1 --hosts local=127.0.0.1";
+        for base in [region, cutover] {
+            assert!(parse(&args(base)).is_ok(), "{base}");
+            let e = parse(&args(&format!("{base} --poll-us 1000")))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains("--poll-us"), "{e}");
+        }
+        let w = sql::waits_record(Duration::from_millis(10));
+        assert_eq!(w["every_us"], serde_json::json!(10_000));
+        assert!(
+            w["every_is"]
+                .as_str()
+                .unwrap()
+                .contains("schedule.patrol-region-interval"),
+            "{w}"
+        );
     }
 
     // G13 step 2: a write counts toward every operation it was in flight during, and only those.

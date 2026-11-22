@@ -623,7 +623,10 @@ the read measures' warm-up is one read of the last preloaded row, waiting on Amp
 (in-process) and otherwise one read at each system's strongest consistency (AC-SH.6); `regionloss` counts the
 region's own copy once a writer, each read waiting on that writer's last write by the system's own control, with
 Amphora's server's figure refused until its protocol carries tokens (AC-SH.7); schema setup asks each node in the
-configured order and gives up at `--deadline-s` (AC-SH.8).
+configured order and gives up at `--deadline-s` (AC-SH.8). TiDB's waits on PD's background work (placement in the region
+measure, leader and replica moves in cutover) read PD's state at PD's own `schedule.patrol-region-interval`, read from
+the cluster, as PD has no watch or long-poll for Region or placement changes; `--poll-us` is gone from every scale
+measure and each record's `waits` says so (lane scaleout-harness-11, AC-SH.11).
 
 ## Measured
 
