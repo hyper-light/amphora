@@ -80,10 +80,10 @@ pub(super) fn trim(db: &Db, ns: &str, feed: Rev, visits: usize) -> anyhow::Resul
         return Ok(true);
     };
     // Lazy DDL in the same committed step, as compaction's own state (`compaction::step`).
-    db.exec("CREATE TABLE IF NOT EXISTS __amphora_stamp_trim(namespace TEXT PRIMARY KEY, through INTEGER NOT NULL, cursor INTEGER NOT NULL)")?;
+    db.exec("CREATE TABLE IF NOT EXISTS __amphora_stamp_trim(namespace TEXT PRIMARY KEY, through INTEGER NOT NULL, swept INTEGER NOT NULL)")?;
     let mut state = None;
     db.query(
-        "SELECT through, cursor FROM __amphora_stamp_trim WHERE namespace = ?1",
+        "SELECT through, swept FROM __amphora_stamp_trim WHERE namespace = ?1",
         [text(ns)],
         |r| {
             state = Some((rev(r, 0)?, rev(r, 1)?));
@@ -125,7 +125,7 @@ pub(super) fn trim(db: &Db, ns: &str, feed: Rev, visits: usize) -> anyhow::Resul
             .ok_or_else(|| anyhow::anyhow!("stamp trim count overflow"))?;
     }
     db.query(
-        "INSERT INTO __amphora_stamp_trim(namespace, through, cursor) VALUES (?1, ?2, ?3) ON CONFLICT(namespace) DO UPDATE SET through = excluded.through, cursor = excluded.cursor",
+        "INSERT INTO __amphora_stamp_trim(namespace, through, swept) VALUES (?1, ?2, ?3) ON CONFLICT(namespace) DO UPDATE SET through = excluded.through, swept = excluded.swept",
         [text(ns), integer(through)?, integer(cursor)?],
         |_| Ok(true),
     )?;
