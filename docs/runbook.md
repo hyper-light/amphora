@@ -48,6 +48,11 @@ scripts/cluster.sh health HOST1:PORT 1     # or, on any member: amphora health ~
 Healthy when every member answers, all name the same leader, each holds the three voters and none
 is fenced or cut. Exit 0 healthy, 1 not, 2 can't ask. One member: `amphora ask CONF N status`.
 
+To wait for a leader (a client that must write, while the group elects): `amphora ask CONF N leader
+WAIT_MS` answers `leader=ID addr=HOST:PORT` once member N knows its group's leader, or is refused
+once WAIT_MS pass. It wakes on the step that names the leader, so a client needn't retry writes a
+follower refuses (`serve::Client::leader` in code).
+
 Logs: `journalctl --user -u amphora-member-N` (Linux), `~/Library/Logs/amphora-member-N.log`
 (macOS). A member whose replica fences exits with the reason; its service manager starts it again
 on its data (`Restart=always`, `KeepAlive`).

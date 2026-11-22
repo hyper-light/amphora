@@ -301,6 +301,9 @@ struct Control {
     /// Rung when a record joins `outgoing` ([`ReplicaHandle::drain_wait`]).
     sent: std::sync::Condvar,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
+    /// Rung when the published status names another leader or the owner ends
+    /// ([`ReplicaHandle::wait_leader`], CP-T1.13).
+    led: std::sync::Condvar,
     meter: Arc<ReplicaMeter>,
     local: Local,
     bell: Arc<Bell>,
@@ -1284,6 +1287,38 @@ impl ReplicaHandle {
         locked(&self.shared.status)?.clone()
     }
 
+    /// Waits on the caller's thread until this replica knows its group's leader, until `until`,
+    /// and answers the status that names it (CP-T1.13; `crate::serve`'s `leader` request). It
+    /// wakes on the owner's step that publishes a new leader, never on a timer. Refused Timeout
+    /// at the deadline, Fenced while the replica is fenced, and with the owner's reason once it
+    /// ended.
+    pub fn wait_leader(&self, until: Instant) -> Result<ReplicaStatus, Refusal> {
+        let mut status = locked(&self.shared.status)?;
+        loop {
+            match &*status {
+                Err(ended) => return Err(ended.clone()),
+                Ok(s) => {
+                    if let Some(reason) = &s.fenced {
+                        return Err(fenced(reason));
+                    }
+                    if s.leader != 0 {
+                        return Ok(s.clone());
+                    }
+                }
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Refusal::Timeout);
+            }
+            status = self
+                .shared
+                .led
+                .wait_timeout(status, left)
+                .map_err(|_| fenced("status lock poisoned"))?
+                .0;
+        }
+    }
+
     /// Makes `change` to the group's members (replication.md, "Membership"). Only the leader takes
     /// one, one at a time. It proposes it through a joint configuration, which it leaves by itself,
     /// and answers its status once the group has left it. A change the configuration already
@@ -1601,6 +1636,7 @@ fn open_on<F: BlockFile + 'static>(
         outgoing: Mutex::default(),
         sent: std::sync::Condvar::new(),
         status: Mutex::new(Ok(status(&replica))),
+        led: std::sync::Condvar::new(),
         meter,
         local,
         bell: Arc::clone(&bell),
@@ -1968,6 +2004,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         if let Ok(mut status) = self.control.status.lock() {
             *status = Err(reason.clone());
+            // Waiters for a leader hear it ended (under the lock, so none misses it).
+            self.control.led.notify_all();
         }
         // Local reads end with the owner: none opens again, and the idle readers let its lease go.
         self.control.local.release();
@@ -2235,7 +2273,16 @@ impl<F: BlockFile + 'static> Actor<F> {
         let entries = self.replica.applied().index.saturating_sub(applied);
         let took = (self.clock)().saturating_duration_since(at);
         self.spacing.stepped(entries, took, queued)?;
-        *locked(&self.control.status)? = Ok(status(&self.replica));
+        let now = status(&self.replica);
+        {
+            let mut published = locked(&self.control.status)?;
+            let led = !matches!(&*published, Ok(was) if was.leader == now.leader);
+            *published = Ok(now);
+            // Waiters for a leader wake on the step that names a new one, never on a timer.
+            if led {
+                self.control.led.notify_all();
+            }
+        }
         self.publish_closed()?;
         let commits = self.replica.core().raft.commit_stats();
         self.control.meter.stepped(
