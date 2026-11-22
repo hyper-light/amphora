@@ -2570,6 +2570,11 @@ wire records queued beside them (`Control::called`).
   envelopes. Calls are counted one fewer, so a wire record always finds a place. An input's place is given back when
   the owner takes it from the channel (`Reservation::taken`), as a bounded channel's slot was; waiting calls are held
   to the same bound. The pump's receipts in the tests grow to the bound (`Pump::receipts`). T-QB.1.6 tests the counts.
+- Each queued input is charged its envelope (`ENVELOPE_BYTES`, `size_of::<Envelope>()`) against the queue's bytes,
+  beside what it carries (lane constants-21): memory is counted once, in the bytes, and bounded once, by them, where
+  before a count of envelopes and a byte bound that left them out together allowed up to twice the room. A change of
+  members, a hand-off and a catch-up carry nothing past their envelope (were charged `size_of::<Input>()`), an
+  attestation its name. The room held back for a wire record holds its envelope too. T-QB.1.10 tests the charge.
 - `MEMBERS` (was 64) is gone (lane constants-21): see "The member bound stated once per group", next.
 
 **Still picked in the replication code (lane constants-20's survey), each with what it should come from.**

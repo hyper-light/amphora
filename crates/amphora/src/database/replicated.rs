@@ -87,11 +87,12 @@ fn image_within(wire: usize, members: usize) -> usize {
 // vendor/hyper-raft/crates/hyper-timing/src/lib.rs), the owner's period before it has measured a
 // quorum's round trips, its timer and its leader's link. Once measured, it bounds nothing.
 const TICK: Duration = Duration::from_millis(10);
-// The admission charge of a change of members, a hand-off of the lead, a catch-up or an
-// attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
-// attestation's name is charged beside it). The response channel's own allocation is charged for
-// no input, as before.
-const CHANGE_BYTES: usize = std::mem::size_of::<Input>();
+// Every queued input is charged its envelope, the bytes it takes in the channel itself, beside
+// what it carries (`enqueue`; lane constants-21): memory is counted once, in the queue's bytes, and
+// bounded once, by them. A change of members, a hand-off of the lead and a catch-up carry nothing
+// past their envelope; an attestation carries its name. The response channel's own allocation is
+// charged for no input, as before.
+const ENVELOPE_BYTES: usize = std::mem::size_of::<Envelope>();
 
 // Session tokens: read-your-writes on any replica (replication.md, "Decision (lane ryw-1):
 // read-your-writes by session tokens").
@@ -1218,8 +1219,9 @@ fn queue_bounds(
     let queued = room;
     let wire = record.min(queued);
     // A wire record's room is held back from application calls, so that waiting calls cannot
-    // block the record that finds a leader.
-    let applications = queued.saturating_sub(wire);
+    // block the record that finds a leader: its bytes and its envelope (lane constants-21).
+    let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
+    let applications = queued.saturating_sub(wire).saturating_sub(envelope);
     let (commands, calls) = command_counts(intake, timeout, room, request);
     // The least the outgoing queue carries and still works: one broadcast, a record to each peer
     // (a leader's heartbeats, its appends), so that a queue held to it sheds no record of one.
@@ -1249,7 +1251,7 @@ fn command_counts(
     room: u64,
     request: u64,
 ) -> (u64, u64) {
-    let envelope = u64::try_from(std::mem::size_of::<Envelope>()).unwrap_or(u64::MAX);
+    let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
     let input = super::drain::Bound {
         bytes: envelope,
         messages: 2,
@@ -1350,7 +1352,10 @@ fn answer<T>(response: Response<T>, result: Result<T, Refusal>) {
 }
 
 impl ReplicaHandle {
+    /// Queues `command`, charged `bytes` for what it carries and its envelope beside them
+    /// (`ENVELOPE_BYTES`).
     fn enqueue(&self, command: Input, bytes: usize) -> Result<(), Refusal> {
+        let bytes = bytes.saturating_add(ENVELOPE_BYTES);
         // Untouched application calls can wait for leadership. They hold no more than the owner
         // takes in an election timeout and the queue's room less a wire record's (QB.1), so that
         // waiting calls leave the rest of the queue to the wire records that discover it.
@@ -1643,7 +1648,7 @@ impl ReplicaHandle {
                 until,
                 response,
             },
-            CHANGE_BYTES,
+            0,
         )?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
@@ -1677,7 +1682,7 @@ impl ReplicaHandle {
         if attesting.as_ref() == Some(&application) {
             return Ok(());
         }
-        let charge = CHANGE_BYTES.saturating_add(application.name.len());
+        let charge = application.name.len();
         self.enqueue(
             Input::Attest {
                 application: application.clone(),
@@ -1707,7 +1712,7 @@ impl ReplicaHandle {
                 until,
                 response,
             },
-            CHANGE_BYTES,
+            0,
         )?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
@@ -1777,7 +1782,7 @@ impl ReplicaHandle {
             return Err(Refusal::Timeout);
         }
         let (response, receiver) = mpsc::sync_channel(1);
-        self.enqueue(Input::CatchUp { until, response }, CHANGE_BYTES)?;
+        self.enqueue(Input::CatchUp { until, response }, 0)?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|error| match error {
@@ -4918,6 +4923,29 @@ mod tests {
         assert_eq!(command_counts(&idle, timeout, 0, request), (2, 1));
     }
 
+    /// T-QB.1.10 (QB.1, lane constants-21): every queued input is charged its envelope against
+    /// the queue's bytes, so memory is counted once and bounded once. Do: on a member whose owner
+    /// is not stepped, queue a wire record of one byte and a catch-up that carries nothing.
+    /// Expect: the queue's bytes are the one byte and two envelopes.
+    #[test]
+    fn t_qb_1_10_each_queued_input_is_charged_its_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        let until = driven.until();
+        let before = handle.shared.admitted.load(Ordering::Acquire);
+        let _record = handle.admit_receive(2, vec![0xff], until).unwrap();
+        let (response, _answer) = mpsc::sync_channel(1);
+        handle
+            .enqueue(Input::CatchUp { until, response }, 0)
+            .unwrap();
+        assert_eq!(
+            handle.shared.admitted.load(Ordering::Acquire) - before,
+            1 + 2 * ENVELOPE_BYTES
+        );
+    }
+
     /// CP-T1.8 on driven time: admitted application calls cannot consume replication's reserved
     /// byte capacity. Do: fill a leaderless member's queue with calls until it refuses one, then
     /// admit a member's heartbeat and step the member. Expect: the refusal is the application
@@ -4978,8 +5006,9 @@ mod tests {
             "the queue's last place stays a wire record's"
         );
         // Calls stop at their bytes' bound or at their count's, the fewer, and the refusal names
-        // the bound that refused (QB.1). The count is checked first.
-        let by_bytes = application / api::REQUEST_MAX;
+        // the bound that refused (QB.1). The count is checked first. Each call is charged its
+        // worst case and its envelope (lane constants-21).
+        let by_bytes = application / (api::REQUEST_MAX + ENVELOPE_BYTES);
         let refused_by = if by_bytes < calls { application } else { calls };
         assert!(matches!(
             refusal,
@@ -9167,7 +9196,7 @@ mod tests {
                     until,
                     response,
                 },
-                CHANGE_BYTES,
+                0,
             )
             .unwrap();
         receiver
@@ -9188,7 +9217,7 @@ mod tests {
                     until,
                     response,
                 },
-                CHANGE_BYTES,
+                0,
             )
             .unwrap();
         receiver
@@ -9268,7 +9297,7 @@ mod tests {
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
-            .enqueue(Input::CatchUp { until, response }, CHANGE_BYTES)
+            .enqueue(Input::CatchUp { until, response }, 0)
             .unwrap();
         receiver
     }
@@ -15429,7 +15458,7 @@ mod tests {
                         until: Instant::now() + HANG_READ,
                         response,
                     },
-                    CHANGE_BYTES,
+                    0,
                 )
                 .unwrap();
             answers.push(answer);
@@ -15718,17 +15747,16 @@ mod tests {
                     finished.send(legacy.receive(2, vec![0xff], until)).unwrap();
                 });
                 // Wait for the legacy record's actual queue reservation, not thread scheduling.
+                // Held: the capture's worst case and a byte for each of the records, and an
+                // envelope for each of them all, the capture's too (lane constants-21).
+                let held = api::REQUEST_MAX + commands + (commands + 1) * ENVELOPE_BYTES;
                 for _ in 0..ROUNDS {
-                    if handle.shared.admitted.load(Ordering::Acquire) == api::REQUEST_MAX + commands
-                    {
+                    if handle.shared.admitted.load(Ordering::Acquire) == held {
                         break;
                     }
                     std::thread::park_timeout(POLL);
                 }
-                assert_eq!(
-                    handle.shared.admitted.load(Ordering::Acquire),
-                    api::REQUEST_MAX + commands
-                );
+                assert_eq!(handle.shared.admitted.load(Ordering::Acquire), held);
                 assert!(matches!(
                     finishing.try_recv(),
                     Err(mpsc::TryRecvError::Empty)

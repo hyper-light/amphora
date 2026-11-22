@@ -1153,6 +1153,7 @@ tests = [
   # lane constants-21
   { id = "T-QB.1.8", text = "A bound entry, stamped, read back; a one-member group's first bound raised as it grows to nine: passes when the entry states its bound and nothing else does, and the bound goes 2, 4, 8, 16, each admitting the configuration that raised it" },
   { id = "T-QB.1.9", text = "A driven one-voter group, a learner running beside it, grows to five members, then nine, then the voter reopens from its first configuration: passes when every change is answered, the bound is 8 at five and 16 at nine at the voter and the learner, and the voter reopens with 16" },
+  { id = "T-QB.1.10", text = "A wire record of one byte and a catch-up queued on an owner not stepped: passes when the queue's bytes grow by the byte and two envelopes" },
 ]
 
 # lane many-writers
