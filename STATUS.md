@@ -700,16 +700,17 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   unless ESCAPE gives one (PostgreSQL, MySQL and ClickHouse take a backslash); likely(), unlikely()
   and likelihood() as their argument; upper() and lower() of ASCII letters only; round() to negative
   digits as to 0; char() of several code points (DuckDB got only the first); format() as printf();
-  hex() of an integer as its text's bytes; zeroblob() on DuckDB and PostgreSQL; GLOB as a case-sensitive regular expression match of the
+  hex() of an integer as its text's bytes; length() of an integer and of a blob; zeroblob() on
+  DuckDB and PostgreSQL; GLOB as a case-sensitive regular expression match of the
   whole string (no other engine has SQLite's GLOB: DuckDB's negates sets with `!` and escapes with a
   backslash), a pattern that isn't a literal not expressible. The untranslatable counts on the gate's pool don't move
   (381, 381, 483, 480 for DuckDB, PostgreSQL, MySQL, ClickHouse): these records were translated
   before, wrongly. A local check, not a record (this Mac, Python's SQLite 3.51 against DuckDB 1.4.2's
   Python module, one script for both, answers compared loosely, the pool's function, expression,
   affinity, operator, collation, rule and storage-class files): of 2,448 queries, 1,270 answered
-  differently with the old translator and 1,188 now, 96 fixed and none newly wrong; what's left is mostly SQLite's types against DuckDB's, functions
+  differently with the old translator and 1,176 now, 108 fixed and none newly wrong; what's left is mostly SQLite's types against DuckDB's, functions
   DuckDB lacks, and tables a translation couldn't make. Left: the DuckDB counts through the harness
-  and the tiny run on every engine on jupiter (kiln was down), and hex() of a REAL.
+  and the tiny run on every engine on jupiter (kiln was down), and hex() and length() of a REAL.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
