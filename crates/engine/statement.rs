@@ -291,6 +291,41 @@ fn combine_arithmetic_primitive(
     }
 }
 
+/// A statement's SQL parsed and planned on `conn` with `prepare_options`: a plan made again
+/// (`Statement::plan_again`), or the exact search that follows a fast plan
+/// (`background_search::SearchRequest::run`, lane pl8-17).
+pub(crate) fn plan_sql(
+    conn: &Arc<Connection>,
+    pager: Arc<Pager>,
+    sql: &str,
+    mode: QueryMode,
+    origin: StatementOrigin,
+    prepare_options: &PrepareOptions,
+) -> Result<vdbe::Program> {
+    let (cmd, _) = conn.parse_sql(sql)?;
+    let Some(cmd) = cmd else {
+        return Err(LimboError::InternalError(
+            "a prepared statement's SQL no longer parses to a statement".to_string(),
+        ));
+    };
+    let syms = conn.syms.read();
+    #[cfg(debug_assertions)]
+    crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
+    let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
+    let schema = conn.schema.read().clone();
+    translate::translate(
+        &schema,
+        stmt,
+        pager,
+        conn.clone(),
+        &syms,
+        mode,
+        sql,
+        origin,
+        prepare_options,
+    )
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -341,6 +376,9 @@ pub struct Statement {
     /// Amphora (PL.13): the run under way was handed to a second prepare once already; it is not
     /// handed off again (`vdbe::ProgramState::handoff_open`).
     handed_off: bool,
+    /// Amphora (PL.8, lane pl8-17): where the exact search that follows this statement's fast plan
+    /// hands its plan back, taken as a run starts (`background_search.rs`).
+    exact_search: Option<Arc<crate::background_search::SearchSlot>>,
 }
 
 /// Amphora (PL.7): a run timed for the fitted cost model (`optimizer::cost_fit`): its counters
@@ -452,7 +490,71 @@ impl Statement {
             custom_run: None,
             cost_sample: None,
             handed_off: false,
+            exact_search: None,
         }
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): a fast plan the greedy search ordered hands its
+    /// exact search to the placement the connection's switch names (`background_search.rs`); a
+    /// request from an earlier plan is dropped with its slot.
+    pub(crate) fn hand_off_exact_search(&mut self) {
+        self.exact_search = None;
+        let conn = self.program.connection.clone();
+        let placement = conn.background_search();
+        if placement == crate::BackgroundSearch::Off || !self.program.fast_planned {
+            return;
+        }
+        let slot = Arc::new(crate::background_search::SearchSlot::default());
+        let request = crate::background_search::SearchRequest {
+            conn: Arc::downgrade(&conn),
+            pager: self.pager.clone(),
+            sql: self.program.sql.clone(),
+            mode: self.query_mode,
+            origin: self.origin,
+            expected_runs: Some(self.runs_since_planned.max(1)),
+            fast_orders: self.program.join_orders.clone(),
+            fast_cost: self.program.plan_cost,
+            slot: Arc::downgrade(&slot),
+        };
+        self.exact_search = Some(slot);
+        match placement {
+            crate::BackgroundSearch::Worker => {
+                let connections = conn.db.n_connections.load(Ordering::SeqCst);
+                conn.db.planner.enqueue(request, connections);
+            }
+            crate::BackgroundSearch::Idle => conn
+                .idle_searches
+                .enqueue(request, conn.db.planner.counters()),
+            crate::BackgroundSearch::Off => {}
+        }
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): as a run starts, the exact plan its search handed
+    /// back, if it has, takes the fast plan's place (as the generic plan while a custom one runs).
+    fn take_exact_plan(&mut self) -> Result<()> {
+        let found = match &self.exact_search {
+            Some(slot) => slot.take(),
+            None => return Ok(()),
+        };
+        let Some(found) = found else {
+            return Ok(());
+        };
+        self.exact_search = None;
+        if let crate::background_search::Found::Better(program) = found {
+            if self.generic.is_some() {
+                self.generic = Some(program);
+            } else {
+                self.install_program(program)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Amphora (PL.8, lane pl8-17): whether this statement's exact search is still to come back.
+    pub fn exact_search_pending(&self) -> bool {
+        self.exact_search
+            .as_ref()
+            .is_some_and(|slot| !slot.is_filled())
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -615,6 +717,8 @@ impl Statement {
                 .fetch_sub(1, Ordering::SeqCst);
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
+                // Amphora (PL.8, lane pl8-17): the connection went idle between statements.
+                self.program.connection.went_idle();
             }
             self.counted_as_active_root = false;
         }
@@ -871,6 +975,13 @@ impl Statement {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
                 self.program.connection.maybe_update_schema();
+            }
+            // Amphora (PL.8, lane pl8-17): the exact plan first, so a stale one is planned again.
+            if self.origin == StatementOrigin::Root {
+                if let Err(err) = self.take_exact_plan() {
+                    self.release_active_root_if_counted();
+                    return Err(err);
+                }
             }
             if !self
                 .program
@@ -1304,13 +1415,20 @@ impl Statement {
                 .clone(),
             crate::CarriedJoinOrders::Off => None,
         };
+        let fast_search = self.origin == StatementOrigin::Root
+            && conn.background_search() != crate::BackgroundSearch::Off;
+        let expected_runs = Some(self.runs_since_planned.max(1));
         let new_program = self.plan_again(&PrepareOptions {
-            expected_runs: Some(self.runs_since_planned.max(1)),
+            expected_runs,
             carried_join_orders,
+            fast_search,
             ..PrepareOptions::default()
         })?;
-        self.runs_since_planned = 0;
         self.install_program(new_program)?;
+        // Amphora (PL.8, lane pl8-17): the exact search of a fast plan made again is sized by the
+        // runs this one served, as the plan made in full would be.
+        self.hand_off_exact_search();
+        self.runs_since_planned = 0;
         self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
         // Amphora (PL.12): the plan made now is the generic one, on the schema and statistics as
         // they now are; the custom runs measured before are of the old ones, and start again.
@@ -1323,27 +1441,11 @@ impl Statement {
     /// The statement's SQL parsed and planned again with `prepare_options`: the generic plan
     /// without values, a custom one with a run's (PL.12).
     fn plan_again(&self, prepare_options: &PrepareOptions) -> Result<vdbe::Program> {
-        let conn = self.program.connection.clone();
-        let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-        let Some(cmd) = cmd else {
-            return Err(LimboError::InternalError(
-                "a prepared statement's SQL no longer parses to a statement".to_string(),
-            ));
-        };
-        let syms = conn.syms.read();
-        let mode = self.query_mode;
-        #[cfg(debug_assertions)]
-        crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
-        let schema = conn.schema.read().clone();
-        translate::translate(
-            &schema,
-            stmt,
+        plan_sql(
+            &self.program.connection,
             self.pager.clone(),
-            conn.clone(),
-            &syms,
-            mode,
             &self.program.sql,
+            self.query_mode,
             self.origin,
             prepare_options,
         )
@@ -2188,6 +2290,231 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect(ConnectOpts::new())
+    }
+
+    /// Amphora (T-PL.8.10, lane pl8-17): a star of a fact table and `STAR_DIMENSIONS` dimensions,
+    /// the third filtered. Its connected subsets (2^10 + 10 = 1,034) pass the fast budget (the
+    /// tables' count squared, 121) and fit the control's 10,000, so its fast plan is greedy and its
+    /// exact search is the dynamic program.
+    const STAR_DIMENSIONS: usize = 10;
+
+    fn star_sql() -> String {
+        use std::fmt::Write;
+        let mut sql = String::from("SELECT count(*) FROM f");
+        for d in 1..=STAR_DIMENSIONS {
+            write!(sql, ", d{d}").unwrap();
+        }
+        sql.push_str(" WHERE d3.v < 5");
+        for d in 1..=STAR_DIMENSIONS {
+            write!(sql, " AND f.a{d} = d{d}.id").unwrap();
+        }
+        sql
+    }
+
+    fn star_connection() -> Arc<crate::Connection> {
+        let conn = open_test_connection().unwrap();
+        let columns: Vec<String> = (1..=STAR_DIMENSIONS).map(|d| format!("a{d} INT")).collect();
+        conn.execute(format!(
+            "CREATE TABLE f(id INTEGER PRIMARY KEY, {})",
+            columns.join(", ")
+        ))
+        .unwrap();
+        let values: Vec<String> = (1..=STAR_DIMENSIONS)
+            .map(|d| format!("x % {} + 1", 20 * d))
+            .collect();
+        conn.execute(format!(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 2000) \
+             INSERT INTO f SELECT x, {} FROM n",
+            values.join(", ")
+        ))
+        .unwrap();
+        for d in 1..=STAR_DIMENSIONS {
+            conn.execute(format!("CREATE TABLE d{d}(id INTEGER PRIMARY KEY, v INT)"))
+                .unwrap();
+            conn.execute(format!(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < {}) \
+                 INSERT INTO d{d} SELECT x, x % 50 FROM n",
+                20 * d
+            ))
+            .unwrap();
+        }
+        conn.execute("ANALYZE").unwrap();
+        conn
+    }
+
+    fn count_of(stmt: &mut Statement) -> Vec<Vec<Value>> {
+        let rows = stmt.run_collect_rows().unwrap();
+        stmt.reset().unwrap();
+        rows
+    }
+
+    /// Do: under placement `Idle`, keep one statement in progress on the connection while the star
+    /// join runs three times to its end. Expect: its fast plan answers, its exact search waits and
+    /// never runs while the connection is busy (one request, no outcome); once the held statement
+    /// is reset the connection goes idle, the search runs, and the next run answers the same
+    /// (T-PL.8.10, lane pl8-17: placement `Idle`'s failure mode, a connection that never goes
+    /// idle).
+    #[test]
+    fn t_pl_8_10_a_connection_that_never_goes_idle_never_runs_its_search() {
+        let conn = star_connection();
+        let mut control = conn.prepare(star_sql()).unwrap();
+        let expected = count_of(&mut control);
+        drop(control);
+        conn.set_background_search(crate::BackgroundSearch::Idle);
+        let mut held = conn.prepare("SELECT id FROM f").unwrap();
+        assert!(held
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_some());
+        let mut stmt = conn.prepare(star_sql()).unwrap();
+        assert!(stmt.program.fast_planned, "the star's fast plan is greedy");
+        for _ in 0..3 {
+            assert_eq!(count_of(&mut stmt), expected);
+        }
+        let busy = conn.background_search_stats();
+        assert_eq!(conn.idle_searches_pending(), 1);
+        assert!(stmt.exact_search_pending());
+        assert_eq!(busy.requested, 1);
+        assert_eq!(busy.kept + busy.replaced + busy.failed + busy.dropped, 0);
+        held.reset().unwrap();
+        let idle = conn.background_search_stats();
+        assert_eq!(conn.idle_searches_pending(), 0);
+        assert!(!stmt.exact_search_pending());
+        assert_eq!(idle.kept + idle.replaced, 1, "{idle:?}");
+        assert_eq!(count_of(&mut stmt), expected);
+        assert!(
+            stmt.exact_search.is_none(),
+            "the run took what the search came to"
+        );
+    }
+
+    /// Do: under placement `Worker`, prepare the star join and run it at once, then wait for its
+    /// exact search (woken by the slot's fill). Expect: the fast plan answers, one request ends in
+    /// one outcome, and the run after it answers the same on whichever plan won (T-PL.8.10).
+    #[test]
+    fn t_pl_8_10_the_worker_hands_back_the_exact_plan() {
+        let conn = star_connection();
+        let mut control = conn.prepare(star_sql()).unwrap();
+        let expected = count_of(&mut control);
+        drop(control);
+        conn.set_background_search(crate::BackgroundSearch::Worker);
+        let mut stmt = conn.prepare(star_sql()).unwrap();
+        assert!(stmt.program.fast_planned);
+        assert_eq!(count_of(&mut stmt), expected);
+        let slot = stmt
+            .exact_search
+            .clone()
+            .expect("the fast plan handed its search off");
+        slot.wait_filled();
+        let stats = conn.background_search_stats();
+        assert_eq!(stats.requested, 1);
+        assert_eq!(stats.kept + stats.replaced, 1, "{stats:?}");
+        assert_eq!(count_of(&mut stmt), expected);
+        assert!(stmt.exact_search.is_none());
+    }
+
+    /// Do: under placement `Worker`, 64 connections each prepare the star join 4 times, dropping
+    /// each statement before its search comes back. Expect: every request ends in exactly one
+    /// outcome, the worker's queue never holds more than the connections open, and none hangs
+    /// (T-PL.8.10: placement `Worker` under many connections).
+    #[test]
+    fn t_pl_8_10_every_worker_request_ends_once_under_many_connections() {
+        let conn = star_connection();
+        conn.set_background_search(crate::BackgroundSearch::Worker);
+        let connections: Vec<_> = (0..64)
+            .map(|_| {
+                let other = conn.db.connect(ConnectOpts::new()).unwrap();
+                other.set_background_search(crate::BackgroundSearch::Worker);
+                other
+            })
+            .collect();
+        let mut last = Vec::new();
+        for _ in 0..4 {
+            last.clear();
+            for other in &connections {
+                let stmt = other.prepare(star_sql()).unwrap();
+                last.push(stmt);
+            }
+        }
+        for stmt in &last {
+            if let Some(slot) = stmt.exact_search.as_ref() {
+                slot.wait_filled();
+            }
+        }
+        let stats = conn.background_search_stats();
+        assert_eq!(stats.requested, 4 * 64);
+        assert!(stats.longest_queue <= 65, "{stats:?}");
+        // The last round's searches are all done; earlier ones may still be leaving the queue.
+        let ended = stats.dropped + stats.abandoned + stats.kept + stats.replaced + stats.failed;
+        assert!(ended >= 64 && ended <= stats.requested, "{stats:?}");
+    }
+
+    /// The harness of record (T-PL.8.10, lane pl8-17): `n` connections to one database, each on its
+    /// own thread, released together, prepare the star join and run it. Reports, over the
+    /// connections, the time to the first row and the time to the exact plan (the search's slot
+    /// filled; at prepare under `Off`, whose plan is exact) at p50, p99 and the largest, and the
+    /// searches' outcomes. Run: `cargo test -p amphora-engine --lib -- --ignored --nocapture
+    /// t_pl_8_10_harness` (AMPHORA_BG_CONNECTIONS=1,32,512 by default).
+    fn harness(placement: crate::BackgroundSearch, n: usize) -> String {
+        let conn = star_connection();
+        let barrier = std::sync::Barrier::new(n);
+        let results: Vec<(f64, f64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+                    other.set_background_search(placement);
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let started = std::time::Instant::now();
+                        let mut stmt = other.prepare(star_sql()).unwrap();
+                        let prepared = started.elapsed();
+                        assert!(stmt
+                            .run_one_step_blocking(|| Ok(()), || Ok(()))
+                            .unwrap()
+                            .is_some());
+                        let first_row = started.elapsed();
+                        stmt.run_ignore_rows().unwrap();
+                        stmt.reset().unwrap();
+                        let exact = match stmt.exact_search.clone() {
+                            Some(slot) => slot.wait_filled().duration_since(started),
+                            None => prepared,
+                        };
+                        (first_row.as_secs_f64() * 1e6, exact.as_secs_f64() * 1e6)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let quantiles = |mut values: Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            let at = |q: f64| values[((values.len() - 1) as f64 * q).round() as usize];
+            format!("p50 {:.0} p99 {:.0} max {:.0}", at(0.5), at(0.99), at(1.0))
+        };
+        format!(
+            "{placement:?} at {n}: first row (us) {}; exact plan (us) {}; {:?}",
+            quantiles(results.iter().map(|r| r.0).collect()),
+            quantiles(results.iter().map(|r| r.1).collect()),
+            conn.background_search_stats()
+        )
+    }
+
+    #[test]
+    #[ignore = "the harness of record: the coordinator's run, with --ignored --nocapture"]
+    fn t_pl_8_10_harness_time_to_first_row_and_to_the_exact_plan() {
+        let ladder = std::env::var("AMPHORA_BG_CONNECTIONS").unwrap_or_else(|_| "1,32,512".into());
+        for n in ladder
+            .split(',')
+            .filter_map(|n| n.trim().parse::<usize>().ok())
+        {
+            for placement in [
+                crate::BackgroundSearch::Off,
+                crate::BackgroundSearch::Worker,
+                crate::BackgroundSearch::Idle,
+            ] {
+                println!("{}", harness(placement, n));
+            }
+        }
     }
 
     /// Do: prepare a three-table join, then plan it again (`Statement::reprepare`) on the same

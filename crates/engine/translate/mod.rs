@@ -184,7 +184,8 @@ pub fn translate(
             connection.join_search_budget(),
             &connection.db.learned_costs,
             prepare_options.expected_runs,
-        ),
+        )
+        .fast(prepare_options.fast_search),
     );
     // Amphora (PL.8, lane pl8-16): where this plan notes its join orders, the last plan's, and the
     // share of a plan's cost the weights' error could explain, which a carried order keeps its
@@ -255,11 +256,11 @@ pub fn translate(
     };
 
     program.epilogue(schema);
-    connection
-        .db
-        .learned_costs
-        .search()
-        .add(crate::translate::optimizer::search_budget::end_statement());
+    let searches = crate::translate::optimizer::search_budget::end_statement();
+    connection.db.learned_costs.search().add(searches);
+    // Amphora (PL.8, lane pl8-17): a fast plan the greedy search ordered has an exact search to
+    // follow; one the exact search planned within the fast budget is already exact.
+    program.fast_planned = prepare_options.fast_search && searches.greedy_searches > 0;
     program.reads_parameter_values = plan_values.asked();
     program.planned_tables = plan_values.take_planned();
     program.join_orders = Some(join_orders);

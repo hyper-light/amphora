@@ -185,6 +185,10 @@ pub struct PrepareOptions {
     /// one weighs against its search's best (`join::keep_carried`); `None` for a first plan.
     pub(crate) carried_join_orders:
         Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): plan with the fast search, the exact search only
+    /// where its subsets fit the joins the greedy search tries (`SearchBudget::fast`), the exact
+    /// search to follow (`background_search.rs`).
+    pub(crate) fast_search: bool,
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
@@ -249,6 +253,21 @@ pub enum CarriedJoinOrders {
     Off = 0,
     /// The last plan's order stands unless the new best is cheaper past the weights' error.
     WithinMargin = 1,
+}
+
+/// Amphora (PL.8, T-PL.8.10, lane pl8-17): where a root statement's exact join search runs when
+/// it is prepared with the fast plan (`background_search.rs`). Behind this switch for the A/B:
+/// today's whole search at prepare is the control and the default, until the measurements decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundSearch {
+    /// Each statement's join search runs in full as it is prepared: the control.
+    Off = 0,
+    /// The fast plan first; the exact search on the database's planner worker, woken by each
+    /// request.
+    Worker = 1,
+    /// The fast plan first; the exact search on the connection, when its last statement in
+    /// progress ends.
+    Idle = 2,
 }
 
 /// Amphora (QT.5, T-QT.5.3): whether a star join's dimensions filter the fact table's scan with
@@ -565,6 +584,11 @@ pub struct Connection {
     pub(super) join_search_budget: AtomicJoinSearchBudget,
     /// Amphora (PL.8, lane pl8-16): `Connection::set_carried_join_orders`.
     pub(super) carried_join_orders: AtomicCarriedJoinOrders,
+    /// Amphora (PL.8, lane pl8-17): `Connection::set_background_search`.
+    pub(super) background_search: AtomicBackgroundSearch,
+    /// Amphora (PL.8, lane pl8-17): the exact searches waiting for this connection to go idle
+    /// (`BackgroundSearch::Idle`).
+    pub(crate) idle_searches: crate::background_search::IdleSearches,
     /// Amphora: see [`Connection::set_star_filters`].
     pub(super) star_filters: AtomicStarFilters,
     /// Amphora: see [`Connection::set_sorted_fetches`].
@@ -1087,6 +1111,35 @@ impl Connection {
         self.carried_join_orders.get()
     }
 
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): chooses where the exact join search of root
+    /// statements prepared from now on runs: in full at prepare (`Off`, the control), or after a
+    /// fast plan, on the database's planner worker or on this connection when it goes idle.
+    pub fn set_background_search(&self, placement: BackgroundSearch) {
+        self.background_search.set(placement);
+    }
+
+    pub(crate) fn background_search(&self) -> BackgroundSearch {
+        self.background_search.get()
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): what the database's exact searches after fast plans
+    /// came to, both placements summed.
+    pub fn background_search_stats(&self) -> crate::BackgroundSearchStats {
+        self.db.planner.counters().stats()
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): the exact searches waiting for this connection to go
+    /// idle.
+    pub fn idle_searches_pending(&self) -> usize {
+        self.idle_searches.pending()
+    }
+
+    /// Amphora (PL.8, lane pl8-17): this connection's last statement in progress ended: it runs
+    /// the exact searches waiting for it (`BackgroundSearch::Idle`).
+    pub(crate) fn went_idle(&self) {
+        self.idle_searches.run(self.db.planner.counters());
+    }
+
     /// Amphora (PL.8, T-PL.8.6, lane pl8-16): chooses the rule that moves the learned cost weights,
     /// for the coordinator's A/B (`learned_costs::WeightRule`). The weights are the database's,
     /// shared by its connections, so this moves them for every connection to it, from the rates as
@@ -1510,17 +1563,25 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let prepare_options = PrepareOptions::default();
+            // Amphora (PL.8, lane pl8-17): a root statement takes the fast plan where a placement
+            // for the exact search is chosen, and hands that search off.
+            let prepare_options = PrepareOptions {
+                fast_search: origin == StatementOrigin::Root
+                    && self.background_search() != BackgroundSearch::Off,
+                ..PrepareOptions::default()
+            };
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
 
-            Ok(Statement::new_with_origin(
+            let mut statement = Statement::new_with_origin(
                 program,
                 pager,
                 mode,
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            ))
+            );
+            statement.hand_off_exact_search();
+            Ok(statement)
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();

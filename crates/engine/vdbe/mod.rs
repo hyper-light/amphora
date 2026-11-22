@@ -1997,6 +1997,9 @@ pub struct PreparedProgram {
     /// Amphora (PL.8, lane pl8-16): the join orders the plan chose, which the statement hands to
     /// its next plan when it plans again (`Statement::reprepare`, `join::JoinOrders`).
     pub(crate) join_orders: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    /// Amphora (PL.8, lane pl8-17): the plan is a fast one the greedy search ordered, its exact
+    /// search handed off (`background_search.rs`).
+    pub(crate) fast_planned: bool,
     /// Amphora (PL.13, lane replan-5): the filter shares the plan read, so a run can tell a build
     /// stored another.
     pub planned_filters: Vec<crate::filter_shares::PlannedFilter>,

@@ -70,6 +70,8 @@ mod json;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;
+// Amphora (PL.8, lane pl8-17): the exact join search after the fast plan.
+mod background_search;
 #[cfg(feature = "percentile")]
 mod percentile;
 mod plan_cache;
@@ -139,9 +141,10 @@ pub use cdc::{
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
-    resolve_ext_path, CarriedJoinOrders, Connection, JoinMethods, JoinSearchBudget, PrepareOptions,
-    Row, StarFilters, StepResult, SymbolTable,
+    resolve_ext_path, BackgroundSearch, CarriedJoinOrders, Connection, JoinMethods,
+    JoinSearchBudget, PrepareOptions, Row, StarFilters, StepResult, SymbolTable,
 };
+pub use background_search::BackgroundSearchStats;
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use translate::optimizer::learned_costs::WeightRule;
 pub use translate::optimizer::search_budget::JoinSearchStats;
