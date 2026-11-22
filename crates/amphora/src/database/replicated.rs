@@ -5170,6 +5170,35 @@ mod tests {
             }
             panic!("no leader followed in {ROUNDS} driven rounds: {last:?}");
         }
+        /// After the leader's power cut: every member's clock moves a tick in turn, each tick's work
+        /// settling (`Driven::tick`), until every owner follows one leader, then as
+        /// [`Driven::follow`] with at least `applied` applied. Returns the leader's index. With
+        /// time standing still no single campaign settles a cut leader's group: the survivor that
+        /// heard the cut leader last refuses another's votes until its own election timer runs
+        /// out (check-quorum's lease), and the restarted member may have lost what it
+        /// acknowledged and so can't be voted in. Time moving for every member, as it does where
+        /// they run, is what ends both (CP-T1.8, AC-T1.8.5).
+        fn elect_after_cut(
+            &mut self,
+            pump: &mut Pump<'_>,
+            clients: &[Client],
+            applied: u64,
+        ) -> usize {
+            for _ in 0..ROUNDS {
+                let states: Vec<_> = clients
+                    .iter()
+                    .map(|c| c.handle().status().unwrap())
+                    .collect();
+                let leader = states.first().unwrap().leader;
+                if leader != 0 && states.iter().all(|s| s.leader == leader) {
+                    return self.follow(pump, clients, applied);
+                }
+                for owner in 0..self.owners.len() {
+                    self.tick(pump, owner);
+                }
+            }
+            panic!("no leader after the leader's cut in {ROUNDS} ticks of every member");
+        }
         /// The lead moves from owner `from` to owner `to` now (`Replica::transfer`, which no lease
         /// refuses), every clock standing still; rounds go on until every owner follows `to`.
         fn transfer(&mut self, pump: &mut Pump<'_>, clients: &[Client], from: usize, to: usize) {
@@ -6442,7 +6471,7 @@ mod tests {
             done.cuts += 1;
             pump = Pump::new(&clients);
             if victim == leader {
-                leader = driven.elect(&mut pump, &clients, (victim + 1) % 3, 1);
+                leader = driven.elect_after_cut(&mut pump, &clients, 1);
             } else {
                 // The leader ran on. A member restarted with all it had applied durable (the
                 // persisted class's) is sent no entry, so only a heartbeat tells it who leads:
