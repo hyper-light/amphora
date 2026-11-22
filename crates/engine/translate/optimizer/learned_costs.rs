@@ -310,6 +310,24 @@ impl Rate {
         }
     }
 
+    /// PL.8 (T-PL.8.2, lane pl8-22): closes a batch of single timed runs (`Sampling`) at `median`,
+    /// their median run's nanoseconds, judged as a batch mean is (`Batches::judge`). A timed run
+    /// the scheduler preempted measures the preemption, milliseconds against the run's tens of
+    /// nanoseconds, and one of those in a batch moved its mean a hundredfold: the first batch
+    /// replaces calibration's rate unjudged, so under load a hash probe's weight jumped and the
+    /// plans flipped (20 copies at once of `t_pl_8_2`, kiln run r124). The median holds while
+    /// fewer than half the runs are preempted, as calibration's samples are read
+    /// (`calibrate`, `t_qt_5_5_calibration_weights_hold_through_preempted_samples`).
+    fn close_runs(&mut self, median: f64) {
+        if !(median.is_finite() && median > 0.0) {
+            return;
+        }
+        self.current = Span::default();
+        if self.batches.judge(self.standing, median.ln()) {
+            self.standing = Some(median);
+        }
+    }
+
     /// The spread between this rate's batch means, as a logarithm's (`Batches`): None under
     /// [WeightRule::Blend], which keeps none, or before a difference was counted.
     fn spread(&self) -> Option<f64> {
@@ -479,6 +497,10 @@ struct Sampling {
     runs: AtomicU64,
     every: AtomicU64,
     spread: Mutex<Spread>,
+    /// PL.8 (T-PL.8.2, lane pl8-22): the timed runs of the batch under way, under
+    /// [WeightRule::BatchMeans]: at most an epoch's, the work calibration timed a sample of
+    /// (`Rate::close_runs`).
+    batch: Mutex<Vec<f64>>,
 }
 
 /// Welford's running mean and sum of squared deviations (Welford, "Note on a method for
@@ -509,6 +531,7 @@ impl Sampling {
             runs: AtomicU64::new(0),
             every: AtomicU64::new(1),
             spread: Mutex::new(Spread::default()),
+            batch: Mutex::new(Vec::new()),
         }
     }
 
@@ -583,18 +606,32 @@ impl LearnedCosts {
     }
 
     /// Records a timed run of `work`, one unit in `nanos`: it moves the rate, and its spread sets
-    /// how often the runs are timed.
+    /// how often the runs are timed. Under [WeightRule::BatchMeans] a batch of runs closes at its
+    /// median run (`Rate::close_runs`); under [WeightRule::Blend], the control, each run blends in.
     pub(crate) fn observe_sampled(&self, work: Work, nanos: f64) {
         if !(nanos.is_finite() && nanos >= 0.0) {
             return;
         }
+        let sampling = self.sampling(work);
         let epoch = {
             let mut rates = self.rates.lock();
             let rate = rates.rate_mut(work);
-            rate.observe(1.0, nanos);
+            match (rate.rule, sampling) {
+                (WeightRule::BatchMeans, Some(sampling)) => {
+                    let mut batch = sampling.batch.lock();
+                    batch.push(nanos);
+                    if batch.len() as f64 >= rate.epoch.max(2.0) {
+                        if let Some(median) = median(&mut batch) {
+                            rate.close_runs(median);
+                        }
+                        batch.clear();
+                    }
+                }
+                _ => rate.observe(1.0, nanos),
+            }
             rate.epoch
         };
-        if let Some(sampling) = self.sampling(work) {
+        if let Some(sampling) = sampling {
             sampling.add(nanos, epoch, self.timing_nanos);
         }
     }
@@ -645,7 +682,11 @@ impl LearnedCosts {
     /// PL.8 (T-PL.8.6, lane pl8-16): moves every weight to `rule` (`WeightRule`), from the rates as
     /// they stand.
     pub(crate) fn set_rule(&self, rule: WeightRule) {
-        self.rates.lock().switch(rule);
+        let mut rates = self.rates.lock();
+        rates.switch(rule);
+        for sampling in [&self.seek, &self.hash_build, &self.hash_probe] {
+            sampling.batch.lock().clear();
+        }
     }
 
     /// The page reads an epoch of the page read's rate holds: the most the open's anchor times
@@ -1101,6 +1142,28 @@ mod tests {
         assert_eq!(costs.weights().unwrap().seek, 125.0);
         batch(500.0);
         assert_eq!(costs.weights().unwrap().seek, 500.0);
+    }
+
+    /// Do: a first batch of seeks timed at 125 ns, two of them preempted for 4 ms, then a later
+    /// batch with a preempted run of its own. Expect: the weight at 125 throughout: a preempted run
+    /// times the scheduler, not the seek (T-PL.8.2, lane pl8-22; the mean of the first batch was
+    /// 80,122.5 ns, and a weight like it flipped the bushy plans under load in kiln run r124).
+    #[test]
+    fn t_pl_8_2_preempted_runs_move_no_weight() {
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        for i in 0..100 {
+            let nanos = if i == 17 || i == 61 {
+                4_000_000.0
+            } else {
+                125.0
+            };
+            costs.observe_sampled(Work::Seek, nanos);
+        }
+        assert_eq!(costs.weights().unwrap().seek, 125.0);
+        for i in 0..300 {
+            costs.observe_sampled(Work::Seek, if i == 150 { 4_000_000.0 } else { 125.0 });
+        }
+        assert_eq!(costs.weights().unwrap().seek, 125.0);
     }
 
     /// Do: a first batch, then a second far from it. Expect: the second holds: one batch mean
