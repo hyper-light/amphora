@@ -1069,7 +1069,7 @@ mod tests {
     use amphora_api::blobs::Blobs;
 
     use super::*;
-    use crate::backup::{Archive, CheckPolicy, FolderBlobs, SECOND_NS};
+    use crate::backup::{Archive, CheckPolicy, FolderBlobs, MICRO_NS, SECOND_NS};
     use crate::store::Moved;
     use crate::xgroup::sql::record_key;
     use crate::xgroup::{Answer, Cluster, Protocol, Txn, Why};
@@ -1216,13 +1216,21 @@ mod tests {
     }
 
     /// T-T1.9.R22 (CP-T1.9; reshard.md, "Decision (lane split-merge-19): the read point, A/B").
-    /// Do: two backed-up groups, the second's clock 500 seconds behind the first's; a row written
-    /// in the first; the changes across them read at the earliest point, then at the latest; then
-    /// a row written in each group, and read again from each read's head. Expect: the earliest
-    /// misses the row (the slow group's stamp is the cut, 500 seconds before the row's) and its
-    /// head is behind the row's stamp; the latest holds it; after its head, the latest point finds
-    /// both later rows (its cut is closed); the earliest never answers a change at or before a
-    /// head it answered, nor a head behind one.
+    /// Do: two backed-up groups, the second's clock 500 seconds behind the first's, the one clock
+    /// moving a microsecond (the cross-group stamps' unit) at each read; a row written in the
+    /// first; the changes across them read at the earliest point, then at the latest; then a row
+    /// written in each group, and read again from each read's head. Expect: the earliest misses
+    /// the row (the slow group's stamp is the cut: its own clock, or the first's as the
+    /// coordinator's opening steps carried it in, the hybrid logical clock's receive rule, either
+    /// way before the row's) and its head is behind the row's stamp; the latest holds it; after
+    /// its head, the latest point finds both later rows (its cut is closed); the earliest never
+    /// answers a change at or before a head it answered, nor a head behind one.
+    ///
+    /// The clock moves a microsecond a read, not a nanosecond (lane split-merge-25): stamps are
+    /// microseconds since T-T1.9.R28, and a clock that moves less than one between reads leaves
+    /// every stamp to the logical count, so the slow group, carried to the first's stamp when the
+    /// coordinator opened, counts up to the row's stamp on its own and the earliest cut rightly
+    /// holds the row ("until the slowest group's clock passes its stamp", [`ReadPoint::Earliest`]).
     #[test]
     fn t_t1_9_r22_the_read_points_a_write_answered_before_a_read() {
         let dir = tempfile::tempdir().unwrap();
@@ -1234,7 +1242,7 @@ mod tests {
             |group| {
                 let read = Arc::clone(&now);
                 let behind = group * 500 * SECOND_NS;
-                Arc::new(move || read.fetch_add(1, Ordering::SeqCst) - behind)
+                Arc::new(move || read.fetch_add(MICRO_NS, Ordering::SeqCst) - behind)
             },
             Arc::new(|_: &[u8]| 0),
         );
