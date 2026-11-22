@@ -19,7 +19,10 @@
 # extrapolated from the counts that system already ran and checked against the host (memory, open
 # files, threads); one that doesn't fit is refused with exit 2, saying why. PostgreSQL's
 # shared_buffers and work_mem are sized to fit beside its backends (bench/commits_fit.py), and the
-# settings are in its record (`engine`) and in <dir>/<writers>/postgres/sizing.json.
+# settings are in its record (`engine`) and in <dir>/<writers>/postgres/sizing.json. The records
+# also go to <dir>/records.jsonl, and at the end bench/commits_verdict.py reads them: each count's
+# systems side by side, Amphora's storages over SQLite's and PostgreSQL's rates, and AC-T1.3.2 to
+# AC-T1.3.5's bars at 32 writers; it refuses records of another platform or driver (exit 2).
 #
 # usage: bench/commits.sh <amphora-bench binary> <dir on the disk under test> <commits> [writers...]
 #   PG_BIN  the directory of PostgreSQL's initdb and pg_ctl (default: `pg_config --bindir`)
@@ -58,12 +61,13 @@ platform=$(printf '{"host":"%s","kernel":"%s","fs":"%s","device":"%s","dir":"%s"
 ulimit -n "$(ulimit -Hn)" 2> /dev/null || true
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 learned="$dir/learned.jsonl"
-rm -f "$learned"
+records="$dir/records.jsonl"
+rm -f "$learned" "$records"
 
 # Runs the driver with --hold, reads what it holds at its last commit (its open files, PostgreSQL's
 # memory), then prints its record with the platform and the client's resources beside it.
 measure() {
-  python3 -I "$here/commits_fit.py" measure "$learned" "$platform" "$@"
+  python3 -I "$here/commits_fit.py" measure "$learned" "$platform" "$@" | tee -a "$records"
 }
 
 # Refuses a count that doesn't fit (exit 2, why on stderr); its JSON verdict otherwise.
@@ -133,3 +137,6 @@ for writers in $ladder; do
     esac
   done
 done
+
+python3 -I "$here/commits_verdict.py" "$records" | tee "$dir/verdict.txt"
+exit "${PIPESTATUS[0]}"

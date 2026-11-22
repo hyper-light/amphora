@@ -239,6 +239,7 @@ def measure(learned, platform, server_pid_file, cmd, system):
     r = json.loads(stdout.decode())
     rss = use.ru_maxrss * (1 if sys.platform == "darwin" else 1024)
     cpu = use.ru_utime + use.ru_stime
+    r["system"] = system
     r["platform"] = platform
     r["client"] = {
         "driver": r.get("client"),
