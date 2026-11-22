@@ -2381,3 +2381,37 @@ another collation, or keys whose affinities differ, aren't counted as ordered he
 operator must sort them in the equality's terms. To be measured once the operator lands: merge
 against hash over the concurrency ladder, ordered and unordered inputs, builds that fit and that
 spill.
+
+## Decision (lane qs5-21): a sort-merge join is the hash join with its rows merged by key, behind a switch
+
+**Decision.** QT.5 step 4, T-QT.5.18. A sort-merge join is a method of the hash join
+(`HashJoinMethod::Merge` on `HashJoinOp` and `AccessMethodParams::HashJoin`), not a new
+`Operation`: it runs through the hash join's instructions, its table (`HashTable::set_merge`) taking
+the build rows as any hash table does. Once the build is done, the rows' positions are sorted by key
+in place (SQLite's order: NULL, numbers by value, text by the key's collation, blobs by their
+bytes). A probe key at or past the previous one merges forward from that key's run, so a probe read
+in key order passes each build row once and a repeated key replays its run with no buffer; a key
+before it finds its run by binary search. The planner takes a merge only under the switch:
+`JoinMethods::MergeJoinsOnly` (always, for the differential tests) or `JoinMethods::ByCostWithMerge`
+(where `estimate_merge_join_cost` is below the hash join's). `ByCost`, the default, never does, so no
+plan changes until the measurement below says so. The parallel path takes only hash joins.
+
+**Why.** Every hash-join site that only cares about the build and probe structure (the open, close
+and init paths, the outer join's unmatched rows, the semi join's first match, the Bloom filter, the
+spill) stays one code path for both methods, so a merge gives every join type's answer the hash
+join gives. The sort is in place with no buffer, and its positions are counted in the table's
+memory: a table whose order would pass its budget, or that spilled, is probed by hash, counted.
+
+**Evidence.** `hash_table::tests::qt_5_18_merge_table_finds_what_the_hash_table_finds` (the same
+rows, with repeats, NULL, 1 and 1.0, text and a blob, probed in key order and out of it, give the
+hash table's matches and unmatched rows; ordered probes merge, the others search);
+`tests/join_methods.rs` under `MergeJoinsOnly` and `ByCostWithMerge` (T-QT.5.1's random joins, the
+star joins' filters, T-QT.5.17's edge cases). Counters: `HashJoinMetrics::merge_steps`,
+`merge_searches`, `merge_tables_hashed`.
+
+**Limits.** The build rows still go in by hash, and a build already in key order is still sorted
+(an in-place sort of ordered input costs about a comparison a row); a probe out of key order pays a
+binary search a row, where the cost function charges it a sort. A merge that spills is a hash join:
+the sort-merge's own spill (sorted runs merged) is not built. To be measured, against the hash join,
+over the concurrency ladder: probes in key order and not, builds already ordered and not, and builds
+that fit and that pass the statement's memory.
