@@ -2667,7 +2667,9 @@ its outgoing queue, as it already rings `drain_wait`'s condition, and when it en
 member that went. The bench gives every member the same bell, and `stop` rings it too. Lane scaleout-harness-9 wrote
 the same hook for `scale.rs`'s relay; lane ryw-5 made the two one (`listen`, which `on_sent` had been). The bell
 keeps a ring given while the relay is moving records, so no record waits for a later ring. A member's records have
-one host to take them, so a waker given again replaces the one before.
+one host to take them, so a waker given again replaces the one before. Each pass drains a member's whole queue:
+`drain` at `ReplicaHandle::outgoing_bound`, the most records the queue holds before its owner fences, where the relay
+drained a picked 4096 before (lane ryw-6, tested by `a_drain_at_the_queues_bound_takes_the_whole_queue`).
 `amphora_ryw`'s records now carry `relay`: its kind (`Bell` or `Park`), its passes, records moved, waits and the
 wakes that found nothing to move.
 
@@ -2683,15 +2685,19 @@ before, and each listener in place is woken again as its owner goes.
 Before its first write the bench needs its group's leader, and it used to find one by trying the schema every 10ms
 until a call went through. Lane ryw-5 (2026-11-22) makes it wait instead on what the member's owner publishes.
 `ReplicaHandle::wait_leader(past, until)` answers the member's status once it names a leader in a term past `past`
-(0 for any leader). The owner tells that wait whenever a step publishes another leader or term, and when it ends or
-its owner is dropped, so nothing waits on a timer and an owner that's gone is never waited on to the deadline. The
+(0 for any leader). The owner tells that wait whenever a step publishes another leader, term or fence, and when it
+ends or is dropped mid-run, so nothing waits on a timer and an owner that's gone is never waited on to the deadline.
+That is the one leader wait and its one wake: lane ryw-6 (2026-11-22) folded in production-5's `wait_leader(until)`
+for serve's `leader WAIT_MS` request (CP-T1.13), which asks for any leader (`past` 0) and needed the fence's wake. The
 bench's `schema_on` waits for any leader and calls. If the lead's move refused the call (`NotLeader`,
 `UnknownOutcome`, `Unavailable`), it waits for a leader of a later term than the one it called under and calls
 again. That is safe because the schema is `IF NOT EXISTS`. Any other refusal, or the deadline, ends the bench and
 names the refusal. Tested by `a_host_waits_for_a_leader_on_the_owners_word` (crates/amphora/src/database/replicated.rs):
 with no leader and no time left the wait is refused Timeout. A waiter for any leader gets the one elected, with its
 term, and with no later term and no time left the wait is refused Timeout again. A waiter past that term gets the
-member the lead moved to, in a later term. A waiter on an owner dropped mid-run is refused Fenced.
+member the lead moved to, in a later term. A waiter on an owner dropped mid-run is refused Fenced. A lone voter's
+waiter is refused Fenced with the failed flush when its disk fills and that fence ends its owner. A status that
+differs from the one published only in its fence wakes the waiters; one that differs only in what it applied doesn't.
 
 ### Evidence
 
