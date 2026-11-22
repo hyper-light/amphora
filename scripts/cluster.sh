@@ -7,6 +7,7 @@
 # usage: scripts/cluster.sh install --bin BIN --class persisted|replicated --deadline-ms MS
 #                                    [--spanning N] [--drills on|off] [--service auto|none]
 #                                    [--spare HOST4:PORT] [--tls DIR|issue] [--cert-days DAYS]
+#                                    [--authority-days DAYS]
 #                                    HOST1:PORT HOST2:PORT HOST3:PORT
 #        scripts/cluster.sh renew --cert-days DAYS --within-days W HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]
 #        scripts/cluster.sh health HOST:PORT N        (member N's host asks every member)
@@ -30,6 +31,8 @@
 #               authority on this machine once, in ~/.config/amphora/authority (its key never leaves
 #               it; a later install reuses it), and issues each member a certificate naming its
 #               host, with a fresh key, for --cert-days DAYS. Needs openssl (or LibreSSL).
+#               The install that makes the authority needs --authority-days DAYS, how long it signs
+#               for: past every certificate `renew` will issue from it.
 #   renew       each member whose certificate expires within W days (or already has) gets a new one
 #               from the authority on this machine (the one install made; renew never makes one),
 #               with a fresh key, for DAYS; the files are replaced on its host (each written beside
@@ -54,7 +57,7 @@ put() { # put HOST LOCAL REMOTE_DIR NAME
 # both OpenSSL and LibreSSL make. Certificates name serverAuth and clientAuth, as each member both
 # listens and dials. No key is printed.
 issue() {
-  local days=$1 out=$2; shift 2
+  local days=$1 out=$2 adays=$3; shift 3
   command -v openssl >/dev/null || die "issuing certificates needs openssl (or give --tls DIR)"
   local auth; auth=$(eval echo "$CONF")/authority
   (umask 077; mkdir -p "$auth" "$out")
@@ -63,9 +66,10 @@ issue() {
     'basicConstraints = critical, CA:TRUE' 'keyUsage = critical, keyCertSign, cRLSign' \
     'subjectKeyIdentifier = hash' >"$cnf"
   if [[ ! -f $auth/roots.pem || ! -f $auth/authority.key ]]; then
+    [[ -n $adays ]] || die "making the cluster's authority needs --authority-days DAYS (past every certificate renew will issue)"
     (umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$auth/authority.key" 2>/dev/null)
     openssl req -x509 -new -key "$auth/authority.key" -subj "/CN=amphora cluster authority" \
-      -days "$days" -sha256 -config "$cnf" -extensions authority -out "$auth/roots.pem"
+      -days "$adays" -sha256 -config "$cnf" -extensions authority -out "$auth/roots.pem"
     echo "made the cluster's authority in $auth: keep it; its key never leaves this machine" >&2
   fi
   cp "$auth/roots.pem" "$out/roots.pem"
@@ -88,12 +92,13 @@ issue() {
 }
 
 install() {
-  local bin='' class='' deadline='' spanning='' drills=off service=auto spare='' tls='' days='' addrs=()
+  local bin='' class='' deadline='' spanning='' drills=off service=auto spare='' tls='' days='' adays='' addrs=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --bin) bin=$2; shift 2 ;; --class) class=$2; shift 2 ;; --deadline-ms) deadline=$2; shift 2 ;;
       --spanning) spanning=$2; shift 2 ;; --drills) drills=$2; shift 2 ;; --service) service=$2; shift 2 ;;
       --spare) spare=$2; shift 2 ;; --tls) tls=$2; shift 2 ;; --cert-days) days=$2; shift 2 ;;
+      --authority-days) adays=$2; shift 2 ;;
       --*) die "unknown flag $1" ;; *) addrs+=("$1"); shift ;;
     esac
   done
@@ -112,10 +117,10 @@ install() {
   [[ -z $tls && $service == auto ]] && tls=issue
   if [[ $tls == issue ]]; then
     [[ -n $days ]] || die "issuing certificates needs --cert-days DAYS (or give --tls DIR)"
-    issue "$days" "$work/tls" "${addrs[@]}"
+    issue "$days" "$work/tls" "$adays" "${addrs[@]}"
     tls=$work/tls
-  elif [[ -n $days ]]; then
-    die "--cert-days is for the certificates the script issues (--tls issue), not --tls DIR's"
+  elif [[ -n $days || -n $adays ]]; then
+    die "--cert-days and --authority-days are for the certificates the script issues (--tls issue), not --tls DIR's"
   fi
   if [[ -n $tls ]]; then
     [[ -f $tls/roots.pem ]] || die "--tls $tls: no roots.pem"
@@ -228,7 +233,7 @@ renew() {
     fi
   done
   [[ ${#due[@]} -gt 0 ]] || { echo "no certificate expires within $within days" >&2; return 0; }
-  issue "$days" "$work/tls" "${addrs[@]}"
+  issue "$days" "$work/tls" '' "${addrs[@]}"
   local failed=0
   for n in "${due[@]}"; do
     host=${addrs[$((n - 1))]%:*}
@@ -273,5 +278,5 @@ EOF
 cmd=${1:-}; shift || true
 case "$cmd" in
   install) install "$@" ;; renew) renew "$@" ;; health) health "$@" ;; uninstall) uninstall "$@" ;;
-  *) sed -n '2,39p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,42p' "$0" >&2; exit 2 ;;
 esac

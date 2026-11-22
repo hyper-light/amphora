@@ -23,7 +23,7 @@ Nothing here touches kiln: the binary goes to `~/.local/lib/amphora/amphora`, co
 
 ```sh
 scripts/cluster.sh install --bin target/release/amphora --class persisted --deadline-ms MS \
-  --cert-days DAYS [--drills on] [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
+  --cert-days DAYS --authority-days ADAYS [--drills on] [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
 ```
 
 - `--class persisted`: a write is answered once a majority of members hold it on disk.
@@ -49,7 +49,8 @@ scripts/cluster.sh install --bin target/release/amphora --class persisted --dead
   it makes the cluster's authority on the machine you run it on, once, in
   `~/.config/amphora/authority/` (`roots.pem` and `authority.key`, the key readable by you only,
   and never copied off that machine), and gives each member a certificate naming its host (an IP
-  address or a DNS name, as you wrote it) with a key of its own, valid `--cert-days DAYS`. Keys
+  address or a DNS name, as you wrote it) with a key of its own, valid `--cert-days DAYS`; the authority is valid `--authority-days
+  ADAYS`, given to the install that makes it, past every certificate `renew` will issue. Keys
   are ECDSA P-256 signed with SHA-256. Each member's key is made for it, copied to it and removed
   from the machine you ran the script on. A later install (a spare, a member replaced, renewed
   certificates) reuses the authority, so members already running still trust the new ones; keep
@@ -176,7 +177,7 @@ deployment has one.
 ## What isn't done
 
 - `cluster.sh renew` renews members' certificates, run from a timer you set up; the authority's
-  own certificate is valid for the `--cert-days` of the install that made it, and renewing it is a
+  own certificate is valid for the `--authority-days` of the install that made it, and renewing it is a
   new install. Nothing revokes a member's certificate: replace the authority (remove
   `~/.config/amphora/authority/` and install again) to stop trusting one. Links open before a
   renewal keep their session until they close.
