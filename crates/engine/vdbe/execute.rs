@@ -1379,15 +1379,17 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
-    // Only the main database's trees are on the versioned storage: a temp or attached database's
-    // tables stay on its own pager, their root pages its pages (G7 step 2, `AC-NS.2.1`).
-    if let Some(switch) = program
-        .connection
-        .versioned
-        .as_ref()
-        .filter(|_| *db == MAIN_DB_ID)
-    {
-        if let Some(cursor) = versioned_cursor(switch, cursor_type, *root_page, &pager)? {
+    // The main database's trees are on its versioned storage and an attached database's on its
+    // own; a temp database's tables stay on its pager, their root pages its pages (G7 step 2,
+    // `AC-NS.2.1`).
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        if let Some(cursor) = versioned_cursor(
+            &program.connection,
+            &switch,
+            cursor_type,
+            *root_page,
+            &pager,
+        )? {
             replace_cursor(&mut state.cursors, *cursor_id, cursor)?;
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -1917,7 +1919,7 @@ pub fn op_rewind(
             .filter(|walk| walk.phase != crate::skipping::WalkPhase::Idle)
         {
             let on_row = state.pc + 1;
-            return skip_walk_step(state, walk, pc_if_empty.as_offset_int(), on_row);
+            return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
         }
     }
     // Clear any bloom filter associated with this cursor so stale filter data
@@ -1946,7 +1948,7 @@ pub fn op_rewind(
         if !program.skip_hints.is_empty() {
             if let Some(walk) = skip_walk_for(program, state, *cursor_id) {
                 let on_row = state.pc + 1;
-                return skip_walk_step(state, walk, pc_if_empty.as_offset_int(), on_row);
+                return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
             }
         }
         // Rewind positions to the first row, which is effectively a read
@@ -1991,8 +1993,11 @@ fn skip_walk_for(
         _ => None,
     })?;
     let (reader_pos, committed) = conn.skipping_positions()?;
-    let candidates = registry
-        .candidates(
+    let writes = registry.counts(root).map(|counts| counts.writes);
+    // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
+    let started = std::time::Instant::now();
+    let (candidates, method) = registry
+        .candidates_by(
             root,
             conn.skipping_id(),
             reader_pos,
@@ -2001,12 +2006,82 @@ fn skip_walk_for(
             bounds.hi,
         )
         .ok()?;
-    crate::skipping::SkipWalk::new(cursor_id, candidates)
+    // Lane skip-5 (T-SKU.5): a method dropped for its upkeep whose trial is due is built again
+    // now, at the snapshot the summary just answered (so it holds what the summary holds).
+    if let Some(method) = registry.rebuild_due(root) {
+        skipping_rebuild(program, cursor_id, root, column, method, writes);
+    }
+    let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
+    walk.measure = method.map(|method| crate::skipping::WalkMeasure {
+        root,
+        method,
+        started,
+    });
+    Some(walk)
+}
+
+/// Lane skip-5 (T-SKU.5): builds a measured summary's dropped method again for its trial: zone
+/// maps from the cracker in memory, the cracker from the table's B-tree (a read of every row,
+/// timed: its cost to build). A build that fails, or a write that came in during it, leaves the
+/// method dropped: the leader keeps answering, and the next trial tries again.
+fn skipping_rebuild(
+    program: &Program,
+    cursor_id: crate::vdbe::CursorID,
+    root: i64,
+    column: usize,
+    method: crate::skipping::SkipMethod,
+    writes: Option<u64>,
+) {
+    let registry = &program.connection.db.skipping;
+    let origin = std::time::Instant::now();
+    match method {
+        crate::skipping::SkipMethod::ZoneMaps => {
+            registry.rebuild_zones(root, &mut || crate::skipping::nanos_since(origin))
+        }
+        crate::skipping::SkipMethod::Cracking => {
+            let (Some(writes), Some((_, super::builder::CursorType::BTreeTable(table)))) =
+                (writes, program.cursor_ref.get(cursor_id))
+            else {
+                return;
+            };
+            let built = crate::skipping::cracker_of_table(
+                program.connection.get_pager(),
+                root,
+                column,
+                table.columns().len(),
+            );
+            match built {
+                Ok(cracker) => {
+                    let cost = crate::skipping::nanos_since(origin);
+                    if !registry.install_cracker(root, writes, cracker, cost) {
+                        tracing::debug!(target: "amphora.skipping", root, "cracker built again was refused: a write came in during the build");
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not be built again")
+                }
+            }
+        }
+    }
+}
+
+/// Lane skip-3 (T-SKU.2): a measured scan's end hands its cost (nanoseconds from asking for its
+/// candidates) to the summary's chooser, once. A scan stopped early (a LIMIT) hands back nothing.
+fn skip_walk_ended(program: &Program, walk: &mut crate::skipping::SkipWalk) {
+    if let Some(measure) = walk.measure.take() {
+        let cost = u64::try_from(measure.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        program
+            .connection
+            .db
+            .skipping
+            .record_cost(measure.root, measure.method, cost);
+    }
 }
 
 /// Moves a skipping scan's cursor to its next candidate row (`on_row`) or ends it (`on_end`),
 /// keeping the walk across an I/O wait.
 fn skip_walk_step(
+    program: &Program,
     state: &mut ProgramState,
     mut walk: crate::skipping::SkipWalk,
     on_end: crate::vdbe::InsnReference,
@@ -2019,6 +2094,9 @@ fn skip_walk_step(
     };
     state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(seeks);
     state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(seeks);
+    if matches!(moved, Ok(crate::types::IOResult::Done(false))) {
+        skip_walk_ended(program, &mut walk);
+    }
     state.skip_walks.put(walk);
     match moved? {
         crate::types::IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
@@ -2089,6 +2167,24 @@ fn skip_settle(
                 CursorStep::IO(io) => return Ok(IOResult::IO(io)),
             },
         }
+    }
+}
+
+/// A fused run's rows past the one its Next stepped onto, counted as that many Next steps.
+fn record_fused_rows(state: &mut ProgramState, rows: usize, fullscan: bool, is_index: bool) {
+    if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
+        let skipped = skipped as u64;
+        state.record_rows_read(skipped);
+        state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
+        state.metrics.search_count = state.metrics.search_count.wrapping_add(skipped as i64);
+        state.metrics.fullscan_steps = state
+            .metrics
+            .fullscan_steps
+            .wrapping_add(fullscan as u64 * skipped);
+        state.metrics.index_steps = state
+            .metrics
+            .index_steps
+            .wrapping_add(is_index as u64 * skipped);
     }
 }
 
@@ -2316,6 +2412,34 @@ fn op_column_fetch(
             let content_reg = pseudo.content_reg();
             return op_column_fetch_pseudo(state, content_reg, column, dest);
         }
+        Some(Some(Cursor::Dyn(dyn_cursor, ..))) => {
+            // Amphora (QT.7 on the versioned storage, G7 step 2): a versioned table cursor's
+            // column comes from its leaf copy's batch, as the pager's does from its leaf's.
+            let versioned = (dyn_cursor.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<crate::storage::versioned::cursor::VersionedCursor>();
+            if let (Some(plan), Some(versioned)) = (program.leaf_batch_plan.as_deref(), versioned) {
+                let dest_reg = state
+                    .registers
+                    .get_mut(dest)
+                    .ok_or_else(|| register_out_of_range("Column", dest))?;
+                match super::leaf_batch::serve_column(
+                    &mut state.leaf_batches,
+                    plan,
+                    cursor_id,
+                    super::leaf_batch::ScanCursor::Versioned(versioned),
+                    column,
+                    dest_reg,
+                )? {
+                    super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
+                    super::leaf_batch::Served::PastEnd => {
+                        apply_column_default(default, dest_reg)?;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    super::leaf_batch::Served::RowAtATime => {}
+                }
+            }
+            return op_column_fetch_other(program, state, cursor_id, column, dest, default);
+        }
         Some(_) => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
         None => return Err(cursor_out_of_range("Column", cursor_id).into()),
     };
@@ -2330,7 +2454,7 @@ fn op_column_fetch(
             &mut state.leaf_batches,
             plan,
             cursor_id,
-            cursor,
+            super::leaf_batch::ScanCursor::Pager(cursor),
             column,
             dest_reg,
         )? {
@@ -2576,7 +2700,7 @@ fn op_column_range_fetch(
                 &mut state.leaf_batches,
                 plan,
                 cursor_id,
-                cursor,
+                super::leaf_batch::ScanCursor::Pager(cursor),
                 column,
                 reg,
             )? {
@@ -3784,7 +3908,9 @@ pub fn op_next(
         insn
     );
     // Amphora (G5 step 4, T-G5.4.3): a scan skipping by a summary steps, then seeks past the rows
-    // its candidates leave out (its body runs row by row: no fused batch).
+    // its candidates leave out. Lane skip-5 (T-SKU.4): on a candidate row, a fused loop's body
+    // runs over the batch up to the candidate run's end, as an unskipped scan's does to the
+    // batch's end.
     if !state.skip_walks.is_empty() {
         if let Some(mut walk) = state.skip_walks.take(*cursor_id) {
             if walk.phase == crate::skipping::WalkPhase::Idle {
@@ -3792,6 +3918,7 @@ pub fn op_next(
                 match step {
                     CursorStep::Row => walk.phase = crate::skipping::WalkPhase::Settle,
                     CursorStep::Empty => {
+                        skip_walk_ended(program, &mut walk);
                         state.skip_walks.put(walk);
                         state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
@@ -3806,8 +3933,24 @@ pub fn op_next(
                     }
                 }
             }
-            let on_end = state.pc + 1;
-            return skip_walk_step(state, walk, on_end, pc_if_next.as_offset_int());
+            let next_pc = state.pc;
+            let on_end = next_pc + 1;
+            let stepped = skip_walk_step(program, state, walk, on_end, pc_if_next.as_offset_int())?;
+            if state.pc == pc_if_next.as_offset_int() {
+                let fused = program
+                    .leaf_batch_plan
+                    .as_deref()
+                    .and_then(|plan| plan.fused_loop(next_pc as usize));
+                if let Some((fused, until)) = fused.zip(state.skip_walks.run_end(*cursor_id)) {
+                    let rows =
+                        super::leaf_batch::fused::run(program, state, fused, pager, Some(until))?;
+                    record_fused_rows(state, rows, *fullscan, *is_index);
+                    if rows > 0 {
+                        state.pc = next_pc;
+                    }
+                }
+            }
+            return Ok(stepped);
         }
     }
     let is_empty = {
@@ -3843,22 +3986,8 @@ pub fn op_next(
             .as_deref()
             .and_then(|plan| plan.fused_loop(next_pc as usize))
         {
-            let rows = super::leaf_batch::fused::run(program, state, fused, pager)?;
-            if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
-                let skipped = skipped as u64;
-                state.record_rows_read(skipped);
-                state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
-                state.metrics.search_count =
-                    state.metrics.search_count.wrapping_add(skipped as i64);
-                state.metrics.fullscan_steps = state
-                    .metrics
-                    .fullscan_steps
-                    .wrapping_add(*fullscan as u64 * skipped);
-                state.metrics.index_steps = state
-                    .metrics
-                    .index_steps
-                    .wrapping_add(*is_index as u64 * skipped);
-            }
+            let rows = super::leaf_batch::fused::run(program, state, fused, pager, None)?;
+            record_fused_rows(state, rows, *fullscan, *is_index);
             if rows > 0 {
                 state.pc = next_pc;
             }
@@ -5815,9 +5944,7 @@ pub fn op_savepoint(
                         return Err(mirror_err);
                     }
                     conn.push_named_savepoint(frame);
-                    if let Some(switch) = conn.versioned.as_ref() {
-                        switch.push_named(name)?;
-                    }
+                    conn.each_versioned(|switch| switch.push_named(name))?;
                     if starts_transaction {
                         turso_assert!(
                             !conn.tx_is_poisoned(),
@@ -5854,9 +5981,10 @@ pub fn op_savepoint(
                 }
                 SavepointResult::Release => {
                     let _ = conn.release_named_savepoint_frame(name);
-                    if let Some(switch) = conn.versioned.as_ref() {
+                    conn.each_versioned(|switch| {
                         switch.release_named(name);
-                    }
+                        Ok(())
+                    })?;
                     mirror_named_savepoint_to_active_non_main_databases(
                         &conn,
                         SavepointMirror::Release(name),
@@ -5891,9 +6019,7 @@ pub fn op_savepoint(
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
             };
             let frame_info = conn.rollback_named_savepoint_frame(name);
-            if let Some(switch) = conn.versioned.as_ref() {
-                switch.rollback_named(name)?;
-            }
+            conn.each_versioned(|switch| switch.rollback_named(name))?;
             mirror_named_savepoint_to_active_non_main_databases(
                 &conn,
                 SavepointMirror::Rollback(name),
@@ -12834,7 +12960,16 @@ fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite)
     let registry = &program.connection.db.skipping;
     match program.connection.skipping_positions() {
         Some((_, committed)) => {
-            registry.on_write(root, program.connection.skipping_id(), committed, write)
+            // Lane skip-5 (T-SKU.5): each measured summary's write upkeep is timed.
+            let origin = std::time::Instant::now();
+            let mut now = || crate::skipping::nanos_since(origin);
+            registry.on_write(
+                root,
+                program.connection.skipping_id(),
+                committed,
+                write,
+                &mut now,
+            )
         }
         None => registry.mark_stale(root),
     }
@@ -14204,6 +14339,7 @@ pub fn op_offset_limit(
 /// Amphora (G7 step 2, `AC-NS.2.1`): with the connection's switch on, the cursor on the versioned
 /// storage's tree at `root_page` for a table or an index; `None` for a cursor of another kind.
 fn versioned_cursor(
+    conn: &Arc<Connection>,
     switch: &crate::storage::versioned::switch::Switch,
     cursor_type: &CursorType,
     root_page: i64,
@@ -14223,7 +14359,9 @@ fn versioned_cursor(
         CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
         _ => return Ok(None),
     };
-    let cursor = switch.cursor(root_page, index, pager.clone())?;
+    let cursor = switch
+        .cursor(root_page, index, pager.clone())?
+        .watched_by(conn);
     Ok(Some(Cursor::new_btree_dyn(Box::new(cursor))))
 }
 
@@ -14322,14 +14460,11 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        // The main database's trees only, as in `op_open_read`.
-        if let Some(switch) = program
-            .connection
-            .versioned
-            .as_ref()
-            .filter(|_| *db == MAIN_DB_ID)
-        {
-            if let Some(cursor) = versioned_cursor(switch, cursor_type, root_page, &pager)? {
+        // By database, as in `op_open_read`.
+        if let Some(switch) = program.connection.versioned_for(*db) {
+            if let Some(cursor) =
+                versioned_cursor(&program.connection, &switch, cursor_type, root_page, &pager)?
+            {
                 replace_cursor(cursors, *cursor_id, cursor)?;
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -14515,12 +14650,10 @@ pub fn op_create_btree(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
-    if let Some(switch) = program.connection.versioned.as_ref() {
-        if *db == crate::MAIN_DB_ID {
-            state.registers[*root].set_int(switch.make_tree(flags.is_table())?);
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        state.registers[*root].set_int(switch.make_tree(flags.is_table())?);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     let mv_store = program.connection.mv_store_for_db(*db);
 
@@ -14706,14 +14839,12 @@ pub fn op_destroy(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    if let Some(switch) = program.connection.versioned.as_ref() {
-        if *db == MAIN_DB_ID {
-            // No tree moves into the dropped one's place: the storage keeps no autovacuum.
-            switch.drop_tree(*root)?;
-            state.registers[*former_root_reg].set_int(0);
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        // No tree moves into the dropped one's place: the storage keeps no autovacuum.
+        switch.drop_tree(*root)?;
+        state.registers[*former_root_reg].set_int(0);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
 
     let destroy_pager = if *db != MAIN_DB_ID {
@@ -14774,22 +14905,25 @@ fn op_clear_btree_inner(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(ClearBtree { db, root, count }, insn);
-    if let Some(switch) = program.connection.versioned.as_ref() {
-        if *db == MAIN_DB_ID {
-            let removed_entries = switch.clear(*root, pager.clone())?;
-            match count {
-                ClearBtreeCount::Nothing => {}
-                ClearBtreeCount::RowsWritten => state.record_rows_written(removed_entries),
-                ClearBtreeCount::ChangesAndRowsWritten => {
-                    let changes =
-                        i64::try_from(removed_entries).map_err(|_| LimboError::IntegerOverflow)?;
-                    state.record_statement_changes(changes);
-                    state.record_rows_written(removed_entries);
-                }
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        let clear_pager = if *db == MAIN_DB_ID {
+            pager.clone()
+        } else {
+            program.get_pager_from_database_index(db)?
+        };
+        let removed_entries = switch.clear(*root, clear_pager)?;
+        match count {
+            ClearBtreeCount::Nothing => {}
+            ClearBtreeCount::RowsWritten => state.record_rows_written(removed_entries),
+            ClearBtreeCount::ChangesAndRowsWritten => {
+                let changes =
+                    i64::try_from(removed_entries).map_err(|_| LimboError::IntegerOverflow)?;
+                state.record_statement_changes(changes);
+                state.record_rows_written(removed_entries);
             }
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
         }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
 
     let mv_store = program.connection.mv_store_for_db(*db);
@@ -17211,6 +17345,28 @@ pub fn op_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Amphora (lane skip-5, T-SKU.6): [Insn::SetSkipping], the summary built from the rows the
+/// table holds when the statement runs (a statement prepared before they loaded still skips them).
+pub fn op_set_skipping(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        SetSkipping {
+            table,
+            column,
+            kind,
+        },
+        insn
+    );
+    crate::skipping::set_skipping(&program.connection, table, column, *kind)
+        .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Amphora (PL.7, T-PL.7.1): [Insn::TreePages], the walk [Insn::Count] makes, its pages kept.
 pub fn op_tree_pages(
     program: &Program,
@@ -17292,23 +17448,21 @@ pub fn op_integrity_check(
         message_register,
     } = data.as_ref();
 
-    // Amphora (G7 step 2, `AC-NS.2.1`): the main database's trees on the versioned storage are
-    // checked there; the pager's pages hold none of them.
-    if *db == MAIN_DB_ID {
-        if let Some(switch) = program.connection.versioned.as_ref() {
-            let found = switch.check(roots, *max_errors)?;
-            let register = state
-                .registers
-                .get_mut(*message_register)
-                .ok_or_else(|| LimboError::InternalError("integrity_check: no register".into()))?;
-            if found.is_empty() {
-                register.set_null();
-            } else {
-                register.set_text(Text::new(found.join("\n")))?;
-            }
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
+    // Amphora (G7 step 2, `AC-NS.2.1`): the trees on a versioned storage (the main database's or
+    // an attached one's) are checked there; the pager's pages hold none of them.
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        let found = switch.check(roots, *max_errors)?;
+        let register = state
+            .registers
+            .get_mut(*message_register)
+            .ok_or_else(|| LimboError::InternalError("integrity_check: no register".into()))?;
+        if found.is_empty() {
+            register.set_null();
+        } else {
+            register.set_text(Text::new(found.join("\n")))?;
         }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
@@ -21248,7 +21402,8 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        TableAggregate, TableBuild, TableJoinAggregate, TableJoinRows, TableSource,
+        JoinStage, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
+        TableJoinAggregate, TableJoinRows, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -21272,12 +21427,43 @@ pub fn op_morsel_aggregate(
         };
         return morsel_rows(state, data, rows);
     }
+    // A scan's rows under a LIMIT with no ORDER BY run on morsels only behind their switch; off,
+    // the control, the serial loop answers (lane qs6-8).
+    if data
+        .body
+        .as_ref()
+        .is_some_and(|body| body.rows && body.want.is_some())
+        && !connection.parallel_limit()
+    {
+        state.pc = data.target_pc_serial.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
     // The costs are taken for the run and put back after, so a statement learns from the last.
     let taken = connection.morsel_costs.lock().take();
     let mut costs = match taken {
         Some(costs) => costs,
         None => MachineCosts::measure().map_err(refused)?,
     };
+    // Each worker's registers start as the statement's are now (the constants the program's
+    // start computed among them), with its bound parameters (lane qs6-7).
+    let mut registers = Vec::new();
+    let mut parameters = Vec::new();
+    if data.body.is_some() {
+        for (at, register) in state.registers.iter().enumerate() {
+            if let Register::Value(value) = register {
+                if !matches!(value, Value::Null) {
+                    registers
+                        .try_reserve(1)
+                        .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+                    registers.push((at, value.clone()));
+                }
+            }
+        }
+        parameters
+            .try_reserve_exact(state.parameters.len())
+            .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+        parameters.extend(state.parameters.iter().cloned());
+    }
     let answered = (|| {
         let table = TableSource::open(
             pager.clone(),
@@ -21286,7 +21472,42 @@ pub fn op_morsel_aggregate(
             data.rowid_alias,
         )?;
         let budget = MemoryBudget::new(pager.statement_memory_budget());
-        let Some(join) = &data.join else {
+        if data.joins.is_empty() {
+            // A copy of the serial loop's body, run per row by each worker (lane qs6-7).
+            if let Some(body) = &data.body {
+                let shape = ScanAggregate {
+                    rows: &[],
+                    filter: &[],
+                    group_by: &body.group_by,
+                    aggregates: &body.aggregates,
+                };
+                let pipeline = TableBodyAggregate {
+                    table: &table,
+                    body,
+                    program,
+                    pager,
+                    registers: &registers,
+                    parameters: &parameters,
+                    shape: &shape,
+                    ran: &connection.morsel_body_rows,
+                };
+                // A scan's rows: kept in leaf order, the result columns as they stand (lane qs6-8).
+                if body.rows {
+                    let rows = TableBodyRows {
+                        body: &pipeline,
+                        want: body
+                            .want
+                            .map(|want| usize::try_from(want).unwrap_or(usize::MAX)),
+                        kept: std::sync::atomic::AtomicUsize::new(0),
+                    };
+                    return rows
+                        .run_mode(connection.parallel_mode(), &mut costs, &budget)
+                        .map(|(rows, _)| (rows, true));
+                }
+                return pipeline
+                    .run_mode(connection.parallel_mode(), &mut costs, &budget)
+                    .map(|(rows, _)| (rows, false));
+            }
             let shape = ScanAggregate {
                 rows: &[],
                 filter: &data.filter,
@@ -21300,37 +21521,46 @@ pub fn op_morsel_aggregate(
             return pipeline
                 .run_mode(connection.parallel_mode(), &mut costs, &budget)
                 .map(|(rows, _)| (rows, false));
-        };
-        // A hash join's probe: the build side read and its table built once, by the workers
+        }
+        // A join's probe: each build side read and its hash table built once, by the workers
         // together (a partition per core the switch lets run), charged to the statement's one
-        // budget; the joined rows' filter is the probe's.
-        let build_table = TableSource::open(
-            pager.clone(),
-            join.root_page,
-            join.columns,
-            join.rowid_alias,
-        )?;
+        // budget, a chain's links in turn (lane qs6-10); the joined rows' filter is the probe's.
         let mode = connection.parallel_mode();
         let partitioner = Partitioner::new(match mode {
             ParallelMode::On => costs.cores(),
             ParallelMode::Off => std::num::NonZeroUsize::MIN,
         });
-        let (build, hash_table, _) = TableBuild {
-            table: &build_table,
-            filter: &join.filter,
-            key: &join.build_key,
-            partitioner: &partitioner,
+        let mut stages = Vec::new();
+        stages.try_reserve_exact(data.joins.len())?;
+        for join in &data.joins {
+            let build_table = TableSource::open(
+                pager.clone(),
+                join.root_page,
+                join.columns,
+                join.rowid_alias,
+            )?;
+            let (rows, hash_table, _) = TableBuild {
+                table: &build_table,
+                filter: &join.filter,
+                key: &join.build_key,
+                partitioner: &partitioner,
+            }
+            .run_mode(mode, &mut costs, &budget)?;
+            stages.push(JoinStage {
+                probe: HashProbe::over(hash_table, &[], &join.probe_key),
+                rows,
+            });
+            connection
+                .morsel_join_links
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        .run_mode(mode, &mut costs, &budget)?;
-        let probe = HashProbe::over(hash_table, &[], &join.probe_key);
         // A join's rows, no aggregates: each worker keeps its own leaves' joined rows, merged
         // in order; they are the answer's rows as they stand.
         if let Some(rows) = &data.joined_rows {
             let pipeline = TableJoinRows {
                 table: &table,
                 probe_filter: &data.filter,
-                probe: &probe,
-                build: &build,
+                stages: &stages,
                 project: &data.result_map,
                 order: &rows.order,
             };
@@ -21349,8 +21579,7 @@ pub fn op_morsel_aggregate(
         let pipeline = TableJoinAggregate {
             table: &table,
             probe_filter: &data.filter,
-            probe: &probe,
-            build: &build,
+            stages: &stages,
             shape: &shape,
         };
         pipeline
@@ -21367,7 +21596,11 @@ pub fn op_morsel_aggregate(
         Ok((rows, false)) => rows,
         // A value the parallel aggregates don't take (a SUM over text), or groups past the
         // statement's memory that the serial loop's spilling GROUP BY can hold: it answers.
-        Err(MorselError::Unsupported { .. } | MorselError::MemoryBudget { .. }) => {
+        Err(
+            MorselError::Unsupported { .. }
+            | MorselError::MemoryBudget { .. }
+            | MorselError::Body(_),
+        ) => {
             state.pc = data.target_pc_serial.as_offset_int();
             return Ok(InsnFunctionStepResult::Step);
         }

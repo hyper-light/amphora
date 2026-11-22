@@ -2706,9 +2706,9 @@ pub fn insn_to_row(
             Value::build_text(""),
             0,
             format!(
-                "root={} join={:?} filter={} group_by={:?} aggregates={:?}",
+                "root={} joins={:?} filter={} group_by={:?} aggregates={:?}",
                 data.root_page,
-                data.join.as_ref().map(|j| j.root_page),
+                data.joins.iter().map(|j| j.root_page).collect::<Vec<_>>(),
                 data.filter.len(),
                 data.group_by,
                 data.aggregates
@@ -2727,6 +2727,19 @@ pub fn insn_to_row(
                 data.order,
                 data.target_pc.as_debug_int()
             ),
+        ),
+        Insn::SetSkipping {
+            table,
+            column,
+            kind,
+        } => (
+            "SetSkipping",
+            0,
+            0,
+            0,
+            Value::build_text(format!("{table}.{column}")),
+            0,
+            format!("skipping({table}.{column}) = {kind:?}"),
         ),
         Insn::TreePages {
             cursor_id,

@@ -138,6 +138,15 @@ impl TableSource {
         leaves: Range<usize>,
         mut each: impl FnMut(i64, &[Value]) -> Result<(), MorselError>,
     ) -> Result<(), MorselError> {
+        self.scan_while(leaves, |rowid, row| each(rowid, row).map(|()| true))
+    }
+
+    /// As [`TableSource::scan`], stopping after the row for which `each` says false.
+    pub fn scan_while(
+        &self,
+        leaves: Range<usize>,
+        mut each: impl FnMut(i64, &[Value]) -> Result<bool, MorselError>,
+    ) -> Result<(), MorselError> {
         if leaves.start >= leaves.end {
             return Ok(());
         }
@@ -208,7 +217,9 @@ impl TableSource {
                 })?;
                 *slot = Value::from_i64(rowid);
             }
-            each(rowid, &row)?;
+            if !each(rowid, &row)? {
+                break;
+            }
             io.block(|| cursor.next()).map_err(storage)?;
         }
         Ok(())
@@ -308,6 +319,331 @@ impl TableAggregate<'_> {
     ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
         let (partial, stats) = execute_at(self, 0, degree, None, budget)?;
         Ok((self.shape.finish(partial)?, stats))
+    }
+}
+
+/// A one-table scan whose filter, GROUP BY values and aggregate inputs are a copy of the serial
+/// loop's body (`MorselBody`, lane qs6-7): each worker runs that range of the statement's program
+/// per row, with registers and cursor of its own, and folds the rows it keeps into its partial
+/// aggregates. Any expression the serial loop runs runs here, through the VDBE's own opcodes.
+pub struct TableBodyAggregate<'a> {
+    pub table: &'a TableSource,
+    pub body: &'a crate::vdbe::insn::MorselBody,
+    pub program: &'a crate::vdbe::Program,
+    pub pager: &'a Arc<Pager>,
+    /// The statement's non-NULL registers when the hook ran, by register: each worker's start.
+    pub registers: &'a [(usize, Value)],
+    pub parameters: &'a [Value],
+    pub shape: &'a ScanAggregate<'a>,
+    /// Counts the rows the copied body ran over.
+    pub ran: &'a std::sync::atomic::AtomicU64,
+}
+
+/// A worker's own state for [`TableBodyAggregate`]: its registers, cursors and program counter,
+/// made at its first morsel, and the output row it reuses.
+pub struct BodyWorker {
+    state: crate::vdbe::ProgramState,
+    out: Vec<Value>,
+}
+
+/// The partial of [`TableBodyAggregate`]: the aggregates, and the worker that folds into them.
+#[derive(Default)]
+pub struct BodyPartial {
+    aggregate: super::morsel::AggregatePartial,
+    worker: Option<Box<BodyWorker>>,
+}
+
+impl TableBodyAggregate<'_> {
+    fn worker(&self) -> Result<BodyWorker, MorselError> {
+        let mut state = crate::vdbe::ProgramState::new(
+            self.program.max_registers,
+            self.program.cursor_ref.len(),
+        );
+        for (at, value) in self.registers {
+            let register = state
+                .registers
+                .get_mut(*at)
+                .ok_or(MorselError::Corrupt("a register past the program's"))?;
+            *register = crate::vdbe::Register::Value(value.clone());
+        }
+        state.parameters.try_reserve_exact(self.parameters.len())?;
+        state.parameters.extend(self.parameters.iter().cloned());
+        let mut out = Vec::new();
+        out.try_reserve_exact(self.body.out_count)?;
+        Ok(BodyWorker { state, out })
+    }
+
+    /// Runs the body over one row; true when the row passed, its values then in `worker.out`.
+    fn row(&self, worker: &mut BodyWorker, rowid: i64, row: &[Value]) -> Result<bool, MorselError> {
+        use crate::vdbe::execute::InsnFunctionStepResult;
+        use crate::vdbe::Register;
+        let state = &mut worker.state;
+        let bad = MorselError::Corrupt("the loop body's register is past the program's");
+        for (at, value) in row.iter().enumerate() {
+            let reg = self
+                .body
+                .columns_start
+                .checked_add(at)
+                .ok_or(MorselError::Overflow {
+                    what: "a column's register",
+                })?;
+            let register = state.registers.get_mut(reg).ok_or(MorselError::Corrupt(
+                "the loop body's register is past the program's",
+            ))?;
+            *register = Register::Value(value.clone());
+        }
+        *state.registers.get_mut(self.body.rowid).ok_or(bad)? =
+            Register::Value(Value::from_i64(rowid));
+        let keep = self.body.keep.as_offset_int();
+        let skip = self.body.skip.as_offset_int();
+        state.pc = self.body.start.as_offset_int();
+        // The body's code jumps forward only (a filter's branches, CASE, a constant call's
+        // `Once`), so it reaches `keep` or `skip` within its own length.
+        loop {
+            if state.pc == keep {
+                break;
+            }
+            if state.pc == skip {
+                return Ok(false);
+            }
+            let at = usize::try_from(state.pc).map_err(|_| MorselError::Overflow {
+                what: "the program counter",
+            })?;
+            let (insn, _) = self
+                .program
+                .insns
+                .get(at)
+                .ok_or(MorselError::Corrupt("the loop body ran past the program"))?;
+            match insn.to_function()(self.program, state, insn, self.pager) {
+                Ok(InsnFunctionStepResult::Step) => {}
+                Ok(_) => {
+                    return Err(MorselError::Body(Box::new(
+                        crate::LimboError::InternalError(
+                            "the loop body stopped short of its row".into(),
+                        ),
+                    )))
+                }
+                Err(error) => return Err(MorselError::Body(error)),
+            }
+        }
+        worker.out.clear();
+        let end =
+            self.body
+                .out_start
+                .checked_add(self.body.out_count)
+                .ok_or(MorselError::Overflow {
+                    what: "the output registers",
+                })?;
+        let values = state
+            .registers
+            .get(self.body.out_start..end)
+            .ok_or(MorselError::Corrupt(
+                "the loop body's output is past the program's registers",
+            ))?;
+        for register in values {
+            let Register::Value(value) = register else {
+                return Err(MorselError::Corrupt(
+                    "the loop body left a non-value output",
+                ));
+            };
+            worker.out.push(value.clone());
+        }
+        for at in &self.body.sums {
+            if let Some(Value::Numeric(crate::numeric::Numeric::Float(_))) = worker.out.get(*at) {
+                return Err(MorselError::Unsupported { kind: "REAL" });
+            }
+        }
+        Ok(true)
+    }
+
+    /// The answer as the switch and the measured costs pick the degree.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let (partial, stats) = execute(self, mode, costs, budget)?;
+        Ok((self.shape.finish(partial.aggregate)?, stats))
+    }
+}
+
+impl Pipeline for TableBodyAggregate<'_> {
+    type Partial = BodyPartial;
+
+    fn rows(&self) -> usize {
+        self.table.leaves()
+    }
+
+    fn empty(&self) -> Self::Partial {
+        BodyPartial::default()
+    }
+
+    fn run(
+        &self,
+        leaves: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let BodyPartial { aggregate, worker } = partial;
+        let worker = match worker {
+            Some(worker) => worker,
+            None => worker.insert(Box::new(self.worker()?)),
+        };
+        let mut ran = 0u64;
+        let scanned = self.table.scan(leaves, |rowid, row| {
+            ran = ran.saturating_add(1);
+            if !self.row(worker, rowid, row)? {
+                return Ok(());
+            }
+            self.shape
+                .fold(&worker.out, position(rowid)?, aggregate, budget)
+        });
+        if scanned.is_ok() {
+            self.ran
+                .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+        }
+        scanned
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        self.shape
+            .merge(&mut into.aggregate, from.aggregate, budget)
+    }
+}
+
+/// A one-table scan's rows through the copy of the serial loop's body (lane qs6-8): each worker
+/// runs the body per row as [`TableBodyAggregate`] does and keeps the outputs of the rows that
+/// pass; the runs are joined in leaf order, so the rows come out in the serial loop's order. Under
+/// a LIMIT (`want`) no morsel is claimed once that many rows are kept, and a morsel stops once it
+/// alone holds that many.
+pub struct TableBodyRows<'a> {
+    pub body: &'a TableBodyAggregate<'a>,
+    pub want: Option<usize>,
+    /// The rows kept so far, by every worker.
+    pub kept: std::sync::atomic::AtomicUsize,
+}
+
+/// The partial of [`TableBodyRows`]: each morsel's rows tagged with its first leaf, and the
+/// worker that runs the body.
+#[derive(Default)]
+pub struct BodyRowsPartial {
+    runs: Vec<(usize, Vec<Vec<Value>>)>,
+    worker: Option<Box<BodyWorker>>,
+}
+
+impl TableBodyRows<'_> {
+    /// The rows in leaf order, the first `want` of them under a LIMIT.
+    pub fn finish(&self, mut partial: BodyRowsPartial) -> Result<Vec<Vec<Value>>, MorselError> {
+        partial.runs.sort_by_key(|(first, _)| *first);
+        let total = partial
+            .runs
+            .iter()
+            .map(|(_, run)| run.len())
+            .fold(0usize, usize::saturating_add);
+        let take = self.want.map_or(total, |want| want.min(total));
+        let mut out = Vec::new();
+        out.try_reserve_exact(take)?;
+        for (_, run) in partial.runs {
+            let room = take.saturating_sub(out.len());
+            out.extend(run.into_iter().take(room));
+        }
+        Ok(out)
+    }
+
+    /// The rows as the switch and the measured costs pick the degree.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let (partial, stats) = execute(self, mode, costs, budget)?;
+        Ok((self.finish(partial)?, stats))
+    }
+}
+
+impl Pipeline for TableBodyRows<'_> {
+    type Partial = BodyRowsPartial;
+
+    fn rows(&self) -> usize {
+        self.body.table.leaves()
+    }
+
+    fn empty(&self) -> Self::Partial {
+        BodyRowsPartial::default()
+    }
+
+    fn done(&self) -> bool {
+        self.want
+            .is_some_and(|want| self.kept.load(std::sync::atomic::Ordering::Relaxed) >= want)
+    }
+
+    fn run(
+        &self,
+        leaves: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let BodyRowsPartial { runs, worker } = partial;
+        let worker = match worker {
+            Some(worker) => worker,
+            None => worker.insert(Box::new(self.body.worker()?)),
+        };
+        let first = leaves.start;
+        let mut found: Vec<Vec<Value>> = Vec::new();
+        let mut ran = 0u64;
+        let scanned = self.body.table.scan_while(leaves, |rowid, row| {
+            ran = ran.saturating_add(1);
+            if !self.body.row(worker, rowid, row)? {
+                return Ok(true);
+            }
+            let mut bytes = std::mem::size_of::<Value>().saturating_mul(worker.out.len());
+            for value in &worker.out {
+                bytes = bytes.saturating_add(match value {
+                    Value::Text(text) => text.as_str().len(),
+                    Value::Blob(blob) => blob.len(),
+                    _ => 0,
+                });
+            }
+            budget.charge(bytes)?;
+            let mut out = Vec::new();
+            out.try_reserve_exact(worker.out.len())?;
+            out.extend(worker.out.iter().cloned());
+            found.try_reserve(1)?;
+            found.push(out);
+            self.kept.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // This morsel alone holds the rows the LIMIT takes: none after them is among those.
+            Ok(match self.want {
+                Some(want) => found.len() < want,
+                None => true,
+            })
+        });
+        if scanned.is_ok() {
+            self.body
+                .ran
+                .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+        }
+        scanned?;
+        runs.try_reserve(1)?;
+        runs.push((first, found));
+        Ok(())
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        _budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        into.runs.try_reserve(from.runs.len())?;
+        into.runs.extend(from.runs);
+        Ok(())
     }
 }
 
@@ -560,16 +896,75 @@ impl TableBuild<'_> {
     }
 }
 
-/// A hash join's probe side read from a table's leaves, each joined row (the probe row's columns,
-/// then the build row's) folded into the aggregates: the probe and the aggregates are one loop
-/// body, run by every worker over its own leaves (QT.6).
+/// One link of a join's chain of hash tables (QT.6, lane qs6-10): the table, keyed by places in
+/// the row joined before it (the probe row's columns, then each earlier link's build row's), and
+/// the build rows it numbers.
+pub struct JoinStage<'a> {
+    pub probe: HashProbe<'a>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// A link's place in a probe row's walk through the chain: its matches, the next one to take, and
+/// the joined row's length before the link's build row.
+type Step<'s> = (&'s [usize], usize, usize);
+
+/// Calls `visit` with each joined row the probe row `row` makes through the chain `stages`, depth
+/// first: the first link's matches in build order, each one's matches in the next link, and so on.
+/// The walk is an explicit stack as deep as the chain, no recursion; `joined` and `walk` are the
+/// worker's, reused from row to row.
+fn each_joined<'s>(
+    stages: &'s [JoinStage<'_>],
+    row: &[Value],
+    joined: &mut Vec<Value>,
+    walk: &mut Vec<Step<'s>>,
+    mut visit: impl FnMut(&[Value]) -> Result<(), MorselError>,
+) -> Result<(), MorselError> {
+    joined.clear();
+    joined.try_reserve(row.len())?;
+    joined.extend_from_slice(row);
+    walk.clear();
+    let Some(first) = stages.first() else {
+        return visit(joined);
+    };
+    walk.try_reserve(stages.len())?;
+    walk.push((first.probe.matches(joined)?, 0, joined.len()));
+    while let Some(top) = walk.last_mut() {
+        let (matches, next, base) = *top;
+        let Some(build) = matches.get(next) else {
+            walk.pop();
+            continue;
+        };
+        top.1 = next.saturating_add(1);
+        let level = walk.len().saturating_sub(1);
+        let stage = stages.get(level).ok_or(MorselError::Overflow {
+            what: "a join's link",
+        })?;
+        let build_row = stage.rows.get(*build).ok_or(MorselError::Overflow {
+            what: "a match's build row",
+        })?;
+        joined.truncate(base);
+        joined.try_reserve(build_row.len())?;
+        joined.extend_from_slice(build_row);
+        match stages.get(level.saturating_add(1)) {
+            None => visit(joined)?,
+            Some(link) => {
+                let found = link.probe.matches(joined)?;
+                walk.push((found, 0, joined.len()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A join's probe side read from a table's leaves, each joined row (the probe row's columns, then
+/// each link's build row's) folded into the aggregates: the probe through the chain and the
+/// aggregates are one loop body, run by every worker over its own leaves (QT.6).
 pub struct TableJoinAggregate<'a> {
     pub table: &'a TableSource,
     /// Terms over the probe row alone, tested before it is probed.
     pub probe_filter: &'a [Predicate],
-    pub probe: &'a HashProbe<'a>,
-    /// The build side's rows, as `probe` numbers them.
-    pub build: &'a [Vec<Value>],
+    /// The chain of hash tables, one link per build side.
+    pub stages: &'a [JoinStage<'a>],
     /// The grouping and the aggregates over a joined row (its filter is not read).
     pub shape: &'a ScanAggregate<'a>,
 }
@@ -592,30 +987,18 @@ impl Pipeline for TableJoinAggregate<'_> {
         budget: &MemoryBudget,
     ) -> Result<(), MorselError> {
         let mut joined: Vec<Value> = Vec::new();
+        let mut walk = Vec::new();
         self.table.scan(leaves, |rowid, row| {
             for term in self.probe_filter {
                 if !term.holds(row)? {
                     return Ok(());
                 }
             }
-            let matches = self.probe.matches(row)?;
-            if matches.is_empty() {
-                return Ok(());
-            }
-            // A probe row's matches share its place: the hook takes only columns whose equal
+            // A probe row's joined rows share its place: the hook takes only columns whose equal
             // values are the same value (translate/parallel.rs), so a tie among them is no choice.
-            let at = position(rowid)?;
-            for build in matches {
-                let build_row = self.build.get(*build).ok_or(MorselError::Overflow {
-                    what: "a match's build row",
-                })?;
-                joined.clear();
-                joined.try_reserve(row.len().saturating_add(build_row.len()))?;
-                joined.extend_from_slice(row);
-                joined.extend_from_slice(build_row);
-                self.shape.fold(&joined, at, partial, budget)?;
-            }
-            Ok(())
+            each_joined(self.stages, row, &mut joined, &mut walk, |joined| {
+                self.shape.fold(joined, position(rowid)?, partial, budget)
+            })
         })
     }
 
@@ -651,10 +1034,9 @@ pub struct TableJoinRows<'a> {
     pub table: &'a TableSource,
     /// Terms over the probe row alone, tested before it is probed.
     pub probe_filter: &'a [Predicate],
-    pub probe: &'a HashProbe<'a>,
-    /// The build side's rows, as `probe` numbers them.
-    pub build: &'a [Vec<Value>],
-    /// The joined row's columns (the probe row's, then the build row's) each output row takes.
+    /// The chain of hash tables, one link per build side.
+    pub stages: &'a [JoinStage<'a>],
+    /// The joined row's columns (the probe row's, then each link's) each output row takes.
     pub project: &'a [usize],
     /// The sort keys: each one's place in the output row, and whether it descends.
     pub order: &'a [(usize, bool)],
@@ -738,27 +1120,22 @@ impl Pipeline for TableJoinRows<'_> {
     ) -> Result<(), MorselError> {
         let first = leaves.start;
         let mut found: Vec<Vec<Value>> = Vec::new();
+        let mut joined: Vec<Value> = Vec::new();
+        let mut walk = Vec::new();
         self.table.scan(leaves, |_, row| {
             for term in self.probe_filter {
                 if !term.holds(row)? {
                     return Ok(());
                 }
             }
-            for build in self.probe.matches(row)? {
-                let build_row = self.build.get(*build).ok_or(MorselError::Overflow {
-                    what: "a match's build row",
-                })?;
+            each_joined(self.stages, row, &mut joined, &mut walk, |joined| {
                 let mut out = Vec::new();
                 out.try_reserve_exact(self.project.len())?;
                 let mut bytes = std::mem::size_of::<Value>().saturating_mul(self.project.len());
                 for at in self.project {
-                    let value = match at.checked_sub(row.len()) {
-                        None => row.get(*at),
-                        Some(at) => build_row.get(at),
-                    }
-                    .ok_or_else(|| MorselError::NoColumn {
+                    let value = joined.get(*at).ok_or(MorselError::NoColumn {
                         column: *at,
-                        width: row.len().saturating_add(build_row.len()),
+                        width: joined.len(),
                     })?;
                     bytes = bytes.saturating_add(match value {
                         Value::Text(text) => text.as_str().len(),
@@ -770,8 +1147,8 @@ impl Pipeline for TableJoinRows<'_> {
                 budget.charge(bytes)?;
                 found.try_reserve(1)?;
                 found.push(out);
-            }
-            Ok(())
+                Ok(())
+            })
         })?;
         if !self.order.is_empty() {
             found.sort_by(|a, b| self.compare(a, b));

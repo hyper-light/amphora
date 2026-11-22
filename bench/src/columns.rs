@@ -30,8 +30,8 @@ use amphora_engine::storage::versioned::columns::{
     Block, Columns, Feed, Packed, Plain, Rows, ScanCounts,
 };
 use amphora_engine::storage::versioned::disk::Files;
-use amphora_engine::storage::versioned::memory::Capped;
 use amphora_engine::storage::versioned::durable::Database;
+use amphora_engine::storage::versioned::memory;
 use amphora_engine::storage::versioned::version::Snapshot;
 
 fn mix(mut x: u64) -> u64 {
@@ -170,14 +170,14 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
     db.sync().map_err(e)?;
     let epoch = Instant::now();
     let copy = if keep {
+        // The queue bounded by the run's option; the blocks by the machine's memory.
         let feed = Arc::new(Feed::new(
             0,
-            // The queue's bytes capped at --queue-bytes, as before the feed took a memory source (CS.5).
-            Arc::new(Capped::new(o.queue_bytes as u64)),
+            memory::capped(u64::try_from(o.queue_bytes).unwrap_or(u64::MAX)),
             Box::new(move || epoch.elapsed().as_nanos() as u64),
         ));
         db.keep_columns(feed.clone()).map_err(e)?;
-        let c = Columns::<B>::new(feed);
+        let c = Columns::<B>::new(feed, memory::machine());
         rebuild(&db, &c, epoch)?;
         Some(c)
     } else {

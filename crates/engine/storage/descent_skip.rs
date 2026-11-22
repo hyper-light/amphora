@@ -1720,6 +1720,11 @@ mod tests {
         /// freed-page count stands in for it there).
         #[test]
         fn t_g3_5_3_skips_on_engine_pages_match_the_cursor() {
+            if crate::storage::versioned::switch::pager_only(
+                "this test reads the pager's own pages; the versioned storage's trees are not on them",
+            ) {
+                return;
+            }
             let (_db, conn) = open();
             let mut rng = ChaCha8Rng::seed_from_u64(0x0050_5235_0003);
             let mut hash = AdaptiveHash::new(4096, 0);
@@ -1800,6 +1805,11 @@ mod tests {
         /// named leaf, under both prototypes, and that the stamp moved with the snapshots.
         #[test]
         fn t_g3_5_4_cursor_hook_matches_the_plain_descent() {
+            if crate::storage::versioned::switch::pager_only(
+                "this test reads the pager's own pages; the versioned storage's trees are not on them",
+            ) {
+                return;
+            }
             use super::super::Switch;
 
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

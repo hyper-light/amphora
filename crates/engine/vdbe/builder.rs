@@ -2017,7 +2017,12 @@ impl ProgramBuilder {
                 Insn::GroupFind { data } => resolve(&mut data.target_pc_full, "GroupFind")?,
                 Insn::GroupDrain { data } => resolve(&mut data.target_pc_done, "GroupDrain")?,
                 Insn::MorselAggregate { data } => {
-                    resolve(&mut data.target_pc_serial, "MorselAggregate")?
+                    resolve(&mut data.target_pc_serial, "MorselAggregate")?;
+                    if let Some(body) = data.body.as_mut() {
+                        resolve(&mut body.start, "MorselAggregate")?;
+                        resolve(&mut body.keep, "MorselAggregate")?;
+                        resolve(&mut body.skip, "MorselAggregate")?;
+                    }
                 }
                 Insn::MorselNext { target_pc_done, .. } => resolve(target_pc_done, "MorselNext")?,
                 Insn::HashMarkFirstMatch { target_pc, .. } => {

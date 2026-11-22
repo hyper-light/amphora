@@ -3910,12 +3910,13 @@ impl Pager {
         // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction rolls back with
         // the pager's, on every path that ends one. This returns no error, so a failed rollback
         // is logged and kept: the connection's next transaction is refused with it.
-        if let Some(switch) = connection.versioned.as_ref() {
+        let _ = connection.each_versioned(|switch| {
             if let Err(e) = switch.finish(true) {
                 tracing::error!(target: "amphora.versioned", event = "rollback_failed", error = %e);
                 switch.rollback_failed(e);
             }
-        }
+            Ok(())
+        });
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;
@@ -4232,11 +4233,21 @@ impl Pager {
         };
 
         match self.cache_insert(page_idx as usize, page.clone())? {
-            IOResult::Done(()) => {
+            IOResult::Done(resident) => {
                 if resumed {
                     self.remove_pending_read(page_idx);
                 }
-                Ok(IOResult::Done((page, c_disk)))
+                let Some(resident) = resident else {
+                    return Ok(IOResult::Done((page, c_disk)));
+                };
+                // Amphora (QT.6): another reader's copy reached the cache first; this read's copy
+                // is dropped and every reader shares the cached frame. While that copy's read is
+                // in flight there is no completion to wait on here, so yield, and the next call
+                // finds it as a cache hit does.
+                if !resident.is_loaded() {
+                    io_yield_one!(crate::Completion::new_yield());
+                }
+                Ok(IOResult::Done((resident, None)))
             }
             IOResult::IO(IOCompletions(spill_c)) => {
                 // Amphora: only a read that must wait on a spill is recorded, so the next call to
@@ -4363,7 +4374,10 @@ impl Pager {
     /// evicted, the page is admitted over capacity rather than failing the
     /// read (mirroring SQLite, where `cache_size` may be exceeded while all
     /// pages are in use); later inserts drain the excess.
-    fn cache_insert(&self, page_idx: usize, page: PageRef) -> IOResultOr<()> {
+    /// Puts `page` in the cache, or, when another reader that missed too inserted its own copy
+    /// first (QT.6: morsel workers loading one page at once), returns that copy, which the caller
+    /// takes in place of its own.
+    fn cache_insert(&self, page_idx: usize, page: PageRef) -> IOResultOr<Option<PageRef>> {
         #[cfg(test)]
         if i64::try_from(page_idx).is_ok_and(|idx| self.insert_yield.should_yield_for(idx)) {
             io_yield_one!(crate::Completion::new_yield());
@@ -4371,11 +4385,8 @@ impl Pager {
         {
             let mut page_cache = self.page_cache.write();
             let page_key = PageCacheKey::new(page_idx);
-            match page_cache.insert(page_key, page.clone()) {
-                Ok(_) => return Ok(IOResult::Done(())),
-                Err(CacheError::KeyExists) => {
-                    unreachable!("Page should not exist in cache after get() miss");
-                }
+            match page_cache.insert_or_get(page_key, page.clone(), false) {
+                Ok(resident) => return Ok(IOResult::Done(resident)),
                 Err(CacheError::Full) => {
                     // Fall through to spilling
                 }
@@ -4387,9 +4398,8 @@ impl Pager {
             IOResult::Done(()) => {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx);
-                match page_cache.force_insert_page(page_key, page) {
-                    Ok(_) => Ok(IOResult::Done(())),
-                    Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
+                match page_cache.insert_or_get(page_key, page, true) {
+                    Ok(resident) => Ok(IOResult::Done(resident)),
                     Err(e) => Err(e.into()),
                 }
             }
@@ -7500,6 +7510,11 @@ mod tests {
     /// each time it reads the rows as committed.
     #[test]
     fn a_reader_forgets_only_the_pages_written_since_its_last_read() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's page cache and its log; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
             crate::Database::open_file(io, "forget.db", Arc::new(crate::SqliteDialect)).unwrap();
@@ -8266,6 +8281,11 @@ mod checkpoint_phase_tests {
 
     #[test]
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's page cache and its log; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
         let conn = db.connect(ConnectOpts::new()).unwrap();

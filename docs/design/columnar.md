@@ -209,6 +209,35 @@ moving rows out of blocks over positional deltas, which complicate reads [c80].
    costs it measures differ, or that loses to some fixed value from the sources' range on any of
    them [c91][c93]: then it is a constant in disguise, or its estimator measures the wrong thing.
 
+## 2. Column copies granted their memory before they are built, a refused copy bought again by a switch
+
+**Decision.**
+
+1. **Asked before built.** Each block of a table's copy asks the storage's memory source for its
+   bytes before it is made, sized from the block's format alone (`Block::bytes`, equal to the made
+   block's resident bytes), and each change asks for its bytes before it is applied. A build refused
+   part way gives back what it took with the blocks it made. So a copy never holds a byte its source
+   did not grant, and a capped source is never passed (T-CB.1.1, T-CB.1.2, T-CB.1.3).
+2. **Bought again by one of two ways, behind `AMPHORA_COLUMN_REBUY`.** A, the control and today's
+   behaviour: a refused copy is let go, its table's next analytic statement pays the rent again and
+   the one after buys again, reading the whole table. B (`room`): a refused copy waits until the
+   source reports room (`Source::room`) for its expected size, what it needed when refused and what
+   its table's commits put since; no whole-table read is spent before (T-CB.2.1, T-CB.2.2).
+3. **Instruments.** Counters (`CopyCounts`: rebuys, the rows and bytes builds and rebuys read, the
+   statements and rows the row loop answered against the rows the copy served, the time copies were
+   absent), a metered source (`Meter`: takes asked, granted and refused, bytes held and at most),
+   the copies waiting and for how long, the bytes resident against the bytes granted, and trace
+   events with their reasons under the target `amphora::columns`.
+4. **Which way is the default is open.** The A/B harness (`columns_sql::tests::ab`, T-CB.4.1) forces
+   each way's failure mode: a laptop's cap with one big table, many tables under a small cap, steady
+   pressure, bursty pressure that frees memory in small pieces, a table that grows while its copy
+   waits, and a huge cap with many tables. It writes one JSONL record per way and scenario. The
+   choice waits for the coordinator's run of record; until then A stays the default. Against DuckDB,
+   one driver (`amphora-bench --colcopy`, AC-CB.4.2) runs the same scenarios on Amphora under both
+   ways and on DuckDB, both in process and in memory, each statement timed the same way. DuckDB's
+   cap is `SET memory_limit` to the bytes it holds before the statement plus the scenario's free
+   bytes: its table is its columns, so it gets the same room for the analytic work as Amphora's copies.
+
 ## What the next steps prototype and measure
 
 **Step 2, in-memory columns against persistent column blocks.** Both prototypes implement the whole

@@ -475,10 +475,64 @@ ends at the LIMIT); the workers still produce every joined row, so the LIMIT sav
 probing. A LIMIT over an order with ties stays serial. T-QT.6.14 checks it row for row against the
 serial loop at 2, 3, 4 and 8 stated cores.
 
-**Not yet.** Workers still run the pipeline's own loop body, not a copy of the VDBE program's,
-so only the filters `Predicate` holds (a column against a literal of its kind, a NULL test) run in
-parallel; joins of more than two tables and outer joins stay serial, and a LIMIT doesn't yet stop
-the workers early.
+**Workers run a copy of the loop body** (lane qs6-7). A one-table scan with its aggregates no
+longer needs its filter and inputs to be ones `Predicate` and `Aggregate` hold: the hook emits a
+copy of the serial loop's body (`MorselBody`) as its own range of the program, after its row loop
+where the serial loop never reaches, translated by the same `translate_condition_expr` and
+`translate_expr` the serial loop uses, with each of the table's columns read from a register (the
+resolver's expression cache) rather than a cursor. Each worker (`TableBodyAggregate`) makes its own
+`ProgramState` (registers, cursors, program counter) at its first morsel, its registers starting
+as the statement's were when the hook ran (the constants the program's start computed, the bound
+parameters), and per row writes the row's columns and rowid into their registers and runs the
+statement's own opcodes from the body's start until it reaches `keep` (its GROUP BY values and
+aggregate inputs are then in the output registers, folded into the worker's partial aggregates)
+or `skip`. So any filter or expression the serial loop runs, functions, CASE, LIKE, arithmetic,
+runs in parallel, with no second evaluator. An error the body raises, or a step that is not a
+plain step, sends the statement to the serial loop, which raises the error its own way; so does a
+REAL a SUM would take, since the parallel sum's one exact rounding is not the serial loop's. The
+GROUP BY values and MIN and MAX are compared bytewise, so a column of another collation, a
+COLLATE, a subquery or a column stored converted (REAL or NUMERIC affinity) stays serial. The
+versioned storage's column copy still reads the simple shape's own filter and aggregates, and
+declines a body only the bytecode states. T-QT.6.15 checks random filters and inputs against the
+serial loop at 1, 2, 3, 4 and 8 stated cores, and that the body ran over every row.
+
+**A scan's rows run through the copy too** (lane qs6-8). A one-table SELECT with no aggregates,
+no GROUP BY and no ORDER BY emits the same copy of the loop body with the result columns as its
+outputs (`MorselBody::rows`); each worker (`TableBodyRows`) keeps the output rows of the rows that
+pass, tagged with its morsel's first leaf, and the runs are joined in leaf order, so the rows come
+out as the serial loop gives them. An ORDER BY stays serial: its sorter orders ties its own way.
+
+**Workers stop early under a LIMIT** (lane qs6-8). With a LIMIT, the body carries the rows the
+LIMIT and OFFSET take (`want`). A shared count of the rows kept is checked before each morsel is
+claimed (`Pipeline::done`), so no morsel is claimed once that many are kept, and a morsel stops
+scanning once it alone holds that many. A morsel claimed always runs, and morsels are claimed in
+leaf order, so the morsels run are a prefix of the table and the first `want` rows in leaf order
+are exactly the serial loop's; the hook's row loop then counts the OFFSET and LIMIT down as it
+does for joins. This runs behind its own switch, `Connection::set_parallel_limit`, off by default:
+off is the control, and the serial loop answers. T-QT.6.16 checks random filters and result
+expressions against the serial loop at 1, 2, 3, 4 and 8 stated cores, with and without a LIMIT;
+under a LIMIT, that the row count is the serial one, that every row is in the serial result, that
+the control never runs the body, and that the body ran over fewer rows than the table holds (the
+workers stopped early) for most statements.
+
+**Joins of any number of tables** (lane qs6-10). An inner join of two or more rowid tables, each
+read whole (a scan, the planner's hash join, or a seek in an ephemeral index the statement builds
+from the whole table), at least one of them a hash join, runs as a chain of hash tables. The probe
+is the first table in the join order that no hash join builds from. Every other table is a link
+(`MorselJoinData`), taken in the join order among the tables an equality links to those already in
+the chain; each equality of two tables' columns is a key of the link that joins the later of its
+two tables, so no join term is left to test, and every other term is a filter on one table. Each
+link's table is read and built once by the workers together, as a two-table join's build side is.
+Each worker walks a probe row through the chain depth first (`each_joined`, an explicit stack as
+deep as the chain, no recursion): the first link's matches in build order, each one's matches in
+the next link, and so on; the joined row is the probe row's columns, then each link's. A join with
+no equality linking a table to the rest (a cross product) stays serial, and a LIMIT or OFFSET is
+taken only when the ORDER BY holds every table's INTEGER PRIMARY KEY. The counter
+`morsel_join_links` counts the hash tables built. T-QT.6.17 checks random joins of three and four
+tables against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**Not yet.** Joins still run the pipeline's own probe loop, so only the filters `Predicate` holds
+run in a join's workers; outer joins stay serial.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 
@@ -660,8 +714,42 @@ anything but an integer (NULL, a real, a text, a blob) gives its term no bound: 
 the same rule as the summaries' (a bound parameter has no affinity, as a numeric literal has none,
 so the comparison it makes is the constant's).
 
-**Not yet.** Neither kind is chosen by measured cost (the harness's numbers aren't recorded), and a
-summary is turned on by `skipping::set_skipping` (no SQL).
+### Choosing a kind by measured cost (lanes skip-3 and skip-4, T-SKU.2)
+
+`SkipKind::Measured` keeps both a zone map and a cracked copy of the column, each fed every write
+(`skipping::Chooser`, `choose.rs`), and answers each filter with one of them. The executor times
+the scan from asking for its candidates to its end and hands the time back
+(`SkipRegistry::record_cost`); a scan stopped early (a LIMIT) hands back nothing. The core reads no
+clock. Each kind is tried once; the kind whose latest measured scan was cheaper leads; the other is
+measured again once the leader has spent as much as the other's last scan cost, times 2 to the
+number of measures in a row that confirmed the leader (the doubling trick, Auer, Cesa-Bianchi,
+Freund and Schapire 2002; ski rental's break-even rule, Karlin et al. 1988, for the first trial).
+The 2 is the doubling trick's base, not a tuned number. A burst of scans issues one trial, not one
+each. Instruments: `ChooserStats` (per kind: filters it answered as leader, trials, costs measured,
+latest and total cost; how often the leader changed) and a debug event on `amphora.skipping` with
+both costs whenever the leader changes.
+
+The scenarios that force each kind's failure mode (`skipping::tests::chooser`): a scattered column
+with narrow filters fails zone maps, and the chooser settles on cracking; a column that follows the
+rowid, with heavy write churn and wide filters, fails cracking, and it settles on zone maps. In
+both, the other kind is measured a logarithmic number of times, and the chooser's total stays
+within twice the better kind alone, plus the kept kind's write upkeep.
+
+**Cost of keeping both.** Both summaries take every write, so the losing kind's write upkeep is paid
+for as long as the column is measured; the doubling bound covers scans, not that upkeep. Dropping
+the loser once its excess cost passes a rebuild's (ski rental again) would bound it; not built.
+
+### A SQL setting (lane skip-4, T-SKU.3)
+
+`PRAGMA skipping = 'table.column'` keeps a measured summary of the column; `'table.column
+zone_maps'`, `'table.column cracking'` and `'table.column off'` pick one kind or drop the summary.
+The summary is built when the statement is prepared, as the other connection settings take effect,
+and as `skipping::set_skipping` builds it: holding the write lock, refused inside an open
+transaction, under MVCC, or for a column the record doesn't hold, with the reason. `PRAGMA skipping`
+with no value is refused: the setting is set, not read.
+
+**Not yet.** A walking scan runs its body row by row, not in fused column batches; rows read and
+latency against DuckDB and ClickHouse are not measured.
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's

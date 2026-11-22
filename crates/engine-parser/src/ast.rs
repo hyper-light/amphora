@@ -2021,6 +2021,9 @@ pub enum PragmaName {
     EmptyResultCallbacks,
     /// VDBE opcode trace output
     VdbeTrace,
+    /// Amphora (lane skip-4, T-SKU.3): `PRAGMA skipping = 'table.column [method]'` keeps a
+    /// skipping summary of one column (`measured`, the default, `zone_maps`, `cracking` or `off`).
+    Skipping,
 }
 
 /// `CREATE TRIGGER` time

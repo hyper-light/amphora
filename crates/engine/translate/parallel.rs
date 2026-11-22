@@ -12,12 +12,13 @@
 //! plain-column GROUP BY keys; COUNT, SUM over INTEGER columns, MIN and MAX; no HAVING, ORDER
 //! BY, LIMIT, DISTINCT, window or subquery.
 //!
-//! A hash join's probe with its aggregates qualifies too (`shape_join`): two rowid tables the
-//! planner joins inner by a hash join on equalities of columns of one affinity, every other term
-//! a filter on one table, every column read of INTEGER or TEXT affinity and BINARY collation.
-//! The build side is read and its hash table built once, by the workers together (each scans its
-//! own build leaves and scatters its rows by partition; each partition is filled by one worker);
-//! each worker probes over its own run of the probe table's leaves and folds the joined rows into
+//! A join's probe with its aggregates qualifies too (`shape_join`): two or more rowid tables the
+//! planner joins inner, by hash joins and scans, on equalities of columns of one affinity, every
+//! other term a filter on one table, every column read of INTEGER or TEXT affinity and BINARY
+//! collation. Each table but the probe is a link of a chain of hash tables (lane qs6-10), read and
+//! built once, by the workers together (each scans its own build leaves and scatters its rows by
+//! partition; each partition is filled by one worker); each worker probes over its own run of the
+//! probe table's leaves, each probe row through every link in turn, and folds the joined rows into
 //! its partial aggregates. Such a join with no aggregates returns its rows instead: each worker
 //! keeps its joined rows, sorted when there is an ORDER BY over the tables' columns, and the runs
 //! merge in leaf order, stably, so the rows come out as the serial loop gives them.
@@ -25,14 +26,18 @@
 use crate::function::AggFunc;
 use crate::schema::{BTreeTable, Table};
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::{
+    translate_condition_expr, translate_expr, walk_expr, ConditionMetadata, WalkControl,
+};
 use crate::translate::plan::{
-    Distinctness, HashJoinType, JoinType, JoinedTable, Operation, QueryDestination, Scan,
+    Distinctness, HashJoinType, JoinType, JoinedTable, Operation, QueryDestination, Scan, Search,
     SelectPlan, WhereTermOrigin,
 };
 use crate::types::Value;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::{Insn, MorselAggregateData, MorselJoinData, MorselRows};
+use crate::vdbe::insn::{Insn, MorselAggregateData, MorselBody, MorselJoinData, MorselRows};
 use crate::vdbe::morsel::{Aggregate, CmpOp, Predicate};
 use amphora_engine_parser::ast::{Expr, Literal, Operator, SortOrder, UnaryOperator};
 
@@ -45,9 +50,58 @@ pub(crate) struct MorselHook {
 pub(crate) fn emit_morsel_hook(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
-) -> Option<MorselHook> {
-    let window = window(plan)?;
-    let data = shape(plan).or_else(|| shape_join(plan))?;
+    resolver: &Resolver,
+) -> crate::Result<Option<MorselHook>> {
+    let Some(window) = window(plan) else {
+        return Ok(None);
+    };
+    // A one-table scan runs a copy of its loop body in the workers (lane qs6-7); the simple
+    // shape's own filter and aggregates stay for the versioned storage's column copy.
+    let looped = body_plan(plan);
+    let simple = shape(plan);
+    let is_simple = simple.is_some();
+    let data = match (&looped, simple) {
+        (_, Some(data)) => data,
+        (Some(looped), None) => MorselAggregateData {
+            root_page: looped.table.root_page,
+            columns: looped.table.columns().len(),
+            rowid_alias: rowid_alias(looped.table),
+            filter: Vec::new(),
+            group_by: looped.group_by.clone(),
+            aggregates: looped.aggregates.clone(),
+            result_map: looped.result_map.clone(),
+            joins: Vec::new(),
+            joined_rows: None,
+            body: None,
+            target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
+        },
+        (None, None) => match shape_join(plan) {
+            Some(data) => data,
+            None => return Ok(None),
+        },
+    };
+    let body = looped.as_ref().map(|looped| MorselBody {
+        start: program.allocate_label(),
+        keep: program.allocate_label(),
+        skip: program.allocate_label(),
+        columns_start: program.alloc_registers(looped.table.columns().len()),
+        rowid: program.alloc_register(),
+        out_start: program.alloc_registers(looped.outs.len()),
+        out_count: looped.outs.len(),
+        group_by: looped.group_by.clone(),
+        aggregates: looped.aggregates.clone(),
+        sums: looped.sums.clone(),
+        simple: is_simple,
+        rows: looped.rows,
+        want: if looped.rows {
+            window
+                .limit
+                .map(|limit| limit.saturating_add(window.offset))
+                .and_then(|want| u64::try_from(want).ok())
+        } else {
+            None
+        },
+    });
     let serial = program.allocate_label();
     let end = program.allocate_label();
     let next = program.allocate_label();
@@ -70,6 +124,7 @@ pub(crate) fn emit_morsel_hook(
     program.emit_insn(Insn::MorselAggregate {
         data: Box::new(MorselAggregateData {
             target_pc_serial: serial,
+            body: body.clone().map(Box::new),
             ..data
         }),
     });
@@ -97,8 +152,239 @@ pub(crate) fn emit_morsel_hook(
         });
     }
     program.emit_insn(Insn::Goto { target_pc: next });
+    if let (Some(looped), Some(body)) = (&looped, &body) {
+        emit_body(program, resolver, plan, looped, body)?;
+    }
     program.preassign_label_to_next_insn(serial);
-    Some(MorselHook { end })
+    Ok(Some(MorselHook { end }))
+}
+
+/// A one-table scan's loop body as the workers run it (QT.6, lane qs6-7): its filter terms, and
+/// the expressions whose values the pipeline folds (the GROUP BY values, then each aggregate's
+/// input), any expression the serial loop takes.
+struct BodyPlan<'p> {
+    table: &'p BTreeTable,
+    id: amphora_engine_parser::ast::TableInternalId,
+    filter: Vec<&'p Expr>,
+    outs: Vec<&'p Expr>,
+    group_by: Vec<usize>,
+    aggregates: Vec<Aggregate>,
+    sums: Vec<usize>,
+    result_map: Vec<usize>,
+    /// The outputs are the result columns, returned as rows (lane qs6-8).
+    rows: bool,
+}
+
+fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
+    // A scan with no aggregates returns its rows (lane qs6-8). No ORDER BY: the serial loop's
+    // sorter orders ties its own way. A LIMIT and OFFSET cut the rows in scan order.
+    let rows = plan.aggregates.is_empty();
+    if !(if rows {
+        plain_rows(plan) && plan.order_by.is_empty()
+    } else {
+        plain(plan)
+    }) {
+        return None;
+    }
+    let [joined] = plan.table_references.joined_tables() else {
+        return None;
+    };
+    let Operation::Scan(Scan::BTreeTable { index: None, .. }) = &joined.op else {
+        return None;
+    };
+    let table = stored(joined)?;
+    let id = joined.internal_id;
+    let filter: Vec<&Expr> = plan
+        .where_clause
+        .iter()
+        .filter(|term| !term.consumed)
+        .map(|term| &term.expr)
+        .collect();
+    let mut outs: Vec<&Expr> = Vec::new();
+    let mut group_by = Vec::new();
+    if let Some(group) = &plan.group_by {
+        if group.having.is_some() {
+            return None;
+        }
+        for expr in &group.exprs {
+            group_by.push(outs.len());
+            outs.push(expr);
+        }
+    }
+    let mut aggregates = Vec::new();
+    let mut sums = Vec::new();
+    for aggregate in &plan.aggregates {
+        if aggregate.filter_expr.is_some()
+            || !matches!(aggregate.distinctness, Distinctness::NonDistinct)
+        {
+            return None;
+        }
+        let at = outs.len();
+        aggregates.push(match (&aggregate.func, aggregate.args.as_slice()) {
+            (AggFunc::Count0, []) => Aggregate::CountStar,
+            (AggFunc::Count, [arg]) => {
+                outs.push(arg);
+                Aggregate::Count(at)
+            }
+            (AggFunc::Sum, [arg]) => {
+                outs.push(arg);
+                sums.push(at);
+                Aggregate::Sum(at)
+            }
+            (AggFunc::Min, [arg]) => {
+                outs.push(arg);
+                Aggregate::Min(at)
+            }
+            (AggFunc::Max, [arg]) => {
+                outs.push(arg);
+                Aggregate::Max(at)
+            }
+            _ => return None,
+        });
+    }
+    let keys = group_by.len();
+    let mut result_map = Vec::new();
+    if rows {
+        for result in &plan.result_columns {
+            result_map.push(outs.len());
+            outs.push(&result.expr);
+        }
+    }
+    for result in plan.result_columns.iter().filter(|_| !rows) {
+        let key = if result.contains_aggregates {
+            None
+        } else {
+            outs.iter().take(keys).position(|g| **g == result.expr)
+        };
+        let at = match key {
+            Some(at) => at,
+            None => keys.checked_add(
+                plan.aggregates
+                    .iter()
+                    .position(|a| a.original_expr == result.expr)?,
+            )?,
+        };
+        result_map.push(at);
+    }
+    // Every column the body reads is this table's, stored as written and compared bytewise (the
+    // pipeline compares GROUP BY values and MIN and MAX bytewise); no COLLATE, no subquery.
+    let columns = table.columns();
+    for expr in filter.iter().chain(outs.iter()) {
+        let mut fine = true;
+        walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+            match e {
+                Expr::Column {
+                    table: t, column, ..
+                } => {
+                    fine &= *t == id
+                        && columns.get(*column).is_some_and(|col| {
+                            matches!(
+                                col.affinity(),
+                                Affinity::Integer
+                                    | Affinity::Text
+                                    | Affinity::Blob
+                                    | Affinity::None
+                            ) && matches!(
+                                col.collation(),
+                                CollationSeq::Binary | CollationSeq::Unset
+                            )
+                        });
+                }
+                Expr::RowId { table: t, .. } => fine &= *t == id,
+                Expr::Collate(..)
+                | Expr::Exists(..)
+                | Expr::InSelect { .. }
+                | Expr::Subquery(..)
+                | Expr::Register(..) => fine = false,
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })
+        .ok()?;
+        if !fine {
+            return None;
+        }
+    }
+    Some(BodyPlan {
+        table,
+        id,
+        filter,
+        outs,
+        group_by,
+        aggregates,
+        sums,
+        result_map,
+        rows,
+    })
+}
+
+/// Emits the body's copy after the hook's row loop, where the serial loop never reaches: each
+/// column of the table read from its register (the worker writes the row there), each filter
+/// term jumping to `skip` when it fails, each output into its register, then `keep`.
+fn emit_body(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &SelectPlan,
+    looped: &BodyPlan,
+    body: &MorselBody,
+) -> crate::Result<()> {
+    let mut resolver = resolver.fork();
+    resolver.enable_expr_to_reg_cache();
+    let mut reads = Vec::new();
+    for expr in looped.filter.iter().chain(looped.outs.iter()) {
+        walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+            match e {
+                Expr::Column { table, column, .. } if *table == looped.id => {
+                    let reg = body.columns_start.checked_add(*column).ok_or_else(|| {
+                        crate::LimboError::InternalError("register overflow".into())
+                    })?;
+                    reads.push((e.clone(), reg));
+                }
+                Expr::RowId { table, .. } if *table == looped.id => {
+                    reads.push((e.clone(), body.rowid))
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    for (expr, reg) in reads {
+        resolver.cache_scalar_expr_reg(
+            std::borrow::Cow::Owned(expr),
+            reg,
+            false,
+            &plan.table_references,
+        )?;
+    }
+    program.preassign_label_to_next_insn(body.start);
+    for term in &looped.filter {
+        let passed = program.allocate_label();
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            term,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: passed,
+                jump_target_when_false: body.skip,
+                jump_target_when_null: body.skip,
+            },
+            &resolver,
+        )?;
+        program.preassign_label_to_next_insn(passed);
+    }
+    for (at, expr) in looped.outs.iter().enumerate() {
+        let reg = body
+            .out_start
+            .checked_add(at)
+            .ok_or_else(|| crate::LimboError::InternalError("register overflow".into()))?;
+        translate_expr(program, Some(&plan.table_references), expr, reg, &resolver)?;
+    }
+    program.preassign_label_to_next_insn(body.keep);
+    program.emit_insn(Insn::Noop);
+    program.preassign_label_to_next_insn(body.skip);
+    program.emit_insn(Insn::Noop);
+    Ok(())
 }
 
 /// A statement's LIMIT and OFFSET as the hook's row loop counts them (QT.6, lane qs6-6).
@@ -192,8 +478,9 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         group_by,
         aggregates,
         result_map,
-        join: None,
+        joins: Vec::new(),
         joined_rows: None,
+        body: None,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
     })
 }
@@ -214,6 +501,21 @@ fn predicate(
         Expr::NotNull(inner) => Some(Predicate::NotNull {
             column: column(inner)?,
         }),
+        // `x IS NULL` and `x IS NOT NULL` as the parser may give them (lane qs6-10).
+        Expr::Binary(inner, Operator::Is, null)
+            if matches!(null.as_ref(), Expr::Literal(Literal::Null)) =>
+        {
+            Some(Predicate::IsNull {
+                column: column(inner)?,
+            })
+        }
+        Expr::Binary(inner, Operator::IsNot, null)
+            if matches!(null.as_ref(), Expr::Literal(Literal::Null)) =>
+        {
+            Some(Predicate::NotNull {
+                column: column(inner)?,
+            })
+        }
         Expr::Binary(left, op, right) => {
             let (at, op, value) = match (column(left), column(right)) {
                 (Some(at), None) => (at, *op, literal(right)?),
@@ -423,13 +725,20 @@ fn joined_rows(
     Some((project, MorselRows { order, width }))
 }
 
-/// A hash join's probe with the aggregates over its matches (QT.6): two rowid tables joined inner
-/// by the planner's hash join on equalities of columns of one affinity, every other term a filter
-/// on one table's columns. The pipeline's row is the probe table's columns, then the build's.
+/// A join's probe with the aggregates over its rows, or its rows (QT.6): two or more rowid tables,
+/// each joined inner and read whole, by a scan of its own rows or the planner's hash join (at least
+/// one hash join; a seek in an index the statement builds from the table, an ephemeral one, reads
+/// it whole as well), every term an equality of two tables' columns of one affinity or a filter on
+/// one table's columns. The hook's probe is the first table in the join order that no hash join
+/// builds from; every other table is a link of a chain of hash tables (lane qs6-10), keyed by its
+/// equalities with the tables before it in the chain, and taken in the join order among the tables
+/// such an equality links to the chain. Every equality is a key of the link that joins the later
+/// of its two tables, so no join term is left to test. The pipeline's row is the probe table's
+/// columns, then each link's.
 ///
 /// Every column read has INTEGER or TEXT affinity and BINARY collation: two such values that
 /// compare equal are the same value, so which joined row a MIN, a MAX or a group's key values take
-/// on a tie (the serial loop's order of a probe row's matches is its hash table's) cannot change
+/// on a tie (the serial loop's order of a probe row's matches is its hash tables') cannot change
 /// the answer.
 fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
     // A join with no aggregates returns its rows (QT.6): the workers' runs merge in order.
@@ -441,134 +750,165 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
     }) {
         return None;
     }
-    let [first, second] = plan.table_references.joined_tables() else {
-        return None;
-    };
-    let tables = [first, second];
-    let hash = tables.iter().find_map(|t| match &t.op {
-        Operation::HashJoin(op) => Some(op),
-        _ => None,
-    })?;
-    // A sort-merge join (QT.5 step 4, lane qs5-21) stays serial for now: its probe merges forward
-    // from the previous probe row's run, which a worker's morsel would start over.
-    if hash.join_type != HashJoinType::Inner
-        || hash.method != crate::translate::plan::HashJoinMethod::Hash
-        || hash.probe_table_idx == hash.build_table_idx
-        || tables.iter().any(|t| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|j| j.join_type != JoinType::Inner)
-        })
-    {
+    let joined = plan.table_references.joined_tables();
+    if joined.len() < 2 {
         return None;
     }
-    let probe = tables.get(hash.probe_table_idx)?;
-    let build = tables.get(hash.build_table_idx)?;
-    let probe_table = stored(probe)?;
-    let build_table = stored(build)?;
-    let width = probe_table.columns().len();
-    // A column the hook reads, and whether it is the probe table's.
-    let side = |expr: &Expr| -> Option<(bool, usize)> {
-        let (t, column) = match expr {
-            Expr::Column {
-                table: t, column, ..
-            } => (*t, *column),
-            // A table's rowid is its INTEGER PRIMARY KEY column, where it has one (lane qs6-6).
-            Expr::RowId { table: t, .. } => {
-                let alias = if *t == probe.internal_id {
-                    rowid_alias(probe_table)?
-                } else if *t == build.internal_id {
-                    rowid_alias(build_table)?
-                } else {
-                    return None;
-                };
-                (*t, alias)
+    let mut built = Vec::new();
+    let mut tables: Vec<&BTreeTable> = Vec::new();
+    for table in joined {
+        if table
+            .join_info
+            .as_ref()
+            .is_some_and(|j| j.join_type != JoinType::Inner)
+        {
+            return None;
+        }
+        match &table.op {
+            Operation::Scan(Scan::BTreeTable { index: None, .. }) => {}
+            // A seek in an index the statement builds from the whole table reads it whole too.
+            Operation::Search(Search::Seek {
+                index: Some(index), ..
+            }) if index.ephemeral => {}
+            // A sort-merge join (QT.5 step 4, lane qs5-21) stays serial for now: its probe merges
+            // forward from the previous probe row's run, which a worker's morsel would start over.
+            Operation::HashJoin(op)
+                if op.join_type == HashJoinType::Inner
+                    && op.method == crate::translate::plan::HashJoinMethod::Hash
+                    && op.probe_table_idx != op.build_table_idx =>
+            {
+                built.push(op.build_table_idx)
             }
             _ => return None,
+        }
+        tables.push(stored(table)?);
+    }
+    if built.is_empty() {
+        return None;
+    }
+    let probe_at = (0..tables.len()).find(|at| !built.contains(at))?;
+    // A column the hook reads: its table's place in the join order, and its own place.
+    let side = |expr: &Expr| -> Option<(usize, usize)> {
+        let (id, column) = match expr {
+            Expr::Column {
+                table: t, column, ..
+            } => (*t, Some(*column)),
+            Expr::RowId { table: t, .. } => (*t, None),
+            _ => return None,
         };
-        let (is_probe, table) = if t == probe.internal_id {
-            (true, probe_table)
-        } else if t == build.internal_id {
-            (false, build_table)
-        } else {
-            return None;
+        let at = joined.iter().position(|t| t.internal_id == id)?;
+        let table = tables.get(at)?;
+        // A table's rowid is its INTEGER PRIMARY KEY column, where it has one (lane qs6-6).
+        let column = match column {
+            Some(column) => column,
+            None => rowid_alias(table)?,
         };
         let col = table.columns().get(column)?;
         let plain = matches!(col.affinity(), Affinity::Integer | Affinity::Text)
             && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-        plain.then_some((is_probe, column))
+        plain.then_some((at, column))
     };
-    let joined_at = |expr: &Expr| -> Option<usize> {
-        let (is_probe, at) = side(expr)?;
-        if is_probe {
-            Some(at)
-        } else {
-            width.checked_add(at)
-        }
+    let affinity = |(at, column): (usize, usize)| {
+        tables
+            .get(at)
+            .and_then(|t| t.columns().get(column))
+            .map(|c| c.affinity())
     };
-    let integer = |at: usize| -> bool {
-        let col = match at.checked_sub(width) {
-            None => probe_table.columns().get(at),
-            Some(at) => build_table.columns().get(at),
-        };
-        col.is_some_and(|c| c.affinity() == Affinity::Integer)
-    };
-    let mut probe_key = Vec::new();
-    let mut build_key = Vec::new();
-    let mut keys = Vec::new();
-    for key in &hash.join_keys {
-        let term = plan.where_clause.get(key.where_clause_idx)?;
-        let Expr::Binary(left, Operator::Equals, right) = &term.expr else {
-            return None;
-        };
-        let (at_probe, at_build) = match (side(left)?, side(right)?) {
-            ((true, p), (false, b)) | ((false, b), (true, p)) => (p, b),
-            _ => return None,
-        };
-        // Keys of one affinity compare with no conversion, as the join's hash table does.
-        if probe_table.columns().get(at_probe)?.affinity()
-            != build_table.columns().get(at_build)?.affinity()
-        {
-            return None;
-        }
-        probe_key.push(at_probe);
-        build_key.push(at_build);
-        keys.push(key.where_clause_idx);
-    }
-    if keys.is_empty() {
-        return None;
-    }
-    let on_probe = |expr: &Expr| side(expr).and_then(|(p, at)| p.then_some(at));
-    let on_build = |expr: &Expr| side(expr).and_then(|(p, at)| (!p).then_some(at));
-    let mut probe_filter = Vec::new();
-    let mut build_filter = Vec::new();
-    // Every term that is not a key is a filter on one table, consumed or not: one the planner
-    // made into a seek still holds of every row the join reads.
-    for (at, term) in plan.where_clause.iter().enumerate() {
-        if keys.contains(&at) {
-            continue;
-        }
+    // Every term, consumed or not (one the planner made into a hash join's key still holds of
+    // every row the join reads): an equality of two tables' columns, or a filter on one table.
+    let mut edges: Vec<((usize, usize), (usize, usize))> = Vec::new();
+    let mut filters: Vec<Vec<Predicate>> = tables.iter().map(|_| Vec::new()).collect();
+    for term in &plan.where_clause {
         if matches!(term.origin, WhereTermOrigin::TableFunction(_)) {
             return None;
         }
-        match predicate(&term.expr, &on_probe, probe_table) {
-            Some(found) => probe_filter.push(found),
-            None => build_filter.push(predicate(&term.expr, &on_build, build_table)?),
+        if let Expr::Binary(left, Operator::Equals, right) = &term.expr {
+            if let (Some(l), Some(r)) = (side(left), side(right)) {
+                if l.0 != r.0 {
+                    // Keys of one affinity compare with no conversion, as a hash table does.
+                    if affinity(l)? != affinity(r)? {
+                        return None;
+                    }
+                    edges.push((l, r));
+                    continue;
+                }
+            }
         }
+        let (at, found) = (0..tables.len()).find_map(|at| {
+            let on = |expr: &Expr| side(expr).and_then(|(t, c)| (t == at).then_some(c));
+            let table: &BTreeTable = tables.get(at)?;
+            predicate(&term.expr, &on, table).map(|p| (at, p))
+        })?;
+        filters.get_mut(at)?.push(found);
     }
+    // The chain: each table's place in the joined row once it is joined.
+    let mut offsets: Vec<Option<usize>> = tables.iter().map(|_| None).collect();
+    *offsets.get_mut(probe_at)? = Some(0);
+    let probe_table: &BTreeTable = tables.get(probe_at)?;
+    let mut width = probe_table.columns().len();
+    let mut kinds: Vec<Affinity> = probe_table.columns().iter().map(|c| c.affinity()).collect();
+    let mut joins = Vec::new();
+    while joins.len().saturating_add(1) < tables.len() {
+        let joined_place = |at: usize| offsets.get(at).copied().flatten();
+        // The next link: the first table in the join order an equality links to the chain; none
+        // is a cross product, which the hook declines.
+        let next = (0..tables.len()).find(|at| {
+            joined_place(*at).is_none()
+                && edges.iter().any(|(l, r)| {
+                    (l.0 == *at && joined_place(r.0).is_some())
+                        || (r.0 == *at && joined_place(l.0).is_some())
+                })
+        })?;
+        let mut probe_key = Vec::new();
+        let mut build_key = Vec::new();
+        for (l, r) in &edges {
+            let (other, own) = if l.0 == next {
+                (r, l)
+            } else if r.0 == next {
+                (l, r)
+            } else {
+                continue;
+            };
+            let Some(base) = joined_place(other.0) else {
+                continue;
+            };
+            probe_key.push(base.checked_add(other.1)?);
+            build_key.push(own.1);
+        }
+        let table: &BTreeTable = tables.get(next)?;
+        *offsets.get_mut(next)? = Some(width);
+        width = width.checked_add(table.columns().len())?;
+        kinds.extend(table.columns().iter().map(|c| c.affinity()));
+        joins.push(MorselJoinData {
+            root_page: table.root_page,
+            columns: table.columns().len(),
+            rowid_alias: rowid_alias(table),
+            filter: std::mem::take(filters.get_mut(next)?),
+            probe_key,
+            build_key,
+        });
+    }
+    let joined_at = |expr: &Expr| -> Option<usize> {
+        let (at, column) = side(expr)?;
+        offsets.get(at).copied().flatten()?.checked_add(column)
+    };
+    let integer = |at: usize| kinds.get(at).is_some_and(|k| *k == Affinity::Integer);
     let (group_by, aggregates, result_map, joined_rows) = if rows_mode {
         // A LIMIT or OFFSET cuts rows in order, so the hook takes one only when its rows' order is
-        // the serial loop's to the row: the ORDER BY keys hold both tables' INTEGER PRIMARY KEYs,
-        // which tell every joined row apart (QT.6, lane qs6-6).
+        // the serial loop's to the row: the ORDER BY keys hold every table's INTEGER PRIMARY KEY,
+        // which tell every joined row apart (QT.6, lanes qs6-6 and qs6-10).
         if plan.limit.is_some() || plan.offset.is_some() {
-            let ordered = |is_probe: bool, table: &BTreeTable| {
-                rowid_alias(table).is_some_and(|alias| {
-                    plan.order_by
-                        .iter()
-                        .any(|(expr, _, _)| side(expr) == Some((is_probe, alias)))
-                })
-            };
-            if !(ordered(true, probe_table) && ordered(false, build_table)) {
+            let ordered = (0..tables.len()).all(|at| {
+                tables
+                    .get(at)
+                    .and_then(|table| rowid_alias(table))
+                    .is_some_and(|alias| {
+                        plan.order_by
+                            .iter()
+                            .any(|(expr, _, _)| side(expr) == Some((at, alias)))
+                    })
+            });
+            if !ordered {
                 return None;
             }
         }
@@ -580,21 +920,15 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
     };
     Some(MorselAggregateData {
         root_page: probe_table.root_page,
-        columns: width,
+        columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
-        filter: probe_filter,
+        filter: std::mem::take(filters.get_mut(probe_at)?),
         group_by,
         aggregates,
         result_map,
-        join: Some(MorselJoinData {
-            root_page: build_table.root_page,
-            columns: build_table.columns().len(),
-            rowid_alias: rowid_alias(build_table),
-            filter: build_filter,
-            probe_key,
-            build_key,
-        }),
+        joins,
         joined_rows,
+        body: None,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
     })
 }

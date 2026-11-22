@@ -15,6 +15,8 @@
 //! through SQL against a serial replay (`many_writers`) and Elle's checks through SQL (`elle_sql`).
 
 pub mod blink;
+#[cfg(test)]
+mod cancel_bench;
 pub mod columns;
 pub(crate) mod columns_path;
 pub mod columns_sql;

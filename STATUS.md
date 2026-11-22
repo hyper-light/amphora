@@ -40,6 +40,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`Resolved`), with today's answer at the decision as the control; `commit_records` answers the touched groups'
   newest closed time as its token. Tests force each mode's failure (a group behind, a retry into its own locks);
   `xgroup_lan ryw` runs both at scale. Waits on the coordinator: which mode stays, from live runs.
+- **Column copies within a fixed memory limit** (kiln goal c436eeb5, CB, lanes colcopy-bound to
+  colcopy-4; docs/design/columnar.md decision 2): each block and change of a copy asks the memory
+  source for its bytes before it is built or applied, a refused build gives back what it took, and a
+  refused copy is bought again by A (rent and rebuy) or B (wait for room) behind
+  `AMPHORA_COLUMN_REBUY`, counted and traced. `amphora-bench --colcopy` (lane colcopy-5) runs the
+  same scenarios on both ways and on DuckDB from one driver, in process, under the same cap. Open: the
+  A/B and DuckDB runs of record and the default they pick.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
@@ -391,8 +398,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   statement writes its row; SQL there is serializable: the cursor keeps each leaf span it copies as
   read for its commit's precision-locking validation, and Elle's histories through SQL show no
   anomaly on either storage (`T-G8.4.1`); an in-memory IO keeps a database's storage beside its
-  file, so a database reopened on it finds its trees. With the switch on, 55 of the engine's lib
-  tests still fail (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
+  file, so a database reopened on it finds its trees. Attached databases keep their trees on their own
+  versioned storage; the versioned cursor stops at the next leaf once its statement is interrupted
+  and pauses where the pager's cursor does in tests (`AC-NS.2.7`, lane g7s2-11). With the switch on,
+  44 of the engine's lib tests still fail (2866 pass, lane g7s2-11, before the pause points; 6 more
+  pass after) (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
   batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and
   page-codec tests). Not yet: the header (schema cookie, user version) on the versioned
   storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
@@ -1193,9 +1203,13 @@ worker), charged to the statement's memory budget with a typed refusal that fall
 serial loop; two-table hash joins that return rows (no aggregates) run on morsels, with an
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Lane qs6-6: such a join under LIMIT and
 OFFSET runs on morsels too when its ORDER BY holds both tables' INTEGER PRIMARY KEYs, so its rows
-are the serial loop's to the row (T-QT.6.14). Still open: workers running a copy of the VDBE loop
-body (any expression in parallel), joins of three or more tables, outer joins, a LIMIT that stops
-the workers early.
+are the serial loop's to the row (T-QT.6.14). Lane qs6-7: workers run a copy of a one-table scan's loop
+body, each with its own registers, so any filter or expression runs in parallel (T-QT.6.15).
+Lane qs6-8: a scan's rows run through the copy too, and under a LIMIT with no ORDER BY
+(behind its switch, serial the control) the workers stop once they hold the LIMIT's rows (T-QT.6.16).
+Lane qs6-10: inner joins of any number of tables run on morsels: every table but the probe is a
+link of a chain of hash tables, each keyed by its equalities with the tables before it, and each
+probe row walks the chain (T-QT.6.17). Still open: the copy of the loop body for joins, outer joins.
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.
@@ -1204,8 +1218,8 @@ G5 step 4 wired (lanes g5s4c, g5s4d): the engine's Insert and Delete opcodes kee
 registry of skipping summaries (zone maps or cracking), and a SELECT's scan with integer bounds on
 a summarized column seeks past the rows the summary leaves out, consulting it only at the snapshot
 it holds (an older reader, or a rolled-back summary, is refused, counted, and reads every row).
-Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). Open: choosing a kind
-by measured cost and a SQL switch (executor.md decision 11, "Not yet").
+Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). A kind chosen by measured
+cost and a SQL setting followed (T-SKU.2, T-SKU.3).
 
 Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
 11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
@@ -1266,3 +1280,13 @@ Lane qs5-19 (QT.5, T-QT.5.13, T-QT.5.14): the measured star order's counts, whol
 Lane qs5-20 (QT.5, T-QT.5.15, T-QT.5.16, T-QT.5.17): a sort-merge join's cost, `estimate_merge_join_cost`, sits beside the hash join's in its plan shape and units (sorts of inputs not in key order, a spilled sort's pages written and read once, a comparison a row, the visits), with unit tests for the cases each method should win; which inputs already come in key order (`merge_inputs_in_key_order`); and, at the hash join's candidate, the merge's cost traced beside the hash join's ("merge-join candidate"), with no plan change until its plan node and operator land. `tests/join_methods.rs` gains the differential test the merge must pass (empty inputs, all-NULL keys, a key repeated on both sides, keys of every storage class, keys meeting at the ends), run today under nested loops, hash joins and by cost. A sized Bloom filter's key hashes now grow within its bound with the old and new lists counted together (`BloomFilter::peak`, counted in `star_filter_bytes`): a growth that would pass the bound passes every key (`docs/design/planner.md`, "Decision (lane qs5-20)").
 
 Lane qs5-21 (QT.5, T-QT.5.18): a sort-merge join's plan node and operator, behind the switch. A merge is a method of the hash join (`HashJoinMethod::Merge`), run through its instructions: its table sorts the build rows by key once built, and a probe merges forward from the previous probe's run (binary search for a probe out of key order), so outer, semi and anti joins, the Bloom filter and the spill stay the hash join's. The planner takes merges only under `JoinMethods::MergeJoinsOnly` or `ByCostWithMerge`; `ByCost`, the default, never does, and the parallel path takes only hash joins. `tests/join_methods.rs` runs every join as a merge too (`docs/design/planner.md`, "Decision (lane qs5-21)").
+Lanes skip-3 and skip-4 (kiln goal 623adc1c): `PRAGMA skipping = 'table.column'` turns skipping
+on (T-SKU.3), and by default it keeps both kinds and answers each filter with whichever measured
+cheaper on that column's own scans, measuring the other again on a doubling schedule (T-SKU.2).
+Lane skip-5: a skipping scan runs its body over the fused column batches up to each candidate
+run's end (T-SKU.4). `PRAGMA skipping = 't.a capped'` keeps the measured choice but drops the
+method not leading once its write upkeep passes its measured build cost (ski rental's break-even),
+building it again when its doubling-schedule trial comes due; `measured` (keep both) is the
+control (T-SKU.5). The setting now acts when its statement runs, by its own instruction, so a
+statement prepared before the data loads still skips it (T-SKU.6).
+Open: the benchmark against DuckDB and ClickHouse.

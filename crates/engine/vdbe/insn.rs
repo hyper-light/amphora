@@ -544,13 +544,51 @@ pub struct MorselAggregateData {
     /// For each result column, its place in the pipeline's row (the GROUP BY values, then the
     /// aggregates).
     pub result_map: Vec<usize>,
-    /// A hash join's build side when the scan is the join's probe: the pipeline's row is the probe
-    /// table's columns, then the build's; `filter` is then over the probe table's alone.
-    pub join: Option<MorselJoinData>,
+    /// A join's build sides when the scan is its probe, a chain of hash tables (lane qs6-10): the
+    /// pipeline's row is the probe table's columns, then each link's build row's in turn; each
+    /// link's `probe_key` names places in the row joined before it. `filter` is then over the
+    /// probe table's columns alone. Empty for a scan.
+    pub joins: Vec<MorselJoinData>,
     /// A join's rows rather than groups: `result_map` then names the joined row's columns each
     /// output row takes (the result columns, then the ORDER BY keys), and there are no aggregates.
     pub joined_rows: Option<MorselRows>,
+    /// A copy of a one-table scan's loop body that each worker runs per row (lane qs6-7): when
+    /// present, the workers' filter, GROUP BY values and aggregate inputs are the statement's own
+    /// bytecode, and `group_by`, `aggregates` and `result_map` name places in its output row.
+    pub body: Option<Box<MorselBody>>,
     pub target_pc_serial: BranchOffset,
+}
+
+/// Amphora (QT.6, lane qs6-7): a one-table scan's loop body, emitted as its own range of the
+/// program, which the serial loop never runs. A worker runs it per row with its own registers
+/// (`ProgramState`): the row's stored columns go into `columns_start..`, its rowid into `rowid`,
+/// then the code runs from `start` until it reaches `keep` (the row passed every filter, its
+/// values in `out_start..out_start + out_count`) or `skip` (it did not).
+#[derive(Debug, Clone)]
+pub struct MorselBody {
+    pub start: BranchOffset,
+    pub keep: BranchOffset,
+    pub skip: BranchOffset,
+    pub columns_start: usize,
+    pub rowid: usize,
+    pub out_start: usize,
+    pub out_count: usize,
+    /// The output row's GROUP BY values (its first places) and the aggregates over its places.
+    pub group_by: Vec<usize>,
+    pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
+    /// The places a SUM reads: a REAL there sends the statement to the serial loop, whose
+    /// rounding the parallel sum's single exact rounding would not repeat.
+    pub sums: Vec<usize>,
+    /// Whether `MorselAggregateData`'s own filter and aggregates state the same query over the
+    /// table's columns (the versioned storage's column copy reads those, not the body).
+    pub simple: bool,
+    /// Amphora (QT.6, lane qs6-8): the outputs are the statement's result columns, kept as rows
+    /// in leaf order rather than folded into aggregates.
+    pub rows: bool,
+    /// With `rows`, under a LIMIT: the rows the LIMIT and OFFSET take. No morsel is claimed once
+    /// that many are kept, and a morsel stops once it alone holds that many; the morsels run are
+    /// then a prefix of the table, so the first rows are the serial loop's.
+    pub want: Option<u64>,
 }
 
 /// Amphora: how [MorselAggregateData]'s joined rows come out (QT.6).
@@ -570,7 +608,8 @@ pub struct MorselJoinData {
     pub rowid_alias: Option<usize>,
     /// Terms over the build table's columns, tested before a row goes into the hash table.
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
-    /// The key's columns, pair by pair, in the probe table and in the build table.
+    /// The key's columns, pair by pair, in the row joined so far (the probe table's columns, then
+    /// each earlier link's) and in the build table.
     pub probe_key: Vec<usize>,
     pub build_key: Vec<usize>,
 }
@@ -2492,6 +2531,15 @@ pub enum Insn {
     StarProbes {
         data: Box<StarProbesData>,
     },
+
+    /// Amphora (lane skip-5, T-SKU.6): `PRAGMA skipping`'s setting, acted on when the statement
+    /// runs: keeps a skipping summary of `column` of `table` built from the rows there now
+    /// (`kind` `None`: drops it), as `skipping::set_skipping` does.
+    SetSkipping {
+        table: String,
+        column: String,
+        kind: Option<crate::skipping::SkipKind>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2749,6 +2797,7 @@ impl InsnVariants {
             InsnVariants::SorterCounted => execute::op_sorter_counted,
             InsnVariants::SubqueryCounted => execute::op_subquery_counted,
             InsnVariants::StarProbes => execute::op_star_probes,
+            InsnVariants::SetSkipping => execute::op_set_skipping,
         }
     }
 }
@@ -2814,6 +2863,7 @@ impl Insn {
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
+            | Self::SetSkipping { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             // A recursive foreign-key action is treated as writable while it's still being

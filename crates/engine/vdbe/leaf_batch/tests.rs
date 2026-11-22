@@ -20,7 +20,8 @@ pub(super) fn note_fused(rows: usize) {
     FUSED.with(|fused| fused.set(fused.get() + rows));
 }
 
-fn fused() -> usize {
+/// Rows the fused loops ran on this thread so far (the skipping tests read it: lane skip-5).
+pub(crate) fn fused() -> usize {
     FUSED.with(Cell::get)
 }
 
@@ -56,9 +57,20 @@ impl Rng {
 }
 
 fn open() -> Arc<Connection> {
+    open_on(false)
+}
+
+/// A connection on the pager's B-trees, or on the versioned storage (G7 step 2).
+fn open_on(versioned: bool) -> Arc<Connection> {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    db.connect(crate::ConnectOpts::new()).unwrap()
+    let opts = crate::ConnectOpts::new();
+    let opts = if versioned {
+        opts.with_versioned_storage()
+    } else {
+        opts
+    };
+    db.connect(opts).unwrap()
 }
 
 /// A statement's rows, or the error it ended with (`sum` overflowing, say): both must match.
@@ -145,10 +157,15 @@ fn queries(rng: &mut Rng) -> Vec<String> {
 
 /// One seed: every query's answer with the switch on equals its answer with it off.
 fn differential(seed: u64, budget: Option<usize>) -> usize {
+    differential_on(seed, budget, false)
+}
+
+/// [`differential`] on the pager's B-trees or the versioned storage's.
+fn differential_on(seed: u64, budget: Option<usize>, versioned: bool) -> usize {
     BUDGET.with(|b| b.set(budget));
     DECODED.with(|d| d.set(0));
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let conn = open();
+    let conn = open_on(versioned);
     build(&conn, &mut rng);
     for sql in queries(&mut rng) {
         conn.set_vectorized_scans(false);
@@ -197,6 +214,33 @@ fn qt7_budget_below_a_page_falls_back_with_identical_results() {
         // Under one row's charge: nothing is batched, every row is read as before.
         let decoded = differential(seed, Some(1));
         assert_eq!(decoded, 0, "seed {seed}: a row was batched past its budget");
+    }
+}
+
+/// G7 step 2 (`AC-NS.2.1`; QT.7 on the versioned storage): batches decoded from the versioned
+/// storage's leaf copies answer as its row-at-a-time scans (the switch off, the control) on the
+/// same random tables and predicates; they were used, several windows a copy under a small
+/// budget, and no row past a budget under one row's charge.
+#[test]
+fn ns_2_1_versioned_batched_scans_answer_as_row_at_a_time_scans() {
+    for seed in 1..=4 {
+        let decoded = differential_on(seed, Some(1 << 20), true);
+        assert!(
+            decoded > 0,
+            "seed {seed}: no versioned row was read from a batch"
+        );
+    }
+    for seed in 7..=8 {
+        let decoded = differential_on(seed, Some(600), true);
+        assert!(
+            decoded > 0,
+            "seed {seed}: no versioned row was read from a batch"
+        );
+        let decoded = differential_on(seed, Some(1), true);
+        assert_eq!(
+            decoded, 0,
+            "seed {seed}: a versioned row was batched past its budget"
+        );
     }
 }
 
