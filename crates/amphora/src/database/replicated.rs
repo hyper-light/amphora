@@ -176,6 +176,15 @@ impl Client {
     pub(super) fn handle(&self) -> ReplicaHandle {
         self.handle.clone()
     }
+    /// Takes in a cross-group stamp a step carried (lane split-merge-21, T-T1.9.R28): every entry
+    /// this owner proposes from now on is stamped past it, so the group's closed time after the
+    /// step is too (`closed::next` keeps it rising past the time before).
+    pub(super) fn observe(&self, micros: u64) {
+        self.handle
+            .shared
+            .observed
+            .fetch_max(micros, Ordering::AcqRel);
+    }
     /// `f` on this owner's own applied state, on the caller's thread, asking the group's leader
     /// nothing (replication.md, "A local read on a replica"): it answers with the leader gone or
     /// out of reach, and sees only entries the group committed and this owner applied, never a
@@ -311,6 +320,10 @@ struct Control {
     moved: std::sync::Condvar,
     // This replica's token reads, counted (`tokens`).
     sessions: tokens::SessionMeter,
+    // The latest cross-group stamp a step carried in (lane split-merge-21, T-T1.9.R28), in the
+    // closed time's microseconds: this owner proposes past it, the hybrid logical clock's receive
+    // rule, so the group's entries after the step are stamped after every stamp it carried.
+    observed: AtomicU64,
 }
 /// What a replica's owner published of its closed time, and of its applied and answered points
 /// (the session tokens', `tokens`).
@@ -1612,6 +1625,7 @@ fn open_on<F: BlockFile + 'static>(
         }),
         moved: std::sync::Condvar::new(),
         sessions: tokens::SessionMeter::default(),
+        observed: AtomicU64::new(0),
     });
     let election = replica.core().raft.config().election_tick;
     let slots = super::slot::Slots::new(slot_bounds(election, TICK)?);
@@ -3816,7 +3830,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             bytes.len(),
             self.entry_room(context.len())?,
         )?;
-        let stamped = crate::replication::closed::stamp(self.wall_now()?, &bytes);
+        // The receive rule (Kulkarni et al., OPODIS 2014): past every stamp a step carried in.
+        let observed = self.control.observed.load(Ordering::Acquire);
+        let now = self.wall_now()?.max(observed.saturating_add(1));
+        let stamped = crate::replication::closed::stamp(now, &bytes);
         self.replica
             .propose(context.to_vec(), stamped)
             .map_err(raft_error)
@@ -12025,6 +12042,37 @@ mod tests {
             })
         });
     }
+    /// Rounds until each of the first `owners` owners has applied all that the leader has
+    /// committed: what a comparison of their rows waits on, since a calm configuration and a round
+    /// with nothing to relay say nothing of a follower whose records were lost or whose disk still
+    /// writes. Time stands still while anything is relayed or written; once nothing is and an owner
+    /// still lags, only the leader's heartbeat finds the lag and sends again, so every clock moves
+    /// a tick, as real time would. Returns the leader the group then follows.
+    fn caught_up(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        clients: &[Client],
+        owners: usize,
+    ) -> usize {
+        for _ in 0..ROUNDS {
+            let leader = settle_lead(driven, pump, clients);
+            let committed = driven.owner(leader).replica.core().raft.log().committed();
+            if (0..owners).all(|owner| driven.owner(owner).replica.applied().index >= committed) {
+                return leader;
+            }
+            if pump.drive_until(driven.until()) == 0 {
+                if (0..4).any(|owner| driven.owner(owner).replica.in_flight() > 0) {
+                    std::thread::park_timeout(POLL);
+                } else {
+                    for owner in 0..4 {
+                        driven.advance_tick(owner);
+                    }
+                }
+            }
+            driven.step();
+        }
+        panic!("the first {owners} owners did not apply the leader's commit in {ROUNDS} rounds");
+    }
     /// The member the group follows, as owner `asked` sees it, by its index; None while it knows
     /// none.
     fn leading(clients: &[Client], asked: usize) -> Option<usize> {
@@ -12471,9 +12519,11 @@ mod tests {
             }
 
             // Calm: join rows equal, every write recorded at or above the floor at its base, and
-            // members' digests equal at every applied index they share.
+            // members' digests equal at every applied index they share, once each voter has
+            // applied all the leader committed.
             quiet(&mut driven, &mut pump);
             calm(&mut driven, &mut pump, 3);
+            leader = caught_up(&mut driven, &mut pump, &clients, 3);
             let rows = floor_rows(&mut driven, 0);
             for owner in 1..3 {
                 assert_eq!(

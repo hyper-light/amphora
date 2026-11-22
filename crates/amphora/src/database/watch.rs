@@ -12,6 +12,25 @@ pub(super) struct Watchers {
 }
 const WAIT_MAX: usize = 4096;
 
+impl Watchers {
+    /// Registers `waker` for every change published here, bounded as a watch is: its id, to
+    /// remove it by (a wait across groups, lane split-merge-19, T-T1.9.R25).
+    pub(super) fn register(&mut self, waker: Waker) -> Result<u64, Refusal> {
+        api::bound(
+            "watch registrations",
+            self.wakers.len().saturating_add(1),
+            WAIT_MAX,
+        )?;
+        let id = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| unavailable("watch registration identity exhausted"))?;
+        self.next = id;
+        self.wakers.insert(id, waker);
+        Ok(id)
+    }
+}
+
 pub struct Watch {
     namespace: Namespace,
     family: String,

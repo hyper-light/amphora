@@ -33,7 +33,15 @@ CREATE TABLE IF NOT EXISTS __amphora_xg_record(coordinator INTEGER NOT NULL, epo
 CREATE TABLE IF NOT EXISTS __amphora_xg_done(coordinator INTEGER NOT NULL, epoch INTEGER NOT NULL, seq INTEGER NOT NULL, outcome INTEGER NOT NULL, PRIMARY KEY(coordinator, epoch, seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS __amphora_xg_guard(coordinator INTEGER PRIMARY KEY, fence INTEGER NOT NULL, floor_epoch INTEGER, floor_seq INTEGER);
 CREATE TABLE IF NOT EXISTS __amphora_xg_epoch(coordinator INTEGER PRIMARY KEY, epoch INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS __amphora_xg_lock_at(coordinator INTEGER NOT NULL, epoch INTEGER NOT NULL, seq INTEGER NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY(coordinator, epoch, seq)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS __amphora_xg_commit_at(coordinator INTEGER NOT NULL, epoch INTEGER NOT NULL, seq INTEGER NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY(coordinator, epoch, seq)) WITHOUT ROWID;
 ";
+
+/// A transaction's lock stamp in a group, and its commit stamp as kept there (lane split-merge-22).
+const LOCK_STAMP: &str =
+    "SELECT stamp FROM __amphora_xg_lock_at WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3";
+const COMMIT_STAMP: &str =
+    "SELECT stamp FROM __amphora_xg_commit_at WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3";
 
 // The tables' codes: a format, written into every group's database; only ever appended to.
 const READ: i64 = 0;
@@ -155,6 +163,28 @@ fn name_at(bytes: &[u8]) -> Option<(&str, &[u8])> {
     Some((std::str::from_utf8(name).ok()?, rest))
 }
 
+/// Whether a transaction across groups holds any lock, a read's or a write's, on a Records row
+/// here: a single-group commit touching it is refused as a conflict, as the lock step would refuse
+/// it (AC-T1.10.1). Unlike [`locked`], a read lock counts: the commit would change what it read.
+pub(crate) fn lock_held(
+    db: &Db,
+    namespace: &str,
+    family: &str,
+    key: &[u8],
+) -> anyhow::Result<bool> {
+    let key = record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut held = false;
+    db.query(
+        "SELECT 1 FROM __amphora_xg_lock WHERE key = ?1 LIMIT 1",
+        [blob(&key)?],
+        |_| {
+            held = true;
+            Ok(false)
+        },
+    )?;
+    Ok(held)
+}
+
 /// The cross-group key of a Records row here a transaction across groups holds a write lock on
 /// (a put or a delete): the row's own, if it is locked (`LockedReads::Wait` and `WaitOnLock` wait
 /// on it). A read lock changes no row, so a read needn't wait on it; `kind <> 0` is [`READ`].
@@ -227,6 +257,48 @@ pub(crate) fn locked_in(
     Ok(held)
 }
 
+/// The first Records row of `namespace`'s `family` from `lower` up to `upper` (none: the family's
+/// end) a transaction across groups holds a write lock on here with its lock stamp at or before
+/// `at`, by its cross-group key (lane split-merge-21, T-T1.9.R28): its commit stamp may then be at
+/// or before `at`, so a read as of `at` can't answer until it resolves, and waits on that row's
+/// waiter list (lane split-merge-22). A read lock writes nothing and holds no read.
+pub(crate) fn held_at(
+    db: &Db,
+    namespace: &str,
+    family: &str,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+    at: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let refused = |e: Refusal| anyhow::anyhow!("{e}");
+    let from = record_key(namespace, family, lower).map_err(refused)?;
+    // Past every row of the family: its prefix with the next byte past the last (the four-byte
+    // lengths keep one family's prefix from being another's).
+    let to = match upper {
+        Some(upper) => record_key(namespace, family, upper).map_err(refused)?,
+        None => {
+            let mut end = record_key(namespace, family, &[]).map_err(refused)?;
+            end.push(u8::MAX);
+            end
+        }
+    };
+    let mut held = None;
+    db.query(
+        "SELECT l.key FROM __amphora_xg_lock l JOIN __amphora_xg_lock_at t ON t.coordinator = l.coordinator AND t.epoch = l.epoch AND t.seq = l.seq WHERE l.key >= ?1 AND l.key < ?2 AND l.kind != ?3 AND t.stamp <= ?4 ORDER BY l.key LIMIT 1",
+        [
+            blob(&from)?,
+            blob(&to)?,
+            Value::from_i64(READ),
+            Value::from_i64(i64::try_from(at)?),
+        ],
+        |row| {
+            held = bytes_at(row, 0);
+            Ok(false)
+        },
+    )?;
+    Ok(held)
+}
+
 /// A group's database as a [`Tablet`], inside the step's one transaction.
 pub(crate) struct SqlTablet<'a> {
     db: &'a Db,
@@ -244,6 +316,17 @@ impl<'a> SqlTablet<'a> {
             revs: BTreeMap::new(),
             dropped: Vec::new(),
         }
+    }
+
+    /// A transaction's stamp as `select` reads it, one of the stamp tables' [`LOCK_STAMP`] and
+    /// [`COMMIT_STAMP`].
+    fn stamp_in(&self, select: &'static str, txn: TxnId) -> anyhow::Result<Option<u64>> {
+        let mut stamp = None;
+        self.db.query(select, txn_params(txn)?, |row| {
+            stamp = Some(u64_at(row, 0)?);
+            Ok(false)
+        })?;
+        Ok(stamp)
     }
 }
 
@@ -276,13 +359,23 @@ impl Tablet for SqlTablet<'_> {
     }
 
     fn set_value(&mut self, key: &[u8], value: Option<&[u8]>) -> anyhow::Result<()> {
+        self.set_value_at(key, value, None)
+    }
+
+    fn set_value_at(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        stamp: Option<u64>,
+    ) -> anyhow::Result<()> {
         if let Some((namespace, family, row)) = record_of(key)? {
             let (at, seq) = match self.revs.get(namespace) {
                 Some(&(at, seq)) => (Some(at), seq),
                 None => (None, 0),
             };
-            let at =
-                crate::database::write_across(self.db, namespace, family, row, value, at, seq)?;
+            let at = crate::database::write_across(
+                self.db, namespace, family, row, value, at, seq, stamp,
+            )?;
             let next = seq
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("a step's rows ran out of places"))?;
@@ -301,6 +394,14 @@ impl Tablet for SqlTablet<'_> {
                 |_| Ok(true),
             ),
         }
+    }
+
+    fn stamp(&mut self, key: &[u8]) -> anyhow::Result<Option<u64>> {
+        // `conditioned` refuses a condition on a key-value row before any step is sent.
+        let Some((namespace, family, row)) = record_of(key)? else {
+            anyhow::bail!("a condition names a key-value row, which has no commit stamps");
+        };
+        crate::database::newest_stamp(self.db, namespace, family, row)
     }
 
     fn locks(&mut self, key: &[u8]) -> anyhow::Result<Vec<Lock>> {
@@ -351,6 +452,19 @@ impl Tablet for SqlTablet<'_> {
             Intent::Delete => (DELETE, Value::Null),
         };
         let [coordinator, epoch, seq] = txn_params(lock.txn)?;
+        // The transaction's lock stamp here (lane split-merge-21, T-T1.9.R28): this group's clock
+        // as it takes the first lock, after the coordinator's carried stamp. Its commit stamp is at
+        // or past it, so a read across groups as of a stamp before it never waits on it, and one
+        // at or past it waits for the resolution. A group that stamps nothing keeps none.
+        if let Some(hooks) = self.db.stamps() {
+            let stamp = hooks.marks.next_micros()?;
+            let [c, e, s] = txn_params(lock.txn)?;
+            self.db.query(
+                "INSERT OR IGNORE INTO __amphora_xg_lock_at(coordinator, epoch, seq, stamp) VALUES (?1, ?2, ?3, ?4)",
+                [c, e, s, int(stamp)?],
+                |_| Ok(true),
+            )?;
+        }
         self.db.query(
             "INSERT INTO __amphora_xg_lock(key, coordinator, epoch, seq, anchor, kind, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             [
@@ -377,6 +491,11 @@ impl Tablet for SqlTablet<'_> {
                 }
                 Ok(true)
             },
+        )?;
+        self.db.query(
+            "DELETE FROM __amphora_xg_lock_at WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3",
+            txn_params(txn)?,
+            |_| Ok(true),
         )?;
         self.db.query(
             "DELETE FROM __amphora_xg_lock WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3",
@@ -439,6 +558,23 @@ impl Tablet for SqlTablet<'_> {
         )
     }
 
+    fn lock_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>> {
+        self.stamp_in(LOCK_STAMP, txn)
+    }
+
+    fn commit_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>> {
+        self.stamp_in(COMMIT_STAMP, txn)
+    }
+
+    fn set_commit_stamp(&mut self, txn: TxnId, at: u64) -> anyhow::Result<()> {
+        let [coordinator, epoch, seq] = txn_params(txn)?;
+        self.db.query(
+            "INSERT OR IGNORE INTO __amphora_xg_commit_at(coordinator, epoch, seq, stamp) VALUES (?1, ?2, ?3, ?4)",
+            [coordinator, epoch, seq, int(at)?],
+            |_| Ok(true),
+        )
+    }
+
     fn guard(&mut self, coordinator: u64) -> anyhow::Result<Guard> {
         let mut guard = Guard::default();
         self.db.query(
@@ -480,6 +616,11 @@ impl Tablet for SqlTablet<'_> {
         };
         self.db.query(
             "DELETE FROM __amphora_xg_done WHERE coordinator = ?1 AND (epoch < ?2 OR (epoch = ?2 AND seq < ?3))",
+            params()?,
+            |_| Ok(true),
+        )?;
+        self.db.query(
+            "DELETE FROM __amphora_xg_commit_at WHERE coordinator = ?1 AND (epoch < ?2 OR (epoch = ?2 AND seq < ?3))",
             params()?,
             |_| Ok(true),
         )?;
@@ -579,10 +720,11 @@ pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
 
 /// A step that came over the transport for this owner's group `here` (`Request::Step`): applied as
 /// a local one is, the coordinator's stamp `carried` taken in first; answers the reply, the group's
-/// newest stamp after it (none: the group makes no stamps), and its closed time after it, a session
-/// token's microseconds (none: the group keeps no closed time; AC-T1.10.1, T-T1.10.W4). Taken
-/// after the step answered, the closed time is at or past the step's own commit, as a token taken
-/// after a write's answer is ([`Database::session_token`]).
+/// newest stamp after it (none: the group makes no stamps), and its clock after it, the one
+/// cross-group clock's microseconds ([`Database::cross_clock`]: a replicated group's closed time, a
+/// backed-up group's writer clock; none: it keeps neither; AC-T1.10.1, T-T1.10.W4). Taken after
+/// the step answered, the clock is at or past the step's own commit, as a token taken after a
+/// write's answer is ([`Database::session_token`]).
 pub(crate) fn serve(
     group: &Database,
     here: GroupId,
@@ -595,12 +737,11 @@ pub(crate) fn serve(
         apply_step(db, here, &envelope)
     })?;
     group.ring_locks(&dropped)?;
-    let closed = group.session_token(until)?.map(|token| token.micros);
-    Ok((
-        reply,
-        group.stamps().map(|_| stamp.load(Ordering::Acquire)),
-        closed,
-    ))
+    // The group's clock after the step, the one cross-group clock as it keeps it (lane
+    // split-merge-22, as `step_on` reads a local group's): a backed-up group's writer clock, which
+    // a standalone group's session token never had, so its lock replies carry a stamp too.
+    let clock = group.cross_clock(until)?;
+    Ok((reply, clock.map(|_| stamp.load(Ordering::Acquire)), clock))
 }
 
 /// Runs one step on `member`, its stamps carried either way. A group on a node answers its closed
@@ -620,8 +761,11 @@ fn step_on(
                 apply_step(db, here, &envelope)
             })?;
             group.ring_locks(&dropped)?;
-            // Read after the step answered, the group's clock is at or past the step's commit.
-            let clock = group.session_token(until)?.map(|token| token.micros);
+            // Read after the step answered, the group's clock is at or past the step's commit:
+            // the one cross-group clock as this group keeps it (lane split-merge-21,
+            // `Database::cross_clock`), so a standalone backed-up group's lock reply carries its
+            // writer's clock, which a session token never had.
+            let clock = group.cross_clock(until)?;
             Ok((reply, clock))
         }
         Member::Node { nodes, node } => {
@@ -999,6 +1143,7 @@ impl Cluster {
     /// A committed answer carries its commit stamp, fixed by the coordinator from its lock
     /// replies' clocks ([`Coordinator::reply`]).
     pub fn transact(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
+        conditioned(&txn)?;
         let began = Instant::now();
         let touched = self.touched(&txn);
         let (answer, answered) = mpsc::sync_channel(1);
@@ -1016,11 +1161,24 @@ impl Cluster {
         result
     }
 
+    /// The groups, group `i` at `i`: what a database's reads across groups read
+    /// ([`Database::across`]).
+    pub(crate) fn groups(&self) -> &[Member] {
+        &self.groups
+    }
+
+    /// The group a routing key's row is in: what a database's reads of one key across groups read
+    /// (lane split-merge-19, T-T1.9.R24).
+    pub(crate) fn group_of(&self, key: &[u8]) -> GroupId {
+        (self.route)(key)
+    }
+
     /// The groups `txn`'s keys are in: the groups the coordinator steps it through.
     fn touched(&self, txn: &Txn) -> BTreeSet<GroupId> {
         txn.reads
             .iter()
             .chain(txn.writes.iter().map(|(key, _)| key))
+            .chain(txn.conds.iter().map(|(key, _)| key))
             .map(|key| (self.route)(key))
             .collect()
     }
@@ -1070,6 +1228,7 @@ impl Cluster {
     pub fn commit(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
         // Refused as the coordinator refuses it, whichever path it takes.
         super::coordinator::validate(&txn)?;
+        conditioned(&txn)?;
         let touched = self.touched(&txn);
         let one = match (touched.first(), touched.len()) {
             (Some(group), 1) => usize::try_from(*group).ok(),
@@ -1087,6 +1246,20 @@ impl Cluster {
     }
 }
 
+/// Refuses a transaction with a condition on a key-value row (lane split-merge-20, T-T1.9.R27):
+/// only a Records row's versions have commit stamps for a condition to name.
+fn conditioned(txn: &Txn) -> Result<(), Refusal> {
+    for (key, _) in &txn.conds {
+        if !matches!(record_of(key), Ok(Some(_))) {
+            return Err(amphora_api::invalid(
+                "condition",
+                "only a Records row has commit stamps to name",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A Records transaction of `namespace` whose rows span groups, committed through `cluster`
 /// (AC-T1.10.1, lane xgroup-sql-6): its writes as [`record_key`]s, in every group or none, each
 /// group's rows at one revision there; a row written twice keeps its last write, as a single-group
@@ -1096,20 +1269,67 @@ impl Cluster {
 /// commit answered. Under
 /// [`AnswerAt::Resolved`] every group has applied its rows by then, so a read that carries the
 /// token reads them in any group; under the control a group may not have yet.
-/// Conditions aren't carried into the coordinator's prepare yet: a transaction with any is refused.
+/// Its conditions are carried into the lock steps as [`commit_stamp`] carries them.
 pub fn commit_records(
     cluster: &Cluster,
     namespace: &str,
     tx: &amphora_api::Tx,
     until: Instant,
 ) -> Result<Token, Refusal> {
-    use amphora_api::Write;
-    if !tx.conds.is_empty() {
-        return Err(amphora_api::invalid(
-            "cross-group transaction",
-            "conditions across groups aren't carried into the prepare yet",
-        ));
+    let (at, touched) = commit_across(cluster, namespace, tx, until)?;
+    // The token is the commit stamp, or the newest closed time of the groups it touched read once
+    // it answered when that is later: a replicated group's replica may have closed past the stamp
+    // before it applied the resolution. No group it touched keeps a clock: its reads see every
+    // write, at any token. Unread by `until`, the caller has no token past its rows, so it hears
+    // the outcome as unknown, as a commit whose answer was lost (Counted::stamps_unread).
+    match closed_at(&cluster.groups, &cluster.closed, &touched, until) {
+        Ok(closed) => Ok(Token::at(at.max(closed).unwrap_or(0))),
+        Err(_) => {
+            counted(&cluster.instruments, |c| {
+                c.stamps_unread = c.stamps_unread.saturating_add(1);
+            });
+            Err(Refusal::UnknownOutcome)
+        }
     }
+}
+
+/// `Records::commit` of `namespace` across `cluster`'s groups (lane split-merge-22, T-T1.9.R29;
+/// reshard.md, "Decision (lane split-merge-21): one clock, one commit stamp"): answers the
+/// transaction's one commit stamp, `Answer::Committed`'s `at`, the stamp every row it wrote carries
+/// in every group (the coordinator resolves it with `Step::ResolveAt` at that stamp), so the
+/// revision it answers is the one reads across groups answer for its rows. A transaction in one
+/// group commits there with no coordinator step, and answers that group's clock read once it
+/// committed, at or past its rows' stamp. Each condition names a row as a read across groups
+/// answered it: [`amphora_api::Cond::At`]'s `rev` is a commit stamp, and the condition holds while
+/// the row's newest version is stamped at or before it (`xgroup::holds`), checked under the
+/// transaction's locks; [`amphora_api::Cond::Absent`], while the row has none. One that fails is
+/// refused `Conflict` on its row and writes nothing. A commit no group gave a stamp for (none keeps
+/// the clock) is refused `Unavailable`: reads across groups need every group stamped.
+pub(crate) fn commit_stamp(
+    cluster: &Cluster,
+    namespace: &str,
+    tx: &amphora_api::Tx,
+    until: Instant,
+) -> Result<amphora_api::Rev, Refusal> {
+    let (at, _) = commit_across(cluster, namespace, tx, until)?;
+    at.ok_or_else(|| {
+        Refusal::Unavailable(
+            "the transaction across groups committed, but no group it touched keeps the cross-group clock"
+                .into(),
+        )
+    })
+}
+
+/// Commits `tx` of `namespace` through `cluster`: its writes and conditions as [`record_key`]s
+/// (a row written twice keeps its last write). Answers the commit stamp the coordinator answered,
+/// and the groups it touched.
+fn commit_across(
+    cluster: &Cluster,
+    namespace: &str,
+    tx: &amphora_api::Tx,
+    until: Instant,
+) -> Result<(Option<u64>, BTreeSet<GroupId>), Refusal> {
+    use amphora_api::{Cond, Write};
     let mut writes = BTreeMap::new();
     for write in &tx.writes {
         let (key, value) = match write {
@@ -1120,37 +1340,30 @@ pub fn commit_records(
         };
         writes.insert(key, value);
     }
+    let mut conds = Vec::with_capacity(tx.conds.len());
+    for cond in &tx.conds {
+        conds.push(match cond {
+            Cond::Absent { family, key } => (record_key(namespace, family, key)?, None),
+            Cond::At { family, key, rev } => (record_key(namespace, family, key)?, Some(*rev)),
+        });
+    }
     let txn = Txn {
         reads: Vec::new(),
         writes: writes.into_iter().collect(),
+        conds,
     };
     let touched = cluster.touched(&txn);
+    let row_refused = |key: &[u8]| match record_of(key) {
+        Ok(Some((_, family, row))) => Refusal::Conflict {
+            family: family.into(),
+            key: row.to_vec(),
+            at: None,
+        },
+        _ => Refusal::Unavailable("a cross-group conflict on a key that isn't a row".into()),
+    };
     match cluster.commit(txn, until)? {
-        // The token is the commit stamp, or the newest closed time of the groups it touched read
-        // once it answered when that is later: under AnswerAt::Resolved that covers the rows each
-        // group wrote as it resolved, until rows are written at the commit stamp itself (lane
-        // split-merge-21). No group it touched keeps a closed time: its reads see every write, at
-        // any token. Unread by `until`, the caller has no token past its rows, so it hears the
-        // outcome as unknown, as a commit whose answer was lost (Counted::stamps_unread).
-        Answer::Committed { at, .. } => {
-            match closed_at(&cluster.groups, &cluster.closed, &touched, until) {
-                Ok(closed) => Ok(Token::at(at.max(closed).unwrap_or(0))),
-                Err(_) => {
-                    counted(&cluster.instruments, |c| {
-                        c.stamps_unread = c.stamps_unread.saturating_add(1);
-                    });
-                    Err(Refusal::UnknownOutcome)
-                }
-            }
-        }
-        Answer::Aborted(Why::Conflict(key)) => Err(match record_of(&key) {
-            Ok(Some((_, family, row))) => Refusal::Conflict {
-                family: family.into(),
-                key: row.to_vec(),
-                at: None,
-            },
-            _ => Refusal::Unavailable("a cross-group conflict on a key that isn't a row".into()),
-        }),
+        Answer::Committed { at, .. } => Ok((at, touched)),
+        Answer::Aborted(Why::Conflict(key) | Why::Unmet(key)) => Err(row_refused(&key)),
         Answer::Aborted(why) => Err(Refusal::Unavailable(format!(
             "the cross-group transaction aborted: {why:?}"
         ))),
@@ -1158,11 +1371,13 @@ pub fn commit_records(
     }
 }
 
-/// The commit stamp of a commit in `touched` groups, read after it answered: the newest closed
-/// time any of them published ([`Database::session_token`], microseconds since the Unix epoch, the
-/// groups' one hybrid logical clock), so a replica of any of them serves a read that carries it
-/// once it has applied everything up to that time. A group that keeps no closed time (standalone:
-/// its reads see every write) adds nothing; none of them keeping one, none. A group on a node adds
+/// The commit stamp of a commit in `touched` groups, read after it answered: the newest reading
+/// of the one cross-group clock any of them gave ([`Database::cross_clock`], microseconds since the
+/// Unix epoch: a replicated group's closed time, so a replica of any of them serves a read that
+/// carries it once it has applied everything up to that time; a backed-up group's writer clock,
+/// at or past the stamp of every row it wrote; lane split-merge-22). A group that keeps neither
+/// (standalone and not backed up: its reads see every write) adds nothing; none of them keeping
+/// one, none. A group on a node adds
 /// the newest closed time its steps answered with, kept in `closed` (T-T1.10.W4): under
 /// [`AnswerAt::Resolved`] its last step resolved the commit there before the answer came, so that
 /// time is at or past the commit's rows.
@@ -1178,7 +1393,7 @@ fn closed_at(
         .filter_map(|group| usize::try_from(*group).ok())
     {
         let heard = match groups.get(i) {
-            Some(Member::Local(database)) => database.session_token(until)?.map(|t| t.micros),
+            Some(Member::Local(database)) => database.cross_clock(until)?,
             // 0: nothing heard from it yet.
             Some(Member::Node { .. }) => closed
                 .get(i)
@@ -1192,16 +1407,22 @@ fn closed_at(
 }
 
 /// A transaction whose rows are all in this group, in the group's one database transaction:
-/// aborted at the first row another transaction holds a lock on, else its reads as they stood
-/// (each key once, in key order) and its writes applied.
+/// aborted at the first row another transaction holds a lock on, or at the first condition that
+/// fails, else its reads as they stood (each key once, in key order) and its writes applied.
 fn one_group(tablet: &mut impl Tablet, txn: &Txn) -> anyhow::Result<Answer> {
     for key in txn
         .reads
         .iter()
         .chain(txn.writes.iter().map(|(key, _)| key))
+        .chain(txn.conds.iter().map(|(key, _)| key))
     {
         if !tablet.locks(key)?.is_empty() {
             return Ok(Answer::Aborted(Why::Conflict(key.clone())));
+        }
+    }
+    for (key, named) in &txn.conds {
+        if !super::holds(*named, tablet.stamp(key)?) {
+            return Ok(Answer::Aborted(Why::Unmet(key.clone())));
         }
     }
     let mut reads = BTreeMap::new();
@@ -1233,25 +1454,18 @@ impl Drop for Cluster {
 
 /// Runs one step on `group`, its stamps carried (T-T1.12.X2): the group takes in the latest stamp
 /// the coordinator heard of before its commit, and answers with its own latest after it. Groups not
-/// backed up here make no stamps and carry none.
+/// backed up or replicated here make no stamps and carry none. The stamps are the cross-group
+/// clock's, in microseconds (lane split-merge-21, T-T1.9.R28), the unit of the commit stamps and
+/// the tokens: a backed-up group's writer clock, a replicated group's closed time
+/// (`Database::observe_clock`, `Database::cross_clock`).
 fn step<R, F>(group: &Database, carried: &AtomicU64, until: Instant, f: F) -> Result<R, Refusal>
 where
     R: Send + 'static,
     F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
 {
-    let stamps = group.stamps();
-    if let Some(hooks) = stamps {
-        hooks
-            .marks
-            .observe(carried.load(Ordering::Acquire))
-            .map_err(|e| Refusal::Unavailable(format!("{e:#}")))?;
-    }
+    group.observe_clock(until, carried.load(Ordering::Acquire))?;
     let reply = group.call_internal(until, f)?;
-    if let Some(hooks) = stamps {
-        let latest = hooks
-            .marks
-            .latest()
-            .map_err(|e| Refusal::Unavailable(format!("{e:#}")))?;
+    if let Some(latest) = group.cross_clock(until)? {
         carried.fetch_max(latest, Ordering::AcqRel);
     }
     Ok(reply)
@@ -1755,7 +1969,11 @@ mod sessions {
                         writes.push((k, value));
                     }
                 }
-                Txn { reads, writes }
+                Txn {
+                    reads,
+                    writes,
+                    conds: Vec::new(),
+                }
             })
             .collect()
     }
@@ -1833,6 +2051,7 @@ mod sessions {
             let all = Txn {
                 reads: (0..keys).map(|k| vec![u8::try_from(k).unwrap()]).collect(),
                 writes: Vec::new(),
+                conds: Vec::new(),
             };
             assert_eq!(commit(&spread, &all), commit(&one, &all), "{protocol:?}");
         }
@@ -1878,6 +2097,7 @@ mod sessions {
         Txn {
             reads: vec![row(0)],
             writes: (0..3).map(|k| (row(k), Some(vec![i]))).collect(),
+            conds: Vec::new(),
         }
     }
 
@@ -1978,6 +2198,7 @@ mod sessions {
                     let all = Txn {
                         reads: (0..3).map(row).collect(),
                         writes: Vec::new(),
+                        conds: Vec::new(),
                     };
                     let got = commit(&recovered, &all);
                     let reads = match &got {
@@ -2043,6 +2264,7 @@ mod sessions {
                         .iter()
                         .map(|(k, v)| (row(k[0]), v.clone()))
                         .collect(),
+                    conds: Vec::new(),
                 };
                 let groups: BTreeSet<u8> = raw
                     .reads
@@ -2066,6 +2288,7 @@ mod sessions {
             let all = Txn {
                 reads: (0..keys).map(row).collect(),
                 writes: Vec::new(),
+                conds: Vec::new(),
             };
             commit(&spread, &all);
             for g in 0..3u8 {
@@ -2159,8 +2382,8 @@ mod sessions {
     /// AC-T1.10.1 (lanes xgroup-sql-6 and xgroup-sql-8): a Records transaction across three groups
     /// through [`commit_records`], both protocols, answered once resolved: its rows read back in
     /// each group straight after the answer, the answer is a cross-group timestamp, a row under
-    /// another transaction's lock is refused as a conflict, and conditions are refused until the
-    /// prepare carries them.
+    /// another transaction's lock is refused as a conflict, and so is a condition that fails, its
+    /// rows unwritten.
     #[test]
     fn ac_t1_10_1_commit_records_writes_rows_in_every_group() {
         use amphora_api::{Cond, Consistency, Records, Tx, Write};
@@ -2209,15 +2432,25 @@ mod sessions {
                 matches!(refused, Err(Refusal::Conflict { .. })),
                 "{protocol:?} {refused:?}"
             );
+            // Clear of the held row 2: the condition is what refuses it (lane split-merge-22).
             let mut conditional = tx(7);
+            conditional.writes.truncate(2);
             conditional.conds.push(Cond::Absent {
                 family: "rows".into(),
                 key: vec![0],
             });
-            assert!(matches!(
-                commit_records(&cluster, "ns", &conditional, until()),
-                Err(Refusal::Invalid { .. })
-            ));
+            let unmet = commit_records(&cluster, "ns", &conditional, until());
+            assert!(
+                matches!(&unmet, Err(Refusal::Conflict { key, .. }) if key == &[0u8]),
+                "{protocol:?} {unmet:?}"
+            );
+            for k in 0..2u8 {
+                let ns = dbs[usize::from(k)].namespace("ns").unwrap();
+                let got = ns
+                    .get("rows", &[k], Consistency::Linearizable, until())
+                    .unwrap();
+                assert_eq!(got.map(|r| r.value), Some(vec![5]), "{protocol:?} row {k}");
+            }
         }
     }
 
@@ -2253,6 +2486,10 @@ mod sessions {
                 crate::xgroup::Step::Decide {
                     outcome: Outcome::Committed,
                     ..
+                }
+                | crate::xgroup::Step::DecideAt {
+                    outcome: Outcome::Committed,
+                    ..
                 } if recovered_first => {
                     let anchor = &dbs[usize::try_from(here).unwrap()];
                     anchor
@@ -2261,7 +2498,7 @@ mod sessions {
                         })
                         .unwrap();
                 }
-                crate::xgroup::Step::Resolve { .. }
+                crate::xgroup::Step::Resolve { .. } | crate::xgroup::Step::ResolveAt { .. }
                     if here == at && !held.swap(true, Ordering::AcqRel) =>
                 {
                     reach.send(()).unwrap();
@@ -2652,6 +2889,7 @@ mod sessions {
         let writes = |rows: &[u8], v: u8| Txn {
             reads: Vec::new(),
             writes: rows.iter().map(|k| (row(*k), Some(vec![v]))).collect(),
+            conds: Vec::new(),
         };
         for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
             let dir = tempfile::tempdir().unwrap();

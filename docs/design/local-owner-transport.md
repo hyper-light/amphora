@@ -35,6 +35,8 @@ The capability never crosses the socket. Thus a stale record whose port was reus
 process cannot authenticate that process or expose the capability. Windows exclusive binding
 prevents another local socket from intercepting or relaying traffic after the handshake. OS-local
 stream isolation protects subsequent SQL/Records frames; this is not a network transport.
+Between machines a node's endpoint listens at a network address under mutual TLS instead
+(transport/network.rs; reshard.md, "The transport between machines").
 
 The wire is a four-byte big-endian length followed by a postcard envelope. Variant order is
 append-only. Frames are limited to RESULT_MAX plus 1 MiB of serialization overhead. Serialization

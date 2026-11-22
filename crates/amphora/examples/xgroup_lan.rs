@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! xgroup_lan node  --path DB --secs S                 serve one group for S seconds
+//!                  [--listen ADDR --cert PEM --key PEM --roots PEM]
 //! xgroup_lan bench --node 0=DB0 --node 1=DB1 [--protocol two-phase|parallel|both]
 //!                  --clients N --keys K --span W --secs S [--id ID] [--host NAME] [--out FILE]
 //! xgroup_lan elle  --node 0=DB0 --node 1=DB1 [--protocol ...] --seeds N --ops M --clients C
@@ -15,14 +16,19 @@
 //!
 //! `bench` appends one JSON line per protocol to `--out` (bench/records). `elle` prints each seed
 //! with an anomaly and the totals, and exits non-zero on any anomaly or unknown outcome.
+//!
+//! Between machines (T-T1.9.R18; reshard.md, "The transport between machines"): `node --listen
+//! ADDR` also serves the group at a network address under mutual TLS, with the node's certificate
+//! chain, key and the authority's roots (PEM); `bench` and `elle` given `--cert`, `--key` and
+//! `--roots` dial `--node G=NAME@ADDR`, NAME the name the node's certificate carries.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use amphora::reshard::NodeId;
-use amphora::transport::Nodes;
+use amphora::transport::{Nodes, network::Credentials};
 use amphora::xgroup::lan::{self, Load, Shape};
 use amphora::xgroup::{Member, Protocol};
 
@@ -89,22 +95,49 @@ impl Args {
         Ok(Duration::try_from_secs_f64(self.number::<f64>("secs")?)?)
     }
 
-    /// The groups, `--node G=ENDPOINT` each: group G's owner at ENDPOINT (its database's path).
+    /// This node's credentials, `--cert`, `--key` and `--roots` (PEM), if given.
+    fn credentials(&self) -> anyhow::Result<Option<Credentials>> {
+        if !self.flags.contains_key("cert") {
+            return Ok(None);
+        }
+        Ok(Some(Credentials::from_pem_files(
+            Path::new(self.one("cert")?),
+            Path::new(self.one("key")?),
+            Path::new(self.one("roots")?),
+        )?))
+    }
+
+    /// The groups, `--node G=ENDPOINT` each: group G's owner at ENDPOINT, its database's path, or
+    /// with credentials `NAME@ADDR`, its network endpoint and the name its certificate carries.
     fn members(&self) -> anyhow::Result<Vec<Member>> {
         let mut endpoints = BTreeMap::new();
         for node in self.flags.get("node").into_iter().flatten() {
-            let (group, path) = node
+            let (group, endpoint) = node
                 .split_once('=')
                 .ok_or_else(|| anyhow::anyhow!("--node {node}: GROUP=ENDPOINT"))?;
-            endpoints.insert(group.parse::<u64>()?, PathBuf::from(path));
+            endpoints.insert(group.parse::<u64>()?, endpoint.to_owned());
         }
         let count = u64::try_from(endpoints.len())?;
         if endpoints.keys().copied().ne(0..count) {
             anyhow::bail!("--node: the groups are numbered 0 to one less than how many there are");
         }
-        let nodes = Arc::new(Nodes::new(
-            endpoints.into_iter().map(|(g, p)| (NodeId(g), p)),
-        ));
+        let nodes = Arc::new(match self.credentials()? {
+            None => Nodes::new(
+                endpoints
+                    .into_iter()
+                    .map(|(g, p)| (NodeId(g), PathBuf::from(p))),
+            ),
+            Some(credentials) => {
+                let mut network = Vec::new();
+                for (g, endpoint) in endpoints {
+                    let (name, address) = endpoint
+                        .split_once('@')
+                        .ok_or_else(|| anyhow::anyhow!("--node {g}={endpoint}: GROUP=NAME@ADDR"))?;
+                    network.push((NodeId(g), address.parse()?, name.to_owned()));
+                }
+                Nodes::network(network, &credentials)?
+            }
+        });
         Ok((0..count)
             .map(|g| Member::Node {
                 nodes: Arc::clone(&nodes),
@@ -150,6 +183,16 @@ fn main() -> anyhow::Result<()> {
             let served = later(secs);
             let database = amphora::database::Database::open(&path, served)?;
             amphora::xgroup::sql::prepare(&database, served)?;
+            let _listening = match args.credentials()? {
+                Some(credentials) => {
+                    let listening = database.listen(args.one("listen")?.parse()?, &credentials)?;
+                    if let Some(address) = listening.address() {
+                        out!("listening at {address}");
+                    }
+                    Some(listening)
+                }
+                None => None,
+            };
             out!("serving {} for {secs:?}", path.display());
             while Instant::now() < served {
                 std::thread::park_timeout(served.saturating_duration_since(Instant::now()));
@@ -373,6 +416,7 @@ fn refusals(args: &Args) -> anyhow::Result<()> {
                 let txn = Txn {
                     reads: Vec::new(),
                     writes: vec![(key(0), Some(vec![0])), (key(1), Some(vec![0]))],
+                    conds: Vec::new(),
                 };
                 warm.commit(txn, later(deadline))?;
             }
@@ -405,6 +449,7 @@ fn refusals(args: &Args) -> anyhow::Result<()> {
                                 let txn = Txn {
                                     reads: vec![read],
                                     writes: vec![(a, Some(value.clone())), (b, Some(value))],
+                                    conds: Vec::new(),
                                 };
                                 let (generation, cluster) = {
                                     let held =
@@ -449,7 +494,10 @@ fn refusals(args: &Args) -> anyhow::Result<()> {
                                                 tally.stopped_seen.saturating_add(1);
                                             stopped = true;
                                         }
-                                        Err(_) => tally.failed = tally.failed.saturating_add(1),
+                                        // It names no conditions, so none can fail.
+                                        Ok(Answer::Aborted(Why::Unmet(_))) | Err(_) => {
+                                            tally.failed = tally.failed.saturating_add(1);
+                                        }
                                     }
                                 }
                                 if stopped {

@@ -7175,6 +7175,13 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get_page();
+        // A new page is all zeros, as SQLite's are (pager.c zero-fills a page past the file's
+        // end). The pool hands out recycled buffers (arena slots, the thread's temporary cache)
+        // still holding an earlier page's bytes, which would otherwise stay in the new page's free
+        // space: written to disk, shipped to replicas and backups, and different from member to
+        // member as allocation differs (CP-T1.8, T-T1.8.A6: members' image digests are equal at
+        // every applied index).
+        buffer.as_mut_slice().fill(0);
         let inner = page.get();
         inner.set_buffer(Arc::new(buffer));
         page.set_loaded();
@@ -7437,6 +7444,34 @@ mod tests {
         default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    /// CP-T1.8, T-T1.8.A6: a new page is all zeros even when the pool hands it a buffer an
+    /// earlier page wrote. Do: take more pages than the test arena holds (so both the arena's
+    /// slots and the temporary buffers are used), fill each with a pattern, drop them, and take
+    /// as many again. Expect: every byte of every new page zero.
+    #[test]
+    fn t_t1_8_a6_a_new_page_is_zeroed_from_a_recycled_buffer() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let page_size = 4096;
+        let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        pool.finalize_with_page_size(page_size).unwrap();
+        let count = BufferPool::TEST_ARENA_SIZE / page_size + 2;
+        let written: Vec<_> = (0..count)
+            .map(|i| {
+                let page = super::allocate_new_page(i as i64 + 2, &pool);
+                page.get_contents().as_ptr().fill(0xa5);
+                page
+            })
+            .collect();
+        drop(written);
+        for i in 0..count {
+            let page = super::allocate_new_page(i as i64 + 2, &pool);
+            assert!(
+                page.get_contents().as_ptr().iter().all(|byte| *byte == 0),
+                "page {i} kept an earlier page's bytes"
+            );
+        }
+    }
 
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {

@@ -39,6 +39,10 @@ pub struct Config {
 pub struct Txn {
     pub reads: Vec<Vec<u8>>,
     pub writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Conditions (lane split-merge-20, T-T1.9.R27): each a key and the commit stamp its newest
+    /// version must be at or before (none: it must have none), checked under the transaction's
+    /// locks in the key's group (`xgroup::holds`); one that fails aborts it, [`Why::Unmet`].
+    pub conds: Vec<(Vec<u8>, Option<u64>)>,
 }
 
 /// What the client hears.
@@ -72,6 +76,9 @@ pub enum Why {
     Lost,
     /// A group had already finished it: another decided it.
     Late,
+    /// A condition on this key failed: it was written after the stamp named, or isn't there, or
+    /// is there when it must not be.
+    Unmet(Vec<u8>),
 }
 
 /// A step's outcome the shell couldn't learn: it may land later, or never.
@@ -162,6 +169,9 @@ enum Phase {
     Preventing {
         waiting: BTreeSet<GroupId>,
         absent: bool,
+        /// The commit stamp a participant already resolved it at (lane split-merge-22): the
+        /// stamp every other group resolves it at too.
+        resolved: Option<u64>,
     },
     Resolving {
         outcome: Outcome,
@@ -219,6 +229,7 @@ pub(super) fn validate(txn: &Txn) -> Result<(), Refusal> {
         .reads
         .len()
         .checked_add(txn.writes.len())
+        .and_then(|n| n.checked_add(txn.conds.len()))
         .ok_or_else(|| broken("too many keys"))?;
     if keys == 0 {
         return Err(broken("it reads and writes nothing"));
@@ -249,6 +260,14 @@ pub(super) fn validate(txn: &Txn) -> Result<(), Refusal> {
         if let Some(value) = value {
             api::bound("value", value.len(), api::VALUE_MAX)?;
             add(value.len())?;
+        }
+    }
+    let mut conditioned = BTreeSet::new();
+    for (key, _) in &txn.conds {
+        api::key(key)?;
+        add(key.len())?;
+        if !conditioned.insert(key.as_slice()) {
+            return Err(broken("it names a key in two conditions"));
         }
     }
     api::bound("cross-group transaction bytes", bytes, api::REQUEST_MAX)
@@ -385,7 +404,11 @@ impl Coordinator {
             });
         }
         validate(&txn)?;
-        type Plan = (Vec<Vec<u8>>, Vec<(Vec<u8>, Option<Vec<u8>>)>);
+        type Plan = (
+            Vec<Vec<u8>>,
+            Vec<(Vec<u8>, Option<Vec<u8>>)>,
+            Vec<(Vec<u8>, Option<u64>)>,
+        );
         let mut plan: BTreeMap<GroupId, Plan> = BTreeMap::new();
         // The anchor: the group of the first key written (CockroachDB's record goes with it), or
         // of the first read when nothing is written.
@@ -393,13 +416,17 @@ impl Coordinator {
             .writes
             .first()
             .map(|(key, _)| key)
-            .or_else(|| txn.reads.first());
+            .or_else(|| txn.reads.first())
+            .or_else(|| txn.conds.first().map(|(key, _)| key));
         let anchor = first.map(|key| route(key)).unwrap_or(self.config.registry);
         for key in txn.reads {
             plan.entry(route(&key)).or_default().0.push(key);
         }
         for (key, value) in txn.writes {
             plan.entry(route(&key)).or_default().1.push((key, value));
+        }
+        for (key, named) in txn.conds {
+            plan.entry(route(&key)).or_default().2.push((key, named));
         }
         if let Some(group) = plan.keys().find(|g| !self.config.groups.contains(g)) {
             return Err(broken(&format!(
@@ -432,14 +459,26 @@ impl Coordinator {
         );
         let mut out = Vec::new();
         let parallel = self.config.protocol == Protocol::Parallel;
-        for (group, (reads, writes)) in plan {
+        for (group, (reads, writes, conds)) in plan {
             let stage = (parallel && group == anchor).then(|| participants.clone());
-            let step = Step::Lock {
-                txn: id,
-                anchor,
-                reads,
-                writes,
-                stage,
+            // A group with no condition gets the step every group knows.
+            let step = if conds.is_empty() {
+                Step::Lock {
+                    txn: id,
+                    anchor,
+                    reads,
+                    writes,
+                    stage,
+                }
+            } else {
+                Step::LockIf {
+                    txn: id,
+                    anchor,
+                    reads,
+                    writes,
+                    stage,
+                    conds,
+                }
             };
             self.send(&mut out, group, Some(id), Kind::Lock, step)?;
         }
@@ -476,7 +515,7 @@ impl Coordinator {
                 Ok(other) => return Err(unexpected(sent.kind, &other)),
             },
             Kind::Scan => self.on_scan(&mut out, sent, reply)?,
-            _ => self.on_run(&mut out, sent, reply)?,
+            _ => self.on_run(&mut out, sent, reply, clock)?,
         }
         Ok(out)
     }
@@ -571,7 +610,13 @@ impl Coordinator {
                     at: None,
                 },
             );
-            self.send(out, anchor, Some(txn), Kind::Recover, Step::Recover { txn })?;
+            self.send(
+                out,
+                anchor,
+                Some(txn),
+                Kind::Recover,
+                Step::RecoverAt { txn },
+            )?;
         }
         self.ready_if_recovered(out);
         Ok(())
@@ -589,6 +634,7 @@ impl Coordinator {
         out: &mut Vec<Event>,
         sent: Sent,
         reply: Result<Reply, Lost>,
+        clock: Option<u64>,
     ) -> Result<(), Refusal> {
         let Some(txn) = sent.txn else {
             return Err(broken(
@@ -605,10 +651,40 @@ impl Coordinator {
             .ok_or_else(|| broken("a step came back twice"))?;
         let mut next: Vec<(GroupId, Kind, Step)> = Vec::new();
         let mut answer = None;
+        // A committed transaction with a commit stamp writes its rows at it in every group
+        // (lane split-merge-21, `Step::ResolveAt`): the stamp `Answer::Committed` answers as `at`.
+        // An aborted one writes nothing, and one whose groups carried no clock has no stamp.
         let resolve_all = |run: &Run, outcome: Outcome, next: &mut Vec<(GroupId, Kind, Step)>| {
             for group in &run.groups {
-                next.push((*group, Kind::Resolve, Step::Resolve { txn, outcome }));
+                let step = match (outcome, run.at) {
+                    (Outcome::Committed, Some(at)) => Step::ResolveAt { txn, outcome, at },
+                    _ => Step::Resolve { txn, outcome },
+                };
+                next.push((*group, Kind::Resolve, step));
             }
+        };
+        // Replies with stamps (lane split-merge-22, T-T1.9.R30): a decision's kept commit stamp is
+        // the transaction's, and a participant's stamps go into a recovery's choice of it; then
+        // each is handled as its plain reply.
+        let reply = match reply {
+            Ok(Reply::DecidedAt { outcome, at }) => {
+                if outcome == Outcome::Committed && at.is_some() {
+                    run.at = at;
+                }
+                Ok(Reply::Decided(outcome))
+            }
+            Ok(Reply::PresentAt {
+                present,
+                committed,
+                locked,
+            }) => {
+                if let Phase::Preventing { resolved, .. } = &mut run.phase {
+                    *resolved = (*resolved).max(committed);
+                }
+                run.at = run.at.max(locked);
+                Ok(Reply::Present(present))
+            }
+            other => other,
         };
         match (sent.kind, reply) {
             (Kind::Lock, reply) => {
@@ -627,6 +703,7 @@ impl Coordinator {
                         None
                     }
                     Ok(Reply::Conflict { key }) => Some(Why::Conflict(key)),
+                    Ok(Reply::Unmet { key, .. }) => Some(Why::Unmet(key)),
                     Ok(Reply::Late) => Some(Why::Late),
                     Err(Lost) => Some(Why::Lost),
                     Ok(other) => return Err(unexpected(sent.kind, &other)),
@@ -658,10 +735,7 @@ impl Coordinator {
                     (None, Protocol::TwoPhase) if all_in => {
                         run.rounds = run.rounds.saturating_add(1);
                         run.phase = Phase::Deciding;
-                        let decide = Step::Decide {
-                            txn,
-                            outcome: Outcome::Committed,
-                        };
+                        let decide = decide_step(txn, Outcome::Committed, run.at);
                         next.push((run.anchor, Kind::Decide, decide));
                     }
                     (None, Protocol::Parallel) if all_in => {
@@ -677,10 +751,7 @@ impl Coordinator {
                             waiting: run.groups.clone(),
                             deciding: true,
                         };
-                        let decide = Step::Decide {
-                            txn,
-                            outcome: Outcome::Committed,
-                        };
+                        let decide = decide_step(txn, Outcome::Committed, run.at);
                         next.push((run.anchor, Kind::Decide, decide));
                         resolve_all(run, Outcome::Committed, &mut next);
                     }
@@ -726,13 +797,19 @@ impl Coordinator {
                 run.phase = Phase::Preventing {
                     waiting: participants.iter().copied().collect(),
                     absent: false,
+                    resolved: None,
                 };
                 for group in participants {
-                    next.push((group, Kind::Prevent, Step::Prevent { txn }));
+                    next.push((group, Kind::Prevent, Step::PreventAt { txn }));
                 }
             }
             (Kind::Prevent, Ok(Reply::Present(present))) => {
-                let Phase::Preventing { waiting, absent } = &mut run.phase else {
+                let Phase::Preventing {
+                    waiting,
+                    absent,
+                    resolved,
+                } = &mut run.phase
+                else {
                     return Err(broken("a prevention came back outside recovery"));
                 };
                 waiting.remove(&sent.group);
@@ -745,8 +822,14 @@ impl Coordinator {
                     } else {
                         Outcome::Committed
                     };
+                    // The one commit stamp (lane split-merge-22, T-T1.9.R30): the one a
+                    // participant already resolved at, else the latest lock stamp, at or past
+                    // every group's, so a read as of one before it never waited on it.
+                    let resolved = *resolved;
+                    run.at = resolved.or(run.at);
                     run.phase = Phase::Deciding;
-                    next.push((run.anchor, Kind::Decide, Step::Decide { txn, outcome }));
+                    let decide = decide_step(txn, outcome, run.at);
+                    next.push((run.anchor, Kind::Decide, decide));
                 }
             }
             (Kind::Resolve, Ok(Reply::Resolved)) => {
@@ -819,5 +902,14 @@ impl Coordinator {
         });
         self.ready_if_recovered(out);
         Ok(())
+    }
+}
+
+/// The decision step: [`Step::DecideAt`] for a commit with a stamp, kept with the record so a
+/// recovery resolves every group at it (lane split-merge-22, T-T1.9.R30); else [`Step::Decide`].
+fn decide_step(txn: TxnId, outcome: Outcome, at: Option<u64>) -> Step {
+    match (outcome, at) {
+        (Outcome::Committed, Some(at)) => Step::DecideAt { txn, outcome, at },
+        _ => Step::Decide { txn, outcome },
     }
 }
