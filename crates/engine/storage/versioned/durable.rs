@@ -1160,6 +1160,70 @@ mod tests {
         assert!(got == want || got == with_late, "{} rows", got.len());
     }
 
+    /// The rows of tree `tree`, as a snapshot begun now sees them.
+    fn tree_rows(db: &Database, tree: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut d = Descender::new();
+        let snap = db.snapshot().unwrap();
+        let all = db.scan(&mut d, &snap, tree, None, usize::MAX).unwrap();
+        db.close_snapshot(snap);
+        all.into_iter().collect()
+    }
+
+    /// AC-NS.2.1 (lane g7s2-18): what commits with a transaction's rows (the pager's header)
+    /// commits in [`Database::commit_with`]'s callback, after the storage's verdict. Do: commit a
+    /// writer begun before a change of the catalog (tree 1), so the storage refuses it
+    /// (`SchemaConflict`); then commit one whose callback fails; then one whose callback succeeds.
+    /// Expect: the refused one's callback never run and its row nowhere; the failed callback's
+    /// transaction rolled back, its row nowhere and the next commit standing; the last one's
+    /// callback run once and its row there.
+    #[test]
+    fn ac_ns_2_1_commit_with_runs_after_the_verdict_and_its_failure_rolls_back() {
+        let disk = Arc::new(Simulated::new(11, 1).unwrap());
+        let db = Database::open(disk, 2_000, 2, cmp).unwrap();
+        db.v.keep_catalog(1);
+        let mut d = Descender::new();
+        let mut early = db.begin().unwrap();
+        db.put(&mut d, &mut early, 0, b"early", b"1").unwrap();
+        let mut schema = db.begin().unwrap();
+        db.put(&mut d, &mut schema, 1, b"index", b"1").unwrap();
+        db.commit(schema, &mut d, db.lane(), true).unwrap();
+        let mut ran = 0;
+        let refused = db.commit_with(early, &mut d, db.lane(), true, || {
+            ran += 1;
+            Ok(())
+        });
+        assert!(
+            matches!(refused, Err(LimboError::SchemaConflict)),
+            "the writer begun before the catalog's change: {refused:?}"
+        );
+        assert_eq!(ran, 0, "the callback ran for a refused commit");
+        assert!(tree_rows(&db, 0).is_empty());
+
+        let mut failing = db.begin().unwrap();
+        db.put(&mut d, &mut failing, 0, b"failing", b"1").unwrap();
+        let failed = db.commit_with(failing, &mut d, db.lane(), true, || {
+            Err(LimboError::InternalError(
+                "the pager's commit failed".into(),
+            ))
+        });
+        assert!(
+            failed.is_err(),
+            "a commit whose callback failed: {failed:?}"
+        );
+        assert!(tree_rows(&db, 0).is_empty());
+
+        let mut last = db.begin().unwrap();
+        db.put(&mut d, &mut last, 0, b"failing", b"2").unwrap();
+        db.commit_with(last, &mut d, db.lane(), true, || {
+            ran += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ran, 1);
+        let want: BTreeMap<_, _> = [(b"failing".to_vec(), b"2".to_vec())].into_iter().collect();
+        assert_eq!(tree_rows(&db, 0), want);
+    }
+
     /// Do: a transaction left open across a checkpoint, then committed after it; another open
     /// across one and rolled back; reopen. Expect: the committed one's rows, not the rolled-back
     /// one's: the checkpoint's list put them back to their versions as of its timestamp and the
