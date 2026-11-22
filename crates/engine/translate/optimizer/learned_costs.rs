@@ -258,12 +258,12 @@ fn sample_every(timing_nanos: f64, epoch: f64, sd: Option<f64>) -> Option<u64> {
 impl LearnedCosts {
     /// An estimator that starts from this process's calibration.
     pub(crate) fn new() -> Self {
-        Self::from_rates(*process_calibration())
+        Self::from_rates(process_calibration())
     }
 
-    fn from_rates(rates: Rates) -> Self {
+    fn from_rates(rates: &Rates) -> Self {
         Self {
-            rates: Mutex::new(rates),
+            rates: Mutex::new(*rates),
             seek: Sampling::new(),
             hash_build: Sampling::new(),
             hash_probe: Sampling::new(),
@@ -709,7 +709,7 @@ mod tests {
     /// the times observed, the hash probe's untouched (step 3a).
     #[test]
     fn t_qt_5_5_sampled_seeks_move_the_rate_and_thin_out() {
-        let costs = LearnedCosts::from_rates(fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
         for i in 0..100 {
             assert!(costs.sampled(Work::Seek));
             costs.observe_sampled(Work::Seek, if i % 2 == 0 { 100.0 } else { 150.0 });
@@ -744,7 +744,7 @@ mod tests {
     /// stay (T-QT.5.5: the estimator follows observed times).
     #[test]
     fn t_qt_5_5_observed_times_move_the_weight() {
-        let costs = LearnedCosts::from_rates(fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
         let start = costs.weights().unwrap();
         assert_eq!(start.sort, 2.0);
         costs.observe(Work::Sort, 50.0, 50.0 * 8.0);
@@ -763,7 +763,7 @@ mod tests {
     /// Do: observe nothing-sized and non-finite times. Expect: the weights unchanged (T-QT.5.5).
     #[test]
     fn t_qt_5_5_meaningless_observations_leave_the_rates() {
-        let costs = LearnedCosts::from_rates(fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
         let start = costs.weights().unwrap();
         costs.observe(Work::Seek, 0.0, 5.0);
         costs.observe(Work::Seek, 10.0, f64::NAN);
@@ -775,8 +775,8 @@ mod tests {
     /// (T-QT.5.5: the weights are relative to the row).
     #[test]
     fn t_qt_5_5_weights_are_in_rows_visits() {
-        let fast = LearnedCosts::from_rates(fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
-        let slow = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        let fast = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        let slow = LearnedCosts::from_rates(&fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
         let (fast, slow) = (fast.weights().unwrap(), slow.weights().unwrap());
         assert_eq!(slow.seek * 2.0, fast.seek);
         assert_eq!(slow.sort * 2.0, fast.sort);
@@ -788,7 +788,7 @@ mod tests {
     /// it runs, and followed as the device moves).
     #[test]
     fn t_qt_5_5_the_row_is_weighed_against_observed_page_reads() {
-        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        let costs = LearnedCosts::from_rates(&fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
         assert_eq!(costs.weights().unwrap().row_in_pages, None);
         costs.observe(Work::PageRead, 1.0, 100.0);
         assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
@@ -804,7 +804,7 @@ mod tests {
     #[test]
     fn t_qt_5_5_the_planner_takes_the_learned_row_cost() {
         let params = super::super::cost_params::CostModelParams::new();
-        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        let costs = LearnedCosts::from_rates(&fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
         let before = params.with_learned(costs.weights());
         assert_eq!(before.cpu_cost_per_row, params.cpu_cost_per_row);
         costs.observe(Work::PageRead, 1.0, 128.0);
@@ -820,7 +820,7 @@ mod tests {
     /// the share passed through as the planner's page miss, clamped to [0, 1] (T-QT.5.5).
     #[test]
     fn t_qt_5_5_the_page_miss_share_reaches_the_planner() {
-        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        let costs = LearnedCosts::from_rates(&fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
         let params = super::super::cost_params::CostModelParams::new();
         assert_eq!(params.with_learned(costs.weights_at(None)).page_miss, 1.0);
         for (miss, want) in [(Some(0.25), 0.25), (Some(3.0), 1.0), (Some(f64::NAN), 1.0)] {
@@ -833,7 +833,7 @@ mod tests {
     /// against the database's own reads alone (the anchor replaced, no fixed number left).
     #[test]
     fn t_qt_5_5_the_open_anchor_stands_until_the_database_reads() {
-        let costs = LearnedCosts::from_rates(fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
+        let costs = LearnedCosts::from_rates(&fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0));
         costs.anchor_page_read(1.0, 100.0);
         assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
         for _ in 0..4 {

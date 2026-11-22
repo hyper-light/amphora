@@ -294,7 +294,11 @@ fn a_materialized_chain_leaves_its_prefix_out_of_the_main_plan() {
     let sql = "SELECT count(*) FROM r JOIN s ON s.k = r.k JOIN t ON t.j = s.j";
     let plan = plan_text(&conn, sql);
     assert!(plan.contains("MATERIALIZE hash build input"), "{plan}");
-    assert_eq!(whole_reads_in_loops(&conn, sql), Vec::<String>::new(), "{plan}");
+    assert_eq!(
+        whole_reads_in_loops(&conn, sql),
+        Vec::<String>::new(),
+        "{plan}"
+    );
     let mut stmt = conn.prepare(format!("EXPLAIN {sql}")).unwrap();
     let opens = stmt
         .run_collect_rows()
