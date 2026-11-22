@@ -109,6 +109,13 @@ pub(crate) fn identity(select: &impl std::fmt::Debug) -> Option<u64> {
     Some(hasher.finish())
 }
 
+/// An uncorrelated `x IN (SELECT ...)` subquery's identity (PL.13, lane replan-10): its syntax's
+/// fingerprint as [identity] takes it, apart from the same text's as a FROM-clause subquery, whose
+/// count is its rows, where this one's is the distinct values its ephemeral index keeps.
+pub(crate) fn in_identity(select: &impl std::fmt::Debug) -> Option<u64> {
+    identity(&("IN", select))
+}
+
 /// A subquery's rows a plan read: its identity, where a count is stored, the count's bits when the
 /// plan read it, and the rows planned on (the counted ones where a fill counted them, else the
 /// subquery's own estimate).
@@ -153,6 +160,9 @@ mod tests {
         assert_eq!(identity(&"SELECT 1"), identity(&"SELECT 1"));
         assert_ne!(identity(&"SELECT 1"), identity(&"SELECT 2"));
         assert_eq!(identity(&"Variable(\"1\")"), None);
+        assert_ne!(in_identity(&"SELECT 1"), identity(&"SELECT 1"));
+        assert_eq!(in_identity(&"SELECT 1"), in_identity(&"SELECT 1"));
+        assert_eq!(in_identity(&"Variable(\"1\")"), None);
         drop((planned, rows));
         for identity in 100..200 {
             drop(store.rows(identity));

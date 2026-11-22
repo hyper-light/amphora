@@ -1876,6 +1876,7 @@ fn build_update_write_set_plan(
         window: None,
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        in_identity: None,
         estimated_cost: None,
         // For regular UPDATEs, only WHERE-clause subqueries move into the ephemeral plan.
         // For UPDATE ... FROM, SET expressions become part of the ephemeral SELECT payload,

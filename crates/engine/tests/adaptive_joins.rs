@@ -1029,3 +1029,117 @@ fn t_pl_13_11_a_sorter_fed_by_an_index_seek_plans_again() {
         assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
     }
 }
+
+/// Do: `a.x IN (SELECT s.y FROM s WHERE s.k <= 1000)`, `s.y` distinct in every row as ANALYZE
+/// counted it (1,000 values read as the plan estimates), then updated so the rows read hold five
+/// values (the rows and the row counter unchanged); each run with adaptive joins off, then on in
+/// one prepared statement twice, and in a statement prepared after. Expect: one answer every way;
+/// off, no IN result counted; on, the ephemeral index's distinct values counted against the ones
+/// the plan read, past its error stored and the statement planned again once; the second run and
+/// the new statement plan on the stored count, and nothing plans again (PL.13, lane replan-10,
+/// T-PL.13.12: an IN subquery's stored result at its materialization point).
+#[test]
+fn t_pl_13_12_an_in_subquerys_stored_result_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("in_subquery.db");
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE INDEX a_x ON a(x)").unwrap();
+    conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, k, y)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO a(x) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 1000 FROM n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO s(k, y) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE s SET y = y % 5").unwrap();
+    let sql = "SELECT a.id, a.x FROM a WHERE a.x IN (SELECT s.y FROM s WHERE s.k <= 1000)";
+    let sorted = |stmt: &mut amphora_engine::Statement| {
+        let mut rows = run_rows(stmt);
+        rows.sort();
+        rows
+    };
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_subquery_checks();
+    let off = sorted(&mut conn.prepare(sql).unwrap());
+    // x in 0..5: five values of a's 1,000, five rows each.
+    assert_eq!(off.len(), 25, "the rows");
+    assert_eq!(conn.adaptive_subquery_checks(), checks, "counted off");
+
+    conn.set_adaptive_joins(true);
+    let replans = conn.adaptive_replans();
+    let mut held = conn.prepare(sql).unwrap();
+    assert_eq!(sorted(&mut held), off, "on and off differ");
+    assert!(
+        conn.adaptive_subquery_checks() > checks,
+        "the IN subquery's result was not counted"
+    );
+    assert_eq!(conn.adaptive_replans() - replans, 1, "planned again once");
+    let (checks, replans) = (conn.adaptive_subquery_checks(), conn.adaptive_replans());
+    assert_eq!(sorted(&mut held), off, "the second run's answer");
+    assert!(
+        conn.adaptive_subquery_checks() > checks,
+        "the second fill was not counted"
+    );
+    assert_eq!(conn.adaptive_replans(), replans, "a second re-plan");
+    assert_eq!(
+        sorted(&mut conn.prepare(sql).unwrap()),
+        off,
+        "a new statement's answer"
+    );
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "a new statement planned again"
+    );
+}
+
+/// Do: `a.x IN (SELECT ...)` over a subquery of 4,000 rows, `a.x` 5,000 distinct values indexed;
+/// the subquery's column distinct in every row, and then one of five values, as ANALYZE counted
+/// them; adaptive joins off. Expect: 4,000 values to look up, four in five of `a`'s rows, read by a
+/// scan of `a`; five values, five rows, looked up in `a_x`. The subquery's values are its rows at
+/// most and its column's distinct values at most, not a cap at the square root of `a`'s rows,
+/// which took both for 70 values (PL.13, lane replan-10, T-PL.13.13: the IN subquery's estimate
+/// from statistics).
+#[test]
+fn t_pl_13_13_an_in_subquerys_values_come_from_its_statistics() {
+    let (_dir, conn) = open("in_values.db");
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE INDEX a_x ON a(x)").unwrap();
+    conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, y, z)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO a(x) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i FROM n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO s(y, z) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4000) SELECT i, i % 5 FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.set_adaptive_joins(false);
+    let outer_step = |sql: &str| -> String {
+        let (steps, _) = steps_and_opcodes(&conn, sql);
+        steps
+            .into_iter()
+            .find(|step| {
+                step.contains(" a") && (step.starts_with("SCAN") || step.starts_with("SEARCH"))
+            })
+            .unwrap_or_else(|| panic!("no step reads a: {sql}"))
+    };
+    let many = outer_step("SELECT a.id FROM a WHERE a.x IN (SELECT s.y FROM s)");
+    assert!(
+        many.starts_with("SCAN a"),
+        "4,000 values, four in five rows, read by a scan: {many}"
+    );
+    let few = outer_step("SELECT a.id FROM a WHERE a.x IN (SELECT s.z FROM s)");
+    assert!(
+        few.starts_with("SEARCH a USING") && few.contains("a_x"),
+        "five values looked up in a_x: {few}"
+    );
+}

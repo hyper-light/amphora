@@ -859,6 +859,10 @@ pub struct SelectPlan {
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,
+    /// Amphora (PL.13, lane replan-10): an uncorrelated IN subquery's identity, the key of the
+    /// distinct values its ephemeral index counted (`subquery_rows::in_identity`); `None` for every
+    /// other query.
+    pub(crate) in_identity: Option<u64>,
     /// Estimated work for this query after its table reads are chosen.
     /// Parent queries use this when they compare a subquery with a join.
     pub(crate) estimated_cost: Option<f64>,

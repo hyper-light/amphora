@@ -1807,12 +1807,38 @@ filtered by `b.v = 7`, and by `b.v IN (7, 8)`, on a column every value of which 
 ANALYZE counted it, half its rows set to 7 after: one answer with adaptive joins off and on, one
 share stored, one re-plan, none on the second run or in a new statement.
 
+**IN subqueries (lane replan-10, `constraints::in_subquery_values`).** An uncorrelated
+`x IN (SELECT y ...)` looks up the subquery's distinct values. Their estimate is at most the
+subquery's rows (its own estimate) and at most `y`'s distinct values where ANALYZE's column
+statistics counted them (decision 20). The values looked up are at most `x`'s distinct values, by
+the containment assumption that the fewer distinct values are among the more (PostgreSQL's
+`eqjoinsel_semi`), and the share of `x`'s table kept is `values / distinct(x)` of its non-NULL
+rows; `x`'s distinct values are its column statistics' count, or the table's rows for a key or a
+column without them, one row a value as an IN list's estimate takes it. A plan with no estimate
+takes SQLite's 25 rows (`in_subquery_rows`, SQLite's own tuning value for `x IN (SELECT ...)`) as
+before. This replaces a cap at the square root of `x`'s table's rows, a picked number. NOT IN keeps
+its estimate, on the new values. Where every table the subquery reads has statistics, the plan
+notes the values it read under the subquery's identity (`subquery_rows::in_identity`, apart from
+the same text's as a FROM-clause subquery) in the database's `SubqueryRows`, and reads a count
+stored there in their place. The ephemeral index, filled inside its run-once block, is counted
+there (`Count`, as a seek index's are): it has no rowid and its inserts skip a key it holds
+(`IdxInsertFlags::no_op_duplicate`), so its entries are the distinct values (a NULL among them one
+more). The count is checked against the values the plan read with the band and the store of a
+stored subquery result, and re-planned, handed off and counted the same way
+(`Connection::adaptive_subquery_checks`). Evidence:
+`t_pl_13_12_an_in_subquerys_stored_result_past_the_estimate_plans_again` (T-PL.13.12): 1,000
+values estimated and five counted after an UPDATE: one answer with adaptive joins off and on, one
+re-plan, none on the second run or in a new statement.
+`t_pl_13_13_an_in_subquerys_values_come_from_its_statistics` (T-PL.13.13): 4,000 rows of distinct
+values read by a scan of the outer table, 4,000 rows of five values by its index, where the square
+root's cap took both for 70 values.
+
 **Not checked yet (lane replan-9's audit of the points this decision names).** A hash join's build
 fed by a materialized input, or filtered by terms that are neither one column statistics term nor
 a set the sample ran together; a sorter fed by anything but one table's full scan or index seek
 (a join, a GROUP BY's or DISTINCT's sorter), or by a seek whose terms the plan read no one share
 for (an `=` its column statistics price beside a range the sample runs, say); a stored subquery result over another subquery or
-a table without statistics, and an IN subquery's ephemeral index. Each needs a store for its own
+a table without statistics. Each needs a store for its own
 correction (a join's or a group's rows, keyed as a filter share is), or the new plan would be the
 old one (the last falsifier below).
 

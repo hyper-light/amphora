@@ -22,8 +22,8 @@ use crate::vdbe::insn::{JoinSwitchBuiltData, JoinSwitchData};
 
 /// ANALYZE's count of a table's rows and its statistics' relative standard error; `None` without
 /// statistics.
-fn analyzed_table(t_ctx: &TranslateCtx, table: &str) -> Option<(f64, f64)> {
-    let stats = t_ctx.resolver.schema().analyze_stats.table_stats(table)?;
+fn analyzed_table(resolver: &Resolver, table: &str) -> Option<(f64, f64)> {
+    let stats = resolver.schema().analyze_stats.table_stats(table)?;
     let analyzed_rows = stats
         .row_count
         .or_else(|| stats.index_stats.values().find_map(|stat| stat.total_rows))?
@@ -81,7 +81,7 @@ fn counted_check(
     if !t_ctx.resolver.adaptive_joins() || !table.has_rowid {
         return None;
     }
-    let (analyzed_rows, estimate_error) = analyzed_table(t_ctx, &table.name)?;
+    let (analyzed_rows, estimate_error) = analyzed_table(&t_ctx.resolver, &table.name)?;
     let filter = match (prefiltered, fingerprint) {
         (false, _) => None,
         (true, None) => return None,
@@ -184,45 +184,76 @@ pub(crate) fn emit_sorter_count(
 /// sequence column keeps equal rows apart), so its entries are the rows.
 pub(crate) fn emit_subquery_count(
     program: &mut ProgramBuilder,
-    t_ctx: &TranslateCtx,
+    resolver: &Resolver,
     plan: &crate::translate::plan::SelectPlan,
     identity: Option<u64>,
     cursor_id: CursorID,
     storage: crate::translate::subquery::MaterializedFromClauseSubqueryStorage,
 ) {
-    use crate::translate::subquery::MaterializedFromClauseSubqueryStorage;
-    if !t_ctx.resolver.adaptive_joins() {
-        return;
+    if let Some(check) = subquery_count_check(resolver, plan, identity) {
+        emit_subquery_counted(program, check, cursor_id, storage);
     }
-    let Some(planned) = identity.and_then(|identity| {
-        t_ctx
-            .resolver
+}
+
+/// What a stored subquery result is checked against: the rows the plan read for the subquery
+/// `identity` names, and the band's error. Taken from the subquery's plan, so it can be taken
+/// before the plan is emitted (an IN subquery's, lane replan-10, is consumed by its emission).
+pub(crate) struct SubqueryCheck {
+    planned: crate::subquery_rows::PlannedSubquery,
+    estimate_error: f64,
+}
+
+/// [emit_subquery_count]'s check, `None` where none is made: adaptive joins off, no identity, no
+/// rows the plan read for it, or an estimate whose error the statistics do not give.
+pub(crate) fn subquery_count_check(
+    resolver: &Resolver,
+    plan: &crate::translate::plan::SelectPlan,
+    identity: Option<u64>,
+) -> Option<SubqueryCheck> {
+    if !resolver.adaptive_joins() {
+        return None;
+    }
+    let planned = identity.and_then(|identity| {
+        resolver
             .plan_values()
             .and_then(|values| values.planned_subquery(identity))
-    }) else {
-        return;
-    };
+    })?;
     let estimate_error =
-        match crate::translate::optimizer::group_count_error(plan, t_ctx.resolver.schema()) {
+        match crate::translate::optimizer::group_count_error(plan, resolver.schema()) {
             Some(error) => error,
             None => {
                 let tables = plan.joined_tables();
                 if tables.is_empty() {
-                    return;
+                    return None;
                 }
                 let mut squared_error = 0.0;
                 for joined in tables {
                     let Table::BTree(btree) = &joined.table else {
-                        return;
+                        return None;
                     };
-                    let Some((_, error)) = analyzed_table(t_ctx, &btree.name) else {
-                        return;
-                    };
+                    let (_, error) = analyzed_table(resolver, &btree.name)?;
                     squared_error += error * error;
                 }
                 f64::sqrt(squared_error)
             }
         };
+    Some(SubqueryCheck {
+        planned,
+        estimate_error,
+    })
+}
+
+/// Counts a stored subquery result's rows where `storage` keeps them and checks them
+/// ([SubqueryCheck]). An IN subquery's ephemeral index (lane replan-10) is a seek index without a
+/// rowid whose inserts skip a key it holds (`IdxInsertFlags::no_op_duplicate`): its entries are the
+/// result's distinct values, counted as `DirectIndex`'s are.
+pub(crate) fn emit_subquery_counted(
+    program: &mut ProgramBuilder,
+    check: SubqueryCheck,
+    cursor_id: CursorID,
+    storage: crate::translate::subquery::MaterializedFromClauseSubqueryStorage,
+) {
+    use crate::translate::subquery::MaterializedFromClauseSubqueryStorage;
     let rows_reg = program.alloc_register();
     match storage {
         MaterializedFromClauseSubqueryStorage::TableBacked => {
@@ -252,9 +283,9 @@ pub(crate) fn emit_subquery_count(
     program.emit_insn(Insn::SubqueryCounted {
         data: Box::new(crate::vdbe::insn::SubqueryCountedData {
             rows_reg,
-            rows: planned.rows,
-            planned_rows: planned.planned_rows,
-            estimate_error,
+            rows: check.planned.rows,
+            planned_rows: check.planned.planned_rows,
+            estimate_error: check.estimate_error,
         }),
     });
 }
@@ -321,7 +352,7 @@ impl<'a> AdaptiveSeek<'a> {
             return None;
         }
         let weights = t_ctx.resolver.learned_weights()?;
-        let (analyzed_rows, estimate_error) = analyzed_table(t_ctx, &btree.name)?;
+        let (analyzed_rows, estimate_error) = analyzed_table(&t_ctx.resolver, &btree.name)?;
         // The rows the plan counts the table at (PL.9): ANALYZE's with the changes since.
         let build_rows = match t_ctx.resolver.plan_values() {
             Some(values) => values.live_rows(&btree.name, analyzed_rows, estimate_error),

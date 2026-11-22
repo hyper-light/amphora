@@ -452,6 +452,111 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
     }
 }
 
+/// Amphora (PL.13, lane replan-10; docs/design/planner.md, decision PL.13, "IN subqueries"): the
+/// distinct values an uncorrelated `x IN (SELECT y ...)` looks up, with the distinct values of `x`
+/// they are drawn against and the share of `x`'s rows that are not NULL.
+///
+/// The subquery's values are at most its rows (its own estimate, `estimated_output_rows`) and at
+/// most the distinct values of `y` where `y` is a column ANALYZE's column statistics counted
+/// (decision 20). Where every table the subquery reads has statistics, the values are noted as
+/// read under the subquery's identity (`SelectPlan::in_identity`), and a count its ephemeral index
+/// stored past them is read in their place (`PlanValues::subquery_rows`): its fill checks them
+/// (`main_loop::subquery_count_check`). The values looked up are at most `x`'s distinct values:
+/// the containment assumption, that the fewer distinct values are among the more (PostgreSQL's
+/// `eqjoinsel_semi`), so the share kept is `values / distinct(x)` of `x`'s non-NULL rows. `x`'s
+/// distinct values are its column statistics' count, or the table's rows for a key or a column
+/// without them (one row a value, the assumption the IN list's estimate makes). A plan with no
+/// estimate takes SQLite's 25 rows (`in_subquery_rows`) as before.
+fn in_subquery_values(
+    schema: &Schema,
+    table_reference: &JoinedTable,
+    lhs_column: Option<usize>,
+    inner_plan: Option<&crate::translate::plan::SelectPlan>,
+    row_count: f64,
+    params: &CostModelParams,
+) -> (f64, f64, f64) {
+    let (lhs_distinct, lhs_non_null) = lhs_column
+        .filter(|pos| {
+            let single_key = table_reference
+                .table
+                .btree()
+                .is_some_and(|t| t.primary_key_columns.len() == 1);
+            table_reference
+                .table
+                .get_column_at(*pos)
+                .is_some_and(|column| {
+                    !(column.is_rowid_alias()
+                        || (column.primary_key() && single_key)
+                        || column.unique())
+                })
+        })
+        .and_then(|pos| column_distinct(schema, table_reference, pos))
+        .map_or((row_count.max(1.0), 1.0), |(distinct, non_null)| {
+            (distinct.min(row_count).max(1.0), non_null)
+        });
+    let Some(inner) = inner_plan else {
+        return (
+            params.in_subquery_rows.min(lhs_distinct),
+            lhs_distinct,
+            lhs_non_null,
+        );
+    };
+    let Some(rows) = inner.estimated_output_rows else {
+        return (
+            params.in_subquery_rows.min(lhs_distinct),
+            lhs_distinct,
+            lhs_non_null,
+        );
+    };
+    let result_distinct = match inner.result_columns.as_slice() {
+        [column] => match &column.expr {
+            ast::Expr::Column { table, column, .. } => inner
+                .joined_tables()
+                .iter()
+                .find(|joined| joined.internal_id == *table)
+                .and_then(|joined| column_distinct(schema, joined, *column))
+                .map(|(distinct, _)| distinct),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut values = result_distinct
+        .map_or(rows, |distinct| rows.min(distinct))
+        .max(0.0);
+    let tables = inner.joined_tables();
+    let analyzed = !tables.is_empty()
+        && tables.iter().all(|joined| {
+            joined
+                .btree()
+                .is_some_and(|btree| schema.analyze_stats.table_stats(&btree.name).is_some())
+        });
+    if let (true, Some(identity), Some(plan_values)) =
+        (analyzed, inner.in_identity, params.plan_values.as_deref())
+    {
+        values = plan_values.subquery_rows(identity, values);
+    }
+    (values.min(lhs_distinct), lhs_distinct, lhs_non_null)
+}
+
+/// A column's distinct non-NULL values and its share of non-NULL rows, as ANALYZE's column
+/// statistics counted them (decision 20); `None` without them.
+fn column_distinct(schema: &Schema, table: &JoinedTable, pos: usize) -> Option<(f64, f64)> {
+    let column = table.table.get_column_at(pos)?;
+    let name = crate::util::normalize_ident(column.name.as_deref()?);
+    let counted = schema
+        .analyze_stats
+        .table_stats(table.table.get_name())?
+        .columns
+        .get(&name)?;
+    let rows = counted.non_null.saturating_add(counted.nulls);
+    (rows > 0).then(|| {
+        (
+            counted.distinct.max(1.0),
+            counted.non_null as f64 / rows as f64,
+        )
+    })
+}
+
 /// Estimate the selectivity of a constraint based on the operator, column type, and ANALYZE stats.
 ///
 /// When ANALYZE stats are available, we use:
@@ -1250,23 +1355,36 @@ pub fn constraints_from_where_clause(
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
                         as f64;
-                    // Use the inner plan's row count instead of always using 25.
-                    // FIXME: The plan does not estimate distinct result values.
-                    // Until it does, cap this estimate at the square root of the
-                    // table row count.
-                    let planned_rows = match &subquery.state {
+                    let inner_plan = match &subquery.state {
                         SubqueryState::Unevaluated {
                             plan: Some(inner_plan),
                         } => match inner_plan.as_ref() {
-                            Plan::Select(plan) => plan.estimated_output_rows,
+                            Plan::Select(plan) => Some(&**plan),
                             _ => None,
                         },
                         _ => None,
                     };
-                    let estimated_values = planned_rows
-                        .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
-                        .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
-                    let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
+                    let lhs_column = match lhs_expr.as_ref() {
+                        ast::Expr::Column { table, column, .. }
+                            if *table == table_reference.internal_id =>
+                        {
+                            Some(*column)
+                        }
+                        _ => None,
+                    };
+                    let (estimated_values, lhs_distinct, lhs_non_null) = in_subquery_values(
+                        schema,
+                        table_reference,
+                        lhs_column,
+                        inner_plan,
+                        row_count,
+                        params,
+                    );
+                    let selectivity = if *not_in {
+                        estimate_in_selectivity(estimated_values, row_count, true)
+                    } else {
+                        (estimated_values / lhs_distinct).min(1.0) * lhs_non_null
+                    };
                     // SQLite's `comparisonAffinity` for IN-subquery combines the
                     // LHS column affinity with each result column via
                     // `sqlite3CompareAffinity` — that result is already cached on
