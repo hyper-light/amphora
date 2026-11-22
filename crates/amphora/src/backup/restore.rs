@@ -81,12 +81,14 @@ pub fn restore_paced(
 
 /// [`restore_paced`], its chunks charged to `memory` (the process's budget, or a test's).
 ///
-/// The chunk bound (T-T1.12.M2): the base's manifest records its chunks' size, so the restore
-/// plans the one chunk it holds at a time before it makes the file: a stream of [`Use::Chunks`],
-/// charged a sealed chunk ([`fetch_charge`]) for the whole fetch. Where that is past the stream's
-/// share of the budget's room or the store's objects, it's refused, typed
-/// ([`Unrestorable::PastRoom`]) and naming both, with nothing written: the store's get gives an
-/// object whole, so a chunk isn't read in parts.
+/// A chunk read in parts (T-T1.12.M2): the restore opens a stream of [`Use::Chunks`] and fetches
+/// each of the base's chunks in ranged gets ([`Blobs::get_range`]) of its stream's share of the
+/// budget's room, no more than the store's objects nor the largest sealed chunk the manifest
+/// records ([`fetch_charge`]), one part held and charged at a time, its sum checked over the parts
+/// ([`object::Opening`]). So a restore with less room than the backup had fetches in more, smaller
+/// requests; with no room for a part it's refused, typed ([`Unrestorable::PastRoom`]), before it
+/// makes the file. A chunk whose sum fails is refused after its parts are written: the restored
+/// file is a failed restore's.
 pub fn restore_within(
     blobs: &dyn Blobs,
     prefix: &str,
@@ -138,19 +140,15 @@ pub fn restore_within(
     let manifest_key = plan.base.key(prefix);
     let manifest = object::manifest(&manifest_key, &blobs.get(&manifest_key, until)?)?;
     let stream = memory.stream(Use::Chunks);
-    let need = fetch_charge(manifest.chunk_bytes.min(manifest.file_bytes));
-    let room = memory
+    let part = memory
         .stream_room(Use::Chunks)?
-        .min(u64::try_from(blobs.object_max())?);
-    if need > room {
-        return Err(Unrestorable::PastRoom {
-            base: manifest.id,
-            need,
-            room,
-        }
-        .into());
+        .min(u64::try_from(blobs.object_max())?)
+        .min(fetch_charge(manifest.chunk_bytes.min(manifest.file_bytes)));
+    if part == 0 {
+        return Err(Unrestorable::PastRoom { base: manifest.id }.into());
     }
-    let held = memory.take(Use::Chunks, need)?;
+    let held = memory.take(Use::Chunks, part)?;
+    let part = usize::try_from(part)?;
     {
         let mut file = std::fs::File::create_new(path)?;
         // An incremental base keeps an earlier base's chunks where the log changed none of their
@@ -158,11 +156,28 @@ pub fn restore_within(
         for (chunk, base) in (0u64..).zip(manifest.chunk_bases()?) {
             let key = plan::chunk_key(prefix, base, chunk);
             pace.ready()?;
-            let sealed = blobs.get(&key, until)?;
-            let pages = object::opened(&key, &sealed)?;
-            file.write_all(pages)?;
-            pace.done(Some(&file), u64::try_from(pages.len())?)?;
-            bytes = bytes.saturating_add(u64::try_from(sealed.len())?);
+            let len = manifest.chunk_bytes.min(
+                manifest
+                    .file_bytes
+                    .saturating_sub(chunk.saturating_mul(manifest.chunk_bytes)),
+            );
+            let sealed = fetch_charge(len);
+            let mut opening = object::Opening::new();
+            let mut at = 0u64;
+            while at < sealed {
+                let want = usize::try_from(sealed.saturating_sub(at))
+                    .unwrap_or(usize::MAX)
+                    .min(part);
+                let got = blobs.get_range(&key, at, want, until)?;
+                if got.is_empty() {
+                    anyhow::bail!("archive object {key} ends at byte {at}, before its {sealed}");
+                }
+                file.write_all(opening.feed(&got))?;
+                at = at.saturating_add(u64::try_from(got.len())?);
+            }
+            opening.finish(&key)?;
+            pace.done(Some(&file), len)?;
+            bytes = bytes.saturating_add(sealed);
         }
         file.sync_all()?;
     }

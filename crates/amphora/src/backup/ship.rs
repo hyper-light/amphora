@@ -41,8 +41,8 @@ pub(super) fn copy_charge(len: u64) -> u64 {
     len.saturating_mul(2).saturating_add(SUM)
 }
 
-/// The memory a chunk of `chunk_bytes` takes while a restore fetches it (T-T1.12.M2): the sealed
-/// object, whole, as the store's get gives it.
+/// The bytes a chunk of `chunk_bytes` takes sealed: what a restore fetches of it, in parts
+/// (T-T1.12.M2).
 pub(super) fn fetch_charge(chunk_bytes: u64) -> u64 {
     chunk_bytes.saturating_add(SUM)
 }

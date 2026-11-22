@@ -7,7 +7,7 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
 
 - **The seam.** Amphora reaches Mantle only through `amphora_api::blobs::Blobs` (CLAUDE.md §9):
   create-once, get, list by prefix, delete; `SimBlobs` is its simulator and `blobs::conformance` its
-  suite (AMPHORA-BLOBS-1 to 7). kiln implements it over `kiln_seams::blobs::Blobs`, with Mantle
+  suite (AMPHORA-BLOBS-1 to 7 and 9). kiln implements it over `kiln_seams::blobs::Blobs`, with Mantle
   behind that.
 - **What is shipped.** The log's own bytes: a segment is a run of frames of one log generation with
   its header (sqlite.org/fileformat2.html, "WAL File Format"), so the restore needs no decoder of its
@@ -52,12 +52,12 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   back once it's put, so a file far larger than memory goes in chunks that fit beside every other
   use, and a chunk taken while another use holds the room is refused, typed, and tried again at the
   next commit. A new base keeps the latest base's chunk size while it still fits, so an incremental
-  base can keep its chunks. The manifest records the chunk size, and a restore plans for it before it
-  makes the file: one sealed chunk held at a time, charged for the whole fetch, refused typed
-  (`Unrestorable::PastRoom`, naming what it needs and has) with nothing written where its share or
-  the store's objects can't hold one. The store's get gives an object whole, so a chunk isn't read
-  in parts: a restore with less room than the backup's copy had (half of it, as a copy holds two
-  buffers) is refused. A ranged get on the `Blobs` seam would lift that (Needs Ada's word).
+  base can keep its chunks. A restore needs no room the backup had: it fetches each chunk in ranged
+  gets (`Blobs::get_range`, AMPHORA-BLOBS-9; S3's ranged GET, as kiln's seam's `get` takes a
+  `Range`) of its own stream's share, no larger than the manifest's largest sealed chunk, one part
+  held and charged at a time, the chunk's sum checked over its parts. With no room for a part it's
+  refused, typed (`Unrestorable::PastRoom`), before it makes the file. Log segments are still
+  fetched whole, each no larger than the store's objects.
 - **The database's shipping thread.** `Database::open_backed_up` stamps the writer's commits as it
   opens and starts a thread woken by each commit the store makes (and once at its start), never by
   a timer: a round ships, then moves a due base on by a chunk, chunks following one another without
@@ -108,7 +108,7 @@ research/backup-single-node.md §1.3).
 - **Deletes** remove the file and then each directory left empty; a create that loses its directory
   to such a delete makes it again, until its deadline.
 
-**Evidence.** `backup::folder` tests: the seam's conformance suite (AMPHORA-BLOBS-1 to 7) on a folder,
+**Evidence.** `backup::folder` tests: the seam's conformance suite (AMPHORA-BLOBS-1 to 7 and 9) on a folder,
 at two depths, leaving the folder empty; names that differ only in case, `.`, `..`, device names and
 a key under a key each kept apart (AMPHORA-BLOBS-8); and 4 seeds of 400 random creates, deletes,
 gets and listings (random prefixes, cursors and limits) answered exactly as `SimBlobs` answers them.

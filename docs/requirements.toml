@@ -481,9 +481,9 @@ tests = [
   { id = "T-T1.12.P10", text = "An archive object round-trips; a changed byte is refused" },
   { id = "T-T1.12.P11", text = "A log started again twice with no write between keeps its link whole; a restart forced before its frames were shipped, or one the fence wasn't told of, breaks it" },
   { id = "T-T1.12.P12", text = "A through mark makes the seconds after the last segment's whole through its time; one that doesn't end at a segment says nothing" },
-  { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
+  { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7 and 9) passes on SimBlobs" },
   # lane pitr-7
-  { id = "AMPHORA-BLOBS-8", text = "The folder store passes AMPHORA-BLOBS-1 to 7, keeps keys apart under case folding and path names, and answers random operations as SimBlobs does" },
+  { id = "AMPHORA-BLOBS-8", text = "The folder store passes AMPHORA-BLOBS-1 to 7 and 9, keeps keys apart under case folding and path names, and answers random operations as SimBlobs does" },
   { id = "T-T1.12.C1", text = "Restore-and-check on a folder passes at the newest whole second against the source's rows and fails naming the rows against rows that differ" },
   { id = "T-T1.12.C2", text = "A check is due at the first, at each new base, and once the log since the last check outweighs what it replayed" },
   { id = "T-T1.12.I1", text = "A second base keeps the first's unchanged chunks and copies the changed; seconds across both restore equal, and after the first expires too" },
@@ -506,7 +506,8 @@ tests = [
   { id = "T-T1.12.N1", text = "A peer store in another process on the same host: the seam's conformance suite passes through its client, and a database backed up to it restores every row through the client and from the peer's folder" },
   # lane backups-7: a chunk's memory, charged to the budget and planned by the restore (kiln goal 15580afd; backup.md "A chunk's memory")
   { id = "T-T1.12.M1", text = "A file far larger than the memory room is copied in chunks that each fit the copy stream's share of the budget, read and sealed; each chunk is charged while held and given back once put, refused typed while another use holds the room, and the restore is whole" },
-  { id = "T-T1.12.M2", text = "A backup made under a large room restored under a small one is refused before anything is written, typed, naming the room a chunk needs (the manifest's chunk size, sealed) and the room the restore has; with that room the restore is whole" },
+  { id = "AMPHORA-BLOBS-9", text = "A ranged get gives an object's bytes from an offset, a length at most, fewer where it ends sooner and none from its end on; a key with no object is refused NotFound: on SimBlobs, the folder store and the peer store" },
+  { id = "T-T1.12.M2", text = "A backup made under a large room restores whole under a small one, each chunk fetched in ranged parts that fit the restore's room, one held at a time, its sum checked over the parts; with no room a restore is refused, typed, before anything is written; an altered chunk is refused by its sum" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.

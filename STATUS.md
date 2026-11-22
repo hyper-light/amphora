@@ -497,9 +497,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   check pausing in steps (T-T1.12.C7, C8); the peer store, an archive in another process's folder
   over the owner transport (`transport::PeerStore`, `PeerBlobs`; T-T1.12.N1).
   Lane backups-7 (not yet built or run): a base's chunk is charged to the process's memory budget
-  while held and bounded by its stream's share of the room, not the whole room taken once; the
-  restore plans for the manifest's chunk size and refuses, typed, before writing, where its room
-  can't hold one (T-T1.12.M1, M2).
+  while held and bounded by its stream's share of the room, not the whole room taken once; a
+  restore fetches each chunk in ranged parts that fit its own room (`Blobs::get_range`,
+  AMPHORA-BLOBS-9), so a backup made with more room restores with less (T-T1.12.M1, M2).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and

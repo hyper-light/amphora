@@ -1514,9 +1514,11 @@ fn t_t1_12_m1_a_file_far_larger_than_the_room() {
 }
 
 /// T-T1.12.M2: a backup under a large room restored under a small one. Do: copy a base under a
-/// 1 GiB budget, then restore it under 64 KiB, and under just the room one of its chunks takes.
-/// Expect: the small restore refused before it writes anything, typed, naming the room a chunk
-/// needs (the manifest's chunk size, sealed) and the room it has; the restore with that room whole.
+/// 1 GiB budget, one chunk holding the whole file; restore it under 64 KiB, under a page, and under
+/// no room; then alter a byte of the chunk in the store and restore again. Expect: the small
+/// restores whole, the chunk fetched in parts that fit their room, every charge given back; no
+/// room refused, typed, before anything is written; the altered chunk refused by its sum, though
+/// read in parts.
 #[test]
 fn t_t1_12_m2_a_large_rooms_backup_restored_in_a_small_room() {
     let dir = tempfile::tempdir().unwrap();
@@ -1527,40 +1529,66 @@ fn t_t1_12_m2_a_large_rooms_backup_restored_in_a_small_room() {
         .unwrap()
         .len();
     assert_eq!(chunks, 1, "the whole file fits one chunk of the large room");
-    assert!(chunk >= file);
+    assert!(chunk >= file && file > 64 * 1024);
     archive_through(&mut shipper, &db, &blobs, &now);
 
-    let small = dir.path().join("small.db");
+    let mut base = None;
+    for (name, limit) in [("small.db", 64 * 1024), ("page.db", 4096)] {
+        let memory = room(limit);
+        let target = dir.path().join(name);
+        let restored = backup::restore_within(
+            &blobs,
+            "db",
+            second,
+            &target,
+            &mut backup::Unpaced,
+            &memory,
+            until(),
+        )
+        .unwrap_or_else(|e| panic!("restore under {limit} bytes: {e:#}"));
+        assert_eq!(rows(&Db::open(&target).unwrap()), model, "under {limit}");
+        assert_eq!(memory.held(Use::Chunks), 0);
+        assert_eq!(memory.streams(Use::Chunks), 0);
+        base = Some(restored.base);
+    }
+
+    let none = dir.path().join("none.db");
     let refused = backup::restore_within(
         &blobs,
         "db",
         second,
-        &small,
+        &none,
         &mut backup::Unpaced,
-        &room(64 * 1024),
+        &room(0),
         until(),
     )
     .unwrap_err();
     assert!(
         matches!(
             refused.downcast_ref::<Unrestorable>(),
-            Some(Unrestorable::PastRoom { need, room, .. })
-                if *need == file.min(chunk) + 32 && *room == 64 * 1024
+            Some(Unrestorable::PastRoom { .. })
         ),
         "{refused:#}"
     );
-    assert!(!small.exists(), "nothing written");
+    assert!(!none.exists(), "nothing written");
 
-    let fits = dir.path().join("fits.db");
-    backup::restore_within(
+    let key = backup::plan::chunk_key("db", base.unwrap(), 0);
+    let mut altered = blobs.get(&key, until()).unwrap();
+    *altered.last_mut().unwrap() ^= 1;
+    blobs.delete(&key, until()).unwrap();
+    blobs.create(&key, &altered, until()).unwrap();
+    let refused = backup::restore_within(
         &blobs,
         "db",
         second,
-        &fits,
+        &dir.path().join("altered.db"),
         &mut backup::Unpaced,
-        &room(file.min(chunk) + 32),
+        &room(4096),
         until(),
     )
-    .unwrap();
-    assert_eq!(rows(&Db::open(&fits).unwrap()), model);
+    .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("doesn't match its sum"),
+        "{refused:#}"
+    );
 }

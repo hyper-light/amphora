@@ -1,8 +1,10 @@
 //! The bytes Amphora keeps outside itself: its backups (CP-T1.12, docs/design/backup.md). Mantle
 //! (kiln's track T10) keeps them; Amphora reaches it only through this trait (CLAUDE.md §9), which
 //! kiln implements over its `kiln_seams::blobs::Blobs` seam (S3's semantics, Mantle behind it). It
-//! asks for the least a backup needs: an object written once and never changed, read whole, listed
-//! by prefix in key order, and deleted. [`SimBlobs`] is its simulator; [`conformance`] is what every
+//! asks for the least a backup needs: an object written once and never changed, read whole or a
+//! range of it at a time (S3's ranged GET, RFC 9110 §14; kiln's seam's `get` with a `Range`), so a
+//! reader holds no more of an object than its memory has room for, listed by prefix in key order,
+//! and deleted. [`SimBlobs`] is its simulator; [`conformance`] is what every
 //! implementation passes.
 //!
 //! Objects are written once: [`Blobs::create`] refuses a key that holds an object
@@ -57,6 +59,15 @@ pub trait Blobs: Send + Sync {
     fn create(&self, key: &str, bytes: &[u8], until: Instant) -> Result<(), BlobRefusal>;
     /// The object at `key`, whole.
     fn get(&self, key: &str, until: Instant) -> Result<Vec<u8>, BlobRefusal>;
+    /// The object at `key`'s bytes from `offset`, `len` at most: fewer where it ends sooner, none
+    /// from its end on.
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, BlobRefusal>;
     /// The keys under `prefix` after `after` (none: from the first), in byte order, `limit` at
     /// most (a limit of 0 is refused).
     fn list(
@@ -199,6 +210,26 @@ impl Blobs for SimBlobs {
             .ok_or_else(|| BlobRefusal::NotFound(key.into()))
     }
 
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, BlobRefusal> {
+        expired(until)?;
+        check_key(key)?;
+        let objects = self.objects()?;
+        let object = objects
+            .get(key)
+            .ok_or_else(|| BlobRefusal::NotFound(key.into()))?;
+        let from = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(object.len());
+        let to = from.saturating_add(len).min(object.len());
+        Ok(object.get(from..to).unwrap_or_default().to_vec())
+    }
+
     fn list(
         &self,
         prefix: &str,
@@ -319,6 +350,28 @@ pub fn conformance(store: &dyn Blobs, prefix: &str, until: Instant) -> Result<()
             other => return fail("get after a refused create", format!("{other:?}")),
         }
     }
+    // AMPHORA-BLOBS-9: a range of an object is its bytes from the offset, the length at most:
+    // fewer where it ends sooner, none from its end on; a key with no object is refused NotFound.
+    for (offset, len, want) in [
+        (0u64, 1usize, &b"A"[..]),
+        (1, 1, b"1"),
+        (0, 2, b"A1"),
+        (1, 5, b"1"),
+        (2, 1, b""),
+        (u64::MAX, 1, b""),
+        (0, 0, b""),
+    ] {
+        match store.get_range(&a, offset, len, until) {
+            Ok(bytes) if bytes == want => {}
+            other => {
+                return fail(&format!("get_range({offset}, {len})"), format!("{other:?}"));
+            }
+        }
+    }
+    match store.get_range(&format!("{prefix}/none"), 0, 1, until) {
+        Err(BlobRefusal::NotFound(_)) => {}
+        other => return fail("get_range of no object", format!("{other:?}")),
+    }
     // AMPHORA-BLOBS-7: a malformed key is refused Invalid.
     for key in [
         format!("{prefix}//e"),
@@ -343,7 +396,7 @@ pub fn conformance(store: &dyn Blobs, prefix: &str, until: Instant) -> Result<()
 mod tests {
     use super::*;
 
-    /// AMPHORA-BLOBS-1 to 7: the simulator passes the seam's conformance suite.
+    /// AMPHORA-BLOBS-1 to 7 and 9: the simulator passes the seam's conformance suite.
     #[test]
     fn amphora_blobs_conformance_on_the_simulator() {
         let store = SimBlobs::new(16, 100, 1 << 20);

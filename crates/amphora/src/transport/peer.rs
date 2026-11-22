@@ -148,6 +148,16 @@ pub(super) fn answer(
             store.delete(&key, until)?;
             BlobAnswer::Done
         }
+        BlobOp::GetRange { key, offset, len } => {
+            if count(len) > OBJECT_BYTES {
+                return Err(BlobRefused::TooLarge {
+                    what: format!("a range of object {key}"),
+                    size: len,
+                    limit: size(OBJECT_BYTES),
+                });
+            }
+            BlobAnswer::Bytes(store.get_range(&key, offset, count(len), until)?)
+        }
     })
 }
 
@@ -241,6 +251,25 @@ impl Blobs for PeerBlobs {
         }
     }
 
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, BlobRefusal> {
+        check_key(key)?;
+        let op = BlobOp::GetRange {
+            key: key.to_owned(),
+            offset,
+            len: size(len),
+        };
+        match self.ask(op, false, until)? {
+            BlobAnswer::Bytes(bytes) => Ok(bytes),
+            _ => Err(not_a_stores()),
+        }
+    }
+
     fn list(
         &self,
         prefix: &str,
@@ -278,7 +307,7 @@ mod tests {
         Instant::now().checked_add(crate::transport::HANG).unwrap()
     }
 
-    /// AMPHORA-BLOBS-1 to 7 over the transport, in one process: a peer store over the seam's
+    /// AMPHORA-BLOBS-1 to 7 and 9 over the transport, in one process: a peer store over the seam's
     /// simulator passes the seam's conformance suite through its client, and a client's limit past
     /// one answer's is held to it.
     #[test]

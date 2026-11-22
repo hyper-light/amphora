@@ -88,6 +88,13 @@ pub(super) enum BlobOp {
         limit: u64,
     },
     Delete(String),
+    /// [`amphora_api::blobs::Blobs::get_range`]: appended after every earlier call (version 9 is
+    /// unreleased; lane backups-7).
+    GetRange {
+        key: String,
+        offset: u64,
+        len: u64,
+    },
 }
 /// A peer's object store's answer.
 #[derive(Serialize, Deserialize)]

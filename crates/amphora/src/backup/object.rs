@@ -157,6 +157,42 @@ pub(super) fn opened<'a>(key: &str, object: &'a [u8]) -> anyhow::Result<&'a [u8]
     Ok(body)
 }
 
+/// A sealed object read in parts (T-T1.12.M2): its sum from its first bytes, its body hashed as
+/// the parts come, and the sum checked once the last is in ([`Opening::finish`]).
+pub(super) struct Opening {
+    sum: Vec<u8>,
+    hasher: Sha256,
+}
+
+impl Opening {
+    pub(super) fn new() -> Self {
+        Self {
+            sum: Vec::with_capacity(SUM_BYTES),
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// The body's bytes in the next part, in order: what of it follows the sum.
+    pub(super) fn feed<'a>(&mut self, part: &'a [u8]) -> &'a [u8] {
+        let want = SUM_BYTES.saturating_sub(self.sum.len()).min(part.len());
+        let (head, body) = part.split_at_checked(want).unwrap_or((&[], part));
+        self.sum.extend_from_slice(head);
+        self.hasher.update(body);
+        body
+    }
+
+    /// Refused where the parts fed held no whole sum, or the body doesn't match it.
+    pub(super) fn finish(self, key: &str) -> anyhow::Result<()> {
+        if self.sum.len() < SUM_BYTES {
+            anyhow::bail!("archive object {key} is shorter than its sum");
+        }
+        if self.hasher.finalize().as_slice() != self.sum.as_slice() {
+            anyhow::bail!("archive object {key} doesn't match its sum");
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn encode<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
     sealed(&postcard::to_allocvec(value)?)
 }

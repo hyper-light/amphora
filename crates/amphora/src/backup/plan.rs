@@ -41,9 +41,9 @@ pub enum Unrestorable {
     #[error("archive object {key}: {why}")]
     Malformed { key: String, why: String },
     #[error(
-        "base {base}'s chunks take {need} bytes each to fetch, past this restore's {room} (its share of the memory budget's room for chunks, or the store's objects)"
+        "base {base}'s chunks can't be fetched: this restore has no room for a part of one (its share of the memory budget's room for chunks, or the store's objects)"
     )]
-    PastRoom { base: u64, need: u64, room: u64 },
+    PastRoom { base: u64 },
 }
 
 /// Whether the generation before a segment's was shipped whole.
