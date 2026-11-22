@@ -2570,9 +2570,13 @@ mod group_holding {
         let retired = dir.path().join("retired");
         let directory = Directory::new(NodeId(0));
         let until = Instant::now() + Duration::from_secs(60);
-        let groups = Groups::on(&directory, store::Config::default(), &retired, |_| {
-            local(&path)
-        })
+        let groups = Groups::on(
+            NodeId(0),
+            &directory,
+            store::Config::default(),
+            &retired,
+            |_| local(&path),
+        )
         .unwrap();
         assert_eq!(
             groups.holding_of(GroupId(0)).unwrap().owned(),
@@ -2587,9 +2591,13 @@ mod group_holding {
         let held = groups.holding_of(GroupId(0)).unwrap();
         drop(groups);
 
-        let again = Groups::on(&directory, store::Config::default(), &retired, |_| {
-            local(&path)
-        })
+        let again = Groups::on(
+            NodeId(0),
+            &directory,
+            store::Config::default(),
+            &retired,
+            |_| local(&path),
+        )
         .unwrap();
         assert_eq!(again.holding_of(GroupId(0)), Some(held));
         drop(again);

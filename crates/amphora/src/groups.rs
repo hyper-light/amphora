@@ -202,6 +202,70 @@ fn keep_book(
     Ok(left)
 }
 
+/// The old group's half of a copy or catch-up batch (CP-T1.9; docs/design/reshard.md, "Moves
+/// across nodes"): what the new group's node asks of the old group's, answered by
+/// [`Groups::serve`] there, at this node's own groups or through [`Peers`] at another's. Its
+/// encoding is postcard's, by variant index: variants are only appended.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Pull {
+    /// The next batch of a copy: at most `positions` of `rest` (none: the span is copied, only
+    /// the log's head is asked). `first`: the operation's first, which holds the old group's log
+    /// from the entry it is read at.
+    Export {
+        from: GroupId,
+        rest: Option<Span>,
+        first: bool,
+        positions: u64,
+    },
+    /// The keys of `span` that `from`'s log entries after `after` changed, up to `upto`, at most
+    /// `entries` of them.
+    Changed {
+        from: GroupId,
+        after: reshard::Seq,
+        upto: reshard::Seq,
+        span: Span,
+        entries: u64,
+    },
+}
+
+impl Pull {
+    /// The old group it asks.
+    #[must_use]
+    pub fn from(&self) -> GroupId {
+        match *self {
+            Self::Export { from, .. } | Self::Changed { from, .. } => from,
+        }
+    }
+}
+
+/// A [`Pull`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Pulled {
+    Exported(crate::store::Exported),
+    /// None: the old group's log no longer reaches back to `after`.
+    Changed(Option<crate::store::Changed>),
+    /// The old group isn't on the node asked.
+    NoGroup,
+}
+
+/// The channel from a node's groups to the other nodes' (CP-T1.9): how a move's new group reads
+/// the old one on another node.
+pub trait Peers {
+    /// `pull`, answered by `node`'s groups ([`Groups::serve`] there) by `until`. An error is the
+    /// channel's: the driver asks the action again.
+    fn pull(&self, node: NodeId, pull: &Pull, until: Instant) -> anyhow::Result<Pulled>;
+}
+
+/// The peers of a node that has none: a pull to another node finds no group there.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Alone;
+
+impl Peers for Alone {
+    fn pull(&self, _: NodeId, _: &Pull, _: Instant) -> anyhow::Result<Pulled> {
+        Ok(Pulled::NoGroup)
+    }
+}
+
 /// A store in groups: cheap to clone, usable from any thread; clones share one route.
 pub struct Groups<E: Engine> {
     route: Arc<RwLock<Route<E>>>,
@@ -327,16 +391,19 @@ impl<E: Engine> Groups<E> {
         mut engine: impl FnMut(usize) -> anyhow::Result<E>,
     ) -> anyhow::Result<Self> {
         let directory = even(NodeId(0), groups)?;
-        Self::on(&directory, config, retired, |g| {
+        Self::on(NodeId(0), &directory, config, retired, |g| {
             engine(usize::try_from(g.0).map_err(|_| anyhow::anyhow!("group {g:?}"))?)
         })
     }
 
-    /// A store for each group `directory` places, started on `engine(group)` with `config`,
-    /// each holding what its engine kept, or, if it kept nothing (a group made now), its span.
+    /// A store for each group `directory` places on `node`, started on `engine(group)` with
+    /// `config`, each holding what its engine kept, or, if it kept nothing (a group made now), its
+    /// span. The groups it places on other nodes are theirs: a key of one is refused here
+    /// ([`Away::Elsewhere`]), and a move pulls from one through [`Peers`].
     /// `retired` is the file this node keeps the groups retired here in (one per node; none yet:
     /// a node started now): a group retired before a restart stays retired after it.
     pub fn on(
+        node: NodeId,
         directory: &Directory,
         config: Config,
         retired: &Path,
@@ -357,8 +424,8 @@ impl<E: Engine> Groups<E> {
         };
         let directory = &directory;
         let mut groups = BTreeMap::new();
-        for (group, _) in directory.groups() {
-            if retired.contains(&group) {
+        for (group, on) in directory.groups() {
+            if on != node || retired.contains(&group) {
                 continue;
             }
             let mut engine = engine(group)?;
@@ -472,9 +539,10 @@ impl<E: Engine> Groups<E> {
     /// before it is acted on; a copy or catch-up batch read on the old group's writer, after every
     /// batch handed to it before, and written to the new group's in one transaction; a fence as
     /// an entry of the group's own log, numbered on its writer, so every batch let in before it
-    /// is in the log before it. `engine` starts a group's engine (`Do::Create`). Both groups of a
-    /// copy or catch-up must be on this node (a move to another node carries rows over the
-    /// network, not built yet): a group not here is [`Failure::NoGroup`].
+    /// is in the log before it. `engine` starts a group's engine (`Do::Create`). A copy or catch-up
+    /// is carried at the new group's node and reads the old group through a [`Pull`]: answered
+    /// here if the old group is here, else by the node the directory routed by places it on,
+    /// through `peers` (a move). A group on no node asked is [`Failure::NoGroup`].
     ///
     /// A batch is as many positions (copy, sweep) or log entries (catch-up) as hold each writer
     /// it runs on about as long as a commit there does, learned from the batches run on it before
@@ -485,6 +553,7 @@ impl<E: Engine> Groups<E> {
         &self,
         action: &Action,
         until: Instant,
+        peers: &dyn Peers,
         engine: impl FnOnce(GroupId) -> anyhow::Result<E>,
     ) -> anyhow::Result<Reply> {
         let op = action.op;
@@ -507,9 +576,9 @@ impl<E: Engine> Groups<E> {
                 Ok(Reply::Created)
             }
             Do::Copy { from, to, span } => {
-                let (Some(src), Some(_)) = (self.store_of(from), self.store_of(to)) else {
+                if self.store_of(to).is_none() {
                     return Ok(Reply::Failed(Failure::NoGroup));
-                };
+                }
                 let progress = match self.hold(to, until, |h| h.receive(op, span)) {
                     Ok(p) => p,
                     Err(e) => return refused(e),
@@ -519,35 +588,21 @@ impl<E: Engine> Groups<E> {
                     Some(p) => p.checked_add(1).and_then(|lo| Span::new(lo, span.hi())),
                     None => Some(span),
                 };
-                let first = progress.first_at.is_none();
-                let batch = self
-                    .batch(from, Work::Export)
-                    .min(self.batch(to, Work::Import));
-                let positions = usize::try_from(batch).unwrap_or(usize::MAX);
-                // The old group's log is held from the first copy's position on, read at the same
-                // entry as the batch, so no entry catch-up needs is let go between them.
-                let (exported, took) = src.run(until, move |e| {
-                    let began = Instant::now();
-                    let head = e.head()?;
-                    if first {
-                        e.keep_log(Some(head))?;
-                    }
-                    let exported = match rest {
-                        Some(rest) => e.export(rest, positions)?,
-                        None => crate::store::Exported {
-                            keys: Vec::new(),
-                            at: head,
-                            last: None,
-                            done: true,
-                        },
-                    };
-                    Ok((exported, began.elapsed()))
-                })?;
+                let pull = Pull::Export {
+                    from,
+                    rest,
+                    first: progress.first_at.is_none(),
+                    positions: self.batch(to, Work::Import),
+                };
+                let exported = match self.pull(peers, &pull, until)? {
+                    Pulled::Exported(exported) => exported,
+                    Pulled::NoGroup => return Ok(Reply::Failed(Failure::NoGroup)),
+                    Pulled::Changed(_) => anyhow::bail!("a copy's pull answered as a catch-up's"),
+                };
                 let units = u64::try_from(exported.keys.len())
                     .unwrap_or(u64::MAX)
                     .max(1);
                 let bytes = moved_bytes(&exported.keys);
-                self.ran(from, Work::Export, units, took, bytes);
                 let dst = self.store_of(to).ok_or(reshard::Refused::NoGroup(to))?;
                 let at = exported.at;
                 let (last, done) = (exported.last, exported.done);
@@ -571,7 +626,7 @@ impl<E: Engine> Groups<E> {
                 span,
                 upto,
             } => {
-                let (Some(src), Some(dst)) = (self.store_of(from), self.store_of(to)) else {
+                let Some(dst) = self.store_of(to) else {
                     return Ok(Reply::Failed(Failure::NoGroup));
                 };
                 let Some(incoming) = self
@@ -582,21 +637,22 @@ impl<E: Engine> Groups<E> {
                     return Ok(Reply::Failed(Failure::Refused(reshard::Refused::Ended(op))));
                 };
                 let after = incoming.progress.replayed;
-                let entries = self
-                    .batch(from, Work::Changed)
-                    .min(self.batch(to, Work::Import));
-                let (changed, took) = src.run(until, move |e| {
-                    let began = Instant::now();
-                    let changed = e.changed(after, upto, span, entries)?;
-                    Ok((changed, began.elapsed()))
-                })?;
-                let Some(changed) = changed else {
-                    return Ok(Reply::Failed(Failure::LogGone));
+                let pull = Pull::Changed {
+                    from,
+                    after,
+                    upto,
+                    span,
+                    entries: self.batch(to, Work::Import),
+                };
+                let changed = match self.pull(peers, &pull, until)? {
+                    Pulled::Changed(Some(changed)) => changed,
+                    Pulled::Changed(None) => return Ok(Reply::Failed(Failure::LogGone)),
+                    Pulled::NoGroup => return Ok(Reply::Failed(Failure::NoGroup)),
+                    Pulled::Exported(_) => anyhow::bail!("a catch-up's pull answered as a copy's"),
                 };
                 let (through, head) = (changed.through, changed.head);
                 let units = through.saturating_sub(after).max(1);
                 let bytes = moved_bytes(&changed.keys);
-                self.ran(from, Work::Changed, units, took, bytes);
                 if !changed.keys.is_empty() {
                     let keys = changed.keys;
                     let took = dst.run(until, move |e| {
@@ -691,6 +747,91 @@ impl<E: Engine> Groups<E> {
                 route.retired = keep_book(&route.book, &route.directory, &next)?;
                 Ok(Reply::Retired)
             }
+        }
+    }
+
+    /// Answers `pull` at this node's old group (CP-T1.9): its half of a copy or catch-up batch,
+    /// for a new group here or on another node. A copy's batch is read on the group's writer, and
+    /// the operation's first holds the group's log from the entry it is read at, on the same turn,
+    /// so no entry catch-up needs is let go between them. A batch is the fewer of the units asked
+    /// and those that hold this writer about as long as a commit does ([`Cost::within`]), so the
+    /// old group's writes wait no longer for it whichever node asks. A group not here is
+    /// [`Pulled::NoGroup`].
+    pub fn serve(&self, pull: &Pull, until: Instant) -> anyhow::Result<Pulled> {
+        let from = pull.from();
+        let Some(src) = self.store_of(from) else {
+            return Ok(Pulled::NoGroup);
+        };
+        match *pull {
+            Pull::Export {
+                rest,
+                first,
+                positions,
+                ..
+            } => {
+                let batch = positions.min(self.batch(from, Work::Export));
+                let positions = usize::try_from(batch).unwrap_or(usize::MAX);
+                let (exported, took) = src.run(until, move |e| {
+                    let began = Instant::now();
+                    let head = e.head()?;
+                    if first {
+                        e.keep_log(Some(head))?;
+                    }
+                    let exported = match rest {
+                        Some(rest) => e.export(rest, positions)?,
+                        None => crate::store::Exported {
+                            keys: Vec::new(),
+                            at: head,
+                            last: None,
+                            done: true,
+                        },
+                    };
+                    Ok((exported, began.elapsed()))
+                })?;
+                let units = u64::try_from(exported.keys.len())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                self.ran(from, Work::Export, units, took, moved_bytes(&exported.keys));
+                Ok(Pulled::Exported(exported))
+            }
+            Pull::Changed {
+                after,
+                upto,
+                span,
+                entries,
+                ..
+            } => {
+                let entries = entries.min(self.batch(from, Work::Changed));
+                let (changed, took) = src.run(until, move |e| {
+                    let began = Instant::now();
+                    let changed = e.changed(after, upto, span, entries)?;
+                    Ok((changed, began.elapsed()))
+                })?;
+                if let Some(c) = &changed {
+                    let units = c.through.saturating_sub(after).max(1);
+                    self.ran(from, Work::Changed, units, took, moved_bytes(&c.keys));
+                }
+                Ok(Pulled::Changed(changed))
+            }
+        }
+    }
+
+    /// `pull` answered where its old group is: here, or the node the directory routed by places
+    /// it on, through `peers`; [`Pulled::NoGroup`] if it is on no node.
+    fn pull(&self, peers: &dyn Peers, pull: &Pull, until: Instant) -> anyhow::Result<Pulled> {
+        let from = pull.from();
+        if self.store_of(from).is_some() {
+            return self.serve(pull, until);
+        }
+        let node = self
+            .route
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .directory
+            .node_of(from);
+        match node {
+            Some(node) => peers.pull(node, pull, until),
+            None => Ok(Pulled::NoGroup),
         }
     }
 

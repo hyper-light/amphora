@@ -190,7 +190,7 @@ fn no_copy_path() -> anyhow::Error {
 /// A key's rows moving from one group to another (CP-T1.9): its rows encoded by its engine (none:
 /// it has none now), the entry of the old group's log that changed it (for a copy, the log's head)
 /// and the head it was read at, the stamp it is written with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Moved {
     pub pos: Pos,
     pub key: String,
@@ -201,7 +201,7 @@ pub struct Moved {
 
 /// A batch of a span's keys, read at entry `at` of the log: through `last` (the last position
 /// whose keys are all in it, none: the span has no key), and `done` when none is past it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Exported {
     pub keys: Vec<Moved>,
     pub at: Seq,
@@ -210,7 +210,7 @@ pub struct Exported {
 }
 
 /// The keys changed by a run of the log's entries, through entry `through`; `head` the log's head.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Changed {
     pub keys: Vec<Moved>,
     pub through: Seq,

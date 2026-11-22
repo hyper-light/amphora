@@ -214,11 +214,16 @@ deterministic simulator:
    holding it keeps a log of its commits and its Records rows indexed by position, and carries the
    copy path over them (decision "A row routes by its namespace, family and key", T-T1.9.R9).
 
+   Built (lane split-merge-9): moves to another node. A copy or catch-up batch reads its old group
+   through a pull (`groups::Pull`), answered by `Groups::serve` at the node the old group is on, on
+   its writer, through `groups::Peers` when that node is another; a node starts only the groups the
+   directory places on it (decision "Moves across nodes", T-T1.9.R10).
+
    Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
    which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
-   one group), with a split and merge of it under writes through `carry`; moves to another node
-   (the copy and catch-up over the network: a node-to-node protocol beside the owner transport,
-   which today speaks to one owner); a retired group's files, which the shell's caller deletes.
+   one group), with a split and merge of it under writes through `carry`; `Peers` over a socket
+   between machines (the owner transport speaks to one owner; the pull would be its appended
+   request variants); a retired group's files, which the shell's caller deletes.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.
@@ -345,3 +350,44 @@ split-merge-8 without her. What it leaves open:
 **Falsified by.** A Records key whose versions are found in two groups, or in none, after a
 split, merge or move; a read at a revision answered differently after a move; a new group's next
 revision of a namespace not newer than one it took.
+
+## Decision (lane split-merge-9): moves across nodes
+
+A move's new group is on another node than the old one, so its copy and catch-up can't read the old
+group's engine in the same process. Every copy and catch-up batch now has two halves:
+- The old group's half is a pull (`groups::Pull`): a copy's next batch of positions, or the keys a
+  run of the old group's log changed. `Groups::serve` answers it at the node the old group is on, on
+  that group's writer, as the path within one node did: the operation's first read holds the old
+  group's log from the entry it reads at, on the same turn, and the batch is the fewer of the units
+  asked and those the old group's writer takes in about a commit's time (decision "Batches learned
+  where they run"), so the old group's writes wait no longer whichever node asks.
+- The new group's half stays in `Groups::carry`, at the new group's node: it asks for at most the
+  units its own writer takes, writes the batch with the stamps it was read at, and keeps its progress
+  in its holding, as before.
+
+`carry` answers a pull itself when the old group is on its node (a split or a merge) and otherwise
+sends it to the node the directory it routes by places the old group on, through `groups::Peers`.
+So a split, a merge and a move all read through `serve`: one path. A node starts only the groups the
+directory places on it (`Groups::on` takes its node) and refuses the keys of the others
+(`Away::Elsewhere`). A pull and its answer are serde types, encoded by postcard by variant index,
+variants only appended.
+
+Nothing else changes. The fence, flip, activate, release and retire are each carried at their own
+group's node, where the driver addresses them (`Do::group`). Correctness never rests on the channel:
+a pull or answer lost is an error, and the driver asks the action again; a stale one is refused by
+the new group's holding.
+
+**Evidence.** `tests/groups.rs`, T-T1.9.R10: two nodes, two groups on the first, the second moved to
+the second node by the driver while a row is written before every action, each pull and its answer
+carried as postcard bytes. The move ends flipped; the first node keeps one group and has retired the
+other; the second holds the moved span; every key's acknowledged rows read back at its group's node,
+and every key is in exactly one group's file. The tests within one node (T-T1.9.R4 to R6) pass
+unchanged through the same path.
+
+**Left.** `Peers` over a socket between machines: the owner transport (`crate::transport`) speaks to
+one database owner, and its authenticated frames are where the pull goes, as appended request
+variants (local-owner-transport.md, "Versions"), with loss and partition tests. That is the next
+piece of this item.
+
+**Falsified by.** A move under writes that loses an acknowledged write or leaves a key in two
+groups; or a pull's batch larger than the old group's writer's learned batch.

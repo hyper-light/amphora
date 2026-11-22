@@ -470,8 +470,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (`reshard::row_key`; needs Ada's word), and `database::Local` carries the copy path over its Records
   rows, indexed by position from its first holding, with a log of its commits and a feed while held
   (`database/group.rs`; T-T1.9.R9).
-  Left: `database::Local` as a group (its holding and log through a replicated command), moves across
-  nodes, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
+  Moved across nodes (lane split-merge-9): a copy or catch-up batch reads its old group through a
+  pull (`groups::Pull`, answered by `Groups::serve` where the group is, through `groups::Peers` from
+  another node), and a group moved to a second node under writes keeps every acknowledged write
+  (T-T1.9.R10). Left: `Peers` over a socket between machines, a `Database` over `Groups<Local>`,
+  load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

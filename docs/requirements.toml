@@ -745,6 +745,8 @@ tests = [
   # lane split-merge-8
   { id = "T-T1.9.R8", text = "Copy-path batches on a node with no commit measured, and batches learned from time with large units — passes when no batch holds more units than the process's memory budget takes at the most bytes a unit has held, and at least one" },
   { id = "T-T1.9.R9", text = "A local database holding Records rows made a group's, its keys copied by position in batches into another local database, changed and caught up from its log, then swept — passes when the second answers every key as the first, with the same live count and a head no older than every revision moved, a catch-up from before the log was held is refused, and the sweep leaves the first with no key" },
+  # lane split-merge-9
+  { id = "T-T1.9.R10", text = "Two nodes, the second of two groups on the first moved to the second by the driver while a row is written before every action, each pull of its copy and catch-up and its answer carried as bytes — passes when the move ends flipped, the first node keeps one group and has retired the moved one, the second holds its span, every key's acknowledged rows read back at its group's node, and every key is in exactly one group's file" },
 ]
 
 # lane qs5

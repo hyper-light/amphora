@@ -186,6 +186,9 @@ pub(super) fn head(db: &Db) -> anyhow::Result<Seq> {
 /// A version of a key as it moves: its revision, its place in its commit, its value (none: a
 /// delete).
 type Version = (u64, u64, Option<Vec<u8>>);
+/// A span's keys read in position order: each with its position, the last position taken, and
+/// whether none is past it ([`keys_in`]).
+type SpanKeys = (Vec<(Id, Pos)>, Option<Pos>, bool);
 
 /// `id`'s versions as they stand now, in revision order (none: it has none).
 fn versions(db: &Db, id: &Id) -> anyhow::Result<Vec<Version>> {
@@ -256,7 +259,7 @@ fn keys_in(
     span: Span,
     positions: usize,
     keep: &dyn Fn(Pos) -> bool,
-) -> anyhow::Result<(Vec<(Id, Pos)>, Option<Pos>, bool)> {
+) -> anyhow::Result<SpanKeys> {
     let mut keys: Vec<(Id, Pos)> = Vec::new();
     let (mut seen, mut last, mut done) = (0usize, None, true);
     db.query(
