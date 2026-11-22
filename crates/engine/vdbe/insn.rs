@@ -304,6 +304,20 @@ pub struct JoinSwitchBuiltData {
     pub estimate_error: f64,
 }
 
+/// Amphora (PL.13, the materialization points): a hash join the planner chose, its build over a
+/// table read whole (no filter of its own), counted against the rows the plan counted the table at.
+#[derive(Debug, Clone)]
+pub struct BuildCountedData {
+    pub hash_table_id: usize,
+    /// The build table, as its row counter (PL.9, `row_changes`) names it.
+    pub table: String,
+    /// ANALYZE's count of the build table's rows.
+    pub analyzed_rows: f64,
+    /// The relative standard error of the statistics that count came from
+    /// (`row_changes::statistics_error`).
+    pub estimate_error: f64,
+}
+
 /// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
 /// them. Most seeks have no such columns, so the empty mask is a null pointer
 /// and only IS-seeks allocate (boxed to keep Insn small).
@@ -2359,6 +2373,14 @@ pub enum Insn {
         cursor_id: CursorID,
         target_reg: usize,
     },
+
+    /// Amphora (PL.13, a materialization point; `docs/design/planner.md`, "Decision (lane pl13)"):
+    /// a planner-chosen hash join's build over a whole table, its rows set against the plan's
+    /// estimate. Past the estimate's error the table's count is corrected and the statement planned
+    /// again, a run that may start again handed off to the new plan (`JoinSwitchBuilt`'s rule).
+    BuildCounted {
+        data: Box<BuildCountedData>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2612,6 +2634,7 @@ impl InsnVariants {
             InsnVariants::JoinSwitchHash => execute::op_join_switch_hash,
             InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
             InsnVariants::TreePages => execute::op_tree_pages,
+            InsnVariants::BuildCounted => execute::op_build_counted,
         }
     }
 }

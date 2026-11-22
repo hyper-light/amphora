@@ -544,6 +544,9 @@ pub struct Connection {
     /// Amphora (PL.13): how many adaptive joins' hash tables held rows past their estimate's
     /// error, so their statements are prepared again; see [`Connection::adaptive_replans`].
     pub(super) adaptive_replans: AtomicU64,
+    /// Amphora (PL.13): planner-chosen hash joins' builds counted against their estimates; see
+    /// [`Connection::adaptive_build_checks`].
+    pub(super) adaptive_build_checks: AtomicU64,
     /// Amphora: see [`Connection::set_adaptive_handoff`].
     pub(super) adaptive_handoff: AtomicBool,
     /// Amphora (PL.13): how many runs an adaptive join's build handed to a second prepare; see
@@ -1094,6 +1097,17 @@ impl Connection {
 
     pub(crate) fn count_adaptive_replan(&self) {
         self.adaptive_replans.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, a materialization point): how many hash joins the planner chose on this
+    /// connection had their build's rows counted against the estimate (each re-plan past its error
+    /// is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_build_checks(&self) -> u64 {
+        self.adaptive_build_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_build_check(&self) {
+        self.adaptive_build_checks.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): when
