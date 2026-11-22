@@ -792,6 +792,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   into ~/.cache). Each record names its client, platform, versions and durability, and the client's CPU, memory
   and sockets. The HTTP client now keeps a connection a writer to each node; ureq's default of 3 a host had
   cost the competitors a new connection on most writes.
+- **Replication measured: each competitor at its strongest commit durability** (CP-T1.8, AC-T1.8.2; lane
+  repl-measure-14): written, not yet run. From each system's own source (cited in its native script): rqlite's
+  and dqlite's defaults already acknowledge once 2 of 3 Raft logs hold a commit, fsynced, and offer nothing
+  stronger. sqld's default (durability_mode relaxed, synchronous=NORMAL) doesn't fsync at commit; the cluster
+  now runs it at strong (FULL) and refuses to come up otherwise. libSQL and LiteFS replicate asynchronously
+  with no mode that waits for a replica, so they can't match 2 of 3: their records say one member's disk.
+  Bring-up waits on each process's own ready line, followed as the log grows, with two minutes as the give-up
+  (no 50 ms poll). setup.sh pairs go-dqlite with the libdqlite it builds against (v3 for 1.18+, v1.22.0 below).
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,

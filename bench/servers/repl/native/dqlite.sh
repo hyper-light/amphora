@@ -3,10 +3,25 @@
 # built by setup.sh against the host's libdqlite) a process on this host for each node, /exec and
 # /count on 127.0.0.1:54240-54242, dqlite's own protocol on 54250-54252. go-dqlite sends every
 # statement to the leader; a commit is acknowledged once a quorum's Raft logs hold it.
+#
+# Durability, from libdqlite v1.18.7's source (setup.sh's build when the host has none):
+# - Raft log segments are opened O_WRONLY|O_DSYNC (src/raft/uv_fs.c:311, UvFsAllocateFile, which
+#   src/raft/uv_prepare.c:54 uses for every open segment), so a write returns once it's on disk.
+# - The leader counts its own copy only from last_stored, set when its append completes
+#   (src/raft/replication.c:471 appendLeaderCb, 562-566 replicationQuorum), and a follower reports
+#   last_stored as its log's end (replication.c:1021).
+# - dqlite keeps SQLite's pages in memory and its WAL frames in that log (include/dqlite.h:262-264).
+# - Neither libdqlite's node API (include/dqlite.h: no sync setting) nor go-dqlite's app options
+#   (app/options.go: none about syncing; WithDiskMode is experimental and moves the database to disk,
+#   not the log) offer anything weaker or stronger.
+# So the defaults already are "2 of 3 members' logs hold it, fsynced".
 set -euo pipefail
 SYS=dqlite
 PORT=${AMPHORA_BENCH_REPL_PORT:-54240}
-DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it; libdqlite's and go-dqlite app's defaults"
+DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it, each written O_DSYNC; libdqlite's and go-dqlite app's defaults, which no setting changes"
+# The shim's own ready line (../shim/main.go), printed once go-dqlite's App.Ready returned (the node
+# joined, or bootstrapped as node 0) and its database is open, with its HTTP listener bound.
+READY='shim ready: listening on '
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 run_node() {
@@ -17,8 +32,6 @@ run_node() {
   spawn "$n" env LD_LIBRARY_PATH="$BIN/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$BIN/shim" -backend dqlite -dir "$(dir "$n")/data" \
     -address "127.0.0.1:$(port2 "$n")" "${join[@]}" -listen "127.0.0.1:$(port "$n")"
 }
-
-ready_node() { curl -sf "http://127.0.0.1:$(port "$1")/ready" >/dev/null; }
 
 leader() {
   local n addr

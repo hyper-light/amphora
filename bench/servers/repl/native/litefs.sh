@@ -7,10 +7,25 @@
 # after (LiteFS replicates asynchronously). A write to a replica fails read-only, so the harness sends
 # it on to the next node. Consul runs in dev mode beside the nodes (HTTP on 54280, its other ports
 # 54281-54283, DNS off), and goes with them. FUSE needs /dev/fuse and fusermount3 on the host.
+#
+# Durability, from LiteFS v0.5.14's source (what setup.sh fetches) and its docs:
+# - The shim opens SQLite with synchronous=FULL (../shim/main.go), and LiteFS's CommitWAL, run as
+#   SQLite releases its write lock inside COMMIT (db.go:1548-1553), fsyncs the WAL (db.go:1568-1569)
+#   and the transaction's LTX file (db.go:1696) on the primary.
+# - Replication is asynchronous: LiteFS "does not confirm that writes are committed to other nodes
+#   before continuing to the next transaction", and "Synchronous replication & time-bound
+#   asynchronous replication are features that are planned for future development"
+#   (docs.fly.io/litefs/how-it-works). No configuration field waits for a replica
+#   (cmd/litefs/config.go:28-42, 145-183).
+# So the strongest LiteFS offers is the primary's own disk, fsynced: it can't match 2 of 3.
 set -euo pipefail
 SYS=litefs
 PORT=${AMPHORA_BENCH_REPL_PORT:-54260}
-DURABILITY="acknowledged once the primary's SQLite WAL holds it on disk (synchronous=FULL); replicas stream it asynchronously, so no quorum: one member's disk"
+DURABILITY="acknowledged once the primary's SQLite WAL and LTX file hold it, fsynced (synchronous=FULL; LiteFS's CommitWAL syncs both); replicas stream it asynchronously and LiteFS has no mode that waits for one, so no quorum: one member's disk"
+# The shim's own ready line (../shim/main.go). LiteFS runs the shim only once its node holds the
+# lease or has connected to the holder ("connected to cluster, ready", cmd/litefs/mount_linux.go:265-270),
+# and passes its stderr on (mount_linux.go:608-609), so the line lands in the node's log.
+READY='shim ready: listening on '
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 CONSUL_PORT=$((PORT + 20))
 CONSUL_DIR="$DATA/consul"
@@ -24,7 +39,10 @@ before_up() {
     -hcl "ports { http = $CONSUL_PORT, serf_lan = $((CONSUL_PORT + 1)), serf_wan = $((CONSUL_PORT + 2)), server = $((CONSUL_PORT + 3)), dns = -1, grpc = -1 }" \
     >>"$CONSUL_DIR/log" 2>&1 </dev/null &
   echo $! >"$CONSUL_DIR/pid"
-  wait_for curl -sf "http://127.0.0.1:$CONSUL_PORT/v1/status/leader"
+  # Consul's own line once its server leads (agent/consul/leader.go:101 at v2.1.0: "cluster leadership
+  # acquired"), so a LiteFS lease can be taken. Its log is new: DATA went with the last down.
+  wait_line "$CONSUL_DIR/log" 0 "$(cat "$CONSUL_DIR/pid")" 'cluster leadership acquired' \
+    || { echo "consul didn't take leadership; its log ends:" >&2; tail -n 40 "$CONSUL_DIR/log" >&2; return 1; }
 }
 
 after_kill() { fusermount3 -uz "$(dir "$1")/mnt" 2>/dev/null || true; }
@@ -61,8 +79,6 @@ exec:
 YML
   spawn "$n" "$BIN/litefs" mount -config "$d/litefs.yml"
 }
-
-ready_node() { curl -sf "http://127.0.0.1:$(port "$1")/ready" >/dev/null; }
 
 leader() {
   local n name

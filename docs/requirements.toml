@@ -1184,6 +1184,10 @@ tests = [
 # Amphora's members as processes, the competitors from bench/servers/repl/native (release binaries
 # fetched by its setup.sh). Each record names its client, platform, system version and durability
 # (`about`) and the client's own use (`client_use`). The runs of record are the coordinator's.
+# lane repl-measure-14 (CP-T1.8, AC-T1.8.2): no new IDs. Each native competitor runs its strongest commit
+# durability, from its own source (cited in bench/servers/repl/native/<system>.sh): sqld at
+# durability_mode=strong, checked by `up`; rqlite and dqlite at their defaults (2 of 3 logs, fsynced);
+# libSQL and LiteFS can't wait for a replica, which their records' `durability` says.
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]

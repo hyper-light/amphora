@@ -6,6 +6,8 @@
 //   GET  /leader                                 dqlite's leader address; on LiteFS the lease holder's
 //                                                hostname: this node's when it takes a write
 //                                                transaction, else its .primary file's
+// Once it listens and its database takes statements, it prints "shim ready: listening on ADDR" on
+// stderr: the ready signal native/lib.sh waits for.
 package main
 
 import (
@@ -235,5 +237,14 @@ func main() {
 		}
 		reply(w, map[string]any{"count": n})
 	})
-	log.Fatal(http.ListenAndServe(*listen, nil))
+	// Bound before the ready line, so a client that read the line connects at once. The line is
+	// the shim's own ready signal (native/lib.sh waits for it on the node's log): dqlite's node is
+	// Ready and its database open, or LiteFS has made this node primary or connected it to one
+	// (LiteFS runs the shim only then). It goes to stderr, which LiteFS passes on as its own.
+	ln, err := net.Listen("tcp", *listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("shim ready: listening on %s", ln.Addr())
+	log.Fatal(http.Serve(ln, nil))
 }

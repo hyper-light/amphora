@@ -9,12 +9,17 @@
 #   dqlite   no release binary exists: the bench's shim (../shim/main.go) is built with Go (go.dev's
 #            release, fetched here) against libdqlite: the host's (pkg-config dqlite) if it has one,
 #            else canonical/dqlite's release source built here with its own raft (needs a C
-#            compiler, autotools, libuv and sqlite3 headers).
+#            compiler, autotools, libuv and sqlite3 headers). go-dqlite goes with the libdqlite it
+#            builds against, as each states: libdqlite 1.18 and later drop
+#            dqlite_node_enable_disk_mode, which go-dqlite v1 and v2 call (internal/bindings/server.go),
+#            and go-dqlite v3 refuses a libdqlite older than 1.18 (its bindings check
+#            DQLITE_VERSION_NUMBER < 11800). So libdqlite 1.18+ takes go-dqlite v3's newest release
+#            (the shim's import moved to v3's module path), and an older one v1.22.0, as
+#            ../shim/Dockerfile pairs with Ubuntu 24.04's libdqlite 1.16.
 # Versions: the newest release of each at the time this runs, unless pinned in the environment
 # (RQLITE_TAG, LIBSQL_TAG, LITEFS_TAG, CONSUL_VERSION, GO_VERSION, DQLITE_TAG, GO_DQLITE: the shim's
-# go-dqlite, v1.22.0 by default, the version the shim was written against, as ../shim/Dockerfile
-# pins). The versions fetched go to $BIN/versions.txt, and each cluster's `about` puts its binary's
-# own version line in every record.
+# go-dqlite, by default as above). The versions fetched go to $BIN/versions.txt, and each cluster's
+# `about` puts its binary's own version line in every record.
 # Exit: 0 when every system is ready; 1 when one isn't (each says why; the others are still set up,
 # and the harness records the missing one's typed refusal).
 set -uo pipefail
@@ -118,8 +123,10 @@ fi
 if pkg-config --exists dqlite 2>/dev/null; then
   DQ_PC=""
   echo "dqlite $(pkg-config --modversion dqlite) (the host's)" >"$BIN/dqlite.version"
+  DQ_VERSION=$(pkg-config --modversion dqlite)
 elif [[ -f "$BIN/lib/pkgconfig/dqlite.pc" ]]; then
   DQ_PC="$BIN/lib/pkgconfig"
+  DQ_VERSION=$(PKG_CONFIG_PATH="$DQ_PC" pkg-config --modversion dqlite)
 else
   DQ_PC="$BIN/lib/pkgconfig"
   if read -r tag url < <(curl -fsSL "https://api.github.com/repos/canonical/dqlite/releases${DQLITE_TAG:+/tags/$DQLITE_TAG}" | python3 -I -c '
@@ -131,19 +138,29 @@ for r in (d if isinstance(d, list) else [d]):
     && d=$(mktemp -d "$WORK/dq.XXXXXX") && curl -fsSL -o "$d/src.tar.gz" "$url" && mkdir -p "$d/src" && tar -xzf "$d/src.tar.gz" -C "$d/src" --strip-components 1 \
     && (cd "$d/src" && autoreconf -i >/dev/null && ./configure --prefix="$BIN" --enable-build-raft >/dev/null && make -j"$(nproc)" >/dev/null && make install >/dev/null); then
     echo "dqlite $tag (built here)" >"$BIN/dqlite.version"
+    DQ_VERSION=$(PKG_CONFIG_PATH="$DQ_PC" pkg-config --modversion dqlite)
     note dqlite "$tag"
   else
     echo "dqlite: libdqlite neither on this host nor built (needs gcc, autotools, libuv and sqlite3 headers)" >&2; failed=1
   fi
 fi
 
-if [[ ! -x "$BIN/shim" && -x "$BIN/go/bin/go" && -f "$BIN/dqlite.version" ]]; then
+if [[ ! -x "$BIN/shim" && -x "$BIN/go/bin/go" && -n "${DQ_VERSION:-}" ]]; then
   s=$(mktemp -d "$WORK/shim.XXXXXX")
   cp "$HERE/../shim/main.go" "$s/"
-  if (cd "$s" && export PATH="$BIN/go/bin:$PATH" GOPATH="$WORK/gopath" GOCACHE="$WORK/gocache" PKG_CONFIG_PATH="${DQ_PC}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
-      && go mod init shim >/dev/null 2>&1 && go get "github.com/canonical/go-dqlite@${GO_DQLITE:-v1.22.0}" github.com/mattn/go-sqlite3 >&2 && go mod tidy >&2 \
+  # go-dqlite for this libdqlite (the header's comment says why): v3's module path is .../v3.
+  IFS=. read -r dq_major dq_minor _ <<<"$DQ_VERSION"
+  if ((dq_major > 1 || (dq_major == 1 && dq_minor >= 18))); then
+    gdq_mod=github.com/canonical/go-dqlite/v3
+    gdq=${GO_DQLITE:-$(curl -fsSL https://api.github.com/repos/canonical/go-dqlite/releases/latest | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])')}
+    sed -i 's|"github.com/canonical/go-dqlite/app"|"github.com/canonical/go-dqlite/v3/app"|' "$s/main.go"
+  else
+    gdq_mod=github.com/canonical/go-dqlite gdq=${GO_DQLITE:-v1.22.0}
+  fi
+  if [[ -n "$gdq" ]] && (cd "$s" && export PATH="$BIN/go/bin:$PATH" GOPATH="$WORK/gopath" GOCACHE="$WORK/gocache" PKG_CONFIG_PATH="${DQ_PC}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+      && go mod init shim >/dev/null 2>&1 && go get "$gdq_mod@$gdq" github.com/mattn/go-sqlite3 >&2 && go mod tidy >&2 \
       && CGO_LDFLAGS_ALLOW="-Wl,-z,now" go build -tags libsqlite3 -o "$BIN/shim" .); then
-    note go-dqlite "${GO_DQLITE:-v1.22.0}"
+    note go-dqlite "$gdq (libdqlite $DQ_VERSION)"
   else
     echo "shim: not built (go-dqlite against libdqlite; see above)" >&2; failed=1
   fi

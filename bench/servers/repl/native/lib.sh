@@ -5,8 +5,9 @@
 # none; Amphora's members (bench/repl_members.sh) are processes here, so its competitors are too.
 #
 # Each script sets SYS and PORT (node n's client port is PORT+n on 127.0.0.1; a system with a
-# second port a node takes PORT+10+n, and a third PORT+20+n), defines `run_node N` (starts node N in
-# the background and prints nothing), `ready_node N`, `leader` (node 0 to 2, or nothing) and
+# second port a node takes PORT+10+n, and a third PORT+20+n) and READY (an ERE for the line the
+# node's own process prints once it takes requests: its ready signal), defines `run_node N` (starts
+# node N in the background and prints nothing), `leader` (node 0 to 2, or nothing) and
 # `version` (the binary's own version line), states DURABILITY (what an acknowledged write has
 # survived, with the flags that make it so), then calls `main "$@"`.
 #
@@ -32,10 +33,14 @@ need_bin() {
 
 # Starts `$@` as node N's process, its output in its log, its PID recorded for kill and down. It
 # leads a process group of its own (setsid), so a kill takes what it started too (LiteFS's shim).
+# The log's length before it starts is kept too, so the wait for its ready line reads only what
+# this start printed (a restarted node's log still holds the last start's).
 spawn() {
   local n=$1
   shift
   mkdir -p "$(dir "$n")"
+  touch "$(dir "$n")/log"
+  stat -c %s "$(dir "$n")/log" >"$(dir "$n")/logpos"
   setsid "$@" >>"$(dir "$n")/log" 2>&1 </dev/null &
   echo $! >"$(dir "$n")/pid"
 }
@@ -58,16 +63,31 @@ select.select([fd],[],[])' "$(cat "$f")"
   if declare -F after_kill >/dev/null; then after_kill "$1"; fi
 }
 
-# A node's readiness through its own blocking check where the system has one; else `$@` is tried
-# until it answers, bounded by the first start's two minutes (../lib.sh's bound). This is bring-up,
-# outside every measure.
-wait_for() {
-  local i
-  for ((i = 0; i < 2400; i++)); do
-    if "$@" >/dev/null 2>&1; then return 0; fi
-    sleep 0.05
-  done
-  return 1
+# Bring-up's give-up, outside every measure: ../lib.sh's two minutes for a first start. Only the
+# give-up is time; readiness itself is the process's own signal.
+BRINGUP_S=120
+
+# Waits for the process PID to print a line matching ERE into LOG past byte FROM: GNU tail -F
+# follows the file as it grows (inotify), so the wait wakes on the line itself, not on a timer.
+# Gives up when the process ends (tail --pid) or at BRINGUP_S. Returns 0 only on the line.
+# wait_line LOG FROM PID ERE
+wait_line() {
+  local log=$1 from=$2 pid=$3 ere=$4 fd p rc=1
+  exec {fd}< <(exec timeout "$BRINGUP_S" tail -c "+$((from + 1))" --pid="$pid" -F "$log" 2>/dev/null)
+  p=$!
+  grep -q -m 1 -E -- "$ere" <&"$fd" && rc=0
+  exec {fd}<&-
+  kill "$p" 2>/dev/null || true
+  return "$rc"
+}
+
+# Node N is ready once its process prints READY (the system's own ready line, named in each
+# script), then whatever after_ready N the script adds (sqld's one blocking request).
+ready_node() {
+  local d
+  d=$(dir "$1")
+  wait_line "$d/log" "$(cat "$d/logpos")" "$(cat "$d/pid")" "$READY" || return 1
+  if declare -F after_ready >/dev/null; then after_ready "$1"; fi
 }
 
 down() {
@@ -84,19 +104,21 @@ up() {
   local n
   for n in 0 1 2; do run_node "$n"; done
   for n in 0 1 2; do
-    if ! wait_for ready_node "$n"; then
-      echo "$SYS node $n didn't come up; its log ends:" >&2
+    if ! ready_node "$n"; then
+      echo "$SYS node $n didn't print its ready line (/$READY/) within ${BRINGUP_S}s or ended first; its log ends:" >&2
       tail -n 40 "$(dir "$n")/log" >&2 || true
       return 1
     fi
   done
-  if ! wait_for has_leader; then
-    echo "$SYS named no leader" >&2
+  # Every system's ready line comes after its node knows a leader (each script says how), so one
+  # look is the check: no leader here is a fault, not a wait.
+  if [[ -z "$(leader)" ]]; then
+    echo "$SYS named no leader once every node was ready" >&2
     return 1
   fi
+  # A script's own check that the cluster runs the durability DURABILITY states (sqld's).
+  if declare -F after_up >/dev/null; then after_up; fi
 }
-
-has_leader() { [[ -n "$(leader)" ]]; }
 
 # What the record says of this cluster: the platform it ran on and what a commit means here.
 about() {
@@ -106,8 +128,10 @@ about() {
   kernel=$(uname -srm)
   # Every option the binary's own help names for syncing or durability, so the record shows the
   # defaults it ran with, not only what DURABILITY says of them.
-  python3 -I -c 'import json,sys; print(json.dumps({"system": sys.argv[1], "version": sys.argv[2], "platform": "native", "kernel": sys.argv[3], "data_fs": sys.argv[4], "durability": sys.argv[5], "sync_options": [l.strip() for l in sys.argv[6].splitlines() if l.strip()]}))' \
-    "$SYS" "$(version 2>&1 | head -n 1)" "$kernel" "$fs" "$DURABILITY" "$(help_text 2>&1 | grep -iE 'sync|durab|fsync' || true)"
+  # durability_check, where a script has one, is what the running cluster itself reports of it.
+  python3 -I -c 'import json,sys; print(json.dumps({"system": sys.argv[1], "version": sys.argv[2], "platform": "native", "kernel": sys.argv[3], "data_fs": sys.argv[4], "durability": sys.argv[5], "sync_options": [l.strip() for l in sys.argv[6].splitlines() if l.strip()], "durability_check": sys.argv[7] or None}))' \
+    "$SYS" "$(version 2>&1 | head -n 1)" "$kernel" "$fs" "$DURABILITY" "$(help_text 2>&1 | grep -iE 'sync|durab|fsync' || true)" \
+    "$(if declare -F durability_check >/dev/null; then durability_check 2>&1; fi)"
 }
 
 main() {
@@ -117,7 +141,7 @@ main() {
     kill) kill_node "$2" ;;
     start)
       run_node "$2"
-      wait_for ready_node "$2"
+      ready_node "$2"
       ;;
     leader) leader ;;
     endpoint) echo "http://127.0.0.1:$(port "$2")" ;;
