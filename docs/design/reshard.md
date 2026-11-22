@@ -228,8 +228,8 @@ deterministic simulator:
 
    Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
    which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
-   one group), with a split and merge of it under writes through `carry`; the transport off
-   loopback, between machines. Built (lane split-merge-12): a retired group's files, named to
+   one group), with a split and merge of it under writes through `carry`. Built (lane split-merge-13):
+   the transport between machines (decision "The transport between machines", T-T1.9.R18). Built (lane split-merge-12): a retired group's files, named to
    the shell's caller, who deletes them (decision "A retired group's files", T-T1.9.R16).
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
@@ -433,7 +433,8 @@ acknowledged write reads back at its group's node, and every key is in exactly o
 **Left.** The owner transport listens on loopback, its record in a protected directory beside the
 database: it reaches another process on the same machine. A node on another machine needs that
 listener on a network address with an authentication that doesn't rest on a shared file (the
-replicated transport's, hyper-transport); `Nodes` is the seam it plugs into.
+replicated transport's, hyper-transport); `Nodes` is the seam it plugs into. Built since (lane
+split-merge-13): decision "The transport between machines".
 
 **Falsified by.** A pull answered through a partition; a move over the transport that loses an
 acknowledged write or leaves a key in two groups; a pull's answer larger than a frame.
@@ -535,6 +536,48 @@ every key still reads back from its group.
 **Falsified by.** A group named whose files are still read or written by this node; a retired
 group's files left after the caller has deleted those named.
 
+## Decision (lane split-merge-13): the transport between machines
+
+A move's new group pulls from the old group's node, and a transaction across groups steps each
+group's owner, through `transport::Nodes`. Until now every endpoint listened on loopback,
+authenticated by a capability in a protected file beside the database: it reached another process
+on the same machine, never another machine.
+
+Now a node's endpoint (`Node::listen`) and a group's database owner (`Database::listen`) also listen
+at a network address, and `Nodes::network` dials them:
+- Authentication is the replicated transport's: mutual TLS 1.3 as hyper-transport's `Tls::mutual`
+  builds it. Each side presents a certificate chain from the deployment's authority and verifies the
+  other's against the authority's roots, and the dialer checks that the server's certificate carries
+  the name it was given for that node. Key exchange is by the hybrid post-quantum groups only and
+  the suites are the 256-bit ones only, as hyper-quic's `node_provider` names them; no early data (a
+  first message may be a write). The TLS is hyper-tls, the rustls the replicated transport already
+  vendors. Nothing rests on a shared file.
+- The owner protocol runs inside the TLS stream unchanged. Its greeting's capability is exported
+  from the TLS session (RFC 8446 §7.5), so the proofs bind each connection to its session and one
+  greeting serves both endpoints. Frames, deadlines, the descriptor budget and the accept loop are
+  the loopback endpoint's (`Owner::accept`, `endpoint::listener`).
+- A network endpoint answers only what a node asks: a pull, a step or a probe. Sessions, Records and
+  SQL requests stay on the loopback endpoint, and a network one refuses them.
+- Each connection builds its TLS configuration from the credentials (hyper-tls drives a connection
+  with its configuration borrowed mutably), checked once when the endpoint or the peers are made.
+  So no connection resumes a TLS session: every pull and step is a full handshake.
+
+Values introduced: the protocol name `amphora-owner` and the exporter label, format values.
+
+**Evidence.** `transport::network`'s tests (T-T1.9.R18): pulls over a network address under mutual
+TLS; a client from another authority, a server from another authority and a server whose
+certificate names another node, each refused with no pull served; a database request refused at a
+network endpoint. `xgroup::lan`'s harness over two databases' network endpoints commits with no
+unknown outcome. The LAN harness (`examples/xgroup_lan.rs`) runs it between machines: `node
+--listen`, and `bench` or `elle` with `--cert`, `--key` and `--roots`.
+
+**Falsified by.** A request served to a peer whose certificate isn't under the roots, or by a node
+other than the one the dialer named; a network endpoint serving a database session.
+
+**Left.** One connection a request, each a full handshake: if the LAN runs show the handshake
+dominating a step's or a pull's time, connections are kept and reused. The coordinator's numbers
+decide it.
+
 ## Decision (lane split-merge-15): the size cut from the B-tree's middle key
 
 The planner splits a group whose size is more than one core's share of the whole at its size cut
@@ -562,3 +605,352 @@ count. If a lab shows cuts far from the middle of the bytes, the root's children
 
 **Falsified by.** A size cut with no key on one side; a measure that reads more than the root page
 of the position index for it.
+
+## Decision (lane split-merge-18): reads across groups by commit stamp
+
+Each group counts its own revisions, so once a namespace's keys are in more than one group a
+revision orders one group's writes only, and a scan, the changes and the head went to one group
+(decision "The routing key is bytes"). Ada's decision (2026-11-22, 07:17Z) is that a revision
+across groups is the cross-group timestamp, the one the session tokens use. Now a database handed
+the groups' coordinator (`Database::across`, the optional `Cluster` agreed with lane xgroup-sql-6)
+reads its namespaces across every group, ordered by each revision's commit stamp:
+- The stamp is the backup's hybrid logical clock (`backup::Marks`; Kulkarni et al., "Logical
+  Physical Clocks", OPODIS 2014), which the cross-group steps already carry from group to group
+  (T-T1.12.X2), so a commit made after another, by any path of steps, is stamped after it, whatever
+  the two machines' clocks read. A backed-up writer takes a stamp for each revision as its commit
+  writes it (`Marks::next`) and keeps it beside the revision (`__amphora_rev_stamps`).
+- A read takes a stamp from every group, and its cut is the latest; every group then observes the
+  cut, so each commit it stamps from then on is later; then one call on each group's writer reads as
+  of the cut, after every commit that took its stamp before. The cut is closed in every group: no
+  revision is ever made at or before it later, so a cursor at the head never passes a change, and
+  the cut holds every write answered before the read began.
+- `head` is the cut. `changes` are every group's after the cursor through the cut, in stamp order;
+  a group with more than the limit bounds the page at its last stamp returned, and no page cuts a
+  stamp. `scan` reads each group as of its newest revision at or before the cut (or a stamp asked
+  as a snapshot), merged by key. The revision answered is the stamp.
+- A group must stamp its commits (opened backed up) and be in this process; otherwise the read is
+  refused, typed, naming the group.
+
+**Evidence.** `database::across`, T-T1.9.R20: two backed-up groups, the second's clock 500
+seconds behind the first's, rows written in turn through their coordinator; the changes across
+them come in the order written, in pages of one alike, a scan merges them by key, and a row written
+after the head is stamped past it.
+
+**Left.**
+- One candidate is built (now both, behind a switch: decision "Decision (lane split-merge-19):
+  the read point, A/B"). Its rival is the earliest of the groups' stamps, with no observe: no
+  group's clock is pushed forward, but the head trails by the widest skew between the groups'
+  clocks, and a write a group with a clock ahead just answered is missing from a read begun after
+  it. They want a switch and the lab's numbers (head latency p50/p99/p99.9, how far the head
+  trails, writes missing from a read begun after them, at 1 to 4096 groups) before either is kept.
+- A revision made before its group stamped, or moved in from another group, has no stamp: a scan
+  answers it at 0, and the changes refuse it. The copy path doesn't move the stamps with the rows
+  yet. Moved rows done: decision "Decision (lane split-merge-19): a moved row carries its commit
+  stamp".
+- Compaction keeps every stamp, one row a revision: it must trim the stamps of the revisions it
+  took, within its bounded steps, before this is bounded. Done: decision "Decision (lane
+  split-merge-19): compaction trims the commit stamps".
+- `get`, `commit`, `changed` and `wait` still answer from this database alone; groups on a node are
+  read through their own endpoint once it answers Records.
+
+**Falsified by.** A change across groups answered after one that was written after it; a change
+made at or before a head answered earlier; a page that cuts a stamp.
+
+## Decision (lane split-merge-19): compaction trims the commit stamps
+
+Every resource is bounded, and `__amphora_rev_stamps` held one row a revision for good. Now
+compaction trims it in the same page-fenced steps as the versions (`across::trim`, called from
+`compaction::step`): a cutoff is complete only once its versions are and the stamps they leave are.
+- A stamp is kept while any version of its revision is, in any family: a scan across groups answers
+  a row's revision as its stamp, and a row compaction keeps can be old.
+- The newest stamp at or before the feed is kept as well: it is the horizon a refused read of the
+  changes is told, and it keeps `through` exact. A cursor at or past it finds the revisions as
+  before; one older finds a revision below the feed, which is refused as compacted, as before.
+- The sweep goes in rounds, each through the stamp kept when it began, its cursor in
+  `__amphora_stamp_trim` (made lazily in the step, as compaction's own state is), so it never
+  holds more than one stamp's work and resumes after any step. A round walks the revisions kept
+  below the feed, as the version pass walks the versions below its cutoff, and finds those whose
+  versions moved out to another group as well as those compaction dropped.
+- Whether a revision is still kept is one seek of each of its namespace's families in the feed
+  index, so commits pay nothing more (no index on revision alone).
+
+So the table holds at most one stamp a revision with a kept version, plus one, plus the revisions
+not yet compacted, the same bound as the versions.
+
+**Evidence.** T-T1.9.R21: one backed-up database, 600 commits each overwriting the next of 8 keys,
+compacted to the head after every 50; after each compaction every revision with a kept version is
+stamped, and the stamps number at most the kept revisions plus one (8 or 9, not the commits so
+far).
+
+**Falsified by.** A stamps table that grows with the commits under compaction; a kept row whose
+stamp is gone; a read of the changes after a trimmed stamp that is answered rather than refused.
+
+## Decision (lane split-merge-19): the read point, A/B
+
+Two ways to take a read's cut across groups are built, behind a switch (`ReadPoint`, chosen by
+`Database::across_at`; `Database::across` takes the control). Each takes a fresh stamp from every
+group, and each cut is closed: a group stamps all it makes from then on after its own fresh stamp,
+so after either cut, and a cursor at either head never passes a change.
+- `Latest`, the control: the latest of the stamps, which every group then observes. A read holds
+  every write answered before it began. Its cost is the push: a second lock of every group's
+  clock a read, and a group whose clock lags has its stamps held at the pushed clock (counted in
+  the marks' `held_back`) until its own clock passes.
+- `Earliest`, the rival: the earliest of the stamps, observed by none, so no clock is pushed. A
+  write answered by a group whose clock runs ahead of the slowest is missing from reads begun
+  after it, until the slowest clock passes its stamp: the head trails by the widest skew between
+  the groups' clocks, not by a quiet group (each group's fresh stamp is its clock's now).
+
+Each cut emits a trace event (`read_point_cut`: the point, the groups, and how far apart their
+clocks read), which is both what the latest point pushes the slow groups by and how far the
+earliest point's reads trail. Neither is kept until the lab's numbers decide.
+
+The lab, `database::across::tests::lab_read_point_a_b`, forces each failure mode: many groups for
+the push, and one group whose clock lags the rest for the staleness. Each round writes a row in
+every group, then reads one page of the changes from the last cursor; it prints the read's and the
+cut's latency (p50, p99, p99.9), the rows answered before the read that the reader has not yet
+seen (a backlog past one page counts too), and how far its head trailed the newest stamp. The run of record (the
+coordinator's, on one machine for both candidates):
+
+    AMPHORA_AB_GROUPS=2,16,128 AMPHORA_AB_ROUNDS=2000 AMPHORA_AB_LAG_NS=1000000000 \
+      cargo test -p amphora --locked --release --lib -- --ignored --nocapture lab_read_point_a_b
+
+The lag is the scenario's input, not a tuning: it stands for a machine whose clock is a second
+behind, and the staleness the rival shows scales with it.
+
+**Evidence.** T-T1.9.R22: two groups, the second's clock 500 seconds behind; a row written in the
+first is missing from a read at the earliest point begun after it, whose head is behind the row,
+and held by one at the latest point; both points' heads are closed.
+
+**Falsified by.** A read at the latest point missing a write answered before it began; a change
+answered at or before a head either point answered; the lab showing the push's latency growing
+faster than the reads' own one call a group.
+
+## Decision (lane split-merge-19): a moved row carries its commit stamp
+
+A version moved in from another group keeps the revision it had there (so a read at any revision
+answers the same in the new group), and that number says nothing here: it can be the number of one
+of this group's own revisions. So a moved row's place in the order across groups must come with it.
+- The copy path sends each version's commit stamp after its versions, in the same `rows` bytes
+  (`group::moved`): the versions first, as before, then one stamp a version (none for one its
+  sender had no stamp for). A reader of the versions alone stops after them, so the format grows
+  without a new field.
+- The importer notes each version it takes with its stamp (`__amphora_moved_stamps`, by namespace,
+  family, key and revision, indexed by stamp) and observes the newest, so every commit it makes
+  after is stamped after the rows it took.
+- A scan answers a moved row's revision as its own stamp. The changes read a group's own versions
+  by revision, as before, leaving out the moved ones, and the moved ones by stamp, and merge the
+  two by stamp; a side that had more bounds the page at its last stamp, as the groups do.
+- A version moved in without a stamp (from a sender that carried none) has no place in the order:
+  the changes are refused, typed, saying so, rather than answered without it.
+- The notes go with their versions: compaction deletes a version's note with it, and a key moved
+  out or swept deletes its notes.
+
+**Evidence.** T-T1.9.R23: two groups with revisions 1 to 3 each, stamped 10, 30, 50 and 20, 40,
+60; the first's keys moved into the second. Each moved row answers its own stamp; the changes
+interleave by stamp, after a stamp the rows after it, two at a time the first two with more; the
+same rows moved without stamps into a third group make its changes refused.
+
+**Left.** A scan as of an older stamp still picks each group's versions by its own revision, so a
+moved row's version is chosen by its old group's number there; the scan at the cut is exact. Done
+by lane split-merge-20: "Decision (lane split-merge-20): a read as of a stamp places moved rows by
+their stamps".
+
+**Falsified by.** A moved row answered with the stamp of this group's own revision of the same
+number; a moved row missing from the changes, or answered twice; changes answered without a moved
+row that has no stamp.
+
+## Decision (lane split-merge-19): one key and what changed, across groups
+
+`get`, `changed` and `wait` on a database handed the groups' coordinator now read across groups, as
+`scan`, `changes` and `head` do, each revision its commit stamp.
+- `get` reads only the group the key's row is in (the cluster's route of its row key). As of a
+  fresh stamp of that group (Linearizable): the group's writer runs the read after every commit
+  that took its stamp before, so it holds every write of the key answered before it began. As of a
+  stamp asked (Snapshot), which that group first observes, so none of its later commits is stamped
+  at or before it, and the answer at that stamp never changes. No other group is read and no other
+  clock is pushed, at either read point: one key lives in one group.
+- `changed` takes the cut at the read point, as `changes` does, and answers the newest stamp of a
+  change to the family after the cursor through the cut in any group, its own versions or moved
+  in; none while there is none. A compacted cursor, or a version moved in without its stamp, is
+  refused as `changes` refuses it.
+
+**Evidence.** T-T1.9.R24: two groups, the second's clock 500 seconds behind; each key read across
+them answers its row with its stamp as its revision, a key never written none, a key as of just
+before its stamp none and as of its stamp the row; what changed after nothing is the newest stamp,
+after the head none, and after a later write its stamp, past the head. T-T1.9.R25: a wait across
+two groups after the head, while a row is written in the second, answers that row's stamp, as
+`changed` does; a wait with nothing written is refused `Timeout` at its deadline.
+
+- `wait` registers one waker in every group's publisher (`Changed::watchers`, bounded as a watch
+  is) before its first check, so a change any group publishes after it wakes the wait: no timer,
+  only the caller's deadline. The check reads each group through `call_internal`, an
+  `Operation::Call`, and every Call wakes every watcher (a Call may write), so after a wake the
+  wait first compares each group's published newest revision of the family with what it read
+  before the check, and reads again only once one moved: its own reads park it again.
+
+**Left.** `commit` still answers from this database alone. A commit across groups goes through
+the coordinator (`Cluster::commit`), but its conditions name revisions, which across groups are
+stamps, and its answer carries no stamp yet. Calls that wake only when they wrote would spare a
+waiter the wakes of reads.
+
+**Falsified by.** A get across groups missing a write of the key answered before it began; a get
+as of a stamp whose answer changes later; `changed` answering none while `changes` after the same
+cursor answers a change.
+
+## Decision (lane split-merge-20): a read as of a stamp places moved rows by their stamps
+
+A scan or a get across groups as of a stamp asked to each group for its newest revision stamped
+at or before it, then read that group as of that revision. A version moved in keeps its old
+group's revision number, which counts the old group's commits, not this one's: as of an older
+stamp it was taken when its number was at or below the revision (though stamped after the read),
+and left out when its number was above it (though stamped before). A row moved after the read's
+stamp, from a group that wrote it before, was missing or answered at the wrong version.
+- Each group now picks each key's version by stamp: a version made here by its revision (at or
+  below the newest revision stamped at or before the read's stamp, which is the same as its own
+  stamp being at or before it), a version moved in by the stamp it carried. One query a page, the
+  same four shapes as a group's own scan, the cursor and the upper bound outside the choice.
+- A key's versions rise in stamp as they rise in revision: a key moved in is dropped and taken
+  whole, and the group's head is raised past its revisions and its clock past their stamps, so
+  every version the group then writes of it is later in both. So the newest version in the read
+  is the key's row as of that stamp.
+- The scan at the cut and the get at a fresh stamp read the same way, so a row moved in after
+  the cut was taken but before the group's read ran (stamped after the cut by its old group) is
+  left out of the read, as a write made there then would be.
+- A version moved in without a stamp has no place in the order, so a scan or get as of any stamp
+  is refused while one is here, as the changes are. A read whose revision compaction took is
+  refused `Compacted`, the horizon a stamp.
+
+**Evidence.** T-T1.9.R26: an old group writes a1 at 10, a2 at 30 and a1 again at 50 (its revisions
+1 to 3), a new one b1, b2, b3 at 20, 22, 24 (its own revisions 1 to 3); the old group's keys move
+into the new one, which then writes b1 at 70 and the moved a2 at 80. Scanned and read key by key
+as of 5, 15, 25, 35, 55, 75 and past every stamp, each read holds exactly the versions stamped at
+or before it: at 15 a1 alone, though the new group had no revision yet; at 25 a1's first value and
+the b-keys, not a2 nor a1's second, whose old numbers are at or below the new group's revision;
+at 55 a1's second. Pages of two answer the same.
+
+**Left.** Compaction still takes a moved version by its old revision number, against this
+group's own revisions; a read as of a stamp that compaction passed that way can miss it.
+
+**Falsified by.** A read as of a stamp holding a version stamped after it, or missing one stamped
+at or before it that is still kept; a key answered twice in a page.
+
+## Decision (lane split-merge-20): conditions across groups name commit stamps
+
+A transaction across groups (`xgroup::Txn`) now carries conditions, as a Records transaction
+does: each a key and the commit stamp its newest version must be at or before (none: the key must
+have none). A revision counts one group's commits only, so across groups a condition names a
+stamp, the one a read across groups answered as the row's revision (`get`, `scan`, `changes`) or
+any later one, such as a head: it holds while nothing was written to the key after it.
+- The condition is checked in the key's group as its locks are taken, in the same step's one
+  commit, and the key is read-locked, so it stays as checked until the transaction resolves. A
+  failed one locks nothing and answers `Reply::Unmet`; the coordinator aborts the transaction as
+  it does on a conflict, `Why::Unmet`, under either protocol (Parallel Commits' staging record
+  turns aborted first).
+- The wire grows only: a group with a condition gets the new `Step::LockIf`, after every other
+  step; a group with none still gets `Step::Lock`, so a transaction without conditions sends what
+  it sent before. `Reply::Unmet` and `Why::Unmet` come after every other variant.
+- In one group (no coordinator step) the same check runs in the group's one transaction.
+- Only a Records row has stamps: a condition on a key-value row is refused before any step.
+- A row whose stamp isn't known (made before its group stamped its commits) reads as 0, as reads
+  across groups answer it.
+
+**Evidence.** T-T1.9.R27 on the simulator's tablet: a lock step conditioned on a key as of a
+stamp before its last write is unmet with nothing locked; one whose conditions hold read-locks
+their keys beside its writes, and a write lock on such a key is then refused; a lock held out
+comes before a condition. Under two-phase commit and Parallel Commits: two backed-up groups, the
+second's clock 500 seconds behind. A commit across both conditioned on a row as of a stamp before
+its last write is aborted on that row with none of its rows written; conditioned on the stamps
+reads answered and on a key absent, committed; on a key absent that is there, or present that
+never was, aborted on it. In one group the same. A condition on a key-value row is refused.
+
+**Left.** `Records::commit` on a database handed the cluster still commits in this database
+alone: its answer is a revision, and across groups that must be the commit's stamp, which the
+coordinator can't answer yet. Each participant stamps the transaction's rows as it resolves,
+after the client heard (both protocols answer before the resolutions), each by its own clock; so
+the rows of one transaction carry different stamps, none known when the answer goes out, and a
+read across groups can see one group's rows of it and not another's. One commit stamp needs the
+participants to write the rows at a stamp fixed before the answer (the largest of stamps the lock
+steps answer, carried in the resolutions), and reads at a cut past a held lock's stamp to wait for
+its resolution, or the stamps within a group no longer rise with its revisions. That is the
+coordinator's change, and the field it fills is `Answer::Committed`'s. Lane xgroup-sql-10's
+`Answer::Committed::at` is not that stamp: it is the newest closed time of the groups touched, in
+microseconds, from replicated groups' session tokens (none for groups without one), while the
+stamps reads across groups answer and conditions name are the backup's clock, in nanoseconds, on
+backed-up groups. A condition compared with it would compare two clocks.
+
+**Falsified by.** A commit across groups committed while a condition's key was written after the
+stamp named; one aborted while every condition held and no lock conflicted; a write to a
+condition's key landing between the check and the resolution.
+
+## Decision (lane split-merge-21): one clock, one commit stamp
+
+Ada's decision (2026-11-22): the commit's revision across groups is the cross-group hybrid logical
+clock's timestamp, the same clock as the read-your-writes tokens. Before it there were two: the
+tokens' closed times, in microseconds, from replicated groups; and the backup's clock, in
+nanoseconds, behind the stamps reads across groups answer. And each group stamped its own rows of a
+transaction by its own clock as it resolved it.
+- **The clock and its unit.** Microseconds since the Unix epoch, a hybrid logical clock (Kulkarni
+  et al., "Logical Physical Clocks", OPODIS 2014): each stamp the later of the clock's reading and
+  one past the last stamp made or taken in. A backed-up group's clock is its writer's
+  (`Marks::next_micros`: the backup clock read up to the microsecond its reading ends, past every
+  microsecond stamp made or seen, nanosecond ones read so too, so a group's stamps rise strictly
+  and a cut at one is closed); a replicated group's
+  is its closed time, the tokens' (lane xgroup-sql-11 reads it for its lock replies). One clock
+  in one unit, two sources by the group's kind, because a standalone group has no log and so no
+  closed time (its session token is none), and every read across groups runs on backed-up
+  standalone groups: with the closed time alone, every transaction across them would commit with
+  no stamp. `Database::cross_clock` is the group's reading either way, what a lock reply carries;
+  `Database::observe_clock` takes a carried stamp in either way (a replicated owner proposes past
+  it), the receive rule each step runs first.
+  The stamp
+  table (`__amphora_rev_stamps`), the cut, a get's fresh stamp, the moved rows' stamps and the
+  stamp a coordinator carries between steps (`xgroup::sql::step`, taken in with
+  `Marks::observe_micros`) are all of it. The backup's own marks stay nanoseconds: they are restore
+  points, not an order across groups.
+- **One stamp a transaction.** `Step::ResolveAt` (after every other step) resolves a transaction at
+  its commit stamp: each row it wrote, in every group, is stamped that one stamp, and the group's
+  clock takes it in, so its later commits are stamped after. The coordinator chooses it at or past
+  every group's lock stamp (lane xgroup-sql-11: the latest of the lock replies' clocks, also
+  `Answer::Committed`'s `at`). `Step::Resolve` stays for a coordinator that has no stamp.
+- **Rows placed by their own stamp.** A revision that resolves a transaction carries the stamp its
+  coordinator chose, which can be older than revisions before it in that group, so stamps no longer
+  rise with revisions. A read as of a stamp takes each version by its own stamp (its revision's, or
+  the one it carried in from another group), never by revision order; `through` bounds the prefix
+  of revisions all stamped at or before the read by the oldest stamped after it. One key's versions
+  still rise in stamp: while a lock holds the key nothing else writes it, the commit stamp is past
+  the lock stamp, which is past every earlier version's, and the clock takes it in as it resolves.
+- **A read past a held lock's stamp waits.** Each group records a transaction's lock stamp
+  (`__amphora_xg_lock_at`: its clock as it takes the first lock, after the coordinator's carried
+  stamp). A get or scan as of a stamp at or past a write lock's stamp in its range can't answer:
+  the commit stamp may be at or before it. It waits for the lock's resolution and reads again. One
+  before the lock's stamp never waits: the commit stamp is past it. The wait is event-driven: a
+  waker in the group's publisher, then the read again, and it reads again only once the group's
+  count of resolutions moved (`Database::locks_resolved`, after each resolving step, local or served
+  over the transport), so other calls' wakes don't send it reading. `Timeout` at the read's deadline.
+- **The change feed** (`changes`, `changed`, so `wait`) takes a group's own versions by their
+  revisions' stamps in the range, not by a range of revisions, and waits as a scan does on a write
+  lock anywhere in the family whose stamp is at or before its cut: otherwise its rows could land
+  later at a stamp behind a cursor the reader has passed.
+
+**Evidence.** Not yet run (kiln was down; nothing compiled). T-T1.9.R28 on two backed-up groups, the
+second's clock 500 seconds behind: a transaction locks a row in each, resolves in the first at the
+latest stamp the groups answered; the first group answers its row at that stamp, the second's read
+as of it is held by the lock, its read as of the head before the locks isn't; a scan across both as
+of the stamp, begun before the second resolves, answers both rows at the one stamp, as do the
+changes after the head before the locks; the second group's next commit is stamped after it. On the simulator's group: one transaction's keys carry the
+one stamp in both groups, each group's next write a later one.
+
+**Left.** The scan waits on a lock anywhere in its range, not only in
+the page it answers (lane xgroup-sql-11's W10 narrows to the page). The wake is per group, not per
+lock (lane xgroup-sql-11's `WaitOnLock` rings a row's own waiters; once merged, these reads can use
+it). A replicated group takes a step's carried stamp in (its owner proposes past it, so its closed
+time after the step is later), but its Records rows are not in the stamp table: reads across groups
+still refuse a group that isn't backed up. Stamping them by the entry's closed time, the same on
+every member, puts them in the order. Recovery resolves with
+`Step::Resolve`: it has no commit stamp, so its rows take each group's own; the lock stamps it
+would need are kept (`__amphora_xg_lock_at`). `Records::commit` across groups waits on both sides
+on one branch. Stamp tables written before this change hold nanoseconds: none is deployed.
+
+**Falsified by.** A read across groups answering a transaction's rows in one group and not another;
+one transaction's rows answering two stamps; a read as of a stamp before a lock's stamp waiting; a
+group's commit after a resolution stamped at or before its commit stamp.

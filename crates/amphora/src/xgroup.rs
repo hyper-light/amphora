@@ -137,6 +137,28 @@ pub enum Step {
     Prevent { txn: TxnId },
     /// At a participant: apply the held writes (committed) or drop them (aborted), and unlock.
     Resolve { txn: TxnId, outcome: Outcome },
+    /// [`Step::Lock`] with conditions (lane split-merge-20, T-T1.9.R27): each a key and the
+    /// commit stamp its newest version must be at or before (none: it must have none), checked
+    /// as the locks are taken, each condition's key read-locked so it stays as checked until the
+    /// transaction resolves. A condition that fails locks nothing: [`Reply::Unmet`].
+    LockIf {
+        txn: TxnId,
+        anchor: GroupId,
+        reads: Vec<Vec<u8>>,
+        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        stage: Option<Vec<GroupId>>,
+        conds: Vec<(Vec<u8>, Option<u64>)>,
+    },
+    /// [`Step::Resolve`] at the transaction's one commit stamp (lane split-merge-21,
+    /// T-T1.9.R28): a committed transaction's rows are written at `at` in every group it touched,
+    /// the cross-group clock's microseconds, which each group's clock takes in first, so its later
+    /// commits are stamped after them. The coordinator chooses `at` at or past every group's lock
+    /// stamp; an aborted transaction writes nothing and ignores it.
+    ResolveAt {
+        txn: TxnId,
+        outcome: Outcome,
+        at: u64,
+    },
 }
 
 impl Step {
@@ -146,10 +168,12 @@ impl Step {
         match self {
             Step::Begin | Step::Scan { .. } => None,
             Step::Lock { txn, .. }
+            | Step::LockIf { txn, .. }
             | Step::Decide { txn, .. }
             | Step::Recover { txn }
             | Step::Prevent { txn }
-            | Step::Resolve { txn, .. } => Some(*txn),
+            | Step::Resolve { txn, .. }
+            | Step::ResolveAt { txn, .. } => Some(*txn),
         }
     }
 }
@@ -189,6 +213,25 @@ pub enum Reply {
     Staging(Vec<GroupId>),
     Present(bool),
     Resolved,
+    /// A condition on `key` fails: its newest version is stamped `at` (none: it has none).
+    /// Nothing was locked.
+    Unmet {
+        key: Vec<u8>,
+        at: Option<u64>,
+    },
+}
+
+/// Whether a condition holds (lane split-merge-20, T-T1.9.R27): a key whose newest version is
+/// stamped `at` (none: it has none), against the stamp the condition names (none: the key must
+/// have none). A stamp names the key as a read saw it, a row's own stamp or any later one: the
+/// condition holds while nothing was written to the key after it.
+#[must_use]
+pub fn holds(named: Option<u64>, at: Option<u64>) -> bool {
+    match (named, at) {
+        (None, at) => at.is_none(),
+        (Some(named), Some(at)) => at <= named,
+        (Some(_), None) => false,
+    }
 }
 
 /// A group's state as the protocol sees it. Every method acts inside the step's one atomic commit.
@@ -196,6 +239,17 @@ pub trait Tablet {
     /// A key's committed value.
     fn value(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
     fn set_value(&mut self, key: &[u8], value: Option<&[u8]>) -> anyhow::Result<()>;
+    /// [`Tablet::set_value`] of a transaction whose commit stamp is `at` (lane split-merge-21,
+    /// T-T1.9.R28): the version is stamped `at`, the same in every group, and the group's clock
+    /// takes it in; none stamps it by the group's own clock, as [`Tablet::set_value`] does.
+    fn set_value_at(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        at: Option<u64>,
+    ) -> anyhow::Result<()>;
+    /// The commit stamp of a key's newest version: none while it has no value.
+    fn stamp(&mut self, key: &[u8]) -> anyhow::Result<Option<u64>>;
     /// The locks on a key: at most one per transaction a coordinator runs at once.
     fn locks(&mut self, key: &[u8]) -> anyhow::Result<Vec<Lock>>;
     /// A transaction's locks here, with their keys: at most its own keys.
@@ -255,7 +309,7 @@ pub fn apply<T: Tablet + ?Sized>(
             reads,
             writes,
             stage,
-        } => lock(tablet, *txn, *anchor, reads, writes, stage.as_deref()),
+        } => lock(tablet, *txn, *anchor, reads, writes, stage.as_deref(), &[]),
         Step::Decide { txn, outcome } => match tablet.record(*txn)? {
             Some(Record::Decided(stands)) => Ok(Reply::Decided(stands)),
             Some(Record::Staging(_)) | None => {
@@ -280,7 +334,24 @@ pub fn apply<T: Tablet + ?Sized>(
                 Ok(Reply::Present(false))
             }
         },
-        Step::Resolve { txn, outcome } => resolve(tablet, *txn, *outcome),
+        Step::Resolve { txn, outcome } => resolve(tablet, *txn, *outcome, None),
+        Step::ResolveAt { txn, outcome, at } => resolve(tablet, *txn, *outcome, Some(*at)),
+        Step::LockIf {
+            txn,
+            anchor,
+            reads,
+            writes,
+            stage,
+            conds,
+        } => lock(
+            tablet,
+            *txn,
+            *anchor,
+            reads,
+            writes,
+            stage.as_deref(),
+            conds,
+        ),
     }
 }
 
@@ -328,16 +399,23 @@ fn lock<T: Tablet + ?Sized>(
     reads: &[Vec<u8>],
     writes: &[(Vec<u8>, Option<Vec<u8>>)],
     stage: Option<&[GroupId]>,
+    conds: &[(Vec<u8>, Option<u64>)],
 ) -> anyhow::Result<Reply> {
     if tablet.done(txn)?.is_some() || (stage.is_some() && tablet.record(txn)?.is_some()) {
         return Ok(Reply::Late);
     }
     let written: BTreeSet<&[u8]> = writes.iter().map(|(key, _)| key.as_slice()).collect();
-    let only_read = reads.iter().filter(|key| !written.contains(key.as_slice()));
+    // A condition's key is read-locked as a read's is, so it stays as checked until resolved.
+    let only_read: BTreeSet<&[u8]> = reads
+        .iter()
+        .map(Vec::as_slice)
+        .chain(conds.iter().map(|(key, _)| key.as_slice()))
+        .filter(|key| !written.contains(key))
+        .collect();
     let wanted = written
         .iter()
         .map(|key| (*key, true))
-        .chain(only_read.clone().map(|key| (key.as_slice(), false)));
+        .chain(only_read.iter().map(|key| (*key, false)));
     for (key, writing) in wanted {
         let conflict = tablet
             .locks(key)?
@@ -345,6 +423,15 @@ fn lock<T: Tablet + ?Sized>(
             .any(|held| held.txn != txn && (writing || held.intent != Intent::Read));
         if conflict {
             return Ok(Reply::Conflict { key: key.to_vec() });
+        }
+    }
+    for (key, named) in conds {
+        let at = tablet.stamp(key)?;
+        if !holds(*named, at) {
+            return Ok(Reply::Unmet {
+                key: key.clone(),
+                at,
+            });
         }
     }
     let mut values = Vec::with_capacity(reads.len());
@@ -382,6 +469,7 @@ fn resolve<T: Tablet + ?Sized>(
     tablet: &mut T,
     txn: TxnId,
     outcome: Outcome,
+    at: Option<u64>,
 ) -> anyhow::Result<Reply> {
     if let Some(done) = tablet.done(txn)? {
         if done != outcome {
@@ -393,8 +481,8 @@ fn resolve<T: Tablet + ?Sized>(
         for (key, lock) in tablet.locks_of(txn)? {
             match lock.intent {
                 Intent::Read => {}
-                Intent::Put(value) => tablet.set_value(&key, Some(&value))?,
-                Intent::Delete => tablet.set_value(&key, None)?,
+                Intent::Put(value) => tablet.set_value_at(&key, Some(&value), at)?,
+                Intent::Delete => tablet.set_value_at(&key, None, at)?,
             }
         }
     }
@@ -413,6 +501,9 @@ pub struct Memory {
     done: BTreeMap<TxnId, Outcome>,
     guards: BTreeMap<u64, Guard>,
     epochs: BTreeMap<u64, u64>,
+    /// Each key's newest version's stamp, from `clock`, one up a value written.
+    stamps: BTreeMap<Vec<u8>, u64>,
+    clock: u64,
 }
 
 impl Memory {
@@ -452,10 +543,48 @@ impl Tablet for Memory {
 
     fn set_value(&mut self, key: &[u8], value: Option<&[u8]>) -> anyhow::Result<()> {
         match value {
-            Some(value) => self.data.insert(key.to_vec(), value.to_vec()),
-            None => self.data.remove(key),
+            Some(value) => {
+                self.clock = self
+                    .clock
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("the simulator's stamps ran out"))?;
+                self.stamps.insert(key.to_vec(), self.clock);
+                self.data.insert(key.to_vec(), value.to_vec())
+            }
+            None => {
+                self.stamps.remove(key);
+                self.data.remove(key)
+            }
         };
         Ok(())
+    }
+
+    fn set_value_at(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        at: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let Some(at) = at else {
+            return self.set_value(key, value);
+        };
+        match value {
+            Some(value) => {
+                // The clock takes the stamp in: the next value written here is stamped after it.
+                self.clock = self.clock.max(at);
+                self.stamps.insert(key.to_vec(), at);
+                self.data.insert(key.to_vec(), value.to_vec())
+            }
+            None => {
+                self.stamps.remove(key);
+                self.data.remove(key)
+            }
+        };
+        Ok(())
+    }
+
+    fn stamp(&mut self, key: &[u8]) -> anyhow::Result<Option<u64>> {
+        Ok(self.stamps.get(key).copied())
     }
 
     fn locks(&mut self, key: &[u8]) -> anyhow::Result<Vec<Lock>> {

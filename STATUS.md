@@ -573,11 +573,21 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (T-T1.9.R13). Load from the store's meter (lane split-merge-12): the shell measures each
   group's load (its writer's commit time) and where its writes fall, its size (a local database's
   pages in use) and the machine's cores, and the planner decides from them (T-T1.9.R14,
-  T-T1.9.R15, T-T1.9.R17). Left: that transport off loopback
-  (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
+  T-T1.9.R15, T-T1.9.R17). Between machines (lane split-merge-13): a node's endpoint and a group's database owner listen at
+  a network address under the replicated transport's mutual TLS (T-T1.9.R18). Left: a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
   full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
   them (T-T1.9.R16). Size cut (lane split-merge-15): a group's size cut is its position index's middle key, read
-  from the index's root page alone (T-T1.9.R19).
+  from the index's root page alone (T-T1.9.R19). Reads across groups (lane split-merge-18): a database handed the groups'
+  coordinator scans, reads changes and heads across every group, each revision by its commit stamp (T-T1.9.R20). Compaction trims
+  the stamps with the revisions it drops, so the table stays bounded (lane split-merge-19, T-T1.9.R21). The read
+  point is an A/B behind `ReadPoint` (latest with a clock push, the control; earliest without), its lab written (T-T1.9.R22). A row moved in
+  carries its commit stamp, so scans and changes across groups place it (T-T1.9.R23). `get`, `changed` and `wait`
+  read across groups too, the wait woken by any group's change (T-T1.9.R24, T-T1.9.R25). A read as of an older stamp
+  places moved rows by their own stamps (lane split-merge-20, T-T1.9.R26), and a transaction across groups takes
+  conditions naming commit stamps, checked under its locks (T-T1.9.R27). One clock (lane split-merge-21, T-T1.9.R28):
+  stamps are the cross-group clock's microseconds, a transaction's rows take its one commit stamp in every group
+  (`Step::ResolveAt`), reads place rows by their own stamps and wait out a held lock whose stamp is at or before
+  theirs; `Records::commit` across groups waits on the coordinator sending that stamp (lane xgroup-sql-11).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

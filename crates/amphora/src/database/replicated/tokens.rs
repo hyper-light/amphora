@@ -87,6 +87,11 @@ pub struct SessionCounters {
 }
 
 impl Client {
+    /// This replica's closed time in microseconds (0 before the group's first stamped entry): the
+    /// replicated group's clock on the one cross-group clock ([`crate::Database::cross_clock`]).
+    pub(in crate::database) fn closed_micros(&self) -> Result<u64, Refusal> {
+        Ok(locked(&self.handle.shared.closed)?.time.unwrap_or(0))
+    }
     /// `read` on a local reader once this replica has applied `token`; `read` answers `Err` with
     /// the time it found if its own transaction's state is earlier than the token's time, and the
     /// next try waits for a later one. Redirected once the replica stays behind past its

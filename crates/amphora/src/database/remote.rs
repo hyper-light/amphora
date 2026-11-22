@@ -107,6 +107,8 @@ pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
             weak.upgrade().map(|shared| Database {
                 shared,
                 application: None,
+                cluster: None,
+                read_point: super::ReadPoint::Latest,
             })
         })?);
     }
@@ -145,6 +147,8 @@ pub(super) fn attach(
     };
     Ok(Database {
         application: None,
+        cluster: None,
+        read_point: super::ReadPoint::Latest,
         shared: Arc::new(Shared {
             transport: Mutex::new(None),
             path: OnceLock::new(),
@@ -330,6 +334,8 @@ impl Database {
                             return Ok(Some(Self {
                                 shared,
                                 application: None,
+                                cluster: None,
+                                read_point: super::ReadPoint::Latest,
                             }));
                         }
                         Err(
@@ -346,6 +352,8 @@ impl Database {
                         return Ok(Some(Self {
                             shared,
                             application: None,
+                            cluster: None,
+                            read_point: super::ReadPoint::Latest,
                         }));
                     }
                     _ => {
@@ -542,6 +550,34 @@ pub(super) fn submit(
             "holding",
             "a group's holding is kept by the group's own engine",
         )),
+    }
+}
+
+impl Database {
+    /// This owner's network endpoint at `address` (port 0: the system's choice), its connections
+    /// authenticated by `credentials`: the steps of a transaction across groups reach this group from
+    /// another machine through it (CP-T1.9, T-T1.9.R18; CP-T1.10). A client refuses: only an owner
+    /// serves. Dropped, it stops listening.
+    pub fn listen(
+        &self,
+        address: std::net::SocketAddr,
+        credentials: &crate::transport::network::Credentials,
+    ) -> Result<crate::transport::Node, Refusal> {
+        if matches!(self.shared.writer, Writer::Client(_)) {
+            return Err(api::invalid(
+                "database owner",
+                "a client cannot listen for its owner",
+            ));
+        }
+        let weak = Arc::downgrade(&self.shared);
+        crate::transport::Node::database(address, credentials, move || {
+            weak.upgrade().map(|shared| Database {
+                shared,
+                application: None,
+                cluster: None,
+                read_point: super::ReadPoint::Latest,
+            })
+        })
     }
 }
 
