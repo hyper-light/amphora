@@ -1060,6 +1060,15 @@ impl Connection {
         self.join_search_budget.get()
     }
 
+    /// Amphora (PL.8, T-PL.8.6, lane pl8-16): chooses the rule that moves the learned cost weights,
+    /// for the coordinator's A/B (`learned_costs::WeightRule`). The weights are the database's,
+    /// shared by its connections, so this moves them for every connection to it, from the rates as
+    /// they stand; newly prepared statements plan on them.
+    pub fn set_weight_rule(&self, rule: crate::WeightRule) {
+        self.db.learned_costs.set_rule(rule);
+        self.bump_prepare_context_generation();
+    }
+
     /// Amphora (G6 step 5, a prototype behind this switch, off by default): lets newly prepared
     /// statements read a non-covering index's rowids into a sorted set and fetch the table's rows
     /// in rowid order (a bitmap-style sorted fetch), chosen by cost against the plain index read.
