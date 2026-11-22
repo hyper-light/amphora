@@ -249,6 +249,7 @@ pub(crate) fn step(
             }
             if obsolete {
                 db.query("DELETE FROM __amphora_versions WHERE namespace=?1 AND family=?2 AND key=?3 AND rev=?4",[text(ns),text(&family),blob(&key)?,integer(revision)?], |_| Ok(true))?;
+                db.query("DELETE FROM __amphora_moved_stamps WHERE namespace=?1 AND family=?2 AND key=?3 AND rev=?4",[text(ns),text(&family),blob(&key)?,integer(revision)?], |_| Ok(true))?;
                 deleted = deleted
                     .checked_add(1)
                     .ok_or_else(|| api::invalid("compaction count", "deleted count overflow"))?;

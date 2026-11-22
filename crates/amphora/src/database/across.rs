@@ -11,13 +11,17 @@
 //! call on each group's writer reads as of the cut: the writer runs it after every commit that took
 //! its stamp before, so every revision stamped at or before the cut is there, and none made after.
 //! The cut is closed in every group and holds every write answered before the read began.
+//!
+//! A version moved in from another group keeps its revision there, which says nothing here, so it
+//! carries its commit stamp with it (`__amphora_moved_stamps`, lane split-merge-19, T-T1.9.R23):
+//! its own place in the order across groups, read by stamp rather than by revision.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use amphora_api::{self as api, Change, Changes, Consistency, Page, Refusal, Rev, Scan};
 
-use super::{Answer, Operation, bytes, integer, rev, text, unavailable};
+use super::{Answer, Operation, blob, bytes, integer, rev, text, unavailable};
 use crate::backup::Hooks;
 use crate::database::Database;
 use crate::db::Db;
@@ -270,6 +274,54 @@ fn stamp_of(db: &Db, ns: &str, at: Rev) -> anyhow::Result<Option<u64>> {
     Ok(stamp)
 }
 
+/// The stamp of the version of `key` at revision `at`: its own, carried in, for a version moved
+/// in from another group (none: its sender carried none), else its revision's here.
+pub(super) fn stamp_of_version(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+    at: Rev,
+) -> anyhow::Result<Option<u64>> {
+    let mut moved = None;
+    db.query(
+        "SELECT stamp FROM __amphora_moved_stamps WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev = ?4",
+        [text(ns), text(family), blob(key)?, integer(at)?],
+        |r| {
+            moved = Some(match r.get_value(0) {
+                amphora_engine::Value::Null => None,
+                _ => Some(rev(r, 0)?),
+            });
+            Ok(false)
+        },
+    )?;
+    match moved {
+        Some(stamp) => Ok(stamp),
+        None => stamp_of(db, ns, at),
+    }
+}
+
+/// Notes a version moved in from another group with the commit stamp it carried (none: its
+/// sender carried none), so reads across groups place it by that stamp.
+pub(super) fn moved_in(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+    at: Rev,
+    stamp: Option<u64>,
+) -> anyhow::Result<()> {
+    let stamp = match stamp {
+        Some(stamp) => integer(stamp)?,
+        None => amphora_engine::Value::Null,
+    };
+    db.query(
+        "INSERT OR REPLACE INTO __amphora_moved_stamps(namespace, family, key, rev, stamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+        [text(ns), text(family), blob(key)?, integer(at)?, stamp],
+        |_| Ok(true),
+    )
+}
+
 /// The namespace's head across groups: the cut, a stamp every group has made all its revisions
 /// at or before by the time this answers.
 pub(super) fn head(
@@ -314,7 +366,7 @@ pub(super) fn scan(
         let page = group.call_internal(until, move |db| {
             let r = through(db, &ns, at)?;
             let operation = Operation::Scan(
-                family,
+                family.clone(),
                 Scan {
                     at: Consistency::Snapshot(r),
                     ..scan
@@ -326,7 +378,7 @@ pub(super) fn scan(
                 Err(refusal) => return Ok(Err(refusal)),
             };
             for row in &mut page.rows {
-                row.rev = stamp_of(db, &ns, row.rev)?.unwrap_or(0);
+                row.rev = stamp_of_version(db, &ns, &family, &row.key, row.rev)?.unwrap_or(0);
             }
             Ok(Ok(page))
         })??;
@@ -377,45 +429,119 @@ fn changes_in(
             horizon,
         }));
     }
-    let mut found = Vec::new();
+    let take = integer(
+        u64::try_from(limit)?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("limit overflow"))?,
+    )?;
+    // This group's own versions, by revision; a version moved in is placed by its own stamp, below.
+    let mut own: Vec<(Rev, u64, Change)> = Vec::new();
     db.query(
-        "SELECT rev, key, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND rev > ?3 AND rev <= ?4 ORDER BY rev, seq LIMIT ?5",
+        "SELECT v.rev, v.key, v.value, v.seq FROM __amphora_versions v LEFT JOIN __amphora_moved_stamps m ON m.namespace = v.namespace AND m.family = v.family AND m.key = v.key AND m.rev = v.rev WHERE v.namespace = ?1 AND v.family = ?2 AND v.rev > ?3 AND v.rev <= ?4 AND m.rev IS NULL ORDER BY v.rev, v.seq LIMIT ?5",
         [
             text(ns),
             text(family),
             integer(from)?,
             integer(to)?,
-            integer(
-                u64::try_from(limit)?
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("limit overflow"))?,
-            )?,
+            take.clone(),
         ],
         |r| {
-            found.push(Change {
-                rev: rev(r, 0)?,
-                key: bytes(r, 1)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
-                value: bytes(r, 2)?,
-            });
+            own.push((
+                rev(r, 0)?,
+                rev(r, 3)?,
+                Change {
+                    rev: rev(r, 0)?,
+                    key: bytes(r, 1)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
+                    value: bytes(r, 2)?,
+                },
+            ));
             Ok(true)
         },
     )?;
+    let own_more = own.len() > limit;
+    let mut found: Vec<(u64, u64, Change)> = Vec::with_capacity(own.len());
     let mut last = None;
-    for change in &mut found {
-        if last.is_none_or(|(at, _)| at != change.rev) {
-            let Some(stamp) = stamp_of(db, ns, change.rev)? else {
+    for (at, seq, mut change) in own {
+        if last.is_none_or(|(r, _)| r != at) {
+            let Some(stamp) = stamp_of(db, ns, at)? else {
                 return Ok(Err(Refusal::Unavailable(format!(
-                    "revision {} has no commit stamp (moved in from another group): the order across groups doesn't place it yet",
-                    change.rev
+                    "revision {at} has no commit stamp (made before its group stamped its commits): the order across groups doesn't place it"
                 ))));
             };
-            last = Some((change.rev, stamp));
+            last = Some((at, stamp));
         }
         if let Some((_, stamp)) = last {
             change.rev = stamp;
+            found.push((stamp, seq, change));
         }
     }
-    let more = found.len() > limit;
+    // The versions moved in, by the stamps they carried; one whose sender carried none has no
+    // place in the order, so the read is refused rather than answered without it.
+    let mut unstamped = None;
+    db.query(
+        "SELECT key, rev FROM __amphora_moved_stamps WHERE namespace = ?1 AND family = ?2 AND stamp IS NULL LIMIT 1",
+        [text(ns), text(family)],
+        |r| {
+            unstamped = Some(rev(r, 1)?);
+            Ok(false)
+        },
+    )?;
+    if let Some(at) = unstamped {
+        return Ok(Err(Refusal::Unavailable(format!(
+            "a version at revision {at} moved in from another group without its commit stamp: the order across groups doesn't place it"
+        ))));
+    }
+    let mut moved: Vec<(Vec<u8>, Rev, u64)> = Vec::new();
+    db.query(
+        "SELECT key, rev, stamp FROM __amphora_moved_stamps WHERE namespace = ?1 AND family = ?2 AND stamp > ?3 AND stamp <= ?4 ORDER BY stamp, key LIMIT ?5",
+        [text(ns), text(family), integer(after)?, integer(cut)?, take],
+        |r| {
+            moved.push((
+                bytes(r, 0)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
+                rev(r, 1)?,
+                rev(r, 2)?,
+            ));
+            Ok(true)
+        },
+    )?;
+    let moved_more = moved.len() > limit;
+    let mut moved_last = None;
+    for (key, at, stamp) in moved {
+        let mut version = None;
+        db.query(
+            "SELECT seq, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev = ?4",
+            [text(ns), text(family), blob(&key)?, integer(at)?],
+            |r| {
+                version = Some((rev(r, 0)?, bytes(r, 1)?));
+                Ok(false)
+            },
+        )?;
+        moved_last = Some(stamp);
+        if let Some((seq, value)) = version {
+            found.push((
+                stamp,
+                seq,
+                Change {
+                    rev: stamp,
+                    key,
+                    value,
+                },
+            ));
+        }
+    }
+    // Each side that had more bounds the answer at its last stamp read, so neither's next is
+    // passed.
+    let mut bound = cut;
+    if own_more && let Some((_, stamp)) = last {
+        bound = bound.min(stamp);
+    }
+    if moved_more && let Some(stamp) = moved_last {
+        bound = bound.min(stamp);
+    }
+    found.retain(|(stamp, _, _)| *stamp <= bound);
+    found.sort_by_key(|(stamp, seq, _)| (*stamp, *seq));
+    let more = own_more || moved_more || found.len() > limit;
+    let found: Vec<Change> = found.into_iter().map(|(_, _, change)| change).collect();
     Ok(whole(found, limit).map(|changes| (changes, more)))
 }
 
@@ -489,6 +615,7 @@ mod tests {
 
     use super::*;
     use crate::backup::{Archive, CheckPolicy, FolderBlobs, SECOND_NS};
+    use crate::store::Moved;
     use crate::xgroup::sql::record_key;
     use crate::xgroup::{Cluster, Protocol, Txn};
 
@@ -775,6 +902,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// T-T1.9.R23 (CP-T1.9; reshard.md, "Decision (lane split-merge-19): a moved row carries its
+    /// commit stamp"). Do: two databases made groups', each with three commits of its own at
+    /// revisions 1 to 3, stamped as a backed-up writer would (these are unbacked, so the test
+    /// writes the stamps): the first's at 10, 30 and 50, the second's at 20, 40 and 60; the first's
+    /// keys exported and imported into the second; then the second's changes read by stamp, from
+    /// the start, after 30, and two at a time; and the same keys imported into a third database
+    /// as a sender that carries no stamps would send them. Expect: each moved row answers its own
+    /// stamp, not that of the second's own revision of the same number; the changes interleave by
+    /// stamp (a1 b1 a2 b2 a3 b3), after 30 are b2 a3 b3, two at a time a1 b1 with more; and the
+    /// third's changes refused, naming the stamp missing, rather than answered without the rows.
+    #[test]
+    fn t_t1_9_r23_rows_moved_in_carry_their_commit_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            let db = Db::open(&dir.path().join(name)).unwrap();
+            crate::database::bootstrap_db(&db).unwrap();
+            db
+        };
+        let commit = |db: &Db, key: &[u8], stamp: u64| {
+            let at = crate::database::write_across(db, "n", "f", key, Some(b"v"), None, 0).unwrap();
+            db.query(
+                "INSERT INTO __amphora_rev_stamps(namespace, rev, stamp) VALUES ('n', ?1, ?2)",
+                [integer(at).unwrap(), integer(stamp).unwrap()],
+                |_| Ok(true),
+            )
+            .unwrap();
+        };
+        let (old, mut new, mut plain) = (open("old.db"), open("new.db"), open("plain.db"));
+        for (i, key) in [b"a1", b"a2", b"a3"].into_iter().enumerate() {
+            commit(&old, key.as_slice(), 10 + 20 * u64::try_from(i).unwrap());
+        }
+        for (i, key) in [b"b1", b"b2", b"b3"].into_iter().enumerate() {
+            commit(&new, key.as_slice(), 20 + 20 * u64::try_from(i).unwrap());
+        }
+        crate::database::group::begin(&old).unwrap();
+        crate::database::group::begin(&new).unwrap();
+        crate::database::group::begin(&plain).unwrap();
+        let batch = crate::database::group::export(&old, crate::reshard::Span::ALL, 100).unwrap();
+        assert_eq!(batch.keys.len(), 3, "{batch:?}");
+        new.transaction(|db| crate::database::group::import(db, &batch.keys))
+            .unwrap();
+
+        assert_eq!(
+            stamp_of_version(&new, "n", "f", b"a1", 1).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            stamp_of_version(&new, "n", "f", b"b1", 1).unwrap(),
+            Some(20)
+        );
+        let read = |after, limit| {
+            changes_in(&new, "n", "f", after, 1_000, limit)
+                .unwrap()
+                .unwrap()
+        };
+        let keys = |changes: &[Change]| -> Vec<Vec<u8>> {
+            changes.iter().map(|c| c.key.clone()).collect()
+        };
+        let (all, more) = read(0, 100);
+        let want: Vec<Vec<u8>> = ["a1", "b1", "a2", "b2", "a3", "b3"]
+            .iter()
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        assert_eq!((keys(&all), more), (want.clone(), false));
+        let revs: Vec<Rev> = all.iter().map(|c| c.rev).collect();
+        assert_eq!(revs, [10, 20, 30, 40, 50, 60]);
+        let (after, _) = read(30, 100);
+        assert_eq!(keys(&after), want[3..]);
+        let (two, more) = read(0, 2);
+        assert_eq!((keys(&two), more), (want[..2].to_vec(), true));
+
+        // A sender that carries no stamps sends the versions alone.
+        let bare: Vec<Moved> = batch
+            .keys
+            .iter()
+            .map(|m| {
+                let rows = m.rows.as_ref().map(|rows| {
+                    let (versions, _) =
+                        postcard::take_from_bytes::<Vec<(u64, u64, Option<Vec<u8>>)>>(rows)
+                            .unwrap();
+                    postcard::to_allocvec(&versions).unwrap()
+                });
+                Moved { rows, ..m.clone() }
+            })
+            .collect();
+        plain
+            .transaction(|db| crate::database::group::import(db, &bare))
+            .unwrap();
+        let refused = changes_in(&plain, "n", "f", 0, 1_000, 100).unwrap();
+        assert!(
+            matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("without its commit stamp")),
+            "{refused:?}"
+        );
     }
 
     /// T-T1.9.R20 (CP-T1.9; reshard.md, "Decision (lane split-merge-18): reads across groups by

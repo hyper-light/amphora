@@ -645,7 +645,8 @@ after the head is stamped past it.
   trails, writes missing from a read begun after them, at 1 to 4096 groups) before either is kept.
 - A revision made before its group stamped, or moved in from another group, has no stamp: a scan
   answers it at 0, and the changes refuse it. The copy path doesn't move the stamps with the rows
-  yet.
+  yet. Moved rows done: decision "Decision (lane split-merge-19): a moved row carries its commit
+  stamp".
 - Compaction keeps every stamp, one row a revision: it must trim the stamps of the revisions it
   took, within its bounded steps, before this is bounded. Done: decision "Decision (lane
   split-merge-19): compaction trims the commit stamps".
@@ -719,3 +720,36 @@ and held by one at the latest point; both points' heads are closed.
 **Falsified by.** A read at the latest point missing a write answered before it began; a change
 answered at or before a head either point answered; the lab showing the push's latency growing
 faster than the reads' own one call a group.
+
+## Decision (lane split-merge-19): a moved row carries its commit stamp
+
+A version moved in from another group keeps the revision it had there (so a read at any revision
+answers the same in the new group), and that number says nothing here: it can be the number of one
+of this group's own revisions. So a moved row's place in the order across groups must come with it.
+- The copy path sends each version's commit stamp after its versions, in the same `rows` bytes
+  (`group::moved`): the versions first, as before, then one stamp a version (none for one its
+  sender had no stamp for). A reader of the versions alone stops after them, so the format grows
+  without a new field.
+- The importer notes each version it takes with its stamp (`__amphora_moved_stamps`, by namespace,
+  family, key and revision, indexed by stamp) and observes the newest, so every commit it makes
+  after is stamped after the rows it took.
+- A scan answers a moved row's revision as its own stamp. The changes read a group's own versions
+  by revision, as before, leaving out the moved ones, and the moved ones by stamp, and merge the
+  two by stamp; a side that had more bounds the page at its last stamp, as the groups do.
+- A version moved in without a stamp (from a sender that carried none) has no place in the order:
+  the changes are refused, typed, saying so, rather than answered without it.
+- The notes go with their versions: compaction deletes a version's note with it, and a key moved
+  out or swept deletes its notes.
+
+**Evidence.** T-T1.9.R23: two groups with revisions 1 to 3 each, stamped 10, 30, 50 and 20, 40,
+60; the first's keys moved into the second. Each moved row answers its own stamp; the changes
+interleave by stamp, after a stamp the rows after it, two at a time the first two with more; the
+same rows moved without stamps into a third group make its changes refused.
+
+**Left.** A scan as of an older stamp still picks each group's versions by its own revision, so a
+moved row's version is chosen by its old group's number there; the scan at the cut is exact.
+`get`, `commit`, `changed` and `wait` still answer from this database alone.
+
+**Falsified by.** A moved row answered with the stamp of this group's own revision of the same
+number; a moved row missing from the changes, or answered twice; changes answered without a moved
+row that has no stamp.

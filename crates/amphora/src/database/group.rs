@@ -334,15 +334,24 @@ fn moved(db: &Db, ids: Vec<(Id, Pos, Seq)>, head: Seq) -> anyhow::Result<Vec<Mov
     let mut out = Vec::with_capacity(ids.len());
     for (id, pos, entry) in ids {
         let now = versions(db, &id)?;
+        let (ns, family, key) = &id;
         let rows = if now.is_empty() {
             None
         } else {
-            Some(
-                postcard::to_allocvec(&now)
-                    .map_err(|_| anyhow::anyhow!("versions that don't encode"))?,
-            )
+            // Each version's commit stamp follows the versions (lane split-merge-19,
+            // T-T1.9.R23): a reader that knows them only reads the versions and stops.
+            let mut stamps = Vec::with_capacity(now.len());
+            for (at, _, _) in &now {
+                stamps.push(super::across::stamp_of_version(db, ns, family, key, *at)?);
+            }
+            let mut rows = postcard::to_allocvec(&now)
+                .map_err(|_| anyhow::anyhow!("versions that don't encode"))?;
+            rows.extend(
+                postcard::to_allocvec(&stamps)
+                    .map_err(|_| anyhow::anyhow!("stamps that don't encode"))?,
+            );
+            Some(rows)
         };
-        let (ns, family, key) = &id;
         let routing =
             row_key(ns, family, key).ok_or_else(|| anyhow::anyhow!("a row key too long"))?;
         out.push(Moved {
@@ -518,6 +527,11 @@ fn drop_key(db: &Db, id: &Id) -> anyhow::Result<()> {
         |_| Ok(true),
     )?;
     db.query(
+        "DELETE FROM __amphora_moved_stamps WHERE namespace = ?1 AND family = ?2 AND key = ?3",
+        params()?,
+        |_| Ok(true),
+    )?;
+    db.query(
         "DELETE FROM __amphora_group_stamps WHERE namespace = ?1 AND family = ?2 AND key = ?3",
         params()?,
         |_| Ok(true),
@@ -549,9 +563,25 @@ pub(super) fn import(db: &Db, moved: &[Moved]) -> anyhow::Result<()> {
             account(db, ns, before, false, None)?;
             continue;
         };
-        let rows: Vec<Version> = postcard::from_bytes(rows)
+        let (rows, rest): (Vec<Version>, &[u8]) = postcard::take_from_bytes(rows)
             .map_err(|_| anyhow::anyhow!("moved versions that don't decode"))?;
-        for (at, seq, value) in &rows {
+        // The versions' commit stamps, if the sender carried them (none from an older one).
+        let stamps: Vec<Option<u64>> = if rest.is_empty() {
+            Vec::new()
+        } else {
+            postcard::from_bytes(rest)
+                .map_err(|_| anyhow::anyhow!("moved stamps that don't decode"))?
+        };
+        if !stamps.is_empty() && stamps.len() != rows.len() {
+            anyhow::bail!("moved stamps that don't match their versions");
+        }
+        for (i, (at, seq, value)) in rows.iter().enumerate() {
+            let stamp = stamps.get(i).copied().flatten();
+            super::across::moved_in(db, ns, family, key, *at, stamp)?;
+            if let (Some(stamp), Some(hooks)) = (stamp, db.stamps()) {
+                // Every commit here from now on is stamped after the rows it took.
+                hooks.marks.observe(stamp)?;
+            }
             let value = value
                 .as_deref()
                 .map(blob)

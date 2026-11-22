@@ -67,7 +67,9 @@ CREATE TABLE IF NOT EXISTS __amphora_families (namespace TEXT NOT NULL, family T
 CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS __amphora_holding (one INTEGER PRIMARY KEY CHECK (one = 0), holding BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS __amphora_rev_stamps (namespace TEXT NOT NULL, rev INTEGER NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY(namespace, rev));
-CREATE INDEX IF NOT EXISTS __amphora_rev_stamps_order ON __amphora_rev_stamps(namespace, stamp);";
+CREATE INDEX IF NOT EXISTS __amphora_rev_stamps_order ON __amphora_rev_stamps(namespace, stamp);
+CREATE TABLE IF NOT EXISTS __amphora_moved_stamps (namespace TEXT NOT NULL, family TEXT NOT NULL, key BLOB NOT NULL, rev INTEGER NOT NULL, stamp INTEGER, PRIMARY KEY(namespace, family, key, rev));
+CREATE INDEX IF NOT EXISTS __amphora_moved_stamps_order ON __amphora_moved_stamps(namespace, family, stamp);";
 const LIVE_MAX: u64 = 10_000_000;
 const QUEUED_BYTES: usize = 512 << 20;
 struct Admission(Arc<AtomicUsize>);
