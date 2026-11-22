@@ -3,7 +3,7 @@ use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use amphora_engine_parser::ast::NullsOrder;
 
-fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
+pub(super) fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
     // not the indexed column's affinity.
     seek_def

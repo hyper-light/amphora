@@ -2751,6 +2751,52 @@ pub fn insn_to_row(
                 None => format!("next group of table {}", data.table_id),
             },
         ),
+        Insn::JoinSwitchStep { data } => (
+            "JoinSwitchStep",
+            data.switch_id as i64,
+            data.build_pc.as_debug_int() as i64,
+            data.probe_pc.as_debug_int() as i64,
+            Value::build_text(""),
+            0,
+            match crate::translate::optimizer::adaptive::switch_point(
+                &crate::translate::optimizer::adaptive::weights(
+                    data.seek,
+                    data.hash_build,
+                    data.hash_probe,
+                ),
+                data.build_rows,
+            ) {
+                Ok(Some(point)) => format!("switch {} at outer row {}", data.switch_id, point.ceil()),
+                _ => format!("switch {} never", data.switch_id),
+            },
+        ),
+        Insn::JoinSwitchHash {
+            switch_id,
+            target_pc,
+        } => (
+            "JoinSwitchHash",
+            *switch_id as i64,
+            target_pc.as_debug_int() as i64,
+            0,
+            Value::build_text(""),
+            0,
+            format!("if switch {switch_id} switched goto {}", target_pc.as_debug_int()),
+        ),
+        Insn::JoinSwitchBuilt { data } => (
+            "JoinSwitchBuilt",
+            data.switch_id as i64,
+            data.hash_table_id as i64,
+            data.target_pc.as_debug_int() as i64,
+            Value::build_text(""),
+            0,
+            format!(
+                "if hash table {} spilled, switch {} refused: goto {}; else its rows against {}'s estimate",
+                data.hash_table_id,
+                data.switch_id,
+                data.target_pc.as_debug_int(),
+                data.table
+            ),
+        ),
         Insn::HashClear { hash_table_id: hash_table_reg } => (
             "HashClear",
             *hash_table_reg as i64,

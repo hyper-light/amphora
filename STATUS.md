@@ -452,8 +452,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
   on a group's database (`Cluster`, each step one call to the group). A crashed coordinator's next incarnation fences
   the old one and finishes what it left. Tested: a crash at every step (T-T1.10.1) and seeded runs with lost and late
-  steps and crashes, Elle-style. Left: the LAN p99 (AC-T1.10.2) on multi-node groups and the 10,000-seed run, which
-  decide between the two; SQL sessions across groups (AC-T1.10.1).
+  steps and crashes, Elle-style. Over the transport (lane xgroup-lan): a step to another node's group is one
+  `Request::Step` through `transport::Nodes`, and `examples/xgroup_lan.rs` measures both protocols (bench) and checks
+  seeded histories (elle); the decision record's rule is written, its numbers blank. Left: the coordinator's LAN p99
+  (AC-T1.10.2) and 10,000-seed run, which decide between the two, once split-merge-11's network listener lets
+  nodes sit on separate machines; SQL sessions across groups (AC-T1.10.1). Lane xgroup-lan-2: a group failing
+  mid-commit is tested at every step (T-T1.10.X3); a begin that finds the coordinator full waits for a finished
+  transaction instead of being refused, so the harness's clients run back to back; both protocols stay until the
+  coordinator's LAN numbers decide (xgroup.md, "Decision (lane xgroup-lan)").
 - **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
   stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
   store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
@@ -855,11 +861,13 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
-  PL.13 is started (lane pl13, docs/design/planner.md "Decision (lane pl13)"): its two run-time
-  checks are built as pure cores with their tests (`optimizer/adaptive.rs`): a nested loop that turns
-  into a hash join at the learned costs' break-even, refused over its memory budget, and a
-  materialization point that asks for a new plan only past its estimate's own error. The executor's
-  shell that drives them, and JOB's 20 slowest queries against the parent (AC-PL.13.1), are open.
+  PL.13 is wired (lane pl13, docs/design/planner.md "Decision (lane pl13)"): with
+  `Connection::set_adaptive_joins` on, an inner join's index seek is emitted with a hash join beside
+  it and switches at the learned costs' break-even; the hash table's build, the inner table whole,
+  is checked against the plan's estimate and, past its error, the table's count is corrected and the
+  statement planned again; a read-only run that has returned no row yet starts again on the new plan
+  at once (the in-run hand-off, `Connection::set_adaptive_handoff`), any other at its next run. The
+  engine's own tests (T-PL.13.1, T-PL.13.3, T-PL.13.4) pass on pinned weights. JOB's 20 slowest queries against the parent (AC-PL.13.1) are open.
   PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
   longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
