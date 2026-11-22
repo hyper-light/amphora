@@ -356,8 +356,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   statement writes its row; SQL there is serializable: the cursor keeps each leaf span it copies as
   read for its commit's precision-locking validation, and Elle's histories through SQL show no
   anomaly on either storage (`T-G8.4.1`); an in-memory IO keeps a database's storage beside its
-  file, so a database reopened on it finds its trees. With the switch on, 55 of the engine's lib
-  tests still fail (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
+  file, so a database reopened on it finds its trees. Attached databases keep their trees on their own
+  versioned storage; the versioned cursor stops at the next leaf once its statement is interrupted
+  and pauses where the pager's cursor does in tests (`AC-NS.2.7`, lane g7s2-11). With the switch on,
+  44 of the engine's lib tests still fail (2866 pass, lane g7s2-11, before the pause points; 6 more
+  pass after) (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
   batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and
   page-codec tests). Not yet: the header (schema cookie, user version) on the versioned
   storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
