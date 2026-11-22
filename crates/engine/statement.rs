@@ -1295,12 +1295,15 @@ impl Statement {
         // length seen at a random point in it (Nature 363, 1993).
         // Amphora (PL.8, lane pl8-16): and it weighs the join orders its last generic plan chose
         // (`generic` while a custom plan runs), so a plan made again on the same facts keeps them.
-        let carried_join_orders = self
-            .generic
-            .as_ref()
-            .unwrap_or(&self.program)
-            .join_orders
-            .clone();
+        let carried_join_orders = match conn.carried_join_orders() {
+            crate::CarriedJoinOrders::WithinMargin => self
+                .generic
+                .as_ref()
+                .unwrap_or(&self.program)
+                .join_orders
+                .clone(),
+            crate::CarriedJoinOrders::Off => None,
+        };
         let new_program = self.plan_again(&PrepareOptions {
             expected_runs: Some(self.runs_since_planned.max(1)),
             carried_join_orders,
@@ -2194,6 +2197,7 @@ mod tests {
     #[test]
     fn t_pl_8_9_a_statement_planned_again_carries_its_join_order() {
         let conn = open_test_connection().unwrap();
+        conn.set_carried_join_orders(crate::CarriedJoinOrders::WithinMargin);
         for sql in [
             "CREATE TABLE a(id INTEGER PRIMARY KEY, b INT)",
             "CREATE TABLE b(id INTEGER PRIMARY KEY, c INT)",

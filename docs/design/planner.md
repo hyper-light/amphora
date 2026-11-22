@@ -1595,7 +1595,9 @@ after a bushy plan that differs from the nested loops'.
   order's cost over `1 + margin`. The margin is the weights' error, `exp(MOVE_Z * s) - 1`, with `s`
   the worst kind's spread between batch means in page reads (`sqrt(s_kind^2 + s_page^2)`); it is 0
   under `Blend` and before any spread is measured, so only a tie keeps the order then. A custom
-  plan (decision pl12) carries nothing.
+  plan (decision pl12) carries nothing. Behind `Connection::set_carried_join_orders`
+  (`CarriedJoinOrders`): `Off`, each plan made again searched afresh, is the control and the
+  default until the A/B decides; `WithinMargin` is the candidate.
 - *LEFT JOINs after a bushy plan* (`optimizer/join.rs`, `bushy_core`, T-PL.8.2). The tail after
   the core of inner joins may hold LEFT JOINs as well as semi and anti joins: each is a loop over
   its right table for each row of the plan so far, read as the outer join it is and null-extended

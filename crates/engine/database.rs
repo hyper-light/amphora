@@ -2852,6 +2852,9 @@ impl Database {
             join_search_budget: crate::connection::AtomicJoinSearchBudget::new(
                 crate::connection::JoinSearchBudget::Fixed,
             ),
+            carried_join_orders: crate::connection::AtomicCarriedJoinOrders::new(
+                crate::connection::CarriedJoinOrders::Off,
+            ),
             star_filters: crate::connection::AtomicStarFilters::new(
                 crate::connection::StarFilters::ByCost,
             ),

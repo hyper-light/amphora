@@ -240,6 +240,17 @@ pub enum JoinSearchBudget {
     RunShareByExecutions = 2,
 }
 
+/// Amphora (PL.8, T-PL.8.9, lane pl8-16): whether a statement planned again weighs the join
+/// orders its last plan chose (`join::keep_carried`). Behind this switch for the A/B: today's
+/// plans made afresh are the control and the default, until the measurements decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum CarriedJoinOrders {
+    /// Each plan made again searches afresh: the control.
+    Off = 0,
+    /// The last plan's order stands unless the new best is cheaper past the weights' error.
+    WithinMargin = 1,
+}
+
 /// Amphora (QT.5, T-QT.5.3): whether a star join's dimensions filter the fact table's scan with
 /// their Bloom filters (`translate/optimizer/lip.rs`, `Connection::set_star_filters`): by the
 /// planner's costs, never (the control), or wherever a filter is safe, for the tests that hold its
@@ -552,6 +563,8 @@ pub struct Connection {
     /// Amphora: see [`Connection::set_join_methods`].
     pub(super) join_methods: AtomicJoinMethods,
     pub(super) join_search_budget: AtomicJoinSearchBudget,
+    /// Amphora (PL.8, lane pl8-16): `Connection::set_carried_join_orders`.
+    pub(super) carried_join_orders: AtomicCarriedJoinOrders,
     /// Amphora: see [`Connection::set_star_filters`].
     pub(super) star_filters: AtomicStarFilters,
     /// Amphora: see [`Connection::set_sorted_fetches`].
@@ -1062,6 +1075,16 @@ impl Connection {
 
     pub(crate) fn join_search_budget(&self) -> JoinSearchBudget {
         self.join_search_budget.get()
+    }
+
+    /// Amphora (PL.8, T-PL.8.9, lane pl8-16): chooses whether statements planned again weigh the
+    /// join orders their last plans chose.
+    pub fn set_carried_join_orders(&self, rule: CarriedJoinOrders) {
+        self.carried_join_orders.set(rule);
+    }
+
+    pub(crate) fn carried_join_orders(&self) -> CarriedJoinOrders {
+        self.carried_join_orders.get()
     }
 
     /// Amphora (PL.8, T-PL.8.6, lane pl8-16): chooses the rule that moves the learned cost weights,
