@@ -1383,7 +1383,13 @@ pub fn op_open_read(
     // own; a temp database's tables stay on its pager, their root pages its pages (G7 step 2,
     // `AC-NS.2.1`).
     if let Some(switch) = program.connection.versioned_for(*db) {
-        if let Some(cursor) = versioned_cursor(&switch, cursor_type, *root_page, &pager)? {
+        if let Some(cursor) = versioned_cursor(
+            &program.connection,
+            &switch,
+            cursor_type,
+            *root_page,
+            &pager,
+        )? {
             replace_cursor(&mut state.cursors, *cursor_id, cursor)?;
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -14197,6 +14203,7 @@ pub fn op_offset_limit(
 /// Amphora (G7 step 2, `AC-NS.2.1`): with the connection's switch on, the cursor on the versioned
 /// storage's tree at `root_page` for a table or an index; `None` for a cursor of another kind.
 fn versioned_cursor(
+    conn: &Arc<Connection>,
     switch: &crate::storage::versioned::switch::Switch,
     cursor_type: &CursorType,
     root_page: i64,
@@ -14216,7 +14223,9 @@ fn versioned_cursor(
         CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
         _ => return Ok(None),
     };
-    let cursor = switch.cursor(root_page, index, pager.clone())?;
+    let cursor = switch
+        .cursor(root_page, index, pager.clone())?
+        .watched_by(conn);
     Ok(Some(Cursor::new_btree_dyn(Box::new(cursor))))
 }
 
@@ -14317,7 +14326,9 @@ pub fn op_open_write(
     if !can_reuse_cursor {
         // By database, as in `op_open_read`.
         if let Some(switch) = program.connection.versioned_for(*db) {
-            if let Some(cursor) = versioned_cursor(&switch, cursor_type, root_page, &pager)? {
+            if let Some(cursor) =
+                versioned_cursor(&program.connection, &switch, cursor_type, root_page, &pager)?
+            {
                 replace_cursor(cursors, *cursor_id, cursor)?;
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
