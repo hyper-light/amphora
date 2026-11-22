@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Fetches every competitor's release binaries into AMPHORA_REPL_BIN (default ~/.cache/amphora-repl-bin)
-# on this host, for the native clusters beside this script (CP-T1.8; Ada's fair-comparison rule: every
+# on this host, for the cluster scripts beside this one (CP-T1.8; Ada's fair-comparison rule: every
 # system on one host, natively). Run it once per host, from a checkout; it's safe to run again (what's
 # there is kept; delete the folder to fetch again).
 #   rqlite   rqlited from rqlite/rqlite's GitHub release
 #   libsql   sqld from tursodatabase/libsql's newest libsql-server-v* release
 #   litefs   litefs from superfly/litefs's release, and consul from releases.hashicorp.com (its lease)
-#   dqlite   no release binary exists: the bench's shim (../shim/main.go) is built with Go (go.dev's
+#   dqlite   no release binary exists: the bench's shim (shim/main.go) is built with Go (go.dev's
 #            release, fetched here) against libdqlite: the host's (pkg-config dqlite) if it has one,
 #            else canonical/dqlite's release source built here with its own raft (needs a C
 #            compiler, autotools, libuv and sqlite3 headers). go-dqlite goes with the libdqlite it
@@ -36,7 +36,7 @@ case "$(uname -m)" in
   aarch64 | arm64) ARCH=arm64 RUST_ARCH=aarch64 ;;
   *) echo "no release builds named for $(uname -m)" >&2; exit 1 ;;
 esac
-[[ "$(uname -s)" == Linux ]] || { echo "the native clusters are Linux's (pidfds, FUSE); this is $(uname -s)" >&2; exit 1; }
+[[ "$(uname -s)" == Linux ]] || { echo "the clusters are Linux processes (pidfds, FUSE); this is $(uname -s)" >&2; exit 1; }
 
 # A release's tag and the URL of its asset whose name matches ERE, from GitHub's API:
 # release REPO TAG_PREFIX ERE [TAG] -> "tag url"
@@ -151,7 +151,7 @@ fi
 
 if [[ ! -x "$BIN/shim" && -x "$BIN/go/bin/go" && -n "${DQ_VERSION:-}" ]]; then
   s=$(mktemp -d "$WORK/shim.XXXXXX")
-  cp "$HERE/../shim/main.go" "$s/"
+  cp "$HERE/shim/main.go" "$s/"
   # go-dqlite for this libdqlite (the header's comment says why): v3's module path is .../v3.
   IFS=. read -r dq_major dq_minor _ <<<"$DQ_VERSION"
   if ((dq_major > 1 || (dq_major == 1 && dq_minor >= 17))); then

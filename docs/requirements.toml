@@ -1181,11 +1181,11 @@ tests = [
 # process on the machines it is given (`amphora-bench --repl-member`, system `amphora-procs`).
 # lane repl-measure-13 (CP-T1.8, AC-T1.8.2): no new IDs. bench/repl_ladder.sh runs the commit measure at
 # 1, 8, 32, 128, 512, 2048 and 4096 writers on one host, every system natively through one client:
-# Amphora's members as processes, the competitors from bench/servers/repl/native (release binaries
+# Amphora's members as processes, the competitors from bench/servers/repl (release binaries
 # fetched by its setup.sh). Each record names its client, platform, system version and durability
 # (`about`) and the client's own use (`client_use`). The runs of record are the coordinator's.
 # lane repl-measure-14 (CP-T1.8, AC-T1.8.2): no new IDs. Each native competitor runs its strongest commit
-# durability, from its own source (cited in bench/servers/repl/native/<system>.sh): sqld at
+# durability, from its own source (cited in bench/servers/repl/<system>.sh): sqld at
 # durability_mode=strong, checked by `up`; rqlite and dqlite at their defaults (2 of 3 logs, fsynced);
 # libSQL and LiteFS can't wait for a replica, which their records' `durability` says.
 

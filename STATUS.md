@@ -763,8 +763,8 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   --system amphora|rqlite|dqlite|litefs|libsql` gives commit latency p50/p99/p99.9 and throughput, the time from a
   leader kill to the first acknowledged write with the acknowledged events lost, and a member's time to catch up,
   every size and duration an input. Amphora's three members run in one process (a kill is a cut from the relay);
-  the competitors run as three-node container clusters through their scripts (dqlite and LiteFS through the bench's
-  Go shim). libSQL has no failover and dqlite no member-local read, so those are refused, typed, as is LiteFS's
+  the competitors run as three-node clusters of processes through their scripts (dqlite and LiteFS through the
+  bench's Go shim; lane repl-measure-15 removed the container scripts they first ran as). libSQL has no failover and dqlite no member-local read, so those are refused, typed, as is LiteFS's
   failover until its script runs a Consul lease (lane repl-measure-2: it does now; `bench/repl.sh RECORDS FLAGS...`
   runs every measure on every system, and all four clusters came up on jupiter). Closes with: the comparison set and Amphora's classes measured on
   adacachy, fedora and jupiter, best of 3, and Amphora's members across machines for the LAN p99.
@@ -783,17 +783,17 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   its peers over TCP; `bench/repl_members.sh RECORDS CLASS HOST1:PORT HOST2:PORT HOST3:PORT FLAGS...` starts
   the three (here, or by ssh) and runs every measure as `amphora-procs-CLASS` (tiny run: three processes on
   jupiter). The competitors' scripts take AMPHORA_BENCH_REPL_NAME and AMPHORA_BENCH_REPL_PORT, so runs sharing
-  a Docker host keep their own containers. A member's kill is still the cut, not its process killed.
+  a host keep their own nodes. A member's kill is still the cut, not its process killed.
 - **Replication measured: the fair commit ladder** (CP-T1.8, AC-T1.8.2; lane repl-measure-13): written, not yet
   compiled or run. The earlier compare ran Amphora natively and its competitors in containers, so it doesn't stand.
   `bench/repl_ladder.sh RECORDS FLAGS...` runs the commit measure at 1, 8, 32, 128, 512, 2048 and 4096 writers on
   one host, every system as processes through the same driver: Amphora's members (persisted and replicated),
-  rqlite, dqlite, libSQL and LiteFS from `bench/servers/repl/native` (`setup.sh` fetches their release binaries
+  rqlite, dqlite, libSQL and LiteFS from `bench/servers/repl` (`setup.sh` fetches their release binaries
   into ~/.cache). Each record names its client, platform, versions and durability, and the client's CPU, memory
   and sockets. The HTTP client now keeps a connection a writer to each node; ureq's default of 3 a host had
   cost the competitors a new connection on most writes.
 - **Replication measured: each competitor at its strongest commit durability** (CP-T1.8, AC-T1.8.2; lane
-  repl-measure-14): written, not yet run. From each system's own source (cited in its native script): rqlite's
+  repl-measure-14): written, not yet run. From each system's own source (cited in its script): rqlite's
   and dqlite's defaults already acknowledge once 2 of 3 Raft logs hold a commit, fsynced, and offer nothing
   stronger. sqld's default (durability_mode relaxed, synchronous=NORMAL) doesn't fsync at commit; the cluster
   now runs it at strong (FULL) and refuses to come up otherwise. libSQL and LiteFS replicate asynchronously

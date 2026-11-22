@@ -4,7 +4,7 @@
 # system, containers for all or for none; the ladder 1, 8, 32, 128, 512, 2048, 4096). For each rung
 # and each system it brings a fresh three-member cluster up, runs `amphora-bench --repl commit
 # --writers W`, and takes it down: Amphora's members as processes on 127.0.0.1 (repl_members.sh),
-# the competitors as processes from servers/repl/native (run native/setup.sh on this host first).
+# the competitors as processes from servers/repl (run servers/repl/setup.sh on this host first).
 # Every record names the client, the platform, the system's version and what its acknowledgement
 # means (`about`, `platform`), and the client's own CPU, memory and sockets (`client_use`), so a rung
 # where the client was the bottleneck shows.
@@ -30,7 +30,7 @@ FLAGS=("$@")
 SYSTEMS=${SYSTEMS:-amphora-procs-persisted amphora-procs-replicated rqlite dqlite libsql litefs}
 LADDER=${LADDER:-1 8 32 128 512 2048 4096}
 PROCS_PORT=${PROCS_PORT:-54290}
-NATIVE="$HERE/servers/repl/native"
+SCRIPTS="$HERE/servers/repl"
 mkdir -p "$RECORDS"
 # The top rung holds a connection a writer to each node it reaches: take the host's hard limit.
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
@@ -59,7 +59,7 @@ for w in $LADDER; do
         ;;
       *)
         out="$RECORDS/$s-commit.jsonl"
-        if "$BIN" --repl commit --system "$s" --scripts "$NATIVE" --record "$out" "${FLAGS[@]}" --writers "$w"; then
+        if "$BIN" --repl commit --system "$s" --scripts "$SCRIPTS" --record "$out" "${FLAGS[@]}" --writers "$w"; then
           echo "ok $s $w" >&2
         elif tail -n 1 "$out" 2>/dev/null | grep -q '"refused"'; then
           echo "refused $s $w: $(tail -n 1 "$out" | sed -n 's/.*"why":"\([^"]*\)".*/\1/p')" >&2

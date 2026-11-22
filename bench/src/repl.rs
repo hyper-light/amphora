@@ -20,11 +20,10 @@
 //! Amphora's three members run in this process, relayed by the host's part as `cluster.rs` does; a
 //! killed member is cut off from the relay, which its peers can't tell from kill -9 (nothing more
 //! comes from it, nothing reaches it). `amphora-procs` runs each member as its own process, on the
-//! machines bench/repl_members.sh is given, over TCP (`procs`), a kill the same cut. The competitors run as containers through their scripts,
-//! `bench/servers/repl/<system>.sh up|down|kill N|start N|leader|endpoint N` (a kill is
-//! `docker kill`, SIGKILL); `--scripts bench/servers/repl/native` runs the same systems as processes
-//! on this host instead (a kill is kill -9 of the node's recorded process group), from the release binaries
-//! `native/setup.sh` fetched: every system on one platform, as Ada's fair-comparison rule asks
+//! machines bench/repl_members.sh is given, over TCP (`procs`), a kill the same cut. The competitors run as
+//! processes on this host through their scripts, `bench/servers/repl/<system>.sh up|down|kill N|start N|leader|endpoint N|about`
+//! (a kill is kill -9 of the node's recorded process group), from the release binaries
+//! `bench/servers/repl/setup.sh` fetched: every system on one platform, as Ada's fair-comparison rule asks
 //! (bench/repl_ladder.sh runs the commit ladder that way). Every record carries `about` (the system's
 //! version, its platform, what its acknowledgement means, and the client: driver, transport, pool)
 //! and `client_use` (the client's CPU, memory and sockets). A system without a measure's concept, or
@@ -39,7 +38,7 @@
 //!        amphora:  --dir DIR --class persisted|replicated [--spanning N] --relay-records N (records the relay
 //!                  moves from a member at a time)
 //!        amphora-procs: --members A1,A2,A3 (each member's address; [--class C] names the record)
-//!        others:   [--scripts DIR (bench/servers/repl; bench/servers/repl/native for processes)] [--shell PROGRAM (bash)]
+//!        others:   [--scripts DIR (bench/servers/repl)] [--shell PROGRAM (bash)]
 //!        a member: amphora-bench --repl-member ... (`procs`)
 
 use std::path::PathBuf;
@@ -861,8 +860,7 @@ mod http {
             Ok(h)
         }
 
-        /// The script run by `--shell` (on Windows, name Git's bash by its full path: a bare `bash`
-        /// can resolve to WSL's, which can't reach Docker Desktop's CLI the same way).
+        /// The script run by `--shell`.
         fn script(&self, args: &[&str]) -> anyhow::Result<String> {
             let out = std::process::Command::new(&self.shell).arg(&self.script).args(args).output()?;
             anyhow::ensure!(out.status.success(), "{} {}: {}", self.script.display(), args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
@@ -892,8 +890,8 @@ mod http {
 
     impl Cluster for Http {
         fn about(&self) -> serde_json::Value {
-            // The cluster script's own account (its binary's version line, native or docker, the
-            // data folder's filesystem and what an acknowledgement means), and the client's.
+            // The cluster script's own account (its binary's version line, the data folder's
+            // filesystem and what an acknowledgement means), and the client's.
             let mut a = self.script(&["about"]).ok().and_then(|out| serde_json::from_str::<serde_json::Value>(out.trim()).ok()).unwrap_or_else(|| serde_json::json!({ "system": self.system }));
             if let Some(o) = a.as_object_mut() {
                 o.insert(
