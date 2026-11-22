@@ -2103,12 +2103,12 @@ mod chooser {
 /// one build per summary at a time, installed only when no write came in during it.
 mod builds {
     use super::super::{
-        start_build, BuildEnd, Chooser, CrackerColumn, Lead, RowWrite, SkipMethod, SkipRegistry,
-        Skipping, Upkeep, ZoneMapBuilder,
+        start_build, zone_map_of_table, BuildEnd, BuildMode, Chooser, CrackerColumn, Lead,
+        RowWrite, SkipMethod, SkipRegistry, Skipping, Upkeep, ZoneMap, ZoneMapBuilder,
     };
     use crate::io::MemoryIO;
     use crate::sync::Arc;
-    use crate::{Database, SqliteDialect};
+    use crate::{Connection, Database, SqliteDialect};
     use std::sync::Barrier;
 
     const ROOT: i64 = 2;
@@ -2117,9 +2117,14 @@ mod builds {
     /// T-SKU.7's scenario: capped, the cracker dropped for its upkeep while zone maps led, then
     /// zone maps measured costlier than the cracker's last scan, so the cracker's build is due.
     fn cracker_due() -> Chooser {
+        due_over(ZoneMapBuilder::new().finish(), CrackerColumn::new([]))
+    }
+
+    /// [`cracker_due`]'s scenario over a summary holding rows: `zones` and `cracker` as built.
+    fn due_over(zones: ZoneMap, cracker: CrackerColumn) -> Chooser {
         let mut chooser = Chooser::with_rules(
-            ZoneMapBuilder::new().finish(),
-            CrackerColumn::new([]),
+            zones,
+            cracker,
             Upkeep::Capped,
             Lead::Scan,
             [Some(10), Some(10)],
@@ -2138,6 +2143,51 @@ mod builds {
         let registry = SkipRegistry::default();
         registry.set(ROOT, 0, Skipping::Measured(Box::new(cracker_due())));
         registry
+    }
+
+    /// Rows `1..=n`, each row's value its rowid.
+    fn table_rows(n: i64) -> Vec<(i64, Option<i64>)> {
+        (1..=n).map(|rowid| (rowid, Some(rowid))).collect()
+    }
+
+    /// A registry whose summary holds `rows`, its cracker due a build, built by `mode`.
+    fn registry_over(rows: &[(i64, Option<i64>)], mode: BuildMode) -> SkipRegistry {
+        let mut zones = ZoneMapBuilder::new();
+        for (rowid, value) in rows {
+            zones.row(*rowid, *value).unwrap();
+        }
+        let chooser = due_over(zones.finish(), CrackerColumn::new(rows.iter().copied()));
+        let registry = SkipRegistry::default();
+        registry.set_with_build(ROOT, 0, Skipping::Measured(Box::new(chooser)), mode);
+        registry
+    }
+
+    /// The rows the summary's cracker holds, by rowid; `None` while it is dropped.
+    fn cracker_rows(registry: &SkipRegistry, root: i64) -> Option<Vec<(i64, Option<i64>)>> {
+        registry
+            .with_summary(root, |s| match s {
+                Skipping::Measured(chooser) => chooser.cracker().map(|c| {
+                    let mut rows = c.rows();
+                    rows.sort_unstable();
+                    rows
+                }),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    /// A writer's insert of `rowid` (value `rowid`) at the newest commit `at`.
+    fn insert(registry: &SkipRegistry, at: (u32, u64), rowid: i64) {
+        registry.on_write(
+            ROOT,
+            9,
+            at,
+            RowWrite::Insert {
+                rowid,
+                value: Some(rowid),
+            },
+            &mut || 0,
+        );
     }
 
     fn copy() -> CrackerColumn {
@@ -2190,7 +2240,7 @@ mod builds {
     /// build is due after it.
     #[test]
     fn t_sku_10_a_write_during_the_build_voids_it() {
-        let registry = registry_due();
+        let registry = registry_over(&[], BuildMode::VoidOnWrite);
         let claim = registry.claim_build(ROOT).unwrap();
         assert!(registry.pin_build(&claim, 1, AT, AT));
         registry.on_write(
@@ -2296,11 +2346,11 @@ mod builds {
         let barrier = std::sync::Arc::new(Barrier::new(askers));
         let handles: Vec<_> = (0..askers)
             .map(|_| {
-                let db = Arc::clone(&db);
+                let asker = db.connect(crate::ConnectOpts::new()).unwrap();
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    start_build(&db, root, 0, 2)
+                    start_build(&asker, root, 0, 2)
                 })
             })
             .collect();
@@ -2324,5 +2374,291 @@ mod builds {
         assert_eq!(held, Some(500));
         assert!(!db.skipping.building(root));
         assert_eq!(db.skipping.claim_build(root), None);
+    }
+
+    /// A table `t (a INTEGER, pad TEXT)` of `rows` rows (`a` = 0, 1, ...) on `conn`, and its root.
+    fn fill_table(conn: &Arc<Connection>, rows: i64) -> i64 {
+        conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..rows {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'x')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.with_schema_mut(|s| s.get_btree_table("t"))
+            .unwrap()
+            .unwrap()
+            .root_page
+    }
+
+    /// `t`'s summary on `conn`'s database, its cracker due a build, built by `mode`.
+    fn set_due(conn: &Arc<Connection>, root: i64, rows: i64, mode: BuildMode) {
+        let zones = zone_map_of_table(conn, "t", "a").unwrap();
+        let cracker = CrackerColumn::new((0..rows).map(|i| (i.saturating_add(1), Some(i))));
+        conn.db.skipping.set_with_build(
+            root,
+            0,
+            Skipping::Measured(Box::new(due_over(zones, cracker))),
+            mode,
+        );
+    }
+
+    /// Lane skip-9 (T-SKU.11), void's failure mode. Do: a write reaches the summary during every
+    /// build, eight trials in a row (a steady write rate), once void-on-write and once replaying.
+    /// Expect: void-on-write installs none (each build voided, the cracker never comes back);
+    /// replay installs the first, its copy holding the table's rows and the write that came in
+    /// during it, and no build is due after.
+    #[test]
+    fn t_sku_11_steady_writes_starve_void_but_replay_installs() {
+        let rows = table_rows(64);
+        let trials = 8u64;
+        for mode in [BuildMode::VoidOnWrite, BuildMode::Replay] {
+            let registry = registry_over(&rows, mode);
+            let mut ends = Vec::new();
+            for trial in 1..=trials {
+                let Some(claim) = registry.claim_build(ROOT) else {
+                    break;
+                };
+                let committed = (0, trial);
+                assert!(
+                    registry.pin_build(&claim, 1, committed, committed),
+                    "{mode:?} trial {trial}"
+                );
+                insert(&registry, committed, 1000 + i64::try_from(trial).unwrap());
+                ends.push(registry.install_cracker(
+                    claim,
+                    CrackerColumn::new(rows.iter().copied()),
+                    10,
+                    &mut || 0,
+                ));
+            }
+            let counts = registry.counts(ROOT).unwrap();
+            match mode {
+                BuildMode::VoidOnWrite => {
+                    assert_eq!(ends, vec![BuildEnd::Invalidated; 8], "void: {ends:?}");
+                    assert_eq!(counts.builds_invalidated, trials);
+                    assert_eq!(counts.builds_installed, 0);
+                    assert!(
+                        !keeps_cracker(&registry, ROOT),
+                        "void: starved, the cracker never came back"
+                    );
+                }
+                _ => {
+                    assert_eq!(ends, vec![BuildEnd::Installed], "replay: {ends:?}");
+                    assert_eq!(counts.builds_installed, 1);
+                    assert_eq!(counts.replayed_writes, 1);
+                    let mut want = rows.clone();
+                    want.push((1001, Some(1001)));
+                    assert_eq!(cracker_rows(&registry, ROOT), Some(want));
+                    assert_eq!(registry.claim_build(ROOT), None, "built: none is due");
+                }
+            }
+        }
+    }
+
+    /// Lane skip-9 (T-SKU.11), replay's failure mode: its memory under a burst. Do: a build on a
+    /// summary of 64 rows, then a burst of writes during it: an update, a delete and inserts, as
+    /// many as the rows (the bound), and once one more. Expect: within the bound, the record
+    /// holds the whole burst and the copy installed is the table after the burst, in order; one
+    /// past it, the record never holds more than the bound, is dropped, and the build falls back
+    /// to void (nothing installed, one overflow counted).
+    #[test]
+    fn t_sku_11_a_burst_past_the_replay_bound_falls_back_to_void() {
+        let rows = table_rows(64);
+        let bound = u64::try_from(rows.len()).unwrap();
+        for burst in [bound, bound + 1] {
+            let registry = registry_over(&rows, BuildMode::Replay);
+            let claim = registry.claim_build(ROOT).unwrap();
+            assert!(registry.pin_build(&claim, 1, AT, AT));
+            let mut writes = vec![
+                RowWrite::Update {
+                    rowid: 1,
+                    old: Some(1),
+                    new: Some(500),
+                },
+                RowWrite::Delete {
+                    rowid: 2,
+                    old: Some(2),
+                },
+            ];
+            let inserts = burst - 2;
+            writes.extend(
+                (0..i64::try_from(inserts).unwrap()).map(|i| RowWrite::Insert {
+                    rowid: 100 + i,
+                    value: Some(i),
+                }),
+            );
+            for write in &writes {
+                registry.on_write(ROOT, 9, AT, *write, &mut || 0);
+            }
+            let end = registry.install_cracker(
+                claim,
+                CrackerColumn::new(rows.iter().copied()),
+                10,
+                &mut || 0,
+            );
+            let counts = registry.counts(ROOT).unwrap();
+            assert!(
+                counts.replay_peak <= bound,
+                "burst {burst}: the record held {} past its bound {bound}",
+                counts.replay_peak
+            );
+            if burst <= bound {
+                assert_eq!(end, BuildEnd::Installed, "burst {burst}");
+                assert_eq!(counts.replay_peak, burst);
+                assert_eq!(counts.replay_overflows, 0);
+                assert_eq!(counts.replayed_writes, burst);
+                let mut want: Vec<_> = rows
+                    .iter()
+                    .copied()
+                    .filter(|(rowid, _)| *rowid > 2)
+                    .collect();
+                want.push((1, Some(500)));
+                want.extend((0..i64::try_from(inserts).unwrap()).map(|i| (100 + i, Some(i))));
+                want.sort_unstable();
+                assert_eq!(
+                    cracker_rows(&registry, ROOT),
+                    Some(want),
+                    "burst {burst}: replayed in order"
+                );
+            } else {
+                assert_eq!(
+                    end,
+                    BuildEnd::Invalidated,
+                    "burst {burst}: fell back to void"
+                );
+                assert_eq!(counts.replay_overflows, 1);
+                assert_eq!(counts.replayed_writes, 0);
+                assert!(!keeps_cracker(&registry, ROOT));
+                assert!(!registry.building(ROOT));
+                assert!(
+                    registry.claim_build(ROOT).is_some(),
+                    "the next trial claims again"
+                );
+            }
+        }
+    }
+
+    /// Lane skip-9 (T-SKU.11), inline's failure mode: the scan that finds the trial due pays the
+    /// build. Do: a real table of 500 rows whose cracker is due, and one filter through SQL,
+    /// under each build mode. Expect: inline, the filter's own statement read every row of the
+    /// table for the build and the cracker is kept when it returns; void-on-write and replay read
+    /// none on the scan's path. Answers equal across modes.
+    #[test]
+    fn t_sku_11_inline_builds_on_the_scans_path_the_others_off_it() {
+        let rows = 500;
+        let mut answers = Vec::new();
+        for mode in [BuildMode::Inline, BuildMode::VoidOnWrite, BuildMode::Replay] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+            let root = fill_table(&conn, rows);
+            set_due(&conn, root, rows, mode);
+            let mut stmt = conn
+                .prepare("SELECT a FROM t WHERE a BETWEEN 10 AND 20")
+                .unwrap();
+            let answer: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| format!("{row:?}"))
+                .collect();
+            answers.push(answer);
+            let counts = db.skipping.counts(root).unwrap();
+            assert_eq!(
+                counts.consulted, 1,
+                "{mode:?}: the filter skipped with the summary"
+            );
+            match mode {
+                BuildMode::Inline => {
+                    assert_eq!(
+                        counts.inline_rows_read, 500,
+                        "inline: the scan read the table for the build"
+                    );
+                    assert_eq!(counts.builds_installed, 1);
+                    assert!(keeps_cracker(&db.skipping, root));
+                }
+                _ => assert_eq!(
+                    counts.inline_rows_read, 0,
+                    "{mode:?}: nothing read on the scan's path"
+                ),
+            }
+        }
+        assert!(
+            answers.windows(2).all(|pair| pair.first() == pair.last()),
+            "{answers:?}"
+        );
+        assert_eq!(answers.first().map(Vec::len), Some(11));
+    }
+
+    /// Lane skip-9 (T-SKU.11): `PRAGMA skipping` takes a measured summary's build mode, replay by
+    /// default, and refuses one after a kind that never builds again.
+    #[test]
+    fn t_sku_11_pragma_sets_the_build_mode() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let root = fill_table(&conn, 10);
+        for (setting, mode) in [
+            ("t.a capped", BuildMode::Replay),
+            ("t.a capped inline", BuildMode::Inline),
+            ("t.a CAPPED void", BuildMode::VoidOnWrite),
+            ("t.a measured replay", BuildMode::Replay),
+        ] {
+            conn.execute(format!("PRAGMA skipping = '{setting}'"))
+                .unwrap();
+            assert_eq!(db.skipping.build_mode(root), Some(mode), "'{setting}'");
+        }
+        for bad in [
+            "t.a zone_maps replay",
+            "t.a cracking void",
+            "t.a off inline",
+            "t.a capped sideways",
+            "t.a capped void again",
+        ] {
+            assert!(
+                conn.execute(format!("PRAGMA skipping = '{bad}'")).is_err(),
+                "'{bad}' was taken"
+            );
+        }
+    }
+
+    /// Lane skip-9 (T-SKU.12). Do: an encrypted database (aes256gcm), its connection opened with
+    /// the key, a table whose cracker is due, and the build started from that connection.
+    /// Expect: the build's own connection opens with the same key, reads every row and installs.
+    #[cfg(all(feature = "encryption", feature = "fs"))]
+    #[test]
+    fn t_sku_12_an_encrypted_databases_build_reads_with_its_key() {
+        // A test key: 32 bytes, as aes256gcm takes (the cipher's key size).
+        let hexkey = "5a".repeat(32);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skip-encrypted.db");
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_encryption(true),
+            Some(crate::EncryptionOpts {
+                cipher: "aes256gcm".to_string(),
+                hexkey: hexkey.clone(),
+            }),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let key = crate::EncryptionKey::from_hex_string(&hexkey).unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new().with_encryption_key(Some(key)))
+            .unwrap();
+        let rows = 300;
+        let root = fill_table(&conn, rows);
+        for mode in [BuildMode::VoidOnWrite, BuildMode::Replay] {
+            set_due(&conn, root, rows, mode);
+            let build = start_build(&conn, root, 0, 2).expect("the cracker's build is due");
+            assert_eq!(build.join().unwrap(), BuildEnd::Installed, "{mode:?}");
+            let held = cracker_rows(&db.skipping, root).map(|rows| rows.len());
+            assert_eq!(held, Some(300), "{mode:?}");
+        }
     }
 }

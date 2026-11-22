@@ -197,6 +197,12 @@ impl CrackerColumn {
             .to_vec())
     }
 
+    /// Lane skip-9 (T-SKU.11): the rows the copy holds, integers and others.
+    pub fn row_count(&self) -> u64 {
+        let rows = self.entries.len().saturating_add(self.others.len());
+        u64::try_from(rows).unwrap_or(u64::MAX)
+    }
+
     /// The rowids whose value isn't an integer.
     pub fn others(&self) -> impl Iterator<Item = i64> + '_ {
         self.others.iter().copied()

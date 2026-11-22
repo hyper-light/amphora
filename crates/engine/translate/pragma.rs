@@ -214,14 +214,21 @@ fn emit_table_list_rows_for_schema(
 
 /// Amphora (lane skip-4, T-SKU.3): `PRAGMA skipping`'s value, `table.column` and an optional
 /// method: `measured` (the default: zone maps or cracking, whichever measures cheaper on the
-/// column's filters), `zone_maps`, `cracking`, or `off` (drop the summary).
+/// column's filters), `zone_maps`, `cracking`, or `off` (drop the summary). Lane skip-9
+/// (T-SKU.11): after `measured` or `capped`, an optional build mode for a dropped method:
+/// `inline`, `void` or `replay` (the default).
 fn parse_skipping_setting(
     value: &str,
-) -> crate::Result<(String, String, Option<crate::skipping::SkipKind>)> {
-    use crate::skipping::SkipKind;
+) -> crate::Result<(
+    String,
+    String,
+    Option<crate::skipping::SkipKind>,
+    crate::skipping::BuildMode,
+)> {
+    use crate::skipping::{BuildMode, SkipKind};
     let refuse = || {
         LimboError::InvalidArgument(format!(
-            "PRAGMA skipping expects 'table.column [measured|capped|zone_maps|cracking|off]', got '{value}'"
+            "PRAGMA skipping expects 'table.column [measured|capped [inline|void|replay]|zone_maps|cracking|off]', got '{value}'"
         ))
     };
     let mut words = value.split_whitespace();
@@ -238,10 +245,18 @@ fn parse_skipping_setting(
         Some("off") => None,
         Some(_) => return Err(refuse()),
     };
+    let measured = matches!(kind, Some(SkipKind::Measured | SkipKind::MeasuredCapped));
+    let build = match words.next().map(str::to_ascii_lowercase).as_deref() {
+        None => BuildMode::default(),
+        Some("inline") if measured => BuildMode::Inline,
+        Some("void") if measured => BuildMode::VoidOnWrite,
+        Some("replay") if measured => BuildMode::Replay,
+        Some(_) => return Err(refuse()),
+    };
     if words.next().is_some() {
         return Err(refuse());
     }
-    Ok((table.to_owned(), column.to_owned(), kind))
+    Ok((table.to_owned(), column.to_owned(), kind, build))
 }
 
 /// SQLite matches PRAGMA names without regard to case.
@@ -775,11 +790,12 @@ fn update_pragma(
             // acted on when the statement runs, by its own instruction: the summary is built
             // from the rows the table holds then, holding the write lock, as `set_skipping`
             // builds it.
-            let (table, column, kind) = parse_skipping_setting(&parse_string(&value)?)?;
+            let (table, column, kind, build) = parse_skipping_setting(&parse_string(&value)?)?;
             program.emit_insn(Insn::SetSkipping {
                 table,
                 column,
                 kind,
+                build,
             });
             Ok(TransactionMode::None)
         }

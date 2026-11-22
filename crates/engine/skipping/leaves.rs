@@ -198,6 +198,18 @@ pub fn set_skipping(
     column: &str,
     kind: Option<SkipKind>,
 ) -> Result<(), LeafBuildError> {
+    set_skipping_with(conn, table, column, kind, super::BuildMode::default())
+}
+
+/// Lane skip-9 (T-SKU.11): [`set_skipping`], a measured summary's dropped method built again by
+/// `build` (inline, void-on-write or replay).
+pub fn set_skipping_with(
+    conn: &Arc<Connection>,
+    table: &str,
+    column: &str,
+    kind: Option<SkipKind>,
+    build: super::BuildMode,
+) -> Result<(), LeafBuildError> {
     if conn.mvcc_enabled() {
         return Err(LeafBuildError::Refused(super::SkipRefusal::Mvcc));
     }
@@ -237,7 +249,9 @@ pub fn set_skipping(
     };
     match built {
         Ok(skipping) => {
-            conn.db.skipping.set(root, index, skipping);
+            conn.db
+                .skipping
+                .set_with_build(root, index, skipping, build);
             conn.execute("COMMIT")?;
             Ok(())
         }

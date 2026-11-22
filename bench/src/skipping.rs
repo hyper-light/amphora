@@ -12,8 +12,17 @@
 //!   `id` times a prime modulo the rows (every leaf spans every value: zone maps' failure mode);
 //! - width `narrow`: a thousandth of the values; `wide`: a quarter (cracking hands back as many
 //!   rowids as match: its failure mode with write churn);
-//! - writes: each of `--writes` (default 0, 8, 64) updates between filters, each setting one
-//!   row's `a` to a value of the scenario's shape.
+//! - writes: each of `--writes` updates between filters, each setting one row's `a` to a value
+//!   of the scenario's shape. Lane skip-9 (T-SKU.11): the default is a write-rate ladder, 0 and
+//!   then 1, 8, 32, 128, 512, 2048, 4096 writes a filter (the brief's ladder), so the writes that
+//!   land during a dropped kind's build climb from none to many times the table's rows.
+//!
+//! Lane skip-9 (T-SKU.11): `capped` runs under each build mode for a dropped kind, as
+//! `capped:inline` (skip-7's, on the scan's path: the control), `capped:void` (skip-8's, voided by
+//! a write during it) and `capped:replay` (the writes during it applied before it installs, up to
+//! the rows the summary holds). Each line reports the summary's build counts: builds installed
+//! and voided, writes replayed, replay records that reached their bound, the largest record, and
+//! rows read for builds on a scan's path.
 //!
 //! The scenario's numbers are its definition (what is being forced), not tuned engine settings.
 //! Bounds and writes come from one seeded generator per scenario (splitmix64, Steele, Lea and Flood,
@@ -29,9 +38,9 @@
 //! client (its HTTP server against an in-process Amphora) would be experiment error (the fair
 //! comparison rule). Its comparison needs both engines behind the same server client.
 //!
-//! usage: amphora-bench --skipping [--rows N] [--filters F] [--writes 0,8,64]
-//!        [--engines off,zone_maps,cracking,measured,capped,duckdb] [--duckdb-threads N]
-//!        [--seed S] [--out FILE]
+//! usage: amphora-bench --skipping [--rows N] [--filters F] [--writes 0,1,8,32,128,512,2048,4096]
+//!        [--engines off,zone_maps,cracking,measured,capped:inline,capped:void,capped:replay,duckdb]
+//!        [--duckdb-threads N] [--seed S] [--out FILE]
 //!
 //! `--duckdb-threads` defaults to 1, the threads one Amphora statement runs on.
 
@@ -184,6 +193,8 @@ struct Tally {
     rows_read: Option<u64>,
     answers: Vec<Vec<Option<i64>>>,
     seconds: f64,
+    /// Lane skip-9 (T-SKU.11): the summary's build counts at the run's end (Amphora only).
+    builds: Option<amphora_engine::skipping::SkipCounts>,
 }
 
 fn fill_sql(shape: Shape, rows: i64, s: &mut Stream) -> Vec<String> {
@@ -239,6 +250,8 @@ fn run_amphora(
     }
     db.conn.execute("COMMIT").map_err(e)?;
     if setting != "off" {
+        // `capped:void` is the setting `capped void`.
+        let setting = setting.replace(':', " ");
         db.conn
             .execute(format!("PRAGMA skipping = 't.a {setting}'"))
             .map_err(e)?;
@@ -265,6 +278,7 @@ fn run_amphora(
         t.answers.push(answer);
     }
     t.seconds = began.elapsed().as_secs_f64();
+    t.builds = amphora_engine::skipping::skipping_counts(&db.conn, "t");
     Ok(t)
 }
 
@@ -342,18 +356,23 @@ pub fn main() -> anyhow::Result<()> {
         1u64,
         None::<std::path::PathBuf>,
     );
-    let mut writes = vec![0usize, 8, 64];
-    let mut engines: Vec<String> = [
+    let mut writes = vec![0usize, 1, 8, 32, 128, 512, 2048, 4096];
+    let known = [
         "off",
         "zone_maps",
         "cracking",
         "measured",
         "capped",
+        "capped:inline",
+        "capped:void",
+        "capped:replay",
         "duckdb",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    ];
+    let mut engines: Vec<String> = known
+        .iter()
+        .filter(|engine| **engine != "capped")
+        .map(|s| s.to_string())
+        .collect();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || {
@@ -374,16 +393,9 @@ pub fn main() -> anyhow::Result<()> {
     }
     for engine in &engines {
         anyhow::ensure!(
-            [
-                "off",
-                "zone_maps",
-                "cracking",
-                "measured",
-                "capped",
-                "duckdb"
-            ]
-            .contains(&engine.as_str()),
-            "unknown engine {engine}: off, zone_maps, cracking, measured, capped or duckdb"
+            known.contains(&engine.as_str()),
+            "unknown engine {engine}: one of {}",
+            known.join(", ")
         );
     }
     let client = serde_json::json!({
@@ -442,6 +454,14 @@ pub fn main() -> anyhow::Result<()> {
                         "write_p999_ns": pct(&t.writes, 0.999),
                         "filters_per_s": rate,
                         "rows_read": t.rows_read,
+                        "builds": t.builds.map(|c| serde_json::json!({
+                            "installed": c.builds_installed,
+                            "voided": c.builds_invalidated,
+                            "replayed_writes": c.replayed_writes,
+                            "replay_overflows": c.replay_overflows,
+                            "replay_peak": c.replay_peak,
+                            "inline_rows_read": c.inline_rows_read,
+                        })),
                         "equal": equal,
                         "client": client,
                         "platform": platform,

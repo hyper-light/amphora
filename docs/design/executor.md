@@ -842,6 +842,62 @@ every row.
 never measured again. Under steady write churn that would show as `rebuilt` staying at 0 while
 trials come due.
 
+### Three ways to build behind one switch: inline, void-on-write, replay (lane skip-9, T-SKU.11)
+
+**Decision.** How a dropped kind is built again is a per-summary switch (`BuildMode`, set by
+`PRAGMA skipping = 'table.column capped [inline|void|replay]'`):
+
+- `inline`: skip-7's build, the control. The scan that finds the trial due builds on its own path,
+  on its own connection and read, its time left out of the scan's measured cost.
+- `void`: skip-8's build above. Off the scan's path, voided by any write during it.
+- `replay`, the default: off the scan's path. From the pin on, the build records each write the
+  hook takes, and applies them to its copy in order before installing it, so it installs however
+  many writes arrive. A write that the copy refuses (it disagrees with the summary) drops the copy
+  and keeps the summary (`BuildEnd::ReplayRefused`). A rollback still makes the summary stale, and
+  the build is superseded.
+
+**Bound.** A replaying build's record holds at most as many writes as the summary held rows at the
+pin. Past that, replaying costs more than reading the table again, and the record would outweigh
+the copy it feeds, so the build drops its record and falls back to void (`replay_overflows`). That
+bound is the summary's own row count, not a picked number. So a build holds at most twice the
+copy's rows, and the claim keeps one build per summary.
+
+**Why.** Each mode has its own failure mode, and the tests force each one. Inline makes the scan
+that finds the trial due read every row of the table (`inline_rows_read`). Void is starved under
+steady writes: with a write during every build, no build installs and the dropped kind never comes
+back. Replay's cost is memory under a burst of writes, which the bound caps. Which mode leads at
+which write rate is the bench's to say (`amphora-bench --skipping`, its write-rate ladder, under
+`capped:inline`, `capped:void` and `capped:replay`). Replay is the default until that data is in.
+
+**Evidence.** `skipping::tests::builds::t_sku_11_*`:
+
+- With a write during each of eight trials, void installs none and replay installs the first. Its
+  copy holds the table and the write.
+- A burst as large as the bound replays in order: an update, a delete and inserts. One write more
+  never holds more than the bound, and falls back to void.
+- On a real table, an inline build reads all 500 rows on the scan's path, and the other two modes
+  read none there. Answers are equal across the modes.
+- The PRAGMA sets each mode and refuses one after a kind that never builds again.
+
+**Falsified by.** At some write rate on the ladder, replay costs more in filter latency or memory
+than void or inline, or a replaying build installs a copy that answers differently from a plain
+scan.
+
+### The build's own connection opens with the database's key (lane skip-9, T-SKU.12)
+
+**Decision.** The build's own connection opens the database with what the scan's connection holds
+when the build is claimed: its encryption key, or its external page codec. The key stays an
+`EncryptionKey`, held the way the scan's connection holds it. It is zeroed when dropped, its
+`Debug` is redacted, and it is moved into the build's connection. The holder (`BuildKeys`) has no
+`Debug`, and nothing logs it. The key is taken only once a build is claimed, so a scan pays nothing
+for it otherwise.
+
+**Why.** Without the key, the build's connection on an encrypted database could not read page 1.
+The build failed every time, and the dropped kind never came back.
+
+**Evidence.** `skipping::tests::builds::t_sku_12_*`: on an aes256gcm database, the build started
+from the keyed connection installs a cracker holding every row, under void and under replay.
+
 ### Fused batches (lane skip-5, T-SKU.4) that decode only the candidate run (lane skip-7, T-SKU.9)
 
 A skipping scan's Next, on a candidate row, runs the fused loop (decision 10) over the leaf's batch

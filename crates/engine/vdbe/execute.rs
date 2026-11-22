@@ -1994,7 +1994,7 @@ fn skip_walk_for(
     })?;
     let (reader_pos, committed) = conn.skipping_positions()?;
     // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
-    let started = std::time::Instant::now();
+    let mut started = std::time::Instant::now();
     let (candidates, method) = registry
         .candidates_by(
             root,
@@ -2007,10 +2007,26 @@ fn skip_walk_for(
         .ok()?;
     // Lane skip-8 (T-SKU.10): a method dropped for its upkeep whose trial is due is built again
     // off this scan's path, one build per summary at a time; this scan goes on with the leader.
+    // Lane skip-9 (T-SKU.11): or on it, under the inline control, at this scan's snapshot, the
+    // build's time left out of this scan's measured cost (skip-7's).
     if let Some((_, super::builder::CursorType::BTreeTable(table))) =
         program.cursor_ref.get(cursor_id)
     {
-        let _detached = crate::skipping::start_build(&conn.db, root, column, table.columns().len());
+        let columns = table.columns().len();
+        match registry.build_mode(root) {
+            Some(crate::skipping::BuildMode::Inline) => {
+                let building = std::time::Instant::now();
+                if crate::skipping::build_inline(conn, root, column, columns).is_some() {
+                    started = started
+                        .checked_add(building.elapsed())
+                        .unwrap_or_else(std::time::Instant::now);
+                }
+            }
+            Some(_) => {
+                let _detached = crate::skipping::start_build(conn, root, column, columns);
+            }
+            None => {}
+        }
     }
     let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
     walk.measure = method.map(|method| crate::skipping::WalkMeasure {
@@ -17321,10 +17337,11 @@ pub fn op_set_skipping(
             table,
             column,
             kind,
+            build,
         },
         insn
     );
-    crate::skipping::set_skipping(&program.connection, table, column, *kind)
+    crate::skipping::set_skipping_with(&program.connection, table, column, *kind, *build)
         .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

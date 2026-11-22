@@ -1099,4 +1099,8 @@ cut points, middle first (T-SKU.8); and a skipping scan's batches stop decoding 
 run's end (T-SKU.9). Decision record: executor.md decision 11.
 Lane skip-8: a dropped kind is built again off the scan's path, on a thread and connection of its
 own, one build per summary at a time, and not installed if a write came in during it (T-SKU.10).
-Open: the benchmark against DuckDB and ClickHouse.
+Lane skip-9: how a dropped kind is built is a per-summary switch, inline (the control), void-on-write
+or replay (the default: the writes during the build are applied before it installs, up to the
+rows the summary holds, then void) (T-SKU.11); the build's own connection opens an encrypted
+database with the scan's key (T-SKU.12). The bench runs each mode up a write-rate ladder.
+Open: the benchmark against DuckDB and ClickHouse; which build mode leads at which write rate.

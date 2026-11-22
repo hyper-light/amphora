@@ -21,6 +21,16 @@
 //! build is claimed marks the build invalidated: the copy would miss it. The builder hands the
 //! claim back with what it built or with nothing, and only a build no write invalidated is
 //! installed ([`BuildEnd`]). Nothing waits on a clock: the write is the event that voids a build.
+//!
+//! Lane skip-9 (T-SKU.11): three ways to build behind one switch ([`BuildMode`]), per summary.
+//! [`BuildMode::Inline`] is skip-7's: the scan that finds the trial due builds on its own path, at
+//! its own snapshot (the control). [`BuildMode::VoidOnWrite`] is skip-8's above: under steady
+//! writes every build is voided, so the dropped method never comes back. [`BuildMode::Replay`]:
+//! the build records each write the hook takes after its pin and applies them, in order, to its
+//! copy before installing it, so it installs however many writes arrive. Its record is bounded by
+//! the rows the summary holds at the pin: past that, replaying costs more than reading the table
+//! again and the record outweighs the copy it feeds, so the build drops its record and falls back
+//! to void ([`SkipCounts::replay_overflows`]).
 
 use super::{Candidates, CrackerColumn, RowWrite, SkipError, SkipMethod, Skipping};
 use crate::sync::Mutex;
@@ -58,6 +68,34 @@ pub struct SkipCounts {
     pub refused_older: u64,
     /// Scans refused because the summary was stale.
     pub refused_stale: u64,
+    /// Lane skip-9 (T-SKU.11): builds of a dropped method installed.
+    pub builds_installed: u64,
+    /// Lane skip-9: builds voided by a write that came in during them.
+    pub builds_invalidated: u64,
+    /// Lane skip-9: writes a replaying build applied to its copy before installing it.
+    pub replayed_writes: u64,
+    /// Lane skip-9: replaying builds whose record reached its bound and fell back to void.
+    pub replay_overflows: u64,
+    /// Lane skip-9: the most writes one replaying build's record held at once.
+    pub replay_peak: u64,
+    /// Lane skip-9: rows inline builds read on a scan's own path (the inline control's cost to
+    /// the scan that finds the trial due).
+    pub inline_rows_read: u64,
+}
+
+/// Lane skip-9 (T-SKU.11): how a summary's dropped method is built again (see the module's
+/// comment).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BuildMode {
+    /// Lane skip-7's: on the scan's own path, at its snapshot; its time is left out of the scan's
+    /// measured cost. The control.
+    Inline,
+    /// Lane skip-8's: off the scan's path; a write during the build voids it.
+    VoidOnWrite,
+    /// Off the scan's path; the writes during the build are applied to its copy before it is
+    /// installed, up to the bound, past which it falls back to void.
+    #[default]
+    Replay,
 }
 
 #[derive(Debug)]
@@ -72,6 +110,30 @@ struct Building {
     ticket: u64,
     /// A write came in since the build's snapshot: what it reads would miss the write.
     invalidated: bool,
+    /// Lane skip-9 (T-SKU.11): under [`BuildMode::Replay`], from the pin on, the writes the
+    /// hook took since, to apply to the copy; `None` before the pin, in the other modes, and
+    /// once the record reached `bound` (the build is then void).
+    record: Option<Vec<RowWrite>>,
+    /// The rows the summary held at the pin: the most writes `record` holds.
+    bound: u64,
+}
+
+impl Building {
+    /// A write the hook took during the build: recorded when replaying within the bound,
+    /// otherwise the build is void. `true`: the record just reached its bound.
+    fn take_write(&mut self, write: RowWrite) -> bool {
+        let Some(record) = self.record.as_mut() else {
+            self.invalidated = true;
+            return false;
+        };
+        if u64::try_from(record.len()).is_ok_and(|held| held < self.bound) {
+            record.push(write);
+            return false;
+        }
+        self.record = None;
+        self.invalidated = true;
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -83,6 +145,8 @@ struct Entry {
     stale: bool,
     counts: SkipCounts,
     building: Option<Building>,
+    /// Lane skip-9 (T-SKU.11): how the summary's dropped method is built again.
+    build_mode: BuildMode,
 }
 
 /// Lane skip-8 (T-SKU.10): the claim to build a summary's dropped `method` again, held by one
@@ -113,6 +177,9 @@ pub enum BuildEnd {
     OlderSnapshot,
     /// The builder couldn't read the table (its error is logged): nothing installed.
     Failed,
+    /// Lane skip-9 (T-SKU.11): the copy refused a write the build recorded (it disagrees with
+    /// the summary): nothing installed, the summary kept.
+    ReplayRefused,
 }
 
 /// The summaries one database keeps, by table root page.
@@ -129,6 +196,17 @@ impl SkipRegistry {
     /// `root_page`, replacing any summary it had; `Skipping::Off` drops it. The caller built it at
     /// the newest commit with no writer open (it held the write lock).
     pub fn set(&self, root_page: i64, column: usize, skipping: Skipping) {
+        self.set_with_build(root_page, column, skipping, BuildMode::default());
+    }
+
+    /// Lane skip-9 (T-SKU.11): [`SkipRegistry::set`], its dropped method built again by `build`.
+    pub fn set_with_build(
+        &self,
+        root_page: i64,
+        column: usize,
+        skipping: Skipping,
+        build: BuildMode,
+    ) {
         let mut entries = self.entries.lock();
         entries.retain(|entry| entry.root_page != root_page);
         if !matches!(skipping, Skipping::Off) {
@@ -140,6 +218,7 @@ impl SkipRegistry {
                 stale: false,
                 counts: SkipCounts::default(),
                 building: None,
+                build_mode: build,
             });
         }
     }
@@ -187,9 +266,17 @@ impl SkipRegistry {
             base: committed,
         });
         entry.counts.writes = entry.counts.writes.saturating_add(1);
-        // Lane skip-8 (T-SKU.10): the write is the event that voids a build under way.
+        // Lane skip-8 (T-SKU.10): the write is the event that voids a build under way; lane
+        // skip-9 (T-SKU.11): a replaying build records it instead, within its bound.
         if let Some(building) = entry.building.as_mut() {
-            building.invalidated = true;
+            let overflowed = building.take_write(write);
+            if overflowed {
+                entry.counts.replay_overflows = entry.counts.replay_overflows.saturating_add(1);
+                tracing::debug!(target: "amphora.skipping", root = root_page, bound = building.bound, "skipping build's replay record reached its bound (the rows the summary held); the build falls back to void");
+            } else if let Some(record) = building.record.as_ref() {
+                let held = u64::try_from(record.len()).unwrap_or(u64::MAX);
+                entry.counts.replay_peak = entry.counts.replay_peak.max(held);
+            }
         }
         if entry.stale {
             return;
@@ -329,6 +416,8 @@ impl SkipRegistry {
         entry.building = Some(Building {
             ticket,
             invalidated: false,
+            record: None,
+            bound: 0,
         });
         Some(BuildClaim {
             root_page,
@@ -373,18 +462,32 @@ impl SkipRegistry {
         if builder_pos != committed {
             return false;
         }
+        let replay = entry.build_mode == BuildMode::Replay;
+        let bound = held_rows(&entry.skipping);
         if let Some(building) = entry.building.as_mut() {
             building.invalidated = false;
+            building.record = replay.then(Vec::new);
+            building.bound = bound;
         }
         true
     }
 
-    /// Takes `claim`'s build off its entry: the entry, and whether a write invalidated the build,
-    /// when the claim is still the one under way and the summary isn't stale.
+    /// Lane skip-9 (T-SKU.11): how the table at `root_page`'s dropped method is built again, if
+    /// a summary is kept.
+    pub fn build_mode(&self, root_page: i64) -> Option<BuildMode> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|entry| entry.root_page == root_page)
+            .map(|entry| entry.build_mode)
+    }
+
+    /// Takes `claim`'s build off its entry: the entry and the build, when the claim is still the
+    /// one under way and the summary isn't stale.
     fn end_build<'a>(
         entries: &'a mut [Entry],
         claim: &BuildClaim,
-    ) -> Result<(&'a mut Entry, bool), BuildEnd> {
+    ) -> Result<(&'a mut Entry, Building), BuildEnd> {
         let entry = entries
             .iter_mut()
             .find(|entry| entry.root_page == claim.root_page)
@@ -394,7 +497,7 @@ impl SkipRegistry {
                 if entry.stale {
                     Err(BuildEnd::Superseded)
                 } else {
-                    Ok((entry, building.invalidated))
+                    Ok((entry, building))
                 }
             }
             other => {
@@ -426,6 +529,7 @@ impl SkipRegistry {
                     entry.stale = true;
                     return BuildEnd::Refused;
                 }
+                entry.counts.builds_installed = entry.counts.builds_installed.saturating_add(1);
                 BuildEnd::Installed
             }
             _ => BuildEnd::Superseded,
@@ -435,29 +539,60 @@ impl SkipRegistry {
     /// Installs the cracker `claim`'s builder read from the table at its pinned snapshot, its read
     /// costing `cost`; not when a write came in since the pin ([`BuildEnd::Invalidated`]), as the
     /// copy would miss it. Lane skip-7 (T-SKU.8): it is cut at the dropped cracker's cut points as
-    /// it is installed, timed by `now`; a cut it refuses makes the summary stale.
+    /// it is installed, timed by `now`; a cut it refuses makes the summary stale. Lane skip-9
+    /// (T-SKU.11): a replaying build's recorded writes are applied to the copy first, in the order
+    /// the hook took them, their time added to the build's cost.
     pub fn install_cracker(
         &self,
         claim: BuildClaim,
-        cracker: CrackerColumn,
+        mut cracker: CrackerColumn,
         cost: u64,
         now: &mut dyn FnMut() -> u64,
     ) -> BuildEnd {
         let mut entries = self.entries.lock();
-        let entry = match Self::end_build(&mut entries, &claim) {
-            Ok((_, true)) => return BuildEnd::Invalidated,
-            Ok((entry, false)) => entry,
+        let (entry, building) = match Self::end_build(&mut entries, &claim) {
+            Ok(ended) => ended,
             Err(end) => return end,
         };
-        match &mut entry.skipping {
-            Skipping::Measured(chooser) if claim.method == SkipMethod::Cracking => {
-                if chooser.install_cracker(cracker, cost, now).is_err() {
-                    entry.stale = true;
-                    return BuildEnd::Refused;
-                }
-                BuildEnd::Installed
+        if building.invalidated {
+            entry.counts.builds_invalidated = entry.counts.builds_invalidated.saturating_add(1);
+            return BuildEnd::Invalidated;
+        }
+        let Skipping::Measured(chooser) = &mut entry.skipping else {
+            return BuildEnd::Superseded;
+        };
+        if claim.method != SkipMethod::Cracking {
+            return BuildEnd::Superseded;
+        }
+        let replay_started = now();
+        let record = building.record.unwrap_or_default();
+        let replayed = u64::try_from(record.len()).unwrap_or(u64::MAX);
+        for write in record {
+            if let Err(error) = cracker.on_write(write) {
+                // The copy disagrees with a write the summary took: the copy is dropped, the
+                // summary (which took the write) is kept.
+                tracing::debug!(target: "amphora.skipping", root = claim.root_page, %error, "skipping build's copy refused a recorded write; nothing installed");
+                return BuildEnd::ReplayRefused;
             }
-            _ => BuildEnd::Superseded,
+        }
+        let cost = cost.saturating_add(now().saturating_sub(replay_started));
+        if chooser.install_cracker(cracker, cost, now).is_err() {
+            entry.stale = true;
+            return BuildEnd::Refused;
+        }
+        entry.counts.builds_installed = entry.counts.builds_installed.saturating_add(1);
+        entry.counts.replayed_writes = entry.counts.replayed_writes.saturating_add(replayed);
+        BuildEnd::Installed
+    }
+
+    /// Lane skip-9 (T-SKU.11): an inline build read `rows` rows on a scan's path.
+    pub fn count_inline_read(&self, root_page: i64, rows: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.root_page == root_page)
+        {
+            entry.counts.inline_rows_read = entry.counts.inline_rows_read.saturating_add(rows);
         }
     }
 
@@ -485,5 +620,19 @@ impl SkipRegistry {
             .iter()
             .find(|entry| entry.root_page == root_page)
             .map(|entry| f(&entry.skipping))
+    }
+}
+
+/// Lane skip-9 (T-SKU.11): the rows a summary holds, by the method it keeps (a replaying build's
+/// bound). Zero when it holds none or can't say (a count past its type): such a build replays
+/// nothing and falls back to void at its first write.
+fn held_rows(skipping: &Skipping) -> u64 {
+    let Skipping::Measured(chooser) = skipping else {
+        return 0;
+    };
+    match (chooser.zone_map(), chooser.cracker()) {
+        (Some(zones), _) => zones.rows().unwrap_or(0),
+        (None, Some(cracker)) => cracker.row_count(),
+        (None, None) => 0,
     }
 }
