@@ -6,7 +6,7 @@
 
 use amphora_engine::{
     ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, Numeric, OpenOptions, PlatformIO,
-    SqliteDialect, Value,
+    SqliteDialect, Statement, Value,
 };
 use std::sync::Arc;
 
@@ -143,6 +143,9 @@ fn t_qt_5_1_every_join_run_both_ways_gives_one_answer() {
             JoinMethods::NestedLoopsOnly,
             JoinMethods::HashJoinsOnly,
             JoinMethods::ByCost,
+            // QT.5 step 4 (lane qs5-21): sort-merge joins, always and by cost.
+            JoinMethods::MergeJoinsOnly,
+            JoinMethods::ByCostWithMerge,
         ] {
             conn.set_join_methods(methods);
             answers.push((methods, plan(&conn, sql), rows(&conn, sql)));
@@ -269,6 +272,8 @@ fn pl_5_star_join_filters_fire_and_answers_hold() {
             JoinMethods::HashJoinsOnly,
             JoinMethods::NestedLoopsOnly,
             JoinMethods::ByCost,
+            JoinMethods::MergeJoinsOnly,
+            JoinMethods::ByCostWithMerge,
         ] {
             conn.set_join_methods(methods);
             assert_eq!(rows(&conn, &sql), want, "{methods:?}: {sql}");
@@ -285,7 +290,385 @@ fn pl_5_star_join_filters_fire_and_answers_hold() {
                 }
                 JoinMethods::HashJoinsOnly => {}
                 JoinMethods::NestedLoopsOnly => assert_eq!(filters, 0, "{}", plan(&conn, &sql)),
-                JoinMethods::ByCost => {}
+                // A merge keeps the hash join's filters (lane qs5-21).
+                JoinMethods::MergeJoinsOnly if !star && d1_cat == 3 => {
+                    assert!(filters > 0, "no filter: {}", plan(&conn, &sql))
+                }
+                JoinMethods::ByCost
+                | JoinMethods::MergeJoinsOnly
+                | JoinMethods::ByCostWithMerge => {}
+            }
+        }
+    }
+}
+
+/// A join key of each kind an equality compares across: what a merge's order must agree with.
+#[derive(Debug, Clone, Copy)]
+enum Key {
+    Int(i64),
+    Real(f64),
+    Text(&'static str),
+    Null,
+}
+
+impl Key {
+    fn sql(self) -> String {
+        match self {
+            Key::Int(v) => v.to_string(),
+            Key::Real(v) => format!("{v:?}"),
+            Key::Text(v) => format!("'{v}'"),
+            Key::Null => "NULL".to_string(),
+        }
+    }
+
+    /// `=` over columns of no affinity: numbers equal by exact value, whatever their storage
+    /// class; text by its bytes; a number never equals text; NULL equals nothing.
+    fn equals(self, other: Key) -> bool {
+        let int_real = |i: i64, r: f64| {
+            r.fract() == 0.0
+                && (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&r)
+                && r as i64 == i
+        };
+        match (self, other) {
+            (Key::Int(a), Key::Int(b)) => a == b,
+            (Key::Real(a), Key::Real(b)) => a == b,
+            (Key::Int(i), Key::Real(r)) | (Key::Real(r), Key::Int(i)) => int_real(i, r),
+            (Key::Text(a), Key::Text(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// QT.5 step 4 (lane qs5-20, T-QT.5.15): the inputs a merge join gets wrong first, run under every
+/// join method. Do: join two tables, inner, left, semi and anti, where both are empty, one is,
+/// every key is NULL, one key repeats forty times on both sides, keys of every storage class meet
+/// (1, 1.0 and '1'; the largest integer and 2^63 as a real; the smallest integer), and the two
+/// sides' keys meet only at their ends. Expect: one answer under every method, the inner and left
+/// joins equal to the model computed here; hash joins only plans a hash join where both sides have
+/// rows, and merge joins only a merge join (lane qs5-21, T-QT.5.18: the sort-merge join's switch
+/// values are in `METHODS`).
+#[test]
+fn qt_5_15_equi_joins_over_empty_null_repeated_and_mixed_keys_give_one_answer() {
+    const METHODS: [JoinMethods; 5] = [
+        JoinMethods::NestedLoopsOnly,
+        JoinMethods::HashJoinsOnly,
+        JoinMethods::ByCost,
+        JoinMethods::MergeJoinsOnly,
+        JoinMethods::ByCostWithMerge,
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.path().join("edges.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE l (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE INDEX r_k ON r (k)").unwrap();
+
+    let repeated: Vec<Key> = (0..40)
+        .map(|_| Key::Int(1))
+        .chain((0..5).map(|_| Key::Null))
+        .collect();
+    let mixed = vec![
+        Key::Int(1),
+        Key::Real(1.0),
+        Key::Text("1"),
+        Key::Real(2.5),
+        Key::Real(2.5),
+        Key::Int(i64::MAX),
+        Key::Real(9.223_372_036_854_776e18),
+        Key::Int(i64::MIN),
+        Key::Text(""),
+        Key::Null,
+    ];
+    let low: Vec<Key> = (0..20).map(Key::Int).collect();
+    let high: Vec<Key> = (19..40).map(Key::Int).collect();
+    let cases: Vec<(&str, Vec<Key>, Vec<Key>)> = vec![
+        ("both empty", vec![], vec![]),
+        ("left empty", vec![], low.clone()),
+        ("right empty", low.clone(), vec![]),
+        ("all NULL", vec![Key::Null; 8], vec![Key::Null; 8]),
+        ("one key repeated on both sides", repeated.clone(), repeated),
+        ("every storage class", mixed.clone(), mixed),
+        ("keys meet at the ends", low, high),
+    ];
+    let queries = [
+        "SELECT l.id, r.id FROM l JOIN r ON r.k = l.k",
+        "SELECT l.id, r.id FROM l LEFT JOIN r ON r.k = l.k",
+        "SELECT l.id FROM l WHERE EXISTS (SELECT 1 FROM r WHERE r.k = l.k)",
+        "SELECT l.id FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k)",
+    ];
+    let int = |v: i64| Value::Numeric(Numeric::Integer(v));
+
+    let mut wrong = Vec::new();
+    for (name, left_keys, right_keys) in &cases {
+        conn.execute("DELETE FROM l").unwrap();
+        conn.execute("DELETE FROM r").unwrap();
+        for (id, k) in (1_i64..).zip(left_keys) {
+            conn.execute(format!("INSERT INTO l VALUES ({id}, {})", k.sql()))
+                .unwrap();
+        }
+        for (id, k) in (1_i64..).zip(right_keys) {
+            conn.execute(format!("INSERT INTO r VALUES ({id}, {})", k.sql()))
+                .unwrap();
+        }
+        conn.execute("ANALYZE").unwrap();
+
+        // The model: the inner and left joins from the keys themselves.
+        let mut want_inner = Vec::new();
+        let mut want_left = Vec::new();
+        for (lid, lk) in (1_i64..).zip(left_keys) {
+            let matches: Vec<i64> = (1_i64..)
+                .zip(right_keys)
+                .filter(|(_, rk)| lk.equals(**rk))
+                .map(|(rid, _)| rid)
+                .collect();
+            for &rid in &matches {
+                want_inner.push(format!("{:?}", vec![int(lid), int(rid)]));
+                want_left.push(format!("{:?}", vec![int(lid), int(rid)]));
+            }
+            if matches.is_empty() {
+                want_left.push(format!("{:?}", vec![int(lid), Value::Null]));
+            }
+        }
+        want_inner.sort();
+        want_left.sort();
+
+        for (q, sql) in queries.iter().enumerate() {
+            let mut answers = Vec::new();
+            for methods in METHODS {
+                conn.set_join_methods(methods);
+                answers.push((methods, plan(&conn, sql), rows(&conn, sql)));
+            }
+            let (_, _, first) = &answers[0];
+            for (methods, plan, got) in &answers[1..] {
+                if got != first {
+                    wrong.push(format!(
+                        "{name}: {sql}\n  {methods:?} ({plan}) gives {} rows, nested loops {}",
+                        got.len(),
+                        first.len()
+                    ));
+                }
+            }
+            let model = match q {
+                0 => Some(&want_inner),
+                1 => Some(&want_left),
+                _ => None,
+            };
+            if let Some(model) = model {
+                if first != model {
+                    wrong.push(format!(
+                        "{name}: {sql}\n  gives {} rows, the model {}",
+                        first.len(),
+                        model.len()
+                    ));
+                }
+            }
+        }
+
+        // Non-vacuity: where both sides have rows, the switch plans a hash join.
+        if !left_keys.is_empty() && !right_keys.is_empty() {
+            conn.set_join_methods(JoinMethods::HashJoinsOnly);
+            let hashed = plan(&conn, queries[0]);
+            if !hashed.contains("HASH JOIN") {
+                wrong.push(format!("{name}: hash joins only plans {hashed}"));
+            }
+            conn.set_join_methods(JoinMethods::MergeJoinsOnly);
+            let merged = plan(&conn, queries[0]);
+            if !merged.contains("MERGE JOIN") {
+                wrong.push(format!("{name}: merge joins only plans {merged}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+fn open_conn(dir: &tempfile::TempDir, name: &str) -> (Arc<Database>, Arc<Connection>) {
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.path().join(name).to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    (db, conn)
+}
+
+/// The merge's counters for one run of `stmt`: its rows (sorted), build rows passed by merging,
+/// probe rows found by search, merge tables probed by hash, and the bytes spilled.
+fn merge_counted(stmt: &mut Statement) -> (Vec<String>, [u64; 4]) {
+    stmt.reset_metrics();
+    let mut out: Vec<String> = stmt
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    out.sort();
+    let m = stmt.metrics().hash_join;
+    stmt.reset().unwrap();
+    (
+        out,
+        [
+            m.merge_steps,
+            m.merge_searches,
+            m.merge_tables_hashed,
+            m.spill_bytes_written,
+        ],
+    )
+}
+
+/// `a` with each key of 1..=`keys` twice and `b` with each once, in rowid order as `ordered`
+/// says: ascending, or scattered by a multiplicative permutation (a key's rows apart).
+fn fill_pair(conn: &Arc<Connection>, keys: i64, ordered: bool) {
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, y)")
+        .unwrap();
+    // 2654435761, Knuth's multiplicative hashing constant, is prime, so i * m mod keys is a
+    // permutation of 0..keys for every size here.
+    let key = |i: i64| {
+        if ordered {
+            i + 1
+        } else {
+            1 + (i * 2_654_435_761 % keys).rem_euclid(keys)
+        }
+    };
+    conn.execute("BEGIN").unwrap();
+    for i in 0..2 * keys {
+        conn.execute(format!("INSERT INTO a VALUES ({}, {})", i + 1, key(i / 2)))
+            .unwrap();
+    }
+    for i in 0..keys {
+        conn.execute(format!(
+            "INSERT INTO b VALUES ({}, {}, {})",
+            i + 1,
+            key(i),
+            i % 7
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("ANALYZE").unwrap();
+}
+
+/// QT.5 step 4 (lane qs5-21, T-QT.5.18): a merge join merges. Do: join two tables read in key
+/// order (each key twice on one side, once on the other) under merge joins only and hash joins
+/// only. Expect: one answer; the merge plans a MERGE JOIN, passes build rows forward and never
+/// searches (both sides come in key order), and the hash join counts no merge step.
+#[test]
+fn qt_5_18_a_merge_join_over_ordered_inputs_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_db, conn) = open_conn(&dir, "merge.db");
+    fill_pair(&conn, 200, true);
+    let sql = "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k";
+    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+    let hash_plan = plan(&conn, sql);
+    let (hashed, [hash_steps, ..]) = merge_counted(&mut conn.prepare(sql).unwrap());
+    conn.set_join_methods(JoinMethods::MergeJoinsOnly);
+    let merge_plan = plan(&conn, sql);
+    let (merged, [merge_steps, merge_searches, merge_hashed, _]) =
+        merge_counted(&mut conn.prepare(sql).unwrap());
+    assert_eq!(merged, hashed, "{merge_plan} against {hash_plan}");
+    assert_eq!(merged.len(), 400);
+    assert!(merge_plan.contains("MERGE JOIN"), "{merge_plan}");
+    assert_eq!(hash_steps, 0, "{hash_plan}");
+    assert!(merge_steps > 0, "{merge_plan}");
+    assert_eq!(merge_searches, 0, "both read in key order: {merge_plan}");
+    assert_eq!(merge_hashed, 0, "{merge_plan}");
+}
+
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    let Some(last) = sorted.len().checked_sub(1) else {
+        return 0;
+    };
+    sorted[((last as f64 * p).round() as usize).min(last)]
+}
+
+fn env_list(name: &str, default: &[usize]) -> Vec<usize> {
+    std::env::var(name).map_or_else(
+        |_| default.to_vec(),
+        |text| text.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+    )
+}
+
+/// The coordinator's merge-versus-hash measurement (T-QT.5.18), one line a scenario, method and
+/// rung: inputs in key order, inputs scattered, and both under memory pressure (a 100-page cache,
+/// so the statement's memory is small and a large build spills), at `AMPHORA_QT518_ROWS` keys
+/// (default 10,000 and 1,000,000) over the concurrency ladder (`AMPHORA_QT518_LADDER`, default 1 to
+/// 4096), each client its own connection and thread, all starting together, running the join
+/// `AMPHORA_QT518_RUNS` times (default 5). Both methods run in this one driver on one machine.
+/// Tiny instance: `AMPHORA_QT518_ROWS=2000 AMPHORA_QT518_LADDER=1,8 AMPHORA_QT518_RUNS=2`.
+#[test]
+#[ignore = "the coordinator's harness: run with --ignored --nocapture"]
+fn qt_5_18_merge_versus_hash_harness() {
+    let sizes = env_list("AMPHORA_QT518_ROWS", &[10_000, 1_000_000]);
+    let ladder = env_list("AMPHORA_QT518_LADDER", &[1, 8, 32, 128, 512, 2048, 4096]);
+    let runs = env_list("AMPHORA_QT518_RUNS", &[5])[0];
+    let sql = "SELECT count(*), sum(b.y) FROM a JOIN b ON b.k = a.k";
+    for &keys in &sizes {
+        for (scenario, ordered, pressure) in [
+            ("ordered", true, false),
+            ("scattered", false, false),
+            ("ordered_pressure", true, true),
+            ("scattered_pressure", false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, conn) = open_conn(&dir, "harness.db");
+            fill_pair(&conn, i64::try_from(keys).unwrap(), ordered);
+            for methods in [JoinMethods::HashJoinsOnly, JoinMethods::MergeJoinsOnly] {
+                conn.set_join_methods(methods);
+                let shown = plan(&conn, sql);
+                for &clients in &ladder {
+                    let start = Arc::new(std::sync::Barrier::new(clients));
+                    let handles: Vec<_> = (0..clients)
+                        .map(|_| {
+                            let (db, start) = (db.clone(), start.clone());
+                            std::thread::spawn(move || {
+                                let conn = db.connect(ConnectOpts::new()).unwrap();
+                                conn.set_join_methods(methods);
+                                if pressure {
+                                    conn.execute("PRAGMA cache_size = 100").unwrap();
+                                }
+                                let mut stmt = conn.prepare(sql).unwrap();
+                                start.wait();
+                                let mut nanos = Vec::with_capacity(runs);
+                                let mut counts = [0_u64; 4];
+                                for _ in 0..runs {
+                                    let began = std::time::Instant::now();
+                                    let (_, c) = merge_counted(&mut stmt);
+                                    nanos.push(
+                                        u64::try_from(began.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                    for (sum, one) in counts.iter_mut().zip(c) {
+                                        *sum += one;
+                                    }
+                                }
+                                (nanos, counts)
+                            })
+                        })
+                        .collect();
+                    let mut nanos = Vec::new();
+                    let mut counts = [0_u64; 4];
+                    for handle in handles {
+                        let (n, c) = handle.join().unwrap();
+                        nanos.extend(n);
+                        for (sum, one) in counts.iter_mut().zip(c) {
+                            *sum += one;
+                        }
+                    }
+                    nanos.sort_unstable();
+                    println!(
+                        "qt5-18 scenario={scenario} keys={keys} method={methods:?} clients={clients} runs={runs} plan=\"{shown}\" merge_steps={} merge_searches={} merge_tables_hashed={} spill_bytes={} run_ns_p50={} p99={} p999={}",
+                        counts[0],
+                        counts[1],
+                        counts[2],
+                        counts[3],
+                        percentile(&nanos, 0.5),
+                        percentile(&nanos, 0.99),
+                        percentile(&nanos, 0.999),
+                    );
+                }
             }
         }
     }

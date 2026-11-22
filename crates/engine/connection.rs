@@ -219,6 +219,20 @@ pub enum JoinMethods {
     NestedLoopsOnly = 1,
     /// A hash join wherever the join can take one.
     HashJoinsOnly = 2,
+    /// Amphora (QT.5 step 4, lane qs5-21, T-QT.5.18): a sort-merge join wherever the join can take
+    /// a hash join (`HashJoinMethod::Merge`), for the tests that run every join every way.
+    MergeJoinsOnly = 3,
+    /// As `ByCost`, with a sort-merge join chosen where its cost (`estimate_merge_join_cost`) is
+    /// below the hash join's. Off (`ByCost`) by default until the merge-versus-hash measurement
+    /// says otherwise, so no plan changes.
+    ByCostWithMerge = 4,
+}
+
+impl JoinMethods {
+    /// Whether every join that can take a hash join takes one (as a hash or as a merge).
+    pub fn hash_shaped_only(self) -> bool {
+        matches!(self, Self::HashJoinsOnly | Self::MergeJoinsOnly)
+    }
 }
 
 /// Amphora (PL.8, decision 19): the rule that sizes the join search's budget, the number of
@@ -248,6 +262,39 @@ pub enum StarFilters {
     Off = 1,
     /// Every filter that is safe, whatever it costs.
     Always = 2,
+}
+
+/// Amphora (QT.5, T-QT.5.11): the order a star join's fact row checks its filters in
+/// (`Connection::set_star_filter_order`, `vdbe/star_order.rs`). Behind this switch so the two can
+/// be measured against each other (the coordinator's A/B, `tests/star_filters.rs`).
+#[derive(Debug, Default, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum StarFilterOrder {
+    /// The planner's: the filter it estimates passes the fewest rows first. The control.
+    #[default]
+    Planned = 0,
+    /// As the run measures them: the filter that has passed the smallest share of its rows first,
+    /// moved as each row's checks are counted, every row the run has seen weighing alike.
+    Measured = 1,
+    /// As `Measured`, with each filter's counts fading to the rows that tell its share from its
+    /// nearest neighbour's (lane qs5-19, `vdbe/star_order.rs`), so the order follows rows that
+    /// change as the run goes.
+    MeasuredFading = 2,
+}
+
+/// Amphora (QT.5, lane qs5-18): the row estimate of `col IS v` where planning doesn't know whether
+/// `v` is NULL: a parameter of a generic plan, or another table's column. Behind this switch so the
+/// two can be measured against each other (the coordinator's A/B, `tests/is_value_estimate.rs`).
+/// A NULL value (the literal, or a parameter a custom plan binds to NULL) always takes the
+/// `IS NULL` estimate, and a known non-NULL one the `=` estimate.
+#[derive(Debug, Default, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum IsValueEstimate {
+    /// The `=` estimate, as SQLite's `whereLoopAddBtreeIndex` gives every `IS` but `IS NULL`.
+    #[default]
+    Equality = 0,
+    /// The worst case over the value's possible values: the larger of the `=` and the `IS NULL`
+    /// estimates. The control: before it, every NULL-matching `IS` took the `IS NULL` estimate,
+    /// which this equals wherever that one is the larger.
+    WorstCase = 1,
 }
 
 /// Test-only control over correlated-subquery rewrites.
@@ -550,6 +597,10 @@ pub struct Connection {
     pub(super) join_search_budget: AtomicJoinSearchBudget,
     /// Amphora: see [`Connection::set_star_filters`].
     pub(super) star_filters: AtomicStarFilters,
+    /// Amphora: see [`Connection::set_is_value_estimate`].
+    pub(super) is_value_estimate: AtomicIsValueEstimate,
+    /// Amphora: see [`Connection::set_star_filter_order`].
+    pub(super) star_filter_order: AtomicStarFilterOrder,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
     /// Amphora: see [`Connection::set_adaptive_joins`].
@@ -1048,6 +1099,28 @@ impl Connection {
 
     pub(crate) fn star_filters(&self) -> StarFilters {
         self.star_filters.get()
+    }
+
+    /// Amphora (QT.5, lane qs5-18): chooses how newly prepared statements estimate the rows of an
+    /// `IS` whose value planning doesn't know (`IsValueEstimate`).
+    pub fn set_is_value_estimate(&self, rule: IsValueEstimate) {
+        self.is_value_estimate.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn is_value_estimate(&self) -> IsValueEstimate {
+        self.is_value_estimate.get()
+    }
+
+    /// Amphora (QT.5, T-QT.5.11): chooses the order newly prepared statements' star joins check
+    /// their filters in (`StarFilterOrder`).
+    pub fn set_star_filter_order(&self, order: StarFilterOrder) {
+        self.star_filter_order.set(order);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn star_filter_order(&self) -> StarFilterOrder {
+        self.star_filter_order.get()
     }
 
     /// Amphora (PL.8): chooses the rule that sizes the join search for newly prepared statements.

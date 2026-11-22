@@ -259,6 +259,15 @@ impl PlanValues {
             .filter(|value| !matches!(value, Value::Null))
     }
 
+    /// Amphora (QT.5, lane qs5-18): whether `variable` is bound to NULL (or left unbound, which
+    /// runs as NULL); `None` with no value bound to it, the generic plan's.
+    pub(crate) fn is_null(&self, variable: &ast::Variable) -> Option<bool> {
+        let index = usize::try_from(variable.index.get()).ok()?.checked_sub(1)?;
+        self.bound
+            .get(index)
+            .map(|value| matches!(value, Value::Null))
+    }
+
     /// Notes that an estimate would take a parameter's value, had it one.
     pub(crate) fn note_asked(&self) {
         self.asked.store(true, Ordering::Relaxed);

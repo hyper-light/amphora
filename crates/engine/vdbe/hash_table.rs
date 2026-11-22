@@ -168,6 +168,30 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     }
 }
 
+/// Amphora (QT.5 step 4, lane qs5-21): the order a sort-merge join's table sorts its keys in:
+/// SQLite's (NULL first, then numbers by value, text by the key's collation, blobs by their
+/// bytes), so the keys `keys_equal` calls equal sit together in one run.
+fn merge_keys_cmp<'a>(
+    a: impl Iterator<Item = ValueRef<'a>>,
+    b: impl Iterator<Item = ValueRef<'a>>,
+    collations: &[CollationSeq],
+) -> Ordering {
+    for (idx, (x, y)) in a.zip(b).enumerate() {
+        let order = match (x, y) {
+            (ValueRef::Text(l), ValueRef::Text(r)) => collations
+                .get(idx)
+                .copied()
+                .unwrap_or(CollationSeq::Binary)
+                .compare_strings(l.as_str(), r.as_str()),
+            (x, y) => x.cmp(&y),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    Ordering::Equal
+}
+
 /// DISTINCT equality: NULLs compare equal to NULL.
 fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     match (v1, v2) {
@@ -1011,6 +1035,17 @@ pub struct HashTable {
     probe_spill_state: Option<ProbeSpillState>,
     /// Grace processing state machine.
     grace_state: Option<GraceState>,
+    /// Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's table (`set_merge`).
+    merge: bool,
+    /// A merge's order: the entries' (bucket, entry) positions sorted by key once the build is
+    /// done. Empty when the table isn't a merge's, or spilled or past its budget (then probed by
+    /// hash).
+    merge_order: Vec<(usize, usize)>,
+    /// Where the last probe's run starts in `merge_order`: a probe key at or past the last merges
+    /// forward from here, and a repeated key replays its run.
+    merge_run: usize,
+    /// The position in `merge_order` that `next_match` tests next.
+    merge_next: usize,
 }
 
 crate::assert::assert_send!(HashTable);
@@ -1103,7 +1138,136 @@ impl HashTable {
             partition_count_override: config.partition_count,
             probe_spill_state: None,
             grace_state: None,
+            merge: false,
+            merge_order: vec![],
+            merge_run: 0,
+            merge_next: 0,
         })
+    }
+
+    /// Amphora (QT.5 step 4, lane qs5-21): makes this a sort-merge join's table
+    /// (`HashJoinMethod::Merge`). Its rows are put in by hash as any table's, so a spill, the
+    /// matched bits and the unmatched-row scan stay the hash table's; once the build is done
+    /// (`finalize_build`) the rows are sorted by key, and `probe` and `next_match` find a probe
+    /// row's matches by merging forward from the previous probe row's run. A table that spilled,
+    /// or whose order would pass its budget, is probed by hash instead, counted in
+    /// `HashJoinMetrics::merge_tables_hashed`.
+    pub fn set_merge(&mut self, merge: bool) {
+        self.merge = merge;
+    }
+
+    /// Sorts the entries' positions by key into `merge_order`, within the table's budget: false,
+    /// and nothing held, when the positions would pass it.
+    fn build_merge_order(&mut self) -> Result<bool> {
+        let bytes = self
+            .num_entries
+            .saturating_mul(std::mem::size_of::<(usize, usize)>());
+        if self.mem_used.saturating_add(bytes) > self.mem_budget {
+            return Ok(false);
+        }
+        let mut order: Vec<(usize, usize)> = vec![];
+        for (bucket_idx, bucket) in self.buckets.iter().enumerate() {
+            for entry_idx in 0..bucket.entries.len() {
+                order.try_push((bucket_idx, entry_idx))?;
+            }
+        }
+        let buckets = &self.buckets;
+        let collations = &self.collations;
+        let entry_at = |(bucket, entry): (usize, usize)| {
+            buckets
+                .get(bucket)
+                .and_then(|bucket| bucket.entries.get(entry))
+        };
+        // In place, with no buffer: the order is all the merge holds beyond the hash table's.
+        order.sort_unstable_by(|a, b| match (entry_at(*a), entry_at(*b)) {
+            (Some(a), Some(b)) => merge_keys_cmp(
+                a.key_values.iter().map(|v| v.as_ref()),
+                b.key_values.iter().map(|v| v.as_ref()),
+                collations,
+            ),
+            _ => Ordering::Equal,
+        });
+        self.mem_used = self.mem_used.saturating_add(bytes);
+        self.merge_order = order;
+        Ok(true)
+    }
+
+    /// A merge's probe: the first entry of the probe key's run. A key at or past the last probe's
+    /// merges forward from that run's start; one before it finds its run by binary search.
+    fn merge_probe(&mut self, metrics: Option<&mut HashJoinMetrics>) -> Result<Option<&HashEntry>> {
+        let (pos, steps, searched) = {
+            let Some(probe_keys) = self.current_probe_keys.as_ref() else {
+                return Ok(None);
+            };
+            let buckets = &self.buckets;
+            let collations = &self.collations;
+            let order = &self.merge_order;
+            let below_probe = |position: &(usize, usize)| {
+                buckets
+                    .get(position.0)
+                    .and_then(|bucket| bucket.entries.get(position.1))
+                    .is_some_and(|entry| {
+                        merge_keys_cmp(
+                            entry.key_values.iter().map(|v| v.as_ref()),
+                            probe_keys.iter().map(|v| v.as_ref()),
+                            collations,
+                        ) == Ordering::Less
+                    })
+            };
+            let start = self.merge_run.min(order.len());
+            // Every entry before the last run is below the last probe key: the new key is at or
+            // past it when the entry just before that run is below the new key too.
+            let forward = start
+                .checked_sub(1)
+                .and_then(|before| order.get(before))
+                .is_none_or(|position| below_probe(position));
+            if forward {
+                let mut pos = start;
+                while order.get(pos).is_some_and(|position| below_probe(position)) {
+                    pos += 1;
+                }
+                (pos, u64::try_from(pos - start).unwrap_or(u64::MAX), false)
+            } else {
+                (
+                    order.partition_point(|position| below_probe(position)),
+                    0,
+                    true,
+                )
+            }
+        };
+        if let Some(metrics) = metrics {
+            metrics.merge_steps = metrics.merge_steps.saturating_add(steps);
+            metrics.merge_searches = metrics.merge_searches.saturating_add(u64::from(searched));
+        }
+        self.merge_run = pos;
+        self.merge_next = pos;
+        self.merge_next_match()
+    }
+
+    /// A merge's next match: the run's next entry, while its key is the probe key's.
+    fn merge_next_match(&mut self) -> Result<Option<&HashEntry>> {
+        let Some(probe_keys) = self.current_probe_keys.as_ref() else {
+            return Ok(None);
+        };
+        let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).try_collect()?;
+        let Some(&(bucket_idx, entry_idx)) = self.merge_order.get(self.merge_next) else {
+            return Ok(None);
+        };
+        let matches = self
+            .buckets
+            .get(bucket_idx)
+            .and_then(|bucket| bucket.entries.get(entry_idx))
+            .is_some_and(|entry| keys_equal(&entry.key_values, &key_refs, &self.collations));
+        if !matches {
+            return Ok(None);
+        }
+        self.merge_next += 1;
+        self.probe_bucket_idx = bucket_idx;
+        self.probe_entry_idx = entry_idx + 1;
+        Ok(self
+            .buckets
+            .get(bucket_idx)
+            .and_then(|bucket| bucket.entries.get(entry_idx)))
     }
 
     /// Get the current state of the hash table.
@@ -1380,6 +1544,9 @@ impl HashTable {
 
     /// Clear all entries and reset spill state.
     pub fn clear(&mut self) -> Result<()> {
+        self.merge_order.clear();
+        self.merge_run = 0;
+        self.merge_next = 0;
         if self.num_entries == 0 && self.spill_state.is_none() {
             self.state = HashTableState::Building;
             self.current_probe_keys = None;
@@ -1860,6 +2027,19 @@ impl HashTable {
             }
         }
         self.current_spill_partition_idx = 0;
+        // Amphora (QT.5 step 4, lane qs5-21): a merge's rows sorted by key, in memory, or probed
+        // by hash when they spilled or their order would pass the budget.
+        self.merge_order.clear();
+        self.merge_run = 0;
+        self.merge_next = 0;
+        if self.merge
+            && self.num_entries > 0
+            && (self.spill_state.is_some() || !self.build_merge_order()?)
+        {
+            if let Some(metrics) = metrics.as_deref_mut() {
+                metrics.merge_tables_hashed = metrics.merge_tables_hashed.saturating_add(1);
+            }
+        }
         self.state = HashTableState::Probing;
         Ok(IOResult::Done(()))
     }
@@ -1883,6 +2063,15 @@ impl HashTable {
             self.current_probe_keys = Some(probe_keys);
             self.current_probe_hash = None;
             return Ok(None);
+        }
+
+        // Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's table, by merging.
+        if !self.merge_order.is_empty() {
+            self.current_probe_keys = Some(probe_keys);
+            self.current_probe_hash = None;
+            let mut metrics = metrics;
+            self.record_probe_call(metrics.as_deref_mut());
+            return self.merge_probe(metrics);
         }
 
         // Compute hash of probe keys using collations
@@ -2002,6 +2191,9 @@ impl HashTable {
         );
 
         turso_assert!(self.current_probe_keys.is_some(), "probe keys must be set");
+        if !self.merge_order.is_empty() {
+            return self.merge_next_match();
+        }
         let Some(probe_keys) = self.current_probe_keys.as_ref() else {
             return Ok(None);
         };
@@ -3548,6 +3740,109 @@ mod hashtests {
         // No more matches
         let result4 = ht.next_match().unwrap();
         assert!(result4.is_none());
+    }
+
+    /// QT.5 step 4 (lane qs5-21, T-QT.5.18): a sort-merge join's table finds what the hash
+    /// table finds. Do: put the same rows (repeated keys, NULLs, 1 and 1.0, text, a blob) in a
+    /// hash table and a merge's, probe both in key order, then out of it, then mark and scan the
+    /// unmatched rows. Expect: the same matches for every probe key, merging forward for the
+    /// ordered probes and by binary search for the rest, and the same unmatched rows.
+    #[test]
+    fn qt_5_18_merge_table_finds_what_the_hash_table_finds() {
+        let keys = [
+            Value::from_i64(3),
+            Value::Null,
+            Value::from_i64(1),
+            Value::from_f64(1.0),
+            Value::from_i64(3),
+            Value::from_text("b"),
+            Value::from_i64(7),
+            Value::from_text("a"),
+            Value::from_i64(3),
+            Value::from_slice(&[1, 2]).unwrap(),
+            Value::from_f64(2.5),
+        ];
+        let table = |merge: bool| {
+            let config = HashTableConfig {
+                initial_buckets: 4,
+                mem_budget: 1024 * 1024,
+                num_keys: 1,
+                collations: vec![CollationSeq::Binary],
+                temp_store: crate::TempStore::Default,
+                track_matched: true,
+                partition_count: None,
+            };
+            let mut ht = HashTable::new(config, Arc::new(MemoryIO::new())).unwrap();
+            ht.set_merge(merge);
+            for (rowid, key) in (0_i64..).zip(&keys) {
+                let _ = ht.insert(vec![key.clone()], rowid, vec![], None).unwrap();
+            }
+            let _ = ht.finalize_build(None).unwrap();
+            ht
+        };
+        let (mut hash, mut merge) = (table(false), table(true));
+        assert!(!merge.merge_order.is_empty(), "the merge's rows are sorted");
+        let matches = |ht: &mut HashTable, key: &Value, metrics: &mut HashJoinMetrics| {
+            let mut rowids = vec![];
+            let mut found = ht
+                .probe(vec![key.clone()], Some(metrics))
+                .unwrap()
+                .map(|e| e.rowid);
+            while let Some(rowid) = found {
+                rowids.push(rowid);
+                ht.mark_current_matched();
+                found = ht.next_match().unwrap().map(|e| e.rowid);
+            }
+            rowids.sort();
+            rowids
+        };
+        let ordered = [
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::from_f64(2.5),
+            Value::from_i64(3),
+            Value::from_i64(3),
+            Value::from_text("a"),
+            Value::from_text("c"),
+        ];
+        let (mut hash_metrics, mut merge_metrics) =
+            (HashJoinMetrics::default(), HashJoinMetrics::default());
+        for key in &ordered {
+            assert_eq!(
+                matches(&mut merge, key, &mut merge_metrics),
+                matches(&mut hash, key, &mut hash_metrics),
+                "{key:?} in key order"
+            );
+        }
+        assert_eq!(merge_metrics.merge_searches, 0, "an ordered probe merges");
+        assert!(merge_metrics.merge_steps > 0);
+        for key in [
+            Value::from_i64(1),
+            Value::Null,
+            Value::from_slice(&[1, 2]).unwrap(),
+            Value::from_i64(3),
+        ] {
+            assert_eq!(
+                matches(&mut merge, &key, &mut merge_metrics),
+                matches(&mut hash, &key, &mut hash_metrics),
+                "{key:?} out of key order"
+            );
+        }
+        assert!(
+            merge_metrics.merge_searches > 0,
+            "a probe out of order searches"
+        );
+        let unmatched = |ht: &mut HashTable| {
+            ht.begin_unmatched_scan();
+            let mut rowids = vec![];
+            while let Some(entry) = ht.next_unmatched() {
+                rowids.push(entry.rowid);
+            }
+            rowids.sort();
+            rowids
+        };
+        assert_eq!(unmatched(&mut merge), unmatched(&mut hash));
     }
 
     #[test]

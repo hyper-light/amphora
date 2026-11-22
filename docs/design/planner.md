@@ -2322,3 +2322,265 @@ cost the same before); `cost::tests::t_pl_7_1_*`. `tests/planner.rs`'
 `a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages` rested on the 50: its
 20,000 items are 198 real pages, under the smallest cache a connection takes (200), so it now
 builds 80,000.
+
+## Decision (lane qs5-18): an IS takes the equality's row estimate unless its value is NULL
+
+**Decision.** QT.5, T-QT.5.9 (carried over from lane qs5-17). Every `col IS v` whose `v` might be
+NULL (a parameter, another table's column) took the `IS NULL` estimate, a tenth of the rows a
+column, so `a IS ? AND b IS ?` on a million-row table without statistics was expected to return
+10,000 rows. Now:
+
+- **NULL.** The NULL literal, and a parameter a custom plan binds to NULL (or leaves unbound, which
+  runs as NULL), keep the `IS NULL` estimate.
+- **Not NULL.** A non-NULL literal, and a parameter a custom plan binds to a value, take the `=`
+  estimate, as `a IS 5` already did.
+- **Not known.** A parameter of the generic plan, and another table's column, take the `=`
+  estimate too (`CostModelParams::value_is_null`, `constraints::is_value`).
+- A NULL-matching `IS` still never counts as one row (`Constraint::null_matching`): an index, even a
+  unique one, can hold many NULL keys, so the plan keeps its sort.
+
+**Why.** At a tenth of the rows a column, the `(a, b)` search was expected to make 10,000 table
+lookups, which priced it near a full scan (1,794 against 1,025 in one run, 2,558 against 9,552 in
+another). The learned weight of a row visit against a page read then chose between them, and it
+moved about 27 times over between runs on a loaded host (0.00033 against 0.0089 pages a row), so
+`tests/records_plans.rs`' `a_one_row_lookup_needs_no_sort_for_its_columns` planned a scan in 1 to
+3 of every 20 runs. The equality's estimate is what SQLite gives the same term.
+
+**Sources.** SQLite's `whereLoopAddBtreeIndex` (`src/where.c`, 3.54.0): an `IS` term takes the
+row estimate of `=` (`WO_EQ|WO_IS`), and only `IS NULL` (`WO_ISNULL`) is estimated on its own.
+
+**Evidence.** `cost_params::tests::t_qt_5_9_an_is_value_is_null_only_where_planning_knows_it`.
+Lane qs5-17, on the fix this redoes: `a_one_row_lookup_needs_no_sort_for_its_columns` passed 40 of
+40 (two rounds of 20 copies at once on adacachy, where it failed 1 to 3 times in each 20 before),
+with every `records_plans` test and the 134 `translate::optimizer` library tests.
+
+**The value planning doesn't know, behind a switch.** Whether the generic plan's `a IS ?` (and `a
+IS other.col`) takes the `=` estimate is open, so it sits behind `Connection::set_is_value_estimate`
+for the coordinator's A/B (T-QT.5.10):
+
+- `Equality`, the default: SQLite's.
+- `WorstCase`, the control: the larger of the `=` and the `IS NULL` estimates, the worst over the
+  value's possible values. It is what every NULL-matching `IS` took before wherever the `IS NULL`
+  estimate is the larger, which is every case without statistics.
+
+`tests/is_value_estimate.rs` forces each one's failure mode and counts cursor steps, not time (asserted
+without statistics, where a million rows are assumed; with them the two may plan alike):
+
+- **Mostly NULL, NULL bound** (`Equality`'s). A run whose parameters are all NULL always takes the
+  generic plan (the plan choice sees nothing bound), so a column NULL in 19 rows of 20 is searched
+  for NULL and nearly every row looked up, where `WorstCase` scans once.
+- **Distinct values bound** (`WorstCase`'s). The generic plan scans for a one-row answer; with
+  custom plans allowed, each custom plan (its value known, so the `=` estimate) costs far less than
+  the generic one, so every run is planned again.
+
+The harness (`qt_5_10_is_estimate_harness`, ignored) reports each scenario, rule, plan mode and
+statistics at 1,000 and 1,000,000 rows over the concurrency ladder: plan, cursor steps a run, custom
+plans, and latency p50, p99 and p99.9. The default stays `Equality` until that data says otherwise.
+
+**What would falsify it.** The harness's mostly-NULL scenario at a million rows, if `Equality`'s
+latency there costs more than `WorstCase`'s costs in the distinct scenario across the ladder.
+
+## Decision (lane qs5-18): a star join's filters checked in their measured order
+
+**Decision.** QT.5, T-QT.5.11. A star join's fact row checked its dimensions' Bloom filters in
+the planner's order, the one it estimates passes the fewest rows first (`optimizer/lip.rs`), one
+`Filter` instruction each. Now the fact row's keys for every filter are read first and one
+`StarProbes` instruction checks them, to the first that rejects the row. Behind
+`Connection::set_star_filter_order`:
+
+- `Planned`, the control and the default: the planner's order, as before.
+- `Measured`: each filter's checks and passes are counted in the program's state as the rows run
+  (`vdbe/star_order.rs`), and the filters are kept sorted by their share of rows passed, by
+  Laplace's rule of succession, the lowest first. The order moves as each row's checks are
+  counted: no batch, no interval.
+
+**Why.** For filters of equal cost, checking the one that passes the smallest share first checks
+the fewest filters a row (Babu et al.); the planner's shares are estimates, and an estimate wrong
+by orders of magnitude makes every row pay for the filters before the one that rejects it. Lookahead
+information passing orders its filters by observed selectivity for the same reason (Zhu et al.,
+§4.3).
+
+**Sources.** Babu, Motwani, Munagala, Nishizawa and Widom, "Adaptive Ordering of Pipelined Stream
+Filters", SIGMOD 2004, §2 (the order by rank, and A-Greedy for correlated filters); Zhu, Potti,
+Saurabh and Patel, "Looking Ahead Makes Query Plans Robust", VLDB 2017, §4.3.
+
+**Evidence.** `star_order::tests::t_qt_5_11_*` (the filter passing 1 row in 10 moves first and the
+rows take fewer checks; equal shares keep the planner's order; the order follows a change in the
+rows); `tests/star_filters.rs`' `t_qt_5_11_star_filters_checked_in_their_measured_order_check_less`
+(one answer; fewer checks measured than planned where the planner's estimates tie) and
+`t_qt_5_3_star_filters_stay_within_the_statements_memory` (the filters' bytes within the smallest
+cache's statement memory, `StatementMetrics::star_filter_bytes`).
+
+`qt_5_11_star_order_harness` (ignored; the coordinator's) runs both orders at 2,000 and 1,000,000
+fact rows over a star whose estimates tie (the planned order's failure mode) and one whose rows
+drift halfway, so the order learned first is wrong after (the measured order's): checks and rejects
+a row, filter bytes, latency p50, p99 and p99.9.
+
+**Limits.** A filter checked after another is measured only on the rows that one passed, so
+correlated filters can be misordered (A-Greedy's case). The counts never decay, so after a drift
+the order turns only once the new rows outnumber the old. Every filter's keys are read before the
+first check, even for a row the first filter rejects. The `Filter` instruction's star flag is gone:
+`StarProbes` counts `star_filter_probes` and `star_filter_rejects`.
+
+**What would falsify it.** The coordinator's A/B (`StarFilterOrder::Planned` against `Measured`
+over JOB and TPC-H's star joins): `Measured` slower where the planner's order was already right,
+by more than the reading of the keys and the counting cost.
+
+## Decision (lane qs5-19): a star order's counts whole or fading, measured against each other
+
+**Decision.** QT.5, T-QT.5.11. The measured star order (lane qs5-18) counts every row the run has
+seen alike, so rows that change as the run goes (data loaded in order, a key range that shifts
+halfway) turn the order only once the new rows outnumber the old. A third setting of
+`Connection::set_star_filter_order`, `MeasuredFading`, fades each filter's counts to the rows that
+tell its share from its nearest neighbour's in the order: the rows `n` at which the share's
+standard error `sqrt(p(1 - p)/n)` equals the distance `d` to that neighbour, `n = p(1 - p)/d²`.
+Past them both counts are scaled to `n`, keeping the share, so each new row weighs `1/(n + 1)`.
+Far-apart shares fade fast, close ones slowly, equal ones never. Nothing is picked: the window
+is the shares' own standard error, measured as the rows run. `Measured` (whole counts) and
+`Planned` stay; the default stays `Planned` until the coordinator's A/B decides it.
+
+**Why.** Each candidate has its own failure mode, and the data decides between them. Whole
+counts stay wrong after a shift; fading counts turn the order on the noise between close shares,
+each turn a row checked in the worse order. A-Greedy keeps a window of recent rows for the same
+reason (Babu et al., §4), its size a parameter; here the window comes from the shares.
+
+**Sources.** Babu, Motwani, Munagala, Nishizawa and Widom, "Adaptive Ordering of Pipelined Stream
+Filters", SIGMOD 2004, §4 (A-Greedy's profile window); the standard error of a binomial share.
+
+**Evidence.** `star_order::tests` (lane qs5-19):
+`t_qt_5_11_fading_counts_follow_rows_that_shift_halfway` (whole counts' failure mode: a filter
+passing every row and then none after 5,000 rows; whole counts still check it second at 10,000,
+and fading ones turn and check less after the shift); and
+`t_qt_5_11_fading_counts_turn_on_noise_between_close_shares` (fading's: filters passing a half and
+three in five at random; fading turns the order more than ten times as often and checks more). A
+model of the same rules (Python, not a record) gave 7,500 checks whole and 5,002 fading over the
+5,000 rows after the shift, and on the noise 6 turns and 15,090 checks whole, 628 turns and 15,344
+fading (1.7% more). `StatementMetrics::star_filter_reorders` counts the turns a run makes, and
+`qt_5_11_star_order_harness` prints them beside checks, bytes and latency for all three settings.
+
+**Limits.** Scaling the counts each row is a pass over the filters, a few a star; the counts are
+`f64` (whole counts exact to 2⁵³ rows a run). A filter checked after another is still measured
+only on the rows that one passed (A-Greedy's correlated case).
+
+**What would falsify it.** The coordinator's A/B over the harness's stars with and without drift
+and over JOB and TPC-H's star joins: `MeasuredFading` taking more checks or time than `Measured`
+where the rows don't shift by more than it saves where they do.
+
+## Decision (lane qs5-19): a sized filter's hashes and finished filter held within its bound
+
+**Decision.** PL.5, T-QT.5.12. A sized Bloom filter (lane qs5-9) collects its build's key hashes
+within its memory bound, then, at its first probe, sizes and fills the filter from them, holding
+the hashes and the finished filter at once: up to twice the bound. Now the filter gets only the
+room the bound leaves beside the hashes, its bits counted in whole words before they are
+allocated, so the two together never pass the bound. Where the hashes' duplicates leave room, the
+list is shrunk first if the copy a shrink may make fits beside it. `BloomFilter::seal` returns the
+most bytes held while sealing, and `StarProbes` counts, in `star_filter_bytes`, the most the star's
+filters hold together as they are sealed one after another: the ones before holding their
+filters, the one sealing both, the ones after their hashes.
+
+**Why.** The bound is the statement's memory share (`optimizer/lip.rs`) or the hash join's budget,
+and its own description already counts the hashes. A filter whose hashes fill the bound now passes
+every key, as one over the bound did before.
+
+**Evidence.** `bloom_filter::tests::qt_5_sealing_holds_the_hashes_and_the_filter_within_the_bound`
+(hashes taking two thirds of the bound, duplicates that leave room, and hashes filling it: each
+within the bound, the last passing every key); `t_qt_5_3_star_filters_stay_within_the_statements_memory`
+for all three orders. The learned-costs calibration's filter (`learned_costs.rs`) is given the
+page's hashes and as many bytes again, so its filter is still built.
+
+**Limits.** While the hash list grew, a reallocation could briefly hold the old and the new list,
+uncounted; lane qs5-20 bounds and counts it (next decision).
+
+## Decision (lane qs5-20): a sized filter's hashes grow within its bound, old and new together
+
+**Decision.** PL.5, T-QT.5.16. A growth of a sized filter's key hashes may move them, holding the
+old list and the new at once. The new list is now what the bound leaves beside the old one: it
+doubles while three lists' room fits, then takes the rest, and a filter whose next growth would
+pass the bound passes every key instead. `BloomFilter::peak` is the most bytes the filter held at
+once, its growths' two lists and its sealing (the copy a shrink makes included) both, and
+`StarProbes` counts each filter's growth beside every other filter's whole list in
+`star_filter_bytes`: at least what they held then, as the filters built after it held nothing.
+
+**Why.** The two ways to keep the copy within the bound are to reserve the bound up front or to
+grow within it. Reserving holds a filter's whole share from its first key, whatever its build
+gives, and counts it all: a star with several filters, and many statements at once, would hold
+their shares for builds of a few keys. Growing within the bound holds what the keys need and
+costs only the last growth's reach: the hashes stop between half and two thirds of the bound, and
+the filter built beside them still gets the rest.
+
+**Evidence.** `bloom_filter::tests::qt_5_16_the_hashes_grow_within_the_bound_old_and_new_together`
+(bounds of 98,304, 65,536 and 1,000 bytes, keys given one at a time: the most held at once within
+the bound after every key; a growth that would pass it passes every key; a small build's peak is
+its last growth's two lists); the qs5-19 sealing test, whose filled filter now stops growing at
+half its bound and passes every key as before. The learned-costs calibration's filter, given
+twice its page's hashes, still fits its hashes and a filter at its rate (at least a third of its
+bound remains, over 40 bits a key against the `ln(rows)/ln²2` its rate takes).
+
+## Decision (lane qs5-20): a sort-merge join costed beside the hash join, traced until its operator lands
+
+**Decision.** QT.5 step 4, T-QT.5.15. `estimate_merge_join_cost` prices a sort-merge join in the
+hash join's plan shape and units, so one choice point (`join.rs`, the hash join's candidate) can
+weigh the two: each input not already in key order is sorted (the build once, the probe on each
+pass), a sort that outgrows the statement's memory writes and reads its pages once, the merge
+compares each row once, and the matches and any unmatched build rows are visited.
+`merge_inputs_in_key_order` says which inputs are ordered: a forward read of a table whose key is
+its rowid, or of an index whose first column is the key, ascending in its default collation; the
+merge leads with the key that leaves the most inputs ordered. Until the plan node and its operator
+land, the choice point only traces the merge's cost beside the hash join's ("merge-join
+candidate"), so no plan changes.
+
+**Why.** A merge join wins where its inputs already come in key order or the hash table would
+spill: it holds one run of equal keys, not the build side. Every weight is the cost model's
+(`sort_cpu_per_row`, `cpu_cost_per_row`, the page reads), and the spill's shape is the sorter's
+own: it writes each full buffer as a sorted chunk and merges every chunk in one heap pass
+(`vdbe/sorter.rs`), so a spilled row is written and read once.
+
+**Evidence.** `access_method::merge_join_cost_tests` (ordered inputs sort nothing, unordered ones
+pay their sorts, a spilled sort its pages once, ordered inputs past memory cost less merged than
+hashed, unordered ones that fit cost less hashed, unmatched build rows a visit each, empty inputs
+only the probe's scan); `join::tests::qt_5_15_merge_inputs_in_key_order_by_rowid_and_index`;
+`tests/join_methods.rs`'s `qt_5_15_equi_joins_over_empty_null_repeated_and_mixed_keys_give_one_answer`
+(T-QT.5.17), the differential test the operator must pass.
+
+**Limits.** An index's order is a merge's only where its comparison is the equality's: an index of
+another collation, or keys whose affinities differ, aren't counted as ordered here, and the
+operator must sort them in the equality's terms. To be measured once the operator lands: merge
+against hash over the concurrency ladder, ordered and unordered inputs, builds that fit and that
+spill.
+
+## Decision (lane qs5-21): a sort-merge join is the hash join with its rows merged by key, behind a switch
+
+**Decision.** QT.5 step 4, T-QT.5.18. A sort-merge join is a method of the hash join
+(`HashJoinMethod::Merge` on `HashJoinOp` and `AccessMethodParams::HashJoin`), not a new
+`Operation`: it runs through the hash join's instructions, its table (`HashTable::set_merge`) taking
+the build rows as any hash table does. Once the build is done, the rows' positions are sorted by key
+in place (SQLite's order: NULL, numbers by value, text by the key's collation, blobs by their
+bytes). A probe key at or past the previous one merges forward from that key's run, so a probe read
+in key order passes each build row once and a repeated key replays its run with no buffer; a key
+before it finds its run by binary search. The planner takes a merge only under the switch:
+`JoinMethods::MergeJoinsOnly` (always, for the differential tests) or `JoinMethods::ByCostWithMerge`
+(where `estimate_merge_join_cost` is below the hash join's). `ByCost`, the default, never does, so no
+plan changes until the measurement below says so. The parallel path takes only hash joins.
+
+**Why.** Every hash-join site that only cares about the build and probe structure (the open, close
+and init paths, the outer join's unmatched rows, the semi join's first match, the Bloom filter, the
+spill) stays one code path for both methods, so a merge gives every join type's answer the hash
+join gives. The sort is in place with no buffer, and its positions are counted in the table's
+memory: a table whose order would pass its budget, or that spilled, is probed by hash, counted.
+
+**Evidence.** `hash_table::tests::qt_5_18_merge_table_finds_what_the_hash_table_finds` (the same
+rows, with repeats, NULL, 1 and 1.0, text and a blob, probed in key order and out of it, give the
+hash table's matches and unmatched rows; ordered probes merge, the others search);
+`tests/join_methods.rs`'s `qt_5_18_a_merge_join_over_ordered_inputs_merges` (a planned MERGE JOIN
+over inputs read in key order merges forward with no search and gives the hash join's answer);
+`tests/join_methods.rs` under `MergeJoinsOnly` and `ByCostWithMerge` (T-QT.5.1's random joins, the
+star joins' filters, T-QT.5.17's edge cases). Counters: `HashJoinMetrics::merge_steps`,
+`merge_searches`, `merge_tables_hashed`.
+
+**Limits.** The build rows still go in by hash, and a build already in key order is still sorted
+(an in-place sort of ordered input costs about a comparison a row); a probe out of key order pays a
+binary search a row, where the cost function charges it a sort. A merge that spills is a hash join:
+the sort-merge's own spill (sorted runs merged) is not built. To be measured, against the hash join,
+over the concurrency ladder: probes in key order and not, builds already ordered and not, and builds
+that fit and that pass the statement's memory: `qt_5_18_merge_versus_hash_harness`, ignored, the
+coordinator's.

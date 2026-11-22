@@ -479,6 +479,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                 payload_start_reg,
                 num_payload,
                 track_matched: planner.hash_join_op.join_type.tracks_matched(),
+                merge: planner.hash_join_op.method == crate::translate::plan::HashJoinMethod::Merge,
             }),
         });
         if config.use_bloom_filter {
@@ -741,7 +742,6 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 target_pc: self.next,
                 key_reg: probe_key_start_reg,
                 num_keys,
-                star: false,
             });
         }
 

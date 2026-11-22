@@ -178,6 +178,8 @@ pub fn translate(
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
     resolver.set_star_filters(connection.star_filters());
+    resolver.set_is_value_estimate(connection.is_value_estimate());
+    resolver.set_star_filter_order(connection.star_filter_order());
     // Amphora (PL.8): the join search's budget, from the rule and this database's measured rates.
     resolver.set_join_search(
         crate::translate::optimizer::search_budget::SearchBudget::new(

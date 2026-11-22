@@ -449,7 +449,10 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
         Operation::HashJoin(op) => Some(op),
         _ => None,
     })?;
+    // A sort-merge join (QT.5 step 4, lane qs5-21) stays serial for now: its probe merges forward
+    // from the previous probe row's run, which a worker's morsel would start over.
     if hash.join_type != HashJoinType::Inner
+        || hash.method != crate::translate::plan::HashJoinMethod::Hash
         || hash.probe_table_idx == hash.build_table_idx
         || tables.iter().any(|t| {
             t.join_info

@@ -1074,7 +1074,7 @@ fn optimize_select_plan_with_cache(
     // joins. A correlated subquery left in place runs as a nested loop beneath its query, so the
     // unnested form is taken wherever it can be emitted, as the forced unnesting mode takes it,
     // rather than weighed against that loop.
-    if resolver.join_methods() == crate::JoinMethods::HashJoinsOnly {
+    if resolver.join_methods().hash_shaped_only() {
         let rewritten_table_plan =
             find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
         if !rewritten_form_is_emittable(&rewritten) {
@@ -1177,7 +1177,8 @@ fn find_select_plan_form(
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
-        .with_plan_values(resolver.plan_values());
+        .with_plan_values(resolver.plan_values())
+        .with_is_value_estimate(resolver.is_value_estimate());
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
 
@@ -3061,7 +3062,8 @@ fn find_table_access_plan(
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
-        .with_plan_values(resolver.plan_values());
+        .with_plan_values(resolver.plan_values())
+        .with_is_value_estimate(resolver.is_value_estimate());
 
     if table_references.joined_tables().is_empty() {
         return Ok(None);
@@ -4513,6 +4515,7 @@ fn apply_table_access_plan(
                 use_bloom_filter,
                 bloom_fp_per_key,
                 join_type,
+                method,
             } => {
                 // Mark WHERE clause terms as consumed since we're using hash join
                 for join_key in join_keys.iter() {
@@ -4529,6 +4532,7 @@ fn apply_table_access_plan(
                         use_bloom_filter: *use_bloom_filter,
                         bloom_fp_per_key: *bloom_fp_per_key,
                         join_type: *join_type,
+                        method: *method,
                         build_group: build_groups
                             .iter()
                             .find(|(probe_position, _)| *probe_position == i)
