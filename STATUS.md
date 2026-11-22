@@ -651,6 +651,22 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   183 and 180 before the refused records given as written. Left: frame EXCLUDE other than NO OTHERS
   on MySQL and ClickHouse (146, no spelling there), conflict clauses other than ABORT, GROUPS frames,
   multi-word type names, RELEASE SAVEPOINT and REINDEX, which sqlglot's SQLite reader refuses.
+  Lane corpus-dialects-3 (`bench/corpus/dialects.py`, `test_dialects.py`): the translator reads what
+  sqlglot's SQLite reader refused, each as SQLite's documentation says it means: n-ary `iif()` and
+  `if()` as CASE, `char()` of nothing as '', a type name of several words (`FLOATING POINT`) and `ANY`
+  as their affinity's name, STRICT left out (every engine types its columns; ANY there is BLOB),
+  SAVEPOINT, RELEASE and REINDEX as commands, a GROUPS frame with no ORDER BY, and a block comment
+  open at the end. Conflict resolutions other than ABORT (on UPDATE and on constraints) and a frame's
+  EXCLUDE CURRENT ROW, GROUP or TIES on MySQL and ClickHouse with no exact rewrite are untranslatable
+  with their reason ("not expressible in <dialect>: ..."), which the oracle reports; count() under
+  those exclusions is said with window arithmetic (checked against DuckDB's EXCLUDE on random rows),
+  and EXCLUDE CURRENT ROW on a ROWS frame that doesn't hold the row is left out. On the gate's pool
+  (26,980 records) the untranslatable records fall from 22, 21, 143 and 140 (DuckDB, PostgreSQL,
+  MySQL, ClickHouse) to 10, 10, 116 and 113: 5 conflict clauses everywhere and 103 exclusions on
+  MySQL and ClickHouse are "not expressible"; 5 still don't parse (WITH ... VALUES, a table
+  PRIMARY KEY with COLLATE or AUTOINCREMENT, two CHECKs without a comma, two upsert clauses), and
+  sqlglot fails on MySQL's NATURAL FULL JOIN (3). Left: refusals compared by kind beside "any error
+  matches" (the coordinator's decision), DuckDB's 6 disagreements and its refused INSERT unclassified.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
