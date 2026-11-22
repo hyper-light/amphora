@@ -270,12 +270,9 @@ fn g8_4_sql_histories_have_no_anomaly_on_the_pager() {
 
 /// T-G8.4.1, CP-T1.4: do record Elle's histories through SQL on the versioned storage; expect no
 /// anomaly at all, the claim being serializable (precision locking, the default validation).
-/// Ignored until it holds: its first tiny run (4 connections, seed 1, spans) showed G2, as the SQL
-/// cursor (`cursor.rs`) reads rows by its snapshot and keeps no reads for its commit's validation
-/// (`VTree::read` and `read_range` keep them; the cursor's leaf copies don't), so SQL there is
-/// snapshot isolation. The switch and its cursor are lane g7s2-3's; `--ignored` runs it.
+/// The SQL cursor keeps the span of each leaf it copies as read (`cursor.rs`, `keep_read`), so a
+/// commit is validated against what it saw (G7 step 2, `AC-NS.2.3`).
 #[test]
-#[ignore = "G2 through SQL on the versioned storage: the SQL cursor keeps no reads for validation (lane g7s2-3's)"]
 fn g8_4_sql_histories_have_no_anomaly_on_the_versioned_storage() {
     histories_have_no_anomaly(Storage::Versioned);
 }

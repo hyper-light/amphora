@@ -105,6 +105,8 @@ pub(crate) fn weights(seek: f64, hash_build: f64, hash_probe: f64) -> LearnedWei
         hash_build,
         hash_probe,
         sort: 0.0,
+        bloom_probe: 0.0,
+        where_step: 0.0,
         page_miss: None,
     }
 }
@@ -289,6 +291,8 @@ mod tests {
             hash_build: build,
             hash_probe: probe,
             sort: 1.0,
+            bloom_probe: 1.0,
+            where_step: 1.0,
             page_miss: None,
         }
     }

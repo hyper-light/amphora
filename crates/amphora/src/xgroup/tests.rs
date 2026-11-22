@@ -318,6 +318,10 @@ struct Sim {
     split: BTreeSet<TxnId>,
     answers: BTreeMap<TxnId, (Answer, u64, u32)>,
     rounds: Vec<u32>,
+    /// A group that failed (its quorum lost): it takes no step until it is back (T-T1.10.X3).
+    down: Option<GroupId>,
+    /// The step in flight as `down` failed landed first, its answer lost.
+    land_on_failure: bool,
 }
 
 impl Sim {
@@ -345,6 +349,8 @@ impl Sim {
             split: BTreeSet::new(),
             answers: BTreeMap::new(),
             rounds: Vec::new(),
+            down: None,
+            land_on_failure: false,
         }
     }
 
@@ -452,6 +458,25 @@ impl Sim {
             return false;
         };
         self.now = time;
+        // A failed group takes no step: the step's call is refused, and the shell stops that
+        // incarnation, as `Cluster`'s driver does on a refusal it can't retry. The step in flight
+        // as it failed may have landed first, its answer lost.
+        let msg = match msg {
+            Msg::Apply { life, send, .. } if self.down == Some(send.group) => {
+                if life == self.life {
+                    self.crash();
+                }
+                if !std::mem::take(&mut self.land_on_failure) {
+                    return true;
+                }
+                Msg::Apply {
+                    life,
+                    send,
+                    lose_reply: true,
+                }
+            }
+            msg => msg,
+        };
         match msg {
             Msg::Apply {
                 life,
@@ -636,6 +661,80 @@ fn t_t1_10_1_a_coordinator_crash_at_every_step_ends_committed_or_aborted_everywh
             }
         }
         // Non-vacuity: the crashes found both ends.
+        assert!(
+            committed > 0 && aborted > 0,
+            "{protocol:?}: {committed} committed, {aborted} aborted"
+        );
+    }
+}
+
+/// Group `group` fails at the coordinator's `at`th input (the step in flight then landed first if
+/// `land`) and stays down until nothing else is left to run; then it is back, and a new incarnation
+/// finishes what the stopped one left (T-T1.10.X3).
+fn fail_group_once(protocol: Protocol, group: GroupId, at: u64, land: bool) -> Sim {
+    let mut sim = Sim::new(1, 3, protocol, 0, 4);
+    sim.start();
+    while !sim.ready() {
+        assert!(sim.step());
+    }
+    let base = sim.inputs;
+    let t = Txn {
+        reads: vec![vec![0], vec![1], vec![2], vec![3]],
+        writes: vec![
+            (vec![0], Some(b"a".to_vec())),
+            (vec![1], Some(b"b".to_vec())),
+            (vec![2], Some(b"c".to_vec())),
+        ],
+    };
+    let id = sim.begin(t).unwrap();
+    let mut failed = false;
+    loop {
+        if !failed && sim.inputs - base >= at {
+            failed = true;
+            sim.down = Some(group);
+            sim.land_on_failure = land;
+        }
+        if !sim.step() {
+            break;
+        }
+    }
+    sim.down = None;
+    sim.settle();
+    sim.assert_settled();
+    let written: Vec<Option<Vec<u8>>> = (0..3u8).map(|k| value_of(&sim.groups, &[k])).collect();
+    let all = written.iter().all(Option::is_some);
+    let none = written.iter().all(Option::is_none);
+    assert!(
+        all || none,
+        "{protocol:?}, group {group} failed at {at}, land {land}: partly applied {written:?}"
+    );
+    assert!(sim.split.is_empty(), "{protocol:?}: resolved both ways");
+    match sim.answers.get(&id).map(|(a, _, _)| a) {
+        Some(Answer::Committed { .. }) => assert!(all, "answered committed, not applied"),
+        Some(Answer::Aborted(_)) => assert!(none, "answered aborted, applied"),
+        Some(Answer::Unknown) | None => {}
+    }
+    sim
+}
+
+#[test]
+fn t_t1_10_x3_a_group_failure_at_every_step_ends_committed_or_aborted_everywhere() {
+    for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+        let (_, steps) = crash_once(protocol, None, true, None);
+        let (mut committed, mut aborted) = (0, 0);
+        // The registry and anchor (group 0) and each participant, at every input.
+        for group in 0..3 {
+            for at in 0..=steps {
+                for land in [true, false] {
+                    let sim = fail_group_once(protocol, group, at, land);
+                    match value_of(&sim.groups, &[0]) {
+                        Some(_) => committed += 1,
+                        None => aborted += 1,
+                    }
+                }
+            }
+        }
+        // Non-vacuity: the failures found both ends.
         assert!(
             committed > 0 && aborted > 0,
             "{protocol:?}: {committed} committed, {aborted} aborted"
