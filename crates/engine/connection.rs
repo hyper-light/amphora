@@ -2236,6 +2236,13 @@ impl Connection {
             // read cookie before consuming statement program - otherwise we can
             // end up reading cookie with closed transaction state
             let cookie = crate::return_if_io!(self.read_current_schema_cookie_nonblock());
+            // Amphora (lane g7s2-19, `AC-NS.2.1`): on the versioned storage a schema change's
+            // cookie can be read a moment before its rows are published; the rows are read only
+            // once every commit the cookie's read may have seen is (`Switch::await_published`),
+            // else the older rows would be kept under the newer cookie, and shared.
+            if let Some(switch) = self.versioned.as_ref() {
+                switch.await_published();
+            }
             *state =
                 ReparseSchemaState::Building(Box::new(self.init_reparse_building(cookie, None)?));
         }
@@ -4049,16 +4056,38 @@ impl Connection {
     }
 
     /// Amphora (G5 step 4): this connection's snapshot and the newest commit, as WAL positions;
-    /// `None` without a WAL.
+    /// `None` without a WAL. On the versioned storage (G7 step 2, `AC-NS.2.1`) they are commit
+    /// timestamps, `(0, ts)`: the open transaction's start (with none open, the newest commit,
+    /// where its next read begins) and the newest commit published.
     pub(crate) fn skipping_positions(
         &self,
     ) -> Option<(crate::skipping::WalPos, crate::skipping::WalPos)> {
+        if let Some(switch) = self.versioned_for(MAIN_DB_ID) {
+            let (start, newest) = switch.skipping_positions();
+            return Some(((0, start), (0, newest)));
+        }
         let pager = self.get_pager();
         let wal = pager.wal.as_ref()?;
         Some((
             wal.connection_wal_pos(),
             (wal.get_checkpoint_seq(), wal.get_max_frame_in_wal()),
         ))
+    }
+
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the newest commit a write to a summarized table is taken
+    /// at, and whether its end must be told (the versioned storage, [`SkipRegistry::on_write_told`]);
+    /// `None` when the summary can't take it and is made stale: without a WAL, or on the versioned
+    /// storage when the writer's snapshot isn't the newest commit (the summary would then hold
+    /// rows it doesn't see).
+    ///
+    /// [`SkipRegistry::on_write_told`]: crate::skipping::SkipRegistry::on_write_told
+    pub(crate) fn skipping_write_base(&self) -> Option<(crate::skipping::WalPos, bool)> {
+        let (snapshot, committed) = self.skipping_positions()?;
+        let told = self.versioned_for(MAIN_DB_ID).is_some();
+        if told && snapshot != committed {
+            return None;
+        }
+        Some((committed, told))
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {

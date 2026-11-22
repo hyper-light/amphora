@@ -948,6 +948,55 @@ table seek. No size is picked: a zone is a table leaf (the page size and the rec
 how many rows it holds), the tail zone grows to the leaves' measured fill, and the cracker's pieces
 are cut where filters asked.
 
+**On the versioned storage (lane g7s2-14, G7 step 2, `AC-NS.2.1`).** A summary is built, built
+again for a trial, and asked through the versioned storage's own cursor (its root page is the
+tree's id). The positions are commit timestamps: a connection's snapshot is its transaction's
+start (the newest commit when none is open), against the newest commit published. Writers there
+take no single write lock, so another may commit while one is open and a newer commit no longer
+means the open writer committed: its writes are taken with `SkipRegistry::on_write_told`, and its
+end is told as its transaction ends (`committed`, or `rolled_back`, which makes the summary
+`Stale`). A write while another writer's is open, or by a writer whose snapshot isn't the newest
+commit, makes the summary `Stale`.
+
+A build there holds no lock against writers either, so a writer may change the table before the
+build or beside it and commit after, and the build, which can't see its open rows, would miss them
+(lane g7s2-15). The versioned storage counts, for each tree, the open transactions that have
+changed a row of it (`Clock::writers_of`; a transaction is counted once a tree, from before its
+first change to after its commit is published). A build is installed with
+`SkipRegistry::set_checked`: under the registry's lock, once the summary is in place, it asks
+whether another open transaction has changed the tree or a commit passed the build's snapshot, and
+if so the summary is kept `Stale` until built again (counted in `SkipCounts::built_stale`, with the
+reason in an `amphora.skipping` trace event). A write whose row changed before that ask is seen by
+it; one after finds the summary and feeds it. An insert that found no summary before its row
+changed reads the registry's install count before and after, and makes a summary installed
+between stale (a delete's hook already runs whether it found one or not).
+
+Stale or wait is decided by data, not argument (lane g7s2-16): both are built behind
+`AMPHORA_SKIP_BUILD` (`SkipRegistry::set_policy`, `BuildPolicy`), stale the control. Under
+`stale` a build beside an open writer goes in stale at once: refused, every scan reads every row
+and stays correct until the next build (lane skip-8's rebuild, or the caller's) makes it current.
+Under `wait` a build first waits for the table's open writers to end, woken by the last one's end
+(`Clock::when_unwritten`, told under the lock that counts the writers, after its commit is
+published: no timer, no poll), then builds; if a writer slipped in beside it, it is installed
+stale and built again after another wait (`SkipRegistry::wait_counts`). Its failure mode: the
+caller is held behind any transaction for as long as it runs, up to its statement's deadline,
+and starved while writers keep the table open. Two waits are refused, typed
+(`UnwrittenRefusal`, counted in `SkipRegistry::wait_refusals`), and that build goes in as `stale`
+builds it (lane g7s2-17): one whose table has an open writer that changed it on the waiting
+thread (on another connection: only that thread can end it, so the wait would never end; the
+clock keeps each open writer's thread beside the tree's count), and one whose deadline passed
+first (the statement's, `state.query_deadline`, or the connection's query timeout for a direct
+call; the waiter is taken out, so waits that give up hold nothing). Each test forces its arm's
+failure (`t_ns_2_1_a_build_beside_an_open_writer_is_kept_stale`: every row read until rebuilt;
+`t_ns_2_1_a_waiting_build_waits_for_the_open_writer`: blocked until the writer commits), the
+refusals theirs (`t_ns_2_1_a_waiting_build_beside_its_own_threads_writer_goes_in_stale`,
+`t_ns_2_1_a_waiting_build_gives_up_at_its_deadline`), and the rebuild path is pinned by a pause
+in the storage between the build's read and its check
+(`t_ns_2_1_a_writer_slipped_in_beside_a_waiting_build_is_built_again`). The run
+of record, the coordinator's: a builder beside the concurrency ladder's writers (1 to 4096) of
+one table, each arm's build latency p50/p99/p99.9, scans' rows read until a current summary, and
+rebuilds.
+
 ### Bounds from parameters (lane skip-usable, T-SKU.1)
 
 Real callers prepare a statement once and bind it on each run (`a BETWEEN ? AND ?`, `a >= :lo`), so

@@ -435,3 +435,480 @@ fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
         vec![vec![Value::build_text("ok")]]
     );
 }
+
+/// Whether `e` is the versioned storage's refusal of a write that met another open writer's row:
+/// its first writer's win, or its commit's validation.
+fn conflict(e: &crate::LimboError) -> bool {
+    matches!(
+        e,
+        crate::LimboError::WriteWriteConflict | crate::LimboError::SerializationFailure
+    )
+}
+
+/// Two connections to one database on the versioned storage, a table of two committed rows.
+fn two_writers() -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+    let (db, a) = connect(true);
+    run(
+        &a,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    );
+    run(&a, "INSERT INTO t VALUES (1, 0), (2, 0)");
+    let b = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    (db, a, b)
+}
+
+/// AC-NS.2.1: do open two write transactions through SQL on the versioned storage at once, each
+/// changing and inserting rows of its own, and commit both; expect neither refused (no pager write
+/// lock between them: they conflict only on the rows they touch) and both one's rows in the table.
+#[test]
+fn ac_ns_2_1_writers_of_different_rows_both_commit() {
+    let (_db, a, b) = two_writers();
+    run(&a, "BEGIN");
+    run(&b, "BEGIN");
+    run(&a, "UPDATE t SET v = 10 WHERE id = 1");
+    run(&b, "UPDATE t SET v = 20 WHERE id = 2");
+    run(&a, "INSERT INTO t VALUES (3, 30)");
+    run(&b, "INSERT INTO t VALUES (4, 40)");
+    run(&a, "COMMIT");
+    run(&b, "COMMIT");
+    let want: Vec<Vec<Value>> = [(1, 10), (2, 20), (3, 30), (4, 40)]
+        .into_iter()
+        .map(|(id, v)| vec![Value::from_i64(id), Value::from_i64(v)])
+        .collect();
+    assert_eq!(rows(&a, "SELECT id, v FROM t ORDER BY id"), want);
+    assert_eq!(rows(&b, "SELECT id, v FROM t ORDER BY id"), want);
+    // The same through BEGIN IMMEDIATE, which on the pager's storage refuses the second writer.
+    run(&a, "BEGIN IMMEDIATE");
+    run(&b, "BEGIN IMMEDIATE");
+    run(&a, "UPDATE t SET v = 11 WHERE id = 1");
+    run(&b, "UPDATE t SET v = 21 WHERE id = 2");
+    run(&b, "COMMIT");
+    run(&a, "COMMIT");
+    assert_eq!(
+        rows(&a, "SELECT v FROM t WHERE id IN (1, 2) ORDER BY id"),
+        vec![vec![Value::from_i64(11)], vec![Value::from_i64(21)]]
+    );
+}
+
+/// AC-NS.2.1: do open two write transactions through SQL on the versioned storage at once, both
+/// changing one row; expect the second refused with a conflict (at its write or its commit), and
+/// after it rolls back, the first's commit to stand alone.
+#[test]
+fn ac_ns_2_1_writers_of_one_row_one_conflicts() {
+    let (_db, a, b) = two_writers();
+    run(&a, "BEGIN");
+    run(&b, "BEGIN");
+    run(&a, "UPDATE t SET v = 10 WHERE id = 1");
+    let refused = match b.execute("UPDATE t SET v = 20 WHERE id = 1") {
+        Err(e) => {
+            assert!(conflict(&e), "the second writer's refusal: {e:?}");
+            true
+        }
+        Ok(()) => false,
+    };
+    run(&a, "COMMIT");
+    if !refused {
+        let e = b
+            .execute("COMMIT")
+            .expect_err("the second writer of one row commits");
+        assert!(conflict(&e), "the second writer's refusal at commit: {e:?}");
+    }
+    if !b.get_auto_commit() {
+        run(&b, "ROLLBACK");
+    }
+    assert_eq!(
+        rows(&b, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(0)],
+        ]
+    );
+}
+
+/// AC-NS.2.1: what writes the pager's header (here a schema change, its cookie) still takes the
+/// pager's write lock, one at a time, beside a writer of rows that holds none: do run a row writer
+/// open and one connection's CREATE TABLE in an open transaction, then another's; expect the first
+/// schema change to pass beside the row writer, the second to be refused busy until it ends, the
+/// row writer, begun before the first committed, refused at its commit (lane g7s2-17: it wrote
+/// against the older catalog) and its write standing once run again, and every commit after to
+/// stand.
+#[test]
+fn ac_ns_2_1_header_writers_still_take_the_pager_lock() {
+    let (db, a, b) = two_writers();
+    let c = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    run(&a, "BEGIN");
+    run(&a, "UPDATE t SET v = 10 WHERE id = 1");
+    run(&b, "BEGIN");
+    run(&b, "CREATE TABLE u (x)");
+    run(&c, "BEGIN");
+    let e = c
+        .execute("CREATE TABLE w (x)")
+        .expect_err("a second schema change beside an open one");
+    assert!(
+        matches!(e, crate::LimboError::Busy | crate::LimboError::BusySnapshot),
+        "the second schema change's refusal: {e:?}"
+    );
+    if !c.get_auto_commit() {
+        run(&c, "ROLLBACK");
+    }
+    run(&b, "COMMIT");
+    let e = a
+        .execute("COMMIT")
+        .expect_err("a writer begun before a schema change commits");
+    assert!(
+        matches!(e, crate::LimboError::SchemaConflict),
+        "the row writer's refusal: {e:?}"
+    );
+    if !a.get_auto_commit() {
+        run(&a, "ROLLBACK");
+    }
+    run(&a, "UPDATE t SET v = 10 WHERE id = 1");
+    run(&c, "CREATE TABLE w (x)");
+    assert_eq!(
+        rows(&c, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT name FROM sqlite_schema WHERE name IN ('u', 'w') ORDER BY name"
+        ),
+        vec![vec![Value::build_text("u")], vec![Value::build_text("w")]]
+    );
+}
+
+/// The ids with `v` found through the index `tv`, and through the table alone: equal when the two
+/// agree.
+fn by_index(conn: &Arc<Connection>, v: i64) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+    (
+        rows(
+            conn,
+            &format!("SELECT id FROM t INDEXED BY tv WHERE v = {v}"),
+        ),
+        rows(conn, &format!("SELECT id FROM t NOT INDEXED WHERE v = {v}")),
+    )
+}
+
+/// AC-NS.2.1 (lane g7s2-17): writers through SQL run at once, so do open a writer that inserts a
+/// row, by a statement prepared before and run after another connection's CREATE INDEX on the
+/// table commits (and, the other way, one whose insert ran before it); then commit the writer.
+/// Expect, both ways: the commit refused with `SchemaConflict` (its statements were compiled
+/// against the catalog without the index: committed, its row would be in the table and not the
+/// index), nothing of it in either; run again, its row in both.
+#[test]
+fn ac_ns_2_1_a_writer_against_an_older_schema_is_refused_at_commit() {
+    for prepared_before in [true, false] {
+        let (_db, a, b) = two_writers();
+        let mut insert = a.prepare("INSERT INTO t VALUES (3, 30)").unwrap();
+        run(&a, "BEGIN");
+        if prepared_before {
+            // Its snapshot begins here, before the index.
+            assert_eq!(
+                rows(&a, "SELECT count(*) FROM t"),
+                vec![vec![Value::from_i64(2)]]
+            );
+        } else {
+            insert.run_ignore_rows().unwrap();
+        }
+        run(&b, "CREATE INDEX tv ON t (v)");
+        if prepared_before {
+            insert.run_ignore_rows().unwrap();
+        }
+        let e = a
+            .execute("COMMIT")
+            .expect_err("a writer against an older schema commits");
+        assert!(
+            matches!(e, crate::LimboError::SchemaConflict),
+            "prepared_before={prepared_before}: the writer's refusal: {e:?}"
+        );
+        if !a.get_auto_commit() {
+            run(&a, "ROLLBACK");
+        }
+        assert_eq!(
+            by_index(&b, 30),
+            (vec![], vec![]),
+            "prepared_before={prepared_before}"
+        );
+        assert_eq!(
+            rows(&b, "SELECT count(*) FROM t"),
+            vec![vec![Value::from_i64(2)]]
+        );
+        run(&a, "INSERT INTO t VALUES (3, 30)");
+        let three = vec![vec![Value::from_i64(3)]];
+        assert_eq!(
+            by_index(&b, 30),
+            (three.clone(), three),
+            "prepared_before={prepared_before}"
+        );
+    }
+}
+
+/// The schema cookie (`PRAGMA schema_version`) as `conn` reads it.
+fn cookie(conn: &Arc<Connection>) -> Vec<Vec<Value>> {
+    rows(conn, "PRAGMA schema_version")
+}
+
+/// The names `sqlite_schema` holds, as `conn` reads them.
+fn names(conn: &Arc<Connection>) -> Vec<Vec<Value>> {
+    rows(conn, "SELECT name FROM sqlite_schema ORDER BY name")
+}
+
+/// AC-NS.2.1 (lane g7s2-18): a commit is one across the pager and the versioned storage. Do open
+/// a transaction that builds an index of `t` (it reads the table and writes its schema row, its
+/// index rows and the pager's header, the cookie), let another connection insert a row of `t` and
+/// commit, then commit the index; expect it refused (it read the table the insert changed), and
+/// nothing of it anywhere: the cookie and the schema rows as before on its own connection, on the
+/// other and on a new one, and no connection knowing the index. Run again, the index stands on
+/// every connection, the cookie one past. The pager committed first: its cookie stood, and its
+/// schema, the index naming a tree the storage dropped, was every connection's.
+#[test]
+fn ac_ns_2_1_a_schema_change_the_storage_refuses_leaves_nothing() {
+    let (db, a, b) = two_writers();
+    let (cookie_before, names_before) = (cookie(&a), names(&a));
+    run(&a, "BEGIN");
+    run(&a, "CREATE INDEX tv ON t (v)");
+    run(&b, "INSERT INTO t VALUES (3, 0)");
+    let e = a
+        .execute("COMMIT")
+        .expect_err("an index built over rows changed beside it commits");
+    assert!(
+        matches!(
+            e,
+            crate::LimboError::SerializationFailure | crate::LimboError::WriteWriteConflict
+        ),
+        "the schema change's refusal: {e:?}"
+    );
+    if !a.get_auto_commit() {
+        run(&a, "ROLLBACK");
+    }
+    let c = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    for (who, conn) in [("its own", &a), ("the other", &b), ("a new one", &c)] {
+        assert_eq!(cookie(conn), cookie_before, "{who} connection's cookie");
+        assert_eq!(names(conn), names_before, "{who} connection's schema rows");
+        assert!(
+            conn.prepare("SELECT id FROM t INDEXED BY tv WHERE v = 0")
+                .is_err(),
+            "{who} connection knows the refused index"
+        );
+    }
+    run(&a, "CREATE INDEX tv ON t (v)");
+    let all = vec![
+        vec![Value::from_i64(1)],
+        vec![Value::from_i64(2)],
+        vec![Value::from_i64(3)],
+    ];
+    for (who, conn) in [("its own", &a), ("the other", &b), ("a new one", &c)] {
+        assert_ne!(cookie(conn), cookie_before, "{who} connection's cookie");
+        let (by_tv, by_table) = by_index(conn, 0);
+        assert_eq!(by_tv, all, "{who} connection, through the index");
+        assert_eq!(by_table, all, "{who} connection, through the table");
+    }
+}
+
+/// AC-NS.2.1 (lane g7s2-19): a writer's schema checks read the header its pager's read sees, and
+/// that read can begin before its storage snapshot does. Do open a transaction whose first
+/// statement reads only the header (`PRAGMA schema_version`: its pager's read begins, no row of
+/// the storage read), let another connection's CREATE INDEX on `t` commit, then insert a row of
+/// `t` (compiled against the schema without the index, its cookie check against the older header
+/// passing, its storage snapshot begun only now, after the index) and commit. Expect the header
+/// still the older one, the commit refused with `SchemaConflict` and nothing of it in the table or
+/// the index; run again, its row in both. Limited by its snapshot's start (lane g7s2-17), the
+/// writer was let through and its row was in the table alone.
+#[test]
+fn ac_ns_2_1_a_writer_checked_before_a_schema_change_and_begun_after_is_refused() {
+    let (_db, a, b) = two_writers();
+    run(&a, "BEGIN");
+    let before = cookie(&a);
+    run(&b, "CREATE INDEX tv ON t (v)");
+    assert_eq!(
+        cookie(&a),
+        before,
+        "the writer's header is its pager read's"
+    );
+    run(&a, "INSERT INTO t VALUES (3, 30)");
+    let e = a
+        .execute("COMMIT")
+        .expect_err("a writer checked against the schema before an index commits");
+    assert!(
+        matches!(e, crate::LimboError::SchemaConflict),
+        "the writer's refusal: {e:?}"
+    );
+    if !a.get_auto_commit() {
+        run(&a, "ROLLBACK");
+    }
+    assert_eq!(by_index(&b, 30), (vec![], vec![]));
+    run(&a, "INSERT INTO t VALUES (3, 30)");
+    let three = vec![vec![Value::from_i64(3)]];
+    assert_eq!(by_index(&b, 30), (three.clone(), three));
+}
+
+/// AC-NS.2.1 (lane g7s2-19): a schema change's cookie can be read a moment before its rows are
+/// published (the pager's part commits under the storage's publish lock, before the rows). Do
+/// pause another connection's CREATE INDEX there (`Switch::pause_next_commit_with`), then run a
+/// statement on a connection whose schema is the older one: it reads the newer cookie, so it
+/// reloads the schema; the index's commit goes on only once that reload is about to wait for it
+/// (`Switch::tell_next_publish_wait`). Expect the reload to have read the index's row: that
+/// connection, another made before the index and a new one all read the same cookie and find the
+/// rows through the index. Without the wait, the reload read the older rows, kept them under the
+/// newer cookie and gave them to the database, so no connection after knew the index.
+#[test]
+fn ac_ns_2_1_a_schema_read_beside_a_schema_change_waits_for_its_rows() {
+    let (db, a, c) = two_writers();
+    let switch = a.versioned_for(crate::MAIN_DB_ID).unwrap();
+    let (paused, go_on) = switch.pause_next_commit_with();
+    let maker = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let b = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            let made = b.execute("CREATE INDEX tv ON t (v)");
+            // A commit that never paused (it failed first) lets the test hear it.
+            if let Some(switch) = b.versioned_for(crate::MAIN_DB_ID) {
+                switch.clear_commit_pause();
+            }
+            made
+        })
+    };
+    // The index's cookie is committed, its rows not yet published.
+    paused
+        .recv()
+        .unwrap_or_else(|_| panic!("the index's commit ended without its pause"));
+    let told = switch.tell_next_publish_wait();
+    let releaser = std::thread::spawn(move || {
+        // Told, or the word dropped unheard: either way the index's commit goes on.
+        told.recv().ok();
+        go_on.send(()).ok();
+    });
+    assert_eq!(
+        rows(&c, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    switch.clear_publish_wait();
+    releaser.join().unwrap();
+    maker.join().unwrap().unwrap();
+    let d = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    let now = cookie(&d);
+    let both = vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]];
+    for (who, conn) in [("the reloaded", &c), ("another", &a), ("a new", &d)] {
+        assert_eq!(cookie(conn), now, "{who} connection's cookie");
+        assert!(
+            conn.prepare("SELECT id FROM t INDEXED BY tv WHERE v = 0")
+                .is_ok(),
+            "{who} connection doesn't know the index"
+        );
+        assert_eq!(
+            by_index(conn, 0),
+            (both.clone(), both.clone()),
+            "{who} connection"
+        );
+    }
+}
+
+/// Two connections to one file database on the versioned storage, each with the same file
+/// attached as `aux` (its trees on a versioned storage of its own, which both share), a table of
+/// two committed rows there.
+#[cfg(feature = "fs")]
+fn two_attached(dir: &std::path::Path) -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+    let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let main = dir.join("main.db");
+    let db = Database::open_file_with_flags(
+        io,
+        main.to_str().unwrap(),
+        crate::OpenFlags::default(),
+        crate::DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let a = attached(&db, dir);
+    run(
+        &a,
+        "CREATE TABLE aux.t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    );
+    run(&a, "INSERT INTO aux.t VALUES (1, 0), (2, 0)");
+    let b = attached(&db, dir);
+    (db, a, b)
+}
+
+/// A connection to `db` on the versioned storage with `dir`'s `aux.db` attached as `aux`.
+#[cfg(feature = "fs")]
+fn attached(db: &Arc<Database>, dir: &std::path::Path) -> Arc<Connection> {
+    let conn = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    let aux = dir.join("aux.db");
+    run(&conn, &format!("ATTACH '{}' AS aux", aux.to_str().unwrap()));
+    conn
+}
+
+/// AC-NS.2.1 (lane g7s2-19): an attached database's commit is one across its pager and its
+/// versioned storage, as the main database's is (lane g7s2-18). Do open a transaction that reads
+/// every row of `aux.t` (its storage snapshot begins), let another connection insert a row of
+/// `aux.t` and commit, then build an index of `aux.t` in the transaction (it writes its schema
+/// row, its index rows and the attached pager's header, the cookie) and commit; expect it refused
+/// (it read the table the insert changed), and nothing of it anywhere: `aux`'s cookie and schema
+/// rows as before on its own connection, on the other and on a new one, and none knowing the
+/// index. Run again, the index stands on every connection, the cookie past the old one. The
+/// attached pager committed first: its cookie and schema stood beside rows the storage refused.
+#[cfg(feature = "fs")]
+#[test]
+fn ac_ns_2_1_an_attached_schema_change_the_storage_refuses_leaves_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, a, b) = two_attached(dir.path());
+    let cookie = |conn: &Arc<Connection>| rows(conn, "PRAGMA aux.schema_version");
+    let names =
+        |conn: &Arc<Connection>| rows(conn, "SELECT name FROM aux.sqlite_schema ORDER BY name");
+    let (cookie_before, names_before) = (cookie(&a), names(&a));
+    run(&a, "BEGIN");
+    assert_eq!(
+        rows(&a, "SELECT count(*) FROM aux.t"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    run(&b, "INSERT INTO aux.t VALUES (3, 0)");
+    run(&a, "CREATE INDEX aux.tv ON t (v)");
+    let e = a
+        .execute("COMMIT")
+        .expect_err("an attached index built over rows changed beside it commits");
+    assert!(conflict(&e), "the schema change's refusal: {e:?}");
+    if !a.get_auto_commit() {
+        run(&a, "ROLLBACK");
+    }
+    let c = attached(&db, dir.path());
+    for (who, conn) in [("its own", &a), ("the other", &b), ("a new one", &c)] {
+        assert_eq!(cookie(conn), cookie_before, "{who} connection's cookie");
+        assert_eq!(names(conn), names_before, "{who} connection's schema rows");
+        assert!(
+            conn.prepare("SELECT id FROM aux.t INDEXED BY tv WHERE v = 0")
+                .is_err(),
+            "{who} connection knows the refused index"
+        );
+    }
+    run(&a, "CREATE INDEX aux.tv ON t (v)");
+    let all = vec![
+        vec![Value::from_i64(1)],
+        vec![Value::from_i64(2)],
+        vec![Value::from_i64(3)],
+    ];
+    for (who, conn) in [("its own", &a), ("the other", &b), ("a new one", &c)] {
+        assert_ne!(cookie(conn), cookie_before, "{who} connection's cookie");
+        assert_eq!(
+            rows(conn, "SELECT id FROM aux.t INDEXED BY tv WHERE v = 0"),
+            all,
+            "{who} connection, through the index"
+        );
+        assert_eq!(
+            rows(conn, "SELECT id FROM aux.t NOT INDEXED WHERE v = 0"),
+            all,
+            "{who} connection, through the table"
+        );
+    }
+}

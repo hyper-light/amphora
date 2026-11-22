@@ -906,15 +906,38 @@ impl Database {
     /// Commits `txn`, logged to `lane`; durable before it returns if `durable` (every commit up to
     /// it durable), else once a later [`Database::sync`] returns. Its timestamp.
     pub fn commit(&self, txn: Txn, d: &mut Descender, lane: LaneId, durable: bool) -> Result<Ts> {
+        self.commit_with(txn, d, lane, durable, || Ok(()))
+    }
+
+    /// [`Database::commit`], with `with` run once the commit's verdict is in and before it is
+    /// published, under the publish lock (lane g7s2-18, `AC-NS.2.1`): the commit was validated,
+    /// its redo record made and checked, and nothing after `with` refuses it. A refusal before
+    /// `with` never runs it; a failure of `with` rolls `txn` back. What else must commit with
+    /// these rows (the pager's header, its schema cookie) commits in `with`, so both commit or
+    /// neither does.
+    pub fn commit_with(
+        &self,
+        txn: Txn,
+        d: &mut Descender,
+        lane: LaneId,
+        durable: bool,
+        with: impl FnOnce() -> Result<()>,
+    ) -> Result<Ts> {
         // Shared for the publish, which a checkpoint's timestamp must not split, and for a
         // rollback a failed append makes, which changes pages.
         let ts = {
             let _changing = self.gate.read();
             self.v.commit_logged(txn, d, |ts, ops| {
-                self.redo.append(lane, ts, ops)?;
+                let ready = self.redo.ready(lane, ts, ops)?;
                 let feeds = self.columns.read();
-                if !feeds.is_empty() {
-                    let whole = self.whole(ops)?;
+                let whole = if feeds.is_empty() {
+                    None
+                } else {
+                    Some(self.whole(ops)?)
+                };
+                with()?;
+                self.redo.push(ready)?;
+                if let Some(whole) = whole {
                     for feed in feeds.iter() {
                         feed.offer(ts, &whole);
                     }
@@ -1135,6 +1158,101 @@ mod tests {
         let mut with_late = want.clone();
         with_late.insert(b"late".to_vec(), b"x".to_vec());
         assert!(got == want || got == with_late, "{} rows", got.len());
+    }
+
+    /// The rows of tree `tree`, as a snapshot begun now sees them.
+    fn tree_rows(db: &Database, tree: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut d = Descender::new();
+        let snap = db.snapshot().unwrap();
+        let all = db.scan(&mut d, &snap, tree, None, usize::MAX).unwrap();
+        db.close_snapshot(snap);
+        all.into_iter().collect()
+    }
+
+    /// AC-NS.2.1 (lane g7s2-18): what commits with a transaction's rows (the pager's header)
+    /// commits in [`Database::commit_with`]'s callback, after the storage's verdict. Do: commit a
+    /// writer begun before a change of the catalog (tree 1), so the storage refuses it
+    /// (`SchemaConflict`); then commit one whose callback fails; then one whose callback succeeds.
+    /// Expect: the refused one's callback never run and its row nowhere; the failed callback's
+    /// transaction rolled back, its row nowhere and the next commit standing; the last one's
+    /// callback run once and its row there.
+    #[test]
+    fn ac_ns_2_1_commit_with_runs_after_the_verdict_and_its_failure_rolls_back() {
+        let disk = Arc::new(Simulated::new(11, 1).unwrap());
+        let db = Database::open(disk, 2_000, 2, cmp).unwrap();
+        db.v.keep_catalog(1);
+        let mut d = Descender::new();
+        let mut early = db.begin().unwrap();
+        db.put(&mut d, &mut early, 0, b"early", b"1").unwrap();
+        let mut schema = db.begin().unwrap();
+        db.put(&mut d, &mut schema, 1, b"index", b"1").unwrap();
+        db.commit(schema, &mut d, db.lane(), true).unwrap();
+        let mut ran = 0;
+        let refused = db.commit_with(early, &mut d, db.lane(), true, || {
+            ran += 1;
+            Ok(())
+        });
+        assert!(
+            matches!(refused, Err(LimboError::SchemaConflict)),
+            "the writer begun before the catalog's change: {refused:?}"
+        );
+        assert_eq!(ran, 0, "the callback ran for a refused commit");
+        assert!(tree_rows(&db, 0).is_empty());
+
+        let mut failing = db.begin().unwrap();
+        db.put(&mut d, &mut failing, 0, b"failing", b"1").unwrap();
+        let failed = db.commit_with(failing, &mut d, db.lane(), true, || {
+            Err(LimboError::InternalError(
+                "the pager's commit failed".into(),
+            ))
+        });
+        assert!(
+            failed.is_err(),
+            "a commit whose callback failed: {failed:?}"
+        );
+        assert!(tree_rows(&db, 0).is_empty());
+
+        let mut last = db.begin().unwrap();
+        db.put(&mut d, &mut last, 0, b"failing", b"2").unwrap();
+        db.commit_with(last, &mut d, db.lane(), true, || {
+            ran += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ran, 1);
+        let want: BTreeMap<_, _> = [(b"failing".to_vec(), b"2".to_vec())].into_iter().collect();
+        assert_eq!(tree_rows(&db, 0), want);
+    }
+
+    /// AC-NS.2.1 (lane g7s2-19): a writer's limit is the newest commit published as its pager's
+    /// read began (`Txn::schema_seen_by`), not its snapshot's start. Do: read the newest commit,
+    /// commit a change of the catalog (tree 1), then begin two writers of tree 0, after it: one
+    /// limited to the commit read before the change, one not. Expect: the limited one refused
+    /// (`SchemaConflict`), its row nowhere; the other's commit standing.
+    #[test]
+    fn ac_ns_2_1_a_writer_limited_before_a_catalog_change_is_refused_though_begun_after() {
+        let disk = Arc::new(Simulated::new(12, 1).unwrap());
+        let db = Database::open(disk, 2_000, 2, cmp).unwrap();
+        db.v.keep_catalog(1);
+        let mut d = Descender::new();
+        let seen = db.v.clock.published();
+        let mut schema = db.begin().unwrap();
+        db.put(&mut d, &mut schema, 1, b"index", b"1").unwrap();
+        db.commit(schema, &mut d, db.lane(), true).unwrap();
+        let mut limited = db.begin().unwrap();
+        limited.schema_seen_by(seen);
+        db.put(&mut d, &mut limited, 0, b"limited", b"1").unwrap();
+        let refused = db.commit(limited, &mut d, db.lane(), true);
+        assert!(
+            matches!(refused, Err(LimboError::SchemaConflict)),
+            "the writer checked before the catalog's change: {refused:?}"
+        );
+        assert!(tree_rows(&db, 0).is_empty());
+        let mut after = db.begin().unwrap();
+        db.put(&mut d, &mut after, 0, b"after", b"1").unwrap();
+        db.commit(after, &mut d, db.lane(), true).unwrap();
+        let want: BTreeMap<_, _> = [(b"after".to_vec(), b"1".to_vec())].into_iter().collect();
+        assert_eq!(tree_rows(&db, 0), want);
     }
 
     /// Do: a transaction left open across a checkpoint, then committed after it; another open

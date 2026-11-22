@@ -1218,6 +1218,15 @@ fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl()
 #[test]
 fn native_table_function_views_survive_checkpoint_and_reopen() {
     for mvcc in [false, true] {
+        // G7 step 2 (`AC-NS.2.1`): the MVCC pass is a test of the pager's MVCC store and its log;
+        // the versioned storage keeps its own row versions, and the pass without it still runs.
+        if mvcc
+            && crate::storage::versioned::switch::pager_only(
+                "its MVCC pass exercises the pager's MVCC store and its log; the versioned storage keeps its own row versions",
+            )
+        {
+            continue;
+        }
         let io = Arc::new(MemoryIO::new());
         let path = format!("native-view-{mvcc}.db");
         let queue = Arc::new(Mutex::new(Vec::new()));

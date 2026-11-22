@@ -1975,15 +1975,17 @@ fn skip_walk_for(
     if conn.mvcc_enabled() {
         return None;
     }
-    let root = match state.get_cursor(cursor_id) {
-        Cursor::BTree(cursor, ..) => {
-            if !cursor.has_rowid() || !Arc::ptr_eq(&cursor.get_pager(), &conn.get_pager()) {
-                return None;
-            }
-            cursor.root_page()
-        }
-        _ => return None,
-    };
+    // G7 step 2 (`AC-NS.2.1`): a table on the versioned storage is read through a cursor of its
+    // own (`Cursor::Dyn`), its root page the tree's id the summary is kept by.
+    let cursor = state.get_cursor(cursor_id);
+    if !matches!(cursor, Cursor::BTree(..) | Cursor::Dyn(..)) {
+        return None;
+    }
+    let cursor = cursor.as_btree_mut();
+    if !cursor.has_rowid() || !Arc::ptr_eq(&cursor.get_pager(), &conn.get_pager()) {
+        return None;
+    }
+    let root = cursor.root_page();
     let registry = &conn.db.skipping;
     let column = registry.column_of(root)?;
     // Lane skip-usable (T-SKU.1): a parameter's bound value is read as the scan starts.
@@ -5306,6 +5308,11 @@ pub fn op_transaction_inner(
                                 OpTransactionState::CheckSchemaCookie;
                             continue;
                         }
+                        // Amphora (lane g7s2-19, `AC-NS.2.1`): the limit of the schema checks
+                        // made in this read, read before it begins (`Switch::pager_read_begins`).
+                        if let Some(switch) = conn.versioned_for(*db) {
+                            switch.pager_read_begins();
+                        }
                         pager.begin_read_tx()?;
                         started_secondary_tx = true;
                         if matches!(tx_mode, TransactionMode::Write) {
@@ -5326,6 +5333,11 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new read transaction"
                         );
+                        // Amphora (lane g7s2-19, `AC-NS.2.1`): the limit of the schema checks
+                        // made in this read, read before it begins (`Switch::pager_read_begins`).
+                        if let Some(switch) = conn.versioned_for(*db) {
+                            switch.pager_read_begins();
+                        }
                         pager.begin_read_tx()?;
                         // https://github.com/tursodatabase/turso/issues/7106 : If auto-commit is turned off,
                         // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
@@ -5334,10 +5346,23 @@ pub fn op_transaction_inner(
                         }
                     }
 
-                    if !is_secondary_db
-                        && updated
-                        && matches!(new_transaction_state, TransactionState::Write { .. })
-                    {
+                    // Amphora (G7 step 2, `AC-NS.2.1`): on the versioned storage the rows are the
+                    // storage's, and its writers conflict only on the rows they touch, so a write
+                    // transaction takes the pager's write lock only for a program that writes the
+                    // pager's header (a cookie, the journal mode, a vacuum), when that program runs,
+                    // even inside a transaction that began without it.
+                    let versioned = !is_secondary_db && conn.versioned_for(*db).is_some();
+                    let takes_write_lock = if versioned {
+                        matches!(new_transaction_state, TransactionState::Write { .. })
+                            && !conn.is_nested_stmt()
+                            && program.writes_pager_header
+                            && !pager.holds_write_lock()
+                    } else {
+                        !is_secondary_db
+                            && updated
+                            && matches!(new_transaction_state, TransactionState::Write { .. })
+                    };
+                    if takes_write_lock {
                         turso_assert!(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
@@ -5363,6 +5388,9 @@ pub fn op_transaction_inner(
                                 | TransactionState::PendingUpgrade { has_read_txn: true } => {
                                     conn.set_tx_state(TransactionState::Read);
                                 }
+                                // A versioned writer refused the pager's lock for its header:
+                                // its transaction stays as it was, for its caller to roll back.
+                                TransactionState::Write { .. } if versioned => {}
                                 TransactionState::Write { .. } => {
                                     panic!("impossible state: {current_state:?}")
                                 }
@@ -5373,7 +5401,10 @@ pub fn op_transaction_inner(
                             // set the transaction state to pending so we don't have to
                             // end the read transaction.
                             conn.set_tx_state(TransactionState::PendingUpgrade {
-                                has_read_txn: matches!(current_state, TransactionState::Read),
+                                has_read_txn: matches!(
+                                    current_state,
+                                    TransactionState::Read | TransactionState::Write { .. }
+                                ),
                             });
                             return Ok(state.suspend_on_io(io));
                         }
@@ -5870,6 +5901,11 @@ pub fn op_savepoint(
                         // materializes at write upgrade and db_size could
                         // move there the same way.
                         if !pager.holds_read_lock() {
+                            // Amphora (lane g7s2-19, `AC-NS.2.1`): the transaction's schema
+                            // checks are made in this read (`Switch::pager_read_begins`).
+                            if let Some(switch) = conn.versioned_for(crate::MAIN_DB_ID) {
+                                switch.pager_read_begins();
+                            }
                             pager.begin_read_tx()?;
                         }
                         if matches!(conn.get_tx_state(), TransactionState::None) {
@@ -12874,6 +12910,8 @@ pub struct OpInsertState {
     pub has_dependent_views: bool,
     /// Amphora (G5 step 4): a skipping summary watches the table, so the old row is captured.
     pub skip_on: bool,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the summaries installed when `skip_on` was read.
+    pub skip_installs: u64,
     pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
@@ -12940,18 +12978,17 @@ fn skipping_integer(value: Option<&Value>) -> Option<i64> {
 /// of the old row (captured before the write).
 fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite) {
     let registry = &program.connection.db.skipping;
-    match program.connection.skipping_positions() {
-        Some((_, committed)) => {
+    match program.connection.skipping_write_base() {
+        Some((committed, told)) => {
             // Lane skip-5 (T-SKU.5): each measured summary's write upkeep is timed.
             let origin = std::time::Instant::now();
             let mut now = || crate::skipping::nanos_since(origin);
-            registry.on_write(
-                root,
-                program.connection.skipping_id(),
-                committed,
-                write,
-                &mut now,
-            )
+            let writer = program.connection.skipping_id();
+            if told {
+                registry.on_write_told(root, writer, committed, write, &mut now)
+            } else {
+                registry.on_write(root, writer, committed, write, &mut now)
+            }
         }
         None => registry.mark_stale(root),
     }
@@ -12994,6 +13031,27 @@ fn skipping_on_insert(
         None => crate::skipping::RowWrite::Insert { rowid, value: new },
     };
     skipping_hand(program, root, write);
+}
+
+/// Amphora (G7 step 2, `AC-NS.2.1`): a write that found no summary of its table before its row
+/// changed, `since` the installs it read then. On the versioned storage a build holds no lock
+/// against it: one installed between may have read the table before the row changed and checked
+/// its open writers before this one counted, so it misses the row, and it is made stale. With
+/// none installed between, a build after the change sees this writer open. (A delete needs no
+/// such look: its hook runs whether or not it found a summary, and one with no row captured makes
+/// the summary stale.)
+fn skipping_missed_install(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: crate::vdbe::CursorID,
+    since: u64,
+) {
+    if program.connection.db.skipping.installs() == since {
+        return;
+    }
+    if let Some(root) = skipping_watched_root(program, state, cursor_id) {
+        program.connection.db.skipping.mark_stale(root);
+    }
 }
 
 fn skipping_on_delete(
@@ -13047,9 +13105,11 @@ pub fn op_insert(
                         .is_empty()
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
+                let skip_installs = program.connection.db.skipping.installs();
                 let skip_on = !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                     && skipping_watched_root(program, state, *cursor_id).is_some();
                 state.active_op_state.insert().skip_on = skip_on;
+                state.active_op_state.insert().skip_installs = skip_installs;
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
@@ -13228,6 +13288,9 @@ pub fn op_insert(
                     }
                     if state.active_op_state.insert().skip_on {
                         skipping_on_insert(program, state, *cursor_id, *key_reg, *record_reg);
+                    } else if !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT) {
+                        let since = state.active_op_state.insert().skip_installs;
+                        skipping_missed_install(program, state, *cursor_id, since);
                     }
                     state.record_rows_written(1);
                 }
@@ -17345,8 +17408,17 @@ pub fn op_set_skipping(
         },
         insn
     );
-    crate::skipping::set_skipping_with(&program.connection, table, column, *kind, *build)
-        .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
+    // Lane g7s2-17: a build that waits for its table's writers gives up at the statement's
+    // deadline.
+    crate::skipping::set_skipping_with_until(
+        &program.connection,
+        table,
+        column,
+        *kind,
+        *build,
+        state.query_deadline,
+    )
+    .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
     // Lane skip-11 (T-SKU.14): the summary just set asks for IN lists as `lists` says (none is
     // kept when `kind` dropped it).
     let _kept = crate::skipping::set_list_probe(&program.connection, table, *lists);

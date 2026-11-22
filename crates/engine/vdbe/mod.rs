@@ -781,6 +781,7 @@ impl ActiveOpStateSlot {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             has_dependent_views: false,
             skip_on: false,
+            skip_installs: 0,
             old_record: None,
             is_noop_update: false,
         }
@@ -2043,6 +2044,21 @@ pub struct PreparedProgram {
     /// Amphora (G5 step 4, T-G5.4.3): the scan cursors that may skip rows by a summary, with
     /// their filters' integer bounds (`skipping/scan.rs`).
     pub skip_hints: Vec<crate::skipping::SkipHint>,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the program writes the pager's database header (a
+    /// schema or user cookie, the journal mode, a vacuum). On the versioned storage the rows are
+    /// the storage's, so only such a program takes the pager's write lock: other writers run
+    /// beside each other and conflict only on the rows they touch (engine.md, decision 13).
+    pub writes_pager_header: bool,
+}
+
+/// Whether `insns` write the pager's database header (`PreparedProgram::writes_pager_header`).
+pub(crate) fn writes_pager_header(insns: &[(Insn, usize)]) -> bool {
+    insns.iter().any(|(insn, _)| {
+        matches!(
+            insn,
+            Insn::SetCookie { .. } | Insn::JournalMode { .. } | Insn::Vacuum { .. }
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -3019,6 +3035,24 @@ impl Program {
             // We don't want to commit on nested statements. Let parent handle it.
             return Ok(IOResult::Done(()));
         }
+        // Amphora (lane g7s2-18, `AC-NS.2.1`): on the versioned storage a transaction that wrote
+        // the pager's header (a schema change's cookie, a pragma) commits it inside the storage's
+        // commit, once the storage's verdict is in and before its rows are published. A refusal
+        // (a conflict, `SchemaConflict`) comes before the pager commits, so the abort that
+        // follows rolls both back; the pager's failure rolls the storage's back. The pager's
+        // commit was first and the storage's after: a refused schema change left its cookie
+        // committed and its rows not.
+        if !rollback
+            && mv_store.is_none()
+            && matches!(program_state.commit_state, CommitState::Ready)
+            && matches!(tx_state, TransactionState::Write { .. })
+            && self.connection.auto_commit.load(Ordering::SeqCst)
+            && pager.holds_write_lock()
+        {
+            if let Some(switch) = self.connection.versioned_for(crate::MAIN_DB_ID) {
+                self.commit_versioned_with_header(&switch, &pager)?;
+            }
+        }
         let res = if let Some(mv_store) = mv_store {
             self.commit_txn_mvcc(pager, program_state, mv_store, rollback)
         } else {
@@ -3036,8 +3070,21 @@ impl Program {
             if transaction_finished {
                 // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction ends
                 // where the pager's does.
-                self.connection
-                    .each_versioned(|switch| switch.finish(rollback))?;
+                let ended = self
+                    .connection
+                    .each_versioned(|switch| switch.finish(rollback));
+                // A skipping summary that took this writer's writes holds the newest commit once
+                // it committed, and is stale if it didn't: on the versioned storage the writer's
+                // end is told, not read from the positions.
+                if self.connection.versioned_for(crate::MAIN_DB_ID).is_some() {
+                    let writer = self.connection.skipping_id();
+                    if rollback || ended.is_err() {
+                        self.connection.db.skipping.rolled_back(writer);
+                    } else {
+                        self.connection.db.skipping.committed(writer);
+                    }
+                }
+                ended?;
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
                 // snapshot after every statement inside an explicit
@@ -3051,6 +3098,40 @@ impl Program {
             }
         }
         Ok(res)
+    }
+
+    /// The pager's commit of its header inside the versioned storage's ([`Switch::commit_with`],
+    /// lane g7s2-18, `AC-NS.2.1`), run to its end there: the storage's publish lock is held
+    /// across it, which only a transaction that wrote the header (DDL, a pragma) pays. The
+    /// transaction stays `Write`, so the commit goes on as it would and finds the pager's part
+    /// done. A schema change is published to the database's shared schema only once the
+    /// storage's rows are, so a connection that takes the new schema reads them.
+    ///
+    /// [`Switch::commit_with`]: crate::storage::versioned::switch::Switch::commit_with
+    fn commit_versioned_with_header(
+        &self,
+        switch: &crate::storage::versioned::switch::Switch,
+        pager: &Arc<Pager>,
+    ) -> Result<()> {
+        use crate::util::IOExt;
+        let connection = &self.connection;
+        let schema_did_change = matches!(
+            connection.get_tx_state(),
+            TransactionState::Write {
+                schema_did_change: true
+            }
+        );
+        let sync_mode = connection.get_sync_mode();
+        switch.commit_with(|| {
+            pager
+                .io
+                .block(|| pager.commit_tx(connection, sync_mode, false))
+        })?;
+        if schema_did_change {
+            let schema = connection.schema.read().clone();
+            connection.db.update_schema_if_newer(schema);
+        }
+        Ok(())
     }
 
     fn commit_txn_wal(
@@ -3365,6 +3446,32 @@ impl Program {
                     continue;
                 }
                 if !rollback {
+                    // Amphora (lane g7s2-19, `AC-NS.2.1`): an attached database on the versioned
+                    // storage commits its pager's part inside its storage's commit, once the
+                    // storage's verdict is in and before its rows are published, as the main
+                    // database's does (`Program::commit_versioned_with_header`): a refusal comes
+                    // before the pager commits, and the pager's failure rolls the storage's back.
+                    // Its schema is published once its rows are.
+                    if let Some(switch) = connection.versioned_for(db_id) {
+                        use crate::util::IOExt;
+                        let sync_mode = connection.get_sync_mode_for_database(db_id)?;
+                        switch.commit_with(|| {
+                            attached_pager.io.block(|| {
+                                attached_pager.commit_wal(
+                                    WalAutoActions::empty(),
+                                    connection.get_wal_autocheckpoint(),
+                                    sync_mode,
+                                    connection.get_data_sync_retry(),
+                                )
+                            })?;
+                            attached_pager.end_write_tx();
+                            attached_pager.end_read_tx();
+                            attached_pager.commit_wal_end();
+                            Ok(())
+                        })?;
+                        connection.publish_database_schema(db_id);
+                        continue;
+                    }
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.
@@ -4572,6 +4679,7 @@ mod tests {
             sub_state: OpInsertSubState::Seek,
             has_dependent_views: false,
             skip_on: false,
+            skip_installs: 0,
             old_record: None,
             is_noop_update: false,
         };

@@ -3216,3 +3216,617 @@ mod builds {
         }
     }
 }
+
+/// G7 step 2 (`AC-NS.2.1`): the summaries on the versioned storage, where writers take no single
+/// write lock: a scan asks the summary, and a writer's end is told rather than read from the
+/// positions.
+mod versioned {
+    use super::super::{
+        set_skipping, set_skipping_until, skipping_candidates, skipping_counts, BuildPolicy,
+        RowWrite, SkipKind, SkipRefusal, SkipRegistry, Skipping, ZoneMapBuilder,
+    };
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+    use crate::{ConnectOpts, Connection, Database, SqliteDialect, Value};
+
+    /// A query's rowids and the rows its scan read (the statement's counter).
+    fn rowids(conn: &Arc<Connection>, sql: &str) -> (Vec<i64>, u64) {
+        let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let rows = stmt
+            .run_collect_rows()
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .into_iter()
+            .map(|row| match row.first() {
+                Some(Value::Numeric(crate::Numeric::Integer(rowid))) => *rowid,
+                other => panic!("{sql}: rowid {other:?}"),
+            })
+            .collect();
+        (rows, stmt.metrics().rows_read)
+    }
+
+    /// Do: a told writer's write, another writer's commit beside it, then its own commit told.
+    /// Expect: a reader at the newest commit is refused until the writer's commit is told (a
+    /// newer commit isn't its commit); the writer sees its own rows; a second open writer's write
+    /// makes the summary stale.
+    #[test]
+    fn t_ns_2_1_a_told_writer_ends_only_when_told() {
+        let (root, writer, other, reader) = (5, 1, 2, 3);
+        let registry = SkipRegistry::default();
+        let mut zones = ZoneMapBuilder::new();
+        for rowid in 1..=8 {
+            zones.row(rowid, Some(rowid)).unwrap();
+        }
+        registry.set(root, 0, Skipping::ZoneMaps(zones.finish()));
+        let insert = |rowid| RowWrite::Insert {
+            rowid,
+            value: Some(rowid),
+        };
+        registry.on_write_told(root, writer, (0, 3), insert(9), &mut || 0);
+        // Another writer committed beside it: the newest commit is 4, without the open writes.
+        assert_eq!(
+            registry.candidates(root, reader, (0, 4), (0, 4), 1, 9),
+            Err(SkipRefusal::OlderSnapshot)
+        );
+        assert!(registry
+            .candidates(root, writer, (0, 3), (0, 4), 1, 9)
+            .is_ok());
+        registry.committed(writer);
+        assert!(registry
+            .candidates(root, reader, (0, 5), (0, 5), 1, 9)
+            .is_ok());
+        registry.on_write_told(root, writer, (0, 5), insert(10), &mut || 0);
+        registry.on_write_told(root, other, (0, 5), insert(11), &mut || 0);
+        assert_eq!(
+            registry.candidates(root, other, (0, 5), (0, 5), 1, 11),
+            Err(SkipRefusal::Stale)
+        );
+    }
+
+    /// Do: a summary of each kind on a versioned table, a SQL filter, writes through SQL, and a
+    /// reader whose snapshot is older than a commit. Expect: the scan asks the summary (counted
+    /// consulted, fewer rows read) and answers as without it; the older reader is refused and
+    /// still sees its snapshot's rows.
+    #[test]
+    fn t_ns_2_1_a_scan_on_the_versioned_storage_asks_the_summary() {
+        let sql = "SELECT rowid FROM t WHERE a BETWEEN 100 AND 120 ORDER BY rowid";
+        for kind in [SkipKind::ZoneMaps, SkipKind::Cracking, SkipKind::Measured] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            assert!(conn.versioned_for(crate::MAIN_DB_ID).is_some());
+            conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+                .unwrap();
+            conn.execute("BEGIN").unwrap();
+            for i in 0..3000 {
+                conn.execute(format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(40)))
+                    .unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+            let (plain, read_plain) = rowids(&conn, sql);
+            assert_eq!(plain, (101..=121).collect::<Vec<_>>());
+            set_skipping(&conn, "t", "a", Some(kind)).unwrap();
+            let (skipped, read_skipped) = rowids(&conn, sql);
+            assert_eq!(skipped, plain, "{kind:?}");
+            assert!(
+                read_skipped < read_plain,
+                "{kind:?}: read {read_skipped} rows skipping, {read_plain} not"
+            );
+            assert_eq!(
+                skipping_counts(&conn, "t").unwrap().consulted,
+                1,
+                "{kind:?}"
+            );
+            // Writes reach the summary through the hook, each committed and told.
+            conn.execute("DELETE FROM t WHERE a = 110").unwrap();
+            conn.execute("INSERT INTO t VALUES (105, 'new')").unwrap();
+            let mut expected: Vec<i64> = (101..=121).filter(|rowid| *rowid != 111).collect();
+            expected.push(3001);
+            assert_eq!(rowids(&conn, sql).0, expected, "{kind:?}");
+            let counts = skipping_counts(&conn, "t").unwrap();
+            assert_eq!((counts.writes, counts.consulted), (2, 2), "{kind:?}");
+            // A reader whose snapshot a commit passed is refused, and reads its snapshot whole.
+            let reader = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            reader.execute("BEGIN").unwrap();
+            let (before, _) = rowids(&reader, sql);
+            assert_eq!(before, expected, "{kind:?}");
+            conn.execute("DELETE FROM t WHERE a BETWEEN 100 AND 120")
+                .unwrap();
+            assert_eq!(
+                skipping_candidates(&reader, "t", 100, 120),
+                Err(SkipRefusal::OlderSnapshot),
+                "{kind:?}"
+            );
+            assert_eq!(rowids(&reader, sql).0, before, "{kind:?}");
+            reader.execute("COMMIT").unwrap();
+            assert!(rowids(&reader, sql).0.is_empty(), "{kind:?}");
+        }
+    }
+
+    /// Do: a checked install whose check says rows were missed, then one whose check finds
+    /// none. Expect: the first is kept stale (counted, a scan refused) and moves the installs; the
+    /// second is consulted.
+    #[test]
+    fn t_ns_2_1_a_checked_install_keeps_a_build_that_missed_rows_stale() {
+        let (root, reader) = (5, 1);
+        let registry = SkipRegistry::default();
+        let zones = || {
+            let mut zones = ZoneMapBuilder::new();
+            for rowid in 1..=8 {
+                zones.row(rowid, Some(rowid)).unwrap();
+            }
+            Skipping::ZoneMaps(zones.finish())
+        };
+        let before = registry.installs();
+        let why = "another open transaction has changed the table";
+        assert_eq!(
+            registry.set_checked(root, 0, zones(), || Some(why)),
+            Some(why)
+        );
+        assert_ne!(registry.installs(), before);
+        assert_eq!(
+            registry.candidates(root, reader, (0, 1), (0, 1), 1, 8),
+            Err(SkipRefusal::Stale)
+        );
+        assert_eq!(registry.counts(root).unwrap().built_stale, 1);
+        assert_eq!(registry.set_checked(root, 0, zones(), || None), None);
+        assert!(registry
+            .candidates(root, reader, (0, 1), (0, 1), 1, 8)
+            .is_ok());
+        let counts = registry.counts(root).unwrap();
+        assert_eq!((counts.built_stale, counts.consulted), (0, 1));
+    }
+
+    /// Do: one connection inserts a row the filter matches and stays open; another builds a
+    /// summary beside it, at a snapshot without the row; the writer commits. Expect: the build is
+    /// kept stale (counted), so the filter scans every row and finds the committed row (a summary
+    /// kept current would skip its zone and lose it); built again with no writer open, it holds
+    /// the row and is consulted. `BuildPolicy::Stale`'s failure mode, forced: until the next
+    /// build every scan of the table reads all its rows.
+    #[test]
+    fn t_ns_2_1_a_build_beside_an_open_writer_is_kept_stale() {
+        let sql = "SELECT rowid FROM t WHERE a BETWEEN 100 AND 120 ORDER BY rowid";
+        for kind in [SkipKind::ZoneMaps, SkipKind::Cracking, SkipKind::Measured] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let open = || {
+                db.connect(ConnectOpts::new().with_versioned_storage())
+                    .unwrap()
+            };
+            let (builder, writer) = (open(), open());
+            db.skipping.set_policy(BuildPolicy::Stale);
+            builder
+                .execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+                .unwrap();
+            builder.execute("BEGIN").unwrap();
+            for i in 0..3000 {
+                builder
+                    .execute(format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(40)))
+                    .unwrap();
+            }
+            builder.execute("COMMIT").unwrap();
+            writer.execute("BEGIN").unwrap();
+            writer
+                .execute("INSERT INTO t VALUES (110, 'open')")
+                .unwrap();
+            set_skipping(&builder, "t", "a", Some(kind)).unwrap();
+            let counts = skipping_counts(&builder, "t").unwrap();
+            assert_eq!(counts.built_stale, 1, "{kind:?}");
+            writer.execute("COMMIT").unwrap();
+            let mut expected: Vec<i64> = (101..=121).collect();
+            expected.push(3001);
+            let (got, stale_read) = rowids(&builder, sql);
+            assert_eq!(got, expected, "{kind:?}");
+            assert!(
+                stale_read >= 3001,
+                "{kind:?}: a stale summary's scan read {stale_read} rows, not every row"
+            );
+            assert_eq!(
+                skipping_candidates(&builder, "t", 100, 120),
+                Err(SkipRefusal::Stale),
+                "{kind:?}"
+            );
+            // Built again with no writer open: it holds the row and is consulted.
+            set_skipping(&builder, "t", "a", Some(kind)).unwrap();
+            let (got, read) = rowids(&builder, sql);
+            assert_eq!(got, expected, "{kind:?}");
+            assert!(
+                read < stale_read,
+                "{kind:?}: the rebuilt summary's scan read {read} rows"
+            );
+            let counts = skipping_counts(&builder, "t").unwrap();
+            assert_eq!((counts.built_stale, counts.consulted), (0, 1), "{kind:?}");
+            assert_eq!(db.skipping.wait_counts(), (0, 0), "{kind:?}");
+        }
+    }
+
+    /// Do: as `t_ns_2_1_a_build_beside_an_open_writer_is_kept_stale`, under `BuildPolicy::Wait`
+    /// (`AMPHORA_SKIP_BUILD=wait`, the A/B's other arm): one connection inserts a matching row
+    /// and stays open; another builds a summary, on a thread of its own. Expect: the build waits
+    /// (its failure mode, forced: blocked behind the open transaction for as long as it stays
+    /// open), and is woken by the writer's commit, not a timer; it then holds the committed row,
+    /// is not stale, and the filter is answered by it, reading fewer rows than the table's.
+    #[test]
+    fn t_ns_2_1_a_waiting_build_waits_for_the_open_writer() {
+        let sql = "SELECT rowid FROM t WHERE a BETWEEN 100 AND 120 ORDER BY rowid";
+        for kind in [SkipKind::ZoneMaps, SkipKind::Cracking, SkipKind::Measured] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let open = || {
+                db.connect(ConnectOpts::new().with_versioned_storage())
+                    .unwrap()
+            };
+            let (builder, writer) = (open(), open());
+            db.skipping.set_policy(BuildPolicy::Wait);
+            builder
+                .execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+                .unwrap();
+            builder.execute("BEGIN").unwrap();
+            for i in 0..3000 {
+                builder
+                    .execute(format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(40)))
+                    .unwrap();
+            }
+            builder.execute("COMMIT").unwrap();
+            let root = {
+                let mut stmt = builder
+                    .prepare("SELECT rootpage FROM sqlite_schema WHERE name = 't'")
+                    .unwrap();
+                match stmt
+                    .run_collect_rows()
+                    .unwrap()
+                    .first()
+                    .and_then(|r| r.first())
+                {
+                    Some(Value::Numeric(crate::Numeric::Integer(root))) => *root,
+                    other => panic!("no root page for t: {other:?}"),
+                }
+            };
+            writer.execute("BEGIN").unwrap();
+            writer
+                .execute("INSERT INTO t VALUES (110, 'open')")
+                .unwrap();
+            let build = {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let builder = db
+                        .connect(ConnectOpts::new().with_versioned_storage())
+                        .unwrap();
+                    set_skipping(&builder, "t", "a", Some(kind))
+                })
+            };
+            // The build's own event: it waits on the table once it found the writer open. Until
+            // the writer ends nothing can wake it, so it stays unfinished however long this runs.
+            let switch = writer.versioned_for(crate::MAIN_DB_ID).unwrap();
+            while switch.waiting_on(root).unwrap() == 0 {
+                std::thread::yield_now();
+            }
+            assert!(
+                !build.is_finished(),
+                "{kind:?}: the build ran beside the open writer"
+            );
+            writer.execute("COMMIT").unwrap();
+            build.join().unwrap().unwrap();
+            assert_eq!(db.skipping.wait_counts(), (1, 0), "{kind:?}");
+            let mut expected: Vec<i64> = (101..=121).collect();
+            expected.push(3001);
+            let (got, read) = rowids(&builder, sql);
+            assert_eq!(got, expected, "{kind:?}");
+            assert!(
+                read < 3001,
+                "{kind:?}: the scan read {read} rows, every row"
+            );
+            let counts = skipping_counts(&builder, "t").unwrap();
+            assert_eq!((counts.built_stale, counts.consulted), (0, 1), "{kind:?}");
+        }
+    }
+
+    /// A versioned database under `BuildPolicy::Wait` with table `t` of 3000 rows (`a` 0..3000):
+    /// the database, a connection, and the table's root page (lane g7s2-17's tests).
+    fn waiting_table() -> (Arc<Database>, Arc<Connection>, i64) {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        db.skipping.set_policy(BuildPolicy::Wait);
+        let conn = db
+            .connect(ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..3000 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(40)))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT rootpage FROM sqlite_schema WHERE name = 't'")
+            .unwrap();
+        let root = match stmt
+            .run_collect_rows()
+            .unwrap()
+            .first()
+            .and_then(|r| r.first())
+        {
+            Some(Value::Numeric(crate::Numeric::Integer(root))) => *root,
+            other => panic!("no root page for t: {other:?}"),
+        };
+        (db, conn, root)
+    }
+
+    const FILTER: &str = "SELECT rowid FROM t WHERE a BETWEEN 100 AND 120 ORDER BY rowid";
+
+    /// The filter's rows once row 3001 (`a` = 110) is in.
+    fn with_the_new_row() -> Vec<i64> {
+        let mut expected: Vec<i64> = (101..=121).collect();
+        expected.push(3001);
+        expected
+    }
+
+    /// Do (lane g7s2-17, `AC-NS.2.1`): under `BuildPolicy::Wait`, this thread opens a writer of
+    /// the table on one connection, inserting a row the filter matches, and builds a summary on
+    /// another. Expect: the wait is refused at once as the thread's own (before, it blocked for
+    /// good: the writer can only end on this thread), counted, and the build goes in as `Stale`
+    /// builds it: kept stale, so once the writer commits the filter reads every row and finds
+    /// the new one.
+    #[test]
+    fn t_ns_2_1_a_waiting_build_beside_its_own_threads_writer_goes_in_stale() {
+        for kind in [SkipKind::ZoneMaps, SkipKind::Cracking, SkipKind::Measured] {
+            let (db, builder, _) = waiting_table();
+            let writer = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            writer.execute("BEGIN").unwrap();
+            writer
+                .execute("INSERT INTO t VALUES (110, 'open')")
+                .unwrap();
+            set_skipping(&builder, "t", "a", Some(kind)).unwrap();
+            assert_eq!(db.skipping.wait_refusals(), (1, 0), "{kind:?}");
+            assert_eq!(db.skipping.wait_counts(), (0, 0), "{kind:?}");
+            let counts = skipping_counts(&builder, "t").unwrap();
+            assert_eq!(counts.built_stale, 1, "{kind:?}");
+            writer.execute("COMMIT").unwrap();
+            let (got, read) = rowids(&builder, FILTER);
+            assert_eq!(got, with_the_new_row(), "{kind:?}");
+            assert!(
+                read >= 3001,
+                "{kind:?}: a stale summary's scan read {read} rows"
+            );
+        }
+    }
+
+    /// Do (lane g7s2-17, `AC-NS.2.1`): under `BuildPolicy::Wait`, another thread opens a writer
+    /// of the table and keeps it open; this thread builds a summary with a deadline already
+    /// passed (its statement's, `set_skipping_until`). Expect: the wait gives up at the deadline
+    /// rather than block for as long as the writer stays open, typed and counted, its waiter
+    /// taken out; the build goes in stale, and once the writer commits the filter finds its row.
+    #[test]
+    fn t_ns_2_1_a_waiting_build_gives_up_at_its_deadline() {
+        for kind in [SkipKind::ZoneMaps, SkipKind::Cracking, SkipKind::Measured] {
+            let (db, builder, root) = waiting_table();
+            let (begun_tx, begun) = std::sync::mpsc::channel();
+            let (end_tx, end) = std::sync::mpsc::channel::<()>();
+            let writer = {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let writer = db
+                        .connect(ConnectOpts::new().with_versioned_storage())
+                        .unwrap();
+                    writer.execute("BEGIN").unwrap();
+                    writer
+                        .execute("INSERT INTO t VALUES (110, 'open')")
+                        .unwrap();
+                    begun_tx.send(()).unwrap();
+                    end.recv().unwrap();
+                    writer.execute("COMMIT").unwrap();
+                })
+            };
+            begun.recv().unwrap();
+            let passed = builder.get_pager().io.current_time_monotonic();
+            set_skipping_until(&builder, "t", "a", Some(kind), Some(passed)).unwrap();
+            assert_eq!(db.skipping.wait_refusals(), (0, 1), "{kind:?}");
+            assert_eq!(db.skipping.wait_counts(), (0, 0), "{kind:?}");
+            let switch = builder.versioned_for(crate::MAIN_DB_ID).unwrap();
+            assert_eq!(switch.waiting_on(root).unwrap(), 0, "{kind:?}");
+            let counts = skipping_counts(&builder, "t").unwrap();
+            assert_eq!(counts.built_stale, 1, "{kind:?}");
+            end_tx.send(()).unwrap();
+            writer.join().unwrap();
+            let (got, read) = rowids(&builder, FILTER);
+            assert_eq!(got, with_the_new_row(), "{kind:?}");
+            assert!(
+                read >= 3001,
+                "{kind:?}: a stale summary's scan read {read} rows"
+            );
+        }
+    }
+
+    /// Do (lane g7s2-17, `AC-NS.2.1`): under `BuildPolicy::Wait`, a build on a thread of its own
+    /// is paused by the storage's hook once it has read its rows, before it checks for writers
+    /// (`Switch::pause_next_build`); then a writer inserts a row the filter matches, and either
+    /// stays open or commits, before the build goes on. Expect, both ways: the build found the
+    /// writer it missed and is done again (counted a rebuild); left open, the build waits for it
+    /// (unfinished until it commits, counted a wait); the summary at the end holds the row, is
+    /// not stale, and answers the filter reading fewer rows than the table's.
+    #[test]
+    fn t_ns_2_1_a_writer_slipped_in_beside_a_waiting_build_is_built_again() {
+        for commit_first in [false, true] {
+            for kind in [SkipKind::ZoneMaps, SkipKind::Cracking, SkipKind::Measured] {
+                let (db, writer, root) = waiting_table();
+                let switch = writer.versioned_for(crate::MAIN_DB_ID).unwrap();
+                let (paused, go_on) = switch.pause_next_build(root);
+                let build = {
+                    let db = db.clone();
+                    std::thread::spawn(move || {
+                        let builder = db
+                            .connect(ConnectOpts::new().with_versioned_storage())
+                            .unwrap();
+                        let built = set_skipping(&builder, "t", "a", Some(kind));
+                        // A build that never paused (it failed first) lets the test hear it.
+                        if let Some(switch) = builder.versioned_for(crate::MAIN_DB_ID) {
+                            switch.clear_build_pause();
+                        }
+                        built
+                    })
+                };
+                // The build has read its rows, none of the writer's.
+                paused
+                    .recv()
+                    .unwrap_or_else(|_| panic!("{kind:?}: the build ended without its pause"));
+                writer.execute("BEGIN").unwrap();
+                writer
+                    .execute("INSERT INTO t VALUES (110, 'slipped in')")
+                    .unwrap();
+                if commit_first {
+                    writer.execute("COMMIT").unwrap();
+                }
+                go_on.send(()).unwrap();
+                if !commit_first {
+                    // It found the writer open, went in stale, and waits on it: nothing but the
+                    // writer's end can wake it.
+                    while switch.waiting_on(root).unwrap() == 0 {
+                        std::thread::yield_now();
+                    }
+                    assert!(
+                        !build.is_finished(),
+                        "{kind:?}: the rebuild ran beside the writer"
+                    );
+                    writer.execute("COMMIT").unwrap();
+                }
+                build.join().unwrap().unwrap();
+                assert_eq!(
+                    db.skipping.wait_counts(),
+                    (u64::from(!commit_first), 1),
+                    "{kind:?} commit_first={commit_first}"
+                );
+                assert_eq!(db.skipping.wait_refusals(), (0, 0), "{kind:?}");
+                let (got, read) = rowids(&writer, FILTER);
+                assert_eq!(
+                    got,
+                    with_the_new_row(),
+                    "{kind:?} commit_first={commit_first}"
+                );
+                assert!(
+                    read < 3001,
+                    "{kind:?}: the scan read {read} rows, every row"
+                );
+                let counts = skipping_counts(&writer, "t").unwrap();
+                assert_eq!(
+                    (counts.built_stale, counts.consulted),
+                    (0, 1),
+                    "{kind:?} commit_first={commit_first}"
+                );
+            }
+        }
+    }
+
+    /// The A/B of stale against wait (G7 step 2, `AC-NS.2.1`; lane g7s2-16), the harness of the
+    /// coordinator's run of record: `AMPHORA_SKIP_AB_WRITERS` connections (the ladder 1, 8, 32,
+    /// 128, 512, 2048, 4096; 2 unless set) each commit `AMPHORA_SKIP_AB_TXNS` single-row inserts
+    /// (16 unless set) into one table, while one connection builds its zone-map summary
+    /// `AMPHORA_SKIP_AB_BUILDS` times (4 unless set) and after each build runs a filter. Each arm
+    /// reports its builds' latency (p50, p99, p99.9, max), the builds kept stale, the waits and
+    /// rebuilds, and the rows the filters read (a stale summary's filter reads every row).
+    /// Expect, on each arm: every filter answers as a scan without the summary would (its rows
+    /// counted from the table), and every build ends once the writers do.
+    #[test]
+    fn t_ns_2_1_stale_against_wait_under_writers() {
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let (writers, txns, builds) = (
+            env("AMPHORA_SKIP_AB_WRITERS", 2),
+            env("AMPHORA_SKIP_AB_TXNS", 16),
+            env("AMPHORA_SKIP_AB_BUILDS", 4),
+        );
+        let sql = "SELECT count(*) FROM t WHERE a BETWEEN 100 AND 120";
+        for policy in [BuildPolicy::Stale, BuildPolicy::Wait] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            db.skipping.set_policy(policy);
+            let builder = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            builder
+                .execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+                .unwrap();
+            builder.execute("BEGIN").unwrap();
+            for i in 0..3000 {
+                builder
+                    .execute(format!(
+                        "INSERT INTO t VALUES ({}, '{}')",
+                        i % 1000,
+                        "x".repeat(40)
+                    ))
+                    .unwrap();
+            }
+            builder.execute("COMMIT").unwrap();
+            let next = Arc::new(std::sync::atomic::AtomicU64::new(3001));
+            let threads: Vec<_> = (0..writers)
+                .map(|w| {
+                    let (db, next) = (db.clone(), next.clone());
+                    std::thread::spawn(move || {
+                        let conn = db
+                            .connect(ConnectOpts::new().with_versioned_storage())
+                            .unwrap();
+                        for t in 0..txns {
+                            let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let a = (w * 31 + t * 7) % 1000;
+                            conn.execute(format!(
+                                "INSERT INTO t (rowid, a, pad) VALUES ({id}, {a}, 'w')"
+                            ))
+                            .unwrap();
+                        }
+                    })
+                })
+                .collect();
+            let (mut latencies, mut read, mut stale) = (Vec::new(), 0u64, 0u64);
+            for _ in 0..builds {
+                let started = std::time::Instant::now();
+                set_skipping(&builder, "t", "a", Some(SkipKind::ZoneMaps)).unwrap();
+                latencies.push(started.elapsed().as_nanos());
+                stale += skipping_counts(&builder, "t").map_or(0, |c| c.built_stale);
+                // The filter and the plain scan at one snapshot: writers commit meanwhile.
+                builder.execute("BEGIN").unwrap();
+                let mut stmt = builder.prepare(sql).unwrap();
+                let got = stmt.run_collect_rows().unwrap();
+                read += stmt.metrics().rows_read;
+                let mut plain = builder.prepare("SELECT a FROM t").unwrap();
+                let want = plain
+                    .run_collect_rows()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| matches!(row.first(), Some(Value::Numeric(crate::Numeric::Integer(a))) if (100..=120).contains(a)))
+                    .count();
+                builder.execute("COMMIT").unwrap();
+                assert_eq!(
+                    got,
+                    vec![vec![Value::from_i64(i64::try_from(want).unwrap())]],
+                    "{policy:?}"
+                );
+            }
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            latencies.sort_unstable();
+            // The latency at `per_mille` of the builds (nearest rank).
+            let at = |per_mille: usize| {
+                let i = latencies.len().saturating_sub(1) * per_mille / 1000;
+                latencies.get(i).copied().unwrap_or(0)
+            };
+            let (waits, rebuilds) = db.skipping.wait_counts();
+            eprintln!(
+                "skip_ab policy={policy:?} writers={writers} txns={txns} builds={builds} build_ns_p50={} p99={} p999={} max={} built_stale={stale} waits={waits} rebuilds={rebuilds} filter_rows_read={read}",
+                at(500),
+                at(990),
+                at(999),
+                latencies.last().copied().unwrap_or(0)
+            );
+        }
+    }
+}

@@ -3830,6 +3830,29 @@ impl Pager {
             self.commit_wal_end();
         };
 
+        // Amphora (G7 step 2, `AC-NS.2.1`): a writer on the versioned storage that never wrote
+        // the pager's header never took its write lock (`PreparedProgram::writes_pager_header`):
+        // the pager has nothing of it to commit, only its read to end. The storage commits the
+        // rows where the pager's transaction ends.
+        if connection.versioned.is_some()
+            && !wal.holds_write_lock()
+            && self.commit_info.read().state != CommitState::AutoCheckpoint
+        {
+            if !self.dirty_pages.read().is_empty() {
+                return Err(LimboError::InternalError(
+                    "versioned storage: a writer without the pager's write lock changed a page"
+                        .into(),
+                )
+                .into());
+            }
+            if wal.holds_read_lock() {
+                wal.end_read_tx();
+            }
+            complete_commit();
+            self.clear_savepoints()?;
+            return Ok(IOResult::Done(()));
+        }
+
         loop {
             let commit_state = self.commit_info.read().state;
             tracing::debug!("commit_state: {:?}", commit_state);
@@ -3874,7 +3897,10 @@ impl Pager {
                     wal.end_read_tx();
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
-                    if schema_did_change {
+                    // On the versioned storage the schema's rows are the storage's: the schema is
+                    // published once they are (`Program::commit_versioned_with_header`, lane
+                    // g7s2-18, `AC-NS.2.1`), not here, inside the storage's commit.
+                    if schema_did_change && connection.versioned.is_none() {
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }
@@ -3921,8 +3947,12 @@ impl Pager {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;
         };
+        // A writer on the versioned storage holds the pager's write lock only once it wrote the
+        // header (G7 step 2, `AC-NS.2.1`); without it the pager has only a read to undo.
         let (is_write, schema_did_change) = match connection.get_tx_state() {
-            TransactionState::Write { schema_did_change } => (true, schema_did_change),
+            TransactionState::Write { schema_did_change } if wal.holds_write_lock() => {
+                (true, schema_did_change)
+            }
             _ => (false, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);

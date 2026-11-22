@@ -404,11 +404,25 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   anomaly on either storage (`T-G8.4.1`); an in-memory IO keeps a database's storage beside its
   file, so a database reopened on it finds its trees. Attached databases keep their trees on their own
   versioned storage; the versioned cursor stops at the next leaf once its statement is interrupted
-  and pauses where the pager's cursor does in tests (`AC-NS.2.7`, lane g7s2-11). With the switch on,
+  and pauses where the pager's cursor does in tests (`AC-NS.2.7`, lane g7s2-11). Only a program
+  that writes the pager's header takes its write lock, so SQL writers run at once and conflict only
+  on rows (lane g7s2-16, uncompiled until run); a writer begun before a schema change is
+  refused at commit (`SchemaConflict`, lane g7s2-17, uncompiled until run), and the pager's header
+  commits inside the storage's commit, after its verdict, so a schema change the storage refuses
+  leaves the cookie and the schema rows unchanged (lane g7s2-18, uncompiled until run); an attached
+  database's commit takes the same order, a schema reload waits for the rows of the cookie it read,
+  and a writer whose cookie check came before a schema change is refused even when its snapshot
+  began after it (lane g7s2-19, uncompiled until run). With the switch on,
   44 of the engine's lib tests still fail (2866 pass, lane g7s2-11, before the pause points; 6 more
   pass after) (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
   batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and
-  page-codec tests). Not yet: the header (schema cookie, user version) on the versioned
+  page-codec tests). The skipping summaries are built and asked on the versioned storage, a
+  writer's end told to them as its transaction ends (lane g7s2-14, executor.md decision 11), and a
+  build beside an open writer of the table is kept stale (lane g7s2-15), or under
+  `AMPHORA_SKIP_BUILD=wait` waits for the table's writers to end (lane g7s2-16, the A/B's arm;
+  refused at once beside its own thread's writer and given up at its statement's deadline, both
+  then built stale, lane g7s2-17, uncompiled until run); the
+  pager's leaf-morsel and MVCC-store tests say why they stand aside there. Not yet: the header (schema cookie, user version) on the versioned
   storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
   budget shared by a process's databases. On the pager as on the switch, `nested_loops`'
   chain of hash joins, `row_counts`' hash join and `sample_filters`' outer join fail (planner

@@ -40,7 +40,21 @@
 //! scan is one filter to a measured summary's chooser: one method chosen, one cost handed back,
 //! covering every probe it made and every row it read ([`SkipRegistry::candidates_spans`]).
 
+//!
+//! On the versioned storage (G7 step 2, `AC-NS.2.1`) writers don't take one write lock: another
+//! may commit while one is open. So a write there is taken with [`SkipRegistry::on_write_told`]:
+//! the positions are commit timestamps, the writer's end is told ([`SkipRegistry::committed`],
+//! [`SkipRegistry::rolled_back`]) rather than read from them, and a second open writer's write
+//! makes the summary stale.
+//!
+//! A build there takes no lock against writers either: a writer may change the table before the
+//! build, beside it, and commit after, its rows missing from the summary. So a build is installed
+//! with [`SkipRegistry::set_checked`], which asks the storage, under the registry's lock, whether
+//! one did; if so the summary is kept stale until built again. A write that had found no summary
+//! to feed before its row changed looks again after ([`SkipRegistry::installs`]).
+
 use super::{Candidates, CrackerColumn, RowWrite, SkipError, SkipMethod, Skipping};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
 
 /// A WAL position: `(checkpoint_seq, max_frame)`, as the pager reports a connection's snapshot
@@ -92,6 +106,9 @@ pub struct SkipCounts {
     /// Lane skip-11 (T-SKU.14): probes of the summary scans made (one per span asked for: one per
     /// filter under [`ListProbe::Span`], one per IN value under [`ListProbe::PerValue`]).
     pub probes: u64,
+    /// Builds kept stale because rows were missing from them (G7 step 2, `AC-NS.2.1`): another
+    /// open transaction had changed the table, or a commit passed the build's snapshot.
+    pub built_stale: u64,
 }
 
 /// Lane skip-11 (T-SKU.14): how a scan asks the summary for an IN list's rows (see the module's
@@ -124,6 +141,9 @@ pub enum BuildMode {
 struct Pending {
     writer: usize,
     base: WalPos,
+    /// Its end is told, not read from the positions: on the versioned storage another writer may
+    /// commit while it is open, so a newer commit doesn't mean it committed.
+    told: bool,
 }
 
 /// Lane skip-8 (T-SKU.10): a build of a dropped method one builder holds the claim to.
@@ -206,16 +226,129 @@ pub enum BuildEnd {
     ReplayRefused,
 }
 
+/// How a skipping build on the versioned storage meets writers open on its table (G7 step 2,
+/// `AC-NS.2.1`), chosen by `AMPHORA_SKIP_BUILD` (`stale`, the control, unless `wait`) for the A/B
+/// of record: each has a failure mode its test forces (`skipping/tests.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildPolicy {
+    /// Build at once; a build that missed an open writer's rows goes in stale, and every scan of
+    /// the table reads all its rows until it is built again.
+    Stale,
+    /// Wait for the table's open writers to end (woken by the last one's end), then build; built
+    /// again, after another wait, if a writer slipped in beside the build. Blocked as long as
+    /// writers keep the table open.
+    Wait,
+}
+
+impl BuildPolicy {
+    /// The environment variable that chooses: `wait`, else stale.
+    pub const ENV: &'static str = "AMPHORA_SKIP_BUILD";
+
+    /// The policy the environment asks for.
+    pub fn asked() -> Self {
+        if std::env::var(Self::ENV).is_ok_and(|v| v == "wait") {
+            Self::Wait
+        } else {
+            Self::Stale
+        }
+    }
+}
+
 /// The summaries one database keeps, by table root page.
-#[derive(Debug, Default)]
 pub struct SkipRegistry {
     entries: Mutex<Vec<Entry>>,
     /// Lane skip-8: the last build claim's ticket, unique across summaries set again; locked only
     /// under `entries`.
     tickets: Mutex<u64>,
+    /// How a build on the versioned storage meets open writers (`BuildPolicy`).
+    policy: Mutex<BuildPolicy>,
+    /// Builds that waited for their table's writers to end, and builds done again because a
+    /// writer slipped in beside them (`BuildPolicy::Wait`): the registry's, not a summary's, as
+    /// a summary built again starts its own counts.
+    build_waits: AtomicU64,
+    rebuilds: AtomicU64,
+    /// Waits refused, by why (lane g7s2-17): the writer was the build's thread's own, or the
+    /// deadline passed. Each such build went in as `Stale` builds.
+    refused_own: AtomicU64,
+    refused_deadline: AtomicU64,
+    /// How many summaries were installed, moved under the entries' lock (G7 step 2,
+    /// `AC-NS.2.1`): a write that found none to feed reads it before and after its row changes.
+    installs: AtomicU64,
+}
+
+impl Default for SkipRegistry {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            tickets: Mutex::new(0),
+            policy: Mutex::new(BuildPolicy::asked()),
+            build_waits: AtomicU64::new(0),
+            rebuilds: AtomicU64::new(0),
+            refused_own: AtomicU64::new(0),
+            refused_deadline: AtomicU64::new(0),
+            installs: AtomicU64::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for SkipRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkipRegistry")
+            .field("entries", &self.entries)
+            .field("installs", &self.installs.load(Ordering::SeqCst))
+            .finish()
+    }
 }
 
 impl SkipRegistry {
+    /// How builds on the versioned storage meet open writers.
+    pub fn policy(&self) -> BuildPolicy {
+        *self.policy.lock()
+    }
+
+    /// Sets it, as `AMPHORA_SKIP_BUILD` does at open (tests and the A/B's driver).
+    pub fn set_policy(&self, policy: BuildPolicy) {
+        *self.policy.lock() = policy;
+    }
+
+    /// A build waited for its table's writers (`BuildPolicy::Wait`); `again`: it is a rebuild,
+    /// a writer having slipped in beside the one before.
+    pub(crate) fn count_wait(&self, waited: bool, again: bool) {
+        if waited {
+            self.build_waits.fetch_add(1, Ordering::SeqCst);
+        }
+        if again {
+            self.rebuilds.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A build's wait for its table's writers was refused (lane g7s2-17).
+    pub(crate) fn count_refused(&self, why: crate::storage::versioned::version::UnwrittenRefusal) {
+        use crate::storage::versioned::version::UnwrittenRefusal;
+        let counter = match why {
+            UnwrittenRefusal::OwnThread => &self.refused_own,
+            UnwrittenRefusal::Deadline => &self.refused_deadline,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Waits refused: the writer the build's own thread's, and the deadline passed
+    /// (`BuildPolicy::Wait`, lane g7s2-17).
+    pub fn wait_refusals(&self) -> (u64, u64) {
+        (
+            self.refused_own.load(Ordering::SeqCst),
+            self.refused_deadline.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Builds that waited for writers, and builds done again (`BuildPolicy::Wait`).
+    pub fn wait_counts(&self) -> (u64, u64) {
+        (
+            self.build_waits.load(Ordering::SeqCst),
+            self.rebuilds.load(Ordering::SeqCst),
+        )
+    }
+
     /// Keeps `skipping` for column `column` (its index in the table's records) of the table at
     /// `root_page`, replacing any summary it had; `Skipping::Off` drops it. The caller built it at
     /// the newest commit with no writer open (it held the write lock).
@@ -231,21 +364,64 @@ impl SkipRegistry {
         skipping: Skipping,
         build: BuildMode,
     ) {
+        self.set_checked_with_build(root_page, column, skipping, build, || None);
+    }
+
+    /// [`SkipRegistry::set`] for a build that held no lock against writers (the versioned
+    /// storage, G7 step 2, `AC-NS.2.1`): `missed`, asked under the registry's lock as the summary
+    /// goes in (no write can feed or miss it meanwhile), says why the build misses rows (`None`:
+    /// it holds the newest commit), and then the summary is kept stale until built again. A write
+    /// whose row changed before the ask is seen by it; one after finds the summary in place. Why
+    /// it was kept stale.
+    pub fn set_checked(
+        &self,
+        root_page: i64,
+        column: usize,
+        skipping: Skipping,
+        missed: impl FnOnce() -> Option<&'static str>,
+    ) -> Option<&'static str> {
+        self.set_checked_with_build(root_page, column, skipping, BuildMode::default(), missed)
+    }
+
+    /// [`SkipRegistry::set_checked`] with its dropped method built again by `build` (lane skip-9's
+    /// modes on the versioned storage's checked install).
+    pub fn set_checked_with_build(
+        &self,
+        root_page: i64,
+        column: usize,
+        skipping: Skipping,
+        build: BuildMode,
+        missed: impl FnOnce() -> Option<&'static str>,
+    ) -> Option<&'static str> {
         let mut entries = self.entries.lock();
         entries.retain(|entry| entry.root_page != root_page);
-        if !matches!(skipping, Skipping::Off) {
-            entries.push(Entry {
-                root_page,
-                column,
-                skipping,
-                pending: None,
-                stale: false,
-                counts: SkipCounts::default(),
-                building: None,
-                build_mode: build,
-                list_probe: ListProbe::default(),
-            });
+        if matches!(skipping, Skipping::Off) {
+            return None;
         }
+        self.installs.fetch_add(1, Ordering::SeqCst);
+        let why = missed();
+        entries.push(Entry {
+            root_page,
+            column,
+            skipping,
+            pending: None,
+            stale: why.is_some(),
+            counts: SkipCounts {
+                built_stale: u64::from(why.is_some()),
+                ..SkipCounts::default()
+            },
+            building: None,
+            build_mode: build,
+            list_probe: ListProbe::default(),
+        });
+        why
+    }
+
+    /// How many summaries were installed so far (G7 step 2, `AC-NS.2.1`). A write that found no
+    /// summary for its table reads it before its row changes and again after: if it moved, a
+    /// build may have missed the row, and the write looks for the table's summary again.
+    pub fn installs(&self) -> u64 {
+        self.installs.load(Ordering::SeqCst)
     }
 
     /// Lane skip-11 (T-SKU.14): how scans of the table at `root_page` ask its summary for an IN
@@ -303,6 +479,34 @@ impl SkipRegistry {
         write: RowWrite,
         now: &mut dyn FnMut() -> u64,
     ) {
+        self.write_by(root_page, writer, committed, false, write, now)
+    }
+
+    /// The write hook on the versioned storage (G7 step 2, `AC-NS.2.1`): as
+    /// [`SkipRegistry::on_write`], by `writer` whose snapshot is the newest commit `committed`,
+    /// whose end the caller tells with [`SkipRegistry::committed`] or
+    /// [`SkipRegistry::rolled_back`]. A write while another writer's is open makes the summary
+    /// stale: it would hold two open transactions' rows.
+    pub fn on_write_told(
+        &self,
+        root_page: i64,
+        writer: usize,
+        committed: WalPos,
+        write: RowWrite,
+        now: &mut dyn FnMut() -> u64,
+    ) {
+        self.write_by(root_page, writer, committed, true, write, now)
+    }
+
+    fn write_by(
+        &self,
+        root_page: i64,
+        writer: usize,
+        committed: WalPos,
+        told: bool,
+        write: RowWrite,
+        now: &mut dyn FnMut() -> u64,
+    ) {
         let mut entries = self.entries.lock();
         let Some(entry) = entries
             .iter_mut()
@@ -310,9 +514,17 @@ impl SkipRegistry {
         else {
             return;
         };
+        if entry
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.told && p.writer != writer)
+        {
+            entry.stale = true;
+        }
         entry.pending = Some(Pending {
             writer,
             base: committed,
+            told,
         });
         entry.counts.writes = entry.counts.writes.saturating_add(1);
         // Lane skip-8 (T-SKU.10): the write is the event that voids a build under way; lane
@@ -332,6 +544,17 @@ impl SkipRegistry {
         }
         if entry.skipping.on_write_timed(write, now).is_err() {
             entry.stale = true;
+        }
+    }
+
+    /// `writer` committed its transaction on the versioned storage (G7 step 2, `AC-NS.2.1`): the
+    /// newest commit holds the writes each summary took from it.
+    pub fn committed(&self, writer: usize) {
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            if entry.pending.as_ref().is_some_and(|p| p.writer == writer) {
+                entry.pending = None;
+            }
         }
     }
 
@@ -399,7 +622,7 @@ impl SkipRegistry {
         let own_write = match &entry.pending {
             Some(p) if p.writer == reader => true,
             // The writer committed since its writes: the newest commit holds them.
-            Some(p) if p.base != committed => {
+            Some(p) if !p.told && p.base != committed => {
                 entry.pending = None;
                 false
             }
