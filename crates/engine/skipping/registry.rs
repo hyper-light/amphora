@@ -179,10 +179,7 @@ impl SkipRegistry {
     }
 
     /// A build's wait for its table's writers was refused (lane g7s2-17).
-    pub(crate) fn count_refused(
-        &self,
-        why: crate::storage::versioned::version::UnwrittenRefusal,
-    ) {
+    pub(crate) fn count_refused(&self, why: crate::storage::versioned::version::UnwrittenRefusal) {
         use crate::storage::versioned::version::UnwrittenRefusal;
         let counter = match why {
             UnwrittenRefusal::OwnThread => &self.refused_own,

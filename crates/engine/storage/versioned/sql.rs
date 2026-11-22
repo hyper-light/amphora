@@ -530,8 +530,10 @@ fn ac_ns_2_1_writers_of_one_row_one_conflicts() {
 /// AC-NS.2.1: what writes the pager's header (here a schema change, its cookie) still takes the
 /// pager's write lock, one at a time, beside a writer of rows that holds none: do run a row writer
 /// open and one connection's CREATE TABLE in an open transaction, then another's; expect the first
-/// schema change to pass beside the row writer, the second to be refused busy until it ends, and
-/// every commit after to stand.
+/// schema change to pass beside the row writer, the second to be refused busy until it ends, the
+/// row writer, begun before the first committed, refused at its commit (lane g7s2-17: it wrote
+/// against the older catalog) and its write standing once run again, and every commit after to
+/// stand.
 #[test]
 fn ac_ns_2_1_header_writers_still_take_the_pager_lock() {
     let (db, a, b) = two_writers();
@@ -554,7 +556,17 @@ fn ac_ns_2_1_header_writers_still_take_the_pager_lock() {
         run(&c, "ROLLBACK");
     }
     run(&b, "COMMIT");
-    run(&a, "COMMIT");
+    let e = a
+        .execute("COMMIT")
+        .expect_err("a writer begun before a schema change commits");
+    assert!(
+        matches!(e, crate::LimboError::SchemaConflict),
+        "the row writer's refusal: {e:?}"
+    );
+    if !a.get_auto_commit() {
+        run(&a, "ROLLBACK");
+    }
+    run(&a, "UPDATE t SET v = 10 WHERE id = 1");
     run(&c, "CREATE TABLE w (x)");
     assert_eq!(
         rows(&c, "SELECT v FROM t WHERE id = 1"),
@@ -567,4 +579,70 @@ fn ac_ns_2_1_header_writers_still_take_the_pager_lock() {
         ),
         vec![vec![Value::build_text("u")], vec![Value::build_text("w")]]
     );
+}
+
+/// The ids with `v` found through the index `tv`, and through the table alone: equal when the two
+/// agree.
+fn by_index(conn: &Arc<Connection>, v: i64) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+    (
+        rows(
+            conn,
+            &format!("SELECT id FROM t INDEXED BY tv WHERE v = {v}"),
+        ),
+        rows(conn, &format!("SELECT id FROM t NOT INDEXED WHERE v = {v}")),
+    )
+}
+
+/// AC-NS.2.1 (lane g7s2-17): writers through SQL run at once, so do open a writer that inserts a
+/// row, by a statement prepared before and run after another connection's CREATE INDEX on the
+/// table commits (and, the other way, one whose insert ran before it); then commit the writer.
+/// Expect, both ways: the commit refused with `SchemaConflict` (its statements were compiled
+/// against the catalog without the index: committed, its row would be in the table and not the
+/// index), nothing of it in either; run again, its row in both.
+#[test]
+fn ac_ns_2_1_a_writer_against_an_older_schema_is_refused_at_commit() {
+    for prepared_before in [true, false] {
+        let (_db, a, b) = two_writers();
+        let mut insert = a.prepare("INSERT INTO t VALUES (3, 30)").unwrap();
+        run(&a, "BEGIN");
+        if prepared_before {
+            // Its snapshot begins here, before the index.
+            assert_eq!(
+                rows(&a, "SELECT count(*) FROM t"),
+                vec![vec![Value::from_i64(2)]]
+            );
+        } else {
+            insert.run_ignore_rows().unwrap();
+        }
+        run(&b, "CREATE INDEX tv ON t (v)");
+        if prepared_before {
+            insert.run_ignore_rows().unwrap();
+        }
+        let e = a
+            .execute("COMMIT")
+            .expect_err("a writer against an older schema commits");
+        assert!(
+            matches!(e, crate::LimboError::SchemaConflict),
+            "prepared_before={prepared_before}: the writer's refusal: {e:?}"
+        );
+        if !a.get_auto_commit() {
+            run(&a, "ROLLBACK");
+        }
+        assert_eq!(
+            by_index(&b, 30),
+            (vec![], vec![]),
+            "prepared_before={prepared_before}"
+        );
+        assert_eq!(
+            rows(&b, "SELECT count(*) FROM t"),
+            vec![vec![Value::from_i64(2)]]
+        );
+        run(&a, "INSERT INTO t VALUES (3, 30)");
+        let three = vec![vec![Value::from_i64(3)]];
+        assert_eq!(
+            by_index(&b, 30),
+            (three.clone(), three),
+            "prepared_before={prepared_before}"
+        );
+    }
 }

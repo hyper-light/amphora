@@ -724,7 +724,9 @@ impl Clock {
         if txn.trees.contains(&tree) {
             return Ok(());
         }
-        let thread = *txn.writer.get_or_insert_with(|| std::thread::current().id());
+        let thread = *txn
+            .writer
+            .get_or_insert_with(|| std::thread::current().id());
         let mut writing = self.writing.lock();
         count_in(&mut writing.counts, tree)?;
         writing.threads.entry(tree).or_default().push(thread);
@@ -1403,6 +1405,17 @@ pub struct Versioned {
     /// until its newest version is at or below the watermark). Locked only under the publish
     /// lock.
     recent: Mutex<VecDeque<Committed>>,
+    /// The catalog's tree and its newest change ([`Versioned::keep_catalog`]).
+    catalog: Catalog,
+}
+
+/// The tree whose rows are the database's catalog (`sqlite_schema` on the switch), named once,
+/// and the timestamp of the newest commit that changed a row of it, moved under the publish lock
+/// (lane g7s2-17, `AC-NS.2.1`).
+#[derive(Default)]
+struct Catalog {
+    tree: crate::sync::OnceLock<u64>,
+    changed_at: AtomicU64,
 }
 
 /// The budget of a pool's versions and records (decision 10). A pool of a fixed count of frames
@@ -1451,6 +1464,7 @@ impl Versioned {
             trees: RwLock::new(made),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
+            catalog: Catalog::default(),
         })
     }
 
@@ -1469,6 +1483,25 @@ impl Versioned {
 
     pub fn validation(&self) -> Validation {
         self.validation
+    }
+
+    /// Names tree `tree` the catalog, once (lane g7s2-17, `AC-NS.2.1`): writers no longer take
+    /// one lock, so a transaction that changed rows commits only if no commit changed the catalog
+    /// after its snapshot. Its statements were compiled against the catalog its snapshot saw (an
+    /// index, a trigger, a column it didn't know of would be left out of its rows); refused,
+    /// typed (`SchemaConflict`), it rolls back and runs again against the new one. Every schema
+    /// change against every writer begun before it, as PostgreSQL's DDL locks and this engine's
+    /// MVCC store refuse them: a table-grain rule is a later A/B.
+    pub fn keep_catalog(&self, tree: u64) {
+        let _ = self.catalog.tree.set(tree);
+    }
+
+    /// Whether `txn` changed a row of the catalog.
+    fn changes_catalog(&self, txn: &Txn) -> bool {
+        self.catalog
+            .tree
+            .get()
+            .is_some_and(|tree| txn.trees.contains(tree))
     }
 
     /// The trees whose roots are `roots`, in `pool` (recovery), tree `i` ordered by `cmp(i)`.
@@ -1490,6 +1523,7 @@ impl Versioned {
             trees: RwLock::new(trees),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
+            catalog: Catalog::default(),
         })
     }
 
@@ -1620,6 +1654,14 @@ impl Versioned {
         let mut reached = false;
         let published = self.clock.commit(&txn, |ts, ops| {
             reached = true;
+            // A writer begun before the catalog's newest change wrote against an older one (lane
+            // g7s2-17): checked and moved under this lock, so none slips between.
+            if !txn.changed.is_empty()
+                && self.catalog.changed_at.load(Ordering::Acquire) > txn.start
+            {
+                self.clock.budget.release(read_bytes);
+                return Err(LimboError::SchemaConflict);
+            }
             let mut recent = self.recent.lock();
             let out_first = match self.validate(&txn, &reads, &recent, d) {
                 Ok(out_first) => out_first,
@@ -1638,6 +1680,9 @@ impl Versioned {
             }
             if let Some(c) = kept {
                 recent.push_back(c);
+            }
+            if self.changes_catalog(&txn) {
+                self.catalog.changed_at.fetch_max(ts, Ordering::AcqRel);
             }
             Ok(())
         });

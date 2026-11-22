@@ -112,6 +112,9 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
             Ok(order.comparator())
         },
     )?);
+    // Tree 1 is `sqlite_schema`: a writer begun before its newest change is refused at commit
+    // (lane g7s2-17, `AC-NS.2.1`).
+    db.v.keep_catalog(1);
     Ok(Arc::new(Storage {
         db,
         orders: Mutex::new(recovered.into_inner()),

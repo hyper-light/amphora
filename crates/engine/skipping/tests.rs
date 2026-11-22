@@ -2045,7 +2045,8 @@ mod versioned {
         let conn = db
             .connect(ConnectOpts::new().with_versioned_storage())
             .unwrap();
-        conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+            .unwrap();
         conn.execute("BEGIN").unwrap();
         for i in 0..3000 {
             conn.execute(format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(40)))
@@ -2101,7 +2102,10 @@ mod versioned {
             writer.execute("COMMIT").unwrap();
             let (got, read) = rowids(&builder, FILTER);
             assert_eq!(got, with_the_new_row(), "{kind:?}");
-            assert!(read >= 3001, "{kind:?}: a stale summary's scan read {read} rows");
+            assert!(
+                read >= 3001,
+                "{kind:?}: a stale summary's scan read {read} rows"
+            );
         }
     }
 
@@ -2144,7 +2148,10 @@ mod versioned {
             writer.join().unwrap();
             let (got, read) = rowids(&builder, FILTER);
             assert_eq!(got, with_the_new_row(), "{kind:?}");
-            assert!(read >= 3001, "{kind:?}: a stale summary's scan read {read} rows");
+            assert!(
+                read >= 3001,
+                "{kind:?}: a stale summary's scan read {read} rows"
+            );
         }
     }
 
@@ -2187,7 +2194,10 @@ mod versioned {
                     while switch.waiting_on(root).unwrap() == 0 {
                         std::thread::yield_now();
                     }
-                    assert!(!build.is_finished(), "{kind:?}: the rebuild ran beside the writer");
+                    assert!(
+                        !build.is_finished(),
+                        "{kind:?}: the rebuild ran beside the writer"
+                    );
                     writer.execute("COMMIT").unwrap();
                 }
                 build.join().unwrap().unwrap();
@@ -2198,8 +2208,15 @@ mod versioned {
                 );
                 assert_eq!(db.skipping.wait_refusals(), (0, 0), "{kind:?}");
                 let (got, read) = rowids(&writer, FILTER);
-                assert_eq!(got, with_the_new_row(), "{kind:?} commit_first={commit_first}");
-                assert!(read < 3001, "{kind:?}: the scan read {read} rows, every row");
+                assert_eq!(
+                    got,
+                    with_the_new_row(),
+                    "{kind:?} commit_first={commit_first}"
+                );
+                assert!(
+                    read < 3001,
+                    "{kind:?}: the scan read {read} rows, every row"
+                );
                 let counts = skipping_counts(&writer, "t").unwrap();
                 assert_eq!(
                     (counts.built_stale, counts.consulted),

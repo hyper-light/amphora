@@ -530,7 +530,15 @@ database header (schema cookie, user version), and only a program that writes th
 `SetCookie`, the journal mode, a vacuum: `PreparedProgram::writes_pager_header`) takes the pager's
 write lock, as it runs, even in a transaction that began without it; every other write transaction
 holds only the pager's read, so writers through SQL run at once and conflict only on the rows they
-touch, as the storage's first writer's win decides (lane g7s2-16). The storage sets no memory aside: it takes its
+touch, as the storage's first writer's win decides (lane g7s2-16). Two schema changes still run
+one at a time, by the pager's lock. A writer of rows checks the schema cookie against its own
+snapshot only, so a schema change committed beside it would go unseen: the storage keeps the
+timestamp of the newest commit that changed `sqlite_schema` (`Versioned::keep_catalog`, moved
+under the publish lock), and a transaction that changed rows and began before it is refused at
+commit with `SchemaConflict` and rolls back (lane g7s2-17), as the MVCC store refuses it and as
+PostgreSQL's DDL locks hold writers off: never committed against a catalog it didn't compile
+against (an index it left its rows out of). It refuses every writer begun before any schema
+change; a rule at a table's grain is a later A/B. The storage sets no memory aside: it takes its
 pages' frames and its row versions' bytes from a memory source as they grow, and gives them back as
 it lets them go (`storage::versioned::memory::Source`, `ConnectOpts::with_memory`). Amphora's shell
 gives its process memory budget (`amphora::memory::StorageMemory`, as caches; store.md, "Decision
