@@ -197,31 +197,48 @@ fn pread(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<usiz
     Ok(done)
 }
 
-/// `bufs` read back to back from `offset` with one `preadv`; a read the kernel ends short (a
-/// signal, the file's end) finished buffer by buffer: the bytes read, fewer past the file's end.
+/// `bufs` read back to back from `offset` with `preadv`: one call, again for what a call left
+/// (the kernel takes at most `IOV_MAX` buffers a call, which rustix caps a call at, and a signal
+/// can end one short), until every buffer is full or the file ends: the bytes read, fewer past the
+/// file's end.
 #[cfg(unix)]
 fn preadv(f: &std::fs::File, offset: u64, bufs: &mut [&mut [u8]]) -> std::io::Result<usize> {
-    let got = {
-        let mut slices: Vec<std::io::IoSliceMut<'_>> = bufs
-            .iter_mut()
-            .map(|b| std::io::IoSliceMut::new(b))
-            .collect();
-        rustix::io::preadv(f, &mut slices, offset)?
-    };
-    let mut done = 0usize;
-    for buf in bufs.iter_mut() {
-        let len = buf.len();
-        let have = got.saturating_sub(done).min(len);
-        let more = if have < len {
-            let at =
-                offset.saturating_add(u64::try_from(done.saturating_add(have)).unwrap_or(u64::MAX));
-            pread(f, at, buf.get_mut(have..).unwrap_or_default())?
-        } else {
-            0
+    let (mut done, mut k, mut within) = (0usize, 0usize, 0usize);
+    while k < bufs.len() {
+        let at = offset.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
+        let got = {
+            let mut rest = bufs.iter_mut().skip(k);
+            let mut slices: Vec<std::io::IoSliceMut<'_>> = Vec::new();
+            if let Some(first) = rest.next() {
+                slices.push(std::io::IoSliceMut::new(
+                    first.get_mut(within..).unwrap_or_default(),
+                ));
+            }
+            slices.extend(rest.map(|b| std::io::IoSliceMut::new(b)));
+            match rustix::io::preadv(f, &mut slices, at) {
+                Ok(got) => got,
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
         };
-        done = done.saturating_add(have).saturating_add(more);
-        if have.saturating_add(more) < len {
+        if got == 0 {
             break;
+        }
+        done = done.saturating_add(got);
+        let mut left = got;
+        while left > 0 {
+            let room = bufs.get(k).map_or(0, |b| b.len().saturating_sub(within));
+            if left < room {
+                within = within.saturating_add(left);
+                left = 0;
+            } else {
+                left = left.saturating_sub(room);
+                k = k.saturating_add(1);
+                within = 0;
+                if room == 0 && k >= bufs.len() {
+                    break;
+                }
+            }
         }
     }
     Ok(done)

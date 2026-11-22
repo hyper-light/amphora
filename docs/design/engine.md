@@ -625,9 +625,13 @@ twice what an endless run's would, and past it each page more saves less than it
 page the walk may never reach (the break-even between an access's fixed cost and its transfer: Gray
 and Graefe, "The Five-Minute Rule Ten Years Later", SIGMOD Record 26(4), 1997). Until two sizes are
 measured, or while noise hides the slope, the run is twice the largest read so far, so each run
-measures a size not measured yet. The pool's budget bounds it by a stated rule: a page read ahead
+measures a size not measured yet (doubling: the search of an unbounded line whose worst case over
+the best is least, Baeza-Yates, Culberson and Rawlins, "Searching in the plane", Information and
+Computation 106(2), 1993). The pool's budget bounds it by a stated rule: a page read ahead
 takes only a frame never used, or one whose reference bit is clear and which no one latches (one
-sweep at most, the bits left as they are), and a run holds at most the pool's frames less one; so a
+sweep of the frames made at most, the bits left as they are; a never-used frame only while the
+pool's room grants its run, so a shared pool's source decides, CP-T1.3), and a run holds at most
+the pool's frames less one; so a
 run never evicts a page CLOCK hasn't found cold, never latches every frame, and holds no memory past
 the frames but the list of its buffers. A full budget shrinks a run, down to the page asked for
 alone. A page joins a run only while it isn't resident, comes from the same file as the page asked

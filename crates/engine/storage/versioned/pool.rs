@@ -235,7 +235,10 @@ impl Fit {
     /// reach (the break-even of Gray and Graefe, "The Five-Minute Rule Ten Years Later", SIGMOD
     /// Record 26(4), 1997, between an access's fixed cost and its transfer). Until the line is
     /// measured (one size read so far, or a slope the noise hides), twice the largest read so far,
-    /// so each run measures a size not measured yet; a pool bounds it ([`Pool::read_run`]).
+    /// so each run measures a size not measured yet: doubling is the search of an unbounded line
+    /// whose worst case over the best run is least (Baeza-Yates, Culberson and Rawlins, "Searching
+    /// in the plane", Information and Computation 106(2), 1993); a pool bounds it
+    /// ([`Pool::read_run`]).
     fn target(&self) -> u64 {
         match self.line() {
             // A float's cast saturates: past `u64::MAX`, `u64::MAX`.
@@ -896,13 +899,14 @@ impl Pool {
         Ok(())
     }
 
-    /// A frame for a page read ahead: a never-used one, else the next frame from `at` whose
-    /// reference bit is clear and which no one latches, its bit left as it is; `looked` counts
-    /// the frames a run has looked at, one sweep at most, and None after it.
+    /// A frame for a page read ahead: a never-used one while the room grants its run (as
+    /// [`Pool::victim`] takes one), else the next frame made from `at` whose reference bit is clear
+    /// and which no one latches, its bit left as it is; `looked` counts the frames a run has
+    /// looked at, one sweep of the frames made at most, and None after it. A source that refuses
+    /// a run of frames ends the read-ahead there, never the read.
     fn cold_victim(&self, at: &mut usize, looked: &mut usize) -> Result<Option<Latched<'_>>> {
-        let n = self.capacity;
         let mut u = self.unused.load(Ordering::Relaxed);
-        while u < n {
+        while u < self.capacity && self.frame_at(u).is_some() {
             match self.unused.compare_exchange(
                 u,
                 u.saturating_add(1),
@@ -913,6 +917,7 @@ impl Pool {
                 Err(now) => u = now,
             }
         }
+        let n = self.frames_made();
         while *looked < n {
             *looked = looked.saturating_add(1);
             let i = at.checked_rem(n).unwrap_or(0);
@@ -1446,6 +1451,56 @@ mod tests {
         }
         let c = pool.counts();
         assert_eq!(c.reads < c.misses, whole, "{c:?}");
+    }
+
+    /// Do: walk 40 pages with runs of 8 in a pool whose frames come from a source with room for
+    /// three (CP-T1.3's shared pool). Expect: every page as written, no read refused, no frame
+    /// made past the three the source grants (a refused run of frames ends a run, never a read).
+    #[test]
+    fn qs2_read_ahead_takes_only_the_frames_a_shared_source_grants() {
+        let source = Arc::new(Capped {
+            limit: frame_bytes() * 3 + frame_bytes() / 2,
+            held: AtomicU64::new(0),
+        });
+        let pool = Pool::backed_in(Room::Shared(source.clone()), data_disk(40), 40).unwrap();
+        pool.set_read_ahead(true);
+        pool.run_pages.store(8, Ordering::Relaxed);
+        for p in 1..=40 {
+            assert!(holds(&pool.read(p).unwrap(), p, 0), "page {p}");
+        }
+        assert_eq!(pool.frames_made(), 3);
+        assert_eq!(source.held.load(Ordering::Acquire), frame_bytes() * 3);
+        let c = pool.counts();
+        assert!(
+            c.longest > 1 && c.longest <= 3 && c.reads < c.misses,
+            "{c:?}"
+        );
+    }
+
+    /// Do: a run of 2,000 pages read with one `Disk::read_run` over a file (past `IOV_MAX`
+    /// buffers, 1,024 on Linux and macOS), and one ending past the file's end. Expect: every page
+    /// as written, and the bytes read stop at the file's end.
+    #[test]
+    fn qs2_a_run_past_iov_max_reads_every_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = super::super::disk::Files::open(dir.path(), 1).unwrap();
+        let mut buf = vec![0u8; PAGE_SIZE];
+        for p in 1..=2_000 {
+            fill(p, 0)(&mut buf);
+            files
+                .write_at(File::Data, page_offset(p).unwrap(), &buf)
+                .unwrap();
+        }
+        let mut frames = vec![vec![0u8; PAGE_SIZE]; 2_010];
+        let mut bufs: Vec<&mut [u8]> = frames.iter_mut().map(|f| &mut f[..]).collect();
+        let got = files
+            .read_run(File::Data, page_offset(1).unwrap(), &mut bufs)
+            .unwrap();
+        assert_eq!(got, 2_000 * PAGE_SIZE);
+        for (k, f) in frames.iter().take(2_000).enumerate() {
+            let p = u64::try_from(k).unwrap() + 1;
+            assert!(holds(f, p, 0), "page {p}");
+        }
     }
 
     /// The fit: `ceil(fixed / each)` once two sizes were read, twice the largest read before.
