@@ -1430,4 +1430,21 @@ mod tests {
         assert!(a.iter().chain(&b).all(|e| e.session == "s-000004"));
         assert_eq!(event_args(&b[0]).unwrap().len(), 13);
     }
+
+    // CP-T1.8, AC-T1.8.2: every record says where the client ran and what it used, so a ladder rung
+    // where the client was the bottleneck shows (Linux's /proc; elsewhere the fields are null).
+    #[test]
+    fn g12_repl_records_name_the_client_and_its_use() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let u = client_use();
+        let p = platform();
+        assert_eq!(p["os"], std::env::consts::OS);
+        if cfg!(target_os = "linux") {
+            assert!(u["cpu_s"].as_f64().is_some(), "{u}");
+            assert!(u["peak_rss_kib"].as_u64().is_some_and(|k| k > 0), "{u}");
+            assert!(u["sockets"].as_u64().is_some_and(|n| n >= 1), "the held listener is a socket: {u}");
+            assert!(p["kernel"].as_str().is_some_and(|k| k.starts_with("Linux")), "{p}");
+        }
+        drop(held);
+    }
 }

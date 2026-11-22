@@ -784,6 +784,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   the three (here, or by ssh) and runs every measure as `amphora-procs-CLASS` (tiny run: three processes on
   jupiter). The competitors' scripts take AMPHORA_BENCH_REPL_NAME and AMPHORA_BENCH_REPL_PORT, so runs sharing
   a Docker host keep their own containers. A member's kill is still the cut, not its process killed.
+- **Replication measured: the fair commit ladder** (CP-T1.8, AC-T1.8.2; lane repl-measure-13): written, not yet
+  compiled or run. The earlier compare ran Amphora natively and its competitors in containers, so it doesn't stand.
+  `bench/repl_ladder.sh RECORDS FLAGS...` runs the commit measure at 1, 8, 32, 128, 512, 2048 and 4096 writers on
+  one host, every system as processes through the same driver: Amphora's members (persisted and replicated),
+  rqlite, dqlite, libSQL and LiteFS from `bench/servers/repl/native` (`setup.sh` fetches their release binaries
+  into ~/.cache). Each record names its client, platform, versions and durability, and the client's CPU, memory
+  and sockets. The HTTP client now keeps a connection a writer to each node; ureq's default of 3 a host had
+  cost the competitors a new connection on most writes.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
