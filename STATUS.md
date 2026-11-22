@@ -406,7 +406,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `synchronous = FULL`); the answers are compared in memory and on the disk. Each writer count's memory,
   open files and threads are extrapolated from the counts already run and checked against the host first
   (`bench/commits_fit.py`): one that doesn't fit is refused, saying why, and PostgreSQL's `shared_buffers`
-  and `work_mem` are sized to fit beside its backends and recorded. Not yet compiled or run: the coordinator's.
+  and `work_mem` are sized to fit beside its backends and recorded. The answers are SAME only when every
+  record was reached by both storages (PARTIAL otherwise). `bench/commits_verdict.py` reads the bench's
+  records: each count's systems side by side, Amphora's storages over SQLite's and PostgreSQL's rates, and
+  AC-T1.3.2 to AC-T1.3.5 at 32 writers, refusing records of another platform or driver. Not yet compiled
+  or run: the coordinator's.
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
