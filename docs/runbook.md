@@ -74,6 +74,25 @@ Lost must be 0; the script exits 1 otherwise.
 - `--local`: the members are processes the script starts from the config's folder (three on one
   machine, no services); `stall` is refused on Windows (no SIGSTOP).
 
+## A region lost, and replacing a member (T-T1.13.1)
+
+Each member is its own region (its own machine). When one is lost for good, the two left still
+hold the majority and keep taking writes; replace the lost one with a spare:
+
+1. Name the spare in every member's `members` (`4@HOST4:PORT`), its own config with `voters =` the
+   current voters (it starts as a learner), and restart the members one at a time.
+2. `amphora member CONFIG add 4`, then `amphora member CONFIG promote 4` once it has caught up
+   (`amphora ask CONFIG 4 status`: its `applied` reaches the leader's).
+3. `amphora member CONFIG remove 3` (the lost one), then set `voters = 1,2,4` in every config:
+   `amphora health` asks the voters the config names.
+
+`amphora member` sends the change to whichever voter says it leads. `demote` makes a voter a
+learner. It tries each voter until the leader makes the change: a follower refuses, a lost member
+doesn't answer. The drill under load is `scripts/drills.sh region` with the spare's HOST:PORT
+fourth (the victim killed and never started again, the spare added, caught up and promoted, the
+victim removed, the count on the new voters); `cargo test -p amphora --test serve a_region_lost`
+is its test.
+
 ## Uninstall
 
 ```sh
@@ -83,8 +102,8 @@ scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT    # services and 
 ## What isn't done
 
 - The link isn't encrypted: run the members on a network you trust, or under a tunnel.
-- Membership changes (add, remove, replace a member) exist in the replica
-  (`ReplicaHandle::change`) but not yet as a command.
+- Mutual TLS on the links waits on the network listener's TLS (`transport/network.rs`, lane
+  split-merge): serve takes its credentials and rules once that lands, so there is one TLS path.
 - kiln doesn't open these members yet: kiln reaches Amphora through its conversation-store seam
   (kiln branch `t1/lane-vendor-amphora-*`), in process. A client for `amphora serve` in that seam
   is the next step, and production kiln on it is Ada's word.

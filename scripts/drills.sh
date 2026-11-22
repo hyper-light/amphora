@@ -9,7 +9,10 @@
 #               every record in and out dropped at its transport for F s: `cut`, the members' config
 #               must say drills = on), stall (the victim's process stopped for F s, SIGSTOP/SIGCONT:
 #               its disk, its network and its clock stop together, the worst a stalled disk does),
-#               or all (the three in turn).
+#               region (the victim lost for good, a region gone: killed and never started again; the
+#               spare, a fourth HOST:PORT named in every member's `members` and started as a learner
+#               by `voters = 1,2,3`, added, caught up, promoted, the victim removed; the count then
+#               runs on the new voters, from CONF's copy region-after.conf), or all (kill, split, stall).
 #   --config    any member's config, on this machine: the members, the secret and the deadline.
 #   --victim    the member to fault (default: the leader when the fault starts).
 #   --local     the members are processes this script starts here from CONF's folder's
@@ -31,7 +34,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n $conf && -n $writers && -n $seconds && -n $at && -n $fault && -n $catchup ]] || die "every flag but --victim and --local is required"
-[[ ${#addrs[@]} -eq 3 ]] || die "three HOST:PORT members, not ${#addrs[@]}"
+[[ ${#addrs[@]} -eq 3 || ( $drill == region && ${#addrs[@]} -eq 4 ) ]] || die "three HOST:PORT members (region: and the spare's), not ${#addrs[@]}"
 BIN=${AMPHORA:-$HOME/.local/lib/amphora/amphora}
 [[ -x $BIN || -x $BIN.exe ]] || die "no amphora at $BIN (AMPHORA=path)"
 here() { [[ "$1" == localhost || "$1" == 127.0.0.1 || "$1" == "$(hostname)" || "$1" == "$(hostname -s 2>/dev/null)" ]]; }
@@ -40,7 +43,7 @@ DIR=$(cd "$(dirname "$conf")" && pwd)
 PID=()
 start_local() { "$BIN" serve "$DIR/member-$1.conf" 2>>"$DIR/member-$1.log" & PID[$1]=$!; }
 if [[ $local == 1 ]]; then
-  for n in 1 2 3; do start_local $n; done
+  for n in $(seq 1 ${#addrs[@]}); do start_local $n; done
   trap 'for p in "${PID[@]}"; do kill -9 "$p" 2>/dev/null || true; done' EXIT
 fi
 
@@ -61,6 +64,7 @@ EOF
 fault_on() { # fault_on DRILL N
   local host=${addrs[$(($2 - 1))]%:*}
   case "$1:$local" in
+    region:*) region "$2" ;;
     kill:1) kill -9 "${PID[$2]}"; sleep "$fault"; start_local "$2" ;;
     kill:0) on "$host" <<EOF
 case "\$(uname -s)" in
@@ -75,6 +79,39 @@ EOF
       kill -STOP "${PID[$2]}"; sleep "$fault"; kill -CONT "${PID[$2]}" ;;
     stall:0) local p; p=$(service_pid "$2"); on "$host" <<<"kill -STOP $p; sleep $fault; kill -CONT $p" ;;
   esac
+}
+
+status_of() { "$BIN" ask "$conf" "$1" status 2>/dev/null | tr ' ' '
+' | sed -n "s/^$2=//p" || true; }
+caught_up() { # caught_up N SECONDS: until member N has applied what the leader has
+  local end=$((SECONDS + $2)) l
+  while ((SECONDS < end)); do
+    local have want; l=$(leader); have=$(status_of "$1" applied); want=$(status_of "${l:-0}" applied)
+    [[ -n $l && -n $have && -n $want ]] && ((have >= want)) && return 0
+    sleep 1
+  done
+  return 1
+}
+change() { # change WHAT N: until a leader makes it (one is elected once the victim's gone), or fails
+  local end=$((SECONDS + catchup))
+  until "$BIN" member "$conf" "$1" "$2" >&2; do ((SECONDS < end)) || return 1; sleep 1; done
+}
+region() { # region N: member N lost for good, the spare (4) in its place
+  local host=${addrs[$(($1 - 1))]%:*}
+  if [[ $local == 1 ]]; then kill -9 "${PID[$1]}"; else on "$host" <<EOF
+case "\$(uname -s)" in
+  Linux) systemctl --user kill -s SIGKILL amphora-member-$1.service; systemctl --user stop amphora-member-$1.service ;;
+  Darwin) launchctl bootout "gui/\$(id -u)/dev.amphora.member-$1" 2>/dev/null || true ;;
+esac
+EOF
+  fi
+  change add 4 || return 1
+  caught_up 4 "$catchup" || { echo "the spare never caught up" >&2; return 1; }
+  change promote 4 && change remove "$1" || return 1
+  local voters; voters=$(printf '%s
+' 1 2 3 4 | grep -vx "$1" | paste -sd, -)
+  grep -v '^ *voters *=' "$conf" >"$DIR/region-after.conf"; echo "voters = $voters" >>"$DIR/region-after.conf"
+  conf="$DIR/region-after.conf"
 }
 
 one() { # one DRILL: load, the fault inside it, heal, count
@@ -98,8 +135,8 @@ one() { # one DRILL: load, the fault inside it, heal, count
 
 failed=0
 case "$drill" in
-  kill | split | stall) one "$drill" || failed=1 ;;
+  kill | split | stall | region) one "$drill" || failed=1 ;;
   all) for d in kill split stall; do one "$d" || failed=1; done ;;
-  *) sed -n '2,24p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,23p' "$0" >&2; exit 2 ;;
 esac
 exit $failed

@@ -6,11 +6,13 @@
 //! the log's rate and the store's put time. It ships through a reader on the writer's engine, so
 //! the writer never waits on the store. When the database ends it ships once more and ends.
 //!
-//! It restores and checks its own archive on the archive's cadence ([`super::check_due`]), as
-//! [`Archive::check`] says ([`CheckPolicy`]): against the source's rows at a second, digested from a
-//! reader whose snapshot lines up with that second's last commit ([`super::Marks::quiet_second`]).
-//! By default ([`CheckPolicy::Continuous`]) the second is drawn at random from those it holds the
-//! rows of ([`Drills`]), and a check runs only within the budget [`admit`] derives from the machine.
+//! A thread of its own beside it restores and checks the archive on the archive's cadence
+//! ([`super::check_due`]), as [`Archive::check`] says ([`CheckPolicy`]): against the source's rows
+//! at a second, digested from a reader whose snapshot lines up with that second's last commit
+//! ([`super::Marks::quiet_second`]). The shipping thread tells it of each round and never waits on
+//! it. Continuous ([`CheckPolicy::Continuous`]), the second is drawn at random from those it holds
+//! the rows of ([`Drills`]), and each step of a check yields to the foreground ([`Pacer`],
+//! T-T1.12.C7).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
@@ -19,11 +21,13 @@ use std::time::{Duration, Instant};
 
 use amphora_api::blobs::Blobs;
 
+use super::check::step_bytes;
+use super::drill::{Foreground, Pace, Pacer, Unpaced};
 use super::ship::FRAME_BYTES;
 use super::{
     BaseCopy, Budget, Check, CheckCounters, CheckPolicy, Clock, DrillMeter, Drills, Hooks,
-    RowDigest, Shipped, Shipper, admit, check_due, digest, newest_second, next_random, plan,
-    restore_and_check_at,
+    RowDigest, Shipped, Shipper, Stopped, admit, check_due, digest_paced, newest_second,
+    next_random, plan, restore_and_check_at,
 };
 use crate::db::Db;
 use crate::store::Watcher;
@@ -101,7 +105,7 @@ impl Shipping {
     }
 
     /// What the drills measured: deferrals by reason ([`super::DEFER_METRIC`]), each check's cost
-    /// ([`super::COST_METRIC`]), the thread's idle time.
+    /// ([`super::COST_METRIC`]), the pace's pauses, waits and rests.
     #[must_use]
     pub fn drills(&self) -> &DrillMeter {
         &self.meter
@@ -140,33 +144,91 @@ impl Shipping {
     }
 }
 
-/// A backup made ready on the writer as it opens, its thread not started yet.
+/// A backup made ready on the writer as it opens, its threads not started yet.
 pub(crate) struct Prepared {
     archive: Archive,
     shipper: Shipper,
     reader: Db,
     hooks: Arc<Hooks>,
+    /// What checks the archive, on a thread of its own ([`Archive::check`]); none when off.
+    checker: Option<Checker>,
+    /// When the store commits, as the checks' pace reads it.
+    foreground: Arc<Foreground>,
+    counters: Arc<CheckCounters>,
+    meter: Arc<DrillMeter>,
+}
+
+/// What the shipping thread tells the check thread: rounds ended, the latest base, the log shipped
+/// since the check thread last looked, and whether the database ended.
+#[derive(Default)]
+struct Feed {
+    state: Mutex<FeedState>,
+    woken: Condvar,
+}
+
+#[derive(Default)]
+struct FeedState {
+    rounds: u64,
+    latest_base: Option<u64>,
+    shipped: u64,
+    ended: bool,
+}
+
+impl Feed {
+    fn round(&self, latest_base: Option<u64>, shipped: u64, ended: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.rounds = state.rounds.saturating_add(1);
+            state.latest_base = latest_base;
+            state.shipped = state.shipped.saturating_add(shipped);
+            state.ended |= ended;
+        }
+        self.woken.notify_all();
+    }
+
+    /// Waits for a round after `seen`: its count, the latest base and the log shipped since the
+    /// last look; none once the database ended.
+    fn next(&self, seen: u64) -> Option<(u64, Option<u64>, u64)> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if state.ended {
+                return None;
+            }
+            if state.rounds != seen {
+                let shipped = std::mem::take(&mut state.shipped);
+                return Some((state.rounds, state.latest_base, shipped));
+            }
+            state = self.woken.wait(state).ok()?;
+        }
+    }
+}
+
+/// The check thread's state: a restore-and-check of the archive, its source's snapshot and its
+/// pace.
+struct Checker {
+    blobs: Arc<dyn Blobs>,
+    prefix: String,
+    patience: Duration,
+    memory: usize,
+    hooks: Arc<Hooks>,
     /// The reader a check's snapshot of the source is taken on, apart from the shipping reader.
-    checker: Option<Db>,
+    reader: Db,
     counters: Arc<CheckCounters>,
     /// The latest check's base and the log it replayed, the log shipped since
     /// ([`super::check_due`]), and a quiet snapshot's second, rows and base waiting to be checked.
     last_check: Option<(u64, u64)>,
     log_since_check: u64,
     pending_check: Option<(u64, RowDigest, u64)>,
-    /// Where checks restore to ([`Archive::check`]), and whether within the budget, at drilled
-    /// seconds ([`CheckPolicy::Continuous`]).
-    scratch: Option<PathBuf>,
+    /// Where checks restore to ([`Archive::check`]), and whether paced, at drilled seconds
+    /// ([`CheckPolicy::Continuous`]).
+    scratch: PathBuf,
     continuous: bool,
     /// The database's file, whose size (with its log's) a restore writes.
     source: PathBuf,
     meter: Arc<DrillMeter>,
     drills: Drills,
     random: u64,
-    /// The thread's idle time since the last check ended, what that check cost, and what the
-    /// pending check's digest cost ([`admit`]).
-    idle_since_check: u64,
-    last_cost: Option<u64>,
+    pacer: Pacer,
+    /// What the pending check's digest cost.
     pending_cost: u64,
 }
 
@@ -213,20 +275,46 @@ impl Prepared {
         reader.hold_log();
         let (scratch, continuous) = match &archive.check {
             CheckPolicy::Off => (None, false),
-            CheckPolicy::Scratch(scratch) => (Some(scratch.clone()), false),
+            CheckPolicy::Scratch(scratch) => (
+                Some(scratch.clone().unwrap_or_else(|| suffixed(path, ".check"))),
+                false,
+            ),
             CheckPolicy::Continuous => (Some(suffixed(path, ".check")), true),
         };
+        let foreground = Arc::new(Foreground::default());
+        let counters: Arc<CheckCounters> = Arc::default();
+        let meter: Arc<DrillMeter> = Arc::default();
         let checker = match scratch {
-            Some(_) => {
-                let checker = db.reader()?;
-                checker.hold_log();
-                Some(checker)
+            Some(scratch) => {
+                let reader = db.reader()?;
+                reader.hold_log();
+                // The drills' draws: seeded once from the system's entropy.
+                let mut seed = [0u8; 8];
+                getrandom::fill(&mut seed)
+                    .map_err(|e| anyhow::anyhow!("the system's entropy: {e}"))?;
+                Some(Checker {
+                    blobs: Arc::clone(&archive.blobs),
+                    prefix: archive.prefix.clone(),
+                    patience: archive.patience,
+                    memory: archive.memory,
+                    hooks: Arc::clone(&hooks),
+                    reader,
+                    counters: Arc::clone(&counters),
+                    last_check: None,
+                    log_since_check: 0,
+                    pending_check: None,
+                    scratch,
+                    continuous,
+                    source: path.to_path_buf(),
+                    meter: Arc::clone(&meter),
+                    drills: Drills::default(),
+                    random: u64::from_le_bytes(seed),
+                    pacer: Pacer::new(Arc::clone(&foreground), Arc::clone(&meter)),
+                    pending_cost: 0,
+                })
             }
             None => None,
         };
-        // The drills' draws: seeded once from the system's entropy.
-        let mut seed = [0u8; 8];
-        getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("the system's entropy: {e}"))?;
         let shipper = Shipper::open(
             &archive.prefix,
             Arc::clone(&hooks),
@@ -240,31 +328,23 @@ impl Prepared {
             reader,
             hooks,
             checker,
-            counters: Arc::default(),
-            last_check: None,
-            log_since_check: 0,
-            pending_check: None,
-            scratch,
-            continuous,
-            source: path.to_path_buf(),
-            meter: Arc::default(),
-            drills: Drills::default(),
-            random: u64::from_le_bytes(seed),
-            idle_since_check: 0,
-            last_cost: None,
-            pending_cost: 0,
+            foreground,
+            counters,
+            meter,
         })
     }
 
-    /// Starts the thread, woken by each commit `on_commit` reports. It ends once the store drops
-    /// its watchers, as the database ends.
-    pub(crate) fn start(self, on_commit: impl FnOnce(Watcher)) -> anyhow::Result<Shipping> {
+    /// Starts the threads, the shipping one woken by each commit `on_commit` reports. They end once
+    /// the store drops its watchers, as the database ends.
+    pub(crate) fn start(mut self, on_commit: impl FnOnce(Watcher)) -> anyhow::Result<Shipping> {
         // One wake pending at most: a commit while one waits is shipped by the same round.
         let (wake, woken) = mpsc::sync_channel::<()>(1);
         // The first round runs at once: what the database committed as it opened is shipped, and
         // its first base begins, without waiting for a commit.
         wake.try_send(())?;
+        let foreground = Arc::clone(&self.foreground);
         on_commit(Box::new(move || {
+            foreground.committed();
             !matches!(wake.try_send(()), Err(TrySendError::Disconnected(())))
         }));
         let shipping = Shipping {
@@ -272,43 +352,52 @@ impl Prepared {
             counters: Arc::clone(&self.counters),
             meter: Arc::clone(&self.meter),
         };
+        let feed = Arc::new(Feed::default());
+        let checks = match self.checker.take() {
+            Some(checker) => {
+                let told = shipping.clone();
+                let fed = Arc::clone(&feed);
+                Some(
+                    std::thread::Builder::new()
+                        .name("amphora-backup-check".into())
+                        .spawn(move || checker.run(&fed, &told))?,
+                )
+            }
+            None => None,
+        };
         let told = shipping.clone();
         std::thread::Builder::new()
             .name("amphora-backup".into())
-            .spawn(move || self.run(&woken, &told))?;
+            .spawn(move || self.run(&woken, &told, &feed, checks))?;
         Ok(shipping)
     }
 
-    fn run(mut self, woken: &Receiver<()>, shipping: &Shipping) {
+    fn run(
+        mut self,
+        woken: &Receiver<()>,
+        shipping: &Shipping,
+        feed: &Feed,
+        checks: Option<std::thread::JoinHandle<()>>,
+    ) {
         let mut copy: Option<BaseCopy> = None;
         loop {
             match self.round(&mut copy) {
-                Ok((shipped, base_ended)) => shipping.record(|s| {
-                    s.rounds = s.rounds.saturating_add(1);
-                    s.shipped.segments = s.shipped.segments.saturating_add(shipped.segments);
-                    s.shipped.bytes = s.shipped.bytes.saturating_add(shipped.bytes);
-                    if base_ended {
-                        s.bases = s.bases.saturating_add(1);
-                    }
-                }),
+                Ok((shipped, base_ended)) => {
+                    shipping.record(|s| {
+                        s.rounds = s.rounds.saturating_add(1);
+                        s.shipped.segments = s.shipped.segments.saturating_add(shipped.segments);
+                        s.shipped.bytes = s.shipped.bytes.saturating_add(shipped.bytes);
+                        if base_ended {
+                            s.bases = s.bases.saturating_add(1);
+                        }
+                    });
+                    feed.round(self.shipper.latest_base(), shipped.bytes, false);
+                }
                 Err(e) => {
                     let why = format!("{e:#}");
                     tracing::warn!(target: "amphora.backup", event = "backup.round_failed", prefix = %self.archive.prefix, error = %why, "a backup round failed: tried again at the next commit");
                     // A base under way starts over: its chunks may straddle the failure.
                     copy = None;
-                    shipping.record(|s| {
-                        s.failures = s.failures.saturating_add(1);
-                        s.last_failure = Some(why);
-                    });
-                }
-            }
-            // A check's failure to run is the round's, but leaves a base under way as it was.
-            match self.checks() {
-                Ok(Some(check)) => shipping.record(|s| s.last_check = Some(check)),
-                Ok(None) => {}
-                Err(e) => {
-                    let why = format!("{e:#}");
-                    tracing::warn!(target: "amphora.backup", event = "backup.check_failed_to_run", prefix = %self.archive.prefix, error = %why, "a backup check couldn't run: tried again at the next commit");
                     shipping.record(|s| {
                         s.failures = s.failures.saturating_add(1);
                         s.last_failure = Some(why);
@@ -322,20 +411,22 @@ impl Prepared {
                     Err(TryRecvError::Disconnected) => Err(()),
                 }
             } else {
-                // Time spent waiting for a commit is the budget checks spend ([`admit`]).
-                let waiting = Instant::now();
-                let woke = woken.recv().map_err(|_| ());
-                let idle = elapsed_ns(waiting);
-                self.idle_since_check = self.idle_since_check.saturating_add(idle);
-                self.meter.idle(idle);
-                woke
+                woken.recv().map_err(|_| ())
             };
             if next.is_err() {
                 break;
             }
         }
-        // The database ended: what it committed last is shipped before the thread lets go of it.
+        // The database ended: what it committed last is shipped before the thread lets go of it,
+        // and a check under way stops at its next step.
         let last = self.ship();
+        self.foreground.end();
+        feed.round(None, 0, true);
+        if let Some(checks) = checks
+            && checks.join().is_err()
+        {
+            tracing::error!(target: "amphora.backup", event = "backup.check_thread_panicked", prefix = %self.archive.prefix);
+        }
         shipping.record(|s| {
             match last {
                 Ok(shipped) => {
@@ -369,7 +460,6 @@ impl Prepared {
     fn round(&mut self, copy: &mut Option<BaseCopy>) -> anyhow::Result<(Shipped, bool)> {
         let generation = self.shipper.generation();
         let shipped = self.ship()?;
-        self.log_since_check = self.log_since_check.saturating_add(shipped.bytes);
         let blobs = self.archive.blobs.as_ref();
         let until = self.until();
         match copy.as_mut() {
@@ -406,13 +496,43 @@ impl Prepared {
             }
         }
     }
+}
+
+impl Checker {
+    fn until(&self) -> Instant {
+        Instant::now()
+            .checked_add(self.patience)
+            .unwrap_or_else(Instant::now)
+    }
+
+    /// Checks after each round the shipping thread tells of, until the database ends.
+    fn run(mut self, feed: &Feed, shipping: &Shipping) {
+        let mut seen = 0;
+        while let Some((rounds, latest_base, shipped)) = feed.next(seen) {
+            seen = rounds;
+            self.log_since_check = self.log_since_check.saturating_add(shipped);
+            match self.checks(latest_base) {
+                Ok(Some(check)) => shipping.record(|s| s.last_check = Some(check)),
+                Ok(None) => {}
+                Err(e) if e.downcast_ref::<Stopped>().is_some() => break,
+                Err(e) => {
+                    let why = format!("{e:#}");
+                    tracing::warn!(target: "amphora.backup", event = "backup.check_failed_to_run", prefix = %self.prefix, error = %why, "a backup check couldn't run: tried again after the next round");
+                    shipping.record(|s| {
+                        s.failures = s.failures.saturating_add(1);
+                        s.last_failure = Some(why);
+                    });
+                }
+            }
+        }
+    }
 
     /// Checks a quiet snapshot's second once it settled and the archive holds it whole, then takes
     /// the next snapshot when a check is due (T-T1.12.C3): what a check found, if one ran.
-    fn checks(&mut self) -> anyhow::Result<Option<Check>> {
-        let check = self.check_pending()?;
+    fn checks(&mut self, latest_base: Option<u64>) -> anyhow::Result<Option<Check>> {
+        let check = self.check_pending(latest_base)?;
         if self.pending_check.is_none()
-            && let Some(base) = self.shipper.latest_base()
+            && let Some(base) = latest_base
             && check_due(self.last_check, base, self.log_since_check)
             && self.admitted()?
         {
@@ -425,22 +545,17 @@ impl Prepared {
         Ok(check)
     }
 
-    /// Whether a due check runs now: at once given a scratch path, within the budget [`admit`]
-    /// derives from the machine when continuous (T-T1.12.C5); a deferral counted with its reason.
+    /// Whether a due check begins now: at once given a scratch path; continuous, once the disk
+    /// holds it ([`admit`], T-T1.12.C5), a deferral counted with its reason.
     fn admitted(&self) -> anyhow::Result<bool> {
-        let Some(scratch) = self.scratch.as_ref() else {
-            return Ok(false);
-        };
         if !self.continuous {
             return Ok(true);
         }
-        let disk = match scratch.parent() {
+        let disk = match self.scratch.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         };
         let budget = Budget {
-            idle_ns: self.idle_since_check,
-            last_cost_ns: self.last_cost,
             free: fs4::available_space(disk)?,
             restore: file_len(&self.source)?
                 .saturating_add(file_len(&suffixed(&self.source, "-wal"))?),
@@ -450,7 +565,7 @@ impl Prepared {
             Ok(()) => Ok(true),
             Err(why) => {
                 self.meter.defer(why);
-                tracing::debug!(target: "amphora.backup.check", event = "deferred", reason = why.reason(), idle_ns = budget.idle_ns, last_cost_ns = ?budget.last_cost_ns, free = budget.free, restore = budget.restore, log_headroom = budget.log_headroom);
+                tracing::debug!(target: "amphora.backup.check", event = "deferred", reason = why.reason(), free = budget.free, restore = budget.restore, log_headroom = budget.log_headroom);
                 Ok(false)
             }
         }
@@ -459,11 +574,15 @@ impl Prepared {
     /// The source's rows at a second, from a snapshot lined up with that second's last commit
     /// ([`super::Marks::quiet_second`]); none when the log isn't quiet now.
     fn quiet_digest(&mut self) -> anyhow::Result<Option<(u64, RowDigest)>> {
-        let Some(checker) = self.checker.as_mut() else {
-            return Ok(None);
-        };
+        let step = step_bytes(self.blobs.as_ref());
         let marks = &self.hooks.marks;
-        checker.query_transaction(|r| {
+        let mut unpaced = Unpaced;
+        let pace: &mut dyn Pace = if self.continuous {
+            &mut self.pacer
+        } else {
+            &mut unpaced
+        };
+        self.reader.query_transaction(|r| {
             let second = marks.quiet_second(|| {
                 // A deferred `BEGIN` takes no snapshot: this first read takes it, under the lock
                 // commits are stamped by, and the log's end is read after it.
@@ -471,13 +590,13 @@ impl Prepared {
                 Ok(r.log_end())
             })?;
             match second {
-                Some(second) => Ok(Some((second, digest(r)?))),
+                Some(second) => Ok(Some((second, digest_paced(r, pace, step)?))),
                 None => Ok(None),
             }
         })
     }
 
-    fn check_pending(&mut self) -> anyhow::Result<Option<Check>> {
+    fn check_pending(&mut self, latest_base: Option<u64>) -> anyhow::Result<Option<Check>> {
         let Some((second, _, _)) = self.pending_check else {
             return Ok(None);
         };
@@ -489,15 +608,12 @@ impl Prepared {
             }
             Some(true) => {}
         }
-        let Some(scratch) = self.scratch.clone() else {
-            self.pending_check = None;
-            return Ok(None);
-        };
+        let scratch = self.scratch.clone();
         let until = self.until();
-        let blobs = self.archive.blobs.as_ref();
+        let blobs = self.blobs.as_ref();
         // The archive holds the second whole once a round shipped past its end: until then the
         // snapshot waits for the next round.
-        if newest_second(blobs, &self.archive.prefix, until)?.is_none_or(|newest| newest < second) {
+        if newest_second(blobs, &self.prefix, until)?.is_none_or(|newest| newest < second) {
             return Ok(None);
         }
         let Some((newest, rows, base)) = self.pending_check.take() else {
@@ -508,7 +624,7 @@ impl Prepared {
         // (T-T1.12.C6). Given a scratch path: the snapshot's own second.
         let (second, rows) = if self.continuous {
             let draw = next_random(&mut self.random);
-            self.drills.offer(newest, rows, self.archive.memory, draw);
+            self.drills.offer(newest, rows, self.memory, draw);
             let draw = next_random(&mut self.random);
             let Some((second, rows)) = self.drills.pick(draw).cloned() else {
                 return Ok(None);
@@ -525,19 +641,24 @@ impl Prepared {
         remove_scratch(&scratch)?;
         let began = Instant::now();
         let source = |s: u64| Ok((s == second).then(|| rows.clone()));
+        let mut unpaced = Unpaced;
+        let pace: &mut dyn Pace = if self.continuous {
+            &mut self.pacer
+        } else {
+            &mut unpaced
+        };
         let check = restore_and_check_at(
             blobs,
-            &self.archive.prefix,
+            &self.prefix,
             second,
             &scratch,
             &source,
             &self.counters,
+            pace,
             until,
         )?;
         let cost = self.pending_cost.saturating_add(elapsed_ns(began));
         self.meter.cost(cost);
-        self.last_cost = Some(cost);
-        self.idle_since_check = 0;
         self.last_check = Some(match &check {
             Check::Passed { restored, .. } => {
                 remove_scratch(&scratch)?;
@@ -548,10 +669,7 @@ impl Prepared {
                 (base, self.log_since_check)
             }
             // Not passed: checked again at the next base, or once as much log again has shipped.
-            _ => (
-                self.shipper.latest_base().unwrap_or(0),
-                self.log_since_check,
-            ),
+            _ => (latest_base.unwrap_or(0), self.log_since_check),
         });
         self.log_since_check = 0;
         Ok(Some(check))

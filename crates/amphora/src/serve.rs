@@ -43,16 +43,16 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use amphora_api::replication::{Durability, Fates, ReplicaConfig};
-use anyhow::{Context, anyhow, bail, ensure};
+use amphora_api::replication::{Durability, Fates, MemberChange, ReplicaConfig};
+use anyhow::{anyhow, bail, ensure, Context};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::database::Database;
 use crate::database::replicated::{OUTGOING_MESSAGES, WIRE_BYTES};
+use crate::database::Database;
 
 const RECORDS: u8 = b'R';
 const CLIENT: u8 = b'C';
@@ -82,9 +82,12 @@ pub struct Config {
     pub secret_file: PathBuf,
     pub deadline: Duration,
     pub drills: bool,
+    /// The members that vote from the start; the others named in `members` are spares, known by
+    /// address and started as learners, for `amphora member` to add (default: every member).
+    pub voters: BTreeSet<u64>,
 }
 
-const KEYS: [&str; 8] = [
+const KEYS: [&str; 9] = [
     "node",
     "members",
     "data",
@@ -93,6 +96,7 @@ const KEYS: [&str; 8] = [
     "secret_file",
     "deadline_ms",
     "drills",
+    "voters",
 ];
 
 impl Config {
@@ -143,6 +147,22 @@ impl Config {
         let ids: BTreeSet<u64> = members.iter().map(|m| m.node).collect();
         ensure!(ids.len() == members.len(), "members: an ID given twice");
         ensure!(ids.contains(&node), "node {node} isn't among the members");
+        let voters: BTreeSet<u64> = match keys.get("voters").copied() {
+            None => ids.clone(),
+            Some(v) => v
+                .split(',')
+                .map(|n| {
+                    n.trim()
+                        .parse::<u64>()
+                        .with_context(|| format!("voters: {n}"))
+                })
+                .collect::<anyhow::Result<_>>()?,
+        };
+        ensure!(!voters.is_empty(), "voters names none");
+        ensure!(
+            voters.is_subset(&ids),
+            "voters names a node that isn't among the members"
+        );
         let class = match take("class")? {
             "persisted" => {
                 ensure!(
@@ -173,6 +193,7 @@ impl Config {
             secret_file: PathBuf::from(take("secret_file")?),
             deadline: Duration::from_millis(deadline_ms),
             drills,
+            voters,
         })
     }
 
@@ -246,8 +267,13 @@ pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
     let ids: BTreeSet<u64> = config.members.iter().map(|m| m.node).collect();
     let replica = ReplicaConfig {
         node_id: config.node,
-        voters: ids.iter().copied().collect(),
-        learners: Vec::new(),
+        voters: config.voters.iter().copied().collect(),
+        // A spare starts as a learner: the group's configuration in its log decides from there.
+        learners: if config.voters.contains(&config.node) {
+            Vec::new()
+        } else {
+            vec![config.node]
+        },
         bootstrap: None,
     };
     let db = Database::open_replicated_with(
@@ -437,12 +463,21 @@ impl Shared {
                     .map(u64::to_string)
                     .collect::<Vec<_>>()
                     .join(",");
+                let learners = if s.learners.is_empty() {
+                    "-".to_owned()
+                } else {
+                    s.learners
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
                 let fenced = s
                     .fenced
                     .as_deref()
                     .map_or_else(|| "-".to_owned(), |f| f.replace(' ', "_"));
                 Ok(format!(
-                    "node={} leader={} term={} applied={} durable={} voters={voters} fenced={fenced} cut={}",
+                    "node={} leader={} term={} applied={} durable={} voters={voters} fenced={fenced} cut={} learners={learners}",
                     s.node_id,
                     s.leader,
                     s.term,
@@ -488,7 +523,40 @@ impl Shared {
                 self.cut.store(to, Ordering::Relaxed);
                 Ok(String::new())
             }
-            other => bail!("unknown request {other:?} (status, exec, count, cut)"),
+            // A membership change, made by the leader (T-T1.13.1): a spare added as a learner,
+            // promoted once it holds the log, a lost member demoted or removed.
+            "member" => {
+                let (what, n) = rest
+                    .split_once(' ')
+                    .ok_or_else(|| anyhow!("member add|promote|demote|remove NODE"))?;
+                let n: u64 = n.trim().parse().context("member: its node")?;
+                let change = match what {
+                    "add" => {
+                        ensure!(
+                            self.ids.contains(&n),
+                            "node {n} isn't in this member's config: name it in members (ID@HOST:PORT) and restart first"
+                        );
+                        MemberChange::AddLearner(n)
+                    }
+                    "promote" => MemberChange::Promote(n),
+                    "demote" => MemberChange::Demote(n),
+                    "remove" => MemberChange::Remove(n),
+                    other => bail!("member {other}: add, promote, demote or remove"),
+                };
+                let s = self
+                    .db
+                    .replica()
+                    .ok_or_else(|| anyhow!("no replica"))?
+                    .change(change, until)
+                    .map_err(|e| anyhow!("refused a membership change: {e:?}"))?;
+                let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+                Ok(format!(
+                    "voters={} learners={}",
+                    list(&s.voters),
+                    list(&s.learners)
+                ))
+            }
+            other => bail!("unknown request {other:?} (status, exec, count, cut, member)"),
         }
     }
 }
@@ -593,16 +661,17 @@ fn fields(status: &str) -> BTreeMap<String, String> {
 /// that is a member, each holds the configured voters and none is fenced or cut.
 pub fn health(config: &Config) -> anyhow::Result<(String, bool)> {
     let secret = config.secret()?;
-    let mut want = config
-        .members
-        .iter()
-        .map(|m| m.node.to_string())
-        .collect::<Vec<_>>();
+    // The config's voters are the cluster it wants: a spare, or a lost member removed, isn't asked.
+    let mut want = config.voters.iter().map(u64::to_string).collect::<Vec<_>>();
     want.sort();
     let mut out = String::new();
     let mut leaders = BTreeSet::new();
     let mut healthy = true;
-    for m in &config.members {
+    for m in config
+        .members
+        .iter()
+        .filter(|m| config.voters.contains(&m.node))
+    {
         match Client::connect(&m.addr, &secret, config.deadline).and_then(|mut c| c.ask("status")) {
             Ok(s) => {
                 let f = fields(&s);
@@ -848,7 +917,12 @@ pub fn check(config: &Config, ledger: &Path, catch_up: Duration) -> anyhow::Resu
         .checked_add(catch_up)
         .ok_or_else(|| anyhow!("--catch-up-s past the clock's range"))?;
     let (mut out, mut ok) = (String::new(), true);
-    for m in &config.members {
+    // Counted on the voters the config names, as health asks them: a lost member removed isn't.
+    for m in config
+        .members
+        .iter()
+        .filter(|m| config.voters.contains(&m.node))
+    {
         let mut lost = 0u64;
         let mut failed = None;
         let mut client = None;
@@ -895,6 +969,7 @@ pub fn check(config: &Config, ledger: &Path, catch_up: Duration) -> anyhow::Resu
 pub const USAGE: &str = "usage: amphora serve CONFIG
        amphora health CONFIG
        amphora ask CONFIG NODE REQUEST...
+       amphora member CONFIG add|promote|demote|remove NODE
        amphora drill load CONFIG --run NAME --writers N --seconds S --ledger FILE
        amphora drill check CONFIG --ledger FILE --catch-up-s S
 ";
@@ -945,6 +1020,31 @@ pub fn command(args: &[String], ready: impl FnOnce(&str)) -> Option<crate::Reply
                 Client::connect(&m.addr, &c.secret()?, c.deadline)?.ask(&request.join(" "))?;
             Ok((format!("{answer}\n"), true))
         })()),
+        // The change goes to each voter in turn until one, the leader, makes it: a follower
+        // refuses it, and a lost member doesn't answer, so a stale idea of the leader costs nothing.
+        ("member", [config, what, node]) => reply((|| {
+            let c = Config::load(Path::new(config))?;
+            let secret = c.secret()?;
+            let request = format!("member {what} {node}");
+            let mut refused = Vec::new();
+            for m in c.members.iter().filter(|m| c.voters.contains(&m.node)) {
+                match Client::connect(&m.addr, &secret, c.deadline)
+                    .and_then(|mut k| k.ask(&request))
+                {
+                    Ok(answer) => {
+                        return Ok((
+                            format!(
+                                "{answer}
+"
+                            ),
+                            true,
+                        ))
+                    }
+                    Err(e) => refused.push(format!("member {}: {e:#}", m.node)),
+                }
+            }
+            bail!("no voter made the change: {}", refused.join("; "))
+        })()),
         ("drill", [what, config, flags @ ..]) if what == "load" => reply((|| {
             let c = Config::load(Path::new(config))?;
             let text = load(
@@ -964,7 +1064,7 @@ pub fn command(args: &[String], ready: impl FnOnce(&str)) -> Option<crate::Reply
                 secs(flag(flags, "--catch-up-s")?)?,
             )
         })()),
-        ("serve" | "health" | "ask" | "drill", _) => crate::Reply {
+        ("serve" | "health" | "ask" | "member" | "drill", _) => crate::Reply {
             text: USAGE.to_owned(),
             to_stderr: true,
             status: 2,
@@ -982,6 +1082,13 @@ mod tests {
     #[test]
     fn t_t1_13_1_config_reads_every_key_and_refuses_what_it_doesnt_know() {
         let c = Config::parse(GOOD).unwrap();
+        assert_eq!(
+            c.voters,
+            BTreeSet::from([1, 2, 3]),
+            "every member votes by default"
+        );
+        let spare = Config::parse(&format!("{GOOD}voters = 1,2\n")).unwrap();
+        assert_eq!(spare.voters, BTreeSet::from([1, 2]));
         assert_eq!(
             (c.node, c.members.len(), c.drills, c.deadline),
             (2, 3, false, Duration::from_millis(5000))
@@ -1002,6 +1109,8 @@ mod tests {
             (GOOD.replace("3@c:7401", "3@c"), "ID@HOST:PORT"),
             (GOOD.replace("persisted", "replicated"), "no spanning"),
             (format!("{GOOD}drills = maybe\n"), "on or off"),
+            (format!("{GOOD}voters = 1,4\n"), "isn't among the members"),
+            (format!("{GOOD}voters = 1,x\n"), "voters: x"),
         ] {
             let e = format!("{:#}", Config::parse(&text).err().unwrap());
             assert!(e.contains(why), "{e} lacks {why}");

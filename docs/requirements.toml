@@ -496,8 +496,11 @@ tests = [
   { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
   # lane backups-3: continuous restore drills (kiln goal 15580afd; backup.md "Continuous restore drills")
   { id = "T-T1.12.C4", text = "With no scratch path given, the shipping thread checks its archive beside the database by default; the checks pass and leave no file behind" },
-  { id = "T-T1.12.C5", text = "A check runs only once the thread was idle as long as the last check took and the disk holds the restore and the log's growth; under one writer per core no check fails and checks take no more time than the thread was idle" },
+  { id = "T-T1.12.C5", text = "A check begins only while the disk holds the restore and the log's growth; under one writer per core, with no checks, unpaced checks and paced checks, no check fails and checks pass once the load ends" },
   { id = "T-T1.12.C6", text = "The drilled seconds are a uniform sample of every quiet snapshot, as many as the memory holds; an expired second is dropped, never picked again" },
+  # lane backups-4: paced checks and the drill after a load (kiln goal 15580afd; backup.md "Continuous restore drills")
+  { id = "T-T1.12.C7", text = "A paced check's step waits for the foreground to be quiet as long as the last step took and rests by the device's measured room; a commit pauses it, the database's end stops it" },
+  { id = "T-T1.12.D3", text = "After a load from one writer per core, random seconds restore with every row equal to the rows recorded at them" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
