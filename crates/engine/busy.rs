@@ -23,12 +23,22 @@ pub enum BusyWake {
 /// its locks, so a release between its failed try and its wait is never missed: [`Self::wait`]
 /// sees the count moved and the statement tries again at once. The wakers held are those of the
 /// statements busy on this log now, at most one each (a waker already held isn't held twice).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LockRelease {
     generation: AtomicU64,
     /// Whether any waker is held, so a release with nobody waiting takes no lock.
     armed: AtomicBool,
     wakers: Mutex<Vec<Waker>>,
+}
+
+impl Default for LockRelease {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            armed: AtomicBool::new(false),
+            wakers: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl LockRelease {

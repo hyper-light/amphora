@@ -1430,7 +1430,8 @@ mod tests {
                         StepResult::Done => break,
                         StepResult::IO | StepResult::Yield => io.step().unwrap(),
                         StepResult::Sleep { duration } => {
-                            if woken_before.is_none() {
+                            // The first wait it holds (a zero sleep is a try again at once).
+                            if woken_before.is_none() && !duration.is_zero() {
                                 woken_before = Some(woken.wakes.load(Ordering::SeqCst));
                                 parked_tx.send(()).unwrap();
                             }
