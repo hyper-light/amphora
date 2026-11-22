@@ -1390,6 +1390,29 @@ impl BTreeCursor {
     /// on, for a scan that decodes the leaf once into column batches (`vdbe/leaf_batch.rs`).
     /// None when the cursor isn't on a row of a table leaf, must restore its position first, or
     /// shares its B-tree with another cursor that could write the leaf.
+    /// Amphora (QT.7): moves a forward scan within its leaf to `cell`, where as many `next`
+    /// steps would have put it, for a fused scan loop that ran the rows between from a batch.
+    /// False, and the cursor unmoved, when it can't: a pending advance, another page type, or
+    /// a cell behind it or past the leaf.
+    pub(crate) fn advance_within_leaf_to(&mut self, cell: usize) -> bool {
+        if self.has_pending_advance_state() {
+            return false;
+        }
+        let Ok(target) = i32::try_from(cell) else {
+            return false;
+        };
+        let (page, cell_idx) = self.stack.top_and_cell_index();
+        let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
+        if !is_leaf || cell_idx < 0 || target < cell_idx || cell >= cell_count {
+            return false;
+        }
+        if target != cell_idx {
+            self.stack.set_cell_index(target);
+            self.invalidate_record();
+        }
+        true
+    }
+
     pub(crate) fn table_leaf_under_cursor(&self) -> Option<TableLeafUnderCursor<'_>> {
         if self.needs_restore()
             || self.null_flag

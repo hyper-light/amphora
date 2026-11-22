@@ -12,8 +12,12 @@ const PREFIX: &[u8] = b"amphora.seed.v1\0";
 pub(super) fn is_seed(bytes: &[u8]) -> bool {
     bytes.starts_with(PREFIX)
 }
-// Existing snapshot encoding permits this much framing beyond the page-image budget.
-const IMAGE_BYTES: usize = super::SNAPSHOT_BYTES.saturating_add(1 << 20);
+/// The most a baseline image's encoding takes now: the memory budget's room for one image and what
+/// an image's encoding adds to it (`image_envelope`, EN.1; SB.1).
+fn image_bytes() -> Result<usize, Refusal> {
+    let room = super::image_room()?;
+    Ok(room.saturating_add(super::image_envelope(room)))
+}
 const FRAMING: usize = 1024;
 
 /// Inspect ownership before a startup importer opens the local writer. A pending baseline also
@@ -151,7 +155,7 @@ fn identity(image: &[u8]) -> [u8; 32] {
     Sha256::digest(image).into()
 }
 fn capture(db: &mut Db) -> Result<Vec<u8>, Refusal> {
-    let pages = db.image_pages(super::SNAPSHOT_BYTES).map_err(unavailable)?;
+    let pages = db.image_pages(super::image_room()?).map_err(unavailable)?;
     if pages.is_empty() {
         return Err(api::invalid(
             "baseline source",
@@ -159,7 +163,7 @@ fn capture(db: &mut Db) -> Result<Vec<u8>, Refusal> {
         ));
     }
     let image = postcard::to_allocvec(&pages).map_err(unavailable)?;
-    api::bound("baseline image", image.len(), IMAGE_BYTES)?;
+    api::bound("baseline image", image.len(), image_bytes()?)?;
     Ok(image)
 }
 impl Baseline {
@@ -181,9 +185,9 @@ impl Baseline {
                 let complete = match row.get::<i64>(2)? { 0 => false, 1 => true, _ => anyhow::bail!("invalid baseline completion flag") };
                 let received = row.get::<String>(3)?.parse::<usize>()?;
                 let total = row.get::<String>(4)?.parse::<usize>()?;
-                api::bound("baseline image", total, IMAGE_BYTES)?;
+                api::bound("baseline image", total, image_bytes()?)?;
                 let image = row.get_value(5).to_blob().ok_or_else(|| anyhow::anyhow!("baseline image is not a blob"))?;
-                api::bound("retained baseline image", image.len(), IMAGE_BYTES)?;
+                api::bound("retained baseline image", image.len(), image_bytes()?)?;
                 saved = Some(Self { declaration: Some(Bootstrap { source_node, source_id }), source: node == source_node, complete, received, total, image: image.to_vec() });
                 Ok(false)
             }).map_err(unavailable)?;
@@ -351,7 +355,7 @@ impl Baseline {
         }
         let offset = usize::try_from(chunk.offset).map_err(unavailable)?;
         let total = usize::try_from(chunk.total).map_err(unavailable)?;
-        api::bound("baseline image", total, IMAGE_BYTES)?;
+        api::bound("baseline image", total, image_bytes()?)?;
         let end = offset
             .checked_add(chunk.image.len())
             .ok_or_else(|| conflict("chunk offset overflow"))?;
@@ -396,7 +400,7 @@ impl Baseline {
                 return Err(conflict("completed image differs from declared identity"));
             }
             let pages: Vec<(u32, Vec<u8>)> = postcard::from_bytes(image).map_err(unavailable)?;
-            super::validate_pages(&pages, super::SNAPSHOT_BYTES)?;
+            super::validate_pages(&pages, super::image_room()?)?;
             let mut expected = 1u32;
             for (id, _) in &pages {
                 if *id != expected {

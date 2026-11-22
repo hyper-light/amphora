@@ -330,11 +330,17 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
   run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
-  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
-  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), SQL's
-  named SAVEPOINT, a database past the pool's frames or a transaction past
-  its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
-  switch on are the coordinator's run.
+  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. A file database
+  reopens and recovers from a crash with its indexes (each tree's order in the redo log, the schema
+  read from tree 1); the storage's budget is `ConnectOpts::with_memory_budget` (the shell's quarter
+  of its process's memory), else a quarter of the machine's, its frames made as pages are handed
+  out (`T-NS.2.10`); DDL undone by a failed statement, a savepoint or a failed commit leaves no
+  orphan tree (`T-NS.2.11`). Not yet: the header (schema cookie, user version) on the versioned
+  storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
+  budget shared by a process's databases. On the pager as on the switch, `nested_loops`'
+  chain of hash joins, `row_counts`' hash join and `sample_filters`' outer join fail (planner
+  work in flight on main), and a failed CREATE TABLE ... AS in a transaction leaves the pager's
+  next statement refused `SchemaUpdated`.
 - **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
   `amphora-bench --reach`): behind one trait, sharing frames, CLOCK eviction and one miss path, (a) a
   page table in shards with pins and a private pin on a client's current page (PostgreSQL), (b)
@@ -454,7 +460,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   rule at an expansion learned from the owner's own measured image and replay costs a byte, its machine reporting its
   image's size (replication.md, "Decision (lane constants): the compaction's expansion learned where it runs"; CT.1); and a
   command's and an image's envelope is what their encoding adds ("Decision (lane constants): an envelope is what its
-  encoding adds"; EN.1).
+  encoding adds"; EN.1); and the process has one memory budget, its limit read where it runs (cgroups and RSS on
+  Linux, the platform's readings on macOS and Windows, a typed refusal where none can be read) and shared out by
+  measured use (store.md, "Decision (lane constants): one process memory budget"; MB.1), an image bounded by its room
+  for one in place of `SNAPSHOT_BYTES` (replication.md, "Decision (lane constants): an image is bounded by the memory
+  budget's room for one"; SB.1).
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
   counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
   and outgoing bounds, and the rest of the list (handoff/amphora-constants-list.md).
@@ -687,9 +697,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   overflow row or one over the budget is read row-at-a-time. Filters and aggregates read the batch through the
   VDBE's own evaluator. COUNT(*) over a table already reads only the leaves' cell counts (`Count`).
   `vdbe/leaf_batch/tests.rs` (T-QT.7.1 to .3) checks switch on against off on random tables. `amphora-bench
-  --planner` runs it as the target `amphora-vectorized`. Left: AC-QT.7.1 to .3 measured (the coordinator's);
-  filter and aggregate kernels over a batch with a selection vector (and, if G5 measures them better, compiled
-  pipelines instead); Windows's cache size, which needs an OS call this crate makes only with unsafe code.
+  --planner` runs it as the target `amphora-vectorized`. Lane qs7-3: a scan loop whose body only filters and
+  steps COUNT, SUM, TOTAL, AVG, MIN or MAX runs over the whole batch by selection vectors
+  (`vdbe/leaf_batch/fused.rs`, executor.md decision 10), through the opcodes' own comparison and aggregate code
+  (T-QT.7.4, .5). Left: AC-QT.7.1 to .3 measured (the coordinator's); GROUP BY bodies still run row-at-a-time
+  from the batch (a batch group lookup is the next piece); compiled pipelines if G5 measures them better;
+  Windows's cache size, which needs an OS call this crate makes only with unsafe code.
 - **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
   `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
