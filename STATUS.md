@@ -741,6 +741,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   (bench/records/power-nemesis/2026-11-22-jupiter-tiny). `bench/repl_lab.sh RUN HOST1 HOST2 HOST3` splits the
   10,000 seeds a class across three named machines and runs the comparison set on each. Not yet: Amphora's
   members on three machines (the LAN p99); the harness runs them in one process.
+- **Replication measured: the classes part, members as processes** (CP-T1.8, AC-T1.8.5; lanes repl-measure-5 to 7):
+  the power-cut nemesis now holds each member's raft-log flushes as well as its database's, so the two classes
+  no longer count alike: the replicated class must answer some write while a majority's logs hold it unflushed,
+  the persisted class never (`the_classes_acknowledge_apart_under_a_held_flush`, and bench/power_nemesis.sh's
+  merge checks both counts). `amphora-bench --repl-member` runs one member as its own process, its records to
+  its peers over TCP; `bench/repl_members.sh RECORDS CLASS HOST1:PORT HOST2:PORT HOST3:PORT FLAGS...` starts
+  the three (here, or by ssh) and runs every measure as `amphora-procs-CLASS` (tiny run: three processes on
+  jupiter). The competitors' scripts take AMPHORA_BENCH_REPL_NAME and AMPHORA_BENCH_REPL_PORT, so runs sharing
+  a Docker host keep their own containers. A member's kill is still the cut, not its process killed.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
