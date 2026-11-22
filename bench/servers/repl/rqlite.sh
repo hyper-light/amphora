@@ -21,6 +21,8 @@ set -euo pipefail
 SYS=rqlite
 PORT=${AMPHORA_BENCH_REPL_PORT:-54200}
 DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it, each fdatasynced (BoltDB without NoSync); rqlited's defaults, which no flag weakens or strengthens"
+# The comparability rule's column (lib.sh): a commit acknowledged by a quorum's Raft logs (above).
+COLUMN="quorum"
 # rqlited's own ready line (cmd/rqlited/main.go:256 at v10.7.4), printed after createCluster
 # returns; with -bootstrap-expect that's once the node knows a leader (main.go:642-645, 672-676).
 READY='node HTTP API available at '

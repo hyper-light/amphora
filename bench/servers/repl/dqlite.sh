@@ -19,6 +19,8 @@ set -euo pipefail
 SYS=dqlite
 PORT=${AMPHORA_BENCH_REPL_PORT:-54240}
 DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it, each written O_DSYNC; libdqlite's and go-dqlite app's defaults, which no setting changes"
+# The comparability rule's column (lib.sh): a commit acknowledged by a quorum's Raft logs (above).
+COLUMN="quorum"
 # The shim's own ready line (shim/main.go), printed once go-dqlite's App.Ready returned (the node
 # joined, or bootstrapped as node 0) and its database is open, with its HTTP listener bound.
 READY='shim ready: listening on '

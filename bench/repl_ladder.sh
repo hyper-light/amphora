@@ -20,7 +20,9 @@
 #   LADDER   default "1 8 32 128 512 2048 4096" (tiny instances may stop at 128).
 #   PROCS_PORT  Amphora's first member's port (default 54290; members take it and the next two).
 # Records: RECORDS/<system>-commit.jsonl (one line a rung), RECORDS/host.json (this host), and the
-# table printed at the end (p50, p99, p99.9 in ms, commits a second, the client's cores in use).
+# tables printed at the end (p50, p99, p99.9 in ms, commits a second, the client's cores in use),
+# the quorum systems and the primary-only ones apart (each record's `about.column`: the
+# comparability rule, bench/src/repl.rs QUORUM), never side by side as equals.
 # Exit: 0 when every rung of every system gave a record or a typed refusal; 1 otherwise.
 set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,7 +74,14 @@ for w in $LADDER; do
   done
 done
 
+# The report keeps the comparability rule's columns apart (bench/src/repl.rs QUORUM): the quorum
+# systems' table, then the primary-only systems' (libSQL, LiteFS) under their own heading, then a
+# record whose `about` named neither (a refusal before its cluster came up) apart again; and the
+# p99 by rung with the primary-only systems in a column group of their own, past a `|`.
 python3 -I -c 'import glob, json, os, sys
+COLUMNS = [("quorum", "acknowledged once a quorum of members hold the commit"),
+           ("primary only", "acknowledged once the primary alone holds the commit; not comparable with the quorum column"),
+           (None, "no column stated (refused before its cluster said what it acknowledges)")]
 rows = []
 for f in sorted(glob.glob(os.path.join(sys.argv[1], "*-commit.jsonl"))):
     for line in open(f):
@@ -80,8 +89,24 @@ for f in sorted(glob.glob(os.path.join(sys.argv[1], "*-commit.jsonl"))):
         a, u, l = r.get("about") or {}, r.get("client_use") or {}, r.get("latency_ms") or {}
         wall = (r.get("warmup_s") or 0) + (r.get("seconds") or 0)
         cores = (u.get("cpu_s") or 0) / wall if wall else None
-        rows.append((r.get("system"), r.get("writers"), l.get("p50"), l.get("p99"), l.get("p999"), r.get("writes_per_s"), cores, u.get("sockets"), a.get("platform"), a.get("version"), r.get("refused")))
-print("system\twriters\tp50_ms\tp99_ms\tp99.9_ms\tcommits_s\tclient_cores\tsockets\tplatform\tversion\trefused")
-for row in sorted(rows, key=lambda r: (str(r[0]), r[1] or 0)):
-    print("\t".join("" if v is None else (f"{v:.3f}" if isinstance(v, float) else str(v)) for v in row))' "$RECORDS"
+        column = a.get("column") if a.get("column") in ("quorum", "primary only") else None
+        rows.append((column, (r.get("system"), r.get("writers"), l.get("p50"), l.get("p99"), l.get("p999"), r.get("writes_per_s"), cores, u.get("sockets"), a.get("platform"), a.get("version"), r.get("refused"))))
+cell = lambda v: "" if v is None else (f"{v:.3f}" if isinstance(v, float) else str(v))
+for column, says in COLUMNS:
+    part = sorted((row for c, row in rows if c == column), key=lambda r: (str(r[0]), r[1] or 0))
+    if not part:
+        continue
+    name = column or "unclassed"
+    print(f"# {name}: {says}")
+    print("system\twriters\tp50_ms\tp99_ms\tp99.9_ms\tcommits_s\tclient_cores\tsockets\tplatform\tversion\trefused")
+    for row in part:
+        print("\t".join(cell(v) for v in row))
+    print()
+group = {c: sorted({str(row[0]) for cc, row in rows if cc == c}) for c, _ in COLUMNS}
+p99 = {(str(row[0]), row[1]): row[3] for _, row in rows}
+heads = [f"quorum: {s}" for s in group["quorum"]] + ["|"] + [f"primary only: {s}" for s in group["primary only"]]
+print("# p99_ms by writers, the primary-only systems past the |")
+print("\t".join(["writers"] + heads))
+for w in sorted({row[1] for _, row in rows if row[1] is not None}):
+    print("\t".join([str(w)] + [cell(p99.get((s, w))) for s in group["quorum"]] + ["|"] + [cell(p99.get((s, w))) for s in group["primary only"]]))' "$RECORDS"
 exit $failed

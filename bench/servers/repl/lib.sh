@@ -9,7 +9,9 @@
 # node's own process prints once it takes requests: its ready signal), defines `run_node N` (starts
 # node N in the background and prints nothing), `leader` (node 0 to 2, or nothing) and
 # `version` (the binary's own version line), states DURABILITY (what an acknowledged write has
-# survived, with the flags that make it so), then calls `main "$@"`.
+# survived, with the flags that make it so) and COLUMN (the comparability rule, bench/src/repl.rs
+# QUORUM: "quorum" when a commit is acknowledged once a quorum of members hold it, "primary only"
+# when the primary alone does; reports keep the two apart), then calls `main "$@"`.
 #
 # Binaries come from AMPHORA_REPL_BIN (default ~/.cache/amphora-repl-bin, setup.sh's). Each node's
 # data, log and PID file live under AMPHORA_REPL_DATA (default ~/.cache/amphora-repl-data)/<name>-<sys>/N:
@@ -130,9 +132,9 @@ about() {
   # Every option the binary's own help names for syncing or durability, so the record shows the
   # defaults it ran with, not only what DURABILITY says of them.
   # durability_check, where a script has one, is what the running cluster itself reports of it.
-  python3 -I -c 'import json,sys; print(json.dumps({"system": sys.argv[1], "version": sys.argv[2], "platform": "native", "kernel": sys.argv[3], "data_fs": sys.argv[4], "durability": sys.argv[5], "sync_options": [l.strip() for l in sys.argv[6].splitlines() if l.strip()], "durability_check": sys.argv[7] or None}))' \
+  python3 -I -c 'import json,sys; print(json.dumps({"system": sys.argv[1], "version": sys.argv[2], "platform": "native", "kernel": sys.argv[3], "data_fs": sys.argv[4], "durability": sys.argv[5], "sync_options": [l.strip() for l in sys.argv[6].splitlines() if l.strip()], "durability_check": sys.argv[7] or None, "column": sys.argv[8]}))' \
     "$SYS" "$(version 2>&1 | head -n 1)" "$kernel" "$fs" "$DURABILITY" "$(help_text 2>&1 | grep -iE 'sync|durab|fsync' || true)" \
-    "$(if declare -F durability_check >/dev/null; then durability_check 2>&1; fi)"
+    "$(if declare -F durability_check >/dev/null; then durability_check 2>&1; fi)" "$COLUMN"
 }
 
 main() {

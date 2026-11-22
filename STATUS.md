@@ -799,7 +799,13 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   now runs it at strong (FULL) and refuses to come up otherwise. libSQL and LiteFS replicate asynchronously
   with no mode that waits for a replica, so they can't match 2 of 3: their records say one member's disk.
   Bring-up waits on each process's own ready line, followed as the log grows, with two minutes as the give-up
-  (no 50 ms poll). setup.sh pairs go-dqlite with the libdqlite it builds against (v3 for 1.18+, v1.22.0 below).
+  (no 50 ms poll). setup.sh pairs go-dqlite with the libdqlite it builds against (v3 for 1.17+, v1.22.0 below).
+- **Replication measured: libSQL and LiteFS in a column of their own** (CP-T1.8, AC-T1.8.2; lane
+  repl-measure-15): written, not yet run. Every record's `about.column` says whether a commit waited for a
+  quorum or only the primary, and the ladder's report prints the primary-only systems (libSQL, LiteFS) in their
+  own table and column group, never beside the quorum systems as equals. The container scripts are gone: the
+  competitors run only as processes from `bench/servers/repl` (Linux). dqlite's cluster refuses to come up
+  unless all three members vote.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,

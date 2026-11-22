@@ -22,6 +22,8 @@ set -euo pipefail
 SYS=litefs
 PORT=${AMPHORA_BENCH_REPL_PORT:-54260}
 DURABILITY="acknowledged once the primary's SQLite WAL and LTX file hold it, fsynced (synchronous=FULL; LiteFS's CommitWAL syncs both); replicas stream it asynchronously and LiteFS has no mode that waits for one, so no quorum: one member's disk"
+# The comparability rule's column (lib.sh): a commit acknowledged by the primary alone; no mode waits for a replica (above).
+COLUMN="primary only"
 # The shim's own ready line (shim/main.go). LiteFS runs the shim only once its node holds the
 # lease or has connected to the holder ("connected to cluster, ready",
 # cmd/litefs/mount_linux.go:265-270), and passes its stdout and stderr on (mount_linux.go:617-623:

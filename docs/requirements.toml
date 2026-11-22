@@ -1188,6 +1188,11 @@ tests = [
 # durability, from its own source (cited in bench/servers/repl/<system>.sh): sqld at
 # durability_mode=strong, checked by `up`; rqlite and dqlite at their defaults (2 of 3 logs, fsynced);
 # libSQL and LiteFS can't wait for a replica, which their records' `durability` says.
+# lane repl-measure-15 (CP-T1.8, AC-T1.8.2): no new IDs. The competitors run one way, as processes from
+# bench/servers/repl (the container scripts are gone). The comparability rule is in the records: each
+# record's `about.column` is "quorum" or "primary only" (bench/src/repl.rs QUORUM; libSQL and LiteFS
+# are primary only), and bench/repl_ladder.sh's report keeps the two columns apart, never side by side
+# as equals (test g12_repl_columns_keep_primary_only_apart). dqlite's `up` refuses unless 3 of 3 vote.
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]

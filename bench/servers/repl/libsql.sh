@@ -31,6 +31,8 @@ set -euo pipefail
 SYS=libsql
 PORT=${AMPHORA_BENCH_REPL_PORT:-54220}
 DURABILITY="acknowledged once the primary's SQLite WAL holds it, fsynced (durability_mode=strong, synchronous=FULL; sqld's default, relaxed, is synchronous=NORMAL and doesn't sync at commit); replicas pull it asynchronously and sqld has no mode that waits for one, so no quorum: one member's disk"
+# The comparability rule's column (lib.sh): a commit acknowledged by the primary alone; no mode waits for a replica (above).
+COLUMN="primary only"
 # sqld's own line once its user HTTP listener is bound (src/main.rs:476-480 at v0.24.32; RUST_LOG
 # defaults to info, main.rs:748-749), then one blocking request (after_ready).
 READY='listening for incoming user HTTP connection on '

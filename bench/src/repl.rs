@@ -116,8 +116,30 @@ pub trait Cluster: Sync {
         None
     }
     /// What the record says of the system and of the client that drove it (Ada's fair-comparison
-    /// rule: each record names its client, its platform, the system's version and its durability).
+    /// rule: each record names its client, its platform, the system's version and its durability),
+    /// and the report column it stands in (`column`, [`QUORUM`] or [`PRIMARY_ONLY`]).
     fn about(&self) -> serde_json::Value;
+}
+
+/// The comparability rule (CP-T1.8, AC-T1.8.2), part of every record's `about`: a system whose
+/// commit is acknowledged once a quorum of its members hold it stands in the `quorum` column; one
+/// whose commit is acknowledged on its primary alone (libSQL's sqld and LiteFS, which replicate
+/// asynchronously with no mode that waits for a replica) stands in `primary only`. Every report
+/// from these records keeps the two columns apart, never side by side as equals: a primary-only
+/// commit has skipped the replication a quorum commit waits for. Each cluster script states its
+/// own (`COLUMN`, bench/servers/repl/lib.sh), from the durability its header cites.
+pub const QUORUM: &str = "quorum";
+/// See [`QUORUM`].
+pub const PRIMARY_ONLY: &str = "primary only";
+
+/// The column a cluster script's `about` states, if it is one of the two; a record whose script
+/// stated neither stands in no column (its report shows it apart, unclassed), never in `quorum`.
+fn column_of(about: &serde_json::Value) -> Option<&'static str> {
+    match about.get("column").and_then(serde_json::Value::as_str) {
+        Some(c) if c == QUORUM => Some(QUORUM),
+        Some(c) if c == PRIMARY_ONLY => Some(PRIMARY_ONLY),
+        _ => None,
+    }
 }
 
 /// The client's own use of this host over the run, to show it wasn't the bottleneck (the
@@ -690,6 +712,7 @@ mod inproc {
             serde_json::json!({
                 "system": "amphora", "version": record_commit(), "platform": "in-process",
                 "durability": "the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed)",
+                "column": QUORUM,
                 "client": { "driver": "amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each", "transport": "in process: calls on the member, no network" },
             })
         }
@@ -893,7 +916,9 @@ mod http {
             // The cluster script's own account (its binary's version line, the data folder's
             // filesystem and what an acknowledgement means), and the client's.
             let mut a = self.script(&["about"]).ok().and_then(|out| serde_json::from_str::<serde_json::Value>(out.trim()).ok()).unwrap_or_else(|| serde_json::json!({ "system": self.system }));
+            let column = column_of(&a);
             if let Some(o) = a.as_object_mut() {
+                o.insert("column".into(), serde_json::json!(column));
                 o.insert(
                     "client".into(),
                     serde_json::json!({
@@ -1330,6 +1355,7 @@ mod procs {
                 "system": "amphora", "version": record_commit(), "platform": "native",
                 "members": self.members,
                 "durability": "the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)",
+                "column": QUORUM,
                 "client": {
                     "driver": "amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each",
                     "transport": "one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight",
@@ -1444,5 +1470,16 @@ mod tests {
             assert!(p["kernel"].as_str().is_some_and(|k| k.starts_with("Linux")), "{p}");
         }
         drop(held);
+    }
+
+    // CP-T1.8, AC-T1.8.2, the comparability rule: a script's column is taken only when it names one
+    // of the two; anything else stands in no column, never beside the quorum systems.
+    #[test]
+    fn g12_repl_columns_keep_primary_only_apart() {
+        assert_eq!(column_of(&serde_json::json!({ "column": "quorum" })), Some(QUORUM));
+        assert_eq!(column_of(&serde_json::json!({ "column": "primary only" })), Some(PRIMARY_ONLY));
+        assert_eq!(column_of(&serde_json::json!({ "column": "Quorum" })), None);
+        assert_eq!(column_of(&serde_json::json!({ "column": 1 })), None);
+        assert_eq!(column_of(&serde_json::json!({ "system": "libsql" })), None);
     }
 }
