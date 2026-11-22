@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::main_loop::adaptive::emit_close_switch;
 use crate::translate::main_loop::hash::{
     emit_hash_join_unmatched_build_rows, GraceHashLoop, HashProbeCloseEmitter,
 };
@@ -151,6 +152,10 @@ impl CloseLoop {
                 }
                 operation => {
                     resolve_next(program);
+                    // Amphora (PL.13): once switched, the next row is the hash table's next match.
+                    if let Some(switch) = t_ctx.adaptive_joins.get(&table_index).copied() {
+                        emit_close_switch(program, &switch);
+                    }
                     let temp_cursor_id = match &mode {
                         OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
                             ephemeral_table_cursor_id,
@@ -478,6 +483,7 @@ fn emit_unmatched_right_rows(
                 loop_end: scan_end,
                 next: next_row,
             },
+            false,
         )
     })?;
 
