@@ -999,6 +999,7 @@ worker), charged to the statement's memory budget with a typed refusal that fall
 serial loop; two-table hash joins that return rows (no aggregates) run on morsels, with an
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Lane qs6-6: such a join under LIMIT and
 OFFSET runs on morsels too when its ORDER BY holds both tables' INTEGER PRIMARY KEYs, so its rows
-are the serial loop's to the row (T-QT.6.14). Still open: workers running a copy of the VDBE loop
-body (any expression in parallel), joins of three or more tables, outer joins, a LIMIT that stops
+are the serial loop's to the row (T-QT.6.14). Lane qs6-7: workers run a copy of a one-table scan's loop
+body, each with its own registers, so any filter or expression runs in parallel (T-QT.6.15).
+Still open: the copy for joins, joins of three or more tables, outer joins, a LIMIT that stops
 the workers early.

@@ -475,10 +475,30 @@ ends at the LIMIT); the workers still produce every joined row, so the LIMIT sav
 probing. A LIMIT over an order with ties stays serial. T-QT.6.14 checks it row for row against the
 serial loop at 2, 3, 4 and 8 stated cores.
 
-**Not yet.** Workers still run the pipeline's own loop body, not a copy of the VDBE program's,
-so only the filters `Predicate` holds (a column against a literal of its kind, a NULL test) run in
-parallel; joins of more than two tables and outer joins stay serial, and a LIMIT doesn't yet stop
-the workers early.
+**Workers run a copy of the loop body** (lane qs6-7). A one-table scan with its aggregates no
+longer needs its filter and inputs to be ones `Predicate` and `Aggregate` hold: the hook emits a
+copy of the serial loop's body (`MorselBody`) as its own range of the program, after its row loop
+where the serial loop never reaches, translated by the same `translate_condition_expr` and
+`translate_expr` the serial loop uses, with each of the table's columns read from a register (the
+resolver's expression cache) rather than a cursor. Each worker (`TableBodyAggregate`) makes its own
+`ProgramState` (registers, cursors, program counter) at its first morsel, its registers starting
+as the statement's were when the hook ran (the constants the program's start computed, the bound
+parameters), and per row writes the row's columns and rowid into their registers and runs the
+statement's own opcodes from the body's start until it reaches `keep` (its GROUP BY values and
+aggregate inputs are then in the output registers, folded into the worker's partial aggregates)
+or `skip`. So any filter or expression the serial loop runs, functions, CASE, LIKE, arithmetic,
+runs in parallel, with no second evaluator. An error the body raises, or a step that is not a
+plain step, sends the statement to the serial loop, which raises the error its own way; so does a
+REAL a SUM would take, since the parallel sum's one exact rounding is not the serial loop's. The
+GROUP BY values and MIN and MAX are compared bytewise, so a column of another collation, a
+COLLATE, a subquery or a column stored converted (REAL or NUMERIC affinity) stays serial. The
+versioned storage's column copy still reads the simple shape's own filter and aggregates, and
+declines a body only the bytecode states. T-QT.6.15 checks random filters and inputs against the
+serial loop at 1, 2, 3, 4 and 8 stated cores, and that the body ran over every row.
+
+**Not yet.** Joins still run the pipeline's own probe loop, so only the filters `Predicate` holds
+run in a join's workers; joins of more than two tables and outer joins stay serial, and a LIMIT
+doesn't yet stop the workers early.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

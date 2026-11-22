@@ -311,6 +311,201 @@ impl TableAggregate<'_> {
     }
 }
 
+/// A one-table scan whose filter, GROUP BY values and aggregate inputs are a copy of the serial
+/// loop's body (`MorselBody`, lane qs6-7): each worker runs that range of the statement's program
+/// per row, with registers and cursor of its own, and folds the rows it keeps into its partial
+/// aggregates. Any expression the serial loop runs runs here, through the VDBE's own opcodes.
+pub struct TableBodyAggregate<'a> {
+    pub table: &'a TableSource,
+    pub body: &'a crate::vdbe::insn::MorselBody,
+    pub program: &'a crate::vdbe::Program,
+    pub pager: &'a Arc<Pager>,
+    /// The statement's non-NULL registers when the hook ran, by register: each worker's start.
+    pub registers: &'a [(usize, Value)],
+    pub parameters: &'a [Value],
+    pub shape: &'a ScanAggregate<'a>,
+    /// Counts the rows the copied body ran over.
+    pub ran: &'a std::sync::atomic::AtomicU64,
+}
+
+/// A worker's own state for [`TableBodyAggregate`]: its registers, cursors and program counter,
+/// made at its first morsel, and the output row it reuses.
+pub struct BodyWorker {
+    state: crate::vdbe::ProgramState,
+    out: Vec<Value>,
+}
+
+/// The partial of [`TableBodyAggregate`]: the aggregates, and the worker that folds into them.
+#[derive(Default)]
+pub struct BodyPartial {
+    aggregate: super::morsel::AggregatePartial,
+    worker: Option<Box<BodyWorker>>,
+}
+
+impl TableBodyAggregate<'_> {
+    fn worker(&self) -> Result<BodyWorker, MorselError> {
+        let mut state = crate::vdbe::ProgramState::new(
+            self.program.max_registers,
+            self.program.cursor_ref.len(),
+        );
+        for (at, value) in self.registers {
+            let register = state
+                .registers
+                .get_mut(*at)
+                .ok_or(MorselError::Corrupt("a register past the program's"))?;
+            *register = crate::vdbe::Register::Value(value.clone());
+        }
+        state.parameters.try_reserve_exact(self.parameters.len())?;
+        state.parameters.extend(self.parameters.iter().cloned());
+        let mut out = Vec::new();
+        out.try_reserve_exact(self.body.out_count)?;
+        Ok(BodyWorker { state, out })
+    }
+
+    /// Runs the body over one row; true when the row passed, its values then in `worker.out`.
+    fn row(&self, worker: &mut BodyWorker, rowid: i64, row: &[Value]) -> Result<bool, MorselError> {
+        use crate::vdbe::execute::InsnFunctionStepResult;
+        use crate::vdbe::Register;
+        let state = &mut worker.state;
+        let bad = MorselError::Corrupt("the loop body's register is past the program's");
+        for (at, value) in row.iter().enumerate() {
+            let reg = self
+                .body
+                .columns_start
+                .checked_add(at)
+                .ok_or(MorselError::Overflow {
+                    what: "a column's register",
+                })?;
+            let register = state.registers.get_mut(reg).ok_or(MorselError::Corrupt(
+                "the loop body's register is past the program's",
+            ))?;
+            *register = Register::Value(value.clone());
+        }
+        *state.registers.get_mut(self.body.rowid).ok_or(bad)? =
+            Register::Value(Value::from_i64(rowid));
+        let keep = self.body.keep.as_offset_int();
+        let skip = self.body.skip.as_offset_int();
+        state.pc = self.body.start.as_offset_int();
+        // The body's code jumps forward only (a filter's branches, CASE, a constant call's
+        // `Once`), so it reaches `keep` or `skip` within its own length.
+        loop {
+            if state.pc == keep {
+                break;
+            }
+            if state.pc == skip {
+                return Ok(false);
+            }
+            let at = usize::try_from(state.pc).map_err(|_| MorselError::Overflow {
+                what: "the program counter",
+            })?;
+            let (insn, _) = self
+                .program
+                .insns
+                .get(at)
+                .ok_or(MorselError::Corrupt("the loop body ran past the program"))?;
+            match insn.to_function()(self.program, state, insn, self.pager) {
+                Ok(InsnFunctionStepResult::Step) => {}
+                Ok(_) => {
+                    return Err(MorselError::Body(Box::new(
+                        crate::LimboError::InternalError(
+                            "the loop body stopped short of its row".into(),
+                        ),
+                    )))
+                }
+                Err(error) => return Err(MorselError::Body(error)),
+            }
+        }
+        worker.out.clear();
+        let end =
+            self.body
+                .out_start
+                .checked_add(self.body.out_count)
+                .ok_or(MorselError::Overflow {
+                    what: "the output registers",
+                })?;
+        let values = state
+            .registers
+            .get(self.body.out_start..end)
+            .ok_or(MorselError::Corrupt(
+                "the loop body's output is past the program's registers",
+            ))?;
+        for register in values {
+            let Register::Value(value) = register else {
+                return Err(MorselError::Corrupt(
+                    "the loop body left a non-value output",
+                ));
+            };
+            worker.out.push(value.clone());
+        }
+        for at in &self.body.sums {
+            if let Some(Value::Numeric(crate::numeric::Numeric::Float(_))) = worker.out.get(*at) {
+                return Err(MorselError::Unsupported { kind: "REAL" });
+            }
+        }
+        Ok(true)
+    }
+
+    /// The answer as the switch and the measured costs pick the degree.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let (partial, stats) = execute(self, mode, costs, budget)?;
+        Ok((self.shape.finish(partial.aggregate)?, stats))
+    }
+}
+
+impl Pipeline for TableBodyAggregate<'_> {
+    type Partial = BodyPartial;
+
+    fn rows(&self) -> usize {
+        self.table.leaves()
+    }
+
+    fn empty(&self) -> Self::Partial {
+        BodyPartial::default()
+    }
+
+    fn run(
+        &self,
+        leaves: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let BodyPartial { aggregate, worker } = partial;
+        let worker = match worker {
+            Some(worker) => worker,
+            None => worker.insert(Box::new(self.worker()?)),
+        };
+        let mut ran = 0u64;
+        let scanned = self.table.scan(leaves, |rowid, row| {
+            ran = ran.saturating_add(1);
+            if !self.row(worker, rowid, row)? {
+                return Ok(());
+            }
+            self.shape
+                .fold(&worker.out, position(rowid)?, aggregate, budget)
+        });
+        if scanned.is_ok() {
+            self.ran
+                .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+        }
+        scanned
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        self.shape
+            .merge(&mut into.aggregate, from.aggregate, budget)
+    }
+}
+
 /// A hash join's probe side read from a table's leaves against a table built once.
 pub struct TableProbe<'a> {
     pub table: &'a TableSource,

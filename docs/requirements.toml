@@ -984,6 +984,8 @@ tests = [
   { id = "T-QT.6.13", text = "t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when random two-table hash joins returning rows, with or without ORDER BY, answer as the serial loop at 2, 3, 4 and 8 stated cores (in ORDER BY order, ties as sets) and the hook ran for most" },
   # lane qs6-6
   { id = "T-QT.6.14", text = "t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-6) — passes when random two-table hash joins returning rows under LIMIT and OFFSET, ordered by keys holding both tables' INTEGER PRIMARY KEYs, answer row for row as the serial loop at 2, 3, 4 and 8 stated cores, the hook ran for most, and a LIMIT over an order with ties stays serial" },
+  # lane qs6-7
+  { id = "T-QT.6.15", text = "t_qt_6_15_workers_run_a_copy_of_the_loop_body_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-7) — passes when random one-table aggregates whose filters, GROUP BY values and aggregate inputs are any expression (functions, CASE, LIKE, arithmetic) answer as the serial loop at 1, 2, 3, 4 and 8 stated cores, the workers' copy of the loop body ran over every row each time, and more than one worker ran for most" },
 ]
 
 # lane g3s2

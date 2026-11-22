@@ -20618,7 +20618,8 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        TableAggregate, TableBuild, TableJoinAggregate, TableJoinRows, TableSource,
+        TableAggregate, TableBodyAggregate, TableBuild, TableJoinAggregate, TableJoinRows,
+        TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -20648,6 +20649,26 @@ pub fn op_morsel_aggregate(
         Some(costs) => costs,
         None => MachineCosts::measure().map_err(refused)?,
     };
+    // Each worker's registers start as the statement's are now (the constants the program's
+    // start computed among them), with its bound parameters (lane qs6-7).
+    let mut registers = Vec::new();
+    let mut parameters = Vec::new();
+    if data.body.is_some() {
+        for (at, register) in state.registers.iter().enumerate() {
+            if let Register::Value(value) = register {
+                if !matches!(value, Value::Null) {
+                    registers
+                        .try_reserve(1)
+                        .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+                    registers.push((at, value.clone()));
+                }
+            }
+        }
+        parameters
+            .try_reserve_exact(state.parameters.len())
+            .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+        parameters.extend(state.parameters.iter().cloned());
+    }
     let answered = (|| {
         let table = TableSource::open(
             pager.clone(),
@@ -20657,6 +20678,28 @@ pub fn op_morsel_aggregate(
         )?;
         let budget = MemoryBudget::new(pager.statement_memory_budget());
         let Some(join) = &data.join else {
+            // A copy of the serial loop's body, run per row by each worker (lane qs6-7).
+            if let Some(body) = &data.body {
+                let shape = ScanAggregate {
+                    rows: &[],
+                    filter: &[],
+                    group_by: &body.group_by,
+                    aggregates: &body.aggregates,
+                };
+                let pipeline = TableBodyAggregate {
+                    table: &table,
+                    body,
+                    program,
+                    pager,
+                    registers: &registers,
+                    parameters: &parameters,
+                    shape: &shape,
+                    ran: &connection.morsel_body_rows,
+                };
+                return pipeline
+                    .run_mode(connection.parallel_mode(), &mut costs, &budget)
+                    .map(|(rows, _)| (rows, false));
+            }
             let shape = ScanAggregate {
                 rows: &[],
                 filter: &data.filter,
@@ -20737,7 +20780,11 @@ pub fn op_morsel_aggregate(
         Ok((rows, false)) => rows,
         // A value the parallel aggregates don't take (a SUM over text), or groups past the
         // statement's memory that the serial loop's spilling GROUP BY can hold: it answers.
-        Err(MorselError::Unsupported { .. } | MorselError::MemoryBudget { .. }) => {
+        Err(
+            MorselError::Unsupported { .. }
+            | MorselError::MemoryBudget { .. }
+            | MorselError::Body(_),
+        ) => {
             state.pc = data.target_pc_serial.as_offset_int();
             return Ok(InsnFunctionStepResult::Step);
         }

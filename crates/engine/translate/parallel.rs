@@ -25,6 +25,10 @@
 use crate::function::AggFunc;
 use crate::schema::{BTreeTable, Table};
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::{
+    translate_condition_expr, translate_expr, walk_expr, ConditionMetadata, WalkControl,
+};
 use crate::translate::plan::{
     Distinctness, HashJoinType, JoinType, JoinedTable, Operation, QueryDestination, Scan,
     SelectPlan, WhereTermOrigin,
@@ -32,7 +36,7 @@ use crate::translate::plan::{
 use crate::types::Value;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::{Insn, MorselAggregateData, MorselJoinData, MorselRows};
+use crate::vdbe::insn::{Insn, MorselAggregateData, MorselBody, MorselJoinData, MorselRows};
 use crate::vdbe::morsel::{Aggregate, CmpOp, Predicate};
 use amphora_engine_parser::ast::{Expr, Literal, Operator, SortOrder, UnaryOperator};
 
@@ -45,9 +49,49 @@ pub(crate) struct MorselHook {
 pub(crate) fn emit_morsel_hook(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
-) -> Option<MorselHook> {
-    let window = window(plan)?;
-    let data = shape(plan).or_else(|| shape_join(plan))?;
+    resolver: &Resolver,
+) -> crate::Result<Option<MorselHook>> {
+    let Some(window) = window(plan) else {
+        return Ok(None);
+    };
+    // A one-table scan runs a copy of its loop body in the workers (lane qs6-7); the simple
+    // shape's own filter and aggregates stay for the versioned storage's column copy.
+    let looped = body_plan(plan);
+    let simple = shape(plan);
+    let is_simple = simple.is_some();
+    let data = match (&looped, simple) {
+        (_, Some(data)) => data,
+        (Some(looped), None) => MorselAggregateData {
+            root_page: looped.table.root_page,
+            columns: looped.table.columns().len(),
+            rowid_alias: rowid_alias(looped.table),
+            filter: Vec::new(),
+            group_by: looped.group_by.clone(),
+            aggregates: looped.aggregates.clone(),
+            result_map: looped.result_map.clone(),
+            join: None,
+            joined_rows: None,
+            body: None,
+            target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
+        },
+        (None, None) => match shape_join(plan) {
+            Some(data) => data,
+            None => return Ok(None),
+        },
+    };
+    let body = looped.as_ref().map(|looped| MorselBody {
+        start: program.allocate_label(),
+        keep: program.allocate_label(),
+        skip: program.allocate_label(),
+        columns_start: program.alloc_registers(looped.table.columns().len()),
+        rowid: program.alloc_register(),
+        out_start: program.alloc_registers(looped.outs.len()),
+        out_count: looped.outs.len(),
+        group_by: looped.group_by.clone(),
+        aggregates: looped.aggregates.clone(),
+        sums: looped.sums.clone(),
+        simple: is_simple,
+    });
     let serial = program.allocate_label();
     let end = program.allocate_label();
     let next = program.allocate_label();
@@ -70,6 +114,7 @@ pub(crate) fn emit_morsel_hook(
     program.emit_insn(Insn::MorselAggregate {
         data: Box::new(MorselAggregateData {
             target_pc_serial: serial,
+            body: body.clone().map(Box::new),
             ..data
         }),
     });
@@ -97,8 +142,223 @@ pub(crate) fn emit_morsel_hook(
         });
     }
     program.emit_insn(Insn::Goto { target_pc: next });
+    if let (Some(looped), Some(body)) = (&looped, &body) {
+        emit_body(program, resolver, plan, looped, body)?;
+    }
     program.preassign_label_to_next_insn(serial);
-    Some(MorselHook { end })
+    Ok(Some(MorselHook { end }))
+}
+
+/// A one-table scan's loop body as the workers run it (QT.6, lane qs6-7): its filter terms, and
+/// the expressions whose values the pipeline folds (the GROUP BY values, then each aggregate's
+/// input), any expression the serial loop takes.
+struct BodyPlan<'p> {
+    table: &'p BTreeTable,
+    id: amphora_engine_parser::ast::TableInternalId,
+    filter: Vec<&'p Expr>,
+    outs: Vec<&'p Expr>,
+    group_by: Vec<usize>,
+    aggregates: Vec<Aggregate>,
+    sums: Vec<usize>,
+    result_map: Vec<usize>,
+}
+
+fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
+    if !plain(plan) {
+        return None;
+    }
+    let [joined] = plan.table_references.joined_tables() else {
+        return None;
+    };
+    let Operation::Scan(Scan::BTreeTable { index: None, .. }) = &joined.op else {
+        return None;
+    };
+    let table = stored(joined)?;
+    let id = joined.internal_id;
+    let filter: Vec<&Expr> = plan
+        .where_clause
+        .iter()
+        .filter(|term| !term.consumed)
+        .map(|term| &term.expr)
+        .collect();
+    let mut outs: Vec<&Expr> = Vec::new();
+    let mut group_by = Vec::new();
+    if let Some(group) = &plan.group_by {
+        if group.having.is_some() {
+            return None;
+        }
+        for expr in &group.exprs {
+            group_by.push(outs.len());
+            outs.push(expr);
+        }
+    }
+    let mut aggregates = Vec::new();
+    let mut sums = Vec::new();
+    for aggregate in &plan.aggregates {
+        if aggregate.filter_expr.is_some()
+            || !matches!(aggregate.distinctness, Distinctness::NonDistinct)
+        {
+            return None;
+        }
+        let at = outs.len();
+        aggregates.push(match (&aggregate.func, aggregate.args.as_slice()) {
+            (AggFunc::Count0, []) => Aggregate::CountStar,
+            (AggFunc::Count, [arg]) => {
+                outs.push(arg);
+                Aggregate::Count(at)
+            }
+            (AggFunc::Sum, [arg]) => {
+                outs.push(arg);
+                sums.push(at);
+                Aggregate::Sum(at)
+            }
+            (AggFunc::Min, [arg]) => {
+                outs.push(arg);
+                Aggregate::Min(at)
+            }
+            (AggFunc::Max, [arg]) => {
+                outs.push(arg);
+                Aggregate::Max(at)
+            }
+            _ => return None,
+        });
+    }
+    let keys = group_by.len();
+    let mut result_map = Vec::new();
+    for result in &plan.result_columns {
+        let key = if result.contains_aggregates {
+            None
+        } else {
+            outs.iter().take(keys).position(|g| **g == result.expr)
+        };
+        let at = match key {
+            Some(at) => at,
+            None => keys.checked_add(
+                plan.aggregates
+                    .iter()
+                    .position(|a| a.original_expr == result.expr)?,
+            )?,
+        };
+        result_map.push(at);
+    }
+    // Every column the body reads is this table's, stored as written and compared bytewise (the
+    // pipeline compares GROUP BY values and MIN and MAX bytewise); no COLLATE, no subquery.
+    let columns = table.columns();
+    for expr in filter.iter().chain(outs.iter()) {
+        let mut fine = true;
+        walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+            match e {
+                Expr::Column {
+                    table: t, column, ..
+                } => {
+                    fine &= *t == id
+                        && columns.get(*column).is_some_and(|col| {
+                            matches!(
+                                col.affinity(),
+                                Affinity::Integer
+                                    | Affinity::Text
+                                    | Affinity::Blob
+                                    | Affinity::None
+                            ) && matches!(
+                                col.collation(),
+                                CollationSeq::Binary | CollationSeq::Unset
+                            )
+                        });
+                }
+                Expr::RowId { table: t, .. } => fine &= *t == id,
+                Expr::Collate(..)
+                | Expr::Exists(..)
+                | Expr::InSelect { .. }
+                | Expr::Subquery(..)
+                | Expr::Register(..) => fine = false,
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })
+        .ok()?;
+        if !fine {
+            return None;
+        }
+    }
+    Some(BodyPlan {
+        table,
+        id,
+        filter,
+        outs,
+        group_by,
+        aggregates,
+        sums,
+        result_map,
+    })
+}
+
+/// Emits the body's copy after the hook's row loop, where the serial loop never reaches: each
+/// column of the table read from its register (the worker writes the row there), each filter
+/// term jumping to `skip` when it fails, each output into its register, then `keep`.
+fn emit_body(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &SelectPlan,
+    looped: &BodyPlan,
+    body: &MorselBody,
+) -> crate::Result<()> {
+    let mut resolver = resolver.fork();
+    resolver.enable_expr_to_reg_cache();
+    let mut reads = Vec::new();
+    for expr in looped.filter.iter().chain(looped.outs.iter()) {
+        walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+            match e {
+                Expr::Column { table, column, .. } if *table == looped.id => {
+                    let reg = body.columns_start.checked_add(*column).ok_or_else(|| {
+                        crate::LimboError::InternalError("register overflow".into())
+                    })?;
+                    reads.push((e.clone(), reg));
+                }
+                Expr::RowId { table, .. } if *table == looped.id => {
+                    reads.push((e.clone(), body.rowid))
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    for (expr, reg) in reads {
+        resolver.cache_scalar_expr_reg(
+            std::borrow::Cow::Owned(expr),
+            reg,
+            false,
+            &plan.table_references,
+        )?;
+    }
+    program.preassign_label_to_next_insn(body.start);
+    for term in &looped.filter {
+        let passed = program.allocate_label();
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            term,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: passed,
+                jump_target_when_false: body.skip,
+                jump_target_when_null: body.skip,
+            },
+            &resolver,
+        )?;
+        program.preassign_label_to_next_insn(passed);
+    }
+    for (at, expr) in looped.outs.iter().enumerate() {
+        let reg = body
+            .out_start
+            .checked_add(at)
+            .ok_or_else(|| crate::LimboError::InternalError("register overflow".into()))?;
+        translate_expr(program, Some(&plan.table_references), expr, reg, &resolver)?;
+    }
+    program.preassign_label_to_next_insn(body.keep);
+    program.emit_insn(Insn::Noop);
+    program.preassign_label_to_next_insn(body.skip);
+    program.emit_insn(Insn::Noop);
+    Ok(())
 }
 
 /// A statement's LIMIT and OFFSET as the hook's row loop counts them (QT.6, lane qs6-6).
@@ -194,6 +454,7 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         result_map,
         join: None,
         joined_rows: None,
+        body: None,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
     })
 }
@@ -592,6 +853,7 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
             build_key,
         }),
         joined_rows,
+        body: None,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
     })
 }

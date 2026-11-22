@@ -63,6 +63,10 @@ pub enum MorselError {
     Unsupported { kind: &'static str },
     #[error("out of memory")]
     Alloc,
+    /// The copied loop body raised an error or stopped short: the serial loop answers, and
+    /// raises any error the statement has its own way (lane qs6-7).
+    #[error("the loop body declined: {0}")]
+    Body(Box<crate::LimboError>),
     #[error("reading the table: {0}")]
     Storage(Box<crate::LimboError>),
     #[error("the table's b-tree is malformed: {0}")]

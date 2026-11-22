@@ -540,6 +540,8 @@ pub struct Connection {
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
+    /// Amphora (QT.6, lane qs6-7): the rows workers ran through a copy of a statement's loop body.
+    pub(crate) morsel_body_rows: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
