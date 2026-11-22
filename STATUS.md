@@ -1095,3 +1095,15 @@ commits). Their benchmarks against the commit before each have harnesses: `bench
 (amphora-bench at two commits, ABBA: finding 4's `--sql-api` with Linux CPU time, and the bulk
 statements with the bytes of log they leave). The runs of record are the coordinator's. amphora-bench
 does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` runs only at commits where it does.
+
+- **Amphora on its own across three machines (CP-T1.13, lane production-1, 2026-11-22):**
+  `amphora serve CONFIG` runs one member of a replicated database as a server, its peers and
+  clients over TCP, each connection proving the cluster's secret (HMAC-SHA256 over a challenge);
+  it reopens on its own data, so a killed member rejoins. `amphora health` checks every member
+  (one leader, the configured voters, none fenced); `scripts/cluster.sh` installs each member as a
+  systemd user unit or a LaunchAgent named amphora-member-N, nothing of kiln's touched;
+  `scripts/drills.sh` runs the kill, split and stall drills under load and counts acknowledged
+  writes on every member (`amphora drill load|check`, AC-T1.13.5). The replica's host now waits
+  for its next record (`ReplicaHandle::drain_wait`) instead of spinning. docs/runbook.md. Not done:
+  the drills of record across three machines, an encrypted link, membership commands, and kiln
+  opening these members (its seam's client).

@@ -28,7 +28,7 @@ use hyper_raft::wire::Record;
 const COMMANDS: usize = 64;
 const QUEUED_BYTES: usize = 512 << 20;
 const OUTGOING_BYTES: usize = 512 << 20;
-const OUTGOING_MESSAGES: usize = 4096;
+pub(crate) const OUTGOING_MESSAGES: usize = 4096;
 pub(crate) const MEMBERS: usize = 64;
 /// The most image bytes one wire record carries into this owner's command queue: the queue's room
 /// held back from application calls for one record (`enqueue`). Picked with `QUEUED_BYTES`, whose
@@ -36,7 +36,7 @@ pub(crate) const MEMBERS: usize = 64;
 /// budget and the measured drain rate). An image's own bound is the memory budget's room for one
 /// (SB.1), no more than this while it travels through this queue (`owner_image_room`).
 const WIRE_IMAGE_BYTES: usize = 256 << 20;
-const WIRE_BYTES: usize = WIRE_IMAGE_BYTES.saturating_add(2 << 20);
+pub(crate) const WIRE_BYTES: usize = WIRE_IMAGE_BYTES.saturating_add(2 << 20);
 const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 << 20);
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
 // randomized election and heartbeat, in the core's fixed tick counts, use this owner clock, never
@@ -293,6 +293,8 @@ struct Control {
     floor_status: Mutex<amphora_api::replication::FloorStatus>,
     floor_meter: FloorMeter,
     outgoing: Mutex<Outgoing>,
+    /// Rung when a record joins `outgoing` ([`ReplicaHandle::drain_wait`]).
+    sent: std::sync::Condvar,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
     local: Local,
@@ -1245,6 +1247,27 @@ impl ReplicaHandle {
         Ok(messages)
     }
 
+    /// As [`Self::drain`], waiting until `until` for a record when none waits: a host's sender
+    /// waits here rather than spinning (`crate::serve`, CP-T1.13).
+    pub fn drain_wait(&self, limit: usize, until: Instant) -> Result<Vec<Outbound>, Refusal> {
+        {
+            let mut outgoing = locked(&self.shared.outgoing)?;
+            while outgoing.messages.is_empty() && locked(&self.shared.status)?.is_ok() {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                outgoing = self
+                    .shared
+                    .sent
+                    .wait_timeout(outgoing, left)
+                    .map_err(|_| fenced("outgoing lock poisoned"))?
+                    .0;
+            }
+        }
+        self.drain(limit)
+    }
+
     pub fn status(&self) -> Result<ReplicaStatus, Refusal> {
         locked(&self.shared.status)?.clone()
     }
@@ -1564,6 +1587,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_status: Mutex::default(),
         floor_meter: FloorMeter::default(),
         outgoing: Mutex::default(),
+        sent: std::sync::Condvar::new(),
         status: Mutex::new(Ok(status(&replica))),
         meter,
         local,
@@ -3448,6 +3472,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 bytes,
             });
         }
+        self.control.sent.notify_all();
         Ok(())
     }
     /// The replicated class at a follower (replication.md, "A write made at a follower is answered
