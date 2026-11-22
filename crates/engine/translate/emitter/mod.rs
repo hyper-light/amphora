@@ -209,6 +209,9 @@ pub struct Resolver<'a> {
     fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
+    /// Amphora (PL.8, lane pl8-20): whether a bushy plan may probe with a LEFT JOIN's table
+    /// (`Connection::set_bushy_left_join_probes`).
+    bushy_left_join_probes: bool,
     /// Amphora (T-QT.5.3): when a star join's fact scan checks its dimensions' filters.
     star_filters: crate::StarFilters,
     /// Amphora (PL.8): what sizes the join search (`Connection::set_join_search_budget`).
@@ -361,6 +364,7 @@ impl<'a> Resolver<'a> {
             learned_weights: None,
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
+            bushy_left_join_probes: false,
             star_filters: crate::StarFilters::ByCost,
             join_search: crate::translate::optimizer::search_budget::SearchBudget::FIXED,
             join_orders: None,
@@ -467,6 +471,14 @@ impl<'a> Resolver<'a> {
 
     pub(crate) fn set_join_methods(&mut self, methods: crate::JoinMethods) {
         self.join_methods = methods;
+    }
+
+    pub(crate) fn bushy_left_join_probes(&self) -> bool {
+        self.bushy_left_join_probes
+    }
+
+    pub(crate) fn set_bushy_left_join_probes(&mut self, allowed: bool) {
+        self.bushy_left_join_probes = allowed;
     }
 
     pub(crate) fn star_filters(&self) -> crate::StarFilters {
@@ -576,6 +588,7 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            bushy_left_join_probes: self.bushy_left_join_probes,
             star_filters: self.star_filters,
             join_search: self.join_search,
             join_orders: self.join_orders.clone(),
@@ -619,6 +632,7 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            bushy_left_join_probes: self.bushy_left_join_probes,
             star_filters: self.star_filters,
             join_search: self.join_search,
             join_orders: self.join_orders.clone(),

@@ -255,6 +255,19 @@ pub enum CarriedJoinOrders {
     WithinMargin = 1,
 }
 
+/// Amphora (PL.8, T-PL.8.14, lane pl8-20): whether a bushy plan's probe may be a LEFT JOIN's right
+/// table, read by an outer hash join that keeps each build row the probe pass didn't match, once for
+/// each outer row (`join::bushy_pair_keeps_left_joins`). Behind this switch for the A/B: today's
+/// bushy plans, with an inner probe only, are the control and the default, until the measurements
+/// decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum BushyLeftJoinProbes {
+    /// A bushy plan's probe is an inner join's table: the control.
+    Off = 0,
+    /// A LEFT JOIN's table may be the probe too, where the planner's costs choose it.
+    ByCost = 1,
+}
+
 /// Amphora (PL.8, T-PL.8.10, lane pl8-17): where a root statement's exact join search runs when
 /// it is prepared with the fast plan (`background_search.rs`). Behind this switch for the A/B:
 /// today's whole search at prepare is the control and the default, until the measurements decide.
@@ -584,6 +597,8 @@ pub struct Connection {
     pub(super) join_search_budget: AtomicJoinSearchBudget,
     /// Amphora (PL.8, lane pl8-16): `Connection::set_carried_join_orders`.
     pub(super) carried_join_orders: AtomicCarriedJoinOrders,
+    /// Amphora (PL.8, lane pl8-20): `Connection::set_bushy_left_join_probes`.
+    pub(super) bushy_left_join_probes: AtomicBushyLeftJoinProbes,
     /// Amphora (PL.8, lane pl8-17): `Connection::set_background_search`.
     pub(super) background_search: AtomicBackgroundSearch,
     /// Amphora (PL.8, lane pl8-17): the exact searches waiting for this connection to go idle
@@ -1109,6 +1124,17 @@ impl Connection {
 
     pub(crate) fn carried_join_orders(&self) -> CarriedJoinOrders {
         self.carried_join_orders.get()
+    }
+
+    /// Amphora (PL.8, T-PL.8.14, lane pl8-20): chooses whether newly prepared statements' bushy
+    /// plans may probe with a LEFT JOIN's table.
+    pub fn set_bushy_left_join_probes(&self, rule: BushyLeftJoinProbes) {
+        self.bushy_left_join_probes.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn bushy_left_join_probes(&self) -> BushyLeftJoinProbes {
+        self.bushy_left_join_probes.get()
     }
 
     /// Amphora (PL.8, T-PL.8.10, lane pl8-17): chooses where the exact join search of root

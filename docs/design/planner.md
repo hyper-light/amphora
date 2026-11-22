@@ -1833,6 +1833,64 @@ That is new emitter work, not taken here.
 **Falsified by.** An answer that differs from nested loops; a LEFT JOIN planned as a probe, or in a
 run without a table its ON reads; a NULL row dropped by an ON term run at the probe.
 
+## Decision (lane pl8-20): a LEFT JOIN as a bushy plan's probe, behind a switch
+
+**Decision.** PL.8, T-PL.8.14 (`join::bushy_pair_keeps_left_joins`, the bushy pairs in
+`compute_best_join_order`, `optimizer::bushy_build_groups`,
+`Connection::set_bushy_left_join_probes`). Decision pl8-19 kept a LEFT JOIN's table from being a
+bushy pair's probe. With the switch `BushyLeftJoinProbes::ByCost` it may be one:
+
+- *The join.* The probe reads the run through the outer hash join a LEFT JOIN's table gets
+  (`HashJoinType::LeftOuter`), whose build side is the run's materialized rows. For each row of the
+  outer loops, the probe pass resets the hash table's matched bits, runs the LEFT JOIN's ON terms on
+  each match and marks the run's rows they pass; after the pass, the run's rows it didn't mark come
+  out once, with the probe's table NULL. That is `(outer JOIN run) LEFT JOIN t ON p`.
+- *The conflict rule.* The order `outer, run, t` must be one a left-deep plan may take: the outer
+  loops and the run hold every table `t` follows (its ON's tables, `required_lhs_by_table`) and none
+  that follows it (`can_add_table_to_prefix`). An ON term with a subquery keeps `t` from the probe.
+- *Terms.* The ON terms run at the probe, before the match is marked, as a left-deep outer hash
+  join runs them. A term between the outer loops and the run (an inner join's) runs after the mark,
+  and again on each unmatched row (`emit_unmatched_row_conditions_and_loop` runs every remaining
+  term), so a run's row comes out NULL-extended only for the outer rows it joins. WHERE terms on
+  `t` run after the mark and on the NULL rows.
+- *Cost.* The probe's cost is the inner probe's plus one visit of every row of the run for each
+  outer row, the unmatched pass; the join has at least the rows of the join before `t`.
+- *The emitter* already had every piece: the matched bits reset at each probe pass, the unmatched
+  pass at the probe's loop end, the payload refilled for each unmatched row. `bushy_build_groups`
+  now accepts the outer hash join as a run's probe (typed refusal otherwise) and counts it for the
+  tests (`LEFT_JOIN_PROBES`).
+
+The switch is off by default: today's bushy plans, with an inner probe only, are the control until
+the A/B says otherwise.
+
+**Why.** A LEFT JOIN whose left side is a join of two cuts (an outer dimension and a run of a fact
+and its dimension) is the bushy shape's case where the outer join's table is the large one, and
+decision pl8-19's rule leaves it no bushy plan: the run must hold the ON's tables, and the probe
+couldn't be the LEFT JOIN. The unmatched pass costs a visit of the run's rows for each outer row,
+which the search weighs.
+
+**Evidence.** Written while kiln's server was down, not run yet (lane pl8-20):
+
+- `join::tests::t_pl_8_13_a_left_join_stands_in_a_bushy_run_only_with_its_on_tables`: with the
+  switch, `l` kept as the probe, and the order before it legal only with the table its ON reads.
+- `bushy_test_hook::tests::t_pl_8_14_a_left_join_probing_a_hand_built_run_answers_as_nested_loops`:
+  the tree `(a ((b c) LEFT JOIN p))` built by hand, a term joining the outer loop to the run, rows
+  matched and not; with an ON term no index reads (on `p`, and on `p` and the outer loop),
+  `WHERE p.id IS NULL`, and a WHERE term on `p` and the run. Checked against nested loops and the
+  left-deep plans; non-vacuity `APPLIED`, `LEFT_JOIN_PROBES` and a NULL row in each answer.
+- `bushy_search_tests::t_pl_8_14_ab_left_join_probes_change_bushy_plans_only_where_cheaper`: every
+  bushy test query planned with the switch off and on; with it on, each answers as nested loops do;
+  it prints how many change plan, how many of those probe with a LEFT JOIN, and their estimated
+  costs off and on. A plan it changes costs no more by the estimate than the control's.
+- `bushy_search_tests::t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows` now forces
+  the LEFT JOIN into the run in every query: the LEFT JOIN's dimension keeps six rows and the other
+  one, so the mirror plan, with the LEFT JOIN's side as the outer loops, scans the probe six times
+  where the plan with it in the run scans it once.
+
+**Falsified by.** An answer under the switch that differs from nested loops; a LEFT JOIN probe whose
+ON reads a table after it; a run's row NULL-extended for an outer row it doesn't join; a plan the
+switch changes to a costlier one by the planner's own estimate.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).

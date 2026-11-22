@@ -75,6 +75,9 @@ pub(crate) struct JoinPlanningContext<'a> {
     /// past what the weights' noise could explain, so a statement planned again on the same facts
     /// keeps its plan.
     pub carried_margin: f64,
+    /// Amphora (PL.8, T-PL.8.14, lane pl8-20): whether a bushy pair's probe may be a LEFT JOIN's
+    /// right table (`Connection::set_bushy_left_join_probes`, off by default).
+    pub left_join_probes: bool,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -91,6 +94,7 @@ impl<'a> JoinPlanningContext<'a> {
             search_budget: super::search_budget::SearchBudget::FIXED,
             carried_order: None,
             carried_margin: 0.0,
+            left_join_probes: false,
         }
     }
 }
@@ -2000,9 +2004,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     &where_terms,
                     build_mask,
                     probe,
+                    planning_context.left_join_probes,
                 ) {
                     continue;
                 }
+                // A LEFT JOIN as the probe (lane pl8-20): its outer hash join keeps the run's rows
+                // it didn't match, so every table before it in a left-deep order is the outer
+                // loops' or the run's.
+                let left_join_probe = joined_tables.get(probe).is_some_and(is_movable_left_join);
                 let mut inner_mask = build_mask.try_clone()?;
                 inner_mask.set(probe)?;
                 let mut outer_mask = all.try_clone()?;
@@ -2022,6 +2031,23 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     continue;
                 };
                 if !connected {
+                    continue;
+                }
+                // The tables before a LEFT JOIN probe: the outer loops and the run, which must
+                // hold every table it follows and none that follows it (lane pl8-20).
+                let before_probe = {
+                    let mut before = outer_mask.try_clone()?;
+                    before.union_with(build_mask)?;
+                    before
+                };
+                if left_join_probe
+                    && !can_add_table_to_prefix(
+                        &before_probe,
+                        probe,
+                        required_lhs_by_table.as_deref(),
+                        left_join_illegal_map.as_ref(),
+                    )
+                {
                     continue;
                 }
                 let build_lasts: TableMask = build_variants.keys().copied().try_collect()?;
@@ -2076,8 +2102,9 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             original_idx: table,
                             // A LEFT JOIN of the run too (lane pl8-19): the run is materialized,
                             // its NULL rows rows of the build input, so the probe's hash join is
-                            // no chain across an outer join (`try_hash_join_access_method`).
-                            is_outer: false,
+                            // no chain across an outer join (`try_hash_join_access_method`). A
+                            // LEFT JOIN probe is the outer join's right table (lane pl8-20).
+                            is_outer: left_join_probe && table == probe,
                         });
                     }
                     let arena_len = access_methods_arena.len();
@@ -2117,14 +2144,24 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             .get(method)
                             .map(|method| &method.params)
                         {
+                            // An inner hash join, or for a LEFT JOIN probe the outer one that
+                            // keeps the run's unmatched rows (lane pl8-20).
                             Some(AccessMethodParams::HashJoin {
                                 build_table_idx,
                                 probe_table_idx,
                                 materialize_build_input: true,
-                                join_type: HashJoinType::Inner,
+                                join_type,
                                 mem_budget,
                                 ..
-                            }) if *build_table_idx == last && *probe_table_idx == probe => {
+                            }) if *build_table_idx == last
+                                && *probe_table_idx == probe
+                                && *join_type
+                                    == if left_join_probe {
+                                        HashJoinType::LeftOuter
+                                    } else {
+                                        HashJoinType::Inner
+                                    } =>
+                            {
                                 Some((method, *mem_budget))
                             }
                             _ => None,
@@ -2137,8 +2174,15 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     // The run is read and built once; the probe table is read once for each outer
                     // row; every row of the join is visited (`estimate_hash_join_cost`), and each
                     // row of the run is materialized at a row's visit, as a left-deep plan's
-                    // materialized build input is.
-                    let rows = set_rows.rows(&all);
+                    // materialized build input is. A LEFT JOIN probe (lane pl8-20) keeps every row
+                    // of the join before it, so the join has at least those rows, and it reads the
+                    // hash table's rows again after each outer row's probe pass, for the ones the
+                    // pass didn't match.
+                    let rows = if left_join_probe {
+                        set_rows.rows(&all).max(set_rows.rows(&before_probe))
+                    } else {
+                        set_rows.rows(&all)
+                    };
                     let outer_rows = outer.output_cardinality.max(1.0);
                     let probe_rows = base_table_rows
                         .get(probe)
@@ -2153,7 +2197,12 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         outer_rows,
                         // The probe's scan costs its own pages, as a left-deep plan's does (PL.7).
                         &params.for_table(probe_table, analyze_stats),
-                    ) + Cost(build.output_cardinality * params.cpu_cost_per_row);
+                    ) + Cost(build.output_cardinality * params.cpu_cost_per_row)
+                        + Cost(if left_join_probe {
+                            build.output_cardinality * outer_rows * params.cpu_cost_per_row
+                        } else {
+                            0.0
+                        });
                     let cost = outer.cost + build.cost + probe_cost;
                     let Some(method) = access_methods_arena.get_mut(probe_method) else {
                         access_methods_arena.truncate(arena_len);
@@ -2354,12 +2403,24 @@ pub(crate) fn is_movable_left_join(table: &JoinedTable) -> bool {
 /// the run (the emitter can't place the subquery's tables there). A LEFT JOIN outside the pair is
 /// one of the outer loops, where the subsets the search builds already hold its ON's tables before
 /// it.
+///
+/// Lane pl8-20 (T-PL.8.14), with `left_join_probes` (`Connection::set_bushy_left_join_probes`):
+/// the right table may be the probe, read by an outer hash join (`HashJoinType::LeftOuter`) whose
+/// build side is the run. For each outer row the probe pass marks the run's rows its ON terms
+/// matched, and the rows it didn't match come out once, NULL-extended, after the pass (the hash
+/// table's matched bits are reset at each pass's start): `(outer JOIN run) LEFT JOIN t ON p`, the
+/// order `outer, run, t` a left-deep plan may take, which the caller checks
+/// (`can_add_table_to_prefix`). Its ON terms run at the probe, before the match is marked; a term
+/// between the outer loops and the run runs after it, and again on each unmatched row, so a run's
+/// row that no outer row joins comes out for none. An ON term with a subquery keeps the table from
+/// the probe, as from the run.
 fn bushy_pair_keeps_left_joins(
     joined_tables: &[JoinedTable],
     where_clause: &[WhereTerm],
     where_terms: &[WhereTermInfo],
     build_mask: &TableMask,
     probe: usize,
+    left_join_probes: bool,
 ) -> bool {
     let keeps = |table: usize| {
         let Some(joined) = joined_tables.get(table) else {
@@ -2369,15 +2430,18 @@ fn bushy_pair_keeps_left_joins(
             return true;
         }
         let on_origin = JoinOrigin::Outer(joined.internal_id);
-        table != probe
-            && where_clause
-                .iter()
-                .zip(where_terms)
-                .filter(|(term, _)| term.origin.join_origin() == Some(on_origin))
-                .all(|(term, info)| {
-                    build_mask.contains_all_set_bits_of(&info.table_mask)
-                        && !expr_references_any_subquery(&term.expr)
-                })
+        let mut on_terms = where_clause
+            .iter()
+            .zip(where_terms)
+            .filter(|(term, _)| term.origin.join_origin() == Some(on_origin));
+        if table == probe {
+            return left_join_probes
+                && on_terms.all(|(term, _)| !expr_references_any_subquery(&term.expr));
+        }
+        on_terms.all(|(term, info)| {
+            build_mask.contains_all_set_bits_of(&info.table_mask)
+                && !expr_references_any_subquery(&term.expr)
+        })
     };
     keeps(probe) && build_mask.iter().all(keeps)
 }
@@ -4933,7 +4997,8 @@ mod tests {
     /// core holds all four tables (a LEFT JOIN with an inner join after it), a pair keeps the LEFT
     /// JOIN where its run holds it with `b`, the table its ON reads, or where it stays one of the
     /// outer loops, and refuses it in a run without `b` or as the probe; with nested loops only,
-    /// no core (T-PL.8.13, lane pl8-19).
+    /// no core (T-PL.8.13, lane pl8-19). With LEFT JOIN probes allowed (T-PL.8.14, lane pl8-20):
+    /// `l` as the probe kept, and the order before it legal only with `b` in it.
     #[test]
     fn t_pl_8_13_a_left_join_stands_in_a_bushy_run_only_with_its_on_tables() {
         let mut ids = TableRefIdCounter::new();
@@ -5021,7 +5086,7 @@ mod tests {
             for &table in run {
                 mask.set(table).unwrap();
             }
-            bushy_pair_keeps_left_joins(joined, &where_clause, &where_terms, &mask, probe)
+            bushy_pair_keeps_left_joins(joined, &where_clause, &where_terms, &mask, probe, false)
         };
         // `a JOIN (b LEFT JOIN l)` and `a JOIN ((b LEFT JOIN l) JOIN e)`.
         assert!(keeps(&[1, 2], 0));
@@ -5031,6 +5096,44 @@ mod tests {
         // `l` in a run without `b`, and `l` as the probe.
         assert!(!keeps(&[2, 3], 1));
         assert!(!keeps(&[1, 3], 2));
+
+        // T-PL.8.14 (lane pl8-20): with the switch on, `l` may be the probe of a run, its outer
+        // hash join keeping the run's unmatched rows; the caller then asks that the outer loops
+        // and the run hold every table `l` follows (`b`) and none that follows it. With the
+        // switch off, today's rule above, unchanged.
+        let keeps_probe = |run: &[usize], probe: usize| {
+            let mut mask = TableMask::default();
+            for &table in run {
+                mask.set(table).unwrap();
+            }
+            bushy_pair_keeps_left_joins(joined, &where_clause, &where_terms, &mask, probe, true)
+        };
+        assert!(keeps_probe(&[1, 3], 2));
+        assert!(keeps_probe(&[0, 1], 2));
+        // Still never in a run without `b`.
+        assert!(!keeps_probe(&[2, 3], 1));
+        let illegal = left_join_illegal_map(&required).unwrap();
+        let before = |tables: &[usize]| {
+            let mut mask = TableMask::default();
+            for &table in tables {
+                mask.set(table).unwrap();
+            }
+            mask
+        };
+        // `a` outer, run `(b e)`, probe `l`: `b` is before it.
+        assert!(can_add_table_to_prefix(
+            &before(&[0, 1, 3]),
+            2,
+            Some(required.as_slice()),
+            Some(&illegal)
+        ));
+        // Without `b` before it, no order is legal: `l` follows the table its ON reads.
+        assert!(!can_add_table_to_prefix(
+            &before(&[0, 3]),
+            2,
+            Some(required.as_slice()),
+            Some(&illegal)
+        ));
     }
 
     /// Do: note two blocks' orders, one twice. Expect: each block's latest order, under its own

@@ -185,6 +185,10 @@ pub fn translate(
     // Amphora: what its hash and group tables hold before they spill (executor decision 8).
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
+    // PL.8 (lane pl8-20): whether a bushy plan may probe with a LEFT JOIN's table.
+    resolver.set_bushy_left_join_probes(
+        connection.bushy_left_join_probes() == crate::BushyLeftJoinProbes::ByCost,
+    );
     resolver.set_star_filters(connection.star_filters());
     // Amphora (PL.8): the join search's budget, from the rule and this database's measured rates.
     resolver.set_join_search(

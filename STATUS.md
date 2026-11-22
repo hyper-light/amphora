@@ -992,9 +992,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lane pl8-19 (docs/design/planner.md "Decision (lane pl8-19)"): a LEFT JOIN with an inner join
   after it is in the bushy core, and a bushy run takes it with every table its ON reads, its NULL
   rows made in the build input and its ON terms spent there (T-PL.8.13).
-  Not built: the search budget derived from a plan-time target, a LEFT JOIN as a bushy plan's
-  probe, and semi and anti joins placed before other loops (the emitter's no-match path); JOB's
-  AC-PL.8.1 is open.
+  Lane pl8-20 (docs/design/planner.md "Decision (lane pl8-20)"): behind
+  `Connection::set_bushy_left_join_probes` (off by default), a LEFT JOIN's table may be a bushy
+  run's probe, read by an outer hash join that NULL-extends the run's rows each outer row's probe
+  pass didn't match (T-PL.8.14); pl8-19's search test now forces its LEFT JOIN into the run.
+  Not built: the search budget derived from a plan-time target, and semi and anti joins placed
+  before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted

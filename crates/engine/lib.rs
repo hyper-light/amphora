@@ -134,6 +134,7 @@ pub use amphora_engine_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use amphora_engine_parser::ast::EqpFormat;
+pub use background_search::BackgroundSearchStats;
 pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
@@ -141,10 +142,9 @@ pub use cdc::{
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
-    resolve_ext_path, BackgroundSearch, CarriedJoinOrders, Connection, JoinMethods,
-    JoinSearchBudget, PrepareOptions, Row, StarFilters, StepResult, SymbolTable,
+    resolve_ext_path, BackgroundSearch, BushyLeftJoinProbes, CarriedJoinOrders, Connection,
+    JoinMethods, JoinSearchBudget, PrepareOptions, Row, StarFilters, StepResult, SymbolTable,
 };
-pub use background_search::BackgroundSearchStats;
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use translate::optimizer::learned_costs::WeightRule;
 pub use translate::optimizer::search_budget::JoinSearchStats;

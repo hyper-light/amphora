@@ -2860,6 +2860,9 @@ impl Database {
             carried_join_orders: crate::connection::AtomicCarriedJoinOrders::new(
                 crate::connection::CarriedJoinOrders::Off,
             ),
+            bushy_left_join_probes: crate::connection::AtomicBushyLeftJoinProbes::new(
+                crate::connection::BushyLeftJoinProbes::Off,
+            ),
             background_search: crate::connection::AtomicBackgroundSearch::new(
                 crate::connection::BackgroundSearch::Off,
             ),
