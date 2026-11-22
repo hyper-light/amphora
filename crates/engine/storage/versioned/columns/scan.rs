@@ -1308,6 +1308,65 @@ fn fold_groups(
     Ok(())
 }
 
+/// Each slot's first row holding its least (or greatest) value, over a typed vector, compared in
+/// its own type; None for a vector whose values mix types (those are compared one by one).
+/// `rows` gives each selected row with a value, and its slot (below `slots`).
+fn extremes(
+    v: &Vector,
+    rows: impl Iterator<Item = (usize, usize)>,
+    slots: usize,
+    want_min: bool,
+) -> Option<Vec<Option<usize>>> {
+    match &v.data {
+        Data::Int(xs) => Some(pick(rows, slots, want_min, |i, j| {
+            match (xs.get(i), xs.get(j)) {
+                (Some(a), Some(b)) => a.cmp(b),
+                _ => Ordering::Equal,
+            }
+        })),
+        Data::Real(xs) => Some(pick(rows, slots, want_min, |i, j| {
+            match (xs.get(i), xs.get(j)) {
+                (Some(a), Some(b)) => reals(*a, *b),
+                _ => Ordering::Equal,
+            }
+        })),
+        Data::Text { bytes, offsets } => {
+            let at = |i: usize| match (
+                offsets.get(i),
+                i.checked_add(1).and_then(|n| offsets.get(n)),
+            ) {
+                (Some(a), Some(b)) => bytes.get(*a..*b).unwrap_or(&[]),
+                _ => &[],
+            };
+            Some(pick(rows, slots, want_min, |i, j| at(i).cmp(at(j))))
+        }
+        Data::Mixed(_) => None,
+    }
+}
+
+/// [`extremes`] by `cmp`, row against row: ties keep the earlier row.
+fn pick(
+    rows: impl Iterator<Item = (usize, usize)>,
+    slots: usize,
+    want_min: bool,
+    cmp: impl Fn(usize, usize) -> Ordering,
+) -> Vec<Option<usize>> {
+    let want = if want_min {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    };
+    let mut best: Vec<Option<usize>> = vec![None; slots];
+    for (i, s) in rows {
+        if let Some(b) = best.get_mut(s) {
+            if (*b).is_none_or(|j| cmp(i, j) == want) {
+                *b = Some(i);
+            }
+        }
+    }
+    best
+}
+
 /// Slot `s`'s accumulator for aggregate `j`.
 fn slot(accs: &mut [Vec<Acc>], s: usize, j: usize) -> Option<&mut Acc> {
     accs.get_mut(s).and_then(|x| x.get_mut(j))
@@ -1390,26 +1449,22 @@ fn fold_slots(
             }
         }
         (Agg::Sum(_), Data::Text { .. }) => {}
-        (Agg::Min(_) | Agg::Max(_), Data::Int(xs)) => {
+        (Agg::Min(_) | Agg::Max(_), _) => {
             let want_min = matches!(a, Agg::Min(_));
-            // Each slot's first row holding its least (or greatest) value.
-            let mut best: Vec<Option<(i64, usize)>> = Vec::new();
-            for (i, s) in rows() {
-                let Some(x) = xs.get(i).copied() else {
-                    continue;
-                };
-                if best.len() <= s {
-                    best.resize(s.saturating_add(1), None);
-                }
-                if let Some(b) = best.get_mut(s) {
-                    if (*b).is_none_or(|(y, _)| if want_min { x < y } else { x > y }) {
-                        *b = Some((x, i));
+            match extremes(v, rows(), accs.len(), want_min) {
+                Some(best) => {
+                    for (s, b) in best.into_iter().enumerate() {
+                        if let (Some(i), Some(m)) = (b, slot(accs, s, j)) {
+                            m.fold(&v.cell(i), pos(i))?;
+                        }
                     }
                 }
-            }
-            for (s, b) in best.into_iter().enumerate() {
-                if let (Some((x, i)), Some(m)) = (b, slot(accs, s, j)) {
-                    m.fold(&Cell::Int(x), pos(i))?;
+                None => {
+                    for (i, s) in rows() {
+                        if let Some(m) = slot(accs, s, j) {
+                            m.fold(&v.cell(i), pos(i))?;
+                        }
+                    }
                 }
             }
         }
@@ -1494,20 +1549,26 @@ fn fold_vector(
             *numbers = numbers.checked_add(k).ok_or_else(overflow)?;
         }
         (Acc::Sum { .. }, Data::Text { .. }) => {}
-        (acc @ (Acc::Min(_) | Acc::Max(_)), Data::Int(xs)) => {
+        (acc @ (Acc::Min(_) | Acc::Max(_)), _) => {
             let want_min = matches!(acc, Acc::Min(_));
-            // The first row holding the least (or greatest) value.
-            let mut best: Option<(i64, usize)> = None;
-            for (i, (x, s)) in xs.iter().zip(sel).enumerate() {
-                if *s
-                    && valid(i)
-                    && best.is_none_or(|(b, _)| if want_min { *x < b } else { *x > b })
-                {
-                    best = Some((*x, i));
+            let rows = sel
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| **s && valid(*i))
+                .map(|(i, _)| (i, 0));
+            match extremes(v, rows, 1, want_min) {
+                Some(best) => {
+                    for i in best.into_iter().flatten() {
+                        acc.fold(&v.cell(i), pos(i))?;
+                    }
                 }
-            }
-            if let Some((b, i)) = best {
-                acc.fold(&Cell::Int(b), pos(i))?;
+                None => {
+                    for (i, s) in sel.iter().enumerate() {
+                        if *s {
+                            acc.fold(&v.cell(i), pos(i))?;
+                        }
+                    }
+                }
             }
         }
         (acc, _) => {
