@@ -2615,8 +2615,9 @@ and ryw-3).
     answer. A call that wrote nothing has no token. The leader publishes its applied point before it answers
     (`Actor::publish_closed`). Within one group the two rise together. `micros` is in the same domain as the
     cross-group coordinator's timestamps (microseconds since the Unix epoch), so a single-group commit and a cross-group
-    one compare in one order, time first (Ada's decision: a cross-group commit answers with its timestamp,
-    `Token::at`; lane xgroup-sql-6 stamps it). A session keeps the latest of its tokens (`Token::after`).
+    one compare in one order, time first. Ada's decision (2026-11-22): a cross-partition commit's revision is its
+    HLC timestamp, the same time as the tokens', so it answers with `Token::at` of that timestamp (lane xgroup-sql-6
+    stamps it). A session keeps the latest of its tokens (`Token::after`).
   - *Reads.* `query_session(Session, Some(token), ..)` is served by the replica it asks once that replica's published
     applied index and closed time are at or past the token. The check is repeated inside the read's own transaction
     (`run_closed`), so the state read is never older than the token. The read waits on that replica alone, only while
@@ -2643,9 +2644,17 @@ and ryw-3).
 ### Instruments
 
 `Database::session_counters` on each replica: reads served at once, reads that waited and their total wait, redirects,
-and the apply lag that bounds the wait. `amphora-bench --cluster --shapes ryw` gives, at each count of sessions: read
-latency straight after a write (p50, p99, p99.9), write p99, write-read pairs a second, reads that missed their own
-write (must be 0), each follower's counters, and the process's CPU seconds and peak memory.
+and the apply lag that bounds the wait. `amphora-bench --cluster --shapes ryw` gives, at each count of sessions on Ada's
+ladder (1, 8, 32, 128, 512, 2048, 4096): read latency straight after a write (p50, p99, p99.9), write p99, write-read
+pairs a second, reads that missed their own write (must be 0), each follower's counters, and the process's CPU
+seconds, its share of the host's cores and its peak memory, so a rung where the client is the bottleneck shows as one.
+Each session reads with the token its own write's answer carried (`call_session`). Both read modes run through this
+one client, on one platform, with the same settings, and each record names its client and platform.
+
+Run of record (the coordinator's), once per read mode, on one host:
+`amphora-bench --cluster --dir <dir> --shapes ryw --partitions 1 --events 100000 --reads 100000 --read-mode latest`,
+then the same with `--read-mode session`. The tiny instance is
+`--events 100 --batch 100 --reads 64 --ladder 1,8,32,128`.
 
 ### Evidence
 

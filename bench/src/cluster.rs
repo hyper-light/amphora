@@ -17,15 +17,18 @@
 //!   AC-T1.10.4's search latency.
 //!
 //! - `ryw` (kiln goal 8119f25d, replication.md "Decision (lane ryw-1): read-your-writes by session
-//!   tokens"): at each count of `--ladder`, that many sessions at once each write one event through
-//!   member 1 and read it straight back on a follower (members 2 and 3 in turn) in `--read-mode`
-//!   (`latest`, the control, or `session`), `--reads` pairs in all: read and write latency, reads
-//!   that missed their own write (must be 0), throughput, each follower's waits, redirects and apply
-//!   lag, and the process's CPU seconds and peak memory.
+//!   tokens"): at each count of `--ladder` (Ada's ladder, 1 to 4096), that many sessions at once each
+//!   write one event through member 1, keep the token its answer carries (`call_session`), and read
+//!   the event straight back on a follower (members 2 and 3 in turn) in `--read-mode` (`latest`,
+//!   the control, or `session`), `--reads` pairs in all: read and write latency, reads that missed
+//!   their own write (must be 0), throughput, each follower's waits, redirects and apply lag, and
+//!   the client's CPU seconds, share of the host's cores and peak memory, so a run shows whether
+//!   the client was the bottleneck. Both read modes run through this one client on one platform,
+//!   with the same settings: a comparison between them is fair only so.
 //!
 //! usage: amphora-bench --cluster --dir <dir> [--shapes read,search,ryw] [--partitions N]
 //!        [--events 1000000] [--sessions 1000] [--batch 1000] [--reads 10000] [--searches 300]
-//!        [--read-mode latest|session] [--ladder 1,8,32,128]
+//!        [--read-mode latest|session] [--ladder 1,8,32,128,512,2048,4096]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,7 +71,8 @@ fn opts() -> anyhow::Result<Opts> {
         searches: 300,
         text_bytes: 600,
         read_mode: ReadMode::Latest,
-        ladder: vec![1, 8, 32, 128],
+        // Ada's concurrency ladder (2026-11-21): a tiny instance may stop at 128.
+        ladder: vec![1, 8, 32, 128, 512, 2048, 4096],
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -94,6 +98,9 @@ fn opts() -> anyhow::Result<Opts> {
             "--ladder" => o.ladder = v()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             other => anyhow::bail!("unknown argument {other}"),
         }
+    }
+    if o.ladder.is_empty() || o.ladder.contains(&0) {
+        anyhow::bail!("--ladder is counts of sessions, each at least 1");
     }
     anyhow::ensure!(!o.dir.as_os_str().is_empty(), "--dir names where the members' files go");
     anyhow::ensure!(o.partitions > 0 && o.batch > 0 && o.sessions > 0, "--partitions, --batch and --sessions take at least 1");
@@ -164,11 +171,11 @@ fn schema_on(partition: &Partition) -> anyhow::Result<()> {
     }
 }
 
-/// `events` written through member 1 in one call.
-fn write(partition: &Partition, events: Vec<crate::Event>) -> anyhow::Result<()> {
+/// `events` written through member 1 in one call, answered with the call's own session token.
+fn write(partition: &Partition, events: Vec<crate::Event>) -> anyhow::Result<Option<amphora::database::Token>> {
     partition
         .member(1)?
-        .call(Instant::now() + WAIT, move |c| {
+        .call_session(Instant::now() + WAIT, move |c| {
             let mut upsert = c.prepare_cached(schema::EVENT_UPSERT)?;
             for e in events {
                 upsert.execute(vec![
@@ -189,6 +196,7 @@ fn write(partition: &Partition, events: Vec<crate::Event>) -> anyhow::Result<()>
             }
             Ok(())
         })
+        .map(|((), token)| token)
         .map_err(|e| anyhow::anyhow!("a write was refused: {e:?}"))
 }
 
@@ -259,8 +267,8 @@ fn process_use() -> (Option<f64>, Option<u64>) {
     (cpu, hwm)
 }
 
-/// The `ryw` shape at one count of sessions: each session writes one event through member 1, takes
-/// its token, and reads the event back on a follower in `o.read_mode`.
+/// The `ryw` shape at one count of sessions: each session writes one event through member 1, keeps
+/// the token the write's answer carries, and reads the event back on a follower in `o.read_mode`.
 fn ryw(partition: &Partition, o: &Opts, sessions: usize, base: u64) -> anyhow::Result<serde_json::Value> {
     let rounds = o.reads.div_ceil(sessions).max(1);
     let (cpu0, _) = process_use();
@@ -271,7 +279,6 @@ fn ryw(partition: &Partition, o: &Opts, sessions: usize, base: u64) -> anyhow::R
             running.push(scope.spawn(move || -> anyhow::Result<(Hist, Hist, u64)> {
                 let (mut w, mut r, mut missed) = (Hist::new(), Hist::new(), 0u64);
                 let mut rng = Rng(0x7279_7731 ^ (u64::try_from(s)? + 1));
-                let writer = partition.member(1)?;
                 let reader = partition.member(2 + u64::try_from(s % 2)?)?;
                 let mut token: Option<amphora::database::Token> = None;
                 for i in 0..rounds {
@@ -279,9 +286,8 @@ fn ryw(partition: &Partition, o: &Opts, sessions: usize, base: u64) -> anyhow::R
                     let event = crate::event(&mut rng, 1_000_000 + s, seq, o.text_bytes);
                     let id = event.id.clone();
                     let t = Instant::now();
-                    write(partition, vec![event])?;
+                    let mine = write(partition, vec![event])?;
                     w.record(us(t));
-                    let mine = writer.session_token(Instant::now() + WAIT).map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     token = match (token, mine) {
                         (Some(held), Some(mine)) => Some(held.after(mine)),
                         (held, mine) => mine.or(held),
@@ -313,6 +319,10 @@ fn ryw(partition: &Partition, o: &Opts, sessions: usize, base: u64) -> anyhow::R
     })?;
     let took = began.elapsed().as_secs_f64();
     let (cpu1, hwm) = process_use();
+    let cpu = cpu0.zip(cpu1).map(|(a, b)| b - a);
+    // The share of the host's cores this process used: near 1, the client (with the in-process
+    // members) was CPU-bound, and the rung measures the host, not the database.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let mut followers = Vec::new();
     for node in [2u64, 3] {
         let c = partition.member(node)?.session_counters(Instant::now() + WAIT).map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -326,8 +336,8 @@ fn ryw(partition: &Partition, o: &Opts, sessions: usize, base: u64) -> anyhow::R
         "bench": "amphora_ryw", "client": "amphora-bench --cluster, in process", "platform": std::env::consts::OS,
         "read_mode": format!("{:?}", o.read_mode), "sessions": sessions, "pairs": pairs, "missed_own_write": missed,
         "pairs_per_s": pairs as f64 / took, "write_ms": summary(writes), "read_after_write_ms": summary(reads),
-        "followers": followers, "cpu_s": cpu0.zip(cpu1).map(|(a, b)| b - a), "wall_s": took, "peak_rss_kb": hwm,
-        "threads": sessions,
+        "followers": followers, "cpu_s": cpu, "wall_s": took, "peak_rss_kb": hwm,
+        "cores": cores, "client_core_share": cpu.map(|c| c / (took * cores as f64)), "threads": sessions,
     }))
 }
 
