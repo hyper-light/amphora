@@ -2683,15 +2683,19 @@ before, and each listener in place is woken again as its owner goes.
 Before its first write the bench needs its group's leader, and it used to find one by trying the schema every 10ms
 until a call went through. Lane ryw-5 (2026-11-22) makes it wait instead on what the member's owner publishes.
 `ReplicaHandle::wait_leader(past, until)` answers the member's status once it names a leader in a term past `past`
-(0 for any leader). The owner tells that wait whenever a step publishes another leader or term, and when it ends or
-its owner is dropped, so nothing waits on a timer and an owner that's gone is never waited on to the deadline. The
+(0 for any leader). The owner tells that wait whenever a step publishes another leader, term or fence, and when it
+ends or is dropped mid-run, so nothing waits on a timer and an owner that's gone is never waited on to the deadline.
+That is the one leader wait and its one wake: lane ryw-6 (2026-11-22) folded in production-5's `wait_leader(until)`
+for serve's `leader WAIT_MS` request (CP-T1.13), which asks for any leader (`past` 0) and needed the fence's wake. The
 bench's `schema_on` waits for any leader and calls. If the lead's move refused the call (`NotLeader`,
 `UnknownOutcome`, `Unavailable`), it waits for a leader of a later term than the one it called under and calls
 again. That is safe because the schema is `IF NOT EXISTS`. Any other refusal, or the deadline, ends the bench and
 names the refusal. Tested by `a_host_waits_for_a_leader_on_the_owners_word` (crates/amphora/src/database/replicated.rs):
 with no leader and no time left the wait is refused Timeout. A waiter for any leader gets the one elected, with its
 term, and with no later term and no time left the wait is refused Timeout again. A waiter past that term gets the
-member the lead moved to, in a later term. A waiter on an owner dropped mid-run is refused Fenced.
+member the lead moved to, in a later term. A waiter on an owner dropped mid-run is refused Fenced. A lone voter's
+waiter is refused Fenced with the failed flush when its disk fills and that fence ends its owner. A status that
+differs from the one published only in its fence wakes the waiters; one that differs only in what it applied doesn't.
 
 ### Evidence
 

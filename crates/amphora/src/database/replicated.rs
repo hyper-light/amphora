@@ -304,8 +304,9 @@ struct Control {
     /// as `sent` is rung, and when the owner ends or is dropped.
     listener: Mutex<Option<std::task::Waker>>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
-    /// Told, under `status`, when the published status names another leader or term, and when the
-    /// owner ends ([`ReplicaHandle::wait_leader`]).
+    /// The one wake of [`ReplicaHandle::wait_leader`]: told, under `status`, when a step publishes
+    /// another leader, term or fence ([`leads_otherwise`]), when the owner ends, and when it is
+    /// dropped mid-run.
     led: std::sync::Condvar,
     meter: Arc<ReplicaMeter>,
     local: Local,
@@ -1086,6 +1087,13 @@ fn nanos_between(from: Instant, to: Instant) -> u64 {
 fn fenced(reason: impl std::fmt::Display) -> Refusal {
     Refusal::Fenced(reason.to_string())
 }
+/// Whether `now` tells a leader waiter something `was` didn't (lane ryw-6, CP-T1.13): another
+/// leader or term ([`ReplicaHandle::wait_leader`]'s answer), or a fence come or gone (its
+/// refusal). Any other change, the applied point's above all, wakes none of them.
+fn leads_otherwise(was: &Result<ReplicaStatus, Refusal>, now: &ReplicaStatus) -> bool {
+    !matches!(was, Ok(was)
+        if was.leader == now.leader && was.term == now.term && was.fenced == now.fenced)
+}
 fn unknown() -> Refusal {
     Refusal::UnknownOutcome
 }
@@ -1320,21 +1328,26 @@ impl ReplicaHandle {
     }
 
     /// Waits until this member's published status names a leader in a term past `past` (0: any
-    /// leader), and answers that status (lane ryw-5, kiln goal 8119f25d; replication.md, "A host
-    /// waits for a leader on the owner's word"). The owner tells this wait each time its step
-    /// publishes another leader or term, and as it ends, so a host waits for its group's first
-    /// leader, or for the next one after a call the lead's move refused, with no retry timer.
-    /// Refused Timeout at `until`; Fenced once the owner ended or is fenced.
+    /// leader), and answers that status (lanes ryw-5 and ryw-6, kiln goal 8119f25d; CP-T1.13;
+    /// replication.md, "A host waits for a leader on the owner's word"). One wake, `led`: the
+    /// owner tells this wait each time its step publishes another leader, term or fence, as it
+    /// ends, and as it is dropped mid-run, so a host waits for its group's first leader (`past`
+    /// 0: the bench's schema, `crate::serve`'s `leader` request), or for the next one after a
+    /// call the lead's move refused, with no retry timer. Refused Timeout at `until`; Fenced
+    /// while the replica is fenced; with the owner's reason once it ended; Fenced once it was
+    /// dropped mid-run.
     pub fn wait_leader(&self, past: u64, until: Instant) -> Result<ReplicaStatus, Refusal> {
         let mut status = locked(&self.shared.status)?;
         loop {
-            // Read under `status`: an owner dropped mid-run releases its reads before it tells
-            // this wait, so the end is seen here or heard below.
-            if locked(&self.shared.local.open)?.is_none() {
-                return Err(fenced("replica owner ended"));
-            }
             match &*status {
+                // The owner ended: its reason.
                 Err(ended) => return Err(ended.clone()),
+                // Dropped mid-run, it left its status standing: it releases its local reads
+                // before it tells this wait (under `status`), so the end is seen here or heard
+                // below.
+                Ok(_) if locked(&self.shared.local.open)?.is_none() => {
+                    return Err(fenced("replica owner ended"));
+                }
                 Ok(now) => {
                     if let Some(reason) = &now.fenced {
                         return Err(fenced(reason));
@@ -2328,9 +2341,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         {
             let now = status(&self.replica);
             let mut published = locked(&self.control.status)?;
-            let led =
-                !matches!(&*published, Ok(was) if was.leader == now.leader && was.term == now.term);
+            let led = leads_otherwise(&published, &now);
             *published = Ok(now);
+            // Leader waiters wake on the step that names another leader, term or fence, never on
+            // a timer.
             if led {
                 self.control.led.notify_all();
             }
@@ -10437,15 +10451,21 @@ mod tests {
         }
     }
 
-    /// Lane ryw-5 (kiln goal 8119f25d; replication.md, "A host waits for a leader on the owner's
-    /// word"): a host waits for a leader on the status its member's owner publishes, not on a
-    /// retry timer. Do: three voters; with no leader, wait for one with no time left; a waiter on
-    /// member 2 for any leader; elect one; wait for a leader past its term with no time left; a
-    /// waiter for one past that term; hand the lead to another member; a waiter for a term past
-    /// that one; member 2's owner dropped mid-run. Expect: Timeout with no leader; the first
-    /// waiter answered with the elected leader and its term; Timeout with none past it; the second
-    /// waiter answered with the new leader in a later term; the third refused Fenced as the owner
-    /// ends. Each waiter's guard is `HANG_READ`: a hang, never a verdict.
+    /// Lanes ryw-5 and ryw-6 (kiln goal 8119f25d; CP-T1.13; replication.md, "A host waits for a
+    /// leader on the owner's word"): a host waits for a leader on the one wake its member's owner
+    /// tells, not on a retry timer, and each reason the owner tells it wakes it. Do: three voters;
+    /// with no leader, wait for one with no time left; a waiter on member 2 for any leader; elect
+    /// one (a new leader); wait past its term with no time left; a waiter past that term; hand the
+    /// lead to another member (a new term); a waiter past that one, then member 2's owner dropped
+    /// mid-run (its drop). Then a lone voter elected, a waiter past its term, its disk made full
+    /// and a write submitted, its owner run on a thread of its own (its fence, which ends it).
+    /// And the step's rule on its own: a status that differs only in its fence, or only in what it
+    /// applied, against the one published. Expect: Timeout with no leader; the first waiter
+    /// answered with the elected leader and its term; Timeout with none past it; the second
+    /// answered with the new leader in a later term; the third refused Fenced as the owner is
+    /// dropped; the lone voter's waiter refused Fenced with the flush that fenced its owner, which
+    /// ends; a fence come or gone wakes waiters, an applied point alone doesn't, and an ended
+    /// status before it does. Each waiter's guard is `HANG_READ`: a hang, never a verdict.
     #[test]
     fn a_host_waits_for_a_leader_on_the_owners_word() {
         let dir = tempfile::tempdir().unwrap();
@@ -10453,15 +10473,16 @@ mod tests {
         let clients: Vec<Client> = (1..=3)
             .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
             .collect();
-        let waiter = |past: u64| {
-            let handle = clients[1].handle();
+        let waiter = |client: &Client, past: u64| {
+            let handle = client.handle();
             std::thread::spawn(move || handle.wait_leader(past, Instant::now() + HANG_READ))
         };
         assert_eq!(
             clients[1].handle().wait_leader(0, Instant::now()),
             Err(Refusal::Timeout)
         );
-        let first = waiter(0);
+        // A new leader.
+        let first = waiter(&clients[1], 0);
         let mut pump = Pump::new(&clients);
         let leader = driven.elect(&mut pump, &clients, 0, 1);
         let led = first.join().unwrap().unwrap();
@@ -10471,7 +10492,8 @@ mod tests {
             clients[1].handle().wait_leader(led.term, Instant::now()),
             Err(Refusal::Timeout)
         );
-        let second = waiter(led.term);
+        // A new term.
+        let second = waiter(&clients[1], led.term);
         let to = (leader + 1) % clients.len();
         driven.transfer(&mut pump, &clients, leader, to);
         let moved = second.join().unwrap().unwrap();
@@ -10479,10 +10501,47 @@ mod tests {
         assert!(moved.term > led.term);
         driven.drain(&mut pump);
         pump.finish();
-        let third = waiter(moved.term);
+        // The owner dropped mid-run.
+        let third = waiter(&clients[1], moved.term);
         drop(driven.owners.get_mut(1).unwrap().take());
-        let ended = third.join().unwrap();
-        assert!(matches!(ended, Err(Refusal::Fenced(_))), "{ended:?}");
+        let dropped = third.join().unwrap();
+        assert!(matches!(dropped, Err(Refusal::Fenced(_))), "{dropped:?}");
+
+        // A fence, which ends the owner: its loop's end tells the waiter its reason.
+        let lone_dir = tempfile::tempdir().unwrap();
+        let mut lone = Driven::new();
+        let voter = vec![lone.open(lone_dir.path(), 1, vec![1], None)];
+        let mut lone_pump = Pump::new(&voter);
+        lone.elect(&mut lone_pump, &voter, 0, 1);
+        lone.drain(&mut lone_pump);
+        lone_pump.finish();
+        let term = voter[0].handle().status().unwrap().term;
+        let fourth = waiter(&voter[0], term);
+        let gate = lone.owner(0).replica.machine().flush_gate();
+        gate.fill();
+        let written = submit(&voter[0], Instant::now() + HANG_READ, |db| {
+            db.exec("CREATE TABLE IF NOT EXISTS member_items(value)")?;
+            Ok(Vec::new())
+        });
+        let (mut owner, inputs) = lone.owners.get_mut(0).unwrap().take().unwrap();
+        let running = std::thread::spawn(move || owner.run(inputs));
+        let fenced_end = fourth.join().unwrap();
+        assert!(
+            matches!(&fenced_end, Err(Refusal::Fenced(why)) if why.contains("failed a flush")),
+            "{fenced_end:?}"
+        );
+        running.join().unwrap();
+        drop(written);
+
+        // The step's rule: a fence come or gone tells the waiters; an applied point alone doesn't.
+        let mut fenced_now = moved.clone();
+        fenced_now.fenced = Some("a test's fence".into());
+        assert!(leads_otherwise(&Ok(moved.clone()), &fenced_now));
+        assert!(leads_otherwise(&Ok(fenced_now), &moved));
+        let mut applied = moved.clone();
+        applied.applied += 1;
+        assert!(!leads_otherwise(&Ok(moved.clone()), &applied));
+        assert!(leads_otherwise(&Err(fenced("ended")), &moved));
     }
 
     /// CP-T1.8, AC-WK.1.2: an owner with nothing to do waits until its next deadline: its next
