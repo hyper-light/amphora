@@ -5,6 +5,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
+  `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
+  groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
+  grouped database's SQL session hands its cross-group batch to it (lane split-merge-13's layer), and a
+  group failure tested through SQL.
 - **The bar** (kiln's CP-M1): a Cargo workspace whose lints deny panics, this repository's rules
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
@@ -383,7 +388,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   for its commit's validation (`Versioned::keep_read`; before, SQL there was snapshot isolation and
   Elle found G2), refusing write skew and phantoms (`T-G8.4.2`), and reads the budget refused refuse
   the commit (`T-G8.4.3`). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the
-  coordinator's; the power-cut harness (`T-T1.4.1`).
+  coordinator's; the power-cut harness (`T-T1.4.1`) runs below.
+- **Power cuts on a real device** (CP-T1.4, AC-T1.4.4, `T-T1.4.1`; `bench/powercut/`, `bench/src/powercut.rs`):
+  32 writers commit single-row transactions with `synchronous = FULL`, each acknowledgement printed once
+  its commit returned; Linux cuts the device's writes (dm-flakey), macOS powers a VM off; a check
+  after recovery counts acknowledged ids missing, and `bench/power_nemesis.sh tally` gives both
+  harnesses' one verdict. A cut lands after 1 to `--powercut span` acknowledgements: two of the WAL's
+  checkpoint cycles by the engine's own `wal_autocheckpoint`, so cuts fall before, across and after a
+  checkpoint. dm-flakey's down interval is 1 s, the least it takes (up 0 s is down at every moment).
+  The 1,000 cuts on each storage and the macOS VM: the coordinator's.
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
@@ -667,6 +680,17 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   PRIMARY KEY with COLLATE or AUTOINCREMENT, two CHECKs without a comma, two upsert clauses), and
   sqlglot fails on MySQL's NATURAL FULL JOIN (3). Left: refusals compared by kind beside "any error
   matches" (the coordinator's decision), DuckDB's 6 disagreements and its refused INSERT unclassified.
+  Lane corpus-dialects-5 (`bench/corpus/dialects.py`, `test_dialects.py`): the last parse gaps read
+  as SQLite's documentation says they mean: VALUES after WITH as its SELECTs (lang_select.html 2.6),
+  table constraints without a comma (parse.y's empty `tconscomma`), a table PRIMARY KEY's ASC or DESC
+  left out and its AUTOINCREMENT moved onto its one column (autoinc.html); not expressible, with the
+  reason: a PRIMARY KEY collation other than its column's, several upsert clauses (lang_upsert.html),
+  AUTOINCREMENT on DuckDB, a NATURAL FULL JOIN on MySQL. min, max, first_value and last_value with
+  EXCLUDE CURRENT ROW on a ROWS frame holding the row are said on MySQL and ClickHouse as the frame's
+  two parts around it (6,720 windows on random rows agree with DuckDB 2.0.1's EXCLUDE). On the gate's
+  pool (26,980 records) the untranslatable records go from 10, 10, 116 and 113 (DuckDB, PostgreSQL,
+  MySQL, ClickHouse) to 8, 7, 109 and 106, every one "not expressible" with its reason: none fails to
+  parse. Left: refusals compared by kind, DuckDB's disagreements classified, the tiny run on every engine.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
