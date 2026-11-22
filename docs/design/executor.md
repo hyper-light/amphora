@@ -776,7 +776,9 @@ total cost). Each upkeep rule goes with its own lead rule (`Lead::for_upkeep`): 
 `Scan`, `Capped` with `Total`. A kind's upkeep is measured only over a stretch it was kept for
 whole; a kind dropped or built again during a stretch keeps the measure it had. Under `Total` the
 leader's upkeep also counts toward what it has spent before the other is measured again, and the
-other's trial budget is its own total.
+other's trial budget is its own total. When the kept kind's cost passes a dropped kind's last
+measure, the dropped kind is due a build and a trial at once (before, the dropped kind could be
+named leader and the filter read every row), and the last kind kept is never dropped.
 
 **Why.** Kept both, every write is applied to both kinds whichever leads, so their upkeep is paid
 either way and only the scan differs: counting upkeep there could pick the slower scan for no

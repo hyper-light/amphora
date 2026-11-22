@@ -312,6 +312,11 @@ impl Chooser {
         if self.upkeep != Upkeep::Capped || self.leader.is_none_or(|leader| leader == method) {
             return;
         }
+        // Lane skip-7: the last kind kept is never dropped (the leader by cost may be the one
+        // dropped, until its build: see `next_method`).
+        if !self.keeps(method.other()) {
+            return;
+        }
         if since <= build {
             return;
         }
@@ -469,6 +474,12 @@ impl Chooser {
                 Some(_) => (SkipMethod::Cracking, true),
             };
         };
+        // Lane skip-7: the kept kind's cost passed the dropped one's last measure, so the dropped
+        // one is due a build and a trial now ([`Chooser::rebuild_due`]); the kept one answers
+        // until it is built.
+        if !self.keeps(leader) {
+            return (leader, true);
+        }
         let other_cost = self.cost_of(leader.other()).unwrap_or(0);
         // Lane skip-5 (T-SKU.5): a dropped method's trial also pays its build.
         let other_cost = if self.keeps(leader.other()) {

@@ -1897,6 +1897,37 @@ mod chooser {
         }
     }
 
+    /// Lane skip-7 (T-SKU.7). Do: capped, the cracker dropped for its upkeep while zone maps
+    /// lead; then zone maps' own scans cost more than the cracker's last measure. Expect: the
+    /// cracker is due a build and a trial at once (`rebuild_due`), zone maps answer until it is
+    /// built, and zone maps, the last kind kept, are never dropped however much upkeep they cost.
+    #[test]
+    fn t_sku_7_a_dropped_kind_measured_cheaper_is_built_again_and_the_last_kept_stays() {
+        let mut chooser = Chooser::with_rules(
+            ZoneMapBuilder::new().finish(),
+            CrackerColumn::new([]),
+            Upkeep::Capped,
+            Lead::Scan,
+            [Some(10), Some(10)],
+        );
+        let (_, first) = chooser.candidates(0, 0).unwrap();
+        chooser.record(first, 1);
+        let (_, second) = chooser.candidates(0, 0).unwrap();
+        chooser.record(second, 100);
+        assert_eq!(chooser.leader(), Some(SkipMethod::ZoneMaps));
+        chooser.record_upkeep(SkipMethod::Cracking, 11);
+        assert!(!chooser.keeps(SkipMethod::Cracking));
+        chooser.record(SkipMethod::ZoneMaps, 200);
+        assert_eq!(chooser.next_method(), (SkipMethod::Cracking, true));
+        assert_eq!(chooser.rebuild_due(), Some(SkipMethod::Cracking));
+        let (candidates, method) = chooser.candidates(0, 0).unwrap();
+        assert_eq!(method, SkipMethod::ZoneMaps);
+        assert_ne!(candidates, Candidates::All);
+        chooser.record_upkeep(SkipMethod::ZoneMaps, 1_000_000);
+        assert!(chooser.keeps(SkipMethod::ZoneMaps), "{:?}", chooser.stats());
+        assert_eq!(chooser.method_stats(SkipMethod::ZoneMaps).dropped, 0);
+    }
+
     /// Lane skip-7 (T-SKU.8). Do: a cracker cut by a few filters, and a fresh copy of the same
     /// rows cut at its cut points. Expect: the copy holds the same cut points, answers each of the
     /// filters with the same rowids without partitioning anything more, and its cutting moved at
