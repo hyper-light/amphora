@@ -996,6 +996,9 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   `Connection::set_bushy_left_join_probes` (off by default), a LEFT JOIN's table may be a bushy
   run's probe, read by an outer hash join that NULL-extends the run's rows each outer row's probe
   pass didn't match (T-PL.8.14); pl8-19's search test now forces its LEFT JOIN into the run.
+  Lane pl8-22 (docs/design/planner.md "Decision (lane pl8-22)"): a batch of timed runs closes at
+  its median run, so a preempted run no longer moves a weight and flips plans under load
+  (T-PL.8.2); T-PL.8.13's search test builds the LEFT JOIN's side, now the smaller one.
   Not built: the search budget derived from a plan-time target, and semi and anti joins placed
   before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's

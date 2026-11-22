@@ -1891,6 +1891,26 @@ which the search weighs.
 ON reads a table after it; a run's row NULL-extended for an outer row it doesn't join; a plan the
 switch changes to a costlier one by the planner's own estimate.
 
+## Decision (lane pl8-22): a batch of timed runs read at its median run
+
+**Decision.** PL.8, T-PL.8.2 (`learned_costs::LearnedCosts::observe_sampled`, `Rate::close_runs`).
+Under `WeightRule::BatchMeans` (the default), a batch of the seek's, the hash build's or the hash
+probe's single timed runs closes at its median run's time, not its mean. `WeightRule::Blend`, the
+control, still blends each run in.
+
+**Why.** Twenty copies at once of `t_pl_8_2` passed 19 times (kiln run r124). The copy that failed
+ran a query with a bushy plan and planned the same query without a hash join right after: the run
+had moved the hash weights. A timed run is tens of nanoseconds; one the scheduler preempted reads
+milliseconds, and one of those in a batch of a hundred multiplies the batch's mean by hundreds
+(`t_pl_8_2_preempted_runs_move_no_weight`). The first batch replaces calibration's rate
+without a test (there is no spread between batches yet), so one preemption in it set the weight.
+The median holds while fewer than half a batch's runs are preempted, which is how calibration
+already reads its samples (`t_qt_5_5_calibration_weights_hold_through_preempted_samples`).
+
+**Given up.** A run's time with a long tail of real work (a cache miss on a large table) counts at
+its median, below its mean. Bulk timings (the sort, page reads) are unchanged. Memory: a batch
+holds at most an epoch's run times, the work calibration timed a sample of.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
