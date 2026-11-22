@@ -976,15 +976,24 @@ pub(super) fn get(
             "the route names group {group}, which the cluster doesn't have"
         )));
     };
-    let at = match at {
-        Consistency::Linearizable => hooks.marks.next_micros().map_err(unavailable)?,
+    let asked = match at {
+        Consistency::Linearizable => None,
         Consistency::Snapshot(asked) => {
             hooks.marks.observe_micros(asked).map_err(unavailable)?;
-            asked
+            Some(asked)
         }
     };
+    // A linearizable get takes a fresh stamp each time it reads (lane split-merge-22): one held by
+    // a lock reads again after the resolution, which took the commit stamp into the group's clock,
+    // so it sees a commit answered before it began even when that stamp came from a group whose
+    // clock is ahead of this one's.
+    let hooks = Arc::clone(hooks);
     let (ns, family, key) = (ns.to_owned(), family.to_owned(), key.to_vec());
     waiting(database, until, move |db| {
+        let at = match asked {
+            Some(at) => at,
+            None => hooks.marks.next_micros()?,
+        };
         row_at(db, &ns, &family, &key, at)
     })
 }
