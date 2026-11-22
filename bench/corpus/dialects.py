@@ -668,7 +668,14 @@ def translate(sql, dialect):
         return None, f"not expressible in {dialect}: several upsert clauses (https://www.sqlite.org/lang_upsert.html) where {dialect} takes at most one"
     try:
         # sqlglot.transpile's steps, each statement given its untyped columns' types between them.
-        out = [spoken(keyed(typed(e), dialect), dialect).sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE) if e else "" for e in sqlglot.parse(text, read=reader())]
+        out = []
+        for e in sqlglot.parse(text, read=reader()):
+            if not e:
+                out.append("")
+                continue
+            e = spoken(keyed(typed(e), dialect), dialect)
+            after = autoincremented(e) if dialect == "postgres" else []
+            out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:
         return None, str(e)
     except Exception as e:  # sqlglot can't say it in this dialect
@@ -688,6 +695,62 @@ def translate(sql, dialect):
     return ";\n".join(out), None
 
 
+def autoincremented(expression):
+    """`expression` (in PostgreSQL's dialect) with each AUTOINCREMENT column's keys given as SQLite
+    gives them, and the statements that do it after it. SQLite's "AUTOINCREMENT"
+    (https://www.sqlite.org/autoinc.html): a new row's key is "one larger than the largest ROWID
+    that has ever before existed in that same table", kept in the table sqlite_sequence, which
+    "is updated ... whenever a normal table that contains an AUTOINCREMENT column is created"
+    and written with each insert, in the inserting statement's transaction; a key written
+    explicitly counts too, and NULL is "the next" key. sqlglot writes it as an identity column,
+    whose sequence moves past neither an explicitly written key nor back on a failed or
+    rolled-back insert (PostgreSQL's manual, 9.17 "Sequence Manipulation Functions": "nextval
+    operations are never rolled back"), so its next key can differ. So the key is given as SQLite
+    gives it: a table `<table>_autoincrement` holds the largest key the table has held (as
+    sqlite_sequence does, transactional as it is), and a BEFORE INSERT trigger (PostgreSQL's
+    CREATE TRIGGER, its PL/pgSQL "Triggers on Data Changes": "a row-level trigger fired before an
+    operation ... can return NEW" changed) gives a row without a key one more than the larger of
+    that and the table's largest key, then records the row's key there. Its UPDATE runs in the
+    inserting statement, so a refused insert leaves it as it was, as SQLite's does. A CREATE TABLE
+    without IF NOT EXISTS starts a fresh count (a table dropped and made again forgets its keys:
+    autoinc.html, "the sqlite_sequence row for an AUTOINCREMENT table is automatically deleted when
+    the table is dropped"). A TEMPORARY table's would need the function in pg_temp, which a
+    trigger can't name without its schema: not expressible."""
+    from sqlglot import exp
+
+    out = []
+    for create in list(expression.find_all(exp.Create)):
+        schema = create.this
+        if create.args.get("kind") != "TABLE" or not isinstance(schema, exp.Schema) or not isinstance(schema.this, exp.Table):
+            continue
+        for column in [c for c in schema.expressions if isinstance(c, exp.ColumnDef)]:
+            auto = [c for c in column.args.get("constraints") or [] if isinstance(c.args.get("kind"), exp.AutoIncrementColumnConstraint)]
+            if not auto:
+                continue
+            properties = create.args.get("properties")
+            if properties is not None and any(isinstance(p, exp.TemporaryProperty) for p in properties.expressions):
+                raise NotExpressible("not expressible in postgres: AUTOINCREMENT on a TEMPORARY table (https://www.sqlite.org/autoinc.html), whose trigger function would be pg_temp's")
+            for c in auto:
+                c.pop()
+            table = schema.this
+            side = table.copy()
+            side.set("this", exp.Identifier(this=table.name + "_autoincrement", quoted=table.this.quoted))
+            t, s, k = table.sql(dialect="postgres"), side.sql(dialect="postgres"), column.this.sql(dialect="postgres")
+            body = (
+                f"BEGIN IF NEW.{k} IS NULL THEN NEW.{k} := greatest((SELECT max({k}) FROM {t}), (SELECT seq FROM {s})) + 1; END IF; "
+                f"UPDATE {s} SET seq = greatest(seq, NEW.{k}); RETURN NEW; END"
+            )
+            if not create.args.get("exists"):
+                out.append(f"DROP TABLE IF EXISTS {s}")
+            out += [
+                f"CREATE TABLE IF NOT EXISTS {s} (seq BIGINT NOT NULL)",
+                f"INSERT INTO {s} SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM {s})",
+                "CREATE OR REPLACE FUNCTION " + s + "() RETURNS trigger LANGUAGE plpgsql AS '" + body.replace("'", "''") + "'",
+                f"CREATE OR REPLACE TRIGGER {s} BEFORE INSERT ON {t} FOR EACH ROW EXECUTE FUNCTION {s}()",
+            ]
+    return out
+
+
 def record_in(record, dialect):
     """`record` (slt.Record) in `dialect`, as translate() says it. A record SQLite refuses
     (`statement error`) that sqlglot can't read either is given as SQLite holds it, its default
@@ -701,9 +764,26 @@ def record_in(record, dialect):
     return sql, why
 
 
+def refusals(pool, rel):
+    """SQLite's error for each `statement error` record of `<pool>/<rel>` (run as the corpus's
+    runner runs it, after its fixture `<pool>/<source>/base.test` when it has one): a JSON-ready
+    dict each, its line, SQLite's extended result code and name (Python's sqlite3.Error
+    `sqlite_errorcode` and `sqlite_errorname`, Python 3.11 on: None before) and its message, which
+    the harness (crates/corpus/src/refusal.rs) reads for the error's kind."""
+    path = os.path.join(pool, rel)
+    fixture = os.path.join(pool, rel.split(os.sep)[0], "base.test")
+    kept = []
+
+    def refused(rec, e):
+        kept.append({"line": rec.line, "code": getattr(e, "sqlite_errorcode", None), "name": getattr(e, "sqlite_errorname", None), "message": str(e)})
+
+    slt.run_file(path, fixture=fixture if os.path.exists(fixture) and os.path.abspath(fixture) != os.path.abspath(path) else None, refused=refused)
+    return kept
+
+
 def files(pool):
     for root, _dirs, names in os.walk(pool, followlinks=True):
-        if os.path.relpath(root, pool).split(os.sep)[0] == "translations":
+        if os.path.relpath(root, pool).split(os.sep)[0] in ("translations", "refusals"):
             continue
         for n in sorted(names):
             if n.endswith(".test"):
@@ -716,6 +796,7 @@ def main():
     pool = sys.argv[1]
     dialects = sys.argv[2:] or DIALECTS
     counts = {d: [0, 0] for d in dialects}
+    refused = 0
     for rel in files(pool):
         records = [r for kind, r in slt.parse(os.path.join(pool, rel)) if kind == "record"]
         for d in dialects:
@@ -726,8 +807,17 @@ def main():
                     sql, why = record_in(r, d)
                     counts[d][why is not None] += 1
                     f.write(json.dumps({"line": r.line, "sql": sql} if why is None else {"line": r.line, "untranslatable": why}) + "\n")
+        # SQLite's error for each record it refuses, for comparing refusals by kind.
+        out = os.path.join(pool, "refusals", rel + ".jsonl")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        kept = refusals(pool, rel)
+        with open(out, "w", encoding="utf-8") as f:
+            for k in kept:
+                f.write(json.dumps(k) + "\n")
+        refused += len(kept)
     for d, (ok, no) in counts.items():
         print(f"{d}: {ok} records translated, {no} untranslatable")
+    print(f"sqlite: {refused} refusals kept (pool/refusals)")
 
 
 if __name__ == "__main__":

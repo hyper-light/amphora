@@ -229,5 +229,54 @@ class ExclusionAround(unittest.TestCase):
             self.assertIsNone(dialects.translate(f"SELECT {f} OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM t1", "mysql")[0], f)
 
 
+class Autoincrement(unittest.TestCase):
+    """Do: AUTOINCREMENT tables for PostgreSQL, plain, IF NOT EXISTS and TEMPORARY. Expect: no
+    identity column; a count table and a BEFORE INSERT trigger after it (a fresh count unless IF
+    NOT EXISTS); the TEMPORARY one not expressible."""
+
+    def test_keys_given_as_sqlite_gives_them(self):
+        out, why = dialects.translate("CREATE TABLE t(x INTEGER PRIMARY KEY AUTOINCREMENT, y TEXT)", "postgres")
+        self.assertIsNone(why)
+        self.assertNotIn("IDENTITY", out)
+        self.assertIn("DROP TABLE IF EXISTS t_autoincrement", out)
+        self.assertIn("BEFORE INSERT ON t FOR EACH ROW", out)
+        self.assertIn("greatest((SELECT max(x) FROM t), (SELECT seq FROM t_autoincrement)) + 1", out)
+        out, why = dialects.translate("CREATE TABLE IF NOT EXISTS t(x INTEGER PRIMARY KEY AUTOINCREMENT)", "postgres")
+        self.assertIsNone(why)
+        self.assertNotIn("DROP TABLE", out)
+        self.assertIsNotNone(dialects.translate("CREATE TEMP TABLE t(x INTEGER PRIMARY KEY AUTOINCREMENT)", "postgres")[1])
+
+    def test_other_dialects_unchanged(self):
+        """Do: the same table for MySQL. Expect: its AUTO_INCREMENT, no trigger."""
+        out, why = dialects.translate("CREATE TABLE t(x INTEGER PRIMARY KEY AUTOINCREMENT)", "mysql")
+        self.assertIsNone(why)
+        self.assertIn("AUTO_INCREMENT", out)
+        self.assertNotIn("TRIGGER", out)
+
+
+class Refusals(unittest.TestCase):
+    """Do: a file whose statements SQLite refuses for four reasons (a UNIQUE key, a syntax error, a
+    missing table, an existing one) and one it runs. Expect: SQLite's error kept for each refused
+    record by its line, with its extended code where Python's sqlite3 gives it."""
+
+    def test_each_refusal_kept_by_line(self):
+        import tempfile
+
+        text = "statement ok\nCREATE TABLE t(a INTEGER UNIQUE)\n\nstatement ok\nINSERT INTO t VALUES (1)\n\nstatement error\nINSERT INTO t VALUES (1)\n\nstatement error\nSELEC 1\n\nstatement error\nSELECT * FROM nope\n\nstatement error\nCREATE TABLE t(b)\n"
+        with tempfile.TemporaryDirectory(dir=os.path.expanduser("~/.cache")) as pool:
+            os.makedirs(os.path.join(pool, "src"))
+            with open(os.path.join(pool, "src", "f.test"), "w", encoding="utf-8") as f:
+                f.write(text)
+            kept = dialects.refusals(pool, os.path.join("src", "f.test"))
+        self.assertEqual([k["line"] for k in kept], [7, 10, 13, 16])
+        self.assertIn("UNIQUE constraint failed", kept[0]["message"])
+        self.assertIn("syntax error", kept[1]["message"])
+        self.assertIn("no such table", kept[2]["message"])
+        self.assertIn("already exists", kept[3]["message"])
+        if sys.version_info >= (3, 11):
+            self.assertEqual(kept[0]["code"], 2067)  # SQLITE_CONSTRAINT_UNIQUE (rescode.html)
+            self.assertEqual(kept[1]["code"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
