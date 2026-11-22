@@ -41,55 +41,148 @@ pub(crate) enum Work {
     PageRead,
 }
 
-/// Units of work and the nanoseconds they took.
+/// One epoch's observations: their work and time summed, with the sums the spread of their rate
+/// needs (how many, and the units' and times' squares and products).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Span {
     units: f64,
     nanos: f64,
+    count: f64,
+    units_sq: f64,
+    nanos_sq: f64,
+    product: f64,
 }
 
-/// One kind's running rate: the work of the epoch under way and of the one before it. An epoch is
-/// as much work as calibration timed, so the rate follows the latest one to two calibrations' worth
-/// of work and leaves older times behind as conditions move.
+impl Span {
+    fn add(&mut self, units: f64, nanos: f64) {
+        self.units += units;
+        self.nanos += nanos;
+        self.count += 1.0;
+        self.units_sq += units * units;
+        self.nanos_sq += nanos * nanos;
+        self.product += units * nanos;
+    }
+
+    /// Nanoseconds a unit over the span, None without work and time.
+    fn per_unit(&self) -> Option<f64> {
+        (self.units > 0.0 && self.nanos > 0.0).then(|| self.nanos / self.units)
+    }
+
+    /// The span's rate and its standard error, the ratio estimator's: with `r` the rate, `k` the
+    /// observations and `u` their mean units, `se^2 = sum((nanos - r * units)^2) / (k (k - 1) u^2)`
+    /// (Cochran, "Sampling Techniques", 3rd ed., Wiley 1977, section 6.3: the variance of a ratio
+    /// of sums). None under two observations: one alone has no spread to read.
+    fn estimate(&self) -> Option<Estimate> {
+        let per_unit = self.per_unit()?;
+        if self.count < 2.0 {
+            return None;
+        }
+        let mean_units = self.units / self.count;
+        let squares = (self.nanos_sq - 2.0 * per_unit * self.product
+            + per_unit * per_unit * self.units_sq)
+            .max(0.0);
+        let se = (squares / (self.count * (self.count - 1.0) * mean_units * mean_units)).sqrt();
+        se.is_finite().then_some(Estimate {
+            per_unit,
+            se: Some(se),
+        })
+    }
+}
+
+/// A rate as it stands: nanoseconds a unit, and its standard error where the times it came from
+/// had a spread to read (calibration's median, an epoch's ratio); None for one time alone (the
+/// page read's anchor at open, a test's fixed rate).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Estimate {
+    per_unit: f64,
+    se: Option<f64>,
+}
+
+/// PL.8 (T-PL.8.6): how far an epoch's rate must sit from the standing one before it replaces it,
+/// in their combined standard errors: the normal quantile of a two-sided 95% test,
+/// Bonferroni-corrected for the eight kinds of work `Rates` tests as their epochs close (Dunn,
+/// "Multiple Comparisons Among Means", JASA 56(293), 1961), as `cost_fit`'s `AGREE_Z` is for its
+/// weights: the quantile of 1 - 0.025/8 of the standard normal distribution.
+const MOVE_Z: f64 = 2.734_369;
+
+impl Estimate {
+    /// Whether `seen`, an epoch's rate, differs from this one by more than chance would: past
+    /// their combined standard error times [MOVE_Z]. A standing rate with no spread of its own is
+    /// refuted by the first epoch that has one.
+    fn refuted_by(&self, seen: &Estimate) -> bool {
+        let Some(se) = self.se else {
+            return true;
+        };
+        let seen_se = seen.se.unwrap_or(0.0);
+        (seen.per_unit - self.per_unit).abs() > MOVE_Z * (se * se + seen_se * seen_se).sqrt()
+    }
+}
+
+/// One kind's rate: the one standing, and the epoch under way. An epoch is as much work as
+/// calibration timed. When one closes, its rate replaces the standing one only if the two differ
+/// significantly, by their own spreads (`Estimate::refuted_by`); otherwise the standing rate stays
+/// exactly where it was. So the weights the planner reads move on evidence alone, never by an
+/// epoch's noise, and a plan chosen on them is chosen again until the work really costs something
+/// else (PL.8, T-PL.8.6: before this, every observation moved the rate, a statement's own earlier
+/// runs moved the weights within their error, and close plans flipped between runs).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Rate {
     epoch: f64,
-    previous: Span,
+    standing: Option<Estimate>,
     current: Span,
 }
 
 impl Rate {
-    /// The rate calibration measured: `units` of work in `nanos`, also the epoch's length.
-    fn calibrated(units: f64, nanos: f64) -> Self {
+    /// A rate calibration measured: `units` of work in `nanos`, also the epoch's length, its
+    /// standard error `se_nanos` over the whole of the work where the times had a spread.
+    fn measured(units: f64, nanos: f64, se_nanos: Option<f64>) -> Self {
         Self {
             epoch: units,
-            previous: Span { units, nanos },
+            standing: (units > 0.0 && nanos > 0.0).then(|| Estimate {
+                per_unit: nanos / units,
+                se: se_nanos
+                    .filter(|se| se.is_finite() && *se >= 0.0)
+                    .map(|se| se / units),
+            }),
             current: Span::default(),
         }
     }
 
+    /// A rate given as `units` of work in `nanos`, with no spread: the first epoch replaces it.
+    #[cfg(test)]
+    fn calibrated(units: f64, nanos: f64) -> Self {
+        Self::measured(units, nanos, None)
+    }
+
     /// Adds an observation. One with no work or a time that is not a finite, non-negative number
-    /// says nothing about the rate, and is left out.
+    /// says nothing about the rate, and is left out. An epoch with one observation alone runs on
+    /// until a second gives it a spread.
     fn observe(&mut self, units: f64, nanos: f64) {
         if !(units.is_finite() && units > 0.0 && nanos.is_finite() && nanos >= 0.0) {
             return;
         }
-        self.current.units += units;
-        self.current.nanos += nanos;
-        if self.current.units >= self.epoch {
-            self.previous = self.current;
-            self.current = Span::default();
+        self.current.add(units, nanos);
+        if self.current.units < self.epoch {
+            return;
+        }
+        let Some(seen) = self.current.estimate() else {
+            return;
+        };
+        self.current = Span::default();
+        if self
+            .standing
+            .is_none_or(|standing| standing.refuted_by(&seen))
+        {
+            self.standing = Some(seen);
         }
     }
 
-    /// Nanoseconds a unit, None before any time was seen.
+    /// Nanoseconds a unit, None before any time was seen: the standing rate, or before there is
+    /// one, the epoch's so far (there is no standing rate for it to move).
     fn nanos_per_unit(&self) -> Option<f64> {
-        let units = self.previous.units + self.current.units;
-        let nanos = self.previous.nanos + self.current.nanos;
-        if units > 0.0 && nanos > 0.0 {
-            Some(nanos / units)
-        } else {
-            None
+        match self.standing {
+            Some(standing) => Some(standing.per_unit),
+            None => self.current.per_unit(),
         }
     }
 }
@@ -344,10 +437,10 @@ impl LearnedCosts {
         if !(reads.is_finite() && reads > 0.0 && nanos.is_finite() && nanos > 0.0) {
             return;
         }
-        rates.page.previous = Span {
-            units: reads,
-            nanos,
-        };
+        rates.page.standing = Some(Estimate {
+            per_unit: nanos / reads,
+            se: None,
+        });
     }
 
     /// The page reads an epoch of the page read's rate holds: the most the open's anchor times
@@ -527,7 +620,8 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
     }
     for ((kind, units, _), (reps, samples, _)) in kinds.iter().zip(sampled.iter_mut()) {
         let nanos = median(samples).unwrap_or(0.0);
-        *rates.rate_mut(*kind) = Rate::calibrated(*reps as f64 * *units, nanos);
+        let se = median_se(samples);
+        *rates.rate_mut(*kind) = Rate::measured(*reps as f64 * *units, nanos, se);
     }
     // A page read can't be timed here: there's no file yet. Each database anchors it at open
     // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
@@ -561,9 +655,16 @@ fn median(samples: &mut [f64]) -> Option<f64> {
 /// populations of unknown distribution form", Annals of Mathematical Statistics 7(3), 1936).
 /// Under two samples there's no spread to read.
 fn median_settled(samples: &mut [f64], resolution: f64) -> bool {
+    median_se(samples).is_some_and(|se| se <= resolution)
+}
+
+/// The standard error of the median of `samples` (sorted here): half the distance between the
+/// order statistics a standard error either side of the middle rank (`median_settled`). None
+/// under two samples.
+fn median_se(samples: &mut [f64]) -> Option<f64> {
     let count = samples.len();
     if count < 2 {
-        return false;
+        return None;
     }
     samples.sort_unstable_by(f64::total_cmp);
     let half = count as f64 / 2.0;
@@ -572,8 +673,8 @@ fn median_settled(samples: &mut [f64], resolution: f64) -> bool {
     let low = (half - reach).floor().clamp(0.0, last) as usize;
     let high = (half + reach).ceil().clamp(0.0, last) as usize;
     match (samples.get(low), samples.get(high)) {
-        (Some(low), Some(high)) => (high - low) / 2.0 <= resolution,
-        _ => false,
+        (Some(low), Some(high)) => Some((high - low) / 2.0),
+        _ => None,
     }
 }
 
@@ -757,7 +858,8 @@ mod tests {
         assert_eq!(start.sort, 2.0);
         costs.observe(Work::Sort, 50.0, 50.0 * 8.0);
         let partway = costs.weights().unwrap();
-        assert!(partway.sort > 2.0 && partway.sort < 8.0, "{partway:?}");
+        // PL.8 (T-PL.8.6): half an epoch is no evidence yet; the weight holds.
+        assert_eq!(partway.sort, 2.0, "{partway:?}");
         for _ in 0..4 {
             costs.observe(Work::Sort, 50.0, 50.0 * 8.0);
         }
@@ -766,6 +868,63 @@ mod tests {
         assert_eq!(moved.seek, start.seek);
         assert_eq!(moved.hash_build, start.hash_build);
         assert_eq!(moved.hash_probe, start.hash_probe);
+    }
+
+    /// Do: settle the seek's rate on an epoch of times 100 ns and 150 ns in turn (125 ns, standard
+    /// error 2.5 ns), then close epochs whose mean sits 4 ns away (inside 2.734 combined standard
+    /// errors), then one 25 ns away. Expect: the weight exactly where the first epoch put it
+    /// through the near epochs, then at the far epoch's mean (T-PL.8.6: weights move only on
+    /// significant evidence, by the samples' own spread).
+    #[test]
+    fn t_pl_8_6_weights_hold_inside_their_error_and_move_past_it() {
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        let epoch = |shift: f64| {
+            for i in 0..100 {
+                let t = if i % 2 == 0 { 100.0 } else { 150.0 };
+                costs.observe_sampled(Work::Seek, t + shift);
+            }
+        };
+        epoch(0.0);
+        assert_eq!(costs.weights().unwrap().seek, 125.0);
+        for shift in [4.0, -4.0, 3.0] {
+            epoch(shift);
+            assert_eq!(costs.weights().unwrap().seek, 125.0, "{shift}");
+        }
+        epoch(25.0);
+        assert_eq!(costs.weights().unwrap().seek, 150.0);
+    }
+
+    /// Do: an epoch of one observation, however large its work. Expect: it closes only once a
+    /// second gives it a spread (T-PL.8.6: one time alone is no evidence of a rate's spread).
+    #[test]
+    fn t_pl_8_6_one_observation_alone_moves_nothing() {
+        let costs = LearnedCosts::from_rates(&fixed_rates(1.0, 10.0, 20.0, 15.0, 2.0));
+        let r = Rate::measured(100.0, 200.0, Some(10.0));
+        assert_eq!(r.standing.and_then(|e| e.se), Some(0.1));
+        costs.observe(Work::Sort, 1_000.0, 1_000.0 * 8.0);
+        assert_eq!(costs.weights().unwrap().sort, 2.0);
+        costs.observe(Work::Sort, 1_000.0, 1_000.0 * 8.0);
+        assert_eq!(costs.weights().unwrap().sort, 8.0);
+    }
+
+    /// Do: calibrate on this machine. Expect: every kind's calibrated rate carries its median's
+    /// standard error (T-PL.8.6: the first epoch is weighed against calibration's own spread).
+    #[test]
+    fn t_pl_8_6_calibration_keeps_its_spread() {
+        let rates = process_calibration();
+        for rate in [
+            rates.row,
+            rates.seek,
+            rates.hash_build,
+            rates.hash_probe,
+            rates.sort,
+        ] {
+            let standing = rate.standing.expect("the clock moved");
+            assert!(
+                standing.se.is_some_and(|se| se.is_finite() && se >= 0.0),
+                "{rate:?}"
+            );
+        }
     }
 
     /// Do: observe nothing-sized and non-finite times. Expect: the weights unchanged (T-QT.5.5).
@@ -800,7 +959,11 @@ mod tests {
         assert_eq!(costs.weights().unwrap().row_in_pages, None);
         costs.observe(Work::PageRead, 1.0, 100.0);
         assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
-        for _ in 0..8 {
+        for _ in 0..3 {
+            costs.observe(Work::PageRead, 1.0, 100.0);
+        }
+        assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 100.0));
+        for _ in 0..4 {
             costs.observe(Work::PageRead, 1.0, 400.0);
         }
         assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 400.0));
