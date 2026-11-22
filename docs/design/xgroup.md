@@ -92,6 +92,37 @@ is tested on the coordinator (T-T1.10.X3), not yet through a SQL session over re
 path refuses a row another transaction only reads; the coordinator's lock rules decide that case the
 same way today (any lock conflicts).
 
+### Reading its own writes across groups (lane xgroup-sql-8, AC-T1.10.1)
+
+A transaction across groups is decided before its groups apply it: each group writes its rows (or
+drops its locks, for an abort) when it resolves it, one round of steps after the decision. So when
+the caller hears decides what it can rely on, and `Options::answer_at` switches it:
+- `AnswerAt::Decided`, the control and today's: the answer comes at the decision (`Event::Answer`). A
+  read straight after it can miss the rows in a group that hasn't resolved it yet, and a retry
+  straight after an abort can run into the transaction's own locks.
+- `AnswerAt::Resolved`: each answer, aborts included, is held until every group it touched has
+  resolved it (`Event::Finished`). The caller waits that one more round. Held answers are counted
+  (`Counted::answers_held`, `answers_held_most`). If the coordinator stops while it holds one, the
+  caller hears `UnknownOutcome`, never "stopped", since its rows may not be readable yet.
+
+`commit_records` answers a token: the newest closed time any touched group published once the commit
+answered (`Database::session_token`; Ada's decision: the commit's revision across groups is the
+cross-group hybrid-logical-clock timestamp, the same one the read-your-writes tokens use, `Token::at`).
+Under `Resolved` every group's resolution is in its closed time by then, so a read that carries the
+token reads the rows on any replica. A group on a node adds nothing to the token yet: its step's
+reply doesn't carry its closed time.
+
+Each mode's failure mode is forced in `xgroup::sql::sessions`: one group's resolution held back (a
+group behind the decision), a read of it straight after the answer
+(`ac_t1_10_1_a_read_straight_after_the_answer_in_a_group_behind`), and an abort with every lock held,
+retried at once by a second caller (`ac_t1_10_1_a_retry_straight_after_an_abort_meets_no_lock_of_its_own`).
+At scale, `xgroup_lan ryw` runs both modes under both protocols, callers writing only their own rows
+so every conflict met is their own earlier transaction's lock. It reports read-your-writes misses,
+conflicts met, the commit's p50, p99 and p99.9 (its tries again included), the answers held at most,
+and throughput. Which mode stays is decided from those numbers, not yet measured. The alternative of
+reads waiting on a held lock (a lock lookup on every Records read, single-group ones included) is not
+built.
+
 ## A refusal before the step (lane xgroup-sql-4, AC-T1.10.6)
 
 A group that refuses a step before taking it (`NotLeader`: its leader moved; `Full`: its writer

@@ -1276,6 +1276,21 @@ tests = [
   { id = "T-T1.10.R2", text = "xgroup::sql::sessions::ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing — passes when a group failing at each of a session transaction's steps leaves its rows all written or none after recovery, equal to one group's, both protocols, both ends reached" },
 ]
 
+# lane xgroup-sql-8: a SQL session reads its own writes across groups (kiln goal e25ba5fe; xgroup.md, "Reading its
+# own writes across groups"). Built behind Options::answer_at, today's answer at the decision the control.
+[[own]]
+id = "T1.10.W"
+title = "A transaction across groups answers once every group resolved it, behind a switch whose control is today's answer at the decision"
+criteria = [
+  { id = "AC-T1.10.W1", text = "Under AnswerAt::Resolved each answer, aborts included, is held until every group the transaction touched has resolved it, counted (answers held now and at most); a stop while one is held answers UnknownOutcome; under Decided (the control) it answers at the decision" },
+  { id = "AC-T1.10.W2", text = "commit_records answers Token::at the newest closed time any touched group published after the commit answered: the cross-group hybrid-logical-clock timestamp the session tokens use" },
+]
+tests = [
+  { id = "T-T1.10.W1", text = "xgroup::sql::sessions::ac_t1_10_1_a_read_straight_after_the_answer_in_a_group_behind — passes when, with group 1's resolution held back, the control answers first and a read of group 1 misses the row, while Resolved holds the answer (counted) until group 1 resolves and the read finds it, both protocols" },
+  { id = "T-T1.10.W2", text = "xgroup::sql::sessions::ac_t1_10_1_a_retry_straight_after_an_abort_meets_no_lock_of_its_own — passes when a two-phase transaction aborted with every lock held and group 0's resolution held back is retried at once with room for a second caller: the control's retry meets a lock of the first try's, Resolved's commits" },
+  { id = "T-T1.10.W3", text = "xgroup::sql::sessions::ac_t1_10_1_commit_records_writes_rows_in_every_group — passes when a Records transaction over three groups through commit_records, answered once resolved, reads back in every group straight after its answer, both protocols" },
+]
+
 # lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session
 # tokens"). Ada's order 2026-11-22: built behind ReadMode, today's read the control.
 [[own]]

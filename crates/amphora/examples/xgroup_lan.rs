@@ -10,6 +10,7 @@
 //!                  --keys K [--id ID] [--secs S]
 //! xgroup_lan refusals (--node G=DB ... | --dir DIR --groups G) [--protocol ...] --clients C
 //!                  --txns T --keys K --burst B --every E [--refusal not-leader|full] --secs S
+//! xgroup_lan ryw   --dir DIR --groups G [--protocol ...] --clients C --txns T --keys K --secs S
 //! ```
 //!
 //! `bench` appends one JSON line per protocol to `--out` (bench/records). `elle` prints each seed
@@ -236,7 +237,8 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         "refusals" => refusals(&args),
-        other => anyhow::bail!("{other}: node, bench, elle or refusals"),
+        "ryw" => ryw(&args),
+        other => anyhow::bail!("{other}: node, bench, elle, refusals or ryw"),
     }
 }
 
@@ -357,7 +359,11 @@ fn refusals(args: &Args) -> anyhow::Result<()> {
                     id,
                     protocol,
                     clients,
-                    Options { on_refused, fault },
+                    Options {
+                        on_refused,
+                        fault,
+                        ..Options::default()
+                    },
                     later(deadline),
                 )
             };
@@ -499,6 +505,182 @@ fn refusals(args: &Args) -> anyhow::Result<()> {
                 tally.retries,
                 tally.held_txns_most,
                 tally.stops,
+                f64::from(u32::try_from(tally.committed).unwrap_or(u32::MAX))
+                    / secs.max(f64::MIN_POSITIVE),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What one run of `ryw` counted.
+#[derive(Default)]
+struct RywTally {
+    committed: u64,
+    failed: u64,
+    conflicts: u64,
+    misses: u64,
+    latencies: lan::Latencies,
+}
+
+/// `ryw` (AC-T1.10.1, lane xgroup-sql-8): the switch `Options::answer_at` at scale, `Decided`
+/// (the control) against `Resolved`, under both protocols, forcing each one's failure mode.
+/// `--clients` callers each commit `--txns` Records transactions through `commit_records`, each
+/// writing one row in every one of `--groups` local groups under `--dir`, drawn from the caller's
+/// own `--keys` rows. No other caller writes them, so every conflict a caller meets is a lock of
+/// its own earlier transaction not yet resolved; it tries again at once, as a session retries a
+/// conflict, until `--secs`. Straight after each answer it reads every row it wrote, in its group:
+/// one that doesn't hold the write is a read-your-writes miss. One JSON line a run: the misses, the
+/// conflicts met, the commit's time (its tries again included) at p50, p99 and p99.9, the answers
+/// held at most, and committed per second.
+fn ryw(args: &Args) -> anyhow::Result<()> {
+    use std::sync::{Mutex, PoisonError};
+
+    use amphora::database::Database;
+    use amphora::xgroup::sql::{AnswerAt, Options, commit_records, prepare, record_of};
+    use amphora::xgroup::{Cluster, Route};
+    use amphora_api::{Consistency, Records, Refusal, Tx, Write};
+
+    let clients: usize = args.number("clients")?;
+    let txns: u64 = args.number("txns")?;
+    let keys: u64 = args.number("keys")?;
+    let groups: u8 = args.number("groups")?;
+    let deadline = args.secs()?;
+    let id: u64 = args.or("id", 1)?;
+    if keys == 0 || clients == 0 || groups < 2 {
+        anyhow::bail!("--keys and --clients above 0, --groups at least 2");
+    }
+    let mut run = 0u64;
+    for protocol in args.protocols()? {
+        for (setting, answer_at) in [
+            ("decided", AnswerAt::Decided),
+            ("resolved", AnswerAt::Resolved),
+        ] {
+            let id = id.wrapping_add(run);
+            run = run.wrapping_add(1);
+            let dir = PathBuf::from(args.one("dir")?)
+                .join(format!("ryw-{}-{setting}", lan::protocol_name(protocol)));
+            std::fs::create_dir_all(&dir)?;
+            let databases = (0..groups)
+                .map(|g| -> anyhow::Result<Database> {
+                    let database =
+                        Database::open(&dir.join(format!("group{g}.db")), later(deadline))?;
+                    prepare(&database, later(deadline))?;
+                    Ok(database)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let count = u32::from(groups);
+            // A row's group is its key's first byte.
+            let route: Route = Arc::new(move |key: &[u8]| {
+                let row = record_of(key).ok().flatten().map_or(key, |(_, _, row)| row);
+                row.first()
+                    .map_or(0, |b| u32::from(*b).checked_rem(count).unwrap_or(0))
+            });
+            let members = databases.iter().cloned().map(Member::Local).collect();
+            let options = Options {
+                answer_at,
+                ..Options::default()
+            };
+            let cluster = Cluster::open_with(
+                members,
+                route,
+                id,
+                protocol,
+                clients,
+                options,
+                later(deadline),
+            )?;
+            let tally = Mutex::new(RywTally::default());
+            let began = Instant::now();
+            std::thread::scope(|scope| -> anyhow::Result<()> {
+                let callers: Vec<_> = (0..clients)
+                    .map(|c| {
+                        let (cluster, databases, tally) = (&cluster, &databases, &tally);
+                        scope.spawn(move || -> anyhow::Result<()> {
+                            let caller = u64::try_from(c)?;
+                            let mut rng = Seeded(caller);
+                            let namespaces = databases
+                                .iter()
+                                .map(|database| database.namespace("ns"))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            for t in 0..txns {
+                                let k = rng.next().checked_rem(keys).unwrap_or(0);
+                                let value = t.to_le_bytes().to_vec();
+                                let rows: Vec<Vec<u8>> = (0..groups)
+                                    .map(|g| {
+                                        [&[g][..], &caller.to_le_bytes(), &k.to_le_bytes()].concat()
+                                    })
+                                    .collect();
+                                let tx = Tx {
+                                    conds: Vec::new(),
+                                    writes: rows
+                                        .iter()
+                                        .map(|row| Write::Put {
+                                            family: "rows".into(),
+                                            key: row.clone(),
+                                            value: value.clone(),
+                                        })
+                                        .collect(),
+                                };
+                                let until = later(deadline);
+                                let asked = Instant::now();
+                                let mut conflicts = 0u64;
+                                let answer = loop {
+                                    match commit_records(cluster, "ns", &tx, until) {
+                                        Err(Refusal::Conflict { .. }) if Instant::now() < until => {
+                                            conflicts = conflicts.saturating_add(1);
+                                        }
+                                        other => break other,
+                                    }
+                                };
+                                let took = asked.elapsed();
+                                let mut misses = 0u64;
+                                if answer.is_ok() {
+                                    for (row, ns) in rows.iter().zip(&namespaces) {
+                                        let got = ns
+                                            .get("rows", row, Consistency::Linearizable, until)?
+                                            .map(|r| r.value);
+                                        misses = misses.saturating_add(u64::from(
+                                            got.as_ref() != Some(&value),
+                                        ));
+                                    }
+                                }
+                                let mut tally =
+                                    tally.lock().unwrap_or_else(PoisonError::into_inner);
+                                tally.conflicts = tally.conflicts.saturating_add(conflicts);
+                                tally.misses = tally.misses.saturating_add(misses);
+                                if answer.is_ok() {
+                                    tally.committed = tally.committed.saturating_add(1);
+                                    tally.latencies.record(took);
+                                } else {
+                                    tally.failed = tally.failed.saturating_add(1);
+                                }
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                for caller in callers {
+                    caller
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("a caller's thread panicked"))??;
+                }
+                Ok(())
+            })?;
+            let secs = began.elapsed().as_secs_f64();
+            let counted = cluster.counted();
+            let tally = tally.into_inner().unwrap_or_else(PoisonError::into_inner);
+            let [p50, p99, p999] = [500, 990, 999].map(|m| tally.latencies.quantile(m).as_micros());
+            let total = u64::try_from(clients)?.saturating_mul(txns);
+            out!(
+                "{{\"bench\":\"xgroup_ryw\",\"protocol\":\"{}\",\"answer_at\":\"{setting}\",\"groups\":{groups},\"clients\":{clients},\"txns\":{total},\"keys\":{keys},\"committed\":{},\"failed\":{},\"misses\":{},\"conflicts\":{},\"answers_held_most\":{},\"stops\":{},\"p50_us\":{p50},\"p99_us\":{p99},\"p999_us\":{p999},\"secs\":{secs:.3},\"committed_per_s\":{:.1}}}",
+                lan::protocol_name(protocol),
+                tally.committed,
+                tally.failed,
+                tally.misses,
+                tally.conflicts,
+                counted.answers_held_most,
+                counted.stops,
                 f64::from(u32::try_from(tally.committed).unwrap_or(u32::MAX))
                     / secs.max(f64::MIN_POSITIVE),
             );

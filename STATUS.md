@@ -17,6 +17,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   over real groups. Waits on the coordinator: which setting stays, from live runs; the LAN p99 and 10,000-seed runs.
   At scale (lane xgroup-sql-5): `xgroup_lan refusals` runs Stop against Retry under many callers and correlated
   refusals, one JSON line a run; the SQL hookup waits on a Database over Groups and a Tablet over the records tables.
+- **Reading its own writes across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql-8; docs/design/xgroup.md):
+  `Options::answer_at` holds a cross-group answer, aborts included, until every touched group resolved it
+  (`Resolved`), with today's answer at the decision as the control; `commit_records` answers the touched groups'
+  newest closed time as its token. Tests force each mode's failure (a group behind, a retry into its own locks);
+  `xgroup_lan ryw` runs both at scale. Waits on the coordinator: which mode stays, from live runs.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the

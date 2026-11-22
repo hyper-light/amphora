@@ -3,7 +3,7 @@
 //! over [`Database`]s, each step one [`Database`] call: one atomic commit in its group, durable and,
 //! on a replicated group, committed by its quorum before it answers.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -563,11 +563,28 @@ pub enum OnRefused {
     Retry,
 }
 
+/// When a transaction across groups answers its caller (AC-T1.10.1, lane xgroup-sql-8; the A/B
+/// switch for read-your-writes across groups).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AnswerAt {
+    /// Today's, the control: once its outcome is decided ([`Event::Answer`]). Its groups apply or
+    /// drop its rows as they resolve it afterwards, so a read straight after the answer can miss
+    /// its rows in a group that hasn't resolved it yet, and a retry straight after an abort can
+    /// run into the transaction's own locks.
+    #[default]
+    Decided,
+    /// Once every group it touched has resolved it ([`Event::Finished`]), aborts included: every
+    /// row it wrote is in its group and every lock it held is gone before the caller hears. The
+    /// caller waits the resolution's one more round of steps for it.
+    Resolved,
+}
+
 /// How a [`Cluster`] runs beyond its groups and protocol.
 #[derive(Clone, Default)]
 pub struct Options {
     pub on_refused: OnRefused,
     pub fault: Option<Fault>,
+    pub answer_at: AnswerAt,
 }
 
 /// What a [`Cluster`] counts (AC-T1.10.6): refusals by kind, retries, steps and transactions held
@@ -582,6 +599,9 @@ pub struct Counted {
     pub held_txns: u64,
     pub held_txns_most: u64,
     pub stops: u64,
+    /// Answers decided and held for their resolution ([`AnswerAt::Resolved`]): now, and at most.
+    pub answers_held: u64,
+    pub answers_held_most: u64,
     pub latencies: Latencies,
 }
 
@@ -596,6 +616,8 @@ impl std::fmt::Debug for Counted {
             .field("held_txns", &self.held_txns)
             .field("held_txns_most", &self.held_txns_most)
             .field("stops", &self.stops)
+            .field("answers_held", &self.answers_held)
+            .field("answers_held_most", &self.answers_held_most)
             .field("answered", &self.latencies.count())
             .field("p50_p99_p999", &self.percentiles())
             .finish()
@@ -831,6 +853,7 @@ impl Cluster {
             carried: Arc::clone(&carried),
             options,
             held: BTreeMap::new(),
+            answers: BTreeMap::new(),
             instruments: Arc::clone(&instruments),
         };
         let driver = std::thread::Builder::new()
@@ -913,8 +936,11 @@ impl Cluster {
 /// A Records transaction of `namespace` whose rows span groups, committed through `cluster`
 /// (AC-T1.10.1, lane xgroup-sql-6): its writes as [`record_key`]s, in every group or none, each
 /// group's rows at one revision there; a row written twice keeps its last write, as a single-group
-/// commit does. Answers the cross-group timestamp (Ada's decision: the one the session tokens use,
-/// [`Token::at`]): the newest commit stamp any group answered with after the transaction's steps.
+/// commit does. Answers the cross-group timestamp, a hybrid logical clock's (Ada's decision: the
+/// commit's revision across groups is the one the session tokens use, [`Token::at`]): the newest
+/// closed time of every group it touched, taken once the commit answered ([`closed_after`]). Under
+/// [`AnswerAt::Resolved`] every group has applied its rows by then, so a read that carries the
+/// token reads them in any group; under the control a group may not have yet.
 /// Conditions aren't carried into the coordinator's prepare yet: a transaction with any is refused.
 pub fn commit_records(
     cluster: &Cluster,
@@ -943,8 +969,13 @@ pub fn commit_records(
         reads: Vec::new(),
         writes: writes.into_iter().collect(),
     };
+    let touched: BTreeSet<GroupId> = txn
+        .writes
+        .iter()
+        .map(|(key, _)| (cluster.route)(key))
+        .collect();
     match cluster.commit(txn, until)? {
-        Answer::Committed { .. } => Ok(Token::at(cluster.carried.load(Ordering::Acquire))),
+        Answer::Committed { .. } => closed_after(cluster, &touched, until),
         Answer::Aborted(Why::Conflict(key)) => Err(match record_of(&key) {
             Ok(Some((_, family, row))) => Refusal::Conflict {
                 family: family.into(),
@@ -958,6 +989,31 @@ pub fn commit_records(
         ))),
         Answer::Unknown => Err(Refusal::UnknownOutcome),
     }
+}
+
+/// The token past a commit's writes in `touched` groups, taken after it answered: the newest closed
+/// time any of them published ([`Database::session_token`], microseconds since the Unix epoch, the
+/// groups' one hybrid logical clock), so a replica of any of them serves a read that carries it
+/// once it has applied everything up to that time. A group that keeps no closed time (standalone:
+/// its reads see every write) adds nothing. A group on a node adds nothing yet: its step's reply
+/// doesn't carry its closed time.
+fn closed_after(
+    cluster: &Cluster,
+    touched: &BTreeSet<GroupId>,
+    until: Instant,
+) -> Result<Token, Refusal> {
+    let mut micros = 0;
+    for group in touched {
+        let member = usize::try_from(*group)
+            .ok()
+            .and_then(|i| cluster.groups.get(i));
+        if let Some(Member::Local(database)) = member
+            && let Some(token) = database.session_token(until)?
+        {
+            micros = micros.max(token.micros);
+        }
+    }
+    Ok(Token::at(micros))
 }
 
 /// A transaction whose rows are all in this group, in the group's one database transaction:
@@ -1067,6 +1123,9 @@ struct Driver {
     /// ([`OnRefused::Retry`]): its group, transaction, envelope and refusals so far. At most the
     /// steps the coordinator has out.
     held: BTreeMap<(Instant, u64), Held>,
+    /// Each decided transaction's answer, held for its caller until every group it touched has
+    /// resolved it ([`AnswerAt::Resolved`]). At most the transactions the coordinator runs.
+    answers: BTreeMap<TxnId, Answer>,
     instruments: Instruments,
 }
 
@@ -1196,9 +1255,15 @@ impl Driver {
             match event {
                 Event::Send(send) => self.send(send.id, send.group, send.txn, send.envelope, 0)?,
                 Event::Answer { txn, answer, .. } => {
-                    if let Some(waiter) = self.waiters.remove(&txn) {
-                        // A caller gone by now needs no answer.
-                        let _ = waiter.send(Ok(answer));
+                    // An unknown outcome has no resolution of this incarnation's to wait for.
+                    let hold = self.options.answer_at == AnswerAt::Resolved
+                        && !matches!(answer, Answer::Unknown)
+                        && self.waiters.contains_key(&txn);
+                    if hold {
+                        self.answers.insert(txn, answer);
+                        self.count_answers();
+                    } else {
+                        self.answer(txn, answer);
                     }
                     // Without a step timed yet (every step of it lost), the caller's deadline holds.
                     if let Some(deadline) = self.deadlines.get_mut(&txn)
@@ -1209,6 +1274,10 @@ impl Driver {
                 }
                 Event::Finished { txn, .. } => {
                     self.deadlines.remove(&txn);
+                    if let Some(answer) = self.answers.remove(&txn) {
+                        self.count_answers();
+                        self.answer(txn, answer);
+                    }
                 }
                 Event::Ready => {
                     if let Some(ready) = self.ready.take() {
@@ -1223,6 +1292,22 @@ impl Driver {
             }
         }
         Ok(())
+    }
+
+    /// Answers `txn`'s caller, if it still waits.
+    fn answer(&mut self, txn: TxnId, answer: Answer) {
+        if let Some(waiter) = self.waiters.remove(&txn) {
+            // A caller gone by now needs no answer.
+            let _ = waiter.send(Ok(answer));
+        }
+    }
+
+    fn count_answers(&self) {
+        let held = u64::try_from(self.answers.len()).unwrap_or(u64::MAX);
+        counted(&self.instruments, |c| {
+            c.answers_held = held;
+            c.answers_held_most = c.answers_held_most.max(held);
+        });
     }
 
     /// When step of `txn` must be answered by, and whether it may be sampled.
@@ -1391,6 +1476,15 @@ impl Driver {
 
     fn stop(&mut self, refusal: &Refusal) {
         counted(&self.instruments, |c| c.stops = c.stops.saturating_add(1));
+        // A held answer's resolution is the next incarnation's to finish, so its rows may not be
+        // readable yet: its caller hears the outcome is unknown to it, never "stopped", which a
+        // caller may take for "not done" and run a committed transaction again.
+        for txn in std::mem::take(&mut self.answers).into_keys() {
+            if let Some(waiter) = self.waiters.remove(&txn) {
+                let _ = waiter.send(Err(Refusal::UnknownOutcome));
+            }
+        }
+        self.count_answers();
         for (_, waiter) in std::mem::take(&mut self.waiters) {
             let _ = waiter.send(Err(refusal.clone()));
         }
@@ -1632,6 +1726,7 @@ mod sessions {
                     let options = Options {
                         on_refused,
                         fault: Some(refusing(&groups, times, refusal)),
+                        ..Options::default()
                     };
                     let cluster = open_over(&dbs, 1, protocol, options);
                     let answer = cluster.commit(across(2), until());
@@ -1688,6 +1783,7 @@ mod sessions {
                     let options = Options {
                         on_refused: OnRefused::Stop,
                         fault: Some(fault),
+                        ..Options::default()
                     };
                     let failing = open_over(&dbs, 1, protocol, options);
                     // The caller hears the failure or the answer; the rows decide.
@@ -1875,17 +1971,22 @@ mod sessions {
         }
     }
 
-    /// AC-T1.10.1 (lane xgroup-sql-6): a Records transaction across three groups through
-    /// [`commit_records`], both protocols: its rows read back in each group, the answer is a
-    /// cross-group timestamp, a row under another transaction's lock is refused as a conflict, and
-    /// conditions are refused until the prepare carries them.
+    /// AC-T1.10.1 (lanes xgroup-sql-6 and xgroup-sql-8): a Records transaction across three groups
+    /// through [`commit_records`], both protocols, answered once resolved: its rows read back in
+    /// each group straight after the answer, the answer is a cross-group timestamp, a row under
+    /// another transaction's lock is refused as a conflict, and conditions are refused until the
+    /// prepare carries them.
     #[test]
     fn ac_t1_10_1_commit_records_writes_rows_in_every_group() {
         use amphora_api::{Cond, Consistency, Records, Tx, Write};
         for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
             let dir = tempfile::tempdir().unwrap();
             let dbs = databases(dir.path(), 3);
-            let cluster = open_over(&dbs, 1, protocol, Options::default());
+            let options = Options {
+                answer_at: AnswerAt::Resolved,
+                ..Options::default()
+            };
+            let cluster = open_over(&dbs, 1, protocol, options);
             let tx = |v: u8| Tx {
                 conds: Vec::new(),
                 writes: (0..3u8)
@@ -1932,6 +2033,190 @@ mod sessions {
                 commit_records(&cluster, "ns", &conditional, until()),
                 Err(Refusal::Invalid { .. })
             ));
+        }
+    }
+
+    /// A first transaction held back at its resolution in one group, as a group behind the
+    /// decision is (slow, or its leader moving): the fault, the instant the resolution reached
+    /// the group, and the gate the test opens to let it through.
+    struct Gate {
+        fault: Fault,
+        reached: Receiver<()>,
+        open: SyncSender<()>,
+    }
+
+    /// Holds the first transaction this incarnation begins at its first resolution step in group
+    /// `at` until the gate opens. With `recovered_first`, a recovery decides that transaction
+    /// aborted at its anchor just before its two-phase decision lands there, so it aborts with
+    /// every lock of it held.
+    fn gate(dbs: &[Database], at: GroupId, recovered_first: bool) -> Gate {
+        let (reach, reached) = mpsc::sync_channel(1);
+        let (open, opened) = mpsc::sync_channel(1);
+        let opened = Mutex::new(opened);
+        let first: Mutex<Option<TxnId>> = Mutex::new(None);
+        let held = std::sync::atomic::AtomicBool::new(false);
+        let dbs = dbs.to_vec();
+        let fault: Fault = Arc::new(move |here, envelope: &Envelope| {
+            let txn = envelope
+                .step
+                .txn()
+                .filter(|txn| txn.epoch == envelope.epoch)?;
+            if *first.lock().unwrap().get_or_insert(txn) != txn {
+                return None;
+            }
+            match &envelope.step {
+                crate::xgroup::Step::Decide {
+                    outcome: Outcome::Committed,
+                    ..
+                } if recovered_first => {
+                    let anchor = &dbs[usize::try_from(here).unwrap()];
+                    anchor
+                        .call_internal(until(), move |db| {
+                            SqlTablet::new(db).set_record(txn, &Record::Decided(Outcome::Aborted))
+                        })
+                        .unwrap();
+                }
+                crate::xgroup::Step::Resolve { .. }
+                    if here == at && !held.swap(true, Ordering::AcqRel) =>
+                {
+                    reach.send(()).unwrap();
+                    opened.lock().unwrap().recv().unwrap();
+                }
+                _ => {}
+            }
+            None
+        });
+        Gate {
+            fault,
+            reached,
+            open,
+        }
+    }
+
+    /// A cluster over `dbs` answering at `answer_at` under `gate`, for `in_flight` callers.
+    fn open_gated(
+        dbs: &[Database],
+        protocol: Protocol,
+        gate: &Gate,
+        answer_at: AnswerAt,
+        in_flight: usize,
+    ) -> Cluster {
+        for group in dbs {
+            prepare(group, until()).unwrap();
+        }
+        let route = route_of(u32::try_from(dbs.len()).unwrap());
+        let members = dbs.iter().cloned().map(Member::Local).collect();
+        let options = Options {
+            fault: Some(Arc::clone(&gate.fault)),
+            answer_at,
+            ..Options::default()
+        };
+        Cluster::open_with(members, route, 1, protocol, in_flight, options, until()).unwrap()
+    }
+
+    /// AC-T1.10.1 (lane xgroup-sql-8), the A/B of when a transaction across groups answers,
+    /// forced: group 1's resolution held back (a group behind the decision). Under the control
+    /// the answer comes first and a read of group 1 straight after it misses the row it wrote;
+    /// answered once resolved, it waits for group 1, holding the answer meanwhile, and the read
+    /// finds the row. Both protocols.
+    #[test]
+    fn ac_t1_10_1_a_read_straight_after_the_answer_in_a_group_behind() {
+        use amphora_api::{Consistency, Records};
+        let read = |db: &Database| {
+            db.namespace("ns")
+                .unwrap()
+                .get("rows", &[1], Consistency::Linearizable, until())
+                .unwrap()
+                .map(|r| r.value)
+        };
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            for answer_at in [AnswerAt::Decided, AnswerAt::Resolved] {
+                let dir = tempfile::tempdir().unwrap();
+                let dbs = databases(dir.path(), 3);
+                let gate = gate(&dbs, 1, false);
+                let cluster = open_gated(&dbs, protocol, &gate, answer_at, 1);
+                std::thread::scope(|scope| {
+                    let (done, answered) = mpsc::sync_channel(1);
+                    let cluster = &cluster;
+                    scope.spawn(move || done.send(cluster.commit(across(4), until())).unwrap());
+                    gate.reached.recv().unwrap();
+                    if answer_at == AnswerAt::Resolved {
+                        // Group 1 hasn't resolved it: no answer can have come.
+                        assert!(
+                            matches!(answered.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                            "{protocol:?}: answered before group 1 resolved"
+                        );
+                        assert_eq!(cluster.counted().answers_held, 1, "{protocol:?}");
+                        gate.open.send(()).unwrap();
+                    }
+                    let answer = answered.recv().unwrap();
+                    assert!(
+                        matches!(answer, Ok(Answer::Committed { .. })),
+                        "{protocol:?} {answer_at:?}: {answer:?}"
+                    );
+                    match answer_at {
+                        AnswerAt::Decided => {
+                            assert_eq!(read(&dbs[1]), None, "{protocol:?}: group 1 wasn't behind");
+                            gate.open.send(()).unwrap();
+                        }
+                        AnswerAt::Resolved => {
+                            assert_eq!(read(&dbs[1]), Some(vec![4]), "{protocol:?}");
+                            let counted = cluster.counted();
+                            assert_eq!(counted.answers_held, 0, "{protocol:?} {counted:?}");
+                            assert_eq!(counted.answers_held_most, 1, "{protocol:?} {counted:?}");
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// AC-T1.10.1 (lane xgroup-sql-8), the A/B of when a transaction across groups answers,
+    /// forced: a two-phase transaction aborts with every lock of it held (a recovery decided it
+    /// aborted first) and its resolution in group 0 is held back, while a second caller may begin.
+    /// Under the control the abort answers first and the caller's retry runs into the first try's
+    /// own locks; answered once resolved, the abort comes once every lock is gone and the retry
+    /// commits.
+    #[test]
+    fn ac_t1_10_1_a_retry_straight_after_an_abort_meets_no_lock_of_its_own() {
+        for answer_at in [AnswerAt::Decided, AnswerAt::Resolved] {
+            let dir = tempfile::tempdir().unwrap();
+            let dbs = databases(dir.path(), 3);
+            let gate = gate(&dbs, 0, true);
+            // Two callers' room: with one, a retry waits behind the first try's resolution.
+            let cluster = open_gated(&dbs, Protocol::TwoPhase, &gate, answer_at, 2);
+            std::thread::scope(|scope| {
+                let (done, answered) = mpsc::sync_channel(1);
+                let cluster = &cluster;
+                scope.spawn(move || done.send(cluster.commit(across(5), until())).unwrap());
+                gate.reached.recv().unwrap();
+                if answer_at == AnswerAt::Resolved {
+                    assert!(
+                        matches!(answered.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                        "answered before group 0 dropped its locks"
+                    );
+                    gate.open.send(()).unwrap();
+                }
+                let answer = answered.recv().unwrap();
+                assert!(
+                    matches!(answer, Ok(Answer::Aborted(_))),
+                    "{answer_at:?}: {answer:?}"
+                );
+                let retry = cluster.commit(across(6), until());
+                match answer_at {
+                    AnswerAt::Decided => {
+                        assert!(
+                            matches!(&retry, Ok(Answer::Aborted(Why::Conflict(key)))
+                                if (0..3).any(|k| row(k) == *key)),
+                            "the control's retry met no lock of the first try's: {retry:?}"
+                        );
+                        gate.open.send(()).unwrap();
+                    }
+                    AnswerAt::Resolved => {
+                        assert!(matches!(retry, Ok(Answer::Committed { .. })), "{retry:?}");
+                    }
+                }
+            });
         }
     }
 }
