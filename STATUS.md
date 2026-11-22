@@ -420,7 +420,7 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   one second, half-done cross-group transactions finished by their records (T-T1.12.X1). Not yet:
   the source's digest taken by the shipping thread itself; cuts across nodes' clocks. Incremental
   bases (T-T1.12.I1 to I3): a new base keeps the latest's chunks the log left unchanged, due once the
-  log outweighs what it would copy; after a reopen the first base is still whole.
+  log outweighs what it would copy, after a reopen too.
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
