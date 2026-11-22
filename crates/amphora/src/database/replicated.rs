@@ -170,7 +170,7 @@ impl Client {
         operation: Operation,
         application: Option<crate::database::Application>,
         until: Instant,
-    ) -> Result<Answer, Refusal> {
+    ) -> Result<Answered, Refusal> {
         self.handle.submit(namespace, operation, application, until)
     }
     pub(super) fn handle(&self) -> ReplicaHandle {
@@ -320,8 +320,6 @@ struct Closed {
     lag: Option<u64>,
     /// The index this replica applied.
     applied: u64,
-    /// The highest index whose write this owner answered: a token taken after the answer names it.
-    answered: u64,
 }
 /// The readers of a replica's local reads (replication.md, "A local read on a replica"):
 /// connections of their own on the machine's database, each on what the machine committed when
@@ -644,7 +642,7 @@ enum Input {
         // The handle's application claim, checked against the floor at the session's base.
         application: Option<crate::database::Application>,
         until: Instant,
-        response: Response<Answer>,
+        response: Response<Answered>,
     },
     Receive {
         from: u64,
@@ -723,10 +721,17 @@ struct Pending {
     until: Instant,
     namespace: String,
     author: Author,
-    response: Option<Response<Answer>>,
+    response: Option<Response<Answered>>,
     phase: Phase,
     // Keep admission charged while its command is in flight, not just while queued.
     _reservation: Reservation,
+}
+/// A submitted operation's answer, with its write's own session token (`tokens`): the index and
+/// time of the entry its group's log took for it, so a session that reads with the token waits
+/// for this write and for no later one. None for an answer that wrote nothing.
+pub(super) struct Answered {
+    pub(super) answer: Answer,
+    pub(super) token: Option<Token>,
 }
 enum Phase {
     Barrier(Option<Operation>),
@@ -1158,7 +1163,7 @@ impl ReplicaHandle {
         operation: Operation,
         application: Option<crate::database::Application>,
         until: Instant,
-    ) -> Result<Answer, Refusal> {
+    ) -> Result<Answered, Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
@@ -1608,7 +1613,6 @@ fn open_on<F: BlockFile + 'static>(
             time: replica.machine().closed(),
             lag: None,
             applied: replica.applied().index,
-            answered: 0,
         }),
         moved: std::sync::Condvar::new(),
         sessions: tokens::SessionMeter::default(),
@@ -3378,9 +3382,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self.replica.applied().index != self.published {
             self.refresh()?;
         }
-        // And the point its answers are at, which a session's token takes (`tokens`).
+        // And its applied point, so that a read carrying an answer's token is served here at
+        // once (`tokens`).
         if !output.answers.is_empty() {
-            self.publish_point(self.replica.applied().index)?;
+            self.publish_closed()?;
         }
         for applied in output.answers {
             let matches = self
@@ -3389,7 +3394,14 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .is_some_and(|p| p.context == applied.context);
             if matches && let Some(mut pending) = self.pending.take() {
                 let result = match pending.phase {
-                    Phase::Proposed(value) => applied.result.map(|()| value),
+                    // The write's own token: its entry's index and time (`tokens`).
+                    Phase::Proposed(value) => applied.result.map(|()| Answered {
+                        answer: value,
+                        token: Some(Token {
+                            micros: applied.time.unwrap_or(0),
+                            index: applied.index,
+                        }),
+                    }),
                     // Answered on the commit: the apply must decide as the log did.
                     Phase::Answered { result: given, .. } => {
                         if given.is_ok() != applied.result.is_ok() {
@@ -3532,16 +3544,16 @@ impl<F: BlockFile + 'static> Actor<F> {
             return;
         };
         let index = entry.index;
+        // The entry's stamp: a lower bound of the time its apply gives it, which is the larger of
+        // the stamp and one past its predecessor's (`closed::next`).
+        let stamp = crate::replication::closed::open(&entry.data)
+            .ok()
+            .and_then(|(stamp, _)| stamp);
         let result = match crate::replication::verdict(&entry.data, before) {
             Ok(result) => result,
             // A malformed entry fences at its apply, which answers.
             Err(_) => return,
         };
-        // The point a session's token takes, published before the answer (`tokens`). Unpublished
-        // (a poisoned lock), no token can be read either, so none is stale.
-        if self.publish_point(index).is_err() {
-            return;
-        }
         let Some(mut pending) = self.pending.take() else {
             return;
         };
@@ -3553,7 +3565,18 @@ impl<F: BlockFile + 'static> Actor<F> {
             },
         ) && let Some(response) = pending.response.take()
         {
-            answer(response, result.map(|()| value));
+            // The write's own token (`tokens`): its index, and its stamp for its time. A read with
+            // it here waits for this member to apply the entry.
+            answer(
+                response,
+                result.map(|()| Answered {
+                    answer: value,
+                    token: Some(Token {
+                        micros: stamp.unwrap_or(0),
+                        index,
+                    }),
+                }),
+            );
         }
         self.pending = Some(pending);
     }
@@ -3828,13 +3851,9 @@ impl<F: BlockFile + 'static> Actor<F> {
     }
     /// Publishes this replica's closed time if it moved since the last step, with the lag it
     /// measured, and tells the reads waiting for it.
-    fn publish_closed(&mut self) -> Result<(), Refusal> {
-        self.publish_point(0)
-    }
-    /// Publishes this replica's closed time, its applied index and, past what it published, the
-    /// index `answered` it is about to answer a write at, if any moved; and tells the reads
+    /// Its applied index too, so it publishes both whenever either moved, and tells the reads
     /// waiting for them (`tokens`): an event of the owner's step, never a timer's.
-    fn publish_point(&mut self, answered: u64) -> Result<(), Refusal> {
+    fn publish_closed(&mut self) -> Result<(), Refusal> {
         let time = self.replica.machine().closed();
         let applied = self.replica.applied().index;
         let mut closed = locked(&self.control.closed)?;
@@ -3846,7 +3865,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             time,
             lag: if moved { self.lag.p99() } else { closed.lag },
             applied,
-            answered: closed.answered.max(answered),
         };
         if *closed == next {
             return Ok(());
@@ -4043,7 +4061,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                 if self.at >= pending.until {
                     Err(Refusal::Timeout)
                 } else if prepared.is_empty() {
-                    Ok(value)
+                    Ok(Answered {
+                        answer: value,
+                        token: None,
+                    })
                 } else {
                     match prepared
                         .encode()
@@ -5145,7 +5166,7 @@ mod tests {
         fn settle(
             &mut self,
             pump: &mut Pump<'_>,
-            answer: &mpsc::Receiver<Result<Answer, Refusal>>,
+            answer: &mpsc::Receiver<Result<Answered, Refusal>>,
         ) -> Result<Vec<u8>, Refusal> {
             self.answer(pump, answer).map(called)
         }
@@ -5716,7 +5737,7 @@ mod tests {
         fn answer_or_stall(
             &mut self,
             pump: &mut Pump<'_>,
-            answer: &mpsc::Receiver<Result<Answer, Refusal>>,
+            answer: &mpsc::Receiver<Result<Answered, Refusal>>,
             gates: &[Arc<Gate>],
         ) -> Option<Result<Vec<u8>, Refusal>> {
             let mut still = 0;
@@ -5939,6 +5960,7 @@ mod tests {
         let refused = owner.release(Output {
             answers: vec![crate::replication::Applied {
                 index,
+                time: None,
                 context,
                 result: Err(api::invalid("test", "the apply refuses")),
             }],
@@ -6583,7 +6605,7 @@ mod tests {
         until: Instant,
         namespace: &str,
         operation: Operation,
-    ) -> mpsc::Receiver<Result<Answer, Refusal>> {
+    ) -> mpsc::Receiver<Result<Answered, Refusal>> {
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
@@ -6605,7 +6627,7 @@ mod tests {
         client: &Client,
         until: Instant,
         f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
-    ) -> mpsc::Receiver<Result<Answer, Refusal>> {
+    ) -> mpsc::Receiver<Result<Answered, Refusal>> {
         let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
             Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
         }))));
@@ -6636,8 +6658,8 @@ mod tests {
         driven.step();
         receiver.try_recv().unwrap()
     }
-    fn called(answer: Answer) -> Vec<u8> {
-        match answer {
+    fn called(answered: Answered) -> Vec<u8> {
+        match answered.answer {
             Answer::Called(value) => *value.downcast::<Vec<u8>>().unwrap(),
             _ => panic!("wrong actor reply"),
         }
@@ -10906,10 +10928,12 @@ mod tests {
                 api::REQUEST_MAX,
             )
             .unwrap();
-        driven.answer(pump, &receiver).map(|answer| match answer {
-            Answer::Called(value) => *value.downcast::<R>().unwrap(),
-            _ => panic!("wrong actor reply"),
-        })
+        driven
+            .answer(pump, &receiver)
+            .map(|answered| match answered.answer {
+                Answer::Called(value) => *value.downcast::<R>().unwrap(),
+                _ => panic!("wrong actor reply"),
+            })
     }
     /// A raise of kiln.host-store's floor to `version` at `client`, by a handle bound to it.
     fn raise(
@@ -11144,7 +11168,10 @@ mod tests {
         let _ = driven.answer(&mut pump, &added);
         settled(&mut driven, &mut pump, 3, &[5]);
         match &first {
-            Ok(Answer::Called(value)) => {
+            Ok(Answered {
+                answer: Answer::Called(value),
+                ..
+            }) => {
                 let (version, learners) = value.downcast_ref::<(u32, Vec<u64>)>().unwrap();
                 assert_eq!(*version, 7);
                 assert!(!learners.contains(&5), "raised while 5 was a member");
@@ -11420,7 +11447,7 @@ mod tests {
 
     /// Enqueues a raise of kiln.host-store's floor to 7 at `client`, by a handle bound to it,
     /// without waiting.
-    fn raise_at(client: &Client, until: Instant) -> mpsc::Receiver<Result<Answer, Refusal>> {
+    fn raise_at(client: &Client, until: Instant) -> mpsc::Receiver<Result<Answered, Refusal>> {
         let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
             let floor = crate::database::application::raise(db, kiln(7), true)?
                 .map_err(|refused| anyhow::Error::from(refused.refusal))?;
@@ -14978,7 +15005,7 @@ mod tests {
         // Stale bases the leader moved by their read sets.
         moved: u64,
     }
-    type Answering = mpsc::Receiver<Result<Answer, Refusal>>;
+    type Answering = mpsc::Receiver<Result<Answered, Refusal>>;
     fn list(db: &mut Db, key: u64) -> anyhow::Result<Vec<String>> {
         let mut out = Vec::new();
         db.query_owned(&format!("SELECT v FROM lists WHERE k = {key}"), [], |row| {

@@ -2589,7 +2589,8 @@ ends, not on a flush of the owner's own.
 ## Decision (lane ryw-1): read-your-writes by session tokens (2026-11-22, kiln goal 8119f25d)
 
 Ada's order (2026-11-22): read-your-writes on any replica, built behind a switch with today's read as the control,
-decided from live runs. Requirements AC-T1.10.R1 to R3, tests T-T1.10.R1 to R3 (docs/requirements.toml, lane ryw-1).
+decided from live runs. Requirements AC-T1.10.R1 to R4, tests T-T1.10.R1 to R4 (docs/requirements.toml, lanes ryw-1
+and ryw-3).
 
 ### What was already there
 
@@ -2608,9 +2609,11 @@ decided from live runs. Requirements AC-T1.10.R1 to R3, tests T-T1.10.R1 to R3 (
 - **(a) `ReadMode::Latest`, the control and today's read.** `Database::query_session(Latest, ..)` is `Database::query`:
   every read crosses the leader's ReadIndex and waits for applied to reach the latest commit, token or not.
 - **(b) `ReadMode::Session`, session tokens.** Built in this change:
-  - *Tokens.* `Database::session_token` after a write's answer gives `Token { micros, index }`. `micros` is the group's
-    time, `index` the commit index. The owner publishes both before it answers, at the leader's apply and at a follower's
-    commit answer (`Actor::publish_point`). Within one group the two rise together. `micros` is in the same domain as the
+  - *Tokens.* Each write's answer carries its own `Token { micros, index }` (`Database::call_session`,
+    `Database::execute_session`; lane ryw-3). `index` is the log position of the write's own entry. `micros` is the
+    group's time once that entry is applied, at the leader's apply, or the entry's stamp, at a follower's commit
+    answer. A call that wrote nothing has no token. The leader publishes its applied point before it answers
+    (`Actor::publish_closed`). Within one group the two rise together. `micros` is in the same domain as the
     cross-group coordinator's timestamps (microseconds since the Unix epoch), so a single-group commit and a cross-group
     one compare in one order, time first (Ada's decision: a cross-group commit answers with its timestamp,
     `Token::at`; lane xgroup-sql-6 stamps it). A session keeps the latest of its tokens (`Token::after`).
@@ -2654,17 +2657,22 @@ write (must be 0), each follower's counters, and the process's CPU seconds and p
 - T-T1.10.R3 `t_t1_10_r3_a_session_reads_its_writes_across_leader_changes`: clocks an hour apart and the lead passed
   1, 2, 3, 1. Each new write's token orders after the last, every token read served sees all of the session's writes,
   and once caught up every member's answer equals the leader's state (the control's answer).
+- T-T1.10.R4 `t_t1_10_r4_each_session_waits_only_for_its_own_writes`: sessions A and B write at once through the
+  leader, and each answer names its own write (A's before B's). With a follower cut off after it holds A's write, B
+  writes again. A's read on that follower is served at once, with no wait or redirect, though B wrote since. B's read
+  is answered with its newer write once the follower rejoins.
 
 ### Limits stated
 
-- A token taken after an answer names the highest index this owner has answered, so with concurrent writers it can name
-  a later write than the caller's. A read then waits for more than it needs, but it never misses its own write. The
-  exact token per answer needs the answer to carry it (a change of `Answer`).
+- Each token names its own write's entry, so with concurrent writers a session waits for its own writes and for no
+  one else's (AC-T1.10.R4). A session that keeps the latest of its tokens (`Token::after`) waits for its latest write,
+  and so for every earlier one of its own in that group.
 - A token's `index` belongs to its group. A session that writes to several groups keeps one token per database, plus
   `Token::at` for a cross-group commit. Mixing two groups' indexes in one token stays correct, through redirects, but
   waits.
-- A follower's commit answer carries its closed time as of that answer, which is a lower bound. That replica's own
-  reads check `index`, but a cross-group comparison of such a token by time alone is weaker until it applies.
+- A follower's commit answer carries its entry's stamp, which is a lower bound of the entry's time (the apply takes
+  the larger of the stamp and one past the time before it, `closed::next`). Reads check `index` too, so no replica
+  serves it early, but a cross-group comparison of such a token by time alone is weaker until it applies.
 - The power-cut case (the nemesis with held flushes) waits on lane repl-measure-8's fix of
   `a_member_power_cut_loses_no_acknowledged_replicated_write`. It is not built on here.
 
