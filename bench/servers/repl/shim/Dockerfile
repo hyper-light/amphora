@@ -4,7 +4,8 @@ FROM ubuntu:24.04 AS build
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends golang-go gcc libc6-dev libdqlite-dev libsqlite3-dev ca-certificates git pkg-config
 WORKDIR /src
 COPY main.go .
-RUN go mod init shim && go get github.com/canonical/go-dqlite/v2@v2.0.0 github.com/mattn/go-sqlite3@v1.14.53 && go mod tidy \
+# go-dqlite v1.22.0 builds against Ubuntu 24.04's libdqlite 1.16 (v2 needs 1.17).
+RUN go mod init shim && go get github.com/canonical/go-dqlite@v1.22.0 github.com/mattn/go-sqlite3@v1.14.53 && go mod tidy \
   && CGO_LDFLAGS_ALLOW="-Wl,-z,now" go build -tags libsqlite3 -o /shim .
 
 FROM ubuntu:24.04

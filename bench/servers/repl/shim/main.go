@@ -14,12 +14,13 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/canonical/go-dqlite/v2/app"
+	"github.com/canonical/go-dqlite/app"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -75,6 +76,18 @@ func main() {
 	var err error
 	switch *backend {
 	case "dqlite":
+		// dqlite binds the address it advertises, which must be an IP: a container's name becomes
+		// its address on the cluster's network.
+		if host, port, err := net.SplitHostPort(*address); err == nil && net.ParseIP(host) == nil {
+			ips, err := net.LookupIP(host)
+			if err != nil || len(ips) == 0 {
+				log.Fatalf("resolve %s: %v", host, err)
+			}
+			*address = net.JoinHostPort(ips[0].String(), port)
+		}
+		if err = os.MkdirAll(*dir, 0o755); err != nil {
+			log.Fatal(err)
+		}
 		opts := []app.Option{app.WithAddress(*address)}
 		if *join != "" {
 			opts = append(opts, app.WithCluster(strings.Split(*join, ",")))
@@ -144,7 +157,14 @@ func main() {
 			http.Error(w, "no leader", http.StatusServiceUnavailable)
 			return
 		}
-		_, _ = w.Write([]byte(info.Address))
+		// The leader by its container's name (the network's reverse lookup), as the script reads it.
+		addr := info.Address
+		if host, port, err := net.SplitHostPort(addr); err == nil {
+			if names, err := net.LookupAddr(host); err == nil && len(names) > 0 {
+				addr = net.JoinHostPort(strings.SplitN(names[0], ".", 2)[0], port)
+			}
+		}
+		_, _ = w.Write([]byte(addr))
 	})
 	http.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 		req, err := decode(r)
