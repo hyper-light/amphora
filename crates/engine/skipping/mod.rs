@@ -34,7 +34,7 @@ mod registry;
 mod scan;
 mod zone_map;
 
-pub use choose::{Chooser, ChooserStats, MethodStats, SkipMethod, Upkeep};
+pub use choose::{Chooser, ChooserStats, Lead, MethodStats, SkipMethod, Upkeep};
 pub use cracking::{CrackerColumn, CrackerStats};
 pub(crate) use leaves::{cracker_of_table, nanos_since};
 pub use leaves::{

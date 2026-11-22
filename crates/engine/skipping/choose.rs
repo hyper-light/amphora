@@ -31,6 +31,17 @@
 //! ([`Chooser::rebuild_due`]): zone maps from the cracker's own copy of the column (in the
 //! dropped map's zones), the cracker from the table. Write upkeep and build costs come from the
 //! caller in the scans' unit; the core reads no clock.
+//!
+//! Lane skip-7 (T-SKU.7): what the leader is chosen by, behind the [`Lead`] switch. Kept both,
+//! every write is applied to both summaries whichever leads, so their upkeep is paid either way
+//! and only the scan differs: [`Lead::Scan`] (T-SKU.2's rule, the control). Capped, the method not
+//! leading is the one whose upkeep is shed, so the choice decides which upkeep goes on being paid:
+//! [`Lead::Total`] compares each method's latest scan plus the write upkeep it cost over the
+//! latest stretch between filters (skip-5's decision: total cost). A method's upkeep is measured
+//! over every stretch it is kept, so a cracker's moves under write churn count against it before
+//! its next scan does. A leader's upkeep also counts toward what it has spent before the other is
+//! measured again, and the other's trial budget is its own total. A cracker built again keeps the
+//! cut points it had when it was dropped (T-SKU.8): its filters find their pieces cut as before.
 
 use super::{Candidates, CrackerColumn, RowWrite, SkipError, ZoneMap};
 
@@ -65,6 +76,9 @@ pub struct MethodStats {
     pub total_cost: u64,
     /// Write upkeep handed back for it, added up (lane skip-5, T-SKU.5).
     pub upkeep: u64,
+    /// The write upkeep it cost over the latest stretch between two filters while it was kept
+    /// (lane skip-7, T-SKU.7); `None` until a filter closed a stretch.
+    pub last_upkeep: Option<u64>,
     /// Times it was dropped for its upkeep, and built again for a trial.
     pub dropped: u64,
     pub rebuilt: u64,
@@ -78,6 +92,29 @@ pub enum Upkeep {
     KeepBoth,
     /// Drop the method not leading once its write upkeep passes its cost to build again.
     Capped,
+}
+
+/// What a [`Chooser`]'s leader is chosen by (lane skip-7, T-SKU.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Lead {
+    /// The latest measured scan alone (T-SKU.2's rule; the control, and [`Upkeep::KeepBoth`]'s:
+    /// both upkeeps are paid whichever leads).
+    #[default]
+    Scan,
+    /// The latest measured scan plus the write upkeep over the latest stretch between filters
+    /// ([`Upkeep::Capped`]'s: the method not leading has its upkeep shed).
+    Total,
+}
+
+impl Lead {
+    /// The rule an upkeep rule goes with: total cost where the choice decides whose upkeep is
+    /// paid, the scan alone where both are paid anyway.
+    pub fn for_upkeep(upkeep: Upkeep) -> Self {
+        match upkeep {
+            Upkeep::KeepBoth => Lead::Scan,
+            Upkeep::Capped => Lead::Total,
+        }
+    }
 }
 
 /// What a [`Chooser`] has done: per method, and how often the leader changed.
@@ -120,7 +157,15 @@ pub struct Chooser {
     cracker: Option<CrackerColumn>,
     /// The dropped zone map's zone starts: it is built again in the same zones.
     zone_starts: Vec<i64>,
+    /// The dropped cracker's cut points: it is cut at them again when built again (T-SKU.8).
+    crack_bounds: Vec<i64>,
     upkeep: Upkeep,
+    lead: Lead,
+    /// Write upkeep each method has cost since the last filter (T-SKU.7).
+    upkeep_window: [u64; 2],
+    /// Whether each method was kept since the last filter: a stretch it was dropped for part of
+    /// is no measure of its upkeep (T-SKU.7).
+    kept_stretch: [bool; 2],
     /// Each method's latest measured cost to build (zone maps, cracking); `None`: never measured,
     /// so never dropped.
     build_cost: [Option<u64>; 2],
@@ -142,18 +187,35 @@ impl Chooser {
     }
 
     /// Lane skip-5 (T-SKU.5): with an upkeep rule and each method's measured build cost (zone
-    /// maps, cracking), in the scans' unit.
+    /// maps, cracking), in the scans' unit; the leader chosen as the upkeep rule goes with
+    /// ([`Lead::for_upkeep`]).
     pub fn with_upkeep(
         zones: ZoneMap,
         cracker: CrackerColumn,
         upkeep: Upkeep,
         build_cost: [Option<u64>; 2],
     ) -> Self {
+        Self::with_rules(zones, cracker, upkeep, Lead::for_upkeep(upkeep), build_cost)
+    }
+
+    /// Lane skip-7 (T-SKU.7): with an upkeep rule and a lead rule of the caller's (the A/B's
+    /// candidates), and each method's measured build cost.
+    pub fn with_rules(
+        zones: ZoneMap,
+        cracker: CrackerColumn,
+        upkeep: Upkeep,
+        lead: Lead,
+        build_cost: [Option<u64>; 2],
+    ) -> Self {
         Self {
             zones: Some(zones),
             cracker: Some(cracker),
             zone_starts: Vec::new(),
+            crack_bounds: Vec::new(),
             upkeep,
+            lead,
+            upkeep_window: [0, 0],
+            kept_stretch: [true, true],
             build_cost,
             upkeep_since: [0, 0],
             stats: ChooserStats::default(),
@@ -179,6 +241,10 @@ impl Chooser {
 
     pub fn upkeep(&self) -> Upkeep {
         self.upkeep
+    }
+
+    pub fn lead(&self) -> Lead {
+        self.lead
     }
 
     /// Whether `method`'s summary is kept now.
@@ -232,6 +298,9 @@ impl Chooser {
     pub fn record_upkeep(&mut self, method: SkipMethod, cost: u64) {
         let entry = self.stats.of(method);
         entry.upkeep = entry.upkeep.saturating_add(cost);
+        if let Some(window) = self.upkeep_window.get_mut(slot(method)) {
+            *window = window.saturating_add(cost);
+        }
         let Some(since) = self.upkeep_since.get_mut(slot(method)) else {
             return;
         };
@@ -252,7 +321,14 @@ impl Chooser {
                     self.zone_starts = zones.starts();
                 }
             }
-            SkipMethod::Cracking => self.cracker = None,
+            SkipMethod::Cracking => {
+                if let Some(cracker) = self.cracker.take() {
+                    self.crack_bounds = cracker.bounds();
+                }
+            }
+        }
+        if let Some(kept) = self.kept_stretch.get_mut(slot(method)) {
+            *kept = false;
         }
         let entry = self.stats.of(method);
         entry.dropped = entry.dropped.saturating_add(1);
@@ -301,10 +377,70 @@ impl Chooser {
         Ok(())
     }
 
-    /// The cracker the caller built again from the table, and what that cost.
-    pub fn install_cracker(&mut self, cracker: CrackerColumn, cost: u64) {
+    /// The cracker the caller built again from the table, and what that cost. Lane skip-7
+    /// (T-SKU.8): it is cut again at the dropped cracker's cut points first, timed by `now` (the
+    /// caller's clock, in the scans' unit) and added to its build cost; a refused cut leaves the
+    /// method dropped.
+    pub fn install_cracker(
+        &mut self,
+        mut cracker: CrackerColumn,
+        cost: u64,
+        now: &mut dyn FnMut() -> u64,
+    ) -> Result<(), SkipError> {
+        let started = now();
+        cracker.crack_at(&self.crack_bounds)?;
+        let cost = cost.saturating_add(now().saturating_sub(started));
         self.cracker = Some(cracker);
+        self.crack_bounds = Vec::new();
         self.rebuilt(SkipMethod::Cracking, cost);
+        Ok(())
+    }
+
+    /// `method`'s cost as the lead rule counts it: its latest scan, plus (under [`Lead::Total`])
+    /// the write upkeep of its latest stretch between filters.
+    fn cost_of(&self, method: SkipMethod) -> Option<u64> {
+        let stats = self.stats.get(method);
+        let scan = stats.last_cost?;
+        Some(match self.lead {
+            Lead::Scan => scan,
+            Lead::Total => scan.saturating_add(stats.last_upkeep.unwrap_or(0)),
+        })
+    }
+
+    /// The method the lead rule picks, once both are measured (zone maps on a tie).
+    fn leading(&self) -> Option<SkipMethod> {
+        let zone = self.cost_of(SkipMethod::ZoneMaps)?;
+        let crack = self.cost_of(SkipMethod::Cracking)?;
+        Some(if crack < zone {
+            SkipMethod::Cracking
+        } else {
+            SkipMethod::ZoneMaps
+        })
+    }
+
+    /// A filter ends the stretch of writes since the last one: the upkeep of each method kept over
+    /// all of it is its latest measure (one dropped for any of it, or built again during it,
+    /// keeps the measure it had while kept), and under [`Lead::Total`] the leader's counts toward
+    /// what it has spent.
+    fn close_stretch(&mut self) {
+        for method in [SkipMethod::ZoneMaps, SkipMethod::Cracking] {
+            let keeps = self.keeps(method);
+            let (Some(window), Some(kept)) = (
+                self.upkeep_window.get_mut(slot(method)),
+                self.kept_stretch.get_mut(slot(method)),
+            ) else {
+                continue;
+            };
+            let upkeep = std::mem::take(window);
+            let whole = std::mem::replace(kept, keeps);
+            if !(keeps && whole) {
+                continue;
+            }
+            self.stats.of(method).last_upkeep = Some(upkeep);
+            if self.lead == Lead::Total && self.leader == Some(method) {
+                self.spent = self.spent.saturating_add(upkeep);
+            }
+        }
     }
 
     fn rebuilt(&mut self, method: SkipMethod, cost: u64) {
@@ -327,24 +463,13 @@ impl Chooser {
     /// The method that answers the next filter, and whether it is a trial (measuring a method
     /// that isn't the leader).
     pub fn next_method(&self) -> (SkipMethod, bool) {
-        let zone = self.stats.zone_maps.last_cost;
-        let crack = self.stats.cracking.last_cost;
-        let (Some(zone), Some(crack)) = (zone, crack) else {
-            return match zone {
+        let Some(leader) = self.leading() else {
+            return match self.stats.zone_maps.last_cost {
                 None => (SkipMethod::ZoneMaps, true),
                 Some(_) => (SkipMethod::Cracking, true),
             };
         };
-        let leader = if crack < zone {
-            SkipMethod::Cracking
-        } else {
-            SkipMethod::ZoneMaps
-        };
-        let other_cost = if leader == SkipMethod::ZoneMaps {
-            crack
-        } else {
-            zone
-        };
+        let other_cost = self.cost_of(leader.other()).unwrap_or(0);
         // Lane skip-5 (T-SKU.5): a dropped method's trial also pays its build.
         let other_cost = if self.keeps(leader.other()) {
             other_cost
@@ -365,6 +490,7 @@ impl Chooser {
     /// The rows a filter `lo <= value <= hi` may need, and the method that named them: hand its
     /// cost back with [`Chooser::record`].
     pub fn candidates(&mut self, lo: i64, hi: i64) -> Result<(Candidates, SkipMethod), SkipError> {
+        self.close_stretch();
         let (method, trial) = match self.next_method() {
             // A dropped method waits for its build (`rebuild_due`): the leader answers.
             (method, true) if !self.keeps(method) => (method.other(), false),
@@ -403,17 +529,13 @@ impl Chooser {
         entry.measured = entry.measured.saturating_add(1);
         entry.last_cost = Some(cost);
         entry.total_cost = entry.total_cost.saturating_add(cost);
-        let (Some(zone), Some(crack)) = (
-            self.stats.zone_maps.last_cost,
-            self.stats.cracking.last_cost,
-        ) else {
+        let Some(leader) = self.leading() else {
             return;
         };
-        let leader = if crack < zone {
-            SkipMethod::Cracking
-        } else {
-            SkipMethod::ZoneMaps
-        };
+        let (zone, crack) = (
+            self.cost_of(SkipMethod::ZoneMaps).unwrap_or(0),
+            self.cost_of(SkipMethod::Cracking).unwrap_or(0),
+        );
         match self.leader {
             Some(previous) if previous == method && previous == leader => {
                 self.spent = self.spent.saturating_add(cost);
@@ -429,9 +551,10 @@ impl Chooser {
                     tracing::debug!(
                         target: "amphora.skipping",
                         leader = ?leader,
+                        lead = ?self.lead,
                         zone_maps_cost = zone,
                         cracking_cost = crack,
-                        "skipping method changed: the latest measured scan was cheaper"
+                        "skipping method changed: its latest measured cost (by the lead rule) was cheaper"
                     );
                 }
                 self.leader = Some(leader);

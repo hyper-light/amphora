@@ -559,6 +559,7 @@ fn run_batch(
         plan,
         fused.cursor_id,
         super::ScanCursor::Pager(cursor),
+        until,
     )?
     else {
         return Ok(0);
@@ -590,7 +591,9 @@ fn run_batch(
         rows += 1;
     }
     // Lane skip-5 (T-SKU.4): a skipping scan's run stops at its candidate run's last rowid. A
-    // leaf's rowids ascend, so the rows up to `until` are a prefix: found by halving.
+    // leaf's rowids ascend, so the rows up to `until` are a prefix: found by halving. A window
+    // decoded for this run already ends there (lane skip-7, T-SKU.9); one decoded before it (the
+    // same cursor's earlier walk in this run of the program, under other bounds) may not.
     if let Some(until) = until {
         let leaf = cursor
             .table_leaf_under_cursor()

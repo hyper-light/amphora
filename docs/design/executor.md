@@ -736,20 +736,107 @@ both, the other kind is measured a logarithmic number of times, and the chooser'
 within twice the better kind alone, plus the kept kind's write upkeep.
 
 **Cost of keeping both.** Both summaries take every write, so the losing kind's write upkeep is paid
-for as long as the column is measured; the doubling bound covers scans, not that upkeep. Dropping
-the loser once its excess cost passes a rebuild's (ski rental again) would bound it; not built.
+for as long as the column is measured; the doubling bound covers scans, not that upkeep. The cap
+below bounds it.
+
+### The losing kind's upkeep capped (lane skip-5, T-SKU.5)
+
+**Decision.** Behind a switch, `Upkeep` (`choose.rs`): `KeepBoth`, the control (`PRAGMA skipping =
+'t.a measured'`), and `Capped` (`'t.a capped'`). Capped drops the kind not leading once the write
+upkeep it has cost since it last answered a filter passes its latest measured cost to build: ski
+rental's break-even rule (Karlin, Manasse, Rudolph and Sleator, Algorithmica 1988: rent until the
+rent paid equals the price, then buy, within twice the best choice in hindsight). The kind leading
+is never dropped. A dropped kind is still measured on the doubling schedule; its trial's budget
+adds its build cost, and when the trial is due the executor builds it again before the filter:
+zone maps from the cracker's own copy of the column, in the dropped map's zones; the cracker from
+the table at the snapshot the summary just answered, refused if a write came in during the build.
+The upkeep is timed per write by the executor's clock and handed in (`SkipRegistry::on_write`'s
+`now`); a build's cost is its own time. No number is picked: the threshold is the kind's own
+measured build cost.
+
+**Why.** Keeping both makes every write pay both kinds' upkeep for as long as the column is
+summarized, so on a write-heavy table the kind that answers nothing still costs the most (a
+cracker's moves under churn). Dropping it outright would lose the chance to notice the workload
+shift back; the doubling trial keeps that, at a cost bounded by its build.
+
+**Instruments.** `MethodStats::{upkeep, last_upkeep, dropped, rebuilt}` per kind, and debug events
+on `amphora.skipping` with the upkeep and build cost when a kind is dropped or built again.
+
+**Evidence.** `skipping::tests::chooser::t_sku_5_*`: a write-heavy table whose filters zone maps
+answer best drops the cracker and pays less upkeep than keeping both, which drops nothing; a
+workload that shifts from cracking's ground to zone maps' drops zone maps and builds them again
+when their trial is due. Every candidate set holds every row the plain scan finds.
+
+### What the leader is chosen by (lane skip-7, T-SKU.7)
+
+**Decision.** Behind a second switch, `Lead`: `Scan` compares the kinds' latest measured scans
+(T-SKU.2's rule, the control); `Total` compares each kind's latest scan plus the write upkeep it
+cost over the latest stretch of writes between two filters (lane skip-5's call: the leader counts
+total cost). Each upkeep rule goes with its own lead rule (`Lead::for_upkeep`): `KeepBoth` with
+`Scan`, `Capped` with `Total`. A kind's upkeep is measured only over a stretch it was kept for
+whole; a kind dropped or built again during a stretch keeps the measure it had. Under `Total` the
+leader's upkeep also counts toward what it has spent before the other is measured again, and the
+other's trial budget is its own total.
+
+**Why.** Kept both, every write is applied to both kinds whichever leads, so their upkeep is paid
+either way and only the scan differs: counting upkeep there could pick the slower scan for no
+saving. Capped, the kind not leading is the one whose upkeep is shed, so the choice decides which
+upkeep goes on being paid: a cracker under write churn whose scans are cheap can cost far more in
+moves than zone maps cost in rows read.
+
+**Evidence.** `t_sku_7_total_cost_leader_counts_the_write_upkeep` (costs handed in: the leader
+changes on total cost, not on the scan alone); `t_sku_7_capped_total_cost_lead_pays_less_under_write_churn`
+(zone maps' scan failure mode under 256 writes a filter: on scan cost cracking leads and its moves
+go on being paid; on total cost zone maps lead, the cracker is dropped, and the run's whole cost of
+scans, builds and upkeep is lower); `t_sku_7_shifting_workload_ends_led_by_zone_maps_on_total_cost`.
+The live comparison at the extremes (a laptop's table and many connections writing at once) is the
+coordinator's, with `skipping_bench`.
+
+**Falsified by.** A workload where `Capped` with `Total` costs more in scans, builds and upkeep
+together than `Capped` with `Scan`.
+
+### A cracker built again keeps its cut points (lane skip-7, T-SKU.8)
+
+When the cap drops a cracker it keeps the bounds it was cut at (`CrackerColumn::bounds`), and the
+cracker built again is cut at them before it answers (`CrackerColumn::crack_at`), so the filters
+that cut it find their pieces as before instead of paying to cut the whole copy again. The bounds
+are cut middle first (each stretch of the sorted bounds cuts at its middle, then each half), so
+each cut partitions only the piece between two cuts already made: about n log k entries moved for a
+copy of n entries and k bounds, not the n k of cutting in ascending order. The cut is timed and
+added to the build's cost. Evidence: `t_sku_8_*` (the same cut points, the same rowids for each
+filter with nothing partitioned again, at most n entries moved per halving of the bounds).
+
+### Fused batches (lane skip-5, T-SKU.4) that decode only the candidate run (lane skip-7, T-SKU.9)
+
+A skipping scan's Next, on a candidate row, runs the fused loop (decision 10) over the leaf's batch
+up to the last rowid of the candidate run it stands in, instead of row by row. A batch's window
+going forward now also stops decoding at that rowid (`leaf_batch::window`'s `until`, from
+`SkipWalks::run_end`), for the fused loop and for a `Column` or `ColumnRange` served from a batch,
+so rows the scan seeks past are never decoded; before, each window ran on to its leaf's end.
+Evidence: `t_sku_4_*` (four databases, batches on and off by skipping on and off, answer alike
+under random writes; skipping rows ran fused) and `t_sku_9_*` (a scattered column, cracking and the
+measured choice: answers as without skipping, and the rows decoded are at most the rows read).
+
+### The setting acts when its statement runs (lane skip-5, T-SKU.6)
+
+**Decision.** `PRAGMA skipping` compiles to its own instruction, `SetSkipping`, which builds the
+summary when the statement runs, not while it is prepared. **Why.** A setting prepared before the
+table holds its rows (a migration script, a prepared statement kept by a pool) built its summary
+from the empty table and so skipped nothing: chosen by a test, `t_sku_6_*`, where the setting
+prepared on an empty table and run once 64,000 rows were in read all 64,000 before and now skips,
+and running it again after `'off'` turns skipping back on.
 
 ### A SQL setting (lane skip-4, T-SKU.3)
 
 `PRAGMA skipping = 'table.column'` keeps a measured summary of the column; `'table.column
 zone_maps'`, `'table.column cracking'` and `'table.column off'` pick one kind or drop the summary.
-The summary is built when the statement is prepared, as the other connection settings take effect,
-and as `skipping::set_skipping` builds it: holding the write lock, refused inside an open
+The summary is built when the statement runs (lane skip-5, below), as `skipping::set_skipping`
+builds it: holding the write lock, refused inside an open
 transaction, under MVCC, or for a column the record doesn't hold, with the reason. `PRAGMA skipping`
 with no value is refused: the setting is set, not read.
 
-**Not yet.** A walking scan runs its body row by row, not in fused column batches; rows read and
-latency against DuckDB and ClickHouse are not measured.
+**Not yet.** Rows read and latency against DuckDB and ClickHouse are not measured. A dropped kind
+is built again inside the scan whose trial is due, so that scan pays the build.
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's

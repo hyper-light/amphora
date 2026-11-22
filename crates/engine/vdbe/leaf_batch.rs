@@ -240,6 +240,16 @@ impl Leaf<'_> {
         }
     }
 
+    /// Cell `cell`'s rowid, where the leaf holds it apart from the record (the pager's table
+    /// leaves); None on a versioned leaf copy, whose window isn't bounded by a skipping run (lane
+    /// skip-7, T-SKU.9: skipping scans read the pager's tables).
+    fn rowid(&self, cell: usize) -> Result<Option<i64>> {
+        match self {
+            Self::Pager(leaf) => leaf.contents.cell_table_leaf_read_rowid(cell).map(Some),
+            Self::Versioned(_) => Ok(None),
+        }
+    }
+
     /// Cell `cell`'s record, or None when it spills to overflow pages (read row-at-a-time).
     fn payload(&self, cell: usize) -> Option<&[u8]> {
         match self {
@@ -310,7 +320,8 @@ pub enum Served {
 }
 
 /// Serves column `column` of the row under `cursor` (cursor id `cursor_id`) from its leaf's
-/// batch, decoding a new window when the cursor has moved past the last one.
+/// batch, decoding a new window when the cursor has moved past the last one. `until`: a skipping
+/// scan's candidate run ends at that rowid, and a new window stops there (lane skip-7, T-SKU.9).
 pub(crate) fn serve_column(
     batches: &mut LeafBatches,
     plan: &BatchPlan,
@@ -318,6 +329,7 @@ pub(crate) fn serve_column(
     cursor: ScanCursor<'_>,
     column: usize,
     dest: &mut Register,
+    until: Option<i64>,
 ) -> Result<Served> {
     let Some(columns) = plan.columns(cursor_id) else {
         return Ok(Served::RowAtATime);
@@ -325,7 +337,7 @@ pub(crate) fn serve_column(
     let Ok(column_slot) = columns.binary_search(&column) else {
         return Ok(Served::RowAtATime);
     };
-    let Some(cell) = window(batches, plan, cursor_id, cursor)? else {
+    let Some(cell) = window(batches, plan, cursor_id, cursor, until)? else {
         return Ok(Served::RowAtATime);
     };
     let batch = batches
@@ -343,12 +355,15 @@ pub(crate) fn serve_column(
 }
 
 /// The cell under `cursor`, its leaf's batch decoded around it (a new window when the cursor
-/// has moved past the last one), or None when the row is read row-at-a-time.
+/// has moved past the last one), or None when the row is read row-at-a-time. A new window going
+/// forward stops after the last row whose rowid is at most `until` (a skipping scan's candidate
+/// run: lane skip-7, T-SKU.9), so rows the scan seeks past are never decoded.
 fn window(
     batches: &mut LeafBatches,
     plan: &BatchPlan,
     cursor_id: usize,
     cursor: ScanCursor<'_>,
+    until: Option<i64>,
 ) -> Result<Option<usize>> {
     let Some(columns) = plan.columns(cursor_id) else {
         return Ok(None);
@@ -375,7 +390,8 @@ fn window(
             return Ok(None);
         };
         let backward = batch.live && batch.leaf == leaf.id() && leaf.cell() < batch.first;
-        let rows = decode_window(batch, &leaf, columns, budget, backward)?;
+        let until = until.filter(|_| !backward);
+        let rows = decode_window(batch, &leaf, columns, budget, backward, until)?;
         #[cfg(test)]
         tests::note_decoded(rows);
         if rows == 0 {
@@ -386,14 +402,16 @@ fn window(
 }
 
 /// Decodes the window of the leaf that starts at the cursor's cell (ends at it, `backward`),
-/// as many rows as `budget` bytes hold. Returns how many rows it decoded: none when the cursor's
-/// own row alone is over the budget (the stated fallback: row-at-a-time).
+/// as many rows as `budget` bytes hold, and going forward none whose rowid is past `until`.
+/// Returns how many rows it decoded: none when the cursor's own row alone is over the budget
+/// (the stated fallback: row-at-a-time).
 fn decode_window(
     batch: &mut LeafBatch,
     leaf: &Leaf<'_>,
     columns: &[usize],
     budget: usize,
     backward: bool,
+    until: Option<i64>,
 ) -> Result<usize> {
     batch.live = false;
     batch.values.clear();
@@ -415,6 +433,12 @@ fn decode_window(
         let Some(cell) = next.filter(|cell| *cell < cells) else {
             break;
         };
+        // Lane skip-7 (T-SKU.9): the candidate run ends here; the scan seeks past what follows.
+        if let Some(until) = until {
+            if leaf.rowid(cell)?.is_some_and(|rowid| rowid > until) {
+                break;
+            }
+        }
         let record = leaf.payload(cell).map_or(0, <[u8]>::len);
         let charge = record.saturating_add(slot_bytes);
         match charged.checked_add(charge).filter(|total| *total <= budget) {

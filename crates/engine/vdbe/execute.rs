@@ -2053,7 +2053,8 @@ fn skipping_rebuild(
             match built {
                 Ok(cracker) => {
                     let cost = crate::skipping::nanos_since(origin);
-                    if !registry.install_cracker(root, writes, cracker, cost) {
+                    let now = &mut || crate::skipping::nanos_since(origin);
+                    if !registry.install_cracker(root, writes, cracker, cost, now) {
                         tracing::debug!(target: "amphora.skipping", root, "cracker built again was refused: a write came in during the build");
                     }
                 }
@@ -2429,6 +2430,7 @@ fn op_column_fetch(
                     super::leaf_batch::ScanCursor::Versioned(versioned),
                     column,
                     dest_reg,
+                    None,
                 )? {
                     super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
                     super::leaf_batch::Served::PastEnd => {
@@ -2450,6 +2452,8 @@ fn op_column_fetch(
     // Amphora (QT.7): a scanned table's column comes from its leaf's batch when the program has
     // one (`leaf_batch.rs`); otherwise, and for a row the batch left out, the row is read here.
     if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        // Lane skip-7 (T-SKU.9): a skipping scan's window ends with its candidate run.
+        let until = state.skip_walks.run_end(cursor_id);
         match super::leaf_batch::serve_column(
             &mut state.leaf_batches,
             plan,
@@ -2457,6 +2461,7 @@ fn op_column_fetch(
             super::leaf_batch::ScanCursor::Pager(cursor),
             column,
             dest_reg,
+            until,
         )? {
             super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
             super::leaf_batch::Served::PastEnd => {
@@ -2692,6 +2697,8 @@ fn op_column_range_fetch(
     // whole below.
     if let Some(plan) = program.leaf_batch_plan.as_deref() {
         let mut served = true;
+        // Lane skip-7 (T-SKU.9): a skipping scan's window ends with its candidate run.
+        let until = state.skip_walks.run_end(cursor_id);
         for (offset, (default, reg)) in defaults.iter().zip(dest_regs.iter_mut()).enumerate() {
             let column = start_column
                 .checked_add(offset)
@@ -2703,6 +2710,7 @@ fn op_column_range_fetch(
                 super::leaf_batch::ScanCursor::Pager(cursor),
                 column,
                 reg,
+                until,
             )? {
                 super::leaf_batch::Served::Value => {}
                 super::leaf_batch::Served::PastEnd => apply_column_default(default, reg)?,

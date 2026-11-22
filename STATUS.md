@@ -1092,4 +1092,10 @@ method not leading once its write upkeep passes its measured build cost (ski ren
 building it again when its doubling-schedule trial comes due; `measured` (keep both) is the
 control (T-SKU.5). The setting now acts when its statement runs, by its own instruction, so a
 statement prepared before the data loads still skips it (T-SKU.6).
-Open: the benchmark against DuckDB and ClickHouse.
+Lane skip-7: under the cap the leader is chosen by total cost, its latest scan plus the write
+upkeep of the latest stretch between filters (`Lead::Total`; keeping both stays on the scan alone,
+as both upkeeps are paid either way) (T-SKU.7); a cracker built again is cut at the dropped one's
+cut points, middle first (T-SKU.8); and a skipping scan's batches stop decoding at its candidate
+run's end (T-SKU.9). Decision record: executor.md decision 11.
+Open: the benchmark against DuckDB and ClickHouse; a dropped kind is still built again inside the
+scan whose trial is due.

@@ -267,13 +267,16 @@ impl SkipRegistry {
     }
 
     /// Installs a cracker the caller built again from the table, read when `writes` writes had
-    /// come in: refused (`false`) when another came in since, as the copy would miss it.
+    /// come in: refused (`false`) when another came in since, as the copy would miss it. Lane
+    /// skip-7 (T-SKU.8): it is cut at the dropped cracker's cut points as it is installed, timed by
+    /// `now`; a cut it refuses makes the summary stale.
     pub fn install_cracker(
         &self,
         root_page: i64,
         writes: u64,
         cracker: super::CrackerColumn,
         cost: u64,
+        now: &mut dyn FnMut() -> u64,
     ) -> bool {
         let mut entries = self.entries.lock();
         let Some(entry) = entries
@@ -284,7 +287,10 @@ impl SkipRegistry {
         };
         match &mut entry.skipping {
             Skipping::Measured(chooser) if entry.counts.writes == writes && !entry.stale => {
-                chooser.install_cracker(cracker, cost);
+                if chooser.install_cracker(cracker, cost, now).is_err() {
+                    entry.stale = true;
+                    return false;
+                }
                 true
             }
             _ => false,

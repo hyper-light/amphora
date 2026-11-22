@@ -81,6 +81,34 @@ impl CrackerColumn {
         self.cracks.len()
     }
 
+    /// The bounds it is cut at, ascending (lane skip-7, T-SKU.8: a cracker built again is cut at
+    /// the dropped one's).
+    pub fn bounds(&self) -> Vec<i64> {
+        self.cracks.keys().copied().collect()
+    }
+
+    /// Cuts the copy at each of `bounds` (lane skip-7, T-SKU.8), the middle bound of each stretch
+    /// first, so each cut partitions only the piece between two cuts already made: a copy of n
+    /// entries cut at k bounds moves about n log k entries, not the n k of cutting in ascending
+    /// order. Iterative: the stretches wait on a stack of at most k entries.
+    pub fn crack_at(&mut self, bounds: &[i64]) -> Result<(), SkipError> {
+        let mut sorted = bounds.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut stretches = vec![(0usize, sorted.len())];
+        while let Some((from, to)) = stretches.pop() {
+            if from >= to {
+                continue;
+            }
+            let middle = from + (to - from) / 2;
+            let bound = *sorted.get(middle).ok_or(SkipError::Inconsistent)?;
+            self.crack(bound)?;
+            stretches.push((from, middle));
+            stretches.push((middle + 1, to));
+        }
+        Ok(())
+    }
+
     /// The piece that holds (or would hold) `value`: from the crack at the largest bound at or
     /// below it to the crack at the smallest bound above it.
     fn piece_of(&self, value: i64) -> (usize, usize) {
