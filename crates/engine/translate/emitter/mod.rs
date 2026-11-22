@@ -211,6 +211,9 @@ pub struct Resolver<'a> {
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
     /// (`Connection::set_adaptive_joins`).
     adaptive_joins: bool,
+    /// Amphora: whether the planner may build an automatic index
+    /// (`Connection::set_automatic_indexes`).
+    automatic_indexes: bool,
     /// Amphora: whether a qualifying scan's aggregates run in leaf-page morsels
     /// (`Connection::set_parallel_mode`, QT.6).
     parallel: bool,
@@ -345,6 +348,7 @@ impl<'a> Resolver<'a> {
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
             adaptive_joins: false,
+            automatic_indexes: true,
             parallel: false,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -451,6 +455,14 @@ impl<'a> Resolver<'a> {
         self.adaptive_joins = on;
     }
 
+    pub(crate) fn automatic_indexes(&self) -> bool {
+        self.automatic_indexes
+    }
+
+    pub(crate) fn set_automatic_indexes(&mut self, on: bool) {
+        self.automatic_indexes = on;
+    }
+
     pub(crate) fn parallel(&self) -> bool {
         self.parallel
     }
@@ -488,6 +500,7 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
+            automatic_indexes: self.automatic_indexes,
             parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -524,6 +537,7 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
+            automatic_indexes: self.automatic_indexes,
             parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),

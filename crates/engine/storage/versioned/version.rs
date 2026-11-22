@@ -42,6 +42,7 @@
 //! a cycle.
 
 use super::blink::{Cell, Change, Descender, Tree};
+use super::memory::Source;
 use super::page::{self, Flags};
 use super::pool::Pool;
 use super::redo::Op;
@@ -127,17 +128,38 @@ fn count_out(map: &mut BTreeMap<Ts, u64>, at: Ts) {
 
 /// The bytes the versioned storage may hold beside its pages (decision 10): row versions and
 /// their heads, transactions' read and write records, and the commits kept for validation. A
-/// reservation past `limit` is refused, typed, and nothing is taken.
+/// reservation past `limit`, or one its memory source refuses, is refused, typed, and nothing is
+/// taken.
 pub struct Budget {
     limit: u64,
-    held: Mutex<u64>,
+    held: Mutex<Held>,
+    /// Where the bytes come from (G7 step 2, `AC-NS.2.1`): the process's budget, shared; None:
+    /// within `limit` alone.
+    source: Option<Arc<dyn Source>>,
+}
+
+/// What a budget holds, and what it has taken from its source for it.
+#[derive(Default)]
+struct Held {
+    held: u64,
+    taken: u64,
 }
 
 impl Budget {
     pub fn new(limit: u64) -> Self {
         Self {
             limit,
-            held: Mutex::new(0),
+            held: Mutex::new(Held::default()),
+            source: None,
+        }
+    }
+
+    /// A budget whose bytes come from `source`, as much as it grants.
+    pub fn shared(source: Arc<dyn Source>) -> Self {
+        Self {
+            limit: u64::MAX,
+            held: Mutex::new(Held::default()),
+            source: Some(source),
         }
     }
 
@@ -147,29 +169,72 @@ impl Budget {
 
     /// The bytes held now.
     pub fn held(&self) -> u64 {
-        *self.held.lock()
+        self.held.lock().held
     }
 
+    /// The bytes taken from the source now (0 without one).
+    pub fn taken(&self) -> u64 {
+        self.held.lock().taken
+    }
+
+    /// `n` bytes more for `what`. With a source, what is taken from it grows as a dynamic table
+    /// does (Cormen et al., *Introduction to Algorithms*, 3rd ed., section 17.4): doubled when the
+    /// bytes held would pass it, so a source is asked once per doubling, not once per row; just
+    /// what is needed when the doubling is refused.
     fn reserve(&self, what: &'static str, n: usize) -> Result<u64> {
         let asked = u64::try_from(n).map_err(|_| LimboError::IntegerOverflow)?;
         let mut held = self.held.lock();
-        match held.checked_add(asked) {
-            Some(after) if after <= self.limit => {
-                *held = after;
-                Ok(asked)
+        let refused = |held: u64| LimboError::MemoryBudget {
+            what,
+            asked,
+            held,
+            limit: self.limit,
+        };
+        let after = held
+            .held
+            .checked_add(asked)
+            .filter(|after| *after <= self.limit)
+            .ok_or_else(|| refused(held.held))?;
+        if let Some(source) = &self.source {
+            if after > held.taken {
+                let doubled = after.max(held.taken.saturating_mul(2));
+                let more = doubled.saturating_sub(held.taken);
+                let need = after.saturating_sub(held.taken);
+                let grown = match source.take(what, more) {
+                    Ok(()) => more,
+                    Err(_) => {
+                        source.take(what, need)?;
+                        need
+                    }
+                };
+                held.taken = held.taken.saturating_add(grown);
             }
-            _ => Err(LimboError::MemoryBudget {
-                what,
-                asked,
-                held: *held,
-                limit: self.limit,
-            }),
         }
+        held.held = after;
+        Ok(asked)
     }
 
+    /// `n` bytes given back. With a source, what is taken from it is halved down to twice what is
+    /// held once the bytes held fall under a quarter of it (the dynamic table's contraction, as
+    /// above): a reservation that went up and down by one row isn't asked of the source each time.
     fn release(&self, n: u64) {
         let mut held = self.held.lock();
-        *held = held.saturating_sub(n);
+        held.held = held.held.saturating_sub(n);
+        if let Some(source) = &self.source {
+            if held.held.saturating_mul(4) < held.taken {
+                let keep = held.held.saturating_mul(2);
+                source.give(held.taken.saturating_sub(keep));
+                held.taken = keep;
+            }
+        }
+    }
+}
+
+impl Drop for Budget {
+    fn drop(&mut self) {
+        if let Some(source) = &self.source {
+            source.give(self.held.lock().taken);
+        }
     }
 }
 
@@ -406,6 +471,11 @@ fn noted_bytes(key: &[u8]) -> u64 {
 impl Clock {
     /// A clock whose versions and records may hold `budget` bytes.
     pub fn new(budget: u64) -> Self {
+        Self::within(Budget::new(budget))
+    }
+
+    /// A clock whose versions and records are held to `budget`.
+    pub fn within(budget: Budget) -> Self {
         Self {
             visible: AtomicU64::new(0),
             publish: Mutex::new(0),
@@ -414,7 +484,7 @@ impl Clock {
                 .map(|_| Mutex::new(FxHashMap::default()))
                 .collect(),
             open: Mutex::new(Open::default()),
-            budget: Budget::new(budget),
+            budget,
         }
     }
 
@@ -1163,13 +1233,21 @@ pub struct Versioned {
     recent: Mutex<VecDeque<Committed>>,
 }
 
-/// The bytes versions and records may hold beside a pool of `frames` pages, until the database is
-/// given its own ([`Versioned::with_budget`]): as many as the pages they version. InnoDB keeps undo
-/// in buffer-pool pages and LeanStore its version records in the buffer manager (Alhomssi, Leis,
-/// PVLDB 2023), so in both the memory the database was given for pages bounds its versions too;
-/// the pool is sized from the process's memory by the shell that opens it.
-fn pool_budget(frames: usize) -> u64 {
-    u64::try_from(frames.saturating_mul(super::page::PAGE_SIZE)).unwrap_or(u64::MAX)
+/// The budget of a pool's versions and records (decision 10). A pool of a fixed count of frames
+/// holds them to as many bytes as the pages they version, until the database is given its own
+/// ([`Versioned::with_budget`]): InnoDB keeps undo in buffer-pool pages and LeanStore its version
+/// records in the buffer manager (Alhomssi, Leis, PVLDB 2023), so in both the memory the database
+/// was given for pages bounds its versions too.
+/// A pool whose frames come from a memory source takes its versions' bytes from it too, as much
+/// as it grants beside the pages (G7 step 2, `AC-NS.2.1`): no part of it is set aside for either.
+fn pool_budget(pool: &Pool) -> Budget {
+    match pool.source() {
+        Some(source) => Budget::shared(source),
+        None => Budget::new(
+            u64::try_from(pool.capacity().saturating_mul(super::page::PAGE_SIZE))
+                .unwrap_or(u64::MAX),
+        ),
+    }
 }
 
 impl Versioned {
@@ -1189,7 +1267,7 @@ impl Versioned {
         trees: usize,
         cmp: impl Fn(usize) -> super::blink::Comparator,
     ) -> Result<Self> {
-        let frames = pool.capacity();
+        let budget = pool_budget(&pool);
         let mut made = Vec::with_capacity(trees);
         for i in 0..trees {
             let id = u64::try_from(i).map_err(|_| LimboError::IntegerOverflow)?;
@@ -1197,7 +1275,7 @@ impl Versioned {
         }
         Ok(Self {
             pool,
-            clock: Clock::new(pool_budget(frames)),
+            clock: Clock::within(budget),
             trees: RwLock::new(made),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
@@ -1233,10 +1311,10 @@ impl Versioned {
             // Root 0, the data file's header, is never a tree's: the tree was dropped.
             trees.push((root != 0).then(|| Arc::new(VTree::new(id, Tree::open(root, cmp(i))))));
         }
-        let budget = pool_budget(pool.capacity());
+        let budget = pool_budget(&pool);
         Ok(Self {
             pool,
-            clock: Clock::new(budget),
+            clock: Clock::within(budget),
             trees: RwLock::new(trees),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
@@ -2594,5 +2672,32 @@ mod tests {
                 refused_budget.load(Ordering::Relaxed)
             );
         }
+    }
+
+    /// T-NS.2.10: a budget over the machine's memory source reserves and releases row bytes.
+    /// Expect: what it takes from the source doubles as it grows (once per doubling), halves
+    /// down to twice what is held once that falls under a quarter, and is all given back when the
+    /// budget drops (`AC-NS.2.1`).
+    #[test]
+    fn ns2_a_shared_budget_takes_from_its_source_as_a_dynamic_table() {
+        let machine = Arc::new(super::super::memory::Machine::new());
+        let source: Arc<dyn Source> = machine.clone();
+        let budget = Budget::shared(source);
+        budget.reserve("a test's rows", 100).unwrap();
+        assert_eq!((budget.held(), budget.taken()), (100, 100));
+        budget.reserve("a test's rows", 10).unwrap();
+        assert_eq!((budget.held(), budget.taken()), (110, 200));
+        budget.reserve("a test's rows", 80).unwrap();
+        assert_eq!((budget.held(), budget.taken()), (190, 200));
+        assert_eq!(machine.held(), 200);
+        budget.release(100);
+        assert_eq!((budget.held(), budget.taken()), (90, 200));
+        budget.release(50);
+        assert_eq!((budget.held(), budget.taken()), (40, 80));
+        budget.release(21);
+        assert_eq!((budget.held(), budget.taken()), (19, 38));
+        assert_eq!(machine.held(), 38);
+        drop(budget);
+        assert_eq!(machine.held(), 0);
     }
 }

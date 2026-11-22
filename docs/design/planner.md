@@ -1445,6 +1445,41 @@ a1 ON NOT (a1.c0 GLOB 'a%') WHERE a1.c1 >= 3` was estimated at 0.684 against its
 main; it passes with the change.
 
 **Falsified by.** A CERT finding where an outer join's ON terms read only an earlier table.
+## Decision (lane pl8-5): a hash join's build side can be a run of tables after the loops
+
+**Decision.** PL.8, the emitter's half of bushy plans. A hash join's operation names a build group
+(`HashJoinOp::build_group`, `plan.rs`): the tables of a bushy plan's run `data[start..end]`
+(`JoinN::inner_joins`). Its materialized build input (`emitter/select.rs`,
+`materialization_prefix`) joins the group's tables among themselves, where a left-deep plan's joins
+the tables before the probe; the loops before the probe outside the group stay loops of the main
+plan, and the probe reads the group's rows from the payload, so a term between the group and those
+loops runs at the probe (`loop_index_for_table_row`). The emitter runs a bushy plan whose runs stand
+apart, each followed by an inner hash join built from the run's last table, with no table of the run
+probing a hash table built outside it or from a materialized input, no join in it or at the probe
+that keeps its place (outer, semi, anti, lateral), no RIGHT or FULL JOIN in the query, and no sort
+removed by the plan's order (`optimizer/mod.rs`, `bushy_build_groups`); any other bushy plan is a
+typed error naming its tree. For inner joins the run joined among itself and then probed is the
+same rows as the left-deep order of the same tables (associativity and commutativity of inner joins,
+f25).
+
+**Evidence.** `optimizer::bushy_test_hook::tests::t_pl_8_2_a_bushy_build_group_answers_as_the_left_deep_plan`
+(T-PL.8.2): eight joins of four tables (a range join before the run, a WHERE term between the run
+and the loop before it, an aggregate, a probe term reading the loop before the run), the reference
+plan chosen by cost and with hash joins only. The test builds the bushy plan itself: a hook pins the
+plan to the FROM order, loops but for one hash join at the last table built from the table before
+it (`bushy_test_hook::PIN`), then splits it into the tree `(a ((b c) p))`. For every query the hook
+reports the plan made bushy, and the pinned left-deep plan and the bushy one give the reference
+plan's rows. (The search alone put each hash join at the second table, so the earlier test's split
+never applied.)
+
+**Not yet built.** The search does not make bushy plans: DPccp's connected complement pairs on an
+explicit stack with a budget derived from the plan-time target, falling back to today's search; and
+semi and anti join tables placed before other loops. The probe is read whole, as a hash join's
+probe is today; a probe that keeps its own access method would let the run's result join a loop
+read by a key.
+
+**Falsified by.** An answer of a plan the hook splits that differs from its left-deep plan's; a CERT
+finding where an outer join's ON terms read only an earlier table.
 
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
@@ -1869,3 +1904,66 @@ twice the build's rows".
   LIP (filters from several dimensions applied to the fact scan in their measured order) and
   predicate transfer across the join graph are not built yet.
 
+
+## Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model
+
+**Decision.** G6 step 3, a prototype behind its own switch (`optimizer/plan_hints.rs`). Bao's
+approach over Amphora's planner: a hint set says which operators the planner may choose (hash joins,
+nested loops, automatic indexes, sorted fetches), as on/off masks the connection's switches carry
+(`HintSet::apply`: `set_join_methods`, `set_automatic_indexes`, new here, and `set_sorted_fetches`);
+the cost model still chooses among what a mask allows. Ten masks are obeyable (a join method must be
+allowed; nested loops alone build no automatic index). For a query, each mask's plan is prepared,
+not run, and read into sixteen features from its `EXPLAIN QUERY PLAN` nodes: a count of each
+operator and the planner's own row and cost estimates (Bao's per-node operator and cardinality
+features, summed over the plan rather than convolved over its tree).
+
+The model is Bayesian linear regression of a run's log time on those features, in constant memory
+(the sufficient statistics: a 16 x 16 matrix, a vector and two sums, whatever the number of runs).
+Features and times are centered on the runs' means before the fit, so the intercept is the mean
+time rather than a weight the prior shrinks (Bishop §3.1.1); uncentered, the features every plan
+shares (a join's row estimates) set the prior's scale and the evidence shrank the differences
+between plans to nothing (lane g6s3b found the fixed point stuck there on a test's two plans).
+Its two precisions are learned from the runs, not picked: the evidence approximation's fixed point,
+one step a run, from the unit-information prior. A training run's mask is chosen by Thompson
+sampling from the posterior; its measured time trains the model, every run, none chosen out.
+
+The guard keeps the cost model's plan for each query class until a hint set's held-out runs (runs
+that never train the model) beat it: the hinted mean log time plus its standard error below the
+unhinted mean less its standard error (the one-standard-error rule, Breiman, Friedman, Olshen and
+Stone, "Classification and Regression Trees", 1984, §3.4.3). It drops the hint set when its held-out mean lies above the
+unhinted mean plus that standard error, and a dropped set stays dropped. A plan equal to the
+unhinted one is no hint. The guard holds as many classes as its caller gives it room for, the least
+recently used evicted past it.
+
+`bench/plan_hints` is the harness: queries sorted by name and split in turn into training and held
+out, training by sampling, then each held-out query's guard trial and its final plan timed against
+the unhinted one, answers against SQLite's.
+
+**Why.** The step: hints learned from measured executions, kept only where they beat the cost model
+on held-out queries without regressions. A linear model with an exact Gaussian posterior gives
+Thompson sampling without the ensemble Bao trains, in fixed memory; the guard, not the model, is
+what bounds a regression.
+
+**Sources.**
+- Marcus, Negi, Mao, Tatbul, Alizadeh, Kraska, "Bao: Making Learned Query Optimization Practical",
+  SIGMOD 2021 (f8): hint sets as operator masks, a model over plan features, Thompson sampling, its
+  training data the executions themselves.
+- Agrawal and Goyal, "Thompson Sampling for Contextual Bandits with Linear Payoffs", ICML 2013:
+  sampling a linear model's Gaussian posterior.
+- MacKay, "Bayesian Interpolation", Neural Computation 1992; Bishop, "Pattern Recognition and
+  Machine Learning" §3.5.2: the evidence approximation's precisions.
+- Kass and Wasserman, "A Reference Bayesian Test for Nested Hypotheses...", JASA 1995: the
+  unit-information prior the fixed point starts from.
+- Breiman, Friedman, Olshen and Stone, "Classification and Regression Trees", 1984: the
+  one-standard-error rule the guard compares held-out means by.
+
+**Evidence.** `optimizer::plan_hints::tests` (the guard admits then drops a regressing hint,
+T-G6.3.2; memory bounded over 20,000 runs and classes, T-G6.3.3; the model learns the faster plan)
+and `crates/engine/tests/plan_hints.rs` (every mask's answers equal the unhinted plan's and a
+computed nested loop's, the planner obeys each mask, T-G6.3.1). Held-out JOB and corpus times are
+the coordinator's (AC-G6.3.1).
+
+**Falsified by.**
+- A held-out query more than 10% slower with hints on than with the cost model alone (AC-G6.3.1).
+- A hinted plan's answer that differs from SQLite's (T-G6.3.1).
+- The model's or the guard's memory growing with the runs past the classes it was given.

@@ -1,0 +1,21 @@
+[package]
+name = "plan-hints"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Learned plan hints (Bao) trained and checked on held-out queries against the cost model alone (G6 step 3)"
+
+# A workspace of its own, outside Amphora's gates, building only the engine and SQLite (the answers' reference).
+[workspace]
+
+[dependencies]
+amphora-engine = { path = "../../crates/engine" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# The product's release profile (the root Cargo.toml).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+debug = "line-tables-only"

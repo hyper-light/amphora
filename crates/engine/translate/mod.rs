@@ -166,6 +166,7 @@ pub fn translate(
     resolver.set_join_methods(connection.join_methods());
     resolver.set_sorted_fetches(connection.sorted_fetches());
     resolver.set_adaptive_joins(connection.adaptive_joins());
+    resolver.set_automatic_indexes(connection.automatic_indexes());
     // Amphora (QT.6): leaf-page morsels read the pager's b-trees, which MVCC and the versioned
     // storage don't keep a table's rows in.
     resolver.set_parallel(

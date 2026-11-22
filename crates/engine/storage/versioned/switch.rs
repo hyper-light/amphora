@@ -17,6 +17,8 @@ use super::blink::{Comparator, Descender};
 use super::cursor::{Access, KeyOrder, SharedTxn, VersionedCursor};
 use super::disk::{Disk, Files, Simulated};
 use super::durable::Database as VDatabase;
+use super::memory::Source;
+use super::pool::Room;
 use super::version::Savepoint;
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, OnceLock};
@@ -50,16 +52,11 @@ pub struct Storage {
 
 /// The versioned storage of the database at `path`: in memory for a memory database or one whose
 /// files the engine keeps in memory (`memory`), else in the directory `<path>-versioned`. It holds
-/// `budget` bytes at most (the shell's, else [`super::memory::default_budget`]): half for its
-/// pool's pages, half for the row versions and records beside them, which the pool's pages bound
-/// (`Versioned`'s `pool_budget`: InnoDB's undo and LeanStore's versions live in the buffer pool's
-/// memory). Its redo log takes a lane per thread the machine runs (decision 11).
-pub fn open(path: &str, memory: bool, budget: Option<u64>) -> Result<Arc<Storage>> {
-    let budget = match budget {
-        Some(b) => b,
-        None => super::memory::default_budget()?,
-    };
-    let frames = super::pool::frames_within(budget / 2)?;
+/// what its memory source grants (the shell's process budget, else [`super::memory::machine`]),
+/// pages and row versions alike, as they grow: no part is set aside for either. Its redo log takes
+/// a lane per thread the machine runs (decision 11).
+pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result<Arc<Storage>> {
+    let source = source.unwrap_or_else(super::memory::machine);
     let lanes = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let disk: Arc<dyn Disk> = if memory || crate::database::is_memory_like(path) {
         Arc::new(Simulated::new(0, lanes)?)
@@ -72,9 +69,9 @@ pub fn open(path: &str, memory: bool, budget: Option<u64>) -> Result<Arc<Storage
     };
     // The index trees' orders the storage recorded, decoded once each as recovery reads them.
     let recovered: Mutex<HashMap<u64, Arc<OnceLock<KeyOrder>>>> = Mutex::new(HashMap::new());
-    let db = Arc::new(VDatabase::open_ordered(
+    let db = Arc::new(VDatabase::open_in(
         disk,
-        frames,
+        Room::Shared(source),
         TREES,
         || KeyOrder::rowid().comparator(),
         |tree, bytes| {

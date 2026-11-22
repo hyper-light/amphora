@@ -528,6 +528,8 @@ pub struct Connection {
     /// Amphora (PL.13): the seek's, hash build's and hash probe's weights a test pins in place of
     /// the learned ones (`Connection::pin_cost_weights`, the simulator's); None: the learned ones.
     pub(super) pinned_cost_weights: crate::sync::RwLock<Option<(f64, f64, f64)>>,
+    /// Amphora: see [`Connection::set_automatic_indexes`].
+    pub(super) automatic_indexes: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_mode`].
     pub(super) parallel_mode: AtomicBool,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
@@ -1071,6 +1073,19 @@ impl Connection {
 
     pub(crate) fn pinned_cost_weights(&self) -> Option<(f64, f64, f64)> {
         *self.pinned_cost_weights.read()
+    }
+
+    /// Amphora (G6 step 3, learned plan hints; `optimizer::plan_hints`): lets newly prepared
+    /// statements build an automatic index for a join, on by default as SQLite's planner has it.
+    /// Off, the planner weighs every join without one. `JoinMethods::NestedLoopsOnly` builds none
+    /// either way.
+    pub fn set_automatic_indexes(&self, on: bool) {
+        self.automatic_indexes.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn automatic_indexes(&self) -> bool {
+        self.automatic_indexes.load(Ordering::Acquire)
     }
 
     /// Amphora (query speed step 7, QT.7; a prototype behind this switch, off by default): newly
