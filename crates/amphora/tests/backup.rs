@@ -1225,9 +1225,9 @@ fn t_t1_12_c8_replay_and_integrity_check_pause_in_steps() {
 ///
 /// With no phase, all three in one process (a tiny instance; a temporary folder if no folder is
 /// given), printing the restore's nanoseconds. The sizes are the caller's; the defaults are a tiny
-/// instance. The memory a chunk may take is the process's room for an image
-/// (`amphora::memory`'s budget, read where it runs), and the folder store's objects are as large as
-/// that room, a get reading one whole; every other bound is the store's `object_max()`. Each phase
+/// instance. A chunk takes its stream's share of the process's room for chunks (`amphora::memory`'s
+/// budget, read where it runs; T-T1.12.M1), and the folder store's objects are as large as the
+/// process's room, a get reading one whole; every other bound is the store's `object_max()`. Each phase
 /// gives up past the goal's bar, 30 minutes (AC-T1.12.3), as a restore past it has failed it.
 #[test]
 #[ignore = "a benchmark: run by bench/backup_restore.sh"]
