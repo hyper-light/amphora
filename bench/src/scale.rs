@@ -1793,25 +1793,53 @@ mod inproc {
                 .ok_or_else(|| anyhow::anyhow!("no group {g}"))
         }
 
-        /// The leader a live member of group `g` names, if it's live too.
+        /// The leader a live member of group `g` names, if it's live too. While no live member
+        /// names a live leader (none elected yet, or the one named is cut off), it waits on a
+        /// live member for the leader change: a leader of a later term than the one it names, on
+        /// the owner's word (ReplicaHandle::wait_leader, lane ryw-5), up to --deadline-s, never
+        /// a retry (lane scaleout-harness-10).
         fn leader(&self, g: usize) -> anyhow::Result<&Database> {
             let group = self.group(g)?;
+            let named = |l: u64| {
+                usize::try_from(l)
+                    .ok()
+                    .and_then(|l| l.checked_sub(1))
+                    .filter(|&i| !self.is_cut(i))
+                    .and_then(|i| group.members.get(i))
+            };
+            let mut waiting = None;
             for (i, m) in group.members.iter().enumerate() {
                 if self.is_cut(i) {
                     continue;
                 }
-                let Some(status) = m.replica().and_then(|h| h.status().ok()) else {
+                let Some(h) = m.replica() else {
                     continue;
                 };
-                let l = usize::try_from(status.leader).unwrap_or(0);
-                if l >= 1 && !self.is_cut(l - 1) {
-                    return group
-                        .members
-                        .get(l - 1)
-                        .ok_or_else(|| anyhow::anyhow!("no member {l}"));
+                let Ok(status) = h.status() else {
+                    continue;
+                };
+                if let Some(leader) = named(status.leader) {
+                    return Ok(leader);
                 }
+                // A leader of the term it names, when it names none; else one of a later term.
+                let past = if status.leader == 0 {
+                    status.term.saturating_sub(1)
+                } else {
+                    status.term
+                };
+                waiting.get_or_insert((h, past));
             }
-            anyhow::bail!("group {g} names no live leader")
+            let (h, past) =
+                waiting.ok_or_else(|| anyhow::anyhow!("group {g} has no live member"))?;
+            let status = h
+                .wait_leader(past, Instant::now() + self.deadline)
+                .map_err(|e| anyhow::anyhow!("group {g} elected no leader: {e:?}"))?;
+            named(status.leader).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "group {g}'s next leader, member {}, is cut off",
+                    status.leader
+                )
+            })
         }
 
         /// The group a session's rows are in: the writers' sessions in even runs, where

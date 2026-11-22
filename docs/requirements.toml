@@ -1294,6 +1294,7 @@ criteria = [
   { id = "AC-SH.6", text = "The read measures' warm-up is one read of the last preloaded row, never asked again: it waits on the write by the system's own control where there is one (Amphora's session token from the write's answer), else it is one read at the system's strongest consistency (CockroachDB's leaseholder, TiDB's ReadIndex follower read); each record says what each system's warm-up did" },
   { id = "AC-SH.7", text = "regionloss's time to serve again is one count a writer on the region's own copy, each waiting on that writer's last acknowledged write by the system's own control, never a poll; a system with no such read has the figure refused, typed and said why, and the rest of the measure stands; --poll-us isn't taken" },
   { id = "AC-SH.8", text = "Schema setup asks each node in the configured order, from node 0, the next only once the one before failed, and gives up at --deadline-s or once every node failed, naming each failure" },
+  { id = "AC-SH.9", text = "In-process, a write or read that finds no live member naming a live leader (none elected yet, or the one named cut off, as after regionloss's kill) waits on a live member for the leader change (ReplicaHandle::wait_leader, a leader of a later term), up to --deadline-s, never a retry" },
   { id = "AC-SH.10", text = "regionloss's and cutover's phases (--settle-s, --after-s) last their length, a condition variable's wait for a duration that a spurious wake can't cut short, or end as soon as a worker fails, woken by that failure" },
 ]
 tests = [
