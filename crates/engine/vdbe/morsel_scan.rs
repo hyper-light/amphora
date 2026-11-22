@@ -9,12 +9,14 @@
 //! by reading the table's interior pages level by level (no recursion; a level's pages in key
 //! order), keeping each leaf's greatest rowid from its parent's divider. A worker's cursor seeks
 //! past the divider below its first leaf and reads until a rowid passes the divider above its last.
+//! A hash join's probe with its aggregates (`TableJoinAggregate`) builds its table once from the
+//! build side's filtered rows, then each worker probes and folds over its own leaves.
 
 use std::ops::Range;
 
 use super::morsel::{
     execute, execute_at, Degree, HashProbe, MachineCosts, MemoryBudget, MorselError, ParallelMode,
-    Pipeline, RunStats, ScanAggregate,
+    Pipeline, Predicate, RunStats, ScanAggregate,
 };
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::{PageRef, Pager};
@@ -398,6 +400,126 @@ impl TableProbe<'_> {
     ) -> Result<(Vec<(i64, usize)>, RunStats), MorselError> {
         let (partial, stats) = execute_at(self, 0, degree, None, budget)?;
         Ok((Self::finish(partial)?, stats))
+    }
+}
+
+impl TableSource {
+    /// The rows that pass `filter`, in rowid order, read on the caller's thread: a hash join's
+    /// build side (QT.6). Each row kept is charged to the statement's budget, its values' own
+    /// bytes and their text or blob bytes.
+    pub fn filtered_rows(
+        &self,
+        filter: &[Predicate],
+        budget: &MemoryBudget,
+    ) -> Result<Vec<Vec<Value>>, MorselError> {
+        let mut out = Vec::new();
+        self.scan(0..self.leaves(), |_, row| {
+            for term in filter {
+                if !term.holds(row)? {
+                    return Ok(());
+                }
+            }
+            let bytes = row.iter().fold(
+                std::mem::size_of::<Value>().saturating_mul(row.len()),
+                |sum, value| {
+                    sum.saturating_add(match value {
+                        Value::Text(text) => text.as_str().len(),
+                        Value::Blob(blob) => blob.len(),
+                        _ => 0,
+                    })
+                },
+            );
+            budget.charge(bytes)?;
+            out.try_reserve(1)?;
+            let mut owned = Vec::new();
+            owned.try_reserve_exact(row.len())?;
+            owned.extend_from_slice(row);
+            out.push(owned);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+/// A hash join's probe side read from a table's leaves, each joined row (the probe row's columns,
+/// then the build row's) folded into the aggregates: the probe and the aggregates are one loop
+/// body, run by every worker over its own leaves (QT.6).
+pub struct TableJoinAggregate<'a> {
+    pub table: &'a TableSource,
+    /// Terms over the probe row alone, tested before it is probed.
+    pub probe_filter: &'a [Predicate],
+    pub probe: &'a HashProbe<'a>,
+    /// The build side's rows, as `probe` numbers them.
+    pub build: &'a [Vec<Value>],
+    /// The grouping and the aggregates over a joined row (its filter is not read).
+    pub shape: &'a ScanAggregate<'a>,
+}
+
+impl Pipeline for TableJoinAggregate<'_> {
+    type Partial = super::morsel::AggregatePartial;
+
+    fn rows(&self) -> usize {
+        self.table.leaves()
+    }
+
+    fn empty(&self) -> Self::Partial {
+        self.shape.empty()
+    }
+
+    fn run(
+        &self,
+        leaves: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let mut joined: Vec<Value> = Vec::new();
+        self.table.scan(leaves, |rowid, row| {
+            for term in self.probe_filter {
+                if !term.holds(row)? {
+                    return Ok(());
+                }
+            }
+            let matches = self.probe.matches(row)?;
+            if matches.is_empty() {
+                return Ok(());
+            }
+            // A probe row's matches share its place: the hook takes only columns whose equal
+            // values are the same value (translate/parallel.rs), so a tie among them is no choice.
+            let at = position(rowid)?;
+            for build in matches {
+                let build_row = self.build.get(*build).ok_or(MorselError::Overflow {
+                    what: "a match's build row",
+                })?;
+                joined.clear();
+                joined.try_reserve(row.len().saturating_add(build_row.len()))?;
+                joined.extend_from_slice(row);
+                joined.extend_from_slice(build_row);
+                self.shape.fold(&joined, at, partial, budget)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        self.shape.merge(into, from, budget)
+    }
+}
+
+impl TableJoinAggregate<'_> {
+    /// The answer as the switch and the measured costs pick the degree.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let (partial, stats) = execute(self, mode, costs, budget)?;
+        Ok((self.shape.finish(partial)?, stats))
     }
 }
 

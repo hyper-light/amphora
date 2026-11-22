@@ -620,6 +620,30 @@ impl Shipper {
         self.identity.is_some_and(|i| i.seq == seq)
     }
 
+    /// The latest base's id, if the archive holds one.
+    #[must_use]
+    pub fn latest_base(&self) -> Option<u64> {
+        self.last_base.as_ref().map(|b| b.id)
+    }
+
+    /// The archive's count of the log's generations: it moves on as the log starts again.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether no base restores the log shipped now: none yet, or the log broke since the latest.
+    #[must_use]
+    pub fn base_needed(&self) -> bool {
+        self.base_bytes.is_none() || self.broken
+    }
+
+    /// The frames of the log's generation now shipped so far.
+    #[must_use]
+    pub fn frames_in_generation(&self) -> u64 {
+        self.shipped
+    }
+
     /// Marks dropped because their generation ended unshipped.
     #[must_use]
     pub fn lost_marks(&self) -> u64 {

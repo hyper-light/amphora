@@ -441,6 +441,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the source's digest taken by the shipping thread itself; cuts across nodes' clocks. Incremental
   bases (T-T1.12.I1 to I3): a new base keeps the latest's chunks the log left unchanged, due once the
   log outweighs what it would copy, after a reopen too.
+  Lane pitr-8: the shipping thread checks itself (`Archive::check`): the source's own rows from a
+  reader snapshot lined up with a second's stamps, checked once that second settles and the archive
+  holds it, the result in `Status::last_check` and the check counters (T-T1.12.C3); a due base waits
+  for the log's next restart, one generation at most (T-T1.12.I4).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -655,6 +659,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 ## Next
 
+- **Replication measured: the harnesses** (G12 steps 1 and 3, CP-T1.8; lane repl-measure; `bench/src/repl.rs`,
+  `bench/servers/repl/`): built and unit-tested, not run at size. `amphora-bench --repl commit|failover|catchup
+  --system amphora|rqlite|dqlite|litefs|libsql` gives commit latency p50/p99/p99.9 and throughput, the time from a
+  leader kill to the first acknowledged write with the acknowledged events lost, and a member's time to catch up,
+  every size and duration an input. Amphora's three members run in one process (a kill is a cut from the relay);
+  the competitors run as three-node container clusters through their scripts (dqlite and LiteFS through the bench's
+  Go shim). libSQL has no failover and dqlite no member-local read, so those are refused, typed, as is LiteFS's
+  failover until its script runs a Consul lease (lane repl-measure-2: it does now; `bench/repl.sh RECORDS FLAGS...`
+  runs every measure on every system, and all four clusters came up on jupiter). Closes with: the comparison set and Amphora's classes measured on
+  adacachy, fedora and jupiter, best of 3, and Amphora's members across machines for the LAN p99.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
@@ -663,7 +677,7 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   partitions at once and merges newest first. Closes with: AC-T1.10.3 and AC-T1.10.4 measured (`amphora-bench
   --cluster`), an idle group's time closed on demand, and the attached client's request on the wire.
 - **Query speed step 6 (QT.6), started** (lane qs6; docs/design/executor.md section 8): built and unit-tested, not
-  measured, not yet in the VDBE's loops. `vdbe/morsel.rs` runs a scan with its filter and aggregates, and a hash join's
+  measured. `vdbe/morsel.rs` runs a scan with its filter and aggregates, and a hash join's
   probe side, in morsels on several threads behind `ParallelMode` (off by default); the worker count and morsel size
   come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5).
   `vdbe/morsel_scan.rs` (lane qs6-2) reads a table b-tree in morsels of leaf pages: the leaves come from its interior
@@ -672,9 +686,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   pages. Answers equal the VDBE's serial SQL answers at every worker count (T-QT.6.7 to T-QT.6.9). The VDBE's hook:
   `Connection::set_parallel_mode` (off by default) lets a single-table scan with its filter and aggregates run as
   `Insn::MorselAggregate` ahead of its serial loop, which answers when the run declines a value (`translate/parallel.rs`;
-  T-QT.6.10). Closes with: the hash join's probe loop handed over the same way, expressions beyond column-against-
-  literal terms (a program's own loop body per worker), a shared hash build, loom or shuttle on the dispatcher, worker
+  T-QT.6.10). Lane qs6-3: a two-table inner hash join with aggregates goes through the same hook, the build side read
+  and hashed once, each worker probing over its own leaves of the probe table with its own cursor and folding the
+  joined rows into its partial aggregates (T-QT.6.11). Closes with: a join's own rows and joins of more than two
+  tables through the hook, expressions beyond column-against-literal terms (a program's own loop body per worker), a shared hash build, loom or shuttle on the dispatcher, worker
   and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
+- **PL.5's Bloom filters sized and chosen by cost** (lane qs5-9): a hash join's filter is sized when its build ends
+  from the distinct keys it measured, at a false-positive rate derived from the learned build and probe weights, and
+  chosen only where it costs less than the probes it saves; its hashes and bits stay within the join's memory budget
+  (`docs/design/planner.md`, "Decision (lane qs5-9)"). LIP and predicate transfer, a measured filter-lookup weight,
+  removing `rhs_has_selective_seek` and deriving `cpu_cost_per_where_step` are left.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
