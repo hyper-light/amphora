@@ -487,8 +487,20 @@ SQL's semantics stay in one place (CLAUDE.md §13): a comparison is the comparis
 `op_agg_step_slow` for what that doesn't take (a first row, text, SUM's exact integer overflow,
 which ends the statement with the same error). A row the batch left out (its record spills to
 overflow pages) ends the fused run before it and is read row-at-a-time. Any other instruction in
-the body (an expression, a GROUP BY's group lookup, a result row) leaves the loop row-at-a-time,
-reading its columns from the batch as decision 9 does.
+the body (an expression, a result row) leaves the loop row-at-a-time, reading its columns from the
+batch as decision 9 does.
+
+A hash GROUP BY's step (decision 4: `GroupFind`, the aggregate steps, `GroupSave`) is one step of
+the fused body. It takes its selection row by row in order and runs the opcodes' own
+`op_group_find` and `op_group_save` for each, so the group table, its budget and its refusals stay
+in one place. Between consecutive rows of one group, their keys identical value for value (then
+equal under any collation the GROUP BY compares with), the save and the next find are skipped and
+the group's accumulators stay in their registers. When the full table refuses a row's new group,
+the run ends before that row: the cursor stops on the row before it, and the refused row runs
+row-at-a-time on to the sorter's insert, which no batch runs. Filters before the group step have no
+effect, so having judged rows past the end costs nothing; a fused body with a group step may hold
+no other aggregate step, nor a jump into the step or the sorter's insert. A ColumnRange (several
+columns into consecutive registers, as multi-key GROUP BYs read them) is one vector a column.
 
 **Why.** Decision 9 decodes each leaf once, but the interpreter still dispatches every filter and
 aggregate instruction once a row. Run by selection, a body instruction is dispatched once a batch
@@ -499,6 +511,6 @@ positions of the rows that pass, read by the next operator; research finding f29
 PVLDB 11(13), 2018 (f30).
 
 **Falsified by.** Any answer or error that differs with the switch on (`vdbe/leaf_batch/tests.rs`,
-T-QT.7.4 and T-QT.7.5); a fused loop running a row the batch left out; or AC-QT.7.1 not met with
-it.
+T-QT.7.4 to T-QT.7.7, the group table whole and filling mid-batch); a fused loop running a row the
+batch left out or a row the group table refused; or AC-QT.7.1 not met with it.
 

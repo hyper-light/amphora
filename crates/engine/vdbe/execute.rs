@@ -3611,7 +3611,7 @@ pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         Next {
@@ -3655,7 +3655,7 @@ pub fn op_next(
             .as_deref()
             .and_then(|plan| plan.fused_loop(next_pc as usize))
         {
-            let rows = super::leaf_batch::fused::run(program, state, fused)?;
+            let rows = super::leaf_batch::fused::run(program, state, fused, pager)?;
             if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
                 let skipped = skipped as u64;
                 state.record_rows_read(skipped);
