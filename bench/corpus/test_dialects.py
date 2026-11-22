@@ -1120,7 +1120,8 @@ class ConstraintSwitches(unittest.TestCase):
     """Do: files with foreign keys and CHECK constraints, PRAGMA foreign_keys and
     ignore_check_constraints off and on (foreignkeys.html, pragma.html), one inside a transaction.
     Expect: with foreign keys never on, REFERENCES and FOREIGN KEY are left out and every write
-    translates; with them on somewhere, a write to a linked table while off is not expressible
+    translates; with them on somewhere, MySQL is given a column's REFERENCES as a FOREIGN KEY (it
+    ignores the column's own), and a write to a linked table while off is not expressible
     (and on ClickHouse while on), with the reason; a write to a CHECKed table while checks are
     ignored is not expressible; a PRAGMA foreign_keys inside BEGIN ... END does nothing."""
 
@@ -1139,6 +1140,9 @@ class ConstraintSwitches(unittest.TestCase):
             with self.subTest(dialect=d):
                 out = file_in(self.SCHEMA + ["INSERT INTO c VALUES (1, 2)", "PRAGMA foreign_keys = ON", "INSERT INTO p VALUES (1)", "PRAGMA main.foreign_keys = 0", "DELETE FROM p", "SELECT 1"], d)
                 self.assertIn("REFERENCES", out[1][0].upper())
+                if d == "mysql":
+                    self.assertIn("FOREIGN KEY (r) REFERENCES p (k) ON DELETE CASCADE", out[1][0])
+                    self.assertNotIn("INTEGER REFERENCES", out[1][0].upper())
                 self.assertIn("foreign_keys is off", out[2][1])
                 self.assertIn("foreign_keys is off", out[6][1])
                 self.assertIsNone(out[7][1])

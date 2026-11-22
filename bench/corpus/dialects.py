@@ -1909,7 +1909,10 @@ def enforced(expression, context, dialect):
       that never turns them on, each REFERENCES and FOREIGN KEY is left out of the statement, which
       then means the same. In one that does, an INSERT, UPDATE, DELETE or DROP TABLE of a table a
       foreign key links (child or parent) while they are off is not expressible; and while they are
-      on, on ClickHouse, which has no foreign keys.
+      on, on ClickHouse, which has no foreign keys. There, on MySQL, a column's own REFERENCES is
+      given as a table's FOREIGN KEY of that column: MySQL 8.0 "parses but ignores 'inline
+      REFERENCES specifications' ... MySQL accepts REFERENCES clauses only when specified as part
+      of a separate FOREIGN KEY specification" (https://dev.mysql.com/doc/refman/8.0/en/ansi-diff-foreign-keys.html).
     - PRAGMA ignore_check_constraints (pragma.html#pragma_ignore_check_constraints): while on,
       SQLite checks no CHECK constraint, where every engine checks them: an INSERT or UPDATE of a
       table with one is not expressible then."""
@@ -1918,6 +1921,12 @@ def enforced(expression, context, dialect):
     if not context.foreign_keys_ever:
         for node in [n for n in expression.walk() if isinstance(n, exp.ForeignKey) or (isinstance(n, exp.ColumnConstraint) and isinstance(n.args.get("kind"), exp.Reference))]:
             node.pop()
+    elif dialect == "mysql" and isinstance(expression, exp.Create) and isinstance(expression.this, exp.Schema):
+        for column in [c for c in expression.this.expressions if isinstance(c, exp.ColumnDef)]:
+            for k in [k for k in column.args.get("constraints") or [] if isinstance(k.args.get("kind"), exp.Reference)]:
+                reference = k.args["kind"]
+                k.pop()
+                expression.this.append("expressions", exp.ForeignKey(expressions=[column.this.copy()], reference=reference))
     target = _written_table(expression)
     if target is None:
         return expression
