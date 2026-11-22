@@ -581,7 +581,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the stamps with the revisions it drops, so the table stays bounded (lane split-merge-19, T-T1.9.R21). The read
   point is an A/B behind `ReadPoint` (latest with a clock push, the control; earliest without), its lab written (T-T1.9.R22). A row moved in
   carries its commit stamp, so scans and changes across groups place it (T-T1.9.R23). `get`, `changed` and `wait`
-  read across groups too, the wait woken by any group's change (T-T1.9.R24, T-T1.9.R25); `commit` is left.
+  read across groups too, the wait woken by any group's change (T-T1.9.R24, T-T1.9.R25). A read as of an older stamp
+  places moved rows by their own stamps (lane split-merge-20, T-T1.9.R26), and a transaction across groups takes
+  conditions naming commit stamps, checked under its locks (T-T1.9.R27); `Records::commit` across groups waits on one
+  commit stamp for all of a transaction's rows, a coordinator change.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

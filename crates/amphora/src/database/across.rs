@@ -976,7 +976,7 @@ mod tests {
     use crate::backup::{Archive, CheckPolicy, FolderBlobs, SECOND_NS};
     use crate::store::Moved;
     use crate::xgroup::sql::record_key;
-    use crate::xgroup::{Cluster, Protocol, Txn};
+    use crate::xgroup::{Answer, Cluster, Protocol, Txn, Why};
 
     fn until() -> Instant {
         Instant::now() + Duration::from_secs(60)
@@ -1503,6 +1503,127 @@ mod tests {
         assert_eq!((seen(&next.rows), next.more), (want(&b[..2]), true));
     }
 
+    /// T-T1.9.R27 (CP-T1.9; reshard.md, "Decision (lane split-merge-20): conditions across groups
+    /// name commit stamps"). Do, under each protocol: two backed-up groups, the second's clock 500
+    /// seconds behind the first's, keys ending in b in the second; 1a, 1b and 7a written, each in
+    /// its own group, and read across them for their stamps; 1a written again. Then across both
+    /// groups: a commit conditioned on 1a as of its first stamp and 1b as of its own; one on 1a as
+    /// of its new stamp, 1b as of its own and 9b absent; one on 1b absent; one on 8a (never
+    /// written) as of the head. Then in one group: on 7a absent, then on 7a as of the head. And a
+    /// condition on a key-value row. Expect: the first aborted, 1a unmet, and none of its rows
+    /// written; the second committed; the third aborted on 1b, the fourth on 8a; in one group the
+    /// first aborted on 7a, the second committed; the key-value condition refused.
+    #[test]
+    fn t_t1_9_r27_a_commit_across_groups_holds_to_conditions_on_stamps() {
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            let dir = tempfile::tempdir().unwrap();
+            let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+            // A row key ends in its own key, so "1b" routes to group 1.
+            let route: crate::xgroup::Route =
+                Arc::new(|key: &[u8]| u32::from(key.last() == Some(&b'b')));
+            let (dbs, _sinks, first) = groups_on(
+                dir.path(),
+                2,
+                |group| {
+                    let read = Arc::clone(&now);
+                    let behind = group * 500 * SECOND_NS;
+                    Arc::new(move || read.fetch_add(1, Ordering::SeqCst) - behind)
+                },
+                Arc::clone(&route),
+            );
+            drop(first);
+            let cluster =
+                Arc::new(Cluster::open(dbs.clone(), route, 6, protocol, 1, until()).unwrap());
+            let across = dbs[0].across(Arc::clone(&cluster)).namespace("n").unwrap();
+            let key = |k: &[u8]| record_key("n", "f", k).unwrap();
+            let commit = |writes: &[&[u8]], conds: Vec<(Vec<u8>, Option<u64>)>| {
+                let txn = Txn {
+                    reads: vec![],
+                    writes: writes.iter().map(|k| (key(*k), Some(vec![1]))).collect(),
+                    conds,
+                };
+                cluster.commit(txn, until())
+            };
+            let stamp = |k: &[u8]| {
+                across
+                    .get("f", k, Consistency::Linearizable, until())
+                    .unwrap()
+                    .map(|row| row.rev)
+            };
+            for k in [b"1a", b"1b", b"7a"] {
+                let answer = commit(&[k.as_slice()], vec![]).unwrap();
+                assert!(matches!(answer, Answer::Committed { .. }), "{answer:?}");
+            }
+            let (a, b) = (stamp(b"1a").unwrap(), stamp(b"1b").unwrap());
+            commit(&[b"1a".as_slice()], vec![]).unwrap();
+            let again = stamp(b"1a").unwrap();
+            assert!(again > a, "{again} {a} ({protocol:?})");
+
+            let stale = commit(
+                &[b"2a".as_slice(), b"2b".as_slice()],
+                vec![(key(b"1a"), Some(a)), (key(b"1b"), Some(b))],
+            );
+            assert_eq!(
+                stale,
+                Ok(Answer::Aborted(Why::Unmet(key(b"1a")))),
+                "{protocol:?}"
+            );
+            assert_eq!((stamp(b"2a"), stamp(b"2b")), (None, None), "{protocol:?}");
+            let held = commit(
+                &[b"3a".as_slice(), b"3b".as_slice()],
+                vec![
+                    (key(b"1a"), Some(again)),
+                    (key(b"1b"), Some(b)),
+                    (key(b"9b"), None),
+                ],
+            )
+            .unwrap();
+            assert!(
+                matches!(held, Answer::Committed { .. }),
+                "{held:?} ({protocol:?})"
+            );
+            let there = commit(
+                &[b"4a".as_slice(), b"4b".as_slice()],
+                vec![(key(b"1b"), None)],
+            );
+            assert_eq!(
+                there,
+                Ok(Answer::Aborted(Why::Unmet(key(b"1b")))),
+                "{protocol:?}"
+            );
+            let head = across.head(until()).unwrap();
+            let missing = commit(
+                &[b"5a".as_slice(), b"5b".as_slice()],
+                vec![(key(b"8a"), Some(head))],
+            );
+            assert_eq!(
+                missing,
+                Ok(Answer::Aborted(Why::Unmet(key(b"8a")))),
+                "{protocol:?}"
+            );
+
+            // In one group, no coordinator step: the same check.
+            let one = commit(&[b"6a".as_slice()], vec![(key(b"7a"), None)]);
+            assert_eq!(
+                one,
+                Ok(Answer::Aborted(Why::Unmet(key(b"7a")))),
+                "{protocol:?}"
+            );
+            let one = commit(&[b"6a".as_slice()], vec![(key(b"7a"), Some(head))]).unwrap();
+            assert!(matches!(one, Answer::Committed { .. }), "{one:?}");
+
+            let plain = cluster.commit(
+                Txn {
+                    reads: vec![],
+                    writes: vec![(b"kv".to_vec(), Some(vec![1]))],
+                    conds: vec![(b"kv".to_vec(), None)],
+                },
+                until(),
+            );
+            assert!(matches!(&plain, Err(Refusal::Invalid { .. })), "{plain:?}");
+        }
+    }
+
     /// T-T1.9.R24 (CP-T1.9; reshard.md, "Decision (lane split-merge-19): one key and what changed,
     /// across groups"). Do: two backed-up groups, the second's clock 500 seconds behind the
     /// first's, routing a key ending in b to the second; rows 1a and 1b written in their groups;
@@ -1654,6 +1775,7 @@ mod tests {
             let txn = Txn {
                 reads: vec![],
                 writes: vec![(record_key("n", "f", key).unwrap(), Some(key.to_vec()))],
+                conds: Vec::new(),
             };
             cluster.commit(txn, until()).unwrap();
         };

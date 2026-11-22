@@ -2467,6 +2467,33 @@ fn get(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<O
     Ok(out)
 }
 
+/// The commit stamp of a Records row's newest version, as a condition of a transaction across
+/// groups checks it under its lock (lane split-merge-20, T-T1.9.R27): none while it has no
+/// value; 0 for one whose stamp isn't known (made before its group stamped its commits), as a
+/// read across groups answers it.
+pub(crate) fn newest_stamp(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+) -> anyhow::Result<Option<u64>> {
+    let mut head = 0;
+    db.query(
+        "SELECT head FROM __amphora_namespaces WHERE name = ?1",
+        [text(ns)],
+        |r| {
+            head = rev(r, 0)?;
+            Ok(false)
+        },
+    )?;
+    let Some(row) = get(db, ns, family, key, head)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        across::stamp_of_version(db, ns, family, key, row.rev)?.unwrap_or(0),
+    ))
+}
+
 /// A Records row's newest value, as a transaction across groups reads it under its lock
 /// (AC-T1.10.1, lane xgroup-sql-6).
 pub(crate) fn newest(

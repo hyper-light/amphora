@@ -606,6 +606,7 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol, skew: u64) {
                 (b"a".to_vec(), Some(v.to_vec())),
                 (b"b".to_vec(), Some(v.to_vec())),
             ],
+            conds: Vec::new(),
         };
         // The first transaction's resolution may still hold the coordinator's one place. A stopped
         // coordinator is opened again and the transaction sent again: its writes are the same
@@ -661,6 +662,7 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol, skew: u64) {
         let read = Txn {
             reads: vec![b"a".to_vec(), b"b".to_vec()],
             writes: vec![],
+            conds: Vec::new(),
         };
         let Answer::Committed { reads } = reader.transact(read, until()).unwrap() else {
             panic!("second {second}: the read didn't commit");

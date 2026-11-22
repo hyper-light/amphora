@@ -410,6 +410,7 @@ fn refusals(args: &Args) -> anyhow::Result<()> {
                 let txn = Txn {
                     reads: Vec::new(),
                     writes: vec![(key(0), Some(vec![0])), (key(1), Some(vec![0]))],
+                    conds: Vec::new(),
                 };
                 warm.commit(txn, later(deadline))?;
             }
@@ -442,6 +443,7 @@ fn refusals(args: &Args) -> anyhow::Result<()> {
                                 let txn = Txn {
                                     reads: vec![read],
                                     writes: vec![(a, Some(value.clone())), (b, Some(value))],
+                                    conds: Vec::new(),
                                 };
                                 let (generation, cluster) = {
                                     let held =
@@ -486,7 +488,10 @@ fn refusals(args: &Args) -> anyhow::Result<()> {
                                                 tally.stopped_seen.saturating_add(1);
                                             stopped = true;
                                         }
-                                        Err(_) => tally.failed = tally.failed.saturating_add(1),
+                                        // It names no conditions, so none can fail.
+                                        Ok(Answer::Aborted(Why::Unmet(_))) | Err(_) => {
+                                            tally.failed = tally.failed.saturating_add(1);
+                                        }
                                     }
                                 }
                                 if stopped {

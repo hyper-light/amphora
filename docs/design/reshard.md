@@ -833,3 +833,51 @@ group's own revisions; a read as of a stamp that compaction passed that way can 
 
 **Falsified by.** A read as of a stamp holding a version stamped after it, or missing one stamped
 at or before it that is still kept; a key answered twice in a page.
+
+## Decision (lane split-merge-20): conditions across groups name commit stamps
+
+A transaction across groups (`xgroup::Txn`) now carries conditions, as a Records transaction
+does: each a key and the commit stamp its newest version must be at or before (none: the key must
+have none). A revision counts one group's commits only, so across groups a condition names a
+stamp, the one a read across groups answered as the row's revision (`get`, `scan`, `changes`) or
+any later one, such as a head: it holds while nothing was written to the key after it.
+- The condition is checked in the key's group as its locks are taken, in the same step's one
+  commit, and the key is read-locked, so it stays as checked until the transaction resolves. A
+  failed one locks nothing and answers `Reply::Unmet`; the coordinator aborts the transaction as
+  it does on a conflict, `Why::Unmet`, under either protocol (Parallel Commits' staging record
+  turns aborted first).
+- The wire grows only: a group with a condition gets the new `Step::LockIf`, after every other
+  step; a group with none still gets `Step::Lock`, so a transaction without conditions sends what
+  it sent before. `Reply::Unmet` and `Why::Unmet` come after every other variant.
+- In one group (no coordinator step) the same check runs in the group's one transaction.
+- Only a Records row has stamps: a condition on a key-value row is refused before any step.
+- A row whose stamp isn't known (made before its group stamped its commits) reads as 0, as reads
+  across groups answer it.
+
+**Evidence.** T-T1.9.R27 on the simulator's tablet: a lock step conditioned on a key as of a
+stamp before its last write is unmet with nothing locked; one whose conditions hold read-locks
+their keys beside its writes, and a write lock on such a key is then refused; a lock held out
+comes before a condition. Under two-phase commit and Parallel Commits: two backed-up groups, the
+second's clock 500 seconds behind. A commit across both conditioned on a row as of a stamp before
+its last write is aborted on that row with none of its rows written; conditioned on the stamps
+reads answered and on a key absent, committed; on a key absent that is there, or present that
+never was, aborted on it. In one group the same. A condition on a key-value row is refused.
+
+**Left.** `Records::commit` on a database handed the cluster still commits in this database
+alone: its answer is a revision, and across groups that must be the commit's stamp, which the
+coordinator can't answer yet. Each participant stamps the transaction's rows as it resolves,
+after the client heard (both protocols answer before the resolutions), each by its own clock; so
+the rows of one transaction carry different stamps, none known when the answer goes out, and a
+read across groups can see one group's rows of it and not another's. One commit stamp needs the
+participants to write the rows at a stamp fixed before the answer (the largest of stamps the lock
+steps answer, carried in the resolutions), and reads at a cut past a held lock's stamp to wait for
+its resolution, or the stamps within a group no longer rise with its revisions. That is the
+coordinator's change, and the field it fills is `Answer::Committed`'s. Lane xgroup-sql-10's
+`Answer::Committed::at` is not that stamp: it is the newest closed time of the groups touched, in
+microseconds, from replicated groups' session tokens (none for groups without one), while the
+stamps reads across groups answer and conditions name are the backup's clock, in nanoseconds, on
+backed-up groups. A condition compared with it would compare two clocks.
+
+**Falsified by.** A commit across groups committed while a condition's key was written after the
+stamp named; one aborted while every condition held and no lock conflicted; a write to a
+condition's key landing between the check and the resolution.

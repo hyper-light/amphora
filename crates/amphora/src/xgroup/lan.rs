@@ -462,6 +462,7 @@ pub fn elle(
         let txn = Txn {
             reads: all.clone(),
             writes: Vec::new(),
+            conds: Vec::new(),
         };
         match cluster.transact(txn, until)? {
             Answer::Committed { reads } => break reads.into_iter().collect::<BTreeMap<_, _>>(),

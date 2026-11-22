@@ -231,6 +231,14 @@ impl Tablet for SqlTablet<'_> {
         }
     }
 
+    fn stamp(&mut self, key: &[u8]) -> anyhow::Result<Option<u64>> {
+        // `conditioned` refuses a condition on a key-value row before any step is sent.
+        let Some((namespace, family, row)) = record_of(key)? else {
+            anyhow::bail!("a condition names a key-value row, which has no commit stamps");
+        };
+        crate::database::newest_stamp(self.db, namespace, family, row)
+    }
+
     fn locks(&mut self, key: &[u8]) -> anyhow::Result<Vec<Lock>> {
         let mut locks = Vec::new();
         self.db.query(
@@ -857,6 +865,7 @@ impl Cluster {
     /// Runs `txn`: committed in every group or aborted in every group, as the answer says.
     /// Unanswered by `until`, its outcome is unknown ([`Refusal::UnknownOutcome`]).
     pub fn transact(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
+        conditioned(&txn)?;
         let began = Instant::now();
         let (answer, answered) = mpsc::sync_channel(1);
         self.inputs
@@ -902,11 +911,13 @@ impl Cluster {
     pub fn commit(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
         // Refused as the coordinator refuses it, whichever path it takes.
         super::coordinator::validate(&txn)?;
+        conditioned(&txn)?;
         let one = {
             let mut keys = txn
                 .reads
                 .iter()
-                .chain(txn.writes.iter().map(|(key, _)| key));
+                .chain(txn.writes.iter().map(|(key, _)| key))
+                .chain(txn.conds.iter().map(|(key, _)| key));
             let first = keys.next().map(|key| (self.route)(key));
             first.filter(|group| keys.all(|key| (self.route)(key) == *group))
         };
@@ -922,17 +933,37 @@ impl Cluster {
     }
 }
 
+/// Refuses a transaction with a condition on a key-value row (lane split-merge-20, T-T1.9.R27):
+/// only a Records row's versions have commit stamps for a condition to name.
+fn conditioned(txn: &Txn) -> Result<(), Refusal> {
+    for (key, _) in &txn.conds {
+        if !matches!(record_of(key), Ok(Some(_))) {
+            return Err(amphora_api::invalid(
+                "condition",
+                "only a Records row has commit stamps to name",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A transaction whose rows are all in this group, in the group's one database transaction:
-/// aborted at the first row another transaction holds a lock on, else its reads as they stood
-/// (each key once, in key order) and its writes applied.
+/// aborted at the first row another transaction holds a lock on, or at the first condition that
+/// fails, else its reads as they stood (each key once, in key order) and its writes applied.
 fn one_group(tablet: &mut impl Tablet, txn: &Txn) -> anyhow::Result<Answer> {
     for key in txn
         .reads
         .iter()
         .chain(txn.writes.iter().map(|(key, _)| key))
+        .chain(txn.conds.iter().map(|(key, _)| key))
     {
         if !tablet.locks(key)?.is_empty() {
             return Ok(Answer::Aborted(Why::Conflict(key.clone())));
+        }
+    }
+    for (key, named) in &txn.conds {
+        if !super::holds(*named, tablet.stamp(key)?) {
+            return Ok(Answer::Aborted(Why::Unmet(key.clone())));
         }
     }
     let mut reads = BTreeMap::new();
@@ -1439,7 +1470,11 @@ mod sessions {
                         writes.push((k, value));
                     }
                 }
-                Txn { reads, writes }
+                Txn {
+                    reads,
+                    writes,
+                    conds: Vec::new(),
+                }
             })
             .collect()
     }
@@ -1516,6 +1551,7 @@ mod sessions {
             let all = Txn {
                 reads: (0..keys).map(|k| vec![u8::try_from(k).unwrap()]).collect(),
                 writes: Vec::new(),
+                conds: Vec::new(),
             };
             assert_eq!(commit(&spread, &all), commit(&one, &all), "{protocol:?}");
         }
@@ -1561,6 +1597,7 @@ mod sessions {
         Txn {
             reads: vec![row(0)],
             writes: (0..3).map(|k| (row(k), Some(vec![i]))).collect(),
+            conds: Vec::new(),
         }
     }
 
@@ -1659,6 +1696,7 @@ mod sessions {
                     let all = Txn {
                         reads: (0..3).map(row).collect(),
                         writes: Vec::new(),
+                        conds: Vec::new(),
                     };
                     let got = commit(&recovered, &all);
                     let reads = match &got {
@@ -1724,6 +1762,7 @@ mod sessions {
                         .iter()
                         .map(|(k, v)| (row(k[0]), v.clone()))
                         .collect(),
+                    conds: Vec::new(),
                 };
                 let groups: BTreeSet<u8> = raw
                     .reads
@@ -1747,6 +1786,7 @@ mod sessions {
             let all = Txn {
                 reads: (0..keys).map(row).collect(),
                 writes: Vec::new(),
+                conds: Vec::new(),
             };
             commit(&spread, &all);
             for g in 0..3u8 {
