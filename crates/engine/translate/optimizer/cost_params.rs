@@ -118,7 +118,11 @@ pub struct CostModelParams {
     /// (`hash_cpu_cost`'s), stands only where the clock never moved.
     pub bloom_lookup_cost: f64,
 
-    /// Estimated bytes per row for hash table spill estimation.
+    /// Amphora (QT.5, T-QT.5.7): a hash table entry's bytes, for its memory and spill estimates
+    /// and the Bloom filter's bit price: a build row's bytes, its table's page over its rows a
+    /// page, plus the entry's fixed bytes (`HashEntry::FIXED_BYTES`). Set for each hash join by
+    /// [Self::with_hash_build] from the build table's [Self::for_table]; until then, the format's
+    /// default page of the fewest-byte one-column records.
     pub hash_bytes_per_row: f64,
 
     /// Amphora (PL.12): the values the estimates may read for the statement's parameters, a run's
@@ -131,14 +135,15 @@ pub struct CostModelParams {
 impl CostModelParams {
     /// Create default parameters as a const fn (for compile-time static).
     pub const fn new() -> Self {
+        let rows_per_table_page = super::cost::rows_per_leaf_page(
+            super::cost::FORMAT_DEFAULT_PAGE_BYTES,
+            super::cost::least_record_bytes(1.0),
+            super::cost::varint_bytes(1_000_000.0),
+        );
         Self {
             // Cardinality fallbacks
             rows_per_table_fallback: 1_000_000.0,
-            rows_per_table_page: super::cost::rows_per_leaf_page(
-                super::cost::FORMAT_DEFAULT_PAGE_BYTES,
-                super::cost::least_record_bytes(1.0),
-                super::cost::varint_bytes(1_000_000.0),
-            ),
+            rows_per_table_page,
             page_bytes: super::cost::FORMAT_DEFAULT_PAGE_BYTES,
             index_rows_per_page: None,
 
@@ -170,11 +175,26 @@ impl CostModelParams {
             hash_insert_cost: 0.002,
             hash_lookup_cost: 0.003,
             bloom_lookup_cost: 0.001,
-            hash_bytes_per_row: 100.0,
+            hash_bytes_per_row: hash_entry_bytes(
+                super::cost::FORMAT_DEFAULT_PAGE_BYTES,
+                rows_per_table_page,
+            ),
 
             plan_values: None,
         }
     }
+}
+
+/// Amphora (QT.5, T-QT.5.7): a hash entry's bytes for a build table of `page_bytes` pages holding
+/// `rows_per_page` rows each: a row's share of its page plus the entry's fixed bytes
+/// (`HashEntry::FIXED_BYTES`). A page holds at least one row.
+const fn hash_entry_bytes(page_bytes: f64, rows_per_page: f64) -> f64 {
+    let rows = if rows_per_page < 1.0 {
+        1.0
+    } else {
+        rows_per_page
+    };
+    page_bytes / rows + crate::vdbe::hash_table::HashEntry::FIXED_BYTES as f64
 }
 
 /// Compile-time static default parameters (zero runtime overhead).
@@ -236,6 +256,16 @@ impl CostModelParams {
                 .map(|s| s.index_rows_per_page.clone())
                 .filter(|m| !m.is_empty()),
             ..self.clone()
+        }
+    }
+
+    /// Amphora (QT.5, T-QT.5.7): these parameters for a hash join whose build side is the table
+    /// `build` was made for ([Self::for_table]): a hash entry holds one of its rows, its page over
+    /// its rows a page, plus the entry's fixed bytes.
+    pub(crate) fn with_hash_build(self, build: &Self) -> Self {
+        Self {
+            hash_bytes_per_row: hash_entry_bytes(build.page_bytes, build.rows_per_table_page),
+            ..self
         }
     }
 
@@ -459,6 +489,33 @@ impl CostModelParams {
 
 #[cfg(all(test, feature = "optimizer_params"))]
 mod tests {
+    /// T-QT.5.7: a hash entry's bytes are the build table's row, its page over its rows a page,
+    /// plus the entry's fixed bytes; the build's, not the probe's.
+    #[test]
+    fn t_qt_5_7_hash_entry_bytes_are_the_build_tables_row() {
+        let fixed = crate::vdbe::hash_table::HashEntry::FIXED_BYTES as f64;
+        let probe = CostModelParams {
+            page_bytes: 4096.0,
+            rows_per_table_page: 400.0,
+            ..CostModelParams::new()
+        };
+        let wide_build = CostModelParams {
+            page_bytes: 4096.0,
+            rows_per_table_page: 8.0,
+            ..CostModelParams::new()
+        };
+        let joined = probe.clone().with_hash_build(&wide_build);
+        assert_eq!(joined.hash_bytes_per_row, 4096.0 / 8.0 + fixed);
+        assert_eq!(joined.rows_per_table_page, 400.0);
+        let narrow = probe.clone().with_hash_build(&probe);
+        assert!(narrow.hash_bytes_per_row < joined.hash_bytes_per_row);
+        let defaults = CostModelParams::new();
+        assert_eq!(
+            defaults.hash_bytes_per_row,
+            defaults.page_bytes / defaults.rows_per_table_page + fixed
+        );
+    }
+
     use super::*;
 
     #[test]

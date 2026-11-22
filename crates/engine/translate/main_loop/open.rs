@@ -138,7 +138,7 @@ impl OpenLoop {
             let (table_cursor_id, index_cursor_id) =
                 table.resolve_cursors(program, mode.clone())?;
             // Amphora (G5 step 4, T-G5.4.3): a SELECT's plain forward scan of a rowid table carries
-            // its WHERE terms' integer bounds, so a skipping summary can leave rows out at run
+            // its WHERE terms' integer bounds (constants or parameters), so a skipping summary can leave rows out at run
             // time. Outer joins are left alone: their NULL rows aren't the filter's to drop.
             if let (
                 true,
@@ -163,7 +163,7 @@ impl OpenLoop {
                     .iter()
                     .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_outer()));
                 if btree.has_rowid && !outer {
-                    let bounds = crate::skipping::integer_bounds(
+                    let terms = crate::skipping::bound_terms(
                         predicates
                             .iter()
                             .filter(|t| {
@@ -176,10 +176,10 @@ impl OpenLoop {
                             .map(|t| &t.expr),
                         table.internal_id,
                     );
-                    if !bounds.is_empty() {
+                    if !terms.is_empty() {
                         program
                             .skip_hints
-                            .push(crate::skipping::SkipHint { cursor_id, bounds });
+                            .push(crate::skipping::SkipHint { cursor_id, terms });
                     }
                 }
             }
