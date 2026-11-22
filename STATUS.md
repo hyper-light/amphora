@@ -884,3 +884,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 Everything else the track's plan names (kiln plan `01a157fdefba746a94a5fcd920a80d5a`): each goal, its criteria and how each is
 measured are in `docs/requirements.toml`.
+
+QT.6 (lane qs6-4): a hash join's table is now built by the workers together, partitioned (each
+worker scans its own build leaves and scatters entries by partition, each partition filled by one
+worker), charged to the statement's memory budget with a typed refusal that falls back to the
+serial loop; two-table hash joins that return rows (no aggregates) run on morsels, with an
+order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
+the VDBE loop body (any expression in parallel), joins of three or more tables.
