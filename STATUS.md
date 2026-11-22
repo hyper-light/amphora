@@ -958,7 +958,7 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   it and switches at the learned costs' break-even; the hash table's build, the inner table whole,
   is checked against the plan's estimate and, past its error, the table's count is corrected and the
   statement planned again; a read-only run that has returned no row yet starts again on the new plan
-  at once (the in-run hand-off, `Connection::set_adaptive_handoff`), any other at its next run. A hash join the planner chose checks its unfiltered build the same way (lane pl13r); filtered builds, sorters and materialized subqueries are not checked yet. The
+  at once (the in-run hand-off, `Connection::set_adaptive_handoff`), any other at its next run. A hash join the planner chose checks its unfiltered build the same way (lane pl13r); a filtered build checks the share of its table its filter keeps and stores the counted share for the planner (lane replan-5, T-PL.13.5); an ORDER BY sorter fed by one table's scan checks its input the same way (T-PL.13.6); materialized subqueries are not checked yet. The
   engine's own tests (T-PL.13.1, T-PL.13.3, T-PL.13.4) pass on pinned weights. JOB's 20 slowest queries against the parent (AC-PL.13.1) are open.
   PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
@@ -1069,3 +1069,5 @@ by measured cost and a SQL switch (executor.md decision 11, "Not yet").
 Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
 11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
 skip (T-SKU.1).
+
+Lane qs5-16 (QT.5, T-QT.5.3): a star join's dimensions filter the fact scan with Bloom filters (`optimizer/lip.rs`, `main_loop/star.rs`), each kept by the planner's costs, sharing the statement's memory, behind `Connection::set_star_filters` (off is the control); `tests/star_filters.rs` holds the answers to the control's over a star, a cyclic graph and outer joins. Left: the order by selectivity is the planner's estimate, not yet re-measured as rows run; sort-merge and prefetched index joins not started.

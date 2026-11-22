@@ -96,6 +96,7 @@ mod cost_params;
 pub(crate) mod join;
 pub(crate) mod learned_costs;
 pub(crate) mod lift_common_subexpressions;
+pub(crate) mod lip;
 pub(crate) mod multi_index;
 pub(crate) mod order;
 pub mod plan_hints;
@@ -979,6 +980,10 @@ struct TableAccessPlan {
     order_target: Option<OrderTarget>,
     sort_eliminated: bool,
     initial_input_rows: f64,
+    /// Amphora (T-QT.5.3): the costs the plan was found with, and each table's rows, for the star
+    /// filters chosen once the plan is applied.
+    params: cost_params::CostModelParams,
+    base_rows: Vec<f64>,
 }
 
 #[derive(Default)]
@@ -1457,6 +1462,7 @@ fn apply_select_table_plan(
     let Some(table_plan) = table_plan else {
         return Ok(());
     };
+    let (lip_params, lip_base_rows) = (table_plan.params.clone(), table_plan.base_rows.clone());
     plan.join_order = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
@@ -1465,6 +1471,16 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    // Amphora (QT.5, T-QT.5.3): the star joins' filters, by cost, once the plan is fixed.
+    let filters = lip::choose(
+        resolver.star_filters(),
+        &plan.table_references,
+        &plan.where_clause,
+        &plan.join_order,
+        &lip_base_rows,
+        &lip_params,
+    );
+    plan.table_references.set_lip_filters(filters);
     Ok(())
 }
 
@@ -3176,6 +3192,8 @@ fn find_table_access_plan(
         order_target: maybe_order_target,
         sort_eliminated,
         initial_input_rows: initial_input_cardinality,
+        params: params.clone(),
+        base_rows: base_table_rows.iter().map(|rows| **rows).collect(),
     }))
 }
 
@@ -3976,6 +3994,8 @@ fn apply_table_access_plan(
         order_target: maybe_order_target,
         sort_eliminated,
         initial_input_rows,
+        params: _,
+        base_rows: _,
     } = plan;
 
     if sort_eliminated {

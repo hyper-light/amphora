@@ -35,20 +35,26 @@ fn analyzed_table(t_ctx: &TranslateCtx, table: &str) -> Option<(f64, f64)> {
 }
 
 /// Amphora (PL.13, a materialization point): after a planner-chosen hash join's build, the check
-/// of its rows against the plan's estimate, where the build holds its table whole: adaptive joins
-/// on, the table with statistics, and no filter in the build (a filtered build's count is the
-/// filter's, not the table's, and is not checked here).
+/// of its rows against the plan's estimate: adaptive joins on, the table with statistics, and its
+/// input the table itself (`filter_terms` is `None` for a materialized input). Unfiltered, the
+/// build holds the table whole and counts its rows. Filtered (lane replan-5; `filter_terms` holds
+/// whether the build has terms of its own and their fingerprint), it counts the share of the table
+/// they keep, checked where the plan's estimate read a share for exactly those terms
+/// (`PlanValues::filter_selectivity`): a build whose terms the sample did not run together, or
+/// that reads a parameter, is not checked.
 pub(super) fn emit_build_count(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
     table: &crate::schema::BTreeTable,
     hash_table_id: usize,
-    filtered: bool,
+    filter_terms: Option<(bool, Option<u64>)>,
 ) {
-    if filtered || !t_ctx.resolver.adaptive_joins() || !table.has_rowid {
+    let Some((prefiltered, fingerprint)) = filter_terms else {
         return;
-    }
-    let Some((analyzed_rows, estimate_error)) = analyzed_table(t_ctx, &table.name) else {
+    };
+    let Some((analyzed_rows, estimate_error, filter)) =
+        counted_check(t_ctx, table, prefiltered, fingerprint)
+    else {
         return;
     };
     program.emit_insn(Insn::BuildCounted {
@@ -57,6 +63,92 @@ pub(super) fn emit_build_count(
             table: table.name.clone(),
             analyzed_rows,
             estimate_error,
+            filter,
+        }),
+    });
+}
+
+/// What a materialization point over one table's rows is checked against: ANALYZE's count of the
+/// table, its error, and for a filtered input (`prefiltered`, its terms' `fingerprint`) the share
+/// the plan read for exactly those terms. `None` where it is not checked: adaptive joins off, no
+/// statistics, no rowid, or filter terms the plan's estimate did not read a share for.
+fn counted_check(
+    t_ctx: &TranslateCtx,
+    table: &crate::schema::BTreeTable,
+    prefiltered: bool,
+    fingerprint: Option<u64>,
+) -> Option<(f64, f64, Option<crate::vdbe::insn::FilteredBuild>)> {
+    if !t_ctx.resolver.adaptive_joins() || !table.has_rowid {
+        return None;
+    }
+    let (analyzed_rows, estimate_error) = analyzed_table(t_ctx, &table.name)?;
+    let filter = match (prefiltered, fingerprint) {
+        (false, _) => None,
+        (true, None) => return None,
+        (true, Some(fingerprint)) => {
+            let planned = t_ctx
+                .resolver
+                .plan_values()
+                .and_then(|values| values.planned_filter(&table.name, fingerprint))?;
+            // The share's error and the table count's, independent, add in quadrature.
+            let error = planned.share_error().hypot(estimate_error);
+            Some(crate::vdbe::insn::FilteredBuild {
+                share: planned.share,
+                planned_share: planned.planned_share,
+                error,
+            })
+        }
+    };
+    Some((analyzed_rows, estimate_error, filter))
+}
+
+/// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter fed by a
+/// full scan of one table, nothing grouped, aggregated, windowed or made distinct in between, holds
+/// the rows of that table its WHERE terms keep. Once the scan has put them all in, ahead of the
+/// sort, their count is checked as a hash join's build is: against the table's rows, or with WHERE
+/// terms against the share the plan read for exactly those terms (`counted_check`).
+pub(crate) fn emit_sorter_count(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx,
+    plan: &crate::translate::plan::SelectPlan,
+    cursor_id: CursorID,
+) {
+    use crate::translate::plan::{Distinctness, Operation, Scan};
+    let [joined] = plan.joined_tables() else {
+        return;
+    };
+    if plan.group_by.is_some()
+        || !plan.aggregates.is_empty()
+        || plan.window.is_some()
+        || plan.contains_constant_false_condition
+        || !matches!(plan.distinctness, Distinctness::NonDistinct)
+    {
+        return;
+    }
+    let (Operation::Scan(Scan::BTreeTable { index: None, .. }), Table::BTree(btree)) =
+        (&joined.op, &joined.table)
+    else {
+        return;
+    };
+    let mut terms = plan
+        .where_clause
+        .iter()
+        .filter(|term| !term.consumed)
+        .peekable();
+    let prefiltered = terms.peek().is_some();
+    let fingerprint = crate::filter_shares::fingerprint(terms.map(|term| &term.expr));
+    let Some((analyzed_rows, estimate_error, filter)) =
+        counted_check(t_ctx, btree, prefiltered, fingerprint)
+    else {
+        return;
+    };
+    program.emit_insn(Insn::SorterCounted {
+        data: Box::new(crate::vdbe::insn::SorterCountedData {
+            cursor_id,
+            table: btree.name.clone(),
+            analyzed_rows,
+            estimate_error,
+            filter,
         }),
     });
 }

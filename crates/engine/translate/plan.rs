@@ -1886,6 +1886,8 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
+    /// Amphora (QT.5, T-QT.5.3): the star joins' Bloom filters the planner chose.
+    lip_filters: Vec<LipFilter>,
 }
 
 impl Default for TableReferences {
@@ -1902,6 +1904,7 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
+            lip_filters: Vec::new(),
         }
     }
 
@@ -1909,7 +1912,18 @@ impl TableReferences {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
+            lip_filters: Vec::new(),
         }
+    }
+
+    /// Amphora (QT.5, T-QT.5.3): the star joins' Bloom filters, each checked at its fact table's
+    /// scan, in the order the scan checks them.
+    pub fn lip_filters(&self) -> &[LipFilter] {
+        &self.lip_filters
+    }
+
+    pub fn set_lip_filters(&mut self, filters: Vec<LipFilter>) {
+        self.lip_filters = filters;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2254,6 +2268,7 @@ impl TableReferences {
         let TableReferences {
             joined_tables,
             outer_query_refs,
+            ..
         } = other;
 
         // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
@@ -2773,6 +2788,26 @@ pub struct ExpressionIndexUsage {
 /// Represents one key pair in a hash join equality condition.
 /// For `expr1 = expr2`, this tracks which WHERE term contains the equality
 /// and which side of the equality belongs to the build table.
+/// Amphora (QT.5, T-QT.5.3): a star join's dimension, read once into a Bloom filter of its join
+/// keys that the fact table's scan checks before any later loop (`optimizer/lip.rs`).
+#[derive(Debug, Clone)]
+pub struct LipFilter {
+    /// The fact table, whose scan checks the filter.
+    pub fact_idx: usize,
+    /// The dimension, read into the filter.
+    pub dim_idx: usize,
+    /// The equalities between them; each key's build side is the dimension's.
+    pub keys: Vec<HashJoinKey>,
+    /// The dimension's own `WHERE` terms the build applies.
+    pub dim_terms: Vec<usize>,
+    /// The filter's false-positive rate per distinct key (`bloom_filter_rate_saving`).
+    pub fp_per_key: f64,
+    /// The filter's share of the statement's memory.
+    pub max_bytes: usize,
+    /// The planner's estimate of the share of fact rows it passes.
+    pub pass: f64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct HashJoinKey {
     /// Index into the where_clause vector

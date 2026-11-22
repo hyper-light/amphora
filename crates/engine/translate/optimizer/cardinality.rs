@@ -1446,6 +1446,21 @@ fn sampled_filters(
     } else {
         share.min(super::sample_filter::backoff(&mut own))
     };
+    // PL.13 (lane replan-5): a share a filtered build counted for these very terms stands in for
+    // the sample's, and the plan notes the share it read.
+    let selectivity = match (
+        params.plan_values.as_deref(),
+        crate::filter_shares::fingerprint(
+            terms
+                .iter()
+                .filter_map(|pos| where_clause.get(*pos).map(|term| &term.expr)),
+        ),
+    ) {
+        (Some(values), Some(fingerprint)) => {
+            values.filter_selectivity(&btree.name, fingerprint, selectivity, n)
+        }
+        _ => selectivity,
+    };
     Some(Sampled { terms, selectivity })
 }
 

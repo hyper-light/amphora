@@ -1564,15 +1564,40 @@ pub fn bloom_filter_rate_per_key(
     matched_probe_rows: f64,
     params: &CostModelParams,
 ) -> Option<f64> {
-    let misses = (probe_rows - matched_probe_rows.max(0.0)).max(0.0);
     let probe_cost = params.hash_cpu_cost + params.hash_lookup_cost;
+    match bloom_filter_rate_saving(
+        build_keys,
+        probe_rows,
+        matched_probe_rows,
+        probe_cost,
+        0.0,
+        params,
+    ) {
+        Some((rate_per_key, true)) => Some(rate_per_key),
+        _ => None,
+    }
+}
+
+/// The filter's rate per key as [bloom_filter_rate_per_key] finds it, for a filter whose misses
+/// each save `probe_cost` and whose build adds `build_cost` beyond its bits (a star join's
+/// dimension read once more, T-QT.5.3), and whether it pays: `None` when a cost isn't measured or
+/// no rate under one is worth its bits.
+pub fn bloom_filter_rate_saving(
+    build_keys: f64,
+    probe_rows: f64,
+    matched_probe_rows: f64,
+    probe_cost: f64,
+    build_cost: f64,
+    params: &CostModelParams,
+) -> Option<(f64, bool)> {
+    let misses = (probe_rows - matched_probe_rows.max(0.0)).max(0.0);
     let lookup_cost = params.bloom_lookup_cost;
     let bit_cost =
         (params.hash_cpu_cost + params.hash_insert_cost) / (8.0 * params.hash_bytes_per_row);
     let measured = [build_keys, misses, probe_cost, bit_cost]
         .iter()
         .all(|v| v.is_finite() && *v > 0.0);
-    if !measured || !lookup_cost.is_finite() {
+    if !measured || !lookup_cost.is_finite() || !build_cost.is_finite() || build_cost < 0.0 {
         return None;
     }
     let ln2_squared = std::f64::consts::LN_2 * std::f64::consts::LN_2;
@@ -1582,9 +1607,10 @@ pub fn bloom_filter_rate_per_key(
         return None;
     }
     let bits = build_keys * -rate.ln() / ln2_squared;
-    let with_filter = probe_rows * lookup_cost + misses * rate * probe_cost + bits * bit_cost;
+    let with_filter =
+        probe_rows * lookup_cost + misses * rate * probe_cost + bits * bit_cost + build_cost;
     let without = misses * probe_cost;
-    (with_filter < without).then_some(rate_per_key)
+    Some((rate_per_key, with_filter < without))
 }
 
 /// Estimate the cost of a hash join between two tables.

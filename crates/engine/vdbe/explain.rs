@@ -2209,7 +2209,7 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
-            Insn::Filter{cursor_id, target_pc, key_reg, num_keys} => (
+            Insn::Filter{cursor_id, target_pc, key_reg, num_keys, ..} => (
                 "Filter",
                 *cursor_id as i64,
                 target_pc.as_debug_int() as i64,
@@ -2733,7 +2733,28 @@ pub fn insn_to_row(
             0,
             Value::build_text(""),
             0,
-            format!("count hash_table[{}] against {}", data.hash_table_id, data.table),
+            match &data.filter {
+                None => format!("count hash_table[{}] against {}", data.hash_table_id, data.table),
+                Some(filter) => format!(
+                    "count hash_table[{}] against {} filtered to share {}",
+                    data.hash_table_id, data.table, filter.planned_share
+                ),
+            },
+        ),
+        Insn::SorterCounted { data } => (
+            "SorterCounted",
+            i64::try_from(data.cursor_id).unwrap_or(i64::MAX),
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            match &data.filter {
+                None => format!("count sorter[{}] against {}", data.cursor_id, data.table),
+                Some(filter) => format!(
+                    "count sorter[{}] against {} filtered to share {}",
+                    data.cursor_id, data.table, filter.planned_share
+                ),
+            },
         ),
         Insn::MorselNext {
             dest_start,

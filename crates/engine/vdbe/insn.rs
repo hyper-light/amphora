@@ -308,6 +308,9 @@ pub struct JoinSwitchBuiltData {
 /// table read whole (no filter of its own), counted against the rows the plan counted the table at.
 #[derive(Debug, Clone)]
 pub struct BuildCountedData {
+    /// Amphora (PL.13, lane replan-5): the build's own filter, whose share of the table is counted
+    /// in place of the table's rows; `None` for a build over the whole table.
+    pub filter: Option<FilteredBuild>,
     pub hash_table_id: usize,
     /// The build table, as its row counter (PL.9, `row_changes`) names it.
     pub table: String,
@@ -316,6 +319,32 @@ pub struct BuildCountedData {
     /// The relative standard error of the statistics that count came from
     /// (`row_changes::statistics_error`).
     pub estimate_error: f64,
+}
+
+/// Amphora (PL.13, lane replan-5): a filtered build's check: the share of its table the plan's
+/// estimate of its filter terms kept, its relative error, and where a counted share is stored.
+#[derive(Debug, Clone)]
+pub struct FilteredBuild {
+    pub share: crate::sync::Arc<crate::filter_shares::FilterShare>,
+    pub planned_share: f64,
+    /// The relative standard error of the build's estimated rows: the share's and the table
+    /// count's together.
+    pub error: f64,
+}
+
+/// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter fed by
+/// one table's full scan, its rows counted against the table's (or its filter's share of them).
+#[derive(Debug, Clone)]
+pub struct SorterCountedData {
+    pub cursor_id: CursorID,
+    /// The scanned table, as its row counter (PL.9, `row_changes`) names it.
+    pub table: String,
+    /// ANALYZE's count of the table's rows.
+    pub analyzed_rows: f64,
+    /// The relative standard error of the statistics that count came from.
+    pub estimate_error: f64,
+    /// The WHERE terms' share check; `None` for a scan with no WHERE term.
+    pub filter: Option<FilteredBuild>,
 }
 
 /// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
@@ -809,6 +838,9 @@ pub enum Insn {
         key_reg: usize,
         /// Number of key registers to hash together
         num_keys: usize,
+        /// Amphora (T-QT.5.3): a star join's filter at its fact scan, counted in the statement's
+        /// metrics (`star_filter_probes`, `star_filter_rejects`).
+        star: bool,
     },
     /// Compute a hash on num_keys registers starting with `r[key_reg]` and add that hash to
     /// the bloom filter associated with the cursor/hash_table.
@@ -2381,6 +2413,13 @@ pub enum Insn {
     BuildCounted {
         data: Box<BuildCountedData>,
     },
+
+    /// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter's
+    /// input, all in, counted against the plan's estimate of the scan that fed it, as
+    /// `BuildCounted` counts a build.
+    SorterCounted {
+        data: Box<SorterCountedData>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2635,6 +2674,7 @@ impl InsnVariants {
             InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
             InsnVariants::TreePages => execute::op_tree_pages,
             InsnVariants::BuildCounted => execute::op_build_counted,
+            InsnVariants::SorterCounted => execute::op_sorter_counted,
         }
     }
 }

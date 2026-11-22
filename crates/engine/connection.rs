@@ -236,6 +236,20 @@ pub enum JoinSearchBudget {
     RunShareByExecutions = 2,
 }
 
+/// Amphora (QT.5, T-QT.5.3): whether a star join's dimensions filter the fact table's scan with
+/// their Bloom filters (`translate/optimizer/lip.rs`, `Connection::set_star_filters`): by the
+/// planner's costs, never (the control), or wherever a filter is safe, for the tests that hold its
+/// answers to the control's.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum StarFilters {
+    /// Each filter kept when it costs less than the work it saves.
+    ByCost = 0,
+    /// No filter: today's plans.
+    Off = 1,
+    /// Every filter that is safe, whatever it costs.
+    Always = 2,
+}
+
 /// Test-only control over correlated-subquery rewrites.
 #[cfg(feature = "simulator")]
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -534,6 +548,8 @@ pub struct Connection {
     /// Amphora: see [`Connection::set_join_methods`].
     pub(super) join_methods: AtomicJoinMethods,
     pub(super) join_search_budget: AtomicJoinSearchBudget,
+    /// Amphora: see [`Connection::set_star_filters`].
+    pub(super) star_filters: AtomicStarFilters,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
     /// Amphora: see [`Connection::set_adaptive_joins`].
@@ -547,6 +563,12 @@ pub struct Connection {
     /// Amphora (PL.13): planner-chosen hash joins' builds counted against their estimates; see
     /// [`Connection::adaptive_build_checks`].
     pub(super) adaptive_build_checks: AtomicU64,
+    /// Amphora (PL.13, lane replan-5): see [`Connection::adaptive_filter_checks`].
+    pub(super) adaptive_filter_checks: AtomicU64,
+    /// Amphora (PL.13, lane replan-5): see [`Connection::adaptive_filter_corrections`].
+    pub(super) adaptive_filter_corrections: AtomicU64,
+    /// Amphora (PL.13, lane replan-5): see [`Connection::adaptive_sort_checks`].
+    pub(super) adaptive_sort_checks: AtomicU64,
     /// Amphora: see [`Connection::set_adaptive_handoff`].
     pub(super) adaptive_handoff: AtomicBool,
     /// Amphora (PL.13): how many runs an adaptive join's build handed to a second prepare; see
@@ -1015,6 +1037,17 @@ impl Connection {
         self.join_methods.get()
     }
 
+    /// Amphora (QT.5, T-QT.5.3): chooses when newly prepared statements filter a star join's fact
+    /// table with its dimensions' Bloom filters.
+    pub fn set_star_filters(&self, rule: StarFilters) {
+        self.star_filters.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn star_filters(&self) -> StarFilters {
+        self.star_filters.get()
+    }
+
     /// Amphora (PL.8): chooses the rule that sizes the join search for newly prepared statements.
     pub fn set_join_search_budget(&self, rule: JoinSearchBudget) {
         self.join_search_budget.set(rule);
@@ -1108,6 +1141,39 @@ impl Connection {
 
     pub(crate) fn count_adaptive_build_check(&self) {
         self.adaptive_build_checks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, lane replan-5): how many filtered builds of hash joins the planner chose on
+    /// this connection had their rows counted against the share of the table the plan's filter
+    /// estimate kept.
+    pub fn adaptive_filter_checks(&self) -> u64 {
+        self.adaptive_filter_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_filter_check(&self) {
+        self.adaptive_filter_checks.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, lane replan-5): how many of those counted past the estimate's error and
+    /// stored the counted share for the planner (each is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_filter_corrections(&self) -> u64 {
+        self.adaptive_filter_corrections.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_filter_correction(&self) {
+        self.adaptive_filter_corrections
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, lane replan-5): how many ORDER BY sorters fed by one table's scan on this
+    /// connection had their input rows counted against the plan's estimate of that scan (each
+    /// re-plan past its error is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_sort_checks(&self) -> u64 {
+        self.adaptive_sort_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_sort_check(&self) {
+        self.adaptive_sort_checks.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): when

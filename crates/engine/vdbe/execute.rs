@@ -19321,18 +19321,115 @@ pub fn op_build_counted(
         .filter(|table| !table.has_spilled())
         .map(|table| table.held());
     if let Some((rows, bytes)) = held {
-        program.connection.count_adaptive_build_check();
-        let replanned = replan_on_built_rows(
+        let replanned = match &data.filter {
+            None => {
+                program.connection.count_adaptive_build_check();
+                replan_on_built_rows(
+                    program,
+                    &data.table,
+                    data.analyzed_rows,
+                    data.estimate_error,
+                    rows,
+                    bytes,
+                )
+            }
+            Some(filter) => {
+                program.connection.count_adaptive_filter_check();
+                correct_filter_share(
+                    program,
+                    &data.table,
+                    data.analyzed_rows,
+                    filter,
+                    rows,
+                    bytes,
+                )
+            }
+        };
+        if hand_off_now(program, state, replanned) {
+            return Ok(InsnFunctionStepResult::Done);
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13, lane replan-5): a filtered build's rows set against the share of its table the
+/// plan's estimate kept (the table's rows now, by its counter, times that share). Past the
+/// estimate's error the counted share (at least half a row's, as the sample's floor) is stored for
+/// the planner, and every plan that read the old one is planned again: true when this one is.
+fn correct_filter_share(
+    program: &Program,
+    table: &str,
+    analyzed_rows: f64,
+    filter: &crate::vdbe::insn::FilteredBuild,
+    rows: usize,
+    bytes: usize,
+) -> bool {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    let counter = program.connection.db.row_changes.counter(table);
+    let table_rows = crate::row_changes::live_rows(
+        analyzed_rows,
+        counter.load(crate::sync::atomic::Ordering::Acquire),
+    );
+    let estimate = table_rows * filter.planned_share;
+    let verdict = MaterializePoint::new(estimate, filter.error, u64::MAX).and_then(|mut point| {
+        point.rows(rows as u64, bytes as u64)?;
+        Ok(point.verdict())
+    });
+    match verdict {
+        Ok(Replan::Again { rows }) => {
+            let share = ((rows as f64).max(0.5) / table_rows).min(1.0);
+            if filter.share.set(share) {
+                program.connection.count_adaptive_filter_correction();
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    table = %table,
+                    planned = filter.planned_share,
+                    share,
+                    "a filtered build counted past its share's estimate: planned again"
+                );
+                return true;
+            }
+            false
+        }
+        Ok(Replan::Keep) => false,
+        Err(refused) => {
+            tracing::debug!(table = %table, %refused, "a filtered build's rows not checked");
+            false
+        }
+    }
+}
+
+/// Amphora (PL.13, lane replan-5): [Insn::SorterCounted]. An ORDER BY sorter's input, all in,
+/// counted against the table's rows ([`replan_on_built_rows`]) or its WHERE terms' share of them
+/// ([`correct_filter_share`]), and the run handed off as a build's is ([`hand_off_now`]).
+pub fn op_sorter_counted(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SorterCounted { data }, insn);
+    let rows = {
+        let cursor = state.get_cursor(data.cursor_id);
+        usize::try_from(cursor.as_sorter_mut().inserted()).unwrap_or(usize::MAX)
+    };
+    program.connection.count_adaptive_sort_check();
+    let replanned = match &data.filter {
+        None => replan_on_built_rows(
             program,
             &data.table,
             data.analyzed_rows,
             data.estimate_error,
             rows,
-            bytes,
-        );
-        if hand_off_now(program, state, replanned) {
-            return Ok(InsnFunctionStepResult::Done);
+            0,
+        ),
+        Some(filter) => {
+            correct_filter_share(program, &data.table, data.analyzed_rows, filter, rows, 0)
         }
+    };
+    if hand_off_now(program, state, replanned) {
+        return Ok(InsnFunctionStepResult::Done);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -20389,7 +20486,8 @@ pub fn op_filter(
             cursor_id,
             target_pc,
             key_reg,
-            num_keys
+            num_keys,
+            star
         },
         insn
     );
@@ -20424,6 +20522,12 @@ pub fn op_filter(
         }
     };
 
+    if *star {
+        state.metrics.star_filter_probes = state.metrics.star_filter_probes.wrapping_add(1);
+        if !contains {
+            state.metrics.star_filter_rejects = state.metrics.star_filter_rejects.wrapping_add(1);
+        }
+    }
     if !contains {
         state.pc = target_pc.as_offset_int();
     } else {

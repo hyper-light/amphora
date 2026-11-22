@@ -1265,6 +1265,11 @@ impl Statement {
             .planned_tables
             .iter()
             .any(|table| table.moved())
+            || self
+                .program
+                .planned_filters
+                .iter()
+                .any(|filter| filter.moved())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
