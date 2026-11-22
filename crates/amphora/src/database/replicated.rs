@@ -1387,15 +1387,11 @@ impl ReplicaHandle {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
                 charged.checked_add(bytes).filter(|next| *next <= limit)
             })
-            .map_err(|charged| {
-                match api::bound(
-                    "replica command queue bytes",
-                    charged.saturating_add(bytes),
-                    limit,
-                ) {
-                    Err(refusal) => refusal,
-                    Ok(()) => Refusal::Full { limit },
-                }
+            .map_err(|charged| match charged.checked_add(bytes) {
+                Some(next) => api::bound("replica command queue bytes", next, limit)
+                    .err()
+                    .unwrap_or(Refusal::Full { limit }),
+                None => Refusal::Full { limit },
             })?;
         reservation.bytes = bytes;
         let envelope = Envelope {
