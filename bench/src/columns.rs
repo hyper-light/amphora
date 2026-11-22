@@ -171,7 +171,7 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
     let copy = if keep {
         let feed = Arc::new(Feed::new(
             0,
-            o.queue_bytes,
+            amphora_engine::storage::versioned::memory::capped(o.queue_bytes as u64),
             Box::new(move || epoch.elapsed().as_nanos() as u64),
         ));
         db.keep_columns(feed.clone()).map_err(e)?;
