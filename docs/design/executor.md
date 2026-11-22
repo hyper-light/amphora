@@ -404,7 +404,8 @@ whose whole work is one rowid table read whole with its filter and aggregates is
 loop (`translate/parallel.rs`). Only shapes whose answers equal the serial loop's qualify: columns
 stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no generated columns, a
 short row padded with its columns' defaults), terms comparing a column with a literal of its own kind or testing it for NULL,
-plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX, and no HAVING, ORDER BY,
+plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX (in the copied body, AVG
+and TOTAL over integers too), and no HAVING, ORDER BY,
 LIMIT, DISTINCT, window or subquery; MVCC and the versioned storage, whose rows are not in the
 pager's b-trees, never qualify. When the run meets a value its aggregates don't take (a SUM over
 text) it jumps to the serial loop, so the answer never depends on the switch. Groups come out in
@@ -677,6 +678,17 @@ it at run time), generated columns, and the versioned storage's column copy of s
 T-QT.6.29 checks scans' aggregates, groups and rows and joins with such columns on either side
 against the serial loop at 1, 2, 3, 4 and 8 stated cores.
 
+**AVG and TOTAL on morsels** (lane qs6-17). The serial loop sums AVG's and TOTAL's values as
+doubles with a compensated (Kahan-Babuska-Neumaier) sum, in row order. Over integers whose
+magnitudes sum below 2^53, the integers a double holds exactly (its 53-bit significand, IEEE 754
+binary64), every partial sum in any order is exact and the compensation is zero, so the serial
+answer is the exact sum, as a double, divided by the count for AVG. The copied body's aggregates
+(`body_outputs`, scans and joins alike) now take `Aggregate::Avg` and `Aggregate::Total`: each
+worker keeps the exact sum, the sum of magnitudes and the count, merged once. A REAL among the
+values goes to the serial loop as a SUM's does (`no_real`), and so does a statement whose
+magnitudes reach 2^53 (`MorselError::Unsupported` at the finish). T-QT.6.30 checks them bit for
+bit against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
 **What still runs on the serial loop** (lane qs6-16's audit, updated by lane qs6-17; each an open
 part of QT.6):
 - *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
@@ -701,7 +713,8 @@ part of QT.6):
   with a DEFAULT, which the serial loop ENCODEs at run time; a table whose short rows read a
   default, on the versioned storage's column copy, which decodes records as written; a scan through an index or a
   rowid range (`Operation::Search` on the probe: a rowid range is a run of leaves); a one-table
-  scan's rows under ORDER BY; AVG, TOTAL, group_concat, DISTINCT and FILTER aggregates, HAVING, and
+  scan's rows under ORDER BY; AVG and TOTAL over REALs or past 2^53, group_concat, DISTINCT and
+  FILTER aggregates, HAVING, and
   an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and
   other statements that don't return rows; joins with no equality of one affinity (a cross
   product, a range join).

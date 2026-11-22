@@ -685,17 +685,22 @@ fn query(data: &MorselAggregateData, budget: usize) -> Result<Query> {
             Predicate::NotNull { column } => Filter::NotNull(*column),
         });
     }
-    let aggs = data
-        .aggregates
-        .iter()
-        .map(|a| match a {
+    let mut aggs = Vec::with_capacity(data.aggregates.len());
+    for a in &data.aggregates {
+        aggs.push(match a {
             Aggregate::CountStar => Agg::Count,
             Aggregate::Count(c) => Agg::CountOf(*c),
             Aggregate::Sum(c) => Agg::Sum(*c),
             Aggregate::Min(c) => Agg::Min(*c),
             Aggregate::Max(c) => Agg::Max(*c),
-        })
-        .collect();
+            // Only the loop body's copy takes them, which `aggregate` hands to the rows.
+            Aggregate::Avg(_) | Aggregate::Total(_) => {
+                return Err(LimboError::InternalError(
+                    "the column copy has no AVG or TOTAL".into(),
+                ))
+            }
+        });
+    }
     Ok(Query {
         filters,
         group: data.group_by.clone(),

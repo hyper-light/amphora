@@ -9,7 +9,8 @@
 //! table read whole, no index, every column it reads stored as written (INTEGER, TEXT or BLOB
 //! affinity, BINARY collation, no generated column, a short row padded with its defaults); terms
 //! comparing a column with an integer or text literal of its own kind, or testing it for NULL;
-//! plain-column GROUP BY keys; COUNT, SUM over INTEGER columns, MIN and MAX; no HAVING, ORDER
+//! plain-column GROUP BY keys; COUNT, SUM over INTEGER columns, MIN and MAX (and in the loop
+//! body's copy, AVG and TOTAL over integers); no HAVING, ORDER
 //! BY, LIMIT, DISTINCT, window or subquery.
 //!
 //! A join's probe with its aggregates qualifies too (`shape_join`): two or more rowid tables the
@@ -315,6 +316,18 @@ fn body_outputs(plan: &SelectPlan, rows: bool) -> Option<BodyOutputs<'_>> {
             (AggFunc::Max, [arg]) => {
                 outs.push(arg);
                 Aggregate::Max(at)
+            }
+            // Over integers only, as a SUM: a REAL sends the statement to the serial loop, whose
+            // compensated double sum isn't the exact one (lane qs6-17).
+            (AggFunc::Avg, [arg]) => {
+                outs.push(arg);
+                sums.push(at);
+                Aggregate::Avg(at)
+            }
+            (AggFunc::Total, [arg]) => {
+                outs.push(arg);
+                sums.push(at);
+                Aggregate::Total(at)
             }
             _ => return None,
         });

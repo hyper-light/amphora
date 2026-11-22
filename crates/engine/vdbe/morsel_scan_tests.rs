@@ -2820,3 +2820,96 @@ fn t_qt_6_29_short_rows_read_their_columns_defaults_as_the_serial_loop() {
         ]]
     );
 }
+
+/// T-QT.6.30 (lane qs6-17): AVG and TOTAL over integers run on morsels, in a scan's copied body and
+/// over joined rows, grouped or not, over expressions and with NULLs and empty groups, and answer
+/// as the serial loop, bit for bit, at 1, 2, 3, 4 and 8 stated cores: the hook ran each (its
+/// body's rows or its links counted). Past a double's exact integers (2^53), or over a REAL, the
+/// statement goes to the serial loop, which answers.
+#[test]
+fn t_qt_6_30_avg_and_total_run_on_morsels_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-30");
+    let mut rng = ChaCha8Rng::seed_from_u64(630);
+    let pad = "x".repeat(64);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, r REAL, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..2500 {
+        let a = rng.random_range(-30i64..30);
+        let b = match rng.random_range(0..5) {
+            0 => "NULL".to_string(),
+            _ => rng.random_range(-1_000_000i64..1_000_000).to_string(),
+        };
+        let c = ["NULL", "'x'", "'y'", "'z'"][rng.random_range(0..4)];
+        conn.execute(format!(
+            "INSERT INTO t(a, b, c, p) VALUES ({a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    for _ in 0..300 {
+        let k = rng.random_range(-30i64..30);
+        let g = rng.random_range(-7i64..7);
+        let r = f64::from(rng.random_range(-1000i32..1000)) / 7.0;
+        conn.execute(format!(
+            "INSERT INTO u(k, g, r, p) VALUES ({k}, {g}, {r}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    // Two rows whose magnitudes pass 2^53 together, behind a filter only some statements keep.
+    conn.execute("INSERT INTO t(a, b, c, p) VALUES (99, 6000000000000000, 'big', 'q')")
+        .unwrap();
+    conn.execute("INSERT INTO t(a, b, c, p) VALUES (99, -5000000000000000, 'big', 'q')")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    let ran = |conn: &Arc<Connection>| {
+        [&conn.morsel_body_rows, &conn.morsel_join_links]
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    // (statement, whether the hook answers it: false where the serial loop must).
+    let queries: [(&str, bool); 12] = [
+        ("SELECT avg(a), total(a), avg(b), total(b) FROM t WHERE a < 99", true),
+        ("SELECT c, avg(b), total(a * 3 - b), count(*) FROM t WHERE a < 99 GROUP BY c", true),
+        ("SELECT a % 5, avg(a + b), total(b) FROM t WHERE c <> 'big' GROUP BY a % 5", true),
+        ("SELECT avg(b), total(b) FROM t WHERE a > 1000", true),
+        ("SELECT avg(CASE WHEN c = 'x' THEN b END), total(CASE WHEN c = 'y' THEN 1 END) FROM t WHERE a < 99", true),
+        ("SELECT avg(a), total(a) FROM t WHERE c = 'nothing'", true),
+        ("SELECT t.c, avg(u.g), total(t.b + u.g) FROM t JOIN u ON t.a = u.k GROUP BY t.c", true),
+        ("SELECT avg(t.b), total(u.g), avg(u.g) FROM t JOIN u ON t.a = u.k WHERE u.g > 0", true),
+        ("SELECT avg(u.g), total(u.g), count(t.id) FROM u LEFT JOIN t ON t.a = u.k AND t.b > 900000", true),
+        // The serial loop's: a sum past 2^53, a REAL.
+        ("SELECT avg(b), total(b) FROM t", false),
+        ("SELECT avg(r), total(r) FROM u", false),
+        ("SELECT t.c, avg(u.r) FROM t JOIN u ON t.a = u.k GROUP BY t.c", false),
+    ];
+    for (sql, hooked) in queries {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        assert!(!serial.is_empty(), "{sql}: no rows to compare");
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = ran(&conn);
+            let parallel = sql_rows(&conn, sql);
+            let after = ran(&conn);
+            // Bit for bit: a REAL's Debug is its exact digits.
+            assert_eq!(
+                format!("{parallel:?}"),
+                format!("{serial:?}"),
+                "{sql} on {cores} cores"
+            );
+            if hooked {
+                assert!(
+                    after[0] > before[0] || after[1] > before[1],
+                    "{sql} on {cores} cores: the hook didn't run"
+                );
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+}
