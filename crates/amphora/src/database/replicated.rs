@@ -5488,6 +5488,9 @@ mod tests {
             *self.held.lock().unwrap() = false;
             self.moved.notify_all();
         }
+        fn is_held(&self) -> bool {
+            *self.held.lock().unwrap()
+        }
         /// Waits while the flushes are held, up to the transport tests' hang guard: a hang,
         /// never a verdict.
         fn pass(&self) -> Result<(), hyper_block::DiskError> {
@@ -5618,12 +5621,13 @@ mod tests {
 
     impl Driven<Gated> {
         /// Member `owner`'s power cut while its log's flushes are held, and the member restarted on
-        /// what survived with its gate open: the held flushes meet the cut device and make nothing
-        /// durable. Returns the restarted member's client.
+        /// what survived, of class `durability`, with its gate open: the held flushes meet the cut
+        /// device and make nothing durable. Returns the restarted member's client.
         fn gated_cut(
             &mut self,
             dir: &Path,
             owner: usize,
+            durability: Durability,
             power: &mut Power,
             gate: &Arc<Gate>,
         ) -> Client {
@@ -5638,9 +5642,49 @@ mod tests {
                 gate: Arc::clone(gate),
             };
             let (client, restarted) =
-                self.owner_on(dir, node_id, vec![1, 2, 3], fated(), power, log, reading);
+                self.owner_on(dir, node_id, vec![1, 2, 3], durability, power, log, reading);
             *self.owners.get_mut(owner).unwrap() = Some(restarted);
             client
+        }
+        /// Rounds, time standing still, until `answer` comes (`Some`), or until the group can move
+        /// no further while the members whose gates are held wait to flush (`None`): two rounds
+        /// running that relay nothing, with nothing in transit and no write out on the disk of a
+        /// member whose gate is open. Two, because the first round's relay takes what the step
+        /// before it sent, and only the second's shows that step sent nothing.
+        fn answer_or_stall(
+            &mut self,
+            pump: &mut Pump<'_>,
+            answer: &mpsc::Receiver<Result<Answer, Refusal>>,
+            gates: &[Arc<Gate>],
+        ) -> Option<Result<Vec<u8>, Refusal>> {
+            let mut still = 0;
+            for _ in 0..ROUNDS {
+                match answer.try_recv() {
+                    Ok(result) => return Some(result.map(called)),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(error) => panic!("owner ended: {error}"),
+                }
+                let admitted = pump.drive_until(self.until());
+                let open_idle = self.owners.iter().zip(gates).all(|(owner, gate)| {
+                    gate.is_held()
+                        || owner
+                            .as_ref()
+                            .is_none_or(|(owner, _)| owner.replica.in_flight() == 0)
+                });
+                still = if admitted == 0 && pump.records == 0 && open_idle {
+                    still + 1
+                } else {
+                    0
+                };
+                if still > 1 {
+                    return None;
+                }
+                if admitted == 0 {
+                    std::thread::park_timeout(POLL);
+                }
+                self.step();
+            }
+            panic!("a driven operation neither answered nor stalled in {ROUNDS} rounds");
         }
     }
 
@@ -5790,6 +5834,7 @@ mod tests {
         let restarted = driven.gated_cut(
             dir.path(),
             follower,
+            fated(),
             powers.get_mut(follower).unwrap(),
             gates.get(follower).unwrap(),
         );
@@ -6000,12 +6045,22 @@ mod tests {
         cuts: usize,
         /// Cuts of a leader whose database held an acknowledged write unflushed.
         unflushed_leader: usize,
+        /// Writes acknowledged while a majority's raft logs held their flushes back, so no
+        /// majority held the write durable: the replicated class's way, never the persisted
+        /// class's (replication.md, "Fast acknowledgement").
+        acknowledged_held: usize,
+        /// Cuts of a leader whose raft log held a write it acknowledged unflushed.
+        unflushed_log_leader: usize,
     }
 
-    /// One seed: three voters of `durability`, their flushes held and let go at random; rounds of
-    /// writes at the leader, each round ending in one member's power cut and restart, and a leader
-    /// elected among the members that ran on when the cut one led. Every acknowledged write must
-    /// be read back at the end.
+    /// One seed: three voters of `durability`, each its raft log behind a gate and its database's
+    /// flushes held and let go at random; rounds of writes at the leader, before each write every
+    /// member's raft-log flushes held or let go on a draw of its own, each round ending in one
+    /// member's power cut and restart, and a leader elected among the members that ran on when the
+    /// cut one led. The classes part at the raft log (replication.md, "Fast acknowledgement"): the
+    /// replicated class may answer a write no majority's log holds durable, the persisted class
+    /// never does, so a write the persisted group can't commit while held is answered once the
+    /// flushes go. Every acknowledged write must be read back at the end.
     fn power_seed(seed: u64, durability: &Durability) -> Cuts {
         const ROUNDS_PER_SEED: u64 = 3;
         let dir = tempfile::tempdir().unwrap();
@@ -6013,18 +6068,21 @@ mod tests {
         // schedule of writes, flushes and cuts, so 10,000 seeds ran 5,000. SplitMix64 spreads them.
         let mut rng = Rng(mix(&mut { seed }) | 1);
         let durability = durability.clone();
+        let persisted = matches!(durability, Durability::Persisted);
         let voters = vec![1, 2, 3];
         let mut power: Vec<Power> = (0..3u64).map(|n| Power::new(seed * 4 + n)).collect();
-        let mut driven = Driven::powered();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let mut driven = Driven::<Gated>::empty();
         let mut clients: Vec<Client> = (1..=3u64)
             .map(|n| {
                 let at = usize::try_from(n - 1).unwrap();
-                driven.open_power(
+                driven.open_gated(
                     dir.path(),
                     n,
                     voters.clone(),
                     durability.clone(),
                     power.get(at).unwrap(),
+                    gates.get(at).unwrap(),
                 )
             })
             .collect();
@@ -6034,6 +6092,14 @@ mod tests {
         let mut done = Cuts::default();
         let mut acknowledged = Vec::new();
         let mut value = 0u64;
+        // Members whose raft log holds, unflushed, a write acknowledged while its gate was held.
+        let mut unflushed_log = [false; 3];
+        let release = |gates: &[Arc<Gate>], unflushed_log: &mut [bool; 3]| {
+            for gate in gates {
+                gate.release();
+            }
+            *unflushed_log = [false; 3];
+        };
         let mut pump = Pump::new(&clients);
         let mut leader = driven.elect(&mut pump, &clients, 0, 1);
         driven
@@ -6046,10 +6112,43 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 value += 1;
                 let v = value;
-                match driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                for (gate, unflushed) in gates.iter().zip(unflushed_log.iter_mut()) {
+                    if rng.below(2) == 0 {
+                        gate.hold();
+                    } else {
+                        gate.release();
+                        *unflushed = false;
+                    }
+                }
+                let held: Vec<usize> = (0..3)
+                    .filter(|at| gates.get(*at).unwrap().is_held())
+                    .collect();
+                let write = submit(clients.get(leader).unwrap(), driven.until(), move |db| {
                     db.exec(&format!("INSERT INTO kept VALUES ({v})"))?;
                     Ok(Vec::new())
-                }) {
+                });
+                let result = match driven.answer_or_stall(&mut pump, &write, &gates) {
+                    Some(result) => {
+                        if result.is_ok() {
+                            for at in &held {
+                                *unflushed_log.get_mut(*at).unwrap() = true;
+                            }
+                            if held.len() * 2 > voters.len() {
+                                assert!(
+                                    !persisted,
+                                    "seed {seed}: the persisted class acknowledged write {v} while the raft logs of members {held:?} held their flushes back"
+                                );
+                                done.acknowledged_held += 1;
+                            }
+                        }
+                        result
+                    }
+                    None => {
+                        release(&gates, &mut unflushed_log);
+                        driven.settle(&mut pump, &write)
+                    }
+                };
+                match result {
                     Ok(_) => acknowledged.push(v),
                     Err(Refusal::UnknownOutcome | Refusal::Timeout) => {}
                     Err(error) => panic!("seed {seed}: write {v}: {error:?}"),
@@ -6062,15 +6161,20 @@ mod tests {
             if victim == leader && driven.owner(leader).replica.machine().unflushed().is_some() {
                 done.unflushed_leader += 1;
             }
+            if victim == leader && *unflushed_log.get(leader).unwrap() {
+                done.unflushed_log_leader += 1;
+            }
             driven.drain(&mut pump);
             pump.finish();
-            let restarted = driven.power_cut(
+            let restarted = driven.gated_cut(
                 dir.path(),
                 victim,
-                voters.clone(),
                 durability.clone(),
                 power.get_mut(victim).unwrap(),
+                gates.get(victim).unwrap(),
             );
+            // The members that ran on flush what they held: an election stores its votes.
+            release(&gates, &mut unflushed_log);
             *clients.get_mut(victim).unwrap() = restarted;
             driven.hold_flushes(victim);
             done.cuts += 1;
@@ -6163,6 +6267,8 @@ mod tests {
                                 total.acknowledged += done.acknowledged;
                                 total.cuts += done.cuts;
                                 total.unflushed_leader += done.unflushed_leader;
+                                total.acknowledged_held += done.acknowledged_held;
+                                total.unflushed_log_leader += done.unflushed_log_leader;
                             }
                             Err(panic) => {
                                 let account = panic
@@ -6188,11 +6294,13 @@ mod tests {
                 })
                 .collect();
             let line = format!(
-                "{{\"class\":{},\"from\":{from},\"count\":{n},\"acknowledged\":{},\"cuts\":{},\"unflushed_leader\":{},\"failed\":[{}]}}\n",
+                "{{\"class\":{},\"from\":{from},\"count\":{n},\"acknowledged\":{},\"cuts\":{},\"unflushed_leader\":{},\"acknowledged_held\":{},\"unflushed_log_leader\":{},\"failed\":[{}]}}\n",
                 json_string(class),
                 total.acknowledged,
                 total.cuts,
                 total.unflushed_leader,
+                total.acknowledged_held,
+                total.unflushed_log_leader,
                 failures.join(",")
             );
             std::fs::write(path, line).unwrap();
@@ -6203,11 +6311,13 @@ mod tests {
             failed.len()
         );
         println!(
-            "power-cut nemesis: seeds {from}..{}, {} writes acknowledged, {} cuts, {} of them of a leader holding a write unflushed, none lost",
+            "power-cut nemesis: seeds {from}..{}, {} writes acknowledged, {} of them while a majority's raft logs held them unflushed, {} cuts, {} of them of a leader holding a write unflushed in its database and {} in its raft log, none lost",
             from + n,
             total.acknowledged,
+            total.acknowledged_held,
             total.cuts,
-            total.unflushed_leader
+            total.unflushed_leader,
+            total.unflushed_log_leader
         );
         // Non-vacuity: writes were acknowledged, members were cut, and some cut hit a leader that
         // held an acknowledged write unflushed.
@@ -6219,6 +6329,15 @@ mod tests {
             total.unflushed_leader > 0,
             "no cut hit a leader holding a write unflushed"
         );
+        // The classes part (replication.md, "Fast acknowledgement"): the replicated class answered
+        // some write no majority's log held durable; the persisted class none (each seed asserts
+        // that at the write).
+        if matches!(durability, Durability::Replicated(_)) {
+            assert!(
+                total.acknowledged_held > 0,
+                "the replicated class acknowledged no write while a majority's raft logs held it unflushed"
+            );
+        }
     }
 
     /// The nemesis's power cut is a machine's (AC-T1.8.5): nothing a powered-off machine does
@@ -6277,6 +6396,86 @@ mod tests {
     #[test]
     fn a_member_power_cut_loses_no_acknowledged_persisted_write() {
         power_seeds(12, 0, 4, &Durability::Persisted, None);
+    }
+
+    /// A write at the leader of three voters of `durability`, each its raft log behind a gate, once
+    /// each follower states a durable promise, with both followers' log flushes held: whether it
+    /// was answered while they were held, and its answer (once the flushes went, if not before).
+    fn held_write(durability: Durability) -> (bool, Result<Vec<u8>, Refusal>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::<Gated>::empty();
+        let powers: Vec<Power> = (1..=3).map(Power::new).collect();
+        let gates: Vec<Arc<Gate>> = (0..3).map(|_| Arc::new(Gate::default())).collect();
+        let clients: Vec<Client> = (0..3)
+            .map(|i| {
+                driven.open_gated(
+                    dir.path(),
+                    u64::try_from(i + 1).unwrap(),
+                    vec![1, 2, 3],
+                    durability.clone(),
+                    powers.get(i).unwrap(),
+                    gates.get(i).unwrap(),
+                )
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        // Writes before the test's, so that each follower states a durable promise and answers
+        // held at once (hyper-raft R-8).
+        for n in 0..4 {
+            let answer = driven.call(&mut pump, clients.get(leader).unwrap(), move |db| {
+                db.exec(&format!("CREATE TABLE warm{n}(value)"))?;
+                Ok(Vec::new())
+            });
+            assert_eq!(answer, Ok(Vec::new()));
+        }
+        let applied = clients
+            .get(leader)
+            .unwrap()
+            .handle()
+            .status()
+            .unwrap()
+            .applied;
+        driven.follow(&mut pump, &clients, applied);
+        for (at, gate) in gates.iter().enumerate() {
+            if at != leader {
+                gate.hold();
+            }
+        }
+        let write = submit(clients.get(leader).unwrap(), driven.until(), |db| {
+            db.exec("INSERT INTO warm0 VALUES (1)")?;
+            Ok(vec![1])
+        });
+        let held = driven.answer_or_stall(&mut pump, &write, &gates);
+        for gate in &gates {
+            gate.release();
+        }
+        let outcome = match held {
+            Some(result) => (true, result),
+            None => (false, driven.settle(&mut pump, &write)),
+        };
+        driven.drain(&mut pump);
+        pump.finish();
+        outcome
+    }
+
+    /// CP-T1.8 (AC-T1.8.5, AC-T1.8.D2): the two classes acknowledge apart under a held flush
+    /// (replication.md, "Fast acknowledgement"). Do: for each class, three voters on raft logs
+    /// behind gates; both followers' log flushes held; a write at the leader. Expect: the
+    /// replicated class answers it while no majority's log holds it durable; the persisted class
+    /// doesn't, its group stalled until the flushes go, and then answers it.
+    #[test]
+    fn the_classes_acknowledge_apart_under_a_held_flush() {
+        assert_eq!(
+            held_write(three_fates()),
+            (true, Ok(vec![1])),
+            "the replicated class waited on its followers' flushes"
+        );
+        assert_eq!(
+            held_write(Durability::Persisted),
+            (false, Ok(vec![1])),
+            "the persisted class answered a write no majority's log held durable"
+        );
     }
 
     /// One share of the 10,000-seed nemesis in `class`, as the environment names it, sharded across
