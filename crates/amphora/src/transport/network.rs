@@ -240,7 +240,17 @@ pub(super) fn listen(
             let connection = ServerConnection::new(&config).map_err(unavailable)?;
             let mut stream = StreamOwned::new(connection, config, socket);
             let token = handshake!(&mut stream, greeting_until);
-            serve(&mut stream, &token, &acquire, pulls.as_deref(), started)
+            // The greeting's clock starts once the handshake is done: the client asks for its
+            // lifetime after its own handshake, so counted from the accept the owner's deadline
+            // would fall a handshake before the client's, and the owner would drop a connection
+            // the client still waits on.
+            serve(
+                &mut stream,
+                &token,
+                &acquire,
+                pulls.as_deref(),
+                Instant::now(),
+            )
         }),
     )?;
     Ok((owner, address))
