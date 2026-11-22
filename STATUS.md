@@ -1120,5 +1120,9 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   (its seam's client). Lane production-2: the serve test's open timeout was the test's own (one
   process's opens take turns under its owner table; members now start one after another);
   `amphora member CONFIG add|promote|demote|remove N` with a config `voters` key (spares start as
-  learners); the region-lost drill replaces a lost member with a spare. Mutual TLS waits on the
-  split-merge listener's TLS landing on t1/group-replication.
+  learners); the region-lost drill replaces a lost member with a spare. Lanes production-3 and 4: one
+  process's opens of different databases run at once (the owner table only reserves a database's
+  slot; an open of the same file by another path, a hard link included, waits for the one in
+  flight); `cluster.sh install --spare`; with `cert_file`, `key_file` and `roots_file` (or
+  `cluster.sh install --tls DIR`) every link runs inside mutual TLS under the network transport's
+  rules (`Credentials::listener`/`dialer` for a protocol of its own).

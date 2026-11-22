@@ -6,7 +6,7 @@
 #
 # usage: scripts/cluster.sh install --bin BIN --class persisted|replicated --deadline-ms MS
 #                                    [--spanning N] [--drills on|off] [--service auto|none]
-#                                    [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
+#                                    [--spare HOST4:PORT] [--tls DIR] HOST1:PORT HOST2:PORT HOST3:PORT
 #        scripts/cluster.sh health HOST:PORT N        (member N's host asks every member)
 #        scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]   (keeps the data)
 #   HOSTn:PORT  each member's address as its peers reach it; member n listens there. A host that is
@@ -18,6 +18,10 @@
 #   --spare     a fourth member, 4, set up beside the three as a learner: every config names it in
 #               `members` and says `voters = 1,2,3`, so it holds no vote until `amphora member
 #               CONFIG add 4` and `promote 4` (docs/runbook.md, "A region lost"; drills.sh region).
+#   --tls       every link inside mutual TLS: DIR holds roots.pem (the deployment's authority) and,
+#               for each member N, member-N.pem (its certificate chain, its own first, naming the
+#               host its peers reach it by) and member-N.key (its private key), PEM each. They are
+#               copied beside each member's config, the key readable by its owner only.
 # Every size and duration is an argument: nothing is picked here.
 set -euo pipefail
 LIB='$HOME/.local/lib/amphora' CONF='$HOME/.config/amphora' DATA='$HOME/.local/share/amphora'
@@ -30,12 +34,13 @@ put() { # put HOST LOCAL REMOTE_DIR NAME
 }
 
 install() {
-  local bin='' class='' deadline='' spanning='' drills=off service=auto spare='' addrs=()
+  local bin='' class='' deadline='' spanning='' drills=off service=auto spare='' tls='' addrs=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --bin) bin=$2; shift 2 ;; --class) class=$2; shift 2 ;; --deadline-ms) deadline=$2; shift 2 ;;
       --spanning) spanning=$2; shift 2 ;; --drills) drills=$2; shift 2 ;; --service) service=$2; shift 2 ;;
-      --spare) spare=$2; shift 2 ;; --*) die "unknown flag $1" ;; *) addrs+=("$1"); shift ;;
+      --spare) spare=$2; shift 2 ;; --tls) tls=$2; shift 2 ;;
+      --*) die "unknown flag $1" ;; *) addrs+=("$1"); shift ;;
     esac
   done
   [[ -n $bin && -n $class && -n $deadline ]] || die "install needs --bin, --class and --deadline-ms"
@@ -44,6 +49,12 @@ install() {
   [[ -n $spare ]] && addrs+=("$spare")
   local members='' n count=${#addrs[@]}
   for n in $(seq 1 "$count"); do members+="${members:+,}$n@${addrs[$((n - 1))]}"; done
+  if [[ -n $tls ]]; then
+    [[ -f $tls/roots.pem ]] || die "--tls $tls: no roots.pem"
+    for n in $(seq 1 "$count"); do
+      [[ -f $tls/member-$n.pem && -f $tls/member-$n.key ]] || die "--tls $tls: no member-$n.pem and member-$n.key"
+    done
+  fi
   # One secret for the cluster, made here once (48 random bytes as base64: past RFC 2104's 32-byte
   # minimum for HMAC-SHA256), readable by its owner only.
   local secret; secret=$(mktemp "${TMPDIR:-$HOME}/amphora-secret.XXXXXX")
@@ -54,9 +65,15 @@ install() {
     echo "== member $n on $addr" >&2
     put "$host" "$bin" "$LIB" amphora
     put "$host" "$secret" "$CONF" secret
+    if [[ -n $tls ]]; then
+      put "$host" "$tls/roots.pem" "$CONF" roots.pem
+      put "$host" "$tls/member-$n.pem" "$CONF" "member-$n.pem"
+      put "$host" "$tls/member-$n.key" "$CONF" "member-$n.key"
+    fi
     on "$host" <<EOF
 set -euo pipefail
 chmod 700 "$CONF"; chmod 600 "$CONF/secret"; chmod 755 "$LIB/amphora"; mkdir -p "$DATA/member-$n"
+${tls:+chmod 600 $CONF/member-$n.key}
 cat >"$CONF/member-$n.conf" <<CONF
 # Amphora member $n (scripts/cluster.sh install; docs/runbook.md)
 node = $n
@@ -68,6 +85,9 @@ ${spare:+voters = 1,2,3}
 secret_file = $CONF/secret
 deadline_ms = $deadline
 drills = $drills
+${tls:+cert_file = $CONF/member-$n.pem}
+${tls:+key_file = $CONF/member-$n.key}
+${tls:+roots_file = $CONF/roots.pem}
 CONF
 case "$service:\$(uname -s)" in
   none:*) echo "member $n: config only: $LIB/amphora serve $CONF/member-$n.conf" ;;
@@ -126,7 +146,7 @@ case "\$(uname -s)" in
   Linux) systemctl --user disable --now amphora-member-$n.service 2>/dev/null || true; rm -f "\$HOME/.config/systemd/user/amphora-member-$n.service"; systemctl --user daemon-reload ;;
   Darwin) launchctl bootout "gui/\$(id -u)/dev.amphora.member-$n" 2>/dev/null || true; rm -f "\$HOME/Library/LaunchAgents/dev.amphora.member-$n.plist" ;;
 esac
-rm -f "$CONF/member-$n.conf"
+rm -f "$CONF/member-$n.conf" "$CONF/member-$n.pem" "$CONF/member-$n.key"
 echo "member $n: service removed; its data stays in $DATA/member-$n"
 EOF
   done

@@ -21,7 +21,7 @@ Nothing here touches kiln: the binary goes to `~/.local/lib/amphora/amphora`, co
 
 ```sh
 scripts/cluster.sh install --bin target/release/amphora --class persisted --deadline-ms MS \
-  [--drills on] [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
+  [--drills on] [--spare HOST4:PORT] [--tls DIR] HOST1:PORT HOST2:PORT HOST3:PORT
 ```
 
 - `--class persisted`: a write is answered once a majority of members hold it on disk.
@@ -34,6 +34,14 @@ scripts/cluster.sh install --bin target/release/amphora --class persisted --dead
 - The script makes one secret (48 random bytes) and copies it to each machine's
   `~/.config/amphora/secret`, readable by its owner only. Every connection proves it holds the
   secret (HMAC-SHA256 over a random challenge); the secret never crosses the link.
+- `--tls DIR`: every link (peers' records, clients' requests) inside mutual TLS 1.3, under the
+  rules of Amphora's transport between machines (`transport/network.rs`). DIR holds `roots.pem`
+  (your deployment's authority) and, for each member N, `member-N.pem` (its certificate chain, its
+  own first, naming the host its peers reach it by: a DNS name or an IP address) and
+  `member-N.key` (its private key). The script copies them beside each config and sets
+  `cert_file`, `key_file` and `roots_file`, all three or none. A member refuses a link whose
+  certificate doesn't chain to the roots, and `amphora ask`, `health` and `drill` present the
+  certificate of the config they read. The secret is still proved inside.
 - On Linux the unit stops at logout unless linger is on: `sudo loginctl enable-linger $USER`
   (the script says so when it isn't).
 
@@ -103,9 +111,8 @@ scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]   # s
 
 ## What isn't done
 
-- The link isn't encrypted: run the members on a network you trust, or under a tunnel.
-- Mutual TLS on the links waits on the network listener's TLS (`transport/network.rs`, lane
-  split-merge): serve takes its credentials and rules once that lands, so there is one TLS path.
+- Without `--tls` the link isn't encrypted: run the members on a network you trust, or under a
+  tunnel. The script issues no certificates: they come from your authority.
 - kiln doesn't open these members yet: kiln reaches Amphora through its conversation-store seam
   (kiln branch `t1/lane-vendor-amphora-*`), in process. A client for `amphora serve` in that seam
   is the next step, and production kiln on it is Ada's word.

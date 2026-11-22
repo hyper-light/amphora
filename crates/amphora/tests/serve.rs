@@ -1,6 +1,7 @@
 //! CP-T1.13 (AC-T1.13.1, AC-T1.13.5, T-T1.13.1): three members of `amphora serve` in one
 //! process, over loopback TCP: healthy once they elect, a wrong secret refused, and a drill's load
-//! with one member split off at its transport losing no acknowledged write.
+//! with one member split off at its transport losing no acknowledged write; the same links inside
+//! mutual TLS.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -12,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use amphora::serve::{self, Client, Config};
+use amphora::serve::{self, Client, Config, Keys};
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -23,6 +24,11 @@ fn free_port() -> u16 {
 }
 
 fn three(dir: &std::path::Path) -> Vec<Config> {
+    three_with(dir, |_| String::new())
+}
+
+/// Three members' configs, each with `more(n)`'s lines.
+fn three_with(dir: &std::path::Path, more: impl Fn(u64) -> String) -> Vec<Config> {
     let secret = dir.join("secret");
     std::fs::write(&secret, "0123456789abcdef0123456789abcdef-test-secret\n").unwrap();
     let members = (1..=3)
@@ -31,10 +37,44 @@ fn three(dir: &std::path::Path) -> Vec<Config> {
         .join(",");
     (1..=3)
         .map(|n| {
-            let text = format!("node = {n}\nmembers = {members}\ndata = {}\nclass = persisted\nsecret_file = {}\ndeadline_ms = 5000\ndrills = on\n", dir.join(format!("m{n}")).display(), secret.display());
+            let text = format!("node = {n}\nmembers = {members}\ndata = {}\nclass = persisted\nsecret_file = {}\ndeadline_ms = 5000\ndrills = on\n{}", dir.join(format!("m{n}")).display(), secret.display(), more(n));
             Config::parse(&text).unwrap()
         })
         .collect()
+}
+
+/// The members of `configs`, each in a thread of its own, started together: one process's opens
+/// of different databases run at once (CP-T1.13), so each open has its whole deadline. Returns once
+/// each listens or has ended; a member's end is reported, and health then fails.
+fn start(configs: &[Config]) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut listening = Vec::new();
+    for c in configs.iter().cloned() {
+        let tx = tx.clone();
+        let (up, listens) = std::sync::mpsc::channel();
+        listening.push(listens);
+        std::thread::spawn(move || {
+            let node = c.node;
+            let started = Instant::now();
+            let ended = serve::serve(&c, move |addr| {
+                eprintln!(
+                    "member {node} listening on {addr}, open took {:?}",
+                    started.elapsed()
+                );
+                let _ = up.send(());
+            });
+            let _ = tx.send(format!("member {node} ended: {ended:?}"));
+        });
+    }
+    // A member whose open failed drops `up` unsent.
+    for listens in listening {
+        let _ = listens.recv();
+    }
+    std::thread::spawn(move || {
+        for line in rx {
+            eprintln!("{line}");
+        }
+    });
 }
 
 fn healthy(c: &Config) -> String {
@@ -53,47 +93,20 @@ fn healthy(c: &Config) -> String {
 fn t_t1_13_1_three_members_elect_refuse_strangers_and_lose_nothing_split() {
     let dir = tempfile::tempdir().unwrap();
     let configs = three(dir.path());
-    let (tx, rx) = std::sync::mpsc::channel();
-    // Each member starts once the one before it listens. One process's opens take turns (its owner
-    // table is held across each open), so started together the last would spend its own deadline
-    // on the others' opens; started on the event, each open has its whole deadline, as one member
-    // per process does in production.
-    for c in configs.clone() {
-        let tx = tx.clone();
-        let (up, listening) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let node = c.node;
-            let started = Instant::now();
-            let ended = serve::serve(&c, move |addr| {
-                eprintln!(
-                    "member {node} listening on {addr}, open took {:?}",
-                    started.elapsed()
-                );
-                let _ = up.send(());
-            });
-            let _ = tx.send(format!("member {node} ended: {ended:?}"));
-        });
-        // A member whose open failed drops `up` unsent: its end is reported below, and health fails.
-        let _ = listening.recv();
-    }
-    std::thread::spawn(move || {
-        for line in rx {
-            eprintln!("{line}");
-        }
-    });
+    start(&configs);
     let c = &configs[0];
     let text = healthy(c);
     assert!(text.ends_with("healthy\n"), "{text}");
 
     // A client without the secret is refused before its first request.
-    let wrong = b"not-the-cluster-secret-not-the-cluster-secret";
+    let wrong = Keys::plain(b"not-the-cluster-secret-not-the-cluster-secret".to_vec());
     let refused =
-        Client::connect(&c.members[0].addr, wrong, c.deadline).and_then(|mut k| k.ask("status"));
+        Client::connect(&c.members[0].addr, &wrong, c.deadline).and_then(|mut k| k.ask("status"));
     assert!(refused.is_err(), "{refused:?}");
 
     // Split member 3 off at its transport, write under load, heal, count.
-    let secret = c.secret().unwrap();
-    let mut three = Client::connect(&c.members[2].addr, &secret, c.deadline).unwrap();
+    let keys = c.keys().unwrap();
+    let mut three = Client::connect(&c.members[2].addr, &keys, c.deadline).unwrap();
     three.ask("cut on").unwrap();
     let ledger = dir.path().join("ledger");
     let summary = serve::load(c, "split", 2, Duration::from_secs(1), &ledger).unwrap();
@@ -157,7 +170,7 @@ drills = on
     }
     let before = config(1, "1,2,3");
     healthy(&before);
-    let key = before.secret().unwrap();
+    let key = before.keys().unwrap();
     let ask = |n: usize, request: &str| {
         Client::connect(&before.members[n - 1].addr, &key, before.deadline)
             .unwrap()
@@ -208,4 +221,95 @@ deadline_ms = 5000
         assert!(Instant::now() < until, "the spare never held both writes");
         std::thread::yield_now();
     }
+}
+
+/// An authority for tests: one root, a certificate per member naming 127.0.0.1, as members on one
+/// machine are reached (Ed25519, as the owner transport's tests issue them).
+struct Authority {
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+    root: String,
+}
+
+impl Authority {
+    fn new() -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let root = params.self_signed(&key).unwrap().pem();
+        Self {
+            issuer: rcgen::Issuer::new(params, key),
+            root,
+        }
+    }
+
+    /// The config lines of a member whose files, under `dir` and named for `who`, this authority
+    /// issued.
+    fn lines(&self, dir: &std::path::Path, who: &str) -> String {
+        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()]).unwrap();
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let certificate = params.signed_by(&key, &self.issuer).unwrap();
+        let (cert, key_file, roots) = (
+            dir.join(format!("{who}.pem")),
+            dir.join(format!("{who}.key")),
+            dir.join(format!("{who}-roots.pem")),
+        );
+        std::fs::write(&cert, certificate.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+        std::fs::write(&roots, &self.root).unwrap();
+        format!(
+            "cert_file = {}\nkey_file = {}\nroots_file = {}\n",
+            cert.display(),
+            key_file.display(),
+            roots.display()
+        )
+    }
+}
+
+/// CP-T1.13 (T-T1.13.1): with cert_file, key_file and roots_file, every link runs inside mutual
+/// TLS: the three elect over it, a client of the config is answered, and a client with the secret
+/// but no TLS, or with a certificate from another authority, is refused before its first request.
+#[test]
+fn t_t1_13_1_links_run_inside_mutual_tls() {
+    let dir = tempfile::tempdir().unwrap();
+    let ours = Authority::new();
+    let configs = three_with(dir.path(), |n| {
+        ours.lines(dir.path(), &format!("member-{n}"))
+    });
+    start(&configs);
+    let c = &configs[0];
+    let text = healthy(c);
+    assert!(text.ends_with("healthy\n"), "{text}");
+    let keys = c.keys().unwrap();
+    let mut client = Client::connect(&c.members[1].addr, &keys, c.deadline).unwrap();
+    client.ask("exec CREATE TABLE t(x INTEGER)").unwrap();
+    client.ask("exec INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(client.ask("count SELECT count(*) FROM t").unwrap(), "1");
+
+    let plain = Keys::plain(c.secret().unwrap());
+    let refused =
+        Client::connect(&c.members[0].addr, &plain, c.deadline).and_then(|mut k| k.ask("status"));
+    assert!(
+        refused.is_err(),
+        "a client without TLS was answered: {refused:?}"
+    );
+
+    let theirs = Authority::new();
+    let stranger = Config::parse(&format!(
+        "node = 1\nmembers = {}\ndata = {}\nclass = persisted\nsecret_file = {}\ndeadline_ms = 5000\n{}",
+        c.members
+            .iter()
+            .map(|m| format!("{}@{}", m.node, m.addr))
+            .collect::<Vec<_>>()
+            .join(","),
+        dir.path().join("stranger").display(),
+        c.secret_file.display(),
+        theirs.lines(dir.path(), "stranger"),
+    ))
+    .unwrap();
+    let refused = Client::connect(&c.members[0].addr, &stranger.keys().unwrap(), c.deadline)
+        .and_then(|mut k| k.ask("status"));
+    assert!(
+        refused.is_err(),
+        "another authority's client was answered: {refused:?}"
+    );
 }
