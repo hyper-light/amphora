@@ -1080,7 +1080,13 @@ def functions_said(expression, context, dialect):
       whose text is the same on every engine, is cast to text first (a REAL's isn't: each writes a
       real its own way). A BLOB X is DuckDB's octet_length() (its length() takes no BLOB) and
       ClickHouse's length(), its bytes, where sqlglot writes CHAR_LENGTH, its UTF-8 characters.
-      PostgreSQL's length() of a bytea and MySQL's CHAR_LENGTH() of a binary string count bytes."""
+      PostgreSQL's length() of a bytea and MySQL's CHAR_LENGTH() of a binary string count bytes.
+    - CAST(X AS <a type of INTEGER affinity>) (lang_expr.html#castexpr): SQLite's INTEGER is 64 bits
+      whatever the type's name ("INTEGER ... stored in 0, 1, 2, 3, 4, 6, or 8 bytes", datatype3.html),
+      where sqlglot writes INT, 32 bits on each engine: the type is given as BIGINT. "When casting a
+      REAL value into an INTEGER, the result is the integer between the REAL value and zero that is
+      closest to the REAL value", where DuckDB's, PostgreSQL's and MySQL's casts round (DuckDB 1.4.2
+      gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first."""
     from sqlglot import exp
 
     classes = storage_classes(expression, context.tables)
@@ -1144,6 +1150,10 @@ def functions_said(expression, context, dialect):
                 node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
             elif arg == "BLOB" and dialect != "postgres":
                 same(node, exp.Anonymous(this="octet_length" if dialect == "duckdb" else "length", expressions=[node.this.copy()]))
+        elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and affinity(node.to.sql(dialect="sqlite")) == "INTEGER":
+            if classes.get(id(node.this)) == "REAL":
+                node.set("this", exp.Trunc(this=node.this.copy()))
+            node.set("to", exp.DataType.build("BIGINT"))
     return expression
 
 
