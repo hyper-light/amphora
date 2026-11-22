@@ -1641,6 +1641,73 @@ probe (the emitter's build groups refuse them).
 join order; `BatchMeans` flipping a plan as often as `Blend` on the same series; a carried order
 kept where the new best is cheaper past the margin.
 
+## Decision (lane pl8-17): the fast plan first, the exact search on a planner worker or the idle connection
+
+**Decision.** PL.8, T-PL.8.10 (`crates/engine/background_search.rs`). Where the exact join search
+runs once a statement has a fast plan is a design decision, so both placements are built behind one
+switch, `Connection::set_background_search` (`BackgroundSearch`), for the A/B. `Off`, the whole
+search at prepare as before, is the control and the default until the measurements decide.
+
+- *The fast plan.* Under `Worker` or `Idle` a root statement is prepared with the fast budget: the
+  exact search only where its connected subsets fit the tables' count squared, the joins the greedy
+  search tries (`SearchBudget::fast`), so the fast plan costs no more than the greedy search; past
+  it, the greedy search. Its first run starts at once. A plan the greedy search ordered
+  (`Program::fast_planned`) hands its exact search off; one the exact search planned within the
+  fast budget is already exact.
+- *The exact plan, through the carried-order path.* The request plans the statement again with the
+  rule's whole budget, carrying the fast plan's join orders (decision pl8-16's `keep_carried`), and
+  hands its plan back in the statement's slot only where its estimate is below the fast plan's over
+  `1 + margin`, the weights' error (`cost_margin`); otherwise the fast plan stands. The statement
+  takes it as its next run starts, before it checks whether its plan is stale, so a plan made on an
+  older schema is planned again as any other.
+- *Placement (a), `Worker`.* One planner thread per database, started by its first request and
+  sleeping on a condition variable each request signals; the database's drop closes it. Its queue
+  is bounded by the connections open to the database, one pending search each on average: requests
+  whose statements have gone leave first, then the oldest live one, its statement keeping its fast
+  plan (`BackgroundSearchStats::dropped`). It plans on the statement's own connection from its
+  thread, as the connection's settings (join methods, budgets, the carried-order switch) shape the
+  plan.
+- *Placement (b), `Idle`.* The connection itself, when its last statement in progress ends
+  (`Statement::release_active_root_if_counted`): it runs its queued searches, oldest first, before
+  the step or reset that ended the statement returns. Bounded by the statements prepared on it. A
+  connection that never goes idle never runs its searches; they stay pending
+  (`Connection::idle_searches_pending`).
+- Every request ends in exactly one counted outcome (`Connection::background_search_stats`):
+  dropped, abandoned, kept, replaced or failed.
+
+**Why.** Ada's method: build both and let the data decide; latency first. The fast plan takes the
+search off the first row's path; the question is what the exact search then costs and where. The
+worker adds a thread per database and plans beside the connection's own work, and under many
+connections its queue is the risk. The idle connection adds nothing beside it but pays the search
+inside the step that ended a statement, and never runs it on a connection that stays busy. Both
+wake on an event (a request, a connection going idle), never on a timer.
+
+**Evidence.** Tests, none run yet (written while kiln's server was down; lane pl8-17):
+`background_search::tests::t_pl_8_10_the_worker_queue_drops_its_oldest_past_the_connections` (512
+connections, 4 requests each: the queue never past 512, the 1,536 oldest dropped);
+`t_pl_8_10_requests_whose_statements_went_leave_before_live_ones`;
+`t_pl_8_10_the_exact_plan_must_be_cheaper_past_the_margin`;
+`search_budget::tests::t_pl_8_10_the_fast_budget_is_the_greedy_search_s_joins`;
+`statement::tests::t_pl_8_10_a_connection_that_never_goes_idle_never_runs_its_search` (a star of
+ten dimensions, its search pending through three runs while another statement is held, then run on
+the reset that leaves the connection idle; answers unchanged);
+`t_pl_8_10_the_worker_hands_back_the_exact_plan`;
+`t_pl_8_10_every_worker_request_ends_once_under_many_connections` (64 connections). The harness of
+record, `statement::tests::t_pl_8_10_harness_time_to_first_row_and_to_the_exact_plan` (ignored),
+reports the time to the first row and to the exact plan at p50, p99 and the largest, and the
+outcomes, for `Off`, `Worker` and `Idle` at 1, 32 and 512 connections on one database, a thread
+each: `AMPHORA_BG_CONNECTIONS=1,32,512 cargo test -p amphora-engine --lib -- --ignored
+--nocapture t_pl_8_10_harness`. Its numbers decide the default; the run of record is the
+coordinator's.
+
+**Falsified by.** A fast plan slower to its first row than the control's; an exact plan installed
+that is not cheaper past the margin; a worker queue longer than the connections open; a request
+that ends in no outcome or two; a search run while its connection is busy under `Idle`.
+
+**Not yet built.** The exact search's plan replaces a custom plan's generic one but no custom plan
+asks for one. A bushy fast plan's shape isn't carried (only left-deep orders are), so the exact
+search weighs it by cost alone. The planner worker's thread count is one per database.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).

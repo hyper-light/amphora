@@ -377,6 +377,8 @@ tests = [
   # lane pl8-16
   { id = "T-PL.8.8", text = "learned_costs::ab_tests::t_pl_8_6_ab_plan_flips_and_batches_to_follow_a_change — passes when, on one seeded series, the blend control flips the plan over ten times as often as batch means, follows every change in one batch, and batch means follows a change at batch 64 in one batch and one at batch 1 only after more" },
   { id = "T-PL.8.9", text = "join::tests::t_pl_8_a_carried_join_order_stands_within_its_margin and learned_costs::ab_tests::t_pl_8_cost_margin_is_the_weights_error — passes when a carried join order stands while the search's best is not cheaper past the margin, is replaced past it, is ignored when not each table once, and the margin is exp(MOVE_Z * s) - 1 of the weights' spread between batch means; statement::tests::t_pl_8_9_* (simulator feature) — a statement planned again carries its order, and under weights pinned 10% either way it flips its order no more often with CarriedJoinOrders::WithinMargin than Off (the counts are the report)" },
+  # lane pl8-17
+  { id = "T-PL.8.10", text = "background_search::tests::t_pl_8_10_* and statement::tests::t_pl_8_10_* — passes when, behind BackgroundSearch (Off the control and the default), a root statement takes the fast plan and runs at once, its exact search runs on the database's planner worker (woken by each request, its queue bounded by the connections open, oldest dropped and counted) or on its connection when the connection goes idle (and never while it is busy), the exact plan replaces the fast one only where cheaper past the weights' margin, and every request ends in exactly one counted outcome" },
 ]
 
 [[own]]

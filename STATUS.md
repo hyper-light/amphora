@@ -981,6 +981,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   again can keep its join order unless the new best is cheaper past the weights' error (T-PL.8.9,
   behind `CarriedJoinOrders`, off by default);
   LEFT JOINs after the inner joins follow a bushy plan as semi and anti joins do (T-PL.8.2).
+  Lane pl8-17 (docs/design/planner.md "Decision (lane pl8-17)"): the fast plan first, its exact
+  search after it on a planner worker or the idle connection, behind `BackgroundSearch` (off by
+  default) for the A/B, with a harness of the time to the first row and to the exact plan
+  (T-PL.8.10).
   Not built: the search budget derived from a plan-time target, outer joins inside a bushy plan,
   and semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1
   is open.
