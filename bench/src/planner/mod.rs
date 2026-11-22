@@ -8,6 +8,14 @@
 //! table loaded and one a query and engine. bench/planner/summary.py reads them. With
 //! `--answers <dir>`, each query's first timed run on each engine writes its whole answer there
 //! (`answers.rs`), which bench/planner/answers.py compares.
+//!
+//! The scaling ladder (`--cores 1,2,4,8,16,32`, QT.6 lane qs6-12, goal 6d2ae944): every query run
+//! on each engine that takes a core count (`Target::set_cores`: Amphora's morsel workers capped,
+//! DuckDB's `threads`) at each count in turn, through this one driver on this one machine, each
+//! engine in this process through its own library, timed the same way. With `--limit N` each
+//! query runs again as `SELECT * FROM (query) LIMIT N`, the LIMIT shapes the workers stop early
+//! under. Each line is a `scaling` record: the query, its variant, the engine, the cores and its
+//! runs, beside the `run` record naming the client and the platform.
 
 mod answers;
 mod data;
@@ -20,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use answers::{Answer, Refusal};
 use data::Format;
-use engines::{for_dialect, Amphora, Count, Duck, Outcome, Postgres, Sqlite, Target};
+use engines::{for_dialect, Amphora, ClickHouse, Count, Duck, Outcome, Postgres, Sqlite, Target};
 
 struct Opts {
     bench: String,
@@ -45,6 +53,11 @@ struct Opts {
     prepared: Option<PathBuf>,
     params: Option<PathBuf>,
     plan_cache_modes: Vec<String>,
+    /// The scaling ladder's core counts (`--cores`), and its LIMIT variant's rows (`--limit`).
+    cores: Vec<usize>,
+    limit: Option<u64>,
+    /// ClickHouse's HTTP interface (`--clickhouse`).
+    clickhouse: String,
 }
 
 fn opts() -> anyhow::Result<Opts> {
@@ -69,6 +82,9 @@ fn opts() -> anyhow::Result<Opts> {
         prepared: None,
         params: None,
         plan_cache_modes: vec!["generic".into(), "auto".into()],
+        cores: Vec::new(),
+        limit: None,
+        clickhouse: "http://127.0.0.1:58123".into(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -95,12 +111,17 @@ fn opts() -> anyhow::Result<Opts> {
             "--prepared" => o.prepared = Some(v()?.into()),
             "--params" => o.params = Some(v()?.into()),
             "--plan-cache-modes" => o.plan_cache_modes = v()?.split(',').map(str::to_owned).collect(),
-            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes)"),
+            "--cores" => o.cores = v()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
+            "--limit" => o.limit = Some(v()?.parse()?),
+            "--clickhouse" => o.clickhouse = v()?,
+            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes, --cores, --limit, --clickhouse)"),
         }
     }
     anyhow::ensure!(matches!(o.bench.as_str(), "job" | "tpch"), "--bench is job or tpch");
     anyhow::ensure!(!o.data.as_os_str().is_empty() && !o.queries.as_os_str().is_empty() && !o.dir.as_os_str().is_empty() && !o.out.as_os_str().is_empty(), "--planner needs --data, --queries, --dir and --out");
     anyhow::ensure!(o.runs > 0, "--runs is at least 1");
+    anyhow::ensure!(o.cores.iter().all(|c| *c > 0), "--cores are at least 1");
+    anyhow::ensure!(o.limit.is_none() || !o.cores.is_empty(), "--limit is the scaling ladder's: give --cores");
     if o.prepared.is_some() {
         anyhow::ensure!(o.bench == "tpch" && o.params.is_some() && o.targets == ["amphora"], "--prepared runs TPC-H on amphora alone, with --params");
         anyhow::ensure!(!o.plan_cache_modes.is_empty(), "--plan-cache-modes names at least one");
@@ -282,7 +303,9 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
             }
             Box::new(Postgres::open(&format!("{} dbname={name}", o.dsn))?)
         }
-        t => anyhow::bail!("--planner runs amphora, amphora-vectorized, sqlite, duckdb, duckdb-mt or postgres, not {t}"),
+        // The scaling ladder's server engine (QT.6 lane qs6-12), a database of the benchmark's own.
+        "clickhouse-mt" => Box::new(ClickHouse::open(&o.clickhouse, &format!("{}_{}", o.bench, o.sf.to_string().replace('.', "_")))?),
+        t => anyhow::bail!("--planner runs amphora, amphora-vectorized, sqlite, duckdb, duckdb-mt, postgres or clickhouse-mt, not {t}"),
     })
 }
 
@@ -373,7 +396,13 @@ pub fn main() -> anyhow::Result<()> {
         "runs": o.runs, "timeout_s": o.timeout.as_secs(), "count_timeout_s": o.count_timeout.as_secs(),
         "max_load": o.max_load,
         "engines": engines,
+        "cores_ladder": o.cores, "limit": o.limit,
+        // Fair comparisons: one client, one platform, for every engine.
+        "client": "amphora-bench --planner, one process, each engine through its own library, one connection each, timed by one Instant around prepare and every row read",
     }))?;
+    if !o.cores.is_empty() {
+        return scaling(&o, &b, &mut targets, &mut write);
+    }
     // --prepared: each query prepared once and run with qgen's parameters under each plan cache
     // mode (PL.12, AC-PL.12.1; prepared.rs).
     if let (Some(dir), Some(params)) = (&o.prepared, &o.params) {
@@ -452,6 +481,53 @@ pub fn main() -> anyhow::Result<()> {
             record["runs"] = serde_json::Value::Array(runs);
             eprintln!("{name} {}: {}", target.name(), record["runs"].as_array().and_then(|r| r.iter().filter_map(|r| r["ms"].as_f64()).reduce(f64::min)).map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
             write(record)?;
+        }
+    }
+    Ok(())
+}
+
+/// The scaling ladder (QT.6 lane qs6-12): for each core count, each query (and its LIMIT variant
+/// under `--limit`) on each engine that takes the count, best of `--runs`, each run begun once the
+/// load average is under `--max-load`. The core counts go round the engines and queries in turn,
+/// so a drift in the machine falls on every engine alike. An engine that takes no core count is
+/// named once and left out.
+fn scaling(o: &Opts, b: &Bench, targets: &mut [Box<dyn Target>], write: &mut impl FnMut(serde_json::Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let mut variants: Vec<(String, &str, String)> = Vec::new();
+    for (name, sql) in &b.queries {
+        if !o.only.is_empty() && !o.only.contains(name) {
+            continue;
+        }
+        let sql = sql.trim().trim_end_matches(';').to_owned();
+        if let Some(n) = o.limit {
+            variants.push((name.clone(), "limit", format!("SELECT * FROM ({sql}) AS limited LIMIT {n}")));
+        }
+        variants.push((name.clone(), "whole", sql));
+    }
+    let mut skipped = std::collections::HashSet::new();
+    for &cores in &o.cores {
+        for (name, variant, sql) in &variants {
+            for target in targets.iter_mut() {
+                if !target.set_cores(cores)? {
+                    if skipped.insert(target.name()) {
+                        write(serde_json::json!({ "record": "scaling_skipped", "target": target.name(), "why": "it takes no core count" }))?;
+                    }
+                    continue;
+                }
+                let sql = for_dialect(sql, target.dialect());
+                let mut runs = Vec::new();
+                for _ in 0..o.runs {
+                    let load = quiet(o.max_load, o.load_wait);
+                    let outcome = target.run(&sql, o.timeout, None);
+                    let stop = !matches!(outcome, Outcome::Done(_));
+                    runs.push(outcome_json(&outcome, load));
+                    if stop {
+                        break;
+                    }
+                }
+                let best = runs.iter().filter_map(|r| r["ms"].as_f64()).reduce(f64::min);
+                eprintln!("{name} {variant} {} at {cores} cores: {}", target.name(), best.map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
+                write(serde_json::json!({ "record": "scaling", "bench": o.bench, "query": name, "variant": variant, "target": target.name(), "cores": cores, "best_ms": best, "runs": runs }))?;
+            }
         }
     }
     Ok(())

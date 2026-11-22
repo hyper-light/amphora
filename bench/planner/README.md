@@ -83,6 +83,35 @@ as in a process started for them. `repeat.py` compares passes timed alike, each 
 end, and such a pass stopped part way starts again from its beginning rather than resuming
 (bench/records/2026-10-26-jupiter-planner-baseline.md).
 
+## The scaling ladder (QT.6, goal 6d2ae944)
+
+`--cores 1,2,4,8,16,32` runs every query on each engine that takes a core count at each count in
+turn: Amphora with its morsel-driven parallel execution on and its workers capped
+(`Connection::set_parallel_cores`; the cost model still picks how many up to the cap), DuckDB with
+`threads` (`duckdb-mt`), ClickHouse with `max_threads` (`clickhouse-mt`, over its HTTP interface on
+`--clickhouse`, `http://127.0.0.1:58123` unless given). `--limit N` runs each query again as
+`SELECT * FROM (query) LIMIT N`, the shapes whose workers stop early. Each line is a `scaling`
+record (query, variant, engine, cores, its runs and the best of them) beside the `run` record that
+names the client (this one driver, each engine timed the same way) and the platform (`host`).
+`amphora-vectorized` takes the count as `amphora` does. Engines that take none (`sqlite`, `duckdb`,
+`postgres`) are named once in a `scaling_skipped` record and left out.
+
+```
+amphora-bench --planner --bench tpch --sf 10 --data ~/.cache/planner-bench/tpch-sf10 \
+  --queries bench/planner/tpch/queries --dir ~/.cache/planner-bench/db-tpch-sf10 \
+  --targets amphora,duckdb-mt,clickhouse-mt --cores 1,2,4,8,16,32 --limit 100 --runs 5 --out scaling-tpch.jsonl
+amphora-bench --planner --bench job --data ~/.cache/planner-bench/imdb \
+  --queries ~/.cache/research-src/join-order-benchmark --dir ~/.cache/planner-bench/db-job \
+  --targets amphora,duckdb-mt,clickhouse-mt --cores 1,2,4,8,16,32 --limit 100 --runs 5 --out scaling-job.jsonl
+```
+
+Fair comparisons: the same driver, machine, OS, disk and filesystem for all three. Amphora and
+DuckDB run in this process; ClickHouse is a server, reached only over HTTP on this machine, so for
+the run of record it runs as its own binary beside the driver (`clickhouse server`), not in
+`servers/clickhouse.sh`'s container, whose 8 GiB cap the others don't have. Its HTTP round trip
+and TSV rows are in its times; the record says so (`about`). Not yet run: the coordinator runs the
+ladder of record, on a machine of at least 32 cores.
+
 ## Prepared statements (PL.12)
 
 AC-PL.12.1 asks that TPC-H's 22 queries, prepared once and run with qgen's parameters, have no

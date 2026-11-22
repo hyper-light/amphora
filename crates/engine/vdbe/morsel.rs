@@ -118,7 +118,10 @@ fn nanos(duration: Duration) -> f64 {
 /// run: its cores, what starting a worker costs, and what one dispatch (a morsel claimed) costs.
 #[derive(Clone, Debug)]
 pub struct MachineCosts {
+    /// The cores the runs may use: the machine's, or fewer when capped.
     cores: NonZeroUsize,
+    /// The machine's cores, measured or stated.
+    machine: NonZeroUsize,
     worker_start: MeanNanos,
     dispatch: MeanNanos,
 }
@@ -129,6 +132,7 @@ impl MachineCosts {
         let cores = std::thread::available_parallelism().map_err(MorselError::Cores)?;
         let mut costs = MachineCosts {
             cores,
+            machine: cores,
             worker_start: MeanNanos::default(),
             dispatch: MeanNanos::default(),
         };
@@ -155,6 +159,7 @@ impl MachineCosts {
     pub fn stated(cores: NonZeroUsize, worker_start_nanos: f64, dispatch_nanos: f64) -> Self {
         let mut costs = MachineCosts {
             cores,
+            machine: cores,
             worker_start: MeanNanos::default(),
             dispatch: MeanNanos::default(),
         };
@@ -165,6 +170,11 @@ impl MachineCosts {
 
     pub fn cores(&self) -> NonZeroUsize {
         self.cores
+    }
+
+    /// Caps the cores the runs may use at `cap`, never past the machine's (`None`: every core).
+    pub fn cap(&mut self, cap: Option<NonZeroUsize>) {
+        self.cores = cap.map_or(self.machine, |cap| cap.min(self.machine));
     }
 
     pub fn worker_start(&self) -> MeanNanos {

@@ -544,6 +544,8 @@ pub struct Connection {
     pub(super) parallel_mode: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_limit`].
     pub(super) parallel_limit: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_cores`]; 0 is the machine's every core.
+    pub(super) parallel_cores: std::sync::atomic::AtomicUsize,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
@@ -1029,6 +1031,20 @@ impl Connection {
     /// control), the serial loop answers them. It counts only with the parallel mode on.
     pub fn set_parallel_limit(&self, on: bool) {
         self.parallel_limit.store(on, Ordering::Release);
+    }
+
+    /// Amphora (QT.6, lane qs6-12): the most cores the morsel workers may use, the machine's
+    /// measured count or fewer (`None`: every core). For the scaling harness's ladder of cores
+    /// (`amphora-bench --planner --cores`); the cost model still picks the workers up to it.
+    pub fn set_parallel_cores(&self, cores: Option<std::num::NonZeroUsize>) {
+        self.parallel_cores.store(
+            cores.map_or(0, std::num::NonZeroUsize::get),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn parallel_cores(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(self.parallel_cores.load(Ordering::Acquire))
     }
 
     pub(crate) fn parallel_limit(&self) -> bool {

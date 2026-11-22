@@ -21108,6 +21108,8 @@ pub fn op_morsel_aggregate(
         Some(costs) => costs,
         None => MachineCosts::measure().map_err(refused)?,
     };
+    // The scaling harness's ladder of cores caps them (lane qs6-12).
+    costs.cap(connection.parallel_cores());
     // Each worker's registers start as the statement's are now (the constants the program's
     // start computed among them), with its bound parameters (lane qs6-7).
     let mut registers = Vec::new();

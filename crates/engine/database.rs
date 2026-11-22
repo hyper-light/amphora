@@ -2854,6 +2854,7 @@ impl Database {
             automatic_indexes: AtomicBool::new(true),
             parallel_mode: AtomicBool::new(false),
             parallel_limit: AtomicBool::new(false),
+            parallel_cores: std::sync::atomic::AtomicUsize::new(0),
             morsel_costs: crate::sync::Mutex::new(None),
             morsel_body_rows: AtomicU64::new(0),
             morsel_join_links: AtomicU64::new(0),
