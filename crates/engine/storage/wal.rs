@@ -28,6 +28,7 @@ use super::pager::{Logged, PageRef, Pager};
 use super::sqlite3_ondisk::{
     self, checksum_wal, DatabaseHeader, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE,
 };
+use crate::busy::LockRelease;
 use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
@@ -846,6 +847,13 @@ trait WalCoordination: Debug + Send + Sync {
     /// Load the current authoritative WAL snapshot.
     fn load_snapshot(&self) -> WalSnapshot;
 
+    /// Amphora (lane constants-22): the event every release of this log's locks fires, when every
+    /// holder is in this process: None for a log shared across processes, whose holders elsewhere
+    /// release unseen.
+    fn lock_release(&self) -> Option<Arc<LockRelease>> {
+        None
+    }
+
     /// Amphora: whether `ensure_local_frame_cache_covers` has anything to do: only under another
     /// process's authority is there a fallback cache to fill, so a reader in one process builds no
     /// snapshot for it on every page it looks up.
@@ -1022,6 +1030,12 @@ trait WalCoordination: Debug + Send + Sync {
 /// Write-ahead log (WAL).
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
+    /// Amphora (lane constants-22): the event a statement busy on this log's locks waits on
+    /// ([`LockRelease`]); None when a release may come from another process unseen.
+    fn lock_release(&self) -> Option<Arc<LockRelease>> {
+        None
+    }
+
     /// Begin a read transaction.
     /// Returns what of the database changed since the connection's last read transaction, for its
     /// page cache to forget: nothing, the pages written since (when they are at most `most`), or
@@ -1334,7 +1348,9 @@ impl InProcessWalCoordination {
     }
 
     fn unlock_read_mark(&self, slot: usize) {
-        self.shared.read().runtime.read_locks[slot].unlock();
+        let shared = self.shared.read();
+        shared.runtime.read_locks[slot].unlock();
+        shared.runtime.released.notify();
     }
 
     fn read_mark_value(&self, slot: usize) -> u32 {
@@ -1378,7 +1394,9 @@ impl InProcessWalCoordination {
     }
 
     fn downgrade_read_mark(&self, slot: usize) {
-        self.shared.read().runtime.read_locks[slot].downgrade();
+        let shared = self.shared.read();
+        shared.runtime.read_locks[slot].downgrade();
+        shared.runtime.released.notify();
     }
 
     fn try_write_lock(&self) -> bool {
@@ -1386,7 +1404,9 @@ impl InProcessWalCoordination {
     }
 
     fn unlock_write_lock(&self) {
-        self.shared.read().runtime.write_lock.unlock();
+        let shared = self.shared.read();
+        shared.runtime.write_lock.unlock();
+        shared.runtime.released.notify();
     }
 
     fn try_checkpoint_lock(&self) -> bool {
@@ -1394,7 +1414,9 @@ impl InProcessWalCoordination {
     }
 
     fn unlock_checkpoint_lock(&self) {
-        self.shared.read().runtime.checkpoint_lock.unlock();
+        let shared = self.shared.read();
+        shared.runtime.checkpoint_lock.unlock();
+        shared.runtime.released.notify();
     }
 }
 
@@ -1414,6 +1436,11 @@ impl WalCoordination for InProcessWalCoordination {
             .metadata
             .transaction_count
             .store(commit.transaction_count, Ordering::Release);
+        shared.runtime.released.notify();
+    }
+
+    fn lock_release(&self) -> Option<Arc<LockRelease>> {
+        Some(Arc::clone(&self.shared.read().runtime.released))
     }
 
     fn publish_backfill(&self, max_frame: u64) {
@@ -1514,6 +1541,7 @@ impl WalCoordination for InProcessWalCoordination {
         if snapshot.max_frame == snapshot.nbackfills && read_locks[0].read() {
             if Self::snapshot_of(&shared) != snapshot {
                 read_locks[0].unlock();
+                shared.runtime.released.notify();
                 return None;
             }
             return Some(ReadGuardKind::DbFile);
@@ -1545,6 +1573,7 @@ impl WalCoordination for InProcessWalCoordination {
                 best_idx = idx as i64;
                 best_mark = snapshot.max_frame as u32;
                 read_lock.unlock();
+                shared.runtime.released.notify();
                 break;
             }
         }
@@ -1557,6 +1586,7 @@ impl WalCoordination for InProcessWalCoordination {
         let current_slot_mark = read_locks[best_idx as usize].get_value();
         if current_slot_mark != best_mark || snapshot_after_lock != snapshot {
             read_locks[best_idx as usize].unlock();
+            shared.runtime.released.notify();
             return None;
         }
 
@@ -3705,6 +3735,9 @@ pub struct WalSharedRuntime {
 
     /// Serialises checkpointer threads, only one checkpoint can be in flight at any time. Blocking and exclusive only
     pub checkpoint_lock: TursoRwLock,
+    /// Amphora (lane constants-22): each release of the locks above in this process, and each
+    /// commit published, for the statements busy on them to wake on ([`LockRelease`]).
+    pub released: Arc<LockRelease>,
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
@@ -3909,7 +3942,9 @@ impl Drop for VacuumLockGuard {
     fn drop(&mut self) {
         match self {
             Self::Read { ptr } | Self::Write { ptr } => {
-                ptr.read().runtime.vacuum_lock.unlock();
+                let shared = ptr.read();
+                shared.runtime.vacuum_lock.unlock();
+                shared.runtime.released.notify();
             }
         }
     }
@@ -5085,6 +5120,10 @@ impl WalFile {
 }
 
 impl Wal for WalFile {
+    fn lock_release(&self) -> Option<Arc<LockRelease>> {
+        self.coordination.lock_release()
+    }
+
     fn begin_read_tx(&self, most: usize) -> Result<ReadChange> {
         // Implement progressive backoff because transient lock contention
         // should resolve quickly, but under heavy contention busy-spinning wastes
@@ -6017,6 +6056,7 @@ impl Wal for WalFile {
     fn release_vacuum_checkpoint_lock(&self) {
         self.with_shared(|shared| {
             shared.runtime.checkpoint_lock.unlock();
+            shared.runtime.released.notify();
         });
     }
 
@@ -6052,6 +6092,7 @@ impl Wal for WalFile {
                     { "read_lock_idx": idx }
                 );
                 shared.runtime.read_locks[idx].unlock();
+                shared.runtime.released.notify();
             }
         });
 
@@ -7908,6 +7949,7 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                released: Arc::default(),
                 epoch: AtomicU32::new(snapshot.checkpoint_epoch),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
@@ -7992,6 +8034,7 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                released: Arc::default(),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
@@ -8042,6 +8085,7 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                released: Arc::default(),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),

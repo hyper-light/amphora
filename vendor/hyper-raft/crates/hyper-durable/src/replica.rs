@@ -707,6 +707,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.quiet = quiet;
     }
 
+    /// The owner's period in force ([`Replica::set_quiet`]).
+    pub fn quiet(&self) -> Duration {
+        self.quiet
+    }
+
+    /// Raises the most members a configuration may name ([`hyper_raft::Raft::grow_members`]): an
+    /// owner whose image states a bound past the one its core was opened for.
+    pub fn grow_members(&mut self, members: usize) -> bool {
+        self.node.raft.grow_members(members)
+    }
+
     /// The bytes the budget holds for this replica.
     pub fn charged(&self) -> u64 {
         self.charged

@@ -1164,6 +1164,35 @@ tests = [
   { id = "T-CS.5.11", text = "cs5_sum_over_text_in_an_integer_column_answers_as_sqlite (crates/engine/storage/versioned/columns_sql.rs) — passes when a SUM over an INTEGER column holding text and a blob answers the same with the copies' switch on and off, as a real, and no such SUM is read from the copy" },
 ]
 
+# lane constants-11 (2026-11-22): QB.1, the queue bounds by drain rate (replication.md, "Decision (lane constants): the
+# queue bounds by drain rate").
+[[own]]
+id = "QB.1"
+title = "The owner's queues hold what their readers drain in a learned election timeout, within the memory budget, not picked bounds"
+criteria = [
+  { id = "AC-QB.1.1", text = "Each queue's drain rate is measured in bytes and messages over the owner's clock, the outgoing queue's in ReplicaHandle::drain and the command queue's at the owner's intake, each a decaying ratio of sums at RFC 6298's gain" },
+  { id = "AC-QB.1.2", text = "The outgoing queue's bound is the lesser of its rate times the learned election timeout (election_tick times the pace's period) and the memory budget's room for queues, the queues' bytes charged through Budget::take. The command queue's bytes are that room, and application calls hold it less one wire record's room; the queue's inputs are counted (Control::commands) to the messages the owner takes in the learned election timeout, at least two and at most the room over an input's envelope (the room's envelopes before anything is measured); calls are counted the same, at least one and at most the inputs less one, and a call refused names the bound that refused it. A wire record's image is the budget's room for one, held inside the command queue's bound" },
+  { id = "AC-QB.1.3", text = "An outgoing queue past the budget's room fences at once; one past its learned bound fences only once it has stayed past it for an election timeout, so a bound that starts small grows before it fences" },
+]
+tests = [
+  { id = "T-QB.1.1", text = "Nothing measured, then an interval with nothing queued or read: passes when the bound is one record" },
+  { id = "T-QB.1.2", text = "A reader draining 1000 bytes in 10 messages every 10 ms under a 100 ms timeout: passes when the bound is about 10,000 bytes and 100 messages, then the room when that is less" },
+  { id = "T-QB.1.3", text = "The reader slows to a tenth, then stops: passes when the bound follows it down to one record, and no time on the clock adds nothing" },
+  { id = "T-QB.1.4", text = "A lone member of three campaigning, its vote requests a burst past one message, its host draining each tick: passes when it is never fenced and the bound grows past one message" },
+  # lane constants-20
+  { id = "T-QB.1.6", text = "The command queue's inputs counted with nothing measured, then for an intake of 10 inputs every 10 ms under a 100 ms timeout, then in a room of one envelope: passes when they are the room's envelopes, then about 100, never fewer than two, the calls always one fewer" },
+  { id = "T-QB.1.7", text = "A leader's measure opened for two members hears a third voter: passes when the third is refused Full naming two" },
+  # lane constants-21
+  { id = "T-QB.1.8", text = "A bound entry, stamped, read back; a one-member group's first bound raised as it grows to nine: passes when the entry states its bound and nothing else does, and the bound goes 2, 4, 8, 16, each admitting the configuration that raised it" },
+  { id = "T-QB.1.9", text = "A driven one-voter group, a learner running beside it, grows to five members, then nine, then the voter reopens from its first configuration: passes when every change is answered, the bound is 8 at five and 16 at nine at the voter and the learner, and the voter reopens with 16" },
+  { id = "T-QB.1.10", text = "A wire record of one byte and a catch-up queued on an owner not stepped: passes when the queue's bytes grow by the byte and two envelopes" },
+  { id = "T-QB.1.11", text = "Five voters, two cut off while the rest commit, then both back, one slow and one fast, under each window (window_slow_flooded_fast_starved): passes when both catch up under each, which prints the most in flight to the slow member and the rounds each took" },
+  { id = "T-QB.1.12", text = "Three voters opened, elected, then three election timeouts of ticks: passes when each owner's quiet period is its election ticks of its pace, the start pace's at open and the learned one's after, never the picked 50 ms" },
+  # lane constants-22
+  { id = "T-QB.1.13", text = "A lock-release event, released before a wait and after: passes when a wait after a release it hadn't counted says try again, a waiting waker is woken once by the next release and let go, and one waker waiting twice is held once" },
+  { id = "T-QB.1.14", text = "Two connections, one holding the write lock while the other's insert waits, then the holder commits, under each busy wake: passes when under the release wake nothing woke the waiter before the commit and the commit did, both inserts commit, and the time from commit to the waiter's insert done is printed for each" },
+]
+
 # lane many-writers
 # Amphora's own IDs for G7 step 5 and G8 steps 4-5 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, under
 # CP-T1.3 stage 3 and CP-T1.4): the harnesses that verify many writers through SQL. Their full runs
