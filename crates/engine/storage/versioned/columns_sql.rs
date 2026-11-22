@@ -922,15 +922,7 @@ mod tests {
         .unwrap();
     }
 
-    const QUERIES: [&str; 7] = [
-        "SELECT count(*), sum(v), min(v), max(v) FROM t",
-        "SELECT count(s), min(s), max(s) FROM t WHERE v >= 500",
-        "SELECT g, count(*), sum(v) FROM t GROUP BY g",
-        "SELECT s, count(*), max(id) FROM t WHERE g <> 3 GROUP BY s",
-        "SELECT g, s, sum(v) FROM t WHERE s IS NOT NULL GROUP BY g, s",
-        "SELECT count(*) FROM t WHERE s IS NULL",
-        "SELECT min(id), max(id), sum(id) FROM t WHERE v < 100",
-    ];
+    use crate::storage::versioned::columns_ab::QUERIES;
 
     /// Do: the same table on two versioned storages, one with the column copies' switch on; the
     /// analytic statements (filters, aggregates, GROUP BY) on both, with inserts, updates and
@@ -1298,44 +1290,22 @@ mod tests {
         assert!(copies(&on).waiting().is_empty());
     }
 
-    /// The A/B harness for the two rebuy policies (lane colcopy-bound, AC-CB.4.1): each scenario
-    /// forces a failure mode at its extreme, under both, and reports per policy and scenario the
-    /// statements' latency percentiles, throughput, the copies' peak and average bytes held, the
-    /// rows their builds read, rebuys, the time copies were absent, and whether every answer
-    /// equalled the row loop's. Sizes scale by `AMPHORA_AB_SCALE` (1 by default: the tiny instance
-    /// the test suite runs); `AMPHORA_AB_OUT` names the JSONL file the records go to. The run of
-    /// record is the coordinator's:
+    /// The A/B harness for the two rebuy policies (lane colcopy-bound, AC-CB.4.1; scenarios shared
+    /// with the bench's DuckDB comparison in [`columns_ab`], lane colcopy-7): each scenario forces
+    /// a failure mode at its extreme, laptop-small and many tables under heavy pressure, under
+    /// both, and reports per policy and scenario the statements' latency percentiles, throughput,
+    /// the copies' peak and average bytes held, the rows their builds read, rebuys, the time
+    /// copies were absent, the copies still waiting at the end, the last copy let go and why, the
+    /// copies' trace events by reason, the writes the memory source refused, and whether every
+    /// answer equalled the row loop's. Sizes scale by `AMPHORA_AB_SCALE` (1 by default: the tiny
+    /// instance the test suite runs); `AMPHORA_AB_OUT` names the JSONL file the records go to. The
+    /// run of record is the coordinator's:
     ///
     /// `AMPHORA_AB_SCALE=200 AMPHORA_AB_OUT=bench/records/<date>-<host>-colcopy-ab.jsonl cargo test -p amphora-engine --release --lib storage::versioned::columns_sql::tests::ab -- --nocapture`
     mod ab {
         use super::*;
+        use crate::storage::versioned::columns_ab::{scenarios, schema, Press, Scenario, Traces};
         use std::time::Instant;
-
-        /// How a scenario presses the copies' room: the bytes left them are a share of what one
-        /// table's copy needs, as measured at that scale (the scenario's definition).
-        #[derive(Clone, Copy)]
-        enum Press {
-            /// `copies` copies' worth of room, held steady.
-            Steady { copies: f64 },
-            /// Half a copy's room; each statement another use frees `piece` of a copy's need and
-            /// takes it back at the next, so the pieces never add up to one copy.
-            Bursty { piece: f64 },
-            /// Half a copy's room until half the statements have run, then a copy's worth more,
-            /// the tables growing all along.
-            Grows,
-            /// No other use: as much room as the machine's source.
-            None,
-        }
-
-        struct Scenario {
-            name: &'static str,
-            tables: usize,
-            rows: i64,
-            statements: usize,
-            press: Press,
-            /// Rows each table grows by before each statement.
-            grow: i64,
-        }
 
         fn scale() -> i64 {
             std::env::var("AMPHORA_AB_SCALE")
@@ -1345,71 +1315,12 @@ mod tests {
                 .max(1)
         }
 
-        fn scenarios(k: i64) -> Vec<Scenario> {
-            let n = |s: i64| usize::try_from(s).unwrap_or(1);
-            vec![
-                Scenario {
-                    name: "laptop_cap_one_big_table",
-                    tables: 1,
-                    rows: 2000 * k,
-                    statements: n(12 * k),
-                    press: Press::Steady { copies: 0.5 },
-                    grow: 0,
-                },
-                Scenario {
-                    name: "many_tables_small_cap",
-                    tables: 6,
-                    rows: 300 * k,
-                    statements: n(24 * k),
-                    press: Press::Steady { copies: 2.0 },
-                    grow: 0,
-                },
-                Scenario {
-                    name: "steady_pressure",
-                    tables: 2,
-                    rows: 500 * k,
-                    statements: n(16 * k),
-                    press: Press::Steady { copies: 1.5 },
-                    grow: 0,
-                },
-                Scenario {
-                    name: "bursty_pressure",
-                    tables: 2,
-                    rows: 500 * k,
-                    statements: n(16 * k),
-                    press: Press::Bursty { piece: 0.125 },
-                    grow: 0,
-                },
-                Scenario {
-                    name: "growing_while_waiting",
-                    tables: 1,
-                    rows: 500 * k,
-                    statements: n(16 * k),
-                    press: Press::Grows,
-                    grow: 20 * k,
-                },
-                Scenario {
-                    name: "huge_cap_many_tables",
-                    tables: 12,
-                    rows: 300 * k,
-                    statements: n(36 * k),
-                    press: Press::None,
-                    grow: 0,
-                },
-            ]
-        }
-
-        fn schema(i: usize) -> String {
-            format!("CREATE TABLE t{i} (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT)")
-        }
-
-        fn fill_in(conn: &Arc<crate::Connection>, i: usize, from: i64, to: i64) {
-            conn.execute(format!(
+        fn fill_sql(i: usize, from: i64, to: i64) -> String {
+            format!(
                 "INSERT INTO t{i} SELECT value, value % 7, (value * 37) % 1000, \
                  CASE WHEN value % 5 = 0 THEN NULL ELSE 'k' || (value % 11) END \
                  FROM generate_series({from}, {to})"
-            ))
-            .unwrap();
+            )
         }
 
         fn at(sorted: &[u64], p: f64) -> u64 {
@@ -1418,7 +1329,7 @@ mod tests {
             sorted.get(i).copied().unwrap_or(0)
         }
 
-        fn run(s: &Scenario, rebuy: Rebuy, need: u64) -> String {
+        fn run(s: &Scenario, rebuy: Rebuy, need: u64) -> serde_json::Value {
             let room = Arc::new(Capped::new(u64::MAX / 2));
             let shared: Arc<dyn Source> = room.clone();
             let (_a, on) = connect_in(Some(shared));
@@ -1428,51 +1339,43 @@ mod tests {
             for c in [&on, &off] {
                 for i in 0..s.tables {
                     c.execute(schema(i)).unwrap();
-                    fill_in(c, i, 1, s.rows);
+                    c.execute(fill_sql(i, 1, s.rows)).unwrap();
                 }
             }
-            let share = |f: f64| (need as f64 * f) as u64;
-            let free = match s.press {
-                Press::Steady { copies } => Some(share(copies)),
-                Press::Bursty { .. } | Press::Grows => Some(share(0.5)),
-                Press::None => None,
-            };
             let mut other = 0u64;
             let mut latencies = Vec::with_capacity(s.statements);
             let (mut held_sum, mut held_peak, mut equal, mut waited_most) =
                 (0u64, 0u64, true, 0u64);
+            let (mut writes_refused, mut write_refusal) = (0u64, None::<String>);
             let mut next = vec![s.rows + 1; s.tables];
             let (mut resident_peak, mut granted_peak) = (0u64, 0u64);
             let began = Instant::now();
             for k in 0..s.statements {
-                let i = k % s.tables;
+                let i = s.table(k);
                 if s.grow > 0 {
                     let from = next.get(i).copied().unwrap_or(s.rows + 1);
-                    for c in [&on, &off] {
-                        fill_in(c, i, from, from + s.grow - 1);
-                    }
-                    if let Some(n) = next.get_mut(i) {
-                        *n = from + s.grow;
+                    let w = fill_sql(i, from, from + s.grow - 1);
+                    // A write the memory source refuses (the copies crowding out the rows) is
+                    // counted, and left out of the row loop's table too, so the answers still
+                    // compare.
+                    match on.execute(&w) {
+                        Ok(()) => {
+                            off.execute(&w).unwrap();
+                            if let Some(n) = next.get_mut(i) {
+                                *n = from + s.grow;
+                            }
+                        }
+                        Err(e) => {
+                            writes_refused += 1;
+                            write_refusal.get_or_insert_with(|| e.to_string());
+                        }
                     }
                 }
                 // The room the copies have at this statement, by the scenario.
-                let now_free = match s.press {
-                    Press::Bursty { piece } if k % 2 == 0 => {
-                        free.map(|f| f.saturating_add(share(piece)))
-                    }
-                    Press::Grows if k >= s.statements / 2 => {
-                        free.map(|f| f.saturating_add(share(1.0)))
-                    }
-                    _ => free,
-                };
-                if let Some(f) = now_free {
+                if let Some(f) = s.free_at(k, need) {
                     press(&room, &mut other, f, &on);
                 }
-                let q = QUERIES
-                    .get(k % QUERIES.len())
-                    .copied()
-                    .unwrap_or(QUERIES[0])
-                    .replace("FROM t", &format!("FROM t{i}"));
+                let q = s.query(k);
                 let t = Instant::now();
                 let got = rows(&on, &q);
                 latencies.push(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
@@ -1498,22 +1401,68 @@ mod tests {
             latencies.sort_unstable();
             let c = copies(&on).counts();
             let m = copies(&on).meter();
+            let waiting = copies(&on).waiting();
             let n = s.statements.max(1) as u64;
-            format!(
-                "{{\"harness\":\"colcopy-ab\",\"policy\":\"{}\",\"scenario\":\"{}\",\"tables\":{},\"rows\":{},\"statements\":{},\"need_bytes\":{},\"free_bytes\":{},\"p50_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"statements_per_s\":{:.1},\"peak_held\":{},\"avg_held\":{},\"build_rows\":{},\"rebuy_rows\":{},\"build_bytes\":{},\"rebuy_bytes\":{},\"resident_peak\":{},\"granted_peak\":{},\"rebuys\":{},\"kept\":{},\"dropped\":{},\"resumed\":{},\"absent_ns\":{},\"longest_wait_ns\":{},\"copy_statements\":{},\"absent_statements\":{},\"copy_rows\":{},\"loop_rows\":{},\"asked\":{},\"granted\":{},\"refused\":{},\"refused_bytes\":{},\"equal\":{}}}",
-                match rebuy { Rebuy::Rent => "A_rent", Rebuy::Room => "B_room" },
-                s.name, s.tables, s.rows, s.statements, need,
-                free.map_or("null".to_string(), |f| f.to_string()),
-                at(&latencies, 0.5), at(&latencies, 0.99), at(&latencies, 0.999),
-                s.statements as f64 / elapsed.max(f64::MIN_POSITIVE),
-                held_peak, held_sum / n, c.build_rows, c.rebuy_rows, c.build_bytes, c.rebuy_bytes, resident_peak, granted_peak, c.rebuys, c.kept, c.dropped, c.resumed,
-                copies(&on).absent_nanos(), waited_most, c.copy, c.absent, c.granule_rows, c.loop_rows,
-                m.asked, m.granted, m.refused, m.refused_bytes, equal
-            )
+            let last_dropped = copies(&on).last_dropped().map(
+                |Dropped::Memory {
+                     tree,
+                     asked,
+                     held,
+                     limit,
+                 }| {
+                    serde_json::json!({"why": "memory source refused", "tree": tree, "asked": asked, "held": held, "limit": limit})
+                },
+            );
+            serde_json::json!({
+                "harness": "colcopy-ab",
+                "policy": match rebuy { Rebuy::Rent => "A_rent", Rebuy::Room => "B_room" },
+                "scenario": s.name,
+                "forces": s.forces,
+                "tables": s.tables,
+                "rows": s.rows,
+                "statements": s.statements,
+                "need_bytes": need,
+                "free_bytes": s.free(need),
+                "p50_ns": at(&latencies, 0.5),
+                "p99_ns": at(&latencies, 0.99),
+                "p999_ns": at(&latencies, 0.999),
+                "statements_per_s": s.statements as f64 / elapsed.max(f64::MIN_POSITIVE),
+                "peak_held": held_peak,
+                "avg_held": held_sum / n,
+                "build_rows": c.build_rows,
+                "rebuy_rows": c.rebuy_rows,
+                "build_bytes": c.build_bytes,
+                "rebuy_bytes": c.rebuy_bytes,
+                "resident_peak": resident_peak,
+                "granted_peak": granted_peak,
+                "rebuys": c.rebuys,
+                "kept": c.kept,
+                "dropped": c.dropped,
+                "resumed": c.resumed,
+                "absent_ns": copies(&on).absent_nanos(),
+                "longest_wait_ns": waited_most,
+                "waiting_end": waiting.len(),
+                "waiting_bytes_end": waiting.iter().fold(0u64, |b, w| b.saturating_add(w.bytes)),
+                "last_dropped": last_dropped,
+                "copy_statements": c.copy,
+                "absent_statements": c.absent,
+                "copy_rows": c.granule_rows,
+                "loop_rows": c.loop_rows,
+                "asked": m.asked,
+                "granted": m.granted,
+                "refused": m.refused,
+                "refused_bytes": m.refused_bytes,
+                "writes_refused": writes_refused,
+                "write_refusal": write_refusal,
+                "equal": equal,
+            })
         }
 
-        /// T-CB.4.1: every scenario once under each policy. Expect: every answer equal to the row
-        /// loop's, one record per policy and scenario (written to `AMPHORA_AB_OUT` when given).
+        /// T-CB.4.1: every scenario once under each policy, the copies' trace events counted.
+        /// Expect: every answer equal to the row loop's; in a steady room under one copy on more
+        /// than one statement a table, each policy's failure mode shows (A buys again, B's copies
+        /// still wait at the end and never buy again); one record per policy and scenario
+        /// (written to `AMPHORA_AB_OUT` when given).
         #[test]
         fn cb4_ab_both_rebuy_policies_at_the_extremes() {
             let k = scale();
@@ -1521,8 +1470,25 @@ mod tests {
             for s in scenarios(k) {
                 let need = need_of(s.rows);
                 for rebuy in [Rebuy::Rent, Rebuy::Room] {
-                    let line = run(&s, rebuy, need);
-                    assert!(line.ends_with("\"equal\":true}"), "{line}");
+                    let traces = Traces::default();
+                    let mut line = traces.during(|| run(&s, rebuy, need));
+                    if let Some(o) = line.as_object_mut() {
+                        o.insert("traces".into(), serde_json::json!(traces.counts()));
+                        o.insert("traces_compiled".into(), Traces::compiled().into());
+                    }
+                    assert_eq!(line["equal"], true, "{line}");
+                    let under_one = matches!(s.press, Press::Steady { copies } if copies < 1.0);
+                    if under_one && s.statements >= 4 * s.tables {
+                        assert!(line["dropped"].as_u64() > Some(0), "{line}");
+                        match rebuy {
+                            Rebuy::Rent => assert!(line["rebuys"].as_u64() > Some(0), "{line}"),
+                            Rebuy::Room => {
+                                assert_eq!(line["rebuys"], 0, "{line}");
+                                assert!(line["waiting_end"].as_u64() > Some(0), "{line}");
+                            }
+                        }
+                    }
+                    let line = line.to_string();
                     eprintln!("{line}");
                     out.push(line);
                 }

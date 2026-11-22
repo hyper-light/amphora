@@ -1,9 +1,10 @@
 //! Column copies within a fixed memory limit against DuckDB (kiln goal c436eeb5, lane colcopy-5,
-//! AC-CB.4.2): the six scenarios of the rebuy policies' A/B (`columns_sql::tests::ab`, T-CB.4.1)
-//! run by one driver over Amphora under each policy and over DuckDB, both in this process through
-//! their Rust libraries (`amphora-engine` and the `duckdb` crate, bundled), in memory, the same
-//! statements on the same rows, timed the same way (each statement's prepare, run and every row
-//! read, by one `Instant`), under the same memory cap (docs/design/columnar.md, decision 2).
+//! AC-CB.4.2): the scenarios of the rebuy policies' A/B (`columns_ab`, the definitions the
+//! engine's A/B test runs too, T-CB.4.1; lane colcopy-7) run by one driver over Amphora under
+//! each policy and over DuckDB, both in this process through their Rust libraries
+//! (`amphora-engine` and the `duckdb` crate, bundled), in memory, the same statements on the same
+//! rows, timed the same way (each statement's prepare, run and every row read, by one `Instant`),
+//! under the same memory cap (docs/design/columnar.md, decision 2).
 //!
 //! The cap, statement by statement: what the engine holds for the table's rows now and the
 //! scenario's free bytes on top. Amphora's rows and its copies take from one memory source; the
@@ -17,7 +18,11 @@
 //! second, the engine's bytes at most (sampled after each statement), its analytic bytes at most
 //! (Amphora: the copies' granted bytes; DuckDB: the same total, its table being its columns), the
 //! cap at most, statements the engine refused, DuckDB's spill at most, whether every answer
-//! equalled Amphora's row loop's, and the client and platform that produced it.
+//! equalled Amphora's row loop's, and the client and platform that produced it. Amphora's lines
+//! add what its copies did and why: kept, let go, bought again, resumed, still waiting at the
+//! end, the last one let go and the memory refusal behind it, and the copies' trace events by
+//! reason (`columns_ab::Traces`). A write the cap refuses is counted (`writes_refused`) and left
+//! out of the reference too, so the answers still compare.
 //!
 //! usage: amphora-bench --colcopy --dir DIR [--scale K] [--engines rent,room,duckdb]
 //!        [--duckdb-threads N] [--out FILE]
@@ -27,102 +32,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use amphora_engine::storage::versioned::columns_sql::Rebuy;
+use amphora_engine::storage::versioned::columns_ab::{Scenario, Traces, scenarios, schema};
+use amphora_engine::storage::versioned::columns_sql::{Dropped, Rebuy};
 use amphora_engine::storage::versioned::memory::{Capped, Source};
 use amphora_engine::storage::versioned::switch::Storage;
 use amphora_engine::{ConnectOpts, Database, MemoryIO, Numeric, SqliteDialect, StepResult, Value};
 
 fn e(err: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{err}")
-}
-
-/// The A/B's analytic statements (`columns_sql::tests::QUERIES`), on table `t`.
-const QUERIES: [&str; 7] = [
-    "SELECT count(*), sum(v), min(v), max(v) FROM t",
-    "SELECT count(s), min(s), max(s) FROM t WHERE v >= 500",
-    "SELECT g, count(*), sum(v) FROM t GROUP BY g",
-    "SELECT s, count(*), max(id) FROM t WHERE g <> 3 GROUP BY s",
-    "SELECT g, s, sum(v) FROM t WHERE s IS NOT NULL GROUP BY g, s",
-    "SELECT count(*) FROM t WHERE s IS NULL",
-    "SELECT min(id), max(id), sum(id) FROM t WHERE v < 100",
-];
-
-/// How a scenario presses the room, as the A/B defines it.
-#[derive(Clone, Copy)]
-enum Press {
-    Steady { copies: f64 },
-    Bursty { piece: f64 },
-    Grows,
-    None,
-}
-
-struct Scenario {
-    name: &'static str,
-    tables: usize,
-    rows: i64,
-    statements: usize,
-    press: Press,
-    grow: i64,
-}
-
-/// The A/B's six scenarios at scale `k` (`columns_sql::tests::ab::scenarios`).
-fn scenarios(k: i64) -> Vec<Scenario> {
-    let n = |s: i64| usize::try_from(s).unwrap_or(1);
-    let s = |name, tables, rows, statements, press, grow| Scenario {
-        name,
-        tables,
-        rows,
-        statements: n(statements),
-        press,
-        grow,
-    };
-    vec![
-        s(
-            "laptop_cap_one_big_table",
-            1,
-            2000 * k,
-            12 * k,
-            Press::Steady { copies: 0.5 },
-            0,
-        ),
-        s(
-            "many_tables_small_cap",
-            6,
-            300 * k,
-            24 * k,
-            Press::Steady { copies: 2.0 },
-            0,
-        ),
-        s(
-            "steady_pressure",
-            2,
-            500 * k,
-            16 * k,
-            Press::Steady { copies: 1.5 },
-            0,
-        ),
-        s(
-            "bursty_pressure",
-            2,
-            500 * k,
-            16 * k,
-            Press::Bursty { piece: 0.125 },
-            0,
-        ),
-        s(
-            "growing_while_waiting",
-            1,
-            500 * k,
-            16 * k,
-            Press::Grows,
-            20 * k,
-        ),
-        s("huge_cap_many_tables", 12, 300 * k, 36 * k, Press::None, 0),
-    ]
-}
-
-fn schema(i: usize) -> String {
-    format!("CREATE TABLE t{i} (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT)")
 }
 
 /// The A/B's rows, in each engine's spelling of a series and a text concatenation.
@@ -204,7 +121,10 @@ impl Amphora {
                     }
                 }
                 StepResult::Done => break,
-                StepResult::IO | StepResult::Yield => self.io.step().map_err(e)?,
+                // A sleep is stepped as I/O is, as its doc allows a caller that keeps no time.
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    self.io.step().map_err(e)?
+                }
                 other => anyhow::bail!("step: {other:?}"),
             }
         }
@@ -284,24 +204,15 @@ fn need(rows: i64) -> anyhow::Result<u64> {
     let a = Amphora::open(None, Some(Rebuy::Rent))?;
     a.exec(&schema(0))?;
     a.exec(&fill(false, 0, 1, rows))?;
-    let q = QUERIES[2].replace("FROM t", "FROM t0");
+    let q = amphora_engine::storage::versioned::columns_ab::QUERIES
+        .get(2)
+        .copied()
+        .unwrap_or_default()
+        .replace("FROM t", "FROM t0");
     for _ in 0..3 {
         a.rows(&q)?;
     }
     Ok(a.copies().1)
-}
-
-/// The free bytes the scenario leaves the analytic work at statement `k` (None: no cap).
-fn free_at(s: &Scenario, k: usize, need: u64) -> Option<u64> {
-    let share = |f: f64| (need as f64 * f) as u64;
-    match s.press {
-        Press::Steady { copies } => Some(share(copies)),
-        Press::Bursty { piece } if k % 2 == 0 => Some(share(0.5).saturating_add(share(piece))),
-        Press::Bursty { .. } => Some(share(0.5)),
-        Press::Grows if k >= s.statements / 2 => Some(share(0.5).saturating_add(share(1.0))),
-        Press::Grows => Some(share(0.5)),
-        Press::None => None,
-    }
 }
 
 fn at(sorted: &[u64], p: f64) -> u64 {
@@ -320,6 +231,9 @@ struct Tally {
     refused: u64,
     /// The first refusal's text.
     refusal: Option<String>,
+    /// Writes the cap refused, and the first one's text.
+    writes_refused: u64,
+    write_refusal: Option<String>,
     equal: bool,
 }
 
@@ -371,22 +285,31 @@ fn run(
     let mut next = vec![s.rows + 1; s.tables];
     let began = Instant::now();
     for k in 0..s.statements {
-        let i = k % s.tables;
+        let i = s.table(k);
         if s.grow > 0 {
             let from = next.get(i).copied().unwrap_or(s.rows + 1);
-            reference.exec(&fill(false, i, from, from + s.grow - 1))?;
-            if let Some(a) = &amphora {
-                a.exec(&fill(false, i, from, from + s.grow - 1))?;
-            }
-            if let Some(d) = &duck {
-                d.conn
-                    .execute_batch(&fill(true, i, from, from + s.grow - 1))?;
-            }
-            if let Some(n) = next.get_mut(i) {
-                *n = from + s.grow;
+            let to = from + s.grow - 1;
+            // The engine's write first: one the cap refuses is counted and left out of the
+            // reference too, so the answers still compare.
+            let wrote = match (&amphora, &duck) {
+                (Some(a), _) => a.exec(&fill(false, i, from, to)),
+                (_, Some(d)) => d.conn.execute_batch(&fill(true, i, from, to)).map_err(e),
+                _ => Ok(()),
+            };
+            match wrote {
+                Ok(()) => {
+                    reference.exec(&fill(false, i, from, to))?;
+                    if let Some(n) = next.get_mut(i) {
+                        *n = from + s.grow;
+                    }
+                }
+                Err(err) => {
+                    t.writes_refused += 1;
+                    t.write_refusal.get_or_insert_with(|| err.to_string());
+                }
             }
         }
-        let free = free_at(s, k, need);
+        let free = s.free_at(k, need);
         // The cap: the engine's bytes for its rows now, and the free bytes on top.
         if let (Some(a), Some(f)) = (&amphora, free) {
             let want = f.saturating_sub(a.storage.copy_meter().held);
@@ -411,11 +334,7 @@ fn run(
                 .execute_batch(&format!("SET memory_limit = '{cap}B'"))?;
             t.cap_peak = t.cap_peak.max(cap);
         }
-        let q = QUERIES
-            .get(k % QUERIES.len())
-            .copied()
-            .unwrap_or(QUERIES[0])
-            .replace("FROM t", &format!("FROM t{i}"));
+        let q = s.query(k);
         let clock = Instant::now();
         let got = match (&amphora, &duck) {
             (Some(a), _) => a.rows(&q),
@@ -449,6 +368,33 @@ fn run(
     let elapsed = began.elapsed().as_secs_f64();
     room.give(other);
     t.latencies.sort_unstable();
+    // What Amphora's copies did and why (DuckDB has no copies: null).
+    let copies = amphora.as_ref().map(|a| {
+        let c = a.storage.copy_counts();
+        let waiting = a.storage.copy_waiting();
+        let last = a.storage.copy_dropped().map(
+            |Dropped::Memory {
+                 tree,
+                 asked,
+                 held,
+                 limit,
+             }| serde_json::json!({"why": "memory source refused", "tree": tree, "asked": asked, "held": held, "limit": limit}),
+        );
+        serde_json::json!({
+            "kept": c.kept,
+            "dropped": c.dropped,
+            "rebuys": c.rebuys,
+            "resumed": c.resumed,
+            "build_rows": c.build_rows,
+            "rebuy_rows": c.rebuy_rows,
+            "copy_statements": c.copy,
+            "absent_statements": c.absent,
+            "waiting_end": waiting.len(),
+            "waiting_bytes_end": waiting.iter().fold(0u64, |b, w| b.saturating_add(w.bytes)),
+            "longest_wait_end_ns": waiting.iter().map(|w| w.nanos).max().unwrap_or(0),
+            "last_dropped": last,
+        })
+    });
     let (engine_name, policy, version) = match engine {
         Engine::Amphora(Rebuy::Rent) => (
             "amphora",
@@ -476,11 +422,12 @@ fn run(
         "version": version,
         "policy": policy,
         "scenario": s.name,
+        "forces": s.forces,
         "tables": s.tables,
         "rows": s.rows,
         "statements": s.statements,
         "need_bytes": need,
-        "free_bytes": free_at(s, 0, need),
+        "free_bytes": s.free(need),
         "p50_ns": at(&t.latencies, 0.5),
         "p99_ns": at(&t.latencies, 0.99),
         "p999_ns": at(&t.latencies, 0.999),
@@ -491,6 +438,9 @@ fn run(
         "spill_bytes_peak": t.spill_peak,
         "refused": t.refused,
         "refusal": t.refusal,
+        "writes_refused": t.writes_refused,
+        "write_refusal": t.write_refusal,
+        "copies": copies,
         "equal": t.equal,
         "threads": match engine { Engine::Duck => cx.threads, Engine::Amphora(_) => 1 },
         "client": cx.client,
@@ -564,7 +514,13 @@ pub fn main() -> anyhow::Result<()> {
     for s in scenarios(scale) {
         let need = need(s.rows)?;
         for &engine in &engines {
-            let line = run(&cx, &s, engine, need)?.to_string();
+            let traces = Traces::default();
+            let mut line = traces.during(|| run(&cx, &s, engine, need))?;
+            if let (Engine::Amphora(_), Some(o)) = (engine, line.as_object_mut()) {
+                o.insert("traces".into(), serde_json::json!(traces.counts()));
+                o.insert("traces_compiled".into(), Traces::compiled().into());
+            }
+            let line = line.to_string();
             println!("{line}");
             lines.push(line);
         }

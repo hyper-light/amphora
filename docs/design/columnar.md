@@ -231,7 +231,12 @@ moving rows out of blocks over positional deltas, which complicate reads [c80].
 4. **Which way is the default is open.** The A/B harness (`columns_sql::tests::ab`, T-CB.4.1) forces
    each way's failure mode: a laptop's cap with one big table, many tables under a small cap, steady
    pressure, bursty pressure that frees memory in small pieces, a table that grows while its copy
-   waits, and a huge cap with many tables. It writes one JSONL record per way and scenario. The
+   waits, and a huge cap with many tables; and at fleet scale, 64 tables in half a copy's room, and
+   64 growing tables given room for every copy at once and then none, so copies are bought and let
+   go together. The scenarios are defined once (`storage::versioned::columns_ab`, AC-CB.4.3) for the
+   test and the DuckDB driver; each record says what its scenario forces, counts the copies' trace
+   events by reason, and gives the last copy let go with its refusal, the copies still waiting, and
+   the writes the cap refused. It writes one JSONL record per way and scenario. The
    choice waits for the coordinator's run of record; until then A stays the default. Against DuckDB,
    one driver (`amphora-bench --colcopy`, AC-CB.4.2) runs the same scenarios on Amphora under both
    ways and on DuckDB, both in process and in memory, each statement timed the same way. DuckDB's

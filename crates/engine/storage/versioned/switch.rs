@@ -146,6 +146,12 @@ impl Storage {
         self.copies.held()
     }
 
+    /// The copies let go and waiting for room, what each waits for and how long it has waited
+    /// (lane colcopy-7, AC-CB.3.2), for the bench's records.
+    pub fn copy_waiting(&self) -> Vec<super::columns_sql::Wait> {
+        self.copies.waiting()
+    }
+
     /// The versioned database under it.
     pub(crate) fn db(&self) -> &Arc<VDatabase> {
         &self.db
