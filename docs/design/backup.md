@@ -406,6 +406,7 @@ failure mode at scale. `CheckPolicy` gains a fourth setting for the A/B, the con
 Evidence: unit tests of the share, the device cost, the decay and both yields, and a restore whose
 paced replay and integrity check end steps inside them (T-T1.12.C8). The A/B of record is the
 coordinator's: `AMPHORA_DRILL_LOAD_RUNS=20 AMPHORA_DRILL_LOAD_COMMITS=500
+AMPHORA_DRILL_LOAD_WRITERS=<1, 8, 32, 128, 512, 2048, 4096>
 AMPHORA_DRILL_RETENTION_MS=<the retention under test> cargo test -p amphora --release --test backup
 t_t1_12_c5 -- --nocapture --test-threads=1`, reading `under_load`, `forced` and commit p99 per
 policy. A single call running long with no other event holds a waiting check until it ends: one

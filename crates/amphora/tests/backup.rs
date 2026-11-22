@@ -957,7 +957,8 @@ fn t_t1_12_d3_restore_drill_after_a_load() {
 
 /// T-T1.12.C5, C7, C8 (AC-T1.12.4): checks competing with foreground load, the failure mode the
 /// pace is for. Do: back a database up to a folder, then commit back to back from one writer per
-/// core (`AMPHORA_DRILL_LOAD_COMMITS` each, a tiny run by default), each commit a second later,
+/// core (`AMPHORA_DRILL_LOAD_WRITERS` to set another count; `AMPHORA_DRILL_LOAD_COMMITS` each, a
+/// tiny run by default), each commit a second later,
 /// under no checks (`off`, the floor), the control (`scratch`: unpaced checks whenever due),
 /// `continuous` (paced, yielding fully to calls in flight, which one writer per core starves) and
 /// `shared` (paced, with a minimum share over a retention period of `AMPHORA_DRILL_RETENTION_MS`,
@@ -979,7 +980,12 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
     let commits = var("AMPHORA_DRILL_LOAD_COMMITS", 50);
     let runs = var("AMPHORA_DRILL_LOAD_RUNS", 1);
     let retention = Duration::from_millis(var("AMPHORA_DRILL_RETENTION_MS", 1_000));
-    let writers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    // One per core by default; `AMPHORA_DRILL_LOAD_WRITERS` walks the ladder (1 to 4,096), one
+    // writer the laptop's extreme and thousands the fleet's.
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let writers = usize::try_from(var("AMPHORA_DRILL_LOAD_WRITERS", cores as u64))
+        .unwrap()
+        .max(1);
     for (run, policy) in
         (0..runs).flat_map(|run| ["off", "scratch", "continuous", "shared"].map(|p| (run, p)))
     {
