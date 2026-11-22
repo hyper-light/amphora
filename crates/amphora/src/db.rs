@@ -75,23 +75,13 @@ pub fn process_pages() -> Arc<SharedPages> {
         .clone()
 }
 
-/// The settings every connection of a store is made with: the engine's versioned storage held to
-/// its share of the memory this process may use (G7 step 2, `AC-NS.2.1`), read from the system
-/// once. Where the system doesn't say ([`crate::memory::limit`]), the engine takes its share of the
-/// machine's memory.
+/// The settings every connection of a store is made with: the engine's versioned storage takes its
+/// memory from the process's budget, as caches, by measured use (G7 step 2, `AC-NS.2.1`; MB.1),
+/// one budget for every database the process opens.
 fn connect_opts() -> ConnectOpts {
-    static BUDGET: OnceLock<Option<u64>> = OnceLock::new();
-    let budget = *BUDGET.get_or_init(|| {
-        crate::memory::limit().map(|bytes| {
-            bytes
-                .checked_div(amphora_engine::storage::versioned::memory::SHARE_DIVISOR)
-                .unwrap_or(0)
-        })
-    });
-    match budget {
-        Some(bytes) => ConnectOpts::new().with_memory_budget(bytes),
-        None => ConnectOpts::new(),
-    }
+    ConnectOpts::new().with_memory(Arc::new(crate::memory::StorageMemory(
+        crate::memory::process(),
+    )))
 }
 
 /// The pages a process's pool keeps at most, given the bytes of memory the process may use: a
