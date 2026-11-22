@@ -753,6 +753,23 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   are untranslatable with their reasons (668 more), so 83 more give SQLite's answer. Left: date
   functions on MySQL and ClickHouse, the rest of JSON, SQLite's CAST of text to an integer (its leading
   digits, where DuckDB rounds '1.5' and refuses 'abc'), INDEXED BY and NOT INDEXED.
+  Lane corpus-dialects-12 (`bench/corpus/dialects.py`, `test_dialects.py`): CAST of text to an integer
+  is read as SQLite reads it (the leading integer after whitespace, 0 if none, clamped at 64 bits:
+  '1.5' is 1, 'abc' 0) on DuckDB and PostgreSQL, a plain integer literal staying a cast; MySQL and
+  ClickHouse: not expressible, saying so. changes(), total_changes() and last_insert_rowid() are not
+  expressible, each with its reason; unistr() and unistr_quote() of literals are SQLite's value. PRAGMA
+  foreign_keys and ignore_check_constraints carry into later records (foreign_keys does nothing inside
+  a transaction): a file that never turns foreign keys on has its REFERENCES left out; in one that
+  does, a write to a linked table while they're off is not expressible (on ClickHouse while on too),
+  and so is a write to a CHECKed table while checks are ignored; there MySQL is given a column's own
+  REFERENCES as a table's FOREIGN KEY, since it ignores the column's own. The date functions are said in MySQL
+  (DATETIME(3), INTERVAL, DATE_FORMAT(), TIMESTAMPDIFF()) and ClickHouse (DateTime64(3) in UTC,
+  addDays() and the rest, formatDateTime(), toUnixTimestamp64Milli()) from their manuals, inside the
+  years each holds; unverified on those engines until the jupiter run. Untranslatable on the gate's
+  pool: 1,073, 1,214, 1,163, 1,335 (DuckDB, PostgreSQL, MySQL, ClickHouse), from 1,043, 1,184, 1,306,
+  1,456. The local check: of 3,545 queries 488 answered differently before and 435 now, none newly; 880
+  are untranslatable with their reasons (25 more). Left: MySQL's and ClickHouse's CAST of text to an
+  integer, the rest of JSON, INDEXED BY and NOT INDEXED.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
