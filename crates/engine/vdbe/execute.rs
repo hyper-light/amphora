@@ -17409,8 +17409,16 @@ pub fn op_set_skipping(
         },
         insn
     );
-    crate::skipping::set_skipping(&program.connection, table, column, *kind)
-        .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
+    // Lane g7s2-17: a build that waits for its table's writers gives up at the statement's
+    // deadline.
+    crate::skipping::set_skipping_until(
+        &program.connection,
+        table,
+        column,
+        *kind,
+        state.query_deadline,
+    )
+    .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

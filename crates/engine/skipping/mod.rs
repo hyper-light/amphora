@@ -38,7 +38,8 @@ pub use choose::{Chooser, ChooserStats, MethodStats, SkipMethod, Upkeep};
 pub use cracking::{CrackerColumn, CrackerStats};
 pub(crate) use leaves::{cracker_of_table, nanos_since};
 pub use leaves::{
-    set_skipping, skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,
+    set_skipping, set_skipping_until, skipping_candidates, skipping_counts, zone_map_of_table,
+    LeafBuildError, SkipKind,
 };
 pub use registry::{BuildPolicy, SkipCounts, SkipRefusal, SkipRegistry, WalPos};
 pub use scan::{

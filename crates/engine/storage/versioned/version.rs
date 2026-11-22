@@ -113,9 +113,35 @@ pub struct Clock {
 #[derive(Default)]
 struct Writing {
     counts: BTreeMap<u64, u64>,
-    /// Woken, each once, when the tree's last open writer ends: one a skipping build that waits
-    /// for its table's writers (`AMPHORA_SKIP_BUILD=wait`), so bounded by the builds under way.
-    idle: BTreeMap<u64, Vec<std::sync::mpsc::SyncSender<()>>>,
+    /// The thread each open writer of a tree changed it on, one entry a writer (lane g7s2-17): a
+    /// waiter on the same thread would wait on itself, so it is refused. Bounded as `counts` is.
+    threads: BTreeMap<u64, Vec<std::thread::ThreadId>>,
+    /// Woken, each once, when the tree's last open writer ends, by waiter: one a skipping build
+    /// that waits for its table's writers (`AMPHORA_SKIP_BUILD=wait`), so bounded by the builds
+    /// under way; a waiter that gives up first takes itself out ([`Clock::give_up`]).
+    idle: BTreeMap<u64, Vec<(u64, std::sync::mpsc::SyncSender<()>)>>,
+    /// The next waiter's number.
+    next_waiter: u64,
+}
+
+/// A wait for a tree's open writers to end ([`Clock::when_unwritten`]): told once the last one
+/// ends; `waiter` takes it out if it gives up first ([`Clock::give_up`]).
+pub struct Unwritten {
+    pub told: std::sync::mpsc::Receiver<()>,
+    pub waiter: u64,
+}
+
+/// Why a wait for a tree's open writers to end is refused (G7 step 2, `AC-NS.2.1`; lane
+/// g7s2-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UnwrittenRefusal {
+    /// An open writer of the tree changed it on the waiting thread: only that thread can end it,
+    /// so the wait would never end.
+    #[error("an open writer of the table is the waiting thread's own")]
+    OwnThread,
+    /// The waiter's deadline (its statement's) passed before the writers ended.
+    #[error("the deadline passed before the table's writers ended")]
+    Deadline,
 }
 
 /// Open snapshots' timestamps, each with how many are open at it: all of them, and those of
@@ -270,6 +296,9 @@ pub struct Txn {
     /// ends (G7 step 2, `AC-NS.2.1`). A rollback to a savepoint keeps them: counted a little
     /// longer, a summary is only built again.
     trees: Vec<u64>,
+    /// The thread it first changed a row on, counted with it among each tree's writers (lane
+    /// g7s2-17): a wait on that thread for the tree's writers is refused.
+    writer: Option<std::thread::ThreadId>,
     /// Its changes in the order made: its redo record (decision 6).
     ops: Vec<Op>,
     /// What it read through [`VTree::read`], [`VTree::read_range`] and [`Versioned::keep_read`]: its
@@ -585,6 +614,7 @@ impl Clock {
             start,
             changed: Vec::new(),
             trees: Vec::new(),
+            writer: None,
             ops: Vec::new(),
             reads: Reads::default(),
             charged: 0,
@@ -659,8 +689,23 @@ impl Clock {
             let mut writing = self.writing.lock();
             for tree in &txn.trees {
                 count_out(&mut writing.counts, *tree);
+                if let (Some(thread), Some(threads)) = (txn.writer, writing.threads.get_mut(tree)) {
+                    if let Some(at) = threads.iter().position(|t| *t == thread) {
+                        threads.swap_remove(at);
+                    }
+                    if threads.is_empty() {
+                        writing.threads.remove(tree);
+                    }
+                }
                 if !writing.counts.contains_key(tree) {
-                    woken.extend(writing.idle.remove(tree).unwrap_or_default());
+                    woken.extend(
+                        writing
+                            .idle
+                            .remove(tree)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(_, tell)| tell),
+                    );
                 }
             }
         }
@@ -679,7 +724,10 @@ impl Clock {
         if txn.trees.contains(&tree) {
             return Ok(());
         }
-        count_in(&mut self.writing.lock().counts, tree)?;
+        let thread = *txn.writer.get_or_insert_with(|| std::thread::current().id());
+        let mut writing = self.writing.lock();
+        count_in(&mut writing.counts, tree)?;
+        writing.threads.entry(tree).or_default().push(thread);
         txn.trees.push(tree);
         Ok(())
     }
@@ -692,18 +740,45 @@ impl Clock {
         self.writing.lock().counts.get(&tree).copied().unwrap_or(0)
     }
 
-    /// Tree `tree`'s end of writing (G7 step 2, `AC-NS.2.1`): `None` when no open transaction has
-    /// changed a row of it, else a receiver told once its last open writer ends (after that
-    /// writer's commit is published, [`Clock::forget`]). Read and registered under one lock, so no
-    /// end is missed between.
-    pub fn when_unwritten(&self, tree: u64) -> Option<std::sync::mpsc::Receiver<()>> {
+    /// Tree `tree`'s end of writing (G7 step 2, `AC-NS.2.1`), waited for on thread `thread`:
+    /// `None` when no open transaction has changed a row of it, else a receiver told once its last
+    /// open writer ends (after that writer's commit is published, [`Clock::forget`]). Read and
+    /// registered under one lock, so no end is missed between. Refused at once, registering
+    /// nothing, when an open writer of the tree is `thread`'s own (lane g7s2-17): `thread` would
+    /// wait on itself for good.
+    pub fn when_unwritten(
+        &self,
+        tree: u64,
+        thread: std::thread::ThreadId,
+    ) -> std::result::Result<Option<Unwritten>, UnwrittenRefusal> {
         let mut writing = self.writing.lock();
         if !writing.counts.contains_key(&tree) {
-            return None;
+            return Ok(None);
         }
+        if writing
+            .threads
+            .get(&tree)
+            .is_some_and(|threads| threads.contains(&thread))
+        {
+            return Err(UnwrittenRefusal::OwnThread);
+        }
+        let waiter = writing.next_waiter;
+        writing.next_waiter = waiter.wrapping_add(1);
         let (tell, told) = std::sync::mpsc::sync_channel(1);
-        writing.idle.entry(tree).or_default().push(tell);
-        Some(told)
+        writing.idle.entry(tree).or_default().push((waiter, tell));
+        Ok(Some(Unwritten { told, waiter }))
+    }
+
+    /// Takes waiter `waiter` of tree `tree` out, one that gave up before the tree's writers ended
+    /// (lane g7s2-17), so waiters that give up hold nothing while writers keep the tree open.
+    pub fn give_up(&self, tree: u64, waiter: u64) {
+        let mut writing = self.writing.lock();
+        if let Some(waiters) = writing.idle.get_mut(&tree) {
+            waiters.retain(|(w, _)| *w != waiter);
+            if waiters.is_empty() {
+                writing.idle.remove(&tree);
+            }
+        }
     }
 
     /// How many wait for tree `tree`'s last open writer to end ([`Clock::when_unwritten`]).
@@ -2936,23 +3011,72 @@ mod tests {
         let v = db();
         let t = v.tree(0).unwrap();
         let mut d = Descender::new();
-        assert!(v.clock.when_unwritten(0).is_none());
+        // The waiter is another thread's: the writers below are this thread's own.
+        let other = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        assert!(v.clock.when_unwritten(0, other).unwrap().is_none());
         let mut a = v.clock.begin().unwrap();
         let mut b = v.clock.begin().unwrap();
         t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"1")
             .unwrap();
         t.put(&v.pool, &mut d, &v.clock, &mut b, b"y", b"2")
             .unwrap();
-        let told = v.clock.when_unwritten(0).unwrap();
+        let wait = v.clock.when_unwritten(0, other).unwrap().unwrap();
         assert_eq!(v.clock.waiting_on(0), 1);
         v.commit(a, &mut d).unwrap();
-        assert!(told.try_recv().is_err(), "told while a writer is open");
+        assert!(wait.told.try_recv().is_err(), "told while a writer is open");
         v.commit(b, &mut d).unwrap();
         assert!(
-            told.try_recv().is_ok(),
+            wait.told.try_recv().is_ok(),
             "untold after the last writer ended"
         );
         assert_eq!(v.clock.waiting_on(0), 0);
-        assert!(v.clock.when_unwritten(0).is_none());
+        assert!(v.clock.when_unwritten(0, other).unwrap().is_none());
+    }
+
+    /// Do (lane g7s2-17, `AC-NS.2.1`): this thread opens a writer of a tree, then waits for the
+    /// tree's writers to end on this thread and on another; the other's waiter gives up. Expect:
+    /// this thread's wait is refused at once as its own (nothing registered: it would wait on
+    /// itself for good); the other's is registered, and taken out when it gives up, so nothing is
+    /// held for it while the writer stays open; once the writer ends, none is refused.
+    #[test]
+    fn t_ns_2_1_a_wait_on_its_own_threads_writer_is_refused() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let here = std::thread::current().id();
+        let other = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        let mut a = v.clock.begin().unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"1")
+            .unwrap();
+        assert_eq!(
+            v.clock.when_unwritten(0, here).err(),
+            Some(UnwrittenRefusal::OwnThread)
+        );
+        assert_eq!(v.clock.waiting_on(0), 0);
+        let wait = v.clock.when_unwritten(0, other).unwrap().unwrap();
+        assert_eq!(v.clock.waiting_on(0), 1);
+        v.clock.give_up(0, wait.waiter);
+        assert_eq!(v.clock.waiting_on(0), 0);
+        v.commit(a, &mut d).unwrap();
+        assert!(v.clock.when_unwritten(0, here).unwrap().is_none());
+        // A writer on another thread: this thread may wait for it.
+        let (begun, mut b) = (std::sync::mpsc::channel(), None);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut txn = v.clock.begin().unwrap();
+                let mut d = Descender::new();
+                t.put(&v.pool, &mut d, &v.clock, &mut txn, b"y", b"2")
+                    .unwrap();
+                begun.0.send(txn).unwrap();
+            });
+            b = begun.1.recv().ok();
+        });
+        assert!(v.clock.when_unwritten(0, here).unwrap().is_some());
+        v.commit(b.unwrap(), &mut d).unwrap();
+        assert_eq!(v.clock.waiting_on(0), 0);
     }
 }

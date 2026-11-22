@@ -734,10 +734,20 @@ Under `wait` a build first waits for the table's open writers to end, woken by t
 (`Clock::when_unwritten`, told under the lock that counts the writers, after its commit is
 published: no timer, no poll), then builds; if a writer slipped in beside it, it is installed
 stale and built again after another wait (`SkipRegistry::wait_counts`). Its failure mode: the
-caller is held behind any transaction for as long as it runs, starved while writers keep the
-table open, and blocked for good behind one open on its own thread. Each test forces its arm's
+caller is held behind any transaction for as long as it runs, up to its statement's deadline,
+and starved while writers keep the table open. Two waits are refused, typed
+(`UnwrittenRefusal`, counted in `SkipRegistry::wait_refusals`), and that build goes in as `stale`
+builds it (lane g7s2-17): one whose table has an open writer that changed it on the waiting
+thread (on another connection: only that thread can end it, so the wait would never end; the
+clock keeps each open writer's thread beside the tree's count), and one whose deadline passed
+first (the statement's, `state.query_deadline`, or the connection's query timeout for a direct
+call; the waiter is taken out, so waits that give up hold nothing). Each test forces its arm's
 failure (`t_ns_2_1_a_build_beside_an_open_writer_is_kept_stale`: every row read until rebuilt;
-`t_ns_2_1_a_waiting_build_waits_for_the_open_writer`: blocked until the writer commits). The run
+`t_ns_2_1_a_waiting_build_waits_for_the_open_writer`: blocked until the writer commits), the
+refusals theirs (`t_ns_2_1_a_waiting_build_beside_its_own_threads_writer_goes_in_stale`,
+`t_ns_2_1_a_waiting_build_gives_up_at_its_deadline`), and the rebuild path is pinned by a pause
+in the storage between the build's read and its check
+(`t_ns_2_1_a_writer_slipped_in_beside_a_waiting_build_is_built_again`). The run
 of record, the coordinator's: a builder beside the concurrency ladder's writers (1 to 4096) of
 one table, each arm's build latency p50/p99/p99.9, scans' rows read until a current summary, and
 rebuilds.

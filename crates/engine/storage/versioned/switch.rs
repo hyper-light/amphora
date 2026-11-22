@@ -21,7 +21,7 @@ use super::disk::{Disk, Files, Simulated};
 use super::durable::Database as VDatabase;
 use super::memory::Source;
 use super::pool::Room;
-use super::version::Savepoint;
+use super::version::{Savepoint, UnwrittenRefusal};
 use crate::error::LimboError;
 use crate::sync::{Arc, Mutex, OnceLock};
 use crate::translate::collate::CollationSeq;
@@ -65,7 +65,18 @@ pub struct Storage {
     orders: Mutex<HashMap<u64, Arc<OnceLock<KeyOrder>>>>,
     /// The SQL tables' column copies (G11 step 5, CS.5; [`super::columns_sql`]).
     pub(crate) copies: super::columns_sql::Copies,
+    /// A test's pause of a skipping build ([`Switch::pause_next_build`]): the table's root page,
+    /// told when the build paused, and what lets it go on.
+    #[cfg(test)]
+    build_pause: Mutex<Option<BuildPause>>,
 }
+
+#[cfg(test)]
+type BuildPause = (
+    i64,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 /// The versioned storage of the database at `path`: in memory for a memory database or one whose
 /// files the engine keeps in memory (`memory`), else in the directory `<path>-versioned`. It holds
@@ -110,6 +121,8 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
             crate::translate::optimizer::column_path::asked(),
             source,
         ),
+        #[cfg(test)]
+        build_pause: Mutex::new(None),
     }))
 }
 
@@ -442,19 +455,74 @@ impl Switch {
     /// Blocks until no open transaction has changed a row of the table at `root_page`, woken by
     /// its last writer's end, not by a timer (G7 step 2, `AC-NS.2.1`; a skipping build under
     /// `AMPHORA_SKIP_BUILD=wait`). Whether it waited. The caller holds no transaction: one of its
-    /// own would never end, and one open on the caller's thread on another connection blocks it
-    /// for good (the policy's known failure, which `stale` doesn't have).
-    pub(crate) fn wait_unwritten(&self, root_page: i64) -> Result<bool> {
+    /// own would never end. Refused, typed (lane g7s2-17): at once, when an open writer of the
+    /// table changed it on the caller's thread (on another connection: it would wait on itself
+    /// for good); and when `give_up` (what is left of the caller's statement's deadline) passes
+    /// first, the waiter then taken out.
+    pub(crate) fn wait_unwritten(
+        &self,
+        root_page: i64,
+        give_up: Option<std::time::Duration>,
+    ) -> Result<std::result::Result<bool, UnwrittenRefusal>> {
         let tree = tree_of(root_page)?;
-        let Some(told) = self.db.v.clock.when_unwritten(tree) else {
-            return Ok(false);
+        let clock = &self.db.v.clock;
+        let wait = match clock.when_unwritten(tree, std::thread::current().id()) {
+            Ok(Some(wait)) => wait,
+            Ok(None) => return Ok(Ok(false)),
+            Err(refused) => return Ok(Err(refused)),
         };
-        told.recv().map_err(|_| {
+        let untold = || {
             LimboError::InternalError(
                 "versioned storage: a table's writers ended untold".to_string(),
             )
-        })?;
-        Ok(true)
+        };
+        match give_up {
+            None => wait.told.recv().map_err(|_| untold())?,
+            Some(left) => match wait.told.recv_timeout(left) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    clock.give_up(tree, wait.waiter);
+                    // Told between the timeout and the give-up: the writers ended.
+                    if wait.told.try_recv().is_ok() {
+                        return Ok(Ok(true));
+                    }
+                    return Ok(Err(UnwrittenRefusal::Deadline));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(untold()),
+            },
+        }
+        Ok(Ok(true))
+    }
+
+    /// A test's pause of the next skipping build of the table at `root_page`, once it has read
+    /// its rows and before it checks for open writers (lane g7s2-17, `AC-NS.2.1`): a receiver
+    /// told when it has paused, and a sender that lets it go on (or is dropped).
+    #[cfg(test)]
+    pub(crate) fn pause_next_build(
+        &self,
+        root_page: i64,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *self.storage.build_pause.lock() = Some((root_page, entered, release));
+        (entered_rx, release_tx)
+    }
+
+    /// A skipping build of the table at `root_page` has read its rows: paused here if a test
+    /// asked ([`Switch::pause_next_build`]).
+    #[cfg(test)]
+    pub(crate) fn built(&self, root_page: i64) {
+        let pause = {
+            let mut slot = self.storage.build_pause.lock();
+            match slot.as_ref() {
+                Some((root, _, _)) if *root == root_page => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, entered, release)) = pause {
+            entered.send(()).ok();
+            release.recv().ok();
+        }
     }
 
     /// How many wait for the table at `root_page`'s open writers to end (tests of

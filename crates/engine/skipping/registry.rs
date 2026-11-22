@@ -124,6 +124,10 @@ pub struct SkipRegistry {
     /// a summary built again starts its own counts.
     build_waits: AtomicU64,
     rebuilds: AtomicU64,
+    /// Waits refused, by why (lane g7s2-17): the writer was the build's thread's own, or the
+    /// deadline passed. Each such build went in as `Stale` builds.
+    refused_own: AtomicU64,
+    refused_deadline: AtomicU64,
     /// How many summaries were installed, moved under the entries' lock (G7 step 2,
     /// `AC-NS.2.1`): a write that found none to feed reads it before and after its row changes.
     installs: AtomicU64,
@@ -136,6 +140,8 @@ impl Default for SkipRegistry {
             policy: Mutex::new(BuildPolicy::asked()),
             build_waits: AtomicU64::new(0),
             rebuilds: AtomicU64::new(0),
+            refused_own: AtomicU64::new(0),
+            refused_deadline: AtomicU64::new(0),
             installs: AtomicU64::new(0),
         }
     }
@@ -170,6 +176,28 @@ impl SkipRegistry {
         if again {
             self.rebuilds.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// A build's wait for its table's writers was refused (lane g7s2-17).
+    pub(crate) fn count_refused(
+        &self,
+        why: crate::storage::versioned::version::UnwrittenRefusal,
+    ) {
+        use crate::storage::versioned::version::UnwrittenRefusal;
+        let counter = match why {
+            UnwrittenRefusal::OwnThread => &self.refused_own,
+            UnwrittenRefusal::Deadline => &self.refused_deadline,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Waits refused: the writer the build's own thread's, and the deadline passed
+    /// (`BuildPolicy::Wait`, lane g7s2-17).
+    pub fn wait_refusals(&self) -> (u64, u64) {
+        (
+            self.refused_own.load(Ordering::SeqCst),
+            self.refused_deadline.load(Ordering::SeqCst),
+        )
     }
 
     /// Builds that waited for writers, and builds done again (`BuildPolicy::Wait`).

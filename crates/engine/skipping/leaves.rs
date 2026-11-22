@@ -242,12 +242,31 @@ fn rows_of(
 /// Amphora (G5 step 4): keeps a summary of `column` of `table` (`None`: drops it), shared by every
 /// connection of the database and kept current by the Insert and Delete opcodes. It is built
 /// holding the write lock, so it holds exactly the newest commit; `conn` must have no
-/// transaction open. On the versioned storage no lock holds writers off: see [`BuildPolicy`].
+/// transaction open. On the versioned storage no lock holds writers off: see [`BuildPolicy`]. A
+/// build that waits gives up at the connection's query timeout, as a statement's would.
 pub fn set_skipping(
     conn: &Arc<Connection>,
     table: &str,
     column: &str,
     kind: Option<SkipKind>,
+) -> Result<(), LeafBuildError> {
+    let deadline = match conn.get_query_timeout_ms() {
+        0 => None,
+        millis => Some(
+            conn.get_pager().io.current_time_monotonic() + std::time::Duration::from_millis(millis),
+        ),
+    };
+    set_skipping_until(conn, table, column, kind, deadline)
+}
+
+/// [`set_skipping`] with the deadline of the statement that asks for it (`PRAGMA skipping`'s
+/// opcode): a build that waits for its table's writers gives up there (lane g7s2-17).
+pub fn set_skipping_until(
+    conn: &Arc<Connection>,
+    table: &str,
+    column: &str,
+    kind: Option<SkipKind>,
+    deadline: Option<crate::MonotonicInstant>,
 ) -> Result<(), LeafBuildError> {
     if conn.mvcc_enabled() {
         return Err(LeafBuildError::Refused(super::SkipRefusal::Mvcc));
@@ -262,17 +281,34 @@ pub fn set_skipping(
     };
     // G7 step 2 (`AC-NS.2.1`): on the versioned storage, under `BuildPolicy::Wait`, a build
     // waits for the table's open writers to end first, and is done again, after another wait,
-    // if one slipped in beside it; under `Stale` (the control) it goes in stale.
+    // if one slipped in beside it; under `Stale` (the control) it goes in stale. A wait refused
+    // (lane g7s2-17: the writer is this thread's own, or the deadline passed) builds as stale
+    // does, once.
     let switch = conn.versioned_for(crate::MAIN_DB_ID);
-    let wait = switch.is_some() && conn.db.skipping.policy() == BuildPolicy::Wait;
+    let mut wait = switch.is_some() && conn.db.skipping.policy() == BuildPolicy::Wait;
     let mut again = false;
     loop {
         if let Some(switch) = switch.as_ref().filter(|_| wait) {
-            let waited = switch.wait_unwritten(root)?;
-            conn.db.skipping.count_wait(waited, again);
+            let give_up = deadline.map(|deadline| {
+                deadline.duration_since(conn.get_pager().io.current_time_monotonic())
+            });
+            let waited = switch.wait_unwritten(root, give_up)?;
+            conn.db.skipping.count_wait(waited == Ok(true), again);
+            if let Err(refused) = waited {
+                conn.db.skipping.count_refused(refused);
+                tracing::debug!(target: "amphora.skipping", table, column, %refused, "a waiting build was refused: built as stale builds");
+                wait = false;
+            }
         }
         conn.execute("BEGIN IMMEDIATE")?;
         let built = build_from_leaves(conn, root, columns, index, kind);
+        // A test's pause point: the rows are read, the check for writers not yet made.
+        #[cfg(test)]
+        {
+            if let Some(switch) = switch.as_ref() {
+                switch.built(root);
+            }
+        }
         match built {
             Ok(skipping) => {
                 let missed = match switch.as_ref() {
