@@ -264,7 +264,7 @@ fn open_backed_up<B: Blobs + 'static>(
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
-        check: None,
+        check: backup::CheckPolicy::Off,
     };
     Database::open_backed_up(path, archive, until()).unwrap()
 }
@@ -394,7 +394,7 @@ fn t_t1_12_c3_the_shipping_thread_checks_itself() {
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
-        check: Some(scratch.clone()),
+        check: backup::CheckPolicy::Scratch(Some(scratch.clone())),
     };
     let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
     database
@@ -574,7 +574,7 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol, skew: u64) {
             }),
             memory: 32 * 1024,
             patience: Duration::from_secs(60),
-            check: None,
+            check: backup::CheckPolicy::Off,
         };
         Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
             .unwrap()
@@ -809,4 +809,355 @@ fn t_t1_12_i1_incremental_bases_keep_unchanged_chunks() {
     );
     check(last, "after-expiry.db");
     check(second_base + 1, "after-expiry-oldest.db");
+}
+
+/// T-T1.12.C4 (AC-T1.12.4): continuous restore drills are on by default. Do: back a database up to
+/// a folder with the default policy, no scratch path given, then write a row a second until three
+/// checks passed. Expect: the checks ran beside the database (`source.db.check`), passed with no
+/// failure, the passed check's scratch file is gone, and the drills' costs were measured.
+#[test]
+fn t_t1_12_c4_continuous_drills_are_on_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let read = Arc::clone(&now);
+    let archive = Archive {
+        blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+        prefix: "db".into(),
+        clock: Arc::new(move || read.load(Ordering::SeqCst)),
+        memory: 32 * 1024,
+        patience: Duration::from_secs(60),
+        check: backup::CheckPolicy::default(),
+    };
+    assert_eq!(archive.check, backup::CheckPolicy::Scratch(None));
+    let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = vec![(now.load(Ordering::SeqCst), model.clone())];
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    let mut id = 1;
+    while shipping.checks().passed.load(Ordering::Relaxed) < 3 {
+        write_seconds(&database, &now, id..id + 1, &mut model, &mut history);
+        id += 1;
+        assert!(
+            id < 4_000,
+            "three checks didn't pass: {:?}",
+            shipping.status().unwrap()
+        );
+    }
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    assert_eq!(shipping.checks().failed.load(Ordering::Relaxed), 0);
+    assert!(shipping.drills().checks() >= 3);
+    if matches!(status.last_check, Some(backup::Check::Passed { .. })) {
+        assert!(!dir.path().join("source.db.check").exists());
+    }
+}
+
+/// T-T1.12.D3 (AC-T1.12.4): a restore drill after a load. Do: back a database up to a folder
+/// through its shipping thread, then load it from one writer per core at once, each commit a
+/// second by the clock and each writer inserting, replacing and deleting rows of a shared range,
+/// recording the rows after every commit; close it; then restore `AMPHORA_DRILL_SECONDS` seconds
+/// drawn at random (16 by default, a tiny run) from the first base's to the last, each into a new
+/// file. Expect: every row of every drilled second equal to the rows recorded at it.
+#[test]
+fn t_t1_12_d3_restore_drill_after_a_load() {
+    let drills = std::env::var("AMPHORA_DRILL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16u64);
+    let writers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as u64;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let (database, shipping) = open_backed_up(&path, &blobs, &now);
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    let first = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    // The model and the clock move under one lock with each commit, so the history records the
+    // rows after every commit at the second it was stamped in.
+    let state = std::sync::Mutex::new((Rows::new(), Vec::<(u64, Rows)>::new()));
+    std::thread::scope(|scope| {
+        for w in 0..writers {
+            let database = &database;
+            let now = &now;
+            let state = &state;
+            scope.spawn(move || {
+                let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (w + 1));
+                for i in 0..40u64 {
+                    let id = rng.below(64) as i64;
+                    let delete = rng.below(4) == 0;
+                    let v = format!("{w}:{i}:{}", "z".repeat(rng.below(3000) as usize));
+                    let mut held = state.lock().unwrap();
+                    now.fetch_add(1 + rng.below(SECOND_NS), Ordering::SeqCst);
+                    let written = v.clone();
+                    database
+                        .call(until(), move |c| {
+                            if delete {
+                                c.execute(
+                                    "DELETE FROM t WHERE id = ?1",
+                                    vec![amphora_api::Value::Integer(id)],
+                                )?;
+                            } else {
+                                c.execute(
+                                    "INSERT OR REPLACE INTO t (id, v) VALUES (?1, ?2)",
+                                    vec![
+                                        amphora_api::Value::Integer(id),
+                                        amphora_api::Value::Text(written),
+                                    ],
+                                )?;
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                    let (model, history) = &mut *held;
+                    if delete {
+                        model.remove(&id);
+                    } else {
+                        model.insert(id, v);
+                    }
+                    history.push((now.load(Ordering::SeqCst), model.clone()));
+                }
+            });
+        }
+    });
+    let last = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    let (_, history) = state.into_inner().unwrap();
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let empty = Rows::new();
+    for n in 0..drills {
+        let second = first + rng.below(last - first + 1);
+        let target = dir.path().join(format!("drill-{n}.db"));
+        backup::restore(blobs.as_ref(), "db", second, &target, until()).unwrap();
+        let restored = Db::open(&target).unwrap();
+        let want = at(&history, second).unwrap_or(&empty);
+        assert_eq!(&rows(&restored), want, "second {second}");
+    }
+}
+
+/// T-T1.12.C5, C7 (AC-T1.12.4): checks competing with foreground load, the failure mode the pace
+/// is for. Do: back a database up to a folder, then commit back to back from one writer per core
+/// (`AMPHORA_DRILL_LOAD_COMMITS` each, a tiny run by default), each commit a second later, under no
+/// checks (`off`, the floor), the control (`scratch`: unpaced checks whenever due) and continuous
+/// (paced checks), `AMPHORA_DRILL_LOAD_RUNS` runs of each interleaved (one by default; the spread
+/// across runs is what a policy's p99 is judged against); then, with checks, a row a second until
+/// a check passes. Expect: no check failed, and checks pass once the load ends. A write the
+/// database refuses `Full` under the load (its typed back-pressure) is counted, not failed. It
+/// prints each run's instruments: commit latency p50/p99/p99.9, writes refused, checks run,
+/// deferrals, drills of older seconds, the pace's pauses, waits and rests, check cost
+/// p50/p99/p99.9 and total.
+#[test]
+fn t_t1_12_c5_checks_competing_with_foreground_load() {
+    let var = |name: &str, default: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let commits = var("AMPHORA_DRILL_LOAD_COMMITS", 50);
+    let runs = var("AMPHORA_DRILL_LOAD_RUNS", 1);
+    let writers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    for (run, policy) in
+        (0..runs).flat_map(|run| ["off", "scratch", "continuous"].map(|p| (run, p)))
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let blobs =
+            Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        let read = Arc::clone(&now);
+        let archive = Archive {
+            blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+            prefix: "db".into(),
+            clock: Arc::new(move || read.load(Ordering::SeqCst)),
+            memory: 32 * 1024,
+            patience: Duration::from_secs(60),
+            check: match policy {
+                "off" => backup::CheckPolicy::Off,
+                "scratch" => backup::CheckPolicy::Scratch(Some(dir.path().join("scratch.db"))),
+                _ => backup::CheckPolicy::Continuous,
+            },
+        };
+        let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
+        database
+            .call(until(), |c| {
+                c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+                Ok(())
+            })
+            .unwrap();
+        shipping.wait(until(), |s| s.bases >= 1).unwrap();
+        // The load: every writer at once, a commit a second by the clock, as fast as they go.
+        let refused = AtomicU64::new(0);
+        let mut latencies: Vec<u64> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..writers)
+                .map(|w| {
+                    let database = &database;
+                    let now = &now;
+                    let refused = &refused;
+                    scope.spawn(move || {
+                        let mut took = Vec::new();
+                        for i in 0..commits {
+                            let id = i64::try_from(i * writers as u64 + w as u64 + 1).unwrap();
+                            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+                            let began = Instant::now();
+                            let wrote = database.call(until(), move |c| {
+                                c.execute(
+                                    "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                                    vec![
+                                        amphora_api::Value::Integer(id),
+                                        amphora_api::Value::Text("x".repeat(512)),
+                                    ],
+                                )?;
+                                Ok(())
+                            });
+                            match wrote {
+                                Ok(()) => {}
+                                Err(amphora_api::Refusal::Full { .. }) => {
+                                    refused.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                Err(e) => panic!("{e:?}"),
+                            }
+                            took.push(u64::try_from(began.elapsed().as_nanos()).unwrap());
+                        }
+                        took
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let under_load = shipping.drills().checks();
+        // The load ends: a row a second until a check passes after it.
+        let mut model = Rows::new();
+        let mut history = Vec::new();
+        let mut id = i64::try_from(commits * writers as u64 + 1).unwrap();
+        let passed = shipping.checks().passed.load(Ordering::Relaxed);
+        while policy != "off" && shipping.checks().passed.load(Ordering::Relaxed) == passed {
+            write_seconds(&database, &now, id..id + 1, &mut model, &mut history);
+            id += 1;
+            assert!(id < 100_000, "no check passed after the load");
+        }
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        drop(database);
+        let status = shipping.wait(until(), |s| s.ended).unwrap();
+        assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+        assert_eq!(shipping.checks().failed.load(Ordering::Relaxed), 0);
+        let meter = shipping.drills();
+        let cost = meter.cost_ns.load(Ordering::Relaxed);
+        latencies.sort_unstable();
+        let q = |p: f64| {
+            let i = ((p * latencies.len() as f64).ceil() as usize).saturating_sub(1);
+            latencies.get(i).copied().unwrap_or(0)
+        };
+        println!(
+            "drill-load run={run} policy={policy} writers={writers} commits={} refused={} commit_ns p50={} p99={} p99.9={} checks={} under_load={under_load} passed={} deferred disk={} older={} paused={} waited_ns={} rested_ns={} cost_ns p50={:?} p99={:?} p99.9={:?} cost_total_ns={cost}",
+            latencies.len(),
+            refused.load(Ordering::Relaxed),
+            q(0.5),
+            q(0.99),
+            q(0.999),
+            meter.checks(),
+            shipping.checks().passed.load(Ordering::Relaxed),
+            meter.deferred_disk.load(Ordering::Relaxed),
+            meter.older.load(Ordering::Relaxed),
+            meter.paused.load(Ordering::Relaxed),
+            meter.waited_ns.load(Ordering::Relaxed),
+            meter.rested_ns.load(Ordering::Relaxed),
+            meter.cost_quantile(0.5),
+            meter.cost_quantile(0.99),
+            meter.cost_quantile(0.999),
+        );
+    }
+}
+
+/// The restore benchmark's Amphora leg (AC-T1.12.3; bench/backup_restore.sh runs it beside
+/// PostgreSQL with pgBackRest and SQLite with Litestream on the same machine). Do: back a database
+/// up to a folder (`AMPHORA_RESTORE_BENCH_DIR`, else a temporary one), write
+/// `AMPHORA_RESTORE_BENCH_BYTES` of 4096-byte rows (a page's worth, the engine's page size: a
+/// format value), a commit of `AMPHORA_RESTORE_BENCH_BATCH` rows each second, close it, then
+/// restore its last second. Expect: every row restored. Prints the bytes and the restore's
+/// nanoseconds. The sizes are the caller's; the defaults are a tiny instance.
+#[test]
+#[ignore = "a benchmark: run by bench/backup_restore.sh"]
+fn restore_bench_amphora() {
+    let var = |name: &str, default: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let bytes = var("AMPHORA_RESTORE_BENCH_BYTES", 4 << 20);
+    let batch = var("AMPHORA_RESTORE_BENCH_BATCH", 256).max(1);
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::env::var("AMPHORA_RESTORE_BENCH_DIR")
+        .map_or_else(|_| temp.path().to_path_buf(), std::path::PathBuf::from);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("source.db");
+    let blobs = Arc::new(backup::FolderBlobs::open(&root.join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let (database, shipping) = open_backed_up(&path, &blobs, &now);
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    let rows = bytes.div_ceil(4096);
+    let mut id = 0u64;
+    while id < rows {
+        let end = (id + batch).min(rows);
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        let first = id;
+        database
+            .call(until(), move |c| {
+                for i in first..end {
+                    c.execute(
+                        "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                        vec![
+                            amphora_api::Value::Integer(i64::try_from(i).unwrap()),
+                            amphora_api::Value::Text("x".repeat(4096)),
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        id = end;
+    }
+    let last = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    let source = std::fs::metadata(&path).unwrap().len();
+    let target = root.join("restored.db");
+    let began = Instant::now();
+    backup::restore(blobs.as_ref(), "db", last, &target, until()).unwrap();
+    let took = began.elapsed().as_nanos();
+    let restored = Db::open(&target).unwrap();
+    assert_eq!(self::rows(&restored).len(), usize::try_from(rows).unwrap());
+    println!("restore system=amphora rows={rows} source_bytes={source} ns={took}");
 }

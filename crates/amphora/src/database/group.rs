@@ -16,6 +16,7 @@
 
 use crate::db::Db;
 use crate::reshard::holding::replays;
+use crate::reshard::plan::Cut;
 use crate::reshard::{Pos, Seq, Span, position_of, row_key, row_parts};
 use crate::store::{Changed, Exported, Moved};
 
@@ -192,6 +193,113 @@ pub(super) fn used_bytes(db: &Db) -> anyhow::Result<u64> {
     };
     let used = one("PRAGMA page_count")?.saturating_sub(one("PRAGMA freelist_count")?);
     Ok(used.saturating_mul(one("PRAGMA page_size")?))
+}
+
+/// Where the database's Records keys fall about half each side by position, read from the root
+/// page of their position index alone (CP-T1.9, T-T1.9.R19; docs/design/reshard.md, decision "The
+/// size cut from the B-tree's middle key"): the root's middle key, weighed by the root's children
+/// on each side (a root that is a leaf: its keys). A B-tree keeps every leaf at one depth and splits
+/// a full page into halves, so the root's children hold about as many keys each, and one page is
+/// read whatever the rows. None: no group's, too few keys to cut, or a page it doesn't know.
+pub(super) fn size_cut(db: &Db) -> anyhow::Result<Option<Cut>> {
+    let mut root = None;
+    db.query(
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'index' AND tbl_name = '__amphora_positions'",
+        [],
+        |r| {
+            root = Some(r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+            Ok(false)
+        },
+    )?;
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let page = Some(db.page(root)?);
+    // Page 1 starts with the file's header (SQLite's file format, §1.3: 100 bytes, a format value).
+    let header = if root == 1 { 100 } else { 0 };
+    Ok(page.and_then(|page| middle(&page, header)))
+}
+
+/// The middle cell of an index B-tree page as a cut: its key's first column (a position, as SQL
+/// orders it) and, before and from it, the page's children (an interior page) or cells (a leaf).
+/// The layout is SQLite's file format (§1.6, "B-tree Pages"; §2.1, "Record Format"), format values
+/// all: a page header of 12 bytes (interior) or 8 (leaf), its cell count at bytes 3 and 4, then a
+/// 2-byte pointer to each cell; an interior index cell is its left child's page number (4 bytes)
+/// then its payload, a leaf's is its payload; a payload is its length, then its record.
+fn middle(page: &[u8], header: usize) -> Option<Cut> {
+    let interior = match page.get(header)? {
+        0x02 => true,
+        0x0a => false,
+        _ => return None,
+    };
+    let count = |at: usize| -> Option<usize> {
+        let two = page.get(at..at.checked_add(2)?)?;
+        Some(usize::from(u16::from_be_bytes([
+            *two.first()?,
+            *two.get(1)?,
+        ])))
+    };
+    let cells = count(header.checked_add(3)?)?;
+    let i = cells.checked_div(2)?;
+    // Keys before the middle cell: an interior page's children up to and with the cell's own left
+    // child; a leaf's cells before it.
+    let (left, right) = if interior {
+        (i.checked_add(1)?, cells.checked_sub(i)?)
+    } else {
+        (i, cells.checked_sub(i)?)
+    };
+    if left == 0 || right == 0 {
+        return None;
+    }
+    let pointers = header.checked_add(if interior { 12 } else { 8 })?;
+    let cell = count(pointers.checked_add(i.checked_mul(2)?)?)?;
+    let payload = cell.checked_add(if interior { 4 } else { 0 })?;
+    let (_, n) = varint(page.get(payload..)?)?;
+    let record = payload.checked_add(n)?;
+    let (header_len, n) = varint(page.get(record..)?)?;
+    let (serial, _) = varint(page.get(record.checked_add(n)?..)?)?;
+    let body = record.checked_add(usize::try_from(header_len).ok()?)?;
+    let at = pos_of(integer_of(serial, page.get(body..)?)?);
+    Some(Cut {
+        at,
+        left: u64::try_from(left).ok()?,
+        right: u64::try_from(right).ok()?,
+    })
+}
+
+/// A varint of SQLite's file format (§1.6): one to nine bytes, big-endian, seven bits a byte with
+/// the top bit set on all but the last, the ninth byte all eight bits. The value and its length.
+fn varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut v: u64 = 0;
+    for (n, b) in bytes.iter().take(9).enumerate() {
+        if n == 8 {
+            return Some(((v.checked_shl(8)?) | u64::from(*b), 9));
+        }
+        v = v.checked_shl(7)? | u64::from(b & 0x7f);
+        if b & 0x80 == 0 {
+            return Some((v, n.checked_add(1)?));
+        }
+    }
+    None
+}
+
+/// An integer column of a record (SQLite's file format, §2.1): serial types 1 to 6 are big-endian
+/// two's complement of 1, 2, 3, 4, 6 and 8 bytes, 8 and 9 the constants 0 and 1. None: another type.
+fn integer_of(serial: u64, body: &[u8]) -> Option<i64> {
+    let len = match serial {
+        1..=4 => usize::try_from(serial).ok()?,
+        5 => 6,
+        6 => 8,
+        8 => return Some(0),
+        9 => return Some(1),
+        _ => return None,
+    };
+    let bytes = body.get(..len)?;
+    let mut v: i64 = if bytes.first()? & 0x80 == 0 { 0 } else { -1 };
+    for b in bytes {
+        v = v.checked_shl(8)? | i64::from(*b);
+    }
+    Some(v)
 }
 
 /// The log's head (0: no entry yet, or no group's).

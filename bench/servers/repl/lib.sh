@@ -5,18 +5,21 @@
 # `main "$@"`. A system with a service beside its nodes (LiteFS's Consul) defines `before_up`
 # (run once the network exists) and `after_down`, and names its image in EXTRA_IMAGE.
 #
-# The nodes share a docker network of their own, amphora-bench-repl-<system>, and reach each other
-# by container name; each publishes its HTTP port on 127.0.0.1 only. Their data stays inside the
-# containers, so `down` (docker rm -f -v) leaves nothing on the host but the pulled or built image:
-# `images` prints its ID for removal by ID. Every container and network is named
-# amphora-bench-repl-<system>[-N]: only those are ever stopped or removed.
+# The nodes share a docker network of their own, <name>-<system>, and reach each other by container
+# name; each publishes its HTTP port on 127.0.0.1 only. Their data stays inside the containers, so
+# `down` (docker rm -f -v) leaves nothing on the host but the pulled or built image: `images` prints
+# its ID for removal by ID. Every container and network is named <name>-<system>[-N]: only those are
+# ever stopped or removed. <name> is AMPHORA_BENCH_REPL_NAME (default amphora-bench-repl): runs
+# sharing a Docker host give each their own, with their own AMPHORA_BENCH_REPL_PORT, and never touch
+# each other's containers.
 #
 # usage: <system>.sh up|down|kill N|start N|leader|endpoint N|images
 set -euo pipefail
 # Git for Windows' bash rewrites arguments that look like paths (/data, /etc/...): not the containers'.
 export MSYS_NO_PATHCONV=1
-NET="amphora-bench-repl-$SYS"
-node() { echo "amphora-bench-repl-$SYS-$1"; }
+NAME=${AMPHORA_BENCH_REPL_NAME:-amphora-bench-repl}
+NET="$NAME-$SYS"
+node() { echo "$NAME-$SYS-$1"; }
 port() { echo $((PORT + $1)); }
 
 # Polls `$@` every half second at most 240 times (two minutes, lib.sh's bound for a first start).

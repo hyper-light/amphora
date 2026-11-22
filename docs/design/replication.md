@@ -2706,3 +2706,93 @@ ends, not on a flush of the owner's own.
 - an acknowledged write lost after a power cut that lost the database log's unflushed tail (the power-cut nemesis);
 - a stalled owner whose raft log never frees room while its flushing thread keeps flushing;
 - a store test whose answers differ between one voter and three.
+
+## Decision (lane ryw-1): read-your-writes by session tokens (2026-11-22, kiln goal 8119f25d)
+
+Ada's order (2026-11-22): read-your-writes on any replica, built behind a switch with today's read as the control,
+decided from live runs. Requirements AC-T1.10.R1 to R3, tests T-T1.10.R1 to R3 (docs/requirements.toml, lane ryw-1).
+
+### What was already there
+
+- **Commit at log durability.** A write is acknowledged once hyper-durable holds it on a quorum's raft logs, and the
+  leader answers at its own apply, which flushes nothing on the owner's thread ("the raft log as the WAL", above). So a
+  read on the leader after its write's answer already sees it, for free. A follower answers a write made through it at
+  the commit it hears ("Fast acknowledgement"). Recovery replays the raft log from the database's durable point.
+- **Closed times.** Every entry carries the group's time, which rises strictly along the committed log and is the same on
+  every member ("Follower reads at a closed time"). A replica publishes the time it is complete up to, and a read at a
+  time, or with bounded staleness, is served on the replica with no trip to the leader.
+- **Apply on events.** The owner applies in its step, which wakes on the arrival that carried the commit (its bell),
+  never on a tick. Lane repl-measure-8 is removing the timers that remain on the commit path (`run_loop`, `deadline`).
+
+### The candidates, behind `ReadMode`
+
+- **(a) `ReadMode::Latest`, the control and today's read.** `Database::query_session(Latest, ..)` is `Database::query`:
+  every read crosses the leader's ReadIndex and waits for applied to reach the latest commit, token or not.
+- **(b) `ReadMode::Session`, session tokens.** Built in this change:
+  - *Tokens.* `Database::session_token` after a write's answer gives `Token { micros, index }`. `micros` is the group's
+    time, `index` the commit index. The owner publishes both before it answers, at the leader's apply and at a follower's
+    commit answer (`Actor::publish_point`). Within one group the two rise together. `micros` is in the same domain as the
+    cross-group coordinator's timestamps (microseconds since the Unix epoch), so a single-group commit and a cross-group
+    one compare in one order, time first (Ada's decision: a cross-group commit answers with its timestamp,
+    `Token::at`; lane xgroup-sql-6 stamps it). A session keeps the latest of its tokens (`Token::after`).
+  - *Reads.* `query_session(Session, Some(token), ..)` is served by the replica it asks once that replica's published
+    applied index and closed time are at or past the token. The check is repeated inside the read's own transaction
+    (`run_closed`), so the state read is never older than the token. The read waits on that replica alone, only while
+    it is behind, woken by the owner's publication (a condition variable the owner signals as its point moves), never
+    by a timer.
+  - *Redirect.* A replica still behind after its own measured apply lag (the p99 of how far its closed time stood
+    behind its clock over its last 100 moves, `closed::Lag`) redirects the read to the leader's read
+    (`Database::query`). One that has measured no lag redirects at once. The bound is learned on each replica, and no
+    number is picked.
+  - *No token.* `query_session(Session, None, ..)` is `Database::query_local`: it never waits for the log.
+- **(c) An overlay, not built.** A read on a replica that is behind would merge the committed log entries it has not
+  applied over its applied state. Its spec:
+  - the replica's log holds committed entries past `applied`, each a resolved transaction's page image or row changes
+    (`replication::verdict` already decodes an entry's outcome without applying it);
+  - a read with a token whose index is in that range opens a reader on the applied state and lays the entries'
+    row changes up to the token over it: a per-table map from key to row or tombstone, consulted before the reader's
+    b-tree;
+  - it never waits for apply, only for the entry to be in the replica's log and committed;
+  - failure mode to force: a long unapplied tail (a follower whose flushes are held) makes every read pay the merge,
+    and the overlay's memory is bounded by the log's room. A scan over a table with many overlaid rows costs the merge
+    of the two orders.
+  It is worth building only if (b)'s measured waits at a lagging follower are a large share of its read latency.
+
+### Instruments
+
+`Database::session_counters` on each replica: reads served at once, reads that waited and their total wait, redirects,
+and the apply lag that bounds the wait. `amphora-bench --cluster --shapes ryw` gives, at each count of sessions: read
+latency straight after a write (p50, p99, p99.9), write p99, write-read pairs a second, reads that missed their own
+write (must be 0), each follower's counters, and the process's CPU seconds and peak memory.
+
+### Evidence
+
+- T-T1.10.R1 `t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`: records to one follower are lost while 2 is
+  written. Its token read waits (counted, non-vacuity asserted: the follower was behind), and once the follower
+  rejoins it answers 1 and 2, never 1 alone. A read with no token answers at once.
+- T-T1.10.R2 `t_t1_10_r2_a_behind_replica_with_no_lag_learned_redirects`: a follower that has applied nothing stamped
+  redirects at once, counted. Once caught up, every member serves the same token with the write.
+- T-T1.10.R3 `t_t1_10_r3_a_session_reads_its_writes_across_leader_changes`: clocks an hour apart and the lead passed
+  1, 2, 3, 1. Each new write's token orders after the last, every token read served sees all of the session's writes,
+  and once caught up every member's answer equals the leader's state (the control's answer).
+
+### Limits stated
+
+- A token taken after an answer names the highest index this owner has answered, so with concurrent writers it can name
+  a later write than the caller's. A read then waits for more than it needs, but it never misses its own write. The
+  exact token per answer needs the answer to carry it (a change of `Answer`).
+- A token's `index` belongs to its group. A session that writes to several groups keeps one token per database, plus
+  `Token::at` for a cross-group commit. Mixing two groups' indexes in one token stays correct, through redirects, but
+  waits.
+- A follower's commit answer carries its closed time as of that answer, which is a lower bound. That replica's own
+  reads check `index`, but a cross-group comparison of such a token by time alone is weaker until it applies.
+- The power-cut case (the nemesis with held flushes) waits on lane repl-measure-8's fix of
+  `a_member_power_cut_loses_no_acknowledged_replicated_write`. It is not built on here.
+
+### Falsified by
+
+- a token read that answers without the session's own write, on any replica, under lag, leader change or power cut;
+- an acknowledged write lost;
+- an answer under `Session` that differs from `Latest`'s for a session carrying its tokens;
+- a read with no token that waits for the log;
+- redirects above 1 in 100 under steady lag (the bound learned is too short).

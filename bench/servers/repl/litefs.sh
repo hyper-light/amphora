@@ -6,7 +6,7 @@
 # write to a replica fails read-only, so the harness sends it on to the next node. When the primary
 # dies its Consul session expires and another candidate takes the lease: that is the failover the
 # harness times. FUSE needs --privileged. Consul runs in dev mode beside the nodes, as
-# amphora-bench-repl-litefs-consul, and goes with them.
+# <name>-litefs-consul (lib.sh), and goes with them.
 set -euo pipefail
 SYS=litefs
 IMAGE=${IMAGE:-amphora-bench-repl-shim:local}
@@ -14,7 +14,7 @@ CONSUL_IMAGE=${CONSUL_IMAGE:-hashicorp/consul:latest}
 PORT=${AMPHORA_BENCH_REPL_PORT:-54130}
 HERE="$(dirname -- "${BASH_SOURCE[0]}")"
 . "$HERE/lib.sh"
-CONSUL="amphora-bench-repl-$SYS-consul"
+CONSUL="$NAME-$SYS-consul"
 EXTRA_IMAGE=$CONSUL_IMAGE
 
 before_up() {
