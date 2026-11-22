@@ -1110,5 +1110,9 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   `scripts/drills.sh` runs the kill, split and stall drills under load and counts acknowledged
   writes on every member (`amphora drill load|check`, AC-T1.13.5). The replica's host now waits
   for its next record (`ReplicaHandle::drain_wait`) instead of spinning. docs/runbook.md. Not done:
-  the drills of record across three machines, an encrypted link, membership commands, and kiln
-  opening these members (its seam's client).
+  the drills of record across three machines, an encrypted link, and kiln opening these members
+  (its seam's client). Lane production-2: the serve test's open timeout was the test's own (one
+  process's opens take turns under its owner table; members now start one after another);
+  `amphora member CONFIG add|promote|demote|remove N` with a config `voters` key (spares start as
+  learners); the region-lost drill replaces a lost member with a spare. Mutual TLS waits on the
+  split-merge listener's TLS landing on t1/group-replication.
