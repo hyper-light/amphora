@@ -9,7 +9,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   colcopy-4; docs/design/columnar.md decision 2): each block and change of a copy asks the memory
   source for its bytes before it is built or applied, a refused build gives back what it took, and a
   refused copy is bought again by A (rent and rebuy) or B (wait for room) behind
-  `AMPHORA_COLUMN_REBUY`, counted and traced. Open: the A/B run of record and the default it picks.
+  `AMPHORA_COLUMN_REBUY`, counted and traced. `amphora-bench --colcopy` (lane colcopy-5) runs the
+  same scenarios on both ways and on DuckDB from one driver, in process, under the same cap. Open: the
+  A/B and DuckDB runs of record and the default they pick.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the

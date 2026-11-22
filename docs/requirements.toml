@@ -1271,6 +1271,8 @@ criteria = [
   { id = "AC-CB.3.1", text = "Counted: state changes with reasons, takes asked, granted and refused, bytes held against bytes granted, rows and bytes rebuys read, rows the copy served against the row loop's" },
   { id = "AC-CB.3.2", text = "Counted: time copies were absent and time they waited" },
   { id = "AC-CB.4.1", text = "An A/B harness forces each way's failure mode at the extremes and records latency percentiles, throughput, memory, bytes read, rebuys and answer equality as JSONL" },
+  # lane colcopy-5
+  { id = "AC-CB.4.2", text = "One driver runs the six scenarios on Amphora under each way and on DuckDB, both in process, in memory, timed alike, under the same cap (the engine's bytes for its rows and the scenario's free bytes); each record names its client and platform" },
 ]
 tests = [
   { id = "T-CB.1.1", text = "columns::tests::cb1_blocks_are_granted_before_they_are_built — each format's bytes before a block is made equal the made block's resident bytes; the source holds exactly what the generations and queue were granted" },
