@@ -2588,6 +2588,27 @@ wire records queued beside them (`Control::called`).
   the members the machine was opened for (`Machine::set_members`, `class::entry(.., members)`), so `MEMBERS` is read
   where the core's limits are stated and in `IMAGE_FRAMING_BYTES`, nowhere else on the owner's side.
 
+**Still picked in the replication code (lane constants-20's survey), each with what it should come from.**
+- `max_inflight_msgs` (4) and `max_inflight_bytes` (64 MiB), the window to each member: hyper-raft's own rule (mantle
+  note 32 R16) is no count of its own (`usize::MAX`) and bytes of twice what the path carries in a round trip
+  (`hyper_timing::inflight_window`), set per member with `set_inflight_bytes` from the round trips `pace` measures
+  and the outgoing queue's learned drain. A design choice to A/B: the window moves what a slow member is sent ahead.
+- hyper-log's settings at open (`segment_bytes` 64 MiB, `max_segments` 16, `group_entries` 65 536, `group_bytes`
+  512 MiB, `group_cache` 64 MiB, `queue_submissions` 16): the log's disk room (`log_bound::log_room`) and an image's
+  share, the memory budget's room for caches, and the device's measured queue depth.
+- `quiet` (50 ms, focal F17's period): the learned election timeout or the pace's period, once settings follow the
+  pace.
+- `TICK` (10 ms): to remove (below).
+- `CHECKPOINT_EVERY` (25 ms, measured once on fedora): learned from this host's checkpoint costs, as `compacting`
+  learns compaction's.
+- The log device's alignment (4096): the device's logical block size, read at open.
+- `MEMBERS` (64): a group-stated bound (above). `IMAGE_FRAMING_BYTES` follows it.
+- `serve::OUTGOING_MESSAGES` (4096, CP-T1.13's peer senders): the outgoing queue's learned bound in messages.
+- `compaction::ENVELOPE` (81): stated as a format value; it could be worked out from the encoding as
+  `COMMAND_ENVELOPE` is.
+Format and requirement values, not picked: `PAGE_BYTES`, `FRAME_BYTES`, `U64_MOST`, `U32_MOST`, `LAG_SAMPLES` (the
+p99 quantile's), `COMMIT_TAIL` (AC-T1.3.4's bound).
+
 **To remove: event-driven (Ada, 2026-11-22).** `TICK`, `POLL` and `DRIVE_QUANTUM`, and any driver that wakes on a timer,
 are to be removed, with that work driven from events, not given better intervals. The election and heartbeat
 timeouts stay learned, since they are truly about time. Lane repl-measure-8 owns the commit path's timer waits
