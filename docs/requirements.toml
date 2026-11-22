@@ -1207,6 +1207,20 @@ tests = [
 # lane repl-measure-7 (CP-T1.8, AC-T1.8.5): no new IDs. The nemesis's classes part at the raft log
 # (`the_classes_acknowledge_apart_under_a_held_flush`); bench/repl_members.sh runs each member its own
 # process on the machines it is given (`amphora-bench --repl-member`, system `amphora-procs`).
+# lane repl-measure-13 (CP-T1.8, AC-T1.8.2): no new IDs. bench/repl_ladder.sh runs the commit measure at
+# 1, 8, 32, 128, 512, 2048 and 4096 writers on one host, every system natively through one client:
+# Amphora's members as processes, the competitors from bench/servers/repl (release binaries
+# fetched by its setup.sh). Each record names its client, platform, system version and durability
+# (`about`) and the client's own use (`client_use`). The runs of record are the coordinator's.
+# lane repl-measure-14 (CP-T1.8, AC-T1.8.2): no new IDs. Each native competitor runs its strongest commit
+# durability, from its own source (cited in bench/servers/repl/<system>.sh): sqld at
+# durability_mode=strong, checked by `up`; rqlite and dqlite at their defaults (2 of 3 logs, fsynced);
+# libSQL and LiteFS can't wait for a replica, which their records' `durability` says.
+# lane repl-measure-15 (CP-T1.8, AC-T1.8.2): no new IDs. The competitors run one way, as processes from
+# bench/servers/repl (the container scripts are gone). The comparability rule is in the records: each
+# record's `about.column` is "quorum" or "primary only" (bench/src/repl.rs QUORUM; libSQL and LiteFS
+# are primary only), and bench/repl_ladder.sh's report keeps the two columns apart, never side by side
+# as equals (test g12_repl_columns_keep_primary_only_apart). dqlite's `up` refuses unless 3 of 3 vote.
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]
