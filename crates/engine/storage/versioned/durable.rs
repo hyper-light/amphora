@@ -239,7 +239,8 @@ fn bytes_order() -> Comparator {
 
 impl Database {
     /// The database `disk` holds, recovered (or made, with `trees` empty trees, if it holds
-    /// none), in a pool of `frames` pages; its trees ordered by `cmp`, and after them the
+    /// none), in a pool of `frames` pages resident at most (the shell's budget,
+    /// [`super::pool::frames_within`]), the rest evicted to the file; its trees ordered by `cmp`, and after them the
     /// overflow tree (`AC-NS.2.4`). Reopened with the `trees` it was made with.
     pub fn open(
         disk: Arc<dyn Disk>,
@@ -281,14 +282,8 @@ impl Database {
         // A checkpoint that switched turns and never finished leaves commits after T in both.
         let replay = redo::merge(redo::read(&*disk)?, disk.lanes(), stamp.ts)?;
         redo::trim(&*disk, &replay.ends)?;
-        let pool = Pool::new(frames);
-        let mut buf = vec![0u8; PAGE_SIZE];
-        for page in 1..=stamp.allocated {
-            if disk.read_at(File::Data, page_offset(page)?, &mut buf)? != PAGE_SIZE {
-                return Err(corrupt("a page past the data file's end"));
-            }
-            pool.load(page, &buf)?;
-        }
+        // Pages are read in as they are asked for, evicted past the frames (G7 step 4).
+        let pool = Pool::backed(frames, disk.clone(), stamp.allocated)?;
         if stamp.roots.len() <= trees {
             return Err(corrupt("fewer trees than the database was opened with"));
         }
@@ -351,7 +346,17 @@ impl Database {
         if changes.is_empty() {
             return Ok(());
         }
-        let parts = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        // No more replayers than the pool's frames can hold latched at once (G7 step 4): past
+        // that, a pool whose every frame is latched refuses.
+        let parts = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(
+                v.pool
+                    .capacity()
+                    .checked_div(super::blink::WRITER_LATCHES)
+                    .unwrap_or(1),
+            )
+            .max(1);
         let mut by: Vec<Vec<&Op>> = vec![Vec::new(); parts];
         for op in changes {
             by.get_mut(partition(op, parts))
@@ -390,17 +395,13 @@ impl Database {
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
         let all = trees.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
-        let v = Versioned::new(
-            frames,
-            all,
-            |i| {
-                if i == trees {
-                    bytes_order()
-                } else {
-                    cmp()
-                }
-            },
-        )?;
+        let v = Versioned::new_in(Pool::backed(frames, disk.clone(), 0)?, all, |i| {
+            if i == trees {
+                bytes_order()
+            } else {
+                cmp()
+            }
+        })?;
         let allocated = v.pool.allocated();
         let epoch = v.pool.begin_copy()?;
         let journal = Journal {

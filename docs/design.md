@@ -58,6 +58,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 11 | The log in lanes: one group-committed log, or a log a writer | [engine.md](design/engine.md#11-the-log-in-lanes-one-group-committed-log-or-a-log-a-writer) |
 | engine | 12 | Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own | [engine.md](design/engine.md#12-large-rows-as-chunk-rows-of-an-overflow-tree-trees-made-and-dropped-as-records-of-their-own) |
 | engine | 13 | The switch: a connection's B-trees on the versioned storage, the pager beside it | [engine.md](design/engine.md#13-the-switch-a-connections-b-trees-on-the-versioned-storage-the-pager-beside-it) |
+| engine | 14 | Eviction: CLOCK to a spill file, slots by page number, reads verified once, a typed bound | [engine.md](design/engine.md#14-eviction-clock-to-a-spill-file-slots-by-page-number-reads-verified-once-a-typed-bound) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |
@@ -66,6 +67,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | executor | 6 | A subquery runs where it is read | [executor.md](design/executor.md#6-a-subquery-runs-where-it-is-read) |
 | executor | 7 | A row's header is parsed once, a cache hit takes no exclusive lock, and the index's terms run before the row is fetched | [executor.md](design/executor.md#7-a-rows-header-is-parsed-once-a-cache-hit-takes-no-exclusive-lock-and-the-indexs-terms-run-before-the-row-is-fetched) |
 | executor | 8 | A scan, its aggregates and a hash join's probe run on every core, in morsels | [executor.md](design/executor.md#8-a-scan-its-aggregates-and-a-hash-joins-probe-run-on-every-core-in-morsels) |
+| executor | 9 | A table scan decodes each leaf once into column batches, behind a switch | [executor.md](design/executor.md#9-a-table-scan-decodes-each-leaf-once-into-column-batches-behind-a-switch) |
 | local-owner-transport | – | Versions (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#versions-2026-11-06) |
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
 | local-owner-transport | – | Owner guards (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#owner-guards-2026-11-06) |
@@ -99,10 +101,12 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl6): No table read whole beneath loops that can give more than one row | [planner.md](design/planner.md#decision-lane-pl6-no-table-read-whole-beneath-loops-that-can-give-more-than-one-row) |
 | planner | – | Decision (lane pl8): a RIGHT JOIN led by one table is planned as its mirrored LEFT JOIN | [planner.md](design/planner.md#decision-lane-pl8-a-right-join-led-by-one-table-is-planned-as-its-mirrored-left-join) |
 | planner | – | Decision (lane pl8-3): a LEFT JOIN's right table follows the tables its ON terms read | [planner.md](design/planner.md#decision-lane-pl8-3-a-left-joins-right-table-follows-the-tables-its-on-terms-read) |
+| planner | – | Decision (lane pl8-4): an outer join's ON terms on an earlier table count given its filters | [planner.md](design/planner.md#decision-lane-pl8-4-an-outer-joins-on-terms-on-an-earlier-table-count-given-its-filters) |
 | planner | – | Decision (lane pl12): custom plans, then a generic one, for prepared statements | [planner.md](design/planner.md#decision-lane-pl12-custom-plans-then-a-generic-one-for-prepared-statements) |
 | planner | – | Decision (lane pl9): row counts kept as rows change, statements planned again past their statistics' error | [planner.md](design/planner.md#decision-lane-pl9-row-counts-kept-as-rows-change-statements-planned-again-past-their-statistics-error) |
 | planner | – | Decision (lane pl13): a nested loop that turns into a hash join at the learned costs' break-even, and a plan made again past its estimate's error | [planner.md](design/planner.md#decision-lane-pl13-a-nested-loop-that-turns-into-a-hash-join-at-the-learned-costs-break-even-and-a-plan-made-again-past-its-estimates-error) |
 | planner | – | Decision (lane pl11): degree-sequence upper bounds guard each joined set's estimate | [planner.md](design/planner.md#decision-lane-pl11-degree-sequence-upper-bounds-guard-each-joined-sets-estimate) |
+| planner | – | Decision (lane pl7): cost weights fitted to measured statement times, behind a switch | [planner.md](design/planner.md#decision-lane-pl7-cost-weights-fitted-to-measured-statement-times-behind-a-switch) |
 | planner | – | Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model | [planner.md](design/planner.md#decision-lane-g6s3-learned-plan-hints-kept-for-a-query-class-only-where-its-held-out-runs-beat-the-cost-model) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
@@ -194,6 +198,10 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | records-compaction | – | Bounded Records compaction on the namespace writer, step by recoverable step | [records-compaction.md](design/records-compaction.md) |
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
 | backup | – | Decision (lane pitr): backups and point-in-time recovery to Mantle (CP-T1.12, G14 step 4) | [backup.md](design/backup.md) |
+| backup | – | The folder store: keys as paths, create once by link(2), listing in key order | [backup.md](design/backup.md#the-folder-store) |
+| backup | – | Restore-and-check: the newest whole second restored and checked, on the archive's cadence | [backup.md](design/backup.md#restore-and-check) |
+| backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
+| backup | – | Incremental bases: a new base keeps the latest's chunks the log left unchanged | [backup.md](design/backup.md#incremental-bases) |
 
 ## Sections that are not decisions
 

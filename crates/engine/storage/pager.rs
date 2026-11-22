@@ -4323,6 +4323,12 @@ impl Pager {
     /// Amphora (QT.5): the share of this pager's recent page fetches that read a file (the
     /// window `PageMissWindow` keeps), or None before its first fetch. The planner prices a page
     /// by it (`LearnedCosts::weights_at`).
+    /// Amphora (PL.7): the pages this pager has read from its file so far, a term of the fitted
+    /// cost model (`cost_fit`).
+    pub(crate) fn page_file_reads(&self) -> u64 {
+        self.page_file_reads.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn page_miss_ratio(&self) -> Option<f64> {
         let now = (
             self.page_fetches.load(Ordering::Relaxed),

@@ -2189,6 +2189,25 @@ fn op_column_fetch(
         .registers
         .get_mut(dest)
         .ok_or_else(|| register_out_of_range("Column", dest))?;
+    // Amphora (QT.7): a scanned table's column comes from its leaf's batch when the program has
+    // one (`leaf_batch.rs`); otherwise, and for a row the batch left out, the row is read here.
+    if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        match super::leaf_batch::serve_column(
+            &mut state.leaf_batches,
+            plan,
+            cursor_id,
+            cursor,
+            column,
+            dest_reg,
+        )? {
+            super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
+            super::leaf_batch::Served::PastEnd => {
+                apply_column_default(default, dest_reg)?;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+            super::leaf_batch::Served::RowAtATime => {}
+        }
+    }
     let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
@@ -2411,6 +2430,34 @@ fn op_column_range_fetch(
         .checked_add(defaults.len())
         .and_then(|end| state.registers.get_mut(dest..end))
         .ok_or_else(|| register_out_of_range("ColumnRange", dest))?;
+    // Amphora (QT.7): as Column does, from the leaf's batch; a row the batch left out is read
+    // whole below.
+    if let Some(plan) = program.leaf_batch_plan.as_deref() {
+        let mut served = true;
+        for (offset, (default, reg)) in defaults.iter().zip(dest_regs.iter_mut()).enumerate() {
+            let column = start_column
+                .checked_add(offset)
+                .ok_or(LimboError::IntegerOverflow)?;
+            match super::leaf_batch::serve_column(
+                &mut state.leaf_batches,
+                plan,
+                cursor_id,
+                cursor,
+                column,
+                reg,
+            )? {
+                super::leaf_batch::Served::Value => {}
+                super::leaf_batch::Served::PastEnd => apply_column_default(default, reg)?,
+                super::leaf_batch::Served::RowAtATime => {
+                    served = false;
+                    break;
+                }
+            }
+        }
+        if served {
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let Some((payload, header)) = return_if_io!(state, cursor.record_payload_with_header()) else {
         dest_regs.iter_mut().for_each(Register::set_null);
         return Ok(InsnFunctionStepResult::Step);
@@ -6508,6 +6555,40 @@ pub fn op_seek(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::Seek,
+        || seek_run(program, state, insn, pager),
+    )
+}
+
+/// Amphora (QT.5, step 3a): runs `run`, one run of `work`, timing it when the database's
+/// estimator samples this one (`LearnedCosts::sampled`). A run that waits on IO is not timed:
+/// its time is its page reads', which the pager times (`Work::PageRead`), and its resumption's
+/// would be part of the work.
+fn timed_run(
+    program: &Program,
+    work: crate::translate::optimizer::learned_costs::Work,
+    run: impl FnOnce() -> InsnResult,
+) -> InsnResult {
+    let costs = &program.connection.db.learned_costs;
+    if !costs.sampled(work) {
+        return run();
+    }
+    let started = std::time::Instant::now();
+    let result = run();
+    if matches!(result, Ok(InsnFunctionStepResult::Step)) {
+        costs.observe_sampled(work, started.elapsed().as_nanos() as f64);
+    }
+    result
+}
+
+fn seek_run(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
     let (cursor_id, is_index, start_reg, num_regs, target_pc) = match insn {
         Insn::SeekGE {
             cursor_id,
@@ -9488,11 +9569,14 @@ pub fn op_sorter_sort(
     // unit, rows times log2 rows (`cost::estimate_sort_cpu_cost`).
     if let Some((rows, nanos)) = timed {
         let rows = rows as f64;
+        let units = rows * rows.max(1.0).log2();
         program.connection.db.learned_costs.observe(
             crate::translate::optimizer::learned_costs::Work::Sort,
-            rows * rows.max(1.0).log2(),
+            units,
             nanos,
         );
+        // Amphora (PL.7): the statement's sort work, a term of the fitted cost model.
+        state.metrics.sort_units += units;
     }
     // Increment metrics for sort operation after cursor is dropped
     if did_sort {
@@ -17966,6 +18050,19 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::HashBuild,
+        || hash_build_run(program, state, insn, pager),
+    )
+}
+
+fn hash_build_run(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
     load_insn!(HashBuild { data }, insn);
 
     let mut op_state = match state.active_op_state.hash_build().take().filter(|s| {
@@ -18076,7 +18173,10 @@ pub fn op_hash_build(
             payload_values: std::mem::replace(&mut op_state.payload_values, crate::alloc::vec![]),
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
-            HashInsertResult::Done => {}
+            HashInsertResult::Done => {
+                state.metrics.hash_join.build_rows =
+                    state.metrics.hash_join.build_rows.saturating_add(1);
+            }
             HashInsertResult::IO { io, pending } => {
                 op_state.key_values = pending.key_values;
                 op_state.payload_values = pending.payload_values;
@@ -18396,6 +18496,19 @@ fn write_hash_payload_to_registers(
 }
 
 pub fn op_hash_probe(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    timed_run(
+        program,
+        crate::translate::optimizer::learned_costs::Work::HashProbe,
+        || hash_probe_run(program, state, insn, pager),
+    )
+}
+
+fn hash_probe_run(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -20217,6 +20330,123 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     } else {
         root_page
     }
+}
+
+/// Amphora (QT.6): [Insn::MorselAggregate]. The statement's read transaction is open, so every
+/// worker's cursor reads its one snapshot through `pager`.
+pub fn op_morsel_aggregate(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::vdbe::morsel::{MachineCosts, MemoryBudget, MorselError, ScanAggregate};
+    use crate::vdbe::morsel_scan::{TableAggregate, TableSource};
+    load_insn!(MorselAggregate { data }, insn);
+    let refused = |error: MorselError| -> Box<LimboError> {
+        Box::new(LimboError::InternalError(format!(
+            "parallel aggregate: {error}"
+        )))
+    };
+    let connection = &program.connection;
+    // The costs are taken for the run and put back after, so a statement learns from the last.
+    let taken = connection.morsel_costs.lock().take();
+    let mut costs = match taken {
+        Some(costs) => costs,
+        None => MachineCosts::measure().map_err(refused)?,
+    };
+    let answered = (|| {
+        let table = TableSource::open(
+            pager.clone(),
+            data.root_page,
+            data.columns,
+            data.rowid_alias,
+        )?;
+        let shape = ScanAggregate {
+            rows: &[],
+            filter: &data.filter,
+            group_by: &data.group_by,
+            aggregates: &data.aggregates,
+        };
+        let pipeline = TableAggregate {
+            table: &table,
+            shape: &shape,
+        };
+        let budget = MemoryBudget::new(pager.statement_memory_budget());
+        pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget)
+    })();
+    *connection.morsel_costs.lock() = Some(costs);
+    let mut rows = match answered {
+        Ok((rows, _)) => rows,
+        // A value the parallel aggregates don't take (a SUM over text), or groups past the
+        // statement's memory that the serial loop's spilling GROUP BY can hold: it answers.
+        Err(MorselError::Unsupported { .. } | MorselError::MemoryBudget { .. }) => {
+            state.pc = data.target_pc_serial.as_offset_int();
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        Err(error) => return Err(refused(error)),
+    };
+    // Groups in the order the serial GROUP BY gives them: by their key values as SQLite orders
+    // them (the pipeline's own key order puts kinds apart).
+    let keys = data.group_by.len();
+    rows.sort_by(|a, b| a.iter().take(keys).cmp(b.iter().take(keys)));
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows.len())
+        .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+    for row in rows {
+        let mut mapped = Vec::new();
+        mapped
+            .try_reserve_exact(data.result_map.len())
+            .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+        for at in &data.result_map {
+            let value = row.get(*at).ok_or_else(|| {
+                refused(MorselError::NoColumn {
+                    column: *at,
+                    width: row.len(),
+                })
+            })?;
+            mapped.push(value.clone());
+        }
+        out.push(mapped);
+    }
+    state.morsel_rows = Some(out.into_iter());
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (QT.6): [Insn::MorselNext].
+pub fn op_morsel_next(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        MorselNext {
+            dest_start,
+            count,
+            target_pc_done
+        },
+        insn
+    );
+    let next = state.morsel_rows.as_mut().and_then(Iterator::next);
+    let Some(row) = next else {
+        state.morsel_rows = None;
+        state.pc = target_pc_done.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let end = dest_start
+        .checked_add(*count)
+        .ok_or(LimboError::IntegerOverflow)?;
+    let registers = state
+        .registers
+        .get_mut(*dest_start..end)
+        .ok_or_else(|| LimboError::InternalError("parallel rows' registers out of range".into()))?;
+    for (register, value) in registers.iter_mut().zip(row) {
+        *register = Register::Value(value);
+    }
+    state.pc = next_pc(state)?;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 #[cfg(test)]

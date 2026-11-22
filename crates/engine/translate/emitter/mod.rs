@@ -201,6 +201,9 @@ pub struct Resolver<'a> {
     /// Amphora (QT.5): the cost weights the connection's database has learned
     /// (`optimizer::learned_costs`), set at prepare.
     learned_weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
+    /// Amphora (PL.7): the weights fitted to the database's measured statement times
+    /// (`optimizer::cost_fit`), set at prepare; None with the switch off.
+    fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
@@ -208,6 +211,9 @@ pub struct Resolver<'a> {
     /// Amphora: whether the planner may build an automatic index
     /// (`Connection::set_automatic_indexes`).
     automatic_indexes: bool,
+    /// Amphora: whether a qualifying scan's aggregates run in leaf-page morsels
+    /// (`Connection::set_parallel_mode`, QT.6).
+    parallel: bool,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -335,9 +341,11 @@ impl<'a> Resolver<'a> {
             plan_values: None,
             statement_memory: 0,
             learned_weights: None,
+            fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
             automatic_indexes: true,
+            parallel: false,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -405,6 +413,20 @@ impl<'a> Resolver<'a> {
         self.learned_weights = weights;
     }
 
+    pub(crate) fn fitted_weights(
+        &self,
+    ) -> Option<crate::translate::optimizer::cost_fit::FittedWeights> {
+        self.fitted_weights
+    }
+
+    /// Amphora (PL.7): sets the fitted cost weights the planner reads over the learned ones.
+    pub(crate) fn set_fitted_weights(
+        &mut self,
+        weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
+    ) {
+        self.fitted_weights = weights;
+    }
+
     pub(crate) fn join_methods(&self) -> crate::JoinMethods {
         self.join_methods
     }
@@ -427,6 +449,14 @@ impl<'a> Resolver<'a> {
 
     pub(crate) fn set_automatic_indexes(&mut self, on: bool) {
         self.automatic_indexes = on;
+    }
+
+    pub(crate) fn parallel(&self) -> bool {
+        self.parallel
+    }
+
+    pub(crate) fn set_parallel(&mut self, on: bool) {
+        self.parallel = on;
     }
 
     pub fn fork(&self) -> Resolver<'a> {
@@ -454,9 +484,11 @@ impl<'a> Resolver<'a> {
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
+            fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
             automatic_indexes: self.automatic_indexes,
+            parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -488,9 +520,11 @@ impl<'a> Resolver<'a> {
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
+            fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
             automatic_indexes: self.automatic_indexes,
+            parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
