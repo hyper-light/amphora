@@ -1477,3 +1477,205 @@ fn t_qt_6_16_live_parallel_limit_matches_serial_at_scale() {
     }
     eprintln!("QT616 rows {rows} queries {queries} ran_parallel {ran_parallel}");
 }
+
+/// A random inner equi-join of `tables` whose filters and outputs only the loop body states (lane
+/// qs6-12): each table after the first joined to a random one before it on `a`, or on `a` and
+/// `c`; filters that are functions, arithmetic, CASE, LIKE, or compare two tables' columns; and
+/// aggregates over grouping expressions, or result expressions with an ORDER BY of plain columns
+/// or none. A MAX over a REAL among them sends the statement to the serial loop. Says whether it
+/// returns rows.
+fn random_body_chain(rng: &mut ChaCha8Rng, tables: &[&str]) -> (String, bool) {
+    let mut terms = Vec::new();
+    for (at, table) in tables.iter().enumerate().skip(1) {
+        let other = tables[rng.random_range(0..at)];
+        let keys: &[&str] = if rng.random_bool(0.5) {
+            &["a"]
+        } else {
+            &["a", "c"]
+        };
+        for key in keys {
+            terms.push(format!("{other}.{key} = {table}.{key}"));
+        }
+    }
+    let pick = |rng: &mut ChaCha8Rng| tables[rng.random_range(0..tables.len())];
+    for _ in 0..rng.random_range(0..3) {
+        let (t, u) = (pick(rng), pick(rng));
+        let n = rng.random_range(-20i64..20);
+        let k = rng.random_range(0i64..3);
+        terms.push(match rng.random_range(0..9) {
+            0 => format!("abs({t}.a) < {}", n.abs()),
+            1 => format!("{t}.c LIKE 't{k}%'"),
+            2 => format!("{t}.a + {u}.a > {n}"),
+            3 => format!("coalesce({t}.b, 0) <> {k}"),
+            4 => format!("length({t}.c) = 2"),
+            5 => format!("CASE WHEN {t}.a > 0 THEN 1 ELSE 0 END = {}", k % 2),
+            6 => format!("{t}.a % 3 = {k}"),
+            7 => format!("{t}.a < {u}.a"),
+            _ => format!("{t}.b IS NULL OR {t}.a > {n}"),
+        });
+    }
+    let rows = rng.random_bool(0.4);
+    let mut select: Vec<String> = Vec::new();
+    let mut group_by: Vec<String> = Vec::new();
+    let mut keys = 0usize;
+    let ordered = rows && rng.random_bool(0.5);
+    if rows {
+        if ordered {
+            // Plain-column ORDER BY keys lead the select list, so a tie's rows can be told apart.
+            keys = rng.random_range(1..=2usize);
+            for _ in 0..keys {
+                select.push(format!(
+                    "{}.{}",
+                    pick(rng),
+                    ["a", "c"][rng.random_range(0..2)]
+                ));
+            }
+        }
+        for _ in 0..rng.random_range(1..4) {
+            let (t, u) = (pick(rng), pick(rng));
+            select.push(match rng.random_range(0..5) {
+                0 => format!("{t}.a + {u}.a"),
+                1 => format!("upper({t}.c)"),
+                2 => format!("{t}.c || '-' || {u}.c"),
+                3 => format!("CASE WHEN {t}.a > {u}.a THEN {t}.c ELSE {u}.c END"),
+                _ => format!("{t}.b"),
+            });
+        }
+    } else {
+        for _ in 0..rng.random_range(0..3) {
+            let t = pick(rng);
+            group_by.push(match rng.random_range(0..4) {
+                0 => format!("{t}.a % 4"),
+                1 => format!("lower({t}.c)"),
+                2 => format!("{t}.b IS NULL"),
+                _ => format!("{t}.c"),
+            });
+        }
+        select = group_by.clone();
+        for _ in 0..rng.random_range(1..4) {
+            let (t, u) = (pick(rng), pick(rng));
+            select.push(match rng.random_range(0..8) {
+                0 => "count(*)".to_string(),
+                1 => format!("sum({t}.a + {u}.a)"),
+                2 => format!("sum(abs({t}.b) % 1000)"),
+                3 => format!("min({t}.c || {u}.c)"),
+                4 => format!("max(length({t}.c))"),
+                5 => format!("count(CASE WHEN {t}.a > {u}.a THEN 1 END)"),
+                6 => format!("max({t}.a - {u}.a)"),
+                _ => format!("max({t}.a * 1.5)"),
+            });
+        }
+    }
+    let mut sql = format!(
+        "SELECT {} FROM {} WHERE {}",
+        select.join(", "),
+        tables.join(", "),
+        terms.join(" AND ")
+    );
+    if !group_by.is_empty() {
+        sql.push_str(&format!(" GROUP BY {}", group_by.join(", ")));
+    }
+    if ordered {
+        let order: Vec<String> = select[..keys]
+            .iter()
+            .map(|key| {
+                let dir = if rng.random_bool(0.5) { " DESC" } else { "" };
+                format!("{key}{dir}")
+            })
+            .collect();
+        sql.push_str(&format!(" ORDER BY {} -- keys {keys}", order.join(", ")));
+    }
+    (sql, rows)
+}
+
+/// Compares a parallel answer with the serial one: row for row with aggregates; with rows, in
+/// ORDER BY order with ties compared as sets, or as the same rows without an ORDER BY.
+fn same_answer(sql: &str, rows: bool, parallel: &[Vec<Value>], serial: &[Vec<Value>], at: &str) {
+    if !rows {
+        assert_eq!(parallel, serial, "{sql} {at}");
+        return;
+    }
+    if let Some(keys) = order_keys(sql) {
+        let key = |row: &Vec<Value>| format!("{:?}", &row[..keys]);
+        let serial_keys: Vec<String> = serial.iter().map(key).collect();
+        let parallel_keys: Vec<String> = parallel.iter().map(key).collect();
+        assert_eq!(parallel_keys, serial_keys, "{sql} {at}");
+    }
+    assert_eq!(canonical(parallel), canonical(serial), "{sql} {at}");
+}
+
+/// T-QT.6.18 (lane qs6-12): a join's workers run the copy of the serial loop's body over each
+/// joined row. Random inner equi-joins of two, three and four tables whose filters and outputs
+/// only the body states (functions, arithmetic, CASE, LIKE, terms over two tables' columns),
+/// with aggregates or returning rows, answer the same with `ParallelMode` off (the serial loop)
+/// and on, the machine stated as 1, 2, 3, 4 and 8 cores. A run that took the hook built one link
+/// per table past the probe and ran the body; most runs took it.
+#[test]
+fn t_qt_6_18_join_workers_run_a_copy_of_the_loop_body_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-18");
+    let mut rng = ChaCha8Rng::seed_from_u64(618);
+    fill(&conn, &mut rng, "t", 600);
+    fill(&conn, &mut rng, "u", 120);
+    fill(&conn, &mut rng, "v", 50);
+    fill(&conn, &mut rng, "w", 30);
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let queries = 36usize;
+    let mut bodied = 0usize;
+    let mut bodied_rows = 0usize;
+    for query in 0..queries {
+        let tables: &[&str] = match query % 3 {
+            0 => &["t", "u"],
+            1 => &["t", "u", "v"],
+            _ => &["t", "u", "v", "w"],
+        };
+        let (sql, rows) = random_body_chain(&mut rng, tables);
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let links_before = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let body_before = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, &sql);
+            let links = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - links_before;
+            let body = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - body_before;
+            same_answer(&sql, rows, &parallel, &serial, &format!("on {cores} cores"));
+            let expected = u64::try_from(tables.len() - 1).unwrap();
+            assert!(
+                links == 0 || links == expected,
+                "{sql} on {cores} cores built {links} links"
+            );
+            // No body runs where no link was built: the hook either ran the chain or declined.
+            assert!(links == expected || body == 0, "{sql} on {cores} cores");
+            if links == expected && body > 0 {
+                bodied += 1;
+                if rows {
+                    bodied_rows += 1;
+                }
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: most runs took the chain and ran the body, row-returning ones among them.
+    assert!(
+        bodied > queries * 5 / 2,
+        "the body ran {bodied} times of {}",
+        queries * 5
+    );
+    assert!(bodied_rows > 0, "no row-returning join ran the body");
+}

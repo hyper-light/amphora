@@ -531,8 +531,25 @@ taken only when the ORDER BY holds every table's INTEGER PRIMARY KEY. The counte
 `morsel_join_links` counts the hash tables built. T-QT.6.17 checks random joins of three and four
 tables against the serial loop at 1, 2, 3, 4 and 8 stated cores.
 
-**Not yet.** Joins still run the pipeline's own probe loop, so only the filters `Predicate` holds
-run in a join's workers; outer joins stay serial.
+**A join's workers run the copy of the loop body** (lane qs6-12). A join's filters and outputs
+are no longer only what `Predicate` and `Aggregate` hold: the hook emits the copy of the serial
+loop's body (`MorselBody`) over the joined row, each table's columns read from registers at its
+place in the chain (the probe's first, then each link's), the probe's rowid its own and a link's
+its INTEGER PRIMARY KEY. The equalities that key the chain stay the hash tables' keys, and a term a
+table's own `Predicate` holds is still tested on that table's rows, before the probe or the
+build; every other term (functions, CASE, LIKE, a comparison of two tables' columns, an equality of
+two kinds) and every output (GROUP BY values, aggregate inputs, result columns, then the ORDER BY
+keys) run in the body, per joined row, through the VDBE's own opcodes (`TableJoinAggregate` and
+`TableJoinRows` hold the body; a join has no other path). The tie argument that held a join's
+columns to INTEGER and TEXT now holds of any value but one: an INTEGER and a REAL can compare equal
+and differ, so a REAL in a GROUP BY value, a MIN's or a MAX's input (`MorselBody::no_real`), as in
+a SUM's, sends the statement to the serial loop, and the serial loop's order of a probe row's
+matches can't change the answer. ORDER BY keys stay plain columns of INTEGER or TEXT affinity, so
+the workers' sort is the serial sorter's. T-QT.6.18 checks random joins of two, three and four
+tables whose filters and outputs only the body states against the serial loop at 1, 2, 3, 4 and
+8 stated cores.
+
+**Not yet.** Outer joins stay serial.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

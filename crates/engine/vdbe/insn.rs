@@ -449,12 +449,14 @@ pub struct MorselAggregateData {
     /// link's `probe_key` names places in the row joined before it. `filter` is then over the
     /// probe table's columns alone. Empty for a scan.
     pub joins: Vec<MorselJoinData>,
-    /// A join's rows rather than groups: `result_map` then names the joined row's columns each
-    /// output row takes (the result columns, then the ORDER BY keys), and there are no aggregates.
+    /// A join's rows rather than groups: the body's outputs are each output row (the result
+    /// columns, then the ORDER BY keys), and there are no aggregates.
     pub joined_rows: Option<MorselRows>,
-    /// A copy of a one-table scan's loop body that each worker runs per row (lane qs6-7): when
-    /// present, the workers' filter, GROUP BY values and aggregate inputs are the statement's own
-    /// bytecode, and `group_by`, `aggregates` and `result_map` name places in its output row.
+    /// A copy of the serial loop's body that each worker runs per row (lane qs6-7), or per joined
+    /// row (lane qs6-12; always present for a join): when present, the workers' filter, GROUP BY
+    /// values and aggregate inputs are the statement's own bytecode, and `group_by`, `aggregates`
+    /// and `result_map` name places in its output row. A join's `filter` and each link's are then
+    /// the terms a table's own `Predicate` holds, tested before the body runs.
     pub body: Option<Box<MorselBody>>,
     pub target_pc_serial: BranchOffset,
 }
@@ -463,7 +465,9 @@ pub struct MorselAggregateData {
 /// program, which the serial loop never runs. A worker runs it per row with its own registers
 /// (`ProgramState`): the row's stored columns go into `columns_start..`, its rowid into `rowid`,
 /// then the code runs from `start` until it reaches `keep` (the row passed every filter, its
-/// values in `out_start..out_start + out_count`) or `skip` (it did not).
+/// values in `out_start..out_start + out_count`) or `skip` (it did not). For a join (lane
+/// qs6-12) the row is the joined row: the probe table's columns, then each link's, and `rowid`
+/// is the probe row's.
 #[derive(Debug, Clone)]
 pub struct MorselBody {
     pub start: BranchOffset,
@@ -476,9 +480,11 @@ pub struct MorselBody {
     /// The output row's GROUP BY values (its first places) and the aggregates over its places.
     pub group_by: Vec<usize>,
     pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
-    /// The places a SUM reads: a REAL there sends the statement to the serial loop, whose
-    /// rounding the parallel sum's single exact rounding would not repeat.
-    pub sums: Vec<usize>,
+    /// The places where a REAL sends the statement to the serial loop: a SUM's, whose rounding
+    /// the parallel sum's single exact rounding would not repeat; and in a join (lane qs6-12) a
+    /// GROUP BY value's, a MIN's and a MAX's, where a REAL equal to an INTEGER would tie with it
+    /// and the serial loop's order of a probe row's matches, its hash tables', could pick the other.
+    pub no_real: Vec<usize>,
     /// Whether `MorselAggregateData`'s own filter and aggregates state the same query over the
     /// table's columns (the versioned storage's column copy reads those, not the body).
     pub simple: bool,

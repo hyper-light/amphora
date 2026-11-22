@@ -21218,14 +21218,34 @@ pub fn op_morsel_aggregate(
                 .morsel_join_links
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        // A join's rows, no aggregates: each worker keeps its own leaves' joined rows, merged
+        // Each joined row runs through the copy of the serial loop's body (lane qs6-12).
+        let Some(body) = &data.body else {
+            return Err(MorselError::Corrupt("a join's hook without its loop body"));
+        };
+        let shape = ScanAggregate {
+            rows: &[],
+            filter: &[],
+            group_by: &body.group_by,
+            aggregates: &body.aggregates,
+        };
+        let looped = TableBodyAggregate {
+            table: &table,
+            body,
+            program,
+            pager,
+            registers: &registers,
+            parameters: &parameters,
+            shape: &shape,
+            ran: &connection.morsel_body_rows,
+        };
+        // A join's rows, no aggregates: each worker keeps its own leaves' output rows, merged
         // in order; they are the answer's rows as they stand.
         if let Some(rows) = &data.joined_rows {
             let pipeline = TableJoinRows {
                 table: &table,
                 probe_filter: &data.filter,
                 stages: &stages,
-                project: &data.result_map,
+                body: &looped,
                 order: &rows.order,
             };
             let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
@@ -21234,17 +21254,11 @@ pub fn op_morsel_aggregate(
             }
             return Ok((out, true));
         }
-        let shape = ScanAggregate {
-            rows: &[],
-            filter: &[],
-            group_by: &data.group_by,
-            aggregates: &data.aggregates,
-        };
         let pipeline = TableJoinAggregate {
             table: &table,
             probe_filter: &data.filter,
             stages: &stages,
-            shape: &shape,
+            body: &looped,
         };
         pipeline
             .run_mode(mode, &mut costs, &budget)
