@@ -501,7 +501,7 @@ serial loop at 1, 2, 3, 4 and 8 stated cores, and that the body ran over every r
 no GROUP BY and no ORDER BY emits the same copy of the loop body with the result columns as its
 outputs (`MorselBody::rows`); each worker (`TableBodyRows`) keeps the output rows of the rows that
 pass, tagged with its morsel's first leaf, and the runs are joined in leaf order, so the rows come
-out as the serial loop gives them. An ORDER BY stays serial: its sorter orders ties its own way.
+out as the serial loop gives them. An ORDER BY stayed serial here; lane qs6-17 sorts it on morsels (below).
 
 **Workers stop early under a LIMIT** (lane qs6-8). With a LIMIT, the body carries the rows the
 LIMIT and OFFSET take (`want`). A shared count of the rows kept is checked before each morsel is
@@ -725,6 +725,19 @@ no integer literal (a parameter, an expression), a seek through an index and a s
 join's table stay serial. T-QT.6.33 checks ranges against the serial loop at 1, 2, 3, 4 and 8
 stated cores, and that the body ran over fewer rows than the table holds.
 
+**A scan's rows under ORDER BY on morsels** (lane qs6-17). A one-table scan's rows under an ORDER
+BY ran serially. They now sort as a join's rows do: `scan_order` takes keys that are the table's
+columns (or its rowid) of INTEGER or TEXT affinity and BINARY collation, no NULLS FIRST or LAST
+named, so the workers' comparison is the serial sorter's, and appends them to the body's outputs
+after the result columns (`MorselRows`, in `MorselAggregateData::joined_rows`). Each worker sorts
+its morsel's rows (`TableBodyRows::order`), and the runs, put in leaf order, are merged by a
+stable merge sort, so rows equal under the keys keep their rowid order. A sorted scan never stops
+early: the hook's row loop counts the LIMIT and OFFSET down over the merged rows, and it takes
+one only when the keys hold the rowid, which tells every row apart, so the rows cut are the
+serial loop's to the row. Only forward scans qualify now: a backward scan may stand for an ORDER
+BY ... DESC the planner removed, and the morsels' rows come out in rowid order. T-QT.6.34 checks
+them against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
 **What still runs on the serial loop** (lane qs6-16's audit, updated by lane qs6-17; each an open
 part of QT.6):
 - *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
@@ -750,7 +763,8 @@ part of QT.6):
   default, on the versioned storage's column copy, which decodes records as written; a scan
   through an index, a rowid range whose bounds aren't integer literals, or one on a join's probe
   (`Operation::Search`; a rowid range is a run of leaves, `TableSource::restrict`); a one-table
-  scan's rows under ORDER BY; AVG and TOTAL over REALs or past 2^53, group_concat and DISTINCT
+  scan's rows under an ORDER BY on an expression, with NULLS FIRST or LAST, or with a LIMIT whose
+  keys don't hold the rowid, and a backward scan; AVG and TOTAL over REALs or past 2^53, group_concat and DISTINCT
   aggregates, a HAVING over a group key or a bare column, and
   an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and
   other statements that don't return rows; joins with no equality of one affinity (a cross

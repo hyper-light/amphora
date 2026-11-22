@@ -3207,3 +3207,83 @@ fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
     conn.set_parallel_limit(false);
     conn.set_parallel_mode(ParallelMode::Off);
 }
+
+/// T-QT.6.34 (lane qs6-17): a one-table scan's rows under an ORDER BY run on morsels: each worker
+/// sorts its morsels' rows by the keys and a stable merge joins the runs in leaf order. ORDER BYs
+/// over INTEGER and TEXT columns and the rowid, ascending and descending, with ties, NULLs, a
+/// filter, a rowid range, and a LIMIT and OFFSET over keys that hold the rowid, answer as the
+/// serial loop at 1, 2, 3, 4 and 8 stated cores: in the keys' order, the same rows (row for row
+/// where the keys tell every row apart), and the body ran over the table's rows. A LIMIT over keys
+/// without the rowid, an expression key, NULLS LAST and a backward scan stay the serial loop's.
+#[test]
+fn t_qt_6_34_a_scans_rows_under_order_by_sort_on_morsels_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-34");
+    let mut rng = ChaCha8Rng::seed_from_u64(634);
+    let pad = "x".repeat(64);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let rows = 2500u64;
+    for _ in 0..rows {
+        let a = rng.random_range(-30i64..30);
+        let b = match rng.random_range(0..5) {
+            0 => "NULL".to_string(),
+            _ => rng.random_range(-1000i64..1000).to_string(),
+        };
+        let c = ["NULL", "'x'", "'y'", "'z'", "'xy'"][rng.random_range(0..5)];
+        conn.execute(format!(
+            "INSERT INTO t(a, b, c, p) VALUES ({a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    // (statement, whether the hook takes it); `-- keys n`: its keys lead the result columns.
+    let queries: [(&str, bool); 12] = [
+        ("SELECT a, id, b FROM t ORDER BY a -- keys 1", true),
+        ("SELECT a, b, c FROM t ORDER BY a DESC, b -- keys 2", true),
+        ("SELECT c, a, id FROM t WHERE a > 0 ORDER BY c, a DESC -- keys 2", true),
+        ("SELECT b, id FROM t ORDER BY b DESC -- keys 1", true),
+        ("SELECT c, id, a FROM t ORDER BY c DESC, id -- keys 2", true),
+        ("SELECT a, id, c FROM t WHERE id > 700 AND id < 1900 ORDER BY a, id DESC -- keys 2", true),
+        ("SELECT a, id FROM t ORDER BY a, id LIMIT 30 OFFSET 7 -- keys 2", true),
+        ("SELECT c, rowid, b FROM t WHERE b IS NOT NULL ORDER BY c DESC, rowid LIMIT 50 -- keys 2", true),
+        // The serial loop's: a LIMIT over keys without the rowid, an expression, NULLS LAST, and
+        // the backward scan the planner may read ORDER BY id DESC by.
+        ("SELECT id, a FROM t ORDER BY id DESC -- keys 1", false),
+        ("SELECT a, id FROM t ORDER BY a LIMIT 10 -- keys 1", false),
+        ("SELECT a, id FROM t ORDER BY a + b -- keys 0", false),
+        ("SELECT b, id FROM t ORDER BY b NULLS LAST -- keys 1", false),
+    ];
+    for (sql, hooked) in queries {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, sql);
+            let after = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if sql.contains("LIMIT") {
+                // The keys hold the rowid: the very rows, in order.
+                assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            } else {
+                same_answer(sql, true, &parallel, &serial, &format!("on {cores} cores"));
+            }
+            if hooked {
+                assert!(
+                    after > before,
+                    "{sql} on {cores} cores: the hook didn't run"
+                );
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+}

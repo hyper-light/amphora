@@ -21210,6 +21210,11 @@ pub fn op_morsel_aggregate(
                             .want
                             .map(|want| usize::try_from(want).unwrap_or(usize::MAX)),
                         kept: std::sync::atomic::AtomicUsize::new(0),
+                        // Under an ORDER BY each worker sorts its morsels' rows (lane qs6-17).
+                        order: data
+                            .joined_rows
+                            .as_ref()
+                            .map_or(&[][..], |rows| rows.order.as_slice()),
                     };
                     return rows
                         .run_mode(connection.parallel_mode(), &mut costs, &budget)

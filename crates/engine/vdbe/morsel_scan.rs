@@ -733,12 +733,16 @@ impl Pipeline for TableBodyAggregate<'_> {
 /// runs the body per row as [`TableBodyAggregate`] does and keeps the outputs of the rows that
 /// pass; the runs are joined in leaf order, so the rows come out in the serial loop's order. Under
 /// a LIMIT (`want`) no morsel is claimed once that many rows are kept, and a morsel stops once it
-/// alone holds that many.
+/// alone holds that many. Under an ORDER BY (lane qs6-17) each worker sorts its morsel's rows and
+/// the runs, in leaf order, are merged by a stable merge, as [`TableJoinRows`]' are: rows equal
+/// under the keys keep their rowid order; no LIMIT stops it early.
 pub struct TableBodyRows<'a> {
     pub body: &'a TableBodyAggregate<'a>,
     pub want: Option<usize>,
     /// The rows kept so far, by every worker.
     pub kept: std::sync::atomic::AtomicUsize,
+    /// The sort keys: each one's place in the output row, and whether it descends.
+    pub order: &'a [(usize, bool)],
 }
 
 /// The partial of [`TableBodyRows`]: each morsel's rows tagged with its first leaf, and the
@@ -764,6 +768,10 @@ impl TableBodyRows<'_> {
         for (_, run) in partial.runs {
             let room = take.saturating_sub(out.len());
             out.extend(run.into_iter().take(room));
+        }
+        // `sort_by` is a stable merge sort that finds the workers' sorted runs and merges them.
+        if !self.order.is_empty() {
+            out.sort_by(|a, b| compare_rows(self.order, a, b));
         }
         Ok(out)
     }
@@ -830,6 +838,9 @@ impl Pipeline for TableBodyRows<'_> {
                 .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
         }
         scanned?;
+        if !self.order.is_empty() {
+            found.sort_by(|a, b| compare_rows(self.order, a, b));
+        }
         runs.try_reserve(1)?;
         runs.push((first, found));
         Ok(())

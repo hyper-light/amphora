@@ -83,7 +83,8 @@ pub(crate) fn emit_morsel_hook(
                 aggregates: looped.aggregates.clone(),
                 result_map: looped.result_map.clone(),
                 joins: Vec::new(),
-                joined_rows: None,
+                // A scan's ORDER BY, sorted by the workers as a join's rows are (lane qs6-17).
+                joined_rows: looped.sorted.clone(),
                 body: None,
                 outer: None,
                 target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
@@ -123,8 +124,8 @@ pub(crate) fn emit_morsel_hook(
         simple: is_simple,
         rows: looped.rows,
         // A join's LIMIT cuts rows the workers all produce (its ORDER BY tells every row apart),
-        // so only a scan's rows stop early.
-        want: if looped.rows && data.joins.is_empty() {
+        // and so does a sorted scan's (lane qs6-17), so only an unsorted scan's rows stop early.
+        want: if looped.rows && data.joins.is_empty() && looped.sorted.is_none() {
             window
                 .limit
                 .map(|limit| limit.saturating_add(window.offset))
@@ -296,6 +297,8 @@ struct BodyPlan<'p> {
     agg_filters: Vec<(usize, &'p Expr)>,
     /// The scan's least and greatest rowid, `(None, None)` for the whole table (lane qs6-17).
     rowid_range: (Option<i64>, Option<i64>),
+    /// A one-table scan's ORDER BY (lane qs6-17); a join's is its data's `joined_rows`.
+    sorted: Option<MorselRows>,
     /// The outputs are the result columns, returned as rows (lane qs6-8).
     rows: bool,
 }
@@ -479,14 +482,11 @@ fn body_reads(exprs: &[&Expr], places: &[BodyTable]) -> Option<()> {
 }
 
 fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
-    // A scan with no aggregates returns its rows (lane qs6-8). No ORDER BY: the serial loop's
-    // sorter orders ties its own way. A LIMIT and OFFSET cut the rows in scan order.
+    // A scan with no aggregates returns its rows (lane qs6-8). A LIMIT and OFFSET cut the rows
+    // in scan order, or in the ORDER BY's, which each worker sorts its morsels' rows by and a
+    // stable merge joins (lane qs6-17, `scan_order`).
     let rows = plan.aggregates.is_empty();
-    if !(if rows {
-        plain_rows(plan) && plan.order_by.is_empty()
-    } else {
-        plain(plan)
-    }) {
+    if !(if rows { plain_rows(plan) } else { plain(plan) }) {
         return None;
     }
     let [joined] = plan.table_references.joined_tables() else {
@@ -504,13 +504,14 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         .map(|term| &term.expr)
         .collect();
     let BodyOutputs {
-        outs,
+        mut outs,
         group_by,
         aggregates,
         sums,
         result_map,
         agg_filters,
     } = body_outputs(plan, rows)?;
+    let sorted = scan_order(plan, joined.internal_id, table, &mut outs)?;
     let places = vec![BodyTable {
         id: joined.internal_id,
         table,
@@ -534,17 +535,73 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         result_map,
         agg_filters,
         rowid_range,
+        sorted,
         rows,
     })
 }
 
-/// The rowids a one-table scan reads (lane qs6-17): the whole table (`(None, None)`), or a
+/// A one-table scan's ORDER BY as its workers sort by (lane qs6-17): each key a column of the
+/// table (or its rowid) of INTEGER or TEXT affinity and BINARY collation, no NULLS FIRST or LAST
+/// named (SQLite's default, NULLs least, is the values' own order), so the workers' sort is the
+/// serial sorter's; each key's expression joins `outs` after the result columns. Under a LIMIT or
+/// OFFSET the keys must hold the rowid, which tells every row apart, so the rows cut are the serial
+/// loop's to the row. `Some(None)`: no ORDER BY; None: the serial loop's.
+fn scan_order<'p>(
+    plan: &'p SelectPlan,
+    id: TableInternalId,
+    table: &BTreeTable,
+    outs: &mut Vec<&'p Expr>,
+) -> Option<Option<MorselRows>> {
+    if plan.order_by.is_empty() {
+        return Some(None);
+    }
+    let alias = rowid_alias(table);
+    let mut whole = false;
+    let width = outs.len();
+    let mut order = Vec::new();
+    for (expr, sort, nulls) in &plan.order_by {
+        if nulls.is_some() {
+            return None;
+        }
+        let column = match expr {
+            Expr::Column {
+                table: t, column, ..
+            } if *t == id => Some(*column),
+            Expr::RowId { table: t, .. } if *t == id => None,
+            _ => return None,
+        };
+        let plain = match column {
+            None => true,
+            Some(column) => table.columns().get(column).is_some_and(|col| {
+                matches!(col.affinity(), Affinity::Integer | Affinity::Text)
+                    && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset)
+            }),
+        };
+        if !plain {
+            return None;
+        }
+        whole |= column.is_none() || column == alias;
+        order.push((outs.len(), matches!(sort, SortOrder::Desc)));
+        outs.push(expr);
+    }
+    if (plan.limit.is_some() || plan.offset.is_some()) && !whole {
+        return None;
+    }
+    Some(Some(MorselRows { order, width }))
+}
+
+/// The rowids a one-table scan reads (lane qs6-17): the whole table read forward (`(None, None)`), or a
 /// forward search of the table b-tree by rowid between integer literals, its least and greatest
 /// rowid (each bound taken inclusively: the morsels are cut from the leaves that hold them, and
 /// the terms the search was made from decide each row). None: another access, the serial loop's.
 fn scanned_rowids(op: &Operation) -> Option<(Option<i64>, Option<i64>)> {
     match op {
-        Operation::Scan(Scan::BTreeTable { index: None, .. }) => Some((None, None)),
+        // Forward only: a backward scan may stand for an ORDER BY ... DESC the planner removed,
+        // and the morsels' rows come out in rowid order.
+        Operation::Scan(Scan::BTreeTable {
+            index: None,
+            iter_dir: IterationDirection::Forwards,
+        }) => Some((None, None)),
         Operation::Search(Search::Seek {
             index: None,
             seek_def,
@@ -1459,6 +1516,7 @@ fn shape_join(
         result_map,
         agg_filters,
         rowid_range: (None, None),
+        sorted: None,
         rows: rows_mode,
     };
     Some((data, looped))
@@ -1812,6 +1870,7 @@ fn shape_chain(
         result_map,
         agg_filters,
         rowid_range: (None, None),
+        sorted: None,
         rows: rows_mode,
     };
     Some((data, looped))
