@@ -2513,8 +2513,8 @@ budget's room fences at once, since memory can't be lent; one past what its host
 only once it has stayed past it for a whole election timeout, so that a burst at start, before any drain is measured,
 waits for the host's drain to be measured and the bound to grow.
 
-**What is left.** The framing a wire record adds (`FRAMING_BYTES`, 2 MiB, in `WIRE_BYTES` and `MESSAGE_BYTES` before)
-and `COMMANDS` and `MEMBERS` (64), to be derived from the budget and the measured message sizes. The image cap set on
+**What is left.** `COMMANDS` and `MEMBERS` (64), to be derived from the budget and the measured message sizes. The
+framing a wire record adds (`FRAMING_BYTES`) is derived (below). The image cap set on
 the owner's machine is the wire record's room at open; the room read later bounds images through `image_room`.
 
 **Amendment (QB.2, lane constants-17, 2026-11-22, not yet landed): past the outgoing bound, shed; don't fence.**
@@ -2534,17 +2534,25 @@ each peer the leader beats (`Actor::resend`). Each member's heartbeat answer res
 it lacks. A follower's shed record is a lost answer, which its leader's heartbeat timeout makes good, as on a lossy
 link. The
 A/B scenario (`qb2_many_slow_one_stalled_for_good_by_egress`: every host slows at once, then the leader's host stalls
-for good) is written but its driver is unfinished. Application calls are held to their own bound apart from the
+for good) is driven by events (lane constants-19: a round waits on a writing owner's bell, not a poll, and counts an owner
+with more to drive as busy), and prints each candidate's numbers; its run of record is the coordinator's. Application calls are held to their own bound apart from the
 wire records queued beside them (`Control::called`).
 
-**Derivations for the numbers still picked (proposed, not built).**
-- `FRAMING_BYTES` (2 MiB) is a format value: what a message record adds past what it carries.
-  `MESSAGE_RECORD_FIXED_BYTES + ENTRY_FIXED_BYTES` (hyper-raft `wire.rs`) for an entry, plus the entry's context (the
-  request identity `Actor::context` writes: four u64s). For an image, add the snapshot's metadata (a `ConfState` of at
-  most `MEMBERS` u64s, postcard varints of at most 10 bytes each).
-- `unstable_entries` and `entries_per_message` (1024 each) override what `hyper_raft::Limits::derive` already derives:
-  the memory stated over `size_of::<Entry>()`, and a message's payload over `ENTRY_FIXED_BYTES`. The fix is to drop
-  the overrides and state the memory as the budget's room for queues (MB.1) in place of the picked `64 << 20`.
+**Derivations for the numbers still picked.**
+- `FRAMING_BYTES` is derived (lane constants-19), a format value: what a wire record adds past the command its one
+  entry carries. That is the record's fixed bytes with its classic commit and checksum (`MESSAGE_RECORD_FIXED_BYTES`)
+  and an incarnation and end (`MESSAGE_TOLD_BYTES`), counted for any record; the entry's fixed bytes
+  (`ENTRY_FIXED_BYTES`, hyper-raft `wire.rs`); its context (the request identity `Actor::context` writes: four u64s);
+  and what a prepared transaction's encoding adds to its pages (`replication::COMMAND_ENVELOPE`, EN.1). It was a
+  picked 2 MiB. An image's record is framed apart (`IMAGE_FRAMING_BYTES`): the record's bytes, the snapshot's
+  presence, data length, index and term, and a `ConfState` of four sets of at most `MEMBERS` eight-byte ids, beside
+  the pages' encoding of its budget (`replication::image_envelope`). An image's cap is the most whose record fits a
+  wire record's room (`image_within`).
+- `unstable_entries` and `entries_per_message` are no longer overridden (lane constants-19). `hyper_raft::Limits::derive`
+  derives them, the first from the memory stated over `size_of::<Entry>()` and the second from a message's payload
+  over `ENTRY_FIXED_BYTES`. The memory stated is the budget's room for queues (MB.1), read at open, in place of the
+  picked `64 << 20`. `pending_reads` stays the command queue's slots, which hold every read asked, and `proposals`
+  stays one, since one command at a time crosses ReadIndex.
 - `COMMANDS` (64) is the command queue's slots. Its bytes are the memory room and its calls are counted by the
   learned message rate (QB.1, lane constants-19). The slots are what the owner takes in an election timeout, counted in
   messages (`Drain::bound(..).messages`), at most the budget's room over the smallest input's charge.

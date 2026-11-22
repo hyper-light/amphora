@@ -82,14 +82,14 @@ const fn pages_envelope(budget: usize) -> usize {
 /// What a prepared transaction's encoding adds to its pages, at the most: the baseline's prefix and
 /// declaration, its base's index and term, and its pages' envelope. A read set rides in what an
 /// entry leaves of it and of the pages' budget, or goes without one (`Prepared::encode`).
-const COMMAND_ENVELOPE: usize = BASELINE_DELTA
+pub(crate) const COMMAND_ENVELOPE: usize = BASELINE_DELTA
     .len()
     .saturating_add(BOOTSTRAP_MOST)
     .saturating_add(U64_MOST.saturating_mul(2))
     .saturating_add(pages_envelope(COMMAND_BYTES));
 /// What an image's encoding adds to its `budget` bytes of pages, at the most: the baseline's prefix
 /// and declaration, and its pages' envelope.
-const fn image_envelope(budget: usize) -> usize {
+pub(crate) const fn image_envelope(budget: usize) -> usize {
     BASELINE_SNAPSHOT
         .len()
         .saturating_add(BOOTSTRAP_MOST)

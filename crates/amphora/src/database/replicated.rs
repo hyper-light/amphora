@@ -30,10 +30,47 @@ use hyper_raft::wire::Record;
 // one (`queue_bounds`; QB.1).
 const COMMANDS: usize = 64;
 pub(crate) const MEMBERS: usize = 64;
-/// The framing a wire record adds past the entry or image it carries. Still picked (lane
-/// constants, the next piece: derived from the measured message sizes).
-const FRAMING_BYTES: usize = 2 << 20;
+/// Format (hyper-raft `wire.rs`): what a message record adds past its entries or image, at the
+/// most: its header, fixed body, classic commit and checksum, and an incarnation and end
+/// (`MESSAGE_TOLD_BYTES`), which a leader's records don't carry but are counted for any record.
+const RECORD_BYTES: usize = hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES
+    .saturating_add(hyper_raft::wire::MESSAGE_TOLD_BYTES);
+/// Format: an entry's context, the request identity `Actor::context` writes: four `u64`s.
+const CONTEXT_BYTES: usize = 4 * 8;
+/// Format: the framing a wire record adds past the command its one entry carries (QB.1, lane
+/// constants-19): the record's, the entry's fixed bytes (hyper-raft `ENTRY_FIXED_BYTES`), its
+/// context, and what a prepared transaction's encoding adds to its pages
+/// (`replication::COMMAND_ENVELOPE`). Derived, no longer the picked 2 MiB.
+const FRAMING_BYTES: usize = RECORD_BYTES
+    .saturating_add(hyper_raft::wire::ENTRY_FIXED_BYTES)
+    .saturating_add(CONTEXT_BYTES)
+    .saturating_add(crate::replication::COMMAND_ENVELOPE);
+/// A message record that carries one command whole.
 const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(FRAMING_BYTES);
+/// Format (hyper-raft `wire.rs`, `Snapshot` and `ConfState`): what a wire record adds past an
+/// image's data, at the most: the record's; the snapshot's presence, data length, index and term;
+/// and its configuration's auto-leave flag, four set lengths and at most `MEMBERS` ids of eight
+/// bytes in each of its four sets.
+const IMAGE_FRAMING_BYTES: usize = RECORD_BYTES
+    .saturating_add(1 + 4 + 2 * 8)
+    .saturating_add(1 + 4 * 4)
+    .saturating_add(MEMBERS.saturating_mul(4 * 8));
+/// The wire record of an image of `image` bytes of pages, at the most: its data, the pages'
+/// encoding (`replication::image_envelope`) and the record's framing.
+fn image_record(image: u64) -> u64 {
+    let pages = usize::try_from(image).unwrap_or(usize::MAX);
+    let framed = pages
+        .saturating_add(crate::replication::image_envelope(pages))
+        .saturating_add(IMAGE_FRAMING_BYTES);
+    u64::try_from(framed).unwrap_or(u64::MAX)
+}
+/// The most bytes of pages an image may take whose wire record fits `wire`: the record's room less
+/// its framing, less the pages' encoding of that room (an encoding grows with its pages, so that
+/// of the larger room is at least that of the image's).
+fn image_within(wire: usize) -> usize {
+    let room = wire.saturating_sub(IMAGE_FRAMING_BYTES);
+    room.saturating_sub(crate::replication::image_envelope(room))
+}
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
 // randomized election and heartbeat, in the core's fixed tick counts, use this owner clock, never
 // host votes. The period between ticks is learned where the owner runs (`pace`): this is only
@@ -1074,7 +1111,7 @@ fn owner_image_room() -> Result<usize, Refusal> {
     let room = usize::try_from(room).unwrap_or(usize::MAX);
     // The command queue holds the image's wire record beside one application call (`queue_bounds`).
     let wire = room.saturating_sub(api::REQUEST_MAX);
-    Ok(crate::replication::image_room()?.min(wire.saturating_sub(FRAMING_BYTES)))
+    Ok(crate::replication::image_room()?.min(image_within(wire)))
 }
 
 /// The owner's queue bounds now (QB.1).
@@ -1114,7 +1151,6 @@ fn queue_bounds(
 ) -> Result<Bounds, Refusal> {
     let room = crate::memory::process().room(crate::memory::Use::Queues)?;
     let image = u64::try_from(crate::replication::image_room()?).unwrap_or(u64::MAX);
-    let framing = u64::try_from(FRAMING_BYTES).unwrap_or(u64::MAX);
     let request = u64::try_from(api::REQUEST_MAX).unwrap_or(u64::MAX);
     // A wire record's room: an image's and its framing, no more than an equal share of the queue's
     // room between the wire record and the application calls beside it, nor than the room less one
@@ -1122,8 +1158,7 @@ fn queue_bounds(
     // whole room: held back whole, it would leave the calls one call's room. The equal share among
     // a queue's holders is the rule the logs and the image share the disk by
     // (`log_bound::image_disk_room`; QB.1).
-    let record = image
-        .saturating_add(framing)
+    let record = image_record(image)
         .min(room.checked_div(2).unwrap_or(0))
         .min(room.saturating_sub(request));
     // The command queue's bytes: the room, which holds one wire record beside one call.
@@ -1716,7 +1751,7 @@ fn open(
         Duration::ZERO,
         0,
     )?;
-    machine.set_snapshot_bytes(first.wire.saturating_sub(FRAMING_BYTES));
+    machine.set_snapshot_bytes(image_within(first.wire));
     let file = DeviceFile::open(
         log_path,
         true,
@@ -2026,16 +2061,20 @@ pub(super) fn validate_durability(
     Ok(())
 }
 fn settings(id: u64, durability: &Durability) -> Result<hyper_durable::Settings, Refusal> {
+    // The core's memory is the memory budget's room for queues (MB.1), where its messages and
+    // unstable entries wait: `Limits::derive` takes its unstable entries, pending messages and
+    // entries a message carries from it and from a message's bytes, no picked counts (QB.1, lane
+    // constants-19). The reads pending are the command queue's slots, which hold every read asked,
+    // and one proposal at a time crosses ReadIndex (the module's head).
+    let memory = crate::memory::process().room(crate::memory::Use::Queues)?;
     let mut limits = hyper_raft::Limits::derive(hyper_raft::Stated {
         message: MESSAGE_BYTES,
         members: MEMBERS,
-        memory: 64 << 20,
+        memory: usize::try_from(memory).unwrap_or(usize::MAX),
         depth: 1,
     })
     .map_err(unavailable)?;
     limits.pending_reads = COMMANDS;
-    limits.unstable_entries = 1024;
-    limits.entries_per_message = 1024;
     limits.proposals = 1;
     // The replicated class: a commit on entries held in memory across fates (hyper-raft R-8), and a
     // leader applying what its own term committed before its own write is durable (R-6).
