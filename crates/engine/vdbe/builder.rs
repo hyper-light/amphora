@@ -339,6 +339,8 @@ pub struct ProgramBuilder {
     pub(crate) planned_tables: Vec<crate::row_changes::PlannedTable>,
     /// Amphora (PL.13, lane replan-5): the filter shares the plan read (`filter_shares.rs`).
     pub(crate) planned_filters: Vec<crate::filter_shares::PlannedFilter>,
+    /// Amphora (PL.13, lane replan-6): the subquery rows the plan read (`subquery_rows.rs`).
+    pub(crate) planned_subqueries: Vec<crate::subquery_rows::PlannedSubquery>,
     /// Amphora (PL.9): the table an INSERT or DELETE folds its change count into.
     pub(crate) write_target: Option<crate::row_changes::WriteTarget>,
     pub resolve_type: ResolveType,
@@ -784,6 +786,7 @@ impl ProgramBuilder {
             reads_parameter_values: false,
             planned_tables: Vec::new(),
             planned_filters: Vec::new(),
+            planned_subqueries: Vec::new(),
             write_target: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
@@ -2593,6 +2596,7 @@ impl ProgramBuilder {
             reads_parameter_values: self.reads_parameter_values,
             planned_tables: self.planned_tables,
             planned_filters: self.planned_filters,
+            planned_subqueries: self.planned_subqueries,
             write_target: self.write_target,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql

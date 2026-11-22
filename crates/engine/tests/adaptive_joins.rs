@@ -671,3 +671,84 @@ fn pl_13_a_sorters_input_past_the_estimate_plans_again() {
         assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
     }
 }
+
+/// The rows of one prepared statement's run, in order, the statement reset after.
+fn run_rows(stmt: &mut amphora_engine::Statement) -> Vec<String> {
+    let out = stmt
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    stmt.reset().unwrap();
+    out
+}
+
+/// Do: a stored subquery result whose filter keeps one row in a hundred as ANALYZE sampled it and
+/// every row after an UPDATE: a CTE referenced twice (stored once, shared) and a GROUP BY in a
+/// materialized CTE; each run with adaptive joins off, then on twice in one prepared statement,
+/// then once more prepared anew. Expect: one answer every way; off, no stored result counted; on,
+/// the fill's rows counted against the estimate, past its error stored and the statement planned
+/// again once; the second run and a new statement plan on the counted rows and nothing plans again
+/// (PL.13, lane replan-6, T-PL.13.7: the stored subquery result's materialization point).
+#[test]
+fn t_pl_13_7_a_stored_subquery_result_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("subquery.db");
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 2000, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE b SET v = v % 50").unwrap();
+    for (case, sql, rows_expected) in [
+        (
+            "a CTE referenced twice",
+            "WITH c AS (SELECT id, k FROM b WHERE v < 50) SELECT x.id, x.k, y.k FROM c AS x JOIN c AS y ON y.id = x.id ORDER BY x.id",
+            5000,
+        ),
+        (
+            "a GROUP BY subquery",
+            "WITH g AS MATERIALIZED (SELECT k, count(*) AS n FROM b WHERE v < 50 GROUP BY k) SELECT b.id, g.n FROM b JOIN g ON g.k = b.k ORDER BY b.id",
+            5000,
+        ),
+    ] {
+        conn.set_adaptive_joins(false);
+        let checks = conn.adaptive_subquery_checks();
+        let off = run_rows(&mut conn.prepare(sql).unwrap());
+        assert_eq!(off.len(), rows_expected, "{case}: the rows");
+        assert_eq!(conn.adaptive_subquery_checks(), checks, "{case}: counted off");
+
+        conn.set_adaptive_joins(true);
+        let replans = conn.adaptive_replans();
+        let mut held = conn.prepare(sql).unwrap();
+        assert_eq!(run_rows(&mut held), off, "{case}: on and off differ");
+        assert!(
+            conn.adaptive_subquery_checks() > checks,
+            "{case}: the stored result was not counted"
+        );
+        assert_eq!(
+            conn.adaptive_replans() - replans,
+            1,
+            "{case}: planned again once"
+        );
+        let (checks, replans) = (conn.adaptive_subquery_checks(), conn.adaptive_replans());
+        assert_eq!(run_rows(&mut held), off, "{case}: the second run's answer");
+        assert!(
+            conn.adaptive_subquery_checks() > checks,
+            "{case}: the second fill was not counted"
+        );
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+        assert_eq!(
+            run_rows(&mut conn.prepare(sql).unwrap()),
+            off,
+            "{case}: a new statement's answer"
+        );
+        assert_eq!(
+            conn.adaptive_replans(),
+            replans,
+            "{case}: a new statement planned again"
+        );
+    }
+}

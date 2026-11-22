@@ -1997,6 +1997,9 @@ pub struct PreparedProgram {
     /// Amphora (PL.13, lane replan-5): the filter shares the plan read, so a run can tell a build
     /// stored another.
     pub planned_filters: Vec<crate::filter_shares::PlannedFilter>,
+    /// Amphora (PL.13, lane replan-6): the subquery rows the plan read, so a run can tell a fill
+    /// stored another count.
+    pub planned_subqueries: Vec<crate::subquery_rows::PlannedSubquery>,
     /// Amphora (PL.9): the table an INSERT or DELETE folds its change count into.
     pub write_target: Option<crate::row_changes::WriteTarget>,
     pub sql: String,

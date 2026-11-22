@@ -1270,6 +1270,11 @@ impl Statement {
                 .planned_filters
                 .iter()
                 .any(|filter| filter.moved())
+            || self
+                .program
+                .planned_subqueries
+                .iter()
+                .any(|subquery| subquery.moved())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

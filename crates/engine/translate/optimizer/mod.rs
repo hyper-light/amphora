@@ -2359,6 +2359,17 @@ fn base_row_estimate(
         Table::FromClauseSubquery(subquery) => match subquery.plan.as_ref() {
             Plan::Select(plan) => {
                 if let Some(rows) = plan.estimated_output_rows {
+                    // Amphora (PL.13, lane replan-6): the rows a fill of this very subquery counted
+                    // past its estimate stand in for the estimate, and the plan notes the rows it
+                    // read. A correlated subquery's rows are per outer row: not read.
+                    let rows = match (subquery.identity, params.plan_values.as_deref()) {
+                        (Some(identity), Some(values))
+                            if !crate::translate::plan::plan_is_correlated(&subquery.plan) =>
+                        {
+                            values.subquery_rows(identity, rows)
+                        }
+                        _ => rows,
+                    };
                     return RowCountEstimate::AnalyzeStats(rows.max(1.0));
                 }
                 RowCountEstimate::hardcoded_fallback(params)

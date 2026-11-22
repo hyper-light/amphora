@@ -347,6 +347,21 @@ pub struct SorterCountedData {
     pub filter: Option<FilteredBuild>,
 }
 
+/// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
+/// uncorrelated FROM-clause subquery's stored result, filled, its rows counted against the rows
+/// the plan read for it.
+#[derive(Debug, Clone)]
+pub struct SubqueryCountedData {
+    /// The register holding the rows the fill stored.
+    pub rows_reg: usize,
+    /// Where a count past the estimate is stored for the planner (`subquery_rows`).
+    pub rows: crate::sync::Arc<crate::subquery_rows::CountedRows>,
+    /// The rows the plan read for the subquery: its estimate, or a count a fill stored.
+    pub planned_rows: f64,
+    /// The relative standard error of the statistics the estimate came from.
+    pub estimate_error: f64,
+}
+
 /// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
 /// them. Most seeks have no such columns, so the empty mask is a null pointer
 /// and only IS-seeks allocate (boxed to keep Insn small).
@@ -2417,6 +2432,14 @@ pub enum Insn {
     SorterCounted {
         data: Box<SorterCountedData>,
     },
+
+    /// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
+    /// uncorrelated FROM-clause subquery's stored result, once filled, counted against the plan's
+    /// estimate, as `BuildCounted` counts a build: past its error the count is stored for the
+    /// planner and the statement planned again.
+    SubqueryCounted {
+        data: Box<SubqueryCountedData>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2672,6 +2695,7 @@ impl InsnVariants {
             InsnVariants::TreePages => execute::op_tree_pages,
             InsnVariants::BuildCounted => execute::op_build_counted,
             InsnVariants::SorterCounted => execute::op_sorter_counted,
+            InsnVariants::SubqueryCounted => execute::op_subquery_counted,
         }
     }
 }

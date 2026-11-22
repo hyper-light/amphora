@@ -2756,6 +2756,18 @@ pub fn insn_to_row(
                 ),
             },
         ),
+        Insn::SubqueryCounted { data } => (
+            "SubqueryCounted",
+            i64::try_from(data.rows_reg).unwrap_or(i64::MAX),
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            format!(
+                "count r[{}] against the subquery's {} rows",
+                data.rows_reg, data.planned_rows
+            ),
+        ),
         Insn::MorselNext {
             dest_start,
             count,
