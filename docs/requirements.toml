@@ -1140,3 +1140,19 @@ tests = [
   { id = "T-G6.3.2", text = "translate::optimizer::plan_hints::tests::t_g6_3_2_* — passes when the guard admits a faster hint, drops it once its held-out runs are slower, and never admits one no faster" },
   { id = "T-G6.3.3", text = "translate::optimizer::plan_hints::tests::t_g6_3_3_memory_stays_bounded — passes when the model's size is constant over 10,000 runs and the guard holds no more classes than it was given" },
 ]
+
+# lane xgroup-lan: G13 step 3's measurement (kiln goal c2e7f9ebe5678ec5a6edc38baec7f3f8; xgroup.md,
+# "Over the transport" and "Decision (lane xgroup-lan)"). AC-T1.10.2 and AC-T1.10.5 are the measures.
+[[own]]
+id = "T1.10.X"
+title = "Transactions across groups over the transport, and the harness that chooses the protocol (G13 step 3)"
+criteria = [
+  { id = "AC-T1.10.X1", text = "A cross-group step to a group on another node is one Request::Step over transport::Nodes (wire version 8), applied by the group's owner as a local step is, the coordinator's commit stamp carried in and the group's carried back" },
+  { id = "AC-T1.10.X3", text = "A group that fails mid-commit leaves every transaction committed in every group or aborted in every group once it answers again; a begin that finds the coordinator full waits for a transaction to finish, at most in_flight of them waiting (lane xgroup-lan-2)" },
+  { id = "AC-T1.10.X2", text = "examples/xgroup_lan.rs bench records p50, p99, p99.9 commit latency and commits a second per protocol to bench/records; elle checks seeded histories over the transport; sizes, durations, seeds and endpoints are inputs (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-T1.10.X1", text = "xgroup::lan::tests::ac_t1_10_2_the_lan_harness_measures_both_protocols_over_two_endpoints — passes when both protocols commit across two groups reached only over the transport, none unknown, percentiles in order" },
+  { id = "T-T1.10.X3", text = "xgroup::tests::t_t1_10_x3_a_group_failure_at_every_step_ends_committed_or_aborted_everywhere — passes when each of three groups failing at every coordinator input, its in-flight step landed or not, ends committed or aborted in every group, as answered, under both protocols, both ends reached" },
+  { id = "T-T1.10.X2", text = "xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly — passes when three seeds of each protocol over the transport commit across groups with no anomaly and no unknown outcome; ac_t1_10_5_the_lan_check_finds_a_lost_update_and_an_aborted_read holds the check to finding them" },
+]

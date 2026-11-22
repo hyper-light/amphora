@@ -452,8 +452,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
   on a group's database (`Cluster`, each step one call to the group). A crashed coordinator's next incarnation fences
   the old one and finishes what it left. Tested: a crash at every step (T-T1.10.1) and seeded runs with lost and late
-  steps and crashes, Elle-style. Left: the LAN p99 (AC-T1.10.2) on multi-node groups and the 10,000-seed run, which
-  decide between the two; SQL sessions across groups (AC-T1.10.1).
+  steps and crashes, Elle-style. Over the transport (lane xgroup-lan): a step to another node's group is one
+  `Request::Step` through `transport::Nodes`, and `examples/xgroup_lan.rs` measures both protocols (bench) and checks
+  seeded histories (elle); the decision record's rule is written, its numbers blank. Left: the coordinator's LAN p99
+  (AC-T1.10.2) and 10,000-seed run, which decide between the two, once split-merge-11's network listener lets
+  nodes sit on separate machines; SQL sessions across groups (AC-T1.10.1). Lane xgroup-lan-2: a group failing
+  mid-commit is tested at every step (T-T1.10.X3); a begin that finds the coordinator full waits for a finished
+  transaction instead of being refused, so the harness's clients run back to back; both protocols stay until the
+  coordinator's LAN numbers decide (xgroup.md, "Decision (lane xgroup-lan)").
 - **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
   stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
   store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
