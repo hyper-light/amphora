@@ -266,9 +266,12 @@ fn sh(cmd: &str) -> String {
 fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
     let dir = o.dir.join(target);
     Ok(match target {
-        "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false)?),
+        "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false, false)?),
+        // PL.13 (lane replan-6): the same engine with adaptive joins and re-planning on
+        // (`Connection::set_adaptive_joins`), on a copy of its own; `amphora` is its control.
+        "amphora-adaptive" => Box::new(Amphora::open(&dir, o.cache_kib, false, true)?),
         // QT.7: the same engine, its scans by column batches, on a copy of its own.
-        "amphora-vectorized" => Box::new(Amphora::open(&dir, o.cache_kib, true)?),
+        "amphora-vectorized" => Box::new(Amphora::open(&dir, o.cache_kib, true, false)?),
         "sqlite" => Box::new(Sqlite::open(&dir, o.cache_kib)?),
         "duckdb" => Box::new(Duck::open(&dir, Some(1))?),
         // A database of its own: DuckDB locks its file to one database a process.
@@ -282,7 +285,7 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
             }
             Box::new(Postgres::open(&format!("{} dbname={name}", o.dsn))?)
         }
-        t => anyhow::bail!("--planner runs amphora, amphora-vectorized, sqlite, duckdb, duckdb-mt or postgres, not {t}"),
+        t => anyhow::bail!("--planner runs amphora, amphora-adaptive, amphora-vectorized, sqlite, duckdb, duckdb-mt or postgres, not {t}"),
     })
 }
 

@@ -128,6 +128,8 @@ pub struct Amphora {
     cache_kib: i64,
     /// QT.7: its scans decode each leaf once into column batches (`Connection::set_vectorized_scans`).
     vectorized: bool,
+    /// PL.13 (lane replan-6): adaptive joins and re-planning on (`Connection::set_adaptive_joins`).
+    adaptive: bool,
 }
 
 /// One table access's or join's estimate and count, as the record keeps it.
@@ -142,7 +144,7 @@ pub struct Count {
 }
 
 impl Amphora {
-    pub fn open(dir: &Path, cache_kib: i64, vectorized: bool) -> anyhow::Result<Self> {
+    pub fn open(dir: &Path, cache_kib: i64, vectorized: bool, adaptive: bool) -> anyhow::Result<Self> {
         use amphora_engine::{ConnectOpts, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect};
         std::fs::create_dir_all(dir)?;
         let io: Arc<dyn amphora_engine::IO> = Arc::new(PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
@@ -154,7 +156,9 @@ impl Amphora {
         counted.set_row_counters(true);
         conn.set_vectorized_scans(vectorized);
         counted.set_vectorized_scans(vectorized);
-        let mut a = Self { io, _db: db, conn, counted, cache_kib, vectorized };
+        conn.set_adaptive_joins(adaptive);
+        counted.set_adaptive_joins(adaptive);
+        let mut a = Self { io, _db: db, conn, counted, cache_kib, vectorized, adaptive };
         for c in [a.conn.clone(), a.counted.clone()] {
             a.exec_on(&c, &format!("PRAGMA cache_size = -{cache_kib}"))?;
         }
@@ -305,7 +309,11 @@ impl Amphora {
 
 impl Target for Amphora {
     fn name(&self) -> String {
-        if self.vectorized { "amphora-vectorized".into() } else { "amphora".into() }
+        match (self.vectorized, self.adaptive) {
+            (true, _) => "amphora-vectorized".into(),
+            (false, true) => "amphora-adaptive".into(),
+            (false, false) => "amphora".into(),
+        }
     }
 
     fn dialect(&self) -> Dialect {
