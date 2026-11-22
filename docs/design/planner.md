@@ -1596,6 +1596,11 @@ after a bushy plan that differs from the nested loops'.
   the worst kind's spread between batch means in page reads (`sqrt(s_kind^2 + s_page^2)`); it is 0
   under `Blend` and before any spread is measured, so only a tie keeps the order then. A custom
   plan (decision pl12) carries nothing.
+- *LEFT JOINs after a bushy plan* (`optimizer/join.rs`, `bushy_core`, T-PL.8.2). The tail after
+  the core of inner joins may hold LEFT JOINs as well as semi and anti joins: each is a loop over
+  its right table for each row of the plan so far, read as the outer join it is and null-extended
+  where none matches, in FROM order. `bushy_build_groups` checks only a run and its probe, so the
+  tail's outer joins need nothing new from the emitter.
 
 **Why.** Ada's method is A/B for every design decision: today's rule stays as the control, and each
 candidate is forced into its own failure. A plan made again on the same facts should be the same
@@ -1612,14 +1617,19 @@ flips in 200 batches, `BatchMeans` 1 to 26; `Blend` follows every change within 
 `join::tests::t_pl_8_a_carried_join_order_stands_within_its_margin`: the five-table chain keeps its
 order at no margin and at a margin just under the reversed order's extra cost, takes the reversed
 order just past it, and ignores a carried order that isn't each table once.
+`bushy_search_tests::t_pl_8_2_left_joins_follow_a_bushy_plan`: the fact query's core followed by
+LEFT JOINs whose ON terms read the probe's table, a run's table, and another LEFT JOIN's table,
+planned bushy and answering (null-extended rows counted) as nested loops do.
 `learned_costs::ab_tests::t_pl_8_cost_margin_is_the_weights_error` pins the margin's formula. The
 runs of record are the coordinator's: `cargo test -p amphora-engine --lib learned_costs::ab_tests
 -- --nocapture`, with more seeds and batches.
 
 **Not yet built.** The fast plan first with the exact search in the background: a statement would
 run the greedy plan at once and take the search's plan when the search completes (an event, not a
-timer). A bushy plan's carried shape (only left-deep orders are carried). Two query blocks with the
-same tables in the same FROM order share one key.
+timer); the engine has no worker to run a search beside a connection, so where it runs needs a
+decision. A bushy plan's carried shape (only left-deep orders are carried). Two query blocks with
+the same tables in the same FROM order share one key. LEFT JOINs inside a bushy run or as its
+probe (the emitter's build groups refuse them).
 
 **Falsified by.** A statement planned again on unchanged statistics and weights that picks another
 join order; `BatchMeans` flipping a plan as often as `Blend` on the same series; a carried order

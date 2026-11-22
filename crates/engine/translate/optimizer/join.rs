@@ -1968,8 +1968,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // row. The pairs are walked on loops over the subsets found, not recursion (CLAUDE.md §11), and
     // counted against what `searchable_subsets` left of `JOIN_SEARCH_BUDGET`: once it runs out, the
     // left-deep plan found so far stands, today's search (decision 19).
-    // The semi and anti joins after the core (`bushy_core`) follow its bushy plan as its last
-    // loops, in their order, each read by a loop (lane pl8-15).
+    // The semi, anti and LEFT JOINs after the core (`bushy_core`) follow its bushy plan as its
+    // last loops, in their order, each read by a loop (lanes pl8-15 and pl8-16).
     if let Some(core) = bushy_core(
         joined_tables,
         table_references,
@@ -2151,8 +2151,9 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         prefix_cardinalities,
                         inner_joins: vec![run],
                     };
-                    // The semi and anti joins after the core, each a loop over its table for each
-                    // row of the plan so far, as the left-deep search adds a table (lane pl8-15).
+                    // The semi, anti and LEFT JOINs after the core, each a loop over its table for
+                    // each row of the plan so far, as the left-deep search adds a table (lanes
+                    // pl8-15 and pl8-16: a LEFT JOIN's table is read as the outer join it is).
                     for tail in core..num_tables {
                         let (Some(tail_table), Some(tail_constraints)) =
                             (joined_tables.get(tail), constraints.get(tail))
@@ -2167,7 +2168,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             join_order.push(JoinOrderMember {
                                 table_id: joined.internal_id,
                                 original_idx: table,
-                                is_outer: false,
+                                is_outer: joined.join_info.as_ref().is_some_and(|j| j.is_outer()),
                             });
                         }
                         let joined = join_lhs_and_rhs(
@@ -2250,12 +2251,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
 /// PL.8: the tables the search may plan bushy, `joined_tables[..core]`, None where it tries no
 /// bushy plan. The core's tables are inner joins free to move (no conflict rule orders them); the
-/// rest, `joined_tables[core..]`, are semi and anti joins (EXISTS, NOT EXISTS), which CD-C keeps
-/// after every table before them and the emitter runs as the last loops (`required_lhs_by_table`),
-/// so a bushy plan of the core is followed by them in their order (lane pl8-15). None for fewer
-/// than three tables in the core, an outer or lateral join or one that keeps its place, a semi or
-/// anti join before an inner one, a RIGHT or FULL JOIN, or a connection that asks for nested loops
-/// only: the cases the emitter's build groups refuse (`bushy_build_groups`) or the tail can't follow.
+/// rest, `joined_tables[core..]`, are semi and anti joins (EXISTS, NOT EXISTS) and LEFT JOINs,
+/// which CD-C keeps after every table before them and the emitter runs as the last loops
+/// (`required_lhs_by_table`), so a bushy plan of the core is followed by them in their order (lane
+/// pl8-15; LEFT JOINs, lane pl8-16: each is a loop over its right table for each row of the plan
+/// so far, null-extended where none matches, as in a left-deep plan). None for fewer than three
+/// tables in the core, a lateral join or one that keeps its place, a semi, anti or LEFT JOIN before
+/// an inner one, a RIGHT or FULL JOIN, or a connection that asks for nested loops only: the cases
+/// the emitter's build groups refuse (`bushy_build_groups`) or the tail can't follow.
 fn bushy_core(
     joined_tables: &[JoinedTable],
     table_references: &TableReferences,
@@ -2267,14 +2270,16 @@ fn bushy_core(
     {
         return None;
     }
-    let semi_or_anti = |table: &JoinedTable| {
+    let follows = |table: &JoinedTable| {
         table.join_info.as_ref().is_some_and(|info| {
-            info.is_semi_or_anti() && !info.is_outer() && !info.no_reorder && !info.lateral
+            ((info.is_semi_or_anti() && !info.is_outer()) || info.join_type == JoinType::LeftOuter)
+                && !info.no_reorder
+                && !info.lateral
         })
     };
     let core = joined_tables
         .iter()
-        .position(semi_or_anti)
+        .position(follows)
         .unwrap_or(joined_tables.len());
     let (inner, tail) = joined_tables.split_at_checked(core)?;
     let free = inner.iter().all(|table| {
@@ -2292,7 +2297,7 @@ fn bushy_core(
             }
         })
     });
-    (core >= 3 && free && ordered && tail.iter().all(semi_or_anti)).then_some(core)
+    (core >= 3 && free && ordered && tail.iter().all(follows)).then_some(core)
 }
 
 fn has_connected_legal_candidate(

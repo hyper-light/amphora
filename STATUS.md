@@ -978,7 +978,8 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   flips a plan; semi and anti joins after the inner joins follow a bushy plan (T-PL.8.2).
   Lane pl8-16 (docs/design/planner.md "Decision (lane pl8-16)"): the old blend rule is back behind
   `WeightRule` as the control for the A/B with batch means (T-PL.8.8), and a statement planned
-  again keeps its join order unless the new best is cheaper past the weights' error (T-PL.8.9).
+  again keeps its join order unless the new best is cheaper past the weights' error (T-PL.8.9);
+  LEFT JOINs after the inner joins follow a bushy plan as semi and anti joins do (T-PL.8.2).
   Not built: the search budget derived from a plan-time target, outer joins inside a bushy plan,
   and semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1
   is open.

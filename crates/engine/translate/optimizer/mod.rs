@@ -4020,6 +4020,38 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        /// PL.8 (T-PL.8.2, lane pl8-16): the fact query's core followed by a LEFT JOIN of a
+        /// dimension whose ON term reads the probe's table (`f2`) or a table of the run (`f1`),
+        /// matching some rows and not others (ids past 50 have no row), then two LEFT JOINs in a
+        /// row. Expect: the core still planned bushy (`BUSHY_PLANS`), the LEFT JOINs after it as
+        /// loops, and every answer, null-extended rows counted, the plan of nested loops gives.
+        #[test]
+        fn t_pl_8_2_left_joins_follow_a_bushy_plan() {
+            let (_db, conn) = facts();
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            let core = "FROM d1, f1, f2, d2";
+            let filter = "WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id \
+                          AND d2.id = 7";
+            for left in [
+                "LEFT JOIN d2 s ON s.id = f2.id % 60",
+                "LEFT JOIN d2 s ON s.id = f1.id % 60",
+                "LEFT JOIN d1 t ON t.id = f1.id % 70 LEFT JOIN d2 s ON s.id = t.id + 5",
+            ] {
+                let sql = format!("{select} {core} {left} {filter}");
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, &sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                BUSHY_PLANS.with(|plans| plans.set(0));
+                let searched = rows(&conn, &sql);
+                let made_bushy = BUSHY_PLANS.with(Cell::get);
+                let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                eprintln!("bushy={made_bushy}: {sql}: {plan:?}");
+                assert!(!nested_loops.is_empty(), "{sql}");
+                assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
+                assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
+            }
+        }
+
         /// PL.8 (T-PL.8.2, lane pl8-15): the fact queries with an EXISTS and a NOT EXISTS on a
         /// dimension, each correlated with the probe's table (`f2`) or a table of the run (`f1`):
         /// semi and anti joins, which CD-C keeps after every table before them and the emitter runs
