@@ -490,6 +490,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   every quiet snapshot, every row compared, with deferral and cost instruments (T-T1.12.C4 to C6).
   The restore benchmark against PostgreSQL+pgBackRest and SQLite+Litestream: `bench/backup_restore.sh`
   (AC-T1.12.3; one tiny instance run, the measurement is the coordinator's).
+  Lane backups-6 (not yet built or run: written while kiln was down): Amphora's bench leg in three
+  processes, backup, restore and count, every leg timed the same way in one image (AC-T1.12.3);
+  checks that wait on events, never timers, counting the database's calls in flight, with a
+  minimum share (`CheckPolicy::Shared`) to A/B against yielding fully, the replay and the integrity
+  check pausing in steps (T-T1.12.C7, C8); the peer store, an archive in another process's folder
+  over the owner transport (`transport::PeerStore`, `PeerBlobs`; T-T1.12.N1).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
