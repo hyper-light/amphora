@@ -23,6 +23,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Amphora's own cases. Amphora (in memory, on a file, through the local owner) and the simulator
   pass it, and a seeded differential test holds the simulator's answers to Amphora's
   (`crates/amphora/tests/records_conformance.rs`).
+- **The Records suite past 200 cases** (CP-T1.5, AC-T1.5.3; kiln goal 0d717247, lanes kiln-records-2
+  and -3): `amphora_api::conformance` holds 209 cases, each id once: kiln-seams' RECORDS-1 to 14,
+  Amphora's three, and one case per row of `crates/api/src/conformance/table.rs` (key and value
+  shapes, each request with each refused family name and key, scan, snapshot and feed paging at each
+  page size, limits, transaction bounds, conditions, snapshots at each step of a history, `Ahead`,
+  waits). Amphora's Namespace (in memory, on a file, through the local owner, one voter and three)
+  and `SimRecords` pass every case with no answer different. kiln's side: `docs/records-inventory.md`
+  (kiln main) lists every SQLite table and JSON file kiln keeps, held to its code by a test. Open:
+  goals, plans and deploys moved onto Records and compared field by field; the production copy.
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
 - **The design's index and the README** (AC-T1.2.3, T-T1.13.2; lane docs): `docs/design.md` gives every
   decision of `docs/design/` one line and a link, held to the records by
@@ -929,8 +938,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lane pl8-4 (docs/design/planner.md "Decision (lane pl8-4)"): a hash join's build side can be a
   run of tables joined among themselves while the loops before the probe stay loops; the emitter
   runs such bushy plans and refuses other shapes with a typed error.
-  Not built: the search over connected complement pairs (DPccp) that would choose bushy plans, and
-  semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
+  Lanes pl8-7 to pl8-9 (docs/design/planner.md "Decision (lane pl8-9)"): the search pairs connected
+  subsets with their connected complements (DPccp) and picks the bushy plan where it costs less; a
+  test's data shows it picked and answering as nested loops do (T-PL.8.2).
+  Not built: the search budget derived from a plan-time target, and semi and anti joins placed
+  before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted
