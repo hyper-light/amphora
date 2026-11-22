@@ -2231,14 +2231,17 @@ impl Connection {
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
         if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
-            mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
-        } else {
-            let pager = self.pager.load();
-            pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie))
-                .map(|cookie| cookie.get())
+            // Amphora (G7 step 2, `AC-NS.2.1`): before the store's bootstrap publishes the
+            // header, page 1 holds it (`MvStore::header_published`).
+            if tx_id.is_some() || mv_store.header_published() {
+                return mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref());
+            }
         }
+        let pager = self.pager.load();
+        pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie))
+            .map(|cookie| cookie.get())
     }
 
     /// Non-blocking variant of [`Self::read_current_schema_cookie`]. The MVCC
@@ -2248,14 +2251,18 @@ impl Connection {
         use crate::types::IOResult;
         if let Some(mv_store) = self.mv_store().as_ref() {
             let tx_id = self.get_mv_tx_id();
-            let cookie =
-                mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())?;
-            Ok(crate::types::IOResult::Done(cookie))
-        } else {
-            let pager = self.pager.load();
-            let cookie = crate::return_if_io!(pager.with_header(|header| header.schema_cookie));
-            Ok(crate::types::IOResult::Done(cookie.get()))
+            // Amphora (G7 step 2, `AC-NS.2.1`): before the store's bootstrap publishes the
+            // header, page 1 holds it (`MvStore::header_published`): an open on the versioned
+            // storage reads its schema first.
+            if tx_id.is_some() || mv_store.header_published() {
+                let cookie =
+                    mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())?;
+                return Ok(IOResult::Done(cookie));
+            }
         }
+        let pager = self.pager.load();
+        let cookie = crate::return_if_io!(pager.with_header(|header| header.schema_cookie));
+        Ok(IOResult::Done(cookie.get()))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
