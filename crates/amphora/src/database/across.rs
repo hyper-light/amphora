@@ -30,7 +30,11 @@ use crate::xgroup::sql::Member;
 /// Writes the commit stamp of revision `at` of namespace `ns`, in the commit that makes it, on a
 /// writer that stamps its commits; a revision already stamped (a cross-group step's rows share one)
 /// keeps its stamp. An unbacked writer stamps nothing: it has no place in the order across groups.
-pub(super) fn stamp(db: &Db, ns: &str, at: Rev) -> anyhow::Result<()> {
+///
+/// The stamp is the cross-group clock's, in microseconds (lane split-merge-21, T-T1.9.R28): the
+/// writer's own fresh one, or `pinned`, the commit stamp a transaction across groups chose for all
+/// its rows in every group, which the writer's clock then takes in so its later commits are later.
+pub(super) fn stamp(db: &Db, ns: &str, at: Rev, pinned: Option<u64>) -> anyhow::Result<()> {
     let Some(hooks) = db.stamps() else {
         return Ok(());
     };
@@ -46,7 +50,13 @@ pub(super) fn stamp(db: &Db, ns: &str, at: Rev) -> anyhow::Result<()> {
     if stamped {
         return Ok(());
     }
-    let stamp = hooks.marks.next()?;
+    let stamp = match pinned {
+        Some(pinned) => {
+            hooks.marks.observe_micros(pinned)?;
+            pinned
+        }
+        None => hooks.marks.next_micros()?,
+    };
     db.query(
         "INSERT INTO __amphora_rev_stamps(namespace, rev, stamp) VALUES (?1, ?2, ?3)",
         [text(ns), integer(at)?, integer(stamp)?],
@@ -217,16 +227,16 @@ pub enum ReadPoint {
 fn cut(groups: &[(Database, Arc<Hooks>)], point: ReadPoint) -> Result<u64, Refusal> {
     let (mut earliest, mut latest) = (None::<u64>, 0u64);
     for (_, hooks) in groups {
-        let stamp = hooks.marks.next().map_err(unavailable)?;
+        let stamp = hooks.marks.next_micros().map_err(unavailable)?;
         earliest = Some(earliest.map_or(stamp, |e| e.min(stamp)));
         latest = latest.max(stamp);
     }
     let earliest = earliest.unwrap_or_default();
-    tracing::trace!(target: "amphora.records", event = "read_point_cut", point = ?point, groups = groups.len(), spread_ns = latest.saturating_sub(earliest), "a read across groups took its cut");
+    tracing::trace!(target: "amphora.records", event = "read_point_cut", point = ?point, groups = groups.len(), spread_us = latest.saturating_sub(earliest), "a read across groups took its cut");
     match point {
         ReadPoint::Latest => {
             for (_, hooks) in groups {
-                hooks.marks.observe(latest).map_err(unavailable)?;
+                hooks.marks.observe_micros(latest).map_err(unavailable)?;
             }
             Ok(latest)
         }
@@ -234,15 +244,19 @@ fn cut(groups: &[(Database, Arc<Hooks>)], point: ReadPoint) -> Result<u64, Refus
     }
 }
 
-/// The newest revision of `ns` here stamped at or before `at`: one below the first stamped after
-/// it (the stamps rise with the revisions), or the namespace's head when none is.
+/// The newest revision of `ns` here through which every revision is stamped at or before `at`:
+/// one below the oldest stamped after it, or the namespace's head when none is. A revision that
+/// resolves a transaction across groups carries the stamp its coordinator chose, which can be
+/// older than a revision before it (lane split-merge-21, T-T1.9.R28), so the stamps need not rise
+/// with the revisions: the oldest by revision bounds the prefix, not the first by stamp.
 fn through(db: &Db, ns: &str, at: u64) -> anyhow::Result<Rev> {
     let mut after = None;
     db.query(
-        "SELECT rev FROM __amphora_rev_stamps WHERE namespace = ?1 AND stamp > ?2 ORDER BY stamp LIMIT 1",
+        // Revisions count from 1: 0 is none stamped after it.
+        "SELECT COALESCE(MIN(rev), 0) FROM __amphora_rev_stamps WHERE namespace = ?1 AND stamp > ?2",
         [text(ns), integer(at)?],
         |r| {
-            after = Some(rev(r, 0)?);
+            after = Some(rev(r, 0)?).filter(|&first| first > 0);
             Ok(false)
         },
     )?;
@@ -324,14 +338,19 @@ pub(super) fn moved_in(
     )
 }
 
-/// Whether a version `w` of `v`'s key is in a read as of stamp `?5`, `?4` the newest revision here
-/// stamped at or before it (lane split-merge-20, T-T1.9.R26): one made here by its revision, one
-/// moved in by the stamp it carried, never by its revision, which counts its old group's commits.
-/// A key's versions rise in stamp as in revision (a group's own commits follow every version it
-/// took in, its clock past their stamps), so the newest of them in the read is its row there.
+/// Whether a version `w` of `v`'s key is in a read as of stamp `?5` (lane split-merge-20,
+/// T-T1.9.R26; lane split-merge-21, T-T1.9.R28): each version is placed by its own stamp, never by
+/// its revision. One moved in by the stamp it carried (its revision counts its old group's
+/// commits), one made here by its revision's stamp: a revision that resolves a transaction across
+/// groups is stamped by the transaction's one commit stamp, which can be older than revisions
+/// before it here. A version with neither was made before its group stamped, so before every
+/// stamped one: stamp 0. `?4` is unused here; it keeps the parameters' places.
+/// A key's versions still rise in stamp as in revision: while a transaction holds a key's lock no
+/// other commit writes it, its stamp is past the lock's, which is past every earlier version's, and
+/// its group's clock takes it in as it resolves, so the newest of them in the read is its row.
 macro_rules! newest_in_the_read {
     () => {
-        "(SELECT MAX(w.rev) FROM __amphora_versions w LEFT JOIN __amphora_moved_stamps m ON m.namespace = w.namespace AND m.family = w.family AND m.key = w.key AND m.rev = w.rev WHERE w.namespace = v.namespace AND w.family = v.family AND w.key = v.key AND ((m.rev IS NULL AND w.rev <= ?4) OR m.stamp <= ?5))"
+        "(SELECT MAX(w.rev) FROM __amphora_versions w LEFT JOIN __amphora_moved_stamps m ON m.namespace = w.namespace AND m.family = w.family AND m.key = w.key AND m.rev = w.rev LEFT JOIN __amphora_rev_stamps s ON m.rev IS NULL AND s.namespace = w.namespace AND s.rev = w.rev WHERE w.namespace = v.namespace AND w.family = v.family AND w.key = v.key AND COALESCE(m.stamp, s.stamp, 0) <= ?5 AND ?4 >= 0)"
     };
 }
 
@@ -372,12 +391,17 @@ fn page_at(
     family: &str,
     scan: &Scan,
     at: u64,
-) -> anyhow::Result<Result<Page, Refusal>> {
+) -> anyhow::Result<Result<Held<Page>, Refusal>> {
     let r = through(db, ns, at)?;
     if let Some(refusal) = refused_at(db, ns, family, at, r)? {
         return Ok(Err(refusal));
     }
     let upper = super::successor(&scan.prefix);
+    // The whole range the scan covers, not only this page's rows: a held put of a row the page
+    // doesn't show yet would land in it.
+    if crate::xgroup::sql::held_at(db, ns, family, &scan.prefix, upper.as_deref(), at)? {
+        return Ok(Ok(Held::Locked));
+    }
     // The same four shapes as a group's own scan, the cursor and the upper bound outside the
     // read's OR; a cursor below the prefix is the prefix's own first seek.
     let (lower, continued) = match scan.after.as_ref() {
@@ -435,7 +459,7 @@ fn page_at(
     for row in &mut rows {
         row.rev = stamp_of_version(db, ns, family, &row.key, row.rev)?.unwrap_or(0);
     }
-    Ok(Ok(Page { rows, more }))
+    Ok(Ok(Held::Read(Page { rows, more })))
 }
 
 /// One key's row here as of stamp `at` (lane split-merge-20, T-T1.9.R26): its newest version in
@@ -446,10 +470,15 @@ fn row_at(
     family: &str,
     key: &[u8],
     at: u64,
-) -> anyhow::Result<Result<Option<api::Row>, Refusal>> {
+) -> anyhow::Result<Result<Held<Option<api::Row>>, Refusal>> {
     let r = through(db, ns, at)?;
     if let Some(refusal) = refused_at(db, ns, family, at, r)? {
         return Ok(Err(refusal));
+    }
+    let mut next = key.to_vec();
+    next.push(0);
+    if crate::xgroup::sql::held_at(db, ns, family, key, Some(&next), at)? {
+        return Ok(Ok(Held::Locked));
     }
     let mut found = None;
     db.query(
@@ -464,14 +493,81 @@ fn row_at(
         },
     )?;
     let Some((version, Some(value))) = found else {
-        return Ok(Ok(None));
+        return Ok(Ok(Held::Read(None)));
     };
     let stamp = stamp_of_version(db, ns, family, key, version)?.unwrap_or(0);
-    Ok(Ok(Some(api::Row {
+    Ok(Ok(Held::Read(Some(api::Row {
         key: key.to_vec(),
         rev: stamp,
         value,
-    })))
+    }))))
+}
+
+/// A group's read as of a stamp, or that a transaction across groups held a lock in its way
+/// (lane split-merge-21, T-T1.9.R28).
+enum Held<T> {
+    Read(T),
+    /// A write lock whose stamp is at or before the read's: the transaction's commit stamp may be
+    /// too, so its rows may belong in the read. The read waits for it to resolve.
+    Locked,
+}
+
+#[cfg(test)]
+impl<T> Held<T> {
+    /// The read; a lock in its way fails the test.
+    fn read(self) -> T {
+        match self {
+            Held::Read(answer) => answer,
+            Held::Locked => panic!("a lock held the read"),
+        }
+    }
+}
+
+/// Reads `read` in `group` as of a stamp, waiting out each lock in its way (lane split-merge-21,
+/// T-T1.9.R28): no read across groups answers part of a transaction, its rows resolved in one
+/// group and not yet in another. It waits on the event, never a timer: a waker registered in the
+/// group's publisher, then the read again, so a resolution between the two isn't missed; it reads
+/// again only once the group's count of resolutions moved, so the wakes of other steps and reads
+/// (each call wakes every watcher) never send it reading. `Timeout` at `until`. A read that waited
+/// is counted on the trace (`held_read`).
+fn waiting<T, F>(group: &Database, until: Instant, read: F) -> Result<T, Refusal>
+where
+    T: Send + 'static,
+    F: Fn(&Db) -> anyhow::Result<Result<Held<T>, Refusal>> + Send + Sync + 'static,
+{
+    let read = Arc::new(read);
+    let signal = Arc::new(Signal::default());
+    let mut registered = None::<Registered>;
+    loop {
+        let seen = group.resolutions(until)?;
+        let try_read = Arc::clone(&read);
+        if let Held::Read(answer) = group.call_internal(until, move |db| try_read(&*db))?? {
+            return Ok(answer);
+        }
+        if registered.is_none() {
+            let publisher = Arc::clone(&group.resolve(until)?.shared.changed);
+            let waker = std::task::Waker::from(Arc::clone(&signal));
+            let id = super::locked(&publisher.watchers)?.register(waker)?;
+            registered = Some(Registered(vec![(publisher, id)]));
+            tracing::trace!(target: "amphora.records", event = "held_read", "a read across groups waits for a lock to resolve");
+            continue;
+        }
+        while group.resolutions(until)? == seen {
+            let woken = super::locked(&signal.woken)?;
+            let (mut woken, timeout) = signal
+                .event
+                .wait_timeout_while(
+                    woken,
+                    until.saturating_duration_since(Instant::now()),
+                    |w| !*w,
+                )
+                .map_err(unavailable)?;
+            if !*woken && timeout.timed_out() {
+                return Err(Refusal::Timeout);
+            }
+            *woken = false;
+        }
+    }
 }
 
 /// The namespace's head across groups: the cut, a stamp every group has made all its revisions
@@ -515,7 +611,7 @@ pub(super) fn scan(
     let mut more = false;
     for (group, _) in &groups {
         let (ns, family, scan) = (ns.to_owned(), family.to_owned(), scan.clone());
-        let page = group.call_internal(until, move |db| page_at(db, &ns, &family, &scan, at))??;
+        let page = waiting(group, until, move |db| page_at(db, &ns, &family, &scan, at))?;
         more |= page.more;
         rows.extend(page.rows);
     }
@@ -894,14 +990,16 @@ pub(super) fn get(
         )));
     };
     let at = match at {
-        Consistency::Linearizable => hooks.marks.next().map_err(unavailable)?,
+        Consistency::Linearizable => hooks.marks.next_micros().map_err(unavailable)?,
         Consistency::Snapshot(asked) => {
-            hooks.marks.observe(asked).map_err(unavailable)?;
+            hooks.marks.observe_micros(asked).map_err(unavailable)?;
             asked
         }
     };
     let (ns, family, key) = (ns.to_owned(), family.to_owned(), key.to_vec());
-    database.call_internal(until, move |db| row_at(db, &ns, &family, &key, at))?
+    waiting(database, until, move |db| {
+        row_at(db, &ns, &family, &key, at)
+    })
 }
 
 /// `changes` cut to `limit`, never through a stamp: a cursor is a stamp, so advancing to the last
@@ -1207,7 +1305,7 @@ mod tests {
             sorted[at.clamp(1, sorted.len()) - 1]
         };
         println!(
-            "point groups rounds lag_ns | read_us p50 p99 p99.9 | cut_us p50 p99 p99.9 | missed p50 max | trail_ns p50 max"
+            "point groups rounds lag_ns | read_us p50 p99 p99.9 | cut_us p50 p99 p99.9 | missed p50 max | trail_us p50 max"
         );
         for &groups in &counts {
             for point in [ReadPoint::Latest, ReadPoint::Earliest] {
@@ -1239,7 +1337,7 @@ mod tests {
                     }
                     let newest = hooks
                         .iter()
-                        .map(|(_, h)| h.marks.latest().unwrap())
+                        .map(|(_, h)| h.marks.latest_micros().unwrap())
                         .max()
                         .unwrap_or(0);
                     let began = Instant::now();
@@ -1295,9 +1393,17 @@ mod tests {
             db
         };
         let commit = |db: &Db, key: &[u8], stamp: u64| {
-            let at =
-                crate::database::write_across(db, "n", "f", key, Some(b"v".as_slice()), None, 0)
-                    .unwrap();
+            let at = crate::database::write_across(
+                db,
+                "n",
+                "f",
+                key,
+                Some(b"v".as_slice()),
+                None,
+                0,
+                None,
+            )
+            .unwrap();
             db.query(
                 "INSERT INTO __amphora_rev_stamps(namespace, rev, stamp) VALUES ('n', ?1, ?2)",
                 [integer(at).unwrap(), integer(stamp).unwrap()],
@@ -1394,8 +1500,8 @@ mod tests {
             db
         };
         let commit = |db: &Db, key: &[u8], value: &[u8], stamp: u64| {
-            let at =
-                crate::database::write_across(db, "n", "f", key, Some(value), None, 0).unwrap();
+            let at = crate::database::write_across(db, "n", "f", key, Some(value), None, 0, None)
+                .unwrap();
             db.query(
                 "INSERT INTO __amphora_rev_stamps(namespace, rev, stamp) VALUES ('n', ?1, ?2)",
                 [integer(at).unwrap(), integer(stamp).unwrap()],
@@ -1443,7 +1549,7 @@ mod tests {
                 limit,
                 at: Consistency::Linearizable,
             };
-            page_at(&new, "n", "f", &scan, at).unwrap().unwrap()
+            page_at(&new, "n", "f", &scan, at).unwrap().unwrap().read()
         };
         let b = [("b1", "1", 20), ("b2", "1", 22), ("b3", "1", 24)];
         let cases: [(u64, Vec<(&str, &str, Rev)>); 7] = [
@@ -1484,9 +1590,7 @@ mod tests {
             assert_eq!(seen(&page.rows), want(rows), "as of {at}");
             assert!(!page.more, "as of {at}");
             for key in ["a1", "a2", "b1", "b2", "b3"] {
-                let row = row_at(&new, "n", "f", key.as_bytes(), *at)
-                    .unwrap()
-                    .unwrap();
+                let row = row_at(&new, "n", "f", key.as_bytes(), *at).unwrap().read();
                 let expected: Seen = want(rows)
                     .into_iter()
                     .filter(|(k, _, _)| k == key)
@@ -1854,5 +1958,134 @@ mod tests {
             matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("stamps no commits")),
             "{refused:?}"
         );
+    }
+
+    /// T-T1.9.R28 (CP-T1.9; reshard.md, "Decision (lane split-merge-21): one clock, one commit
+    /// stamp"). Do: two backed-up groups, the second's clock 500 seconds behind the first's; the
+    /// head across them read; a transaction across them locks a row in each, its steps served as
+    /// the transport serves them, its commit stamp the latest stamp the groups answered after their
+    /// locks; the first group resolves it at that stamp. Then each group read as of the stamp, and
+    /// the second as of the head before the locks; then a scan across both as of the stamp, begun
+    /// before the second group resolves it, which it then does; then a commit of the second
+    /// group's own. Expect: the first group answers its row at the commit stamp; the second's read
+    /// as of the stamp is held by the lock, and as of the head before answers no row unheld; the
+    /// scan answers both rows, each at the one commit stamp, never one alone; the commit after it
+    /// in the second group is stamped after it.
+    #[test]
+    fn t_t1_9_r28_no_read_across_groups_sees_half_a_transaction() {
+        use crate::xgroup::{Envelope, GroupId, Outcome, Reply, Step, TxnId};
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        let (dbs, _sinks, cluster) = groups_on(
+            dir.path(),
+            2,
+            |group| {
+                let read = Arc::clone(&now);
+                let behind = group * 500 * SECOND_NS;
+                Arc::new(move || read.fetch_add(1, Ordering::SeqCst) - behind)
+            },
+            Arc::new(|_: &[u8]| 0),
+        );
+        let across = dbs[0]
+            .across_at(Arc::clone(&cluster), ReadPoint::Latest)
+            .namespace("n")
+            .unwrap();
+        let before = across.head(until()).unwrap();
+        let txn = TxnId {
+            coordinator: 7,
+            epoch: 1,
+            seq: 1,
+        };
+        let envelope = |step: Step| Envelope {
+            coordinator: 7,
+            epoch: 1,
+            floor: None,
+            step,
+        };
+        let key = |g: usize| vec![u8::try_from(g).unwrap(), b'a'];
+        let serve = |g: usize, carried: u64, step: Step| {
+            crate::xgroup::sql::serve(
+                &dbs[g],
+                GroupId::try_from(g).unwrap(),
+                carried,
+                envelope(step),
+                until(),
+            )
+            .unwrap()
+        };
+        let mut carried = 0;
+        for g in 0..2 {
+            let lock = Step::Lock {
+                txn,
+                anchor: 0,
+                reads: vec![],
+                writes: vec![(record_key("n", "f", &key(g)).unwrap(), Some(vec![1]))],
+                stage: None,
+            };
+            let (reply, latest) = serve(g, carried, lock);
+            assert!(matches!(reply, Reply::Locked { .. }), "{reply:?}");
+            carried = carried.max(latest.unwrap());
+        }
+        let at = carried;
+        let resolve = Step::ResolveAt {
+            txn,
+            outcome: Outcome::Committed,
+            at,
+        };
+        assert_eq!(serve(0, at, resolve.clone()).0, Reply::Resolved);
+
+        let read = |g: usize, stamp: u64| {
+            let k = key(g);
+            dbs[g]
+                .call_internal(until(), move |db| {
+                    Ok(match row_at(db, "n", "f", &k, stamp)? {
+                        Ok(Held::Read(row)) => Some(row.map(|r| r.rev)),
+                        Ok(Held::Locked) => None,
+                        Err(refusal) => anyhow::bail!("{refusal}"),
+                    })
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            read(0, at),
+            Some(Some(at)),
+            "the first group's row at the one stamp"
+        );
+        assert_eq!(
+            read(1, at),
+            None,
+            "the second group's read held by the lock"
+        );
+        assert_eq!(
+            read(1, before),
+            Some(None),
+            "a read before the lock's stamp isn't held"
+        );
+
+        let scanning = std::thread::spawn(move || {
+            across.scan(
+                "f",
+                Scan {
+                    prefix: vec![],
+                    after: None,
+                    limit: 10,
+                    at: Consistency::Snapshot(at),
+                },
+                until(),
+            )
+        });
+        assert_eq!(serve(1, at, resolve).0, Reply::Resolved);
+        let page = scanning.join().unwrap().unwrap();
+        let rows: Vec<(Vec<u8>, Rev)> = page.rows.iter().map(|r| (r.key.clone(), r.rev)).collect();
+        assert_eq!(rows, vec![(key(0), at), (key(1), at)], "{page:?}");
+
+        put(&dbs[1], vec![1, b'z']);
+        let later = dbs[1]
+            .call_internal(until(), |db| {
+                crate::database::newest_stamp(db, "n", "f", &[1, b'z'])
+            })
+            .unwrap()
+            .unwrap();
+        assert!(later > at, "{later} after {at}");
     }
 }

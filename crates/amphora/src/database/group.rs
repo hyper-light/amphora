@@ -580,7 +580,7 @@ pub(super) fn import(db: &Db, moved: &[Moved]) -> anyhow::Result<()> {
             super::across::moved_in(db, ns, family, key, *at, stamp)?;
             if let (Some(stamp), Some(hooks)) = (stamp, db.stamps()) {
                 // Every commit here from now on is stamped after the rows it took.
-                hooks.marks.observe(stamp)?;
+                hooks.marks.observe_micros(stamp)?;
             }
             let value = value
                 .as_deref()

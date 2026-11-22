@@ -283,6 +283,58 @@ fn lock_if(id: TxnId, writes: &[(&[u8], &[u8])], conds: &[(&[u8], Option<u64>)])
 /// first stamp; and one on k absent. Expect: the first unmet at k's new stamp with nothing locked;
 /// the second locked, k and m read-locked beside w's write; the write lock on m refused, a
 /// conflict; the step on w a conflict before its condition is looked at; the last unmet, k there.
+/// T-T1.9.R28 (lane split-merge-21; reshard.md, "Decision (lane split-merge-21): one clock, one
+/// commit stamp"), on the simulator's group. Do: two groups, the second's clock ahead of the first's; one
+/// transaction locks a key in each and resolves at one commit stamp in both; then each writes a
+/// key of its own. Expect: both keys stamped the one commit stamp; each group's next write stamped
+/// after it; a transaction resolved with `Step::Resolve` (no stamp) stamped by its group's clock.
+#[test]
+fn t_t1_9_r28_one_transaction_has_one_stamp_in_every_group() {
+    let mut groups = [Memory::default(), Memory::default()];
+    // The second group's clock is ahead: 40 writes before.
+    for i in 0..40u8 {
+        groups[1].set_value(&[b'z', i], Some(b"v")).unwrap();
+    }
+    let stamp = 1_000;
+    for (g, t) in groups.iter_mut().enumerate() {
+        let key = [b'k', u8::try_from(g).unwrap()];
+        let locked = apply(
+            0,
+            t,
+            &env(1, None, lock_step(txn(1), &[], &[(&key, b"x")], None)),
+        );
+        assert!(matches!(locked.unwrap(), Reply::Locked { .. }));
+        let resolve = Step::ResolveAt {
+            txn: txn(1),
+            outcome: Outcome::Committed,
+            at: stamp,
+        };
+        assert_eq!(
+            apply(0, t, &env(1, None, resolve)).unwrap(),
+            Reply::Resolved
+        );
+        assert_eq!(t.stamp(&key).unwrap(), Some(stamp), "group {g}");
+        t.set_value(b"after", Some(b"v")).unwrap();
+        assert!(t.stamp(b"after").unwrap() > Some(stamp), "group {g}");
+    }
+    let t = &mut groups[0];
+    apply(
+        0,
+        t,
+        &env(1, None, lock_step(txn(2), &[], &[(b"m", b"x")], None)),
+    )
+    .unwrap();
+    let resolve = Step::Resolve {
+        txn: txn(2),
+        outcome: Outcome::Committed,
+    };
+    assert_eq!(
+        apply(0, t, &env(1, None, resolve)).unwrap(),
+        Reply::Resolved
+    );
+    assert!(t.stamp(b"m").unwrap() > t.stamp(b"k\x00").unwrap());
+}
+
 #[test]
 fn t_t1_9_r27_a_lock_step_holds_to_its_conditions() {
     let mut t = Memory::default();

@@ -149,6 +149,16 @@ pub enum Step {
         stage: Option<Vec<GroupId>>,
         conds: Vec<(Vec<u8>, Option<u64>)>,
     },
+    /// [`Step::Resolve`] at the transaction's one commit stamp (lane split-merge-21,
+    /// T-T1.9.R28): a committed transaction's rows are written at `at` in every group it touched,
+    /// the cross-group clock's microseconds, which each group's clock takes in first, so its later
+    /// commits are stamped after them. The coordinator chooses `at` at or past every group's lock
+    /// stamp; an aborted transaction writes nothing and ignores it.
+    ResolveAt {
+        txn: TxnId,
+        outcome: Outcome,
+        at: u64,
+    },
 }
 
 impl Step {
@@ -162,7 +172,8 @@ impl Step {
             | Step::Decide { txn, .. }
             | Step::Recover { txn }
             | Step::Prevent { txn }
-            | Step::Resolve { txn, .. } => Some(*txn),
+            | Step::Resolve { txn, .. }
+            | Step::ResolveAt { txn, .. } => Some(*txn),
         }
     }
 }
@@ -228,6 +239,15 @@ pub trait Tablet {
     /// A key's committed value.
     fn value(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
     fn set_value(&mut self, key: &[u8], value: Option<&[u8]>) -> anyhow::Result<()>;
+    /// [`Tablet::set_value`] of a transaction whose commit stamp is `at` (lane split-merge-21,
+    /// T-T1.9.R28): the version is stamped `at`, the same in every group, and the group's clock
+    /// takes it in; none stamps it by the group's own clock, as [`Tablet::set_value`] does.
+    fn set_value_at(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        at: Option<u64>,
+    ) -> anyhow::Result<()>;
     /// The commit stamp of a key's newest version: none while it has no value.
     fn stamp(&mut self, key: &[u8]) -> anyhow::Result<Option<u64>>;
     /// The locks on a key: at most one per transaction a coordinator runs at once.
@@ -314,7 +334,8 @@ pub fn apply<T: Tablet + ?Sized>(
                 Ok(Reply::Present(false))
             }
         },
-        Step::Resolve { txn, outcome } => resolve(tablet, *txn, *outcome),
+        Step::Resolve { txn, outcome } => resolve(tablet, *txn, *outcome, None),
+        Step::ResolveAt { txn, outcome, at } => resolve(tablet, *txn, *outcome, Some(*at)),
         Step::LockIf {
             txn,
             anchor,
@@ -448,6 +469,7 @@ fn resolve<T: Tablet + ?Sized>(
     tablet: &mut T,
     txn: TxnId,
     outcome: Outcome,
+    at: Option<u64>,
 ) -> anyhow::Result<Reply> {
     if let Some(done) = tablet.done(txn)? {
         if done != outcome {
@@ -459,8 +481,8 @@ fn resolve<T: Tablet + ?Sized>(
         for (key, lock) in tablet.locks_of(txn)? {
             match lock.intent {
                 Intent::Read => {}
-                Intent::Put(value) => tablet.set_value(&key, Some(&value))?,
-                Intent::Delete => tablet.set_value(&key, None)?,
+                Intent::Put(value) => tablet.set_value_at(&key, Some(&value), at)?,
+                Intent::Delete => tablet.set_value_at(&key, None, at)?,
             }
         }
     }
@@ -527,6 +549,30 @@ impl Tablet for Memory {
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("the simulator's stamps ran out"))?;
                 self.stamps.insert(key.to_vec(), self.clock);
+                self.data.insert(key.to_vec(), value.to_vec())
+            }
+            None => {
+                self.stamps.remove(key);
+                self.data.remove(key)
+            }
+        };
+        Ok(())
+    }
+
+    fn set_value_at(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        at: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let Some(at) = at else {
+            return self.set_value(key, value);
+        };
+        match value {
+            Some(value) => {
+                // The clock takes the stamp in: the next value written here is stamped after it.
+                self.clock = self.clock.max(at);
+                self.stamps.insert(key.to_vec(), at);
                 self.data.insert(key.to_vec(), value.to_vec())
             }
             None => {

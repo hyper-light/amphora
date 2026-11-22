@@ -583,8 +583,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   carries its commit stamp, so scans and changes across groups place it (T-T1.9.R23). `get`, `changed` and `wait`
   read across groups too, the wait woken by any group's change (T-T1.9.R24, T-T1.9.R25). A read as of an older stamp
   places moved rows by their own stamps (lane split-merge-20, T-T1.9.R26), and a transaction across groups takes
-  conditions naming commit stamps, checked under its locks (T-T1.9.R27); `Records::commit` across groups waits on one
-  commit stamp for all of a transaction's rows, a coordinator change.
+  conditions naming commit stamps, checked under its locks (T-T1.9.R27). One clock (lane split-merge-21, T-T1.9.R28):
+  stamps are the cross-group clock's microseconds, a transaction's rows take its one commit stamp in every group
+  (`Step::ResolveAt`), reads place rows by their own stamps and wait out a held lock whose stamp is at or before
+  theirs; `Records::commit` across groups waits on the coordinator sending that stamp (lane xgroup-sql-11).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

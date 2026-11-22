@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS __amphora_xg_record(coordinator INTEGER NOT NULL, epo
 CREATE TABLE IF NOT EXISTS __amphora_xg_done(coordinator INTEGER NOT NULL, epoch INTEGER NOT NULL, seq INTEGER NOT NULL, outcome INTEGER NOT NULL, PRIMARY KEY(coordinator, epoch, seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS __amphora_xg_guard(coordinator INTEGER PRIMARY KEY, fence INTEGER NOT NULL, floor_epoch INTEGER, floor_seq INTEGER);
 CREATE TABLE IF NOT EXISTS __amphora_xg_epoch(coordinator INTEGER PRIMARY KEY, epoch INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS __amphora_xg_lock_at(coordinator INTEGER NOT NULL, epoch INTEGER NOT NULL, seq INTEGER NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY(coordinator, epoch, seq)) WITHOUT ROWID;
 ";
 
 // The tables' codes: a format, written into every group's database; only ever appended to.
@@ -170,6 +171,47 @@ pub(crate) fn locked(db: &Db, namespace: &str, family: &str, key: &[u8]) -> anyh
     Ok(held)
 }
 
+/// Whether a transaction across groups holds a write lock here on a Records row of `namespace`'s
+/// `family` from `lower` up to `upper` (none: the family's end), with its lock stamp at or before
+/// `at` (lane split-merge-21, T-T1.9.R28): its commit stamp may then be at or before `at`, so a
+/// read as of `at` can't answer until it resolves. A read lock writes nothing and holds no read.
+pub(crate) fn held_at(
+    db: &Db,
+    namespace: &str,
+    family: &str,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+    at: u64,
+) -> anyhow::Result<bool> {
+    let refused = |e: Refusal| anyhow::anyhow!("{e}");
+    let from = record_key(namespace, family, lower).map_err(refused)?;
+    // Past every row of the family: its prefix with the next byte past the last (the four-byte
+    // lengths keep one family's prefix from being another's).
+    let to = match upper {
+        Some(upper) => record_key(namespace, family, upper).map_err(refused)?,
+        None => {
+            let mut end = record_key(namespace, family, &[]).map_err(refused)?;
+            end.push(u8::MAX);
+            end
+        }
+    };
+    let mut held = false;
+    db.query(
+        "SELECT 1 FROM __amphora_xg_lock l JOIN __amphora_xg_lock_at t ON t.coordinator = l.coordinator AND t.epoch = l.epoch AND t.seq = l.seq WHERE l.key >= ?1 AND l.key < ?2 AND l.kind != ?3 AND t.stamp <= ?4 LIMIT 1",
+        [
+            blob(&from)?,
+            blob(&to)?,
+            Value::from_i64(READ),
+            Value::from_i64(i64::try_from(at)?),
+        ],
+        |_| {
+            held = true;
+            Ok(false)
+        },
+    )?;
+    Ok(held)
+}
+
 /// A group's database as a [`Tablet`], inside the step's one transaction.
 pub(crate) struct SqlTablet<'a> {
     db: &'a Db,
@@ -204,13 +246,23 @@ impl Tablet for SqlTablet<'_> {
     }
 
     fn set_value(&mut self, key: &[u8], value: Option<&[u8]>) -> anyhow::Result<()> {
+        self.set_value_at(key, value, None)
+    }
+
+    fn set_value_at(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        stamp: Option<u64>,
+    ) -> anyhow::Result<()> {
         if let Some((namespace, family, row)) = record_of(key)? {
             let (at, seq) = match self.revs.get(namespace) {
                 Some(&(at, seq)) => (Some(at), seq),
                 None => (None, 0),
             };
-            let at =
-                crate::database::write_across(self.db, namespace, family, row, value, at, seq)?;
+            let at = crate::database::write_across(
+                self.db, namespace, family, row, value, at, seq, stamp,
+            )?;
             let next = seq
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("a step's rows ran out of places"))?;
@@ -287,6 +339,19 @@ impl Tablet for SqlTablet<'_> {
             Intent::Delete => (DELETE, Value::Null),
         };
         let [coordinator, epoch, seq] = txn_params(lock.txn)?;
+        // The transaction's lock stamp here (lane split-merge-21, T-T1.9.R28): this group's clock
+        // as it takes the first lock, after the coordinator's carried stamp. Its commit stamp is at
+        // or past it, so a read across groups as of a stamp before it never waits on it, and one
+        // at or past it waits for the resolution. A group that stamps nothing keeps none.
+        if let Some(hooks) = self.db.stamps() {
+            let stamp = hooks.marks.next_micros()?;
+            let [c, e, s] = txn_params(lock.txn)?;
+            self.db.query(
+                "INSERT OR IGNORE INTO __amphora_xg_lock_at(coordinator, epoch, seq, stamp) VALUES (?1, ?2, ?3, ?4)",
+                [c, e, s, int(stamp)?],
+                |_| Ok(true),
+            )?;
+        }
         self.db.query(
             "INSERT INTO __amphora_xg_lock(key, coordinator, epoch, seq, anchor, kind, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             [
@@ -303,6 +368,11 @@ impl Tablet for SqlTablet<'_> {
     }
 
     fn drop_locks_of(&mut self, txn: TxnId) -> anyhow::Result<()> {
+        self.db.query(
+            "DELETE FROM __amphora_xg_lock_at WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3",
+            txn_params(txn)?,
+            |_| Ok(true),
+        )?;
         self.db.query(
             "DELETE FROM __amphora_xg_lock WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3",
             txn_params(txn)?,
@@ -513,10 +583,23 @@ pub(crate) fn serve(
     until: Instant,
 ) -> Result<(Reply, Option<u64>), Refusal> {
     let stamp = AtomicU64::new(carried);
+    let resolving = resolves(&envelope);
     let reply = step(group, &stamp, until, move |db| {
         apply(here, &mut SqlTablet::new(db), &envelope)
     })?;
+    if resolving {
+        group.locks_resolved(until)?;
+    }
     Ok((reply, group.stamps().map(|_| stamp.load(Ordering::Acquire))))
+}
+
+/// Whether a step resolves a transaction here, dropping its locks: the reads across groups they
+/// held wait for it (lane split-merge-21, T-T1.9.R28).
+fn resolves(envelope: &Envelope) -> bool {
+    matches!(
+        envelope.step,
+        super::Step::Resolve { .. } | super::Step::ResolveAt { .. }
+    )
 }
 
 /// Runs one step on `member`, its stamps carried either way.
@@ -528,9 +611,16 @@ fn step_on(
     envelope: Envelope,
 ) -> Result<Reply, Refusal> {
     match member {
-        Member::Local(group) => step(group, carried, until, move |db| {
-            apply(here, &mut SqlTablet::new(db), &envelope)
-        }),
+        Member::Local(group) => {
+            let resolving = resolves(&envelope);
+            let reply = step(group, carried, until, move |db| {
+                apply(here, &mut SqlTablet::new(db), &envelope)
+            })?;
+            if resolving {
+                group.locks_resolved(until)?;
+            }
+            Ok(reply)
+        }
         Member::Node { nodes, node } => {
             let (reply, latest) = nodes
                 .step(
@@ -993,7 +1083,8 @@ impl Drop for Cluster {
 
 /// Runs one step on `group`, its stamps carried (T-T1.12.X2): the group takes in the latest stamp
 /// the coordinator heard of before its commit, and answers with its own latest after it. Groups not
-/// backed up here make no stamps and carry none.
+/// backed up here make no stamps and carry none. The stamps are the cross-group clock's, in
+/// microseconds (lane split-merge-21, T-T1.9.R28), the unit of the commit stamps and the tokens.
 fn step<R, F>(group: &Database, carried: &AtomicU64, until: Instant, f: F) -> Result<R, Refusal>
 where
     R: Send + 'static,
@@ -1003,14 +1094,14 @@ where
     if let Some(hooks) = stamps {
         hooks
             .marks
-            .observe(carried.load(Ordering::Acquire))
+            .observe_micros(carried.load(Ordering::Acquire))
             .map_err(|e| Refusal::Unavailable(format!("{e:#}")))?;
     }
     let reply = group.call_internal(until, f)?;
     if let Some(hooks) = stamps {
         let latest = hooks
             .marks
-            .latest()
+            .latest_micros()
             .map_err(|e| Refusal::Unavailable(format!("{e:#}")))?;
         carried.fetch_max(latest, Ordering::AcqRel);
     }

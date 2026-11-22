@@ -157,6 +157,9 @@ pub(crate) struct Changed {
     event: Condvar,
     published: Mutex<BTreeMap<String, Published>>,
     watchers: Mutex<watch::Watchers>,
+    /// How many steps have resolved transactions across groups here, each dropping its locks
+    /// (lane split-merge-21, T-T1.9.R28): what a read across groups held by a lock waits to move.
+    resolutions: AtomicU64,
 }
 
 #[derive(Default)]
@@ -695,6 +698,28 @@ fn read_published(db: &Db) -> Result<BTreeMap<String, Published>, Refusal> {
 pub(crate) fn reload_changed(db: &Db, changed: &Changed) -> Result<(), Refusal> {
     *locked(&changed.published)? = read_published(db)?;
     wake_changed(changed)
+}
+
+impl Database {
+    /// Tells the reads across groups held by a lock here that a step resolved a transaction and
+    /// dropped its locks (lane split-merge-21, T-T1.9.R28): counted, then every watcher woken. The
+    /// step's own call woke them before the count moved; this wake is the one they read again on.
+    pub(crate) fn locks_resolved(&self, until: Instant) -> Result<(), Refusal> {
+        let database = self.resolve(until)?;
+        let changed = &database.shared.changed;
+        changed.resolutions.fetch_add(1, Ordering::AcqRel);
+        wake_changed(changed)
+    }
+
+    /// How many steps have resolved transactions across groups here ([`Database::locks_resolved`]).
+    pub(crate) fn resolutions(&self, until: Instant) -> Result<u64, Refusal> {
+        Ok(self
+            .resolve(until)?
+            .shared
+            .changed
+            .resolutions
+            .load(Ordering::Acquire))
+    }
 }
 
 pub(crate) fn wake_changed(changed: &Changed) -> Result<(), Refusal> {
@@ -2518,6 +2543,10 @@ pub(crate) fn newest(
 /// step that resolves it (AC-T1.10.1, lane xgroup-sql-6): a revision and a feed row as a
 /// single-group commit writes them. The step's rows in a namespace share one revision, `at` (none:
 /// the first of them takes the namespace's next), each at its own `seq`; answers the revision.
+/// `stamp` is the transaction's one commit stamp, the same in every group it wrote (lane
+/// split-merge-21, T-T1.9.R28), when its coordinator chose one; none stamps the revision by this
+/// group's clock.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_across(
     db: &Db,
     ns: &str,
@@ -2526,6 +2555,7 @@ pub(crate) fn write_across(
     value: Option<&[u8]>,
     at: Option<Rev>,
     seq: u64,
+    stamp: Option<u64>,
 ) -> anyhow::Result<Rev> {
     db.query("INSERT OR IGNORE INTO __amphora_namespaces(name, head, horizon, feed, live) VALUES (?1, 0, 0, 0, 0)", [text(ns)], |_| Ok(true))?;
     let (mut head, mut live) = (0, 0);
@@ -2559,7 +2589,7 @@ pub(crate) fn write_across(
         None => EValue::Null,
     };
     db.query("INSERT INTO __amphora_versions(namespace, family, key, rev, seq, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", [text(ns), text(family), blob(key)?, integer(at)?, integer(seq)?, stored], |_| Ok(true))?;
-    across::stamp(db, ns, at)?;
+    across::stamp(db, ns, at, stamp)?;
     group::wrote(db, ns, family, key)?;
     db.query("INSERT INTO __amphora_families(namespace, family, newest) VALUES (?1, ?2, ?3) ON CONFLICT(namespace, family) DO UPDATE SET newest = excluded.newest", [text(ns), text(family), integer(at)?], |_| Ok(true))?;
     db.query(
@@ -2645,7 +2675,7 @@ fn commit(
     let at = head
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("revision overflow"))?;
-    across::stamp(db, ns, at)?;
+    across::stamp(db, ns, at, None)?;
     for ((family, key), (seq, w)) in final_writes {
         let value = match w {
             Write::Put { value, .. } => blob(value)?,
