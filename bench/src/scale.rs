@@ -171,6 +171,50 @@ fn first_reachable<T>(
     anyhow::bail!("no node answered: {}", failed.join("; "))
 }
 
+/// A measure's first failure, and the phases that end on it (lane scaleout-harness-10): a phase
+/// (`--settle-s`, `--after-s`) lasts its length, an input and the one wait here that is about
+/// time, or ends as soon as a worker fails, woken by that failure. A condition variable's wait for
+/// a duration, so a spurious wake doesn't cut a phase short as a bare park_timeout's would.
+#[derive(Default)]
+struct Halt {
+    failed: Mutex<Option<anyhow::Error>>,
+    told: std::sync::Condvar,
+}
+
+impl Halt {
+    /// Keeps the first failure and wakes the phase waiting.
+    fn fail(&self, e: anyhow::Error) {
+        if let Ok(mut f) = self.failed.lock() {
+            f.get_or_insert(e);
+            self.told.notify_all();
+        }
+    }
+    /// Whether a worker failed (a poisoned slot counts as one).
+    fn failed(&self) -> bool {
+        self.failed.lock().map_or(true, |f| f.is_some())
+    }
+    /// Waits `d`, or until a worker fails: whether the phase ran its length with none failed.
+    fn hold(&self, d: Duration) -> bool {
+        let Ok(f) = self.failed.lock() else {
+            return false;
+        };
+        self.told
+            .wait_timeout_while(f, d, |f| f.is_none())
+            .is_ok_and(|(f, _)| f.is_none())
+    }
+    /// The first failure, if any: the measure's error.
+    fn take(self) -> anyhow::Result<()> {
+        match self
+            .failed
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("a failure was poisoned"))?
+        {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 /// A cluster of `nodes()` nodes, 0 up.
 pub trait System: Sync {
     fn nodes(&self) -> usize;
@@ -915,11 +959,11 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
     let stop = AtomicBool::new(false);
     // Each writer's last acknowledged seq and that write's mark, which the region's copy waits on.
     let acked: Vec<Mutex<(u64, Mark)>> = (0..o.writers).map(|_| Mutex::new((0, None))).collect();
-    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let halt = Halt::default();
     let mut first_ack_ms = 0.0;
     std::thread::scope(|scope| -> anyhow::Result<()> {
         for w in 0..o.writers {
-            let (down, stop, acked, failed) = (&down, &stop, &acked, &failed);
+            let (down, stop, acked, halt) = (&down, &stop, &acked, &halt);
             scope.spawn(move || {
                 let mut wr = Writer::new(w, w % nodes);
                 let mut conn = Conn::new(sys, down, w % nodes);
@@ -932,9 +976,7 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
                             }
                         }
                         Err(e) => {
-                            if let Ok(mut f) = failed.lock() {
-                                f.get_or_insert(e);
-                            }
+                            halt.fail(e);
                             return;
                         }
                     }
@@ -942,7 +984,9 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
             });
         }
         let ran = (|| -> anyhow::Result<()> {
-            std::thread::park_timeout(settle);
+            if !halt.hold(settle) {
+                return Ok(());
+            }
             let mut probe = Writer::new(o.writers, (lose + 1) % nodes);
             let rows = probe.next(batch, text);
             let mut pc = Conn::new(sys, &down, (lose + 1) % nodes);
@@ -953,20 +997,14 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
             sys.kill(lose)?;
             pc.run(o.deadline, |s| s.write(false, &rows))?;
             first_ack_ms = us(at) as f64 / 1000.0;
-            std::thread::park_timeout(after);
+            halt.hold(after);
             stop.store(true, Ordering::Relaxed);
             Ok(())
         })();
         stop.store(true, Ordering::Relaxed);
         ran
     })?;
-    if let Some(e) = failed
-        .lock()
-        .map_err(|_| anyhow::anyhow!("a writer's failure was poisoned"))?
-        .take()
-    {
-        return Err(e);
-    }
+    halt.take()?;
     let acked = acked
         .into_iter()
         .map(|a| a.into_inner())
@@ -1161,12 +1199,8 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
     // is bounded by --ops and --deadline-s, so they are too).
     let sent: Vec<Mutex<Vec<Sent>>> = (0..o.writers).map(|_| Mutex::new(Vec::new())).collect();
     let spans: Mutex<Vec<Moved>> = Mutex::new(Vec::new());
-    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let fail = |e: anyhow::Error| {
-        if let Ok(mut f) = failed.lock() {
-            f.get_or_insert(e);
-        }
-    };
+    let halt = Halt::default();
+    let fail = |e: anyhow::Error| halt.fail(e);
     let start = Instant::now();
     let at = || u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     let stale_before = sys.stale_routes()?;
@@ -1203,13 +1237,13 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
                 }
             });
         }
-        std::thread::park_timeout(settle);
+        halt.hold(settle);
         let runners: Vec<_> = (0..concurrent)
             .map(|_| {
-                let (next, spans, failed, fail, at) = (&next, &spans, &failed, &fail, &at);
+                let (next, spans, halt, fail, at) = (&next, &spans, &halt, &fail, &at);
                 scope.spawn(move || {
                     loop {
-                        if failed.lock().map_or(true, |f| f.is_some()) {
+                        if halt.failed() {
                             return;
                         }
                         let k = next.fetch_add(1, Ordering::SeqCst);
@@ -1240,13 +1274,7 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
         stop.store(true, Ordering::Relaxed);
         Ok(())
     })?;
-    if let Some(e) = failed
-        .lock()
-        .map_err(|_| anyhow::anyhow!("a failure was poisoned"))?
-        .take()
-    {
-        return Err(e);
-    }
+    halt.take()?;
     let stale = sys.stale_routes()?.saturating_sub(stale_before);
     let mut writes = Vec::new();
     for s in &sent {
@@ -3195,6 +3223,27 @@ mod tests {
         .to_string();
         assert_eq!(asked, 0);
         assert!(e.contains("--deadline-s passed before node 0"), "{e}");
+    }
+
+    // Lane scaleout-harness-10 (T-SH.11): a measure's phase lasts its length unless a worker
+    // fails, and then ends on the failure, which the measure returns. Do: hold a zero-length
+    // phase; fail from another thread while a long phase holds; fail again. Expect: the first
+    // ran its length, the second ended on the failure, and the first failure is the error.
+    #[test]
+    fn scaleout_harness_10_a_phase_ends_on_a_workers_failure() {
+        let halt = Halt::default();
+        assert!(halt.hold(Duration::ZERO));
+        assert!(!halt.failed());
+        std::thread::scope(|scope| {
+            scope.spawn(|| halt.fail(anyhow::anyhow!("first")));
+            assert!(
+                !halt.hold(Duration::from_secs(3600)),
+                "the failure ends the phase"
+            );
+        });
+        halt.fail(anyhow::anyhow!("second"));
+        assert!(halt.failed());
+        assert_eq!(halt.take().unwrap_err().to_string(), "first");
     }
 
     /// A session that counts what it's asked, for the default warm-up and catch-up reads.

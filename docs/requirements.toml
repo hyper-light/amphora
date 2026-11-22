@@ -1294,6 +1294,7 @@ criteria = [
   { id = "AC-SH.6", text = "The read measures' warm-up is one read of the last preloaded row, never asked again: it waits on the write by the system's own control where there is one (Amphora's session token from the write's answer), else it is one read at the system's strongest consistency (CockroachDB's leaseholder, TiDB's ReadIndex follower read); each record says what each system's warm-up did" },
   { id = "AC-SH.7", text = "regionloss's time to serve again is one count a writer on the region's own copy, each waiting on that writer's last acknowledged write by the system's own control, never a poll; a system with no such read has the figure refused, typed and said why, and the rest of the measure stands; --poll-us isn't taken" },
   { id = "AC-SH.8", text = "Schema setup asks each node in the configured order, from node 0, the next only once the one before failed, and gives up at --deadline-s or once every node failed, naming each failure" },
+  { id = "AC-SH.10", text = "regionloss's and cutover's phases (--settle-s, --after-s) last their length, a condition variable's wait for a duration that a spurious wake can't cut short, or end as soon as a worker fails, woken by that failure" },
 ]
 tests = [
   { id = "T-SH.1", text = "scale::tests::g13_scale_inputs_are_required_not_picked — passes when the served amphora system is refused without --hosts or --class, as the others are, refused --spanning under the persisted class, and amphora-inproc keeps the in-process flags" },
@@ -1307,6 +1308,7 @@ tests = [
   # lane scaleout-harness-10
   { id = "T-SH.8", text = "scale::tests::scaleout_harness_10_schema_asks_each_node_in_turn_then_gives_up — passes when node 1 is asked only after node 0 failed and no node after the one that answered, every node once when all fail (each failure named), and none past the deadline" },
   { id = "T-SH.9", text = "scale::tests::scaleout_harness_10_warmup_and_catch_up_read_once_by_each_systems_rule — passes when a system with no wait control gets one read for the warm-up and one own-copy count for the catch-up, regionloss parses without --poll-us, and each system's warm-up and catch-up rules are stated" },
+  { id = "T-SH.11", text = "scale::tests::scaleout_harness_10_a_phase_ends_on_a_workers_failure — passes when a phase with no failure runs its length, a failure from another thread ends a long phase at once, and the first failure is the measure's error" },
   { id = "T-SH.10", text = "scale::inproc::tests::scaleout_harness_10_a_token_read_waits_for_its_write — passes when a replicated write gives a session token, one leader read and one follower read carrying it find the row, and a member cut off then put back holds both rows at its first count" },
 ]
 
