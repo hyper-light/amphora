@@ -537,8 +537,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   routes by (`Engine::routes`); a local database's Records transaction routes by every key it names
   and stays within one group, and local databases as groups split and merge under Records writes
   (T-T1.9.R13). Load from the store's meter (lane split-merge-12): the shell measures each
-  group's load (its writer's commit time) and where its writes fall, and the machine's cores, and
-  the planner decides from them (T-T1.9.R14, T-T1.9.R15). Left: that transport off loopback
+  group's load (its writer's commit time) and where its writes fall, its size (a local database's
+  pages in use) and the machine's cores, and the planner decides from them (T-T1.9.R14,
+  T-T1.9.R15, T-T1.9.R17). Left: that transport off loopback
   (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
   full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
   them (T-T1.9.R16).
@@ -996,5 +997,8 @@ QT.6 (lane qs6-4): a hash join's table is now built by the workers together, par
 worker scans its own build leaves and scatters entries by partition, each partition filled by one
 worker), charged to the statement's memory budget with a typed refusal that falls back to the
 serial loop; two-table hash joins that return rows (no aggregates) run on morsels, with an
-order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
-the VDBE loop body (any expression in parallel), joins of three or more tables.
+order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Lane qs6-6: such a join under LIMIT and
+OFFSET runs on morsels too when its ORDER BY holds both tables' INTEGER PRIMARY KEYs, so its rows
+are the serial loop's to the row (T-QT.6.14). Still open: workers running a copy of the VDBE loop
+body (any expression in parallel), joins of three or more tables, outer joins, a LIMIT that stops
+the workers early.
