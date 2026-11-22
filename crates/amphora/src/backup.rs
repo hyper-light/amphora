@@ -14,6 +14,8 @@
 //!   ([`crate::database::Database::open_backed_up`]).
 //! - [`restore()`]: the shell that restores a second.
 //! - [`restore_and_check`]: restores the newest whole second into a scratch file and checks it.
+//! - [`CheckPolicy`]: whether the shipping thread checks its archive: by default continuously, at
+//!   seconds drawn at random ([`Drills`]), within a budget derived from the machine ([`admit`]).
 //! - [`restore_cut`]: several groups restored to one second, cross-group transactions finished.
 //! - [`FolderBlobs`]: the store Amphora owns: a folder, local or a peer's over a mount.
 
@@ -22,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 mod check;
 mod cut;
+mod drill;
 mod folder;
 mod object;
 pub mod plan;
@@ -34,6 +37,10 @@ pub use check::{
     restore_and_check, restore_and_check_at,
 };
 pub use cut::restore_cut;
+pub use drill::{
+    Budget, COST_METRIC, CheckPolicy, DEFER_METRIC, Deferred, DrillMeter, Drills, admit,
+    next_random,
+};
 pub use folder::FolderBlobs;
 pub use restore::{Restored, expire, restore};
 pub use ship::{BaseCopy, Shipped, Shipper};

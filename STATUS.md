@@ -5,6 +5,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
+  `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
+  groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
+  grouped database's SQL session hands its cross-group batch to it (lane split-merge-13's layer), and a
+  group failure tested through SQL.
 - **The bar** (kiln's CP-M1): a Cargo workspace whose lints deny panics, this repository's rules
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
@@ -468,6 +473,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   for the log's next restart, one generation at most (T-T1.12.I4); cuts across machines: each
   cross-group step carries a hybrid logical clock, so a decision is stamped after the writes it
   decides whatever the nodes' clocks read (T-T1.12.X2).
+  Lane backups-3: restore checks are on by default (`backup::CheckPolicy`: off, scratch, continuous),
+  within a budget measured on the machine (idle time, free disk), at seconds drawn uniformly from
+  every quiet snapshot, every row compared, with deferral and cost instruments (T-T1.12.C4 to C6).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -667,6 +675,17 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   PRIMARY KEY with COLLATE or AUTOINCREMENT, two CHECKs without a comma, two upsert clauses), and
   sqlglot fails on MySQL's NATURAL FULL JOIN (3). Left: refusals compared by kind beside "any error
   matches" (the coordinator's decision), DuckDB's 6 disagreements and its refused INSERT unclassified.
+  Lane corpus-dialects-5 (`bench/corpus/dialects.py`, `test_dialects.py`): the last parse gaps read
+  as SQLite's documentation says they mean: VALUES after WITH as its SELECTs (lang_select.html 2.6),
+  table constraints without a comma (parse.y's empty `tconscomma`), a table PRIMARY KEY's ASC or DESC
+  left out and its AUTOINCREMENT moved onto its one column (autoinc.html); not expressible, with the
+  reason: a PRIMARY KEY collation other than its column's, several upsert clauses (lang_upsert.html),
+  AUTOINCREMENT on DuckDB, a NATURAL FULL JOIN on MySQL. min, max, first_value and last_value with
+  EXCLUDE CURRENT ROW on a ROWS frame holding the row are said on MySQL and ClickHouse as the frame's
+  two parts around it (6,720 windows on random rows agree with DuckDB 2.0.1's EXCLUDE). On the gate's
+  pool (26,980 records) the untranslatable records go from 10, 10, 116 and 113 (DuckDB, PostgreSQL,
+  MySQL, ClickHouse) to 8, 7, 109 and 106, every one "not expressible" with its reason: none fails to
+  parse. Left: refusals compared by kind, DuckDB's disagreements classified, the tiny run on every engine.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691

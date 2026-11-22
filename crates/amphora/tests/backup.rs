@@ -264,7 +264,7 @@ fn open_backed_up<B: Blobs + 'static>(
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
-        check: None,
+        check: backup::CheckPolicy::Off,
     };
     Database::open_backed_up(path, archive, until()).unwrap()
 }
@@ -394,7 +394,7 @@ fn t_t1_12_c3_the_shipping_thread_checks_itself() {
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
-        check: Some(scratch.clone()),
+        check: backup::CheckPolicy::Scratch(scratch.clone()),
     };
     let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
     database
@@ -574,7 +574,7 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol, skew: u64) {
             }),
             memory: 32 * 1024,
             patience: Duration::from_secs(60),
-            check: None,
+            check: backup::CheckPolicy::Off,
         };
         Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
             .unwrap()
@@ -809,4 +809,194 @@ fn t_t1_12_i1_incremental_bases_keep_unchanged_chunks() {
     );
     check(last, "after-expiry.db");
     check(second_base + 1, "after-expiry-oldest.db");
+}
+
+/// T-T1.12.C4 (AC-T1.12.4): continuous restore drills are on by default. Do: back a database up to
+/// a folder with the default policy, no scratch path given, then write a row a second until three
+/// checks passed. Expect: the checks ran beside the database (`source.db.check`), passed with no
+/// failure, the passed check's scratch file is gone, and the drills' costs were measured.
+#[test]
+fn t_t1_12_c4_continuous_drills_are_on_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let read = Arc::clone(&now);
+    let archive = Archive {
+        blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+        prefix: "db".into(),
+        clock: Arc::new(move || read.load(Ordering::SeqCst)),
+        memory: 32 * 1024,
+        patience: Duration::from_secs(60),
+        check: backup::CheckPolicy::default(),
+    };
+    assert_eq!(archive.check, backup::CheckPolicy::Continuous);
+    let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = vec![(now.load(Ordering::SeqCst), model.clone())];
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    let mut id = 1;
+    while shipping.checks().passed.load(Ordering::Relaxed) < 3 {
+        write_seconds(&database, &now, id..id + 1, &mut model, &mut history);
+        id += 1;
+        assert!(
+            id < 4_000,
+            "three checks didn't pass: {:?}",
+            shipping.status().unwrap()
+        );
+    }
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    assert_eq!(shipping.checks().failed.load(Ordering::Relaxed), 0);
+    assert!(shipping.drills().checks() >= 3);
+    if matches!(status.last_check, Some(backup::Check::Passed { .. })) {
+        assert!(!dir.path().join("source.db.check").exists());
+    }
+}
+
+/// T-T1.12.C5 (AC-T1.12.4): checks competing with foreground load, the failure mode the budget is
+/// for. Do: back a database up to a folder, then commit back to back from one writer per core
+/// (`AMPHORA_DRILL_LOAD_COMMITS` each, a tiny run by default), each commit a second later, under
+/// the control (a scratch path: checks whenever due) and under the default (continuous, within the
+/// budget); then a row a second until a check passes. Expect, under both: no check failed, and
+/// checks pass once the load ends; under the budget, the checks took no more of the thread than it
+/// was idle, the last check aside (each check waits for idle time as long as the last took). A
+/// write the database refuses `Full` under the load (its typed back-pressure) is counted, not
+/// failed. It prints each run's instruments: commit latency p50/p99/p99.9, writes refused, checks run, deferrals by reason,
+/// drills of older seconds, check cost p50/p99/p99.9, idle and check time.
+#[test]
+fn t_t1_12_c5_checks_competing_with_foreground_load() {
+    let commits: u64 = std::env::var("AMPHORA_DRILL_LOAD_COMMITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let writers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    for continuous in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let blobs =
+            Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        let read = Arc::clone(&now);
+        let archive = Archive {
+            blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+            prefix: "db".into(),
+            clock: Arc::new(move || read.load(Ordering::SeqCst)),
+            memory: 32 * 1024,
+            patience: Duration::from_secs(60),
+            check: if continuous {
+                backup::CheckPolicy::Continuous
+            } else {
+                backup::CheckPolicy::Scratch(dir.path().join("scratch.db"))
+            },
+        };
+        let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
+        database
+            .call(until(), |c| {
+                c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+                Ok(())
+            })
+            .unwrap();
+        shipping.wait(until(), |s| s.bases >= 1).unwrap();
+        // The load: every writer at once, a commit a second by the clock, as fast as they go.
+        let refused = AtomicU64::new(0);
+        let mut latencies: Vec<u64> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..writers)
+                .map(|w| {
+                    let database = &database;
+                    let now = &now;
+                    let refused = &refused;
+                    scope.spawn(move || {
+                        let mut took = Vec::new();
+                        for i in 0..commits {
+                            let id = i64::try_from(i * writers as u64 + w as u64 + 1).unwrap();
+                            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+                            let began = Instant::now();
+                            let wrote = database.call(until(), move |c| {
+                                c.execute(
+                                    "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                                    vec![
+                                        amphora_api::Value::Integer(id),
+                                        amphora_api::Value::Text("x".repeat(512)),
+                                    ],
+                                )?;
+                                Ok(())
+                            });
+                            match wrote {
+                                Ok(()) => {}
+                                Err(amphora_api::Refusal::Full { .. }) => {
+                                    refused.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                Err(e) => panic!("{e:?}"),
+                            }
+                            took.push(u64::try_from(began.elapsed().as_nanos()).unwrap());
+                        }
+                        took
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let under_load = shipping.drills().checks();
+        // The load ends: a row a second until a check passes after it.
+        let mut model = Rows::new();
+        let mut history = Vec::new();
+        let mut id = i64::try_from(commits * writers as u64 + 1).unwrap();
+        let passed = shipping.checks().passed.load(Ordering::Relaxed);
+        while shipping.checks().passed.load(Ordering::Relaxed) == passed {
+            write_seconds(&database, &now, id..id + 1, &mut model, &mut history);
+            id += 1;
+            assert!(id < 100_000, "no check passed after the load");
+        }
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        drop(database);
+        let status = shipping.wait(until(), |s| s.ended).unwrap();
+        assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+        assert_eq!(shipping.checks().failed.load(Ordering::Relaxed), 0);
+        let meter = shipping.drills();
+        let cost = meter.cost_ns.load(Ordering::Relaxed);
+        let idle = meter.idle_ns.load(Ordering::Relaxed);
+        if continuous {
+            let last = meter.cost_quantile(1.0).unwrap();
+            assert!(
+                cost <= idle.saturating_add(last),
+                "checks took {cost} ns, idle {idle} ns"
+            );
+        }
+        latencies.sort_unstable();
+        let q = |p: f64| {
+            let i = ((p * latencies.len() as f64).ceil() as usize).saturating_sub(1);
+            latencies.get(i).copied().unwrap_or(0)
+        };
+        println!(
+            "drill-load policy={} writers={writers} commits={} refused={} commit_ns p50={} p99={} p99.9={} checks={} under_load={under_load} passed={} deferred busy={} disk={} older={} cost_ns p50={:?} p99={:?} p99.9={:?} cost_total_ns={cost} idle_total_ns={idle}",
+            if continuous { "continuous" } else { "scratch" },
+            latencies.len(),
+            refused.load(Ordering::Relaxed),
+            q(0.5),
+            q(0.99),
+            q(0.999),
+            meter.checks(),
+            shipping.checks().passed.load(Ordering::Relaxed),
+            meter.deferred_busy.load(Ordering::Relaxed),
+            meter.deferred_disk.load(Ordering::Relaxed),
+            meter.older.load(Ordering::Relaxed),
+            meter.cost_quantile(0.5),
+            meter.cost_quantile(0.99),
+            meter.cost_quantile(0.999),
+        );
+    }
 }

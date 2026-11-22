@@ -494,6 +494,10 @@ tests = [
   { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
   { id = "T-T1.12.X2", text = "Cuts across two groups whose clocks differ by 5 seconds, under both protocols: both keys or neither at every cut, the carried clock taken out failing it" },
   { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
+  # lane backups-3: continuous restore drills (kiln goal 15580afd; backup.md "Continuous restore drills")
+  { id = "T-T1.12.C4", text = "With no scratch path given, the shipping thread checks its archive beside the database by default; the checks pass and leave no file behind" },
+  { id = "T-T1.12.C5", text = "A check runs only once the thread was idle as long as the last check took and the disk holds the restore and the log's growth; under one writer per core no check fails and checks take no more time than the thread was idle" },
+  { id = "T-T1.12.C6", text = "The drilled seconds are a uniform sample of every quiet snapshot, as many as the memory holds; an expired second is dropped, never picked again" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
@@ -1228,6 +1232,18 @@ tests = [
   { id = "T-T1.10.X2", text = "xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly — passes when three seeds of each protocol over the transport commit across groups with no anomaly and no unknown outcome; ac_t1_10_5_the_lan_check_finds_a_lost_update_and_an_aborted_read holds the check to finding them" },
 ]
 
+# lane xgroup-sql: G13 step 3's SQL part (kiln goal 3d2c567d4a24841eb73cc0fb95b76f27; xgroup.md,
+# "A SQL session's commit")
+[[own]]
+id = "T1.10.S"
+title = "A SQL session's transaction across groups commits through the coordinator; one group's keeps its fast path (G13 step 3)"
+criteria = [
+  { id = "AC-T1.10.S1", text = "Cluster::commit commits rows all in one local group in that group's one database transaction, aborting Conflict on a row another transaction holds a lock on, and rows in several groups through the coordinator, under either protocol" },
+]
+tests = [
+  { id = "T-T1.10.S1", text = "xgroup::sql::sessions::ac_t1_10_1_a_sessions_answers_across_groups_equal_the_same_on_one_group — passes when 40 seeded transactions over three groups answer as the same over one group, some spanning groups, under both protocols, and every key reads the same after" },
+]
+
 # lane pl8-9: no new IDs. T-PL.8.2 gains the search test of docs/design/planner.md "Decision (lane pl8-9)".
 
 # lane skip-usable: row skipping usable by real statements (kiln goal 99e6cc88; executor.md decision 11).
@@ -1237,4 +1253,17 @@ title = "Row skipping usable by real statements: bounds from parameters, a measu
 criteria = []
 tests = [
   { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
+]
+
+# lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,
+# "A refusal before the step")
+[[own]]
+id = "T1.10.R"
+title = "A step refused before it was taken is retried with the learned back-off, behind a switch whose control is today's"
+criteria = [
+  { id = "AC-T1.10.6", text = "Under OnRefused::Retry a step refused NotLeader or Full is sent again after the RFC 6298 timeout, doubled per refusal, within its deadline; under Stop it counts as lost; Cluster::counted gives refusals by kind, retries, held steps and transactions, stops and p50/p99/p99.9" },
+]
+tests = [
+  { id = "T-T1.10.R1", text = "xgroup::sql::sessions::ac_t1_10_6_refusals_before_a_step_retried_commit_and_the_control_aborts — passes when one group refusing three times and all three refusing twice commit with no stop under Retry, and abort under Stop, both protocols" },
+  { id = "T-T1.10.R2", text = "xgroup::sql::sessions::ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing — passes when a group failing at each of a session transaction's steps leaves its rows all written or none after recovery, equal to one group's, both protocols, both ends reached" },
 ]
