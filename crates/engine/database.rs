@@ -2771,9 +2771,10 @@ impl Database {
                 crate::storage::versioned::switch::asked() && self.versioned_found(),
                 None,
             )?
-            .map(crate::storage::versioned::switch::Switch::new);
+            .map(|s| Arc::new(crate::storage::versioned::switch::Switch::new(s)));
         let conn = Arc::new(Connection {
             versioned,
+            versioned_attached: RwLock::new(HashMap::default()),
             db: self.clone(),
             context,
             pager: ArcSwap::new(pager),

@@ -427,7 +427,12 @@ impl Drop for ExplicitCheckpointGuard {
 pub struct Connection {
     /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its B-trees are on, when switched
     /// on (`storage::versioned::switch`); else the pager's.
-    pub(crate) versioned: Option<crate::storage::versioned::switch::Switch>,
+    pub(crate) versioned: Option<Arc<crate::storage::versioned::switch::Switch>>,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): each attached database's own versioned storage, by its
+    /// database index, when the main database's B-trees are on one: an attached database's trees
+    /// are its own, never the main storage's, so the file reopened alone finds them.
+    pub(crate) versioned_attached:
+        RwLock<HashMap<usize, Arc<crate::storage::versioned::switch::Switch>>>,
     pub(crate) db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -1574,6 +1579,40 @@ impl Connection {
     /// visible to other connections.
     pub fn force_reparse_schema_without_publish(self: &Arc<Connection>) -> Result<()> {
         self.force_reparse_schema_inner(false)
+    }
+
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage the database at `db` keeps its
+    /// trees on: the main database's, or an attached database's own; none for TEMP, whose trees
+    /// stay on its pager, or with the switch off.
+    pub(crate) fn versioned_for(
+        &self,
+        db: usize,
+    ) -> Option<Arc<crate::storage::versioned::switch::Switch>> {
+        let main = self.versioned.as_ref()?;
+        match db {
+            MAIN_DB_ID => Some(main.clone()),
+            TEMP_DB_ID => None,
+            _ => self.versioned_attached.read().get(&db).cloned(),
+        }
+    }
+
+    /// Amphora (G7 step 2, `AC-NS.2.1`): runs `f` on every versioned storage the connection's
+    /// transaction may span, the main database's first, then each attached database's; every one
+    /// is run even after one fails, and the first failure is returned.
+    pub(crate) fn each_versioned(
+        &self,
+        mut f: impl FnMut(&crate::storage::versioned::switch::Switch) -> Result<()>,
+    ) -> Result<()> {
+        let Some(main) = self.versioned.as_ref() else {
+            return Ok(());
+        };
+        let mut first = f(main).err();
+        for switch in self.versioned_attached.read().values() {
+            if let Err(e) = f(switch) {
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 
     /// Amphora (G7 step 2, `AC-NS.2.1`): reads the schema from the versioned storage's
@@ -4173,12 +4212,32 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
+                    // Amphora (G7 step 2, `AC-NS.2.1`): with the main database's trees on the
+                    // versioned storage, the attached database's go on its own (made, or
+                    // recovered from beside its file), before any statement reads them.
+                    let switch = match self.versioned {
+                        Some(_) => db
+                            .versioned_storage(true, None)?
+                            .map(|s| Arc::new(crate::storage::versioned::switch::Switch::new(s))),
+                        None => None,
+                    };
                     self.has_non_main_pagers.store(true, Ordering::Release);
                     self.attached_databases.write().insert(
                         alias.as_str(),
                         db.clone(),
                         pager.clone(),
                     );
+                    if let Some(switch) = switch {
+                        let index = self
+                            .attached_databases
+                            .read()
+                            .name_to_index
+                            .get(alias.as_str())
+                            .copied();
+                        if let Some(index) = index {
+                            self.versioned_attached.write().insert(index, switch);
+                        }
+                    }
                     self.bump_prepare_context_generation();
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
@@ -4232,6 +4291,18 @@ impl Connection {
             return Err(LimboError::InvalidArgument(format!(
                 "database {alias} is locked"
             )));
+        }
+        // Amphora (G7 step 2, `AC-NS.2.1`): its versioned storage goes with it; a transaction
+        // that wrote there holds it, as the pager's write lock does.
+        if let Some(switch) = self.versioned_attached.read().get(&database_id) {
+            if switch.wrote() {
+                return Err(LimboError::InvalidArgument(format!(
+                    "database {alias} is locked"
+                )));
+            }
+        }
+        if let Some(switch) = self.versioned_attached.write().remove(&database_id) {
+            switch.finish(true)?;
         }
 
         if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
@@ -5851,10 +5922,8 @@ impl Connection {
         // the pager's, so a statement abandoned or failed mid-write leaves nothing for the next
         // statement's commit to make durable. The pager's rollback reports no error either; one
         // here is logged, and the storage refuses the ended transaction's cursors their writes.
-        if let Some(switch) = self.versioned.as_ref() {
-            if let Err(e) = switch.finish(true) {
-                tracing::error!("versioned storage: rolling back the transaction: {e}");
-            }
+        if let Err(e) = self.each_versioned(|switch| switch.finish(true)) {
+            tracing::error!("versioned storage: rolling back the transaction: {e}");
         }
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
