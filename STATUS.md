@@ -452,8 +452,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
   on a group's database (`Cluster`, each step one call to the group). A crashed coordinator's next incarnation fences
   the old one and finishes what it left. Tested: a crash at every step (T-T1.10.1) and seeded runs with lost and late
-  steps and crashes, Elle-style. Left: the LAN p99 (AC-T1.10.2) on multi-node groups and the 10,000-seed run, which
-  decide between the two; SQL sessions across groups (AC-T1.10.1).
+  steps and crashes, Elle-style. Over the transport (lane xgroup-lan): a step to another node's group is one
+  `Request::Step` through `transport::Nodes`, and `examples/xgroup_lan.rs` measures both protocols (bench) and checks
+  seeded histories (elle); the decision record's rule is written, its numbers blank. Left: the coordinator's LAN p99
+  (AC-T1.10.2) and 10,000-seed run, which decide between the two, once split-merge-11's network listener lets
+  nodes sit on separate machines; SQL sessions across groups (AC-T1.10.1). Lane xgroup-lan-2: a group failing
+  mid-commit is tested at every step (T-T1.10.X3); a begin that finds the coordinator full waits for a finished
+  transaction instead of being refused, so the harness's clients run back to back; both protocols stay until the
+  coordinator's LAN numbers decide (xgroup.md, "Decision (lane xgroup-lan)").
 - **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
   stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
   store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a
@@ -517,8 +523,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (T-T1.9.R10). Over the transport (lane split-merge-10): a pull and its answer are appended variants of
   the owner transport (version 7), a node's endpoint answers them (`transport::Node`) and its peers
   ask through it (`transport::Nodes`); a move through loss and partition keeps every acknowledged
-  write (T-T1.9.R12). Left: that transport off loopback (between machines), a `Database` over
-  `Groups<Local>`, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
+  write (T-T1.9.R12). Routing key in bytes (lane split-merge-11): an engine says the keys a row
+  routes by (`Engine::routes`); a local database's Records transaction routes by every key it names
+  and stays within one group, and local databases as groups split and merge under Records writes
+  (T-T1.9.R13). Load from the store's meter (lane split-merge-12): the shell measures each
+  group's load (its writer's commit time) and where its writes fall, and the machine's cores, and
+  the planner decides from them (T-T1.9.R14, T-T1.9.R15). Left: that transport off loopback
+  (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
+  full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
+  them (T-T1.9.R16).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -607,6 +620,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   disagreement; `CORPUS_BIN_<ENGINE>` may be a command (a client in its server's container). The five
   server engines ran a pool through the harness on jupiter's Docker (2026-11-21). Left: kiln's queries
   in the pool (kiln_queries.py needs sqlglot).
+  Lane corpus-dialects-2 (`bench/corpus/dialects.py`, `test_dialects.py`): the translator says SQLite's
+  blob literals in PostgreSQL's and ClickHouse's spelling and its collations in MySQL's; leaves out the
+  clauses that state what every engine does unasked (`OR ABORT`, `ON CONFLICT ABORT`, `NOT DEFERRABLE`,
+  `MATCH` on REFERENCES, `EXCLUDE NO OTHERS`), each by SQLite's documentation; and gives a record SQLite
+  refuses that sqlglot can't read as SQLite holds it. On the gate's pool (26,980 records) the records
+  sqlglot can't say fall from 43, 40, 237 and 234 (DuckDB, PostgreSQL, MySQL, ClickHouse) to 37, 34,
+  183 and 180 before the refused records given as written. Left: frame EXCLUDE other than NO OTHERS
+  on MySQL and ClickHouse (146, no spelling there), conflict clauses other than ABORT, GROUPS frames,
+  multi-word type names, RELEASE SAVEPOINT and REINDEX, which sqlglot's SQLite reader refuses.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -701,6 +723,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   chosen only where it costs less than the probes it saves; its hashes and bits stay within the join's memory budget
   (`docs/design/planner.md`, "Decision (lane qs5-9)"). LIP and predicate transfer, a measured filter-lookup weight,
   removing `rhs_has_selective_seek` and deriving `cpu_cost_per_where_step` are left.
+- **Calibration that holds under load; the filter's lookup and a WHERE step measured** (lane qs5-10): calibration
+  samples each kind of work in rounds and takes medians, stopping once each median's order-statistic standard error
+  is within the timer's cost; it also times a Bloom filter's lookup and a WHERE step, which now price the filter and
+  `cpu_cost_per_where_step` (`docs/design/planner.md`, "Decision (lane qs5-10)"). Left: `hash_bytes_per_row`, the
+  `rhs_has_selective_seek` gate, LIP and predicate transfer, sort-merge and prefetched index joins.
+- **A chained hash join's materialized prefix leaves the main plan** (lane qs5-12): where a hash join's build table
+  was an earlier join's probe, the build input is materialized from the join prefix, and the main plan no longer
+  opens or lists the earlier join's build table (`main_loop/init.rs`, `subquery.rs` walk the join order).
+  `nested_loops::a_chain_of_hash_joins_reads_each_table_once` failed whenever calibration chose the chained plan.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness

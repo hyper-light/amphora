@@ -48,6 +48,15 @@ pub trait Engine: Send + 'static {
     /// The key a row is of: a read of a key waits for its writes handed over before it.
     fn key(row: &Self::Row) -> &str;
 
+    /// The keys, in bytes, a store in groups routes `row` by, each given to `each` (CP-T1.9;
+    /// docs/design/reshard.md, decision "The routing key is bytes"): every key it reads or writes,
+    /// which must all be in one group, else [`crate::groups::Groups`] refuses it
+    /// ([`Refused::Groups`]). A row with none goes to the group holding position 0. Its key, unless
+    /// the engine says otherwise.
+    fn routes(row: &Self::Row, each: &mut dyn FnMut(&[u8])) {
+        each(Self::key(row).as_bytes());
+    }
+
     /// The rows, in one transaction, committed whole or not at all: how many it wrote. They stay
     /// the store's: a commit that fails is tried again with fewer of them.
     fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize>;
