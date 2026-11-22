@@ -852,3 +852,84 @@ fn ns_1_1_a_reading_cursor_refuses_writes() {
     ));
     assert_eq!(forward(&mut c), Vec::<i64>::new());
 }
+
+/// Two transactions through writing cursors on a tree holding rows 1, 2 and 10, each reading by
+/// `read` and then putting its row (`writes`); the first commits, then the second: whether the
+/// second was refused (`SerializationFailure`).
+fn second_refused(read: [fn(&mut VersionedCursor); 2], writes: [i64; 2]) -> bool {
+    use super::blink::Descender;
+    let order = KeyOrder::rowid();
+    let vdb = Arc::new(
+        VDatabase::open(Arc::new(Simulated::new(5, 1).unwrap()), 2_000, 1, || {
+            order.comparator()
+        })
+        .unwrap(),
+    );
+    let (pager, _db, _conn) = engine();
+    let mut d = Descender::new();
+    let rec = record(&[Value::from_i64(1)]);
+    let cursor = |txn: &Arc<Mutex<Option<super::version::Txn>>>| {
+        VersionedCursor::new(
+            vdb.clone(),
+            0,
+            order.clone(),
+            Access::Write(txn.clone()),
+            pager.clone(),
+        )
+        .unwrap()
+    };
+    let load = Arc::new(Mutex::new(Some(vdb.begin().unwrap())));
+    let mut c = cursor(&load);
+    for k in [1, 2, 10] {
+        now(c.insert(&BTreeKey::new_table_rowid(k, Some(&rec))));
+    }
+    drop(c);
+    let load = load.lock().take().unwrap();
+    vdb.commit(load, &mut d, vdb.lane(), true).unwrap();
+    let txns = [0, 1].map(|_| Arc::new(Mutex::new(Some(vdb.begin().unwrap()))));
+    for (i, txn) in txns.iter().enumerate() {
+        let mut c = cursor(txn);
+        read[i](&mut c);
+        now(c.seek(SeekKey::TableRowId(writes[i]), SeekOp::GE { eq_only: true }));
+        now(c.insert(&BTreeKey::new_table_rowid(writes[i], Some(&rec))));
+    }
+    let [first, second] = txns.map(|t| t.lock().take().unwrap());
+    vdb.commit(first, &mut d, vdb.lane(), true).unwrap();
+    match vdb.commit(second, &mut d, vdb.lane(), true) {
+        Ok(_) => false,
+        Err(crate::LimboError::SerializationFailure) => true,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+fn read_row_1(c: &mut VersionedCursor) {
+    now(c.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }));
+}
+
+fn read_row_2(c: &mut VersionedCursor) {
+    now(c.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }));
+}
+
+fn read_all(c: &mut VersionedCursor) {
+    forward(c);
+}
+
+fn read_back(c: &mut VersionedCursor) {
+    now(c.last());
+    while c.has_record() {
+        now(c.prev());
+    }
+}
+
+/// T-G8.4.2, CP-T1.4: do, through the SQL cursor on the versioned storage (precision locking, the
+/// default validation), the write skew Elle's SQL histories found as G2: each transaction reads
+/// the row the other writes; and a phantom: each scans the tree (forward, or back) and puts a row
+/// in a gap the other scanned. Expect the second to commit refused each time, the cursor's reads
+/// kept for its validation; and, reading and writing rows apart, both to commit.
+#[test]
+fn g8_4_2_cursor_reads_refuse_write_skew_and_phantoms() {
+    assert!(second_refused([read_row_1, read_row_2], [2, 1]));
+    assert!(second_refused([read_all, read_all], [5, 7]));
+    assert!(second_refused([read_back, read_back], [12, 0]));
+    assert!(!second_refused([read_row_1, read_row_2], [3, 4]));
+}

@@ -5,6 +5,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
+  `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
+  groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
+  grouped database's SQL session hands its cross-group batch to it (lane split-merge-13's layer), and a
+  group failure tested through SQL.
 - **The bar** (kiln's CP-M1): a Cargo workspace whose lints deny panics, this repository's rules
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
@@ -379,9 +384,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   N connections run the suite's write classes at once and every committed transaction answers as a
   serial replay in commit order does (`T-G7.5.1`), passing on the pager's storage and the versioned
   one; Elle's list-append and register histories are recorded through SQL and checked (`T-G8.4.1`),
-  clean on the pager's storage. On the versioned storage they show G2: its SQL cursor keeps no reads
-  for the commit's validation, so SQL there is snapshot isolation (that test is ignored until it
-  holds). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the coordinator's.
+  clean on both storages. The versioned storage's SQL cursor keeps the span of keys each move reads
+  for its commit's validation (`Versioned::keep_read`; before, SQL there was snapshot isolation and
+  Elle found G2), refusing write skew and phantoms (`T-G8.4.2`), and reads the budget refused refuse
+  the commit (`T-G8.4.3`). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the
+  coordinator's; the power-cut harness (`T-T1.4.1`).
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
@@ -649,6 +656,33 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   183 and 180 before the refused records given as written. Left: frame EXCLUDE other than NO OTHERS
   on MySQL and ClickHouse (146, no spelling there), conflict clauses other than ABORT, GROUPS frames,
   multi-word type names, RELEASE SAVEPOINT and REINDEX, which sqlglot's SQLite reader refuses.
+  Lane corpus-dialects-3 (`bench/corpus/dialects.py`, `test_dialects.py`): the translator reads what
+  sqlglot's SQLite reader refused, each as SQLite's documentation says it means: n-ary `iif()` and
+  `if()` as CASE, `char()` of nothing as '', a type name of several words (`FLOATING POINT`) and `ANY`
+  as their affinity's name, STRICT left out (every engine types its columns; ANY there is BLOB),
+  SAVEPOINT, RELEASE and REINDEX as commands, a GROUPS frame with no ORDER BY, and a block comment
+  open at the end. Conflict resolutions other than ABORT (on UPDATE and on constraints) and a frame's
+  EXCLUDE CURRENT ROW, GROUP or TIES on MySQL and ClickHouse with no exact rewrite are untranslatable
+  with their reason ("not expressible in <dialect>: ..."), which the oracle reports; count() under
+  those exclusions is said with window arithmetic (checked against DuckDB's EXCLUDE on random rows),
+  and EXCLUDE CURRENT ROW on a ROWS frame that doesn't hold the row is left out. On the gate's pool
+  (26,980 records) the untranslatable records fall from 22, 21, 143 and 140 (DuckDB, PostgreSQL,
+  MySQL, ClickHouse) to 10, 10, 116 and 113: 5 conflict clauses everywhere and 103 exclusions on
+  MySQL and ClickHouse are "not expressible"; 5 still don't parse (WITH ... VALUES, a table
+  PRIMARY KEY with COLLATE or AUTOINCREMENT, two CHECKs without a comma, two upsert clauses), and
+  sqlglot fails on MySQL's NATURAL FULL JOIN (3). Left: refusals compared by kind beside "any error
+  matches" (the coordinator's decision), DuckDB's 6 disagreements and its refused INSERT unclassified.
+  Lane corpus-dialects-5 (`bench/corpus/dialects.py`, `test_dialects.py`): the last parse gaps read
+  as SQLite's documentation says they mean: VALUES after WITH as its SELECTs (lang_select.html 2.6),
+  table constraints without a comma (parse.y's empty `tconscomma`), a table PRIMARY KEY's ASC or DESC
+  left out and its AUTOINCREMENT moved onto its one column (autoinc.html); not expressible, with the
+  reason: a PRIMARY KEY collation other than its column's, several upsert clauses (lang_upsert.html),
+  AUTOINCREMENT on DuckDB, a NATURAL FULL JOIN on MySQL. min, max, first_value and last_value with
+  EXCLUDE CURRENT ROW on a ROWS frame holding the row are said on MySQL and ClickHouse as the frame's
+  two parts around it (6,720 windows on random rows agree with DuckDB 2.0.1's EXCLUDE). On the gate's
+  pool (26,980 records) the untranslatable records go from 10, 10, 116 and 113 (DuckDB, PostgreSQL,
+  MySQL, ClickHouse) to 8, 7, 109 and 106, every one "not expressible" with its reason: none fails to
+  parse. Left: refusals compared by kind, DuckDB's disagreements classified, the tiny run on every engine.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -1030,4 +1064,8 @@ registry of skipping summaries (zone maps or cracking), and a SELECT's scan with
 a summarized column seeks past the rows the summary leaves out, consulting it only at the snapshot
 it holds (an older reader, or a rolled-back summary, is refused, counted, and reads every row).
 Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). Open: choosing a kind
-by measured cost, a SQL switch, parameter bounds (executor.md decision 11, "Not yet").
+by measured cost and a SQL switch (executor.md decision 11, "Not yet").
+
+Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
+11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
+skip (T-SKU.1).

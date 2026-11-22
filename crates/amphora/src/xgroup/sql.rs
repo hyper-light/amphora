@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use amphora_api::Refusal;
 use amphora_engine::Value;
 
-use super::coordinator::{Answer, Config, Coordinator, Event, Lost, Protocol, Txn};
+use super::coordinator::{Answer, Config, Coordinator, Event, Lost, Protocol, Txn, Why};
 use super::{
     Envelope, GroupId, Guard, Intent, Lock, Mark, OpenPage, Outcome, Record, Reply, Tablet, TxnId,
     apply,
@@ -481,6 +481,11 @@ enum Input {
 pub struct Cluster {
     inputs: SyncSender<Input>,
     driver: Option<JoinHandle<()>>,
+    /// The groups, the route and the carried stamp the driver has too: [`Cluster::commit`]'s one
+    /// group fast path runs on them without it.
+    groups: Arc<Vec<Member>>,
+    route: Route,
+    carried: Arc<AtomicU64>,
 }
 
 /// `by` from now; an instant past the clock's range can't be waited for, so it is now.
@@ -620,9 +625,11 @@ impl Cluster {
             .ok_or_else(|| amphora_api::invalid("cross-group cluster", "too many steps out"))?;
         let (inputs, receiver) = mpsc::sync_channel(room);
         let (ready, is_ready) = mpsc::sync_channel(1);
+        let groups = Arc::new(groups);
+        let carried: Arc<AtomicU64> = Arc::default();
         let driver = Driver {
-            groups: Arc::new(groups),
-            route,
+            groups: Arc::clone(&groups),
+            route: Arc::clone(&route),
             coordinator,
             inputs: inputs.clone(),
             waiters: BTreeMap::new(),
@@ -633,7 +640,7 @@ impl Cluster {
             times: StepTimes::default(),
             open_until: until,
             ready: Some(ready),
-            carried: Arc::default(),
+            carried: Arc::clone(&carried),
         };
         let driver = std::thread::Builder::new()
             .name("amphora-xgroup".into())
@@ -644,6 +651,9 @@ impl Cluster {
         let cluster = Self {
             inputs,
             driver: Some(driver),
+            groups,
+            route,
+            carried,
         };
         match is_ready.recv_timeout(until.saturating_duration_since(Instant::now())) {
             Ok(result) => result.map(|()| cluster),
@@ -665,6 +675,62 @@ impl Cluster {
             Err(RecvTimeoutError::Disconnected) => Err(stopped()),
         }
     }
+}
+
+impl Cluster {
+    /// Commits a SQL session's transaction (AC-T1.10.1, lane xgroup-sql): the rows it read and
+    /// wrote, by key. Rows all in one group this process holds commit in that group's one database
+    /// transaction, no coordinator step (the fast path); a row another transaction holds a lock on
+    /// aborts it, as a lock step would. Rows in several groups, or a group on a node, commit through
+    /// the coordinator ([`Cluster::transact`]): in every group or none.
+    pub fn commit(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
+        // Refused as the coordinator refuses it, whichever path it takes.
+        super::coordinator::validate(&txn)?;
+        let one = {
+            let mut keys = txn
+                .reads
+                .iter()
+                .chain(txn.writes.iter().map(|(key, _)| key));
+            let first = keys.next().map(|key| (self.route)(key));
+            first.filter(|group| keys.all(|key| (self.route)(key) == *group))
+        };
+        let local = one
+            .and_then(|group| usize::try_from(group).ok())
+            .and_then(|i| self.groups.get(i));
+        match local {
+            Some(Member::Local(group)) => step(group, &self.carried, until, move |db| {
+                one_group(&mut SqlTablet::new(db), &txn)
+            }),
+            _ => self.transact(txn, until),
+        }
+    }
+}
+
+/// A transaction whose rows are all in this group, in the group's one database transaction:
+/// aborted at the first row another transaction holds a lock on, else its reads as they stood
+/// (each key once, in key order) and its writes applied.
+fn one_group(tablet: &mut impl Tablet, txn: &Txn) -> anyhow::Result<Answer> {
+    for key in txn
+        .reads
+        .iter()
+        .chain(txn.writes.iter().map(|(key, _)| key))
+    {
+        if !tablet.locks(key)?.is_empty() {
+            return Ok(Answer::Aborted(Why::Conflict(key.clone())));
+        }
+    }
+    let mut reads = BTreeMap::new();
+    for key in &txn.reads {
+        if !reads.contains_key(key) {
+            reads.insert(key.clone(), tablet.value(key)?);
+        }
+    }
+    for (key, value) in &txn.writes {
+        tablet.set_value(key, value.as_deref())?;
+    }
+    Ok(Answer::Committed {
+        reads: reads.into_iter().collect(),
+    })
 }
 
 impl Drop for Cluster {
@@ -972,5 +1038,119 @@ mod step_times {
         // Each resolution step lost doubles it (RFC 6298 §5.5), and an overflow stays the longest.
         assert_eq!(times.timeout(2), slower.checked_mul(4));
         assert_eq!(times.timeout(200), Some(Duration::MAX));
+    }
+}
+
+/// AC-T1.10.1 (lane xgroup-sql): a SQL session's transactions across groups.
+#[cfg(test)]
+mod sessions {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn until() -> Instant {
+        Instant::now() + crate::transport::HANG
+    }
+
+    /// A seeded generator (splitmix64), so every run makes the same transactions.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn txns(seed: u64, count: usize, keys: u64) -> Vec<Txn> {
+        let mut rng = Seeded(seed);
+        (0..count)
+            .map(|i| {
+                let key = |rng: &mut Seeded| vec![u8::try_from(rng.below(keys)).unwrap()];
+                let mut reads: Vec<Vec<u8>> = (0..=rng.below(3)).map(|_| key(&mut rng)).collect();
+                reads.sort();
+                reads.dedup();
+                let mut writes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+                for _ in 0..=rng.below(3) {
+                    let k = key(&mut rng);
+                    if writes.iter().all(|(w, _)| *w != k) {
+                        let value = (rng.below(4) != 0).then(|| i.to_be_bytes().to_vec());
+                        writes.push((k, value));
+                    }
+                }
+                Txn { reads, writes }
+            })
+            .collect()
+    }
+
+    /// Commits `txn`, again while another transaction's locks are still being resolved (as a SQL
+    /// client retries a conflict), by `until`.
+    fn commit(cluster: &Cluster, txn: &Txn) -> Answer {
+        let deadline = until();
+        loop {
+            let answer = cluster.commit(txn.clone(), deadline).unwrap();
+            if !matches!(answer, Answer::Aborted(Why::Conflict(_))) || Instant::now() >= deadline {
+                return in_key_order(answer);
+            }
+        }
+    }
+
+    /// A SQL answer's rows are a set: the coordinator answers reads as their groups reply.
+    fn in_key_order(answer: Answer) -> Answer {
+        match answer {
+            Answer::Committed { mut reads } => {
+                reads.sort();
+                reads.dedup();
+                Answer::Committed { reads }
+            }
+            other => other,
+        }
+    }
+
+    fn open(dir: &std::path::Path, groups: u32, id: u64, protocol: Protocol) -> Cluster {
+        let databases = (0..groups)
+            .map(|g| Database::open(&dir.join(format!("group{g}.db")), until()).unwrap())
+            .collect();
+        let route: Route =
+            Arc::new(move |key: &[u8]| key.first().map_or(0, |b| GroupId::from(*b) % groups));
+        Cluster::open(databases, route, id, protocol, 1, until()).unwrap()
+    }
+
+    #[test]
+    fn ac_t1_10_1_a_sessions_answers_across_groups_equal_the_same_on_one_group() {
+        for (seed, protocol) in [(1, Protocol::TwoPhase), (2, Protocol::Parallel)] {
+            let spread_dir = tempfile::tempdir().unwrap();
+            let one_dir = tempfile::tempdir().unwrap();
+            let spread = open(spread_dir.path(), 3, 1, protocol);
+            let one = open(one_dir.path(), 1, 1, protocol);
+            let keys = 6;
+            let mut across = 0;
+            for txn in txns(seed, 40, keys) {
+                let groups: BTreeSet<u8> = txn
+                    .reads
+                    .iter()
+                    .chain(txn.writes.iter().map(|(k, _)| k))
+                    .map(|k| k[0] % 3)
+                    .collect();
+                across += usize::from(groups.len() > 1);
+                assert_eq!(
+                    commit(&spread, &txn),
+                    commit(&one, &txn),
+                    "{protocol:?} {txn:?}"
+                );
+            }
+            assert!(across > 0, "{protocol:?}: no transaction spanned groups");
+            let all = Txn {
+                reads: (0..keys).map(|k| vec![u8::try_from(k).unwrap()]).collect(),
+                writes: Vec::new(),
+            };
+            assert_eq!(commit(&spread, &all), commit(&one, &all), "{protocol:?}");
+        }
     }
 }

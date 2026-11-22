@@ -1338,6 +1338,17 @@ impl Connection {
         sql: impl AsRef<str>,
         origin: StatementOrigin,
     ) -> Result<Statement> {
+        let dialect = self.db.dialect();
+        self.prepare_with_parser(sql, origin, |sql| dialect.parse(sql))
+    }
+
+    /// [`Self::prepare_with_origin`], the SQL parsed by `parse`.
+    fn prepare_with_parser(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        origin: StatementOrigin,
+        parse: impl Fn(&str) -> Result<(Option<Cmd>, usize)>,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1357,7 +1368,7 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
+                parse(sql)?
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1802,7 +1813,14 @@ impl Connection {
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        // The engine's own query, SQLite's SQL: parsed by SQLite's parser, never the database's
+        // dialect, which may not read it (G7 step 2: the versioned storage reads its schema
+        // this way at open, where the pager reads page 1 without SQL).
+        let stmt = self.prepare_with_parser(
+            "SELECT * FROM sqlite_schema",
+            StatementOrigin::Root,
+            crate::dialect::sqlite::parse,
+        )?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
