@@ -11,6 +11,8 @@ taking them down. The server is `amphora serve` (`crates/amphora/src/serve.rs`);
 - ssh from the machine you run the scripts on to each of them (`ssh -o BatchMode=yes HOST true`).
 - The `amphora` binary built for those machines: `cargo build --release --locked -p amphora`
   (target/release/amphora). Linux and macOS members need their own builds.
+- `openssl` (OpenSSL or LibreSSL) on the machine you run the scripts on, unless you bring your own
+  certificates (`--tls DIR`).
 
 Nothing here touches kiln: the binary goes to `~/.local/lib/amphora/amphora`, configs to
 `~/.config/amphora/`, data to `~/.local/share/amphora/member-N/`, and the services are
@@ -21,7 +23,7 @@ Nothing here touches kiln: the binary goes to `~/.local/lib/amphora/amphora`, co
 
 ```sh
 scripts/cluster.sh install --bin target/release/amphora --class persisted --deadline-ms MS \
-  [--drills on] [--spare HOST4:PORT] [--tls DIR] HOST1:PORT HOST2:PORT HOST3:PORT
+  --cert-days DAYS [--drills on] [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
 ```
 
 - `--class persisted`: a write is answered once a majority of members hold it on disk.
@@ -42,6 +44,19 @@ scripts/cluster.sh install --bin target/release/amphora --class persisted --dead
   `cert_file`, `key_file` and `roots_file`, all three or none. A member refuses a link whose
   certificate doesn't chain to the roots, and `amphora ask`, `health` and `drill` present the
   certificate of the config they read. The secret is still proved inside.
+- TLS is required in production (below, "Why TLS is required"). With a service (the default,
+  `--service auto`) and no `--tls DIR`, the script issues the certificates itself (`--tls issue`):
+  it makes the cluster's authority on the machine you run it on, once, in
+  `~/.config/amphora/authority/` (`roots.pem` and `authority.key`, the key readable by you only,
+  and never copied off that machine), and gives each member a certificate naming its host (an IP
+  address or a DNS name, as you wrote it) with a key of its own, valid `--cert-days DAYS`. Keys
+  are ECDSA P-256 signed with SHA-256. Each member's key is made for it, copied to it and removed
+  from the machine you ran the script on. A later install (a spare, a member replaced, renewed
+  certificates) reuses the authority, so members already running still trust the new ones; keep
+  that directory, and back it up as you would any key.
+- `--service none` writes the configs and the secret only, for members you run by hand or in a
+  test. Only there are plain links allowed: without `--tls` the links aren't encrypted.
+  `--service none --tls issue --cert-days DAYS` issues certificates there too.
 - On Linux the unit stops at logout unless linger is on: `sudo loginctl enable-linger $USER`
   (the script says so when it isn't).
 
@@ -114,10 +129,22 @@ is its test.
 scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]   # services and configs; data kept
 ```
 
+## Why TLS is required
+
+Decided 2026-11-22 (lane production-5, CP-T1.13): a member run as a service always runs its links
+inside mutual TLS. Without it, the cluster's secret keeps strangers from writing, but anyone on the
+path reads every record and every answer, and can cut or replay a link. Plain links are kept only
+for `--service none`, where members run by hand or in tests on one machine. So that requiring TLS
+costs nothing to set up, the script issues the certificates when none are given, from an authority
+it keeps on the machine you install from. Bring your own authority with `--tls DIR` when the
+deployment has one.
+
 ## What isn't done
 
-- Without `--tls` the link isn't encrypted: run the members on a network you trust, or under a
-  tunnel. The script issues no certificates: they come from your authority.
+- Certificates the script issues aren't renewed by themselves: install again before `--cert-days`
+  run out (the authority is reused; its own certificate is valid for the `--cert-days` of the
+  install that made it). Nothing revokes a member's certificate: replace the authority (remove
+  `~/.config/amphora/authority/` and install again) to stop trusting one.
 - kiln doesn't open these members yet: kiln reaches Amphora through its conversation-store seam
   (kiln branch `t1/lane-vendor-amphora-*`), in process. A client for `amphora serve` in that seam
   is the next step, and production kiln on it is Ada's word.

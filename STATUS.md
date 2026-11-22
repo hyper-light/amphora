@@ -1125,4 +1125,7 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   slot; an open of the same file by another path, a hard link included, waits for the one in
   flight); `cluster.sh install --spare`; with `cert_file`, `key_file` and `roots_file` (or
   `cluster.sh install --tls DIR`) every link runs inside mutual TLS under the network transport's
-  rules (`Credentials::listener`/`dialer` for a protocol of its own).
+  rules (`Credentials::listener`/`dialer` for a protocol of its own). Lane production-5: a `leader WAIT_MS` request that waits
+  for the group's leader, woken by the step that names it (`Client::leader`); TLS required for
+  real services: `cluster.sh install` issues the authority and each member's certificate when no
+  `--tls DIR` is given, plain links only with `--service none`.
