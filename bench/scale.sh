@@ -9,9 +9,12 @@
 #   every flag the chosen measures take; each run is given all of them.
 #   MEASURES  (env, default "write read follower xgroup region regionloss cutover")
 #   SYSTEMS   (env, default "amphora cockroach tidb")
-#   amphora also takes --dir, --class, --relay-records and --relay-pending (and --spanning,
-#   --protocol); the others ignore them. CockroachDB and TiDB take --hosts ENDPOINT=ADDR,...: the
-#   machines their nodes run on (bench/servers/scale/lib.sh); Amphora's groups run in the bench.
+#   Every system but amphora-inproc takes --hosts ENDPOINT=ADDR,...: the machines its nodes run on
+#   (bench/servers/scale/lib.sh), natively by default (AMPHORA_BENCH_SCALE_MODE=native: release
+#   binaries from AMPHORA_BENCH_SCALE_BIN, bench/servers/scale/fetch.sh; Amphora's server from
+#   AMPHORA_BENCH_SCALE_AMPHORA), or in containers (docker; not Amphora's server). amphora takes
+#   --class (and --spanning); amphora-inproc, Amphora's groups in the bench's process, also takes
+#   --dir, --relay-records, --relay-pending and --protocol, for the measures the server doesn't serve.
 #   RECORDS is a path in the repository (bench/records/scale/<run> for the runs of record).
 #   KEEP_IMAGES=1 keeps the images the containers ran; otherwise they're removed by ID at the end.
 # Exit: 0 when every pair gave a record or a typed refusal; 1 when any failed otherwise.
@@ -30,6 +33,9 @@ BIN="$TARGET/release/amphora-bench"
 SHELL_PATH=$(command -v bash)
 command -v cygpath >/dev/null && SHELL_PATH=$(cygpath -w "$SHELL_PATH")
 # Flags only Amphora takes are dropped for the others, and --hosts for Amphora.
+# amphora (its own server, reached over TCP) takes --class and --spanning beside --hosts;
+# amphora-inproc (its groups in the bench's process) takes those and the relay's flags, not --hosts.
+inproc=()
 amphora=()
 others=()
 hosts=""
@@ -37,9 +43,10 @@ args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   a=${args[i]}
   case "$a" in
-    --dir|--class|--spanning|--relay-records|--relay-pending|--protocol) amphora+=("$a" "${args[i+1]:-}"); i=$((i + 1)) ;;
-    --hosts) hosts=${args[i+1]:-}; others+=("$a" "$hosts"); i=$((i + 1)) ;;
-    *) amphora+=("$a"); others+=("$a") ;;
+    --class|--spanning) inproc+=("$a" "${args[i+1]:-}"); amphora+=("$a" "${args[i+1]:-}"); i=$((i + 1)) ;;
+    --dir|--relay-records|--relay-pending|--protocol) inproc+=("$a" "${args[i+1]:-}"); i=$((i + 1)) ;;
+    --hosts) hosts=${args[i+1]:-}; amphora+=("$a" "$hosts"); others+=("$a" "$hosts"); i=$((i + 1)) ;;
+    *) inproc+=("$a"); amphora+=("$a"); others+=("$a") ;;
   esac
 done
 failed=0
@@ -47,7 +54,7 @@ for m in $MEASURES; do
   for s in $SYSTEMS; do
     out="$RECORDS/$s-$m.jsonl"
     echo "== $s $m" >&2
-    if [[ $s == amphora ]]; then flags=("${amphora[@]}"); else flags=("${others[@]}"); fi
+    case $s in amphora) flags=("${amphora[@]}") ;; amphora-inproc) flags=("${inproc[@]}") ;; *) flags=("${others[@]}") ;; esac
     before=0
     [[ -f $out ]] && before=$(wc -l <"$out")
     if "$BIN" --scale "$m" --system "$s" --shell "$SHELL_PATH" --record "$out" "${flags[@]}"; then

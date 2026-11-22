@@ -31,6 +31,9 @@ ureq = { version = "3", default-features = false }
 # The planner bench's DuckDB (`--planner`), compiled in as SQLite is.
 duckdb = { version = "1", features = ["bundled"] }
 anyhow = "1"
+# Amphora's server's client handshake (`--scale --system amphora`): HMAC-SHA256 over its challenge (RFC 2104).
+hmac = "0.12"
+sha2 = "0.10"
 # float_roundtrip: the planner bench keeps estimates exactly as EXPLAIN QUERY PLAN FORMAT=JSON gives them.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 

@@ -583,6 +583,17 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is built P
 catalog change hides the column as a slot (no name finds it, `*` and inserts pass it, every write
 stores NULL in it), learned rowid batches clear its old values, then the drop is recorded.
 
+Scale harness made fair (lane scaleout-harness, kiln goal 45b65f3e; AC-SH.1, AC-SH.2): `amphora-bench --scale`
+drives Amphora, CockroachDB and TiDB with one client and one timing, each as its own server over the network:
+Amphora through `amphora serve` (CP-T1.13's server, bench/servers/scale/amphora.sh) and its client protocol,
+CockroachDB through Postgres wire, TiDB through MySQL wire. The nodes run natively by default, from each system's
+release binaries (bench/servers/scale/fetch.sh) with data on the machine's own disk; containers stay as
+`AMPHORA_BENCH_SCALE_MODE=docker` (not for Amphora's server; native mode refuses `delay`, which takes root). Every
+record carries `platform` (OS, kernel, arch, how the system ran, its wire client). `amphora-inproc` keeps the
+in-process groups for the measures the server doesn't serve (follower, xgroup, region). Not yet: the smoke on
+adacachy2 end to end; Amphora's server serves one database (`--groups 1`) and refuses cutover until the reshard
+shell is built.
+
 ## Measured
 
 - **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,

@@ -45,27 +45,34 @@
 //!   shell that carries out its splits, merges and moves over replicated groups is built
 //!   (docs/design/reshard.md, "What is left").
 //!
-//! CockroachDB's and TiDB's nodes run on the machines `--hosts` names (`ENDPOINT=ADDR,...`, node `n`
-//! on machine `n` mod their count; bench/servers/scale/lib.sh): one a machine for the runs of
-//! record, all on one for a lab. Amphora's groups run in this process on the bench's machine.
+//! Every system's nodes run on the machines `--hosts` names (`ENDPOINT=ADDR,...`, node `n` on
+//! machine `n` mod their count; bench/servers/scale/lib.sh): one a machine for the runs of record,
+//! all on one for a lab. Natively by default (each system's own release binaries as processes, data
+//! on the machine's disk; Ada's fair comparisons: the same client, OS, disk and filesystem for all),
+//! or in containers (`AMPHORA_BENCH_SCALE_MODE=docker`, not Amphora's server). `amphora` is
+//! Amphora's own server (`amphora serve`), reached over TCP by its client protocol as the others
+//! are by theirs ([`served`]); `amphora-inproc` keeps its groups in this process for the measures
+//! the server doesn't serve yet (follower, xgroup, region). Each record says which client and
+//! platform produced it (`platform`).
 //!
 //! Every size, duration and interval is an input with no default: nothing is picked here. A system
 //! without a measure's concept, or whose cluster can't be brought up here, is refused, typed (the
 //! same record as `repl.rs`'s: `"refused": "no-concept" | "unavailable"`, with why).
 //!
-//! Amphora's groups run in this process, each `--nodes` members relayed as `repl.rs` relays them
-//! (member `n` of every group is node `n`, in region `n`). CockroachDB and TiDB run in containers
-//! through `bench/servers/scale/<system>.sh up N|down|kill N|start N|endpoint N|delay MS|images`.
+//! `amphora-inproc`'s groups run in this process, each `--nodes` members relayed as `repl.rs` relays
+//! them (member `n` of every group is node `n`, in region `n`). The others are brought up through
+//! `bench/servers/scale/<system>.sh up N|down|kill N|start N|endpoint N|delay MS|rmi`.
 //!
 //! usage: amphora-bench --scale <write|read|follower|xgroup|region|regionloss|cutover>
-//!        --system <amphora|cockroach|tidb> --nodes N --groups N --writers N --deadline-s N [--record FILE]
+//!        --system <amphora|amphora-inproc|cockroach|tidb> --nodes N --groups N --writers N --deadline-s N [--record FILE]
 //!        write, region: --batch N --text-bytes N --warmup-s N --seconds N (region: --between-ms N --poll-us N)
 //!        read, follower: --rows N --batch N --text-bytes N --warmup-s N --seconds N
 //!        xgroup:     --keys N --span N --warmup-s N --seconds N (amphora: --protocol 2pc|parallel)
 //!        regionloss: --batch N --text-bytes N --lose N --settle-s N --after-s N --poll-us N
 //!        cutover:    --batch N --text-bytes N --ops N --concurrent-ops N --settle-s N --poll-us N
-//!        amphora:    --dir DIR --class persisted|replicated [--spanning N] --relay-records N --relay-pending N
-//!        others:     --hosts ENDPOINT=ADDR,... [--scripts DIR (bench/servers/scale)] [--shell PROGRAM (bash)]
+//!        amphora:    --class persisted|replicated [--spanning N]
+//!        amphora-inproc: --dir DIR --class persisted|replicated [--spanning N] --relay-records N --relay-pending N
+//!        all but amphora-inproc: --hosts ENDPOINT=ADDR,... [--scripts DIR (bench/servers/scale)] [--shell PROGRAM (bash)]
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -290,7 +297,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
                 "--span takes 2 to --groups: one key in each of that many groups"
             );
             anyhow::ensure!(keys >= o.groups, "--keys takes at least --groups");
-            if o.system == "amphora" {
+            if o.system == "amphora-inproc" {
                 need(o.protocol.as_deref(), "--protocol", &m)?;
             }
         }
@@ -321,7 +328,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             need(o.poll, "--poll-us", &m)?;
         }
     }
-    if o.system != "amphora" {
+    if o.system != "amphora-inproc" {
         let hosts = need(o.hosts.as_deref(), "--hosts", &m)?;
         anyhow::ensure!(
             hosts.split(',').all(|h| h
@@ -331,6 +338,16 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
         );
     }
     if o.system == "amphora" {
+        match need(o.class.as_deref(), "--class", &m)? {
+            "persisted" => {}
+            "replicated" => anyhow::ensure!(
+                need(o.spanning, "--spanning", &m)? >= 2,
+                "--spanning takes at least 2"
+            ),
+            other => anyhow::bail!("unknown class {other} (persisted, replicated)"),
+        }
+    }
+    if o.system == "amphora-inproc" {
         need(o.dir.as_ref(), "--dir", &m)?;
         anyhow::ensure!(
             need(o.relay_records, "--relay-records", &m)? > 0,
@@ -1038,8 +1055,15 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
 }
 
 fn record_head(o: &Opts) -> serde_json::Value {
+    // bash doesn't export HOSTNAME to its children: the kernel's name is the fallback.
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|h| h.trim().to_owned())
+        })
         .unwrap_or_default();
     let commit = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -1059,6 +1083,49 @@ fn record_head(o: &Opts) -> serde_json::Value {
         "bench": format!("scale_{}", o.measure), "system": o.system, "nodes": o.nodes, "groups": o.groups,
         "host": host, "cpus": std::thread::available_parallelism().map_or(0, usize::from), "commit": commit, "unix_s": date, "load1": load,
     });
+    // Which client and platform produced the record (Ada's fair comparisons): the OS, how the
+    // system ran (natively as its own processes, in containers, or in the bench's process) and the
+    // wire client the bench drove it through.
+    let mode = std::env::var("AMPHORA_BENCH_SCALE_MODE").unwrap_or_else(|_| "native".into());
+    let (ran, client) = match o.system.as_str() {
+        "amphora" => (
+            "native: amphora serve, one process a member".to_owned(),
+            "Amphora's client protocol over TCP (amphora-bench scale::served)",
+        ),
+        "amphora-inproc" => ("in the bench's process".to_owned(), "in-process calls"),
+        "cockroach" => (
+            format!("{mode}: cockroach start, one process a node"),
+            "Postgres wire: rust-postgres (postgres crate, sync)",
+        ),
+        _ => (
+            format!("{mode}: pd-server, tikv-server, tidb-server a node"),
+            "MySQL wire: rust-mysql-simple (mysql crate)",
+        ),
+    };
+    let os = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                l.strip_prefix("PRETTY_NAME=")
+                    .map(|v| v.trim_matches('"').to_owned())
+            })
+        })
+        .unwrap_or_else(|| std::env::consts::OS.to_owned());
+    let kernel = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_owned());
+    if let Some(h) = head.as_object_mut() {
+        h.insert(
+            "platform".into(),
+            serde_json::json!({ "os": os, "kernel": kernel, "arch": std::env::consts::ARCH, "ran": ran, "client": client, "driver": "amphora-bench --scale: closed-loop writers, Instant-timed per acknowledgement" }),
+        );
+        if let Ok(b) = std::env::var("AMPHORA_BENCH_SCALE_BIN") {
+            h.insert("binaries".into(), b.into());
+        }
+    }
     if let (Some(h), Some(class)) = (head.as_object_mut(), &o.class) {
         h.insert("class".into(), class.clone().into());
     }
@@ -1097,9 +1164,10 @@ fn emit(o: &Opts, mut head: serde_json::Value, body: serde_json::Value) -> anyho
 
 fn open(o: &Opts) -> anyhow::Result<Box<dyn System>> {
     Ok(match o.system.as_str() {
-        "amphora" => Box::new(inproc::Amphora::open(o)?),
+        "amphora" => Box::new(served::Amphora::up(o)?),
+        "amphora-inproc" => Box::new(inproc::Amphora::open(o)?),
         "cockroach" | "tidb" => Box::new(sql::Containers::up(o)?),
-        other => anyhow::bail!("unknown system {other} (amphora, cockroach, tidb)"),
+        other => anyhow::bail!("unknown system {other} (amphora, amphora-inproc, cockroach, tidb)"),
     })
 }
 
@@ -1579,6 +1647,277 @@ mod inproc {
     }
 }
 
+/// Amphora as its own server (`amphora serve`, CP-T1.13), one member a node, brought up and down by
+/// bench/servers/scale/amphora.sh as CockroachDB's and TiDB's are by theirs, and reached over TCP by
+/// the server's client protocol: a connection opens with `C`, answers the member's challenge with
+/// HMAC-SHA256(secret, challenge || `C`) (RFC 2104), then sends one request a line (`exec SQL`,
+/// `count SQL`, `status`) and reads one answer a line (`ok ...` or `err ...`). The server serves one
+/// replicated database: `--groups` takes 1. A write goes to the member that leads (a member's
+/// `status` names it), as a client of a single-leader database sends it; a refused one is sent again
+/// by the bench's closed loop after the leader is asked again.
+mod served {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    const EVENTS: &str = "CREATE TABLE IF NOT EXISTS events(session TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(session, seq))";
+
+    pub struct Amphora {
+        c: sql::Scripted,
+        /// Each node's address and the cluster's secret.
+        members: Vec<(String, Vec<u8>)>,
+        deadline: Duration,
+    }
+
+    /// One client connection to one member.
+    struct Link {
+        r: BufReader<TcpStream>,
+        w: TcpStream,
+    }
+
+    impl Link {
+        fn open(addr: &str, secret: &[u8], deadline: Duration) -> anyhow::Result<Self> {
+            let to = addr
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("{addr} names no address"))?;
+            let s = TcpStream::connect_timeout(&to, deadline)?;
+            s.set_nodelay(true)?;
+            s.set_read_timeout(Some(deadline))?;
+            s.set_write_timeout(Some(deadline))?;
+            let mut w = s.try_clone()?;
+            let mut r = BufReader::new(s);
+            w.write_all(b"C")?;
+            let mut nonce = [0u8; 32];
+            r.read_exact(&mut nonce)?;
+            let mut tag = <Hmac<Sha256> as Mac>::new_from_slice(secret)
+                .map_err(|e| anyhow::anyhow!("the secret as a key: {e}"))?;
+            tag.update(&nonce);
+            tag.update(b"C");
+            w.write_all(&tag.finalize().into_bytes())?;
+            Ok(Self { r, w })
+        }
+
+        /// One request, its answer's text past `ok`; an `err` answer is the error.
+        fn ask(&mut self, line: &str) -> anyhow::Result<String> {
+            anyhow::ensure!(!line.contains(['\n', '\r']), "a request is one line");
+            self.w.write_all(line.as_bytes())?;
+            self.w.write_all(b"\n")?;
+            let mut answer = String::new();
+            anyhow::ensure!(
+                self.r.read_line(&mut answer)? > 0,
+                "the member closed the connection"
+            );
+            let answer = answer.trim_end_matches(['\r', '\n']);
+            match answer.split_once(' ').unwrap_or((answer, "")) {
+                ("ok", rest) => Ok(rest.to_owned()),
+                ("err", why) => anyhow::bail!("{why}"),
+                _ => anyhow::bail!("an answer neither ok nor err: {answer}"),
+            }
+        }
+    }
+
+    /// A SQL text literal.
+    fn lit(v: &str) -> String {
+        format!("'{}'", v.replace('\'', "''"))
+    }
+
+    fn no_concept(what: &str) -> anyhow::Error {
+        anyhow::Error::from(Refusal::Unavailable(format!(
+            "Amphora's server doesn't serve {what} yet (its client protocol takes exec, count and status)"
+        )))
+    }
+
+    impl Amphora {
+        pub fn up(o: &Opts) -> anyhow::Result<Self> {
+            if o.groups != 1 {
+                return Err(anyhow::Error::from(Refusal::Unavailable("Amphora's server serves one replicated database: --groups 1 (groups across servers aren't served yet)".into())));
+            }
+            let mut env = vec![
+                (
+                    "CLASS".to_owned(),
+                    need(o.class.clone(), "--class", &o.measure)?,
+                ),
+                ("DEADLINE_MS".to_owned(), o.deadline.as_millis().to_string()),
+            ];
+            if let Some(sp) = o.spanning {
+                env.push(("SPANNING".to_owned(), sp.to_string()));
+            }
+            let c = sql::Scripted::up(o, env)?;
+            let mut members = Vec::new();
+            for n in 0..o.nodes {
+                let ep = c.run(&["endpoint", &n.to_string()])?;
+                let ep = ep.trim();
+                let (addr, secret) = ep.split_once(' ').ok_or_else(|| {
+                    anyhow::anyhow!("amphora.sh's endpoint {ep}: not ADDR SECRET_FILE")
+                })?;
+                let mut bytes = std::fs::read(secret)?;
+                while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+                    bytes.pop();
+                }
+                members.push((addr.to_owned(), bytes));
+            }
+            Ok(Self {
+                c,
+                members,
+                deadline: o.deadline,
+            })
+        }
+
+        fn link(&self, node: usize) -> anyhow::Result<Link> {
+            let (addr, secret) = self
+                .members
+                .get(node)
+                .ok_or_else(|| anyhow::anyhow!("no node {node}"))?;
+            Link::open(addr, secret, self.deadline)
+        }
+
+        /// The node that leads, as node `via` names it.
+        fn leader(&self, via: &mut Link) -> anyhow::Result<usize> {
+            let status = via.ask("status")?;
+            let l: usize = status
+                .split_whitespace()
+                .find_map(|f| f.strip_prefix("leader="))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            anyhow::ensure!(l >= 1 && l <= self.members.len(), "no leader yet: {status}");
+            Ok(l - 1)
+        }
+    }
+
+    struct S<'a> {
+        a: &'a Amphora,
+        own: Link,
+        /// The leader's node and a link to it, asked again after a refusal.
+        lead: Option<(usize, Link)>,
+        node: usize,
+    }
+
+    impl S<'_> {
+        fn to_leader(&mut self, line: &str) -> anyhow::Result<String> {
+            if self.lead.is_none() {
+                let l = self.a.leader(&mut self.own)?;
+                self.lead = Some((l, self.a.link(l)?));
+            }
+            let Some((_, link)) = self.lead.as_mut() else {
+                anyhow::bail!("no leader link");
+            };
+            let answer = link.ask(line);
+            if answer.is_err() {
+                self.lead = None;
+            }
+            answer
+        }
+    }
+
+    impl Session for S<'_> {
+        fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()> {
+            if regional {
+                return Err(no_concept("regional tables"));
+            }
+            if rows.is_empty() {
+                return Ok(());
+            }
+            // One statement, so the rows commit together.
+            let values = rows
+                .iter()
+                .map(|r| format!("({}, {}, {})", lit(&r.session), r.seq, lit(&r.body)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.to_leader(&format!("exec INSERT INTO events(session, seq, body) VALUES {values} ON CONFLICT(session, seq) DO UPDATE SET body = excluded.body"))
+                .map(|_| ())
+        }
+
+        fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
+            if follower {
+                return Err(no_concept("follower reads"));
+            }
+            let n: u64 = self
+                .to_leader(&format!(
+                    "count SELECT count(*) FROM events WHERE session = {} AND seq = {seq}",
+                    lit(session)
+                ))?
+                .parse()?;
+            Ok(n > 0)
+        }
+
+        fn add(&mut self, _keys: &[i64], _value: i64) -> anyhow::Result<()> {
+            Err(no_concept("transactions across groups"))
+        }
+
+        fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64> {
+            let q = format!(
+                "count SELECT count(*) FROM events WHERE session = {} AND seq <= {upto}",
+                lit(session)
+            );
+            Ok(if own {
+                self.own.ask(&q)?
+            } else {
+                self.to_leader(&q)?
+            }
+            .parse()?)
+        }
+    }
+
+    impl System for Amphora {
+        fn nodes(&self) -> usize {
+            self.members.len()
+        }
+
+        fn prepare(&self, o: &Opts) -> anyhow::Result<()> {
+            match o.measure.as_str() {
+                "write" | "read" | "regionloss" => {}
+                "cutover" => return Err(anyhow::Error::from(Refusal::Unavailable("Amphora's splits, merges and moves are a pure core so far: the shell that carries them out over replicated groups isn't built (docs/design/reshard.md, \"What is left\")".into()))),
+                other => return Err(no_concept(&format!("the {other} measure"))),
+            }
+            // The schema through the leader, once one is elected: each refusal is an election
+            // still under way, asked again until --deadline-s.
+            let until = Instant::now() + o.deadline;
+            // Each try waits on the member's answer: no timer between them.
+            loop {
+                let tried = self.link(0).and_then(|mut via| {
+                    let l = self.leader(&mut via)?;
+                    self.link(l)?.ask(&format!("exec {EVENTS}"))
+                });
+                match tried {
+                    Ok(_) => return Ok(()),
+                    Err(e) => anyhow::ensure!(
+                        Instant::now() < until,
+                        "Amphora took no schema within --deadline-s: {e}"
+                    ),
+                }
+            }
+        }
+
+        fn connect(&self, node: usize) -> anyhow::Result<Box<dyn Session + '_>> {
+            Ok(Box::new(S {
+                a: self,
+                own: self.link(node)?,
+                lead: None,
+                node,
+            }))
+        }
+
+        fn kill(&self, node: usize) -> anyhow::Result<()> {
+            self.c.run(&["kill", &node.to_string()]).map(|_| ())
+        }
+
+        fn start(&self, node: usize) -> anyhow::Result<()> {
+            self.c.run(&["start", &node.to_string()]).map(|_| ())
+        }
+
+        fn stale_routes(&self) -> anyhow::Result<u64> {
+            Err(no_concept("a count of stale routes"))
+        }
+
+        fn reshard(&self, _op: usize, _o: &Opts) -> anyhow::Result<()> {
+            Err(no_concept("range operations"))
+        }
+    }
+}
+
 /// CockroachDB (Postgres's protocol) and TiDB (MySQL's), each cluster brought up and down by its
 /// script; each node in region `r<n>` (CockroachDB's `--locality`, TiKV's labels).
 pub mod sql {
@@ -1590,11 +1929,74 @@ pub mod sql {
         Tidb,
     }
 
-    pub struct Containers {
-        kind: Kind,
+    /// A cluster brought up by its script (bench/servers/scale/<system>.sh) and taken down by it
+    /// when dropped.
+    pub struct Scripted {
         script: PathBuf,
         shell: String,
         hosts: String,
+        deadline: Duration,
+        env: Vec<(String, String)>,
+    }
+
+    impl Scripted {
+        /// `up --nodes` through the system's script, `env` added to what it's given.
+        pub fn up(o: &Opts, env: Vec<(String, String)>) -> anyhow::Result<Self> {
+            let c = Self {
+                script: PathBuf::from(format!("{}/{}.sh", o.scripts.display(), o.system)),
+                shell: o.shell.clone(),
+                hosts: need(o.hosts.clone(), "--hosts", &o.measure)?,
+                deadline: o.deadline,
+                env,
+            };
+            c.run(&["up", &o.nodes.to_string()]).map_err(|e| {
+                Refusal::Unavailable(format!(
+                    "{}'s cluster didn't come up through {}: {e}",
+                    o.system,
+                    c.script.display()
+                ))
+            })?;
+            Ok(c)
+        }
+
+        /// The script run by `--shell`, given the run's deadline as its bound on waiting.
+        pub fn run(&self, args: &[&str]) -> anyhow::Result<String> {
+            let out = std::process::Command::new(&self.shell)
+                .arg(&self.script)
+                .args(args)
+                .env("WAIT_S", self.deadline.as_secs().max(1).to_string())
+                .env("HOSTS", &self.hosts)
+                .envs(self.env.iter().map(|(k, v)| (k, v)))
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{} {}: {}",
+                self.script.display(),
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            Ok(String::from_utf8(out.stdout)?)
+        }
+    }
+
+    impl Drop for Scripted {
+        fn drop(&mut self) {
+            if let Err(e) = self.run(&["down"]) {
+                use std::io::Write;
+                // Drop can't return the failure: it goes to stderr, and the nodes stay for `down`.
+                writeln!(
+                    std::io::stderr().lock(),
+                    "{} down: {e}",
+                    self.script.display()
+                )
+                .ok();
+            }
+        }
+    }
+
+    pub struct Containers {
+        kind: Kind,
+        s: Scripted,
         endpoints: Vec<String>,
         deadline: Duration,
     }
@@ -1694,19 +2096,10 @@ pub mod sql {
             };
             let mut c = Self {
                 kind,
-                script: PathBuf::from(format!("{}/{}.sh", o.scripts.display(), o.system)),
-                shell: o.shell.clone(),
-                hosts: need(o.hosts.clone(), "--hosts", &o.measure)?,
+                s: Scripted::up(o, Vec::new())?,
                 endpoints: Vec::new(),
                 deadline: o.deadline,
             };
-            c.script(&["up", &o.nodes.to_string()]).map_err(|e| {
-                Refusal::Unavailable(format!(
-                    "{}'s cluster didn't come up through {}: {e}",
-                    o.system,
-                    c.script.display()
-                ))
-            })?;
             for n in 0..o.nodes {
                 c.endpoints
                     .push(c.script(&["endpoint", &n.to_string()])?.trim().to_owned());
@@ -1714,22 +2107,8 @@ pub mod sql {
             Ok(c)
         }
 
-        /// The script run by `--shell`, given the run's deadline as its bound on waiting.
         fn script(&self, args: &[&str]) -> anyhow::Result<String> {
-            let out = std::process::Command::new(&self.shell)
-                .arg(&self.script)
-                .args(args)
-                .env("WAIT_S", self.deadline.as_secs().max(1).to_string())
-                .env("HOSTS", &self.hosts)
-                .output()?;
-            anyhow::ensure!(
-                out.status.success(),
-                "{} {}: {}",
-                self.script.display(),
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            Ok(String::from_utf8(out.stdout)?)
+            self.s.run(args)
         }
 
         fn endpoint(&self, n: usize) -> anyhow::Result<&str> {
@@ -1737,21 +2116,6 @@ pub mod sql {
                 .get(n)
                 .map(String::as_str)
                 .ok_or_else(|| anyhow::anyhow!("no node {n}"))
-        }
-    }
-
-    impl Drop for Containers {
-        fn drop(&mut self) {
-            if let Err(e) = self.script(&["down"]) {
-                use std::io::Write;
-                // Drop can't return the failure: it goes to stderr, and the containers stay for `down`.
-                writeln!(
-                    std::io::stderr().lock(),
-                    "{} down: {e}",
-                    self.script.display()
-                )
-                .ok();
-            }
         }
     }
 
@@ -2243,8 +2607,23 @@ mod tests {
         assert!(e.contains("--nodes"), "{e}");
         let e = parse(&args("--scale region --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
         assert!(e.contains("--between-ms"), "{e}");
-        let e = parse(&args("--scale xgroup --system amphora --nodes 3 --groups 3 --writers 2 --deadline-s 5 --keys 30 --span 2 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
+        let e = parse(&args("--scale xgroup --system amphora-inproc --nodes 3 --groups 3 --writers 2 --deadline-s 5 --keys 30 --span 2 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
         assert!(e.contains("--protocol"), "{e}");
+        // Amphora's server is brought up on the machines it's given, as the others are.
+        let served = "--scale write --system amphora --nodes 3 --groups 1 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1";
+        let e = parse(&args(served)).err().unwrap().to_string();
+        assert!(e.contains("--hosts"), "{e}");
+        let e = parse(&args(&format!("{served} --hosts local=127.0.0.1")))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("--class"), "{e}");
+        assert!(
+            parse(&args(&format!(
+                "{served} --hosts local=127.0.0.1 --class persisted"
+            )))
+            .is_ok()
+        );
         let e = parse(&args("--scale regionloss --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --lose 3 --settle-s 1 --after-s 1 --poll-us 10")).err().unwrap().to_string();
         assert!(e.contains("--lose"), "{e}");
         let e = parse(&args("--scale xgroup --system tidb --nodes 3 --groups 2 --writers 2 --deadline-s 5 --keys 30 --span 3 --warmup-s 1 --seconds 1")).err().unwrap().to_string();

@@ -1266,3 +1266,15 @@ tests = [
 
 # lane many-writers-7 (CP-T1.4, AC-T1.4.4): no new IDs. T-T1.4.1's harness: bench/powercut/{linux,macos}.sh,
 # amphora-bench --powercut write|check|span, and their verdict through bench/power_nemesis.sh tally.
+
+# lane scaleout-harness: the scale harness made fair (kiln goal 45b65f3e; bench/src/scale.rs, bench/servers/scale).
+[[own]]
+id = "SH"
+title = "Amphora, CockroachDB and TiDB measured by one client on one platform: each its own server over the network, natively by default"
+criteria = [
+  { id = "AC-SH.1", text = "amphora-bench --scale drives all three through the same closed-loop writers and timing, each over the network by its own wire client (Amphora's client protocol, Postgres wire, MySQL wire), each system's own processes on the same machines, OS, disk and filesystem (native by default; containers for all or none)" },
+  { id = "AC-SH.2", text = "Every scale record says which client and platform produced it: host, OS, kernel, arch, how the system ran, its wire client and the binaries' folder" },
+]
+tests = [
+  { id = "T-SH.1", text = "scale::tests::g13_scale_inputs_are_required_not_picked — passes when the served amphora system is refused without --hosts or --class, as the others are, and amphora-inproc keeps the in-process flags" },
+]
