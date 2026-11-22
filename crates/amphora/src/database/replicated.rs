@@ -8772,7 +8772,7 @@ mod tests {
     /// Do: a lone member of three campaigns, sending its vote requests in one step (a burst past
     /// one message), its host draining after each tick, for ten election timeouts. Expect: the
     /// outgoing bound starts at the room, with no count of messages; never fenced; then held to
-    /// a count the host's measured drain gives, no less than one message.
+    /// a count the host's measured drain gives, no less than a record to each peer.
     #[test]
     fn queue_bound_a_burst_at_start_is_held_by_the_room() {
         let dir = tempfile::tempdir().unwrap();
@@ -8797,7 +8797,8 @@ mod tests {
         assert!(burst > 1, "no burst past one message: {burst}");
         assert!(drained > burst, "{drained}");
         let learned = locked(&driven.owner(0).control.outgoing).unwrap().bound;
-        assert!((1..u64::MAX).contains(&learned.messages), "{learned:?}");
+        // Its least is one broadcast: a record to each of its two peers (QB.2).
+        assert!((2..u64::MAX).contains(&learned.messages), "{learned:?}");
     }
 
     /// AC-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan 01a1a283e14c,
