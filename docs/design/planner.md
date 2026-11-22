@@ -1463,10 +1463,14 @@ same rows as the left-deep order of the same tables (associativity and commutati
 f25).
 
 **Evidence.** `optimizer::bushy_test_hook::tests::t_pl_8_2_a_bushy_build_group_answers_as_the_left_deep_plan`
-(T-PL.8.2): four inner joins of four tables (a range join before the run, a WHERE term between the
-run and the loop before it, an aggregate, a probe term reading the loop before the run), each run
-left-deep and with its build side split into a run after the first table, by cost and with hash
-joins only, give the same rows; a counter shows the hook made plans bushy.
+(T-PL.8.2): eight joins of four tables (a range join before the run, a WHERE term between the run
+and the loop before it, an aggregate, a probe term reading the loop before the run), the reference
+plan chosen by cost and with hash joins only. The test builds the bushy plan itself: a hook pins the
+plan to the FROM order, loops but for one hash join at the last table built from the table before
+it (`bushy_test_hook::PIN`), then splits it into the tree `(a ((b c) p))`. For every query the hook
+reports the plan made bushy, and the pinned left-deep plan and the bushy one give the reference
+plan's rows. (The search alone put each hash join at the second table, so the earlier test's split
+never applied.)
 
 **Not yet built.** The search does not make bushy plans: DPccp's connected complement pairs on an
 explicit stack with a budget derived from the plan-time target, falling back to today's search; and

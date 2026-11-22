@@ -3646,6 +3646,13 @@ pub(crate) mod bushy_test_hook {
     }
 
     thread_local! {
+        /// Pins the left-deep plan the hook splits: the tables in the FROM order, each read by a
+        /// loop but the last, which probes a hash join built from the table before it. The search
+        /// would rarely choose that plan for a test's few rows, so the test builds it.
+        pub(crate) static PIN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    thread_local! {
         /// How many plans `split_build_side` made bushy.
         pub(crate) static APPLIED: Cell<usize> = const { Cell::new(0) };
     }
@@ -3717,7 +3724,7 @@ pub(crate) mod bushy_test_hook {
             clippy::indexing_slicing,
             clippy::arithmetic_side_effects
         )]
-        use super::{APPLIED, SPLIT};
+        use super::{APPLIED, PIN, SPLIT};
         use crate::io::MemoryIO;
         use crate::sync::Arc;
         use crate::{ConnectOpts, Database, JoinMethods, SqliteDialect};
@@ -3787,6 +3794,8 @@ pub(crate) mod bushy_test_hook {
                 conn.execute(format!("INSERT INTO p VALUES ({id}, {}, {id})", id % 4))
                     .unwrap();
             }
+            // Statistics, so the pinned plan's build input is estimated at its few rows.
+            conn.execute("ANALYZE").unwrap();
             let queries = [
                 "SELECT a.id, b.id, c.id, p.id FROM a JOIN b ON b.x > a.x JOIN c ON c.y = b.y \
                  JOIN p ON p.z = c.z",
@@ -3804,32 +3813,38 @@ pub(crate) mod bushy_test_hook {
                 "SELECT a.id, b.id, q.id, c.id, c.y FROM a, b JOIN q ON q.id = b.qid \
                  JOIN c ON c.z = q.y AND c.y <> a.x WHERE a.id = 4",
             ];
-            APPLIED.with(|applied| applied.set(0));
             let mut compared = 0;
-            let mut plans = Vec::new();
             for methods in [JoinMethods::ByCost, JoinMethods::HashJoinsOnly] {
                 conn.set_join_methods(methods);
                 for sql in queries {
+                    // The plan the search chooses, left-deep.
+                    PIN.with(|pin| pin.set(false));
                     SPLIT.with(|split| split.set(None));
                     let left_deep = rows(&conn, sql);
+                    // The pinned left-deep plan: loops, then a hash join at the last table.
+                    PIN.with(|pin| pin.set(true));
+                    let pinned = rows(&conn, sql);
+                    let pinned_plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                    // The same plan with the tables after the first joined among themselves
+                    // into the hash join's build input: a bushy tree `(a ((b c) p))`.
+                    APPLIED.with(|applied| applied.set(0));
                     SPLIT.with(|split| split.set(Some(1)));
                     let bushy = rows(&conn, sql);
+                    let made_bushy = APPLIED.with(Cell::get);
                     SPLIT.with(|split| split.set(None));
+                    PIN.with(|pin| pin.set(false));
                     assert!(!left_deep.is_empty(), "{sql}");
-                    assert_eq!(bushy, left_deep, "{methods:?}: {sql}");
-                    plans.push(format!(
-                        "{methods:?} {:?}",
-                        rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"))
-                    ));
+                    // Non-vacuity: this query's plan was run bushy.
+                    assert!(
+                        made_bushy > 0,
+                        "{methods:?}: no plan was made bushy: {sql}: {pinned_plan:?}"
+                    );
+                    assert_eq!(pinned, left_deep, "{methods:?} pinned: {sql}");
+                    assert_eq!(bushy, left_deep, "{methods:?} bushy: {sql}");
                     compared += 1;
                 }
             }
             assert_eq!(compared, 16);
-            // Non-vacuity: some of the plans were run bushy.
-            assert!(
-                APPLIED.with(Cell::get) > 0,
-                "no plan was made bushy: {plans:#?}"
-            );
         }
     }
 }
