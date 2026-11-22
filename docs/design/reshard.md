@@ -895,7 +895,12 @@ transaction by its own clock as it resolved it.
   (`Marks::next_micros`: the backup clock read up to the microsecond its reading ends, past every
   microsecond stamp made or seen, nanosecond ones read so too, so a group's stamps rise strictly
   and a cut at one is closed); a replicated group's
-  is its closed time, the tokens' (lane xgroup-sql-11 reads it for its lock replies). The stamp
+  is its closed time, the tokens' (lane xgroup-sql-11 reads it for its lock replies). One clock
+  in one unit, two sources by the group's kind, because a standalone group has no log and so no
+  closed time (its session token is none), and every read across groups runs on backed-up
+  standalone groups: with the closed time alone, every transaction across them would commit with
+  no stamp. `Database::cross_clock` is the group's reading either way, what a lock reply carries.
+  The stamp
   table (`__amphora_rev_stamps`), the cut, a get's fresh stamp, the moved rows' stamps and the
   stamp a coordinator carries between steps (`xgroup::sql::step`, taken in with
   `Marks::observe_micros`) are all of it. The backup's own marks stay nanoseconds: they are restore

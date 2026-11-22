@@ -1372,6 +1372,22 @@ impl Database {
         }
     }
 
+    /// This group's clock on the one cross-group clock (lane split-merge-21, T-T1.9.R28; Ada's
+    /// decision of 2026-11-22), microseconds since the Unix epoch: a replicated group's closed
+    /// time (its session token's), a backed-up group's writer clock (`Marks::latest_micros`, which
+    /// stamps the rows reads across groups place); none for a group that
+    /// keeps neither. What a lock reply carries for the coordinator to choose the commit stamp.
+    pub fn cross_clock(&self, until: Instant) -> Result<Option<u64>, Refusal> {
+        if let Some(token) = self.session_token(until)? {
+            return Ok(Some(token.micros));
+        }
+        let database = self.resolve(until)?;
+        database
+            .stamps()
+            .map(|hooks| hooks.marks.latest_micros().map_err(unavailable))
+            .transpose()
+    }
+
     /// One read-only SQL session in the read mode asked (kiln goal 8119f25d, the switch):
     /// - [`ReadMode::Latest`], the control and today's read: [`Database::query`], which waits for
     ///   the leader's latest commit whatever `token` says;
