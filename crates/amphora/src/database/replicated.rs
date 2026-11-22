@@ -301,7 +301,7 @@ struct Control {
     /// Rung when a record joins `outgoing` ([`ReplicaHandle::drain_wait`]).
     sent: std::sync::Condvar,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
-    /// Rung when the published status names another leader or the owner ends
+    /// Rung when the published status names another leader, fences, or the owner ends
     /// ([`ReplicaHandle::wait_leader`], CP-T1.13).
     led: std::sync::Condvar,
     meter: Arc<ReplicaMeter>,
@@ -2276,9 +2276,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         let now = status(&self.replica);
         {
             let mut published = locked(&self.control.status)?;
-            let led = !matches!(&*published, Ok(was) if was.leader == now.leader);
+            let led = !matches!(&*published,
+                Ok(was) if was.leader == now.leader && was.fenced == now.fenced);
             *published = Ok(now);
-            // Waiters for a leader wake on the step that names a new one, never on a timer.
+            // Waiters for a leader wake on the step that names a new one or fences, never on a
+            // timer.
             if led {
                 self.control.led.notify_all();
             }
