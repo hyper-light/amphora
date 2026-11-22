@@ -1995,7 +1995,7 @@ fn skip_walk_for(
     let (reader_pos, committed) = conn.skipping_positions()?;
     let writes = registry.counts(root).map(|counts| counts.writes);
     // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
-    let started = std::time::Instant::now();
+    let mut started = std::time::Instant::now();
     let (candidates, method) = registry
         .candidates_by(
             root,
@@ -2009,7 +2009,13 @@ fn skip_walk_for(
     // Lane skip-5 (T-SKU.5): a method dropped for its upkeep whose trial is due is built again
     // now, at the snapshot the summary just answered (so it holds what the summary holds).
     if let Some(method) = registry.rebuild_due(root) {
+        let building = std::time::Instant::now();
         skipping_rebuild(program, cursor_id, root, column, method, writes);
+        // Lane skip-7: the build is the dropped kind's cost (its own build cost), not this
+        // scan's: the scan's measure leaves it out, so the leader isn't charged for it.
+        started = started
+            .checked_add(building.elapsed())
+            .unwrap_or_else(std::time::Instant::now);
     }
     let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
     walk.measure = method.map(|method| crate::skipping::WalkMeasure {

@@ -836,7 +836,8 @@ transaction, under MVCC, or for a column the record doesn't hold, with the reaso
 with no value is refused: the setting is set, not read.
 
 **Not yet.** Rows read and latency against DuckDB and ClickHouse are not measured. A dropped kind
-is built again inside the scan whose trial is due, so that scan pays the build.
+is built again inside the scan whose trial is due, so that scan waits for the build (its measured
+cost leaves the build out, lane skip-7: the leader isn't charged for it).
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's
