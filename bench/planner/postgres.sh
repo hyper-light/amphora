@@ -4,33 +4,47 @@
 # host's files through it), published on 127.0.0.1:55432, so it runs where Docker has no host
 # network as where it has one. bench/servers/postgres.sh is the store benchmarks' (host network).
 #
-# usage: bench/planner/postgres.sh start|stop|settings
+# usage: bench/planner/postgres.sh start|restart|stop|settings
+# restart (PL.13, lane replan-9: a cold run's server) stops the server and starts it again, its
+# shared buffers empty; it starts one where none runs.
 set -euo pipefail
 # Git for Windows' shell rewrites arguments that look like paths (the volume's mount point).
 export MSYS_NO_PATHCONV=1
 NAME=amphora-planner-postgres
 IMAGE=${IMAGE:-postgres:17}
-case "${1:-}" in
-  start)
-    if [[ -z "$(docker ps -q -f "name=^${NAME}$")" ]]; then
-      docker rm -f "$NAME" >/dev/null 2>&1 || true
-      docker run -d --name "$NAME" -p 127.0.0.1:55432:5432 --shm-size 1g \
-        -e POSTGRES_HOST_AUTH_METHOD=trust -v amphora-planner-postgres:/var/lib/postgresql/data "$IMAGE" >/dev/null
+# Ready when it answers, for at most two minutes.
+ready() {
+  for _ in $(seq 1 120); do
+    if docker exec "$NAME" pg_isready -q -U postgres; then
+      return 0
     fi
-    # Ready when it answers, for at most two minutes.
-    for _ in $(seq 1 120); do
-      if docker exec "$NAME" pg_isready -q -U postgres; then
-        exit 0
-      fi
-      sleep 1
-    done
-    echo "postgres did not answer in 120 s" >&2
-    exit 1
+    sleep 1
+  done
+  echo "postgres did not answer in 120 s" >&2
+  return 1
+}
+start() {
+  if [[ -z "$(docker ps -q -f "name=^${NAME}$")" ]]; then
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    docker run -d --name "$NAME" -p 127.0.0.1:55432:5432 --shm-size 1g \
+      -e POSTGRES_HOST_AUTH_METHOD=trust -v amphora-planner-postgres:/var/lib/postgresql/data "$IMAGE" >/dev/null
+  fi
+  ready
+}
+case "${1:-}" in
+  start) start ;;
+  restart)
+    if [[ -n "$(docker ps -q -f "name=^${NAME}$")" ]]; then
+      docker restart "$NAME" >/dev/null
+      ready
+    else
+      start
+    fi
     ;;
   stop) docker stop "$NAME" >/dev/null ;;
   settings) docker exec "$NAME" psql -U postgres -AtX -c "SELECT version()" ;;
   *)
-    echo "usage: $0 start|stop|settings" >&2
+    echo "usage: $0 start|restart|stop|settings" >&2
     exit 2
     ;;
 esac

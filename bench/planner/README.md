@@ -83,6 +83,28 @@ as in a process started for them. `repeat.py` compares passes timed alike, each 
 end, and such a pass stopped part way starts again from its beginning rather than resuming
 (bench/records/2026-10-26-jupiter-planner-baseline.md).
 
+## Cold and warm (PL.13)
+
+Every query's timed runs are warm: each engine has run the query once before them, Amphora by its
+counted run and the others by a warm-up run (`warmup` in the record, timed but not one of its runs), as
+`warmed_by` says. An adaptive engine (`amphora-adaptive`) learns its corrections in that first run,
+so its warm runs start from them. A cold run is the other end: `cold.sh <queries> <driver
+command>` restarts PostgreSQL (`postgres.sh restart`, its shared buffers empty), drops the
+operating system's page cache where the host lets it (as root, by `sudo -n`, or from a privileged
+container), and has a process of its own time each query once on every engine as it opened it
+(`--phase cold --only <query>`): Amphora with no correction learned and nothing run before it. A
+cold run's record is a `cold` one (`run`: its outcome; `state`: `server_started_s`, the server's age,
+`os_cache_dropped`, the script's claim, and `page_cache_kib`, what Linux had cached as it began),
+which the readers of `query` records pass over. `adaptive.py` shows both for every engine, and the
+speed-up off/on each way: what the adaptive engine gains by learning is the gap between them.
+
+```
+bench/planner/cold.sh 1a,2a amphora-bench --planner --bench job --data ~/.cache/planner-bench/imdb \
+  --queries ~/.cache/research-src/join-order-benchmark --dir ~/.cache/planner-bench/db-job \
+  --targets amphora,amphora-adaptive,postgres --out job-cold.jsonl
+python3 -I bench/planner/adaptive.py job.jsonl job-cold.jsonl
+```
+
 ## Prepared statements (PL.12)
 
 AC-PL.12.1 asks that TPC-H's 22 queries, prepared once and run with qgen's parameters, have no

@@ -80,6 +80,11 @@ pub trait Target {
     fn amphora(&mut self) -> Option<&mut Amphora> {
         None
     }
+    /// PL.13 (lane replan-9, a cold run): how long ago the engine's server started, in seconds;
+    /// None for an engine embedded in this process, which starts with it.
+    fn server_started_s(&mut self) -> Option<f64> {
+        None
+    }
 }
 
 fn first_row(cells: impl Iterator<Item = String>) -> String {
@@ -786,6 +791,10 @@ impl Target for Postgres {
 
     fn loaded(&mut self, table: &str) -> anyhow::Result<bool> {
         Ok(self.client.query_opt(&format!("SELECT 1 FROM {table} LIMIT 1"), &[]).ok().flatten().is_some())
+    }
+
+    fn server_started_s(&mut self) -> Option<f64> {
+        self.client.query_one("SELECT extract(epoch FROM now() - pg_postmaster_start_time())::float8", &[]).ok().map(|row| row.get::<_, f64>(0))
     }
 
     fn run(&mut self, sql: &str, deadline: Duration, mut answer: Option<&mut Answer>) -> Outcome {
