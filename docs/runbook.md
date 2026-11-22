@@ -134,6 +134,29 @@ fourth (the victim killed and never started again, the spare added, caught up an
 victim removed, the count on the new voters); `cargo test -p amphora --test serve a_region_lost`
 is its test.
 
+## Renewing certificates (CP-T1.13)
+
+```sh
+scripts/cluster.sh renew --cert-days DAYS --within-days W HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]
+```
+
+Run it on the machine that holds the authority (the one you installed from), from a timer of your
+own, well inside the certificates' life. For each member whose certificate expires within W days,
+it issues a new one from the same authority, with a fresh key, valid DAYS; copies both to the
+member's host, each beside its old file and renamed over it; then asks the member to `reload`.
+The member reads its TLS files again and uses them for every link made from then on; links already
+open keep the session they agreed, and nothing restarts. Members not due are left as they are.
+It refuses when there is no authority here (renew never makes one: members wouldn't trust it) and
+when the authority itself expires within DAYS (a certificate can't outlive its root: that is a
+new authority and a new install).
+
+The member wakes on the `reload` request, sent once both new files are in place, never by polling
+its files. A member doesn't wake on its files changing by other means: Amphora has no file-change
+source yet. The source to add is the OS's own, one per platform: inotify on Linux (`IN_CLOSE_WRITE`
+and `IN_MOVED_TO` on the config folder, as a rename lands), kqueue on macOS (`EVFILT_VNODE` on the
+folder), and `ReadDirectoryChangesW` on Windows (the `notify` crate wraps all three; it isn't a
+dependency today). Until then, whatever replaces the files asks `amphora ask CONF N reload`.
+
 ## Uninstall
 
 ```sh
@@ -152,10 +175,11 @@ deployment has one.
 
 ## What isn't done
 
-- Certificates the script issues aren't renewed by themselves: install again before `--cert-days`
-  run out (the authority is reused; its own certificate is valid for the `--cert-days` of the
-  install that made it). Nothing revokes a member's certificate: replace the authority (remove
-  `~/.config/amphora/authority/` and install again) to stop trusting one.
+- `cluster.sh renew` renews members' certificates, run from a timer you set up; the authority's
+  own certificate is valid for the `--cert-days` of the install that made it, and renewing it is a
+  new install. Nothing revokes a member's certificate: replace the authority (remove
+  `~/.config/amphora/authority/` and install again) to stop trusting one. Links open before a
+  renewal keep their session until they close.
 - kiln doesn't open these members yet: kiln reaches Amphora through its conversation-store seam
   (kiln branch `t1/lane-vendor-amphora-*`), in process. A client for `amphora serve` in that seam
   is the next step, and production kiln on it is Ada's word.

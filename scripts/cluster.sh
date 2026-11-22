@@ -8,6 +8,7 @@
 #                                    [--spanning N] [--drills on|off] [--service auto|none]
 #                                    [--spare HOST4:PORT] [--tls DIR|issue] [--cert-days DAYS]
 #                                    HOST1:PORT HOST2:PORT HOST3:PORT
+#        scripts/cluster.sh renew --cert-days DAYS --within-days W HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]
 #        scripts/cluster.sh health HOST:PORT N        (member N's host asks every member)
 #        scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]   (keeps the data)
 #   HOSTn:PORT  each member's address as its peers reach it; member n listens there. A host that is
@@ -29,6 +30,12 @@
 #               authority on this machine once, in ~/.config/amphora/authority (its key never leaves
 #               it; a later install reuses it), and issues each member a certificate naming its
 #               host, with a fresh key, for --cert-days DAYS. Needs openssl (or LibreSSL).
+#   renew       each member whose certificate expires within W days (or already has) gets a new one
+#               from the authority on this machine (the one install made; renew never makes one),
+#               with a fresh key, for DAYS; the files are replaced on its host (each written beside
+#               its old one and renamed over it), then the member is asked to `reload` them: links
+#               made from then on use them, no restart. Run it from a timer well inside the
+#               certificates' life; W and DAYS are the operator's, nothing is picked here.
 # Every size and duration is an argument: nothing is picked here.
 set -euo pipefail
 LIB='$HOME/.local/lib/amphora' CONF='$HOME/.config/amphora' DATA='$HOME/.local/share/amphora'
@@ -191,6 +198,57 @@ EOF
   echo "installed; check: scripts/cluster.sh health ${addrs[0]} 1" >&2
 }
 
+renew() {
+  local days='' within='' addrs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cert-days) days=$2; shift 2 ;; --within-days) within=$2; shift 2 ;;
+      --*) die "unknown flag $1" ;; *) addrs+=("$1"); shift ;;
+    esac
+  done
+  [[ -n $days && -n $within ]] || die "renew needs --cert-days and --within-days"
+  [[ $days =~ ^[0-9]+$ && $within =~ ^[0-9]+$ ]] || die "--cert-days and --within-days take whole days"
+  [[ ${#addrs[@]} -eq 3 || ${#addrs[@]} -eq 4 ]] || die "renew takes the three HOST:PORT members and the spare's, if any"
+  local auth; auth=$(eval echo "$CONF")/authority
+  [[ -f $auth/roots.pem && -f $auth/authority.key ]] || die "no authority in $auth: renew reissues from the one install made"
+  # The authority itself must outlive what it signs: a member's certificate never outlives its root.
+  openssl x509 -checkend $((days * 86400)) -noout -in "$auth/roots.pem" >/dev/null ||
+    die "the authority in $auth expires within $days days: a new one is a new install (docs/runbook.md, \"Renewing certificates\")"
+  work=$(umask 077; mktemp -d "${TMPDIR:-$HOME}/amphora-renew.XXXXXX")
+  trap 'rm -rf "$work"' EXIT
+  local n due=() addr host
+  for n in $(seq 1 "${#addrs[@]}"); do
+    host=${addrs[$((n - 1))]%:*}
+    # The member's certificate as its host holds it (a public file), its expiry read here.
+    on "$host" <<<"cat \"$CONF/member-$n.pem\"" >"$work/current-$n.pem" || die "member $n: no certificate on $host"
+    if openssl x509 -checkend $((within * 86400)) -noout -in "$work/current-$n.pem" >/dev/null; then
+      echo "member $n: its certificate outlives $within days: kept" >&2
+    else
+      due+=("$n")
+    fi
+  done
+  [[ ${#due[@]} -gt 0 ]] || { echo "no certificate expires within $within days" >&2; return 0; }
+  issue "$days" "$work/tls" "${addrs[@]}"
+  local failed=0
+  for n in "${due[@]}"; do
+    host=${addrs[$((n - 1))]%:*}
+    put "$host" "$work/tls/member-$n.key" "$CONF" "member-$n.key.new"
+    put "$host" "$work/tls/member-$n.pem" "$CONF" "member-$n.pem.new"
+    # Both renamed into place before the member is asked: a reload reads a matching pair.
+    if on "$host" <<EOF
+set -euo pipefail
+chmod 600 "$CONF/member-$n.key.new"
+mv -f "$CONF/member-$n.key.new" "$CONF/member-$n.key"
+mv -f "$CONF/member-$n.pem.new" "$CONF/member-$n.pem"
+"$LIB/amphora" ask "$CONF/member-$n.conf" $n reload
+EOF
+    then echo "member $n: renewed for $days days and reloaded" >&2
+    else echo "member $n: renewal FAILED (its files may be new and not yet reloaded: ask it to reload, or restart it)" >&2; failed=1
+    fi
+  done
+  return $failed
+}
+
 health() {
   [[ $# -eq 2 ]] || die "health takes HOST:PORT N"
   on "${1%:*}" <<<"$LIB/amphora health $CONF/member-$2.conf"
@@ -214,6 +272,6 @@ EOF
 
 cmd=${1:-}; shift || true
 case "$cmd" in
-  install) install "$@" ;; health) health "$@" ;; uninstall) uninstall "$@" ;;
-  *) sed -n '2,32p' "$0" >&2; exit 2 ;;
+  install) install "$@" ;; renew) renew "$@" ;; health) health "$@" ;; uninstall) uninstall "$@" ;;
+  *) sed -n '2,39p' "$0" >&2; exit 2 ;;
 esac

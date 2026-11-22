@@ -10,7 +10,8 @@
 //!   all name the same leader, each holds the configured voters and none is fenced.
 //! - `amphora ask CONFIG NODE REQUEST`: one request to one member (`status`, `exec SQL`,
 //!   `count SQL`, `cut on|off` and `disk on|off` where the member's config says `drills = on`,
-//!   `member …`, and
+//!   `member …`, `reload` (its TLS files read again, for the links made from then on: a
+//!   certificate renewed), and
 //!   `leader WAIT_MS`: wait until the member knows its group's leader, at most WAIT_MS, and answer
 //!   `leader=ID addr=HOST:PORT term=T`; woken by the election's step, never by polling).
 //! - `amphora drill load|check`: the fire drills' writers and their loss count ([`load`], [`check`]).
@@ -274,22 +275,11 @@ impl Config {
         let Some(files) = &self.tls else {
             return Ok(Keys::plain(secret));
         };
-        let refused = |e: amphora_api::Refusal| anyhow!("mutual TLS: {e:?}");
-        let credentials = Credentials::from_pem_files(&files.cert, &files.key, &files.roots)
-            .map_err(refused)
-            .with_context(|| {
-                format!(
-                    "reading {}, {} and {}",
-                    files.cert.display(),
-                    files.key.display(),
-                    files.roots.display()
-                )
-            })?;
         Ok(Keys {
             secret,
-            tls: Some(Arc::new(Tls {
-                listener: credentials.listener(ALPN).map_err(refused)?,
-                dialer: credentials.dialer(ALPN).map_err(refused)?,
+            tls: Some(Arc::new(Renewable {
+                now: std::sync::RwLock::new(Arc::new(Tls::read(files)?)),
+                files: files.clone(),
             })),
         })
     }
@@ -314,7 +304,22 @@ fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
 #[derive(Clone)]
 pub struct Keys {
     secret: Vec<u8>,
-    tls: Option<Arc<Tls>>,
+    tls: Option<Arc<Renewable>>,
+}
+
+/// A member's mutual TLS as its files hold it now, read again by [`Keys::reload`]: links made
+/// after a reload use what it read; links already made keep the session they agreed.
+struct Renewable {
+    files: TlsFiles,
+    now: std::sync::RwLock<Arc<Tls>>,
+}
+
+impl Renewable {
+    fn now(&self) -> anyhow::Result<Arc<Tls>> {
+        Ok(Arc::clone(
+            &*self.now.read().map_err(|_| anyhow!("TLS keys poisoned"))?,
+        ))
+    }
 }
 
 /// Both sides of a member's mutual TLS.
@@ -323,10 +328,45 @@ struct Tls {
     dialer: network::Dialer,
 }
 
+impl Tls {
+    /// `files` read and checked: the chain, its key and the roots, each PEM.
+    fn read(files: &TlsFiles) -> anyhow::Result<Self> {
+        let refused = |e: amphora_api::Refusal| anyhow!("mutual TLS: {e:?}");
+        let credentials = Credentials::from_pem_files(&files.cert, &files.key, &files.roots)
+            .map_err(refused)
+            .with_context(|| {
+                format!(
+                    "reading {}, {} and {}",
+                    files.cert.display(),
+                    files.key.display(),
+                    files.roots.display()
+                )
+            })?;
+        Ok(Self {
+            listener: credentials.listener(ALPN).map_err(refused)?,
+            dialer: credentials.dialer(ALPN).map_err(refused)?,
+        })
+    }
+}
+
 impl Keys {
     /// The secret alone: the links of a cluster whose configs name no TLS files.
     pub fn plain(secret: Vec<u8>) -> Self {
         Self { secret, tls: None }
+    }
+
+    /// Reads the TLS files again (CP-T1.13: a certificate renewed, `scripts/cluster.sh renew`):
+    /// links made from now on present the new chain and verify under the new roots; links already
+    /// made keep theirs. Files that don't read or don't check are refused, and the keys held stay.
+    /// Woken by the request that asks for it, sent once the new files are in place: never a
+    /// poll of the files.
+    pub fn reload(&self) -> anyhow::Result<()> {
+        let Some(tls) = &self.tls else {
+            bail!("this config names no TLS files: nothing to reload");
+        };
+        let fresh = Arc::new(Tls::read(&tls.files)?);
+        *tls.now.write().map_err(|_| anyhow!("TLS keys poisoned"))? = fresh;
+        Ok(())
     }
 
     /// `s`, accepted, inside mutual TLS by `until` when these keys hold it.
@@ -334,7 +374,8 @@ impl Keys {
         match &self.tls {
             None => Ok(Link::Plain(s)),
             Some(tls) => Ok(Link::Accepted(Box::new(
-                tls.listener
+                tls.now()?
+                    .listener
                     .accept(s, until)
                     .map_err(|e| anyhow!("mutual TLS: {e:?}"))?,
             ))),
@@ -351,7 +392,8 @@ impl Keys {
                 // An IPv6 address in a member's address is bracketed ([::1]:7401).
                 let host = host.trim_start_matches('[').trim_end_matches(']');
                 Ok(Link::Dialed(Box::new(
-                    tls.dialer
+                    tls.now()?
+                        .dialer
                         .connect(s, host, until)
                         .map_err(|e| anyhow!("mutual TLS with {addr}: {e:?}"))?,
                 )))
@@ -699,6 +741,12 @@ impl Shared {
                 self.cut.store(to, Ordering::Relaxed);
                 Ok(String::new())
             }
+            // A certificate renewed (CP-T1.13; `scripts/cluster.sh renew` asks once the new files
+            // are in place): the TLS files read again, for the links made from now on.
+            "reload" => {
+                self.keys.reload()?;
+                Ok(String::new())
+            }
             // A disk cut (T-T1.13.1): every read, write and flush of this member's log fails as a
             // disk gone away fails them, and its replica fences on the first, ending the process
             // with the reason; the member started again finds its disk back.
@@ -771,7 +819,9 @@ impl Shared {
                 ))
             }
             other => {
-                bail!("unknown request {other:?} (status, exec, count, cut, disk, member, leader)")
+                bail!(
+                    "unknown request {other:?} (status, exec, count, cut, disk, member, leader, reload)"
+                )
             }
         }
     }

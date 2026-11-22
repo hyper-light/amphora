@@ -314,6 +314,54 @@ fn t_t1_13_1_links_run_inside_mutual_tls() {
     );
 }
 
+/// A certificate renewed without a restart (CP-T1.13): each member's TLS files replaced in place,
+/// then `reload` asked of each over a link made with the old keys; from then on the members present
+/// the new certificates and verify under the new roots, so a client of the new files is answered
+/// and one of the old is refused. (The new files come from another authority here only so the
+/// switch shows; `scripts/cluster.sh renew` reissues from the same one.)
+#[test]
+fn cp_t1_13_a_renewed_certificate_is_taken_up_by_reload_without_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = Authority::new();
+    let configs = three_with(dir.path(), |n| {
+        before.lines(dir.path(), &format!("member-{n}"))
+    });
+    start(&configs);
+    let c = &configs[0];
+    healthy(c);
+    let old = c.keys().unwrap();
+
+    // The renewal: every member's files replaced where its config names them.
+    let after = Authority::new();
+    for n in 1..=3 {
+        after.lines(dir.path(), &format!("member-{n}"));
+    }
+    let new = c.keys().unwrap();
+    let early =
+        Client::connect(&c.members[0].addr, &new, c.deadline).and_then(|mut k| k.ask("status"));
+    assert!(early.is_err(), "answered before its reload: {early:?}");
+
+    for m in &c.members {
+        Client::connect(&m.addr, &old, c.deadline)
+            .unwrap()
+            .ask("reload")
+            .unwrap();
+    }
+    for m in &c.members {
+        let status = Client::connect(&m.addr, &new, c.deadline)
+            .and_then(|mut k| k.ask("status"))
+            .unwrap();
+        assert!(status.contains("leader="), "{status}");
+        let stale = Client::connect(&m.addr, &old, c.deadline).and_then(|mut k| k.ask("status"));
+        assert!(
+            stale.is_err(),
+            "the old certificate still answered: {stale:?}"
+        );
+    }
+    let text = healthy(c);
+    assert!(text.ends_with("healthy\n"), "{text}");
+}
+
 /// One member started on its own, and a client's `leader` request to it (CP-T1.13): with one of
 /// three voters up there is no leader, so a request whose deadline passes is refused, and one made
 /// then is answered, with the leader's ID and address, once the other two start and the group
