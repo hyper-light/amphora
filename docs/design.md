@@ -69,6 +69,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | executor | 8 | A scan, its aggregates and a hash join's probe run on every core, in morsels | [executor.md](design/executor.md#8-a-scan-its-aggregates-and-a-hash-joins-probe-run-on-every-core-in-morsels) |
 | executor | 9 | A table scan decodes each leaf once into column batches, behind a switch | [executor.md](design/executor.md#9-a-table-scan-decodes-each-leaf-once-into-column-batches-behind-a-switch) |
 | executor | 10 | A scan loop's filters and aggregates run over a whole batch by selection | [executor.md](design/executor.md#10-a-scan-loops-filters-and-aggregates-run-over-a-whole-batch-by-selection) |
+| executor | 11 | Skipping rows: zone maps over leaf runs against cracking, behind one switch | [executor.md](design/executor.md#11-skipping-rows-zone-maps-over-leaf-runs-against-cracking-behind-one-switch) |
 | local-owner-transport | – | Versions (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#versions-2026-11-06) |
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
 | local-owner-transport | – | Owner guards (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#owner-guards-2026-11-06) |
@@ -111,6 +112,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl7): cost weights fitted to measured statement times, behind a switch | [planner.md](design/planner.md#decision-lane-pl7-cost-weights-fitted-to-measured-statement-times-behind-a-switch) |
 | planner | – | Decision (lane qs5-9): a hash join's Bloom filter sized from its build's measured keys, chosen by the learned weights | [planner.md](design/planner.md#decision-lane-qs5-9-a-hash-joins-bloom-filter-sized-from-its-builds-measured-keys-chosen-by-the-learned-weights) |
 | planner | – | Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model | [planner.md](design/planner.md#decision-lane-g6s3-learned-plan-hints-kept-for-a-query-class-only-where-its-held-out-runs-beat-the-cost-model) |
+| planner | – | Decision (lane pl7c): a table's pages counted by ANALYZE, else derived from its page and records | [planner.md](design/planner.md#decision-lane-pl7c-a-tables-pages-counted-by-analyze-else-derived-from-its-page-and-records) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
@@ -151,6 +153,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-8): a batch bounded by the process's memory | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-batch-bounded-by-the-processs-memory) |
 | reshard | – | Decision (lane split-merge-8): a row routes by its namespace, family and key | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-row-routes-by-its-namespace-family-and-key) |
 | reshard | – | Decision (lane split-merge-9): moves across nodes | [reshard.md](design/reshard.md#decision-lane-split-merge-9-moves-across-nodes) |
+| reshard | – | Decision (lane split-merge-10): pulls over the owner transport | [reshard.md](design/reshard.md#decision-lane-split-merge-10-pulls-over-the-owner-transport) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |

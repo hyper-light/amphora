@@ -507,8 +507,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Moved across nodes (lane split-merge-9): a copy or catch-up batch reads its old group through a
   pull (`groups::Pull`, answered by `Groups::serve` where the group is, through `groups::Peers` from
   another node), and a group moved to a second node under writes keeps every acknowledged write
-  (T-T1.9.R10). Left: `Peers` over a socket between machines, a `Database` over `Groups<Local>`,
-  load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
+  (T-T1.9.R10). Over the transport (lane split-merge-10): a pull and its answer are appended variants of
+  the owner transport (version 7), a node's endpoint answers them (`transport::Node`) and its peers
+  ask through it (`transport::Nodes`); a move through loss and partition keeps every acknowledged
+  write (T-T1.9.R12). Left: that transport off loopback (between machines), a `Database` over
+  `Groups<Local>`, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -825,7 +828,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   sort work, file page reads) by non-negative least squares with Huber weights, in bounded memory;
   weights no sample determines, or none tells from nothing at 95%, keep the learned calibration's
   (docs/design/planner.md, "Decision (lane pl7)"; lane pl7b, T-PL.7.6, after a loaded run's noisy
-  weights flipped a plan in `tests/planner.rs`). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
+  weights flipped a plan in `tests/planner.rs`). Lane pl7c (T-PL.7.1): ANALYZE counts each table's and index's
+  B-tree pages and the planner reads rows a page from them, else from the page size and the
+  sample's measured records, else from the format's smallest record; the picked 50 rows a page is
+  gone (docs/design/planner.md, "Decision (lane pl7c)"). Open: the audit's 09-cost-model run, the P-error harness (AC-PL.7.2), and
   AC-PL.7.1's JOB rank correlation with the switch on and off.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
@@ -903,6 +909,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
   SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
   coordinator's.
+- **G5 step 4, skipping rows** (docs/design/executor.md decision 11; AC-G5.4.1, T-G5.4.1; lanes
+  g5s4, g5s4b): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf
+  runs and database cracking behind one switch, each kept from the write path through one hook;
+  zone maps are built from the table's own leaves (`zone_map_of_table`), one zone a leaf. With
+  writes between scans each names exactly what a plain scan finds, in the model and on a real table
+  through SQL (T-G5.4.1). Open: the scan and write costs (`crates/engine/tests/skipping_bench.rs`,
+  through the engine), the choice they make, and the VDBE's scan and write opcodes calling the
+  switch.
 
 ## Open
 

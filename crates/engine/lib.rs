@@ -36,6 +36,7 @@ pub mod native_ext;
 pub mod numeric;
 pub mod schema;
 pub mod skiplist;
+pub mod skipping;
 pub mod state_machine;
 pub mod storage;
 pub mod types;
