@@ -972,6 +972,8 @@ tests = [
   { id = "T-QT.6.10", text = "Random filters, groupings and aggregates in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook ran for most of them" },
   # lane qs6-3
   { id = "T-QT.6.11", text = "Random inner equi-joins of two tables of many leaf pages on one or two columns, with filters on either table and groupings and aggregates over both, in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores and the planner held to hash joins (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook probed for most of them" },
+  { id = "T-QT.6.12", text = "t_qt_6_12_partitioned_parallel_build_matches_the_serial_join (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when a hash join's table built by 1, 2, 3, 4 and 8 workers into 1, 2, 3, 4 and 8 partitions gives the serial join's matches in order, most runs parallel and partitioned, and a budget too small is refused by type at every degree" },
+  { id = "T-QT.6.13", text = "t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when random two-table hash joins returning rows, with or without ORDER BY, answer as the serial loop at 2, 3, 4 and 8 stated cores (in ORDER BY order, ties as sets) and the hook ran for most" },
 ]
 
 # lane g3s2
@@ -1061,6 +1063,9 @@ tests = [
   # lane qs7-3
   { id = "T-QT.7.4", text = "Filters (comparisons, ranges, IN, IS NULL, AND, OR) and aggregates (COUNT, SUM with its overflow error, TOTAL, AVG, MIN, MAX, with and without GROUP BY) over random tables of every storage class, NULLs, a collation, overflow rows and added columns, switch on against off — passes when answers and errors are identical and the fused loops ran rows" },
   { id = "T-QT.7.5", text = "A fused loop over rows with overflow records amid the batch and the scan's end — passes when its answer is exact and matches row-at-a-time, and the fused loop ran" },
+  # lane qs7-4
+  { id = "T-QT.7.6", text = "Hash GROUP BYs (one key and two, filtered and not) over random tables of every storage class, NULLs, a collation, overflow rows and added columns, the group table whole and bounded so it fills mid-scan, switch on against off — passes when answers are identical, batch group steps ran rows, and with the bound a full table ended a batch run early" },
+  { id = "T-QT.7.7", text = "A GROUP BY over runs of rows of one group, with the group table whole and then filling mid-batch — passes when answers match row-at-a-time, rows of the group just stepped skipped the find, and a full table ended a run before the row it refused" },
 ]
 
 # lane g11s5
@@ -1078,6 +1083,23 @@ tests = [
   { id = "T-CS.5.4", text = "cs5_* in translate/optimizer/column_path.rs — passes when the choice follows the costs: copy for wide shapes, rows for point reads and short ranges, no path when off or stale, queued keys priced, an unmeasured copy tried only for whole tables" },
   { id = "T-CS.5.5", text = "cs5_vectorized_aggregates_identical_and_chosen_by_cost (crates/engine/storage/versioned/columns_path.rs) — passes when whole-table, grouped and key-range aggregates equal the rows' at the snapshot by either path, with the switch on the copy is read by step 4's vectorized scan (granules read, only queued keys from the rows), off every row is read, and a copy behind its snapshot reads no granule" },
   { id = "T-CS.5.6", text = "cs5_scan_hook_runs_only_when_the_copy_is_chosen — passes when a scan given to the CopyScan hook runs once per aggregate the copy is chosen for and answers it, never with the switch off or on a stale copy" },
+]
+
+# lane many-writers
+# Amphora's own IDs for G7 step 5 and G8 steps 4-5 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, under
+# CP-T1.3 stage 3 and CP-T1.4): the harnesses that verify many writers through SQL. Their full runs
+# (the suite's sizes, 10,000 seeds) and the commit p99 bar (G8 step 5: p99 at most 5 ms, p99.9 at most
+# 15 ms at 32 writers) are the coordinator's.
+[[own]]
+id = "G7.5"
+title = "Many writers through SQL answer as a serial replay, and Elle finds no anomaly through SQL (G7 step 5, G8 steps 4-5)"
+criteria = [
+  { id = "AC-G7.5.1", text = "every committed transaction of every write class, run by N connections at once, answers statement for statement as a serial replay in commit order, on each storage" },
+  { id = "AC-G7.5.2", text = "anomalies over 10,000 Elle seeds recorded through SQL at the claimed isolation (serializable) is exactly 0, on each storage" },
+]
+tests = [
+  { id = "T-G7.5.1", text = "storage::versioned::many_writers::g7_5_many_writers_answer_as_a_serial_replay — passes when every answer and the ending rows and index match the serial replay's, on the pager's storage and the versioned one, ids from writers' own slices and from every row" },
+  { id = "T-G8.4.1", text = "storage::versioned::elle_sql::g8_4_sql_histories_have_no_anomaly_on_* — passes when list-append and register histories recorded from N SQL connections show no G0, G1a, G1b, G1c, G-single or G2 (the versioned storage's is ignored until its SQL cursor keeps reads for validation)" },
 ]
 
 # lane repl-measure (G12 steps 1 and 3, CP-T1.8): no new IDs. `amphora-bench --repl` is the harness
