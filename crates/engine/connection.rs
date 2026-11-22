@@ -219,6 +219,20 @@ pub enum JoinMethods {
     NestedLoopsOnly = 1,
     /// A hash join wherever the join can take one.
     HashJoinsOnly = 2,
+    /// Amphora (QT.5 step 4, lane qs5-21, T-QT.5.18): a sort-merge join wherever the join can take
+    /// a hash join (`HashJoinMethod::Merge`), for the tests that run every join every way.
+    MergeJoinsOnly = 3,
+    /// As `ByCost`, with a sort-merge join chosen where its cost (`estimate_merge_join_cost`) is
+    /// below the hash join's. Off (`ByCost`) by default until the merge-versus-hash measurement
+    /// says otherwise, so no plan changes.
+    ByCostWithMerge = 4,
+}
+
+impl JoinMethods {
+    /// Whether every join that can take a hash join takes one (as a hash or as a merge).
+    pub fn hash_shaped_only(self) -> bool {
+        matches!(self, Self::HashJoinsOnly | Self::MergeJoinsOnly)
+    }
 }
 
 /// Amphora (PL.8, decision 19): the rule that sizes the join search's budget, the number of

@@ -133,6 +133,8 @@ pub enum AccessMethodParams {
         bloom_fp_per_key: f64,
         /// Join semantics: Inner, LeftOuter, or FullOuter.
         join_type: HashJoinType,
+        /// QT.5 step 4 (lane qs5-21): by hash or by sort-merge.
+        method: crate::translate::plan::HashJoinMethod,
     },
     /// Custom index method access (e.g., FTS).
     /// This variant is used when the optimizer determines that a custom index method
@@ -1948,6 +1950,7 @@ pub fn try_hash_join_access_method(
             use_bloom_filter: false,
             bloom_fp_per_key: 0.0,
             join_type: hash_join_type,
+            method: crate::translate::plan::HashJoinMethod::Hash,
         },
     }))
 }

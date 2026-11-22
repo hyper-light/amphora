@@ -878,9 +878,11 @@ fn join_lhs_and_rhs<'a>(
                 pinned_hash_here
             } else {
                 match planning_context.join_methods {
-                    crate::JoinMethods::ByCost => !build_unique_key_search_without_statistics,
+                    crate::JoinMethods::ByCost | crate::JoinMethods::ByCostWithMerge => {
+                        !build_unique_key_search_without_statistics
+                    }
                     crate::JoinMethods::NestedLoopsOnly => false,
-                    crate::JoinMethods::HashJoinsOnly => true,
+                    crate::JoinMethods::HashJoinsOnly | crate::JoinMethods::MergeJoinsOnly => true,
                 }
             };
             let allow_hash_join = preferred_over_seek
@@ -948,6 +950,7 @@ fn join_lhs_and_rhs<'a>(
                         bloom_fp_per_key,
                         join_keys,
                         join_type,
+                        method,
                         ..
                     } = &mut hash_join_method.params
                     {
@@ -1067,11 +1070,18 @@ fn join_lhs_and_rhs<'a>(
                             } else {
                                 *materialize_build_input = false;
                             }
-                            // Amphora (QT.5, step 4, lane qs5-20): a sort-merge join of the same
-                            // pair, costed beside the hash join and traced until its operator lands
-                            // (`estimate_merge_join_cost`). A materialized build input comes in
-                            // rowid order, not its keys'.
-                            if tracing::enabled!(tracing::Level::DEBUG) {
+                            // Amphora (QT.5, step 4, lanes qs5-20 and qs5-21, T-QT.5.18): a
+                            // sort-merge join of the same pair, costed beside the hash join
+                            // (`estimate_merge_join_cost`) and taken where the switch allows it:
+                            // always (`MergeJoinsOnly`) or where it costs less (`ByCostWithMerge`).
+                            // Off by default (`ByCost`). A materialized build input comes in rowid
+                            // order, not its keys'.
+                            let merges = matches!(
+                                planning_context.join_methods,
+                                crate::JoinMethods::MergeJoinsOnly
+                                    | crate::JoinMethods::ByCostWithMerge
+                            );
+                            if merges || tracing::enabled!(tracing::Level::DEBUG) {
                                 let build_read =
                                     build_access_method.filter(|_| !*materialize_build_input);
                                 let (build_ordered, probe_ordered) =
@@ -1103,6 +1113,22 @@ fn join_lhs_and_rhs<'a>(
                                         hash_probe_multiplier,
                                         &hash_params,
                                     );
+                                // The materialized input's visits are the merge's as well.
+                                let merge_join_cost = if *materialize_build_input {
+                                    merge_join_cost
+                                        + Cost(
+                                            effective_build_cardinality * params.cpu_cost_per_row,
+                                        )
+                                } else {
+                                    merge_join_cost
+                                };
+                                let take_merge = match planning_context.join_methods {
+                                    crate::JoinMethods::MergeJoinsOnly => true,
+                                    crate::JoinMethods::ByCostWithMerge => {
+                                        merge_join_cost < hash_join_method.cost
+                                    }
+                                    _ => false,
+                                };
                                 tracing::debug!(
                                     lhs_table = build_table.table.get_name(),
                                     rhs_table = rhs_table_reference.table.get_name(),
@@ -1110,8 +1136,13 @@ fn join_lhs_and_rhs<'a>(
                                     probe_ordered,
                                     merge_join_cost = ?merge_join_cost,
                                     hash_join_cost = ?hash_join_method.cost,
+                                    take_merge,
                                     "merge-join candidate"
                                 );
+                                if take_merge {
+                                    *method = crate::translate::plan::HashJoinMethod::Merge;
+                                    hash_join_method.cost = merge_join_cost;
+                                }
                             }
                             tracing::debug!(
                                 lhs_table = build_table.table.get_name(),
@@ -1140,8 +1171,7 @@ fn join_lhs_and_rhs<'a>(
                         params,
                     );
                     let forced = pinned_hash_here
-                        || (!pinned
-                            && planning_context.join_methods == crate::JoinMethods::HashJoinsOnly);
+                        || (!pinned && planning_context.join_methods.hash_shaped_only());
                     if hash_join_allowed
                         && (forced
                             || hash_join_method.cost < best_access_method.cost

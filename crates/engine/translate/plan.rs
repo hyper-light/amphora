@@ -2873,6 +2873,21 @@ impl HashJoinType {
     }
 }
 
+/// Amphora (QT.5 step 4, lane qs5-21, T-QT.5.18): how a hash-shaped join finds a probe row's build
+/// rows. Both keep the build rows in the hash table (`vdbe/hash_table.rs`), with its matched bits,
+/// unmatched-row scan and spills, so every join type runs the same way under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashJoinMethod {
+    /// By the key's hash: the control.
+    #[default]
+    Hash,
+    /// By a sort-merge: the build rows sorted by key once built, and each probe row's matches
+    /// found by merging forward from the previous probe row's, so a probe read in key order passes
+    /// each build row once and a repeated key replays its run. A probe row out of key order
+    /// finds its run by binary search instead.
+    Merge,
+}
+
 /// Hash join operation metadata
 #[derive(Debug, Clone)]
 pub struct HashJoinOp {
@@ -2894,6 +2909,8 @@ pub struct HashJoinOp {
     pub bloom_fp_per_key: f64,
     /// Join semantics.
     pub join_type: HashJoinType,
+    /// QT.5 step 4: by hash or by sort-merge (`HashJoinMethod`).
+    pub method: HashJoinMethod,
     /// PL.8: the tables of a bushy plan's inner join whose result is the build side, joined among
     /// themselves in the materialized build input and read from its payload; the build table is
     /// one of them. Empty for a left-deep plan, whose build input is the tables before the probe.
