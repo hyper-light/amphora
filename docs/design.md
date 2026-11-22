@@ -153,6 +153,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-8): a batch bounded by the process's memory | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-batch-bounded-by-the-processs-memory) |
 | reshard | – | Decision (lane split-merge-8): a row routes by its namespace, family and key | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-row-routes-by-its-namespace-family-and-key) |
 | reshard | – | Decision (lane split-merge-9): moves across nodes | [reshard.md](design/reshard.md#decision-lane-split-merge-9-moves-across-nodes) |
+| reshard | – | Decision (lane split-merge-10): pulls over the owner transport | [reshard.md](design/reshard.md#decision-lane-split-merge-10-pulls-over-the-owner-transport) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
@@ -214,6 +215,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | backup | – | The source's own rows at a quiet second: the shipping thread checks itself against a snapshot lined up with a second's stamps | [backup.md](design/backup.md#the-sources-own-rows-at-a-quiet-second) |
 | backup | – | A base begins just after a restart, so the next base copies least | [backup.md](design/backup.md#a-base-begins-just-after-a-restart) |
 | backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
+| backup | – | Cuts across machines: each cross-group step carries a hybrid logical clock, so a decision is stamped after the writes it decides | [backup.md](design/backup.md#cuts-across-machines) |
 | backup | – | Incremental bases: a new base keeps the latest's chunks the log left unchanged | [backup.md](design/backup.md#incremental-bases) |
 
 ## Sections that are not decisions

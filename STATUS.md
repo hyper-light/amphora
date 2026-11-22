@@ -444,7 +444,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Lane pitr-8: the shipping thread checks itself (`Archive::check`): the source's own rows from a
   reader snapshot lined up with a second's stamps, checked once that second settles and the archive
   holds it, the result in `Status::last_check` and the check counters (T-T1.12.C3); a due base waits
-  for the log's next restart, one generation at most (T-T1.12.I4).
+  for the log's next restart, one generation at most (T-T1.12.I4); cuts across machines: each
+  cross-group step carries a hybrid logical clock, so a decision is stamped after the writes it
+  decides whatever the nodes' clocks read (T-T1.12.X2).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -512,8 +514,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Moved across nodes (lane split-merge-9): a copy or catch-up batch reads its old group through a
   pull (`groups::Pull`, answered by `Groups::serve` where the group is, through `groups::Peers` from
   another node), and a group moved to a second node under writes keeps every acknowledged write
-  (T-T1.9.R10). Left: `Peers` over a socket between machines, a `Database` over `Groups<Local>`,
-  load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
+  (T-T1.9.R10). Over the transport (lane split-merge-10): a pull and its answer are appended variants of
+  the owner transport (version 7), a node's endpoint answers them (`transport::Node`) and its peers
+  ask through it (`transport::Nodes`); a move through loss and partition keeps every acknowledged
+  write (T-T1.9.R12). Left: that transport off loopback (between machines), a `Database` over
+  `Groups<Local>`, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
