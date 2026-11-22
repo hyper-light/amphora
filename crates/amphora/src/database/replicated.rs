@@ -300,6 +300,9 @@ struct Control {
     outgoing: Mutex<Outgoing>,
     /// Rung when a record joins `outgoing` ([`ReplicaHandle::drain_wait`]).
     sent: std::sync::Condvar,
+    /// Woken, as `sent` is rung, for a host that relays many members from one thread
+    /// ([`ReplicaHandle::on_sent`]). One: a member's records have one host to take them.
+    sent_waker: Mutex<Option<std::task::Waker>>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
     local: Local,
@@ -1285,6 +1288,17 @@ impl ReplicaHandle {
         self.drain(limit)
     }
 
+    /// Wakes `waker` each time records join this member's outgoing queue, as
+    /// [`Self::drain_wait`]'s wait is woken (lane ryw-4, kiln goal 8119f25d; replication.md, "The
+    /// bench's relay wakes on records"): a host that relays many members from one thread waits on
+    /// one bell of its own for all of them, then drains each, with no timer between a record and
+    /// its delivery. A member's records have one host to take them, so a waker given again
+    /// replaces the one before.
+    pub fn on_sent(&self, waker: std::task::Waker) -> Result<(), Refusal> {
+        *locked(&self.shared.sent_waker)? = Some(waker);
+        Ok(())
+    }
+
     pub fn status(&self) -> Result<ReplicaStatus, Refusal> {
         locked(&self.shared.status)?.clone()
     }
@@ -1605,6 +1619,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_meter: FloorMeter::default(),
         outgoing: Mutex::default(),
         sent: std::sync::Condvar::new(),
+        sent_waker: Mutex::new(None),
         status: Mutex::new(Ok(status(&replica))),
         meter,
         local,
@@ -3483,6 +3498,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             .unwrap_or(u32::MAX);
         let now = self.now()?;
         let mut outgoing = locked(&self.control.outgoing)?;
+        let any = !output.messages.is_empty();
         for message in output.messages {
             self.pace.sent(&message, now, lost);
             let mut bytes = Vec::new();
@@ -3504,6 +3520,16 @@ impl<F: BlockFile + 'static> Actor<F> {
             });
         }
         self.control.sent.notify_all();
+        drop(outgoing);
+        // Taken out first, so the host's waker runs with no lock of this member's held.
+        let waker = if any {
+            locked(&self.control.sent_waker)?.clone()
+        } else {
+            None
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
         Ok(())
     }
     /// The replicated class at a follower (replication.md, "A write made at a follower is answered
@@ -10272,6 +10298,59 @@ mod tests {
             "the waker's ring"
         );
         ringer.join().unwrap();
+    }
+
+    /// Lane ryw-4 (kiln goal 8119f25d; replication.md, "The bench's relay wakes on records"): a
+    /// member's records wake the waker its host gave it, so a host relaying many members from one
+    /// thread needs no timer. Do: three voters, a counting waker given to each member's handle;
+    /// elect a leader; give the leader a second waker; write through it. Expect: every member's
+    /// waker was woken by the election's records (votes and their answers, appends and theirs);
+    /// the write's records wake the second waker and not the first, which it replaced.
+    #[test]
+    fn a_members_records_wake_the_waker_its_host_gave() {
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counted = |count: &Arc<Count>| count.0.load(Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let counts: Vec<Arc<Count>> = clients
+            .iter()
+            .map(|client| {
+                let count = Arc::new(Count(AtomicUsize::new(0)));
+                client
+                    .handle()
+                    .on_sent(std::task::Waker::from(Arc::clone(&count)))
+                    .unwrap();
+                count
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        for (member, count) in counts.iter().enumerate() {
+            assert!(counted(count) > 0, "member {member}'s records woke no one");
+        }
+        let again = Arc::new(Count(AtomicUsize::new(0)));
+        clients[leader]
+            .handle()
+            .on_sent(std::task::Waker::from(Arc::clone(&again)))
+            .unwrap();
+        let before = counted(&counts[leader]);
+        write(&mut driven, &mut pump, &clients[leader], 1);
+        assert!(counted(&again) > 0, "the write's records woke no one");
+        assert_eq!(
+            counted(&counts[leader]),
+            before,
+            "a replaced waker was woken"
+        );
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     /// CP-T1.8, AC-WK.1.2: an owner with nothing to do waits until its next deadline: its next
