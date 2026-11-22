@@ -217,6 +217,77 @@ fn out_of_descriptors(error: &std::io::Error) -> bool {
         .is_some_and(|code| refusals.contains(&code))
 }
 
+/// A node's answer to a pull from one of its groups, its batch held to the bytes given
+/// ([`crate::groups::Groups::serve_within`]).
+type Pulls = dyn Fn(&crate::groups::Pull, Instant, u64) -> anyhow::Result<crate::groups::Pulled>
+    + Send
+    + Sync;
+
+/// The most bytes a pull's answer holds in keys and rows: the protocol's bound on a result
+/// (`amphora_api::RESULT_MAX`, a format value), so its frame, a mebibyte more ([`FRAME_MAX`]),
+/// carries it whole.
+const PULL_BYTES: u64 = amphora_api::RESULT_MAX as u64;
+
+/// A node's endpoint (CP-T1.9; docs/design/reshard.md, "Moves across nodes"): the owner
+/// transport's listener, record and authentication at `path`, answering a pull from one of this
+/// node's groups for a new group on another node ([`Nodes`]). It serves no database: any other
+/// request finds none. Dropped, it stops listening.
+pub struct Node {
+    _owner: Owner,
+}
+impl Node {
+    /// An endpoint at `path` whose pulls `serve` answers: a node's
+    /// [`crate::groups::Groups::serve_within`].
+    pub fn start(
+        path: &Path,
+        serve: impl Fn(&crate::groups::Pull, Instant, u64) -> anyhow::Result<crate::groups::Pulled>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<Self, Refusal> {
+        Ok(Self {
+            _owner: Owner::listen(path, || None, Some(Arc::new(serve)))?,
+        })
+    }
+}
+
+/// A node's peers over the owner transport (CP-T1.9): each other node's endpoint ([`Node`]) by
+/// the path it was started at. A pull is one authenticated connection and one request; a pull
+/// lost or refused on the way is an error, and the driver asks its action again.
+#[derive(Debug, Clone, Default)]
+pub struct Nodes {
+    endpoints: std::collections::BTreeMap<crate::reshard::NodeId, PathBuf>,
+}
+impl Nodes {
+    /// Peers at these nodes' endpoints.
+    pub fn new(endpoints: impl IntoIterator<Item = (crate::reshard::NodeId, PathBuf)>) -> Self {
+        Self {
+            endpoints: endpoints.into_iter().collect(),
+        }
+    }
+}
+impl crate::groups::Peers for Nodes {
+    fn pull(
+        &self,
+        node: crate::reshard::NodeId,
+        pull: &crate::groups::Pull,
+        until: Instant,
+    ) -> anyhow::Result<crate::groups::Pulled> {
+        let Some(path) = self.endpoints.get(&node) else {
+            anyhow::bail!("no endpoint known for node {}", node.0);
+        };
+        let client = Client {
+            path: path.clone(),
+            application: None,
+        };
+        match client.request(Request::Pull(pull.clone()), until) {
+            Ok(Answer::Pulled(pulled)) => Ok(pulled),
+            Ok(_) => anyhow::bail!("node {}'s answer to a pull is not a pull's", node.0),
+            Err(error) => anyhow::bail!("node {}'s pull: {error}", node.0),
+        }
+    }
+}
+
 /// Stored once in the database's shared owner, never on individual clone handles.
 pub struct Owner {
     stop: Arc<AtomicBool>,
@@ -228,6 +299,16 @@ impl Owner {
     pub fn start(
         path: &Path,
         acquire: impl Fn() -> Option<crate::database::Database> + Send + Sync + 'static,
+    ) -> Result<Self, Refusal> {
+        Self::listen(path, acquire, None)
+    }
+
+    /// The listener at `path`, each connection served by `acquire`'s database, and a pull by
+    /// `pulls` (a node's endpoint, [`Node`]; none: a pull finds no group here).
+    fn listen(
+        path: &Path,
+        acquire: impl Fn() -> Option<crate::database::Database> + Send + Sync + 'static,
+        pulls: Option<Arc<Pulls>>,
     ) -> Result<Self, Refusal> {
         let endpoint::Bound {
             listener,
@@ -263,13 +344,14 @@ impl Owner {
                                 continue;
                             };
                             let acquire = Arc::clone(&acquire);
+                            let pulls = pulls.clone();
                             let waits = Arc::clone(&waits);
                             // Detached workers are bounded by permits and the absolute session deadline.
                             let spawned = thread::Builder::new()
                                 .name("amphora.client".into())
                                 .spawn(move || {
                                     let _permit = permit;
-                                    if let Err(error) = serve(stream, token, &*acquire, &waits, GREETING_MAX) {
+                                    if let Err(error) = serve(stream, token, &*acquire, pulls.as_deref(), &waits, GREETING_MAX) {
                                         tracing::debug!(target: "amphora.transport", event = "connection_finished", %error);
                                     }
                                 });
@@ -757,6 +839,7 @@ fn serve(
     mut stream: Stream,
     token: [u8; 32],
     acquire: &dyn Fn() -> Option<crate::database::Database>,
+    pulls: Option<&Pulls>,
     waits: &Arc<AtomicUsize>,
     greeting: Duration,
 ) -> Result<(), Refusal> {
@@ -825,6 +908,17 @@ fn serve(
     }
     if matches!(request, Request::Probe) {
         return write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until);
+    }
+    // A node's pull needs no database: its groups answer it, a batch no larger than a frame
+    // carries (CP-T1.9; reshard.md, "Moves across nodes").
+    if let Request::Pull(pull) = &request {
+        let answer = match pulls {
+            Some(pulls) => pulls(pull, until, PULL_BYTES)
+                .map(Answer::Pulled)
+                .map_err(|error| unavailable(format_args!("{error:#}"))),
+            None => Ok(Answer::Pulled(crate::groups::Pulled::NoGroup)),
+        };
+        return write(&mut stream, &answer, until);
     }
     let mut database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
     if let Some(application) = application {
@@ -895,7 +989,8 @@ fn serve(
         | Request::LocalSession
         | Request::Probe
         | Request::Capabilities
-        | Request::Application(_) => Err(unavailable("unexpected session")),
+        | Request::Application(_)
+        | Request::Pull(_) => Err(unavailable("unexpected session")),
     };
     if watch_batch {
         let encoded = match encode(&result, WATCH_REPLY_MAX) {
@@ -1405,6 +1500,7 @@ mod tests {
                     observed.fetch_add(1, Ordering::AcqRel);
                     None
                 },
+                None,
                 &Arc::new(AtomicUsize::new(0)),
                 HANG,
             )
@@ -1447,6 +1543,7 @@ mod tests {
                     observed.fetch_add(1, Ordering::AcqRel);
                     None
                 },
+                None,
                 &Arc::new(AtomicUsize::new(0)),
                 HANG,
             )
@@ -1488,6 +1585,7 @@ mod tests {
                         observed.fetch_add(1, Ordering::AcqRel);
                         Some(db.clone())
                     },
+                    None,
                     &Arc::new(AtomicUsize::new(0)),
                     HANG,
                 )
