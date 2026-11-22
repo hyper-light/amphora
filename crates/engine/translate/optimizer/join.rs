@@ -920,6 +920,11 @@ fn join_lhs_and_rhs<'a>(
             );
             if allow_hash_join {
                 let lhs_constraints = build_constraints;
+                // Amphora (PL.7): the probe table's scan costs its own pages; (QT.5, T-QT.5.7) a
+                // hash entry holds a row of the build table.
+                let hash_params = params
+                    .for_table(rhs_table_reference, analyze_stats)
+                    .with_hash_build(&params.for_table(build_table, analyze_stats));
                 if let Some(hash_join_method) = try_hash_join_access_method(
                     build_table,
                     rhs_table_reference,
@@ -943,8 +948,7 @@ fn join_lhs_and_rhs<'a>(
                     hash_can_replace_build_index,
                     subqueries,
                     joined_tables,
-                    // Amphora (PL.7): the probe table's scan costs its own pages.
-                    &params.for_table(rhs_table_reference, analyze_stats),
+                    &hash_params,
                     !pinned_hash_here
                         && planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
@@ -1044,7 +1048,7 @@ fn join_lhs_and_rhs<'a>(
                                 build_filtered_rows,
                                 probe_rows,
                                 matched_probe_rows,
-                                params,
+                                &hash_params,
                             );
                             *use_bloom_filter = rate_per_key.is_some();
                             *bloom_fp_per_key = rate_per_key.unwrap_or(0.0);
@@ -1057,7 +1061,7 @@ fn join_lhs_and_rhs<'a>(
                                     *join_type,
                                     mem_budget,
                                     hash_probe_multiplier,
-                                    &params.for_table(rhs_table_reference, analyze_stats),
+                                    &hash_params,
                                 );
                             }
                             if should_materialize {
