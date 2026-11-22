@@ -1063,32 +1063,39 @@ impl<E: Engine> Groups<E> {
 
     /// What each group on this node was measured doing since the last call, for
     /// [`crate::reshard::plan::plan`] (CP-T1.9; docs/design/reshard.md, decision "Load from the
-    /// store's meter"): its load, the time its writer spent committing ([`Counters::apply_us`]),
-    /// and the load's cut, where the keys written to it fall half each side. Each call starts the
-    /// next window, so the window is the time between planner runs, and the shares the plan
-    /// compares don't depend on its length. A group's size isn't measured yet: its bytes are none
-    /// and it has no size cut, so it splits and merges by its load alone.
-    #[must_use]
-    pub fn measure(&self) -> Vec<GroupLoad> {
-        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
-        route
-            .groups
-            .iter()
-            .map(|(group, held)| {
-                let now = held.store.counters().apply_us;
-                let mut window = held.window.lock().unwrap_or_else(PoisonError::into_inner);
-                let load = now.saturating_sub(window.apply_us);
-                window.apply_us = now;
-                let written = std::mem::take(&mut window.written);
-                GroupLoad {
-                    group: *group,
-                    bytes: 0,
-                    load,
-                    by_size: None,
-                    by_load: written.cut(),
-                }
-            })
-            .collect()
+    /// store's meter"): its load, the time its writer spent committing ([`Counters::apply_us`]);
+    /// the load's cut, where the keys written to it fall half each side; and its size, the bytes
+    /// its engine says its rows hold ([`Engine::bytes`], asked on its writer; none: 0). Each call
+    /// starts the next window, so the window is the time between planner runs, and the shares the
+    /// plan compares don't depend on its length. A group has no size cut yet, so it splits by its
+    /// load alone.
+    pub fn measure(&self, until: Instant) -> anyhow::Result<Vec<GroupLoad>> {
+        type Measured<E> = (GroupId, Store<E>, Arc<Mutex<Window>>);
+        let held: Vec<Measured<E>> = {
+            let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+            route
+                .groups
+                .iter()
+                .map(|(g, h)| (*g, h.store.clone(), Arc::clone(&h.window)))
+                .collect()
+        };
+        let mut out = Vec::with_capacity(held.len());
+        for (group, store, window) in held {
+            let bytes = store.run(until, |e| e.bytes())?.unwrap_or(0);
+            let now = store.counters().apply_us;
+            let mut window = window.lock().unwrap_or_else(PoisonError::into_inner);
+            let load = now.saturating_sub(window.apply_us);
+            window.apply_us = now;
+            let written = std::mem::take(&mut window.written);
+            out.push(GroupLoad {
+                group,
+                bytes,
+                load,
+                by_size: None,
+                by_load: written.cut(),
+            });
+        }
+        Ok(out)
     }
 
     /// [`Store::put`] to the rows' group.
