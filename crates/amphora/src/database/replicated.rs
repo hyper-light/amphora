@@ -2289,25 +2289,37 @@ fn settings(
         super::drain::Window::Picked => (4, 64 << 20),
         super::drain::Window::Carried => (usize::MAX, hyper_timing::inflight_window(record)),
     };
+    let core = hyper_raft::Config {
+        fates,
+        apply_unpersisted,
+        check_quorum: true,
+        pre_vote: true,
+        max_size_per_msg: message,
+        max_uncommitted_size: held,
+        max_committed_size_per_ready: held,
+        max_inflight_msgs,
+        max_inflight_bytes,
+        seed: id,
+        ..hyper_raft::Config::new(id, limits)
+    };
+    // The owner's quiet period is its learned election timeout (lane constants-21; was focal
+    // F17's picked 50 ms): at open the start pace's, then the pace's as it is learned (`repace`).
+    let quiet = quiet_period(core.election_tick, TICK);
     Ok(hyper_durable::Settings {
-        core: hyper_raft::Config {
-            fates,
-            apply_unpersisted,
-            check_quorum: true,
-            pre_vote: true,
-            max_size_per_msg: message,
-            max_uncommitted_size: held,
-            max_committed_size_per_ready: held,
-            max_inflight_msgs,
-            max_inflight_bytes,
-            seed: id,
-            ..hyper_raft::Config::new(id, limits)
-        },
+        core,
         // CP-T2.2: preserve flush-proved group durability during API reconciliation.
         disk: hyper_durable::Disk::Flushed,
         elections: hyper_raft::Elections::Ticks,
-        quiet: Duration::from_millis(50),
+        quiet,
     })
+}
+/// The owner's quiet period (hyper-durable's `Settings::quiet`): a commit no write stated while
+/// the applied index ran past the durable commit is written once the owner has been quiet this
+/// long, so a member that stops reopens with what it applied. The learned election timeout, the
+/// core's `election_tick` periods of the pace (lane constants-21): a member a group takes for
+/// lost after an election timeout has stated what it applied by then.
+fn quiet_period(election_tick: usize, period: Duration) -> Duration {
+    super::drain::election_timeout(election_tick, period)
 }
 fn status<F: BlockFile + 'static>(replica: &Durable<F>) -> ReplicaStatus {
     ReplicaStatus {
@@ -2518,6 +2530,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             .pace
             .derive(&voters, id, election, heartbeat, votes, now);
         self.slots.bound(slot_bounds(election, pace.period)?);
+        self.replica.set_quiet(quiet_period(election, pace.period));
         Ok(())
     }
     /// The owner's next deadline: its next tick, or sooner a deadline of what it holds (a queued
@@ -5181,8 +5194,8 @@ mod tests {
         assert_eq!(progress.completed, 2);
         assert_eq!(progress.feed, 1);
         let applied = client.handle().status().unwrap().applied;
-        // Past hyper-durable's quiet period, so the owner states its durable commit before it stops.
-        driven.advance(0, Duration::from_millis(60));
+        // Past the owner's quiet period, so it states its durable commit before it stops.
+        driven.advance(0, past_quiet(&driven, 0));
         for _ in 0..8 {
             driven.round(&mut pump);
         }
@@ -9344,6 +9357,55 @@ mod tests {
             })
             .unwrap();
     }
+    /// A tick past owner `owner`'s quiet period, its learned election timeout (lane constants-21):
+    /// what a test advances its clock by so that it states its durable commit before it stops.
+    fn past_quiet(driven: &Driven, owner: usize) -> Duration {
+        driven.owner(owner).replica.quiet() + driven.owner(owner).pace.period()
+    }
+    /// T-QB.1.12 (QB.1, lane constants-21): the owner's quiet period is its learned election
+    /// timeout, not focal F17's picked 50 ms. Do: open three voters, elect, then three election
+    /// timeouts of ticks, a tick on every clock each round. Expect: at open, each owner's quiet
+    /// period is its core's election ticks of the start pace; after, its election ticks of the
+    /// pace it learned, whatever that is.
+    #[test]
+    fn t_qb_1_12_the_quiet_period_is_the_learned_election_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let voters = vec![1, 2, 3];
+        let clients: Vec<Client> = voters
+            .iter()
+            .map(|n| driven.open(dir.path(), *n, voters.clone(), None))
+            .collect();
+        let quiet = |driven: &Driven, owner: usize| {
+            let actor = driven.owner(owner);
+            let election = actor.replica.core().raft.config().election_tick;
+            (
+                actor.replica.quiet(),
+                quiet_period(election, actor.pace.period()),
+            )
+        };
+        for owner in 0..3 {
+            let (held, learned) = quiet(&driven, owner);
+            assert_eq!(held, learned);
+            assert_ne!(held, Duration::from_millis(50));
+        }
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        let election = driven.owner(0).replica.core().raft.config().election_tick;
+        for _ in 0..3 * election {
+            for owner in 0..3 {
+                let period = driven.owner(owner).pace.period();
+                driven.advance(owner, period);
+            }
+            driven.round(&mut pump);
+        }
+        for owner in 0..3 {
+            let (held, learned) = quiet(&driven, owner);
+            assert_eq!(held, learned, "owner {owner}");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
     /// The values of member_items that owner `owner` has applied, read on its own state.
     fn held(driven: &mut Driven, owner: usize) -> Vec<u8> {
         let actor = driven.owner_mut(owner);
@@ -9887,7 +9949,7 @@ mod tests {
         write(&mut driven, &mut pump, &clients[0], 1);
         catch_up(&mut driven, &mut pump, &clients, 0, 1);
         for owner in 0..2 {
-            driven.advance(owner, Duration::from_millis(60));
+            driven.advance(owner, past_quiet(&driven, owner));
         }
         for _ in 0..8 {
             driven.round(&mut pump);
@@ -10164,7 +10226,8 @@ mod tests {
         let leader = driven.elect(&mut pump, &clients, 0, 1);
         let tick = |driven: &mut Driven| {
             for owner in 0..5 {
-                driven.advance(owner, TICK);
+                let period = driven.owner(owner).pace.period();
+                driven.advance(owner, period);
             }
         };
         pump.lost = vec![2, 3];
@@ -14170,7 +14233,7 @@ mod tests {
         );
         // Past hyper-durable's quiet period, so each owner states its durable commit before it stops.
         for owner in 0..3 {
-            driven.advance(owner, Duration::from_millis(60));
+            driven.advance(owner, past_quiet(&driven, owner));
         }
         for _ in 0..8 {
             driven.round(&mut pump);
@@ -14295,7 +14358,7 @@ mod tests {
             assert_eq!(driven.call(&mut pump, client, unchanged).unwrap(), original);
         }
         for owner in 0..3 {
-            driven.advance(owner, Duration::from_millis(60));
+            driven.advance(owner, past_quiet(&driven, owner));
         }
         for _ in 0..8 {
             driven.round(&mut pump);

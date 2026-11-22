@@ -1155,6 +1155,7 @@ tests = [
   { id = "T-QB.1.9", text = "A driven one-voter group, a learner running beside it, grows to five members, then nine, then the voter reopens from its first configuration: passes when every change is answered, the bound is 8 at five and 16 at nine at the voter and the learner, and the voter reopens with 16" },
   { id = "T-QB.1.10", text = "A wire record of one byte and a catch-up queued on an owner not stepped: passes when the queue's bytes grow by the byte and two envelopes" },
   { id = "T-QB.1.11", text = "Five voters, two cut off while the rest commit, then both back, one slow and one fast, under each window (window_slow_flooded_fast_starved): passes when both catch up under each, which prints the most in flight to the slow member and the rounds each took" },
+  { id = "T-QB.1.12", text = "Three voters opened, elected, then three election timeouts of ticks: passes when each owner's quiet period is its election ticks of its pace, the start pace's at open and the learned one's after, never the picked 50 ms" },
 ]
 
 # lane many-writers

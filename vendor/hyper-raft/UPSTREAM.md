@@ -32,6 +32,8 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 
 | `crates/hyper-raft/src/{raft,progress,fast,read,lib}.rs`, `crates/hyper-durable/src/replica.rs` | `Raft::grow_members` raises the most members a configuration may name (the tracker's, the fast votes' and the pending reads' bound with it), never lowers it; `Raft::state_members` takes the owner's reader of a bound its entries state, which the core folds in as it takes entries, before the configurations they change take effect; `Replica::state_members` and `Replica::grow_members` pass both through, additive | hyper-raft stops a member handed a configuration past the members it was opened for, so a group that grows needs its bound to grow at every member: Amphora states the bound once in its log and raises it ahead of a change that passes it (Amphora's docs/design/replication.md, "The member bound stated once per group"; QB.1, lane constants-21) | `0006-qb-1-the-member-bound-stated-in-the-owners-log.patch` |
 
+| `crates/hyper-durable/src/replica.rs` | `Replica::quiet`: the owner's quiet period in force, read back, additive | Amphora sets its quiet period from its learned election timeout as its pace moves (`Replica::set_quiet`; Amphora's docs/design/replication.md, QB.1, lane constants-21), and its test reads it back | `0007-qb-1-the-owners-quiet-period-read-back.patch` |
+
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
 would reach slates. Focal's agent agrees (2026-10-22), and notes that Focal names `RamStore` only in a

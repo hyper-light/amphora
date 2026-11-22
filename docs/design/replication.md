@@ -2583,8 +2583,10 @@ wire records queued beside them (`Control::called`).
 - hyper-log's settings at open (`segment_bytes` 64 MiB, `max_segments` 16, `group_entries` 65 536, `group_bytes`
   512 MiB, `group_cache` 64 MiB, `queue_submissions` 16): the log's disk room (`log_bound::log_room`) and an image's
   share, the memory budget's room for caches, and the device's measured queue depth.
-- `quiet` (50 ms, focal F17's period): the learned election timeout or the pace's period, once settings follow the
-  pace.
+- `quiet` is now the learned election timeout (lane constants-21; was focal F17's picked 50 ms): the core's election
+  ticks of the start pace at open, and of the learned pace at each repace (`quiet_period`, `Replica::set_quiet`), so a
+  member a group takes for lost after an election timeout has stated what it applied by then. Tests that let an owner
+  state its durable commit before it stops advance its clock a tick past it (`past_quiet`). T-QB.1.12 tests it.
 - `TICK` (10 ms): to remove (below).
 - `CHECKPOINT_EVERY` (25 ms, measured once on fedora): learned from this host's checkpoint costs, as `compacting`
   learns compaction's.

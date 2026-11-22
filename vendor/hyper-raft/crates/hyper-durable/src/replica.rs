@@ -707,6 +707,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.quiet = quiet;
     }
 
+    /// The owner's period in force ([`Replica::set_quiet`]).
+    pub fn quiet(&self) -> Duration {
+        self.quiet
+    }
+
     /// How the owner's entries state its group's member bound ([`hyper_raft::Raft::state_members`]).
     pub fn state_members(&mut self, stated: hyper_raft::StatedMembers) {
         self.node.raft.state_members(stated);

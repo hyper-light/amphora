@@ -1,0 +1,19 @@
+Subject: QB.1 the owner's quiet period read back
+Why: Amphora sets its quiet period from its learned election timeout as the pace moves (Replica::set_quiet; lane constants-21), and its test reads the period in force back
+
+diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
+index 2d986f253a5cb7734d9e5889a3356217a31eae98..736c83c67b6edc634191d46a19a5a24392f33008 100644
+--- a/crates/hyper-durable/src/replica.rs
++++ b/crates/hyper-durable/src/replica.rs
+@@ -707,6 +707,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+         self.quiet = quiet;
+     }
+ 
++    /// The owner's period in force ([`Replica::set_quiet`]).
++    pub fn quiet(&self) -> Duration {
++        self.quiet
++    }
++
+     /// How the owner's entries state its group's member bound ([`hyper_raft::Raft::state_members`]).
+     pub fn state_members(&mut self, stated: hyper_raft::StatedMembers) {
+         self.node.raft.state_members(stated);
