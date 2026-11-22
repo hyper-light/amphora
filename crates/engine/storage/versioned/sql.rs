@@ -812,3 +812,103 @@ fn ac_ns_2_1_a_schema_read_beside_a_schema_change_waits_for_its_rows() {
         );
     }
 }
+
+/// Two connections to one file database on the versioned storage, each with the same file
+/// attached as `aux` (its trees on a versioned storage of its own, which both share), a table of
+/// two committed rows there.
+#[cfg(feature = "fs")]
+fn two_attached(dir: &std::path::Path) -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+    let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+    let main = dir.join("main.db");
+    let db = Database::open_file_with_flags(
+        io,
+        main.to_str().unwrap(),
+        crate::OpenFlags::default(),
+        crate::DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let a = attached(&db, dir);
+    run(
+        &a,
+        "CREATE TABLE aux.t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    );
+    run(&a, "INSERT INTO aux.t VALUES (1, 0), (2, 0)");
+    let b = attached(&db, dir);
+    (db, a, b)
+}
+
+/// A connection to `db` on the versioned storage with `dir`'s `aux.db` attached as `aux`.
+#[cfg(feature = "fs")]
+fn attached(db: &Arc<Database>, dir: &std::path::Path) -> Arc<Connection> {
+    let conn = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    let aux = dir.join("aux.db");
+    run(&conn, &format!("ATTACH '{}' AS aux", aux.to_str().unwrap()));
+    conn
+}
+
+/// AC-NS.2.1 (lane g7s2-19): an attached database's commit is one across its pager and its
+/// versioned storage, as the main database's is (lane g7s2-18). Do open a transaction that reads
+/// every row of `aux.t` (its storage snapshot begins), let another connection insert a row of
+/// `aux.t` and commit, then build an index of `aux.t` in the transaction (it writes its schema
+/// row, its index rows and the attached pager's header, the cookie) and commit; expect it refused
+/// (it read the table the insert changed), and nothing of it anywhere: `aux`'s cookie and schema
+/// rows as before on its own connection, on the other and on a new one, and none knowing the
+/// index. Run again, the index stands on every connection, the cookie past the old one. The
+/// attached pager committed first: its cookie and schema stood beside rows the storage refused.
+#[cfg(feature = "fs")]
+#[test]
+fn ac_ns_2_1_an_attached_schema_change_the_storage_refuses_leaves_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, a, b) = two_attached(dir.path());
+    let cookie = |conn: &Arc<Connection>| rows(conn, "PRAGMA aux.schema_version");
+    let names =
+        |conn: &Arc<Connection>| rows(conn, "SELECT name FROM aux.sqlite_schema ORDER BY name");
+    let (cookie_before, names_before) = (cookie(&a), names(&a));
+    run(&a, "BEGIN");
+    assert_eq!(
+        rows(&a, "SELECT count(*) FROM aux.t"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    run(&b, "INSERT INTO aux.t VALUES (3, 0)");
+    run(&a, "CREATE INDEX aux.tv ON t (v)");
+    let e = a
+        .execute("COMMIT")
+        .expect_err("an attached index built over rows changed beside it commits");
+    assert!(conflict(&e), "the schema change's refusal: {e:?}");
+    if !a.get_auto_commit() {
+        run(&a, "ROLLBACK");
+    }
+    let c = attached(&db, dir.path());
+    for (who, conn) in [("its own", &a), ("the other", &b), ("a new one", &c)] {
+        assert_eq!(cookie(conn), cookie_before, "{who} connection's cookie");
+        assert_eq!(names(conn), names_before, "{who} connection's schema rows");
+        assert!(
+            conn.prepare("SELECT id FROM aux.t INDEXED BY tv WHERE v = 0")
+                .is_err(),
+            "{who} connection knows the refused index"
+        );
+    }
+    run(&a, "CREATE INDEX aux.tv ON t (v)");
+    let all = vec![
+        vec![Value::from_i64(1)],
+        vec![Value::from_i64(2)],
+        vec![Value::from_i64(3)],
+    ];
+    for (who, conn) in [("its own", &a), ("the other", &b), ("a new one", &c)] {
+        assert_ne!(cookie(conn), cookie_before, "{who} connection's cookie");
+        assert_eq!(
+            rows(conn, "SELECT id FROM aux.t INDEXED BY tv WHERE v = 0"),
+            all,
+            "{who} connection, through the index"
+        );
+        assert_eq!(
+            rows(conn, "SELECT id FROM aux.t NOT INDEXED WHERE v = 0"),
+            all,
+            "{who} connection, through the table"
+        );
+    }
+}

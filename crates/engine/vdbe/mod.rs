@@ -3426,6 +3426,32 @@ impl Program {
                     continue;
                 }
                 if !rollback {
+                    // Amphora (lane g7s2-19, `AC-NS.2.1`): an attached database on the versioned
+                    // storage commits its pager's part inside its storage's commit, once the
+                    // storage's verdict is in and before its rows are published, as the main
+                    // database's does (`Program::commit_versioned_with_header`): a refusal comes
+                    // before the pager commits, and the pager's failure rolls the storage's back.
+                    // Its schema is published once its rows are.
+                    if let Some(switch) = connection.versioned_for(db_id) {
+                        use crate::util::IOExt;
+                        let sync_mode = connection.get_sync_mode_for_database(db_id)?;
+                        switch.commit_with(|| {
+                            attached_pager.io.block(|| {
+                                attached_pager.commit_wal(
+                                    WalAutoActions::empty(),
+                                    connection.get_wal_autocheckpoint(),
+                                    sync_mode,
+                                    connection.get_data_sync_retry(),
+                                )
+                            })?;
+                            attached_pager.end_write_tx();
+                            attached_pager.end_read_tx();
+                            attached_pager.commit_wal_end();
+                            Ok(())
+                        })?;
+                        connection.publish_database_schema(db_id);
+                        continue;
+                    }
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.

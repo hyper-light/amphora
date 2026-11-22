@@ -370,7 +370,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   on rows (lane g7s2-16, uncompiled until run); a writer begun before a schema change is
   refused at commit (`SchemaConflict`, lane g7s2-17, uncompiled until run), and the pager's header
   commits inside the storage's commit, after its verdict, so a schema change the storage refuses
-  leaves the cookie and the schema rows unchanged (lane g7s2-18, uncompiled until run). With the switch on,
+  leaves the cookie and the schema rows unchanged (lane g7s2-18, uncompiled until run); an attached
+  database's commit takes the same order, a schema reload waits for the rows of the cookie it read,
+  and a writer whose cookie check came before a schema change is refused even when its snapshot
+  began after it (lane g7s2-19, uncompiled until run). With the switch on,
   44 of the engine's lib tests still fail (2866 pass, lane g7s2-11, before the pause points; 6 more
   pass after) (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
   batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and

@@ -546,7 +546,16 @@ the pager's failure rolls the storage's back; the shared schema takes the change
 rows are published. The pager committed first before: a schema change the storage then refused
 left its cookie committed, and its schema, naming a tree the storage dropped, every connection's.
 The storage's publish lock is held across the pager's commit of its header, which only DDL and
-pragmas pay. The storage sets no memory aside: it takes its
+pragmas pay. That commit order leaves a gap, inside the publish lock, where another connection can
+read the new cookie before the rows are published (lane g7s2-19): a schema reload that read the
+cookie then passes through the publish lock before it reads the schema rows
+(`Switch::await_published`), else it kept the older rows under the newer cookie and gave them to
+every connection; and a writer's limit is the storage's newest commit read just before its pager
+began the read its cookie checks see (`Switch::pager_read_begins`, `Txn::schema_seen_by`), not its
+snapshot's start, which can come after a schema change its checks missed. The limit can be a
+little older than the pager's read, so a schema change committed in between refuses a writer
+that would have passed: a retry, never a wrong commit. Attached databases on the versioned storage
+commit their pager's part the same way, inside their storage's commit. The storage sets no memory aside: it takes its
 pages' frames and its row versions' bytes from a memory source as they grow, and gives them back as
 it lets them go (`storage::versioned::memory::Source`, `ConnectOpts::with_memory`). Amphora's shell
 gives its process memory budget (`amphora::memory::StorageMemory`, as caches; store.md, "Decision
