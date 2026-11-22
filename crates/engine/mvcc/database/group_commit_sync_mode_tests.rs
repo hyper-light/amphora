@@ -8,6 +8,11 @@ use std::sync::Arc;
 
 #[test]
 fn full_waiter_is_synced_when_group_leader_uses_sync_off() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     let (_db, io, [mut leader, mut waiter]) =
         prepare_group_commit("group-commit-sync-off-leader.db", SyncMode::Off);
     let before = io.syncs.load(Ordering::Acquire);
