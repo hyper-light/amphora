@@ -1175,7 +1175,9 @@ mod tests {
             db
         };
         let commit = |db: &Db, key: &[u8], stamp: u64| {
-            let at = crate::database::write_across(db, "n", "f", key, Some(b"v"), None, 0).unwrap();
+            let at =
+                crate::database::write_across(db, "n", "f", key, Some(b"v".as_slice()), None, 0)
+                    .unwrap();
             db.query(
                 "INSERT INTO __amphora_rev_stamps(namespace, rev, stamp) VALUES ('n', ?1, ?2)",
                 [integer(at).unwrap(), integer(stamp).unwrap()],
