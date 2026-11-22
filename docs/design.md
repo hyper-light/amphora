@@ -58,6 +58,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 11 | The log in lanes: one group-committed log, or a log a writer | [engine.md](design/engine.md#11-the-log-in-lanes-one-group-committed-log-or-a-log-a-writer) |
 | engine | 12 | Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own | [engine.md](design/engine.md#12-large-rows-as-chunk-rows-of-an-overflow-tree-trees-made-and-dropped-as-records-of-their-own) |
 | engine | 13 | The switch: a connection's B-trees on the versioned storage, the pager beside it | [engine.md](design/engine.md#13-the-switch-a-connections-b-trees-on-the-versioned-storage-the-pager-beside-it) |
+| engine | 14 | Eviction: CLOCK to a spill file, slots by page number, reads verified once, a typed bound | [engine.md](design/engine.md#14-eviction-clock-to-a-spill-file-slots-by-page-number-reads-verified-once-a-typed-bound) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |
@@ -202,6 +203,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | backup | – | The folder store: keys as paths, create once by link(2), listing in key order | [backup.md](design/backup.md#the-folder-store) |
 | backup | – | Restore-and-check: the newest whole second restored and checked, on the archive's cadence | [backup.md](design/backup.md#restore-and-check) |
 | backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
+| backup | – | Incremental bases: a new base keeps the latest's chunks the log left unchanged | [backup.md](design/backup.md#incremental-bases) |
 
 ## Sections that are not decisions
 

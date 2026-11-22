@@ -476,6 +476,9 @@ tests = [
   { id = "AMPHORA-BLOBS-8", text = "The folder store passes AMPHORA-BLOBS-1 to 7, keeps keys apart under case folding and path names, and answers random operations as SimBlobs does" },
   { id = "T-T1.12.C1", text = "Restore-and-check on a folder passes at the newest whole second against the source's rows and fails naming the rows against rows that differ" },
   { id = "T-T1.12.C2", text = "A check is due at the first, at each new base, and once the log since the last check outweighs what it replayed" },
+  { id = "T-T1.12.I1", text = "A second base keeps the first's unchanged chunks and copies the changed; seconds across both restore equal, and after the first expires too" },
+  { id = "T-T1.12.I2", text = "Manifests of format 1 still read; format 2's runs give each chunk's base and are refused when they don't add up" },
+  { id = "T-T1.12.I3", text = "An incremental base is due once the log since the latest base outweighs what it would copy" },
   { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
 ]
 
@@ -535,6 +538,20 @@ criteria = [
 ]
 tests = [
   { id = "T-NS.3.1", text = "The model test with eviction under 32 threads (crates/engine/storage/reach/model.rs) — passes when no stale or torn page read and no use after eviction, every page equal to the reference map" },
+]
+
+# lane g7s4
+[[own]]
+id = "NS.4"
+title = "Eviction and a bound (G7 step 4)"
+criteria = [
+  { id = "AC-NS.4.1", text = "a 10M-row corpus run within a pool a tenth of the data's size" },
+  { id = "AC-NS.4.2", text = "resident memory over the pool's budget is at most 10%" },
+]
+tests = [
+  { id = "T-NS.4.1", text = "Crash injection through eviction and checkpoints (crates/engine/storage/versioned/evict.rs) — passes when no acknowledged write is lost" },
+  { id = "T-NS.4.2", text = "A database ten times its pool read and written correctly, across a checkpoint and a reopen" },
+  { id = "T-NS.4.3", text = "The pool's model test with eviction under 32 threads — every read whole, every owner reads its last write" },
 ]
 
 # lane follower-reads (G13 step 4, kiln goal 80d4cf5e; docs/design/replication.md, "Follower reads at a
@@ -897,6 +914,11 @@ tests = [
   { id = "T-QT.6.4", text = "A statement whose workers together pass its memory budget — passes when refused with the typed error at every worker count and the budget never passed" },
   { id = "T-QT.6.5", text = "The degree from stated costs — passes when off and short statements are serial, a long one uses more than one worker and no more than the cores, and morsels grow as dispatch grows against a row's cost" },
   { id = "T-QT.6.6", text = "Every JOB and TPC-H query at 1, 2, 4, 8, 16 and 32 workers (the coordinator's) — passes when identical answers at every count" },
+  # lane qs6-2
+  { id = "T-QT.6.7", text = "Random filters, groupings and aggregates over random tables of many leaf pages, each worker reading its leaves with its own cursor in one snapshot, at 1, 2, 3, 4 and 8 workers, several morsel sizes and ParallelMode On and Off (vdbe/morsel_scan_tests.rs) — passes when every answer equals the VDBE's serial SQL answer" },
+  { id = "T-QT.6.8", text = "One- and two-column equi-joins whose probe side workers read over the probe table's leaves (vdbe/morsel_scan_tests.rs) — passes when the matches equal the VDBE's join, match for match and in its order" },
+  { id = "T-QT.6.9", text = "A table whose INTEGER PRIMARY KEY is its rowid, and an empty table, read in leaf morsels (vdbe/morsel_scan_tests.rs) — passes when the rowid reads into its column, the aggregates equal the VDBE's, and the empty table is one leaf with no rows" },
+  { id = "T-QT.6.10", text = "Random filters, groupings and aggregates in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook ran for most of them" },
 ]
 
 # lane g3s2
