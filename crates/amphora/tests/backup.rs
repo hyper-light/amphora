@@ -1365,6 +1365,16 @@ fn written(
     count: i64,
     blobs: &dyn Blobs,
 ) -> (Db, Shipper, Rows, Arc<AtomicU64>, u64) {
+    written_within(dir, count, blobs, &amphora::memory::process())
+}
+
+/// [`written`], its shipper's parts charged to `memory`.
+fn written_within(
+    dir: &std::path::Path,
+    count: i64,
+    blobs: &dyn Blobs,
+    memory: &Arc<amphora::memory::Budget>,
+) -> (Db, Shipper, Rows, Arc<AtomicU64>, u64) {
     let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
     let read = Arc::clone(&now);
     let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
@@ -1372,7 +1382,8 @@ fn written(
     db.back_up(Arc::clone(&hooks));
     db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
         .unwrap();
-    let mut shipper = Shipper::open("db", Arc::clone(&hooks), blobs, &db, until()).unwrap();
+    let mut shipper =
+        Shipper::open_within("db", Arc::clone(&hooks), blobs, &db, memory, until()).unwrap();
     let mut model = Rows::new();
     now.fetch_add(SECOND_NS, Ordering::SeqCst);
     db.transaction(|db| {
@@ -1566,7 +1577,7 @@ fn t_t1_12_m2_a_large_rooms_backup_restored_in_a_small_room() {
     assert!(
         matches!(
             refused.downcast_ref::<Unrestorable>(),
-            Some(Unrestorable::PastRoom { .. })
+            Some(Unrestorable::PastRoom { .. } | Unrestorable::SegmentPastRoom { .. })
         ),
         "{refused:#}"
     );
@@ -1591,4 +1602,196 @@ fn t_t1_12_m2_a_large_rooms_backup_restored_in_a_small_room() {
         format!("{refused:#}").contains("doesn't match its sum"),
         "{refused:#}"
     );
+}
+
+/// `count` rows of 4,000 bytes from `from`, in one commit a second later.
+fn one_commit(db: &mut Db, now: &AtomicU64, from: i64, count: i64, model: &mut Rows) {
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    db.transaction(|db| {
+        for id in from..from + count {
+            let v = format!("{id}:{}", "y".repeat(4000));
+            db.query_owned(
+                "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                [Value::from_i64(id), Value::from_text(v.clone())],
+                |_| Ok(true),
+            )?;
+            model.insert(id, v);
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A store that says how it was read: the largest answer a get of a log segment gave, and the
+/// gets of one whole.
+struct Reads<'a> {
+    inner: &'a dyn Blobs,
+    largest: AtomicU64,
+    wholes: AtomicU64,
+}
+
+impl<'a> Reads<'a> {
+    fn new(inner: &'a dyn Blobs) -> Self {
+        Self {
+            inner,
+            largest: AtomicU64::new(0),
+            wholes: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Blobs for Reads<'_> {
+    fn object_max(&self) -> usize {
+        self.inner.object_max()
+    }
+    fn create(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        until: Instant,
+    ) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.create(key, bytes, until)
+    }
+    fn get(&self, key: &str, until: Instant) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        if key.contains("/log/") {
+            self.wholes.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key, until)
+    }
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        let got = self.inner.get_range(key, offset, len, until)?;
+        if key.contains("/log/") {
+            self.largest.fetch_max(got.len() as u64, Ordering::SeqCst);
+        }
+        Ok(got)
+    }
+    fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        until: Instant,
+    ) -> Result<amphora_api::blobs::Listing, amphora_api::blobs::BlobRefusal> {
+        self.inner.list(prefix, after, limit, until)
+    }
+    fn delete(&self, key: &str, until: Instant) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.delete(key, until)
+    }
+}
+
+/// The largest log segment under "db" in `blobs`.
+fn largest_segment(blobs: &dyn Blobs) -> u64 {
+    blobs
+        .list("db/log/", None, 1000, until())
+        .unwrap()
+        .objects
+        .iter()
+        .map(|(_, size)| *size)
+        .max()
+        .unwrap_or(0)
+}
+
+/// T-T1.12.M3: large log segments restored under a far smaller room. Do: copy a base, then ship
+/// about 2 MB of log in one commit to a store whose objects hold it, so it's one segment; restore
+/// under 64 KiB and under 8 KiB. Expect: the restore whole, each segment fetched in ranged parts of
+/// half the room at most and never whole, every charge given back.
+#[test]
+fn t_t1_12_m3_large_segments_restored_in_a_small_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
+    let (mut db, mut shipper, mut model, now, _) =
+        written_within(dir.path(), 10, &blobs, &room(1 << 30));
+    copy_whole(&mut shipper, &db, &blobs, &room(1 << 30));
+    one_commit(&mut db, &now, 100, 500, &mut model);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let second = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    archive_through(&mut shipper, &db, &blobs, &now);
+    let largest = largest_segment(&blobs);
+    for (name, limit) in [("small.db", 64 * 1024u64), ("smaller.db", 8 * 1024)] {
+        assert!(
+            largest > 16 * limit,
+            "a segment of {largest} bytes, the room {limit}"
+        );
+        let memory = room(limit);
+        let reads = Reads::new(&blobs);
+        let target = dir.path().join(name);
+        backup::restore_within(
+            &reads,
+            "db",
+            second,
+            &target,
+            &mut backup::Unpaced,
+            &memory,
+            until(),
+        )
+        .unwrap_or_else(|e| panic!("restore under {limit} bytes: {e:#}"));
+        assert_eq!(rows(&Db::open(&target).unwrap()), model, "under {limit}");
+        let part = reads.largest.load(Ordering::SeqCst);
+        assert!(
+            part > 0 && part <= limit / 2,
+            "parts of {part} bytes under {limit}"
+        );
+        assert_eq!(
+            reads.wholes.load(Ordering::SeqCst),
+            0,
+            "no segment read whole"
+        );
+        assert_eq!(memory.held(Use::Chunks), 0);
+        assert_eq!(memory.streams(Use::Chunks), 0);
+    }
+}
+
+/// T-T1.12.M3: shipping's parts are charged and bounded by the room. Do: ship under a 64 KiB
+/// budget, then about 2 MB in one commit; take the room away and ship; give it back and ship again;
+/// restore. Expect: every segment, sealed, within half the room; no charge held between rounds;
+/// the round without room refused typed, its commits shipped by the next and the restore whole.
+#[test]
+fn t_t1_12_m3_shipping_charges_its_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
+    let limit = 64 * 1024u64;
+    let memory = room(limit);
+    let (mut db, mut shipper, mut model, now, _) = written_within(dir.path(), 10, &blobs, &memory);
+    copy_whole(&mut shipper, &db, &blobs, &room(1 << 30));
+    one_commit(&mut db, &now, 100, 500, &mut model);
+    let taken = memory.take(Use::Images, limit - 1024).unwrap();
+    let refused = shipper.ship(&db, &blobs, until()).unwrap_err();
+    assert!(
+        matches!(
+            refused.downcast_ref::<amphora_api::Refusal>(),
+            Some(amphora_api::Refusal::TooLarge { .. })
+        ),
+        "{refused:#}"
+    );
+    drop(taken);
+    assert_eq!(memory.held(Use::Chunks), 0);
+    let shipped = shipper.ship(&db, &blobs, until()).unwrap();
+    assert!(shipped.segments > 16, "{} segments", shipped.segments);
+    assert_eq!(memory.held(Use::Chunks), 0);
+    assert_eq!(memory.streams(Use::Chunks), 0);
+    let largest = largest_segment(&blobs);
+    assert!(
+        largest <= limit / 2,
+        "a segment of {largest} bytes under {limit}"
+    );
+    let second = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    archive_through(&mut shipper, &db, &blobs, &now);
+    let target = dir.path().join("restored.db");
+    backup::restore_within(
+        &blobs,
+        "db",
+        second,
+        &target,
+        &mut backup::Unpaced,
+        &room(1 << 30),
+        until(),
+    )
+    .unwrap();
+    assert_eq!(rows(&Db::open(&target).unwrap()), model);
 }

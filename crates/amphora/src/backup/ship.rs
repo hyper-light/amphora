@@ -41,6 +41,14 @@ pub(super) fn copy_charge(len: u64) -> u64 {
     len.saturating_mul(2).saturating_add(SUM)
 }
 
+/// The memory a part of a segment takes while it's shipped (T-T1.12.M3): `bytes`, its frames and
+/// the segment's other fields as sealed, held twice at most ([`Shipper::send`]: the frames read and
+/// their body encoded, then the body and its sealed copy, then the sealed copy and a part compared
+/// where it already exists).
+pub(super) fn ship_charge(bytes: u64) -> u64 {
+    bytes.saturating_mul(2)
+}
+
 /// The bytes a chunk of `chunk_bytes` takes sealed: what a restore fetches of it, in parts
 /// (T-T1.12.M2).
 pub(super) fn fetch_charge(chunk_bytes: u64) -> u64 {
@@ -207,6 +215,11 @@ pub struct Shipper {
     /// The key of the archive's latest through mark ([`ThroughKey`]), let go once a later one or a
     /// segment says more.
     through_mark: Option<String>,
+    /// The budget each part of a segment is charged to while it's shipped (T-T1.12.M3).
+    memory: Arc<Memory>,
+    /// A send that didn't end: the frame it began after, and the frames in each of its parts, so
+    /// sent again it makes the same objects whatever room there is now.
+    unfinished: Option<(u64, u64)>,
 }
 
 pub(super) fn list_all(
@@ -230,12 +243,19 @@ pub(super) fn list_all(
 }
 
 /// Creates `key` with `bytes`; where an object is there already (an earlier create whose answer was
-/// lost), it must be the same.
-fn create(blobs: &dyn Blobs, key: &str, bytes: &[u8], until: Instant) -> anyhow::Result<()> {
+/// lost), it must be the same: compared in ranged parts of `part` bytes at most (T-T1.12.M4), so
+/// the caller holds `bytes` and one part, as its charge counts them, never the object read whole.
+fn create(
+    blobs: &dyn Blobs,
+    key: &str,
+    bytes: &[u8],
+    part: usize,
+    until: Instant,
+) -> anyhow::Result<()> {
     match blobs.create(key, bytes, until) {
         Ok(()) => Ok(()),
         Err(BlobRefusal::Exists(_)) => {
-            if blobs.get(key, until)? == bytes {
+            if same(blobs, key, bytes, part, until)? {
                 Ok(())
             } else {
                 anyhow::bail!("archive object {key} exists and differs")
@@ -243,6 +263,26 @@ fn create(blobs: &dyn Blobs, key: &str, bytes: &[u8], until: Instant) -> anyhow:
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Whether the object at `key` is `bytes`, read in parts of `part` bytes at most: the first holds
+/// its sum, so an object that differs is told from its first part.
+fn same(
+    blobs: &dyn Blobs,
+    key: &str,
+    bytes: &[u8],
+    part: usize,
+    until: Instant,
+) -> anyhow::Result<bool> {
+    let mut at = 0u64;
+    for want in bytes.chunks(part.max(1)) {
+        if blobs.get_range(key, at, want.len(), until)? != want {
+            return Ok(false);
+        }
+        at = at.saturating_add(u64::try_from(want.len())?);
+    }
+    // Nor longer.
+    Ok(blobs.get_range(key, at, 1, until)?.is_empty())
 }
 
 fn identity_of(header: &[u8]) -> anyhow::Result<Identity> {
@@ -282,6 +322,19 @@ impl Shipper {
         db: &Db,
         until: Instant,
     ) -> anyhow::Result<Self> {
+        Self::open_within(prefix, hooks, blobs, db, &crate::memory::process(), until)
+    }
+
+    /// [`Shipper::open`], each part of a segment it ships charged to `memory` (the process's budget,
+    /// or a test's) while it's held (T-T1.12.M3).
+    pub fn open_within(
+        prefix: &str,
+        hooks: Arc<Hooks>,
+        blobs: &dyn Blobs,
+        db: &Db,
+        memory: &Arc<Memory>,
+        until: Instant,
+    ) -> anyhow::Result<Self> {
         let mut shipper = Self {
             prefix: prefix.into(),
             hooks,
@@ -303,6 +356,8 @@ impl Shipper {
             last_base: None,
             lost_marks: 0,
             through_mark: None,
+            memory: Arc::clone(memory),
+            unfinished: None,
         };
         let segments = list_all(blobs, &format!("{prefix}/log/"), until)?;
         if let Some((key, _)) = segments.last() {
@@ -440,7 +495,8 @@ impl Shipper {
             last: mark.last,
             through: mark.through,
         };
-        create(blobs, &key, &object::encode(&body)?, until)?;
+        let bytes = object::encode(&body)?;
+        create(blobs, &key, &bytes, bytes.len(), until)?;
         self.archived_through = self.through;
         if let Some(old) = self.through_mark.replace(key) {
             blobs.delete(&old, until)?;
@@ -486,14 +542,16 @@ impl Shipper {
         if ready == 0 {
             return Ok(Shipped::default());
         }
-        let mut marks: Vec<Mark> = self.pending.drain(..ready).collect();
+        // Kept pending until the send ends, so a send refused (the store, or no room for its parts)
+        // ships them at the next round.
+        let mut marks: Vec<Mark> = self.pending.iter().take(ready).copied().collect();
         if let (Some(first), Some(unknown)) = (marks.first_mut(), self.unknown) {
             first.unknown_from = Some(first.unknown_from.map_or(unknown, |u| u.min(unknown)));
         }
         let last = marks.last().map_or(self.shipped, |m| m.frame);
         // Every commit stamped at or before `through` is in this segment or before it: those after
         // it are in the next mark's second, or weren't drained yet.
-        let through = match self.pending.front() {
+        let through = match self.pending.get(ready) {
             Some(next) => {
                 let second_before = second_of(next.ns)
                     .saturating_sub(1)
@@ -504,6 +562,7 @@ impl Shipper {
             None => self.through,
         };
         let shipped = self.send(db, blobs, &marks, last, through, until)?;
+        self.pending.drain(..ready);
         self.shipped = last;
         self.hooks.fence.shipped(identity.seq, last)?;
         self.archived_through = through;
@@ -546,11 +605,16 @@ impl Shipper {
         self.identity = Some(identity);
         self.header = head;
         self.shipped = 0;
+        self.unfinished = None;
         self.next_link = Some(link);
         Ok(())
     }
 
-    /// Sends frames `shipped + 1..=last` with `marks`: in as few objects as the store takes.
+    /// Sends frames `shipped + 1..=last` with `marks`: in as few objects as the store takes and this
+    /// send's room in the memory budget allows (T-T1.12.M3). The send opens a stream of
+    /// [`Use::Chunks`], and a part takes at most that stream's share of the room, its frames read,
+    /// encoded and sealed ([`ship_charge`]), charged while the send is held, before any part is
+    /// put: refused, typed, where the room is gone, and sent again at the next round.
     fn send(
         &mut self,
         db: &Db,
@@ -584,10 +648,31 @@ impl Shipper {
             .object_max()
             .checked_sub(object::segment_overhead(&body)?)
             .ok_or_else(|| anyhow::anyhow!("the store's objects can't hold a segment's marks"))?;
-        let per_object = u64::try_from(room)?.checked_div(FRAME_BYTES).unwrap_or(0);
-        if per_object == 0 {
+        let by_store = u64::try_from(room)?.checked_div(FRAME_BYTES).unwrap_or(0);
+        if by_store == 0 {
             anyhow::bail!("the store's objects can't hold one frame of the log");
         }
+        let overhead = u64::try_from(object::segment_overhead(&body)?)?;
+        let _stream = self.memory.stream(Use::Chunks);
+        let by_memory = self
+            .memory
+            .stream_room(Use::Chunks)?
+            .checked_div(2)
+            .unwrap_or(0)
+            .saturating_sub(overhead)
+            .checked_div(FRAME_BYTES)
+            .unwrap_or(0);
+        // A part of one frame at least: where there's no room for one, the charge is refused.
+        let per_object = match self.unfinished {
+            Some((from, per)) if from == self.shipped => per,
+            _ => by_store.min(by_memory.max(1)),
+        };
+        let part_bytes = per_object
+            .min(last.saturating_sub(self.shipped))
+            .saturating_mul(FRAME_BYTES)
+            .saturating_add(overhead);
+        let _held = self.memory.take(Use::Chunks, ship_charge(part_bytes))?;
+        self.unfinished = Some((self.shipped, per_object));
         let mut stored = std::mem::take(&mut body.marks);
         let mut shipped = Shipped::default();
         let mut from = self.shipped;
@@ -627,12 +712,23 @@ impl Shipper {
             if is_last {
                 body.marks = std::mem::take(&mut stored);
             }
-            let bytes = object::encode(&body)?;
-            create(blobs, &key.key(&self.prefix), &bytes, until)?;
+            // Encoded, its frames let go, then sealed: two copies held at most ([`ship_charge`]).
+            let plain = postcard::to_allocvec(&body)?;
+            body.frames = Vec::new();
+            let bytes = object::sealed(&plain)?;
+            drop(plain);
+            create(
+                blobs,
+                &key.key(&self.prefix),
+                &bytes,
+                usize::try_from(part_bytes)?,
+                until,
+            )?;
             shipped.segments = shipped.segments.saturating_add(1);
             shipped.bytes = shipped.bytes.saturating_add(u64::try_from(bytes.len())?);
             from = to;
         }
+        self.unfinished = None;
         Ok(shipped)
     }
 
@@ -819,11 +915,14 @@ impl Shipper {
                 // Charged while it's held (T-T1.12.M1): refused, typed, where another use took the
                 // room since the copy began; the round is tried again at the next commit.
                 let _held = copy.memory.take(Use::Chunks, copy_charge(len))?;
+                // The file's bytes are let go once sealed: the charge's second copy is a part
+                // compared where the chunk already exists (T-T1.12.M4).
                 let bytes = object::sealed(&db.read_file(from, usize::try_from(len)?)?)?;
                 create(
                     blobs,
                     &plan::chunk_key(&self.prefix, copy.id, copy.next),
                     &bytes,
+                    usize::try_from(len)?,
                     until,
                 )?;
                 copy.bases.push(copy.id);
@@ -872,12 +971,8 @@ impl Shipper {
             start_gen: manifest.start_gen,
             id: manifest.id,
         };
-        create(
-            blobs,
-            &key.key(&self.prefix),
-            &object::encode(&manifest)?,
-            until,
-        )?;
+        let bytes = object::encode(&manifest)?;
+        create(blobs, &key.key(&self.prefix), &bytes, bytes.len(), until)?;
         self.base_bytes = Some(copy.file_bytes);
         self.since_base = 0;
         self.broken = false;
@@ -889,5 +984,92 @@ impl Shipper {
             bases: copy.bases,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use amphora_api::blobs::{Listing, SimBlobs};
+
+    use super::*;
+
+    /// A store that says the largest answer a read gave, and the reads of an object whole.
+    struct Reads {
+        inner: SimBlobs,
+        largest: AtomicUsize,
+        wholes: AtomicUsize,
+    }
+
+    impl Blobs for Reads {
+        fn object_max(&self) -> usize {
+            self.inner.object_max()
+        }
+        fn create(&self, key: &str, bytes: &[u8], until: Instant) -> Result<(), BlobRefusal> {
+            self.inner.create(key, bytes, until)
+        }
+        fn get(&self, key: &str, until: Instant) -> Result<Vec<u8>, BlobRefusal> {
+            self.wholes.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key, until)
+        }
+        fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: usize,
+            until: Instant,
+        ) -> Result<Vec<u8>, BlobRefusal> {
+            let got = self.inner.get_range(key, offset, len, until)?;
+            self.largest.fetch_max(got.len(), Ordering::SeqCst);
+            Ok(got)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+            until: Instant,
+        ) -> Result<Listing, BlobRefusal> {
+            self.inner.list(prefix, after, limit, until)
+        }
+        fn delete(&self, key: &str, until: Instant) -> Result<(), BlobRefusal> {
+            self.inner.delete(key, until)
+        }
+    }
+
+    fn until() -> Instant {
+        Instant::now()
+            .checked_add(std::time::Duration::from_secs(60))
+            .unwrap()
+    }
+
+    /// T-T1.12.M4: a create whose object already exists (its first answer lost) compares it in
+    /// parts. Do: store an object, create it again with the same bytes, with one byte changed,
+    /// shorter and longer. Expect: the same is no error, each other refused, and no read gave more
+    /// than a part or read the object whole.
+    #[test]
+    fn t_t1_12_m4_an_existing_object_compared_in_parts() {
+        let blobs = Reads {
+            inner: SimBlobs::new(1 << 20, 100, 1 << 22),
+            largest: AtomicUsize::new(0),
+            wholes: AtomicUsize::new(0),
+        };
+        let bytes = object::sealed(&[5u8; 10_000]).unwrap();
+        blobs.create("a/b", &bytes, until()).unwrap();
+        let part = 1000;
+        create(&blobs, "a/b", &bytes, part, until()).unwrap();
+        let mut changed = bytes.clone();
+        let last = changed.len() - 1;
+        changed[last] ^= 1;
+        assert!(create(&blobs, "a/b", &changed, part, until()).is_err());
+        assert!(create(&blobs, "a/b", &bytes[..bytes.len() - 1], part, until()).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(create(&blobs, "a/b", &longer, part, until()).is_err());
+        assert!(blobs.largest.load(Ordering::SeqCst) <= part);
+        assert_eq!(blobs.wholes.load(Ordering::SeqCst), 0);
     }
 }

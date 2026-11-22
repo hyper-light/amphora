@@ -44,6 +44,10 @@ pub enum Unrestorable {
         "base {base}'s chunks can't be fetched: this restore has no room for a part of one (its share of the memory budget's room for chunks, or the store's objects)"
     )]
     PastRoom { base: u64 },
+    #[error(
+        "log segment {key} can't be fetched: this restore has no room for a part of it (its share of the memory budget's room for chunks, or the store's objects)"
+    )]
+    SegmentPastRoom { key: String },
 }
 
 /// Whether the generation before a segment's was shipped whole.
