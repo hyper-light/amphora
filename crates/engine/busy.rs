@@ -279,9 +279,9 @@ mod tests {
         }
     }
 
-    /// Lane constants-22: a release after the count was read is never missed (the wait says try
-    /// again), a waiting waker is woken once by the next release and then let go, and one waker
-    /// waiting twice is held once.
+    /// T-QB.1.13 (lane constants-22): a release after the count was read is never missed (the
+    /// wait says try again), a waiting waker is woken once by the next release and then let go,
+    /// and one waker waiting twice is held once.
     #[test]
     fn constants_22_lock_release_wakes_its_waiters_once_and_misses_none() {
         let release = LockRelease::default();

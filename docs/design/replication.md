@@ -2640,7 +2640,8 @@ format bound (about 1.6 million) would take megabytes of every image record. The
   (`patience::Answers::grow`), so a voter added past the old bound is measured.
 - **What is still open.** A joiner that installs an image whose configuration names more members than its own opening
   bound fails in hyper-raft before the machine sees the image's bound. A joiner opened with the group's members today
-  is in bound. Carrying the bound in the snapshot itself would close this; it needs a hyper-raft wire change.
+  is in bound. Carrying the bound in the snapshot itself would close this; it needs a hyper-raft wire change,
+  written up below ("The joiner's image and the member bound"), not built.
   A member whose core took an uncommitted bound entry that a new leader replaced keeps the higher bound; that only
   costs room. `IMAGE_FRAMING_BYTES` is now `image_framing(members)`, sized by the bound, read on the flushing thread
   as it rises (`Machine::members_shared`).
@@ -2648,6 +2649,44 @@ format bound (about 1.6 million) would take megabytes of every image record. The
   and 2, 4, 8, 16 as a group grows to 9) and `replicated::tests::t_qb_1_9_a_one_voter_group_grows_to_five_then_nine_members`
   (driven: a voter grows its group to 5 members, then 9, beside a running learner that took the raising entries with
   the changes behind them, then reopens with the 16 its log recorded).
+
+### The joiner's image and the member bound: the wire change it needs (lane constants-22, not built)
+
+- **The failure.** `Raft::restore` (vendored `crates/hyper-raft/src/raft.rs`) rebuilds the tracker from the image's
+  `SnapshotMetadata::conf_state` with `config.limits.members`, the bound the joiner opened with. An image whose
+  configuration names more members than that fails there (`Tracker::new`, then `Progress::apply`: "a configuration of
+  more members than the member was opened for"), before Amphora's machine restores the image and reads the
+  `__amphora_member_bound` it records. `Config::stated_members` doesn't help: it reads entries as they are taken, and an
+  image carries no entries.
+- **The change.** The bound travels with the image's metadata, in hyper-raft's own record, so the core can raise its
+  bound before it builds the tracker:
+  - `SnapshotMetadata` gains `members: Option<u64>`: the bound in force at `index`, as the core held it when the image
+    was made (its tracker's bound; the owner's `stated_members` reader has already folded every bound entry through
+    `index` into it).
+  - The wire (`wire.rs`, `impl Record for Snapshot`, kind 5, docs/raft.md section 3.1): a third presence bit,
+    `HAS_MEMBERS = 1 << 2`, valid only with `HAS_METADATA`, and the bound as a little-endian u64 after the
+    configuration. `body_len` adds 8 when present. A record without the bit decodes as `members: None`, so an image
+    from an older member still reads. An older decoder refuses the new bit (`take_body` rejects unknown presence
+    bits), so a group mixes versions only if the leader leaves the bit off until every member decodes it: hyper-raft
+    has no capability exchange for that, so the bit is set only when the owner says so (`Config::image_members`,
+    off by default), and Amphora turns it on once every member runs the patched core, in the same release as the
+    member bound itself (which isn't landed either, so no Amphora group has mixed versions to cover).
+  - `Raft::restore`: before `Tracker::new`, `self.grow_members(members)` when the image states more than the core
+    holds (the patch-0006 path: tracker, fast votes and pending reads raised together; a bound only rises), then the
+    tracker is built with the raised bound. The image's own `members` is checked against the configuration it
+    carries (a bound below its own configuration's count is a corrupt image: `Error::Violation`).
+  - Wherever the core fills an image's metadata for a send (`Storage::snapshot`'s caller in `raft.rs`): `members:
+    Some(self.config.limits.members)` when `image_members` is on.
+  - `hyper-durable`'s replica passes nothing new: the metadata is the core's.
+- **Amphora's side.** None in the protocol: `Actor::keep_member_bound` already takes the image's recorded bound
+  after restore, and with the core raised first it finds the core in bound. The joiner's opening bound no longer
+  has to cover the group's current size; it only has to cover the configuration it opens with.
+- **Cost.** Eight bytes per image record; one comparison at restore.
+- **Tests it would need.** A wire round trip with and without the bit (and an old record decoding as `None`); a
+  restore of an image naming more members than the core's bound raising it and building the tracker; a driven
+  test where a joiner opened with one member installs the image of a nine-member group and serves.
+- **Where it lives.** It is a change to hyper-raft's wire, so it belongs upstream or in the one shared series
+  (`vendor/hyper-raft/UPSTREAM.md`, "The two QB.1 changes reach kiln's and Quiver's copies too"): Ada's call.
 
 ## The window to each member (lane constants-21, 2026-11-22, not yet landed)
 

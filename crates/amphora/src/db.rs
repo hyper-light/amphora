@@ -1397,8 +1397,8 @@ mod tests {
         }
     }
 
-    /// Lane constants-22 (goal dfabffcc, "every wait wakes on an event"): a write busy on another
-    /// connection's write lock wakes on its release. One connection holds the write lock; the
+    /// T-QB.1.14 (lane constants-22; goal dfabffcc, "every wait wakes on an event"): a write busy
+    /// on another connection's write lock wakes on its release. One connection holds the write lock; the
     /// other's insert finds it held and parks, saying so; then the first commits. Under the release
     /// wake (the default) nothing woke the waiter before the commit, and the commit's release does;
     /// under SQLite's schedule (the control) the engine woke it at once, before any release, and it

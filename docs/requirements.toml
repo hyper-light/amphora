@@ -1156,6 +1156,9 @@ tests = [
   { id = "T-QB.1.10", text = "A wire record of one byte and a catch-up queued on an owner not stepped: passes when the queue's bytes grow by the byte and two envelopes" },
   { id = "T-QB.1.11", text = "Five voters, two cut off while the rest commit, then both back, one slow and one fast, under each window (window_slow_flooded_fast_starved): passes when both catch up under each, which prints the most in flight to the slow member and the rounds each took" },
   { id = "T-QB.1.12", text = "Three voters opened, elected, then three election timeouts of ticks: passes when each owner's quiet period is its election ticks of its pace, the start pace's at open and the learned one's after, never the picked 50 ms" },
+  # lane constants-22
+  { id = "T-QB.1.13", text = "A lock-release event, released before a wait and after: passes when a wait after a release it hadn't counted says try again, a waiting waker is woken once by the next release and let go, and one waker waiting twice is held once" },
+  { id = "T-QB.1.14", text = "Two connections, one holding the write lock while the other's insert waits, then the holder commits, under each busy wake: passes when under the release wake nothing woke the waiter before the commit and the commit did, both inserts commit, and the time from commit to the waiter's insert done is printed for each" },
 ]
 
 # lane many-writers

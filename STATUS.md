@@ -535,6 +535,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   charged its envelope; the window to each member is twice what its path carries in a round trip, the picked 4
   messages and 64 MiB kept as the A/B's control ("The window to each member"); and `quiet` is the learned election
   timeout.
+  Lane constants-22 (not yet built or landed): a busy statement wakes on the release of the lock it found held, the
+  busy timeout its deadline only, SQLite's schedule kept as the control, and `BUSY_WAIT`/`BUSY_TRIES` gone (store.md,
+  "a busy statement wakes on the lock's release"); the joiner's-image wire change written up, not built.
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
   counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), and the rest of the list
   (handoff/amphora-constants-list.md).
