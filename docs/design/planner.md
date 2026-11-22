@@ -1775,10 +1775,24 @@ its printed form; every reference to one CTE, and every statement writing the sa
 the key; a lateral subquery or one reading a parameter has none. The planner reads the count in
 place of the estimate (`base_row_estimate`), and every plan that read the old rows plans again, at
 once by the hand-off where the run may start over. Counted by `Connection::adaptive_subquery_checks`.
-A subquery stored in its seek index (`DirectMaterializedIndex`) is not checked yet. Evidence:
+A subquery stored in its seek index (`DirectMaterializedIndex`, lane replan-8) is counted there,
+once filled, inside the block that fills it once: the index has no rowid to read, so `Count` walks
+its pages once, each page's cells summed, no row decoded; the index keeps an entry a row (a
+sequence column keeps equal rows apart), so its entries are the rows.
+
+A GROUP BY's estimate is the fewer of the rows it reads and its groups. Where ANALYZE's group count
+set it (an index starting with the GROUP BY's columns, `group_count_from_analyze`), the band is that
+count's error, not the rows' (lane replan-8, `optimizer::group_count_error`): `sqlite_stat1` keeps
+the rows a group as `ceil(total / groups)`, so an average `a` of two or more stands for up to
+`1 / (a - 1)` more groups than read (one is exact), in quadrature with the statistics' own error.
+Where the rows read, or a LIMIT, set the estimate, the rows' error stands. Evidence:
 `t_pl_13_7_a_stored_subquery_result_past_the_estimate_plans_again` (T-PL.13.7): a CTE referenced
 twice and a GROUP BY in a materialized CTE, each over a range whose share an UPDATE moved: one
 answer with adaptive joins off and on, one re-plan, none on the second run or in a new statement.
+`t_pl_13_8_a_subquery_stored_in_its_seek_index_past_the_estimate_plans_again` (T-PL.13.8): a
+GROUP BY subquery read through its seek index, the same way. `t_pl_13_9_a_grouped_result_is_checked_against_its_group_counts_error`
+(T-PL.13.9): 2,000 groups read as 1,667 (3 rows a group), within the group count's error though past
+the rows' (1 / sqrt(1,024)), not planned again; 5,000 after an UPDATE, past it, planned again once.
 
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).

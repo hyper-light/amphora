@@ -752,3 +752,133 @@ fn t_pl_13_7_a_stored_subquery_result_past_the_estimate_plans_again() {
         );
     }
 }
+
+/// The plan's steps as EXPLAIN QUERY PLAN states them, and the program's opcodes.
+fn steps_and_opcodes(conn: &Arc<Connection>, sql: &str) -> (Vec<String>, Vec<String>) {
+    let column = |sql: String, at: usize| -> Vec<String> {
+        conn.prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[at].to_string())
+            .collect()
+    };
+    (
+        column(format!("EXPLAIN QUERY PLAN {sql}"), 3),
+        column(format!("EXPLAIN {sql}"), 1),
+    )
+}
+
+/// Do: a GROUP BY subquery joined on its key with nested loops only, so the subquery is stored in
+/// the seek index its key's lookups read (`DirectMaterializedIndex`), over a range whose share an
+/// UPDATE moved (ANALYZE sampled one row in a hundred kept, every row after); run with adaptive
+/// joins off, then on twice in one prepared statement, then once more prepared anew. Expect: the
+/// plan reads the subquery through its seek index; one answer every way; off, nothing counted; on,
+/// the index's entries counted against the estimate, past its error stored and the statement
+/// planned again once; the second run and a new statement plan on the counted rows and nothing
+/// plans again (PL.13, lane replan-8, T-PL.13.8: the seek index's materialization point).
+#[test]
+fn t_pl_13_8_a_subquery_stored_in_its_seek_index_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("seek_index.db");
+    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 2000, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE b SET v = v % 50").unwrap();
+    let sql = "SELECT b.id, s.n FROM b JOIN (SELECT k, count(*) AS n FROM b WHERE v < 50 GROUP BY k) AS s ON s.k = b.k ORDER BY b.id";
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_subquery_checks();
+    let off = run_rows(&mut conn.prepare(sql).unwrap());
+    assert_eq!(off.len(), 5000, "the rows");
+    assert_eq!(conn.adaptive_subquery_checks(), checks, "counted off");
+
+    conn.set_adaptive_joins(true);
+    let (steps, opcodes) = steps_and_opcodes(&conn, sql);
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.contains("USING INDEX ephemeral_subquery_")),
+        "the subquery is not read through its seek index: {steps:?}"
+    );
+    assert!(
+        opcodes.iter().any(|opcode| opcode == "SubqueryCounted"),
+        "the seek index is not counted: {opcodes:?}"
+    );
+    let replans = conn.adaptive_replans();
+    let mut held = conn.prepare(sql).unwrap();
+    assert_eq!(run_rows(&mut held), off, "on and off differ");
+    assert!(
+        conn.adaptive_subquery_checks() > checks,
+        "the seek index was not counted"
+    );
+    assert_eq!(conn.adaptive_replans() - replans, 1, "planned again once");
+    let (checks, replans) = (conn.adaptive_subquery_checks(), conn.adaptive_replans());
+    assert_eq!(run_rows(&mut held), off, "the second run's answer");
+    assert!(
+        conn.adaptive_subquery_checks() > checks,
+        "the second fill was not counted"
+    );
+    assert_eq!(conn.adaptive_replans(), replans, "a second re-plan");
+    assert_eq!(
+        run_rows(&mut conn.prepare(sql).unwrap()),
+        off,
+        "a new statement's answer"
+    );
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "a new statement planned again"
+    );
+}
+
+/// Do: a materialized GROUP BY subquery whose groups ANALYZE's index on its key gave: 5,000 rows in
+/// 2,000 groups, stored as 3 rows a group (`ceil`), so read as 1,667 groups, up to half again as
+/// many (`1 / (3 - 1)`). Run it with adaptive joins on as analyzed, then after an UPDATE gives
+/// every row a group of its own. Expect: as analyzed, the 2,000 groups counted fall within the
+/// group count's error, though past the statistics' rows error (1 / sqrt(1,024)): nothing planned
+/// again; after the UPDATE, 5,000 groups fall past it: planned again once; one answer with
+/// adaptive joins off and on each time (PL.13, lane replan-8, T-PL.13.9: a grouped result's band).
+#[test]
+fn t_pl_13_9_a_grouped_result_is_checked_against_its_group_counts_error() {
+    let (_dir, conn) = open("groups.db");
+    conn.execute("CREATE TABLE g (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute("CREATE INDEX g_k ON g(k)").unwrap();
+    conn.execute(
+        "INSERT INTO g(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 2000, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    let sql = "WITH s AS MATERIALIZED (SELECT k, count(*) AS n FROM g GROUP BY k) SELECT g.id, s.n FROM g JOIN s ON s.k = g.k ORDER BY g.id";
+    for (case, replanned) in [("as analyzed", 0), ("a group a row", 1)] {
+        if replanned == 1 {
+            conn.execute("UPDATE g SET k = id").unwrap();
+        }
+        conn.set_adaptive_joins(false);
+        let off = run_rows(&mut conn.prepare(sql).unwrap());
+        assert_eq!(off.len(), 5000, "{case}: the rows");
+
+        conn.set_adaptive_joins(true);
+        let (checks, replans) = (conn.adaptive_subquery_checks(), conn.adaptive_replans());
+        let mut held = conn.prepare(sql).unwrap();
+        assert_eq!(run_rows(&mut held), off, "{case}: on and off differ");
+        assert!(
+            conn.adaptive_subquery_checks() > checks,
+            "{case}: the grouped result was not counted"
+        );
+        assert_eq!(
+            conn.adaptive_replans() - replans,
+            replanned,
+            "{case}: planned again"
+        );
+        let replans = conn.adaptive_replans();
+        assert_eq!(run_rows(&mut held), off, "{case}: the second run's answer");
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+    }
+}

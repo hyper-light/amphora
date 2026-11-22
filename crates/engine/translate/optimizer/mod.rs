@@ -2412,6 +2412,16 @@ fn base_row_estimate(
 /// total row count and the average rows for one key. Dividing them gives the
 /// number of groups.
 fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Schema) -> Option<f64> {
+    group_count_from_index_stats(plan, group_by, schema).map(|(groups, ..)| groups)
+}
+
+/// [group_count_from_analyze]'s group count, with the stored average rows a group of the index
+/// that gave it and the statistics of its table (PL.13, lane replan-8: the count's error).
+fn group_count_from_index_stats<'a>(
+    plan: &SelectPlan,
+    group_by: &GroupBy,
+    schema: &'a Schema,
+) -> Option<(f64, u64, &'a crate::stats::TableStat)> {
     let mut table_id = None;
     let mut columns: SmallVec<[usize; 4]> = SmallVec::new();
     for expr in &group_by.exprs {
@@ -2456,12 +2466,54 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
             let total_rows = index_stats.total_rows? as f64;
             let rows_per_group = *index_stats
                 .avg_rows_per_distinct_prefix
-                .get(columns.len().checked_sub(1)?)? as f64;
-            (rows_per_group > 0.0).then_some(total_rows / rows_per_group)
+                .get(columns.len().checked_sub(1)?)?;
+            (rows_per_group > 0).then_some((total_rows / rows_per_group as f64, rows_per_group))
         })
-        .fold(None, |best: Option<f64>, groups| {
-            Some(best.map_or(groups, |best| best.max(groups)))
-        })
+        .fold(
+            None,
+            |best: Option<(f64, u64)>, (groups, rows_per_group)| {
+                Some(match best {
+                    Some(best) if best.0 >= groups => best,
+                    _ => (groups, rows_per_group),
+                })
+            },
+        )
+        .map(|(groups, rows_per_group)| (groups, rows_per_group, table_stats))
+}
+
+/// Amphora (PL.13, lane replan-8; `docs/design/planner.md`, "Stored subquery results"): the
+/// relative error of a GROUP BY plan's estimated output rows where ANALYZE's group count set them
+/// ([group_count_from_analyze], the estimate being the fewer of the groups and the rows read), so
+/// a grouped result is checked against its group count's error, not its rows'. Two independent
+/// parts, in quadrature:
+/// - the stored average: sqlite_stat1 keeps `ceil(total / groups)` (`translate::analyze`, as
+///   SQLite's analyze.c), so an average `a` of two or more stands for groups between `total / a`
+///   and `total / (a - 1)`: up to `1 / (a - 1)` more than read. An average of one is exact;
+/// - the statistics' own error, as a count read from them has (`row_changes::statistics_error`).
+///
+/// `None` where the estimate did not come from ANALYZE's groups: no GROUP BY, keys that are not
+/// one table's columns an index starts with, or fewer rows read (or a LIMIT) setting it. There the
+/// estimate is the rows', and so is its error.
+pub(crate) fn group_count_error(plan: &SelectPlan, schema: &Schema) -> Option<f64> {
+    let group_by = plan
+        .group_by
+        .as_ref()
+        .filter(|group_by| !group_by.exprs.is_empty())?;
+    let (groups, rows_per_group, table_stats) =
+        group_count_from_index_stats(plan, group_by, schema)?;
+    let calls = plan.input_cardinality_hint.unwrap_or(1.0);
+    if plan.estimated_output_rows? < calls * groups.max(1.0) {
+        return None;
+    }
+    let stored_average = match rows_per_group {
+        0 | 1 => 0.0,
+        a => ((a - 1) as f64).recip(),
+    };
+    let total_rows = table_stats
+        .row_count
+        .map_or(groups * rows_per_group as f64, |rows| rows as f64);
+    let statistics = crate::row_changes::statistics_error(table_stats, total_rows);
+    Some(stored_average.hypot(statistics))
 }
 
 /// Amphora: the calls of a correlated subquery that runs where `phase` says, `loop_calls` being

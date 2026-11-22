@@ -1921,6 +1921,7 @@ pub fn emit_from_clause_subqueries(
                         table_reference.internal_id,
                         direct_index.index,
                         direct_index.affinity_str,
+                        from_clause_subquery.identity,
                     )?;
                     None
                 }
@@ -2117,6 +2118,7 @@ fn emit_indexed_materialized_subquery(
     internal_id: ast::TableInternalId,
     index: Arc<Index>,
     affinity_str: Option<Arc<String>>,
+    identity: Option<u64>,
 ) -> Result<()> {
     let cursor_id = program
         .alloc_cursor_index_if_not_exists(CursorKey::index(internal_id, index.clone()), &index)?;
@@ -2199,6 +2201,19 @@ fn emit_indexed_materialized_subquery(
     }
 
     if let Some(build_end) = build_end {
+        // Amphora (PL.13, lane replan-8: the stored result's materialization point, as the
+        // table-backed one's below): once filled, inside the run-once block, its rows counted
+        // against the estimate the plan read. A correlated fill runs at each read: not counted.
+        if let Plan::Select(select_plan) = &*plan {
+            crate::translate::main_loop::emit_subquery_count(
+                program,
+                t_ctx,
+                select_plan,
+                identity,
+                cursor_id,
+                MaterializedFromClauseSubqueryStorage::DirectIndex,
+            );
+        }
         program.preassign_label_to_next_insn(build_end);
     }
 
@@ -2342,6 +2357,7 @@ fn emit_materialized_subquery_table(
                 select_plan,
                 identity,
                 cursor_id,
+                MaterializedFromClauseSubqueryStorage::TableBacked,
             );
         }
     }

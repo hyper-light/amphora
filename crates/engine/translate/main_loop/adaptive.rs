@@ -154,21 +154,32 @@ pub(crate) fn emit_sorter_count(
 }
 
 /// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
-/// uncorrelated FROM-clause subquery's result, once its fill has stored it whole in its ephemeral
-/// table, holds the rows the plan estimated. Its rows are counted there and checked against the
-/// rows the plan read for the subquery (`PlanValues::subquery_rows`: its estimate, or a count a
-/// fill stored). The estimate's error is the statistics' of each table the subquery reads,
-/// independent, in quadrature; a subquery reading anything else (another subquery, a table
-/// without statistics) or no table is not checked, as a build without statistics is not. The
-/// fill numbers its rows 1, 2, ... (`EphemeralRowidMode::Auto`'s `NewRowid` on a table it only
-/// inserts into), so the last row's rowid is the count, read without a scan.
+/// uncorrelated FROM-clause subquery's result, once its fill has stored it whole, holds the rows
+/// the plan estimated. Its rows are counted there and checked against the rows the plan read for
+/// the subquery (`PlanValues::subquery_rows`: its estimate, or a count a fill stored).
+///
+/// The band is the estimate's own error. A GROUP BY whose rows ANALYZE's group count set is
+/// checked against that count's error (lane replan-8, `optimizer::group_count_error`). Any other
+/// estimate is the rows read: the statistics' error of each table the subquery reads, independent,
+/// in quadrature; a subquery reading anything else (another subquery, a table without statistics)
+/// or no table is not checked, as a build without statistics is not.
+///
+/// Where the result is stored decides the count. In its ephemeral table
+/// (`MaterializedFromClauseSubqueryStorage::TableBacked`), the fill numbers its rows 1, 2, ...
+/// (`EphemeralRowidMode::Auto`'s `NewRowid` on a table it only inserts into), so the last row's
+/// rowid is the count, read without a scan. In its seek index (`DirectIndex`, lane replan-8) there
+/// is no rowid to read: `Count` walks the index's pages once, each page's cells summed, no row
+/// decoded. The seek index holds an entry for each row (`ephemeral_subquery_*` has a rowid: a
+/// sequence column keeps equal rows apart), so its entries are the rows.
 pub(crate) fn emit_subquery_count(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
     plan: &crate::translate::plan::SelectPlan,
     identity: Option<u64>,
     cursor_id: CursorID,
+    storage: crate::translate::subquery::MaterializedFromClauseSubqueryStorage,
 ) {
+    use crate::translate::subquery::MaterializedFromClauseSubqueryStorage;
     if !t_ctx.resolver.adaptive_joins() {
         return;
     }
@@ -180,41 +191,59 @@ pub(crate) fn emit_subquery_count(
     }) else {
         return;
     };
-    let tables = plan.joined_tables();
-    if tables.is_empty() {
-        return;
-    }
-    let mut squared_error = 0.0;
-    for joined in tables {
-        let Table::BTree(btree) = &joined.table else {
-            return;
+    let estimate_error =
+        match crate::translate::optimizer::group_count_error(plan, t_ctx.resolver.schema()) {
+            Some(error) => error,
+            None => {
+                let tables = plan.joined_tables();
+                if tables.is_empty() {
+                    return;
+                }
+                let mut squared_error = 0.0;
+                for joined in tables {
+                    let Table::BTree(btree) = &joined.table else {
+                        return;
+                    };
+                    let Some((_, error)) = analyzed_table(t_ctx, &btree.name) else {
+                        return;
+                    };
+                    squared_error += error * error;
+                }
+                f64::sqrt(squared_error)
+            }
         };
-        let Some((_, error)) = analyzed_table(t_ctx, &btree.name) else {
-            return;
-        };
-        squared_error += error * error;
-    }
     let rows_reg = program.alloc_register();
-    let counted = program.allocate_label();
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: rows_reg,
-    });
-    program.emit_insn(Insn::Last {
-        cursor_id,
-        pc_if_empty: counted,
-    });
-    program.emit_insn(Insn::RowId {
-        cursor_id,
-        dest: rows_reg,
-    });
-    program.preassign_label_to_next_insn(counted);
+    match storage {
+        MaterializedFromClauseSubqueryStorage::TableBacked => {
+            let counted = program.allocate_label();
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: rows_reg,
+            });
+            program.emit_insn(Insn::Last {
+                cursor_id,
+                pc_if_empty: counted,
+            });
+            program.emit_insn(Insn::RowId {
+                cursor_id,
+                dest: rows_reg,
+            });
+            program.preassign_label_to_next_insn(counted);
+        }
+        MaterializedFromClauseSubqueryStorage::DirectIndex => {
+            program.emit_insn(Insn::Count {
+                cursor_id,
+                target_reg: rows_reg,
+                exact: false,
+            });
+        }
+    }
     program.emit_insn(Insn::SubqueryCounted {
         data: Box::new(crate::vdbe::insn::SubqueryCountedData {
             rows_reg,
             rows: planned.rows,
             planned_rows: planned.planned_rows,
-            estimate_error: f64::sqrt(squared_error),
+            estimate_error,
         }),
     });
 }
