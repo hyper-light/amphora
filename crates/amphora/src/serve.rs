@@ -917,7 +917,12 @@ pub fn check(config: &Config, ledger: &Path, catch_up: Duration) -> anyhow::Resu
         .checked_add(catch_up)
         .ok_or_else(|| anyhow!("--catch-up-s past the clock's range"))?;
     let (mut out, mut ok) = (String::new(), true);
-    for m in &config.members {
+    // Counted on the voters the config names, as health asks them: a lost member removed isn't.
+    for m in config
+        .members
+        .iter()
+        .filter(|m| config.voters.contains(&m.node))
+    {
         let mut lost = 0u64;
         let mut failed = None;
         let mut client = None;
@@ -1015,31 +1020,30 @@ pub fn command(args: &[String], ready: impl FnOnce(&str)) -> Option<crate::Reply
                 Client::connect(&m.addr, &c.secret()?, c.deadline)?.ask(&request.join(" "))?;
             Ok((format!("{answer}\n"), true))
         })()),
-        // The change goes to whichever voter says it leads.
+        // The change goes to each voter in turn until one, the leader, makes it: a follower
+        // refuses it, and a lost member doesn't answer, so a stale idea of the leader costs nothing.
         ("member", [config, what, node]) => reply((|| {
             let c = Config::load(Path::new(config))?;
             let secret = c.secret()?;
-            let leader = c
-                .members
-                .iter()
-                .filter(|m| c.voters.contains(&m.node))
-                .find_map(|m| {
-                    let s = Client::connect(&m.addr, &secret, c.deadline)
-                        .and_then(|mut k| k.ask("status"))
-                        .ok()?;
-                    fields(&s).get("leader")?.parse::<u64>().ok()
-                })
-                .ok_or_else(|| anyhow!("no voter named a leader"))?;
-            let m = c.member(leader)?;
-            let answer = Client::connect(&m.addr, &secret, c.deadline)?
-                .ask(&format!("member {what} {node}"))?;
-            Ok((
-                format!(
-                    "{answer}
+            let request = format!("member {what} {node}");
+            let mut refused = Vec::new();
+            for m in c.members.iter().filter(|m| c.voters.contains(&m.node)) {
+                match Client::connect(&m.addr, &secret, c.deadline)
+                    .and_then(|mut k| k.ask(&request))
+                {
+                    Ok(answer) => {
+                        return Ok((
+                            format!(
+                                "{answer}
 "
-                ),
-                true,
-            ))
+                            ),
+                            true,
+                        ))
+                    }
+                    Err(e) => refused.push(format!("member {}: {e:#}", m.node)),
+                }
+            }
+            bail!("no voter made the change: {}", refused.join("; "))
         })()),
         ("drill", [what, config, flags @ ..]) if what == "load" => reply((|| {
             let c = Config::load(Path::new(config))?;

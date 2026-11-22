@@ -87,8 +87,11 @@ hold the majority and keep taking writes; replace the lost one with a spare:
    `amphora health` asks the voters the config names.
 
 `amphora member` sends the change to whichever voter says it leads. `demote` makes a voter a
-learner. The drill of record is `cargo test -p amphora --test serve a_region_lost`: the third
-member cut off for good, the spare added and promoted, the lost one removed, every write kept.
+learner. It tries each voter until the leader makes the change: a follower refuses, a lost member
+doesn't answer. The drill under load is `scripts/drills.sh region` with the spare's HOST:PORT
+fourth (the victim killed and never started again, the spare added, caught up and promoted, the
+victim removed, the count on the new voters); `cargo test -p amphora --test serve a_region_lost`
+is its test.
 
 ## Uninstall
 
