@@ -1021,7 +1021,9 @@ impl Flushing {
 fn owner_image_room() -> Result<usize, Refusal> {
     let room = crate::memory::process().room(crate::memory::Use::Queues)?;
     let room = usize::try_from(room).unwrap_or(usize::MAX);
-    Ok(crate::replication::image_room()?.min(room.saturating_sub(FRAMING_BYTES)))
+    // The command queue holds the image's wire record beside one application call (`queue_bounds`).
+    let wire = room.saturating_sub(api::REQUEST_MAX);
+    Ok(crate::replication::image_room()?.min(wire.saturating_sub(FRAMING_BYTES)))
 }
 
 /// The owner's queue bounds now (QB.1).
@@ -1042,8 +1044,9 @@ struct Bounds {
 /// The owner's queue bounds from what it measured (replication.md, "Decision (lane constants): the
 /// queue bounds by drain rate"; QB.1): each queue holds what its reader drains in `timeout`, the
 /// learned election timeout, no more than the memory budget's room for queues (MB.1). Before any
-/// drain is measured, one record: for the command queue, an image's wire record; for the
-/// application calls in it, one call; for the outgoing queue, one message. The image a wire record
+/// drain is measured, the memory budget's room for queues. The command queue holds at least one
+/// wire record beside one application call, and application calls no more than what that record
+/// leaves. The image a wire record
 /// carries is the budget's room for one (SB.1), held inside the command queue's bound. Application
 /// calls hold no more than the owner takes in an election timeout, so that waiting calls leave the
 /// rest of the queue to the wire records that find a leader.
@@ -1056,9 +1059,14 @@ fn queue_bounds(
     let image = u64::try_from(crate::replication::image_room()?).unwrap_or(u64::MAX);
     let framing = u64::try_from(FRAMING_BYTES).unwrap_or(u64::MAX);
     let request = u64::try_from(api::REQUEST_MAX).unwrap_or(u64::MAX);
-    let record = image.saturating_add(framing);
+    // A wire record's room: an image's and its framing, no more than the queue's room less one
+    // application call. The command queue must hold one wire record beside one call, or calls are
+    // never admitted while an image travels; the image is what that leaves (QB.1).
+    let record = image
+        .saturating_add(framing)
+        .min(room.saturating_sub(request));
     let least = super::drain::Bound {
-        bytes: record,
+        bytes: record.saturating_add(request),
         messages: 1,
     };
     let queued = intake.bound(timeout, least, room).bytes;
