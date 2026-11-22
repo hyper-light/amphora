@@ -1205,7 +1205,7 @@ fn put_at(nodes: &[Groups<Events>; 2], key: &str, seq: i64) -> bool {
 /// at the node its group is on, and every key in exactly one group's file.
 #[test]
 fn t_t1_9_r10_a_group_moves_to_another_node_under_writes_and_loses_no_acknowledged_write() {
-    assert_eq!(move_under_writes(None), 0);
+    assert_eq!(move_under_writes(Channel::Bytes(None)), 0);
 }
 
 /// T-T1.9.R11 (CP-T1.9; docs/design/reshard.md, "Moves across nodes": correctness never rests on
@@ -1215,12 +1215,79 @@ fn t_t1_9_r10_a_group_moves_to_another_node_under_writes_and_loses_no_acknowledg
 /// acknowledged write at its group's node, every key in exactly one group's file.
 #[test]
 fn t_t1_9_r11_a_move_whose_pull_answers_are_lost_asks_again_and_loses_no_acknowledged_write() {
-    assert!(move_under_writes(Some(3)) > 0);
+    assert!(move_under_writes(Channel::Bytes(Some(3))) > 0);
 }
 
-/// The move of T-T1.9.R10, every `lose_every`th pull's answer lost if some: how many were lost.
-fn move_under_writes(lose_every: Option<u64>) -> u64 {
+/// T-T1.9.R12 (CP-T1.9; docs/design/reshard.md, "Moves across nodes"): the move of T-T1.9.R10
+/// with each pull carried over the owner transport, from one node's peers
+/// ([`amphora::transport::Nodes`]) to the other node's endpoint ([`amphora::transport::Node`]),
+/// every fourth pull asked while that endpoint is down (a partition: the pull never reaches the
+/// node, and it is started again after) and every third answer lost on the way back, after the
+/// node acted on it; each an error of the action, asked again by the driver. Expect both faults
+/// met and the outcome of T-T1.9.R10: the move flipped, every acknowledged write at its group's
+/// node, every key in exactly one group's file.
+#[test]
+fn t_t1_9_r12_a_move_over_the_transport_through_loss_and_partition_loses_no_acknowledged_write() {
+    assert!(
+        move_under_writes(Channel::Transport {
+            lose_every: 3,
+            cut_every: 4,
+        }) > 0
+    );
+}
+
+/// How a lab of two nodes carries its pulls.
+#[derive(Clone, Copy)]
+enum Channel {
+    /// As postcard bytes in process ([`Wire`]), every so many answers lost if some.
+    Bytes(Option<u64>),
+    /// Over the owner transport between the nodes' endpoints ([`Faulty`]).
+    Transport { lose_every: u64, cut_every: u64 },
+}
+
+/// A node's peers over the owner transport, with faults: every `cut_every`th pull asked while
+/// the node's endpoint is down (started again after), and every `lose_every`th answer dropped
+/// after it arrived.
+struct Faulty<'a> {
+    nodes: amphora::transport::Nodes,
+    endpoints: &'a [std::cell::RefCell<Option<amphora::transport::Node>>; 2],
+    start: &'a dyn Fn(usize) -> amphora::transport::Node,
+    pulls: &'a std::cell::Cell<u64>,
+    cuts: &'a std::cell::Cell<u64>,
+    lose_every: u64,
+    cut_every: u64,
+}
+
+impl Peers for Faulty<'_> {
+    fn pull(&self, node: NodeId, pull: &Pull, until: Instant) -> anyhow::Result<Pulled> {
+        let n = self.pulls.get() + 1;
+        self.pulls.set(n);
+        if n.is_multiple_of(self.cut_every) {
+            drop(self.endpoints[ix(node)].borrow_mut().take());
+            let through = self.nodes.pull(node, pull, until);
+            assert!(through.is_err(), "a pull answered through a partition");
+            self.cuts.set(self.cuts.get() + 1);
+            *self.endpoints[ix(node)].borrow_mut() = Some((self.start)(ix(node)));
+            return through;
+        }
+        let answer = self.nodes.pull(node, pull, until)?;
+        if n.is_multiple_of(self.lose_every) {
+            anyhow::bail!("the pull's answer lost on the way back");
+        }
+        Ok(answer)
+    }
+}
+
+/// The move of T-T1.9.R10, its pulls carried by `channel`: how many actions failed for the
+/// channel's sake.
+fn move_under_writes(channel: Channel) -> u64 {
+    let lose_every = match channel {
+        Channel::Bytes(lose_every) => lose_every,
+        Channel::Transport { .. } => None,
+    };
+    let faults = !matches!(channel, Channel::Bytes(None));
     let (pulls, mut lost) = (std::cell::Cell::new(0u64), 0u64);
+    let cuts = std::cell::Cell::new(0u64);
     let dir = tempfile::tempdir().unwrap();
     let dirs = [dir.path().join("n0"), dir.path().join("n1")];
     for d in &dirs {
@@ -1246,6 +1313,23 @@ fn move_under_writes(lose_every: Option<u64>) -> u64 {
         .unwrap(),
     ];
     assert_eq!((nodes[0].len(), nodes[1].len()), (2, 0));
+    let endpoint = |i: usize| dirs[i].join("node");
+    let start = |i: usize| {
+        let groups = nodes[i].clone();
+        amphora::transport::Node::start(&endpoint(i), move |pull, until, bytes| {
+            groups.serve_within(pull, until, bytes)
+        })
+        .unwrap()
+    };
+    let endpoints = match channel {
+        Channel::Transport { .. } => [
+            std::cell::RefCell::new(Some(start(0))),
+            std::cell::RefCell::new(Some(start(1))),
+        ],
+        Channel::Bytes(_) => [std::cell::RefCell::new(None), std::cell::RefCell::new(None)],
+    };
+    let transport =
+        amphora::transport::Nodes::new([(NodeId(0), endpoint(0)), (NodeId(1), endpoint(1))]);
     let keys: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
     let mut acked = vec![0i64; keys.len()];
     for (i, key) in keys.iter().enumerate() {
@@ -1284,20 +1368,43 @@ fn move_under_writes(lose_every: Option<u64>) -> u64 {
                         .unwrap_or(NodeId(0)),
                 };
                 let (here, there) = (ix(n), 1 - ix(n));
-                let peers = Wire {
+                let wire = Wire {
                     node: NodeId(u64::try_from(there).unwrap()),
                     groups: &nodes[there],
                     pulls: &pulls,
                     lose_every,
                 };
-                let carried = nodes[here].carry(&a, soon(), &peers, |g| {
-                    events(&dirs[here], &g.0.to_string())
-                });
+                let faulty = match channel {
+                    Channel::Transport {
+                        lose_every,
+                        cut_every,
+                    } => Some(Faulty {
+                        nodes: transport.clone(),
+                        endpoints: &endpoints,
+                        start: &start,
+                        pulls: &pulls,
+                        cuts: &cuts,
+                        lose_every,
+                        cut_every,
+                    }),
+                    Channel::Bytes(_) => None,
+                };
+                let peers: &dyn Peers = match &faulty {
+                    Some(faulty) => faulty,
+                    None => &wire,
+                };
+                let carried =
+                    nodes[here].carry(&a, soon(), peers, |g| events(&dirs[here], &g.0.to_string()));
                 let reply = match carried {
                     Ok(reply) => reply,
-                    // The answer lost: the action's error, asked again by the driver.
-                    Err(e) if lose_every.is_some() => {
-                        assert!(e.to_string().contains("lost on the way back"), "{e}");
+                    // The answer lost, or the pull cut off: the action's error, asked again by
+                    // the driver.
+                    Err(e) if faults => {
+                        let e = format!("{e:#}");
+                        assert!(
+                            e.contains("lost on the way back") || e.contains("'s pull:"),
+                            "{e}"
+                        );
                         lost += 1;
                         pending.extend(driver.restarted(group).unwrap());
                         continue;
@@ -1365,5 +1472,8 @@ fn move_under_writes(lose_every: Option<u64>) -> u64 {
         }
     }
     assert_eq!(seen.len(), keys.len());
+    if matches!(channel, Channel::Transport { .. }) {
+        assert!(cuts.get() > 0 && lost > cuts.get(), "both faults met");
+    }
     lost
 }

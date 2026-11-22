@@ -36,6 +36,7 @@ pub mod native_ext;
 pub mod numeric;
 pub mod schema;
 pub mod skiplist;
+pub mod skipping;
 pub mod state_machine;
 pub mod storage;
 pub mod types;
@@ -139,6 +140,7 @@ pub use connection::{
     resolve_ext_path, Connection, JoinMethods, PrepareOptions, Row, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+// Amphora (G6 step 3): learned plan hints, a prototype behind `HintSet::apply`.
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
@@ -189,6 +191,10 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::optimizer::plan_hints::{
+    candidate_plans, plan_features, HintChooser, HintGuard, HintModel, HintSet, PlanFeatures,
+    Verdict,
+};
 pub use translate::plan::TablePlanEstimate;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;

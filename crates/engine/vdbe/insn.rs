@@ -2295,6 +2295,14 @@ pub enum Insn {
         count: usize,
         target_pc_done: BranchOffset,
     },
+
+    /// Amphora (PL.7, T-PL.7.1): writes into `target_reg` the pages of the B-tree open at
+    /// `cursor_id`, its interior and leaf pages, as the walk [Insn::Count] makes counts them; NULL
+    /// for a cursor over no B-tree of its own. ANALYZE keeps it beside its other statistics.
+    TreePages {
+        cursor_id: CursorID,
+        target_reg: usize,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2544,6 +2552,7 @@ impl InsnVariants {
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
             InsnVariants::MorselAggregate => execute::op_morsel_aggregate,
             InsnVariants::MorselNext => execute::op_morsel_next,
+            InsnVariants::TreePages => execute::op_tree_pages,
         }
     }
 }

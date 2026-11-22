@@ -16898,6 +16898,34 @@ pub fn op_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Amphora (PL.7, T-PL.7.1): [Insn::TreePages], the walk [Insn::Count] makes, its pages kept.
+pub fn op_tree_pages(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        TreePages {
+            cursor_id,
+            target_reg,
+        },
+        insn
+    );
+    let pages = {
+        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "TreePages");
+        let cursor = cursor.as_btree_mut();
+        return_if_io!(state, cursor.count());
+        cursor.counted_pages()
+    };
+    match pages.and_then(|p| i64::try_from(p).ok()) {
+        Some(pages) => state.registers[*target_reg].set_int(pages),
+        None => state.registers[*target_reg].set_null(),
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Format integrity check errors into a result string.
 /// Returns NULL when no errors were found.
 fn format_integrity_check_result(errors: &[IntegrityCheckError]) -> Result<Option<String>> {

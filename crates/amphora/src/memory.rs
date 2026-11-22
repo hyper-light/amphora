@@ -231,12 +231,35 @@ impl Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        let _ =
-            self.budget
-                .slot(self.used)
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    Some(held.saturating_sub(self.bytes))
-                });
+        self.budget.give(self.used, self.bytes);
+    }
+}
+
+/// The engine's versioned storage takes its memory from the process's budget as caches
+/// ([`Use::Caches`]: its page frames and row versions), what the rest of the process leaves it by
+/// measured use (G7 step 2, `AC-NS.2.1`; MB.1). Every database the process opens shares the one
+/// budget.
+pub struct StorageMemory(pub Arc<Budget>);
+
+impl amphora_engine::storage::versioned::memory::Source for StorageMemory {
+    fn take(&self, what: &'static str, bytes: u64) -> amphora_engine::Result<()> {
+        self.0
+            .hold(Use::Caches, bytes)
+            .map_err(|refusal| match refusal {
+                Refusal::TooLarge { limit, .. } => amphora_engine::LimboError::MemoryBudget {
+                    what,
+                    asked: bytes,
+                    held: self.0.held(Use::Caches),
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                },
+                other => amphora_engine::LimboError::InternalError(format!(
+                    "versioned storage: {what}: {other}"
+                )),
+            })
+    }
+
+    fn give(&self, bytes: u64) {
+        self.0.give(Use::Caches, bytes);
     }
 }
 
@@ -283,21 +306,38 @@ impl Budget {
     /// `bytes` more held by `used`, refused typed (past its room, [`Refusal::TooLarge`] naming the
     /// use and the room) when they would pass it.
     pub fn take(self: &Arc<Self>, used: Use, bytes: u64) -> Result<Charge, Refusal> {
-        let room = self.room(used)?;
-        self.slot(used)
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(bytes).filter(|after| *after <= room)
-            })
-            .map_err(|held| Refusal::TooLarge {
-                what: format!("memory for {}", used.name()),
-                size: usize::try_from(held.saturating_add(bytes)).unwrap_or(usize::MAX),
-                limit: usize::try_from(room).unwrap_or(usize::MAX),
-            })?;
+        self.hold(used, bytes)?;
         Ok(Charge {
             budget: Arc::clone(self),
             used,
             bytes,
         })
+    }
+
+    /// `bytes` more held by `used`, as [`Budget::take`], for a holder that counts its own and
+    /// gives them back with [`Budget::give`] (the engine's versioned storage, which takes a run of
+    /// frames or a step of its versions' reservation at a time).
+    pub fn hold(&self, used: Use, bytes: u64) -> Result<(), Refusal> {
+        let room = self.room(used)?;
+        self.slot(used)
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(bytes).filter(|after| *after <= room)
+            })
+            .map(|_| ())
+            .map_err(|held| Refusal::TooLarge {
+                what: format!("memory for {}", used.name()),
+                size: usize::try_from(held.saturating_add(bytes)).unwrap_or(usize::MAX),
+                limit: usize::try_from(room).unwrap_or(usize::MAX),
+            })
+    }
+
+    /// `bytes` held by `used` ([`Budget::hold`]) given back.
+    pub fn give(&self, used: Use, bytes: u64) {
+        let _ = self
+            .slot(used)
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(bytes))
+            });
     }
 
     /// The room for one image: [`Use::Images`]' room, in the `usize` an image's bytes are

@@ -1,7 +1,8 @@
 //! Amphora: the versioned storage's buffer pool (Amphora's `docs/design/engine.md`, decisions 2
 //! and 15; G7 step 4).
 //!
-//! A fixed number of frames, sized by the byte budget the shell gives it ([`frames_within`]), each
+//! Frames made as pages need them, a run at a time, each run's bytes taken from the memory source
+//! the shell gives it ([`Room::Shared`], `super::memory`) or within a fixed count ([`Room::Frames`]); each
 //! holding one page behind a latch (shared to read, exclusive to write) and a version counter that
 //! every exclusive hold bumps as it ends. Readers that keep a copy of a page (the inner pages a
 //! B-link descent reads, decision 3) know it is current while the version [`Pool::version`] gives
@@ -27,6 +28,7 @@
 //! before it changes them.
 
 use super::disk::{Disk, File};
+use super::memory::Source;
 use super::page::PAGE_SIZE;
 use crate::error::LimboError;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -143,23 +145,21 @@ fn run_start(k: u32) -> usize {
         .map_or(usize::MAX, |n| n.saturating_sub(1))
 }
 
-/// The frames a byte budget holds: each a page and its frame's state. The budget is the shell's,
-/// from the memory the process may use (`amphora::memory::limit`), else a share of the machine's
-/// ([`super::memory::default_budget`]).
-pub fn frames_within(bytes: u64) -> Result<usize> {
-    let each = PAGE_SIZE.saturating_add(std::mem::size_of::<Frame>());
-    let each = u64::try_from(each).map_err(|_| LimboError::IntegerOverflow)?;
-    let n = bytes.checked_div(each).unwrap_or(0);
-    if n == 0 {
-        return Err(LimboError::MemoryBudget {
-            what: "a page pool's first frame",
-            asked: each,
-            held: 0,
-            limit: bytes,
-        });
-    }
-    usize::try_from(n).map_err(|_| LimboError::IntegerOverflow)
+/// The bytes one frame takes: its page and its state.
+fn frame_bytes() -> u64 {
+    u64::try_from(PAGE_SIZE.saturating_add(std::mem::size_of::<Frame>())).unwrap_or(u64::MAX)
 }
+
+/// How many frames a pool may make: a fixed count, or as many as a memory source grants it, a run
+/// at a time, up to its slots' width (G7 step 2, `AC-NS.2.1`).
+#[derive(Clone)]
+pub enum Room {
+    Frames(usize),
+    Shared(Arc<dyn Source>),
+}
+
+/// The most frames a pool's slots can name: their frame index is a `u32` less the none mark.
+const SLOT_FRAMES: usize = u32::MAX as usize - 1;
 
 /// The pool's counts since it was made.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -178,8 +178,17 @@ pub struct Pool {
     /// frame is first used: frames are used in order ([`Pool::victim`]), so a pool sized from the
     /// machine's memory holds only the frames its pages took, at most twice those (G7 step 2).
     runs: Box<[OnceLock<Box<[Frame]>>]>,
-    /// The frames the pool holds at most.
+    /// The frames the pool may make at most: the room's count, or its slots' width for a shared
+    /// room, whose source decides at each run.
     capacity: usize,
+    /// The source each run's bytes are taken from (a shared room); None: within `capacity`.
+    source: Option<Arc<dyn Source>>,
+    /// Frames in runs made: runs are made in order, so frames `0..made`.
+    made: AtomicUsize,
+    /// The bytes taken from `source`, given back when the pool drops.
+    taken: AtomicU64,
+    /// Held while a run is made: one maker takes its bytes once.
+    growing: Mutex<()>,
     slots: Slots,
     /// Where evicted pages go and pages not resident come from; None: every page stays resident.
     disk: Option<Arc<dyn Disk>>,
@@ -204,6 +213,14 @@ pub struct Pool {
     misses: AtomicU64,
     evictions: AtomicU64,
     spilled: AtomicU64,
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if let Some(source) = &self.source {
+            source.give(self.taken.load(Ordering::Acquire));
+        }
+    }
 }
 
 /// A page read under its frame's shared latch.
@@ -274,20 +291,32 @@ impl Pool {
     /// A pool of `frames` pages with no disk: every page stays resident, and a page past the
     /// frames is refused (`DatabaseFull`).
     pub fn new(frames: usize) -> Self {
-        Self::make(frames, None)
+        Self::make(Room::Frames(frames), None)
+    }
+
+    /// A pool with no disk whose frames are taken from `source` as pages need them.
+    pub fn shared(source: Arc<dyn Source>) -> Self {
+        Self::make(Room::Shared(source), None)
     }
 
     /// A pool of `frames` frames over `disk`'s data file, whose first `allocated` pages are the
     /// database's: read in as they are asked for, each checked once against the checksum taken
     /// here, and evicted by CLOCK when the frames are full. The spill file starts empty.
     pub fn backed(frames: usize, disk: Arc<dyn Disk>, allocated: u64) -> Result<Self> {
-        if frames == 0 || u32::try_from(frames).is_err() {
-            return Err(LimboError::InvalidArgument(format!(
-                "versioned storage: a pool of {frames} frames (1 to 2^32 - 1, its slots' width)"
-            )));
+        Self::backed_in(Room::Frames(frames), disk, allocated)
+    }
+
+    /// [`Pool::backed`], its frames within `room`.
+    pub fn backed_in(room: Room, disk: Arc<dyn Disk>, allocated: u64) -> Result<Self> {
+        if let Room::Frames(frames) = room {
+            if frames == 0 || frames > SLOT_FRAMES {
+                return Err(LimboError::InvalidArgument(format!(
+                    "versioned storage: a pool of {frames} frames (1 to 2^32 - 2, its slots' width)"
+                )));
+            }
         }
         disk.truncate(File::Spill, 0)?;
-        let pool = Self::make(frames, Some(disk.clone()));
+        let pool = Self::make(room, Some(disk.clone()));
         let mut buf = vec![0u8; PAGE_SIZE];
         for page in 1..=allocated {
             if disk.read_at(File::Data, page_offset(page)?, &mut buf)? != PAGE_SIZE {
@@ -304,7 +333,11 @@ impl Pool {
         Ok(pool)
     }
 
-    fn make(frames: usize, disk: Option<Arc<dyn Disk>>) -> Self {
+    fn make(room: Room, disk: Option<Arc<dyn Disk>>) -> Self {
+        let (frames, source) = match room {
+            Room::Frames(n) => (n, None),
+            Room::Shared(source) => (SLOT_FRAMES, Some(source)),
+        };
         // Runs until one starts at or past the capacity: `usize::BITS` of them cover any.
         let runs = (0..usize::BITS)
             .take_while(|&k| run_start(k) < frames)
@@ -316,6 +349,10 @@ impl Pool {
         Self {
             runs,
             capacity: frames,
+            source,
+            made: AtomicUsize::new(0),
+            taken: AtomicU64::new(0),
+            growing: Mutex::new(()),
             slots: Slots::new(),
             disk,
             allocated: AtomicU64::new(0),
@@ -332,9 +369,19 @@ impl Pool {
         }
     }
 
-    /// The pages the pool holds resident at most.
+    /// The pages the pool holds resident at most: for a shared room, as many as its source grants.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// The memory source its frames come from, if shared.
+    pub fn source(&self) -> Option<Arc<dyn Source>> {
+        self.source.clone()
+    }
+
+    /// The frames made so far.
+    pub fn frames_made(&self) -> usize {
+        self.made.load(Ordering::Acquire)
     }
 
     /// The pages handed out.
@@ -404,16 +451,28 @@ impl Pool {
         })
     }
 
-    /// Frame `i`, its run made if it wasn't; None past the capacity.
+    /// Frame `i`, its run made if it wasn't; None past the capacity, or when the source refuses
+    /// the run's bytes.
     fn frame_at(&self, i: usize) -> Option<&Frame> {
         if i >= self.capacity {
             return None;
         }
         let k = usize::BITS - 1 - i.checked_add(1)?.leading_zeros();
         let start = run_start(k);
-        let run = self.runs.get(usize::try_from(k).ok()?)?.get_or_init(|| {
+        let cell = self.runs.get(usize::try_from(k).ok()?)?;
+        if let Some(run) = cell.get() {
+            return run.get(i.checked_sub(start)?);
+        }
+        let _making = self.growing.lock();
+        if cell.get().is_none() {
             let end = run_start(k.saturating_add(1)).min(self.capacity);
-            (start..end)
+            let count = end.checked_sub(start)?;
+            if let Some(source) = &self.source {
+                let bytes = frame_bytes().saturating_mul(u64::try_from(count).ok()?);
+                source.take("a page pool's run of frames", bytes).ok()?;
+                self.taken.fetch_add(bytes, Ordering::AcqRel);
+            }
+            let run: Box<[Frame]> = (start..end)
                 .map(|_| Frame {
                     page: RwLock::new(vec![0u8; PAGE_SIZE].into_boxed_slice()),
                     version: AtomicU64::new(0),
@@ -421,16 +480,18 @@ impl Pool {
                     referenced: AtomicBool::new(false),
                     dirty: AtomicBool::new(false),
                 })
-                .collect()
-        });
-        run.get(i.checked_sub(start)?)
+                .collect();
+            let _ = cell.set(run);
+            self.made.store(end, Ordering::Release);
+        }
+        cell.get()?.get(i.checked_sub(start)?)
     }
 
     /// The refusal of a page that left its frame as often as there are frames while it was asked
     /// for, or of a frame when every one is latched.
     fn refused(&self, what: &'static str) -> LimboError {
         let each = u64::try_from(PAGE_SIZE).unwrap_or(u64::MAX);
-        let all = u64::try_from(self.capacity)
+        let all = u64::try_from(self.frames_made())
             .unwrap_or(u64::MAX)
             .saturating_mul(each);
         LimboError::MemoryBudget {
@@ -446,7 +507,11 @@ impl Pool {
         let slot = self.slot(page)?;
         // Each pass that doesn't return saw the page leave its frame, or read it in: one a frame
         // at most before the pool is churning faster than this reader can latch.
-        for _ in 0..=self.capacity {
+        // Bounded by the frames made, read again at each try: a pool making its frames lazily has
+        // as many tries as frames once they are made.
+        let mut tries = 0usize;
+        while tries <= self.frames_made().saturating_add(1) {
+            tries = tries.saturating_add(1);
             if let Some(i) = slot.frame() {
                 let fr = self.frame(i)?;
                 let guard = fr.page.read();
@@ -467,7 +532,11 @@ impl Pool {
     /// checkpoint's pause.
     pub fn write(&self, page: u64) -> Result<PageWrite<'_>> {
         let slot = self.slot(page)?;
-        for _ in 0..=self.capacity {
+        // Bounded by the frames made, read again at each try: a pool making its frames lazily has
+        // as many tries as frames once they are made.
+        let mut tries = 0usize;
+        while tries <= self.frames_made().saturating_add(1) {
+            tries = tries.saturating_add(1);
             if let Some(i) = slot.frame() {
                 let frame = self.frame(i)?;
                 let guard = frame.page.write();
@@ -582,9 +651,9 @@ impl Pool {
     /// whose reference bit is clear and which no one latches. Two sweeps: the first clears every
     /// bit it passes, so the second finds a frame unless every one is latched, which is refused.
     fn victim(&self) -> Result<(usize, RwLockWriteGuard<'_, Box<[u8]>>)> {
-        let n = self.capacity;
         let mut u = self.unused.load(Ordering::Relaxed);
-        while u < n {
+        // A frame never used, while the room grants its run: frames are used in order.
+        while u < self.capacity && self.frame_at(u).is_some() {
             match self.unused.compare_exchange(
                 u,
                 u.saturating_add(1),
@@ -597,6 +666,10 @@ impl Pool {
         }
         if self.disk.is_none() {
             return Err(LimboError::DatabaseFull);
+        }
+        let n = self.frames_made();
+        if n == 0 {
+            return Err(self.refused("a page pool's first frame"));
         }
         for _ in 0..n.saturating_mul(2) {
             let i = self
@@ -652,7 +725,11 @@ impl Pool {
 
     /// Page `page`'s bytes at the pause that ended `epoch`, if it was written in it.
     fn owed(&self, page: u64, slot: &Slot, epoch: u64) -> Result<Option<Vec<u8>>> {
-        for _ in 0..=self.capacity {
+        // Bounded by the frames made, read again at each try: a pool making its frames lazily has
+        // as many tries as frames once they are made.
+        let mut tries = 0usize;
+        while tries <= self.frames_made().saturating_add(1) {
+            tries = tries.saturating_add(1);
             let take = |held: &[u8]| -> Result<Option<Vec<u8>>> {
                 if slot.copied.load(Ordering::Acquire) == low(epoch) {
                     return match self.kept.lock().remove(&page) {
@@ -825,8 +902,68 @@ mod tests {
         ));
         drop((a, b));
         assert!(pool.read(pages[2]).is_ok());
+    }
+
+    /// A source of `limit` bytes for a test, counting what it holds.
+    struct Capped {
+        limit: u64,
+        held: AtomicU64,
+    }
+
+    impl Source for Capped {
+        fn take(&self, what: &'static str, bytes: u64) -> Result<()> {
+            let limit = self.limit;
+            self.held
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |h| {
+                    h.checked_add(bytes).filter(|a| *a <= limit)
+                })
+                .map(|_| ())
+                .map_err(|held| LimboError::MemoryBudget {
+                    what,
+                    asked: bytes,
+                    held,
+                    limit,
+                })
+        }
+
+        fn give(&self, bytes: u64) {
+            self.held.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    /// T-NS.2.10: a pool over a disk whose frames come from a source with room for three (runs of
+    /// one and two; the next run, four, refused), handing out ten pages. Expect: three frames made,
+    /// their bytes held by the source, the other pages evicted and read back as written; a source
+    /// with no room for one frame refused typed; everything given back when the pool drops
+    /// (`AC-NS.2.1`: no share picked, the source decides).
+    #[test]
+    fn ns2_a_shared_pools_frames_are_what_its_source_grants() {
+        let source = Arc::new(Capped {
+            limit: frame_bytes() * 3 + frame_bytes() / 2,
+            held: AtomicU64::new(0),
+        });
+        let disk: Arc<dyn Disk> = Arc::new(Simulated::new(5, 1).unwrap());
+        let pool = Pool::backed_in(Room::Shared(source.clone()), disk, 0).unwrap();
+        let pages: Vec<u64> = (0..10).map(|_| pool.allocate().unwrap()).collect();
+        for &p in &pages {
+            fill(p, 1)(&mut pool.write(p).unwrap());
+        }
+        for &p in &pages {
+            assert!(holds(&pool.read(p).unwrap(), p, 1), "page {p}");
+        }
+        assert_eq!(pool.frames_made(), 3);
+        assert_eq!(source.held.load(Ordering::Acquire), frame_bytes() * 3);
+        assert!(pool.counts().evictions > 0);
+        drop(pool);
+        assert_eq!(source.held.load(Ordering::Acquire), 0);
+        let none = Arc::new(Capped {
+            limit: frame_bytes() - 1,
+            held: AtomicU64::new(0),
+        });
+        let disk: Arc<dyn Disk> = Arc::new(Simulated::new(6, 1).unwrap());
+        let pool = Pool::backed_in(Room::Shared(none), disk, 0).unwrap();
         assert!(matches!(
-            frames_within(1),
+            pool.allocate(),
             Err(LimboError::MemoryBudget { .. })
         ));
     }

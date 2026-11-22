@@ -145,6 +145,11 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
+    /// The writer's stamps.
+    pub(crate) fn hooks(&self) -> Arc<Hooks> {
+        Arc::clone(&self.hooks)
+    }
+
     /// Backs `db`, the writer, up to `archive`: its commits stamped from now on, its log started
     /// again only once shipped ([`Db::back_up`]), and a shipper carrying on from what the archive
     /// holds, on a reader of the same engine.

@@ -2714,6 +2714,18 @@ pub fn insn_to_row(
                 data.aggregates
             ),
         ),
+        Insn::TreePages {
+            cursor_id,
+            target_reg,
+        } => (
+            "TreePages",
+            i64::try_from(*cursor_id).unwrap_or(i64::MAX),
+            i64::try_from(*target_reg).unwrap_or(i64::MAX),
+            0,
+            Value::build_text(""),
+            0,
+            format!("r[{target_reg}]=pages(cursor {cursor_id})"),
+        ),
         Insn::MorselNext {
             dest_start,
             count,

@@ -17,8 +17,9 @@ pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
 /// The protocol both ends speak. Postcard is not self-describing, so a field added to any message
 /// changes it (local-owner-transport.md, "Versions"). 3: ReplicaStatus gained voters_outgoing; 4: the owner's Identity gained durability.
 /// 5: Request gained Application, the client's claim before its ordinary request. 6: Request gained
-/// LocalSession, a local read.
-pub(super) const VERSION: u32 = 6;
+/// LocalSession, a local read. 7: Request gained Pull and Answer Pulled, a node's half of a copy
+/// or catch-up batch for another node's new group (CP-T1.9; reshard.md, "Moves across nodes").
+pub(super) const VERSION: u32 = 7;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Hello {
@@ -54,6 +55,9 @@ pub(super) enum Request {
     // Appended: a session read-only on the owner's own state, asking no leader (replication.md,
     // "A local read on a replica").
     LocalSession,
+    // Appended: a node's pull from one of its groups, for a move's new group on another node
+    // (CP-T1.9; reshard.md, "Moves across nodes"), answered by a node endpoint (`Node`).
+    Pull(crate::groups::Pull),
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Record {
@@ -127,5 +131,7 @@ pub(super) enum Answer {
     SqlError(String),
     Capabilities(u64),
     Compaction(amphora_api::CompactionProgress),
+    // Appended: a Pull's answer.
+    Pulled(crate::groups::Pulled),
 }
 pub(super) type Response = Result<Answer, Refusal>;

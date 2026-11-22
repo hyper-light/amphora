@@ -192,6 +192,9 @@ pub struct Resolver<'a> {
     /// costs (`docs/design/planner.md`, decision 5): the connection's, set at prepare; the engine's
     /// default page cache until then.
     cache_pages: usize,
+    /// Amphora (PL.7): the usable bytes of the connection's pages, where its pager knows them; set
+    /// at prepare.
+    page_bytes: Option<usize>,
     /// Amphora (PL.12): the values the estimates may read for the statement's parameters (none for
     /// the generic plan), and where they note that one asked; set at prepare.
     plan_values: Option<Arc<crate::plan_cache::PlanValues>>,
@@ -208,6 +211,9 @@ pub struct Resolver<'a> {
     join_methods: crate::JoinMethods,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
+    /// Amphora: whether the planner may build an automatic index
+    /// (`Connection::set_automatic_indexes`).
+    automatic_indexes: bool,
     /// Amphora: whether a qualifying scan's aggregates run in leaf-page morsels
     /// (`Connection::set_parallel_mode`, QT.6).
     parallel: bool,
@@ -335,12 +341,14 @@ impl<'a> Resolver<'a> {
             dialect,
             trigger_context: None,
             cache_pages: crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES,
+            page_bytes: None,
             plan_values: None,
             statement_memory: 0,
             learned_weights: None,
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
+            automatic_indexes: true,
             parallel: false,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -374,6 +382,16 @@ impl<'a> Resolver<'a> {
     /// Amphora: sets the pages a read finds without reading the file: the connection's.
     pub(crate) fn set_cache_pages(&mut self, pages: usize) {
         self.cache_pages = pages;
+    }
+
+    /// Amphora (PL.7): the usable bytes of the connection's pages, where its pager knows them.
+    pub fn page_bytes(&self) -> Option<usize> {
+        self.page_bytes
+    }
+
+    /// Amphora (PL.7): sets the usable bytes of the connection's pages.
+    pub(crate) fn set_page_bytes(&mut self, bytes: Option<usize>) {
+        self.page_bytes = bytes;
     }
 
     /// Amphora (PL.12): the values the statement's estimates may read, if any were set.
@@ -439,6 +457,14 @@ impl<'a> Resolver<'a> {
         self.sorted_fetches = on;
     }
 
+    pub(crate) fn automatic_indexes(&self) -> bool {
+        self.automatic_indexes
+    }
+
+    pub(crate) fn set_automatic_indexes(&mut self, on: bool) {
+        self.automatic_indexes = on;
+    }
+
     pub(crate) fn parallel(&self) -> bool {
         self.parallel
     }
@@ -469,12 +495,14 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            page_bytes: self.page_bytes,
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
+            automatic_indexes: self.automatic_indexes,
             parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -504,12 +532,14 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            page_bytes: self.page_bytes,
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
+            automatic_indexes: self.automatic_indexes,
             parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
