@@ -183,10 +183,18 @@ pub(crate) struct SearchRate {
 impl SearchRate {
     pub(crate) fn add(&self, stats: JoinSearchStats) {
         let add = |counter: &AtomicU64, value: u64| {
-            if value > 0 {
-                let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                    Some(old.saturating_add(value))
-                });
+            if value == 0 {
+                return;
+            }
+            // A saturating add: the counters are instruments, read alone (`Relaxed`).
+            let mut old = counter.load(Ordering::Relaxed);
+            while let Err(seen) = counter.compare_exchange_weak(
+                old,
+                old.saturating_add(value),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                old = seen;
             }
         };
         add(&self.exact_searches, stats.exact_searches);
