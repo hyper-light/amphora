@@ -379,9 +379,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   N connections run the suite's write classes at once and every committed transaction answers as a
   serial replay in commit order does (`T-G7.5.1`), passing on the pager's storage and the versioned
   one; Elle's list-append and register histories are recorded through SQL and checked (`T-G8.4.1`),
-  clean on the pager's storage. On the versioned storage they show G2: its SQL cursor keeps no reads
-  for the commit's validation, so SQL there is snapshot isolation (that test is ignored until it
-  holds). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the coordinator's.
+  clean on both storages. The versioned storage's SQL cursor keeps the span of keys each move reads
+  for its commit's validation (`Versioned::keep_read`; before, SQL there was snapshot isolation and
+  Elle found G2), refusing write skew and phantoms (`T-G8.4.2`), and reads the budget refused refuse
+  the commit (`T-G8.4.3`). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the
+  coordinator's; the power-cut harness (`T-T1.4.1`).
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
@@ -649,6 +651,22 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   183 and 180 before the refused records given as written. Left: frame EXCLUDE other than NO OTHERS
   on MySQL and ClickHouse (146, no spelling there), conflict clauses other than ABORT, GROUPS frames,
   multi-word type names, RELEASE SAVEPOINT and REINDEX, which sqlglot's SQLite reader refuses.
+  Lane corpus-dialects-3 (`bench/corpus/dialects.py`, `test_dialects.py`): the translator reads what
+  sqlglot's SQLite reader refused, each as SQLite's documentation says it means: n-ary `iif()` and
+  `if()` as CASE, `char()` of nothing as '', a type name of several words (`FLOATING POINT`) and `ANY`
+  as their affinity's name, STRICT left out (every engine types its columns; ANY there is BLOB),
+  SAVEPOINT, RELEASE and REINDEX as commands, a GROUPS frame with no ORDER BY, and a block comment
+  open at the end. Conflict resolutions other than ABORT (on UPDATE and on constraints) and a frame's
+  EXCLUDE CURRENT ROW, GROUP or TIES on MySQL and ClickHouse with no exact rewrite are untranslatable
+  with their reason ("not expressible in <dialect>: ..."), which the oracle reports; count() under
+  those exclusions is said with window arithmetic (checked against DuckDB's EXCLUDE on random rows),
+  and EXCLUDE CURRENT ROW on a ROWS frame that doesn't hold the row is left out. On the gate's pool
+  (26,980 records) the untranslatable records fall from 22, 21, 143 and 140 (DuckDB, PostgreSQL,
+  MySQL, ClickHouse) to 10, 10, 116 and 113: 5 conflict clauses everywhere and 103 exclusions on
+  MySQL and ClickHouse are "not expressible"; 5 still don't parse (WITH ... VALUES, a table
+  PRIMARY KEY with COLLATE or AUTOINCREMENT, two CHECKs without a comma, two upsert clauses), and
+  sqlglot fails on MySQL's NATURAL FULL JOIN (3). Left: refusals compared by kind beside "any error
+  matches" (the coordinator's decision), DuckDB's 6 disagreements and its refused INSERT unclassified.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -936,8 +954,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lane pl8-4 (docs/design/planner.md "Decision (lane pl8-4)"): a hash join's build side can be a
   run of tables joined among themselves while the loops before the probe stay loops; the emitter
   runs such bushy plans and refuses other shapes with a typed error.
-  Not built: the search over connected complement pairs (DPccp) that would choose bushy plans, and
-  semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
+  Lanes pl8-7 to pl8-9 (docs/design/planner.md "Decision (lane pl8-9)"): the search pairs connected
+  subsets with their connected complements (DPccp) and picks the bushy plan where it costs less; a
+  test's data shows it picked and answering as nested loops do (T-PL.8.2).
+  Not built: the search budget derived from a plan-time target, and semi and anti joins placed
+  before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted
