@@ -3030,7 +3030,9 @@ fn compute_left_deep_plan_in_order<'a>(
     }
 
     // Start with first table
-    let first = order[0];
+    let Some(&first) = order.first() else {
+        return Ok(None);
+    };
     let mut best_plan = join_lhs_and_rhs(
         None,
         set_rows,
@@ -3059,8 +3061,7 @@ fn compute_left_deep_plan_in_order<'a>(
     }
 
     // Add remaining tables one at a time from left to right
-    for i in 1..n {
-        let table = order[i];
+    for (i, &table) in order.iter().enumerate().skip(1) {
         best_plan = join_lhs_and_rhs(
             best_plan.as_ref(),
             set_rows,

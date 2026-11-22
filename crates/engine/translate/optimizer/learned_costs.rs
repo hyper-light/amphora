@@ -315,8 +315,11 @@ impl Rate {
     fn spread(&self) -> Option<f64> {
         let batches = &self.batches;
         let spread = (batches.squares / batches.differences).sqrt();
-        (self.rule == WeightRule::BatchMeans && batches.differences >= 1.0 && spread.is_finite())
-            .then_some(spread)
+        if self.rule == WeightRule::BatchMeans && batches.differences >= 1.0 && spread.is_finite() {
+            Some(spread)
+        } else {
+            None
+        }
     }
 
     /// Nanoseconds a unit, None before any time was seen: the standing rate, or before there is
