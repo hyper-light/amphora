@@ -1127,6 +1127,7 @@ mod tests {
             memory: 32 * 1024,
             patience: Duration::from_secs(60),
             check: CheckPolicy::Off,
+            chunks: crate::backup::ChunkGrowth::Keep,
         };
         let (db, _sink) =
             Database::open_backed_up(&dir.path().join("g0.db"), archive, until()).unwrap();
@@ -1188,6 +1189,7 @@ mod tests {
                 memory: 32 * 1024,
                 patience: Duration::from_secs(60),
                 check: CheckPolicy::Off,
+                chunks: crate::backup::ChunkGrowth::Keep,
             };
             let (db, sink) =
                 Database::open_backed_up(&dir.join(format!("g{group}.db")), archive, until())
@@ -1867,6 +1869,7 @@ mod tests {
                 memory: 32 * 1024,
                 patience: Duration::from_secs(60),
                 check: CheckPolicy::Off,
+                chunks: crate::backup::ChunkGrowth::Keep,
             };
             Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
                 .unwrap()
