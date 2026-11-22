@@ -1238,8 +1238,10 @@ impl Database {
     /// namespaces' scans, changes and heads read every group, each revision in the order of its
     /// commit stamp, the hybrid logical clock the cross-group steps carry
     /// (docs/design/reshard.md, "Decision (lane split-merge-18): reads across groups by commit
-    /// stamp"). Every group must be backed up, so that it stamps its commits. The groups' own
-    /// handles are the ones the cluster was opened over, without it.
+    /// stamp"). Its `Records::commit` commits across them through the coordinator, answering the
+    /// transaction's one commit stamp (lane split-merge-22, T-T1.9.R29). Every group must be backed
+    /// up, so that it stamps its commits. The groups' own handles are the ones the cluster was
+    /// opened over, without it.
     #[must_use]
     pub fn across(&self, cluster: Arc<crate::xgroup::sql::Cluster>) -> Self {
         self.across_at(cluster, ReadPoint::Latest)
