@@ -279,6 +279,8 @@ pub struct ProgramBuilder {
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
     write_databases: BitSet,
+    /// Amphora (G5 step 4, T-G5.4.3): the scans that may skip rows by a summary.
+    pub skip_hints: Vec<crate::skipping::SkipHint>,
     /// Set of attached database IDs that need read transactions.
     read_databases: BitSet,
     /// Schema cookies for attached databases at prepare time.
@@ -769,6 +771,7 @@ impl ProgramBuilder {
             mvcc_enabled: false,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
+            skip_hints: Vec::new(),
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
@@ -1991,6 +1994,12 @@ impl ProgramBuilder {
                     resolve(deferred_target_pc, "HashProbe")?;
                 }
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
+                Insn::JoinSwitchStep { data } => {
+                    resolve(&mut data.build_pc, "JoinSwitchStep")?;
+                    resolve(&mut data.probe_pc, "JoinSwitchStep")?;
+                }
+                Insn::JoinSwitchHash { target_pc, .. } => resolve(target_pc, "JoinSwitchHash")?,
+                Insn::JoinSwitchBuilt { data } => resolve(&mut data.target_pc, "JoinSwitchBuilt")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::GroupFind { data } => resolve(&mut data.target_pc_full, "GroupFind")?,
                 Insn::GroupDrain { data } => resolve(&mut data.target_pc_done, "GroupDrain")?,
@@ -2595,6 +2604,7 @@ impl ProgramBuilder {
             resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,
+            skip_hints: self.skip_hints,
             read_databases: self.read_databases,
             leaf_batch_plan: None,
         };

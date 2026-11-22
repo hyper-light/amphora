@@ -779,6 +779,7 @@ impl ActiveOpStateSlot {
         OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             has_dependent_views: false,
+            skip_on: false,
             old_record: None,
             is_noop_update: false,
         }
@@ -962,6 +963,8 @@ pub struct ProgramState {
     pub(crate) row_counts: Vec<u64>,
     /// Amphora (QT.7): this run's column batches (`leaf_batch.rs`).
     pub(crate) leaf_batches: leaf_batch::LeafBatches,
+    /// Amphora (G5 step 4, T-G5.4.3): the scans skipping rows by a summary, a walk a cursor.
+    pub(crate) skip_walks: crate::skipping::SkipWalks,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
@@ -972,6 +975,16 @@ pub struct ProgramState {
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
+    /// Amphora (PL.13): each adaptive join's switch, by switch id; None for one that cannot
+    /// switch (`optimizer::adaptive::JoinSwitch`).
+    join_switches: HashMap<usize, Option<crate::translate::optimizer::adaptive::JoinSwitch>>,
+    /// Amphora (PL.13, the in-run hand-off): this run may still be handed to a second prepare.
+    /// `Statement` opens it as a read-only root statement's run starts and shuts it at the run's
+    /// first row, so a run that has returned a row is never started again.
+    pub(crate) handoff_open: bool,
+    /// Amphora (PL.13): an adaptive join's build counted past its estimate's band while the
+    /// hand-off was open, and stopped the run so `Statement` starts it again on a new plan.
+    pub(crate) handoff_asked: bool,
     /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
     group_tables: HashMap<usize, group_table::GroupTable>,
     /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
@@ -1114,6 +1127,7 @@ impl ProgramState {
             metrics: StatementMetrics::new(),
             row_counts: Vec::new(),
             leaf_batches: leaf_batch::LeafBatches::default(),
+            skip_walks: crate::skipping::SkipWalks::default(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
@@ -1124,6 +1138,9 @@ impl ProgramState {
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
+            join_switches: HashMap::default(),
+            handoff_open: false,
+            handoff_asked: false,
             group_tables: HashMap::default(),
             morsel_rows: None,
             ephemeral_temp_files: HashMap::default(),
@@ -1278,6 +1295,7 @@ impl ProgramState {
             self.row_counts.fill(0);
         }
         self.leaf_batches.clear();
+        self.skip_walks.clear();
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
         self.once.clear();
@@ -1315,6 +1333,11 @@ impl ProgramState {
         if !self.hash_tables.is_empty() {
             self.hash_tables.clear();
         }
+        if !self.join_switches.is_empty() {
+            self.join_switches.clear();
+        }
+        self.handoff_open = false;
+        self.handoff_asked = false;
         if !self.group_tables.is_empty() {
             self.group_tables.clear();
         }
@@ -1701,6 +1724,8 @@ impl ProgramState {
                 }
             }
             EndStatement::RollbackSavepoint => {
+                // Amphora (G5 step 4): a skipping summary that took the undone writes is stale.
+                connection.db.skipping.rolled_back(connection.skipping_id());
                 // Amphora: a statement kept no journal to undo it by: only rolling back the whole
                 // transaction undoes it, so COMMIT must not go through.
                 if self.skipped_subjournal {
@@ -1996,6 +2021,9 @@ pub struct PreparedProgram {
     /// Amphora (query speed step 7, QT.7): the scanned table cursors whose leaves are decoded
     /// into column batches, when the connection's switch was on as the program was built.
     pub leaf_batch_plan: Option<Arc<leaf_batch::BatchPlan>>,
+    /// Amphora (G5 step 4, T-G5.4.3): the scan cursors that may skip rows by a summary, with
+    /// their filters' integer bounds (`skipping/scan.rs`).
+    pub skip_hints: Vec<crate::skipping::SkipHint>,
 }
 
 #[derive(Clone)]
@@ -4525,6 +4553,7 @@ mod tests {
         *state.active_op_state.insert() = OpInsertState {
             sub_state: OpInsertSubState::Seek,
             has_dependent_views: false,
+            skip_on: false,
             old_record: None,
             is_noop_update: false,
         };

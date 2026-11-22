@@ -721,6 +721,8 @@ pub struct Database<
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
+    /// Amphora (G5 step 4): the skipping summaries its connections share (executor.md decision 11).
+    pub(crate) skipping: crate::skipping::SkipRegistry,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
@@ -905,6 +907,7 @@ impl Database {
 
         let db = Database {
             mv_store,
+            skipping: crate::skipping::SkipRegistry::default(),
             allocators,
             path,
             wal_path,
@@ -2819,6 +2822,12 @@ impl Database {
                 crate::connection::JoinMethods::ByCost,
             ),
             sorted_fetches: AtomicBool::new(false),
+            adaptive_joins: AtomicBool::new(false),
+            adaptive_join_switches: AtomicU64::new(0),
+            adaptive_replans: AtomicU64::new(0),
+            adaptive_handoff: AtomicBool::new(true),
+            adaptive_handoffs: AtomicU64::new(0),
+            pinned_cost_weights: crate::sync::RwLock::new(None),
             automatic_indexes: AtomicBool::new(true),
             parallel_mode: AtomicBool::new(false),
             morsel_costs: crate::sync::Mutex::new(None),
@@ -2857,11 +2866,16 @@ impl Database {
     ) -> Result<Option<Arc<crate::storage::versioned::switch::Storage>>> {
         let mut slot = self.versioned.lock();
         if slot.is_none() && ask {
-            *slot = Some(crate::storage::versioned::switch::open(
-                &self.path,
-                self.io.is_memory(),
-                memory,
-            )?);
+            // An IO whose files live in memory keeps the storage beside the file, so a database
+            // reopened on it finds its trees (G7 step 2, `AC-NS.2.1`).
+            let memory_io = self.io.is_memory();
+            let mut make =
+                || crate::storage::versioned::switch::open(&self.path, memory_io, memory.clone());
+            let kept = self.io.versioned_beside(&self.path, &mut make)?;
+            *slot = Some(match kept {
+                Some(storage) => storage,
+                None => make()?,
+            });
         }
         Ok(slot.clone())
     }

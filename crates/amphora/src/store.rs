@@ -48,6 +48,15 @@ pub trait Engine: Send + 'static {
     /// The key a row is of: a read of a key waits for its writes handed over before it.
     fn key(row: &Self::Row) -> &str;
 
+    /// The keys, in bytes, a store in groups routes `row` by, each given to `each` (CP-T1.9;
+    /// docs/design/reshard.md, decision "The routing key is bytes"): every key it reads or writes,
+    /// which must all be in one group, else [`crate::groups::Groups`] refuses it
+    /// ([`Refused::Groups`]). A row with none goes to the group holding position 0. Its key, unless
+    /// the engine says otherwise.
+    fn routes(row: &Self::Row, each: &mut dyn FnMut(&[u8])) {
+        each(Self::key(row).as_bytes());
+    }
+
     /// The rows, in one transaction, committed whole or not at all: how many it wrote. They stay
     /// the store's: a commit that fails is tried again with fewer of them.
     fn apply(&mut self, rows: &[Self::Row]) -> anyhow::Result<usize>;
@@ -129,6 +138,12 @@ pub trait Engine: Send + 'static {
     // of rows, and each [`Engine::keep_holding`], is one entry, numbered from 1 in the order made,
     // and the log's head is the last entry's number. By default an engine keeps none, and a span
     // can't be copied out of it or into it.
+
+    /// The bytes its rows hold now, for the planner's share of size (CP-T1.9; docs/design/reshard.md,
+    /// decision "Load from the store's meter"): none if it can't say.
+    fn bytes(&mut self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
 
     /// The number of the last entry in its log (0: none yet).
     fn head(&mut self) -> anyhow::Result<Seq> {

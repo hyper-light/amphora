@@ -274,6 +274,22 @@ impl Rows {
     }
 
     /// Copies `leaf`'s rows on `after`'s side of the point it was read for, as `snap` sees them.
+    /// Keeps the copied leaf's span of keys, its lower bound to its upper, as read by `txn` for its
+    /// commit's validation (G7 step 2, `AC-NS.2.3`): a superset of the rows and gaps the cursor
+    /// sees in the copy, as PostgreSQL's SSI locks an index page it scanned, so a commit since the
+    /// snapshot that wrote a key in it refuses a transaction that wrote. A reading cursor, or one
+    /// whose transaction has ended, keeps nothing.
+    fn keep_read(&self, db: &Database, txn: Option<&SharedTxn>, tree: u64) -> Result<()> {
+        let Some(txn) = txn else {
+            return Ok(());
+        };
+        let mut txn = txn.lock();
+        let Some(txn) = txn.as_mut() else {
+            return Ok(());
+        };
+        txn.keep_span(&db.v.clock, tree, self.low.as_deref(), self.high.as_deref())
+    }
+
     fn copy(
         &mut self,
         vt: &VTree,
@@ -351,6 +367,17 @@ pub struct VersionedCursor {
     at: At,
     null_flag: bool,
     record: Option<ImmutableRecord>,
+    /// The row incremental blob I/O stands on (`sqlite3_blob_open`), as the handle last saw it.
+    blob: Option<BlobPin>,
+    /// Whether the blob handle's row was written by another cursor or removed: refused for good
+    /// (SQLite's expired handle, `SQLITE_ABORT`).
+    blob_expired: bool,
+}
+
+/// The row a blob handle stands on: its key, and its record as the handle last read or wrote it.
+struct BlobPin {
+    key: Vec<u8>,
+    value: Vec<u8>,
 }
 
 impl VersionedCursor {
@@ -385,6 +412,8 @@ impl VersionedCursor {
             at: At::Nowhere,
             null_flag: false,
             record: None,
+            blob: None,
+            blob_expired: false,
         })
     }
 
@@ -405,6 +434,7 @@ impl VersionedCursor {
             tree,
             order,
             snap,
+            txn,
             d,
             rows,
             ..
@@ -423,6 +453,7 @@ impl VersionedCursor {
                 rows.copy(&vt, db, snap, l, true)
             })?;
             rows.join_chunks(db, d, snap, *tree)?;
+            rows.keep_read(db, txn.as_ref(), *tree)?;
             if !rows.is_empty() {
                 self.at = At::Row(0);
                 return Ok(true);
@@ -450,6 +481,7 @@ impl VersionedCursor {
             tree,
             order,
             snap,
+            txn,
             d,
             rows,
             ..
@@ -472,6 +504,7 @@ impl VersionedCursor {
                     rows.copy(&vt, db, snap, l, false)
                 })?;
                 rows.join_chunks(db, d, snap, *tree)?;
+                rows.keep_read(db, txn.as_ref(), *tree)?;
             }
             if let Some(last) = rows.len().checked_sub(1) {
                 self.at = At::Row(last);
@@ -804,6 +837,144 @@ impl VersionedCursor {
             .map(|(key, value)| if is_index { key } else { value }))
     }
 
+    /// The record of the row a blob handle stands on (G7 step 2, `AC-NS.2.1`): pinned at the
+    /// handle's first access, and refused for good (`BlobHandleExpired`) once the row is gone or
+    /// its record differs from what the handle last saw, so a write to the row by another cursor
+    /// expires the handle while writes to other rows leave it. Only a table's rows.
+    fn blob_row(&mut self) -> Result<&mut BlobPin> {
+        if self.order.index.is_some() {
+            return Err(LimboError::InternalError(
+                "incremental blob I/O is only supported on table rows".into(),
+            ));
+        }
+        if self.blob_expired {
+            return Err(LimboError::BlobHandleExpired);
+        }
+        // Once the transaction the cursor began in has ended (another statement's autocommit),
+        // its snapshot no longer shows the connection's writes: the row is read as committed now.
+        let ended = self.txn.as_ref().is_some_and(|t| t.lock().is_none());
+        if ended {
+            if let Some(pin) = self.blob.as_ref() {
+                let snap = self.db.snapshot()?;
+                let now = self.db.get(&mut self.d, &snap, self.tree, &pin.key);
+                self.db.close_snapshot(snap);
+                if now?.as_deref() == Some(pin.value.as_slice()) {
+                    return self
+                        .blob
+                        .as_mut()
+                        .ok_or_else(|| corrupt("a blob row unpinned"));
+                }
+                self.blob_expired = true;
+                return Err(LimboError::BlobHandleExpired);
+            }
+        }
+        // A copy still current is the row as the handle last saw it; else the row is found
+        // again by its key and its record compared.
+        let unmoved = self.blob.is_some() && matches!(self.at, At::Row(_)) && self.fresh()?;
+        let live = if unmoved {
+            true
+        } else {
+            self.settle()?;
+            let row = match self.at {
+                At::Row(i) => Some(self.rows.row(i)?),
+                _ => None,
+            };
+            match (row, &self.blob) {
+                (None, _) => false,
+                (Some((key, value)), Some(pin)) => key == pin.key && value == pin.value,
+                (Some((key, value)), None) => {
+                    let pin = BlobPin {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                    };
+                    self.blob = Some(pin);
+                    true
+                }
+            }
+        };
+        match self.blob.as_mut() {
+            Some(pin) if live => Ok(pin),
+            _ => {
+                self.blob_expired = true;
+                Err(LimboError::BlobHandleExpired)
+            }
+        }
+    }
+
+    /// Where column `column`'s value lies in the blob row's record, `[start, start + len)`, after
+    /// checking it is TEXT or BLOB and that `[off, off + want)` lies within it.
+    fn blob_span(&mut self, column: usize, off: usize, want: usize) -> Result<(usize, usize)> {
+        let record = self.blob_row()?.value.as_slice();
+        let (header, hpos0) = crate::storage::sqlite3_ondisk::read_varint(record)?;
+        let header = usize::try_from(header)
+            .ok()
+            .and_then(|h| record.get(..h))
+            .ok_or_else(|| corrupt("a record whose header runs past its end"))?;
+        let (start, len, serial) = crate::storage::btree::blob_locate_column_in_header(
+            header,
+            hpos0,
+            record.len(),
+            column,
+        )?;
+        crate::storage::btree::blob_text_or_blob(serial)?;
+        if off.saturating_add(want) > len {
+            return Err(LimboError::InternalError(
+                "blob access past end of column value".into(),
+            ));
+        }
+        Ok((start, len))
+    }
+
+    fn blob_read(
+        &mut self,
+        column: usize,
+        off: usize,
+        len: usize,
+        out: &mut crate::ValueBlob,
+    ) -> Result<()> {
+        let (start, _) = self.blob_span(column, off, len)?;
+        let from = start.checked_add(off).ok_or(LimboError::IntegerOverflow)?;
+        let to = from.checked_add(len).ok_or(LimboError::IntegerOverflow)?;
+        let bytes = self
+            .blob
+            .as_ref()
+            .and_then(|pin| pin.value.get(from..to))
+            .ok_or_else(|| corrupt("a blob's range past its record"))?;
+        out.clear();
+        out.try_reserve(len)
+            .map_err(|_| LimboError::InternalError("no memory for a blob's read".into()))?;
+        out.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Writes `data` at `off` in column `column`'s value: the row's record again, its size kept,
+    /// as a new version of the row in the cursor's transaction.
+    fn blob_write(&mut self, column: usize, off: usize, data: &[u8]) -> Result<()> {
+        let (start, _) = self.blob_span(column, off, data.len())?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let from = start.checked_add(off).ok_or(LimboError::IntegerOverflow)?;
+        let to = from
+            .checked_add(data.len())
+            .ok_or(LimboError::IntegerOverflow)?;
+        let (key, value) = {
+            let pin = self
+                .blob
+                .as_mut()
+                .ok_or_else(|| corrupt("a blob row unpinned"))?;
+            pin.value
+                .get_mut(from..to)
+                .ok_or_else(|| corrupt("a blob's range past its record"))?
+                .copy_from_slice(data);
+            (pin.key.clone(), pin.value.clone())
+        };
+        self.record_stale();
+        self.put(&key, &value)?;
+        self.at = At::Put(key);
+        Ok(())
+    }
+
     fn record_now(&mut self) -> Result<Option<&ImmutableRecord>> {
         if self.null_flag {
             return Ok(None);
@@ -834,6 +1005,24 @@ fn done<T>(r: Result<T>) -> IOResultOr<T> {
 }
 
 impl CursorTrait for VersionedCursor {
+    fn blob_read_column(
+        &mut self,
+        column: usize,
+        off: usize,
+        len: usize,
+        out: &mut crate::ValueBlob,
+    ) -> IOResultOr<()> {
+        done(self.blob_read(column, off, len, out))
+    }
+
+    fn blob_write_column(&mut self, column: usize, off: usize, data: &[u8]) -> IOResultOr<()> {
+        done(self.blob_write(column, off, data))
+    }
+
+    fn blob_column_len(&mut self, column: usize) -> IOResultOr<usize> {
+        done(self.blob_span(column, 0, 0).map(|(_, len)| len))
+    }
+
     fn last(&mut self) -> IOResultOr<()> {
         done(
             self.place(&Point::Last, SeekOp::LE { eq_only: false })

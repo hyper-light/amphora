@@ -115,6 +115,8 @@ mod amphora_target {
         params: Vec<Vec<P>>,
     }
 
+    const HOLDING_TABLE: &str = "CREATE TABLE IF NOT EXISTS __suite_holding(one INTEGER PRIMARY KEY, holding BLOB NOT NULL)";
+
     pub struct SqlEngine {
         db: Db,
         reader_pages: Option<i64>,
@@ -184,6 +186,28 @@ mod amphora_target {
 
         fn flusher(&self) -> Option<Flush> {
             Some(self.db.flusher())
+        }
+
+        // The suite's one group keeps its holding with its rows, durable, as Amphora's own engine
+        // does (CP-T1.9, docs/design/reshard.md, "A group's holding"): `Groups::start` asks for it.
+        fn holding(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+            self.db.exec(HOLDING_TABLE)?;
+            let mut kept = None;
+            self.db.query("SELECT holding FROM __suite_holding WHERE one = 0", [], |r| {
+                kept = r.get_value(0).to_blob().map(<[u8]>::to_vec);
+                Ok(false)
+            })?;
+            Ok(kept)
+        }
+
+        fn keep_holding(&mut self, holding: &[u8]) -> anyhow::Result<()> {
+            let bytes = Value::from_slice(holding).map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.db.transaction(|db| {
+                db.exec(HOLDING_TABLE)?;
+                db.query("INSERT INTO __suite_holding(one, holding) VALUES (0, ?1) ON CONFLICT(one) DO UPDATE SET holding = excluded.holding", [bytes], |_| Ok(true))
+            })?;
+            (self.db.flusher())()?;
+            Ok(())
         }
 
         fn opener(&self) -> Option<Opener<Db>> {
