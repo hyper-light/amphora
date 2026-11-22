@@ -523,6 +523,22 @@ impl<T> Held<T> {
     }
 }
 
+/// `read` of `family`'s changes through `cut`, unless a write lock anywhere in the family holds a
+/// stamp at or before it (lane split-merge-21, T-T1.9.R28): the transaction's rows may land at or
+/// before the cut, behind a cursor a reader would then have passed.
+fn held_whole<T>(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    cut: u64,
+    read: impl FnOnce(&Db) -> anyhow::Result<Result<T, Refusal>>,
+) -> anyhow::Result<Result<Held<T>, Refusal>> {
+    if crate::xgroup::sql::held_at(db, ns, family, &[], None, cut)? {
+        return Ok(Ok(Held::Locked));
+    }
+    Ok(read(db)?.map(Held::Read))
+}
+
 /// Reads `read` in `group` as of a stamp, waiting out each lock in its way (lane split-merge-21,
 /// T-T1.9.R28): no read across groups answers part of a transaction, its rows resolved in one
 /// group and not yet in another. It waits on the event, never a timer: a waker registered in the
@@ -633,7 +649,7 @@ fn changes_in(
     cut: u64,
     limit: usize,
 ) -> anyhow::Result<Result<(Vec<Change>, bool), Refusal>> {
-    let (from, to) = (through(db, ns, after)?, through(db, ns, cut)?);
+    let from = through(db, ns, after)?;
     if let Some(refusal) = compacted(db, ns, after, from)? {
         return Ok(Err(refusal));
     }
@@ -642,23 +658,28 @@ fn changes_in(
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("limit overflow"))?,
     )?;
-    // This group's own versions, by revision; a version moved in is placed by its own stamp, below.
-    let mut own: Vec<(Rev, u64, Change)> = Vec::new();
+    // This group's own versions, by their revisions' stamps, not by revision (lane
+    // split-merge-21, T-T1.9.R28): a revision resolving a transaction across groups carries its
+    // coordinator's stamp, which can be older than revisions before it here. One made before the
+    // group stamped has none, and is before every stamped one, as `through` places it. A version
+    // moved in is placed by its own stamp, below.
+    let mut found: Vec<(u64, u64, Change)> = Vec::new();
     db.query(
-        "SELECT v.rev, v.key, v.value, v.seq FROM __amphora_versions v LEFT JOIN __amphora_moved_stamps m ON m.namespace = v.namespace AND m.family = v.family AND m.key = v.key AND m.rev = v.rev WHERE v.namespace = ?1 AND v.family = ?2 AND v.rev > ?3 AND v.rev <= ?4 AND m.rev IS NULL ORDER BY v.rev, v.seq LIMIT ?5",
+        "SELECT s.stamp, v.key, v.value, v.seq FROM __amphora_versions v JOIN __amphora_rev_stamps s ON s.namespace = v.namespace AND s.rev = v.rev LEFT JOIN __amphora_moved_stamps m ON m.namespace = v.namespace AND m.family = v.family AND m.key = v.key AND m.rev = v.rev WHERE v.namespace = ?1 AND v.family = ?2 AND s.stamp > ?3 AND s.stamp <= ?4 AND m.rev IS NULL ORDER BY s.stamp, v.seq LIMIT ?5",
         [
             text(ns),
             text(family),
-            integer(from)?,
-            integer(to)?,
+            integer(after)?,
+            integer(cut)?,
             take.clone(),
         ],
         |r| {
-            own.push((
-                rev(r, 0)?,
+            let stamp = rev(r, 0)?;
+            found.push((
+                stamp,
                 rev(r, 3)?,
                 Change {
-                    rev: rev(r, 0)?,
+                    rev: stamp,
                     key: bytes(r, 1)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
                     value: bytes(r, 2)?,
                 },
@@ -666,23 +687,8 @@ fn changes_in(
             Ok(true)
         },
     )?;
-    let own_more = own.len() > limit;
-    let mut found: Vec<(u64, u64, Change)> = Vec::with_capacity(own.len());
-    let mut last = None;
-    for (at, seq, mut change) in own {
-        if last.is_none_or(|(r, _)| r != at) {
-            let Some(stamp) = stamp_of(db, ns, at)? else {
-                return Ok(Err(Refusal::Unavailable(format!(
-                    "revision {at} has no commit stamp (made before its group stamped its commits): the order across groups doesn't place it"
-                ))));
-            };
-            last = Some((at, stamp));
-        }
-        if let Some((_, stamp)) = last {
-            change.rev = stamp;
-            found.push((stamp, seq, change));
-        }
-    }
+    let own_more = found.len() > limit;
+    let last = found.last().map(|(stamp, _, _)| *stamp);
     // The versions moved in, by the stamps they carried; one whose sender carried none has no
     // place in the order, so the read is refused rather than answered without it.
     if let Some(refusal) = unstamped(db, ns, family)? {
@@ -729,7 +735,7 @@ fn changes_in(
     // Each side that had more bounds the answer at its last stamp read, so neither's next is
     // passed.
     let mut bound = cut;
-    if own_more && let Some((_, stamp)) = last {
+    if own_more && let Some(stamp) = last {
         bound = bound.min(stamp);
     }
     if moved_more && let Some(stamp) = moved_last {
@@ -802,33 +808,24 @@ fn newest_in(
     after: u64,
     cut: u64,
 ) -> anyhow::Result<Result<Option<u64>, Refusal>> {
-    let (from, to) = (through(db, ns, after)?, through(db, ns, cut)?);
+    let from = through(db, ns, after)?;
     if let Some(refusal) = compacted(db, ns, after, from)? {
         return Ok(Err(refusal));
     }
     if let Some(refusal) = unstamped(db, ns, family)? {
         return Ok(Err(refusal));
     }
+    // The newest own version's stamp in the range, by stamp, as `changes_in` places them; 0 is
+    // none (every stamp in the range is past `after`).
     let mut own = None;
     db.query(
-        "SELECT v.rev FROM __amphora_versions v LEFT JOIN __amphora_moved_stamps m ON m.namespace = v.namespace AND m.family = v.family AND m.key = v.key AND m.rev = v.rev WHERE v.namespace = ?1 AND v.family = ?2 AND v.rev > ?3 AND v.rev <= ?4 AND m.rev IS NULL ORDER BY v.rev DESC LIMIT 1",
-        [text(ns), text(family), integer(from)?, integer(to)?],
+        "SELECT COALESCE(MAX(s.stamp), 0) FROM __amphora_versions v JOIN __amphora_rev_stamps s ON s.namespace = v.namespace AND s.rev = v.rev LEFT JOIN __amphora_moved_stamps m ON m.namespace = v.namespace AND m.family = v.family AND m.key = v.key AND m.rev = v.rev WHERE v.namespace = ?1 AND v.family = ?2 AND s.stamp > ?3 AND s.stamp <= ?4 AND m.rev IS NULL",
+        [text(ns), text(family), integer(after)?, integer(cut)?],
         |r| {
-            own = Some(rev(r, 0)?);
+            own = Some(rev(r, 0)?).filter(|&stamp| stamp > 0);
             Ok(false)
         },
     )?;
-    let own = match own {
-        Some(at) => match stamp_of(db, ns, at)? {
-            Some(stamp) => Some(stamp),
-            None => {
-                return Ok(Err(Refusal::Unavailable(format!(
-                    "revision {at} has no commit stamp (made before its group stamped its commits): the order across groups doesn't place it"
-                ))));
-            }
-        },
-        None => None,
-    };
     let mut moved = None;
     db.query(
         "SELECT stamp FROM __amphora_moved_stamps WHERE namespace = ?1 AND family = ?2 AND stamp > ?3 AND stamp <= ?4 ORDER BY stamp DESC LIMIT 1",
@@ -859,8 +856,11 @@ pub(super) fn changed(
     let mut newest = None;
     for (group, _) in &groups {
         let (ns, family) = (ns.to_owned(), family.to_owned());
-        let found =
-            group.call_internal(until, move |db| newest_in(db, &ns, &family, after, cut))??;
+        let found = waiting(group, until, move |db| {
+            held_whole(db, &ns, &family, cut, |db| {
+                newest_in(db, &ns, &family, after, cut)
+            })
+        })?;
         newest = newest.max(found);
     }
     Ok(newest)
@@ -1046,9 +1046,11 @@ pub(super) fn changes(
     let mut bound = cut;
     for (group, _) in &groups {
         let (ns, family) = (ns.to_owned(), family.to_owned());
-        let (found, more) = group.call_internal(until, move |db| {
-            changes_in(db, &ns, &family, after, cut, limit)
-        })??;
+        let (found, more) = waiting(group, until, move |db| {
+            held_whole(db, &ns, &family, cut, |db| {
+                changes_in(db, &ns, &family, after, cut, limit)
+            })
+        })?;
         if more && let Some(last) = found.last() {
             bound = bound.min(last.rev);
         }
@@ -1969,8 +1971,8 @@ mod tests {
     /// before the second group resolves it, which it then does; then a commit of the second
     /// group's own. Expect: the first group answers its row at the commit stamp; the second's read
     /// as of the stamp is held by the lock, and as of the head before answers no row unheld; the
-    /// scan answers both rows, each at the one commit stamp, never one alone; the commit after it
-    /// in the second group is stamped after it.
+    /// scan answers both rows, each at the one commit stamp, never one alone, and so do the
+    /// changes after the head before; the commit after it in the second group is stamped after it.
     #[test]
     fn t_t1_9_r28_no_read_across_groups_sees_half_a_transaction() {
         use crate::xgroup::{Envelope, GroupId, Outcome, Reply, Step, TxnId};
@@ -1987,6 +1989,10 @@ mod tests {
             Arc::new(|_: &[u8]| 0),
         );
         let across = dbs[0]
+            .across_at(Arc::clone(&cluster), ReadPoint::Latest)
+            .namespace("n")
+            .unwrap();
+        let feed = dbs[0]
             .across_at(Arc::clone(&cluster), ReadPoint::Latest)
             .namespace("n")
             .unwrap();
@@ -2078,6 +2084,14 @@ mod tests {
         let page = scanning.join().unwrap().unwrap();
         let rows: Vec<(Vec<u8>, Rev)> = page.rows.iter().map(|r| (r.key.clone(), r.rev)).collect();
         assert_eq!(rows, vec![(key(0), at), (key(1), at)], "{page:?}");
+        let changes = feed.changes("f", before, 10, until()).unwrap();
+        let mut changed: Vec<(Vec<u8>, Rev)> = changes
+            .changes
+            .iter()
+            .map(|c| (c.key.clone(), c.rev))
+            .collect();
+        changed.sort();
+        assert_eq!(changed, rows, "{changes:?}");
 
         put(&dbs[1], vec![1, b'z']);
         let later = dbs[1]

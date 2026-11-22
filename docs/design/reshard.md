@@ -892,8 +892,9 @@ transaction by its own clock as it resolved it.
 - **The clock and its unit.** Microseconds since the Unix epoch, a hybrid logical clock (Kulkarni
   et al., "Logical Physical Clocks", OPODIS 2014): each stamp the later of the clock's reading and
   one past the last stamp made or taken in. A backed-up group's clock is its writer's
-  (`Marks::next_micros`: the backup clock read in microseconds, each stamp spending the rest of its
-  microsecond, so a group's stamps rise strictly and a cut at one is closed); a replicated group's
+  (`Marks::next_micros`: the backup clock read up to the microsecond its reading ends, past every
+  microsecond stamp made or seen, nanosecond ones read so too, so a group's stamps rise strictly
+  and a cut at one is closed); a replicated group's
   is its closed time, the tokens' (lane xgroup-sql-11 reads it for its lock replies). The stamp
   table (`__amphora_rev_stamps`), the cut, a get's fresh stamp, the moved rows' stamps and the
   stamp a coordinator carries between steps (`xgroup::sql::step`, taken in with
@@ -919,18 +920,20 @@ transaction by its own clock as it resolved it.
   waker in the group's publisher, then the read again, and it reads again only once the group's
   count of resolutions moved (`Database::locks_resolved`, after each resolving step, local or served
   over the transport), so other calls' wakes don't send it reading. `Timeout` at the read's deadline.
+- **The change feed** (`changes`, `changed`, so `wait`) takes a group's own versions by their
+  revisions' stamps in the range, not by a range of revisions, and waits as a scan does on a write
+  lock anywhere in the family whose stamp is at or before its cut: otherwise its rows could land
+  later at a stamp behind a cursor the reader has passed.
 
 **Evidence.** Not yet run (kiln was down; nothing compiled). T-T1.9.R28 on two backed-up groups, the
 second's clock 500 seconds behind: a transaction locks a row in each, resolves in the first at the
 latest stamp the groups answered; the first group answers its row at that stamp, the second's read
 as of it is held by the lock, its read as of the head before the locks isn't; a scan across both as
-of the stamp, begun before the second resolves, answers both rows at the one stamp; the second
-group's next commit is stamped after it. On the simulator's group: one transaction's keys carry the
+of the stamp, begun before the second resolves, answers both rows at the one stamp, as do the
+changes after the head before the locks; the second group's next commit is stamped after it. On the simulator's group: one transaction's keys carry the
 one stamp in both groups, each group's next write a later one.
 
-**Left.** The change feed across groups (`changes`, `changed`, `wait`) doesn't wait on held locks
-yet: a feed read through a cut past a lock's stamp can pass the transaction's rows, written later
-at a stamp at or before its cursor. The scan waits on a lock anywhere in its range, not only in
+**Left.** The scan waits on a lock anywhere in its range, not only in
 the page it answers (lane xgroup-sql-11's W10 narrows to the page). The wake is per group, not per
 lock (lane xgroup-sql-11's `WaitOnLock` rings a row's own waiters; once merged, these reads can use
 it). A replicated group's rows are stamped by its writer's backup clock only when it is backed up;

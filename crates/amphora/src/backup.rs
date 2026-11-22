@@ -54,6 +54,12 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// The nanoseconds of a second: what "any second" is counted in (AC-T1.12.1).
 pub const SECOND_NS: u64 = 1_000_000_000;
 
+/// The latest stamp in microseconds `state` has made or seen: its own, or a nanosecond stamp read
+/// up to the microsecond it ends.
+fn latest_micros(state: &MarkState) -> u64 {
+    state.micros.max(state.last.div_ceil(MICRO_NS))
+}
+
 /// The nanoseconds of a microsecond: the cross-group clock's unit, as [`Marks::next_micros`] reads
 /// this one (a unit, not a tuned number).
 pub const MICRO_NS: u64 = 1_000;
@@ -232,15 +238,20 @@ impl Marks {
     /// held-back count stays the clock's own steps back).
     pub fn next_micros(&self) -> anyhow::Result<u64> {
         let mut state = self.state()?;
-        let micros = (self.stamp(&mut state) / MICRO_NS).max(state.micros.saturating_add(1));
+        let before = latest_micros(&state);
+        let micros = self
+            .stamp(&mut state)
+            .div_ceil(MICRO_NS)
+            .max(before.saturating_add(1));
         state.micros = micros;
         Ok(micros)
     }
 
-    /// [`Marks::latest`] in microseconds, as [`Marks::next_micros`] reads it.
+    /// The latest stamp in microseconds made or seen here, the backup's nanosecond stamps among
+    /// them (so a step's carried stamp covers its commit, T-T1.12.X2): every one
+    /// [`Marks::next_micros`] makes from now on is later.
     pub fn latest_micros(&self) -> anyhow::Result<u64> {
-        let state = self.state()?;
-        Ok(state.micros.max(state.last / MICRO_NS))
+        Ok(latest_micros(&*self.state()?))
     }
 
     /// [`Marks::observe`] of a stamp in microseconds: every stamp here from now on, in either
@@ -248,10 +259,7 @@ impl Marks {
     pub fn observe_micros(&self, micros: u64) -> anyhow::Result<()> {
         let mut state = self.state()?;
         state.micros = state.micros.max(micros);
-        let through = micros
-            .saturating_mul(MICRO_NS)
-            .saturating_add(MICRO_NS.saturating_sub(1));
-        state.last = state.last.max(through);
+        state.last = state.last.max(micros.saturating_mul(MICRO_NS));
         Ok(())
     }
 
@@ -441,14 +449,14 @@ mod tests {
         let hooks = Hooks::new(clock, 100);
         let first = hooks.marks.next_micros().unwrap();
         let second = hooks.marks.next_micros().unwrap();
-        assert_eq!(first, 10 * SECOND_NS / MICRO_NS);
+        assert_eq!(first, 10 * SECOND_NS / MICRO_NS + 1);
         assert!(second > first, "{second} after {first}");
         let ahead = first + SECOND_NS / MICRO_NS;
         hooks.marks.observe_micros(ahead).unwrap();
         let third = hooks.marks.next_micros().unwrap();
         assert!(third > ahead, "{third} after {ahead}");
         assert!(hooks.marks.latest_micros().unwrap() >= third);
-        assert!(hooks.marks.next().unwrap() > ahead * MICRO_NS + MICRO_NS - 1);
+        assert!(hooks.marks.next().unwrap() > ahead * MICRO_NS);
     }
 
     /// T-T1.12.P1: commits within a second keep one mark, its last; a new second a new mark.
