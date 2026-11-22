@@ -446,3 +446,51 @@ fn t_t1_13_1_a_refused_log_write_ends_the_replica_and_wakes_its_drain() {
         "the replica's status after the refused write: {ended:?}"
     );
 }
+
+/// A hung disk waits with no time limit, so only a drill cluster may ask for one (CP-T1.13,
+/// T-T1.13.1): a member whose config says `drills = off` refuses `disk` (and `cut`), naming the
+/// switch, and its log's disk is untouched: its writes go on.
+#[test]
+fn t_t1_13_1_a_member_without_drills_refuses_the_disk_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret");
+    std::fs::write(&secret, "0123456789abcdef0123456789abcdef-test-secret\n").unwrap();
+    let text = format!(
+        "node = 1\nmembers = 1@127.0.0.1:{}\ndata = {}\nclass = persisted\nsecret_file = {}\ndeadline_ms = 5000\ndrills = off\n",
+        free_port(),
+        dir.path().join("m1").display(),
+        secret.display()
+    );
+    let c = Config::parse(&text).unwrap();
+    assert!(!c.drills);
+    let (up, listening) = std::sync::mpsc::channel();
+    {
+        let c = c.clone();
+        std::thread::spawn(move || {
+            let ended = serve::serve(&c, move |_| {
+                let _ = up.send(());
+            });
+            eprintln!("member 1 ended: {ended:?}");
+        });
+    }
+    listening.recv().unwrap();
+    let secret = c.secret().unwrap();
+    let mut member = Client::connect(&c.members[0].addr, &secret, c.deadline).unwrap();
+    member.leader(Duration::from_secs(60)).unwrap();
+    for request in ["disk hang", "disk cut", "disk back", "cut on"] {
+        let refused = member
+            .ask(request)
+            .expect_err("a member without drills took a drill's request");
+        assert!(
+            format!("{refused:#}").contains("drills are off"),
+            "{request}: {refused:#}"
+        );
+    }
+    member
+        .ask("exec CREATE TABLE t(v INTEGER); INSERT INTO t VALUES(1)")
+        .unwrap();
+    assert_eq!(
+        member.ask("count SELECT count(*) FROM t").unwrap().trim(),
+        "1"
+    );
+}
