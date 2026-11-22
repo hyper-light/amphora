@@ -374,6 +374,41 @@ class MissingTables(unittest.TestCase):
         self.assertIsNone(out[3][1])
 
 
+class Collations(unittest.TestCase):
+    """Do: SQLite's BINARY, NOCASE and RTRIM on a column and on an expression. Expect: DuckDB's
+    "binary" and "nocase", PostgreSQL's "C", ClickHouse's bytes (the clause left out), MySQL's
+    as before; RTRIM everywhere but MySQL, and NOCASE on PostgreSQL and ClickHouse, not
+    expressible; on DuckDB, a comparison's operands both of the explicit collation SQLite picks (the
+    left's first), and (when its Python module is here) BINARY orders and compares as SQLite does."""
+
+    def test_each_dialect(self):
+        sql = "CREATE TABLE r(b TEXT COLLATE BINARY, n TEXT COLLATE NOCASE)"
+        self.assertEqual(dialects.translate(sql, "duckdb")[0], 'CREATE TABLE r (b TEXT COLLATE "binary", n TEXT COLLATE "nocase")')
+        self.assertEqual(dialects.translate("SELECT b FROM r ORDER BY b COLLATE BINARY", "postgres")[0], 'SELECT b FROM r ORDER BY b COLLATE "C" NULLS FIRST')
+        self.assertEqual(dialects.translate("CREATE TABLE r(b TEXT COLLATE BINARY)", "clickhouse")[0], "CREATE TABLE r (b Nullable(String))")
+        self.assertIn("COLLATE utf8mb4_0900_as_ci", dialects.translate(sql, "mysql")[0])
+        for d, word in (("duckdb", "RTRIM"), ("postgres", "RTRIM"), ("clickhouse", "RTRIM"), ("postgres", "NOCASE"), ("clickhouse", "NOCASE")):
+            with self.subTest(dialect=d, collation=word):
+                self.assertIn(f"not expressible in {d}: SQLite's collation {word}", dialects.translate(f"SELECT 'a' COLLATE {word} = 'a '", d)[1])
+        self.assertIsNone(dialects.translate("SELECT 'a' COLLATE RTRIM = 'a '", "mysql")[1])
+        self.assertEqual(dialects.translate("SELECT b COLLATE NOCASE = n COLLATE BINARY, b = 'a' COLLATE BINARY FROM r", "duckdb")[0], 'SELECT b COLLATE "nocase" = n COLLATE "nocase", b COLLATE "binary" = \'a\' COLLATE "binary" FROM r')
+
+    def test_binary_orders_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        s, d = sqlite3.connect(":memory:"), duckdb.connect()
+        for q in ["CREATE TABLE r(b TEXT COLLATE NOCASE)", "INSERT INTO r VALUES ('a'), ('B'), ('A')"]:
+            s.execute(q)
+            d.execute(dialects.translate(q, "duckdb")[0])
+        for q in ["SELECT b FROM r ORDER BY b COLLATE BINARY", "SELECT b = 'a' COLLATE BINARY FROM r ORDER BY b COLLATE BINARY"]:
+            with self.subTest(sql=q):
+                self.assertEqual([tuple(x) for x in d.execute(dialects.translate(q, "duckdb")[0]).fetchall()], [tuple(int(v) if isinstance(v, bool) else v for v in x) for x in s.execute(q).fetchall()])
+
+
 class LeftOutColumns(unittest.TestCase):
     """Do: a table with typed columns and one without a type that holds values of several storage
     classes (the written files' shared t1), then inserts with and without a column list, an

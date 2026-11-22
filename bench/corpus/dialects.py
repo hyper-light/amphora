@@ -1267,7 +1267,7 @@ def spoken(expression, dialect):
       and converts it to the byte represented by the number") gives the bytes as a String, the type a
       BLOB column is there.
     - a collation SQLite names (NOCASE, RTRIM, BINARY) is MySQL's that compares the same
-      (MYSQL_COLLATIONS).
+      (MYSQL_COLLATIONS), and the other engines' that does (OTHER_COLLATIONS), or not expressible.
     - a window frame's EXCLUDE NO OTHERS, its default, is left out; its other exclusions, which
       MySQL and ClickHouse don't have, are said as excluded() says them, or the record is not
       expressible there (NotExpressible)."""
@@ -1324,7 +1324,55 @@ def spoken(expression, dialect):
             mysql = MYSQL_COLLATIONS.get(name.name.upper()) if isinstance(name, (exp.Var, exp.Column, exp.Identifier)) else None
             if mysql:
                 node.set(arg, exp.Var(this=mysql))
+    else:
+        for node, arg in [(c, "expression") for c in expression.find_all(exp.Collate)] + [(c, "this") for c in expression.find_all(exp.CollateColumnConstraint)]:
+            name = node.args.get(arg)
+            said = name.name.upper() if isinstance(name, (exp.Var, exp.Column, exp.Identifier)) else None
+            if said not in ("BINARY", "NOCASE", "RTRIM"):
+                continue
+            to = OTHER_COLLATIONS[dialect].get(said)
+            if to is None:
+                raise NotExpressible(f"not expressible in {dialect}: SQLite's collation {said} (https://www.sqlite.org/datatype3.html#collating_sequences), which {dialect} has none like")
+            if to == "":
+                (node.pop() if isinstance(node, exp.CollateColumnConstraint) else node.replace(node.this.copy()))
+            else:
+                node.set(arg, exp.Identifier(this=to, quoted=True))
+        if dialect == "duckdb":
+            # SQLite: "If either operand has an explicit collating function assignment using the
+            # postfix COLLATE operator, then the explicit collating function is used for comparison,
+            # with precedence to the collating function of the left operand" (datatype3.html 7.1).
+            # DuckDB refuses operands of different collations ("Cannot combine types with different
+            # collation"): the other operand is given the same explicit collation.
+            def explicit(e):
+                while isinstance(e, exp.Paren):
+                    e = e.this
+                return e.expression if isinstance(e, exp.Collate) else None
+
+            for node in list(expression.find_all(exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ)):
+                left, right = explicit(node.this), explicit(node.expression)
+                pick = left or right
+                if pick is None:
+                    continue
+                for arg, own in (("this", left), ("expression", right)):
+                    if own is None or own.sql() != pick.sql():
+                        side = node.args[arg]
+                        inner = side
+                        while isinstance(inner, exp.Paren):
+                            inner = inner.this
+                        node.set(arg, exp.Collate(this=(inner.this if isinstance(inner, exp.Collate) else side).copy(), expression=pick.copy()))
     return expression
+
+
+# SQLite's built-in collations (datatype3.html#collating_sequences) on the other engines, where one
+# compares the same: DuckDB's "binary" (its collation list, PRAGMA collations) and "nocase" (its
+# "Collations" page: "NOCASE ... case-insensitive"); PostgreSQL's "C" ("Collation Support",
+# 23.2.2.1: "C ... sorts by byte values"); ClickHouse's String compares bytes and takes no
+# collation on a column ("" leaves it out). RTRIM ("the same as binary, except that trailing space
+# characters are ignored") has no like on any of them, nor NOCASE on PostgreSQL (its case-insensitive
+# collations are ICU's, which fold every letter, and LIKE refuses them) or ClickHouse: not expressible.
+# DuckDB's nocase folds letters beyond ASCII too, where SQLite's folds ASCII's only: as it was
+# before this map, a difference for text beyond ASCII, which the written files' cases don't hold.
+OTHER_COLLATIONS = {"duckdb": {"BINARY": "binary", "NOCASE": "nocase"}, "postgres": {"BINARY": "C"}, "clickhouse": {"BINARY": ""}}
 
 
 # Clauses SQLite reads that state what every engine the corpus compares does unasked, so the record
