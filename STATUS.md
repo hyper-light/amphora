@@ -731,6 +731,28 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   `WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT max(n) + 1 FROM c WHERE n < 3) SELECT * FROM c`, a
   `statement error` SQLite refuses (an aggregate in a recursive select) that DuckDB runs forever: the
   harness's own per-record bound covers it. Left: datetime() and the other date functions, JSON, PRAGMAs.
+  Lane corpus-dialects-11 (`bench/corpus/dialects.py`, `test_dialects.py`): integer columns are each
+  engine's 64-bit integer (BIGINT, ClickHouse's Int64), as SQLite's INTEGER is whatever the type's name;
+  sqlglot wrote INT, SMALLINT and TINYINT as 32, 16 and 8 bits. SQLite's date and time functions (date(),
+  time(), datetime(), julianday(), unixepoch(), strftime()) of a literal time value are DuckDB's
+  strftime() and epoch_ms() and PostgreSQL's to_char() and extract(epoch) of a TIMESTAMP literal of the
+  moment SQLite reads (Python's SQLite reads the literal, in all its forms), with whole-unit additions,
+  'start of', 'subsec', and months while the day is 28 or less; 'now', 'localtime', 'utc', 'weekday N',
+  a month past the 28th, fractional amounts, the strftime() substitutions no engine writes alike,
+  timediff() and a value read as it runs are not expressible, each with SQLite's doc reference, and
+  MySQL's and ClickHouse's are not written yet (not expressible there, saying so). SQLite's JSON
+  functions and operators, PRAGMAs and pragma_ table functions are not expressible (json1.html,
+  pragma.html), but json_array() and json_object() of integers and json_array_length() of RFC 8259 JSON
+  on DuckDB; so are typeof() and quote() of a value whose storage class only running it shows, which
+  now includes a declared column written a value its affinity doesn't convert (an INTEGER column keeps
+  1.5 a REAL). CAST to BLOB is a BLOB, an integer's through its text, a text's encode() on DuckDB.
+  Untranslatable on the gate's pool: 1,043, 1,184, 1,306, 1,456 (DuckDB, PostgreSQL, MySQL,
+  ClickHouse), from 267, 406, 338, 507; most of the rise is JSON (about 300 each), PRAGMAs (about 150),
+  typeof() and quote() (about 85), and on MySQL and ClickHouse the date functions (262). The local
+  check (as lane 10's): of 3,545 queries 1,239 answered differently before and 488 now, none newly; 855
+  are untranslatable with their reasons (668 more), so 83 more give SQLite's answer. Left: date
+  functions on MySQL and ClickHouse, the rest of JSON, SQLite's CAST of text to an integer (its leading
+  digits, where DuckDB rounds '1.5' and refuses 'abc'), INDEXED BY and NOT INDEXED.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
