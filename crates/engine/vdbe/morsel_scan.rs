@@ -1587,17 +1587,11 @@ impl Pipeline for TableOuterJoin<'_> {
     fn merge(
         &self,
         into: &mut Self::Partial,
-        from: Self::Partial,
+        mut from: Self::Partial,
         budget: &MemoryBudget,
     ) -> Result<(), MorselError> {
         // The matched-row bitmaps merge by OR: a build row matched when any worker matched it.
-        if into.matched.len() < from.matched.len() {
-            into.matched.try_reserve_exact(from.matched.len())?;
-            into.matched.resize(from.matched.len(), 0);
-        }
-        for (word, other) in into.matched.iter_mut().zip(&from.matched) {
-            *word |= *other;
-        }
+        or_marks(&mut into.matched, std::mem::take(&mut from.matched));
         self.merge_into(into, from, budget)
     }
 }
@@ -1905,13 +1899,7 @@ impl<'a> TableChain<'a> {
                 matched: marks,
                 ..
             } = partial;
-            if matched.len() < marks.len() {
-                matched.try_reserve_exact(marks.len().saturating_sub(matched.len()))?;
-                matched.resize(marks.len(), Vec::new());
-            }
-            for (into, other) in matched.iter_mut().zip(marks) {
-                or_into(into, &other)?;
-            }
+            or_link_marks(&mut matched, marks);
             self.body.shape.merge(&mut aggregate, more, budget)?;
             runs.try_reserve(rows.len())?;
             runs.extend(rows.into_iter().map(|(first, run)| (phase, first, run)));
@@ -1937,16 +1925,27 @@ impl<'a> TableChain<'a> {
     }
 }
 
-/// ORs one matched-row bitmap into another.
-fn or_into(into: &mut Vec<u64>, from: &[u64]) -> Result<(), MorselError> {
+/// ORs one matched-row bitmap into another (lane qs6-15). The longer of the two is kept and the
+/// shorter ORed into it, so a merge allocates nothing: the bitmaps held are only the workers' own,
+/// each charged to the statement's budget when the worker sized it. (A merge into the run's empty
+/// partial used to allocate a copy of the first worker's bitmap that no budget saw.)
+fn or_marks(into: &mut Vec<u64>, mut from: Vec<u64>) {
     if into.len() < from.len() {
-        into.try_reserve_exact(from.len().saturating_sub(into.len()))?;
-        into.resize(from.len(), 0);
+        std::mem::swap(into, &mut from);
     }
-    for (word, other) in into.iter_mut().zip(from) {
+    for (word, other) in into.iter_mut().zip(&from) {
         *word |= *other;
     }
-    Ok(())
+}
+
+/// [`or_marks`] for a chain's bitmaps, one per link (lane qs6-15).
+fn or_link_marks(into: &mut Vec<Vec<u64>>, mut from: Vec<Vec<u64>>) {
+    if into.len() < from.len() {
+        std::mem::swap(into, &mut from);
+    }
+    for (marks, other) in into.iter_mut().zip(from) {
+        or_marks(marks, other);
+    }
 }
 
 /// One phase of a [`TableChain`] (lane qs6-14): the probe's leaves (`from` none), or the build
@@ -2092,17 +2091,10 @@ impl Pipeline for ChainPhase<'_> {
     fn merge(
         &self,
         into: &mut Self::Partial,
-        from: Self::Partial,
+        mut from: Self::Partial,
         budget: &MemoryBudget,
     ) -> Result<(), MorselError> {
-        if into.matched.len() < from.matched.len() {
-            into.matched
-                .try_reserve_exact(from.matched.len().saturating_sub(into.matched.len()))?;
-            into.matched.resize(from.matched.len(), Vec::new());
-        }
-        for (marks, other) in into.matched.iter_mut().zip(&from.matched) {
-            or_into(marks, other)?;
-        }
+        or_link_marks(&mut into.matched, std::mem::take(&mut from.matched));
         self.chain
             .body
             .shape
