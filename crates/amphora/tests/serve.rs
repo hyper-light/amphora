@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 use amphora::serve::{self, Client, Config};
 
+/// One test's members at a time: one process's opens take turns under its owner table, so two
+/// tests' members opening together would spend each other's deadlines.
+static ONE_CLUSTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -51,6 +55,9 @@ fn healthy(c: &Config) -> String {
 
 #[test]
 fn t_t1_13_1_three_members_elect_refuse_strangers_and_lose_nothing_split() {
+    let _one = ONE_CLUSTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let configs = three(dir.path());
     let (tx, rx) = std::sync::mpsc::channel();
@@ -116,6 +123,9 @@ fn t_t1_13_1_three_members_elect_refuse_strangers_and_lose_nothing_split() {
 /// two left keep the majority. The cluster the config then names is healthy and holds every write.
 #[test]
 fn t_t1_13_1_a_region_lost_is_replaced_by_a_spare() {
+    let _one = ONE_CLUSTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let secret = dir.path().join("secret");
     std::fs::write(
