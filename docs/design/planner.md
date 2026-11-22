@@ -1769,7 +1769,9 @@ searches.
 
 **Not yet built.** The last strong reference to a connection the worker upgraded can drop on the
 worker's thread (its statement and connection closed mid-search), so the connection's close then
-runs there.
+runs there; `Connection` is `Send`, so that is allowed, but the close's work lands on the planner's
+thread. A write whose SELECT the greedy search orders is planned in full at prepare, so it never
+has a fast plan.
 
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
