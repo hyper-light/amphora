@@ -86,9 +86,44 @@ struct Entry {
     counts: SkipCounts,
 }
 
+/// How a skipping build on the versioned storage meets writers open on its table (G7 step 2,
+/// `AC-NS.2.1`), chosen by `AMPHORA_SKIP_BUILD` (`stale`, the control, unless `wait`) for the A/B
+/// of record: each has a failure mode its test forces (`skipping/tests.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildPolicy {
+    /// Build at once; a build that missed an open writer's rows goes in stale, and every scan of
+    /// the table reads all its rows until it is built again.
+    Stale,
+    /// Wait for the table's open writers to end (woken by the last one's end), then build; built
+    /// again, after another wait, if a writer slipped in beside the build. Blocked as long as
+    /// writers keep the table open.
+    Wait,
+}
+
+impl BuildPolicy {
+    /// The environment variable that chooses: `wait`, else stale.
+    pub const ENV: &'static str = "AMPHORA_SKIP_BUILD";
+
+    /// The policy the environment asks for.
+    pub fn asked() -> Self {
+        if std::env::var(Self::ENV).is_ok_and(|v| v == "wait") {
+            Self::Wait
+        } else {
+            Self::Stale
+        }
+    }
+}
+
 /// The summaries one database keeps, by table root page.
 pub struct SkipRegistry {
     entries: Mutex<Vec<Entry>>,
+    /// How a build on the versioned storage meets open writers (`BuildPolicy`).
+    policy: Mutex<BuildPolicy>,
+    /// Builds that waited for their table's writers to end, and builds done again because a
+    /// writer slipped in beside them (`BuildPolicy::Wait`): the registry's, not a summary's, as
+    /// a summary built again starts its own counts.
+    build_waits: AtomicU64,
+    rebuilds: AtomicU64,
     /// How many summaries were installed, moved under the entries' lock (G7 step 2,
     /// `AC-NS.2.1`): a write that found none to feed reads it before and after its row changes.
     installs: AtomicU64,
@@ -98,6 +133,9 @@ impl Default for SkipRegistry {
     fn default() -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
+            policy: Mutex::new(BuildPolicy::asked()),
+            build_waits: AtomicU64::new(0),
+            rebuilds: AtomicU64::new(0),
             installs: AtomicU64::new(0),
         }
     }
@@ -113,6 +151,35 @@ impl std::fmt::Debug for SkipRegistry {
 }
 
 impl SkipRegistry {
+    /// How builds on the versioned storage meet open writers.
+    pub fn policy(&self) -> BuildPolicy {
+        *self.policy.lock()
+    }
+
+    /// Sets it, as `AMPHORA_SKIP_BUILD` does at open (tests and the A/B's driver).
+    pub fn set_policy(&self, policy: BuildPolicy) {
+        *self.policy.lock() = policy;
+    }
+
+    /// A build waited for its table's writers (`BuildPolicy::Wait`); `again`: it is a rebuild,
+    /// a writer having slipped in beside the one before.
+    pub(crate) fn count_wait(&self, waited: bool, again: bool) {
+        if waited {
+            self.build_waits.fetch_add(1, Ordering::SeqCst);
+        }
+        if again {
+            self.rebuilds.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Builds that waited for writers, and builds done again (`BuildPolicy::Wait`).
+    pub fn wait_counts(&self) -> (u64, u64) {
+        (
+            self.build_waits.load(Ordering::SeqCst),
+            self.rebuilds.load(Ordering::SeqCst),
+        )
+    }
+
     /// Keeps `skipping` for column `column` (its index in the table's records) of the table at
     /// `root_page`, replacing any summary it had; `Skipping::Off` drops it. The caller built it at
     /// the newest commit with no writer open (it held the write lock).

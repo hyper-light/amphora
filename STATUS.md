@@ -373,7 +373,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and
   page-codec tests). The skipping summaries are built and asked on the versioned storage, a
   writer's end told to them as its transaction ends (lane g7s2-14, executor.md decision 11), and a
-  build beside an open writer of the table is kept stale (lane g7s2-15); the
+  build beside an open writer of the table is kept stale (lane g7s2-15), or under
+  `AMPHORA_SKIP_BUILD=wait` waits for the table's writers to end (lane g7s2-16, the A/B's arm); the
   pager's leaf-morsel and MVCC-store tests say why they stand aside there. Not yet: the header (schema cookie, user version) on the versioned
   storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
   budget shared by a process's databases. On the pager as on the switch, `nested_loops`'

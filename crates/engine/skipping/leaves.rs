@@ -6,8 +6,8 @@
 //! This is the one place the skipping module reads storage; the summaries themselves stay pure.
 
 use super::{
-    Candidates, Chooser, CrackerColumn, SkipCounts, SkipError, SkipRefusal, Skipping, Upkeep,
-    ZoneMap, ZoneMapBuilder,
+    BuildPolicy, Candidates, Chooser, CrackerColumn, SkipCounts, SkipError, SkipRefusal, Skipping,
+    Upkeep, ZoneMap, ZoneMapBuilder,
 };
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
@@ -242,7 +242,7 @@ fn rows_of(
 /// Amphora (G5 step 4): keeps a summary of `column` of `table` (`None`: drops it), shared by every
 /// connection of the database and kept current by the Insert and Delete opcodes. It is built
 /// holding the write lock, so it holds exactly the newest commit; `conn` must have no
-/// transaction open.
+/// transaction open. On the versioned storage no lock holds writers off: see [`BuildPolicy`].
 pub fn set_skipping(
     conn: &Arc<Connection>,
     table: &str,
@@ -260,8 +260,71 @@ pub fn set_skipping(
         conn.db.skipping.set(root, index, Skipping::Off);
         return Ok(());
     };
-    conn.execute("BEGIN IMMEDIATE")?;
-    let built = LeafCursor::open(conn, root, columns).and_then(|mut cursor| match kind {
+    // G7 step 2 (`AC-NS.2.1`): on the versioned storage, under `BuildPolicy::Wait`, a build
+    // waits for the table's open writers to end first, and is done again, after another wait,
+    // if one slipped in beside it; under `Stale` (the control) it goes in stale.
+    let switch = conn.versioned_for(crate::MAIN_DB_ID);
+    let wait = switch.is_some() && conn.db.skipping.policy() == BuildPolicy::Wait;
+    let mut again = false;
+    loop {
+        if let Some(switch) = switch.as_ref().filter(|_| wait) {
+            let waited = switch.wait_unwritten(root)?;
+            conn.db.skipping.count_wait(waited, again);
+        }
+        conn.execute("BEGIN IMMEDIATE")?;
+        let built = build_from_leaves(conn, root, columns, index, kind);
+        match built {
+            Ok(skipping) => {
+                let missed = match switch.as_ref() {
+                    None => {
+                        conn.db.skipping.set(root, index, skipping);
+                        None
+                    }
+                    // The build there held no lock against writers. One that changed the table
+                    // and is still open, or one that committed since the build's snapshot, left
+                    // rows out of it: it is kept stale until built again.
+                    Some(switch) => {
+                        let missed = conn.db.skipping.set_checked(root, index, skipping, || {
+                            switch.skipping_build_missed(root).unwrap_or_else(|e| {
+                                tracing::warn!(target: "amphora.skipping", error = %e, "a build's check of open writers failed");
+                                Some("the check of open writers failed")
+                            })
+                        });
+                        if let Some(why) = missed {
+                            tracing::debug!(target: "amphora.skipping", table, column, why, wait, "summary built stale");
+                        }
+                        missed
+                    }
+                };
+                conn.execute("COMMIT")?;
+                if wait && missed.is_some() {
+                    again = true;
+                    continue;
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                // The build's error is the one to report; the rollback ends a read-only
+                // transaction.
+                if let Err(rollback) = conn.execute("ROLLBACK") {
+                    tracing::warn!(target: "amphora.skipping", error = %rollback, "rollback after a failed build");
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// A summary of `kind` of column `index`, read from the leaves of the table at `root` in the
+/// connection's open transaction.
+fn build_from_leaves(
+    conn: &Arc<Connection>,
+    root: i64,
+    columns: usize,
+    index: usize,
+    kind: SkipKind,
+) -> Result<Skipping, LeafBuildError> {
+    LeafCursor::open(conn, root, columns).and_then(|mut cursor| match kind {
         SkipKind::ZoneMaps => zone_map_from_leaves(&mut cursor, index).map(Skipping::ZoneMaps),
         SkipKind::Cracking => {
             rows_of(&mut cursor, index).map(|rows| Skipping::Cracking(CrackerColumn::new(rows)))
@@ -284,37 +347,7 @@ pub fn set_skipping(
                 })
             })
         }
-    });
-    match built {
-        Ok(skipping) => {
-            match conn.versioned_for(crate::MAIN_DB_ID) {
-                None => conn.db.skipping.set(root, index, skipping),
-                // G7 step 2 (`AC-NS.2.1`): the build there held no lock against writers. One
-                // that changed the table and is still open, or one that committed since the
-                // build's snapshot, left rows out of it: it is kept stale until built again.
-                Some(switch) => {
-                    let missed = conn.db.skipping.set_checked(root, index, skipping, || {
-                        switch.skipping_build_missed(root).unwrap_or_else(|e| {
-                            tracing::warn!(target: "amphora.skipping", error = %e, "a build's check of open writers failed");
-                            Some("the check of open writers failed")
-                        })
-                    });
-                    if let Some(why) = missed {
-                        tracing::debug!(target: "amphora.skipping", table, column, why, "summary built stale");
-                    }
-                }
-            }
-            conn.execute("COMMIT")?;
-            Ok(())
-        }
-        Err(e) => {
-            // The build's error is the one to report; the rollback ends a read-only transaction.
-            if let Err(rollback) = conn.execute("ROLLBACK") {
-                tracing::warn!(target: "amphora.skipping", error = %rollback, "rollback after a failed build");
-            }
-            Err(e)
-        }
-    }
+    })
 }
 
 /// Amphora (G5 step 4): the rows a filter `lo <= column <= hi` on `table` may need, as its

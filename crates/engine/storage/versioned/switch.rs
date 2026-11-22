@@ -439,6 +439,31 @@ impl Switch {
         Ok(None)
     }
 
+    /// Blocks until no open transaction has changed a row of the table at `root_page`, woken by
+    /// its last writer's end, not by a timer (G7 step 2, `AC-NS.2.1`; a skipping build under
+    /// `AMPHORA_SKIP_BUILD=wait`). Whether it waited. The caller holds no transaction: one of its
+    /// own would never end, and one open on the caller's thread on another connection blocks it
+    /// for good (the policy's known failure, which `stale` doesn't have).
+    pub(crate) fn wait_unwritten(&self, root_page: i64) -> Result<bool> {
+        let tree = tree_of(root_page)?;
+        let Some(told) = self.db.v.clock.when_unwritten(tree) else {
+            return Ok(false);
+        };
+        told.recv().map_err(|_| {
+            LimboError::InternalError(
+                "versioned storage: a table's writers ended untold".to_string(),
+            )
+        })?;
+        Ok(true)
+    }
+
+    /// How many wait for the table at `root_page`'s open writers to end (tests of
+    /// [`Switch::wait_unwritten`]).
+    #[cfg(test)]
+    pub(crate) fn waiting_on(&self, root_page: i64) -> Result<usize> {
+        Ok(self.db.v.clock.waiting_on(tree_of(root_page)?))
+    }
+
     /// The connection's transaction, begun if none is open.
     fn txn(&self) -> Result<SharedTxn> {
         let mut slot = self.txn.lock();

@@ -726,11 +726,21 @@ it; one after finds the summary and feeds it. An insert that found no summary be
 changed reads the registry's install count before and after, and makes a summary installed
 between stale (a delete's hook already runs whether it found one or not).
 
-Keeping the build stale was chosen over waiting for the open writers to end: a wait needs a wake
-on a tree's last writer ending and a retry of the build, and it holds the caller behind any
-transaction however long it runs (and forever behind one on the same thread). A stale summary is
-refused at once, every scan reads every row and stays correct, and the next build (lane skip-8's
-rebuild, or the caller's) makes it current.
+Stale or wait is decided by data, not argument (lane g7s2-16): both are built behind
+`AMPHORA_SKIP_BUILD` (`SkipRegistry::set_policy`, `BuildPolicy`), stale the control. Under
+`stale` a build beside an open writer goes in stale at once: refused, every scan reads every row
+and stays correct until the next build (lane skip-8's rebuild, or the caller's) makes it current.
+Under `wait` a build first waits for the table's open writers to end, woken by the last one's end
+(`Clock::when_unwritten`, told under the lock that counts the writers, after its commit is
+published: no timer, no poll), then builds; if a writer slipped in beside it, it is installed
+stale and built again after another wait (`SkipRegistry::wait_counts`). Its failure mode: the
+caller is held behind any transaction for as long as it runs, starved while writers keep the
+table open, and blocked for good behind one open on its own thread. Each test forces its arm's
+failure (`t_ns_2_1_a_build_beside_an_open_writer_is_kept_stale`: every row read until rebuilt;
+`t_ns_2_1_a_waiting_build_waits_for_the_open_writer`: blocked until the writer commits). The run
+of record, the coordinator's: a builder beside the concurrency ladder's writers (1 to 4096) of
+one table, each arm's build latency p50/p99/p99.9, scans' rows read until a current summary, and
+rebuilds.
 
 ### Bounds from parameters (lane skip-usable, T-SKU.1)
 

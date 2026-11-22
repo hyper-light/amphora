@@ -103,9 +103,19 @@ pub struct Clock {
     /// Each tree's count of open transactions that have changed a row of it (G7 step 2,
     /// `AC-NS.2.1`): a summary built beside one would miss its rows once it commits. Bounded by
     /// the trees, each counted once a transaction.
-    writing: Mutex<BTreeMap<u64, u64>>,
+    writing: Mutex<Writing>,
     /// What versions, transactions' records and kept commits may hold.
     budget: Budget,
+}
+
+/// Each tree's open writers, and who waits for a tree to have none (G7 step 2, `AC-NS.2.1`): one
+/// lock, so a waiter that found writers is told by the last one's end.
+#[derive(Default)]
+struct Writing {
+    counts: BTreeMap<u64, u64>,
+    /// Woken, each once, when the tree's last open writer ends: one a skipping build that waits
+    /// for its table's writers (`AMPHORA_SKIP_BUILD=wait`), so bounded by the builds under way.
+    idle: BTreeMap<u64, Vec<std::sync::mpsc::SyncSender<()>>>,
 }
 
 /// Open snapshots' timestamps, each with how many are open at it: all of them, and those of
@@ -515,7 +525,7 @@ impl Clock {
                 .map(|_| Mutex::new(FxHashMap::default()))
                 .collect(),
             open: Mutex::new(Open::default()),
-            writing: Mutex::new(BTreeMap::new()),
+            writing: Mutex::new(Writing::default()),
             budget,
         }
     }
@@ -644,11 +654,19 @@ impl Clock {
             count_out(&mut open.txns, txn.start);
         }
         // After its commit is published: one who finds it no longer writing finds its commit.
+        let mut woken = Vec::new();
         {
             let mut writing = self.writing.lock();
             for tree in &txn.trees {
-                count_out(&mut writing, *tree);
+                count_out(&mut writing.counts, *tree);
+                if !writing.counts.contains_key(tree) {
+                    woken.extend(writing.idle.remove(tree).unwrap_or_default());
+                }
             }
+        }
+        // A waiter that went away dropped its end: nothing to tell it.
+        for waiter in woken {
+            let _ = waiter.try_send(());
         }
         self.budget
             .release(txn.charged.saturating_add(txn.read_bytes));
@@ -661,7 +679,7 @@ impl Clock {
         if txn.trees.contains(&tree) {
             return Ok(());
         }
-        count_in(&mut self.writing.lock(), tree)?;
+        count_in(&mut self.writing.lock().counts, tree)?;
         txn.trees.push(tree);
         Ok(())
     }
@@ -671,7 +689,26 @@ impl Clock {
     /// is no longer counted only after its commit was published ([`Clock::forget`]), so a caller
     /// that reads this first, then the newest commit, sees either the writer or its commit.
     pub fn writers_of(&self, tree: u64) -> u64 {
-        self.writing.lock().get(&tree).copied().unwrap_or(0)
+        self.writing.lock().counts.get(&tree).copied().unwrap_or(0)
+    }
+
+    /// Tree `tree`'s end of writing (G7 step 2, `AC-NS.2.1`): `None` when no open transaction has
+    /// changed a row of it, else a receiver told once its last open writer ends (after that
+    /// writer's commit is published, [`Clock::forget`]). Read and registered under one lock, so no
+    /// end is missed between.
+    pub fn when_unwritten(&self, tree: u64) -> Option<std::sync::mpsc::Receiver<()>> {
+        let mut writing = self.writing.lock();
+        if !writing.counts.contains_key(&tree) {
+            return None;
+        }
+        let (tell, told) = std::sync::mpsc::sync_channel(1);
+        writing.idle.entry(tree).or_default().push(tell);
+        Some(told)
+    }
+
+    /// How many wait for tree `tree`'s last open writer to end ([`Clock::when_unwritten`]).
+    pub fn waiting_on(&self, tree: u64) -> usize {
+        self.writing.lock().idle.get(&tree).map_or(0, Vec::len)
     }
 
     /// The oldest open snapshot's timestamp, or the last commit's with none open: versions older
@@ -2889,5 +2926,33 @@ mod tests {
         v.abort(b, &mut d).unwrap();
         v.commit(reader, &mut d).unwrap();
         assert_eq!(v.clock.writers_of(0), 0);
+    }
+
+    /// Do: wait for a tree's writers to end while two are open; end one, then the other. Expect
+    /// (G7 step 2, `AC-NS.2.1`, `AMPHORA_SKIP_BUILD=wait`): no wait with none open, the waiter
+    /// untold while either is open and told once, by the last one's end.
+    #[test]
+    fn t_ns_2_1_a_tree_tells_its_waiters_when_its_last_writer_ends() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        assert!(v.clock.when_unwritten(0).is_none());
+        let mut a = v.clock.begin().unwrap();
+        let mut b = v.clock.begin().unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"1")
+            .unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"y", b"2")
+            .unwrap();
+        let told = v.clock.when_unwritten(0).unwrap();
+        assert_eq!(v.clock.waiting_on(0), 1);
+        v.commit(a, &mut d).unwrap();
+        assert!(told.try_recv().is_err(), "told while a writer is open");
+        v.commit(b, &mut d).unwrap();
+        assert!(
+            told.try_recv().is_ok(),
+            "untold after the last writer ended"
+        );
+        assert_eq!(v.clock.waiting_on(0), 0);
+        assert!(v.clock.when_unwritten(0).is_none());
     }
 }
