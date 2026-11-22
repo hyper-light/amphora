@@ -152,7 +152,9 @@ if [[ ! -x "$BIN/shim" && -x "$BIN/go/bin/go" && -n "${DQ_VERSION:-}" ]]; then
   IFS=. read -r dq_major dq_minor _ <<<"$DQ_VERSION"
   if ((dq_major > 1 || (dq_major == 1 && dq_minor >= 18))); then
     gdq_mod=github.com/canonical/go-dqlite/v3
-    gdq=${GO_DQLITE:-$(curl -fsSL https://api.github.com/repos/canonical/go-dqlite/releases/latest | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])')}
+    gdq=${GO_DQLITE:-$(curl -fsSL 'https://api.github.com/repos/canonical/go-dqlite/releases?per_page=100' | python3 -I -c '
+import json, sys
+print(next((r["tag_name"] for r in json.load(sys.stdin) if not r["draft"] and not r["prerelease"] and r["tag_name"].startswith("v3.")), ""))')}
     sed -i 's|"github.com/canonical/go-dqlite/app"|"github.com/canonical/go-dqlite/v3/app"|' "$s/main.go"
   else
     gdq_mod=github.com/canonical/go-dqlite gdq=${GO_DQLITE:-v1.22.0}
