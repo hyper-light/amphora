@@ -1295,11 +1295,29 @@ impl Database {
         R: Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
+        self.call_session(until, f).map(|(value, _)| value)
+    }
+
+    /// [`Database::call`], answered with its write's own session token (replication.md,
+    /// "Decision (lane ryw-1): read-your-writes by session tokens"; kiln goal 8119f25d,
+    /// AC-T1.10.R4): the index and time of the entry its group's log took for it, so a read that
+    /// carries it ([`Database::query_session`]) waits for this write and for no later one, whoever
+    /// else writes. A session keeps the latest of its tokens (`Token::after`). None standalone,
+    /// for an attached client (whose reads all see every write) and for a session that wrote
+    /// nothing.
+    pub fn call_session<R, F>(&self, until: Instant, f: F) -> Result<(R, Option<Token>), Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
         let database = self.resolve(until)?;
         if let Some(client) = database.remote_client() {
-            return client.call(until, f).map_err(Refusal::from);
+            return client
+                .call(until, f)
+                .map(|value| (value, None))
+                .map_err(Refusal::from);
         }
-        database.call_db(until, move |db| {
+        database.call_db_session(until, move |db| {
             let mut connection = crate::sql::Connection::new(db);
             let value = f(&mut connection)?;
             connection.finish()?;
@@ -1330,11 +1348,19 @@ impl Database {
         R: Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
+        self.call_db_session(until, f).map(|(value, _)| value)
+    }
+
+    fn call_db_session<R, F>(&self, until: Instant, f: F) -> Result<(R, Option<Token>), Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+    {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
-        match self.submit("", Operation::Call(Mutex::new(Some(call))), until)? {
-            Answer::Called(v) => v
+        match self.submit_session("", Operation::Call(Mutex::new(Some(call))), until)? {
+            (Answer::Called(v), token) => v
                 .downcast::<R>()
-                .map(|v| *v)
+                .map(|v| (*v, token))
                 .map_err(|_| unavailable("wrong SQL session answer")),
             _ => Err(unavailable("wrong SQL session answer")),
         }
@@ -1437,19 +1463,6 @@ impl Database {
         }
     }
 
-    /// The token of this node's last acknowledged write (replication.md, "Decision (lane ryw-1):
-    /// read-your-writes by session tokens"): taken after a write's answer, it is at or past that
-    /// write, so a read that carries it sees the write on any replica. A session keeps the latest
-    /// of its tokens (`Token::after`). None standalone and for an attached client, whose reads
-    /// all see every write.
-    pub fn session_token(&self, until: Instant) -> Result<Option<Token>, Refusal> {
-        let database = self.resolve(until)?;
-        match &database.shared.writer {
-            Writer::Replicated { client, .. } => client.token().map(Some),
-            Writer::Client(_) | Writer::Local(_) => Ok(None),
-        }
-    }
-
     /// One read-only SQL session in the read mode asked (kiln goal 8119f25d, the switch):
     /// - [`ReadMode::Latest`], the control and today's read: [`Database::query`], which waits for
     ///   the leader's latest commit whatever `token` says;
@@ -1540,6 +1553,17 @@ impl Database {
         statements: Vec<Statement>,
         until: Instant,
     ) -> Result<Vec<SqlResult>, Refusal> {
+        self.execute_session(statements, until)
+            .map(|(results, _)| results)
+    }
+
+    /// [`Database::execute`], answered with its write's own session token, as
+    /// [`Database::call_session`] gives it (AC-T1.10.R4).
+    pub fn execute_session(
+        &self,
+        statements: Vec<Statement>,
+        until: Instant,
+    ) -> Result<(Vec<SqlResult>, Option<Token>), Refusal> {
         api::bound("statements", statements.len(), api::TX_MAX)?;
         let mut bytes = 0usize;
         for s in &statements {
@@ -1555,8 +1579,8 @@ impl Database {
             }
         }
         api::bound("SQL request bytes", bytes, api::REQUEST_MAX)?;
-        match self.submit("", Operation::Mutation(Mutation::Sql(statements)), until)? {
-            Answer::Sql(v) => Ok(v),
+        match self.submit_session("", Operation::Mutation(Mutation::Sql(statements)), until)? {
+            (Answer::Sql(v), token) => Ok((v, token)),
             _ => Err(unavailable("wrong SQL answer")),
         }
     }
@@ -1576,6 +1600,17 @@ impl Database {
         operation: Operation,
         until: Instant,
     ) -> Result<Answer, Refusal> {
+        self.submit_session(namespace, operation, until)
+            .map(|(answer, _)| answer)
+    }
+
+    /// [`Database::submit`] with its write's own session token, if its group's log took one.
+    fn submit_session(
+        &self,
+        namespace: &str,
+        operation: Operation,
+        until: Instant,
+    ) -> Result<(Answer, Option<Token>), Refusal> {
         self.resolve(until)?
             .submit_selected(namespace, operation, until)
     }
@@ -1585,22 +1620,24 @@ impl Database {
         namespace: &str,
         operation: Operation,
         until: Instant,
-    ) -> Result<Answer, Refusal> {
+    ) -> Result<(Answer, Option<Token>), Refusal> {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
         if let Operation::Mutation(Mutation::Compact { before, .. }) = &operation {
             self.namespace(namespace)?.compact(*before, until)?;
-            return Ok(Answer::Done);
+            return Ok((Answer::Done, None));
         }
         let store = match &self.shared.writer {
             Writer::Replicated { client, .. } => {
-                return client.submit(
-                    namespace.to_owned(),
-                    operation,
-                    self.application.clone(),
-                    until,
-                );
+                return client
+                    .submit(
+                        namespace.to_owned(),
+                        operation,
+                        self.application.clone(),
+                        until,
+                    )
+                    .map(|answered| (answered.answer, answered.token));
             }
             Writer::Local(store) => store,
             Writer::Client(backend) => {
@@ -1609,7 +1646,8 @@ impl Database {
                     namespace,
                     operation,
                     until,
-                );
+                )
+                .map(|answer| (answer, None));
             }
         };
         let admission = Admission::reserve(&self.shared.admitted)?;
@@ -1759,6 +1797,7 @@ impl Database {
                     Refusal::UnknownOutcome
                 }
             })?
+            .map(|answer| (answer, None))
     }
 }
 

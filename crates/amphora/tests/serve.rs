@@ -555,7 +555,7 @@ fn t_t1_13_1_a_refused_log_write_ends_the_replica_and_wakes_its_drain() {
     let db =
         Database::open_replicated(&dir.path().join("state.db"), &log, config, until()).unwrap();
     let handle = db.replica().unwrap();
-    handle.wait_leader(until()).unwrap();
+    handle.wait_leader(0, until()).unwrap();
     db.call(until(), |c| {
         c.execute_batch("CREATE TABLE t(v INTEGER); INSERT INTO t VALUES(1)")?;
         Ok(())

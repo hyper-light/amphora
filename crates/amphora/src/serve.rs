@@ -812,7 +812,7 @@ impl Shared {
                     .db
                     .replica()
                     .ok_or_else(|| anyhow!("no replica"))?
-                    .wait_leader(after(Duration::from_millis(wait))?)
+                    .wait_leader(0, after(Duration::from_millis(wait))?)
                     .map_err(|e| anyhow!("no leader within {wait} ms: {e:?}"))?;
                 Ok(format!(
                     "leader={} addr={} term={}",
