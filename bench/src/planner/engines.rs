@@ -321,7 +321,7 @@ impl Target for Amphora {
     }
 
     fn about(&mut self) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::json!({ "engine": "amphora", "cache_kib": self.cache_kib, "threads": 1, "vectorized_scans": self.vectorized }))
+        Ok(serde_json::json!({ "engine": "amphora", "cache_kib": self.cache_kib, "threads": 1, "vectorized_scans": self.vectorized, "adaptive_joins": self.adaptive }))
     }
 
     fn exec(&mut self, sql: &str) -> anyhow::Result<()> {
@@ -687,7 +687,7 @@ mod tests {
         let io: Arc<dyn amphora_engine::IO> = Arc::new(MemoryIO::new());
         let db = Database::open(io.clone(), &format!("planner-answers-{}.db", std::process::id()), OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).unwrap();
         let (conn, counted) = (db.connect(ConnectOpts::new()).unwrap(), db.connect(ConnectOpts::new()).unwrap());
-        let mut amphora = Amphora { io, _db: db, conn, counted, cache_kib: 0, vectorized: false };
+        let mut amphora = Amphora { io, _db: db, conn, counted, cache_kib: 0, vectorized: false, adaptive: false };
         let mut answer = writer();
         assert!(matches!(amphora.run(LITE_ROW, Duration::from_secs(60), Some(&mut answer)), Outcome::Done(Run { rows: 1, .. })));
         assert_eq!(answer.finish(), LITE_ANSWER);
