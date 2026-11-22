@@ -20,6 +20,12 @@ use std::path::{Path, PathBuf};
 use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
 use hyper_raft::proto::{ConfChangeV2, ConfState};
 
+/// The memory budget's room for one image now (SB.1), as the directory's machine fails: a budget
+/// that can't be read stops the machine as a directory image past it would.
+fn image_room() -> Result<usize, Fatal> {
+    crate::replication::image_room().map_err(|_| Fatal("the process's memory budget can't be read"))
+}
+
 use super::directory::{Change, Directory};
 use super::driver::{Driver, Out};
 use super::{NodeId, Refused};
@@ -127,7 +133,7 @@ impl DirectoryMachine {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(fresh),
             Err(_) => return Err(Fatal("the directory's kept image can't be read")),
         };
-        if bytes.len() > crate::replication::SNAPSHOT_BYTES {
+        if bytes.len() > image_room()? {
             return Err(Fatal("a kept directory image larger than a snapshot"));
         }
         let k: Kept = postcard::from_bytes(&bytes)
@@ -229,7 +235,7 @@ impl StateMachine for DirectoryMachine {
         into.clear();
         let bytes = postcard::to_allocvec(&self.directory)
             .map_err(|_| Fatal("the directory doesn't encode"))?;
-        if bytes.len() > crate::replication::SNAPSHOT_BYTES {
+        if bytes.len() > image_room()? {
             return Err(Fatal("the directory's image is larger than a snapshot"));
         }
         into.extend_from_slice(&bytes);
@@ -241,7 +247,7 @@ impl StateMachine for DirectoryMachine {
     }
 
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
-        if image.len() > crate::replication::SNAPSHOT_BYTES {
+        if image.len() > image_room()? {
             return Err(Fatal("a directory image larger than a snapshot"));
         }
         let directory: Directory = postcard::from_bytes(image)

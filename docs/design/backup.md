@@ -119,9 +119,8 @@ owner).
   the last check outweighs the log that check replayed, so the log a restore replays is checked as
   fast as it grows.
 - **The source's rows at the second** are the caller's to give (`source(second)`), none when it can
-  no longer say them, which counts as `source_moved`, never as a pass. Open: the shipping thread
-  taking the source's digest while it writes a through mark (the source quiet, its rows those of
-  that second), so a running database checks itself; not built.
+  no longer say them, which counts as `source_moved`, never as a pass. The shipping thread gives
+  its own: the next section.
 
 **Evidence.** T-T1.12.C1: a database backed up to a folder, written a row a second and closed;
 restore-and-check passes at its newest second against the model's rows and fails naming the rows
@@ -129,6 +128,62 @@ against rows that differ; the counters say one of each. T-T1.12.C2: the cadence 
 
 **Falsified by.** A check that passes on an archive whose restore differs from the source at that
 second; a check that never comes due while bases land.
+
+## The source's own rows at a quiet second
+
+**Decision.** Given a scratch path (`Archive::check`), the shipping thread checks its own archive on
+the cadence above, against the database's own rows: no caller and no model supplies them. It takes
+them from a reader of its own (apart from the shipping reader, which never waits on a digest) whose
+snapshot holds exactly the commits stamped by one second's end, so the check compares the restore
+with the source at that very second.
+
+- **Lining the snapshot up with a stamp** (`Marks::quiet_second`). Under the lock commits are
+  stamped by, the reader begins its snapshot (a deferred `BEGIN` takes none until its first read,
+  which runs there) and reads where the log ends. If that is the newest commit stamped, no commit
+  lies between the snapshot and the stamps: a commit not yet stamped would have moved the log's end
+  past it, and none can be stamped while the lock is held. The snapshot then holds every commit
+  stamped at or before that commit's stamp and none after; it is not quiet otherwise (a commit
+  between its write and its stamp, a log just started again) and the next round tries again.
+- **Settling the second** (`Marks::settled`). The snapshot is the rows of the newest commit's second
+  only if no later commit is stamped in that second. The marks watch it: a commit stamped in it
+  says no, and the clock past the second's end with none says yes (stamps never go back, so every
+  later commit is in a later second). The digest waits, a few dozen bytes a table, until it
+  settles and the archive holds the second whole, then the thread restores that second and checks
+  it (`restore_and_check_at`).
+- **Where the result goes.** `Status::last_check` (the typed `Check`) and `Shipping::checks()`, the
+  counters behind `amphora_backup_checks_total`. A check that can't run (the store, the scratch
+  disk) is a failed round, logged and counted, leaving a base under way as it was. A passed check's
+  scratch file is removed; a failed one's stays to look into until the next check.
+- **What it costs.** One full read of the database a check, the snapshot held meanwhile, so the log
+  can't start again until the digest ends (`Db::restart_log` waits, as for any reader); checks come
+  as often as bases land or the log doubles, never on a timer. The scratch path is the caller's:
+  the restore takes as much disk as the database. A database whose commits never leave a second
+  quiet (one commit stamped in each second, every second, with the next always unstamped at the
+  round) is never checked; each round tries.
+
+**Evidence.** T-T1.12.C3 (unit): a snapshot lines up only at the newest stamp; its second settles
+past its end, and never once a commit is stamped in it. T-T1.12.C3 (`tests/backup.rs`): a database
+backed up to a folder with a scratch path, written a row a second, checks itself and passes with no
+failure counted; the second it passed restores equal to the model's rows at that second.
+
+**Falsified by.** A passed check at a second whose restore differs from the model's rows then; a
+check counted `source_moved` or failed on an archive that restores the source exactly.
+
+## A base begins just after a restart
+
+**Decision.** A base due waits for the log to start again before it begins (`plan::base_begins_now`):
+a base's own generation counts as changed for the next base, frames from before the base began
+included ("Incremental bases"), so a base begun as its generation starts leaves the next the least
+to copy. It begins at once when no base restores the log (none yet, or the log broke since the
+latest), in the round the log started again, or once its generation holds the frames a restart
+keeps (decision 31): past that the log starts again whether shipped or not, so the wait is one
+generation at most, and no number is picked for it.
+
+**Evidence.** T-T1.12.I4: the rule's cases. T-T1.12.C1, C3, D2 and X1 still take their first bases
+through the thread.
+
+**Falsified by.** A base that waits past a generation the size a restart keeps; a later base copying
+more chunks after a base begun just after a restart than after one begun late in a generation.
 
 ## One cut across groups
 

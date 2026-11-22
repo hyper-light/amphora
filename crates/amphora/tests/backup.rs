@@ -264,6 +264,7 @@ fn open_backed_up<B: Blobs + 'static>(
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
+        check: None,
     };
     Database::open_backed_up(path, archive, until()).unwrap()
 }
@@ -370,6 +371,72 @@ fn oracle_digest(dir: &std::path::Path, name: &str, rows: &Rows) -> backup::RowD
         .unwrap();
     drop(database);
     backup::digest(&Db::open(&path).unwrap()).unwrap()
+}
+
+/// T-T1.12.C3 (AC-T1.12.4): the shipping thread checks its own archive. Do: back a database up
+/// to a folder with a scratch path for checks, then write a row a second, each commit waking a
+/// round. Expect: a check runs on its own and passes, against the source's own rows at a quiet
+/// second; that second restores equal to the model's rows at it (so the snapshot the thread
+/// digested held exactly that second's rows); the counters say one pass or more and no failure,
+/// and the passed check's scratch file is gone.
+#[test]
+fn t_t1_12_c3_the_shipping_thread_checks_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let scratch = dir.path().join("check.db");
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let read = Arc::clone(&now);
+    let archive = Archive {
+        blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+        prefix: "db".into(),
+        clock: Arc::new(move || read.load(Ordering::SeqCst)),
+        memory: 32 * 1024,
+        patience: Duration::from_secs(60),
+        check: Some(scratch.clone()),
+    };
+    let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = vec![(now.load(Ordering::SeqCst), model.clone())];
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    // A row a second until a check passed: a check needs a quiet second, then a round after it.
+    let mut id = 1;
+    let passed = loop {
+        write_seconds(&database, &now, id..id + 1, &mut model, &mut history);
+        id += 1;
+        let status = shipping.status().unwrap();
+        if let Some(backup::Check::Passed { second, .. }) = status.last_check {
+            break second;
+        }
+        assert!(id < 400, "no check passed: {status:?}");
+    };
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    assert!(shipping.checks().passed.load(Ordering::Relaxed) >= 1);
+    assert_eq!(shipping.checks().failed.load(Ordering::Relaxed), 0);
+    assert_eq!(shipping.checks().source_moved.load(Ordering::Relaxed), 0);
+    if matches!(status.last_check, Some(backup::Check::Passed { .. })) {
+        assert!(!scratch.exists(), "a passed check's scratch file stays");
+    }
+
+    let again = dir.path().join("again.db");
+    backup::restore(blobs.as_ref(), "db", passed, &again, until()).unwrap();
+    let oracle_dir = tempfile::tempdir().unwrap();
+    let want = at(&history, passed).cloned().unwrap_or_default();
+    assert_eq!(
+        backup::digest(&Db::open(&again).unwrap()).unwrap(),
+        oracle_digest(oracle_dir.path(), "o.db", &want),
+        "second {passed}"
+    );
 }
 
 /// T-T1.12.C1 (AC-T1.12.4): restore-and-check on the folder store. Do: back a database up to a
@@ -491,6 +558,7 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
             clock: Arc::new(move || read.fetch_add(SECOND_NS, Ordering::SeqCst) + SECOND_NS),
             memory: 32 * 1024,
             patience: Duration::from_secs(60),
+            check: None,
         };
         Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
             .unwrap()
