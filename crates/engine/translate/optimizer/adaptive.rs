@@ -198,6 +198,7 @@ impl JoinSwitch {
     }
 
     /// The outer rows counted so far.
+    #[cfg(test)]
     pub(crate) fn rows_seen(&self) -> u64 {
         self.seen
     }

@@ -18742,8 +18742,10 @@ pub fn op_join_switch_step(
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(entry) => {
             // As HashBuild sizes its table: no limit where temporary storage is memory.
-            let budget = if matches!(program.connection.get_temp_store(), crate::TempStore::Memory)
-            {
+            let budget = if matches!(
+                program.connection.get_temp_store(),
+                crate::TempStore::Memory
+            ) {
                 u64::MAX
             } else {
                 u64::try_from(table_share(
@@ -18854,7 +18856,12 @@ pub fn op_join_switch_built(
 /// second prepare, on the counted rows, before its next run (`Statement::statistics_moved`); every
 /// other statement planned on the table is too. This run goes on as planned: its answer is right,
 /// and the rows it may have returned already are not returned again.
-fn replan_on_built_rows(program: &Program, data: &JoinSwitchBuiltData, rows: usize, bytes: usize) {
+fn replan_on_built_rows(
+    program: &Program,
+    data: &crate::vdbe::insn::JoinSwitchBuiltData,
+    rows: usize,
+    bytes: usize,
+) {
     use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
     let counter = program.connection.db.row_changes.counter(&data.table);
     let estimate = crate::row_changes::live_rows(
@@ -18862,12 +18869,11 @@ fn replan_on_built_rows(program: &Program, data: &JoinSwitchBuiltData, rows: usi
         counter.load(crate::sync::atomic::Ordering::Acquire),
     );
     // The table's bytes are already held to its share of memory: it spills past it, checked above.
-    let verdict = MaterializePoint::new(estimate, data.estimate_error, u64::MAX).and_then(
-        |mut point| {
+    let verdict =
+        MaterializePoint::new(estimate, data.estimate_error, u64::MAX).and_then(|mut point| {
             point.rows(rows as u64, bytes as u64)?;
             Ok(point.verdict())
-        },
-    );
+        });
     match verdict {
         Ok(Replan::Again { rows }) => {
             let changes = i64::try_from(rows)

@@ -61,6 +61,9 @@ fn open(name: &str) -> (tempfile::TempDir, Arc<Connection>) {
     let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
     let db = Database::open(io, dir.path().join(name).to_str().unwrap(), options).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
+    // A seek four rows' visits, a hash table's build and probe one each: a break-even on any
+    // machine, where the learned weights may have none (a probe timed at a seek's cost or more).
+    conn.pin_cost_weights(Some((4.0, 1.0, 1.0)));
     (dir, conn)
 }
 
@@ -185,7 +188,11 @@ fn t_pl_13_1_answers_identical_with_switching_on_and_off() {
         conn.set_adaptive_joins(false);
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
-    // Every join whose plan states a point under its outer rows switched.
+    // Every join whose plan states a point under its outer rows switched, and some did.
+    assert!(
+        stated > 0,
+        "no plan stated a switch point under its outer rows"
+    );
     assert_eq!(fired, stated, "switches fired where the plan's point came");
 }
 
@@ -215,13 +222,7 @@ fn t_pl_13_1_switch_fires_past_the_point_and_not_before() {
     conn.set_adaptive_joins(true);
 
     let sql = |n: u64| format!("SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE a.id <= {n}");
-    let Some(point) = switch_point(&conn, &sql(1)) else {
-        // No break-even under this machine's learned costs: the join never switches.
-        let before = conn.adaptive_join_switches();
-        rows(&conn, "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k");
-        assert_eq!(conn.adaptive_join_switches(), before);
-        return;
-    };
+    let point = switch_point(&conn, &sql(1)).unwrap();
     assert!(point >= 1, "a switch point of {point}");
     // The outer table holds the point's rows and more; the point is the inner side's alone.
     conn.execute("BEGIN").unwrap();
@@ -252,4 +253,87 @@ fn t_pl_13_1_switch_fires_past_the_point_and_not_before() {
         );
         assert_eq!(on, off, "{n} outer rows: switch on and off differ");
     }
+}
+
+/// Do: an inner table whose count the planner holds far past its rows (a transaction inserted rows
+/// into it, its count took them, and it rolled back), joined with the switch on past the point its
+/// plan states; then the same join again. Expect: the hash table's build counts the true rows, past
+/// the estimate's error, and hands the statement to a second prepare (one re-plan counted) with the
+/// answer the switch-off one; run again, the statement is planned on the counted rows and no
+/// re-plan comes (T-PL.13.3).
+#[test]
+fn t_pl_13_3_a_build_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("replan.db");
+    let mut state = 0xd1b5_4a32_d192_ed03_u64;
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE INDEX b_k ON b (k)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=50 {
+        conn.execute(format!(
+            "INSERT INTO b VALUES ({id}, {})",
+            sql_value(key(&mut state, 20))
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("ANALYZE").unwrap();
+    // The count takes a finished INSERT's rows; the rollback takes them back out of the table only.
+    conn.execute("BEGIN").unwrap();
+    conn.execute(
+        "INSERT INTO b(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i % 20 FROM n",
+    )
+    .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+    conn.set_adaptive_joins(true);
+
+    let sql = "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k";
+    let point = switch_point(&conn, sql).unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=point + 10 {
+        conn.execute(format!(
+            "INSERT INTO a VALUES ({id}, {})",
+            sql_value(key(&mut state, 20))
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    conn.set_adaptive_joins(false);
+    let off = rows(&conn, sql);
+    conn.set_adaptive_joins(true);
+    let stated = switch_point(&conn, sql);
+    let (switches, replans) = (conn.adaptive_join_switches(), conn.adaptive_replans());
+    let on = rows(&conn, sql);
+    assert_eq!(on, off, "switch on and off differ");
+    assert_eq!(stated, Some(point));
+    assert_eq!(
+        conn.adaptive_join_switches() - switches,
+        1,
+        "the join switched"
+    );
+    assert_eq!(
+        conn.adaptive_replans() - replans,
+        1,
+        "the build's rows planned again"
+    );
+
+    // Planned again on the counted rows: the point comes sooner, and the build's count meets the
+    // estimate.
+    let replanned = switch_point(&conn, sql).unwrap();
+    assert!(
+        replanned < point,
+        "the point {replanned} on the counted rows, {point} before"
+    );
+    let replans = conn.adaptive_replans();
+    let again = rows(&conn, sql);
+    assert_eq!(again, off, "the second plan's answer");
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "a second re-plan on the counted rows"
+    );
 }

@@ -525,6 +525,9 @@ pub struct Connection {
     /// Amphora (PL.13): how many adaptive joins' hash tables held rows past their estimate's
     /// error, so their statements are prepared again; see [`Connection::adaptive_replans`].
     pub(super) adaptive_replans: AtomicU64,
+    /// Amphora (PL.13): the seek's, hash build's and hash probe's weights a test pins in place of
+    /// the learned ones (`Connection::pin_cost_weights`, the simulator's); None: the learned ones.
+    pub(super) pinned_cost_weights: crate::sync::RwLock<Option<(f64, f64, f64)>>,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1031,6 +1034,19 @@ impl Connection {
 
     pub(crate) fn count_adaptive_replan(&self) {
         self.adaptive_replans.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, T-PL.13.1): plans newly prepared statements with these weights of a seek, a
+    /// hash table's build and its probe (in rows' visits) in place of the learned ones, so a test's
+    /// switch point does not move with the machine's timings. None: the learned ones again.
+    #[cfg(feature = "simulator")]
+    pub fn pin_cost_weights(&self, weights: Option<(f64, f64, f64)>) {
+        *self.pinned_cost_weights.write() = weights;
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn pinned_cost_weights(&self) -> Option<(f64, f64, f64)> {
+        *self.pinned_cost_weights.read()
     }
 
     /// Amphora (query speed step 7, QT.7; a prototype behind this switch, off by default): newly

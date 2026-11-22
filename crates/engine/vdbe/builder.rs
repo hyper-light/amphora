@@ -1996,9 +1996,7 @@ impl ProgramBuilder {
                     resolve(&mut data.probe_pc, "JoinSwitchStep")?;
                 }
                 Insn::JoinSwitchHash { target_pc, .. } => resolve(target_pc, "JoinSwitchHash")?,
-                Insn::JoinSwitchBuilt { data } => {
-                    resolve(&mut data.target_pc, "JoinSwitchBuilt")?
-                }
+                Insn::JoinSwitchBuilt { data } => resolve(&mut data.target_pc, "JoinSwitchBuilt")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::GroupFind { data } => resolve(&mut data.target_pc_full, "GroupFind")?,
                 Insn::GroupDrain { data } => resolve(&mut data.target_pc_done, "GroupDrain")?,

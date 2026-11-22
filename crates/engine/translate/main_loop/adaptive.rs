@@ -45,11 +45,9 @@ impl<'a> AdaptiveSeek<'a> {
         if !t_ctx.resolver.adaptive_joins() {
             return None;
         }
-        if table
-            .join_info
-            .as_ref()
-            .is_some_and(|info| info.is_outer() || info.is_semi_or_anti() || info.keeps_right_rows())
-        {
+        if table.join_info.as_ref().is_some_and(|info| {
+            info.is_outer() || info.is_semi_or_anti() || info.keeps_right_rows()
+        }) {
             return None;
         }
         let Search::Seek {
@@ -84,13 +82,15 @@ impl<'a> AdaptiveSeek<'a> {
             return None;
         }
         let weights = t_ctx.resolver.learned_weights()?;
-        let stats = t_ctx.resolver.schema().analyze_stats.table_stats(&btree.name)?;
-        let analyzed_rows = stats.row_count.or_else(|| {
-            stats
-                .index_stats
-                .values()
-                .find_map(|stat| stat.total_rows)
-        })? as f64;
+        let stats = t_ctx
+            .resolver
+            .schema()
+            .analyze_stats
+            .table_stats(&btree.name)?;
+        let analyzed_rows = stats
+            .row_count
+            .or_else(|| stats.index_stats.values().find_map(|stat| stat.total_rows))?
+            as f64;
         let estimate_error = crate::row_changes::statistics_error(stats, analyzed_rows);
         // The rows the plan counts the table at (PL.9): ANALYZE's with the changes since.
         let build_rows = match t_ctx.resolver.plan_values() {
