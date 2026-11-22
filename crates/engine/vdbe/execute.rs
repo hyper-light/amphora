@@ -21265,6 +21265,11 @@ pub fn op_morsel_aggregate(
             connection
                 .morsel_join_links
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if join.searched {
+                connection
+                    .morsel_searched_links
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         // Each joined row runs through the copy of the serial loop's body (lane qs6-12).
         let Some(body) = &data.body else {

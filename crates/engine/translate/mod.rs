@@ -171,6 +171,7 @@ pub fn translate(
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
     resolver.set_outer_probe(connection.parallel_outer_probe());
+    resolver.set_searched_links(connection.parallel_searched_links());
     resolver.set_sorted_fetches(connection.sorted_fetches());
     resolver.set_adaptive_joins(connection.adaptive_joins());
     resolver.set_automatic_indexes(connection.automatic_indexes());

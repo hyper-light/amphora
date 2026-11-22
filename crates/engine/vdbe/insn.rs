@@ -578,6 +578,9 @@ pub struct MorselJoinData {
     /// What the link keeps that matches nothing, in a [`MorselOuter::Chain`] (lane qs6-14);
     /// neither for any other shape.
     pub keeps: MorselKeeps,
+    /// Whether the planner reads this table by a seek, the hook reading it whole instead
+    /// (`Connection::set_parallel_searched_links`, lane qs6-16): counted when it is built.
+    pub searched: bool,
 }
 
 /// Amphora: data for [Insn::GroupSort].

@@ -212,6 +212,9 @@ pub struct Resolver<'a> {
     /// Amphora (QT.6, lane qs6-15): which table a two-table outer join on morsels probes
     /// (`Connection::set_parallel_outer_probe`).
     outer_probe: crate::OuterJoinProbe,
+    /// Amphora (QT.6, lane qs6-16): whether a table read by a seek may be a morsel join's hash
+    /// link (`Connection::set_parallel_searched_links`).
+    searched_links: bool,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
@@ -354,6 +357,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
             outer_probe: crate::OuterJoinProbe::Padded,
+            searched_links: false,
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
@@ -465,6 +469,14 @@ impl<'a> Resolver<'a> {
         self.outer_probe = probe;
     }
 
+    pub(crate) fn searched_links(&self) -> bool {
+        self.searched_links
+    }
+
+    pub(crate) fn set_searched_links(&mut self, on: bool) {
+        self.searched_links = on;
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches
     }
@@ -526,6 +538,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             outer_probe: self.outer_probe,
+            searched_links: self.searched_links,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
@@ -565,6 +578,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             outer_probe: self.outer_probe,
+            searched_links: self.searched_links,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,

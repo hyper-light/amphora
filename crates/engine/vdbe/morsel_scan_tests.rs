@@ -2569,3 +2569,98 @@ fn t_qt_6_25_more_than_one_outer_join_answers_as_the_serial_loop_at(probe: crate
         "no statement of LEFT joins alone took the hook"
     );
 }
+
+/// T-QT.6.27 (lane qs6-16): with `Connection::set_parallel_searched_links` on, a join whose table
+/// the planner reads by a seek per row of the tables before it (a foreign key to an INTEGER
+/// PRIMARY KEY, a seek in an index on the joined column), planned by cost as it is outside the
+/// tests, runs on morsels with that table a hash link read whole. Inner joins of two and three
+/// tables, a LEFT JOIN onto a primary key (an ON term beside it too), with aggregates, GROUP BY,
+/// rows, and rows ordered by both ids under a LIMIT and an OFFSET, answer as the serial loop at 1,
+/// 2, 3, 4 and 8 stated cores with the switch off and on; with it on some links were built from
+/// a searched table, and with it off none was (today's: such a join stays on the serial loop).
+#[test]
+fn t_qt_6_27_joins_through_seeks_run_on_morsels_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-27");
+    let mut rng = ChaCha8Rng::seed_from_u64(627);
+    fill_with_ids(&conn, &mut rng, &[("f", 400), ("d", 60), ("e", 30)]);
+    conn.execute("CREATE INDEX d_b ON d(b)").unwrap();
+    let queries: [(&str, bool); 9] = [
+        (
+            "SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.id",
+            false,
+        ),
+        (
+            "SELECT d.c, count(*), min(f.b), max(d.b) FROM f JOIN d ON f.a = d.id GROUP BY d.c",
+            false,
+        ),
+        (
+            "SELECT f.id, d.id, d.b FROM f JOIN d ON f.a = d.id WHERE f.b > 0",
+            true,
+        ),
+        (
+            "SELECT count(*), sum(e.b) FROM f JOIN d ON f.a = d.id JOIN e ON d.a = e.id",
+            false,
+        ),
+        (
+            "SELECT e.c, count(*), sum(f.b) FROM f JOIN d ON d.id = f.a JOIN e ON e.id = d.a \
+             WHERE d.c <> 't4' GROUP BY e.c",
+            false,
+        ),
+        (
+            "SELECT count(*), sum(f.b) FROM f JOIN d ON f.b = d.b",
+            false,
+        ),
+        (
+            "SELECT count(*), count(d.id), sum(d.b) FROM f LEFT JOIN d ON f.a = d.id",
+            false,
+        ),
+        (
+            "SELECT f.id, d.b FROM f LEFT JOIN d ON f.a = d.id AND d.c <> 't3'",
+            true,
+        ),
+        (
+            "SELECT f.id, d.id FROM f JOIN d ON f.a = d.id ORDER BY f.id, d.id \
+             LIMIT 7 OFFSET 3 -- keys 2",
+            true,
+        ),
+    ];
+    let searched = |conn: &Arc<Connection>| {
+        conn.morsel_searched_links
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    for on in [false, true] {
+        conn.set_parallel_searched_links(on);
+        let before = searched(&conn);
+        for (sql, rows) in queries {
+            conn.set_parallel_mode(ParallelMode::Off);
+            let serial = sql_rows(&conn, sql);
+            conn.set_parallel_mode(ParallelMode::On);
+            for cores in [1usize, 2, 3, 4, 8] {
+                *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                    NonZeroUsize::new(cores).unwrap(),
+                    1.0,
+                    1.0,
+                ));
+                let parallel = sql_rows(&conn, sql);
+                same_answer(
+                    sql,
+                    rows,
+                    &parallel,
+                    &serial,
+                    &format!("on {cores} cores, searched links {on}"),
+                );
+            }
+        }
+        conn.set_parallel_mode(ParallelMode::Off);
+        let built = searched(&conn) - before;
+        if on {
+            assert!(built > 0, "no link was built from a searched table");
+        } else {
+            assert_eq!(
+                built, 0,
+                "a searched table was read whole with the switch off"
+            );
+        }
+    }
+    conn.set_parallel_searched_links(false);
+}

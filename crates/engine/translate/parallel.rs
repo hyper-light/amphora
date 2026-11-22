@@ -85,8 +85,10 @@ pub(crate) fn emit_morsel_hook(
         }
         // Which table a two-table outer join probes (lane qs6-15): `shape_join` takes the padded
         // one, `shape_chain` the kept one, as the connection's switch says.
-        (None, None) => match shape_join(plan, resolver.outer_probe())
-            .or_else(|| shape_chain(plan, resolver.outer_probe()))
+        // A table the planner reads by a seek is a hash link when the switch says so (lane
+        // qs6-16).
+        (None, None) => match shape_join(plan, resolver.outer_probe(), resolver.searched_links())
+            .or_else(|| shape_chain(plan, resolver.outer_probe(), resolver.searched_links()))
         {
             Some((data, looped)) => (data, Some(looped)),
             None => return Ok(None),
@@ -898,6 +900,23 @@ fn outputs(
     Some((group_by, aggregates, result_map))
 }
 
+/// Whether the planner reads the table at `at` in the join order by a seek the hook may replace
+/// with a hash link read whole (lane qs6-16, `Connection::set_parallel_searched_links`): a rowid
+/// lookup or a seek in one of the table's indexes, past the first table (a seek there has no row
+/// before it to key it). The hook tests every WHERE and ON term, consumed or not, on the joined
+/// row, so the rows a seek would have skipped fail the very terms the seek was made from (a
+/// partial index's rows too: the planner takes one only when the terms imply its condition). A
+/// link is still keyed only by an equality of one affinity with a table before it, else the
+/// hook declines (`next` finds no link). An IN-list seek is not taken.
+fn searched_by_seek(op: &Operation, at: usize, searched_links: bool) -> bool {
+    searched_links
+        && at > 0
+        && matches!(
+            op,
+            Operation::Search(Search::RowidEq { .. } | Search::Seek { .. })
+        )
+}
+
 /// A join's probe with the aggregates over its rows, or its rows (QT.6): two or more rowid tables,
 /// each joined inner and read whole, by a scan of its own rows or the planner's hash join (at least
 /// one hash join; a seek in an index the statement builds from the table, an ephemeral one, reads
@@ -917,6 +936,7 @@ fn outputs(
 fn shape_join(
     plan: &SelectPlan,
     probe: crate::OuterJoinProbe,
+    searched_links: bool,
 ) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
     // A join with no aggregates returns its rows (QT.6): the workers' runs merge in order.
     let rows_mode = plan.aggregates.is_empty();
@@ -932,6 +952,8 @@ fn shape_join(
         return None;
     }
     let mut built = Vec::new();
+    // The tables the planner reads by a seek, links read whole (lane qs6-16).
+    let mut searched = Vec::new();
     let mut tables: Vec<&BTreeTable> = Vec::new();
     // An outer join (lane qs6-12): its table and which rows it keeps that match nothing.
     let mut outer: Option<(usize, MorselOuter)> = None;
@@ -967,6 +989,7 @@ fn shape_join(
             {
                 built.push(op.build_table_idx)
             }
+            op if searched_by_seek(op, at, searched_links) => searched.push(at),
             _ => return None,
         }
         tables.push(stored(table)?);
@@ -981,10 +1004,13 @@ fn shape_join(
     let padded_at = outer.map(|(at, _)| at);
     let (probe_at, outer) = match outer {
         None => {
-            if built.is_empty() {
+            if built.is_empty() && searched.is_empty() {
                 return None;
             }
-            ((0..tables.len()).find(|at| !built.contains(at))?, None)
+            (
+                (0..tables.len()).find(|at| !built.contains(at) && !searched.contains(at))?,
+                None,
+            )
         }
         Some((at, kind)) if tables.len() == 2 => {
             // Probing the kept table instead is the chain's (lane qs6-15).
@@ -997,8 +1023,8 @@ fn shape_join(
         // probed per joined row of the others; the probe is one of the tables it keeps.
         Some((at, MorselOuter::Left)) => {
             let probe = (0..tables.len())
-                .find(|t| *t != at && !built.contains(t))
-                .or_else(|| (0..tables.len()).find(|t| *t != at))?;
+                .find(|t| *t != at && !built.contains(t) && !searched.contains(t))
+                .or_else(|| (0..tables.len()).find(|t| *t != at && !searched.contains(t)))?;
             (probe, Some(MorselOuter::LeftLink))
         }
         Some(_) => return None,
@@ -1131,6 +1157,7 @@ fn shape_join(
             probe_key,
             build_key,
             keeps: MorselKeeps::default(),
+            searched: searched.contains(&next),
         });
     }
     // The body's row: each table's columns at its place in the chain, the probe's rowid its own,
@@ -1322,6 +1349,7 @@ fn reach(joined: &[JoinedTable], expr: &Expr) -> Option<usize> {
 fn shape_chain(
     plan: &SelectPlan,
     probe: crate::OuterJoinProbe,
+    searched_links: bool,
 ) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
     let rows_mode = plan.aggregates.is_empty();
     if !(if rows_mode {
@@ -1334,6 +1362,8 @@ fn shape_chain(
     let joined = plan.table_references.joined_tables();
     let mut keeps = Vec::new();
     let mut tables: Vec<&BTreeTable> = Vec::new();
+    // The tables the planner reads by a seek, links read whole (lane qs6-16).
+    let mut searched = Vec::new();
     for (at, table) in joined.iter().enumerate() {
         let kept = match table.join_info.as_ref().map(|j| &j.join_type) {
             None | Some(JoinType::Inner) => MorselKeeps::default(),
@@ -1362,6 +1392,7 @@ fn shape_chain(
             Operation::Search(Search::Seek {
                 index: Some(index), ..
             }) if index.ephemeral => {}
+            op if searched_by_seek(op, at, searched_links) => searched.push(at),
             _ => return None,
         }
         keeps.push(kept);
@@ -1468,6 +1499,7 @@ fn shape_chain(
             probe_key,
             build_key,
             keeps: *keeps.get(at)?,
+            searched: searched.contains(&at),
         });
     }
     // The body's row: each table's columns at its place, the probe's rowid its own (NULL in a

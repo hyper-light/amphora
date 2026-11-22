@@ -642,6 +642,47 @@ words per statement, and the bytes charged to the statement's memory budget, the
 (`OuterCounters::charged_bytes`, `charged_peak`; a budget is not credited back within its
 statement, so a statement's charge bounds what it held at once).
 
+**A table the planner reads by a seek, as a hash link, behind a switch** (lane qs6-16).
+Planned by cost, a join onto a primary key or an indexed column is an index nested loop: the
+joined table is read by a seek per row of the tables before it (`Search::RowidEq`, `Search::Seek`),
+and the hook declined it, so the commonest join of all ran on the serial loop unless the planner
+chose a hash join somewhere in it. `Connection::set_parallel_searched_links` (off, today's, the
+control) lets `shape_join` and `shape_chain` take such a table past the first as a hash link read
+whole and keyed by its equalities with the tables before it, as they already take a seek in an
+index the statement builds. It is correct because the hook tests every term, consumed or not,
+on the joined row: the rows a seek skips fail the terms it was made from. Its cost is not a seek's:
+the whole table is read once, which pays against a large probe and loses against a small one (a
+probe of a few rows, or a seek on a constant), so the switch stays off until measured; a seek per
+row in each worker, its own cursor, is the other candidate. `MorselJoinData::searched` marks such
+a link and `morsel_searched_links` counts it (T-QT.6.27).
+
+**What still runs on the serial loop** (lane qs6-16's audit; each an open part of QT.6):
+- *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
+  answer is the serial loop's rows exactly, and a probe row's matches come in its hash tables'
+  order, not the hook's. Parallel needs an order the hook can reproduce (or a check of any rows of
+  the right count, as SQL allows) and the scans' early stop.
+- *The merge join* (lane qs5-21): not on this branch; once it is an `Operation`, it is taken as a
+  hash link (as above), or run by key ranges cut at the driving table's leaves.
+- *Correlated subqueries* (`non_from_clause_subqueries`, `outer_query_refs`, `Exists`, `InSelect`):
+  the subquery's code needs cursors of its own in each worker; the unnesting the planner already
+  does turns some into joins, which do run on morsels.
+- *Window functions* (`plan.window`): need a parallel sort, partitioned by PARTITION BY across the
+  workers, and a frame pass per partition.
+- *Recursive CTEs*: each round needs the last; a round's scan or join could run on morsels once an
+  ephemeral table (the queue) is a morsel source (`stored` takes only b-tree tables with a root
+  page).
+- *Scans on the versioned storage*: its pager holds no table's rows, so every statement its column
+  copy doesn't take (joins, expressions only the body states, rows, a statement in a transaction
+  that wrote, a table with no copy yet, or the planner's choice of the rows) runs on the serial
+  loop. Needs a morsel source over the row versions at the statement's snapshot, cut by key ranges.
+- Also found: a table with a DEFAULT value or a generated column (`stored`; padding a short row
+  with its constant default instead of NULL would take the first); a scan through an index or a
+  rowid range (`Operation::Search` on the probe: a rowid range is a run of leaves); a one-table
+  scan's rows under ORDER BY; AVG, TOTAL, group_concat, DISTINCT and FILTER aggregates, HAVING, and
+  an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and
+  other statements that don't return rows; joins with no equality of one affinity (a cross
+  product, a range join).
+
 **Not yet.** One path for LEFT joins: which orientation wins, or a choice per query from measured
 costs, is T-QT.6.26's run of record to say (qs6-14's plan, step 4: the leftover paths removed).
 

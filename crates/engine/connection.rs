@@ -570,6 +570,8 @@ pub struct Connection {
     pub(super) parallel_join_direct: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_outer_probe`].
     pub(super) parallel_outer_probe: AtomicOuterJoinProbe,
+    /// Amphora: see [`Connection::set_parallel_searched_links`].
+    pub(super) parallel_searched_links: AtomicBool,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
@@ -581,6 +583,8 @@ pub struct Connection {
     pub(crate) morsel_join_direct_rows: AtomicU64,
     /// Amphora (QT.6, lane qs6-15): what the outer joins on morsels did in each orientation.
     pub(crate) morsel_outer: crate::vdbe::morsel_scan::OuterCounters,
+    /// Amphora (QT.6, lane qs6-16): the links built from a table the planner reads by a seek.
+    pub(crate) morsel_searched_links: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1090,6 +1094,22 @@ impl Connection {
 
     pub(crate) fn parallel_outer_probe(&self) -> OuterJoinProbe {
         self.parallel_outer_probe.get()
+    }
+
+    /// Amphora (QT.6, lane qs6-16): whether a join's table that the planner reads by a seek per
+    /// row of the tables before it (a rowid lookup, or a seek in one of its indexes) runs on
+    /// morsels as a hash link, read whole and keyed by its equalities with those tables, for
+    /// statements prepared after. Off (today's: such a join, the commonest of foreign key to
+    /// primary key, runs on the serial loop unless the planner chose a hash join somewhere in it)
+    /// until measurements decide; a seek per row in the workers is the other candidate.
+    pub fn set_parallel_searched_links(&self, on: bool) {
+        self.parallel_searched_links.store(on, Ordering::Release);
+        // The shape is chosen at prepare: cached statements prepare again.
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn parallel_searched_links(&self) -> bool {
+        self.parallel_searched_links.load(Ordering::Acquire)
     }
 
     pub(crate) fn parallel_join_direct(&self) -> bool {

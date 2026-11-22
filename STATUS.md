@@ -1088,7 +1088,12 @@ walked through the rest of the chain once its bitmaps merge (T-QT.6.24, T-QT.6.2
 a two-table LEFT or FULL join's orientation is a switch (`Connection::set_parallel_outer_probe`:
 the padded table probed with a bitmap, today's default, or the kept table probed through the
 chain, padded during the walk), counted and traced per statement; every outer-join test runs at
-both settings, and the scaling run decides between them.
+both settings, and the scaling run decides between them. Lane qs6-16: T-QT.6.26, a harness of the two
+orientations at the extremes (a tiny padded table against a huge kept one and the reverse, nearly
+every row matched, nearly none), with each statement's memory; a join's table the planner reads
+by a seek (onto a primary key or an indexed column) runs on morsels as a hash link read whole,
+behind `set_parallel_searched_links` (off) until measured (T-QT.6.27); the audit of what still runs
+serially is in docs/design/executor.md.
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.
