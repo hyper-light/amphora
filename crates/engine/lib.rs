@@ -102,7 +102,7 @@ pub use function::{ExternalFunc, Func};
 pub use functions::printf::{exec_printf_values, printf_c_arg_plan, PrintfCArg};
 
 use crate::{
-    busy::{BusyHandler, BusyHandlerCallback},
+    busy::{BusyHandler, BusyHandlerCallback, BusyWake},
     incremental::view::AllViewsTxState,
     index_method::IndexMethod,
     schema::Trigger,
