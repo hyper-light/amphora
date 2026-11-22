@@ -1604,6 +1604,7 @@ fn pre_materialize_multi_ref_ctes_in_tables(
                                     from_clause_subquery.plan.as_mut(),
                                     t_ctx,
                                     &from_clause_subquery.columns,
+                                    from_clause_subquery.identity,
                                 )
                             },
                         )?;
@@ -1902,6 +1903,7 @@ pub fn emit_from_clause_subqueries(
                             from_clause_subquery.plan.as_mut(),
                             t_ctx,
                             &from_clause_subquery.columns,
+                            from_clause_subquery.identity,
                         )?;
                     from_clause_subquery.materialized_cursor_id = Some(cursor_id);
                     if let (Some(cte_id), Some(cte_info)) =
@@ -2208,6 +2210,7 @@ fn emit_materialized_subquery_table(
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
     columns: &[Column],
+    identity: Option<u64>,
 ) -> Result<(usize, CursorID, Option<MaterializedCteInfo>)> {
     use super::plan::EphemeralRowidMode;
 
@@ -2325,6 +2328,21 @@ fn emit_materialized_subquery_table(
         }
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+        }
+    }
+
+    // Amphora (PL.13, lane replan-6: the stored result's materialization point): once filled,
+    // inside the run-once block, its rows counted against the estimate the plan read. A
+    // correlated fill runs at each read (no run-once block): not counted.
+    if fill_subroutine.is_some() {
+        if let Plan::Select(select_plan) = &*plan {
+            crate::translate::main_loop::emit_subquery_count(
+                program,
+                t_ctx,
+                select_plan,
+                identity,
+                cursor_id,
+            );
         }
     }
 

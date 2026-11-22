@@ -3185,6 +3185,7 @@ impl JoinedTable {
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte: None,
+            identity: None,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -3207,6 +3208,8 @@ impl JoinedTable {
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
+    /// `identity` is the subquery's syntax's fingerprint (PL.13, lane replan-6), where its stored
+    /// result may be counted against its estimate.
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
@@ -3215,6 +3218,7 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
+        identity: Option<u64>,
     ) -> Result<Self> {
         let columns = subquery_output_columns(&plan, explicit_columns)?;
         // Get result columns and table references from the plan
@@ -3234,6 +3238,7 @@ impl JoinedTable {
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte,
+            identity,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),

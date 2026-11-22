@@ -83,6 +83,7 @@ mod series;
 mod stack;
 mod statement;
 mod stats;
+mod subquery_rows;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;

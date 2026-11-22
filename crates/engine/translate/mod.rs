@@ -154,6 +154,8 @@ pub fn translate(
     // filtered builds counted.
     if connection.adaptive_joins() {
         plan_values.attach_filter_shares(connection.db.filter_shares.clone());
+        // Amphora (PL.13, lane replan-6): and the subquery estimates the rows fills counted.
+        plan_values.attach_subquery_rows(connection.db.subquery_rows.clone());
     }
     // Amphora (PL.9): an INSERT or DELETE of a main-database table folds its change count into
     // that table's counter when it finishes.
@@ -251,6 +253,7 @@ pub fn translate(
     program.reads_parameter_values = plan_values.asked();
     program.planned_tables = plan_values.take_planned();
     program.planned_filters = plan_values.take_planned_filters();
+    program.planned_subqueries = plan_values.take_planned_subqueries();
     program.write_target = write_target;
 
     program.build(connection, change_cnt_on, input)

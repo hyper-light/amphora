@@ -1761,6 +1761,25 @@ rules. The sorter counts every row put in, kept by a LIMIT or not, in memory or 
 and a range whose share an UPDATE moved, each one answer in order with adaptive joins off and on,
 one re-plan, none on the second run.
 
+**Stored subquery results (lane replan-6).** An uncorrelated FROM-clause subquery stored whole in
+an ephemeral table (a CTE read more than once, or one declared `MATERIALIZED`, or a source a
+RIGHT or FULL JOIN reads again) holds the rows the planner estimated for it. Once its fill
+finishes, inside the block that runs it once, `SubqueryCounted` checks their count against the rows
+the plan read for the subquery: its own estimate, `estimated_output_rows`, or a count a fill stored.
+The band is the statistics' relative error of each table the subquery reads, in quadrature; a
+subquery over anything else (another subquery, a table without statistics) is not checked. The
+count is the last row's rowid (the fill numbers its rows 1, 2, ...), read without a scan. Past the
+band the count goes to the database's `SubqueryRows`, keyed by the subquery's identity: a
+fingerprint of its syntax taken when it is planned, since optimizing and emitting the plan rewrite
+its printed form; every reference to one CTE, and every statement writing the same subquery, share
+the key; a lateral subquery or one reading a parameter has none. The planner reads the count in
+place of the estimate (`base_row_estimate`), and every plan that read the old rows plans again, at
+once by the hand-off where the run may start over. Counted by `Connection::adaptive_subquery_checks`.
+A subquery stored in its seek index (`DirectMaterializedIndex`) is not checked yet. Evidence:
+`t_pl_13_7_a_stored_subquery_result_past_the_estimate_plans_again` (T-PL.13.7): a CTE referenced
+twice and a GROUP BY in a materialized CTE, each over a range whose share an UPDATE moved: one
+answer with adaptive joins off and on, one re-plan, none on the second run or in a new statement.
+
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).
 - A filtered build's stored share planned on by a statement whose build then counts past it again,

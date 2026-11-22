@@ -60,6 +60,10 @@ pub(crate) struct PlanValues {
     /// adaptive joins on, and the shares the plan read.
     filter_shares: crate::sync::OnceLock<crate::sync::Arc<crate::filter_shares::FilterShares>>,
     filters: crate::sync::Mutex<Vec<crate::filter_shares::PlannedFilter>>,
+    /// Amphora (PL.13, lane replan-6): the subquery results fills counted, attached only with
+    /// adaptive joins on, and the subquery rows the plan read.
+    subquery_rows: crate::sync::OnceLock<crate::sync::Arc<crate::subquery_rows::SubqueryRows>>,
+    subqueries: crate::sync::Mutex<Vec<crate::subquery_rows::PlannedSubquery>>,
 }
 
 impl PlanValues {
@@ -171,6 +175,55 @@ impl PlanValues {
     /// The filter shares the plan read (PL.13), taken once the statement is planned.
     pub(crate) fn take_planned_filters(&self) -> Vec<crate::filter_shares::PlannedFilter> {
         std::mem::take(&mut *self.filters.lock())
+    }
+
+    /// Where the subquery estimates read the rows stored results counted (PL.13, lane replan-6).
+    /// Set once, at translate, with adaptive joins on.
+    pub(crate) fn attach_subquery_rows(
+        &self,
+        rows: crate::sync::Arc<crate::subquery_rows::SubqueryRows>,
+    ) {
+        let _already_attached = self.subquery_rows.set(rows);
+    }
+
+    /// The rows of the subquery `identity` names: the ones a fill counted where one did, else
+    /// `estimated`, the subquery's own estimate; noted as rows the plan read. Without the store
+    /// attached, `estimated`.
+    pub(crate) fn subquery_rows(&self, identity: u64, estimated: f64) -> f64 {
+        let Some(store) = self.subquery_rows.get() else {
+            return estimated;
+        };
+        let mut subqueries = self.subqueries.lock();
+        if let Some(noted) = subqueries.iter().find(|noted| noted.identity == identity) {
+            return noted.planned_rows;
+        }
+        let rows = store.rows(identity);
+        let read = rows.bits();
+        let planned_rows = rows.get().unwrap_or(estimated);
+        subqueries.push(crate::subquery_rows::PlannedSubquery {
+            identity,
+            rows,
+            read,
+            planned_rows,
+        });
+        planned_rows
+    }
+
+    /// The rows the plan read for the subquery `identity`, if it read them.
+    pub(crate) fn planned_subquery(
+        &self,
+        identity: u64,
+    ) -> Option<crate::subquery_rows::PlannedSubquery> {
+        self.subqueries
+            .lock()
+            .iter()
+            .find(|noted| noted.identity == identity)
+            .cloned()
+    }
+
+    /// The subquery rows the plan read (PL.13), taken once the statement is planned.
+    pub(crate) fn take_planned_subqueries(&self) -> Vec<crate::subquery_rows::PlannedSubquery> {
+        std::mem::take(&mut *self.subqueries.lock())
     }
 
     /// The tables the plan counted (PL.9), taken once the statement is planned.

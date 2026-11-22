@@ -19435,6 +19435,55 @@ pub fn op_sorter_counted(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Amphora (PL.13, lane replan-6): [Insn::SubqueryCounted]. A stored subquery result, filled,
+/// counted against the rows the plan read for it; past the estimate's error the count is stored for
+/// the planner, every plan that read the old rows is planned again, and the run handed off as a
+/// build's is ([`hand_off_now`]).
+pub fn op_subquery_counted(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    load_insn!(SubqueryCounted { data }, insn);
+    let rows = match state.get_register(data.rows_reg).get_value() {
+        Value::Numeric(Numeric::Integer(rows)) => u64::try_from(*rows).unwrap_or(0),
+        _ => 0,
+    };
+    program.connection.count_adaptive_subquery_check();
+    let verdict = MaterializePoint::new(data.planned_rows, data.estimate_error, u64::MAX).and_then(
+        |mut point| {
+            point.rows(rows, 0)?;
+            Ok(point.verdict())
+        },
+    );
+    let replanned = match verdict {
+        Ok(Replan::Again { rows }) => {
+            let stored = data.rows.set(rows);
+            if stored {
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    planned = data.planned_rows,
+                    rows,
+                    "a stored subquery result counted past its estimate: planned again"
+                );
+            }
+            stored
+        }
+        Ok(Replan::Keep) => false,
+        Err(refused) => {
+            tracing::debug!(%refused, "a stored subquery result's rows not checked");
+            false
+        }
+    };
+    if hand_off_now(program, state, replanned) {
+        return Ok(InsnFunctionStepResult::Done);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_clear(
     _program: &Program,
     state: &mut ProgramState,
