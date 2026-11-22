@@ -12894,6 +12894,8 @@ pub struct OpInsertState {
     pub has_dependent_views: bool,
     /// Amphora (G5 step 4): a skipping summary watches the table, so the old row is captured.
     pub skip_on: bool,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the summaries installed when `skip_on` was read.
+    pub skip_installs: u64,
     pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
@@ -13015,6 +13017,27 @@ fn skipping_on_insert(
     skipping_hand(program, root, write);
 }
 
+/// Amphora (G7 step 2, `AC-NS.2.1`): a write that found no summary of its table before its row
+/// changed, `since` the installs it read then. On the versioned storage a build holds no lock
+/// against it: one installed between may have read the table before the row changed and checked
+/// its open writers before this one counted, so it misses the row, and it is made stale. With
+/// none installed between, a build after the change sees this writer open. (A delete needs no
+/// such look: its hook runs whether or not it found a summary, and one with no row captured makes
+/// the summary stale.)
+fn skipping_missed_install(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: crate::vdbe::CursorID,
+    since: u64,
+) {
+    if program.connection.db.skipping.installs() == since {
+        return;
+    }
+    if let Some(root) = skipping_watched_root(program, state, cursor_id) {
+        program.connection.db.skipping.mark_stale(root);
+    }
+}
+
 fn skipping_on_delete(
     program: &Program,
     state: &mut ProgramState,
@@ -13066,9 +13089,11 @@ pub fn op_insert(
                         .is_empty()
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
+                let skip_installs = program.connection.db.skipping.installs();
                 let skip_on = !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                     && skipping_watched_root(program, state, *cursor_id).is_some();
                 state.active_op_state.insert().skip_on = skip_on;
+                state.active_op_state.insert().skip_installs = skip_installs;
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
@@ -13247,6 +13272,9 @@ pub fn op_insert(
                     }
                     if state.active_op_state.insert().skip_on {
                         skipping_on_insert(program, state, *cursor_id, *key_reg, *record_reg);
+                    } else if !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT) {
+                        let since = state.active_op_state.insert().skip_installs;
+                        skipping_missed_install(program, state, *cursor_id, since);
                     }
                     state.record_rows_written(1);
                 }

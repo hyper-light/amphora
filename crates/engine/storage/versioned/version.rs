@@ -100,6 +100,10 @@ pub struct Clock {
     next_tx: AtomicU64,
     states: Vec<Mutex<FxHashMap<u64, State>>>,
     open: Mutex<Open>,
+    /// Each tree's count of open transactions that have changed a row of it (G7 step 2,
+    /// `AC-NS.2.1`): a summary built beside one would miss its rows once it commits. Bounded by
+    /// the trees, each counted once a transaction.
+    writing: Mutex<BTreeMap<u64, u64>>,
     /// What versions, transactions' records and kept commits may hold.
     budget: Budget,
 }
@@ -252,6 +256,10 @@ pub struct Txn {
     pub id: u64,
     pub start: Ts,
     changed: Vec<(u64, Vec<u8>)>,
+    /// The trees it has changed a row of, each once, counted in [`Clock`]'s `writing` until it
+    /// ends (G7 step 2, `AC-NS.2.1`). A rollback to a savepoint keeps them: counted a little
+    /// longer, a summary is only built again.
+    trees: Vec<u64>,
     /// Its changes in the order made: its redo record (decision 6).
     ops: Vec<Op>,
     /// What it read through [`VTree::read`], [`VTree::read_range`] and [`Versioned::keep_read`]: its
@@ -434,6 +442,11 @@ impl Txn {
         !self.changed.is_empty()
     }
 
+    /// Whether it has changed a row of tree `tree` (G7 step 2, `AC-NS.2.1`).
+    pub fn wrote_tree(&self, tree: u64) -> bool {
+        self.trees.contains(&tree)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             start: self.start,
@@ -502,6 +515,7 @@ impl Clock {
                 .map(|_| Mutex::new(FxHashMap::default()))
                 .collect(),
             open: Mutex::new(Open::default()),
+            writing: Mutex::new(BTreeMap::new()),
             budget,
         }
     }
@@ -560,6 +574,7 @@ impl Clock {
             id,
             start,
             changed: Vec::new(),
+            trees: Vec::new(),
             ops: Vec::new(),
             reads: Reads::default(),
             charged: 0,
@@ -628,9 +643,35 @@ impl Clock {
             count_out(&mut open.all, txn.start);
             count_out(&mut open.txns, txn.start);
         }
+        // After its commit is published: one who finds it no longer writing finds its commit.
+        {
+            let mut writing = self.writing.lock();
+            for tree in &txn.trees {
+                count_out(&mut writing, *tree);
+            }
+        }
         self.budget
             .release(txn.charged.saturating_add(txn.read_bytes));
         Ok(())
+    }
+
+    /// `txn` changes a row of tree `tree`: counted among the tree's writers once, before the
+    /// change is made, until it ends (G7 step 2, `AC-NS.2.1`).
+    fn writes_to(&self, txn: &mut Txn, tree: u64) -> Result<()> {
+        if txn.trees.contains(&tree) {
+            return Ok(());
+        }
+        count_in(&mut self.writing.lock(), tree)?;
+        txn.trees.push(tree);
+        Ok(())
+    }
+
+    /// How many open transactions have changed a row of tree `tree` (G7 step 2, `AC-NS.2.1`): a
+    /// skipping summary built while one is open misses its rows when it commits. One that ended
+    /// is no longer counted only after its commit was published ([`Clock::forget`]), so a caller
+    /// that reads this first, then the newest commit, sees either the writer or its commit.
+    pub fn writers_of(&self, tree: u64) -> u64 {
+        self.writing.lock().get(&tree).copied().unwrap_or(0)
     }
 
     /// The oldest open snapshot's timestamp, or the last commit's with none open: versions older
@@ -909,6 +950,7 @@ impl VTree {
         heads: &mut FxHashMap<Vec<u8>, Head>,
     ) -> Result<Option<Vec<u8>>> {
         let before = row_of(cell);
+        clock.writes_to(txn, self.id)?;
         // What the version kept for the snapshots that see it, and `txn`'s note of the row, take
         // from the budget: reserved before anything changes, so a refusal leaves the row as it is.
         let older = Older {
@@ -2808,5 +2850,44 @@ mod tests {
         assert_eq!(machine.held(), 38);
         drop(budget);
         assert_eq!(machine.held(), 0);
+    }
+
+    /// Do: two transactions change rows of one tree, one of them twice, beside a third that only
+    /// reads it; one commits, one rolls back. Expect (G7 step 2, `AC-NS.2.1`): the tree counts each
+    /// writer once while it is open, the reader not at all, and none once they end; a write refused
+    /// by the first writer's win still counts its transaction until it rolls back.
+    #[test]
+    fn t_ns_2_1_a_tree_counts_its_open_writers() {
+        let v = db();
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let mut a = v.clock.begin().unwrap();
+        let mut b = v.clock.begin().unwrap();
+        let reader = v.clock.begin().unwrap();
+        assert_eq!(v.clock.writers_of(0), 0);
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"x", b"1")
+            .unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut a, b"y", b"1")
+            .unwrap();
+        assert!(a.wrote_tree(0) && !b.wrote_tree(0));
+        assert_eq!(v.clock.writers_of(0), 1);
+        t.put(&v.pool, &mut d, &v.clock, &mut b, b"z", b"2")
+            .unwrap();
+        assert_eq!(
+            t.get(&v.pool, &mut d, &v.clock, &reader.snapshot(), b"x")
+                .unwrap(),
+            None
+        );
+        assert_eq!(v.clock.writers_of(0), 2);
+        assert!(matches!(
+            t.put(&v.pool, &mut d, &v.clock, &mut b, b"x", b"2"),
+            Err(LimboError::WriteWriteConflict)
+        ));
+        assert_eq!(v.clock.writers_of(0), 2);
+        v.commit(a, &mut d).unwrap();
+        assert_eq!(v.clock.writers_of(0), 1);
+        v.abort(b, &mut d).unwrap();
+        v.commit(reader, &mut d).unwrap();
+        assert_eq!(v.clock.writers_of(0), 0);
     }
 }

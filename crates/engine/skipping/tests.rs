@@ -1857,4 +1857,88 @@ mod versioned {
             assert!(rowids(&reader, sql).0.is_empty(), "{kind:?}");
         }
     }
+
+    /// Do: a checked install whose check says rows were missed, then one whose check finds
+    /// none. Expect: the first is kept stale (counted, a scan refused) and moves the installs; the
+    /// second is consulted.
+    #[test]
+    fn t_ns_2_1_a_checked_install_keeps_a_build_that_missed_rows_stale() {
+        let (root, reader) = (5, 1);
+        let registry = SkipRegistry::default();
+        let zones = || {
+            let mut zones = ZoneMapBuilder::new();
+            for rowid in 1..=8 {
+                zones.row(rowid, Some(rowid)).unwrap();
+            }
+            Skipping::ZoneMaps(zones.finish())
+        };
+        let before = registry.installs();
+        let why = "another open transaction has changed the table";
+        assert_eq!(
+            registry.set_checked(root, 0, zones(), || Some(why)),
+            Some(why)
+        );
+        assert_ne!(registry.installs(), before);
+        assert_eq!(
+            registry.candidates(root, reader, (0, 1), (0, 1), 1, 8),
+            Err(SkipRefusal::Stale)
+        );
+        assert_eq!(registry.counts(root).unwrap().built_stale, 1);
+        assert_eq!(registry.set_checked(root, 0, zones(), || None), None);
+        assert!(registry
+            .candidates(root, reader, (0, 1), (0, 1), 1, 8)
+            .is_ok());
+        let counts = registry.counts(root).unwrap();
+        assert_eq!((counts.built_stale, counts.consulted), (0, 1));
+    }
+
+    /// Do: one connection inserts a row the filter matches and stays open; another builds a
+    /// summary beside it, at a snapshot without the row; the writer commits. Expect: the build is
+    /// kept stale (counted), so the filter scans every row and finds the committed row (a summary
+    /// kept current would skip its zone and lose it); built again with no writer open, it holds
+    /// the row and is consulted.
+    #[test]
+    fn t_ns_2_1_a_build_beside_an_open_writer_is_kept_stale() {
+        let sql = "SELECT rowid FROM t WHERE a BETWEEN 100 AND 120 ORDER BY rowid";
+        for kind in [SkipKind::ZoneMaps, SkipKind::Cracking, SkipKind::Measured] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let open = || {
+                db.connect(ConnectOpts::new().with_versioned_storage())
+                    .unwrap()
+            };
+            let (builder, writer) = (open(), open());
+            builder
+                .execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+                .unwrap();
+            builder.execute("BEGIN").unwrap();
+            for i in 0..3000 {
+                builder
+                    .execute(format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(40)))
+                    .unwrap();
+            }
+            builder.execute("COMMIT").unwrap();
+            writer.execute("BEGIN").unwrap();
+            writer
+                .execute("INSERT INTO t VALUES (110, 'open')")
+                .unwrap();
+            set_skipping(&builder, "t", "a", Some(kind)).unwrap();
+            let counts = skipping_counts(&builder, "t").unwrap();
+            assert_eq!(counts.built_stale, 1, "{kind:?}");
+            writer.execute("COMMIT").unwrap();
+            let mut expected: Vec<i64> = (101..=121).collect();
+            expected.push(3001);
+            assert_eq!(rowids(&builder, sql).0, expected, "{kind:?}");
+            assert_eq!(
+                skipping_candidates(&builder, "t", 100, 120),
+                Err(SkipRefusal::Stale),
+                "{kind:?}"
+            );
+            // Built again with no writer open: it holds the row and is consulted.
+            set_skipping(&builder, "t", "a", Some(kind)).unwrap();
+            assert_eq!(rowids(&builder, sql).0, expected, "{kind:?}");
+            let counts = skipping_counts(&builder, "t").unwrap();
+            assert_eq!((counts.built_stale, counts.consulted), (0, 1), "{kind:?}");
+        }
+    }
 }

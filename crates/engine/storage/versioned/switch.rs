@@ -411,6 +411,32 @@ impl Switch {
         (start.unwrap_or(newest), newest)
     }
 
+    /// Why a skipping summary of the table at `root_page`, built in the connection's open
+    /// transaction, misses rows the newest commit or a later one will hold (G7 step 2,
+    /// `AC-NS.2.1`); `None` when it holds exactly the newest commit. Writers here take no single
+    /// write lock, so one may have changed the table before the build, beside it, and commit after.
+    /// The tree's writers are read before the newest commit: a writer is uncounted only after its
+    /// commit is published, so one that ended between is seen by its commit.
+    pub(crate) fn skipping_build_missed(&self, root_page: i64) -> Result<Option<&'static str>> {
+        let tree = tree_of(root_page)?;
+        let (start, own) = match self.txn.lock().as_ref() {
+            Some(shared) => match shared.lock().as_ref() {
+                Some(txn) => (Some(txn.start), txn.wrote_tree(tree)),
+                None => (None, false),
+            },
+            None => (None, false),
+        };
+        let writers = self.db.v.clock.writers_of(tree);
+        let newest = self.db.newest();
+        if writers > u64::from(own) {
+            return Ok(Some("another open transaction has changed the table"));
+        }
+        if start.is_some_and(|start| start != newest) {
+            return Ok(Some("a commit passed the build's snapshot"));
+        }
+        Ok(None)
+    }
+
     /// The connection's transaction, begun if none is open.
     fn txn(&self) -> Result<SharedTxn> {
         let mut slot = self.txn.lock();
@@ -776,7 +802,10 @@ mod tests {
         let stopped = cursor.count();
         conn.interrupt_requested.store(false, Ordering::SeqCst);
         assert!(
-            matches!(stopped.as_ref().map_err(|e| &**e), Err(LimboError::Interrupt)),
+            matches!(
+                stopped.as_ref().map_err(|e| &**e),
+                Err(LimboError::Interrupt)
+            ),
             "{stopped:?}"
         );
         switch.finish(true).unwrap();

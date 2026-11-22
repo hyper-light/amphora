@@ -18,8 +18,15 @@
 //! the positions are commit timestamps, the writer's end is told ([`SkipRegistry::committed`],
 //! [`SkipRegistry::rolled_back`]) rather than read from them, and a second open writer's write
 //! makes the summary stale.
+//!
+//! A build there takes no lock against writers either: a writer may change the table before the
+//! build, beside it, and commit after, its rows missing from the summary. So a build is installed
+//! with [`SkipRegistry::set_checked`], which asks the storage, under the registry's lock, whether
+//! one did; if so the summary is kept stale until built again. A write that had found no summary
+//! to feed before its row changed looks again after ([`SkipRegistry::installs`]).
 
 use super::{Candidates, RowWrite, SkipError, SkipMethod, Skipping};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Mutex;
 
 /// A WAL position: `(checkpoint_seq, max_frame)`, as the pager reports a connection's snapshot
@@ -55,6 +62,9 @@ pub struct SkipCounts {
     pub refused_older: u64,
     /// Scans refused because the summary was stale.
     pub refused_stale: u64,
+    /// Builds kept stale because rows were missing from them (G7 step 2, `AC-NS.2.1`): another
+    /// open transaction had changed the table, or a commit passed the build's snapshot.
+    pub built_stale: u64,
 }
 
 #[derive(Debug)]
@@ -77,9 +87,29 @@ struct Entry {
 }
 
 /// The summaries one database keeps, by table root page.
-#[derive(Debug, Default)]
 pub struct SkipRegistry {
     entries: Mutex<Vec<Entry>>,
+    /// How many summaries were installed, moved under the entries' lock (G7 step 2,
+    /// `AC-NS.2.1`): a write that found none to feed reads it before and after its row changes.
+    installs: AtomicU64,
+}
+
+impl Default for SkipRegistry {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            installs: AtomicU64::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for SkipRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkipRegistry")
+            .field("entries", &self.entries)
+            .field("installs", &self.installs.load(Ordering::SeqCst))
+            .finish()
+    }
 }
 
 impl SkipRegistry {
@@ -87,18 +117,48 @@ impl SkipRegistry {
     /// `root_page`, replacing any summary it had; `Skipping::Off` drops it. The caller built it at
     /// the newest commit with no writer open (it held the write lock).
     pub fn set(&self, root_page: i64, column: usize, skipping: Skipping) {
+        self.set_checked(root_page, column, skipping, || None);
+    }
+
+    /// [`SkipRegistry::set`] for a build that held no lock against writers (the versioned
+    /// storage, G7 step 2, `AC-NS.2.1`): `missed`, asked under the registry's lock as the summary
+    /// goes in (no write can feed or miss it meanwhile), says why the build misses rows (`None`:
+    /// it holds the newest commit), and then the summary is kept stale until built again. A write
+    /// whose row changed before the ask is seen by it; one after finds the summary in place. Why
+    /// it was kept stale.
+    pub fn set_checked(
+        &self,
+        root_page: i64,
+        column: usize,
+        skipping: Skipping,
+        missed: impl FnOnce() -> Option<&'static str>,
+    ) -> Option<&'static str> {
         let mut entries = self.entries.lock();
         entries.retain(|entry| entry.root_page != root_page);
-        if !matches!(skipping, Skipping::Off) {
-            entries.push(Entry {
-                root_page,
-                column,
-                skipping,
-                pending: None,
-                stale: false,
-                counts: SkipCounts::default(),
-            });
+        if matches!(skipping, Skipping::Off) {
+            return None;
         }
+        self.installs.fetch_add(1, Ordering::SeqCst);
+        let why = missed();
+        entries.push(Entry {
+            root_page,
+            column,
+            skipping,
+            pending: None,
+            stale: why.is_some(),
+            counts: SkipCounts {
+                built_stale: u64::from(why.is_some()),
+                ..SkipCounts::default()
+            },
+        });
+        why
+    }
+
+    /// How many summaries were installed so far (G7 step 2, `AC-NS.2.1`). A write that found no
+    /// summary for its table reads it before its row changes and again after: if it moved, a
+    /// build may have missed the row, and the write looks for the table's summary again.
+    pub fn installs(&self) -> u64 {
+        self.installs.load(Ordering::SeqCst)
     }
 
     /// Marks the table at `root_page`'s summary stale: a write reached it that it couldn't take.

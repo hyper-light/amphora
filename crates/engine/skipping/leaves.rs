@@ -285,19 +285,25 @@ pub fn set_skipping(
             })
         }
     });
-    // G7 step 2 (`AC-NS.2.1`): on the versioned storage another writer may commit during the
-    // build, which holds no lock against it: the summary is kept only if the build's snapshot is
-    // still the newest commit.
-    let built = built.and_then(|skipping| {
-        if conn.versioned_for(crate::MAIN_DB_ID).is_none() || conn.skipping_write_base().is_some() {
-            Ok(skipping)
-        } else {
-            Err(LeafBuildError::Refused(SkipRefusal::OlderSnapshot))
-        }
-    });
     match built {
         Ok(skipping) => {
-            conn.db.skipping.set(root, index, skipping);
+            match conn.versioned_for(crate::MAIN_DB_ID) {
+                None => conn.db.skipping.set(root, index, skipping),
+                // G7 step 2 (`AC-NS.2.1`): the build there held no lock against writers. One
+                // that changed the table and is still open, or one that committed since the
+                // build's snapshot, left rows out of it: it is kept stale until built again.
+                Some(switch) => {
+                    let missed = conn.db.skipping.set_checked(root, index, skipping, || {
+                        switch.skipping_build_missed(root).unwrap_or_else(|e| {
+                            tracing::warn!(target: "amphora.skipping", error = %e, "a build's check of open writers failed");
+                            Some("the check of open writers failed")
+                        })
+                    });
+                    if let Some(why) = missed {
+                        tracing::debug!(target: "amphora.skipping", table, column, why, "summary built stale");
+                    }
+                }
+            }
             conn.execute("COMMIT")?;
             Ok(())
         }

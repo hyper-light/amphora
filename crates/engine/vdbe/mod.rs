@@ -780,6 +780,7 @@ impl ActiveOpStateSlot {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             has_dependent_views: false,
             skip_on: false,
+            skip_installs: 0,
             old_record: None,
             is_noop_update: false,
         }
@@ -4565,6 +4566,7 @@ mod tests {
             sub_state: OpInsertSubState::Seek,
             has_dependent_views: false,
             skip_on: false,
+            skip_installs: 0,
             old_record: None,
             is_noop_update: false,
         };

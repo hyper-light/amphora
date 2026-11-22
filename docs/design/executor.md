@@ -711,9 +711,26 @@ take no single write lock, so another may commit while one is open and a newer c
 means the open writer committed: its writes are taken with `SkipRegistry::on_write_told`, and its
 end is told as its transaction ends (`committed`, or `rolled_back`, which makes the summary
 `Stale`). A write while another writer's is open, or by a writer whose snapshot isn't the newest
-commit, makes the summary `Stale`; a build whose snapshot a commit passed is refused
-(`OlderSnapshot`). Not covered yet: a writer that wrote the table before a build and commits after
-it (the build can't see that writer's open rows); the pager's write lock rules that out there.
+commit, makes the summary `Stale`.
+
+A build there holds no lock against writers either, so a writer may change the table before the
+build or beside it and commit after, and the build, which can't see its open rows, would miss them
+(lane g7s2-15). The versioned storage counts, for each tree, the open transactions that have
+changed a row of it (`Clock::writers_of`; a transaction is counted once a tree, from before its
+first change to after its commit is published). A build is installed with
+`SkipRegistry::set_checked`: under the registry's lock, once the summary is in place, it asks
+whether another open transaction has changed the tree or a commit passed the build's snapshot, and
+if so the summary is kept `Stale` until built again (counted in `SkipCounts::built_stale`, with the
+reason in an `amphora.skipping` trace event). A write whose row changed before that ask is seen by
+it; one after finds the summary and feeds it. An insert that found no summary before its row
+changed reads the registry's install count before and after, and makes a summary installed
+between stale (a delete's hook already runs whether it found one or not).
+
+Keeping the build stale was chosen over waiting for the open writers to end: a wait needs a wake
+on a tree's last writer ending and a retry of the build, and it holds the caller behind any
+transaction however long it runs (and forever behind one on the same thread). A stale summary is
+refused at once, every scan reads every row and stays correct, and the next build (lane skip-8's
+rebuild, or the caller's) makes it current.
 
 ### Bounds from parameters (lane skip-usable, T-SKU.1)
 
