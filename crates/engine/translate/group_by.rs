@@ -1192,6 +1192,21 @@ pub fn group_by_agg_phase(
     t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
 ) -> Result<()> {
+    // PL.13 (lane replan-10): a GROUP BY sorter that took every row read, all in now, ahead of its
+    // sort, counted against the estimate as an ORDER BY sorter's input is.
+    if let Some(GroupByMetadata {
+        row_source:
+            GroupByRowSource::Sorter {
+                sort_cursor,
+                hash: None,
+                ..
+            },
+        ..
+    }) = t_ctx.meta_group_by.as_ref()
+    {
+        let sort_cursor = *sort_cursor;
+        crate::translate::main_loop::emit_sorter_count(program, t_ctx, plan, sort_cursor, true);
+    }
     let GroupByMetadata {
         labels, row_source, ..
     } = t_ctx.meta_group_by.as_mut().unwrap();

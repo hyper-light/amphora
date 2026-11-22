@@ -448,6 +448,7 @@ tests = [
   # lane replan-10
   { id = "T-PL.13.12", text = "An uncorrelated IN subquery's ephemeral index counts its distinct values once filled, against the values the plan read for it, keyed by the subquery's identity; past the estimate's error the count is stored for the planner and the statement is planned again, once; the answer is the same with adaptive joins on and off" },
   { id = "T-PL.13.13", text = "An uncorrelated IN subquery's values are estimated from statistics: at most its rows, at most its column's distinct values where ANALYZE counted them, and at most the distinct values of the column it is tested against (the containment assumption), the share kept that many of that column's distinct values; no cap at the square root of the table's rows" },
+  { id = "T-PL.13.14", text = "A GROUP BY's sorter that takes every row read, fed by one table's full scan or index seek, counts its input once all in, ahead of its sort, against the table's rows or its WHERE terms' share of them; past the estimate's error the count or share is corrected and the statement is planned again, once; the answer is the same with adaptive joins on and off" },
 ]
 
 # Amphora's own IDs for its query time (Amphora goal 7788ef29, kiln plan

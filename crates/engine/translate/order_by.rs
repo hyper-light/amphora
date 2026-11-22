@@ -382,7 +382,13 @@ impl EmitOrderBy {
             });
 
             // PL.13 (lane replan-5): the sorter's rows, all in, counted against the estimate.
-            crate::translate::main_loop::emit_sorter_count(program, t_ctx, plan, sort_cursor);
+            crate::translate::main_loop::emit_sorter_count(
+                program,
+                t_ctx,
+                plan,
+                sort_cursor,
+                false,
+            );
             program.emit_insn(Insn::SorterSort {
                 cursor_id: sort_cursor,
                 pc_if_empty: sort_loop_end_label,

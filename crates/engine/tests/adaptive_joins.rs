@@ -1143,3 +1143,67 @@ fn t_pl_13_13_an_in_subquerys_values_come_from_its_statistics() {
         "five values looked up in a_x: {few}"
     );
 }
+
+/// Do: a GROUP BY read through its sorter (a `count(DISTINCT ...)` keeps the groups out of a hash
+/// table), over one table's full scan: the table counted far past its rows (inserted, counted,
+/// rolled back), then a range whose share an UPDATE moved (one row in a hundred at ANALYZE, every
+/// row after); each run with adaptive joins off, then on twice in one prepared statement. Expect:
+/// one answer every way; off, no sorter counted; on, the sorter's input counted once all in, ahead
+/// of its sort, against the table's rows or the range's share, past its error corrected and the
+/// statement planned again once; the second run's sorter counted, and nothing plans again (PL.13,
+/// lane replan-10, T-PL.13.14: a GROUP BY's sorter at its materialization point).
+#[test]
+fn t_pl_13_14_a_group_by_sorters_input_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("group_sorter.db");
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 20, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE b SET v = v % 50").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50000) SELECT i % 20, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    for (case, sql) in [
+        (
+            "unfiltered",
+            "SELECT k, count(DISTINCT v) FROM b GROUP BY k ORDER BY k",
+        ),
+        (
+            "filtered",
+            "SELECT k, count(DISTINCT v) FROM b WHERE v < 50 GROUP BY k ORDER BY k",
+        ),
+    ] {
+        conn.set_adaptive_joins(false);
+        let checks = conn.adaptive_sort_checks();
+        let off = run_rows(&mut conn.prepare(sql).unwrap());
+        assert_eq!(off.len(), 20, "{case}: the groups");
+        assert_eq!(conn.adaptive_sort_checks(), checks, "{case}: counted off");
+
+        conn.set_adaptive_joins(true);
+        let replans = conn.adaptive_replans();
+        let mut held = conn.prepare(sql).unwrap();
+        assert_eq!(run_rows(&mut held), off, "{case}: on and off differ");
+        assert!(
+            conn.adaptive_sort_checks() > checks,
+            "{case}: the GROUP BY sorter was not counted"
+        );
+        assert_eq!(
+            conn.adaptive_replans() - replans,
+            1,
+            "{case}: planned again once"
+        );
+        let (checks, replans) = (conn.adaptive_sort_checks(), conn.adaptive_replans());
+        assert_eq!(run_rows(&mut held), off, "{case}: the second run's answer");
+        assert!(
+            conn.adaptive_sort_checks() > checks,
+            "{case}: the second sorter was not counted"
+        );
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+    }
+}

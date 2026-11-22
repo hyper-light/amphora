@@ -111,18 +111,27 @@ fn counted_check(
 /// Fed by an index seek on the table (lane replan-9), it holds the rows the seek's terms and the
 /// rest keep: every WHERE term counts, the seek's (consumed by it) among them, so a seek by one
 /// `=` or IN list the column statistics estimate is checked against the share they gave.
+///
+/// A GROUP BY's sorter (`grouped`, lane replan-10) holds the same rows, one a row read, before
+/// they are grouped: its input is the table's rows its WHERE terms keep, checked and corrected the
+/// same way (the table's row counter, or the filter's stored share), and the GROUP BY's estimate is
+/// made from them again. Only a sorter that takes every row: one beside a hash table of groups
+/// (`GroupByRowSource::Sorter`'s `hash`) takes only the rows of groups past its budget, and is
+/// not checked; nor is a GROUP BY under a window.
 pub(crate) fn emit_sorter_count(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
     plan: &crate::translate::plan::SelectPlan,
     cursor_id: CursorID,
+    grouped: bool,
 ) {
     use crate::translate::plan::{Distinctness, Operation, Scan, Search};
     let [joined] = plan.joined_tables() else {
         return;
     };
-    if plan.group_by.is_some()
-        || !plan.aggregates.is_empty()
+    // An ORDER BY sorter after a GROUP BY or an aggregate holds groups, not the rows read.
+    if (!grouped && (plan.group_by.is_some() || !plan.aggregates.is_empty()))
+        || (grouped && plan.group_by.is_none())
         || plan.window.is_some()
         || plan.contains_constant_false_condition
         || !matches!(plan.distinctness, Distinctness::NonDistinct)

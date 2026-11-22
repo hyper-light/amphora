@@ -1768,7 +1768,15 @@ one re-plan, none on the second run. A sorter fed by an index seek on one table 
 checked the same way against the share the plan read for every WHERE term, the seek's own among
 them: `t_pl_13_11_a_sorter_fed_by_an_index_seek_plans_again` (T-PL.13.11), a seek by `v = 7`, and
 by `v IN (7, 8)`, on an index whose values were all distinct at ANALYZE, half the rows set to 7
-after.
+after. A GROUP BY's sorter (lane replan-10) holds the same rows, one a row read, before they are
+grouped, and is checked the same way once the loop has put them all in, ahead of its sort
+(`group_by_agg_phase`); its correction is the table's row counter or the filter's stored share, so
+the GROUP BY's estimate is made again from the rows counted. Only a sorter that takes every row:
+one beside a hash table of groups takes only the rows of groups past its budget (executor decision
+4) and is not checked. `t_pl_13_14_a_group_by_sorters_input_past_the_estimate_plans_again`
+(T-PL.13.14): a `count(DISTINCT v)` GROUP BY (no hash table) over a table counted far past its rows,
+and over a range whose share an UPDATE moved: one answer with adaptive joins off and on, one
+re-plan, none on the second run.
 
 **Stored subquery results (lane replan-6).** An uncorrelated FROM-clause subquery stored whole in
 an ephemeral table (a CTE read more than once, or one declared `MATERIALIZED`, or a source a
@@ -1836,7 +1844,7 @@ root's cap took both for 70 values.
 **Not checked yet (lane replan-9's audit of the points this decision names).** A hash join's build
 fed by a materialized input, or filtered by terms that are neither one column statistics term nor
 a set the sample ran together; a sorter fed by anything but one table's full scan or index seek
-(a join, a GROUP BY's or DISTINCT's sorter), or by a seek whose terms the plan read no one share
+(a join), a GROUP BY's hash table of groups (a store of group counts), a DISTINCT, or by a seek whose terms the plan read no one share
 for (an `=` its column statistics price beside a range the sample runs, say); a stored subquery result over another subquery or
 a table without statistics. Each needs a store for its own
 correction (a join's or a group's rows, keyed as a filter share is), or the new plan would be the
