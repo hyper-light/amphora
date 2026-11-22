@@ -43,6 +43,9 @@ pub struct TableSource {
     defaults: Vec<Value>,
     /// Each leaf's greatest rowid in key order; `None` for the last leaf, which has no bound.
     upper: Vec<Option<i64>>,
+    /// The greatest rowid before the first leaf `upper` holds; `None` when that is the table's
+    /// first (lane qs6-17: [`TableSource::restrict`]).
+    floor: Option<i64>,
 }
 
 /// One page entry of a level of the walk: its number, the greatest rowid under it, and whether it
@@ -130,6 +133,7 @@ impl TableSource {
             rowid_alias,
             defaults,
             upper,
+            floor: None,
         })
     }
 
@@ -142,6 +146,30 @@ impl TableSource {
         for (slot, default) in row.iter_mut().zip(&self.defaults).skip(written) {
             slot.clone_from(default);
         }
+    }
+
+    /// Keeps only the leaves that may hold a rowid from `lower` to `upper` (each inclusive, `None`
+    /// unbounded): the first whose greatest rowid reaches `lower`, through the first whose greatest
+    /// rowid reaches `upper` (lane qs6-17). The rows past the bounds in those leaves are still
+    /// read: the caller's terms decide them.
+    pub fn restrict(&mut self, lower: Option<i64>, upper: Option<i64>) {
+        // A leaf's bound is `None` only for the last, which holds every rowid past the others'.
+        let reaches = |bound: &Option<i64>, rowid: i64| bound.is_none_or(|b| b >= rowid);
+        let first = lower.map_or(0, |lower| {
+            self.upper.partition_point(|bound| !reaches(bound, lower))
+        });
+        let end = upper.map_or(self.upper.len(), |upper| {
+            self.upper
+                .partition_point(|bound| !reaches(bound, upper))
+                .saturating_add(1)
+                .min(self.upper.len())
+        });
+        let end = end.max(first);
+        if let Some(below) = first.checked_sub(1) {
+            self.floor = self.upper.get(below).copied().flatten();
+        }
+        self.upper.truncate(end);
+        self.upper.drain(..first);
     }
 
     /// How many leaf pages the table has: the units its morsels are cut in.
@@ -169,7 +197,7 @@ impl TableSource {
             return Ok(());
         }
         let lower = match leaves.start.checked_sub(1) {
-            None => None,
+            None => self.floor,
             Some(below) => Some(self.upper.get(below).copied().flatten().ok_or(
                 MorselError::Corrupt("a leaf before the last has no greatest rowid"),
             )?),

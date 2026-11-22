@@ -33,8 +33,8 @@ use crate::translate::expr::{
     WalkControl,
 };
 use crate::translate::plan::{
-    Distinctness, HashJoinType, JoinType, JoinedTable, Operation, QueryDestination, Scan, Search,
-    SelectPlan, WhereTermOrigin,
+    Distinctness, HashJoinType, IterationDirection, JoinType, JoinedTable, Operation,
+    QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan, WhereTermOrigin,
 };
 use crate::types::Value;
 use crate::vdbe::affinity::Affinity;
@@ -77,6 +77,7 @@ pub(crate) fn emit_morsel_hook(
                 columns: looped.table.columns().len(),
                 rowid_alias: rowid_alias(looped.table),
                 defaults: defaults(looped.table),
+                rowid_range: looped.rowid_range,
                 filter: Vec::new(),
                 group_by: looped.group_by.clone(),
                 aggregates: looped.aggregates.clone(),
@@ -293,6 +294,8 @@ struct BodyPlan<'p> {
     result_map: Vec<usize>,
     /// Each aggregate's FILTER and its input's place in `outs` (lane qs6-17).
     agg_filters: Vec<(usize, &'p Expr)>,
+    /// The scan's least and greatest rowid, `(None, None)` for the whole table (lane qs6-17).
+    rowid_range: (Option<i64>, Option<i64>),
     /// The outputs are the result columns, returned as rows (lane qs6-8).
     rows: bool,
 }
@@ -489,14 +492,15 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
     let [joined] = plan.table_references.joined_tables() else {
         return None;
     };
-    let Operation::Scan(Scan::BTreeTable { index: None, .. }) = &joined.op else {
-        return None;
-    };
+    let rowid_range = scanned_rowids(&joined.op)?;
     let table = stored(joined)?;
+    // A rowid range's leaves hold rows past its bounds: the terms it was made from are tested on
+    // every row, consumed or not (lane qs6-17).
+    let ranged = rowid_range != (None, None);
     let filter: Vec<&Expr> = plan
         .where_clause
         .iter()
-        .filter(|term| !term.consumed)
+        .filter(|term| ranged || !term.consumed)
         .map(|term| &term.expr)
         .collect();
     let BodyOutputs {
@@ -529,8 +533,44 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         no_real: sums,
         result_map,
         agg_filters,
+        rowid_range,
         rows,
     })
+}
+
+/// The rowids a one-table scan reads (lane qs6-17): the whole table (`(None, None)`), or a
+/// forward search of the table b-tree by rowid between integer literals, its least and greatest
+/// rowid (each bound taken inclusively: the morsels are cut from the leaves that hold them, and
+/// the terms the search was made from decide each row). None: another access, the serial loop's.
+fn scanned_rowids(op: &Operation) -> Option<(Option<i64>, Option<i64>)> {
+    match op {
+        Operation::Scan(Scan::BTreeTable { index: None, .. }) => Some((None, None)),
+        Operation::Search(Search::Seek {
+            index: None,
+            seek_def,
+        }) if seek_def.prefix.is_empty()
+            && seek_def.skip == 0
+            && seek_def.iter_dir == IterationDirection::Forwards =>
+        {
+            let bound = |key: &SeekKeyComponent<Expr>| -> Option<Option<i64>> {
+                match key {
+                    SeekKeyComponent::None => Some(None),
+                    SeekKeyComponent::Expr(expr) => integer(expr).map(Some),
+                    SeekKeyComponent::Row(_) | SeekKeyComponent::Null => None,
+                }
+            };
+            let lower = bound(&seek_def.start.last_component)?;
+            let upper = bound(&seek_def.end.last_component)?;
+            // An empty range is the serial loop's: it reads nothing.
+            if let (Some(lower), Some(upper)) = (lower, upper) {
+                if lower > upper {
+                    return None;
+                }
+            }
+            Some((lower, upper))
+        }
+        _ => None,
+    }
 }
 
 /// A GROUP BY's HAVING terms as the hook's row loop tests them (lane qs6-17): each aggregate in
@@ -848,6 +888,7 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         columns: columns.len(),
         rowid_alias: rowid_alias(table),
         defaults: defaults(table),
+        rowid_range: (None, None),
         filter,
         group_by,
         aggregates,
@@ -1393,6 +1434,7 @@ fn shape_join(
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
         defaults: defaults(probe_table),
+        rowid_range: (None, None),
         filter: std::mem::take(filters.get_mut(probe_at)?),
         group_by: group_by.clone(),
         aggregates: aggregates.clone(),
@@ -1416,6 +1458,7 @@ fn shape_join(
         no_real,
         result_map,
         agg_filters,
+        rowid_range: (None, None),
         rows: rows_mode,
     };
     Some((data, looped))
@@ -1743,6 +1786,7 @@ fn shape_chain(
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
         defaults: defaults(probe_table),
+        rowid_range: (None, None),
         filter: std::mem::take(filters.first_mut()?),
         group_by: group_by.clone(),
         aggregates: aggregates.clone(),
@@ -1767,6 +1811,7 @@ fn shape_chain(
         no_real,
         result_map,
         agg_filters,
+        rowid_range: (None, None),
         rows: rows_mode,
     };
     Some((data, looped))

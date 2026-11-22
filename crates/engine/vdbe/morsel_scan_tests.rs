@@ -3081,3 +3081,129 @@ fn t_qt_6_32_having_over_aggregates_runs_on_morsels_as_the_serial_loop() {
     .len();
     assert!(kept > 0 && kept < all, "{kept} of {all} groups kept");
 }
+
+/// T-QT.6.33 (lane qs6-17): a one-table search by a rowid range runs on morsels cut from the
+/// leaves that hold the range (`TableSource::restrict`), every term the search was made from
+/// tested on each row. Ranges open and closed at either end, through the INTEGER PRIMARY KEY and
+/// through rowid, with other terms, aggregates, groups, rows and a LIMIT, over a table with gaps,
+/// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores; the body ran over some rows but
+/// fewer than the table holds (the leaves were cut). A backward search, and a range of bounds that
+/// aren't integer literals, stay the serial loop's.
+#[test]
+fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
+    let conn = open(":memory:qt-6-33");
+    let mut rng = ChaCha8Rng::seed_from_u64(633);
+    let pad = "x".repeat(64);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut id = 0i64;
+    let rows = 3000u64;
+    for _ in 0..rows {
+        id += rng.random_range(1i64..4);
+        let a = rng.random_range(-30i64..30);
+        let b = match rng.random_range(0..5) {
+            0 => "NULL".to_string(),
+            _ => rng.random_range(-1000i64..1000).to_string(),
+        };
+        let c = ["NULL", "'x'", "'y'", "'z'"][rng.random_range(0..4)];
+        conn.execute(format!(
+            "INSERT INTO t(id, a, b, c, p) VALUES ({id}, {a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    // (statement, whether it returns rows, whether the hook takes it).
+    let queries: [(&str, bool, bool); 11] = [
+        (
+            "SELECT count(*), sum(b), min(c), max(a) FROM t WHERE id > 4000",
+            false,
+            true,
+        ),
+        (
+            "SELECT count(*), sum(a) FROM t WHERE id >= 1000 AND id <= 2000",
+            false,
+            true,
+        ),
+        (
+            "SELECT a % 5, count(*), avg(b) FROM t WHERE id BETWEEN 300 AND 5500 GROUP BY a % 5",
+            false,
+            true,
+        ),
+        (
+            "SELECT count(*), total(b) FROM t WHERE rowid < 2500 AND a > 0",
+            false,
+            true,
+        ),
+        (
+            "SELECT c, count(*) FROM t WHERE id > 100 AND id < 7000 AND c IS NOT NULL GROUP BY c",
+            false,
+            true,
+        ),
+        (
+            "SELECT id, a, b FROM t WHERE id > 6000 AND b > 0",
+            true,
+            true,
+        ),
+        (
+            "SELECT id, c FROM t WHERE id >= 2500 AND id < 2600",
+            true,
+            true,
+        ),
+        (
+            "SELECT id, b FROM t WHERE id > 1234 LIMIT 20 OFFSET 5",
+            true,
+            true,
+        ),
+        ("SELECT count(*) FROM t WHERE id > 100000", false, true),
+        // The serial loop's: a backward search, a bound that isn't a literal.
+        (
+            "SELECT id FROM t WHERE id > 8000 ORDER BY id DESC",
+            true,
+            false,
+        ),
+        ("SELECT count(*) FROM t WHERE id > abs(-50)", false, false),
+    ];
+    for (sql, returns_rows, hooked) in queries {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        conn.set_parallel_limit(true);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, sql);
+            let after = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if returns_rows {
+                // In the serial loop's rowid order, row for row.
+                assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            } else {
+                assert_eq!(
+                    format!("{parallel:?}"),
+                    format!("{serial:?}"),
+                    "{sql} on {cores} cores"
+                );
+            }
+            let ran = after - before;
+            if hooked {
+                assert!(
+                    ran < rows,
+                    "{sql} on {cores} cores: the body ran over {ran} rows of {rows}: the leaves weren't cut"
+                );
+                if !sql.contains("100000") {
+                    assert!(ran > 0, "{sql} on {cores} cores: the hook didn't run");
+                }
+            }
+        }
+    }
+    conn.set_parallel_limit(false);
+    conn.set_parallel_mode(ParallelMode::Off);
+}

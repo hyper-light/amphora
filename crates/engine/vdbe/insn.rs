@@ -441,6 +441,9 @@ pub struct MorselAggregateData {
     /// Each column's value in a row written before the column was added (ALTER TABLE ADD COLUMN),
     /// as the serial loop's Column reads it; empty when every one is NULL (lane qs6-17).
     pub defaults: Vec<crate::types::Value>,
+    /// The least and greatest rowid the scan reads, each inclusive; `(None, None)`: the whole
+    /// table. The morsels are cut from the leaves that hold them (lane qs6-17).
+    pub rowid_range: (Option<i64>, Option<i64>),
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
     pub group_by: Vec<usize>,
     pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,

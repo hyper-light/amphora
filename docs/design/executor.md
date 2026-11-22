@@ -711,6 +711,20 @@ column's affinity in a comparison, which the serial loop applies, so those stay 
 with no GROUP BY is a GROUP BY of no keys, its one group tested the same way. T-QT.6.32 checks
 them in scans and joins against the serial loop at 1, 2, 3, 4 and 8 stated cores.
 
+**A rowid range on morsels** (lane qs6-17). A one-table statement the planner reads by a forward
+search of the table b-tree between integer literals (`Search::Seek` with no index, no prefix, no
+skip: `WHERE id > 4000`, `rowid BETWEEN 300 AND 5500`) ran serially. `scanned_rowids` takes the
+search's least and greatest rowid, each inclusive, into `MorselAggregateData::rowid_range`, and
+`TableSource::restrict` keeps the leaves that may hold them: the first whose greatest rowid
+reaches the lower bound, through the first whose greatest rowid reaches the upper (two binary
+searches over the leaves' bounds the open already found), its first morsel seeking past the
+leaf before. The morsels are cut from those leaves as from a whole table. The rows of the end
+leaves past the bounds are still read, so the terms the search was made from are tested on every
+row, consumed or not. A backward search (its rows come out in the other order), a bound that is
+no integer literal (a parameter, an expression), a seek through an index and a search on a
+join's table stay serial. T-QT.6.33 checks ranges against the serial loop at 1, 2, 3, 4 and 8
+stated cores, and that the body ran over fewer rows than the table holds.
+
 **What still runs on the serial loop** (lane qs6-16's audit, updated by lane qs6-17; each an open
 part of QT.6):
 - *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
@@ -733,8 +747,9 @@ part of QT.6):
   loop. Needs a morsel source over the row versions at the statement's snapshot, cut by key ranges.
 - Also found: a table with a generated column (`stored`); a STRICT table's custom-typed column
   with a DEFAULT, which the serial loop ENCODEs at run time; a table whose short rows read a
-  default, on the versioned storage's column copy, which decodes records as written; a scan through an index or a
-  rowid range (`Operation::Search` on the probe: a rowid range is a run of leaves); a one-table
+  default, on the versioned storage's column copy, which decodes records as written; a scan
+  through an index, a rowid range whose bounds aren't integer literals, or one on a join's probe
+  (`Operation::Search`; a rowid range is a run of leaves, `TableSource::restrict`); a one-table
   scan's rows under ORDER BY; AVG and TOTAL over REALs or past 2^53, group_concat and DISTINCT
   aggregates, a HAVING over a group key or a bare column, and
   an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and

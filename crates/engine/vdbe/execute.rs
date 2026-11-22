@@ -21171,13 +21171,16 @@ pub fn op_morsel_aggregate(
         parameters.extend(state.parameters.iter().cloned());
     }
     let answered = (|| {
-        let table = TableSource::open(
+        let mut table = TableSource::open(
             pager.clone(),
             data.root_page,
             data.columns,
             data.rowid_alias,
             data.defaults.clone(),
         )?;
+        // A search by a rowid range reads the leaves that hold it (lane qs6-17).
+        let (lower, upper) = data.rowid_range;
+        table.restrict(lower, upper);
         let budget = MemoryBudget::new(pager.statement_memory_budget());
         if data.joins.is_empty() {
             // A copy of the serial loop's body, run per row by each worker (lane qs6-7).
