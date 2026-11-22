@@ -1250,3 +1250,16 @@ criteria = []
 tests = [
   { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
 ]
+
+# lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,
+# "A refusal before the step")
+[[own]]
+id = "T1.10.R"
+title = "A step refused before it was taken is retried with the learned back-off, behind a switch whose control is today's"
+criteria = [
+  { id = "AC-T1.10.6", text = "Under OnRefused::Retry a step refused NotLeader or Full is sent again after the RFC 6298 timeout, doubled per refusal, within its deadline; under Stop it counts as lost; Cluster::counted gives refusals by kind, retries, held steps and transactions, stops and p50/p99/p99.9" },
+]
+tests = [
+  { id = "T-T1.10.R1", text = "xgroup::sql::sessions::ac_t1_10_6_refusals_before_a_step_retried_commit_and_the_control_aborts — passes when one group refusing three times and all three refusing twice commit with no stop under Retry, and abort under Stop, both protocols" },
+  { id = "T-T1.10.R2", text = "xgroup::sql::sessions::ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing — passes when a group failing at each of a session transaction's steps leaves its rows all written or none after recovery, equal to one group's, both protocols, both ends reached" },
+]
