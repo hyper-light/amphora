@@ -485,6 +485,9 @@ tests = [
   { id = "T-T1.12.I2", text = "Manifests of format 1 still read; format 2's runs give each chunk's base and are refused when they don't add up" },
   { id = "T-T1.12.I3", text = "An incremental base is due once the log since the latest base outweighs what it would copy" },
   { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
+  # lane pitr-8
+  { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
+  { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
@@ -1067,6 +1070,17 @@ tests = [
   { id = "T-CS.5.5", text = "cs5_vectorized_aggregates_identical_and_chosen_by_cost (crates/engine/storage/versioned/columns_path.rs) — passes when whole-table, grouped and key-range aggregates equal the rows' at the snapshot by either path, with the switch on the copy is read by step 4's vectorized scan (granules read, only queued keys from the rows), off every row is read, and a copy behind its snapshot reads no granule" },
   { id = "T-CS.5.6", text = "cs5_scan_hook_runs_only_when_the_copy_is_chosen — passes when a scan given to the CopyScan hook runs once per aggregate the copy is chosen for and answers it, never with the switch off or on a stale copy" },
 ]
+
+# lane repl-measure (G12 steps 1 and 3, CP-T1.8): no new IDs. `amphora-bench --repl` is the harness
+# for AC-T1.8.2 and AC-T1.8.3 (`commit`), AC-T1.8.4 and the lab half of AC-T1.8.5 (`failover`: kill the
+# leader under load, count acknowledged events lost), the catch-up of G12 step 3 (`catchup`), and
+# G12 step 1's comparison set (dqlite, rqlite, LiteFS and libSQL through bench/servers/repl/). Its
+# tests: bench/src/repl.rs g12_repl_*. The measurements are the coordinator's.
+
+# lane repl-measure-2 (G12 steps 1 and 3-5, CP-T1.8): no new IDs. bench/repl.sh runs every measure on
+# every system with one command; LiteFS fails over on Consul's lease (servers/repl/litefs.sh); dqlite's
+# shim builds and its cluster comes up. libSQL's failover and dqlite's member catch-up stay refused,
+# typed: sqld has no election, and dqlite reads only through its leader.
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]
