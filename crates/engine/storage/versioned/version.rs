@@ -689,11 +689,14 @@ impl Clock {
             let mut writing = self.writing.lock();
             for tree in &txn.trees {
                 count_out(&mut writing.counts, *tree);
-                if let (Some(thread), Some(threads)) = (txn.writer, writing.threads.get_mut(tree)) {
-                    if let Some(at) = threads.iter().position(|t| *t == thread) {
-                        threads.swap_remove(at);
-                    }
-                    if threads.is_empty() {
+                if let Some(thread) = txn.writer {
+                    let emptied = writing.threads.get_mut(tree).is_some_and(|threads| {
+                        if let Some(at) = threads.iter().position(|t| *t == thread) {
+                            threads.swap_remove(at);
+                        }
+                        threads.is_empty()
+                    });
+                    if emptied {
                         writing.threads.remove(tree);
                     }
                 }
@@ -1412,10 +1415,18 @@ pub struct Versioned {
 /// The tree whose rows are the database's catalog (`sqlite_schema` on the switch), named once,
 /// and the timestamp of the newest commit that changed a row of it, moved under the publish lock
 /// (lane g7s2-17, `AC-NS.2.1`).
-#[derive(Default)]
 struct Catalog {
     tree: crate::sync::OnceLock<u64>,
     changed_at: AtomicU64,
+}
+
+impl Catalog {
+    fn new() -> Self {
+        Self {
+            tree: crate::sync::OnceLock::new(),
+            changed_at: AtomicU64::new(0),
+        }
+    }
 }
 
 /// The budget of a pool's versions and records (decision 10). A pool of a fixed count of frames
@@ -1464,7 +1475,7 @@ impl Versioned {
             trees: RwLock::new(made),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
-            catalog: Catalog::default(),
+            catalog: Catalog::new(),
         })
     }
 
@@ -1523,7 +1534,7 @@ impl Versioned {
             trees: RwLock::new(trees),
             validation: Validation::default(),
             recent: Mutex::new(VecDeque::new()),
-            catalog: Catalog::default(),
+            catalog: Catalog::new(),
         })
     }
 
@@ -1681,8 +1692,9 @@ impl Versioned {
             if let Some(c) = kept {
                 recent.push_back(c);
             }
+            // Moved only here, under the publish lock, where timestamps rise.
             if self.changes_catalog(&txn) {
-                self.catalog.changed_at.fetch_max(ts, Ordering::AcqRel);
+                self.catalog.changed_at.store(ts, Ordering::Release);
             }
             Ok(())
         });

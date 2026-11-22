@@ -511,15 +511,22 @@ impl Switch {
         (entered_rx, release_tx)
     }
 
+    /// Drops a pause no build took: its test hears the build ended without pausing.
+    #[cfg(test)]
+    pub(crate) fn clear_build_pause(&self) {
+        *self.storage.build_pause.lock() = None;
+    }
+
     /// A skipping build of the table at `root_page` has read its rows: paused here if a test
     /// asked ([`Switch::pause_next_build`]).
     #[cfg(test)]
     pub(crate) fn built(&self, root_page: i64) {
         let pause = {
             let mut slot = self.storage.build_pause.lock();
-            match slot.as_ref() {
-                Some((root, _, _)) if *root == root_page => slot.take(),
-                _ => None,
+            if slot.as_ref().is_some_and(|(root, _, _)| *root == root_page) {
+                slot.take()
+            } else {
+                None
             }
         };
         if let Some((_, entered, release)) = pause {

@@ -2175,11 +2175,18 @@ mod versioned {
                         let builder = db
                             .connect(ConnectOpts::new().with_versioned_storage())
                             .unwrap();
-                        set_skipping(&builder, "t", "a", Some(kind))
+                        let built = set_skipping(&builder, "t", "a", Some(kind));
+                        // A build that never paused (it failed first) lets the test hear it.
+                        if let Some(switch) = builder.versioned_for(crate::MAIN_DB_ID) {
+                            switch.clear_build_pause();
+                        }
+                        built
                     })
                 };
                 // The build has read its rows, none of the writer's.
-                paused.recv().unwrap();
+                paused
+                    .recv()
+                    .unwrap_or_else(|_| panic!("{kind:?}: the build ended without its pause"));
                 writer.execute("BEGIN").unwrap();
                 writer
                     .execute("INSERT INTO t VALUES (110, 'slipped in')")
