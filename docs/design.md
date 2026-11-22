@@ -118,6 +118,8 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl7c): a table's pages counted by ANALYZE, else derived from its page and records | [planner.md](design/planner.md#decision-lane-pl7c-a-tables-pages-counted-by-analyze-else-derived-from-its-page-and-records) |
 | planner | – | Decision (lane qs5-18): an IS takes the equality's row estimate unless its value is NULL | [planner.md](design/planner.md#decision-lane-qs5-18-an-is-takes-the-equalitys-row-estimate-unless-its-value-is-null) |
 | planner | – | Decision (lane qs5-18): a star join's filters checked in their measured order | [planner.md](design/planner.md#decision-lane-qs5-18-a-star-joins-filters-checked-in-their-measured-order) |
+| planner | – | Decision (lane qs5-19): a star order's counts whole or fading, measured against each other | [planner.md](design/planner.md#decision-lane-qs5-19-a-star-orders-counts-whole-or-fading-measured-against-each-other) |
+| planner | – | Decision (lane qs5-19): a sized filter's hashes and finished filter held within its bound | [planner.md](design/planner.md#decision-lane-qs5-19-a-sized-filters-hashes-and-finished-filter-held-within-its-bound) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |

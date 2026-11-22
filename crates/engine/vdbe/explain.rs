@@ -2718,13 +2718,13 @@ pub fn insn_to_row(
             "StarProbes",
             i64::try_from(data.probes.len()).unwrap_or(i64::MAX),
             data.target_pc.as_debug_int() as i64,
-            i64::from(data.measured),
+            data.order as i64,
             Value::build_text(""),
             0,
             format!(
-                "if !bloom_filter(...) of {} filters, {} order, goto {}",
+                "if !bloom_filter(...) of {} filters, {:?} order, goto {}",
                 data.probes.len(),
-                if data.measured { "measured" } else { "planned" },
+                data.order,
                 data.target_pc.as_debug_int()
             ),
         ),

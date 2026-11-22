@@ -306,9 +306,9 @@ pub struct StarProbesData {
     pub probes: Box<[StarProbeKeys]>,
     /// Where a row a filter rejects goes.
     pub target_pc: BranchOffset,
-    /// Whether the filters are checked in their measured order (`StarFilterOrder::Measured`),
-    /// else in the planner's.
-    pub measured: bool,
+    /// The order the filters are checked in: the planner's, or measured as the rows run, with
+    /// counts kept whole or fading (`Connection::set_star_filter_order`).
+    pub order: crate::StarFilterOrder,
 }
 
 /// Amphora (PL.13): an adaptive join's hash table, built (boxed to keep Insn small).
@@ -2466,10 +2466,10 @@ pub enum Insn {
 
     /// Amphora (QT.5, T-QT.5.11; `docs/design/planner.md`, "Decision (lane qs5-18): a star join's
     /// filters checked in their measured order"): checks the fact row's keys against each of its
-    /// star join's Bloom filters, jumping to `target_pc` at the first that rejects them. With
-    /// `measured`, in the order the run has measured (each filter's checks and passes, kept in the
-    /// program's state, `vdbe/star_order.rs`), the filter passing the smallest share first; else
-    /// in the planner's. Its first row ends every filter's build.
+    /// star join's Bloom filters, jumping to `target_pc` at the first that rejects them. In
+    /// `order`: the order the run has measured (each filter's checks and passes, kept in the
+    /// program's state, `vdbe/star_order.rs`), the filter passing the smallest share first, or the
+    /// planner's. Its first row ends every filter's build.
     StarProbes {
         data: Box<StarProbesData>,
     },

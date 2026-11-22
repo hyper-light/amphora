@@ -93,9 +93,13 @@ pub struct StatementMetrics {
     /// Amphora (T-QT.5.3): fact rows a star join's filters checked, and those they rejected.
     pub star_filter_probes: u64,
     pub star_filter_rejects: u64,
-    /// Amphora (T-QT.5.3, lane qs5-18): the most bytes a star probe's filters held together, as
-    /// their builds ended and once sized (`BloomFilter::bytes`).
+    /// Amphora (T-QT.5.3, lanes qs5-18 and qs5-19): the most bytes a star probe's filters held
+    /// together as their builds ended, each sealed one holding its key hashes and its finished
+    /// filter at once (`BloomFilter::seal`).
     pub star_filter_bytes: u64,
+    /// Amphora (T-QT.5.11, lane qs5-19): the fact rows after which a star probe's measured order
+    /// moved (`vdbe/star_order.rs`): how often its counts turned it.
+    pub star_filter_reorders: u64,
 
     // B-tree operations
     pub btree_seeks: u64,
@@ -146,6 +150,9 @@ impl StatementMetrics {
             .star_filter_rejects
             .wrapping_add(other.star_filter_rejects);
         self.star_filter_bytes = self.star_filter_bytes.max(other.star_filter_bytes);
+        self.star_filter_reorders = self
+            .star_filter_reorders
+            .wrapping_add(other.star_filter_reorders);
         self.btree_seeks = self.btree_seeks.wrapping_add(other.btree_seeks);
         self.btree_table_seeks = self.btree_table_seeks.wrapping_add(other.btree_table_seeks);
         self.btree_index_seeks = self.btree_index_seeks.wrapping_add(other.btree_index_seeks);

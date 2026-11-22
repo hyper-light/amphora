@@ -2259,3 +2259,68 @@ first check, even for a row the first filter rejects. The `Filter` instruction's
 **What would falsify it.** The coordinator's A/B (`StarFilterOrder::Planned` against `Measured`
 over JOB and TPC-H's star joins): `Measured` slower where the planner's order was already right,
 by more than the reading of the keys and the counting cost.
+
+## Decision (lane qs5-19): a star order's counts whole or fading, measured against each other
+
+**Decision.** QT.5, T-QT.5.11. The measured star order (lane qs5-18) counts every row the run has
+seen alike, so rows that change as the run goes (data loaded in order, a key range that shifts
+halfway) turn the order only once the new rows outnumber the old. A third setting of
+`Connection::set_star_filter_order`, `MeasuredFading`, fades each filter's counts to the rows that
+tell its share from its nearest neighbour's in the order: the rows `n` at which the share's
+standard error `sqrt(p(1 - p)/n)` equals the distance `d` to that neighbour, `n = p(1 - p)/d²`.
+Past them both counts are scaled to `n`, keeping the share, so each new row weighs `1/(n + 1)`.
+Far-apart shares fade fast, close ones slowly, equal ones never. Nothing is picked: the window
+is the shares' own standard error, measured as the rows run. `Measured` (whole counts) and
+`Planned` stay; the default stays `Planned` until the coordinator's A/B decides it.
+
+**Why.** Each candidate has its own failure mode, and the data decides between them. Whole
+counts stay wrong after a shift; fading counts turn the order on the noise between close shares,
+each turn a row checked in the worse order. A-Greedy keeps a window of recent rows for the same
+reason (Babu et al., §4), its size a parameter; here the window comes from the shares.
+
+**Sources.** Babu, Motwani, Munagala, Nishizawa and Widom, "Adaptive Ordering of Pipelined Stream
+Filters", SIGMOD 2004, §4 (A-Greedy's profile window); the standard error of a binomial share.
+
+**Evidence.** `star_order::tests` (lane qs5-19):
+`t_qt_5_11_fading_counts_follow_rows_that_shift_halfway` (whole counts' failure mode: a filter
+passing every row and then none after 5,000 rows; whole counts still check it second at 10,000,
+and fading ones turn and check less after the shift); and
+`t_qt_5_11_fading_counts_turn_on_noise_between_close_shares` (fading's: filters passing a half and
+three in five at random; fading turns the order more than ten times as often and checks more). A
+model of the same rules (Python, not a record) gave 7,500 checks whole and 5,002 fading over the
+5,000 rows after the shift, and on the noise 6 turns and 15,090 checks whole, 628 turns and 15,344
+fading (1.7% more). `StatementMetrics::star_filter_reorders` counts the turns a run makes, and
+`qt_5_11_star_order_harness` prints them beside checks, bytes and latency for all three settings.
+
+**Limits.** Scaling the counts each row is a pass over the filters, a few a star; the counts are
+`f64` (whole counts exact to 2⁵³ rows a run). A filter checked after another is still measured
+only on the rows that one passed (A-Greedy's correlated case).
+
+**What would falsify it.** The coordinator's A/B over the harness's stars with and without drift
+and over JOB and TPC-H's star joins: `MeasuredFading` taking more checks or time than `Measured`
+where the rows don't shift by more than it saves where they do.
+
+## Decision (lane qs5-19): a sized filter's hashes and finished filter held within its bound
+
+**Decision.** PL.5, T-QT.5.12. A sized Bloom filter (lane qs5-9) collects its build's key hashes
+within its memory bound, then, at its first probe, sizes and fills the filter from them, holding
+the hashes and the finished filter at once: up to twice the bound. Now the filter gets only the
+room the bound leaves beside the hashes, its bits counted in whole words before they are
+allocated, so the two together never pass the bound. Where the hashes' duplicates leave room, the
+list is shrunk first if the copy a shrink may make fits beside it. `BloomFilter::seal` returns the
+most bytes held while sealing, and `StarProbes` counts, in `star_filter_bytes`, the most the star's
+filters hold together as they are sealed one after another: the ones before holding their
+filters, the one sealing both, the ones after their hashes.
+
+**Why.** The bound is the statement's memory share (`optimizer/lip.rs`) or the hash join's budget,
+and its own description already counts the hashes. A filter whose hashes fill the bound now passes
+every key, as one over the bound did before.
+
+**Evidence.** `bloom_filter::tests::qt_5_sealing_holds_the_hashes_and_the_filter_within_the_bound`
+(hashes taking two thirds of the bound, duplicates that leave room, and hashes filling it: each
+within the bound, the last passing every key); `t_qt_5_3_star_filters_stay_within_the_statements_memory`
+for all three orders. The learned-costs calibration's filter (`learned_costs.rs`) is given the
+page's hashes and as many bytes again, so its filter is still built.
+
+**Limits.** While the hash list grows, a reallocation may briefly hold the old and the new list;
+that copy is the allocator's and isn't counted.

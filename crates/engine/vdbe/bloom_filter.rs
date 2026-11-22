@@ -79,23 +79,39 @@ fn hash_of(value: &impl Hash) -> u64 {
 /// best number of hashes a Bloom filter's rate is `exp(-(m/n)·ln²2)` (Broder and Mitzenmacher,
 /// "Network Applications of Bloom Filters: A Survey", 2004, §2.1). A rate of one or more filters
 /// nothing, so the filter passes every key.
-fn sized_store(hashes: &[u64], sizing: FilterSizing) -> Store {
+///
+/// QT.5 (lane qs5-19): the filter is built while `held` bytes, the hashes it is built from, are
+/// still held, so its bits are what the bound leaves beside them: the hashes and the finished
+/// filter together never pass `max_bytes`. Its bits are counted before they are allocated, in
+/// fastbloom's unit, whole 64-bit words, so a filter over the bound is never made.
+fn sized_store(hashes: &[u64], sizing: FilterSizing, held: usize) -> Store {
     if hashes.is_empty() {
         return Store::NoKeys;
     }
     let keys = hashes.len() as f64;
     let ln2_squared = std::f64::consts::LN_2 * std::f64::consts::LN_2;
-    let bound_bits = sizing.max_bytes as f64 * 8.0;
-    let floor = (-(bound_bits / keys) * ln2_squared).exp();
+    let room_words = sizing.max_bytes.saturating_sub(held) / size_of::<u64>();
+    let floor = (-(room_words as f64 * 64.0 / keys) * ln2_squared).exp();
     let rate = (sizing.fp_per_key * keys).max(floor);
     if rate.is_nan() || rate <= 0.0 || rate >= 1.0 {
         return Store::PassAll;
     }
-    let mut inner = BloomFilterInner::with_false_pos(rate).expected_items(hashes.len());
-    if inner.num_bits() / 8 > sizing.max_bytes {
-        // fastbloom rounds its bits up to whole blocks; a filter over the bound is not built.
+    // The bits `rate` takes over the keys (the same survey's `m = -n·ln(rate)/ln²2`), in words,
+    // at most the room's: the floor's rate fills the room.
+    let wanted_words = (keys * -rate.ln() / ln2_squared / 64.0).ceil();
+    let words = if wanted_words.is_finite() && wanted_words < room_words as f64 {
+        // Within the room, so within usize.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let wanted = wanted_words as usize;
+        wanted.max(1)
+    } else {
+        room_words
+    };
+    if words == 0 {
         return Store::PassAll;
     }
+    let mut inner =
+        BloomFilterInner::with_num_bits(words.saturating_mul(64)).expected_items(hashes.len());
     for &hash in hashes {
         inner.insert_hash(hash);
     }
@@ -174,15 +190,34 @@ impl BloomFilter {
     }
 
     /// Amphora (PL.5): ends a sized filter's build: sizes it from the distinct keys it was given
-    /// and fills it. A filter already sealed, or of fixed size, is left as it is.
-    pub fn seal(&mut self) {
+    /// and fills it. A filter already sealed, or of fixed size, is left as it is. Returns the most
+    /// bytes the filter held while sealed (QT.5, lane qs5-19): its key hashes and the finished
+    /// filter at once, within its bound (`sized_store`); a filter left as it is, its bytes.
+    pub fn seal(&mut self) -> usize {
         let (Store::Collecting(hashes), Some(sizing)) = (&mut self.store, self.sizing) else {
-            return;
+            return self.bytes();
         };
         let mut hashes = std::mem::take(hashes);
         hashes.sort_unstable();
         hashes.dedup();
-        self.store = sized_store(&hashes, sizing);
+        // The duplicates' room is given back to the filter where the copy a shrink may make fits
+        // in the bound beside the hashes it copies.
+        let copying = hashes
+            .capacity()
+            .saturating_add(hashes.len())
+            .saturating_mul(size_of::<u64>());
+        if hashes.len() < hashes.capacity() && copying <= sizing.max_bytes {
+            hashes.shrink_to_fit();
+        }
+        let held = hashes.capacity().saturating_mul(size_of::<u64>());
+        self.store = sized_store(&hashes, sizing, held);
+        held.saturating_add(self.bytes())
+    }
+
+    /// Amphora (QT.5, lane qs5-19): whether this is a sized filter whose build has not ended
+    /// ([Self::seal]).
+    pub fn building(&self) -> bool {
+        matches!(self.store, Store::Collecting(_)) && self.sizing.is_some()
     }
 
     /// Amphora (PL.5): whether this filter rejects any key at all (false when it passes every key).
@@ -471,5 +506,44 @@ mod bloomtests {
         tight.seal();
         assert!(tight.bytes() <= 4_096);
         assert!((0..2_000).all(|i| tight.contains_i64(i)));
+    }
+
+    /// QT.5 (lane qs5-19): a sized filter is built while its build's hashes are still held. Do:
+    /// seal filters under a bound of 98,304 bytes whose hashes take 65,536 of it (7,000 keys), whose
+    /// duplicates leave room once removed (3,000 keys, each twice), and, under 65,536, whose hashes
+    /// fill all of it (8,192 keys). Expect: the most bytes each held while sealed, its hashes and
+    /// the finished filter at once, within its bound; the first two filtering, the last passing
+    /// every key, as no filter fits beside its hashes; none rejecting a key it was given.
+    #[test]
+    fn qt_5_sealing_holds_the_hashes_and_the_filter_within_the_bound() {
+        let bound = 98_304;
+        let mut full = BloomFilter::sized(sizing(1e-12, bound));
+        for i in 0..7_000 {
+            full.insert_i64(i);
+        }
+        let held = full.seal();
+        assert!(held <= bound, "{held} bytes held, the bound {bound}");
+        assert!(full.filters());
+        assert!((0..7_000).all(|i| full.contains_i64(i)));
+
+        let mut twice = BloomFilter::sized(sizing(1e-12, bound));
+        for i in 0..6_000 {
+            twice.insert_i64(i % 3_000);
+        }
+        let held = twice.seal();
+        assert!(held <= bound, "{held} bytes held, the bound {bound}");
+        assert!(twice.filters());
+        assert!((0..3_000).all(|i| twice.contains_i64(i)));
+
+        let mut filled = BloomFilter::sized(sizing(1e-12, 65_536));
+        for i in 0..8_192 {
+            filled.insert_i64(i);
+        }
+        let held = filled.seal();
+        assert!(held <= 65_536, "{held} bytes held, the bound 65536");
+        assert!(!filled.filters());
+        assert!((0..8_192).all(|i| filled.contains_i64(i)));
+        // Sealed again, it holds what it holds.
+        assert_eq!(filled.seal(), filled.bytes());
     }
 }

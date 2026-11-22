@@ -171,14 +171,16 @@ fn t_qt_5_11_star_filters_checked_in_their_measured_order_check_less() {
     let (control, _, _) = run(&conn, StarFilters::Off, sql);
     conn.set_star_filter_order(StarFilterOrder::Planned);
     let (planned, planned_probes, _) = run(&conn, StarFilters::Always, sql);
-    conn.set_star_filter_order(StarFilterOrder::Measured);
-    let (measured, measured_probes, _) = run(&conn, StarFilters::Always, sql);
+    for order in [StarFilterOrder::Measured, StarFilterOrder::MeasuredFading] {
+        conn.set_star_filter_order(order);
+        let (measured, measured_probes, _) = run(&conn, StarFilters::Always, sql);
+        assert_eq!(measured, control, "{order:?}");
+        assert!(
+            measured_probes < planned_probes,
+            "{order:?}: {measured_probes} checks, the planner's {planned_probes}"
+        );
+    }
     assert_eq!(planned, control);
-    assert_eq!(measured, control);
-    assert!(
-        measured_probes < planned_probes,
-        "measured order {measured_probes} checks, the planner's {planned_probes}"
-    );
 }
 
 /// T-QT.5.3 (lane qs5-18): the filters' memory within the statement's stated bound. Do: the
@@ -222,12 +224,22 @@ fn t_qt_5_3_star_filters_stay_within_the_statements_memory() {
     conn.set_star_filters(StarFilters::Off);
     let control = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
     conn.set_star_filters(StarFilters::Always);
-    for order in [StarFilterOrder::Planned, StarFilterOrder::Measured] {
+    for order in [
+        StarFilterOrder::Planned,
+        StarFilterOrder::Measured,
+        StarFilterOrder::MeasuredFading,
+    ] {
         conn.set_star_filter_order(order);
         let mut stmt = conn.prepare(sql).unwrap();
         assert_eq!(stmt.run_collect_rows().unwrap(), control, "{order:?}");
         let metrics = stmt.metrics();
         assert!(metrics.star_filter_probes > 0, "{order:?}: the filters ran");
+        if order == StarFilterOrder::Planned {
+            assert_eq!(
+                metrics.star_filter_reorders, 0,
+                "the planner's order never turns"
+            );
+        }
         assert!(
             metrics.star_filter_bytes <= budget,
             "{order:?}: the filters held {} bytes, the statement's memory {budget}",
@@ -241,7 +253,11 @@ fn t_qt_5_3_star_filters_stay_within_the_statements_memory() {
 /// change halfway: the first half name only kept `dc` keys, the second half none, so an order
 /// learned on the first half is wrong for the second (the measured order's failure mode); without
 /// it the planner's estimates tie and it checks `dc` last (the planned order's).
-fn harness_star(dir: &std::path::Path, facts: i64, drift: bool) -> Arc<Connection> {
+fn harness_star(
+    dir: &std::path::Path,
+    facts: i64,
+    drift: bool,
+) -> (Arc<Database>, Arc<Connection>) {
     let io = Arc::new(PlatformIO::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
     let db = Database::open(io, dir.join("h.db").to_str().unwrap(), options).unwrap();
@@ -264,14 +280,16 @@ fn harness_star(dir: &std::path::Path, facts: i64, drift: bool) -> Arc<Connectio
     ] {
         conn.execute(sql).unwrap();
     }
-    conn
+    (db, conn)
 }
 
-/// The coordinator's harness (T-QT.5.11): the planned and measured orders over a star whose
+/// The coordinator's harness (T-QT.5.11): the planned order and the measured one, with whole and
+/// with fading counts (lane qs5-19: the line's `reorders` shows fading's cost), over a star whose
 /// estimates tie and one whose rows drift, at `AMPHORA_QT511_FACTS` fact rows (default 2,000 and
 /// 1,000,000), `AMPHORA_QT511_RUNS` runs each (default 10): a line each with the filter checks a
-/// fact row, the rejects, and run latency p50, p99 and p99.9. Tiny instance:
-/// `AMPHORA_QT511_FACTS=2000 AMPHORA_QT511_RUNS=3`.
+/// fact row, the rejects, and run latency p50, p99 and p99.9, over the concurrency ladder
+/// `AMPHORA_QT511_LADDER` (default 1 to 4,096 clients, lane qs5-19). Tiny instance:
+/// `AMPHORA_QT511_FACTS=2000 AMPHORA_QT511_RUNS=3 AMPHORA_QT511_LADDER=1,8`.
 #[test]
 #[ignore = "the coordinator's harness: run with --ignored --nocapture"]
 fn qt_5_11_star_order_harness() {
@@ -282,38 +300,80 @@ fn qt_5_11_star_order_harness() {
         )
     };
     let runs = list("AMPHORA_QT511_RUNS", &[10])[0];
+    let ladder = list("AMPHORA_QT511_LADDER", &[1, 8, 32, 128, 512, 2048, 4096]);
     let sql = "SELECT count(*), sum(f.v) FROM f CROSS JOIN da CROSS JOIN db CROSS JOIN dc \
         WHERE f.a = da.k AND f.b = db.k AND f.c = dc.k AND da.x < 9 AND db.x < 9 AND dc.x = 0";
     for facts in list("AMPHORA_QT511_FACTS", &[2_000, 1_000_000]) {
         for drift in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let conn = harness_star(dir.path(), facts, drift);
+            let (db, conn) = harness_star(dir.path(), facts, drift);
             conn.set_star_filters(StarFilters::Off);
-            let control = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
-            conn.set_star_filters(StarFilters::Always);
-            for order in [StarFilterOrder::Planned, StarFilterOrder::Measured] {
-                conn.set_star_filter_order(order);
-                let mut stmt = conn.prepare(sql).unwrap();
-                let mut nanos = Vec::new();
-                for _ in 0..runs {
-                    let began = std::time::Instant::now();
-                    assert_eq!(stmt.run_collect_rows().unwrap(), control, "{order:?}");
-                    nanos.push(u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX));
-                    stmt.reset().unwrap();
+            // The control's answer as text, shared with every client's thread.
+            let control: Arc<str> = format!(
+                "{:?}",
+                conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+            )
+            .into();
+            for order in [
+                StarFilterOrder::Planned,
+                StarFilterOrder::Measured,
+                StarFilterOrder::MeasuredFading,
+            ] {
+                for &clients in &ladder {
+                    // Lane qs5-19: `clients` connections, each its own thread, starting together
+                    // (a correlated burst of one template), each running the star `runs` times.
+                    let clients = usize::try_from(clients).unwrap();
+                    let start = Arc::new(std::sync::Barrier::new(clients));
+                    let handles: Vec<_> = (0..clients)
+                        .map(|_| {
+                            let (db, start, control) = (db.clone(), start.clone(), control.clone());
+                            std::thread::spawn(move || {
+                                let conn = db.connect(ConnectOpts::new()).unwrap();
+                                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                                conn.set_star_filters(StarFilters::Always);
+                                conn.set_star_filter_order(order);
+                                let mut stmt = conn.prepare(sql).unwrap();
+                                start.wait();
+                                let mut nanos = Vec::new();
+                                for _ in 0..runs {
+                                    let began = std::time::Instant::now();
+                                    assert_eq!(
+                                        format!("{:?}", stmt.run_collect_rows().unwrap()).as_str(),
+                                        &*control,
+                                        "{order:?}"
+                                    );
+                                    nanos.push(
+                                        u64::try_from(began.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                    stmt.reset().unwrap();
+                                }
+                                (nanos, stmt.metrics())
+                            })
+                        })
+                        .collect();
+                    let (mut nanos, mut probes, mut rejects, mut reorders, mut bytes) =
+                        (Vec::new(), 0u64, 0u64, 0u64, 0u64);
+                    for handle in handles {
+                        let (one, m) = handle.join().unwrap();
+                        nanos.extend(one);
+                        probes += m.star_filter_probes;
+                        rejects += m.star_filter_rejects;
+                        reorders += m.star_filter_reorders;
+                        bytes = bytes.max(m.star_filter_bytes);
+                    }
+                    nanos.sort_unstable();
+                    let at = |p: f64| nanos[((nanos.len() - 1) as f64 * p).round() as usize];
+                    let rows = (facts * runs) as f64 * clients as f64;
+                    println!(
+                        "qt5-11 facts={facts} drift={drift} order={order:?} clients={clients} runs={runs} checks_per_row={:.3} rejects_per_row={:.3} reorders={reorders} filter_bytes={bytes} run_ns_p50={} p99={} p999={}",
+                        probes as f64 / rows,
+                        rejects as f64 / rows,
+                        at(0.5),
+                        at(0.99),
+                        at(0.999),
+                    );
                 }
-                nanos.sort_unstable();
-                let at = |p: f64| nanos[((nanos.len() - 1) as f64 * p).round() as usize];
-                let m = stmt.metrics();
-                let rows = (facts * runs) as f64;
-                println!(
-                    "qt5-11 facts={facts} drift={drift} order={order:?} runs={runs} checks_per_row={:.3} rejects_per_row={:.3} filter_bytes={} run_ns_p50={} p99={} p999={}",
-                    m.star_filter_probes as f64 / rows,
-                    m.star_filter_rejects as f64 / rows,
-                    m.star_filter_bytes,
-                    at(0.5),
-                    at(0.99),
-                    at(0.999),
-                );
             }
         }
     }

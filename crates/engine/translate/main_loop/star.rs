@@ -166,7 +166,7 @@ pub(super) fn emit_probes(
         data: Box::new(crate::vdbe::insn::StarProbesData {
             probes: keys.into_boxed_slice(),
             target_pc: skip,
-            measured: t_ctx.resolver.star_filter_order() == crate::StarFilterOrder::Measured,
+            order: t_ctx.resolver.star_filter_order(),
         }),
     });
     Ok(())

@@ -259,8 +259,12 @@ pub enum StarFilterOrder {
     #[default]
     Planned = 0,
     /// As the run measures them: the filter that has passed the smallest share of its rows first,
-    /// moved as each row's checks are counted.
+    /// moved as each row's checks are counted, every row the run has seen weighing alike.
     Measured = 1,
+    /// As `Measured`, with each filter's counts fading to the rows that tell its share from its
+    /// nearest neighbour's (lane qs5-19, `vdbe/star_order.rs`), so the order follows rows that
+    /// change as the run goes.
+    MeasuredFading = 2,
 }
 
 /// Amphora (QT.5, lane qs5-18): the row estimate of `col IS v` where planning doesn't know whether

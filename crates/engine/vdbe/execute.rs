@@ -20595,8 +20595,9 @@ fn filter_contains(
     }
 }
 
-/// Amphora (QT.5, T-QT.5.11): [Insn::StarProbes]. At its first row, each filter's build ends
-/// (sealed, as [Insn::Filter]'s first probe seals it) and its bytes are counted; then the row's
+/// Amphora (QT.5, T-QT.5.11): [Insn::StarProbes]. At the first row that reaches a filter still
+/// building, every filter's build ends (sealed, as [Insn::Filter]'s first probe seals it) and
+/// their bytes are counted; then the row's
 /// keys are checked against each filter, in the measured order or the planner's, to the first
 /// that rejects them. A filter not built passes the row, as [Insn::Filter] lets it.
 pub fn op_star_probes(
@@ -20607,32 +20608,49 @@ pub fn op_star_probes(
 ) -> InsnResult {
     load_insn!(StarProbes { data }, insn);
     let pc = state.pc;
-    if !state.star_orders.contains_key(&pc) {
-        let (mut building, mut sized) = (0usize, 0usize);
+    // A filter still building ends its build at the row that first reaches it, as at a run's
+    // first row, so does one built again (a star join run again within the statement).
+    let building = data.probes.iter().any(|probe| {
+        state
+            .bloom_filters
+            .get(&probe.cursor_id)
+            .is_some_and(crate::vdbe::bloom_filter::BloomFilter::building)
+    });
+    if building {
+        // The filters are sealed one after another: while one is, it holds its hashes and its
+        // finished filter at once (`BloomFilter::seal`), the ones before it their filters and the
+        // ones after it their hashes. The most they hold together is counted (lane qs5-19).
+        let mut held = data
+            .probes
+            .iter()
+            .filter_map(|probe| state.bloom_filters.get(&probe.cursor_id))
+            .fold(0usize, |held, filter| held.saturating_add(filter.bytes()));
+        let mut most = held;
         for probe in data.probes.iter() {
             if let Some(filter) = state.bloom_filters.get_mut(&probe.cursor_id) {
-                building = building.saturating_add(filter.bytes());
-                filter.seal();
-                sized = sized.saturating_add(filter.bytes());
+                let others = held.saturating_sub(filter.bytes());
+                let sealing = filter.seal();
+                most = most.max(others.saturating_add(sealing));
+                held = others.saturating_add(filter.bytes());
             }
         }
-        let held = u64::try_from(building.max(sized)).unwrap_or(u64::MAX);
-        state.metrics.star_filter_bytes = state.metrics.star_filter_bytes.max(held);
-        state
-            .star_orders
-            .insert(pc, super::star_order::StarOrder::new(data.probes.len()));
+        let most = u64::try_from(most).unwrap_or(u64::MAX);
+        state.metrics.star_filter_bytes = state.metrics.star_filter_bytes.max(most);
+    }
+    if !state.star_orders.contains_key(&pc) {
+        state.star_orders.insert(
+            pc,
+            super::star_order::StarOrder::new(data.probes.len(), data.order),
+        );
     }
     let Some(order) = state.star_orders.get_mut(&pc) else {
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
     let mut rejected = false;
+    let measured = data.order != crate::StarFilterOrder::Planned;
     for nth in 0..data.probes.len() {
-        let at = if data.measured {
-            order.nth(nth)
-        } else {
-            Some(nth)
-        };
+        let at = if measured { order.nth(nth) } else { Some(nth) };
         let Some((at, probe)) = at.and_then(|at| data.probes.get(at).map(|p| (at, p))) else {
             continue;
         };
@@ -20643,7 +20661,7 @@ pub fn op_star_probes(
                 filter_contains(filter, &state.registers, probe.key_reg, probe.num_keys)
             });
         state.metrics.star_filter_probes = state.metrics.star_filter_probes.wrapping_add(1);
-        if data.measured {
+        if measured {
             order.observe(at, passed);
         }
         if !passed {
@@ -20652,8 +20670,8 @@ pub fn op_star_probes(
             break;
         }
     }
-    if data.measured {
-        order.settle();
+    if measured && order.settle() {
+        state.metrics.star_filter_reorders = state.metrics.star_filter_reorders.wrapping_add(1);
     }
     if rejected {
         state.pc = data.target_pc.as_offset_int();
