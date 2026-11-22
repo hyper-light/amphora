@@ -1500,7 +1500,26 @@ def dated(expression, dialect):
     return expression
 
 
-def sqlite_own(expression, dialect):
+def _canonical_json(text):
+    """Whether `text` is RFC 8259 JSON (Python's json reads it, with no NaN or Infinity), which every
+    reader reads alike: SQLite's json functions "accept JSON text that conforms to RFC-8259"
+    (json1.html section 3.1) and the JSON5 extensions beyond it are where readers differ."""
+    import json
+
+    def refuse(_):
+        raise ValueError("not RFC 8259")
+
+    try:
+        json.loads(text, parse_constant=refuse)
+    except ValueError:
+        return False
+    return True
+
+
+_PLAIN_KEY = re.compile(r"[A-Za-z0-9_ ]*$")
+
+
+def sqlite_own(expression, context, dialect):
     """`expression` as it is, or not expressible where it uses what is SQLite's own:
     - SQLite's JSON functions and operators (json(), json_extract(), -> and ->>, json_set(), the
       jsonb_ functions, json_each() ...: https://www.sqlite.org/json1.html) read JSON5 ("JSON5
@@ -1512,8 +1531,42 @@ def sqlite_own(expression, dialect):
     - a PRAGMA, and a pragma_ table-valued function (https://www.sqlite.org/pragma.html): it reads
       or sets SQLite's own settings and catalog, which no engine has a statement like (DuckDB's
       PRAGMA table_info gives other columns); case_sensitive_like's effect is carried into each
-      later LIKE's translation (liked()), the PRAGMA itself is not expressible."""
+      later LIKE's translation (liked()), the PRAGMA itself is not expressible.
+    Exact on DuckDB, where its JSON text is SQLite's ("Minified" both, no spaces), each written as
+    DuckDB's function of the same name cast to TEXT: json_array() of INTEGERs and NULLs
+    (storage_classes(): an integer's text is the same, NULL null; json1.html#jarray), json_object()
+    of the same with literal keys of letters, digits, '_' and spaces (no escapes to differ in;
+    json1.html#jobj), and json_array_length() of a literal of RFC 8259 JSON (_canonical_json();
+    json1.html#jarraylen). PostgreSQL's, MySQL's and ClickHouse's JSON text puts spaces between
+    elements ('[1, 2]'): not expressible there."""
     from sqlglot import exp
+
+    classes = storage_classes(expression, context.tables)
+
+    def exact(node):
+        if dialect != "duckdb":
+            return False
+        if isinstance(node, exp.Anonymous) and node.name.lower() == "json_array":
+            return all(classes.get(id(a)) in (None, "INTEGER") for a in node.expressions)
+        if isinstance(node, exp.JSONObject):
+            pairs = node.expressions
+            return all(isinstance(kv, exp.JSONKeyValue) and isinstance(kv.this, exp.Literal) and kv.this.is_string and _PLAIN_KEY.match(kv.this.this)
+                       and classes.get(id(kv.expression)) in (None, "INTEGER") for kv in pairs) and not any(node.args.get(k) for k in ("null_handling", "unique_keys", "return_type", "encoding"))
+        if isinstance(node, exp.Anonymous) and node.name.lower() == "json_array_length" and len(node.expressions) == 1:
+            x = node.expressions[0]
+            return isinstance(x, exp.Literal) and x.is_string and _canonical_json(x.this)
+        return False
+
+    approved = set()
+    for node in [n for n in reversed(list(expression.walk())) if isinstance(n, exp.Func)]:
+        if exact(node):
+            kept = node.copy()
+            approved.add(id(kept))
+            said = exp.Cast(this=kept, to=exp.DataType.build("TEXT")) if isinstance(kept, exp.JSONObject) or kept.name.lower() == "json_array" else kept
+            if node is expression:
+                expression = said
+            else:
+                node.replace(said)
 
     if isinstance(expression, exp.Pragma):
         target = expression.this.this if isinstance(expression.this, exp.EQ) else expression.this
@@ -1524,7 +1577,7 @@ def sqlite_own(expression, dialect):
         if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier) and node.name.lower().startswith("pragma_"):
             # A pragma_ table function without arguments, which sqlglot reads as a table.
             raise NotExpressible(f"not expressible in {dialect}: the table-valued {node.name.lower()} (https://www.sqlite.org/pragma.html#pragfunc), which reads SQLite's own catalog, which {dialect} has nothing like")
-        if not isinstance(node, exp.Func):
+        if not isinstance(node, exp.Func) or id(node) in approved:
             continue
         name = node.name.lower() if isinstance(node, exp.Anonymous) else type(node).__name__.lower()
         if name.startswith("pragma_"):
@@ -1783,7 +1836,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(globbed(functions_said(extremes(dated(sqlite_own(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
+            e = spoken(globbed(functions_said(extremes(dated(sqlite_own(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), context or Context(), dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:

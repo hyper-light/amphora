@@ -875,7 +875,7 @@ class SQLiteOwn(unittest.TestCase):
     name stays; a PRAGMA record SQLite refuses is given as written, for the engine to refuse."""
 
     JSON = ["SELECT json(' { \"a\" : 1 } ')", "SELECT json_extract('{\"a\":1}', '$.a')", "SELECT '{\"a\":1}' -> '$.a'", "SELECT '{\"a\":1}' ->> '$.a'",
-            "SELECT json_set('{}', '$.a', 1)", "SELECT jsonb('[1]')", "SELECT json_group_array(x) FROM t", "SELECT value FROM json_each('[1,2]')", "SELECT json_valid('{}')", "SELECT json_type('[1]')"]
+            "SELECT json_set('{}', '$.a', 1)", "SELECT jsonb('[1]')", "SELECT json_group_array(x) FROM t", "SELECT value FROM json_each('[1,2]')", "SELECT json_valid('{}')", "SELECT json_type('[1]')", "SELECT json_array(1.5)"]
     PRAGMAS = ["PRAGMA foreign_keys = ON", "PRAGMA main.user_version", "PRAGMA table_info(t)", "PRAGMA integrity_check", "PRAGMA case_sensitive_like = 1", "SELECT name FROM pragma_table_info('t')", "SELECT strict FROM pragma_table_list WHERE name = 'st'"]
 
     def test_not_expressible_everywhere(self):
@@ -888,6 +888,30 @@ class SQLiteOwn(unittest.TestCase):
                     self.assertIn(f"not expressible in {d}", why)
                     self.assertIn(ref, why)
         self.assertIn("pragma.html#pragma_user_version", dialects.translate("PRAGMA main.user_version", "duckdb")[1])
+
+    EXACT = ["json_object('k', 1, 'b', NULL)", "json_array(1, NULL, -3)", "json_array()", "json_object()", "json_array(1) || 'x'", "length(json_array(1, 2))",
+             "json_array_length('[1,[2],3]')", "json_array_length('{\"a\":1}')"]
+
+    def test_exact_on_duckdb(self):
+        """json_array() and json_object() of integers and NULLs (plain keys), json_array_length() of RFC
+        8259 JSON: DuckDB's, giving SQLite's text (when its Python module is here); else not expressible."""
+        for case in self.EXACT:
+            for d in ("postgres", "mysql", "clickhouse"):
+                self.assertIn("https://www.sqlite.org/json1.html", dialects.translate(f"SELECT {case}", d)[1])
+        for case in ["json_array(1.5)", "json_array(json_array(1))", "json_object('a\"', 1)", "json_array_length('[1,]')", "json_array_length('[NaN]')", "json_array(x) FROM t"]:
+            self.assertIn("https://www.sqlite.org/json1.html", dialects.translate(f"SELECT {case}", "duckdb")[1])
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.EXACT:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                self.assertEqual(duckdb.sql(out).fetchone()[0], db.execute(f"SELECT {case}").fetchone()[0])
 
     def test_words_in_strings_and_names_stay(self):
         for d in ENGINES:
