@@ -1633,7 +1633,7 @@ def _left_out(e, table, gone):
             elif any(i.name.upper() in gone for i in c.find_all(exp.Identifier, exp.Column)):
                 return None
         return e
-    if isinstance(e, exp.Insert):
+    if isinstance(e, exp.Insert) and (e.this.this if isinstance(e.this, exp.Schema) else e.this).name.upper() == table.name:
         target = e.this
         names = [i.name.upper() for i in target.expressions] if isinstance(target, exp.Schema) else list(table.columns)
         drop = [k for k, n in enumerate(names) if n in gone]
@@ -1698,22 +1698,30 @@ def records_in(records, dialect, around=None):
         lean = [m for m, e in made if ran and m is not None and why is not None and ("has no type" in why or "SQLite's collation" in why) and isinstance(e, exp.Create)
                 and e.args.get("kind") == "TABLE" and m in c.created and _unsayable(e, c.created[m], dialect) and _unsayable(e, c.created[m], dialect) != set(c.created[m].columns)]
         touched = sorted(n for n in named if n in partial) if why is None else []
-        if (lean or touched) and len(statements) == 1:
-            t = lean[0] if lean else touched[0]
-            table, gone_cols = (c.created[t], _unsayable(statements[0], c.created[t], dialect)) if lean else (partial[t][0], partial[t][1])
+        if lean and len(statements) == 1:
+            t = lean[0]
+            table, gone_cols = c.created[t], _unsayable(statements[0], c.created[t], dialect)
             e = _left_out(statements[0], table, gone_cols)
-            if e is not None:
-                lean_sql, lean_why = record_in(_Said(e.sql(dialect="sqlite"), r), dialect, c)
-                if lean_why is None:
-                    if lean:
-                        partial[t] = (table, gone_cols, r.line, why)
-                        missing.pop(t, None)
-                        out.append((lean_sql, None))
-                        continue
-                    sql = lean_sql
-            if touched and e is None:
-                table, gone_cols, line, reason = partial[t]
-                why, sql = f"untranslatable in {dialect}: reads column {', '.join(sorted(g.lower() for g in gone_cols))} of {t.lower()}, left out of its CREATE (line {line}) there: {reason}", None
+            lean_sql, lean_why = record_in(_Said(e.sql(dialect="sqlite"), r), dialect, c) if e is not None else (None, why)
+            if lean_why is None:
+                partial[t] = (table, gone_cols, r.line, why)
+                missing.pop(t, None)
+                out.append((lean_sql, None))
+                continue
+        elif touched:
+            # Each table of the record's with columns left out, in turn; a record of several
+            # statements is read as one would be only by the engine: not expressible.
+            e, culprit = statements[0] if len(statements) == 1 else None, touched[0]
+            for t in touched:
+                if e is None:
+                    break
+                culprit = t
+                e = _left_out(e, partial[t][0], partial[t][1])
+            if e is None:
+                table, gone_cols, line, reason = partial[culprit]
+                why, sql = f"untranslatable in {dialect}: reads column {', '.join(sorted(g.lower() for g in gone_cols))} of {culprit.lower()}, left out of its CREATE (line {line}) there: {reason}", None
+            else:
+                sql, why = record_in(_Said(e.sql(dialect="sqlite"), r), dialect, c)
         gone = sorted(n for n in named if n in missing)
         if why is None and gone:
             line, reason = missing[gone[0]]

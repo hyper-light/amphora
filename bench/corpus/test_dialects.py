@@ -448,7 +448,9 @@ class LeftOutColumns(unittest.TestCase):
             "CREATE TABLE s(a INTEGER, e INTEGER)", "INSERT INTO s VALUES (4, 5)", "INSERT INTO t SELECT a, 'four', e FROM s",
             ("SELECT a, b FROM t ORDER BY a", "query"), ("SELECT count(*), sum(a) FROM t WHERE b IS NOT NULL", "query"),
             ("SELECT e FROM t", "query"), ("SELECT * FROM t", "query"), ("SELECT a FROM t NATURAL JOIN s", "query"), ("SELECT a FROM t JOIN s USING (a)", "query"),
-            "UPDATE t SET e = 2 WHERE a = 1", "UPDATE t SET b = 'uno' WHERE a = 1", ("SELECT b FROM t WHERE a = 1", "query")]
+            "UPDATE t SET e = 2 WHERE a = 1", "UPDATE t SET b = 'uno' WHERE a = 1", ("SELECT b FROM t WHERE a = 1", "query"),
+            "CREATE TABLE w(x INTEGER, y TEXT, z INTEGER)", "INSERT INTO w SELECT a, b, a FROM t", ("SELECT x, y, z FROM w ORDER BY x", "query"),
+            "CREATE TABLE v2(a INTEGER, f TEXT COLLATE RTRIM, g INTEGER)", ("SELECT t.a FROM t JOIN v2 ON t.a = v2.a", "query"), ("SELECT t.a FROM t JOIN v2 ON t.a = v2.a WHERE f = 'x'", "query")]
 
     def records(self):
         out = []
@@ -465,8 +467,12 @@ class LeftOutColumns(unittest.TestCase):
                 self.assertIn("'one'", out[1][0])
                 self.assertNotIn("7", out[2][0].replace("'\\x07'", "").replace("x'07'", ""))
                 self.assertRegex(out[5][0], r"SELECT a, 'four' FROM s$")
-                for i in (6, 7, 13, 14):
+                for i in (6, 7, 13, 14, 16, 17):
                     self.assertIsNone(out[i][1], (i, out[i][1]))
+                self.assertRegex(out[16][0], r"SELECT a, b, a FROM t$")
+                if d != "mysql":  # MySQL has RTRIM's like
+                    self.assertIsNone(out[19][1], out[19][1])
+                    self.assertIn("reads column f of v2", out[20][1])
                 for i in (8, 9, 10, 11, 12):
                     self.assertIsNone(out[i][0], i)
                     self.assertIn("reads column e of t, left out of its CREATE (line 0) there: not expressible", out[i][1])
