@@ -426,3 +426,111 @@ fn t_qt_6_10_vdbe_hook_answers_as_the_serial_loop() {
     // Non-vacuity: most queries qualify (every shape `random_query` makes does).
     assert!(hooked > 120, "the hook ran {hooked} times of 240");
 }
+
+/// A random inner equi-join of `t` and `u` on one or two columns, with filters on either table, a
+/// grouping and aggregates over both tables' columns.
+fn random_join(rng: &mut ChaCha8Rng) -> String {
+    let tables = ["t", "u"];
+    let ops = ["<", "<=", "=", "<>", ">", ">="];
+    let keys: &[&str] = match rng.random_range(0..3) {
+        0 => &["a"],
+        1 => &["c"],
+        _ => &["a", "c"],
+    };
+    let on: Vec<String> = keys.iter().map(|k| format!("t.{k} = u.{k}")).collect();
+    let mut terms = Vec::new();
+    for _ in 0..rng.random_range(0..3) {
+        let table = tables[rng.random_range(0..2)];
+        let op = ops[rng.random_range(0..ops.len())];
+        terms.push(match rng.random_range(0..5) {
+            0 => format!("{table}.a {op} {}", rng.random_range(-20i64..20)),
+            1 => format!(
+                "{table}.b {op} {}",
+                rng.random_range(-1_000_000_000_000i64..1_000_000_000_000)
+            ),
+            2 => format!("{table}.c {op} 't{}'", rng.random_range(0..12)),
+            3 => format!("{table}.c IS NULL"),
+            _ => format!("{table}.a IS NOT NULL"),
+        });
+    }
+    let column = |rng: &mut ChaCha8Rng| {
+        format!(
+            "{}.{}",
+            tables[rng.random_range(0..2)],
+            ["a", "b", "c"][rng.random_range(0..3)]
+        )
+    };
+    let group_by: Vec<String> = (0..rng.random_range(0..3)).map(|_| column(rng)).collect();
+    let mut select = group_by.clone();
+    for _ in 0..rng.random_range(1..4) {
+        select.push(match rng.random_range(0..5) {
+            0 => "count(*)".to_string(),
+            1 => format!("count({})", column(rng)),
+            2 => format!(
+                "sum({}.{})",
+                tables[rng.random_range(0..2)],
+                ["a", "b"][rng.random_range(0..2)]
+            ),
+            3 => format!("min({})", column(rng)),
+            _ => format!("max({})", column(rng)),
+        });
+    }
+    let mut sql = format!(
+        "SELECT {} FROM t JOIN u ON {}",
+        select.join(", "),
+        on.join(" AND ")
+    );
+    if !terms.is_empty() {
+        sql.push_str(&format!(" WHERE {}", terms.join(" AND ")));
+    }
+    if !group_by.is_empty() {
+        sql.push_str(&format!(" GROUP BY {}", group_by.join(", ")));
+    }
+    sql
+}
+
+/// T-QT.6.11: the VDBE's hook for a hash join's probe. Random inner equi-joins of two tables of
+/// many leaves, on one or two columns, with filters on either table and groupings and aggregates
+/// over both tables' columns, answer the same, row for row and in order, with `ParallelMode` off
+/// (the serial hash join) and on, the machine stated as 2, 3, 4 and 8 cores; and the hook ran for
+/// most of them (the planner held to hash joins).
+#[test]
+fn t_qt_6_11_vdbe_hook_probes_a_hash_join_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-11");
+    let mut rng = ChaCha8Rng::seed_from_u64(611);
+    fill(&conn, &mut rng, "t", 1500);
+    fill(&conn, &mut rng, "u", 400);
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let queries = 40usize;
+    let mut hooked = 0usize;
+    for _ in 0..queries {
+        let sql = random_join(&mut rng);
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [2usize, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            assert_eq!(sql_rows(&conn, &sql), serial, "{sql} on {cores} cores");
+            let ran = conn
+                .morsel_costs
+                .lock()
+                .as_ref()
+                .is_some_and(|costs| costs.worker_start().samples() > 1);
+            if ran {
+                hooked += 1;
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: most joins take the planner's hash join and the hook.
+    assert!(
+        hooked > queries * 2,
+        "the hook ran {hooked} times of {}",
+        queries * 4
+    );
+}

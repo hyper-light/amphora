@@ -897,6 +897,8 @@ tests = [
   { id = "T-QT.6.8", text = "One- and two-column equi-joins whose probe side workers read over the probe table's leaves (vdbe/morsel_scan_tests.rs) — passes when the matches equal the VDBE's join, match for match and in its order" },
   { id = "T-QT.6.9", text = "A table whose INTEGER PRIMARY KEY is its rowid, and an empty table, read in leaf morsels (vdbe/morsel_scan_tests.rs) — passes when the rowid reads into its column, the aggregates equal the VDBE's, and the empty table is one leaf with no rows" },
   { id = "T-QT.6.10", text = "Random filters, groupings and aggregates in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook ran for most of them" },
+  # lane qs6-3
+  { id = "T-QT.6.11", text = "Random inner equi-joins of two tables of many leaf pages on one or two columns, with filters on either table and groupings and aggregates over both, in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores and the planner held to hash joins (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook probed for most of them" },
 ]
 
 # lane g3s2
