@@ -407,7 +407,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   open files and threads are extrapolated from the counts already run and checked against the host first
   (`bench/commits_fit.py`): one that doesn't fit is refused, saying why, and PostgreSQL's `shared_buffers`
   and `work_mem` are sized to fit beside its backends and recorded. The answers are SAME only when every
-  record was reached by both storages (PARTIAL otherwise). `bench/commits_verdict.py` reads the bench's
+  one of the pool's records, counted from its files before the runs, was reached by both storages
+  (PARTIAL otherwise, so two runs stopped at the same record aren't SAME; a pool of none is refused). `bench/commits_verdict.py` reads the bench's
   records: each count's systems side by side, Amphora's storages over SQLite's and PostgreSQL's rates, and
   AC-T1.3.2 to AC-T1.3.5 at 32 writers, refusing records of another platform or driver. Not yet compiled
   or run: the coordinator's.
