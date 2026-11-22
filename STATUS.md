@@ -712,6 +712,23 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   newly wrong; what's left is mostly SQLite's types against DuckDB's, functions DuckDB lacks, and tables a
   translation couldn't make. Left: the DuckDB counts through the harness and the tiny run on every engine
   on jupiter (kiln was down), and hex() and length() of a REAL.
+  Lane corpus-dialects-10 (`bench/corpus/dialects.py`, `test_dialects.py`): a record that names a table
+  whose CREATE a dialect can't say is untranslatable there, with that CREATE's line and reason, where it
+  had been sent to the engine to fail for want of the table; and a table is made without the columns the
+  dialect can't hold as SQLite does (an untyped column of several storage classes, as the written files'
+  shared t1.e; a collation it has none like, as t2.b's NOCASE on PostgreSQL and ClickHouse), each record
+  that doesn't read them run on it unchanged in meaning, inserts without their values. Also said as SQLite
+  means them: hex() and length() of a REAL (SQLite's %!.15g text of it on DuckDB, not expressible on the
+  others), typeof() and quote() of a value of known storage class, `X IS Y` of values (IS NOT DISTINCT
+  FROM), BINARY and NOCASE collations (DuckDB's "binary" and "nocase", PostgreSQL's "C"; RTRIM not
+  expressible but on MySQL), and total() of numbers. Untranslatable on the gate's pool: 201, 306, 272, 407
+  (DuckDB, PostgreSQL, MySQL, ClickHouse), from 381, 381, 483, 480. The local check (as lane 9's, every
+  written file now, DuckDB's Python replacement scans off, each statement given up after 10 s): of 3,544
+  queries 2,129 answered differently before and 1,306 now, none newly; 120 are untranslatable with their
+  reasons. The record that hung lane 9's check is written/syntax/recursive-cte's
+  `WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT max(n) + 1 FROM c WHERE n < 3) SELECT * FROM c`, a
+  `statement error` SQLite refuses (an aggregate in a recursive select) that DuckDB runs forever: the
+  harness's own per-record bound covers it. Left: datetime() and the other date functions, JSON, PRAGMAs.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
