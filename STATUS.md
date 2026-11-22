@@ -335,7 +335,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   read from tree 1); the storage's budget is `ConnectOpts::with_memory_budget` (the shell's quarter
   of its process's memory), else a quarter of the machine's, its frames made as pages are handed
   out (`T-NS.2.10`); DDL undone by a failed statement, a savepoint or a failed commit leaves no
-  orphan tree (`T-NS.2.11`). Not yet: the header (schema cookie, user version) on the versioned
+  orphan tree (`T-NS.2.11`). Incremental blob I/O runs on it, a handle expiring once another
+  statement writes its row; SQL there is serializable: the cursor keeps each leaf span it copies as
+  read for its commit's precision-locking validation, and Elle's histories through SQL show no
+  anomaly on either storage (`T-G8.4.1`); an in-memory IO keeps a database's storage beside its
+  file, so a database reopened on it finds its trees. With the switch on, 55 of the engine's lib
+  tests still fail (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
+  batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and
+  page-codec tests). Not yet: the header (schema cookie, user version) on the versioned
   storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
   budget shared by a process's databases. On the pager as on the switch, `nested_loops`'
   chain of hash joins, `row_counts`' hash join and `sample_filters`' outer join fail (planner
