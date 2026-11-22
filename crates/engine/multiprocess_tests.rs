@@ -1561,6 +1561,11 @@ fn subprocess_database_open_parent_execute_uses_child_created_table() {
 
 #[test]
 fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
         .path()
@@ -1748,6 +1753,11 @@ fn subprocess_db_file_reader_stops_checkpoint_in_other_process() {
 
 #[test]
 fn subprocess_db_file_reader_allows_wal_restart_but_stops_backfill() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-db-file-reader-restart.db");
     let ready_file = dir.path().join("child-ready");
@@ -2000,6 +2010,11 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
 
 #[test]
 fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the pager's coordination between processes (its shared memory and log); the versioned storage is one process's",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-dead-reader-slot.db");
     let ready_file = dir.path().join("child-ready");

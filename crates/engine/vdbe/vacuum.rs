@@ -3192,6 +3192,11 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn vacuum_db_header_meta_schema_cookie_survives_mvcc_target_checkpoint() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's MVCC store and its log; the versioned storage keeps its own row versions",
+        ) {
+            return Ok(());
+        }
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let target_dir = tempfile::tempdir().unwrap();
         let target_path = target_dir.path().join("target.db");

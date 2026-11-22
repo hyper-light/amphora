@@ -1379,15 +1379,11 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
-    // Only the main database's trees are on the versioned storage: a temp or attached database's
-    // tables stay on its own pager, their root pages its pages (G7 step 2, `AC-NS.2.1`).
-    if let Some(switch) = program
-        .connection
-        .versioned
-        .as_ref()
-        .filter(|_| *db == MAIN_DB_ID)
-    {
-        if let Some(cursor) = versioned_cursor(switch, cursor_type, *root_page, &pager)? {
+    // The main database's trees are on its versioned storage and an attached database's on its
+    // own; a temp database's tables stay on its pager, their root pages its pages (G7 step 2,
+    // `AC-NS.2.1`).
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        if let Some(cursor) = versioned_cursor(&switch, cursor_type, *root_page, &pager)? {
             replace_cursor(&mut state.cursors, *cursor_id, cursor)?;
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -5815,9 +5811,7 @@ pub fn op_savepoint(
                         return Err(mirror_err);
                     }
                     conn.push_named_savepoint(frame);
-                    if let Some(switch) = conn.versioned.as_ref() {
-                        switch.push_named(name)?;
-                    }
+                    conn.each_versioned(|switch| switch.push_named(name))?;
                     if starts_transaction {
                         turso_assert!(
                             !conn.tx_is_poisoned(),
@@ -5854,9 +5848,10 @@ pub fn op_savepoint(
                 }
                 SavepointResult::Release => {
                     let _ = conn.release_named_savepoint_frame(name);
-                    if let Some(switch) = conn.versioned.as_ref() {
+                    conn.each_versioned(|switch| {
                         switch.release_named(name);
-                    }
+                        Ok(())
+                    })?;
                     mirror_named_savepoint_to_active_non_main_databases(
                         &conn,
                         SavepointMirror::Release(name),
@@ -5891,9 +5886,7 @@ pub fn op_savepoint(
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")).into());
             };
             let frame_info = conn.rollback_named_savepoint_frame(name);
-            if let Some(switch) = conn.versioned.as_ref() {
-                switch.rollback_named(name)?;
-            }
+            conn.each_versioned(|switch| switch.rollback_named(name))?;
             mirror_named_savepoint_to_active_non_main_databases(
                 &conn,
                 SavepointMirror::Rollback(name),
@@ -14322,14 +14315,9 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        // The main database's trees only, as in `op_open_read`.
-        if let Some(switch) = program
-            .connection
-            .versioned
-            .as_ref()
-            .filter(|_| *db == MAIN_DB_ID)
-        {
-            if let Some(cursor) = versioned_cursor(switch, cursor_type, root_page, &pager)? {
+        // By database, as in `op_open_read`.
+        if let Some(switch) = program.connection.versioned_for(*db) {
+            if let Some(cursor) = versioned_cursor(&switch, cursor_type, root_page, &pager)? {
                 replace_cursor(cursors, *cursor_id, cursor)?;
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -14515,12 +14503,10 @@ pub fn op_create_btree(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
-    if let Some(switch) = program.connection.versioned.as_ref() {
-        if *db == crate::MAIN_DB_ID {
-            state.registers[*root].set_int(switch.make_tree(flags.is_table())?);
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        state.registers[*root].set_int(switch.make_tree(flags.is_table())?);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     let mv_store = program.connection.mv_store_for_db(*db);
 
@@ -14706,14 +14692,12 @@ pub fn op_destroy(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    if let Some(switch) = program.connection.versioned.as_ref() {
-        if *db == MAIN_DB_ID {
-            // No tree moves into the dropped one's place: the storage keeps no autovacuum.
-            switch.drop_tree(*root)?;
-            state.registers[*former_root_reg].set_int(0);
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        // No tree moves into the dropped one's place: the storage keeps no autovacuum.
+        switch.drop_tree(*root)?;
+        state.registers[*former_root_reg].set_int(0);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
 
     let destroy_pager = if *db != MAIN_DB_ID {
@@ -14774,22 +14758,25 @@ fn op_clear_btree_inner(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(ClearBtree { db, root, count }, insn);
-    if let Some(switch) = program.connection.versioned.as_ref() {
-        if *db == MAIN_DB_ID {
-            let removed_entries = switch.clear(*root, pager.clone())?;
-            match count {
-                ClearBtreeCount::Nothing => {}
-                ClearBtreeCount::RowsWritten => state.record_rows_written(removed_entries),
-                ClearBtreeCount::ChangesAndRowsWritten => {
-                    let changes =
-                        i64::try_from(removed_entries).map_err(|_| LimboError::IntegerOverflow)?;
-                    state.record_statement_changes(changes);
-                    state.record_rows_written(removed_entries);
-                }
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        let clear_pager = if *db == MAIN_DB_ID {
+            pager.clone()
+        } else {
+            program.get_pager_from_database_index(db)?
+        };
+        let removed_entries = switch.clear(*root, clear_pager)?;
+        match count {
+            ClearBtreeCount::Nothing => {}
+            ClearBtreeCount::RowsWritten => state.record_rows_written(removed_entries),
+            ClearBtreeCount::ChangesAndRowsWritten => {
+                let changes =
+                    i64::try_from(removed_entries).map_err(|_| LimboError::IntegerOverflow)?;
+                state.record_statement_changes(changes);
+                state.record_rows_written(removed_entries);
             }
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
         }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
 
     let mv_store = program.connection.mv_store_for_db(*db);
@@ -17292,23 +17279,21 @@ pub fn op_integrity_check(
         message_register,
     } = data.as_ref();
 
-    // Amphora (G7 step 2, `AC-NS.2.1`): the main database's trees on the versioned storage are
-    // checked there; the pager's pages hold none of them.
-    if *db == MAIN_DB_ID {
-        if let Some(switch) = program.connection.versioned.as_ref() {
-            let found = switch.check(roots, *max_errors)?;
-            let register = state
-                .registers
-                .get_mut(*message_register)
-                .ok_or_else(|| LimboError::InternalError("integrity_check: no register".into()))?;
-            if found.is_empty() {
-                register.set_null();
-            } else {
-                register.set_text(Text::new(found.join("\n")))?;
-            }
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
+    // Amphora (G7 step 2, `AC-NS.2.1`): the trees on a versioned storage (the main database's or
+    // an attached one's) are checked there; the pager's pages hold none of them.
+    if let Some(switch) = program.connection.versioned_for(*db) {
+        let found = switch.check(roots, *max_errors)?;
+        let register = state
+            .registers
+            .get_mut(*message_register)
+            .ok_or_else(|| LimboError::InternalError("integrity_check: no register".into()))?;
+        if found.is_empty() {
+            register.set_null();
+        } else {
+            register.set_text(Text::new(found.join("\n")))?;
         }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
@@ -20912,7 +20897,8 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        TableAggregate, TableBuild, TableJoinAggregate, TableJoinRows, TableSource,
+        TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild, TableJoinAggregate,
+        TableJoinRows, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -20936,12 +20922,43 @@ pub fn op_morsel_aggregate(
         };
         return morsel_rows(state, data, rows);
     }
+    // A scan's rows under a LIMIT with no ORDER BY run on morsels only behind their switch; off,
+    // the control, the serial loop answers (lane qs6-8).
+    if data
+        .body
+        .as_ref()
+        .is_some_and(|body| body.rows && body.want.is_some())
+        && !connection.parallel_limit()
+    {
+        state.pc = data.target_pc_serial.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
     // The costs are taken for the run and put back after, so a statement learns from the last.
     let taken = connection.morsel_costs.lock().take();
     let mut costs = match taken {
         Some(costs) => costs,
         None => MachineCosts::measure().map_err(refused)?,
     };
+    // Each worker's registers start as the statement's are now (the constants the program's
+    // start computed among them), with its bound parameters (lane qs6-7).
+    let mut registers = Vec::new();
+    let mut parameters = Vec::new();
+    if data.body.is_some() {
+        for (at, register) in state.registers.iter().enumerate() {
+            if let Register::Value(value) = register {
+                if !matches!(value, Value::Null) {
+                    registers
+                        .try_reserve(1)
+                        .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+                    registers.push((at, value.clone()));
+                }
+            }
+        }
+        parameters
+            .try_reserve_exact(state.parameters.len())
+            .map_err(|_| Box::new(LimboError::OutOfMemory))?;
+        parameters.extend(state.parameters.iter().cloned());
+    }
     let answered = (|| {
         let table = TableSource::open(
             pager.clone(),
@@ -20951,6 +20968,41 @@ pub fn op_morsel_aggregate(
         )?;
         let budget = MemoryBudget::new(pager.statement_memory_budget());
         let Some(join) = &data.join else {
+            // A copy of the serial loop's body, run per row by each worker (lane qs6-7).
+            if let Some(body) = &data.body {
+                let shape = ScanAggregate {
+                    rows: &[],
+                    filter: &[],
+                    group_by: &body.group_by,
+                    aggregates: &body.aggregates,
+                };
+                let pipeline = TableBodyAggregate {
+                    table: &table,
+                    body,
+                    program,
+                    pager,
+                    registers: &registers,
+                    parameters: &parameters,
+                    shape: &shape,
+                    ran: &connection.morsel_body_rows,
+                };
+                // A scan's rows: kept in leaf order, the result columns as they stand (lane qs6-8).
+                if body.rows {
+                    let rows = TableBodyRows {
+                        body: &pipeline,
+                        want: body
+                            .want
+                            .map(|want| usize::try_from(want).unwrap_or(usize::MAX)),
+                        kept: std::sync::atomic::AtomicUsize::new(0),
+                    };
+                    return rows
+                        .run_mode(connection.parallel_mode(), &mut costs, &budget)
+                        .map(|(rows, _)| (rows, true));
+                }
+                return pipeline
+                    .run_mode(connection.parallel_mode(), &mut costs, &budget)
+                    .map(|(rows, _)| (rows, false));
+            }
             let shape = ScanAggregate {
                 rows: &[],
                 filter: &data.filter,
@@ -21031,7 +21083,11 @@ pub fn op_morsel_aggregate(
         Ok((rows, false)) => rows,
         // A value the parallel aggregates don't take (a SUM over text), or groups past the
         // statement's memory that the serial loop's spilling GROUP BY can hold: it answers.
-        Err(MorselError::Unsupported { .. } | MorselError::MemoryBudget { .. }) => {
+        Err(
+            MorselError::Unsupported { .. }
+            | MorselError::MemoryBudget { .. }
+            | MorselError::Body(_),
+        ) => {
             state.pc = data.target_pc_serial.as_offset_int();
             return Ok(InsnFunctionStepResult::Step);
         }

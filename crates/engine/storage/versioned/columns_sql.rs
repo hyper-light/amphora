@@ -711,6 +711,10 @@ pub(crate) fn aggregate(
     connection: &crate::Connection,
     statement_memory: usize,
 ) -> Result<Option<Vec<Vec<Value>>>> {
+    // A filter or expression only the loop body states: the serial loop reads the rows.
+    if data.body.as_ref().is_some_and(|body| !body.simple) {
+        return Ok(None);
+    }
     let storage = switch.storage();
     let copies = &storage.copies;
     if !copies.on() || data.join.is_some() || !connection.get_auto_commit() || switch.wrote() {

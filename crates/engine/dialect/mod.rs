@@ -603,6 +603,11 @@ mod tests {
 
     #[test]
     fn dialect_catalog_survives_mvcc_recovery() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's MVCC store and its log; the versioned storage keeps its own row versions",
+        ) {
+            return;
+        }
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let path = "dialect-catalog-mvcc-recovery.db";
 

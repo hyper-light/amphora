@@ -63,6 +63,10 @@ pub enum MorselError {
     Unsupported { kind: &'static str },
     #[error("out of memory")]
     Alloc,
+    /// The copied loop body raised an error or stopped short: the serial loop answers, and
+    /// raises any error the statement has its own way (lane qs6-7).
+    #[error("the loop body declined: {0}")]
+    Body(Box<crate::LimboError>),
     #[error("reading the table: {0}")]
     Storage(Box<crate::LimboError>),
     #[error("the table's b-tree is malformed: {0}")]
@@ -291,6 +295,12 @@ pub trait Pipeline: Sync {
     /// How many input rows the pipeline reads.
     fn rows(&self) -> usize;
     fn empty(&self) -> Self::Partial;
+    /// Whether the pipeline holds all it needs (a LIMIT's rows, lane qs6-8): no more morsels are
+    /// claimed. It is asked before each claim, and a morsel claimed runs, so the morsels run are a
+    /// prefix of the input.
+    fn done(&self) -> bool {
+        false
+    }
     /// Folds the rows of `rows` (input row positions) into `partial`.
     fn run(
         &self,
@@ -346,7 +356,7 @@ pub fn execute<P: Pipeline>(
     let mut done = 0usize;
     let mut size = 1usize;
     // Ends: every pass moves `done` forward by at least one row, and `done` stops at `total`.
-    while done < total {
+    while done < total && !pipeline.done() {
         let end = done.saturating_add(size).min(total);
         pipeline.run(done..end, &mut partial, budget)?;
         stats.morsels = stats.morsels.saturating_add(1);
@@ -358,7 +368,7 @@ pub fn execute<P: Pipeline>(
     }
     stats.pilot_rows = done;
     let rest = total.saturating_sub(done);
-    if rest == 0 {
+    if rest == 0 || pipeline.done() {
         return Ok((partial, stats));
     }
     let row_nanos = nanos(began.elapsed()) / done.max(1) as f64;
@@ -411,6 +421,10 @@ pub fn execute_at<P: Pipeline>(
         let mut claims = 0u64;
         // Ends: each pass takes the next morsel index, and indexes past `morsels` end the loop.
         loop {
+            // Asked before the claim, so every morsel claimed runs (lane qs6-8).
+            if pipeline.done() {
+                break;
+            }
             let before = Instant::now();
             let index = next.fetch_add(1, Ordering::Relaxed);
             claim_nanos += nanos(before.elapsed());

@@ -887,3 +887,292 @@ fn t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop() {
         queries * 4
     );
 }
+
+/// T-QT.6.15 (lane qs6-7): a one-table scan's aggregates whose filters and inputs are any
+/// expression (functions, CASE, LIKE, arithmetic) run on morsels through a copy of the serial
+/// loop's body, each worker with its own registers, and answer as the serial loop at 1, 2, 3, 4
+/// and 8 stated cores; the body ran over every row of the table each time.
+#[test]
+fn t_qt_6_15_workers_run_a_copy_of_the_loop_body_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-15");
+    let mut rng = ChaCha8Rng::seed_from_u64(615);
+    let pad = "x".repeat(64);
+    let rows = 2500u64;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..rows {
+        let a = rng.random_range(-50i64..50);
+        let b = if rng.random_range(0..5) == 0 {
+            "NULL".to_string()
+        } else {
+            rng.random_range(-9i64..9).to_string()
+        };
+        let c = match rng.random_range(0..8) {
+            0 => "NULL".to_string(),
+            k => format!("'t{k}{}'", ["", "a", "Ab", "_%"][rng.random_range(0..4)]),
+        };
+        conn.execute(format!(
+            "INSERT INTO t(a, b, c, p) VALUES ({a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let filters = [
+        "a > {n}",
+        "abs(a) < {n}",
+        "a % 3 = {k}",
+        "c LIKE 't{k}%'",
+        "c NOT LIKE '%a'",
+        "CASE WHEN a > 0 THEN b ELSE -b END > {k}",
+        "length(c) = 3",
+        "a + b * 2 > {n}",
+        "coalesce(b, 0) <> {k}",
+        "upper(c) = 'T{k}AB'",
+        "a BETWEEN -{k} AND {n}",
+        "c IN ('t1', 't2a', 't3Ab')",
+        "b IS NULL OR a < {n}",
+        "substr(c, 2, 1) = '{k}'",
+        "id % 7 = {k}",
+        "max(a, b) > {k}",
+        "iif(c IS NULL, 1, 0) = 0",
+    ];
+    let aggregates = [
+        "COUNT(*)",
+        "COUNT(b)",
+        "SUM(a)",
+        "SUM(a * 2 + b)",
+        "SUM(CASE WHEN c LIKE '%a' THEN 1 ELSE 0 END)",
+        "MIN(c)",
+        "MAX(a - b)",
+        "MIN(length(c))",
+        "MAX(CASE WHEN a > 0 THEN c ELSE 'z' END)",
+        "COUNT(CASE WHEN c LIKE '%1' THEN 1 END)",
+        "MAX(lower(c) || id)",
+        "MIN(abs(a) + 1)",
+    ];
+    let groups = ["", "a % 4", "c", "lower(c)", "b IS NULL", "abs(b)"];
+    let fill = |template: &str, rng: &mut ChaCha8Rng| {
+        template
+            .replace("{n}", &rng.random_range(-40i64..40).to_string())
+            .replace("{k}", &rng.random_range(0i64..4).to_string())
+    };
+    let queries = 40usize;
+    let mut hooked = 0usize;
+    for _ in 0..queries {
+        let mut terms = Vec::new();
+        for _ in 0..rng.random_range(0..3) {
+            terms.push(fill(filters[rng.random_range(0..filters.len())], &mut rng));
+        }
+        let mut outs = Vec::new();
+        for _ in 0..rng.random_range(1..4) {
+            outs.push(aggregates[rng.random_range(0..aggregates.len())].to_string());
+        }
+        let group = groups[rng.random_range(0..groups.len())];
+        let filter = if terms.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", terms.join(" AND "))
+        };
+        let (lead, grouped) = if group.is_empty() {
+            (String::new(), String::new())
+        } else {
+            (format!("{group}, "), format!(" GROUP BY {group}"))
+        };
+        let sql = format!("SELECT {lead}{} FROM t{filter}{grouped}", outs.join(", "));
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, &sql);
+            let after = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            // The copied body ran over every row once: the parallel path answered.
+            assert_eq!(
+                after - before,
+                rows,
+                "{sql} on {cores} cores: the body's rows"
+            );
+            let workers = conn
+                .morsel_costs
+                .lock()
+                .as_ref()
+                .is_some_and(|costs| costs.worker_start().samples() > 1);
+            if workers {
+                hooked += 1;
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    // Non-vacuity: more than one worker ran the body for most statements.
+    assert!(
+        hooked > queries,
+        "workers ran {hooked} times of {}",
+        queries * 5
+    );
+}
+
+/// T-QT.6.16 (lane qs6-8): a one-table scan's rows, any filter and any result expression, run on
+/// morsels through the copy of the serial loop's body and come out as the serial loop's at 1, 2,
+/// 3, 4 and 8 stated cores. Under a LIMIT with no ORDER BY, behind its switch (off, the control:
+/// the serial loop answers and the body never runs), the row count is the serial one, every row
+/// is in the serial result (here the very rows in order, as the morsels run are a prefix of the
+/// table), and the workers stopped early: the body ran over fewer rows than the table holds.
+#[test]
+fn t_qt_6_16_a_scans_rows_run_in_parallel_and_stop_early_under_limit() {
+    let conn = open(":memory:qt-6-16");
+    let mut rng = ChaCha8Rng::seed_from_u64(616);
+    let pad = "x".repeat(64);
+    let rows = 2500u64;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..rows {
+        let a = rng.random_range(-50i64..50);
+        let b = if rng.random_range(0..5) == 0 {
+            "NULL".to_string()
+        } else {
+            rng.random_range(-9i64..9).to_string()
+        };
+        let c = match rng.random_range(0..8) {
+            0 => "NULL".to_string(),
+            k => format!("'t{k}{}'", ["", "a", "Ab", "_%"][rng.random_range(0..4)]),
+        };
+        conn.execute(format!(
+            "INSERT INTO t(a, b, c, p) VALUES ({a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let filters = [
+        "a > {n}",
+        "abs(a) < {n}",
+        "a % 3 = {k}",
+        "c LIKE 't{k}%'",
+        "c NOT LIKE '%a'",
+        "CASE WHEN a > 0 THEN b ELSE -b END > {k}",
+        "a + b * 2 > {n}",
+        "coalesce(b, 0) <> {k}",
+        "b IS NULL OR a < {n}",
+        "id % 7 = {k}",
+        "iif(c IS NULL, 1, 0) = 0",
+    ];
+    let outputs = [
+        "id",
+        "a",
+        "c",
+        "a * 2 + b",
+        "upper(c)",
+        "CASE WHEN a > 0 THEN c ELSE 'n' END",
+        "length(p)",
+        "coalesce(b, -1)",
+        "id || c",
+    ];
+    let fill = |template: &str, rng: &mut ChaCha8Rng| {
+        template
+            .replace("{n}", &rng.random_range(-40i64..40).to_string())
+            .replace("{k}", &rng.random_range(0i64..4).to_string())
+    };
+    let body_rows = || {
+        conn.morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let stated = |cores: usize| {
+        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+            NonZeroUsize::new(cores).unwrap(),
+            1.0,
+            1.0,
+        ));
+    };
+    let queries = 30usize;
+    let mut hooked = 0usize;
+    let mut limited = 0usize;
+    let mut stopped = 0usize;
+    for query in 0..queries {
+        let mut terms = Vec::new();
+        for _ in 0..rng.random_range(0..3) {
+            terms.push(fill(filters[rng.random_range(0..filters.len())], &mut rng));
+        }
+        let mut outs = Vec::new();
+        for _ in 0..rng.random_range(1..4) {
+            outs.push(outputs[rng.random_range(0..outputs.len())]);
+        }
+        let filter = if terms.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", terms.join(" AND "))
+        };
+        let limit = match query % 3 {
+            0 => String::new(),
+            1 => format!(" LIMIT {}", rng.random_range(1..60)),
+            _ => format!(
+                " LIMIT {} OFFSET {}",
+                rng.random_range(1..60),
+                rng.random_range(0..20)
+            ),
+        };
+        let sql = format!("SELECT {} FROM t{filter}{limit}", outs.join(", "));
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        if !limit.is_empty() {
+            // The switch's control: the serial loop answers, the body never runs.
+            conn.set_parallel_limit(false);
+            stated(4);
+            let before = body_rows();
+            assert_eq!(sql_rows(&conn, &sql), serial, "{sql}: the control");
+            assert_eq!(body_rows(), before, "{sql}: the control ran the body");
+            conn.set_parallel_limit(true);
+        }
+        for cores in [1usize, 2, 3, 4, 8] {
+            stated(cores);
+            let before = body_rows();
+            let parallel = sql_rows(&conn, &sql);
+            let ran = body_rows() - before;
+            assert_eq!(parallel.len(), serial.len(), "{sql} on {cores} cores: rows");
+            for row in &parallel {
+                assert!(serial.contains(row), "{sql} on {cores} cores: {row:?}");
+            }
+            assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            if limit.is_empty() {
+                assert_eq!(ran, rows, "{sql} on {cores} cores: the body's rows");
+            } else {
+                assert!(ran > 0 && ran <= rows, "{sql} on {cores} cores: ran {ran}");
+                limited += 1;
+                if ran < rows {
+                    stopped += 1;
+                }
+            }
+            let workers = conn
+                .morsel_costs
+                .lock()
+                .as_ref()
+                .is_some_and(|costs| costs.worker_start().samples() > 1);
+            if workers {
+                hooked += 1;
+            }
+        }
+        conn.set_parallel_limit(false);
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    // Non-vacuity: more than one worker ran for most statements, and most LIMITs stopped early.
+    assert!(
+        hooked > queries,
+        "workers ran {hooked} times of {}",
+        queries * 5
+    );
+    assert!(
+        stopped * 2 > limited,
+        "the workers stopped early {stopped} times of {limited}"
+    );
+}
