@@ -20,7 +20,7 @@ use super::{
     Envelope, GroupId, Guard, Intent, Lock, Mark, OpenPage, Outcome, Record, Reply, Tablet, TxnId,
     apply,
 };
-use crate::database::Database;
+use crate::database::{Database, Token};
 use crate::db::Db;
 
 /// The tables a group keeps for transactions across groups. The data a transaction reads and
@@ -907,6 +907,56 @@ impl Cluster {
             }),
             _ => self.transact(txn, until),
         }
+    }
+}
+
+/// A Records transaction of `namespace` whose rows span groups, committed through `cluster`
+/// (AC-T1.10.1, lane xgroup-sql-6): its writes as [`record_key`]s, in every group or none, each
+/// group's rows at one revision there; a row written twice keeps its last write, as a single-group
+/// commit does. Answers the cross-group timestamp (Ada's decision: the one the session tokens use,
+/// [`Token::at`]): the newest commit stamp any group answered with after the transaction's steps.
+/// Conditions aren't carried into the coordinator's prepare yet: a transaction with any is refused.
+pub fn commit_records(
+    cluster: &Cluster,
+    namespace: &str,
+    tx: &amphora_api::Tx,
+    until: Instant,
+) -> Result<Token, Refusal> {
+    use amphora_api::Write;
+    if !tx.conds.is_empty() {
+        return Err(amphora_api::invalid(
+            "cross-group transaction",
+            "conditions across groups aren't carried into the prepare yet",
+        ));
+    }
+    let mut writes = BTreeMap::new();
+    for write in &tx.writes {
+        let (key, value) = match write {
+            Write::Put { family, key, value } => {
+                (record_key(namespace, family, key)?, Some(value.clone()))
+            }
+            Write::Delete { family, key } => (record_key(namespace, family, key)?, None),
+        };
+        writes.insert(key, value);
+    }
+    let txn = Txn {
+        reads: Vec::new(),
+        writes: writes.into_iter().collect(),
+    };
+    match cluster.commit(txn, until)? {
+        Answer::Committed { .. } => Ok(Token::at(cluster.carried.load(Ordering::Acquire))),
+        Answer::Aborted(Why::Conflict(key)) => Err(match record_of(&key) {
+            Ok(Some((_, family, row))) => Refusal::Conflict {
+                family: family.into(),
+                key: row.to_vec(),
+                at: None,
+            },
+            _ => Refusal::Unavailable("a cross-group conflict on a key that isn't a row".into()),
+        }),
+        Answer::Aborted(why) => Err(Refusal::Unavailable(format!(
+            "the cross-group transaction aborted: {why:?}"
+        ))),
+        Answer::Unknown => Err(Refusal::UnknownOutcome),
     }
 }
 
@@ -1822,6 +1872,66 @@ mod sessions {
             db.call_internal(until(), move |db| SqlTablet::new(db).drop_locks_of(txn))
                 .unwrap();
             assert!(ns.commit(put(3), until()).is_ok());
+        }
+    }
+
+    /// AC-T1.10.1 (lane xgroup-sql-6): a Records transaction across three groups through
+    /// [`commit_records`], both protocols: its rows read back in each group, the answer is a
+    /// cross-group timestamp, a row under another transaction's lock is refused as a conflict, and
+    /// conditions are refused until the prepare carries them.
+    #[test]
+    fn ac_t1_10_1_commit_records_writes_rows_in_every_group() {
+        use amphora_api::{Cond, Consistency, Records, Tx, Write};
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            let dir = tempfile::tempdir().unwrap();
+            let dbs = databases(dir.path(), 3);
+            let cluster = open_over(&dbs, 1, protocol, Options::default());
+            let tx = |v: u8| Tx {
+                conds: Vec::new(),
+                writes: (0..3u8)
+                    .map(|k| Write::Put {
+                        family: "rows".into(),
+                        key: vec![k],
+                        value: vec![v],
+                    })
+                    .collect(),
+            };
+            let token = commit_records(&cluster, "ns", &tx(5), until()).unwrap();
+            assert_eq!(token.index, 0, "{protocol:?}");
+            for k in 0..3u8 {
+                let ns = dbs[usize::from(k)].namespace("ns").unwrap();
+                let got = ns
+                    .get("rows", &[k], Consistency::Linearizable, until())
+                    .unwrap();
+                assert_eq!(got.map(|r| r.value), Some(vec![5]), "{protocol:?} row {k}");
+            }
+            let lock = Lock {
+                txn: TxnId {
+                    coordinator: 9,
+                    epoch: 1,
+                    seq: 1,
+                },
+                anchor: 2,
+                intent: Intent::Read,
+            };
+            let key = row(2);
+            dbs[2]
+                .call_internal(until(), move |db| SqlTablet::new(db).put_lock(&key, &lock))
+                .unwrap();
+            let refused = commit_records(&cluster, "ns", &tx(6), until());
+            assert!(
+                matches!(refused, Err(Refusal::Conflict { .. })),
+                "{protocol:?} {refused:?}"
+            );
+            let mut conditional = tx(7);
+            conditional.conds.push(Cond::Absent {
+                family: "rows".into(),
+                key: vec![0],
+            });
+            assert!(matches!(
+                commit_records(&cluster, "ns", &conditional, until()),
+                Err(Refusal::Invalid { .. })
+            ));
         }
     }
 }
