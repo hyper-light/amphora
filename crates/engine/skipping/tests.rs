@@ -600,6 +600,9 @@ mod wired {
             let skipped_any = db.skipping.with_summary(root, |s| match s {
                 Skipping::ZoneMaps(z) => z.stats().zones_skipped > 0,
                 Skipping::Cracking(c) => c.crack_count() > 0,
+                Skipping::Measured(m) => {
+                    m.zone_map().stats().zones_skipped > 0 || m.cracker().crack_count() > 0
+                }
                 Skipping::Off => false,
             });
             assert_eq!(
@@ -618,6 +621,11 @@ mod wired {
     #[test]
     fn t_g5_4_2_cracking_sql_writes_between_scans_answer_as_plain() {
         writes_between_scans(SkipKind::Cracking);
+    }
+
+    #[test]
+    fn t_sku_2_measured_sql_writes_between_scans_answer_as_plain() {
+        writes_between_scans(SkipKind::Measured);
     }
 
     /// The candidates `conn` gets in a read transaction of its own: its snapshot the newest
@@ -690,6 +698,11 @@ mod wired {
     #[test]
     fn t_g5_4_2_cracking_older_snapshot_never_skips_stale() {
         older_snapshot_refused(SkipKind::Cracking);
+    }
+
+    #[test]
+    fn t_sku_2_measured_older_snapshot_never_skips_stale() {
+        older_snapshot_refused(SkipKind::Measured);
     }
 }
 
@@ -808,6 +821,9 @@ mod scans {
             let skipped = db.skipping.with_summary(root_of(&on), |s| match s {
                 Skipping::ZoneMaps(z) => z.stats().zones_skipped > 0,
                 Skipping::Cracking(c) => c.crack_count() > 0,
+                Skipping::Measured(m) => {
+                    m.zone_map().stats().zones_skipped > 0 || m.cracker().crack_count() > 0
+                }
                 Skipping::Off => false,
             });
             assert_eq!(skipped, Some(true), "seed {seed} {kind:?}: nothing skipped");
@@ -822,6 +838,11 @@ mod scans {
     #[test]
     fn t_g5_4_3_cracking_sql_filter_skips_rows_and_answers_as_unswitched() {
         filters_skip_and_answer_as_unswitched(SkipKind::Cracking);
+    }
+
+    #[test]
+    fn t_sku_2_measured_sql_filter_skips_rows_and_answers_as_unswitched() {
+        filters_skip_and_answer_as_unswitched(SkipKind::Measured);
     }
 
     fn transactions_answer_as_unswitched(kind: SkipKind) {
@@ -876,7 +897,94 @@ mod scans {
         transactions_answer_as_unswitched(SkipKind::Cracking);
     }
 
+    #[test]
+    fn t_sku_2_measured_transactions_and_older_snapshots_answer_as_unswitched() {
+        transactions_answer_as_unswitched(SkipKind::Measured);
+    }
+
     /// One run of a prepared statement bound to `values`: its rows, printed, and the rows it read.
+    /// Lane skip-4 (T-SKU.3): a SQL statement turns skipping on; answers equal the unskipped
+    /// scan's under random writes, rows are skipped, and `off` drops the summary.
+    #[test]
+    fn t_sku_3_pragma_turns_skipping_on_and_answers_as_unswitched() {
+        let rows = 4000;
+        let queries = 24;
+        for (seed, setting) in [
+            (0u64, "t.a"),
+            (1, "t.a measured"),
+            (2, "t.a ZONE_MAPS"),
+            (3, "t.a cracking"),
+        ] {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let (db, on) = open();
+            let (_off_db, off) = open();
+            fill([&on, &off], rows);
+            on.execute(format!("PRAGMA skipping = '{setting}'"))
+                .unwrap();
+            let (mut read_on, mut read_off) = (0u64, 0u64);
+            for _ in 0..queries {
+                for _ in 0..rng.random_range(0..15) {
+                    let sql = random_write(&mut rng, rows);
+                    on.execute(&sql).unwrap();
+                    off.execute(&sql).unwrap();
+                }
+                let lo = rng.random_range(-10..rows);
+                let hi = lo.saturating_add(rng.random_range(0..rows / 20));
+                let sql = format!(
+                    "SELECT rowid, a, b FROM t WHERE a BETWEEN {lo} AND {hi} ORDER BY rowid"
+                );
+                let (answer_on, r_on) = query(&on, &sql);
+                let (answer_off, r_off) = query(&off, &sql);
+                assert_eq!(answer_on, answer_off, "seed {seed} '{setting}': {sql}");
+                read_on += r_on;
+                read_off += r_off;
+            }
+            assert!(
+                read_on < read_off,
+                "seed {seed} '{setting}': read {read_on} skipping, {read_off} without"
+            );
+            assert_eq!(
+                skipping_counts(&on, "t").unwrap().consulted,
+                queries,
+                "seed {seed} '{setting}'"
+            );
+            on.execute("PRAGMA skipping = 't.a off'").unwrap();
+            let dropped = db
+                .skipping
+                .with_summary(root_of(&on), |s| matches!(s, Skipping::Off));
+            assert_ne!(dropped, Some(false), "seed {seed}: 'off' kept a summary");
+        }
+    }
+
+    /// Lane skip-4 (T-SKU.3): a setting that names no stored column, or no method kiln knows, is
+    /// refused with why, and nothing is kept.
+    #[test]
+    fn t_sku_3_pragma_refuses_what_it_cant_summarize() {
+        let (_db, on) = open();
+        let (_other_db, other) = open();
+        fill([&on, &other], 10);
+        for bad in [
+            "t",
+            "t.",
+            ".a",
+            "t.nope",
+            "nope.a",
+            "t.a sideways",
+            "t.a measured again",
+        ] {
+            let err = on.execute(format!("PRAGMA skipping = '{bad}'"));
+            assert!(err.is_err(), "'{bad}' was taken");
+        }
+        assert!(
+            on.execute("PRAGMA skipping").is_err(),
+            "skipping is set, not read"
+        );
+        assert!(
+            skipping_counts(&on, "t").is_none(),
+            "a refused setting kept a summary"
+        );
+    }
+
     fn run_bound(stmt: &mut crate::Statement, values: &[crate::Value]) -> (Vec<String>, u64) {
         stmt.reset().unwrap();
         stmt.reset_metrics();
@@ -953,5 +1061,320 @@ mod scans {
     #[test]
     fn t_sku_1_cracking_prepared_parameters_skip_and_answer_as_unswitched() {
         prepared_parameters_skip(SkipKind::Cracking);
+    }
+
+    #[test]
+    fn t_sku_2_measured_prepared_parameters_skip_and_answer_as_unswitched() {
+        prepared_parameters_skip(SkipKind::Measured);
+    }
+}
+
+/// Lane skip-3 (T-SKU.2): the chooser under each method's failure mode. The scenario's cost of a
+/// filter is the work its method did, from the method's own counters, plus the rows its candidates
+/// make the scan read (the executor measures time instead; this keeps the test off the clock).
+mod chooser {
+    use super::*;
+
+    fn n(count: usize) -> u64 {
+        u64::try_from(count).unwrap_or(u64::MAX)
+    }
+
+    /// The rows a scan reads for `candidates` of `table`.
+    fn rows_read(table: &Table, candidates: &Candidates) -> u64 {
+        match candidates {
+            Candidates::All => n(table.len()),
+            Candidates::Ranges(ranges) => ranges
+                .iter()
+                .map(|r| n(table.range(r.first..=r.last).count()))
+                .sum(),
+            Candidates::Rowids(rowids) => n(rowids.len()),
+        }
+    }
+
+    fn zone_work(zones: &ZoneMap) -> u64 {
+        let s = zones.stats();
+        s.zones_read + s.zones_skipped + s.zones_split
+    }
+
+    fn crack_work(cracker: &CrackerColumn) -> u64 {
+        let s = cracker.stats();
+        s.entries_partitioned + s.entries_searched + s.entries_moved
+    }
+
+    fn work_of(chooser: &Chooser, method: SkipMethod) -> u64 {
+        match method {
+            SkipMethod::ZoneMaps => zone_work(chooser.zone_map()),
+            SkipMethod::Cracking => crack_work(chooser.cracker()),
+        }
+    }
+
+    fn sound(table: &Table, candidates: &Candidates, lo: i64, hi: i64) {
+        let expected = plain(table, lo, hi);
+        let found: Vec<i64> = expected
+            .iter()
+            .copied()
+            .filter(|rowid| match candidates {
+                Candidates::All => true,
+                Candidates::Ranges(ranges) => {
+                    ranges.iter().any(|r| (r.first..=r.last).contains(rowid))
+                }
+                Candidates::Rowids(rowids) => rowids.binary_search(rowid).is_ok(),
+            })
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a candidate set missed a row for {lo}..={hi}"
+        );
+    }
+
+    struct Run {
+        zone_total: u64,
+        crack_total: u64,
+        chooser_total: u64,
+        stats: ChooserStats,
+        leader: Option<SkipMethod>,
+        /// Each method's write upkeep inside the chooser over the run (zone maps, cracking): kept
+        /// summaries both take every write, which the doubling bound on scans doesn't cover.
+        upkeep: [u64; 2],
+    }
+
+    /// Runs the zone map alone, the cracker alone and the chooser in lockstep over one stream of
+    /// writes and filters, the chooser handed each filter's cost as the scenario counts it.
+    fn lockstep(
+        seed: u64,
+        rows: i64,
+        value: impl Fn(&mut ChaCha8Rng, i64) -> Option<i64>,
+        writes_per_filter: usize,
+        width: i64,
+        filters: usize,
+    ) -> Run {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut table = Table::new();
+        for rowid in 1..=rows {
+            let v = value(&mut rng, rowid);
+            table.insert(rowid, v);
+        }
+        // The scenario's stand-in for a table's leaves: a zone per 64 rows (the zone map's own
+        // tests build zones from real leaves).
+        let build = |table: &Table| {
+            let mut builder = ZoneMapBuilder::new();
+            for (i, (rowid, v)) in table.iter().enumerate() {
+                if i % 64 == 0 {
+                    builder.end_run();
+                }
+                builder.row(*rowid, *v).unwrap();
+            }
+            builder.finish()
+        };
+        let mut zones = build(&table);
+        let mut cracker = CrackerColumn::new(table.iter().map(|(r, v)| (*r, *v)));
+        let mut chooser = Chooser::new(
+            build(&table),
+            CrackerColumn::new(table.iter().map(|(r, v)| (*r, *v))),
+        );
+        let (mut zone_total, mut crack_total, mut chooser_total) = (0u64, 0u64, 0u64);
+        let mut seen = [zone_work(chooser.zone_map()), crack_work(chooser.cracker())];
+        let top = rows / 4 + 10;
+        let mut upkeep = [0u64; 2];
+        for _ in 0..filters {
+            let upkeep_from = [
+                work_of(&chooser, SkipMethod::ZoneMaps),
+                work_of(&chooser, SkipMethod::Cracking),
+            ];
+            for _ in 0..writes_per_filter {
+                let rowid = rng.random_range(1..=rows);
+                let old = table[&rowid];
+                let new = value(&mut rng, rowid);
+                table.insert(rowid, new);
+                let write = RowWrite::Update { rowid, old, new };
+                zones.on_write(write).unwrap();
+                cracker.on_write(write).unwrap();
+                chooser.on_write(write).unwrap();
+            }
+            upkeep[0] += work_of(&chooser, SkipMethod::ZoneMaps) - upkeep_from[0];
+            upkeep[1] += work_of(&chooser, SkipMethod::Cracking) - upkeep_from[1];
+            let lo = rng.random_range(-20..top);
+            let hi = lo + rng.random_range(0..=width);
+
+            let before = zone_work(&zones);
+            let c = Candidates::Ranges(zones.candidate_ranges(lo, hi));
+            sound(&table, &c, lo, hi);
+            zone_total += zone_work(&zones) - before + rows_read(&table, &c);
+
+            let before = crack_work(&cracker);
+            let c = Candidates::Rowids(cracker.candidate_rowids(lo, hi).unwrap());
+            sound(&table, &c, lo, hi);
+            crack_total += crack_work(&cracker) - before + rows_read(&table, &c);
+
+            let (c, method) = chooser.candidates(lo, hi).unwrap();
+            sound(&table, &c, lo, hi);
+            let at = usize::from(method == SkipMethod::Cracking);
+            let work = work_of(&chooser, method);
+            // A method's cost includes the work its writes made since it last answered.
+            let cost = work - seen[at] + rows_read(&table, &c);
+            seen[at] = work;
+            chooser.record(method, cost);
+            chooser_total += cost;
+        }
+        Run {
+            zone_total,
+            crack_total,
+            chooser_total,
+            upkeep,
+            stats: chooser.stats(),
+            leader: chooser.leader(),
+        }
+    }
+
+    /// Do: zone maps' failure mode: the column's values scattered at random over the rowids, so
+    /// every zone spans the whole range and none is skipped; narrow repeated-ish filters, no
+    /// writes. Expect: the chooser leads with cracking, measures zone maps again only a logarithmic
+    /// number of times, and its total stays within the doubling bound of the better method alone.
+    #[test]
+    fn t_sku_2_zone_maps_failure_mode_chooses_cracking() {
+        for seed in 0..8 {
+            let rows = 4096;
+            let filters = 256;
+            let run = lockstep(
+                seed,
+                rows,
+                |rng, _| Some(rng.random_range(0..rows / 4)),
+                0,
+                8,
+                filters,
+            );
+            assert!(
+                run.crack_total < run.zone_total,
+                "seed {seed}: scenario didn't fail zone maps"
+            );
+            assert_eq!(
+                run.leader,
+                Some(SkipMethod::Cracking),
+                "seed {seed}: {:?}",
+                run.stats
+            );
+            let log = u64::from(usize::BITS - filters.leading_zeros());
+            assert!(
+                run.stats.zone_maps.trials <= 1 + log * (1 + run.stats.switches),
+                "seed {seed}: zone maps measured {} times: {:?}",
+                run.stats.zone_maps.trials,
+                run.stats
+            );
+            assert!(
+                run.chooser_total
+                    <= 2 * run.crack_total + run.upkeep[0] + 2 * u64::try_from(rows).unwrap(),
+                "seed {seed}: chooser {} vs cracking alone {}",
+                run.chooser_total,
+                run.crack_total
+            );
+        }
+    }
+
+    /// Do: cracking's failure mode: a column that follows the rowid (zones skip all but a few),
+    /// heavy write churn between filters (each write ripples through the cracker's pieces) and
+    /// wide filters. Expect: the chooser leads with zone maps, cracking measured a logarithmic
+    /// number of times, and its total within the doubling bound of zone maps alone.
+    #[test]
+    fn t_sku_2_cracking_failure_mode_chooses_zone_maps() {
+        for seed in 0..8 {
+            let rows = 4096;
+            let filters = 256;
+            let run = lockstep(
+                seed,
+                rows,
+                |rng, rowid| Some(rowid / 4 + rng.random_range(-2..=2)),
+                64,
+                rows / 8,
+                filters,
+            );
+            assert!(
+                run.zone_total < run.crack_total,
+                "seed {seed}: scenario didn't fail cracking"
+            );
+            assert_eq!(
+                run.leader,
+                Some(SkipMethod::ZoneMaps),
+                "seed {seed}: {:?}",
+                run.stats
+            );
+            let log = u64::from(usize::BITS - filters.leading_zeros());
+            assert!(
+                run.stats.cracking.trials <= 1 + log * (1 + run.stats.switches),
+                "seed {seed}: cracking measured {} times: {:?}",
+                run.stats.cracking.trials,
+                run.stats
+            );
+            assert!(
+                run.chooser_total
+                    <= 2 * run.zone_total + run.upkeep[1] + 2 * u64::try_from(rows).unwrap(),
+                "seed {seed}: chooser {} vs zone maps alone {}",
+                run.chooser_total,
+                run.zone_total
+            );
+        }
+    }
+
+    fn empty_chooser() -> Chooser {
+        Chooser::new(ZoneMapBuilder::new().finish(), CrackerColumn::new([]))
+    }
+
+    /// Do: costs handed in directly: zone maps cheap, then their cost jumps (writes scattered
+    /// the column). Expect: each method tried once first; the leader changes on the leader's own
+    /// next measure, with no trial needed; a switch is counted.
+    #[test]
+    fn t_sku_2_leader_changes_when_its_cost_rises() {
+        let mut chooser = empty_chooser();
+        assert_eq!(chooser.next_method(), (SkipMethod::ZoneMaps, true));
+        chooser.record(SkipMethod::ZoneMaps, 10);
+        assert_eq!(chooser.next_method(), (SkipMethod::Cracking, true));
+        chooser.record(SkipMethod::Cracking, 100);
+        assert_eq!(chooser.leader(), Some(SkipMethod::ZoneMaps));
+        assert_eq!(chooser.next_method(), (SkipMethod::ZoneMaps, false));
+        chooser.record(SkipMethod::ZoneMaps, 1000);
+        assert_eq!(chooser.leader(), Some(SkipMethod::Cracking));
+        assert_eq!(chooser.stats().switches, 1);
+        assert_eq!(chooser.next_method(), (SkipMethod::Cracking, false));
+    }
+
+    /// Do: a leader confirmed again and again. Expect: the other method's trials come after the
+    /// leader spent its cost times 1, 2, 4, 8...: geometrically rarer.
+    #[test]
+    fn t_sku_2_confirmed_leader_is_checked_geometrically_less_often() {
+        let mut chooser = empty_chooser();
+        chooser.record(SkipMethod::ZoneMaps, 1);
+        chooser.record(SkipMethod::Cracking, 10);
+        let mut gaps = Vec::new();
+        let mut since = 0u64;
+        for _ in 0..2000 {
+            let (_, method) = chooser.candidates(0, 0).unwrap();
+            if method == SkipMethod::Cracking {
+                gaps.push(since);
+                since = 0;
+                chooser.record(method, 10);
+            } else {
+                since += 1;
+                chooser.record(method, 1);
+            }
+        }
+        assert_eq!(&gaps[..5], &[10, 20, 40, 80, 160], "{gaps:?}");
+    }
+
+    /// Do: a burst: once a trial is due, a thousand scans start before any cost comes back
+    /// (connections at once). Expect: one trial of the other method, the rest stay with the leader.
+    #[test]
+    fn t_sku_2_burst_issues_one_trial() {
+        let mut chooser = empty_chooser();
+        chooser.record(SkipMethod::ZoneMaps, 1);
+        chooser.record(SkipMethod::Cracking, 5);
+        for _ in 0..5 {
+            chooser.candidates(0, 0).unwrap();
+            chooser.record(SkipMethod::ZoneMaps, 1);
+        }
+        let mut trials = 0;
+        for _ in 0..1000 {
+            let (_, method) = chooser.candidates(0, 0).unwrap();
+            trials += usize::from(method == SkipMethod::Cracking);
+        }
+        assert_eq!(trials, 1, "{:?}", chooser.stats());
     }
 }

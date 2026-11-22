@@ -212,6 +212,37 @@ fn emit_table_list_rows_for_schema(
     }
 }
 
+/// Amphora (lane skip-4, T-SKU.3): `PRAGMA skipping`'s value, `table.column` and an optional
+/// method: `measured` (the default: zone maps or cracking, whichever measures cheaper on the
+/// column's filters), `zone_maps`, `cracking`, or `off` (drop the summary).
+fn parse_skipping_setting(
+    value: &str,
+) -> crate::Result<(String, String, Option<crate::skipping::SkipKind>)> {
+    use crate::skipping::SkipKind;
+    let refuse = || {
+        LimboError::InvalidArgument(format!(
+            "PRAGMA skipping expects 'table.column [measured|zone_maps|cracking|off]', got '{value}'"
+        ))
+    };
+    let mut words = value.split_whitespace();
+    let (table, column) = words
+        .next()
+        .and_then(|spec| spec.split_once('.'))
+        .filter(|(table, column)| !table.is_empty() && !column.is_empty())
+        .ok_or_else(refuse)?;
+    let kind = match words.next().map(str::to_ascii_lowercase).as_deref() {
+        None | Some("measured") => Some(SkipKind::Measured),
+        Some("zone_maps") => Some(SkipKind::ZoneMaps),
+        Some("cracking") => Some(SkipKind::Cracking),
+        Some("off") => None,
+        Some(_) => return Err(refuse()),
+    };
+    if words.next().is_some() {
+        return Err(refuse());
+    }
+    Ok((table.to_owned(), column.to_owned(), kind))
+}
+
 /// SQLite matches PRAGMA names without regard to case.
 fn parse_pragma_name(name: &str) -> Option<PragmaName> {
     if let Ok(pragma) = PragmaName::from_str(name) {
@@ -736,6 +767,14 @@ fn update_pragma(
         }
         PragmaName::MvccGroupCommit => {
             connection.set_mvcc_group_commit(parse_pragma_enabled(&value))?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::Skipping => {
+            // Amphora (lane skip-4, T-SKU.3): the summary is built now, holding the write lock,
+            // as `set_skipping` builds it; the statement itself does nothing when run.
+            let (table, column, kind) = parse_skipping_setting(&parse_string(&value)?)?;
+            crate::skipping::set_skipping(&connection, &table, &column, kind)
+                .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
             Ok(TransactionMode::None)
         }
         PragmaName::FtsMergeThreshold => {
@@ -1688,6 +1727,10 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
+        PragmaName::Skipping => Err(LimboError::InvalidArgument(
+            "skipping is set, not read: PRAGMA skipping = 'table.column [measured|zone_maps|cracking|off]'"
+                .to_owned(),
+        )),
         PragmaName::FtsMergeThreshold => {
             let threshold = connection.get_fts_merge_threshold();
             let register = program.alloc_register();
