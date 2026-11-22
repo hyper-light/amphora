@@ -42,7 +42,7 @@ pub use drill::{
     InFlight, Pace, Pacer, Stopped, Unpaced, Yield, admit, behind, device_ns, next_random,
 };
 pub use folder::FolderBlobs;
-pub use restore::{Restored, expire, restore, restore_paced};
+pub use restore::{Restored, expire, restore, restore_paced, restore_within};
 pub use ship::{BaseCopy, Shipped, Shipper};
 pub(crate) use shipping::Prepared;
 pub use shipping::{Archive, Shipping, Status, system_clock};

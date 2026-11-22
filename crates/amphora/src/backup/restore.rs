@@ -4,6 +4,7 @@
 
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use amphora_api::blobs::Blobs;
@@ -11,9 +12,10 @@ use amphora_api::blobs::Blobs;
 use super::Mark;
 use super::drill::{Pace, Unpaced};
 use super::object::{self, Segment};
-use super::plan::{self, BaseKey, SegmentKey, ThroughKey};
-use super::ship::{FRAME_BYTES, list_all};
+use super::plan::{self, BaseKey, SegmentKey, ThroughKey, Unrestorable};
+use super::ship::{FRAME_BYTES, fetch_charge, list_all};
 use crate::db::Db;
+use crate::memory::{Budget as Memory, Use};
 
 /// What a restore did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +68,34 @@ pub fn restore_paced(
     pace: &mut dyn Pace,
     until: Instant,
 ) -> anyhow::Result<Restored> {
+    restore_within(
+        blobs,
+        prefix,
+        second,
+        path,
+        pace,
+        &crate::memory::process(),
+        until,
+    )
+}
+
+/// [`restore_paced`], its chunks charged to `memory` (the process's budget, or a test's).
+///
+/// The chunk bound (T-T1.12.M2): the base's manifest records its chunks' size, so the restore
+/// plans the one chunk it holds at a time before it makes the file: a stream of [`Use::Chunks`],
+/// charged a sealed chunk ([`fetch_charge`]) for the whole fetch. Where that is past the stream's
+/// share of the budget's room or the store's objects, it's refused, typed
+/// ([`Unrestorable::PastRoom`]) and naming both, with nothing written: the store's get gives an
+/// object whole, so a chunk isn't read in parts.
+pub fn restore_within(
+    blobs: &dyn Blobs,
+    prefix: &str,
+    second: u64,
+    path: &Path,
+    pace: &mut dyn Pace,
+    memory: &Arc<Memory>,
+    until: Instant,
+) -> anyhow::Result<Restored> {
     if path.try_exists()? || wal_path(path).try_exists()? {
         anyhow::bail!("{} exists: a restore makes a new database", path.display());
     }
@@ -107,6 +137,20 @@ pub fn restore_paced(
     // The base's pages, as the file.
     let manifest_key = plan.base.key(prefix);
     let manifest = object::manifest(&manifest_key, &blobs.get(&manifest_key, until)?)?;
+    let stream = memory.stream(Use::Chunks);
+    let need = fetch_charge(manifest.chunk_bytes.min(manifest.file_bytes));
+    let room = memory
+        .stream_room(Use::Chunks)?
+        .min(u64::try_from(blobs.object_max())?);
+    if need > room {
+        return Err(Unrestorable::PastRoom {
+            base: manifest.id,
+            need,
+            room,
+        }
+        .into());
+    }
+    let held = memory.take(Use::Chunks, need)?;
     {
         let mut file = std::fs::File::create_new(path)?;
         // An incremental base keeps an earlier base's chunks where the log changed none of their
@@ -122,6 +166,7 @@ pub fn restore_paced(
         }
         file.sync_all()?;
     }
+    drop((held, stream));
 
     // Each generation's log, replayed whole but the last, which ends at the cut.
     let mut index = 0usize;

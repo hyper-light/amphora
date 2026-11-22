@@ -44,6 +44,20 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   last outweighs it, after a break, or once restore rates measured by drills say a restore would pass
   AC-T1.12.3's 30 minutes (`plan::base_due`). Marks are kept one a second (the restore target's
   granularity, AC-T1.12.1) and at most as many as the log holds frames between restarts.
+- **A chunk's memory** (T-T1.12.M1, M2). The memory given is the process's budget
+  (`memory::Use::Chunks`), not a size taken once: a base copy and a restore each open a stream of
+  chunks, and a chunk takes at most its stream's share of the room for chunks now (the room over
+  the streams open), read and sealed at once (twice its bytes and the sum), under the store's
+  objects and the caller's cap (`Archive::memory`). Each chunk is charged while it's held and given
+  back once it's put, so a file far larger than memory goes in chunks that fit beside every other
+  use, and a chunk taken while another use holds the room is refused, typed, and tried again at the
+  next commit. A new base keeps the latest base's chunk size while it still fits, so an incremental
+  base can keep its chunks. The manifest records the chunk size, and a restore plans for it before it
+  makes the file: one sealed chunk held at a time, charged for the whole fetch, refused typed
+  (`Unrestorable::PastRoom`, naming what it needs and has) with nothing written where its share or
+  the store's objects can't hold one. The store's get gives an object whole, so a chunk isn't read
+  in parts: a restore with less room than the backup's copy had (half of it, as a copy holds two
+  buffers) is refused. A ranged get on the `Blobs` seam would lift that (Needs Ada's word).
 - **The database's shipping thread.** `Database::open_backed_up` stamps the writer's commits as it
   opens and starts a thread woken by each commit the store makes (and once at its start), never by
   a timer: a round ships, then moves a due base on by a chunk, chunks following one another without

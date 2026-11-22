@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use amphora::backup::{self, Archive, BaseCopy, Hooks, SECOND_NS, Shipper, plan::Unrestorable};
 use amphora::database::Database;
 use amphora::db::Db;
+use amphora::memory::Use;
 use amphora_api::blobs::{Blobs, SimBlobs};
 use amphora_engine::Value;
 
@@ -160,7 +161,9 @@ fn drill(seed: u64) {
                 None => {
                     shipper.ship(&db, &blobs, until()).unwrap();
                     (dirty, shipped_at) = (false, now.load(Ordering::SeqCst));
-                    copy = shipper.begin_base(&db, &blobs, 32 * 1024).ok();
+                    copy = shipper
+                        .begin_base(&db, &blobs, &amphora::memory::process(), 32 * 1024)
+                        .ok();
                     base_began = now.load(Ordering::SeqCst);
                 }
                 Some(c) => {
@@ -744,7 +747,9 @@ fn t_t1_12_i1_incremental_bases_keep_unchanged_chunks() {
     put(&mut db, &now, 400..401, "c", &mut model, &mut history);
     shipper.ship(&db, &blobs, until()).unwrap();
     let copy_all = |shipper: &mut Shipper, db: &Db| {
-        let mut copy = shipper.begin_base(db, &blobs, 32 * 1024).unwrap();
+        let mut copy = shipper
+            .begin_base(db, &blobs, &amphora::memory::process(), 32 * 1024)
+            .unwrap();
         while shipper.copy_base(db, &blobs, &mut copy, until()).unwrap() {}
         let reused = copy.reused();
         shipper.end_base(db, &blobs, copy, until()).unwrap();
@@ -1333,4 +1338,229 @@ fn restore_bench_amphora() {
             .unwrap();
         println!("count rows={rows}");
     }
+}
+
+/// Readings a test sets: a memory limit and nothing resident, so a use's room is the limit less
+/// what the budget's charges hold.
+struct Room(u64);
+
+impl amphora::memory::Readings for Room {
+    fn read(&self) -> amphora::memory::Reading {
+        amphora::memory::Reading {
+            limit: Some(self.0),
+            resident: Some(0),
+        }
+    }
+}
+
+fn room(limit: u64) -> Arc<amphora::memory::Budget> {
+    amphora::memory::Budget::new(Box::new(Room(limit)))
+}
+
+/// A database in `dir` of `count` rows of 4,000 bytes, written in one commit, its log folded into
+/// the file and started again, then one row more, shipped to `blobs`: its rows, the clock and the
+/// second of its last commit.
+fn written(
+    dir: &std::path::Path,
+    count: i64,
+    blobs: &dyn Blobs,
+) -> (Db, Shipper, Rows, Arc<AtomicU64>, u64) {
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
+    let read = Arc::clone(&now);
+    let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
+    let mut db = Db::open(&dir.join("source.db")).unwrap();
+    db.back_up(Arc::clone(&hooks));
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    let mut shipper = Shipper::open("db", Arc::clone(&hooks), blobs, &db, until()).unwrap();
+    let mut model = Rows::new();
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    db.transaction(|db| {
+        for id in 0..count {
+            let v = format!("{id}:{}", "z".repeat(4000));
+            db.query_owned(
+                "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                [Value::from_i64(id), Value::from_text(v.clone())],
+                |_| Ok(true),
+            )?;
+            model.insert(id, v);
+        }
+        Ok(())
+    })
+    .unwrap();
+    // The log folded into the file and started again (as in T-T1.12.I1), so the base holds the
+    // rows; a row after, so the shipper has seen the new generation.
+    shipper.ship(&db, blobs, until()).unwrap();
+    assert!(db.restart_log().unwrap());
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    let v = "after".to_owned();
+    db.transaction(|db| {
+        db.query_owned(
+            "INSERT INTO t (id, v) VALUES (?1, ?2)",
+            [Value::from_i64(count), Value::from_text(v.clone())],
+            |_| Ok(true),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    model.insert(count, v);
+    let second = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    shipper.ship(&db, blobs, until()).unwrap();
+    (db, shipper, model, now, second)
+}
+
+/// Copies a base whole under `memory`: its chunks' size and count.
+fn copy_whole(
+    shipper: &mut Shipper,
+    db: &Db,
+    blobs: &dyn Blobs,
+    memory: &Arc<amphora::memory::Budget>,
+) -> (u64, u64) {
+    let mut copy = shipper.begin_base(db, blobs, memory, usize::MAX).unwrap();
+    let chunk = copy.chunk_bytes();
+    let mut chunks = 0;
+    loop {
+        chunks += 1;
+        let more = shipper.copy_base(db, blobs, &mut copy, until()).unwrap();
+        assert_eq!(
+            memory.held(Use::Chunks),
+            0,
+            "a chunk's charge is given back once it's put"
+        );
+        if !more {
+            break;
+        }
+    }
+    shipper.end_base(db, blobs, copy, until()).unwrap();
+    (chunk, chunks)
+}
+
+/// Archives the second of the last commit: a second later, shipped again.
+fn archive_through(shipper: &mut Shipper, db: &Db, blobs: &dyn Blobs, now: &AtomicU64) {
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    shipper.ship(db, blobs, until()).unwrap();
+    shipper.ship(db, blobs, until()).unwrap();
+}
+
+/// T-T1.12.M1: a file far larger than the memory room. Do: write about 3 MB, copy a base under a
+/// 64 KiB budget, another use taking the room once mid-copy; restore under the same budget. Expect:
+/// each chunk, read and sealed, fits the room (so the first chunk is no larger than the rest), the
+/// chunk taken while the room is gone refused typed and copied once it's back, every charge given
+/// back, and the restore whole.
+#[test]
+fn t_t1_12_m1_a_file_far_larger_than_the_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
+    let (db, mut shipper, model, now, second) = written(dir.path(), 700, &blobs);
+    let limit = 64 * 1024u64;
+    let memory = room(limit);
+    let file = std::fs::metadata(dir.path().join("source.db"))
+        .unwrap()
+        .len();
+    assert!(
+        file > 32 * limit,
+        "the file ({file} bytes) is far past the room"
+    );
+
+    let mut copy = shipper
+        .begin_base(&db, &blobs, &memory, usize::MAX)
+        .unwrap();
+    let chunk = copy.chunk_bytes();
+    assert!(
+        chunk > 0 && 2 * chunk + 32 <= limit,
+        "a chunk of {chunk} bytes, read and sealed, fits {limit}"
+    );
+    assert_eq!(memory.streams(Use::Chunks), 1, "the copy's stream");
+    let taken = memory.take(Use::Images, limit - chunk).unwrap();
+    let refused = shipper
+        .copy_base(&db, &blobs, &mut copy, until())
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused.downcast_ref::<amphora_api::Refusal>(),
+            Some(amphora_api::Refusal::TooLarge { .. })
+        ),
+        "{refused:#}"
+    );
+    drop(taken);
+    let mut chunks = 0u64;
+    loop {
+        chunks += 1;
+        let more = shipper.copy_base(&db, &blobs, &mut copy, until()).unwrap();
+        assert_eq!(memory.held(Use::Chunks), 0);
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(chunks, file.div_ceil(chunk), "every chunk copied once");
+    shipper.end_base(&db, &blobs, copy, until()).unwrap();
+    assert_eq!(memory.streams(Use::Chunks), 0, "the copy's stream closed");
+    archive_through(&mut shipper, &db, &blobs, &now);
+
+    let target = dir.path().join("restored.db");
+    backup::restore_within(
+        &blobs,
+        "db",
+        second,
+        &target,
+        &mut backup::Unpaced,
+        &memory,
+        until(),
+    )
+    .unwrap();
+    assert_eq!(rows(&Db::open(&target).unwrap()), model);
+    assert_eq!(memory.held(Use::Chunks), 0);
+    assert_eq!(memory.streams(Use::Chunks), 0);
+}
+
+/// T-T1.12.M2: a backup under a large room restored under a small one. Do: copy a base under a
+/// 1 GiB budget, then restore it under 64 KiB, and under just the room one of its chunks takes.
+/// Expect: the small restore refused before it writes anything, typed, naming the room a chunk
+/// needs (the manifest's chunk size, sealed) and the room it has; the restore with that room whole.
+#[test]
+fn t_t1_12_m2_a_large_rooms_backup_restored_in_a_small_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
+    let (db, mut shipper, model, now, second) = written(dir.path(), 100, &blobs);
+    let (chunk, chunks) = copy_whole(&mut shipper, &db, &blobs, &room(1 << 30));
+    let file = std::fs::metadata(dir.path().join("source.db"))
+        .unwrap()
+        .len();
+    assert_eq!(chunks, 1, "the whole file fits one chunk of the large room");
+    assert!(chunk >= file);
+    archive_through(&mut shipper, &db, &blobs, &now);
+
+    let small = dir.path().join("small.db");
+    let refused = backup::restore_within(
+        &blobs,
+        "db",
+        second,
+        &small,
+        &mut backup::Unpaced,
+        &room(64 * 1024),
+        until(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            refused.downcast_ref::<Unrestorable>(),
+            Some(Unrestorable::PastRoom { need, room, .. })
+                if *need == file.min(chunk) + 32 && *room == 64 * 1024
+        ),
+        "{refused:#}"
+    );
+    assert!(!small.exists(), "nothing written");
+
+    let fits = dir.path().join("fits.db");
+    backup::restore_within(
+        &blobs,
+        "db",
+        second,
+        &fits,
+        &mut backup::Unpaced,
+        &room(file.min(chunk) + 32),
+        until(),
+    )
+    .unwrap();
+    assert_eq!(rows(&Db::open(&fits).unwrap()), model);
 }

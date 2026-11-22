@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 /// The archive's format: a format value, raised when a body's layout changes.
 pub(super) const FORMAT: u8 = 1;
 
-const SUM_BYTES: usize = 32;
+/// The bytes of a SHA-256 sum (FIPS 180-4): a format value.
+pub(super) const SUM_BYTES: usize = 32;
 
 /// The log generation a segment's frames are of, as its header names it: SQLite's WAL header's
 /// checkpoint sequence and salts (sqlite.org/fileformat2.html, "WAL File Format"), which change

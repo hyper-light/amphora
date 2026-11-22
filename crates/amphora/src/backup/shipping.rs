@@ -41,7 +41,8 @@ pub struct Archive {
     pub prefix: String,
     /// When each commit was made ([`system_clock`] in production).
     pub clock: Clock,
-    /// The memory a base's chunk may take ([`Shipper::begin_base`]).
+    /// The most bytes a base's chunk may hold ([`Shipper::begin_base`]'s `cap`): under it, a
+    /// chunk holds what the process's memory budget leaves its stream (T-T1.12.M1).
     pub memory: usize,
     /// How long one request to the store may take: past it the round is given up and tried again
     /// at the next commit. The caller states it, as the store's own answer time is the caller's
@@ -485,6 +486,7 @@ impl Prepared {
                     *copy = Some(self.shipper.begin_base(
                         &self.reader,
                         blobs,
+                        &crate::memory::process(),
                         self.archive.memory,
                     )?);
                 }

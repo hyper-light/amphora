@@ -504,6 +504,9 @@ tests = [
   # lane backups-6: a minimum share against yielding fully, event-driven; the peer store (kiln goal 15580afd; backup.md "Continuous restore drills", "The peer store")
   { id = "T-T1.12.C8", text = "Checks wait on events, never timers; under a minimum share (a check's work over the retention period) a check behind it steps with calls in flight; a step costs its bytes at the fastest step of its kind over this check and the last; the replay and the integrity check pause in steps" },
   { id = "T-T1.12.N1", text = "A peer store in another process on the same host: the seam's conformance suite passes through its client, and a database backed up to it restores every row through the client and from the peer's folder" },
+  # lane backups-7: a chunk's memory, charged to the budget and planned by the restore (kiln goal 15580afd; backup.md "A chunk's memory")
+  { id = "T-T1.12.M1", text = "A file far larger than the memory room is copied in chunks that each fit the copy stream's share of the budget, read and sealed; each chunk is charged while held and given back once put, refused typed while another use holds the room, and the restore is whole" },
+  { id = "T-T1.12.M2", text = "A backup made under a large room restored under a small one is refused before anything is written, typed, naming the room a chunk needs (the manifest's chunk size, sealed) and the room the restore has; with that room the restore is whole" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.

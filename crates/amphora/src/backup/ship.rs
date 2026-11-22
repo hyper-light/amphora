@@ -19,6 +19,7 @@ use super::object::{
 use super::plan::{self, BaseKey, Link, Rates, SegmentKey, ThroughKey};
 use super::{Hooks, Mark, SECOND_NS, second_of};
 use crate::db::{Db, PAGE_BYTES};
+use crate::memory::{Budget as Memory, Stream, Use};
 
 /// SQLite's WAL format (sqlite.org/fileformat2.html): a 32-byte header, then frames of a 24-byte
 /// header and a page.
@@ -32,6 +33,21 @@ pub(super) const LIST_PAGE: usize = 1000;
 /// What a restore of 100 GB may take at most (AC-T1.12.3: 30 minutes), in seconds: the objective a
 /// new base is due by ([`plan::base_due`]).
 pub const RESTORE_OBJECTIVE_S: f64 = 1800.0;
+
+/// The memory a base's chunk of `len` bytes takes while it's copied (T-T1.12.M1): the bytes read
+/// from the file and their sealed copy (its sum, then the bytes again), both held until its put
+/// ends.
+pub(super) fn copy_charge(len: u64) -> u64 {
+    len.saturating_mul(2).saturating_add(SUM)
+}
+
+/// The memory a chunk of `chunk_bytes` takes while a restore fetches it (T-T1.12.M2): the sealed
+/// object, whole, as the store's get gives it.
+pub(super) fn fetch_charge(chunk_bytes: u64) -> u64 {
+    chunk_bytes.saturating_add(SUM)
+}
+
+const SUM: u64 = object::SUM_BYTES as u64;
 
 /// What one round shipped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -118,7 +134,6 @@ struct Reuse {
 }
 
 /// A base being copied, a chunk at a time ([`Shipper::copy_base`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseCopy {
     id: u64,
     start_gen: u64,
@@ -128,9 +143,31 @@ pub struct BaseCopy {
     reuse: Option<Reuse>,
     /// The base each chunk so far is stored under: this one's id, or the earlier base's it reuses.
     bases: Vec<u64>,
+    /// The budget each chunk is charged to while it's held, and this copy's stream of
+    /// [`Use::Chunks`], open while the copy is (T-T1.12.M1).
+    memory: Arc<Memory>,
+    _stream: Stream,
+}
+
+impl std::fmt::Debug for BaseCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseCopy")
+            .field("id", &self.id)
+            .field("start_gen", &self.start_gen)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("file_bytes", &self.file_bytes)
+            .field("next", &self.next)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BaseCopy {
+    /// The bytes each chunk holds (the last fewer), as the base's manifest records them.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.chunk_bytes
+    }
+
     /// The chunks so far kept from an earlier base rather than copied.
     #[must_use]
     pub fn reused(&self) -> usize {
@@ -669,28 +706,50 @@ impl Shipper {
         Some(bytes)
     }
 
-    /// Begins a copy of the database's file, in chunks as large as the store's objects and
-    /// `memory` allow: a chunk is a request, and a restore's fetch moves more bytes a second the
-    /// fewer requests it waits on. Refused until the log's generation now has been seen by
-    /// [`Shipper::ship`].
+    /// Begins a copy of the database's file, in chunks as large as the store's objects, `cap` and
+    /// this copy's room in `memory` allow: a chunk is a request, and a restore's fetch moves more
+    /// bytes a second the fewer requests it waits on. Refused until the log's generation now has
+    /// been seen by [`Shipper::ship`].
+    ///
+    /// The room (T-T1.12.M1): the copy opens a stream of [`Use::Chunks`], and a chunk takes at
+    /// most that stream's share of the budget's room for chunks, measured now, read and sealed
+    /// ([`copy_charge`]); each chunk is charged as it's held ([`Shipper::copy_base`]). So a file
+    /// far larger than memory is copied in chunks that fit together with every other stream's,
+    /// and a restore with the room this copy had fetches one ([`super::restore_within`]).
     pub fn begin_base(
         &mut self,
         db: &Db,
         blobs: &dyn Blobs,
-        memory: usize,
+        memory: &Arc<Memory>,
+        cap: usize,
     ) -> anyhow::Result<BaseCopy> {
         let (seq, _) = db.log_end();
         if self.identity.is_none_or(|i| i.seq != seq) {
             anyhow::bail!("ship the log's generation before copying a base in it");
         }
-        let room = blobs.object_max().saturating_sub(32).min(memory);
-        let chunk_bytes = u64::try_from(room)?
+        let stream = memory.stream(Use::Chunks);
+        let share = memory.stream_room(Use::Chunks)?;
+        let by_memory = share.saturating_sub(SUM).checked_div(2).unwrap_or(0);
+        let room = u64::try_from(blobs.object_max())?
+            .saturating_sub(SUM)
+            .min(u64::try_from(cap)?)
+            .min(by_memory);
+        let bound = room
             .checked_div(PAGE_BYTES)
             .unwrap_or(0)
             .saturating_mul(PAGE_BYTES);
-        if chunk_bytes == 0 {
-            anyhow::bail!("a base's chunk can't hold a page");
+        if bound == 0 {
+            anyhow::bail!(
+                "a base's chunk can't hold a page: this copy's memory room is {share} bytes, the store's objects {} bytes",
+                blobs.object_max()
+            );
         }
+        // The latest base's chunks keep their size while it still fits, so an incremental base can
+        // keep the ones the log didn't change: a chunk of another size covers other pages.
+        let chunk_bytes = match &self.last_base {
+            Some(last) if last.chunk_bytes > 0 && last.chunk_bytes <= bound => last.chunk_bytes,
+            _ => bound,
+        };
         let id = {
             let mut state = self.hooks.marks.state()?;
             self.hooks.marks.stamp(&mut state)
@@ -724,6 +783,8 @@ impl Shipper {
             next: 0,
             reuse,
             bases: Vec::new(),
+            memory: Arc::clone(memory),
+            _stream: stream,
         })
     }
 
@@ -755,6 +816,9 @@ impl Shipper {
         match kept {
             Some(base) => copy.bases.push(base),
             None => {
+                // Charged while it's held (T-T1.12.M1): refused, typed, where another use took the
+                // room since the copy began; the round is tried again at the next commit.
+                let _held = copy.memory.take(Use::Chunks, copy_charge(len))?;
                 let bytes = object::sealed(&db.read_file(from, usize::try_from(len)?)?)?;
                 create(
                     blobs,
