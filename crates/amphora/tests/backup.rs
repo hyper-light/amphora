@@ -540,11 +540,25 @@ fn t_t1_12_x1_cross_group_cut_at_every_second() {
         amphora::xgroup::Protocol::TwoPhase,
         amphora::xgroup::Protocol::Parallel,
     ] {
-        cross_group_cut(protocol);
+        cross_group_cut(protocol, 0);
     }
 }
 
-fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
+/// T-T1.12.X2 (AC-T1.12.4): cuts across machines. Do: as T-T1.12.X1, but the two groups' clocks
+/// differ as two nodes' do: the participant's reads 5 seconds ahead of the anchor's, so without a
+/// carried clock its prepared write is stamped later than the anchor's decision. Expect: as
+/// T-T1.12.X1 at every cut: never the decision kept and the participant's write lost.
+#[test]
+fn t_t1_12_x2_cross_group_cut_across_skewed_clocks() {
+    for protocol in [
+        amphora::xgroup::Protocol::TwoPhase,
+        amphora::xgroup::Protocol::Parallel,
+    ] {
+        cross_group_cut(protocol, 5 * SECOND_NS);
+    }
+}
+
+fn cross_group_cut(protocol: amphora::xgroup::Protocol, skew: u64) {
     use amphora::xgroup::{Answer, Cluster, Txn};
     let dir = tempfile::tempdir().unwrap();
     let blobs =
@@ -555,7 +569,9 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
         let archive = Archive {
             blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
             prefix: format!("g{group}"),
-            clock: Arc::new(move || read.fetch_add(SECOND_NS, Ordering::SeqCst) + SECOND_NS),
+            clock: Arc::new(move || {
+                read.fetch_add(SECOND_NS, Ordering::SeqCst) + SECOND_NS + skew * group as u64
+            }),
             memory: 32 * 1024,
             patience: Duration::from_secs(60),
             check: None,
@@ -578,7 +594,10 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
     for shipping in &shippings {
         shipping.wait(until(), |s| s.bases >= 1).unwrap();
     }
-    let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    // Cuts begin once every group's clock is past its first base; the transactions come later
+    // than that by the skew again, so the seconds between a decision and a skewed write are cut.
+    let based = (now.load(Ordering::SeqCst) + skew).div_ceil(SECOND_NS);
+    now.fetch_add(2 * skew, Ordering::SeqCst);
     let mut ended = Vec::new();
     for v in [b"1", b"2"] {
         let txn = Txn {

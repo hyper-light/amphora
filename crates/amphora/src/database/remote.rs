@@ -158,6 +158,7 @@ pub(super) fn attach(
             changed: Arc::new(Changed::default()),
             restoring: AtomicBool::new(false),
             admitted: Arc::new(AtomicUsize::new(0)),
+            stamps: std::sync::OnceLock::new(),
             _owner: None,
         }),
     })
