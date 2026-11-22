@@ -524,6 +524,11 @@ impl Db {
         self.backup = Some(hooks);
     }
 
+    /// The backup's hooks this writer stamps its commits by; none unbacked and for a reader.
+    pub(crate) fn stamps(&self) -> Option<&Arc<crate::backup::Hooks>> {
+        self.backup.as_ref()
+    }
+
     /// Turns off the engine's own restart of the log at this connection's next write and its
     /// emptying of the log when this connection closes last ([`Db::back_up`]).
     pub(crate) fn hold_log(&self) {

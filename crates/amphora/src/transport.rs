@@ -5,6 +5,7 @@ mod auth;
 mod bounded;
 mod common;
 mod endpoint;
+pub mod network;
 mod peer;
 mod watch;
 mod wire;

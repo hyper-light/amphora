@@ -26,6 +26,7 @@ use crate::db::Db;
 use crate::reshard;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
+mod across;
 mod application;
 pub(crate) use application::Application;
 
@@ -50,6 +51,7 @@ mod restore;
 pub(crate) mod session;
 mod slot;
 mod watch;
+pub use across::ReadPoint;
 pub use guards::Guards;
 pub(crate) use guards::Owned;
 pub use online::SchemaChange;
@@ -63,7 +65,11 @@ CREATE TABLE IF NOT EXISTS __amphora_versions (namespace TEXT NOT NULL, family T
 CREATE INDEX IF NOT EXISTS __amphora_feed ON __amphora_versions(namespace, family, rev, seq);
 CREATE TABLE IF NOT EXISTS __amphora_families (namespace TEXT NOT NULL, family TEXT NOT NULL, newest INTEGER NOT NULL, PRIMARY KEY(namespace, family));
 CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS __amphora_holding (one INTEGER PRIMARY KEY CHECK (one = 0), holding BLOB NOT NULL);";
+CREATE TABLE IF NOT EXISTS __amphora_holding (one INTEGER PRIMARY KEY CHECK (one = 0), holding BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS __amphora_rev_stamps (namespace TEXT NOT NULL, rev INTEGER NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY(namespace, rev));
+CREATE INDEX IF NOT EXISTS __amphora_rev_stamps_order ON __amphora_rev_stamps(namespace, stamp);
+CREATE TABLE IF NOT EXISTS __amphora_moved_stamps (namespace TEXT NOT NULL, family TEXT NOT NULL, key BLOB NOT NULL, rev INTEGER NOT NULL, stamp INTEGER, PRIMARY KEY(namespace, family, key, rev));
+CREATE INDEX IF NOT EXISTS __amphora_moved_stamps_order ON __amphora_moved_stamps(namespace, family, stamp);";
 const LIVE_MAX: u64 = 10_000_000;
 const QUEUED_BYTES: usize = 512 << 20;
 struct Admission(Arc<AtomicUsize>);
@@ -90,6 +96,12 @@ impl Drop for Admission {
 pub struct Database {
     shared: Arc<Shared>,
     application: Option<Application>,
+    /// The groups a namespace's rows are spread over (CP-T1.9, lane split-merge-18; the field
+    /// agreed with lane xgroup-sql-6): with one, a namespace's scans, changes and head are read
+    /// across every group, in the order of their commit stamps ([`Database::across`]).
+    cluster: Option<Arc<crate::xgroup::sql::Cluster>>,
+    /// Where a read across `cluster`'s groups takes its cut (lane split-merge-19, T-T1.9.R22).
+    read_point: ReadPoint,
 }
 
 struct Shared {
@@ -148,6 +160,9 @@ pub(crate) struct Changed {
     event: Condvar,
     published: Mutex<BTreeMap<String, Published>>,
     watchers: Mutex<watch::Watchers>,
+    /// How many steps have resolved transactions across groups here, each dropping its locks
+    /// (lane split-merge-21, T-T1.9.R28): what a read across groups held by a lock waits to move.
+    resolutions: AtomicU64,
 }
 
 #[derive(Default)]
@@ -688,6 +703,28 @@ pub(crate) fn reload_changed(db: &Db, changed: &Changed) -> Result<(), Refusal> 
     wake_changed(changed)
 }
 
+impl Database {
+    /// Tells the reads across groups held by a lock here that a step resolved a transaction and
+    /// dropped its locks (lane split-merge-21, T-T1.9.R28): counted, then every watcher woken. The
+    /// step's own call woke them before the count moved; this wake is the one they read again on.
+    pub(crate) fn locks_resolved(&self, until: Instant) -> Result<(), Refusal> {
+        let database = self.resolve(until)?;
+        let changed = &database.shared.changed;
+        changed.resolutions.fetch_add(1, Ordering::AcqRel);
+        wake_changed(changed)
+    }
+
+    /// How many steps have resolved transactions across groups here ([`Database::locks_resolved`]).
+    pub(crate) fn resolutions(&self, until: Instant) -> Result<u64, Refusal> {
+        Ok(self
+            .resolve(until)?
+            .shared
+            .changed
+            .resolutions
+            .load(Ordering::Acquire))
+    }
+}
+
 pub(crate) fn wake_changed(changed: &Changed) -> Result<(), Refusal> {
     {
         let mut generation = locked(&changed.generation)?;
@@ -772,6 +809,8 @@ impl Database {
                                 return Ok(Self {
                                     shared,
                                     application: None,
+                                    cluster: None,
+                                    read_point: ReadPoint::Latest,
                                 });
                             }
                             // Identity probes cannot submit application work. Only a successful
@@ -805,11 +844,15 @@ impl Database {
                         return Ok(Self {
                             shared,
                             application: None,
+                            cluster: None,
+                            read_point: ReadPoint::Latest,
                         });
                     } else {
                         return Ok(Self {
                             shared,
                             application: None,
+                            cluster: None,
+                            read_point: ReadPoint::Latest,
                         });
                     }
                 }
@@ -1041,6 +1084,8 @@ impl Database {
                 )?;
                 Ok(Self {
                     application: None,
+                    cluster: None,
+                    read_point: ReadPoint::Latest,
                     shared: Arc::new(Shared {
                         transport: Mutex::new(None),
                         path: OnceLock::new(),
@@ -1117,6 +1162,8 @@ impl Database {
         *locked(&changed.published)? = read_published(&db)?;
         let database = Self {
             application: None,
+            cluster: None,
+            read_point: ReadPoint::Latest,
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
@@ -1135,6 +1182,29 @@ impl Database {
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
         database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
         Ok(database)
+    }
+
+    /// This database's handle over `cluster`'s groups (lane split-merge-18, T-T1.9.R20): its
+    /// namespaces' scans, changes and heads read every group, each revision in the order of its
+    /// commit stamp, the hybrid logical clock the cross-group steps carry
+    /// (docs/design/reshard.md, "Decision (lane split-merge-18): reads across groups by commit
+    /// stamp"). Every group must be backed up, so that it stamps its commits. The groups' own
+    /// handles are the ones the cluster was opened over, without it.
+    #[must_use]
+    pub fn across(&self, cluster: Arc<crate::xgroup::sql::Cluster>) -> Self {
+        self.across_at(cluster, ReadPoint::Latest)
+    }
+
+    /// [`Database::across`], each read's cut taken at `point` (lane split-merge-19, T-T1.9.R22):
+    /// the A/B of decision "Decision (lane split-merge-19): the read point, A/B", until the lab's
+    /// numbers keep one.
+    #[must_use]
+    pub fn across_at(&self, cluster: Arc<crate::xgroup::sql::Cluster>, point: ReadPoint) -> Self {
+        Self {
+            cluster: Some(cluster),
+            read_point: point,
+            ..self.clone()
+        }
     }
 
     pub fn namespace(&self, name: &str) -> Result<Namespace, Refusal> {
@@ -1311,6 +1381,36 @@ impl Database {
             Writer::Replicated { client, .. } => client.token().map(Some),
             Writer::Client(_) | Writer::Local(_) => Ok(None),
         }
+    }
+
+    /// Takes a stamp of the one cross-group clock in (lane split-merge-21, T-T1.9.R28), the hybrid
+    /// logical clock's receive rule, before a step a coordinator carries it into: a backed-up
+    /// group's writer stamps its commits after it, a replicated group's owner proposes past it.
+    pub(crate) fn observe_clock(&self, until: Instant, micros: u64) -> Result<(), Refusal> {
+        let database = self.resolve(until)?;
+        if let Writer::Replicated { client, .. } = &database.shared.writer {
+            client.observe(micros);
+        }
+        if let Some(hooks) = database.stamps() {
+            hooks.marks.observe_micros(micros).map_err(unavailable)?;
+        }
+        Ok(())
+    }
+
+    /// This group's clock on the one cross-group clock (lane split-merge-21, T-T1.9.R28; Ada's
+    /// decision of 2026-11-22), microseconds since the Unix epoch: a replicated group's closed
+    /// time (its session token's), a backed-up group's writer clock (`Marks::latest_micros`, which
+    /// stamps the rows reads across groups place); none for a group that
+    /// keeps neither. What a lock reply carries for the coordinator to choose the commit stamp.
+    pub fn cross_clock(&self, until: Instant) -> Result<Option<u64>, Refusal> {
+        if let Some(token) = self.session_token(until)? {
+            return Ok(Some(token.micros));
+        }
+        let database = self.resolve(until)?;
+        database
+            .stamps()
+            .map(|hooks| hooks.marks.latest_micros().map_err(unavailable))
+            .transpose()
     }
 
     /// One read-only SQL session in the read mode asked (kiln goal 8119f25d, the switch):
@@ -1716,6 +1816,18 @@ impl Records for Namespace {
     ) -> Result<Option<Row>, Refusal> {
         api::family(family)?;
         api::key(key)?;
+        if let Some(cluster) = &self.database.cluster {
+            let routing = crate::xgroup::sql::record_key(&self.name, family, key)?;
+            return across::get(
+                cluster.groups(),
+                cluster.group_of(&routing),
+                &self.name,
+                family,
+                key,
+                at,
+                until,
+            );
+        }
         match self.database.submit(
             &self.name,
             Operation::Get(family.into(), key.into(), at),
@@ -1731,6 +1843,16 @@ impl Records for Namespace {
         api::bound("prefix", scan.prefix.len(), api::KEY_MAX)?;
         if let Some(k) = &scan.after {
             api::key(k)?;
+        }
+        if let Some(cluster) = &self.database.cluster {
+            return across::scan(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                family,
+                &scan,
+                until,
+            );
         }
         match self
             .database
@@ -1763,6 +1885,17 @@ impl Records for Namespace {
     ) -> Result<Changes, Refusal> {
         api::family(family)?;
         let limit = api::limit(limit)?;
+        if let Some(cluster) = &self.database.cluster {
+            return across::changes(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                family,
+                after,
+                limit,
+                until,
+            );
+        }
         match self.database.submit(
             &self.name,
             Operation::Changes(family.into(), after, limit),
@@ -1773,10 +1906,29 @@ impl Records for Namespace {
         }
     }
     fn changed(&self, family: &str, after: Rev, until: Instant) -> Result<Option<Rev>, Refusal> {
+        if let Some(cluster) = &self.database.cluster {
+            api::family(family)?;
+            return across::changed(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                family,
+                after,
+                until,
+            );
+        }
         self.resolved(until)?
             .try_wait_selected(family, after, until)
     }
     fn head(&self, until: Instant) -> Result<Rev, Refusal> {
+        if let Some(cluster) = &self.database.cluster {
+            return across::head(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                until,
+            );
+        }
         match self.database.submit(&self.name, Operation::Head, until)? {
             Answer::Rev(v) => Ok(v),
             _ => Err(unavailable("wrong head answer")),
@@ -1804,6 +1956,16 @@ impl Records for Namespace {
     }
     fn wait(&self, family: &str, after: Rev, until: Instant) -> Result<Rev, Refusal> {
         api::family(family)?;
+        if let Some(cluster) = &self.database.cluster {
+            return across::wait(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                family,
+                after,
+                until,
+            );
+        }
         let namespace = self.resolved(until)?;
         if let Some(remote) = namespace.remote()? {
             return remote.wait(family, after, until);
@@ -2377,6 +2539,33 @@ fn get(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<O
     Ok(out)
 }
 
+/// The commit stamp of a Records row's newest version, as a condition of a transaction across
+/// groups checks it under its lock (lane split-merge-20, T-T1.9.R27): none while it has no
+/// value; 0 for one whose stamp isn't known (made before its group stamped its commits), as a
+/// read across groups answers it.
+pub(crate) fn newest_stamp(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+) -> anyhow::Result<Option<u64>> {
+    let mut head = 0;
+    db.query(
+        "SELECT head FROM __amphora_namespaces WHERE name = ?1",
+        [text(ns)],
+        |r| {
+            head = rev(r, 0)?;
+            Ok(false)
+        },
+    )?;
+    let Some(row) = get(db, ns, family, key, head)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        across::stamp_of_version(db, ns, family, key, row.rev)?.unwrap_or(0),
+    ))
+}
+
 /// A Records row's newest value, as a transaction across groups reads it under its lock
 /// (AC-T1.10.1, lane xgroup-sql-6).
 pub(crate) fn newest(
@@ -2401,6 +2590,10 @@ pub(crate) fn newest(
 /// step that resolves it (AC-T1.10.1, lane xgroup-sql-6): a revision and a feed row as a
 /// single-group commit writes them. The step's rows in a namespace share one revision, `at` (none:
 /// the first of them takes the namespace's next), each at its own `seq`; answers the revision.
+/// `stamp` is the transaction's one commit stamp, the same in every group it wrote (lane
+/// split-merge-21, T-T1.9.R28), when its coordinator chose one; none stamps the revision by this
+/// group's clock.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_across(
     db: &Db,
     ns: &str,
@@ -2409,6 +2602,7 @@ pub(crate) fn write_across(
     value: Option<&[u8]>,
     at: Option<Rev>,
     seq: u64,
+    stamp: Option<u64>,
 ) -> anyhow::Result<Rev> {
     db.query("INSERT OR IGNORE INTO __amphora_namespaces(name, head, horizon, feed, live) VALUES (?1, 0, 0, 0, 0)", [text(ns)], |_| Ok(true))?;
     let (mut head, mut live) = (0, 0);
@@ -2442,6 +2636,7 @@ pub(crate) fn write_across(
         None => EValue::Null,
     };
     db.query("INSERT INTO __amphora_versions(namespace, family, key, rev, seq, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", [text(ns), text(family), blob(key)?, integer(at)?, integer(seq)?, stored], |_| Ok(true))?;
+    across::stamp(db, ns, at, stamp)?;
     group::wrote(db, ns, family, key)?;
     db.query("INSERT INTO __amphora_families(namespace, family, newest) VALUES (?1, ?2, ?3) ON CONFLICT(namespace, family) DO UPDATE SET newest = excluded.newest", [text(ns), text(family), integer(at)?], |_| Ok(true))?;
     db.query(
@@ -2527,6 +2722,7 @@ fn commit(
     let at = head
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("revision overflow"))?;
+    across::stamp(db, ns, at, None)?;
     for ((family, key), (seq, w)) in final_writes {
         let value = match w {
             Write::Put { value, .. } => blob(value)?,

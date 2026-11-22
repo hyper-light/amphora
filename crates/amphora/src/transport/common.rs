@@ -20,6 +20,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// A byte stream the owner protocol's frames cross: the loopback socket, or mutual TLS over a
+/// network socket ([`super::network`]). Each read and write is bounded by the time it is given.
+pub(super) trait Wire: Read + Write {
+    fn read_within(&mut self, within: Duration) -> std::io::Result<()>;
+    fn write_within(&mut self, within: Duration) -> std::io::Result<()>;
+}
+impl Wire for Stream {
+    fn read_within(&mut self, within: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(within))
+    }
+    fn write_within(&mut self, within: Duration) -> std::io::Result<()> {
+        self.set_write_timeout(Some(within))
+    }
+}
 pub(super) fn unavailable(e: impl std::fmt::Display) -> Refusal {
     Refusal::Unavailable(e.to_string())
 }
@@ -53,12 +67,10 @@ pub(super) fn remaining(until: Instant) -> Result<Duration, Refusal> {
         Ok(left)
     }
 }
-fn transfer(stream: &mut Stream, bytes: &mut [u8], until: Instant) -> Result<(), Refusal> {
+fn transfer<S: Wire>(stream: &mut S, bytes: &mut [u8], until: Instant) -> Result<(), Refusal> {
     let mut offset = 0usize;
     while offset < bytes.len() {
-        stream
-            .set_read_timeout(Some(remaining(until)?))
-            .map_err(unavailable)?;
+        stream.read_within(remaining(until)?).map_err(unavailable)?;
         let rest = bytes
             .get_mut(offset..)
             .ok_or_else(|| unavailable("frame offset"))?;
@@ -79,11 +91,14 @@ fn transfer(stream: &mut Stream, bytes: &mut [u8], until: Instant) -> Result<(),
     }
     Ok(())
 }
-pub(super) fn read<T: DeserializeOwned>(stream: &mut Stream, until: Instant) -> Result<T, Refusal> {
+pub(super) fn read<T: DeserializeOwned, S: Wire>(
+    stream: &mut S,
+    until: Instant,
+) -> Result<T, Refusal> {
     read_limit(stream, until, FRAME_MAX)
 }
-pub(super) fn read_limit<T: DeserializeOwned>(
-    stream: &mut Stream,
+pub(super) fn read_limit<T: DeserializeOwned, S: Wire>(
+    stream: &mut S,
     until: Instant,
     max: usize,
 ) -> Result<T, Refusal> {
@@ -154,14 +169,14 @@ pub(super) fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>, Ref
     )
     .map_err(|error| failure.unwrap_or_else(|| unavailable(error)))
 }
-pub(super) fn send(stream: &mut Stream, encoded: &[u8], until: Instant) -> Result<(), Refusal> {
+pub(super) fn send<S: Wire>(stream: &mut S, encoded: &[u8], until: Instant) -> Result<(), Refusal> {
     let size = u32::try_from(encoded.len())
         .map_err(unavailable)?
         .to_be_bytes();
     for mut part in [size.as_slice(), encoded] {
         while !part.is_empty() {
             stream
-                .set_write_timeout(Some(remaining(until)?))
+                .write_within(remaining(until)?)
                 .map_err(unavailable)?;
             let n = match stream.write(part) {
                 Ok(n) => n,
@@ -176,12 +191,21 @@ pub(super) fn send(stream: &mut Stream, encoded: &[u8], until: Instant) -> Resul
             part = part.get(n..).ok_or_else(|| unavailable("frame offset"))?;
         }
     }
-    Ok(())
+    // What a TLS stream still holds goes out now, before the caller drops it (a socket's flush
+    // does nothing).
+    stream
+        .write_within(remaining(until)?)
+        .map_err(unavailable)?;
+    stream.flush().map_err(transfer_error)
 }
-fn write<T: Serialize>(stream: &mut Stream, value: &T, until: Instant) -> Result<(), Refusal> {
+fn write<T: Serialize, S: Wire>(stream: &mut S, value: &T, until: Instant) -> Result<(), Refusal> {
     send(stream, &encode(value, FRAME_MAX)?, until)
 }
-fn write_auth<T: Serialize>(stream: &mut Stream, value: &T, until: Instant) -> Result<(), Refusal> {
+fn write_auth<T: Serialize, S: Wire>(
+    stream: &mut S,
+    value: &T,
+    until: Instant,
+) -> Result<(), Refusal> {
     send(stream, &encode(value, 256)?, until)
 }
 struct Permit(Arc<AtomicUsize>);
@@ -219,7 +243,9 @@ fn out_of_descriptors(error: &std::io::Error) -> bool {
 
 /// A node's answer to a pull from one of its groups, its batch held to the bytes given
 /// ([`crate::groups::Groups::serve_within`]).
-type Pulls = dyn Fn(&crate::groups::Pull, Instant, u64) -> anyhow::Result<crate::groups::Pulled>
+/// One accepted connection's service ([`Owner::accept`]).
+pub(super) type Connection = dyn Fn(Stream, &Arc<AtomicUsize>) -> Result<(), Refusal> + Send + Sync;
+pub(super) type Pulls = dyn Fn(&crate::groups::Pull, Instant, u64) -> anyhow::Result<crate::groups::Pulled>
     + Send
     + Sync;
 
@@ -239,11 +265,50 @@ const PULL_BYTES: u64 = amphora_api::RESULT_MAX as u64;
 /// A node's endpoint (CP-T1.9; docs/design/reshard.md, "Moves across nodes"): the owner
 /// transport's listener, record and authentication at `path`, answering a pull from one of this
 /// node's groups for a new group on another node ([`Nodes`]). It serves no database: any other
-/// request finds none. Dropped, it stops listening.
+/// request finds none. Or a network endpoint ([`Node::listen`], [`crate::database::Database::listen`];
+/// decision "The transport between machines"). Dropped, it stops listening.
 pub struct Node {
     _owner: Owner,
+    address: Option<std::net::SocketAddr>,
 }
 impl Node {
+    /// A network endpoint at `address` (port 0: the system's choice) whose pulls `serve` answers,
+    /// its connections authenticated by `credentials` (CP-T1.9, T-T1.9.R18).
+    pub fn listen(
+        address: std::net::SocketAddr,
+        credentials: &super::network::Credentials,
+        serve: impl Fn(&crate::groups::Pull, Instant, u64) -> anyhow::Result<crate::groups::Pulled>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<Self, Refusal> {
+        let (owner, address) =
+            super::network::listen(address, credentials, || None, Some(Arc::new(serve)))?;
+        Ok(Self {
+            _owner: owner,
+            address: Some(address),
+        })
+    }
+
+    /// A network endpoint's address, as bound (none: a loopback endpoint, named by its path).
+    #[must_use]
+    pub fn address(&self) -> Option<std::net::SocketAddr> {
+        self.address
+    }
+
+    /// The network endpoint of `database`'s owner, for steps (CP-T1.10).
+    pub(crate) fn database(
+        address: std::net::SocketAddr,
+        credentials: &super::network::Credentials,
+        acquire: impl Fn() -> Option<crate::database::Database> + Send + Sync + 'static,
+    ) -> Result<Self, Refusal> {
+        let (owner, address) = super::network::listen(address, credentials, acquire, None)?;
+        Ok(Self {
+            _owner: owner,
+            address: Some(address),
+        })
+    }
+
     /// An endpoint at `path` whose pulls `serve` answers: a node's
     /// [`crate::groups::Groups::serve_within`].
     pub fn start(
@@ -262,6 +327,7 @@ impl Node {
                     blobs: None,
                 },
             )?,
+            address: None,
         })
     }
 }
@@ -271,13 +337,68 @@ impl Node {
 /// lost or refused on the way is an error, and the driver asks its action again.
 #[derive(Debug, Clone, Default)]
 pub struct Nodes {
-    endpoints: std::collections::BTreeMap<crate::reshard::NodeId, PathBuf>,
+    endpoints: std::collections::BTreeMap<crate::reshard::NodeId, Endpoint>,
+    dial: Option<Arc<super::network::Dial>>,
+}
+/// Where a node is reached: its loopback endpoint's path, or its network address and the name its
+/// certificate carries.
+#[derive(Debug, Clone)]
+enum Endpoint {
+    Local(PathBuf),
+    Network {
+        address: std::net::SocketAddr,
+        name: hyper_tls::pki_types::ServerName<'static>,
+    },
 }
 impl Nodes {
     /// Peers at these nodes' endpoints.
     pub fn new(endpoints: impl IntoIterator<Item = (crate::reshard::NodeId, PathBuf)>) -> Self {
         Self {
-            endpoints: endpoints.into_iter().collect(),
+            endpoints: endpoints
+                .into_iter()
+                .map(|(node, path)| (node, Endpoint::Local(path)))
+                .collect(),
+            dial: None,
+        }
+    }
+
+    /// Peers at these nodes' network endpoints ([`Node::listen`]), each the address it listens at
+    /// and the name its certificate carries (a DNS name or an IP address), dialed with
+    /// `credentials` (CP-T1.9, T-T1.9.R18).
+    pub fn network(
+        endpoints: impl IntoIterator<Item = (crate::reshard::NodeId, std::net::SocketAddr, String)>,
+        credentials: &super::network::Credentials,
+    ) -> Result<Self, Refusal> {
+        let endpoints = endpoints
+            .into_iter()
+            .map(|(node, address, name)| {
+                let name = super::network::name(&name)?;
+                Ok((node, Endpoint::Network { address, name }))
+            })
+            .collect::<Result<_, Refusal>>()?;
+        Ok(Self {
+            endpoints,
+            dial: Some(Arc::new(super::network::Dial::new(credentials)?)),
+        })
+    }
+
+    /// `request` to `node`'s endpoint: one authenticated connection and one request.
+    fn request(
+        &self,
+        node: crate::reshard::NodeId,
+        request: Request,
+        until: Instant,
+    ) -> Result<Answer, Error> {
+        match (self.endpoints.get(&node), &self.dial) {
+            (Some(Endpoint::Local(path)), _) => Client {
+                path: path.clone(),
+                application: None,
+            }
+            .request(request, until),
+            (Some(Endpoint::Network { address, name }), Some(dial)) => {
+                super::network::request(dial, *address, name, &request, until)
+            }
+            _ => Err(unavailable(format_args!("no endpoint known for node {}", node.0)).into()),
         }
     }
 }
@@ -295,19 +416,12 @@ impl Nodes {
         envelope: crate::xgroup::Envelope,
         until: Instant,
     ) -> Result<(crate::xgroup::Reply, Option<u64>), Error> {
-        let Some(path) = self.endpoints.get(&node) else {
-            return Err(unavailable(format_args!("no endpoint known for node {}", node.0)).into());
-        };
-        let client = Client {
-            path: path.clone(),
-            application: None,
-        };
         let request = Request::Step {
             here,
             carried,
             envelope,
         };
-        match client.request(request, until)? {
+        match self.request(node, request, until)? {
             Answer::Stepped { reply, latest } => Ok((reply, latest)),
             _ => Err(unavailable(format_args!(
                 "node {}'s answer to a step is not a step's",
@@ -324,14 +438,7 @@ impl crate::groups::Peers for Nodes {
         pull: &crate::groups::Pull,
         until: Instant,
     ) -> anyhow::Result<crate::groups::Pulled> {
-        let Some(path) = self.endpoints.get(&node) else {
-            anyhow::bail!("no endpoint known for node {}", node.0);
-        };
-        let client = Client {
-            path: path.clone(),
-            application: None,
-        };
-        match client.request(Request::Pull(pull.clone()), until) {
+        match self.request(node, Request::Pull(pull.clone()), until) {
             Ok(Answer::Pulled(pulled)) => Ok(pulled),
             Ok(_) => anyhow::bail!("node {}'s answer to a pull is not a pull's", node.0),
             Err(error) => anyhow::bail!("node {}'s pull: {error}", node.0),
@@ -367,9 +474,26 @@ impl Owner {
             token,
             guard,
         } = endpoint::bind(path)?;
+        let acquire = Arc::new(acquire);
+        Self::accept(
+            listener,
+            guard,
+            Arc::new(move |stream, waits: &Arc<AtomicUsize>| {
+                serve(stream, token, &*acquire, &serves, waits, GREETING_MAX)
+            }),
+        )
+    }
+
+    /// The connections `listener` accepts, each served by `connection` on its own thread and
+    /// charged to the process's descriptor budget, `guard` kept while it listens: the loopback
+    /// endpoint's and the network's one loop ([`super::network`]).
+    pub(super) fn accept(
+        listener: endpoint::Listener,
+        guard: impl Send + 'static,
+        connection: Arc<Connection>,
+    ) -> Result<Self, Refusal> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
-        let acquire = Arc::new(acquire);
         let descriptors = crate::descriptors::process()?;
         let waits = Arc::new(AtomicUsize::new(0));
         let handle = thread::Builder::new()
@@ -395,15 +519,14 @@ impl Owner {
                                 drop(stream);
                                 continue;
                             };
-                            let acquire = Arc::clone(&acquire);
-                            let serves = serves.clone();
+                            let connection = Arc::clone(&connection);
                             let waits = Arc::clone(&waits);
                             // Detached workers are bounded by permits and the absolute session deadline.
                             let spawned = thread::Builder::new()
                                 .name("amphora.client".into())
                                 .spawn(move || {
                                     let _permit = permit;
-                                    if let Err(error) = serve(stream, token, &*acquire, &serves, &waits, GREETING_MAX) {
+                                    if let Err(error) = connection(stream, &waits) {
                                         tracing::debug!(target: "amphora.transport", event = "connection_finished", %error);
                                     }
                                 });
@@ -497,22 +620,7 @@ impl Client {
                 .ok_or(Refusal::Timeout)?,
         );
         let (mut stream, token) = endpoint::connect(&self.path, auth_until)?;
-        let millis =
-            u64::try_from(remaining(until)?.min(SESSION_MAX).as_millis()).map_err(unavailable)?;
-        let hello = Hello {
-            version: VERSION,
-            nonce: auth::nonce()?,
-            millis,
-        };
-        write_auth(&mut stream, &hello, auth_until)?;
-        let challenge: Challenge = read_limit(&mut stream, auth_until, 256)?;
-        auth::verify(&token, true, &hello, &challenge.nonce, &challenge.proof)?;
-        let proof = auth::proof(&token, false, &hello, &challenge.nonce)?;
-        write_auth(&mut stream, &proof, auth_until)?;
-        match read_limit::<Response>(&mut stream, auth_until, 256)?? {
-            Answer::Ready => (),
-            _ => return Err(unavailable("unexpected owner greeting")),
-        }
+        greet_client(&mut stream, &token, until, auth_until)?;
         if let Some(application) = &self.application {
             application.validate()?;
             send(
@@ -520,7 +628,7 @@ impl Client {
                 &encode(&Request::Application(application.clone()), 256)?,
                 until,
             )?;
-            match read_limit::<Response>(&mut stream, until, 256)?? {
+            match read_limit::<Response, _>(&mut stream, until, 256)?? {
                 Answer::Ready => (),
                 _ => return Err(unavailable("application declaration refused")),
             }
@@ -528,12 +636,10 @@ impl Client {
         Ok(stream)
     }
     pub(super) fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
-        let encoded = encode(&request, FRAME_MAX)?;
+        // Encoded before connecting: a request too large for a frame never opens a connection.
+        encode(&request, FRAME_MAX)?;
         let mut stream = self.stream(until)?;
-        send(&mut stream, &encoded, until).map_err(|_| Error::UnknownOutcome)?;
-        read::<Response>(&mut stream, until)
-            .map_err(|_| Error::UnknownOutcome)?
-            .map_err(Error::from)
+        exchange(&mut stream, &request, until)
     }
     fn compact_step(
         &self,
@@ -627,7 +733,7 @@ impl Client {
     {
         let mut stream = self.stream(until)?;
         write(&mut stream, &request, until)?;
-        match read::<Response>(&mut stream, until)?? {
+        match read::<Response, _>(&mut stream, until)?? {
             Answer::Ready => (),
             _ => return Err(unavailable("session not ready").into()),
         }
@@ -690,8 +796,8 @@ impl Remote {
         let mut stream = self.stream.try_borrow_mut().map_err(unavailable)?;
         let result = (|| {
             let encoded = encode(&command, FRAME_MAX)?;
-            send(&mut stream, &encoded, self.until).map_err(|_| Error::UnknownOutcome)?;
-            read::<Response>(&mut stream, self.until)
+            send(&mut *stream, &encoded, self.until).map_err(|_| Error::UnknownOutcome)?;
+            read::<Response, _>(&mut *stream, self.until)
                 .map_err(|_| Error::UnknownOutcome)?
                 .map_err(Error::from)
         })();
@@ -835,7 +941,7 @@ fn compact_step_on(
     let encoded = encode(&request, 256)?;
     // Once mutation transmission begins, loss/decode failure is conservatively unknown outcome.
     send(stream, &encoded, until).map_err(|_| Refusal::UnknownOutcome)?;
-    match read::<Response>(stream, until).map_err(|_| Refusal::UnknownOutcome)?? {
+    match read::<Response, _>(stream, until).map_err(|_| Refusal::UnknownOutcome)?? {
         Answer::Compaction(progress) => Ok(progress),
         _ => Err(Refusal::UnknownOutcome),
     }
@@ -896,17 +1002,16 @@ fn session(
     Err(anyhow::anyhow!("SQL session command budget exhausted"))
 }
 
-fn serve(
-    mut stream: Stream,
-    token: [u8; 32],
-    acquire: &dyn Fn() -> Option<crate::database::Database>,
-    serves: &Serves,
-    waits: &Arc<AtomicUsize>,
+/// The owner's half of the greeting, from a connection accepted at `started`: the peer's hello,
+/// both proofs over `token`, and `Ready`. The session's deadline, the peer's asked lifetime.
+pub(super) fn greet_owner<S: Wire>(
+    stream: &mut S,
+    token: &[u8; 32],
+    started: Instant,
     greeting: Duration,
-) -> Result<(), Refusal> {
-    let started = Instant::now();
+) -> Result<Instant, Refusal> {
     let greeting_until = started.checked_add(greeting).ok_or(Refusal::Timeout)?;
-    let hello: Hello = read_limit(&mut stream, greeting_until, 256)?;
+    let hello: Hello = read_limit(stream, greeting_until, 256)?;
     // A peer of another version is refused here, before any frame whose shape differs.
     if hello.version != VERSION {
         return Err(api::invalid(
@@ -922,19 +1027,98 @@ fn serve(
     }
     let nonce = auth::nonce()?;
     write_auth(
-        &mut stream,
+        stream,
         &Challenge {
             nonce,
-            proof: auth::proof(&token, true, &hello, &nonce)?,
+            proof: auth::proof(token, true, &hello, &nonce)?,
         },
         greeting_until,
     )?;
-    let proof: [u8; 32] = read_limit(&mut stream, greeting_until, 256)?;
-    auth::verify(&token, false, &hello, &nonce, &proof)?;
+    let proof: [u8; 32] = read_limit(stream, greeting_until, 256)?;
+    auth::verify(token, false, &hello, &nonce, &proof)?;
     let until = started
         .checked_add(Duration::from_millis(hello.millis))
         .ok_or(Refusal::Timeout)?;
-    write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+    write(stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
+    Ok(until)
+}
+
+/// A pull's answer: by `pulls` (a node's groups), or none here.
+pub(super) fn pulled(
+    pulls: Option<&Pulls>,
+    pull: &crate::groups::Pull,
+    until: Instant,
+) -> Response {
+    match pulls {
+        Some(pulls) => pulls(pull, until, PULL_BYTES)
+            .map(Answer::Pulled)
+            .map_err(|error| unavailable(format_args!("{error:#}"))),
+        None => Ok(Answer::Pulled(crate::groups::Pulled::NoGroup)),
+    }
+}
+
+/// A step's answer, on `database`'s writer (CP-T1.10; xgroup.md, "Over the transport").
+pub(super) fn stepped(
+    database: &crate::database::Database,
+    here: crate::xgroup::GroupId,
+    carried: u64,
+    envelope: crate::xgroup::Envelope,
+    until: Instant,
+) -> Response {
+    crate::xgroup::sql::serve(database, here, carried, envelope, until)
+        .map(|(reply, latest)| Answer::Stepped { reply, latest })
+}
+
+/// The client's half of the greeting: its hello asking for the time to `until`, the owner's
+/// proof checked over `token` before its own goes out, then `Ready`, all by `auth_until`.
+pub(super) fn greet_client<S: Wire>(
+    stream: &mut S,
+    token: &[u8; 32],
+    until: Instant,
+    auth_until: Instant,
+) -> Result<(), Refusal> {
+    let millis =
+        u64::try_from(remaining(until)?.min(SESSION_MAX).as_millis()).map_err(unavailable)?;
+    let hello = Hello {
+        version: VERSION,
+        nonce: auth::nonce()?,
+        millis,
+    };
+    write_auth(stream, &hello, auth_until)?;
+    let challenge: Challenge = read_limit(stream, auth_until, 256)?;
+    auth::verify(token, true, &hello, &challenge.nonce, &challenge.proof)?;
+    let proof = auth::proof(token, false, &hello, &challenge.nonce)?;
+    write_auth(stream, &proof, auth_until)?;
+    match read_limit::<Response, _>(stream, auth_until, 256)?? {
+        Answer::Ready => (),
+        _ => return Err(unavailable("unexpected owner greeting")),
+    }
+    Ok(())
+}
+
+/// One request and its answer on an authenticated stream. A request lost on the way, or an answer
+/// lost after it went out, is [`Error::UnknownOutcome`]: it may have landed.
+pub(super) fn exchange<S: Wire>(
+    stream: &mut S,
+    request: &Request,
+    until: Instant,
+) -> Result<Answer, Error> {
+    let encoded = encode(request, FRAME_MAX)?;
+    send(stream, &encoded, until).map_err(|_| Error::UnknownOutcome)?;
+    read::<Response, S>(stream, until)
+        .map_err(|_| Error::UnknownOutcome)?
+        .map_err(Error::from)
+}
+
+fn serve(
+    mut stream: Stream,
+    token: [u8; 32],
+    acquire: &dyn Fn() -> Option<crate::database::Database>,
+    serves: &Serves,
+    waits: &Arc<AtomicUsize>,
+    greeting: Duration,
+) -> Result<(), Refusal> {
+    let until = greet_owner(&mut stream, &token, Instant::now(), greeting)?;
     let mut request: Request = read(&mut stream, until)?;
     let application = if let Request::Application(application) = request {
         application.validate()?;
@@ -973,13 +1157,11 @@ fn serve(
     // A node's pull needs no database: its groups answer it, a batch no larger than a frame
     // carries (CP-T1.9; reshard.md, "Moves across nodes").
     if let Request::Pull(pull) = &request {
-        let answer = match serves.pulls.as_deref() {
-            Some(pulls) => pulls(pull, until, PULL_BYTES)
-                .map(Answer::Pulled)
-                .map_err(|error| unavailable(format_args!("{error:#}"))),
-            None => Ok(Answer::Pulled(crate::groups::Pulled::NoGroup)),
-        };
-        return write(&mut stream, &answer, until);
+        return write(
+            &mut stream,
+            &pulled(serves.pulls.as_deref(), pull, until),
+            until,
+        );
     }
     // A request to a peer's object store needs no database either: its store answers it
     // (CP-T1.12; backup.md, "The peer store").
@@ -1037,8 +1219,7 @@ fn serve(
             here,
             carried,
             envelope,
-        } => crate::xgroup::sql::serve(&database, here, carried, envelope, until)
-            .map(|(reply, latest)| Answer::Stepped { reply, latest }),
+        } => stepped(&database, here, carried, envelope, until),
         Request::Records { namespace, op } => (|| {
             let ns = database.namespace(&namespace)?;
             Ok(match op {
@@ -1434,7 +1615,7 @@ mod tests {
         let (mut sender, mut receiver) = pair();
         sender.write_all(&u32::MAX.to_be_bytes()).unwrap();
         assert!(matches!(
-            read::<Request>(&mut receiver, until()),
+            read::<Request, _>(&mut receiver, until()),
             Err(Refusal::TooLarge { .. })
         ));
 
@@ -1458,7 +1639,7 @@ mod tests {
             let (mut client, mut server) = pair();
             let fake = thread::spawn(move || {
                 assert!(matches!(
-                    read::<Request>(&mut server, until()).unwrap(),
+                    read::<Request, _>(&mut server, until()).unwrap(),
                     Request::Capabilities
                 ));
                 if supported {
@@ -1469,7 +1650,7 @@ mod tests {
                     )
                     .unwrap();
                     assert!(matches!(
-                        read::<Request>(&mut server, until()).unwrap(),
+                        read::<Request, _>(&mut server, until()).unwrap(),
                         Request::Records {
                             op: Record::CompactStep(3),
                             ..
@@ -1554,7 +1735,7 @@ mod tests {
                 until(),
             )
             .unwrap();
-            assert!(read_limit::<[u8; 32]>(&mut stream, until(), 256).is_err());
+            assert!(read_limit::<[u8; 32], _>(&mut stream, until(), 256).is_err());
         });
         assert!(matches!(
             Client::connect(&path, until()),
@@ -1603,7 +1784,7 @@ mod tests {
             ),
             "{refused:?}"
         );
-        assert!(read::<Challenge>(&mut client, until()).is_err());
+        assert!(read::<Challenge, _>(&mut client, until()).is_err());
         assert_eq!(accessed.load(Ordering::Acquire), 0);
     }
 
@@ -1680,13 +1861,13 @@ mod tests {
             let proof = auth::proof(&[1; 32], false, &hello, &challenge.nonce).unwrap();
             write(&mut client, &proof, until()).unwrap();
             assert!(matches!(
-                read::<Response>(&mut client, until()).unwrap().unwrap(),
+                read::<Response, _>(&mut client, until()).unwrap().unwrap(),
                 Answer::Ready
             ));
             if probe_only {
                 write(&mut client, &Request::Capabilities, until()).unwrap();
                 assert!(matches!(
-                    read::<Response>(&mut client, until()).unwrap().unwrap(),
+                    read::<Response, _>(&mut client, until()).unwrap().unwrap(),
                     Answer::Capabilities(CAP_BOUNDED_COMPACTION)
                 ));
                 drop(client);

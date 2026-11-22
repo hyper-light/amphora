@@ -1277,6 +1277,7 @@ mod inproc {
                     xgroup::Txn {
                         reads: Vec::new(),
                         writes,
+                        conds: Vec::new(),
                     },
                     Instant::now() + self.a.deadline,
                 )
