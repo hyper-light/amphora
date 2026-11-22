@@ -7,7 +7,7 @@
 
 use amphora_engine::{
     ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, Numeric, OpenOptions, PlatformIO,
-    SqliteDialect, Value,
+    SqliteDialect, StepResult, Value,
 };
 use std::sync::Arc;
 
@@ -350,25 +350,33 @@ fn t_pl_13_3_a_build_past_the_estimate_plans_again() {
 /// Do: T-PL.13.3's join, its build counted past the estimate's band, each time on its own copy of
 /// the tables: an aggregate over it, which returns no row before its end, with the in-run hand-off
 /// on and off (`Connection::set_adaptive_handoff`); and the plain join, whose rows come before the
-/// build, with it on. Expect: every answer the switch-off one, each row once; the aggregate's run
-/// handed off once with it on (planned once again, and switched again on the new plan before its
-/// one answer), none with it off; the plain join hands nothing off, as it has returned rows
-/// (T-PL.13.4).
+/// build, with it on; and the aggregate again with it on while another statement on the connection
+/// is part way through its rows in the same implicit transaction. Expect: every answer the
+/// switch-off one, each row once; the aggregate's run handed off once with it on (planned once
+/// again, and switched again on the new plan before its one answer), none with it off; the plain
+/// join hands nothing off, as it has returned rows; nor does the aggregate beside the other
+/// statement, whose transaction a restart would end, and that statement reads on (T-PL.13.4).
 #[test]
 fn t_pl_13_4_a_run_past_the_estimate_starts_again_on_the_new_plan() {
     let aggregate =
         "SELECT count(*), sum(a.id * 1000 + b.id), min(b.id), max(a.id) FROM a JOIN b ON b.k = a.k";
     let plain = "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k";
     let mut aggregates = Vec::new();
-    for (sql, handoff, handed_off) in [
-        (aggregate, true, 1),
-        (aggregate, false, 0),
-        (plain, true, 0),
+    for (sql, handoff, sibling, handed_off) in [
+        (aggregate, true, false, 1),
+        (aggregate, false, false, 0),
+        (plain, true, false, 0),
+        (aggregate, true, true, 0),
     ] {
         let (_dir, conn, point) = inflated_inner("handoff.db");
         let case = format!(
-            "{sql} with the hand-off {}",
-            if handoff { "on" } else { "off" }
+            "{sql} with the hand-off {}{}",
+            if handoff { "on" } else { "off" },
+            if sibling {
+                ", another statement under way"
+            } else {
+                ""
+            }
         );
         conn.set_adaptive_joins(false);
         let off = rows(&conn, sql);
@@ -380,7 +388,25 @@ fn t_pl_13_4_a_run_past_the_estimate_starts_again_on_the_new_plan() {
             conn.adaptive_replans(),
             conn.adaptive_handoffs(),
         );
+        let mut other = sibling.then(|| conn.prepare("SELECT id FROM a").unwrap());
+        if let Some(other) = other.as_mut() {
+            assert!(
+                matches!(other.step().unwrap(), StepResult::Row),
+                "{case}: the other's row"
+            );
+        }
         let on = rows(&conn, sql);
+        if let Some(mut other) = other {
+            let mut read = 1;
+            loop {
+                match other.step().unwrap() {
+                    StepResult::Row => read += 1,
+                    StepResult::IO => other._io().step().unwrap(),
+                    _ => break,
+                }
+            }
+            assert_eq!(read, point + 10, "{case}: the other statement's rows");
+        }
         assert_eq!(on, off, "{case}: switch on and off differ");
         assert_eq!(
             conn.adaptive_handoffs() - handoffs,

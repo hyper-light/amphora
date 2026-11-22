@@ -1644,7 +1644,8 @@ without a row twice: a read-only root statement that has returned no row yet. As
 run past the band, and the statement starts it again on the plan made now, the way a schema change
 part way through restarts one: its implicit transaction ended, the statement prepared again, the
 same bound values. Nothing was written and nothing returned, so the new run's rows are the run's only
-rows. A run is handed off once at most: the new plan is made on the counted rows, so its own build
+rows. In autocommit the implicit transaction it ends must be its own: with another statement on the
+connection under way in it, the run goes on as planned. A run is handed off once at most: the new plan is made on the counted rows, so its own build
 falls within the band, and were it not, it goes on as planned. A run that has returned rows, or
 writes, goes on as planned and the new plan waits for its next run: its answer is right and no row
 comes twice. The other materialization points (a sorter, a materialized subquery) are not built.

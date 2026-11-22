@@ -18875,7 +18875,15 @@ pub fn op_join_switch_built(
                 .is_some_and(|(_, (rows, bytes))| replan_on_built_rows(program, data, rows, bytes));
             // The in-run hand-off: a run that may start again (read-only, no row returned) stops
             // here, and `Statement` runs it from the start on the plan made on the counted rows.
-            if replanned && state.handoff_open {
+            // An implicit transaction it would end there must be its own: no other statement on
+            // the connection is under way in it (`ProgramState::can_autocommit_now`'s siblings).
+            let txn_its_own = !program.connection.get_auto_commit()
+                || program
+                    .connection
+                    .n_active_root_statements
+                    .load(crate::sync::atomic::Ordering::SeqCst)
+                    == 1;
+            if replanned && state.handoff_open && txn_its_own {
                 state.handoff_asked = true;
                 return Ok(InsnFunctionStepResult::Done);
             }
