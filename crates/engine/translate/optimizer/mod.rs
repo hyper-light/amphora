@@ -4001,6 +4001,36 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        /// PL.8 (T-PL.8.2, lane pl8-15): the fact queries with an EXISTS and a NOT EXISTS on a
+        /// dimension, each correlated with the probe's table (`f2`) or a table of the run (`f1`):
+        /// semi and anti joins, which CD-C keeps after every table before them and the emitter runs
+        /// as the last loops. Expect: the core of inner joins still planned bushy (`BUSHY_PLANS`),
+        /// the semi and anti joins after it, and every answer the plan of nested loops gives.
+        #[test]
+        fn t_pl_8_2_semi_and_anti_joins_follow_a_bushy_plan() {
+            let (_db, conn) = facts();
+            let core = "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
+                        WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id \
+                        AND d2.id = 7";
+            for tail in [
+                "EXISTS (SELECT 1 FROM d2 s WHERE s.id = f2.id % 60)",
+                "NOT EXISTS (SELECT 1 FROM d2 s WHERE s.id = f2.id % 60)",
+                "EXISTS (SELECT 1 FROM d2 s WHERE s.id = f1.id % 60)",
+                "NOT EXISTS (SELECT 1 FROM d2 s WHERE s.id = f1.id % 60)",
+            ] {
+                let sql = format!("{core} AND {tail}");
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, &sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                BUSHY_PLANS.with(|plans| plans.set(0));
+                let searched = rows(&conn, &sql);
+                let made_bushy = BUSHY_PLANS.with(Cell::get);
+                let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
+                assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
+            }
+        }
+
         /// PL.8 (T-PL.8.2, lane pl8-15): pins the corners of the weights' range the bushy plan's
         /// lead is argued over (`t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest`):
         /// a hash probe of 10 and of 400 rows' visits, the least and most the probe's learned

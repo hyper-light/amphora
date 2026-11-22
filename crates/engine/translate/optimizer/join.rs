@@ -1793,22 +1793,24 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // row. The pairs are walked on loops over the subsets found, not recursion (CLAUDE.md §11), and
     // counted against what `searchable_subsets` left of `JOIN_SEARCH_BUDGET`: once it runs out, the
     // left-deep plan found so far stands, today's search (decision 19).
-    if bushy_plans_allowed(
+    // The semi and anti joins after the core (`bushy_core`) follow its bushy plan as its last
+    // loops, in their order, each read by a loop (lane pl8-15).
+    if let Some(core) = bushy_core(
         joined_tables,
         table_references,
         planning_context,
         required_lhs_by_table.as_deref(),
     ) {
         let mut pairs_left = budget.saturating_sub(subsets_built);
-        let all: TableMask = (0..num_tables).try_collect()?;
+        let all: TableMask = (0..core).try_collect()?;
         'pairs: for build_mask in subsets.iter().skip(1).flatten() {
-            if build_mask.count().saturating_add(2) > num_tables {
+            if build_mask.count().saturating_add(2) > core || build_mask.iter().any(|t| t >= core) {
                 continue;
             }
             let Some(build_variants) = best_plan_memo.get(build_mask) else {
                 continue;
             };
-            for probe in 0..num_tables {
+            for probe in 0..core {
                 if build_mask.get(probe) || !tables_are_connected(build_mask, probe, &where_terms) {
                     continue;
                 }
@@ -1950,15 +1952,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         &params.for_table(probe_table, analyze_stats),
                     ) + Cost(build.output_cardinality * params.cpu_cost_per_row);
                     let cost = outer.cost + build.cost + probe_cost;
-                    let cheaper = cost < cost_upper_bound
-                        && best_plan.as_ref().is_none_or(|plan| cost < plan.cost);
                     let Some(method) = access_methods_arena.get_mut(probe_method) else {
-                        continue;
-                    };
-                    if !cheaper {
                         access_methods_arena.truncate(arena_len);
                         continue;
-                    }
+                    };
                     method.cost = probe_cost;
                     let mut data = Vec::with_capacity(num_tables);
                     data.extend_from_slice(&outer.data);
@@ -1968,16 +1965,88 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     prefix_cardinalities.extend_from_slice(&outer.prefix_cardinalities);
                     prefix_cardinalities.extend_from_slice(&build.prefix_cardinalities);
                     prefix_cardinalities.push(rows);
-                    best_plan = Some(JoinN {
+                    let run = InnerJoin {
+                        start: outer.data.len(),
+                        end: outer.data.len().saturating_add(build.data.len()),
+                    };
+                    let mut plan = JoinN {
                         data,
                         output_cardinality: rows,
                         cost,
                         prefix_cardinalities,
-                        inner_joins: vec![InnerJoin {
-                            start: outer.data.len(),
-                            end: outer.data.len().saturating_add(build.data.len()),
-                        }],
-                    });
+                        inner_joins: vec![run],
+                    };
+                    // The semi and anti joins after the core, each a loop over its table for each
+                    // row of the plan so far, as the left-deep search adds a table (lane pl8-15).
+                    for tail in core..num_tables {
+                        let (Some(tail_table), Some(tail_constraints)) =
+                            (joined_tables.get(tail), constraints.get(tail))
+                        else {
+                            break;
+                        };
+                        join_order.clear();
+                        for table in plan.table_numbers().chain([tail]) {
+                            let Some(joined) = joined_tables.get(table) else {
+                                continue;
+                            };
+                            join_order.push(JoinOrderMember {
+                                table_id: joined.internal_id,
+                                original_idx: table,
+                                is_outer: false,
+                            });
+                        }
+                        let joined = join_lhs_and_rhs(
+                            Some(&plan),
+                            set_rows,
+                            initial_input_cardinality,
+                            tail_table,
+                            tail_constraints,
+                            constraints,
+                            base_table_rows,
+                            &join_order,
+                            JoinPlanningContext {
+                                join_methods: crate::JoinMethods::NestedLoopsOnly,
+                                ..planning_context
+                            },
+                            access_methods_arena,
+                            Cost(f64::MAX),
+                            joined_tables,
+                            where_clause,
+                            &where_terms,
+                            subqueries,
+                            index_method_candidates,
+                            params,
+                            analyze_stats,
+                            available_indexes,
+                            table_references,
+                            schema,
+                        )?;
+                        join_order.clear();
+                        // A loop only: a hash join here would build from the bushy run's probe.
+                        let looped = joined.filter(|joined| {
+                            joined.data.last().is_some_and(|&(_, method)| {
+                                !matches!(
+                                    access_methods_arena
+                                        .get(method)
+                                        .map(|method| &method.params),
+                                    Some(AccessMethodParams::HashJoin { .. })
+                                )
+                            })
+                        });
+                        let Some(mut joined) = looped else {
+                            break;
+                        };
+                        joined.inner_joins = vec![run];
+                        plan = joined;
+                    }
+                    let cheaper = plan.data.len() == num_tables
+                        && plan.cost < cost_upper_bound
+                        && best_plan.as_ref().is_none_or(|best| plan.cost < best.cost);
+                    if !cheaper {
+                        access_methods_arena.truncate(arena_len);
+                        continue;
+                    }
+                    best_plan = Some(plan);
                     // A bushy plan's run reads its rows before the loops: it keeps no order.
                     best_plan_is_also_ordered = false;
                 }
@@ -2003,26 +2072,51 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     }
 }
 
-/// PL.8: whether the search tries bushy plans for this join. Not where a join keeps its place
-/// (outer, semi, anti or lateral: the conflict rules order those left-deep), a RIGHT or FULL JOIN,
-/// or a connection that asks for nested loops only, the cases the emitter's build groups refuse
-/// (`bushy_build_groups`).
-fn bushy_plans_allowed(
+/// PL.8: the tables the search may plan bushy, `joined_tables[..core]`, None where it tries no
+/// bushy plan. The core's tables are inner joins free to move (no conflict rule orders them); the
+/// rest, `joined_tables[core..]`, are semi and anti joins (EXISTS, NOT EXISTS), which CD-C keeps
+/// after every table before them and the emitter runs as the last loops (`required_lhs_by_table`),
+/// so a bushy plan of the core is followed by them in their order (lane pl8-15). None for fewer
+/// than three tables in the core, an outer or lateral join or one that keeps its place, a semi or
+/// anti join before an inner one, a RIGHT or FULL JOIN, or a connection that asks for nested loops
+/// only: the cases the emitter's build groups refuse (`bushy_build_groups`) or the tail can't follow.
+fn bushy_core(
     joined_tables: &[JoinedTable],
     table_references: &TableReferences,
     planning_context: JoinPlanningContext<'_>,
     required_lhs_by_table: Option<&[TableMask]>,
-) -> bool {
-    joined_tables.len() >= 3
-        && planning_context.join_methods != crate::JoinMethods::NestedLoopsOnly
-        && required_lhs_by_table.is_none_or(|required| required.iter().all(TableMask::is_empty))
-        && !table_references.has_right_or_full_join()
-        && !joined_tables.iter().any(|table| {
-            table
-                .join_info
-                .as_ref()
-                .is_some_and(JoinInfo::is_ordering_constrained)
+) -> Option<usize> {
+    if planning_context.join_methods == crate::JoinMethods::NestedLoopsOnly
+        || table_references.has_right_or_full_join()
+    {
+        return None;
+    }
+    let semi_or_anti = |table: &JoinedTable| {
+        table.join_info.as_ref().is_some_and(|info| {
+            info.is_semi_or_anti() && !info.is_outer() && !info.no_reorder && !info.lateral
         })
+    };
+    let core = joined_tables
+        .iter()
+        .position(semi_or_anti)
+        .unwrap_or(joined_tables.len());
+    let (inner, tail) = joined_tables.split_at_checked(core)?;
+    let free = inner.iter().all(|table| {
+        !table
+            .join_info
+            .as_ref()
+            .is_some_and(JoinInfo::is_ordering_constrained)
+    });
+    let ordered = required_lhs_by_table.is_none_or(|required| {
+        required.iter().enumerate().all(|(table, lhs)| {
+            if table < core {
+                lhs.is_empty()
+            } else {
+                lhs.iter().all(|before| before < table)
+            }
+        })
+    });
+    (core >= 3 && free && ordered && tail.iter().all(semi_or_anti)).then_some(core)
 }
 
 fn has_connected_legal_candidate(
