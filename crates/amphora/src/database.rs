@@ -1292,6 +1292,37 @@ impl Database {
             .map_err(|e| refused(&e))
     }
 
+    /// [`Database::query`] for a session whose Records reads wait on a held cross-group lock
+    /// under this database's [`LockedReads`] (T-T1.10.W11, lane xgroup-sql-11). A session reads
+    /// one snapshot, so it can't wait inside itself: under [`LockedReads::Wait`] or
+    /// [`LockedReads::WaitOnLock`] its Records get of a row under a lock is refused, the row
+    /// noted, and once the session ends the read waits as a get does and runs the session again,
+    /// on a snapshot past the resolution; so `f` may run more than once and answers from its last
+    /// run only. Under [`LockedReads::Committed`] it is [`Database::query`].
+    pub fn query_waiting<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
+    {
+        let reads = LockedReads::of(self.shared.changed.locked_reads.load(Ordering::Acquire));
+        if reads == LockedReads::Committed {
+            return self.query(until, f);
+        }
+        let database = self.resolve(until)?;
+        let f = Arc::new(f);
+        database.wait_locked(reads, until, || {
+            let f = Arc::clone(&f);
+            database.query(until, move |c| {
+                let watch = session::Watch::begin();
+                let answer = (*f)(c);
+                match watch.met() {
+                    Some(row) => Ok(Err(row)),
+                    None => answer.map(Ok),
+                }
+            })
+        })
+    }
+
     /// Runs one read-only SQL session on this node's own state: a local read (replication.md, "A
     /// local read on a replica"). Standalone, it is [`Database::query`]. On a replica it runs on a
     /// reader of the owner's applied state, asking the group's leader nothing, so it answers with

@@ -186,9 +186,13 @@ Scans wait the same way (lane xgroup-sql-11, `t_t1_10_w10_*`): a scan of the lat
 either wait setting looks for a lock in the range its page covers (from its cursor to its last row
 when it stopped short, else the whole range, so a put of a row it doesn't show yet counts) with one
 range lookup in `__amphora_xg_lock`, and waits on the first locked row it meets, then scans again.
-SQL reads are not covered: a SQL session reads one snapshot from when it began, inside the writer or
-on a reader, so it can't wait inside itself for a resolution to land; it would have to be run again
-after it, which `Database::query`'s run-once session can't be.
+SQL reads wait by running again (`t_t1_10_w11_*`): a SQL session reads one snapshot from when it
+began, so it can't wait inside itself for a resolution to land. `Database::query_waiting` runs a
+session that may run more than once (`Fn`, not `FnOnce`): under either wait setting its Records gets
+look for a lock on their row, and one that meets it is refused and noted; once the session ends, the
+read waits on that row as a get does and runs the session again, on a snapshot past the resolution,
+answering from its last run. `Database::query`, and any session inside the writer, reads as today.
+SQL that reads Records' tables directly, not through a get, doesn't look for locks.
 
 ## A refusal before the step (lane xgroup-sql-4, AC-T1.10.6)
 

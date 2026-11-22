@@ -2949,4 +2949,66 @@ mod sessions {
             });
         }
     }
+
+    /// T-T1.10.W11 (AC-T1.10.1, lane xgroup-sql-11): a SQL session's Records read of a row under
+    /// a held lock, run by `Database::query_waiting`, runs again once the lock resolves, under
+    /// [`LockedReads::Wait`] and [`LockedReads::WaitOnLock`]; `Database::query` reads as today.
+    /// Do: three standalone groups, the answer at the decision, group 1's resolution held back; a
+    /// session reading row 1 in group 1 through `query`, then one through `query_waiting`, group
+    /// 1 let go once it waits. Expect: `query`'s session reads no row, unwaited;
+    /// `query_waiting`'s waits (counted once) and reads the transaction's row, its session run
+    /// twice.
+    ///
+    /// [`LockedReads::WaitOnLock`]: crate::database::LockedReads::WaitOnLock
+    /// [`LockedReads::Wait`]: crate::database::LockedReads::Wait
+    #[test]
+    fn t_t1_10_w11_a_sql_read_of_a_held_lock_runs_again_once_it_resolves() {
+        use crate::database::LockedReads;
+        use std::sync::atomic::AtomicUsize;
+        for reads in [LockedReads::Wait, LockedReads::WaitOnLock] {
+            let dir = tempfile::tempdir().unwrap();
+            let dbs = databases(dir.path(), 3);
+            for db in &dbs {
+                db.set_locked_reads(reads);
+            }
+            let gate = gate(&dbs, 1, false);
+            let cluster = open_gated(&dbs, Protocol::TwoPhase, &gate, AnswerAt::Decided, 1);
+            std::thread::scope(|scope| {
+                let answer = {
+                    let cluster = &cluster;
+                    scope.spawn(move || cluster.commit(across(8), until()))
+                };
+                gate.reached.recv().unwrap();
+                let answer = answer.join().unwrap();
+                assert!(
+                    matches!(answer, Ok(Answer::Committed { .. })),
+                    "{reads:?}: {answer:?}"
+                );
+                let reader = &dbs[1];
+                let today = reader
+                    .query(until(), |c| {
+                        Ok(c.records_get("ns", "rows", &[1])?.map(|r| r.value))
+                    })
+                    .unwrap();
+                assert_eq!(today, None, "{reads:?}");
+                assert_eq!(reader.locked_waits(), 0, "{reads:?}");
+                let runs = Arc::new(AtomicUsize::new(0));
+                let waiting = {
+                    let runs = Arc::clone(&runs);
+                    scope.spawn(move || {
+                        reader.query_waiting(until(), move |c| {
+                            runs.fetch_add(1, Ordering::AcqRel);
+                            Ok(c.records_get("ns", "rows", &[1])?.map(|r| r.value))
+                        })
+                    })
+                };
+                reader.locked_waits_reach(1, until()).unwrap();
+                gate.open.send(()).unwrap();
+                let seen = waiting.join().unwrap();
+                assert_eq!(seen, Ok(Some(vec![8])), "{reads:?}");
+                assert_eq!(reader.locked_waits(), 1, "{reads:?}");
+                assert_eq!(runs.load(Ordering::Acquire), 2, "{reads:?}");
+            });
+        }
+    }
 }
