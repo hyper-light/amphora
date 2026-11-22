@@ -1386,6 +1386,11 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         constraints,
         where_clause,
         |term| where_terms.get(term).and_then(|info| info.home_table),
+        |term| {
+            where_terms
+                .get(term)
+                .and_then(|info| crate::alloc::TryClone::try_clone(&info.table_mask).ok())
+        },
         base_table_rows,
         initial_input_cardinality,
         params,

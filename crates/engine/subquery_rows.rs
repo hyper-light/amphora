@@ -87,6 +87,17 @@ impl SubqueryRows {
         rows
     }
 
+    /// Whether a fill has counted the rows `identity` names, read without making an entry
+    /// (PL.13, lane replan-11): the join search asks it of every set of tables it estimates.
+    pub(crate) fn counted(&self, identity: u64) -> bool {
+        self.entries
+            .lock()
+            .map
+            .get(&identity)
+            .and_then(Weak::upgrade)
+            .is_some_and(|rows| rows.get().is_some())
+    }
+
     /// How many entries the store holds, dead ones not yet swept included.
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -125,10 +136,55 @@ pub(crate) fn join_identity<'a>(
     tables: impl Iterator<Item = &'a str>,
     terms: impl Iterator<Item = &'a amphora_engine_parser::ast::Expr>,
 ) -> Option<u64> {
-    let terms = crate::filter_shares::fingerprint(terms)?;
-    let mut names: Vec<String> = tables.map(crate::util::normalize_ident).collect();
+    let mut each = Vec::new();
+    for expr in terms {
+        each.push(crate::filter_shares::term_fingerprint(expr)?);
+    }
+    join_identity_of(tables.map(crate::util::normalize_ident).collect(), each)
+}
+
+/// [join_identity] of the tables named `names` (normalized) and the terms whose
+/// [`term_fingerprint`](crate::filter_shares::term_fingerprint)s are `terms`, both in any order.
+pub(crate) fn join_identity_of(mut names: Vec<String>, terms: Vec<u64>) -> Option<u64> {
+    let terms = crate::filter_shares::combine(terms)?;
     names.sort_unstable();
     identity(&("JOIN", names, terms))
+}
+
+/// The identity of the rows of a join prefix (PL.13, lane replan-11: a build fed by a materialized
+/// input): the tables `set` holds and every WHERE term that reads only them, keyed as a whole
+/// join's is ([join_identity]), so the prefix of one query and the whole of another that joins the
+/// same tables by the same terms share one count. `None` for a term reading a parameter among
+/// them, or none at all. The planner notes the prefix's estimate under it once the join order is
+/// chosen (`optimizer::note_materialized_prefixes`), reads a count stored there in its place
+/// (`cardinality::JoinedSetRows::rows`), and the materialization counts its rows against it
+/// (`main_loop::join_prefix_check`).
+pub(crate) fn prefix_identity(
+    table_references: &crate::translate::plan::TableReferences,
+    subqueries: &[crate::translate::plan::NonFromClauseSubquery],
+    where_clause: &[crate::translate::plan::WhereTerm],
+    set: &crate::translate::planner::TableMask,
+) -> Option<u64> {
+    let joined = table_references.joined_tables();
+    let mut names = Vec::new();
+    for table_idx in set.iter() {
+        names.push(crate::util::normalize_ident(
+            joined.get(table_idx)?.table.get_name(),
+        ));
+    }
+    let mut terms = Vec::new();
+    for term in where_clause {
+        let mask = crate::translate::planner::table_mask_from_expr(
+            &term.expr,
+            table_references,
+            subqueries,
+        )
+        .ok()?;
+        if set.contains_all_set_bits_of(&mask) {
+            terms.push(crate::filter_shares::term_fingerprint(&term.expr)?);
+        }
+    }
+    join_identity_of(names, terms)
 }
 
 /// A subquery's rows a plan read: its identity, where a count is stored, the count's bits when the

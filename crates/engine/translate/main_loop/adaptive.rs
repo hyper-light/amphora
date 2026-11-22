@@ -307,6 +307,49 @@ pub(crate) fn subquery_count_check(
     })
 }
 
+/// Amphora (PL.13, lane replan-11: a build fed by a materialized input): a hash join's build input
+/// materialized from a join prefix (`emitter::emit_materialized_build_inputs`, key and payload
+/// stored, one row of the ephemeral table a row of the prefix) holds the rows of the tables
+/// `prefix` names that every WHERE term reading only them keeps. Once filled they are checked
+/// against the rows the plan noted for the prefix (`optimizer::note_materialized_prefixes`, under
+/// `subquery_rows::prefix_identity`), as a stored subquery result is: the fill numbers its rows
+/// 1, 2, ... (`EphemeralRowidMode::Auto`), so the last rowid is the count. The band is each
+/// prefix table's statistics' error, independent, in quadrature, as for a sorter fed by a join.
+/// `None` where it is not checked: adaptive joins off, a table without statistics, terms reading
+/// a parameter, or no rows noted for the prefix (an outer, semi or anti join in the query, a plan
+/// for more than one run, a bushy plan).
+pub(crate) fn join_prefix_check(
+    resolver: &Resolver,
+    plan: &crate::translate::plan::SelectPlan,
+    prefix: &crate::translate::planner::TableMask,
+) -> Option<SubqueryCheck> {
+    if !resolver.adaptive_joins() {
+        return None;
+    }
+    let identity = crate::subquery_rows::prefix_identity(
+        &plan.table_references,
+        &plan.non_from_clause_subqueries,
+        &plan.where_clause,
+        prefix,
+    )?;
+    let planned = resolver
+        .plan_values()
+        .and_then(|values| values.planned_subquery(identity))?;
+    let tables = plan.joined_tables();
+    let mut squared_error = 0.0;
+    for table_idx in prefix.iter() {
+        let Table::BTree(btree) = &tables.get(table_idx)?.table else {
+            return None;
+        };
+        let (_, error) = analyzed_table(resolver, &btree.name)?;
+        squared_error += error * error;
+    }
+    Some(SubqueryCheck {
+        planned,
+        estimate_error: f64::sqrt(squared_error),
+    })
+}
+
 /// The relative error of the rows a query reads, its tables' statistics' errors, independent, in
 /// quadrature; `None` where one has none (a table without statistics, a table-valued function), or
 /// for a query reading no table. A FROM-clause subquery it reads (lane replan-10) adds its own:

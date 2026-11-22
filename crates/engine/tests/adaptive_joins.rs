@@ -1387,3 +1387,78 @@ fn t_pl_13_17_a_stored_subquery_over_a_subquery_plans_again() {
         "a new statement planned again"
     );
 }
+
+/// Do: three tables chained by hash joins only (`r.k = s.k`, `s.j = t.j`), so the third join's build
+/// input is materialized from the first two (`MATERIALIZE hash build input`: `s` both the first
+/// join's probe and the second's build, the materialization PL.6 requires). At ANALYZE no row of
+/// `s` meets `r` (its keys distinct, `r`'s two values among none of them: 20 estimated for the
+/// pair); then every `s.k` is set to 1, so each of `r`'s ten rows with 1 meets all 200 of `s`
+/// (2,000), the tables' counts unchanged; `s` meets `t` as estimated (each `s.j` ten rows of `t`).
+/// Run with adaptive joins off, then on twice in one prepared statement, and in a statement
+/// prepared after. Expect: one answer every way; off, nothing counted; on, the plan materializes
+/// the prefix and counts it (`SubqueryCounted`), past its error the count stored and the statement
+/// planned again once; nothing plans again after (PL.13, lane replan-11, T-PL.13.18: a build fed by
+/// a materialized input, at its materialization point).
+#[test]
+fn t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again() {
+    let (_dir, conn) = open("materialized_prefix.db");
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k, j)",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, j)",
+        "INSERT INTO r(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) SELECT i % 2 FROM n",
+        "INSERT INTO s(k, j) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) SELECT i + 1000, i FROM n",
+        "INSERT INTO t(j) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i % 200 FROM n",
+        "ANALYZE",
+        "UPDATE s SET k = 1",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+    let sql = "SELECT count(*) FROM r JOIN s ON s.k = r.k JOIN t ON t.j = s.j";
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_subquery_checks();
+    let off = run_rows(&mut conn.prepare(sql).unwrap());
+    // r's ten rows with k = 1, each with all of s; s.j 1 to 199 ten rows of t each, 200 none.
+    assert_eq!(off.len(), 1, "the count's row");
+    assert!(
+        off[0].contains(&(10 * 199 * 10).to_string()),
+        "the count: {off:?}"
+    );
+    assert_eq!(conn.adaptive_subquery_checks(), checks, "counted off");
+
+    conn.set_adaptive_joins(true);
+    let (steps, opcodes) = steps_and_opcodes(&conn, sql);
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.contains("MATERIALIZE hash build input")),
+        "the prefix is not materialized: {steps:?}"
+    );
+    assert!(
+        opcodes.iter().any(|op| op == "SubqueryCounted"),
+        "the materialized prefix is not counted: {steps:?}"
+    );
+    let replans = conn.adaptive_replans();
+    let mut held = conn.prepare(sql).unwrap();
+    assert_eq!(run_rows(&mut held), off, "on and off differ");
+    assert!(
+        conn.adaptive_subquery_checks() > checks,
+        "the materialized prefix was not counted"
+    );
+    assert_eq!(conn.adaptive_replans() - replans, 1, "planned again once");
+    let replans = conn.adaptive_replans();
+    assert_eq!(run_rows(&mut held), off, "the second run's answer");
+    assert_eq!(conn.adaptive_replans(), replans, "a second re-plan");
+    assert_eq!(
+        run_rows(&mut conn.prepare(sql).unwrap()),
+        off,
+        "a new statement's answer"
+    );
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "a new statement planned again"
+    );
+}

@@ -2482,6 +2482,77 @@ fn group_count_from_index_stats<'a>(
         .map(|(groups, rows_per_group)| (groups, rows_per_group, table_stats))
 }
 
+/// Amphora (PL.13, lane replan-11; `docs/design/planner.md`, "Filtered builds"): once the join
+/// order is chosen, the rows the plan estimated for each join prefix a hash join's build input is
+/// materialized from (the tables before its probe, its build table among them) are noted under the
+/// prefix's identity (`subquery_rows::prefix_identity`, keyed as a whole join's rows are), so the
+/// materialization is checked against them (`main_loop::join_prefix_check`); a count stored there
+/// is read in their place, as the join search did (`cardinality::JoinedSetRows::rows`). The rows
+/// are the search's own for that set (`JoinN::prefix_cardinalities`). Only where the search reads
+/// such counts: adaptive joins on, a plan for one run of inner joins only, left-deep (a bushy run
+/// is joined among itself, apart from the tables before it), and a prefix of two tables or more.
+fn note_materialized_prefixes(
+    best_plan: &JoinN,
+    access_methods_arena: &[AccessMethod],
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    where_clause: &[WhereTerm],
+    initial_input_cardinality: f64,
+    params: &cost_params::CostModelParams,
+) {
+    let Some(values) = params
+        .plan_values
+        .as_deref()
+        .filter(|values| values.reads_subquery_rows())
+    else {
+        return;
+    };
+    if initial_input_cardinality > 1.0
+        || !best_plan.is_left_deep()
+        || table_references.joined_tables().iter().any(|joined| {
+            joined.join_info.as_ref().is_some_and(|info| {
+                info.is_outer() || info.is_semi_or_anti() || info.keeps_right_rows()
+            })
+        })
+    {
+        return;
+    }
+    for (pos, (_, method)) in best_plan.data.iter().enumerate() {
+        let Some(AccessMethodParams::HashJoin {
+            build_table_idx,
+            materialize_build_input: true,
+            ..
+        }) = access_methods_arena
+            .get(*method)
+            .map(|method| &method.params)
+        else {
+            continue;
+        };
+        let (Some(before), Some(rows)) = (
+            best_plan.data.get(..pos),
+            pos.checked_sub(1)
+                .and_then(|last| best_plan.prefix_cardinalities.get(last)),
+        ) else {
+            continue;
+        };
+        if before.len() < 2 || before.iter().all(|(table, _)| table != build_table_idx) {
+            continue;
+        }
+        let mut prefix = TableMask::default();
+        if before.iter().any(|(table, _)| prefix.set(*table).is_err()) {
+            continue;
+        }
+        if let Some(identity) = crate::subquery_rows::prefix_identity(
+            table_references,
+            subqueries,
+            where_clause,
+            &prefix,
+        ) {
+            values.subquery_rows(identity, *rows);
+        }
+    }
+}
+
 /// Amphora (PL.13, lane replan-8; `docs/design/planner.md`, "Stored subquery results"): the
 /// relative error of a GROUP BY plan's estimated output rows where ANALYZE's group count set them
 /// ([group_count_from_analyze], the estimate being the fewer of the groups and the rows read), so
@@ -3212,6 +3283,16 @@ fn find_table_access_plan(
     } else {
         best_plan
     };
+
+    note_materialized_prefixes(
+        &best_plan,
+        &access_methods_arena,
+        table_references,
+        subqueries,
+        where_clause,
+        initial_input_cardinality,
+        params,
+    );
 
     // PL.8: a bushy plan's run reads its rows before the loops, so it keeps no order.
     let sort_eliminated = best_plan.is_left_deep()

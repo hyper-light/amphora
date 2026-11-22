@@ -348,6 +348,10 @@ struct MaterializationSpec {
     prefix_tables: TableMask,
     key_exprs: Vec<Expr>,
     payload_columns: Vec<MaterializedColumnRef>,
+    /// PL.13 (lane replan-11): the join prefix whose rows the input holds, one a row, where they
+    /// are checked against the plan's estimate (`main_loop::join_prefix_check`): a left-deep
+    /// prefix of two tables or more, each of them in it, stored key and payload.
+    checked_prefix: Option<TableMask>,
 }
 
 /// Store filtered hash-build inputs before the hash table is built.
@@ -479,12 +483,19 @@ pub(crate) fn emit_materialized_build_inputs(
             // Therefore: if the prefix has other tables, we must store key+payload
             // rows so each prefix match stays distinct and the main plan can drop
             // the prefix loops.
-            let (_, included_tables) = materialization_prefix(
+            let (prefix_order, included_tables) = materialization_prefix(
                 plan,
                 hash_join_op.build_table_idx,
                 probe_table_idx,
                 &hash_join_op.build_group,
             )?;
+            let prefix_mask: TableMask =
+                prefix_order.iter().map(|m| m.original_idx).try_collect()?;
+            let checked_prefix = (hash_join_op.build_group.is_empty()
+                && prefix_order.len() >= 2
+                && prefix_mask.contains_all_set_bits_of(&included_tables)
+                && included_tables.contains_all_set_bits_of(&prefix_mask))
+            .then_some(prefix_mask);
             let prefix_has_other_tables = included_tables
                 .iter()
                 .any(|table_idx| table_idx != hash_join_op.build_table_idx);
@@ -513,6 +524,7 @@ pub(crate) fn emit_materialized_build_inputs(
                     prefix_tables: included_tables,
                     key_exprs,
                     payload_columns,
+                    checked_prefix,
                 });
             } else {
                 // Single-table prefix: a rowid list preserves the build-side filters
@@ -524,6 +536,7 @@ pub(crate) fn emit_materialized_build_inputs(
                     prefix_tables: TableMask::default(),
                     key_exprs: Vec::new(),
                     payload_columns: Vec::new(),
+                    checked_prefix: None,
                 });
             }
         }
@@ -602,6 +615,22 @@ pub(crate) fn emit_materialized_build_inputs(
             program.clear_hash_tables_to_keep_open();
             Ok(())
         })?;
+        // PL.13 (lane replan-11: a build fed by a materialized input): the prefix's rows, all in,
+        // counted against the rows the plan noted for it.
+        let check = match spec.checked_prefix.as_ref() {
+            Some(prefix) => {
+                crate::translate::main_loop::join_prefix_check(resolver, &*plan, prefix)
+            }
+            None => None,
+        };
+        if let Some(check) = check {
+            crate::translate::main_loop::emit_subquery_counted(
+                program,
+                check,
+                cursor_id,
+                crate::translate::subquery::MaterializedFromClauseSubqueryStorage::TableBacked,
+            );
+        }
         program.pop_current_parent_explain();
 
         build_inputs.insert(

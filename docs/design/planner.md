@@ -1758,7 +1758,30 @@ sorter stored for them is read in its place; the error is the sample's binomial 
 `t_pl_13_16_a_build_filtered_by_a_mix_of_terms_plans_again` (T-PL.13.16): `b.v = 7 AND b.w < 50`,
 the `=` priced by the column statistics and the range by the sample, half the rows set to 7 after:
 one answer with adaptive joins off and on, one share stored, one re-plan, none after. A build fed
-by a materialized input is not checked. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
+by a materialized input (lane replan-11) holds the rows of a join prefix, the tables before its
+probe with its build table among them, that every term reading only them keeps (PL.6's
+materialization, stored key and payload, one row a row of the prefix). No table's counter or share
+can correct them; their correction is the prefix's rows, keyed as a whole join's are
+(`subquery_rows::prefix_identity`: the tables' names and the fingerprint of every term reading
+only them), so one query's prefix and another's whole join of the same tables by the same terms
+share a count. Once the join order is chosen the plan notes the search's own estimate of each
+materialized prefix under that key (`optimizer::note_materialized_prefixes`, from
+`JoinN::prefix_cardinalities`); the join search reads a count stored under a set's key in place of
+its estimate, asking the store only whether one is there, so the sets it merely tries leave no
+entry (`cardinality::PrefixKeys`, `SubqueryRows::counted`). Once filled, the input's rows (its last
+rowid: the fill numbers them) are checked against the noted rows (`main_loop::join_prefix_check`,
+`SubqueryCounted`), the band each prefix table's statistics' error in quadrature, as for a sorter
+fed by a join; past it the count is stored, the plan made again and the run handed off as a stored
+subquery result's is. Only where the whole join's rows are read: inner joins only, a plan for one
+run, a left-deep plan (a bushy run is joined among itself), a prefix of two tables or more holding
+every table the input reads. A single table's filtered materialized input is not checked.
+`t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again` (T-PL.13.18): `r JOIN s JOIN t` by
+hash joins only, `s` the first join's probe and the second's build, so the second's input is
+materialized from `r` and `s`; every `s.k` set to `r`'s common value after ANALYZE (20 rows
+estimated for the pair, 2,000 counted): one answer with adaptive joins off and on, the prefix
+counted, one re-plan, none after. A superset of a corrected prefix keeps its own estimate (the
+whole join's store corrects the whole join only); carrying a prefix's correction into the sets
+that hold it is not built. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
 (`crates/engine/tests/adaptive_joins.rs`; T-PL.13.5), a range one row in a hundred passed at
 ANALYZE and every row after an UPDATE: one answer with adaptive joins off and on, one share stored,
 one re-plan, none on the second run or in a statement prepared on the stored share.

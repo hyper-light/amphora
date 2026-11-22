@@ -211,6 +211,34 @@ pub(super) struct JoinedSetRows<'a> {
     joined: Option<u64>,
     /// PL.13 (lane replan-10): each table's own filter terms, where it has a sample.
     own_filters: Vec<Option<OwnFilter>>,
+    /// PL.13 (lane replan-11): what keys a set's rows as a join prefix's
+    /// (`subquery_rows::prefix_identity`), under the same conditions as `joined`.
+    prefixes: Option<PrefixKeys>,
+}
+
+/// The parts of a set of tables' identity as a join prefix (PL.13, lane replan-11), taken once:
+/// each table's normalized name, and each WHERE term's tables with its fingerprint (`None` for a
+/// term reading a parameter). A set's identity is its tables' names and the terms reading only
+/// them ([PrefixKeys::identity]), the same value `subquery_rows::prefix_identity` gives the plan.
+struct PrefixKeys {
+    names: Vec<String>,
+    terms: Vec<(TableMask, Option<u64>)>,
+}
+
+impl PrefixKeys {
+    fn identity(&self, set: &TableMask) -> Option<u64> {
+        let mut names = Vec::new();
+        for table in set.iter() {
+            names.push(self.names.get(table)?.clone());
+        }
+        let mut terms = Vec::new();
+        for (mask, fingerprint) in &self.terms {
+            if set.contains_all_set_bits_of(mask) {
+                terms.push((*fingerprint)?);
+            }
+        }
+        crate::subquery_rows::join_identity_of(names, terms)
+    }
 }
 
 /// A table's own filter terms together (PL.13, lane replan-10): every term its sample ran and every
@@ -236,6 +264,7 @@ impl<'a> JoinedSetRows<'a> {
         constraints: &'a [TableConstraints],
         where_clause: &[WhereTerm],
         homes: impl Fn(usize) -> Option<usize>,
+        masks: impl Fn(usize) -> Option<TableMask>,
         base_table_rows: &[RowCountEstimate],
         initial: f64,
         params: &'a CostModelParams,
@@ -649,6 +678,33 @@ impl<'a> JoinedSetRows<'a> {
             )
         })
         .flatten();
+        // PL.13 (lane replan-11): a join prefix's rows are keyed as a whole join's, read only
+        // where a fill counted them; under the same conditions, and only with the store attached.
+        let prefixes = (joined_tables.len() > 2
+            && initial <= 1.0
+            && kinds.iter().all(|kind| matches!(kind, Kind::Inner))
+            && params
+                .plan_values
+                .as_deref()
+                .is_some_and(|values| values.reads_subquery_rows()))
+        .then(|| {
+            let terms = where_clause
+                .iter()
+                .enumerate()
+                .map(|(pos, term)| {
+                    masks(pos)
+                        .map(|mask| (mask, crate::filter_shares::term_fingerprint(&term.expr)))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(PrefixKeys {
+                names: joined_tables
+                    .iter()
+                    .map(|joined| crate::util::normalize_ident(joined.table.get_name()))
+                    .collect(),
+                terms,
+            })
+        })
+        .flatten();
         Self {
             tables,
             columns,
@@ -661,6 +717,7 @@ impl<'a> JoinedSetRows<'a> {
             bound,
             joined,
             own_filters,
+            prefixes,
         }
     }
 
@@ -675,9 +732,24 @@ impl<'a> JoinedSetRows<'a> {
         // PL.13 (lane replan-10): the whole join's rows a sorter fed by it counted past their
         // estimate stand in for it, noted as the rows the plan read, so the sorter is checked
         // against them and the plan made again when a count is stored.
+        let tables = set.iter().count();
         let rows = match (self.joined, self.params.plan_values.as_deref()) {
-            (Some(identity), Some(values)) if set.iter().count() == self.tables.len() => {
+            (Some(identity), Some(values)) if tables == self.tables.len() => {
                 values.subquery_rows(identity, rows)
+            }
+            _ => rows,
+        };
+        // PL.13 (lane replan-11): a join prefix's rows a materialized build input counted stand in
+        // for its estimate, and are noted as read, as the whole join's are; a set no fill counted
+        // leaves no entry.
+        let rows = match (self.prefixes.as_ref(), self.params.plan_values.as_deref()) {
+            (Some(prefixes), Some(values)) if tables >= 2 && tables < self.tables.len() => {
+                match prefixes.identity(set) {
+                    Some(identity) if values.counted_subquery(identity) => {
+                        values.subquery_rows(identity, rows)
+                    }
+                    _ => rows,
+                }
             }
             _ => rows,
         };

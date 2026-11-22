@@ -209,6 +209,25 @@ impl PlanValues {
         planned_rows
     }
 
+    /// Whether the store of counted rows is attached (adaptive joins on, PL.13).
+    pub(crate) fn reads_subquery_rows(&self) -> bool {
+        self.subquery_rows.get().is_some()
+    }
+
+    /// Whether the plan already read rows for `identity`, or a fill has counted them (PL.13, lane
+    /// replan-11): a set of tables the join search estimates reads a count only where one is
+    /// stored, so the sets it only tries leave no entry.
+    pub(crate) fn counted_subquery(&self, identity: u64) -> bool {
+        let Some(store) = self.subquery_rows.get() else {
+            return false;
+        };
+        self.subqueries
+            .lock()
+            .iter()
+            .any(|noted| noted.identity == identity)
+            || store.counted(identity)
+    }
+
     /// The rows the plan read for the subquery `identity`, if it read them.
     pub(crate) fn planned_subquery(
         &self,
