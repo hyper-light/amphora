@@ -188,7 +188,7 @@ fn write(name: &str, writers: u64) -> anyhow::Result<()> {
     schema(&io, &db)?;
     let target = Target::Amphora { io, db };
     let out = Mutex::new(std::io::stdout());
-    std::thread::scope(|s| {
+    std::thread::scope(|s| -> anyhow::Result<()> {
         let threads = (0..writers)
             .map(|w| {
                 let (target, out) = (&target, &out);
@@ -288,7 +288,10 @@ impl Commit for AmphoraCommit {
 }
 
 /// SQLite's commit (rusqlite, SQLite compiled in): WAL, `synchronous = FULL`, no busy handler, so a
-/// busy database is refused at once and tried again by the loop, as Amphora's is.
+/// busy database is refused at once and tried again by the loop, as Amphora's is (its connections
+/// have none by default, `BusyHandler::None`). rusqlite gives every connection it opens a 5 s busy
+/// timeout, which [`Target::connect`] takes away: with it, SQLite would wait in its own handler
+/// where Amphora is refused and tries again, two loops, not one.
 struct SqliteCommit(rusqlite::Connection);
 
 impl Commit for SqliteCommit {
@@ -360,6 +363,7 @@ impl Target {
             }
             Target::Sqlite { path } => {
                 let c = rusqlite::Connection::open(path)?;
+                c.busy_handler(None)?;
                 c.pragma_update(None, "journal_mode", "WAL")?;
                 c.pragma_update(None, "synchronous", "FULL")?;
                 Box::new(SqliteCommit(c))
@@ -384,7 +388,7 @@ impl Target {
                 } else {
                     "pager"
                 };
-                serde_json::json!({ "engine": "amphora", "storage": storage, "synchronous": "FULL", "journal": "WAL" })
+                serde_json::json!({ "engine": "amphora", "storage": storage, "synchronous": "FULL", "journal": "WAL", "busy_handler": "none" })
             }
             Target::Sqlite { path } => {
                 let c = rusqlite::Connection::open(path)?;
@@ -392,7 +396,7 @@ impl Target {
                     c.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
                 c.pragma_update(None, "synchronous", "FULL")?;
                 c.execute_batch("CREATE TABLE IF NOT EXISTS acked (id INTEGER PRIMARY KEY, writer INTEGER NOT NULL)")?;
-                serde_json::json!({ "engine": "sqlite", "version": rusqlite::version(), "synchronous": "FULL", "journal": mode })
+                serde_json::json!({ "engine": "sqlite", "version": rusqlite::version(), "synchronous": "FULL", "journal": mode, "busy_handler": "none" })
             }
             Target::Postgres { dsn } => {
                 let mut c = postgres::Client::connect(dsn, postgres::NoTls)?;
