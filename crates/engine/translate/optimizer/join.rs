@@ -876,24 +876,12 @@ fn join_lhs_and_rhs<'a>(
             // build input is materialized from the join prefix.
             // Amphora: one method only when the connection asks (QT.5);
             // the structural conditions below hold whichever it asks for.
-            // PL.8's test hook pins the plan: loops in the FROM order and one hash join, at the last
-            // table (`bushy_test_hook::PIN`).
-            #[cfg(test)]
-            let pinned = super::bushy_test_hook::PIN.with(std::cell::Cell::get);
-            #[cfg(not(test))]
-            let pinned = false;
-            let pinned_hash_here =
-                pinned && joined_tables.len().checked_sub(1) == Some(rhs_table_idx);
-            let preferred_over_seek = if pinned {
-                pinned_hash_here
-            } else {
-                match planning_context.join_methods {
-                    crate::JoinMethods::ByCost => {
-                        !rhs_has_selective_seek && !build_unique_key_search_without_statistics
-                    }
-                    crate::JoinMethods::NestedLoopsOnly => false,
-                    crate::JoinMethods::HashJoinsOnly => true,
+            let preferred_over_seek = match planning_context.join_methods {
+                crate::JoinMethods::ByCost => {
+                    !rhs_has_selective_seek && !build_unique_key_search_without_statistics
                 }
+                crate::JoinMethods::NestedLoopsOnly => false,
+                crate::JoinMethods::HashJoinsOnly => true,
             };
             let allow_hash_join = preferred_over_seek
                 && !probe_table_is_prior_build
@@ -944,8 +932,7 @@ fn join_lhs_and_rhs<'a>(
                     subqueries,
                     joined_tables,
                     params,
-                    !pinned_hash_here
-                        && planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
+                    planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -1106,9 +1093,7 @@ fn join_lhs_and_rhs<'a>(
                         input_cardinality,
                         params,
                     );
-                    let forced = pinned_hash_here
-                        || (!pinned
-                            && planning_context.join_methods == crate::JoinMethods::HashJoinsOnly);
+                    let forced = planning_context.join_methods == crate::JoinMethods::HashJoinsOnly;
                     if hash_join_allowed
                         && (forced
                             || hash_join_method.cost < best_access_method.cost
@@ -1501,17 +1486,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             _ => false,
         };
 
-    // PL.8's test hook pins the plan to the FROM order (`bushy_test_hook::PIN`).
-    #[cfg(test)]
-    if super::bushy_test_hook::PIN.with(std::cell::Cell::get) {
-        if let Some(plan) = naive_plan {
-            return Ok(Some(BestJoinOrderResult {
-                best_plan: plan,
-                best_ordered_plan: None,
-            }));
-        }
-    }
-
     // If we have one table, then the "naive left-to-right plan" is always the best.
     if joined_tables.len() == 1 {
         return match naive_plan {
@@ -1788,6 +1762,204 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         }
     }
 
+    // PL.8 piece 2: the bushy plans, each a connected subgraph and its connected complement
+    // (DPccp, Moerkotte and Neumann, VLDB 2006), in the shape the emitter runs: the tables of the
+    // complement but one as loops (`outer`), then a run (`build`) joined among itself once into the
+    // materialized build input of a hash join probed by the last table, read once for each outer
+    // row. The pairs are walked on loops over the subsets found, not recursion (CLAUDE.md §11), and
+    // counted against what `searchable_subsets` left of `JOIN_SEARCH_BUDGET`: once it runs out, the
+    // left-deep plan found so far stands, today's search (decision 19).
+    if bushy_plans_allowed(
+        joined_tables,
+        table_references,
+        planning_context,
+        required_lhs_by_table.as_deref(),
+    ) {
+        let mut pairs_left =
+            JOIN_SEARCH_BUDGET.saturating_sub(subsets.iter().map(Vec::len).sum::<usize>());
+        let all: TableMask = (0..num_tables).try_collect()?;
+        'pairs: for build_mask in subsets.iter().skip(1).flatten() {
+            if build_mask.count().saturating_add(2) > num_tables {
+                continue;
+            }
+            let Some(build_variants) = best_plan_memo.get(build_mask) else {
+                continue;
+            };
+            for probe in 0..num_tables {
+                if build_mask.get(probe) || !tables_are_connected(build_mask, probe, &where_terms) {
+                    continue;
+                }
+                let mut inner_mask = build_mask.try_clone()?;
+                inner_mask.set(probe)?;
+                let mut outer_mask = all.try_clone()?;
+                for table in inner_mask.iter() {
+                    outer_mask.clear(table);
+                }
+                // The complement is one of the connected subsets planned, joined to the run or
+                // its probe by a term.
+                let connected = outer_mask
+                    .iter()
+                    .any(|table| tables_are_connected(&inner_mask, table, &where_terms));
+                let Some(outer) = best_plan_memo.get(&outer_mask).and_then(|variants| {
+                    variants
+                        .values()
+                        .min_by(|left, right| left.cost.0.total_cmp(&right.cost.0))
+                }) else {
+                    continue;
+                };
+                if !connected {
+                    continue;
+                }
+                let build_lasts: TableMask = build_variants.keys().copied().try_collect()?;
+                for last in &build_lasts {
+                    let Some(build) = build_variants.get(&last) else {
+                        continue;
+                    };
+                    let Some(budget_left) = pairs_left.checked_sub(1) else {
+                        break 'pairs;
+                    };
+                    pairs_left = budget_left;
+                    let (Some(probe_table), Some(probe_constraints)) =
+                        (joined_tables.get(probe), constraints.get(probe))
+                    else {
+                        continue;
+                    };
+                    // The run's reads hold no hash table built from a materialized input: the
+                    // emitter joins the run among itself only.
+                    let run_reads_materialized = build.data.iter().any(|(_, method)| {
+                        matches!(
+                            access_methods_arena
+                                .get(*method)
+                                .map(|method| &method.params),
+                            Some(AccessMethodParams::HashJoin {
+                                materialize_build_input: true,
+                                ..
+                            })
+                        )
+                    });
+                    if run_reads_materialized {
+                        continue;
+                    }
+                    join_order.clear();
+                    for table in build.table_numbers().chain([probe]) {
+                        let Some(joined) = joined_tables.get(table) else {
+                            continue;
+                        };
+                        join_order.push(JoinOrderMember {
+                            table_id: joined.internal_id,
+                            original_idx: table,
+                            is_outer: false,
+                        });
+                    }
+                    let arena_len = access_methods_arena.len();
+                    let run_joined = join_lhs_and_rhs(
+                        Some(build),
+                        set_rows,
+                        initial_input_cardinality,
+                        probe_table,
+                        probe_constraints,
+                        constraints,
+                        base_table_rows,
+                        &join_order,
+                        // The probe's read is the hash join, whatever a lone join would choose.
+                        JoinPlanningContext {
+                            join_methods: crate::JoinMethods::HashJoinsOnly,
+                            ..planning_context
+                        },
+                        access_methods_arena,
+                        Cost(f64::MAX),
+                        joined_tables,
+                        where_clause,
+                        &where_terms,
+                        subqueries,
+                        index_method_candidates,
+                        params,
+                        analyze_stats,
+                        available_indexes,
+                        table_references,
+                        schema,
+                    )?;
+                    join_order.clear();
+                    // The probe reads the run by a hash join built from the run's last table,
+                    // materialized from the run's rows.
+                    let probe_method = run_joined.as_ref().and_then(|run_joined| {
+                        let &(_, method) = run_joined.data.last()?;
+                        match access_methods_arena
+                            .get(method)
+                            .map(|method| &method.params)
+                        {
+                            Some(AccessMethodParams::HashJoin {
+                                build_table_idx,
+                                probe_table_idx,
+                                materialize_build_input: true,
+                                join_type: HashJoinType::Inner,
+                                mem_budget,
+                                ..
+                            }) if *build_table_idx == last && *probe_table_idx == probe => {
+                                Some((method, *mem_budget))
+                            }
+                            _ => None,
+                        }
+                    });
+                    let Some((probe_method, mem_budget)) = probe_method else {
+                        access_methods_arena.truncate(arena_len);
+                        continue;
+                    };
+                    // The run is read and built once; the probe table is read once for each outer
+                    // row; every row of the join is visited (`estimate_hash_join_cost`), and each
+                    // row of the run is materialized at a row's visit, as a left-deep plan's
+                    // materialized build input is.
+                    let rows = set_rows.rows(&all);
+                    let outer_rows = outer.output_cardinality.max(1.0);
+                    let probe_rows = base_table_rows
+                        .get(probe)
+                        .copied()
+                        .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+                    let probe_cost = estimate_hash_join_cost(
+                        build.output_cardinality,
+                        *probe_rows,
+                        rows,
+                        HashJoinType::Inner,
+                        mem_budget,
+                        outer_rows,
+                        params,
+                    ) + Cost(build.output_cardinality * params.cpu_cost_per_row);
+                    let cost = outer.cost + build.cost + probe_cost;
+                    let cheaper = cost < cost_upper_bound
+                        && best_plan.as_ref().is_none_or(|plan| cost < plan.cost);
+                    let Some(method) = access_methods_arena.get_mut(probe_method) else {
+                        continue;
+                    };
+                    if !cheaper {
+                        access_methods_arena.truncate(arena_len);
+                        continue;
+                    }
+                    method.cost = probe_cost;
+                    let mut data = Vec::with_capacity(num_tables);
+                    data.extend_from_slice(&outer.data);
+                    data.extend_from_slice(&build.data);
+                    data.push((probe, probe_method));
+                    let mut prefix_cardinalities = Vec::with_capacity(num_tables);
+                    prefix_cardinalities.extend_from_slice(&outer.prefix_cardinalities);
+                    prefix_cardinalities.extend_from_slice(&build.prefix_cardinalities);
+                    prefix_cardinalities.push(rows);
+                    best_plan = Some(JoinN {
+                        data,
+                        output_cardinality: rows,
+                        cost,
+                        prefix_cardinalities,
+                        inner_joins: vec![InnerJoin {
+                            start: outer.data.len(),
+                            end: outer.data.len().saturating_add(build.data.len()),
+                        }],
+                    });
+                    // A bushy plan's run reads its rows before the loops: it keeps no order.
+                    best_plan_is_also_ordered = false;
+                }
+            }
+        }
+    }
+
     match best_plan {
         Some(best_plan) => Ok(Some(BestJoinOrderResult {
             best_plan,
@@ -1799,6 +1971,28 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         })),
         None => Err(LimboError::PlanningError("no query solution".to_string())),
     }
+}
+
+/// PL.8: whether the search tries bushy plans for this join. Not where a join keeps its place
+/// (outer, semi, anti or lateral: the conflict rules order those left-deep), a RIGHT or FULL JOIN,
+/// or a connection that asks for nested loops only, the cases the emitter's build groups refuse
+/// (`bushy_build_groups`).
+fn bushy_plans_allowed(
+    joined_tables: &[JoinedTable],
+    table_references: &TableReferences,
+    planning_context: JoinPlanningContext<'_>,
+    required_lhs_by_table: Option<&[TableMask]>,
+) -> bool {
+    joined_tables.len() >= 3
+        && planning_context.join_methods != crate::JoinMethods::NestedLoopsOnly
+        && required_lhs_by_table.is_none_or(|required| required.iter().all(TableMask::is_empty))
+        && !table_references.has_right_or_full_join()
+        && !joined_tables.iter().any(|table| {
+            table
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::is_ordering_constrained)
+        })
 }
 
 fn has_connected_legal_candidate(
@@ -1859,8 +2053,8 @@ pub const JOIN_SEARCH_BUDGET: usize = 10_000;
 /// set holds every table each of its tables must follow, and when it is joined to the smaller set
 /// by a term or no table that may follow it is: so the sets are the connected ones, cross products
 /// only where no join term is left, as DPccp enumerates (Moerkotte and Neumann, VLDB 2006), on a
-/// worklist instead of its recursion (CLAUDE.md §11), each set extended one table at a time so
-/// plans stay left-deep. The walk does at most `budget` times the tables' count of checks.
+/// worklist instead of its recursion (CLAUDE.md §11), each set extended one table at a time; the
+/// bushy plans pair these sets afterwards (PL.8). The walk does at most `budget` times the tables' count of checks.
 fn searchable_subsets(
     num_tables: usize,
     where_terms: &[WhereTermInfo],

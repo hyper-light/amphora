@@ -3128,16 +3128,18 @@ fn find_table_access_plan(
         best_plan
     };
 
-    let sort_eliminated = maybe_order_target.as_ref().is_some_and(|order_target| {
-        plan_satisfies_order_target(
-            &best_plan,
-            &access_methods_arena,
-            table_references.joined_tables(),
-            &constraints_per_table,
-            order_target,
-            schema,
-        )
-    });
+    // PL.8: a bushy plan's run reads its rows before the loops, so it keeps no order.
+    let sort_eliminated = best_plan.is_left_deep()
+        && maybe_order_target.as_ref().is_some_and(|order_target| {
+            plan_satisfies_order_target(
+                &best_plan,
+                &access_methods_arena,
+                table_references.joined_tables(),
+                &constraints_per_table,
+                order_target,
+                schema,
+            )
+        });
     let subquery_calls = count_subquery_calls_for_plan(
         &best_plan,
         &access_methods_arena,
@@ -3638,87 +3640,14 @@ fn bushy_build_groups(
 }
 
 #[cfg(test)]
-pub(crate) mod bushy_test_hook {
-    //! PL.8: a hand-built bushy plan for the emitter's tests, before the search makes them.
-    use super::*;
+pub(crate) mod bushy_search_tests {
+    //! PL.8 piece 2: the bushy plans the search makes, run by the emitter.
     use std::cell::Cell;
 
     thread_local! {
-        /// The position at which the build side of the plan's first materialized hash join is
-        /// split: the tables before it stay loops, the rest up to the probe form the build group.
-        pub(crate) static SPLIT: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    thread_local! {
-        /// Pins the left-deep plan the hook splits: the tables in the FROM order, each read by a
-        /// loop but the last, which probes a hash join built from the table before it. The search
-        /// would rarely choose that plan for a test's few rows, so the test builds it.
-        pub(crate) static PIN: Cell<bool> = const { Cell::new(false) };
-    }
-
-    thread_local! {
-        /// How many plans `split_build_side` made bushy.
-        pub(crate) static APPLIED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// The plan with the first run `data[split..probe]` the emitter can run as the build group of
-    /// the hash join at `probe`, the split from `SPLIT` on: a bushy plan of the same tables.
-    pub(crate) fn split_build_side(
-        plan: JoinN,
-        access_methods_arena: &mut [AccessMethod],
-        table_references: &TableReferences,
-        sort_eliminated: bool,
-    ) -> JoinN {
-        let Some(first_split) = SPLIT.with(Cell::get) else {
-            return plan;
-        };
-        if !plan.is_left_deep() {
-            return plan;
-        }
-        for probe in 0..plan.data.len() {
-            // The hand-built plan materializes the probe's build input from the run.
-            let Some(&(_, probe_method)) = plan.data.get(probe) else {
-                continue;
-            };
-            let materialized = match access_methods_arena
-                .get_mut(probe_method)
-                .map(|method| &mut method.params)
-            {
-                Some(AccessMethodParams::HashJoin {
-                    materialize_build_input,
-                    ..
-                }) => std::mem::replace(materialize_build_input, true),
-                _ => continue,
-            };
-            for split in first_split.max(1)..probe.saturating_sub(1) {
-                let mut bushy = plan.clone();
-                bushy.inner_joins.push(join::InnerJoin {
-                    start: split,
-                    end: probe,
-                });
-                if bushy_build_groups(
-                    &bushy,
-                    access_methods_arena,
-                    table_references,
-                    sort_eliminated,
-                )
-                .is_ok()
-                {
-                    APPLIED.with(|applied| applied.set(applied.get() + 1));
-                    return bushy;
-                }
-            }
-            if let Some(AccessMethodParams::HashJoin {
-                materialize_build_input,
-                ..
-            }) = access_methods_arena
-                .get_mut(probe_method)
-                .map(|method| &mut method.params)
-            {
-                *materialize_build_input = materialized;
-            }
-        }
-        plan
+        /// How many plans with a build group the planner handed to the emitter: what shows a
+        /// test's query was run bushy.
+        pub(crate) static BUSHY_PLANS: Cell<usize> = const { Cell::new(0) };
     }
 
     #[cfg(test)]
@@ -3728,7 +3657,7 @@ pub(crate) mod bushy_test_hook {
             clippy::indexing_slicing,
             clippy::arithmetic_side_effects
         )]
-        use super::{APPLIED, PIN, SPLIT};
+        use super::BUSHY_PLANS;
         use crate::io::MemoryIO;
         use crate::sync::Arc;
         use crate::{ConnectOpts, Database, JoinMethods, SqliteDialect};
@@ -3751,104 +3680,77 @@ pub(crate) mod bushy_test_hook {
             rows
         }
 
-        /// PL.8 piece 1 (T-PL.8.2): a hand-built bushy plan, a run of the left-deep plan's tables
-        /// joined among themselves into the build input of the hash join after them while the
-        /// tables before the run stay loops, answers as the left-deep plan does.
+        /// PL.8 piece 2 (T-PL.8.2): a join whose cheapest plan is bushy gets it from the search,
+        /// a few outer rows as loops and a large run built once into a hash join's input, and
+        /// answers as the left-deep plan of nested loops does.
         #[test]
-        fn t_pl_8_2_a_bushy_build_group_answers_as_the_left_deep_plan() {
+        fn t_pl_8_2_the_search_makes_bushy_plans_with_the_same_answers() {
             let io = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             for sql in [
                 "CREATE TABLE a(id INTEGER PRIMARY KEY, x INT)",
-                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT, qid INT)",
-                "CREATE TABLE q(id INTEGER PRIMARY KEY, y INT)",
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT)",
                 "CREATE TABLE c(id INTEGER PRIMARY KEY, y INT, z INT)",
                 "CREATE TABLE p(id INTEGER PRIMARY KEY, z INT, w INT)",
-                "CREATE INDEX c_y ON c(y)",
             ] {
                 conn.execute(sql).unwrap();
             }
-            for id in 1..=6 {
+            for id in 1..=4 {
                 conn.execute(format!("INSERT INTO a VALUES ({id}, {id})"))
                     .unwrap();
             }
-            for id in 1..=12 {
+            for id in 1..=300 {
                 conn.execute(format!(
-                    "INSERT INTO b VALUES ({id}, {}, {}, {})",
-                    id % 5,
-                    id % 3,
-                    id % 4 + 1
+                    "INSERT INTO b VALUES ({id}, {}, {})",
+                    id % 7,
+                    id % 50
                 ))
                 .unwrap();
-            }
-            for id in 1..=4 {
-                conn.execute(format!("INSERT INTO q VALUES ({id}, {})", id % 3))
-                    .unwrap();
-            }
-            for id in 1..=15 {
                 conn.execute(format!(
                     "INSERT INTO c VALUES ({id}, {}, {})",
-                    id % 3,
-                    id % 4
+                    id % 50,
+                    id % 40
                 ))
                 .unwrap();
             }
-            for id in 1..=20 {
-                conn.execute(format!("INSERT INTO p VALUES ({id}, {}, {id})", id % 4))
-                    .unwrap();
+            for id in 1..=12 {
+                conn.execute(format!(
+                    "INSERT INTO p VALUES ({id}, {}, {})",
+                    id % 40,
+                    id % 6
+                ))
+                .unwrap();
             }
-            // Statistics, so the pinned plan's build input is estimated at its few rows.
             conn.execute("ANALYZE").unwrap();
             let queries = [
-                "SELECT a.id, b.id, c.id, p.id FROM a JOIN b ON b.x > a.x JOIN c ON c.y = b.y \
-                 JOIN p ON p.z = c.z",
-                "SELECT a.id, b.id, c.id, p.id, p.w FROM a JOIN b ON b.x > a.x JOIN c ON c.y = b.y \
-                 JOIN p ON p.z = c.z WHERE a.x + c.z < 7 AND b.id <> p.w",
-                "SELECT count(*), sum(p.w) FROM a, b, c, p WHERE b.x = a.x AND c.y = b.y AND p.z = c.z",
-                "SELECT a.id, b.id, c.id, p.id FROM a JOIN b ON b.x = a.x JOIN c ON c.y = b.y \
-                 JOIN p ON p.z = c.z AND p.w > a.x",
-                            "SELECT a.id, b.id, c.id, p.id FROM a, b JOIN c ON c.y = b.y JOIN p ON p.z = c.z \
-                 WHERE a.id = 2",
-                "SELECT a.id, b.id, c.id, p.id, p.w FROM a, b JOIN c ON c.y = b.y \
-                 JOIN p ON p.z = c.z WHERE a.id = 3 AND b.x <> a.x AND p.w > a.x + c.id",
-                "SELECT a.id, b.id, q.id, c.id FROM a, b JOIN q ON q.id = b.qid \
-                 JOIN c ON c.z = q.y WHERE a.id = 2 AND b.x <> a.x",
-                "SELECT a.id, b.id, q.id, c.id, c.y FROM a, b JOIN q ON q.id = b.qid \
-                 JOIN c ON c.z = q.y AND c.y <> a.x WHERE a.id = 4",
+                "SELECT a.id, b.id, c.id, p.id FROM a, b, c, p \
+                 WHERE c.y = b.y AND p.z = c.z AND p.w > a.x",
+                "SELECT count(*), sum(p.w) FROM a, b, c, p \
+                 WHERE c.y = b.y AND p.z = c.z AND p.w > a.x AND b.x <> a.x",
+                "SELECT a.id, b.id, c.id, p.id FROM a JOIN p ON p.w > a.x \
+                 JOIN c ON c.z = p.z JOIN b ON b.y = c.y WHERE a.id < 3",
+                "SELECT a.id, b.id, c.id, p.id, p.w FROM a, b, c, p \
+                 WHERE c.y = b.y AND p.z = c.z AND p.w + a.x = 7 AND b.x < a.x + c.id",
             ];
-            let mut compared = 0;
+            let mut bushy = 0;
             for methods in [JoinMethods::ByCost, JoinMethods::HashJoinsOnly] {
-                conn.set_join_methods(methods);
                 for sql in queries {
-                    // The plan the search chooses, left-deep.
-                    PIN.with(|pin| pin.set(false));
-                    SPLIT.with(|split| split.set(None));
+                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
                     let left_deep = rows(&conn, sql);
-                    // The pinned left-deep plan: loops, then a hash join at the last table.
-                    PIN.with(|pin| pin.set(true));
-                    let pinned = rows(&conn, sql);
-                    let pinned_plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
-                    // The same plan with the tables after the first joined among themselves
-                    // into the hash join's build input: a bushy tree `(a ((b c) p))`.
-                    APPLIED.with(|applied| applied.set(0));
-                    SPLIT.with(|split| split.set(Some(1)));
-                    let bushy = rows(&conn, sql);
-                    let made_bushy = APPLIED.with(Cell::get);
-                    SPLIT.with(|split| split.set(None));
-                    PIN.with(|pin| pin.set(false));
+                    conn.set_join_methods(methods);
+                    BUSHY_PLANS.with(|plans| plans.set(0));
+                    let searched = rows(&conn, sql);
+                    let made_bushy = BUSHY_PLANS.with(Cell::get);
+                    let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                    eprintln!("{methods:?} bushy={made_bushy}: {sql}: {plan:?}");
+                    bushy += made_bushy.min(1);
                     assert!(!left_deep.is_empty(), "{sql}");
-                    // Non-vacuity: this query's plan was run bushy.
-                    assert!(
-                        made_bushy > 0,
-                        "{methods:?}: no plan was made bushy: {sql}: {pinned_plan:?}"
-                    );
-                    assert_eq!(pinned, left_deep, "{methods:?} pinned: {sql}");
-                    assert_eq!(bushy, left_deep, "{methods:?} bushy: {sql}");
-                    compared += 1;
+                    assert_eq!(searched, left_deep, "{methods:?}: {sql}: {plan:?}");
                 }
             }
-            assert_eq!(compared, 16);
+            // Non-vacuity: the search chose bushy plans.
+            assert!(bushy > 0, "no query was planned bushy");
         }
     }
 }
@@ -3899,13 +3801,6 @@ fn apply_table_access_plan(
         }
     }
 
-    #[cfg(test)]
-    let best_plan = bushy_test_hook::split_build_side(
-        best_plan,
-        &mut access_methods_arena,
-        table_references,
-        sort_eliminated,
-    );
     // PL.8: a bushy plan's inner joins are hash joins whose build side is the run's tables.
     let build_groups = bushy_build_groups(
         &best_plan,
@@ -3913,6 +3808,10 @@ fn apply_table_access_plan(
         table_references,
         sort_eliminated,
     )?;
+    #[cfg(test)]
+    if !build_groups.is_empty() {
+        bushy_search_tests::BUSHY_PLANS.with(|plans| plans.set(plans.get() + 1));
+    }
     let (best_access_methods, best_table_numbers) = (
         best_plan.best_access_methods().collect::<Vec<_>>(),
         best_plan.table_numbers().collect::<Vec<_>>(),
