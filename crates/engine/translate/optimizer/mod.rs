@@ -4026,6 +4026,12 @@ pub(crate) mod bushy_search_tests {
                 let searched = rows(&conn, &sql);
                 let made_bushy = BUSHY_PLANS.with(Cell::get);
                 let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                // Non-vacuity: the EXISTS was planned as a semi or anti join, not a subquery.
+                let json = rows(&conn, &format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}")).join("");
+                assert!(
+                    json.contains("\"semi\"") || json.contains("\"anti\""),
+                    "no semi or anti join: {sql}: {json}"
+                );
                 assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
                 assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
             }
