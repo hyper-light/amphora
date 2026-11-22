@@ -6,7 +6,8 @@
 //! This is the one place the skipping module reads storage; the summaries themselves stay pure.
 
 use super::{
-    Candidates, CrackerColumn, SkipCounts, SkipError, SkipRefusal, Skipping, ZoneMap, ZoneMapBuilder,
+    Candidates, CrackerColumn, SkipCounts, SkipError, SkipRefusal, Skipping, ZoneMap,
+    ZoneMapBuilder,
 };
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, CursorTrait};

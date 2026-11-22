@@ -623,9 +623,24 @@ newest commit (`connection_wal_pos` against the shared position); any other read
 summaries that took its writes `Stale` until built again; MVCC is refused (`SkipRefusal::Mvcc`).
 `skipping::skipping_candidates` is the scan's question and `skipping_counts` what each summary did.
 
-**Not yet.** The VDBE's table scan doesn't yet ask `skipping_candidates` (a planner hint for an
-integer-bounded term on the summarized column, and a rowid-range walk in the scan cursor), and
-neither kind is chosen by measured cost until the harness's numbers are recorded.
+**The scan (lane g5s4d, T-G5.4.3).** At translation a SELECT's plain forward scan of a rowid
+table (no index, no outer join in the query) carries a `SkipHint`: each column's integer bounds
+that its WHERE terms put on every result row (`a BETWEEN 10 AND 20`, `a >= 10 AND a < 20`,
+`5 < a`, `a = 7`; a real, text or parameter constant, a COLLATE, an IN list or NOT BETWEEN gives no
+bound: loose, never wrong). At run time the Rewind asks the registry for the hinted column's
+candidates only when a summary is kept for it and the reader may consult it (the rule above); a
+refusal is counted (`SkipCounts`) and the scan reads every row. With candidates, a `SkipWalk` on
+the cursor seeks past each run of rows they leave out (a zone map's rowid ranges, or the cracker's
+rowids folded into runs), keeping its place across an I/O wait; the filter is still evaluated on
+each row read, so the answer is the plain scan's. A walking scan runs its body row by row (no
+fused batch). The statement's `rows_read` counts only the rows read, and each seek counts as a
+table seek. No size is picked: a zone is a table leaf (the page size and the record format set
+how many rows it holds), the tail zone grows to the leaves' measured fill, and the cracker's pieces
+are cut where filters asked.
+
+**Not yet.** Neither kind is chosen by measured cost (the harness's numbers aren't recorded), a
+summary is turned on by `skipping::set_skipping` (no SQL), and bounds from parameters
+(`a BETWEEN ? AND ?`) aren't read.
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's

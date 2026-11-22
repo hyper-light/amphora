@@ -938,7 +938,10 @@ worker), charged to the statement's memory budget with a typed refusal that fall
 serial loop; two-table hash joins that return rows (no aggregates) run on morsels, with an
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.
-Lane g5s4c (G5 step 4, wiring): the engine's Insert and Delete opcodes feed a per-database registry
-of skipping summaries (zone maps or cracking), consulted only at the snapshot a summary holds (an
-older reader is refused, typed, and scans every row; a rollback makes it stale). The scan doesn't
-ask it yet; see executor.md decision 11, "Not yet".
+
+G5 step 4 wired (lanes g5s4c, g5s4d): the engine's Insert and Delete opcodes keep a per-database
+registry of skipping summaries (zone maps or cracking), and a SELECT's scan with integer bounds on
+a summarized column seeks past the rows the summary leaves out, consulting it only at the snapshot
+it holds (an older reader, or a rolled-back summary, is refused, counted, and reads every row).
+Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). Open: choosing a kind
+by measured cost, a SQL switch, parameter bounds (executor.md decision 11, "Not yet").

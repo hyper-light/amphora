@@ -30,6 +30,7 @@
 mod cracking;
 mod leaves;
 mod registry;
+mod scan;
 mod zone_map;
 
 pub use cracking::{CrackerColumn, CrackerStats};
@@ -37,6 +38,9 @@ pub use leaves::{
     set_skipping, skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,
 };
 pub use registry::{SkipCounts, SkipRefusal, SkipRegistry, WalPos};
+pub use scan::{
+    integer_bounds, ColumnBounds, SkipHint, SkipWalk, SkipWalks, WalkPhase, WalkTarget,
+};
 pub use zone_map::{RowidRange, ZoneMap, ZoneMapBuilder, ZoneStats};
 
 /// One finished write to the summarized table, as the write path hands it to the hook: the row's

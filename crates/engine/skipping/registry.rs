@@ -95,7 +95,10 @@ impl SkipRegistry {
     /// Marks the table at `root_page`'s summary stale: a write reached it that it couldn't take.
     pub fn mark_stale(&self, root_page: i64) {
         let mut entries = self.entries.lock();
-        for entry in entries.iter_mut().filter(|entry| entry.root_page == root_page) {
+        for entry in entries
+            .iter_mut()
+            .filter(|entry| entry.root_page == root_page)
+        {
             entry.stale = true;
         }
     }
@@ -114,7 +117,10 @@ impl SkipRegistry {
     /// the summary refuses makes it stale.
     pub fn on_write(&self, root_page: i64, writer: usize, committed: WalPos, write: RowWrite) {
         let mut entries = self.entries.lock();
-        let Some(entry) = entries.iter_mut().find(|entry| entry.root_page == root_page) else {
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.root_page == root_page)
+        else {
             return;
         };
         entry.pending = Some(Pending {

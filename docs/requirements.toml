@@ -1111,6 +1111,7 @@ title = "Skipping rows wired into the engine's writes, read at the summary's sna
 criteria = []
 tests = [
   { id = "T-G5.4.2", text = "skipping::tests::wired::t_g5_4_2_* — passes when, with SQL inserts, updates and deletes between scans, each kind's candidates read through SQL answer exactly as a plain scan and something was skipped; a reader at an older snapshot, or beside an open writer, is refused (OlderSnapshot) and its plain scan keeps its rows; a rollback makes the summary Stale until built again" },
+  { id = "T-G5.4.3", text = "skipping::tests::scans::t_g5_4_3_* (lane g5s4d) — passes when, for each kind, SQL filters (BETWEEN, >= and <=, a flipped <, =) on a summarized column answer exactly as the same SQL on a database without the summary, with random SQL inserts, updates and deletes between queries; every query consulted the summary, the statement's rows_read summed lower than without it, and zones were skipped or the column cracked; an open writer reads its own writes through it, a rollback makes it Stale (counted, every row read, right answer), and a reader at an older snapshot is refused (counted) and keeps its snapshot's rows" },
 ]
 
 # lane repl-measure-2 (G12 steps 1 and 3-5, CP-T1.8): no new IDs. bench/repl.sh runs every measure on
