@@ -258,7 +258,11 @@ pub(crate) fn step(
                 .checked_add(1)
                 .ok_or_else(|| api::invalid("compaction count", "visited count overflow"))?;
         }
-        if next(db, ns, cutoff, cursor.as_ref())?.is_none() {
+        // A cutoff is complete once its versions are, and the stamps of the revisions they
+        // leave (T-T1.9.R21), so the stamp table stays bounded with the versions.
+        if next(db, ns, cutoff, cursor.as_ref())?.is_none()
+            && super::across::trim(db, ns, feed, visits.saturating_sub(visited))?
+        {
             completed = cutoff;
             target = if completed < horizon {
                 Some(horizon)

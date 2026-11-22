@@ -51,6 +51,124 @@ pub(super) fn stamp(db: &Db, ns: &str, at: Rev) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Trims the stamps of revisions compaction took through (CP-T1.9, T-T1.9.R21), at most `visits`
+/// of them, inside compaction's page-fenced step: whether every stamp it may trim is gone. A stamp
+/// is kept while a version of its revision is (a scan answers a row's revision as its stamp), and
+/// so is the newest stamp at or before the feed: it is the horizon a refused read is told, and it
+/// places a cursor older than it below the feed, so `through` stays exact for every cursor
+/// compaction hasn't passed. So the table holds at most one stamp a kept revision, plus one.
+///
+/// It sweeps in rounds, each through the stamp kept when it began (`__amphora_stamp_trim`): a
+/// revision whose versions compaction dropped since the last round, or that moved out, is found by
+/// the next. A round walks the revisions kept below the feed, as the version pass walks the
+/// versions below its cutoff.
+pub(super) fn trim(db: &Db, ns: &str, feed: Rev, visits: usize) -> anyhow::Result<bool> {
+    let mut keep = None;
+    db.query(
+        "SELECT rev FROM __amphora_rev_stamps WHERE namespace = ?1 AND rev <= ?2 ORDER BY rev DESC LIMIT 1",
+        [text(ns), integer(feed)?],
+        |r| {
+            keep = Some(rev(r, 0)?);
+            Ok(false)
+        },
+    )?;
+    let Some(keep) = keep else {
+        return Ok(true);
+    };
+    // Lazy DDL in the same committed step, as compaction's own state (`compaction::step`).
+    db.exec("CREATE TABLE IF NOT EXISTS __amphora_stamp_trim(namespace TEXT PRIMARY KEY, through INTEGER NOT NULL, cursor INTEGER NOT NULL)")?;
+    let mut state = None;
+    db.query(
+        "SELECT through, cursor FROM __amphora_stamp_trim WHERE namespace = ?1",
+        [text(ns)],
+        |r| {
+            state = Some((rev(r, 0)?, rev(r, 1)?));
+            Ok(false)
+        },
+    )?;
+    let (mut through, mut cursor) = state.unwrap_or((0, 0));
+    if cursor >= through {
+        if keep <= through {
+            return Ok(true);
+        }
+        (through, cursor) = (keep, 0);
+    }
+    let mut visited = 0usize;
+    while visited < visits {
+        let mut next = None;
+        db.query(
+            "SELECT rev FROM __amphora_rev_stamps WHERE namespace = ?1 AND rev > ?2 AND rev < ?3 ORDER BY rev LIMIT 1",
+            [text(ns), integer(cursor)?, integer(through)?],
+            |r| {
+                next = Some(rev(r, 0)?);
+                Ok(false)
+            },
+        )?;
+        let Some(at) = next else {
+            cursor = through;
+            break;
+        };
+        if !written_at(db, ns, at)? {
+            db.query(
+                "DELETE FROM __amphora_rev_stamps WHERE namespace = ?1 AND rev = ?2",
+                [text(ns), integer(at)?],
+                |_| Ok(true),
+            )?;
+        }
+        cursor = at;
+        visited = visited
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("stamp trim count overflow"))?;
+    }
+    db.query(
+        "INSERT INTO __amphora_stamp_trim(namespace, through, cursor) VALUES (?1, ?2, ?3) ON CONFLICT(namespace) DO UPDATE SET through = excluded.through, cursor = excluded.cursor",
+        [text(ns), integer(through)?, integer(cursor)?],
+        |_| Ok(true),
+    )?;
+    Ok(cursor >= through && keep <= through)
+}
+
+/// Whether a version of revision `at` of `ns` is still here, in any of its families: one seek of
+/// each family's feed index.
+fn written_at(db: &Db, ns: &str, at: Rev) -> anyhow::Result<bool> {
+    let mut family: Option<String> = None;
+    loop {
+        let mut next = None;
+        let found = |r: &amphora_engine::Row| -> anyhow::Result<bool> {
+            next = Some(r.get::<String>(0).map_err(unavailable)?);
+            Ok(false)
+        };
+        match &family {
+            None => db.query(
+                "SELECT family FROM __amphora_families WHERE namespace = ?1 ORDER BY family LIMIT 1",
+                [text(ns)],
+                found,
+            )?,
+            Some(after) => db.query(
+                "SELECT family FROM __amphora_families WHERE namespace = ?1 AND family > ?2 ORDER BY family LIMIT 1",
+                [text(ns), text(after)],
+                found,
+            )?,
+        }
+        let Some(name) = next else {
+            return Ok(false);
+        };
+        let mut kept = false;
+        db.query(
+            "SELECT 1 FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND rev = ?3 LIMIT 1",
+            [text(ns), text(&name), integer(at)?],
+            |_| {
+                kept = true;
+                Ok(false)
+            },
+        )?;
+        if kept {
+            return Ok(true);
+        }
+        family = Some(name);
+    }
+}
+
 /// Each group's database and the stamps it makes, in the cluster's order. A group on a node is
 /// refused (its endpoint answers only what a node asks, decision "The transport between
 /// machines"), as is a group that stamps no commits.
@@ -345,6 +463,92 @@ mod tests {
 
     fn until() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    /// Each stamped revision of `ns` here, and each revision a version of it is kept at.
+    fn stamps_and_versions(db: &Database, ns: &'static str) -> (Vec<Rev>, Vec<Rev>) {
+        db.call_internal(until(), move |db| {
+            let (mut stamps, mut versions) = (Vec::new(), Vec::new());
+            db.query(
+                "SELECT rev FROM __amphora_rev_stamps WHERE namespace = ?1 ORDER BY rev",
+                [text(ns)],
+                |r| {
+                    stamps.push(rev(r, 0)?);
+                    Ok(true)
+                },
+            )?;
+            db.query(
+                "SELECT DISTINCT rev FROM __amphora_versions WHERE namespace = ?1 ORDER BY rev",
+                [text(ns)],
+                |r| {
+                    versions.push(rev(r, 0)?);
+                    Ok(true)
+                },
+            )?;
+            Ok((stamps, versions))
+        })
+        .unwrap()
+    }
+
+    /// T-T1.9.R21 (CP-T1.9; reshard.md, "Decision (lane split-merge-19): compaction trims the
+    /// commit stamps"). Do: one backed-up database; 600 commits, each overwriting the next of 8
+    /// keys, compacting to the head after every 50; after each compaction, the stamps and the
+    /// revisions whose versions are kept. Expect: every kept revision still stamped (a scan across
+    /// groups answers a row's revision as its stamp), and at most one stamp a kept revision plus
+    /// one, the newest at or before the feed, however long the run: 8 or 9, never the commits so
+    /// far.
+    #[test]
+    fn t_t1_9_r21_compaction_keeps_the_stamp_table_bounded() {
+        const KEYS: u64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        let archive = Archive {
+            blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+            prefix: "g0".into(),
+            clock: Arc::new(move || now.fetch_add(1, Ordering::SeqCst)),
+            memory: 32 * 1024,
+            patience: Duration::from_secs(60),
+            check: CheckPolicy::Off,
+        };
+        let (db, _sink) =
+            Database::open_backed_up(&dir.path().join("g0.db"), archive, until()).unwrap();
+        let ns = db.namespace("n").unwrap();
+        for i in 0..600u64 {
+            let head = ns
+                .commit(
+                    api::Tx {
+                        conds: vec![],
+                        writes: vec![api::Write::Put {
+                            family: "f".into(),
+                            key: (i % KEYS).to_be_bytes().to_vec(),
+                            value: i.to_be_bytes().to_vec(),
+                        }],
+                    },
+                    until(),
+                )
+                .unwrap();
+            if (i + 1) % 50 != 0 {
+                continue;
+            }
+            ns.compact(head, until()).unwrap();
+            let (stamps, versions) = stamps_and_versions(&db, "n");
+            assert!(
+                versions.iter().all(|at| stamps.binary_search(at).is_ok()),
+                "a kept revision lost its stamp: {versions:?} {stamps:?}"
+            );
+            let bound = versions.len().checked_add(1).unwrap();
+            assert!(
+                stamps.len() <= bound,
+                "after commit {i}: {} stamps for {} kept revisions",
+                stamps.len(),
+                versions.len()
+            );
+            assert!(
+                u64::try_from(versions.len()).unwrap() <= KEYS,
+                "{versions:?}"
+            );
+        }
     }
 
     /// T-T1.9.R20 (CP-T1.9; reshard.md, "Decision (lane split-merge-18): reads across groups by

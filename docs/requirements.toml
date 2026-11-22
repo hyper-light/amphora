@@ -833,6 +833,8 @@ tests = [
   { id = "T-T1.9.R19", text = "A local database made a group's, with one key, then eight, then more keys than one page of its position index holds — passes when it has no size cut with one key, and after that a cut with weight on each side and keys on each side of it, read from the index's root page alone" },
   # lane split-merge-18
   { id = "T-T1.9.R20", text = "Two backed-up groups, the second's clock 500 seconds behind the first's, rows written in turn through their coordinator, then read across groups — passes when the changes come in the order written, in pages of one alike, after a row's stamp the rows after it, the head at or past the last, a scan merged by key with more until its last page, a row written after the head stamped past it, and a group that stamps nothing refused" },
+  # lane split-merge-19
+  { id = "T-T1.9.R21", text = "One backed-up database, 600 commits each overwriting the next of 8 keys, compacted to the head after every 50 — passes when after each compaction every revision with a kept version is still stamped and the stamps number at most the kept revisions plus one" },
 ]
 
 # lane qs5

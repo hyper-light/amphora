@@ -646,9 +646,39 @@ after the head is stamped past it.
   answers it at 0, and the changes refuse it. The copy path doesn't move the stamps with the rows
   yet.
 - Compaction keeps every stamp, one row a revision: it must trim the stamps of the revisions it
-  took, within its bounded steps, before this is bounded.
+  took, within its bounded steps, before this is bounded. Done: decision "Decision (lane
+  split-merge-19): compaction trims the commit stamps".
 - `get`, `commit`, `changed` and `wait` still answer from this database alone; groups on a node are
   read through their own endpoint once it answers Records.
 
 **Falsified by.** A change across groups answered after one that was written after it; a change
 made at or before a head answered earlier; a page that cuts a stamp.
+
+## Decision (lane split-merge-19): compaction trims the commit stamps
+
+Every resource is bounded, and `__amphora_rev_stamps` held one row a revision for good. Now
+compaction trims it in the same page-fenced steps as the versions (`across::trim`, called from
+`compaction::step`): a cutoff is complete only once its versions are and the stamps they leave are.
+- A stamp is kept while any version of its revision is, in any family: a scan across groups answers
+  a row's revision as its stamp, and a row compaction keeps can be old.
+- The newest stamp at or before the feed is kept as well: it is the horizon a refused read of the
+  changes is told, and it keeps `through` exact. A cursor at or past it finds the revisions as
+  before; one older finds a revision below the feed, which is refused as compacted, as before.
+- The sweep goes in rounds, each through the stamp kept when it began, its cursor in
+  `__amphora_stamp_trim` (made lazily in the step, as compaction's own state is), so it never
+  holds more than one stamp's work and resumes after any step. A round walks the revisions kept
+  below the feed, as the version pass walks the versions below its cutoff, and finds those whose
+  versions moved out to another group as well as those compaction dropped.
+- Whether a revision is still kept is one seek of each of its namespace's families in the feed
+  index, so commits pay nothing more (no index on revision alone).
+
+So the table holds at most one stamp a revision with a kept version, plus one, plus the revisions
+not yet compacted, the same bound as the versions.
+
+**Evidence.** T-T1.9.R21: one backed-up database, 600 commits each overwriting the next of 8 keys,
+compacted to the head after every 50; after each compaction every revision with a kept version is
+stamped, and the stamps number at most the kept revisions plus one (8 or 9, not the commits so
+far).
+
+**Falsified by.** A stamps table that grows with the commits under compaction; a kept row whose
+stamp is gone; a read of the changes after a trimmed stamp that is answered rather than refused.
