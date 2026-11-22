@@ -879,3 +879,8 @@ tests = [
 # leader under load, count acknowledged events lost), the catch-up of G12 step 3 (`catchup`), and
 # G12 step 1's comparison set (dqlite, rqlite, LiteFS and libSQL through bench/servers/repl/). Its
 # tests: bench/src/repl.rs g12_repl_*. The measurements are the coordinator's.
+
+# lane repl-measure-2 (G12 steps 1 and 3-5, CP-T1.8): no new IDs. bench/repl.sh runs every measure on
+# every system with one command; LiteFS fails over on Consul's lease (servers/repl/litefs.sh); dqlite's
+# shim builds and its cluster comes up. libSQL's failover and dqlite's member catch-up stay refused,
+# typed: sqld has no election, and dqlite reads only through its leader.
