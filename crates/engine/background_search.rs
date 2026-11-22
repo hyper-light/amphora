@@ -458,18 +458,26 @@ impl IdleSearches {
         counters.end(gone);
     }
 
-    /// The connection went idle: runs its oldest search, one, so the call that ended the
+    /// The connection went idle: runs its oldest live search, one, so the call that ended the
     /// connection's last statement returns late by one search at most; the rest wait for the next
-    /// time it goes idle (lane pl8-18). One is the least work that still moves the queue on: the
+    /// time it goes idle (lane pl8-18). Requests whose statements have gone ahead of it leave as
+    /// abandoned, which costs no search. One is the least work that still moves the queue on: the
     /// bound is the search, never a count or a time of ours. A search that makes the connection
     /// idle again (none does) doesn't start another inside it.
     pub(crate) fn run(&self, counters: &SearchCounters) {
         if self.running.swap(true, Ordering::AcqRel) {
             return;
         }
-        let next = self.queue.lock().pop_front();
-        if let Some(request) = next {
-            request.run(counters);
+        loop {
+            let next = self.queue.lock().pop_front();
+            let Some(request) = next else {
+                break;
+            };
+            if request.live() {
+                request.run(counters);
+                break;
+            }
+            SearchCounters::add(&counters.abandoned);
         }
         self.running.store(false, Ordering::Release);
     }

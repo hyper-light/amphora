@@ -2612,10 +2612,11 @@ mod tests {
         assert!(stats.stale <= stats.replaced, "{stats:?}");
     }
 
-    /// Do: under placement `Idle`, with the connection kept busy, prepare two star joins, then let
-    /// the connection go idle twice. Expect: each time it goes idle it runs one search, the oldest
-    /// first, so the call that ended its last statement is late by one search at most (T-PL.8.12,
-    /// lane pl8-18).
+    /// Do: under placement `Idle`, with the connection kept busy, prepare three star joins and drop
+    /// the first, then let the connection go idle twice. Expect: each time it goes idle it runs one
+    /// search, the oldest live one first, the dropped statement's request leaving as abandoned on
+    /// the way, so the call that ended its last statement is late by one search at most
+    /// (T-PL.8.12, lane pl8-18).
     #[test]
     fn t_pl_8_12_each_idle_runs_one_search() {
         let conn = star_connection();
@@ -2625,15 +2626,24 @@ mod tests {
             .run_one_step_blocking(|| Ok(()), || Ok(()))
             .unwrap()
             .is_some());
+        let gone = conn.prepare(star_sql()).unwrap();
         let first = conn.prepare(star_sql()).unwrap();
         let second = conn
             .prepare(format!("{} AND d1.v < 40", star_sql()))
             .unwrap();
+        drop(gone);
         assert!(first.exact_search_pending() && second.exact_search_pending());
-        assert_eq!(conn.idle_searches_pending(), 2);
+        assert_eq!(conn.idle_searches_pending(), 3);
+        let before = conn.background_search_stats();
         held.reset().unwrap();
+        let after = conn.background_search_stats();
+        assert_eq!(
+            after.abandoned - before.abandoned,
+            1,
+            "the gone statement's, no search"
+        );
         assert_eq!(conn.idle_searches_pending(), 1);
-        assert!(!first.exact_search_pending(), "the oldest first");
+        assert!(!first.exact_search_pending(), "the oldest live one first");
         assert!(second.exact_search_pending());
         let mut quick = conn.prepare("SELECT 1").unwrap();
         count_of(&mut quick);

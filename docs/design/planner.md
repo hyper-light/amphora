@@ -1740,9 +1740,10 @@ of the connection, read for this decision:
 - *Shared estimators.* The learned weights and row counters are the database's, shared by its
   connections and synchronised for that; the search reads them as any connection's prepare does.
 
-Placement `Idle` now runs one search each time the connection goes idle, the oldest, so the step or
-reset that ended the connection's last statement returns late by one search at most; the rest wait
-for the next time it goes idle. One is the least work that still moves the queue on, not a tuned
+Placement `Idle` now runs one search each time the connection goes idle, the oldest live one
+(requests whose statements have gone leave on the way, as abandoned, costing no search), so the step
+or reset that ended the connection's last statement returns late by one search at most; the rest
+wait for the next time it goes idle. One is the least work that still moves the queue on, not a tuned
 count.
 
 **Why.** A snapshot taken where the fast plan was made means the exact plan answers the same
