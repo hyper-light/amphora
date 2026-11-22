@@ -1423,8 +1423,8 @@ fn planned_rows(conn: &Arc<Connection>, sql: &str, opcode: &str, marker: &str) -
 /// one prepared statement, and in a statement prepared after. Expect: one answer every way; off,
 /// nothing counted; on, the prefix counted, past its error the count stored and the statement
 /// planned again once; nothing plans again after, whichever prefix the new plan holds (PL.13, lane
-/// replan-11, robust in lane replan-12, T-PL.13.18: a build fed by a materialized input, at its
-/// materialization point).
+/// replan-11, robust in lane replan-12, the prefix's two tables checked in lane replan-14,
+/// T-PL.13.18: a build fed by a materialized input, at its materialization point).
 #[test]
 fn t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again() {
     let (_dir, conn) = open("materialized_prefix.db");
@@ -1450,6 +1450,28 @@ fn t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again() {
             .iter()
             .any(|step| step.contains("MATERIALIZE hash build input")),
         "the prefix is not materialized: {steps:?}"
+    );
+    // The build input is a join of two tables, not one table's rows: the steps under the
+    // materialization read both of a prefix's tables (lane replan-14).
+    let plan = conn
+        .prepare(format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    let materialized: Vec<String> = plan
+        .iter()
+        .filter(|row| row[3].to_string().contains("MATERIALIZE hash build input"))
+        .flat_map(|input| {
+            plan.iter()
+                .filter(|row| row[1].to_string() == input[0].to_string())
+                .map(|row| row[3].to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        materialized.len(),
+        2,
+        "the materialized input reads a two-table prefix: {materialized:?} in {steps:?}"
     );
     let planned = planned_rows(&conn, sql, "SubqueryCounted", "subquery's ");
     let [estimate] = planned[..] else {

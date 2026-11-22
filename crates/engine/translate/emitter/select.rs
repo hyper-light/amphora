@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{TursoFromIterator, TursoIteratorExt},
+    alloc::{TryClone, TursoFromIterator, TursoIteratorExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
@@ -350,7 +350,8 @@ struct MaterializationSpec {
     payload_columns: Vec<MaterializedColumnRef>,
     /// PL.13 (lane replan-11): the join prefix whose rows the input holds, one a row, where they
     /// are checked against the plan's estimate (`main_loop::join_prefix_check`): a left-deep
-    /// prefix of two tables or more, each of them in it, stored key and payload.
+    /// prefix of two tables or more (its loops and the build tables their hash joins read, lane
+    /// replan-14), stored key and payload.
     checked_prefix: Option<TableMask>,
 }
 
@@ -483,19 +484,24 @@ pub(crate) fn emit_materialized_build_inputs(
             // Therefore: if the prefix has other tables, we must store key+payload
             // rows so each prefix match stays distinct and the main plan can drop
             // the prefix loops.
-            let (prefix_order, included_tables) = materialization_prefix(
+            let (_, included_tables) = materialization_prefix(
                 plan,
                 hash_join_op.build_table_idx,
                 probe_table_idx,
                 &hash_join_op.build_group,
             )?;
-            let prefix_mask: TableMask =
-                prefix_order.iter().map(|m| m.original_idx).try_collect()?;
-            let checked_prefix = (hash_join_op.build_group.is_empty()
-                && prefix_order.len() >= 2
-                && prefix_mask.contains_all_set_bits_of(&included_tables)
-                && included_tables.contains_all_set_bits_of(&prefix_mask))
-            .then_some(prefix_mask);
+            // T-PL.13.18 (lane replan-14): the prefix the input holds is every table it joins,
+            // the loops before the probe and the build tables their hash joins read. A hash
+            // join's build table runs no loop of its own (the plan's join order leaves it out),
+            // so a two-table prefix whose second table probes the first has a join order of one
+            // table: the check goes by the tables joined, as the planner noted them
+            // (`optimizer::note_materialized_prefixes`, every table before the probe).
+            let checked_prefix =
+                if hash_join_op.build_group.is_empty() && included_tables.count() >= 2 {
+                    Some(included_tables.try_clone()?)
+                } else {
+                    None
+                };
             let prefix_has_other_tables = included_tables
                 .iter()
                 .any(|table_idx| table_idx != hash_join_op.build_table_idx);
