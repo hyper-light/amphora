@@ -879,6 +879,12 @@ impl Cluster {
         &self.groups
     }
 
+    /// The group a routing key's row is in: what a database's reads of one key across groups read
+    /// (lane split-merge-19, T-T1.9.R24).
+    pub(crate) fn group_of(&self, key: &[u8]) -> GroupId {
+        (self.route)(key)
+    }
+
     /// What it counted so far (AC-T1.10.6).
     pub fn counted(&self) -> Counted {
         let mut out = Counted::default();

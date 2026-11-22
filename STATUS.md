@@ -580,7 +580,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   coordinator scans, reads changes and heads across every group, each revision by its commit stamp (T-T1.9.R20). Compaction trims
   the stamps with the revisions it drops, so the table stays bounded (lane split-merge-19, T-T1.9.R21). The read
   point is an A/B behind `ReadPoint` (latest with a clock push, the control; earliest without), its lab written (T-T1.9.R22). A row moved in
-  carries its commit stamp, so scans and changes across groups place it (T-T1.9.R23).
+  carries its commit stamp, so scans and changes across groups place it (T-T1.9.R23). `get` and `changed` read
+  across groups too (T-T1.9.R24); `commit` and `wait` are left.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

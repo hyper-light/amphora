@@ -403,31 +403,9 @@ fn changes_in(
     cut: u64,
     limit: usize,
 ) -> anyhow::Result<Result<(Vec<Change>, bool), Refusal>> {
-    let mut feed = 0;
-    db.query(
-        "SELECT feed FROM __amphora_namespaces WHERE name = ?1",
-        [text(ns)],
-        |r| {
-            feed = rev(r, 0)?;
-            Ok(false)
-        },
-    )?;
     let (from, to) = (through(db, ns, after)?, through(db, ns, cut)?);
-    if from < feed {
-        // The newest stamp compaction may have taken changes through.
-        let mut horizon = 0;
-        db.query(
-            "SELECT COALESCE(MAX(stamp), 0) FROM __amphora_rev_stamps WHERE namespace = ?1 AND rev <= ?2",
-            [text(ns), integer(feed)?],
-            |r| {
-                horizon = rev(r, 0)?;
-                Ok(false)
-            },
-        )?;
-        return Ok(Err(Refusal::Compacted {
-            asked: after,
-            horizon,
-        }));
+    if let Some(refusal) = compacted(db, ns, after, from)? {
+        return Ok(Err(refusal));
     }
     let take = integer(
         u64::try_from(limit)?
@@ -477,19 +455,8 @@ fn changes_in(
     }
     // The versions moved in, by the stamps they carried; one whose sender carried none has no
     // place in the order, so the read is refused rather than answered without it.
-    let mut unstamped = None;
-    db.query(
-        "SELECT key, rev FROM __amphora_moved_stamps WHERE namespace = ?1 AND family = ?2 AND stamp IS NULL LIMIT 1",
-        [text(ns), text(family)],
-        |r| {
-            unstamped = Some(rev(r, 1)?);
-            Ok(false)
-        },
-    )?;
-    if let Some(at) = unstamped {
-        return Ok(Err(Refusal::Unavailable(format!(
-            "a version at revision {at} moved in from another group without its commit stamp: the order across groups doesn't place it"
-        ))));
+    if let Some(refusal) = unstamped(db, ns, family)? {
+        return Ok(Err(refusal));
     }
     let mut moved: Vec<(Vec<u8>, Rev, u64)> = Vec::new();
     db.query(
@@ -543,6 +510,172 @@ fn changes_in(
     let more = own_more || moved_more || found.len() > limit;
     let found: Vec<Change> = found.into_iter().map(|(_, _, change)| change).collect();
     Ok(whole(found, limit).map(|changes| (changes, more)))
+}
+
+/// The refusal a read of the changes after stamp `after` gets once compaction took them: `from`,
+/// the newest revision here stamped at or before it, is below the feed.
+fn compacted(db: &Db, ns: &str, after: u64, from: Rev) -> anyhow::Result<Option<Refusal>> {
+    let mut feed = 0;
+    db.query(
+        "SELECT feed FROM __amphora_namespaces WHERE name = ?1",
+        [text(ns)],
+        |r| {
+            feed = rev(r, 0)?;
+            Ok(false)
+        },
+    )?;
+    if from >= feed {
+        return Ok(None);
+    }
+    // The newest stamp compaction may have taken changes through.
+    let mut horizon = 0;
+    db.query(
+        "SELECT COALESCE(MAX(stamp), 0) FROM __amphora_rev_stamps WHERE namespace = ?1 AND rev <= ?2",
+        [text(ns), integer(feed)?],
+        |r| {
+            horizon = rev(r, 0)?;
+            Ok(false)
+        },
+    )?;
+    Ok(Some(Refusal::Compacted {
+        asked: after,
+        horizon,
+    }))
+}
+
+/// The refusal a read of `family`'s changes gets while a version moved in without its commit
+/// stamp is here: it has no place in the order, so the read is refused rather than answered
+/// without it.
+fn unstamped(db: &Db, ns: &str, family: &str) -> anyhow::Result<Option<Refusal>> {
+    let mut found = None;
+    db.query(
+        "SELECT key, rev FROM __amphora_moved_stamps WHERE namespace = ?1 AND family = ?2 AND stamp IS NULL LIMIT 1",
+        [text(ns), text(family)],
+        |r| {
+            found = Some(rev(r, 1)?);
+            Ok(false)
+        },
+    )?;
+    Ok(found.map(|at| {
+        Refusal::Unavailable(format!(
+            "a version at revision {at} moved in from another group without its commit stamp: the order across groups doesn't place it"
+        ))
+    }))
+}
+
+/// The stamp of `family`'s newest change here after stamp `after` through `cut`, its own or moved
+/// in; none while there is none.
+fn newest_in(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    after: u64,
+    cut: u64,
+) -> anyhow::Result<Result<Option<u64>, Refusal>> {
+    let (from, to) = (through(db, ns, after)?, through(db, ns, cut)?);
+    if let Some(refusal) = compacted(db, ns, after, from)? {
+        return Ok(Err(refusal));
+    }
+    if let Some(refusal) = unstamped(db, ns, family)? {
+        return Ok(Err(refusal));
+    }
+    let mut own = None;
+    db.query(
+        "SELECT v.rev FROM __amphora_versions v LEFT JOIN __amphora_moved_stamps m ON m.namespace = v.namespace AND m.family = v.family AND m.key = v.key AND m.rev = v.rev WHERE v.namespace = ?1 AND v.family = ?2 AND v.rev > ?3 AND v.rev <= ?4 AND m.rev IS NULL ORDER BY v.rev DESC LIMIT 1",
+        [text(ns), text(family), integer(from)?, integer(to)?],
+        |r| {
+            own = Some(rev(r, 0)?);
+            Ok(false)
+        },
+    )?;
+    let own = match own {
+        Some(at) => match stamp_of(db, ns, at)? {
+            Some(stamp) => Some(stamp),
+            None => {
+                return Ok(Err(Refusal::Unavailable(format!(
+                    "revision {at} has no commit stamp (made before its group stamped its commits): the order across groups doesn't place it"
+                ))));
+            }
+        },
+        None => None,
+    };
+    let mut moved = None;
+    db.query(
+        "SELECT stamp FROM __amphora_moved_stamps WHERE namespace = ?1 AND family = ?2 AND stamp > ?3 AND stamp <= ?4 ORDER BY stamp DESC LIMIT 1",
+        [text(ns), text(family), integer(after)?, integer(cut)?],
+        |r| {
+            moved = Some(rev(r, 0)?);
+            Ok(false)
+        },
+    )?;
+    Ok(Ok(own.max(moved)))
+}
+
+/// `wait`'s answer now across groups (`Records::changed`): the stamp of `family`'s newest change
+/// in any group after stamp `after`, through the cut, or none while there is none.
+pub(super) fn changed(
+    groups: &[Member],
+    point: ReadPoint,
+    ns: &str,
+    family: &str,
+    after: Rev,
+    until: Instant,
+) -> Result<Option<Rev>, Refusal> {
+    let groups = stamped(groups)?;
+    let cut = cut(&groups, point)?;
+    if after >= cut {
+        return Ok(None);
+    }
+    let mut newest = None;
+    for (group, _) in &groups {
+        let (ns, family) = (ns.to_owned(), family.to_owned());
+        let found =
+            group.call_internal(until, move |db| newest_in(db, &ns, &family, after, cut))??;
+        newest = newest.max(found);
+    }
+    Ok(newest)
+}
+
+/// One key's row across groups, read in the group its row is in (`group`, by the cluster's
+/// route): as of that group's fresh stamp (Linearizable), or of a stamp asked, which the group
+/// first observes, so none of its later commits is stamped at or before it. The row's revision is
+/// its stamp. One group is read, and no other group's clock is pushed, whatever the read point.
+pub(super) fn get(
+    groups: &[Member],
+    group: crate::xgroup::GroupId,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+    at: Consistency,
+    until: Instant,
+) -> Result<Option<api::Row>, Refusal> {
+    let groups = stamped(groups)?;
+    let Some((database, hooks)) = usize::try_from(group).ok().and_then(|g| groups.get(g)) else {
+        return Err(Refusal::Unavailable(format!(
+            "the route names group {group}, which the cluster doesn't have"
+        )));
+    };
+    let at = match at {
+        Consistency::Linearizable => hooks.marks.next().map_err(unavailable)?,
+        Consistency::Snapshot(asked) => {
+            hooks.marks.observe(asked).map_err(unavailable)?;
+            asked
+        }
+    };
+    let (ns, family, key) = (ns.to_owned(), family.to_owned(), key.to_vec());
+    database.call_internal(until, move |db| {
+        let r = through(db, &ns, at)?;
+        let operation = Operation::Get(family.clone(), key, Consistency::Snapshot(r));
+        match super::apply(db, &ns, &operation)? {
+            Ok(Answer::Row(Some(mut row))) => {
+                row.rev = stamp_of_version(db, &ns, &family, &row.key, row.rev)?.unwrap_or(0);
+                Ok(Ok(Some(row)))
+            }
+            Ok(Answer::Row(None)) => Ok(Ok(None)),
+            Ok(_) => Ok(Err(unavailable("wrong record answer"))),
+            Err(refusal) => Ok(Err(refusal)),
+        }
+    })?
 }
 
 /// `changes` cut to `limit`, never through a stamp: a cursor is a stamp, so advancing to the last
@@ -709,11 +842,13 @@ mod tests {
         }
     }
 
-    /// `groups` backed-up groups in `dir`, each read by `clock(group)`, under one coordinator.
+    /// `groups` backed-up groups in `dir`, each read by `clock(group)`, under one coordinator
+    /// routing by `route`.
     fn groups_on(
         dir: &std::path::Path,
         groups: u64,
         clock: impl Fn(u64) -> crate::backup::Clock,
+        route: crate::xgroup::Route,
     ) -> (Vec<Database>, Vec<crate::backup::Shipping>, Arc<Cluster>) {
         let blobs = Arc::new(FolderBlobs::open(&dir.join("archive"), 64 * 1024).unwrap());
         let (mut dbs, mut sinks) = (Vec::new(), Vec::new());
@@ -732,8 +867,6 @@ mod tests {
             dbs.push(db);
             sinks.push(sink);
         }
-        // Rows are written into each group directly, so the route is never asked.
-        let route: crate::xgroup::Route = Arc::new(|_: &[u8]| 0);
         let cluster =
             Arc::new(Cluster::open(dbs.clone(), route, 5, Protocol::TwoPhase, 1, until()).unwrap());
         (dbs, sinks, cluster)
@@ -770,11 +903,17 @@ mod tests {
     fn t_t1_9_r22_the_read_points_a_write_answered_before_a_read() {
         let dir = tempfile::tempdir().unwrap();
         let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
-        let (dbs, _sinks, cluster) = groups_on(dir.path(), 2, |group| {
-            let read = Arc::clone(&now);
-            let behind = group * 500 * SECOND_NS;
-            Arc::new(move || read.fetch_add(1, Ordering::SeqCst) - behind)
-        });
+        // Rows are written into each group directly, so the route is never asked.
+        let (dbs, _sinks, cluster) = groups_on(
+            dir.path(),
+            2,
+            |group| {
+                let read = Arc::clone(&now);
+                let behind = group * 500 * SECOND_NS;
+                Arc::new(move || read.fetch_add(1, Ordering::SeqCst) - behind)
+            },
+            Arc::new(|_: &[u8]| 0),
+        );
         let latest = dbs[0]
             .across_at(Arc::clone(&cluster), ReadPoint::Latest)
             .namespace("n")
@@ -845,10 +984,16 @@ mod tests {
         for &groups in &counts {
             for point in [ReadPoint::Latest, ReadPoint::Earliest] {
                 let dir = tempfile::tempdir().unwrap();
-                let (dbs, _sinks, cluster) = groups_on(dir.path(), groups, |group| {
-                    let behind = if group == 0 { lag } else { 0 };
-                    Arc::new(move || wall() - behind)
-                });
+                // Rows are written into each group directly, so the route is never asked.
+                let (dbs, _sinks, cluster) = groups_on(
+                    dir.path(),
+                    groups,
+                    |group| {
+                        let behind = if group == 0 { lag } else { 0 };
+                        Arc::new(move || wall() - behind)
+                    },
+                    Arc::new(|_: &[u8]| 0),
+                );
                 let across = dbs[0]
                     .across_at(Arc::clone(&cluster), point)
                     .namespace("n")
@@ -996,6 +1141,71 @@ mod tests {
             matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("without its commit stamp")),
             "{refused:?}"
         );
+    }
+
+    /// T-T1.9.R24 (CP-T1.9; reshard.md, "Decision (lane split-merge-19): one key and what changed,
+    /// across groups"). Do: two backed-up groups, the second's clock 500 seconds behind the
+    /// first's, routing a key ending in b to the second; rows 1a and 1b written in their groups;
+    /// then across them: each key read, a key never written, 1a as of just before its stamp, and
+    /// what changed after nothing and after the head; then 2b written, and what changed after the
+    /// head again. Expect: each row with its own stamp as its revision (the changes' stamps), the
+    /// key never written none, 1a before its stamp none; what changed after nothing the newest
+    /// stamp (1b's), after the head none, and after 2b its stamp, past the head.
+    #[test]
+    fn t_t1_9_r24_one_key_and_what_changed_across_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        let (dbs, _sinks, cluster) = groups_on(
+            dir.path(),
+            2,
+            |group| {
+                let read = Arc::clone(&now);
+                let behind = group * 500 * SECOND_NS;
+                Arc::new(move || read.fetch_add(1, Ordering::SeqCst) - behind)
+            },
+            // A row key ends in its own key, so "1b" routes to group 1.
+            Arc::new(|key: &[u8]| u32::from(key.last() == Some(&b'b'))),
+        );
+        put(&dbs[0], b"1a".to_vec());
+        put(&dbs[1], b"1b".to_vec());
+        let across = dbs[0].across(Arc::clone(&cluster)).namespace("n").unwrap();
+        let all = across.changes("f", 0, 100, until()).unwrap();
+        let stamp = |key: &[u8]| {
+            all.changes
+                .iter()
+                .find(|c| c.key == key)
+                .map(|c| c.rev)
+                .unwrap()
+        };
+        let get = |key: &[u8], at| across.get("f", key, at, until()).unwrap();
+        let a = get(b"1a".as_slice(), Consistency::Linearizable).unwrap();
+        let b = get(b"1b".as_slice(), Consistency::Linearizable).unwrap();
+        assert_eq!(
+            (a.rev, b.rev),
+            (stamp(b"1a".as_slice()), stamp(b"1b".as_slice()))
+        );
+        assert!(get(b"1c".as_slice(), Consistency::Linearizable).is_none());
+        assert!(
+            get(
+                b"1a".as_slice(),
+                Consistency::Snapshot(stamp(b"1a".as_slice()) - 1)
+            )
+            .is_none()
+        );
+        assert_eq!(
+            get(
+                b"1a".as_slice(),
+                Consistency::Snapshot(stamp(b"1a".as_slice()))
+            ),
+            Some(a)
+        );
+
+        let newest = all.changes.iter().map(|c| c.rev).max();
+        assert_eq!(across.changed("f", 0, until()).unwrap(), newest);
+        assert_eq!(across.changed("f", all.head, until()).unwrap(), None);
+        put(&dbs[1], b"2b".to_vec());
+        let later = across.changed("f", all.head, until()).unwrap().unwrap();
+        assert!(later > all.head, "{later} {}", all.head);
     }
 
     /// T-T1.9.R20 (CP-T1.9; reshard.md, "Decision (lane split-merge-18): reads across groups by

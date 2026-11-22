@@ -1744,6 +1744,18 @@ impl Records for Namespace {
     ) -> Result<Option<Row>, Refusal> {
         api::family(family)?;
         api::key(key)?;
+        if let Some(cluster) = &self.database.cluster {
+            let routing = crate::xgroup::sql::record_key(&self.name, family, key)?;
+            return across::get(
+                cluster.groups(),
+                cluster.group_of(&routing),
+                &self.name,
+                family,
+                key,
+                at,
+                until,
+            );
+        }
         match self.database.submit(
             &self.name,
             Operation::Get(family.into(), key.into(), at),
@@ -1822,6 +1834,17 @@ impl Records for Namespace {
         }
     }
     fn changed(&self, family: &str, after: Rev, until: Instant) -> Result<Option<Rev>, Refusal> {
+        if let Some(cluster) = &self.database.cluster {
+            api::family(family)?;
+            return across::changed(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                family,
+                after,
+                until,
+            );
+        }
         self.resolved(until)?
             .try_wait_selected(family, after, until)
     }

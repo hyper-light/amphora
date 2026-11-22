@@ -748,8 +748,36 @@ same rows moved without stamps into a third group make its changes refused.
 
 **Left.** A scan as of an older stamp still picks each group's versions by its own revision, so a
 moved row's version is chosen by its old group's number there; the scan at the cut is exact.
-`get`, `commit`, `changed` and `wait` still answer from this database alone.
 
 **Falsified by.** A moved row answered with the stamp of this group's own revision of the same
 number; a moved row missing from the changes, or answered twice; changes answered without a moved
 row that has no stamp.
+
+## Decision (lane split-merge-19): one key and what changed, across groups
+
+`get` and `changed` on a database handed the groups' coordinator now read across groups, as
+`scan`, `changes` and `head` do, each revision its commit stamp.
+- `get` reads only the group the key's row is in (the cluster's route of its row key). As of a
+  fresh stamp of that group (Linearizable): the group's writer runs the read after every commit
+  that took its stamp before, so it holds every write of the key answered before it began. As of a
+  stamp asked (Snapshot), which that group first observes, so none of its later commits is stamped
+  at or before it, and the answer at that stamp never changes. No other group is read and no other
+  clock is pushed, at either read point: one key lives in one group.
+- `changed` takes the cut at the read point, as `changes` does, and answers the newest stamp of a
+  change to the family after the cursor through the cut in any group, its own versions or moved
+  in; none while there is none. A compacted cursor, or a version moved in without its stamp, is
+  refused as `changes` refuses it.
+
+**Evidence.** T-T1.9.R24: two groups, the second's clock 500 seconds behind; each key read across
+them answers its row with its stamp as its revision, a key never written none, a key as of just
+before its stamp none and as of its stamp the row; what changed after nothing is the newest stamp,
+after the head none, and after a later write its stamp, past the head.
+
+**Left.** `commit` and `wait` still answer from this database alone. A commit across groups goes
+through the coordinator (`Cluster::commit`) but its conditions name revisions, which across groups
+are stamps; `wait` wakes on one database's commits, and across groups it wants one event a commit
+of any group, not a poll.
+
+**Falsified by.** A get across groups missing a write of the key answered before it began; a get
+as of a stamp whose answer changes later; `changed` answering none while `changes` after the same
+cursor answers a change.
