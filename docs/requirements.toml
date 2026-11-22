@@ -1232,6 +1232,18 @@ tests = [
   { id = "T-T1.10.X2", text = "xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly — passes when three seeds of each protocol over the transport commit across groups with no anomaly and no unknown outcome; ac_t1_10_5_the_lan_check_finds_a_lost_update_and_an_aborted_read holds the check to finding them" },
 ]
 
+# lane xgroup-sql: G13 step 3's SQL part (kiln goal 3d2c567d4a24841eb73cc0fb95b76f27; xgroup.md,
+# "A SQL session's commit")
+[[own]]
+id = "T1.10.S"
+title = "A SQL session's transaction across groups commits through the coordinator; one group's keeps its fast path (G13 step 3)"
+criteria = [
+  { id = "AC-T1.10.S1", text = "Cluster::commit commits rows all in one local group in that group's one database transaction, aborting Conflict on a row another transaction holds a lock on, and rows in several groups through the coordinator, under either protocol" },
+]
+tests = [
+  { id = "T-T1.10.S1", text = "xgroup::sql::sessions::ac_t1_10_1_a_sessions_answers_across_groups_equal_the_same_on_one_group — passes when 40 seeded transactions over three groups answer as the same over one group, some spanning groups, under both protocols, and every key reads the same after" },
+]
+
 # lane pl8-9: no new IDs. T-PL.8.2 gains the search test of docs/design/planner.md "Decision (lane pl8-9)".
 
 # lane skip-usable: row skipping usable by real statements (kiln goal 99e6cc88; executor.md decision 11).
