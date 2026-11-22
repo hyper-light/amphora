@@ -1574,18 +1574,35 @@ Two run-time checks, each a pure core the executor drives, each with a fixed few
   decision "lane pl9" uses it), the rest of the statement is due to be planned again on the counted
   rows. Within it, the estimate could not be told apart from its own noise, and nothing changes.
 - **Memory.** The switch's hash table is held to the hash table's share of the statement's budget
-  (`vdbe::hash_table::table_share`), measured before the switch by an upper bound known without
-  reading it (the inner table's pages). A materialization point counts the bytes it holds against
-  its budget. Past either, a typed refusal (`AdaptiveError`): the join stays a nested loop, the
-  plan under way goes on, both always correct answers.
+  (`vdbe::hash_table::table_share`): before the switch, by the bytes the statistics say it would
+  take (the inner rows, each its index entry's values at `Value`'s in-memory size, a format value);
+  after the build, by the table's own spill check, since the estimate can miss. A materialization
+  point counts the bytes it holds against its budget. Past either, a typed refusal (`AdaptiveError`)
+  or a spilled table freed: the join stays a nested loop, the plan under way goes on, both always
+  correct answers.
 - Nothing is picked: the point moves with the learned weights and the inner side's rows, the band
   with the statistics' own sample size.
 
-**Built so far.** The two cores and their tests. The executor's shell is the next piece: a join
-emitted with both inner loops (the seek and the hash probe, `main_loop/hash.rs`'s build emitted
-behind the switch's jump) and an instruction that steps the switch; and a materialization point
-that hands its counted rows to a second prepare of the statement's rest. Until it lands no plan
-switches.
+**The executor's shell** (`translate/main_loop/adaptive.rs`, `Connection::set_adaptive_joins`, off
+by default until AC-PL.13.1's measurement). An inner join's forward equality seek on a table's own
+index, in a query, with statistics and a break-even under the learned weights, is emitted with both
+inner loops: ahead of the seek, `JoinSwitchStep` counts the outer row and falls through to the seek,
+jumps once (at the point) to the hash table's build over the inner table, keyed on the seek's
+columns with the rest of the index entry and the rowid beside them, and from then on to its probe.
+A probe's match positions the index cursor on the very entry the seek would have found, so both
+loops share one body, and the loop's close reads the hash table's next match once switched
+(`JoinSwitchHash`). The table takes its own hash table id: a hash join the plan chose keys its table
+by its build table's id. A spilled build is freed and the switch refused (`JoinSwitchBuilt`); the
+adaptive join has no grace loop.
+
+**The re-plan.** The switch's build is the materialization point the executor drives: it holds the
+whole inner table. `JoinSwitchBuilt` sets its rows against the rows the plan counted the table at
+(ANALYZE's with the changes since, decision "lane pl9"). Past the band, the table's row counter is
+set to the rows counted, so the statement's planned table has moved: it is prepared again on the
+counted rows before its next run (`Statement::statistics_moved`), as is every other statement
+planned on the table. The run under way goes on as planned: rows it has returned are not returned
+again, and its answer is right. Restarting a statement that has returned no row yet, and the other
+materialization points (a sorter, a materialized subquery), are not built.
 
 **Why.** Audit row 13 (`bench/planner/audit/10-no-adaptive.sql`): a nested loop chosen for an
 estimate ran on however many rows came, and an estimate wrong by orders of magnitude was never
@@ -1599,11 +1616,17 @@ observed cardinalities cut JOB's 20 longest queries by 27%. Karlin, Manasse, Rud
 "Competitive snoopy caching", Algorithmica 3, 1988: the ski-rental rule's bound of 2.
 
 **Evidence.** `adaptive.rs`'s unit tests: answers identical with the switch on and off over 300
-random joins with NULL and repeated keys (T-PL.13.1, against the cores' model join; the engine's
-own differential waits on the shell); the switch fires once past the point and never at an
-estimate below it, its cost under twice the best, refused over budget (T-PL.13.2); a new plan asked
-only outside the band, the bytes held bounded (T-PL.13.3). JOB's 20 slowest queries against the
-parent (AC-PL.13.1) are the coordinator's, once the shell lands.
+random joins with NULL and repeated keys (T-PL.13.1, against the cores' model join); the switch
+fires once past the point and never at an estimate below it, its cost under twice the best, refused
+over budget (T-PL.13.2); a new plan asked only outside the band, the bytes held bounded (T-PL.13.3).
+The engine's own (`crates/engine/tests/adaptive_joins.rs`, with the simulator's
+`Connection::pin_cost_weights` so the point holds on any machine): random joins (one key and two,
+filters, three tables, an aggregate) give one answer with the switch off and on and by cost, the
+model's for the plain join, and every plan whose point came under its outer rows switched
+(T-PL.13.1); one join switches at the point its plan states and not one row before; an inner table
+counted far past its rows (inserted, counted, rolled back) is counted at its build, planned again
+once, and the second plan's point comes sooner with no further re-plan (T-PL.13.3). JOB's 20
+slowest queries against the parent (AC-PL.13.1) are the coordinator's.
 
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).

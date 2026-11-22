@@ -423,7 +423,7 @@ tests = [
   { id = "T-PL.13.1", text = "A join whose build side outgrows its estimate mid-query — passes when it switches method within its memory bound and its answer is unchanged" },
   # lane pl13
   { id = "T-PL.13.2", text = "The switch fires once, at the first outer row whose count reaches the learned-cost switch point, never at the planner's estimate below it; its cost stays under twice the cheaper method in hindsight; over its memory budget it is refused with a typed error and the join stays a nested loop" },
-  { id = "T-PL.13.3", text = "A materialization point asks for a new plan only when its counted rows fall outside the estimate's band, estimate / (1 + error) to estimate x (1 + error); the rows it holds stay within their budget or are refused with a typed error" },
+  { id = "T-PL.13.3", text = "A materialization point asks for a new plan only when its counted rows fall outside the estimate's band, estimate / (1 + error) to estimate x (1 + error); the rows it holds stay within their budget or are refused with a typed error; an adaptive join's build counted past its estimate's band corrects the table's count, and its statement is planned again on it, once" },
 ]
 
 # Amphora's own IDs for its query time (Amphora goal 7788ef29, kiln plan
