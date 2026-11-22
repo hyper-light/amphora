@@ -945,6 +945,7 @@ fn join_lhs_and_rhs<'a>(
                     if let AccessMethodParams::HashJoin {
                         materialize_build_input,
                         use_bloom_filter,
+                        bloom_fp_per_key,
                         join_keys,
                         join_type,
                         ..
@@ -1012,18 +1013,27 @@ fn join_lhs_and_rhs<'a>(
                                 .product::<f64>();
                             let probe_filtered_rows =
                                 (*rhs_base_rows) * probe_self_selectivity.clamp(0.0, 1.0);
-                            if probe_filtered_rows > 0.0 {
-                                let build_filtered_rows = if build_is_eligible {
-                                    effective_build_cardinality
-                                } else {
-                                    build_cardinality
-                                };
-                                // Bloom filters help when the probe side is much larger than the build.
-                                *use_bloom_filter = build_filtered_rows > 0.0
-                                    && probe_filtered_rows / build_filtered_rows >= 2.0;
+                            // Amphora (PL.5): a filter where it costs less than the probes
+                            // it saves, at the rate the learned weights give
+                            // (`bloom_filter_rate_per_key`). The probe rows that match are at
+                            // most the rows the join visits.
+                            let build_filtered_rows = if build_is_eligible {
+                                effective_build_cardinality
                             } else {
-                                *use_bloom_filter = false;
-                            }
+                                build_cardinality
+                            };
+                            let probe_rows = probe_filtered_rows * hash_probe_multiplier;
+                            let matched_probe_rows = (build_filtered_rows
+                                * hash_join_method.estimated_rows_per_outer_row)
+                                .min(probe_rows);
+                            let rate_per_key = super::access_method::bloom_filter_rate_per_key(
+                                build_filtered_rows,
+                                probe_rows,
+                                matched_probe_rows,
+                                params,
+                            );
+                            *use_bloom_filter = rate_per_key.is_some();
+                            *bloom_fp_per_key = rate_per_key.unwrap_or(0.0);
                             if should_materialize {
                                 hash_join_method.cost = estimate_hash_join_cost(
                                     effective_build_cardinality,

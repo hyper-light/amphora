@@ -434,6 +434,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the source's digest taken by the shipping thread itself; cuts across nodes' clocks. Incremental
   bases (T-T1.12.I1 to I3): a new base keeps the latest's chunks the log left unchanged, due once the
   log outweighs what it would copy, after a reopen too.
+  Lane pitr-8: the shipping thread checks itself (`Archive::check`): the source's own rows from a
+  reader snapshot lined up with a second's stamps, checked once that second settles and the archive
+  holds it, the result in `Status::last_check` and the check counters (T-T1.12.C3); a due base waits
+  for the log's next restart, one generation at most (T-T1.12.I4).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -670,6 +674,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   joined rows into its partial aggregates (T-QT.6.11). Closes with: a join's own rows and joins of more than two
   tables through the hook, expressions beyond column-against-literal terms (a program's own loop body per worker), a shared hash build, loom or shuttle on the dispatcher, worker
   and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
+- **PL.5's Bloom filters sized and chosen by cost** (lane qs5-9): a hash join's filter is sized when its build ends
+  from the distinct keys it measured, at a false-positive rate derived from the learned build and probe weights, and
+  chosen only where it costs less than the probes it saves; its hashes and bits stay within the join's memory budget
+  (`docs/design/planner.md`, "Decision (lane qs5-9)"). LIP and predicate transfer, a measured filter-lookup weight,
+  removing `rhs_has_selective_seek` and deriving `cpu_cost_per_where_step` are left.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness

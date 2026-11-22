@@ -19812,6 +19812,10 @@ pub fn op_filter(
         },
         insn
     );
+    // Amphora (PL.5): the first probe ends a sized filter's build.
+    if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
+        filter.seal();
+    }
     let Some(filter) = state.get_bloom_filter(*cursor_id) else {
         // always safe to fall though, no filter present
         state.pc += 1;
@@ -19857,21 +19861,23 @@ pub fn op_filter_add(
         FilterAdd {
             cursor_id,
             key_reg,
-            num_keys
+            num_keys,
+            sizing
         },
         insn
     );
+    let sizing = *sizing;
 
     if *num_keys == 1 {
         let reg: *const Register = &state.registers[*key_reg];
         let value = unsafe { &*reg }.get_value();
-        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        let filter = state.get_or_create_bloom_filter_for(*cursor_id, sizing);
         filter.insert_value(value);
     } else {
         let values: Vec<Value> = (0..*num_keys)
             .map(|i| state.registers[*key_reg + i].get_value().clone())
             .collect();
-        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        let filter = state.get_or_create_bloom_filter_for(*cursor_id, sizing);
         let value_refs: Vec<&Value> = values.iter().collect();
         filter.insert_values(&value_refs);
     }
