@@ -1354,3 +1354,159 @@ fn ac_t1_10_1_the_commit_stamp_is_the_latest_lock_replys_clock() {
         );
     }
 }
+
+/// What [`drive`] does with a step about to land in its group.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    Land,
+    /// Never lands, and no reply comes before the crash that follows.
+    Lose,
+    /// Lands, then the coordinator crashes before its reply.
+    LandThenCrash,
+    /// The coordinator crashes before it lands.
+    Crash,
+}
+
+/// Runs a coordinator's events on groups in memory, each lock reply carrying `clocks`' entry for
+/// its group: `begin` begun once it is ready, each step's fate asked before it lands. Ends at a
+/// crash or once nothing is left; answers what the client heard.
+fn drive(
+    groups: &mut [Memory],
+    coordinator: &mut Coordinator,
+    first: Vec<Event>,
+    mut begin: Option<Txn>,
+    clocks: &[u64],
+    mut fate: impl FnMut(&Step) -> Fate,
+) -> Option<Answer> {
+    let mut queue: std::collections::VecDeque<Event> = first.into();
+    let mut answer = None;
+    while let Some(event) = queue.pop_front() {
+        match event {
+            Event::Send(send) => {
+                let fated = fate(&send.envelope.step);
+                match fated {
+                    Fate::Crash => return answer,
+                    Fate::Lose => continue,
+                    Fate::Land | Fate::LandThenCrash => {}
+                }
+                let at = usize::try_from(send.group).unwrap();
+                let reply = apply(send.group, &mut groups[at], &send.envelope).unwrap();
+                if fated == Fate::LandThenCrash {
+                    return answer;
+                }
+                let clock = match send.envelope.step {
+                    Step::Lock { .. } | Step::LockIf { .. } => clocks.get(at).copied(),
+                    _ => None,
+                };
+                queue.extend(coordinator.reply(send.id, Ok(reply), clock).unwrap());
+            }
+            Event::Ready => {
+                if let Some(txn) = begin.take() {
+                    let route = |key: &[u8]| key.first().map_or(0, |g| GroupId::from(*g));
+                    let (_, events) = coordinator.begin(txn, route).unwrap();
+                    queue.extend(events);
+                }
+            }
+            Event::Answer { answer: heard, .. } => answer = Some(heard),
+            _ => {}
+        }
+    }
+    answer
+}
+
+/// T-T1.9.R30 (CP-T1.9; reshard.md, "Decision (lane split-merge-22): Records::commit and
+/// recovery on the one stamp"). Do: three groups in memory, their clocks 0, 10 and 20 writes
+/// along, both protocols; a transaction writing a key in each, its lock replies carrying clocks
+/// 30, 50 and 40. First the coordinator crashes once the first group resolved it (under Parallel
+/// Commits its explicit commit lost before), and a new incarnation recovers it. Then, under
+/// Parallel Commits, a crash with every lock in place and nothing decided or resolved, and a
+/// recovery. Expect: the client heard committed at 50, and after the recovery every group's key
+/// is stamped 50, the stamp the first group resolved at; in the second, every key carries one
+/// stamp, the latest of the groups' lock stamps (21), at or before the 50 the client heard.
+#[test]
+fn t_t1_9_r30_a_recovered_transaction_resolves_at_its_one_stamp() {
+    let lock_clocks = [30u64, 50, 40];
+    let txn = Txn {
+        reads: Vec::new(),
+        writes: (0..3u8).map(|g| (vec![g], Some(vec![g]))).collect(),
+        conds: Vec::new(),
+    };
+    let fresh = || -> Vec<Memory> {
+        (0..3u8)
+            .map(|g| {
+                let mut group = Memory::default();
+                for i in 0..g * 10 {
+                    group.set_value(&[b'z', i], Some(b"v")).unwrap();
+                }
+                group
+            })
+            .collect()
+    };
+    let stamps = |groups: &mut [Memory]| -> Vec<Option<u64>> {
+        (0..3u8)
+            .map(|g| groups[usize::from(g)].stamp(&[g]).unwrap())
+            .collect()
+    };
+    for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+        let config = Config {
+            id: 7,
+            protocol,
+            registry: 0,
+            groups: vec![0, 1, 2],
+            in_flight: 1,
+        };
+        let mut groups = fresh();
+        let (mut first, events) = Coordinator::start(config.clone()).unwrap();
+        let heard = drive(
+            &mut groups,
+            &mut first,
+            events,
+            Some(txn.clone()),
+            &lock_clocks,
+            |step| match step {
+                Step::Decide { .. } | Step::DecideAt { .. } if protocol == Protocol::Parallel => {
+                    Fate::Lose
+                }
+                Step::Resolve { .. } | Step::ResolveAt { .. } => Fate::LandThenCrash,
+                _ => Fate::Land,
+            },
+        );
+        assert!(
+            matches!(heard, Some(Answer::Committed { at: Some(50), .. })),
+            "{protocol:?}: {heard:?}"
+        );
+        let (mut second, events) = Coordinator::start(config.clone()).unwrap();
+        drive(&mut groups, &mut second, events, None, &[], |_| Fate::Land);
+        assert_eq!(stamps(&mut groups), vec![Some(50); 3], "{protocol:?}");
+        assert!(groups.iter().all(|g| g.held().is_empty()), "{protocol:?}");
+    }
+
+    let config = Config {
+        id: 7,
+        protocol: Protocol::Parallel,
+        registry: 0,
+        groups: vec![0, 1, 2],
+        in_flight: 1,
+    };
+    let mut groups = fresh();
+    let (mut first, events) = Coordinator::start(config.clone()).unwrap();
+    let heard = drive(
+        &mut groups,
+        &mut first,
+        events,
+        Some(txn),
+        &lock_clocks,
+        |step| match step {
+            Step::Decide { .. } | Step::DecideAt { .. } => Fate::Crash,
+            _ => Fate::Land,
+        },
+    );
+    assert!(
+        matches!(heard, Some(Answer::Committed { at: Some(50), .. })),
+        "{heard:?}"
+    );
+    let (mut second, events) = Coordinator::start(config).unwrap();
+    drive(&mut groups, &mut second, events, None, &[], |_| Fate::Land);
+    assert_eq!(stamps(&mut groups), vec![Some(21); 3]);
+    assert!(groups.iter().all(|g| g.held().is_empty()));
+}

@@ -159,6 +159,21 @@ pub enum Step {
         outcome: Outcome,
         at: u64,
     },
+    /// [`Step::Decide`] with the transaction's commit stamp (lane split-merge-22, T-T1.9.R30): a
+    /// committed decision keeps `at` with the record ([`Tablet::set_commit_stamp`]), before any
+    /// group resolves it under two-phase commit, so a recovery resolves every group at the one
+    /// stamp. Answers [`Reply::DecidedAt`] with what stands.
+    DecideAt {
+        txn: TxnId,
+        outcome: Outcome,
+        at: u64,
+    },
+    /// [`Step::Recover`] answering the commit stamp its decision kept: [`Reply::DecidedAt`], or
+    /// [`Reply::Staging`] (lane split-merge-22, T-T1.9.R30).
+    RecoverAt { txn: TxnId },
+    /// [`Step::Prevent`] answering the stamps this group keeps for the transaction:
+    /// [`Reply::PresentAt`] (lane split-merge-22, T-T1.9.R30).
+    PreventAt { txn: TxnId },
 }
 
 impl Step {
@@ -173,7 +188,10 @@ impl Step {
             | Step::Recover { txn }
             | Step::Prevent { txn }
             | Step::Resolve { txn, .. }
-            | Step::ResolveAt { txn, .. } => Some(*txn),
+            | Step::ResolveAt { txn, .. }
+            | Step::DecideAt { txn, .. }
+            | Step::RecoverAt { txn }
+            | Step::PreventAt { txn } => Some(*txn),
         }
     }
 }
@@ -219,6 +237,20 @@ pub enum Reply {
         key: Vec<u8>,
         at: Option<u64>,
     },
+    /// [`Reply::Decided`] with the commit stamp the decision kept (lane split-merge-22,
+    /// T-T1.9.R30): none when it aborted, or was decided with no stamp.
+    DecidedAt {
+        outcome: Outcome,
+        at: Option<u64>,
+    },
+    /// [`Reply::Present`] with the stamps this group keeps for the transaction (lane
+    /// split-merge-22, T-T1.9.R30): `committed`, the commit stamp it resolved it at; `locked`,
+    /// its lock stamp while it holds its locks.
+    PresentAt {
+        present: bool,
+        committed: Option<u64>,
+        locked: Option<u64>,
+    },
 }
 
 /// Whether a condition holds (lane split-merge-20, T-T1.9.R27): a key whose newest version is
@@ -261,6 +293,16 @@ pub trait Tablet {
     /// How a transaction finished here, until the coordinator's floor passes it.
     fn done(&mut self, txn: TxnId) -> anyhow::Result<Option<Outcome>>;
     fn set_done(&mut self, txn: TxnId, outcome: Outcome) -> anyhow::Result<()>;
+    /// The transaction's lock stamp here (lane split-merge-21's `__amphora_xg_lock_at`): this
+    /// group's clock as it took the transaction's first lock, while it holds them; none in a
+    /// group that stamps nothing.
+    fn lock_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>>;
+    /// The transaction's commit stamp as kept here (lane split-merge-22, T-T1.9.R30): by its
+    /// anchor as it decided it committed ([`Step::DecideAt`]), by a group as it resolved it
+    /// committed ([`Step::ResolveAt`]); forgotten with its done row and record, below the floor.
+    fn commit_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>>;
+    /// Keeps the transaction's commit stamp; one already kept stands.
+    fn set_commit_stamp(&mut self, txn: TxnId, at: u64) -> anyhow::Result<()>;
     fn guard(&mut self, coordinator: u64) -> anyhow::Result<Guard>;
     fn set_guard(&mut self, coordinator: u64, guard: Guard) -> anyhow::Result<()>;
     /// Forgets the coordinator's done rows and decided records below `floor`.
@@ -326,16 +368,43 @@ pub fn apply<T: Tablet + ?Sized>(
                 Ok(Reply::Decided(Outcome::Aborted))
             }
         },
-        Step::Prevent { txn } => match tablet.done(*txn)? {
-            Some(outcome) => Ok(Reply::Present(outcome == Outcome::Committed)),
-            None if !tablet.locks_of(*txn)?.is_empty() => Ok(Reply::Present(true)),
-            None => {
-                tablet.set_done(*txn, Outcome::Aborted)?;
-                Ok(Reply::Present(false))
-            }
-        },
+        Step::Prevent { txn } => Ok(Reply::Present(prevent(tablet, *txn)?)),
         Step::Resolve { txn, outcome } => resolve(tablet, *txn, *outcome, None),
         Step::ResolveAt { txn, outcome, at } => resolve(tablet, *txn, *outcome, Some(*at)),
+        Step::DecideAt { txn, outcome, at } => {
+            let stands = match tablet.record(*txn)? {
+                Some(Record::Decided(stands)) => stands,
+                Some(Record::Staging(_)) | None => {
+                    tablet.set_record(*txn, &Record::Decided(*outcome))?;
+                    if *outcome == Outcome::Committed {
+                        tablet.set_commit_stamp(*txn, *at)?;
+                    }
+                    *outcome
+                }
+            };
+            decided_at(tablet, *txn, stands)
+        }
+        Step::RecoverAt { txn } => match tablet.record(*txn)? {
+            Some(Record::Decided(stands)) => decided_at(tablet, *txn, stands),
+            Some(Record::Staging(participants)) => Ok(Reply::Staging(participants)),
+            None => {
+                // No record: no staging can land now, and two-phase commit never decided it.
+                tablet.set_record(*txn, &Record::Decided(Outcome::Aborted))?;
+                decided_at(tablet, *txn, Outcome::Aborted)
+            }
+        },
+        Step::PreventAt { txn } => {
+            let present = prevent(tablet, *txn)?;
+            let committed = match tablet.done(*txn)? {
+                Some(Outcome::Committed) => tablet.commit_stamp(*txn)?,
+                _ => None,
+            };
+            Ok(Reply::PresentAt {
+                present,
+                committed,
+                locked: tablet.lock_stamp(*txn)?,
+            })
+        }
         Step::LockIf {
             txn,
             anchor,
@@ -465,6 +534,32 @@ fn lock<T: Tablet + ?Sized>(
     Ok(Reply::Locked { reads: values })
 }
 
+/// [`Step::Prevent`]'s part: whether the transaction holds its locks here, or resolved committed
+/// here; one that does neither never will, so it is marked aborted here.
+fn prevent<T: Tablet + ?Sized>(tablet: &mut T, txn: TxnId) -> anyhow::Result<bool> {
+    match tablet.done(txn)? {
+        Some(outcome) => Ok(outcome == Outcome::Committed),
+        None if !tablet.locks_of(txn)?.is_empty() => Ok(true),
+        None => {
+            tablet.set_done(txn, Outcome::Aborted)?;
+            Ok(false)
+        }
+    }
+}
+
+/// The decision that stands, with the commit stamp it kept if it committed.
+fn decided_at<T: Tablet + ?Sized>(
+    tablet: &mut T,
+    txn: TxnId,
+    outcome: Outcome,
+) -> anyhow::Result<Reply> {
+    let at = match outcome {
+        Outcome::Committed => tablet.commit_stamp(txn)?,
+        Outcome::Aborted => None,
+    };
+    Ok(Reply::DecidedAt { outcome, at })
+}
+
 fn resolve<T: Tablet + ?Sized>(
     tablet: &mut T,
     txn: TxnId,
@@ -478,6 +573,11 @@ fn resolve<T: Tablet + ?Sized>(
         return Ok(Reply::Resolved);
     }
     if outcome == Outcome::Committed {
+        // Kept before the locks go: a recovery that finds some groups resolved and others not
+        // resolves the rest at this stamp ([`Step::PreventAt`]).
+        if let Some(at) = at {
+            tablet.set_commit_stamp(txn, at)?;
+        }
         for (key, lock) in tablet.locks_of(txn)? {
             match lock.intent {
                 Intent::Read => {}
@@ -504,6 +604,10 @@ pub struct Memory {
     /// Each key's newest version's stamp, from `clock`, one up a value written.
     stamps: BTreeMap<Vec<u8>, u64>,
     clock: u64,
+    /// Each transaction's lock stamp while it holds locks here, from `clock`, one up.
+    lock_at: BTreeMap<TxnId, u64>,
+    /// Each transaction's commit stamp as kept here ([`Tablet::commit_stamp`]).
+    commit_at: BTreeMap<TxnId, u64>,
 }
 
 impl Memory {
@@ -613,11 +717,32 @@ impl Tablet for Memory {
         {
             anyhow::bail!("transaction {:?} locked a key twice", lock.txn);
         }
+        if !self.lock_at.contains_key(&lock.txn) {
+            self.clock = self
+                .clock
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("the simulator's stamps ran out"))?;
+            self.lock_at.insert(lock.txn, self.clock);
+        }
         Ok(())
     }
 
     fn drop_locks_of(&mut self, txn: TxnId) -> anyhow::Result<()> {
         self.locks.retain(|(_, of), _| *of != txn);
+        self.lock_at.remove(&txn);
+        Ok(())
+    }
+
+    fn lock_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>> {
+        Ok(self.lock_at.get(&txn).copied())
+    }
+
+    fn commit_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>> {
+        Ok(self.commit_at.get(&txn).copied())
+    }
+
+    fn set_commit_stamp(&mut self, txn: TxnId, at: u64) -> anyhow::Result<()> {
+        self.commit_at.entry(txn).or_insert(at);
         Ok(())
     }
 
@@ -650,6 +775,8 @@ impl Tablet for Memory {
 
     fn forget_below(&mut self, coordinator: u64, floor: Mark) -> anyhow::Result<()> {
         self.done.retain(|txn, _| !below(txn, coordinator, floor));
+        self.commit_at
+            .retain(|txn, _| !below(txn, coordinator, floor));
         self.records.retain(|txn, record| {
             !(below(txn, coordinator, floor) && matches!(record, Record::Decided(_)))
         });

@@ -169,6 +169,9 @@ enum Phase {
     Preventing {
         waiting: BTreeSet<GroupId>,
         absent: bool,
+        /// The commit stamp a participant already resolved it at (lane split-merge-22): the
+        /// stamp every other group resolves it at too.
+        resolved: Option<u64>,
     },
     Resolving {
         outcome: Outcome,
@@ -607,7 +610,13 @@ impl Coordinator {
                     at: None,
                 },
             );
-            self.send(out, anchor, Some(txn), Kind::Recover, Step::Recover { txn })?;
+            self.send(
+                out,
+                anchor,
+                Some(txn),
+                Kind::Recover,
+                Step::RecoverAt { txn },
+            )?;
         }
         self.ready_if_recovered(out);
         Ok(())
@@ -652,6 +661,29 @@ impl Coordinator {
                 };
                 next.push((*group, Kind::Resolve, step));
             }
+        };
+        // Replies with stamps (lane split-merge-22, T-T1.9.R30): a decision's kept commit stamp is
+        // the transaction's, and a participant's stamps go into a recovery's choice of it; then
+        // each is handled as its plain reply.
+        let reply = match reply {
+            Ok(Reply::DecidedAt { outcome, at }) => {
+                if outcome == Outcome::Committed && at.is_some() {
+                    run.at = at;
+                }
+                Ok(Reply::Decided(outcome))
+            }
+            Ok(Reply::PresentAt {
+                present,
+                committed,
+                locked,
+            }) => {
+                if let Phase::Preventing { resolved, .. } = &mut run.phase {
+                    *resolved = (*resolved).max(committed);
+                }
+                run.at = run.at.max(locked);
+                Ok(Reply::Present(present))
+            }
+            other => other,
         };
         match (sent.kind, reply) {
             (Kind::Lock, reply) => {
@@ -702,10 +734,7 @@ impl Coordinator {
                     (None, Protocol::TwoPhase) if all_in => {
                         run.rounds = run.rounds.saturating_add(1);
                         run.phase = Phase::Deciding;
-                        let decide = Step::Decide {
-                            txn,
-                            outcome: Outcome::Committed,
-                        };
+                        let decide = decide_step(txn, Outcome::Committed, run.at);
                         next.push((run.anchor, Kind::Decide, decide));
                     }
                     (None, Protocol::Parallel) if all_in => {
@@ -721,10 +750,7 @@ impl Coordinator {
                             waiting: run.groups.clone(),
                             deciding: true,
                         };
-                        let decide = Step::Decide {
-                            txn,
-                            outcome: Outcome::Committed,
-                        };
+                        let decide = decide_step(txn, Outcome::Committed, run.at);
                         next.push((run.anchor, Kind::Decide, decide));
                         resolve_all(run, Outcome::Committed, &mut next);
                     }
@@ -770,13 +796,19 @@ impl Coordinator {
                 run.phase = Phase::Preventing {
                     waiting: participants.iter().copied().collect(),
                     absent: false,
+                    resolved: None,
                 };
                 for group in participants {
-                    next.push((group, Kind::Prevent, Step::Prevent { txn }));
+                    next.push((group, Kind::Prevent, Step::PreventAt { txn }));
                 }
             }
             (Kind::Prevent, Ok(Reply::Present(present))) => {
-                let Phase::Preventing { waiting, absent } = &mut run.phase else {
+                let Phase::Preventing {
+                    waiting,
+                    absent,
+                    resolved,
+                } = &mut run.phase
+                else {
                     return Err(broken("a prevention came back outside recovery"));
                 };
                 waiting.remove(&sent.group);
@@ -789,8 +821,14 @@ impl Coordinator {
                     } else {
                         Outcome::Committed
                     };
+                    // The one commit stamp (lane split-merge-22, T-T1.9.R30): the one a
+                    // participant already resolved at, else the latest lock stamp, at or past
+                    // every group's, so a read as of one before it never waited on it.
+                    let resolved = *resolved;
+                    run.at = resolved.or(run.at);
                     run.phase = Phase::Deciding;
-                    next.push((run.anchor, Kind::Decide, Step::Decide { txn, outcome }));
+                    let decide = decide_step(txn, outcome, run.at);
+                    next.push((run.anchor, Kind::Decide, decide));
                 }
             }
             (Kind::Resolve, Ok(Reply::Resolved)) => {
@@ -863,5 +901,14 @@ impl Coordinator {
         });
         self.ready_if_recovered(out);
         Ok(())
+    }
+}
+
+/// The decision step: [`Step::DecideAt`] for a commit with a stamp, kept with the record so a
+/// recovery resolves every group at it (lane split-merge-22, T-T1.9.R30); else [`Step::Decide`].
+fn decide_step(txn: TxnId, outcome: Outcome, at: Option<u64>) -> Step {
+    match (outcome, at) {
+        (Outcome::Committed, Some(at)) => Step::DecideAt { txn, outcome, at },
+        _ => Step::Decide { txn, outcome },
     }
 }

@@ -34,7 +34,14 @@ CREATE TABLE IF NOT EXISTS __amphora_xg_done(coordinator INTEGER NOT NULL, epoch
 CREATE TABLE IF NOT EXISTS __amphora_xg_guard(coordinator INTEGER PRIMARY KEY, fence INTEGER NOT NULL, floor_epoch INTEGER, floor_seq INTEGER);
 CREATE TABLE IF NOT EXISTS __amphora_xg_epoch(coordinator INTEGER PRIMARY KEY, epoch INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS __amphora_xg_lock_at(coordinator INTEGER NOT NULL, epoch INTEGER NOT NULL, seq INTEGER NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY(coordinator, epoch, seq)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS __amphora_xg_commit_at(coordinator INTEGER NOT NULL, epoch INTEGER NOT NULL, seq INTEGER NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY(coordinator, epoch, seq)) WITHOUT ROWID;
 ";
+
+/// A transaction's lock stamp in a group, and its commit stamp as kept there (lane split-merge-22).
+const LOCK_STAMP: &str =
+    "SELECT stamp FROM __amphora_xg_lock_at WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3";
+const COMMIT_STAMP: &str =
+    "SELECT stamp FROM __amphora_xg_commit_at WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3";
 
 // The tables' codes: a format, written into every group's database; only ever appended to.
 const READ: i64 = 0;
@@ -281,6 +288,17 @@ impl<'a> SqlTablet<'a> {
             dropped: Vec::new(),
         }
     }
+
+    /// A transaction's stamp as `select` reads it, one of the stamp tables' [`LOCK_STAMP`] and
+    /// [`COMMIT_STAMP`].
+    fn stamp_in(&self, select: &'static str, txn: TxnId) -> anyhow::Result<Option<u64>> {
+        let mut stamp = None;
+        self.db.query(select, txn_params(txn)?, |row| {
+            stamp = Some(u64_at(row, 0)?);
+            Ok(false)
+        })?;
+        Ok(stamp)
+    }
 }
 
 /// Applies one step on a group's database, and answers the Records rows whose locks it dropped.
@@ -511,6 +529,23 @@ impl Tablet for SqlTablet<'_> {
         )
     }
 
+    fn lock_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>> {
+        self.stamp_in(LOCK_STAMP, txn)
+    }
+
+    fn commit_stamp(&mut self, txn: TxnId) -> anyhow::Result<Option<u64>> {
+        self.stamp_in(COMMIT_STAMP, txn)
+    }
+
+    fn set_commit_stamp(&mut self, txn: TxnId, at: u64) -> anyhow::Result<()> {
+        let [coordinator, epoch, seq] = txn_params(txn)?;
+        self.db.query(
+            "INSERT OR IGNORE INTO __amphora_xg_commit_at(coordinator, epoch, seq, stamp) VALUES (?1, ?2, ?3, ?4)",
+            [coordinator, epoch, seq, int(at)?],
+            |_| Ok(true),
+        )
+    }
+
     fn guard(&mut self, coordinator: u64) -> anyhow::Result<Guard> {
         let mut guard = Guard::default();
         self.db.query(
@@ -552,6 +587,11 @@ impl Tablet for SqlTablet<'_> {
         };
         self.db.query(
             "DELETE FROM __amphora_xg_done WHERE coordinator = ?1 AND (epoch < ?2 OR (epoch = ?2 AND seq < ?3))",
+            params()?,
+            |_| Ok(true),
+        )?;
+        self.db.query(
+            "DELETE FROM __amphora_xg_commit_at WHERE coordinator = ?1 AND (epoch < ?2 OR (epoch = ?2 AND seq < ?3))",
             params()?,
             |_| Ok(true),
         )?;
@@ -2432,6 +2472,10 @@ mod sessions {
             }
             match &envelope.step {
                 crate::xgroup::Step::Decide {
+                    outcome: Outcome::Committed,
+                    ..
+                }
+                | crate::xgroup::Step::DecideAt {
                     outcome: Outcome::Committed,
                     ..
                 } if recovered_first => {
