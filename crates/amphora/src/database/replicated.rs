@@ -1078,11 +1078,15 @@ fn queue_bounds(
     let image = u64::try_from(crate::replication::image_room()?).unwrap_or(u64::MAX);
     let framing = u64::try_from(FRAMING_BYTES).unwrap_or(u64::MAX);
     let request = u64::try_from(api::REQUEST_MAX).unwrap_or(u64::MAX);
-    // A wire record's room: an image's and its framing, no more than the queue's room less one
-    // application call. The command queue must hold one wire record beside one call, or calls are
-    // never admitted while an image travels; the image is what that leaves (QB.1).
+    // A wire record's room: an image's and its framing, no more than an equal share of the queue's
+    // room between the wire record and the application calls beside it, nor than the room less one
+    // call. Images and queues draw on one memory budget, so an image's room is about the queue's
+    // whole room: held back whole, it would leave the calls one call's room. The equal share among
+    // a queue's holders is the rule the logs and the image share the disk by
+    // (`log_bound::image_disk_room`; QB.1).
     let record = image
         .saturating_add(framing)
+        .min(room.checked_div(2).unwrap_or(0))
         .min(room.saturating_sub(request));
     let least = super::drain::Bound {
         bytes: record.saturating_add(request),
