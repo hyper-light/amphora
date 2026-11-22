@@ -29,19 +29,22 @@
 set -euo pipefail
 # Git for Windows' bash rewrites arguments that look like paths (/data, /etc/...): not the containers'.
 export MSYS_NO_PATHCONV=1
-LABEL="amphora-bench-scale=$SYS"
+# RUN (AMPHORA_BENCH_SCALE_RUN) names this run's containers apart from other runs sharing a Docker
+# daemon: they carry it in their names, label and state file, so `down` removes only this run's.
+RUN=${AMPHORA_BENCH_SCALE_RUN:-}
+LABEL="amphora-bench-scale=$SYS${RUN:+-$RUN}"
 NETEM_IMAGE=${NETEM_IMAGE:-nicolaka/netshoot:latest}
 WAIT_S=${WAIT_S:?WAIT_S: the deadline in seconds the driver passes}
 POLL_S=${POLL_S:-1}
 HOSTS=${HOSTS:?HOSTS: the machines, ENDPOINT=ADDR,... (ENDPOINT local or a docker -H endpoint)}
 BASE=${AMPHORA_BENCH_SCALE_PORT:-$BASE}
-STATE="${XDG_CACHE_HOME:-$HOME/.cache}/amphora-bench-scale-$SYS.nodes"
+STATE="${XDG_CACHE_HOME:-$HOME/.cache}/amphora-bench-scale-$SYS${RUN:+-$RUN}.nodes"
 IFS=, read -r -a MACHINES <<<"$HOSTS"
 ((${#MACHINES[@]} > 0)) || { echo "HOSTS names no machine" >&2; exit 2; }
 for spec in "${MACHINES[@]}"; do
   [[ $spec == *=?* && ${spec%%=*} != "" ]] || { echo "HOSTS entry '$spec' isn't ENDPOINT=ADDR" >&2; exit 2; }
 done
-name() { echo "amphora-bench-scale-$SYS-$1"; }
+name() { echo "amphora-bench-scale-$SYS${RUN:+-$RUN}-$1"; }
 nodes() { cat "$STATE" 2>/dev/null || echo 0; }
 machine() { echo "${MACHINES[$(($1 % ${#MACHINES[@]}))]}"; }
 # Node n's machine's address.
