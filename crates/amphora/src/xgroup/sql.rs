@@ -590,7 +590,8 @@ pub(crate) fn serve(
     if resolving {
         group.locks_resolved(until)?;
     }
-    Ok((reply, group.stamps().map(|_| stamp.load(Ordering::Acquire))))
+    let clocked = group.cross_clock(until)?.is_some();
+    Ok((reply, clocked.then(|| stamp.load(Ordering::Acquire))))
 }
 
 /// Whether a step resolves a transaction here, dropping its locks: the reads across groups they
@@ -1083,26 +1084,18 @@ impl Drop for Cluster {
 
 /// Runs one step on `group`, its stamps carried (T-T1.12.X2): the group takes in the latest stamp
 /// the coordinator heard of before its commit, and answers with its own latest after it. Groups not
-/// backed up here make no stamps and carry none. The stamps are the cross-group clock's, in
-/// microseconds (lane split-merge-21, T-T1.9.R28), the unit of the commit stamps and the tokens.
+/// backed up or replicated here make no stamps and carry none. The stamps are the cross-group
+/// clock's, in microseconds (lane split-merge-21, T-T1.9.R28), the unit of the commit stamps and
+/// the tokens: a backed-up group's writer clock, a replicated group's closed time
+/// (`Database::observe_clock`, `Database::cross_clock`).
 fn step<R, F>(group: &Database, carried: &AtomicU64, until: Instant, f: F) -> Result<R, Refusal>
 where
     R: Send + 'static,
     F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
 {
-    let stamps = group.stamps();
-    if let Some(hooks) = stamps {
-        hooks
-            .marks
-            .observe_micros(carried.load(Ordering::Acquire))
-            .map_err(|e| Refusal::Unavailable(format!("{e:#}")))?;
-    }
+    group.observe_clock(until, carried.load(Ordering::Acquire))?;
     let reply = group.call_internal(until, f)?;
-    if let Some(hooks) = stamps {
-        let latest = hooks
-            .marks
-            .latest_micros()
-            .map_err(|e| Refusal::Unavailable(format!("{e:#}")))?;
+    if let Some(latest) = group.cross_clock(until)? {
         carried.fetch_max(latest, Ordering::AcqRel);
     }
     Ok(reply)

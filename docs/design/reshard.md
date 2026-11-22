@@ -899,7 +899,9 @@ transaction by its own clock as it resolved it.
   in one unit, two sources by the group's kind, because a standalone group has no log and so no
   closed time (its session token is none), and every read across groups runs on backed-up
   standalone groups: with the closed time alone, every transaction across them would commit with
-  no stamp. `Database::cross_clock` is the group's reading either way, what a lock reply carries.
+  no stamp. `Database::cross_clock` is the group's reading either way, what a lock reply carries;
+  `Database::observe_clock` takes a carried stamp in either way (a replicated owner proposes past
+  it), the receive rule each step runs first.
   The stamp
   table (`__amphora_rev_stamps`), the cut, a get's fresh stamp, the moved rows' stamps and the
   stamp a coordinator carries between steps (`xgroup::sql::step`, taken in with
@@ -941,9 +943,10 @@ one stamp in both groups, each group's next write a later one.
 **Left.** The scan waits on a lock anywhere in its range, not only in
 the page it answers (lane xgroup-sql-11's W10 narrows to the page). The wake is per group, not per
 lock (lane xgroup-sql-11's `WaitOnLock` rings a row's own waiters; once merged, these reads can use
-it). A replicated group's rows are stamped by its writer's backup clock only when it is backed up;
-stamping them by the entry's closed time, the same on every member, and taking a step's carried
-stamp into the proposer's clock, makes the closed time the one clock there. Recovery resolves with
+it). A replicated group takes a step's carried stamp in (its owner proposes past it, so its closed
+time after the step is later), but its Records rows are not in the stamp table: reads across groups
+still refuse a group that isn't backed up. Stamping them by the entry's closed time, the same on
+every member, puts them in the order. Recovery resolves with
 `Step::Resolve`: it has no commit stamp, so its rows take each group's own; the lock stamps it
 would need are kept (`__amphora_xg_lock_at`). `Records::commit` across groups waits on both sides
 on one branch. Stamp tables written before this change hold nanoseconds: none is deployed.

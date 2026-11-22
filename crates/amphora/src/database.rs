@@ -1372,6 +1372,20 @@ impl Database {
         }
     }
 
+    /// Takes a stamp of the one cross-group clock in (lane split-merge-21, T-T1.9.R28), the hybrid
+    /// logical clock's receive rule, before a step a coordinator carries it into: a backed-up
+    /// group's writer stamps its commits after it, a replicated group's owner proposes past it.
+    pub(crate) fn observe_clock(&self, until: Instant, micros: u64) -> Result<(), Refusal> {
+        let database = self.resolve(until)?;
+        if let Writer::Replicated { client, .. } = &database.shared.writer {
+            client.observe(micros);
+        }
+        if let Some(hooks) = database.stamps() {
+            hooks.marks.observe_micros(micros).map_err(unavailable)?;
+        }
+        Ok(())
+    }
+
     /// This group's clock on the one cross-group clock (lane split-merge-21, T-T1.9.R28; Ada's
     /// decision of 2026-11-22), microseconds since the Unix epoch: a replicated group's closed
     /// time (its session token's), a backed-up group's writer clock (`Marks::latest_micros`, which
