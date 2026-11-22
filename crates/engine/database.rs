@@ -742,6 +742,10 @@ pub struct Database<
     pub(crate) filter_shares: Arc<crate::filter_shares::FilterShares>,
     /// Amphora (PL.13, lane replan-6): subquery results stored results counted.
     pub(crate) subquery_rows: Arc<crate::subquery_rows::SubqueryRows>,
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): where the exact join searches of statements
+    /// prepared with the fast plan run under `BackgroundSearch::Worker`, and both placements'
+    /// counters (`background_search.rs`).
+    pub(crate) planner: crate::background_search::Planner,
     /// Amphora (PL.7): the cost weights fitted to its statements' measured times, and the switch
     /// the planner reads them behind.
     pub(crate) cost_fit: Arc<crate::translate::optimizer::cost_fit::DatabaseFit>,
@@ -925,6 +929,7 @@ impl Database {
             row_changes: Arc::new(crate::row_changes::RowChanges::new()),
             filter_shares: Arc::new(crate::filter_shares::FilterShares::new()),
             subquery_rows: Arc::new(crate::subquery_rows::SubqueryRows::new()),
+            planner: crate::background_search::Planner::default(),
             cost_fit: Arc::new(crate::translate::optimizer::cost_fit::DatabaseFit::new()),
             shared_wal,
             #[cfg(host_shared_wal)]
@@ -2853,6 +2858,16 @@ impl Database {
             join_search_budget: crate::connection::AtomicJoinSearchBudget::new(
                 crate::connection::JoinSearchBudget::Fixed,
             ),
+            carried_join_orders: crate::connection::AtomicCarriedJoinOrders::new(
+                crate::connection::CarriedJoinOrders::Off,
+            ),
+            bushy_left_join_probes: crate::connection::AtomicBushyLeftJoinProbes::new(
+                crate::connection::BushyLeftJoinProbes::Off,
+            ),
+            background_search: crate::connection::AtomicBackgroundSearch::new(
+                crate::connection::BackgroundSearch::Off,
+            ),
+            idle_searches: crate::background_search::IdleSearches::default(),
             star_filters: crate::connection::AtomicStarFilters::new(
                 crate::connection::StarFilters::ByCost,
             ),

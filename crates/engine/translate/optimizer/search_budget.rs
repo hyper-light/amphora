@@ -44,6 +44,10 @@ pub(crate) struct SearchBudget {
     pub nanos_per_candidate: Option<f64>,
     /// The runs the plan is expected to serve, at least one.
     pub executions: f64,
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): the fast plan, its exact search to follow
+    /// (`background_search.rs`): the budget is the joins the greedy search tries, the tables' count
+    /// squared, so the fast plan costs no more than the greedy search would.
+    pub fast: bool,
 }
 
 /// Which search planned a join.
@@ -60,6 +64,7 @@ impl SearchBudget {
         nanos_per_row: None,
         nanos_per_candidate: None,
         executions: 1.0,
+        fast: false,
     };
 
     /// The budget `rule` takes with `costs`' measured rates.
@@ -73,12 +78,21 @@ impl SearchBudget {
             nanos_per_row: costs.nanos_per(Work::Row),
             nanos_per_candidate: costs.search().nanos_per_candidate(),
             executions: expected_runs.map_or(1.0, |runs| runs as f64).max(1.0),
+            fast: false,
         }
+    }
+
+    /// This budget, or the fast plan's where `fast` (`SearchBudget::fast`).
+    pub(crate) fn fast(self, fast: bool) -> Self {
+        Self { fast, ..self }
     }
 
     /// The subsets the exact search may build for a join of `tables` tables whose left-to-right
     /// plan costs `bound_cost` row visits (None when there is none).
     pub(crate) fn subsets(&self, bound_cost: Option<f64>, tables: usize) -> usize {
+        if self.fast {
+            return tables.saturating_mul(tables);
+        }
         let derived = match self.rule {
             JoinSearchBudget::Fixed => return JOIN_SEARCH_BUDGET,
             JoinSearchBudget::RunShare => self.derived(bound_cost, 1.0),
@@ -240,6 +254,25 @@ mod tests {
             nanos_per_row: Some(10.0),
             nanos_per_candidate: Some(1_000.0),
             executions,
+            fast: false,
+        }
+    }
+
+    /// Do: a fast budget for 8 tables under each rule. Expect: 64 subsets, the joins the greedy
+    /// search tries, whatever the rule or the run (T-PL.8.10, lane pl8-17).
+    #[test]
+    fn t_pl_8_10_the_fast_budget_is_the_greedy_search_s_joins() {
+        for rule in [
+            JoinSearchBudget::Fixed,
+            JoinSearchBudget::RunShare,
+            JoinSearchBudget::RunShareByExecutions,
+        ] {
+            let budget = measured(rule, 1_000.0).fast(true);
+            assert_eq!(budget.subsets(Some(1.0e9), 8), 64);
+            assert_eq!(
+                budget.fast(false).subsets(Some(1.0e9), 8),
+                measured(rule, 1_000.0).subsets(Some(1.0e9), 8)
+            );
         }
     }
 

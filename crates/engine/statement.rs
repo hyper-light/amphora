@@ -291,6 +291,56 @@ fn combine_arithmetic_primitive(
     }
 }
 
+/// A statement's SQL parsed and planned on `conn` with `prepare_options`, on the connection's
+/// schema as it is now: a plan made again (`Statement::plan_again`).
+pub(crate) fn plan_sql(
+    conn: &Arc<Connection>,
+    pager: Arc<Pager>,
+    sql: &str,
+    mode: QueryMode,
+    origin: StatementOrigin,
+    prepare_options: &PrepareOptions,
+) -> Result<vdbe::Program> {
+    let schema = conn.schema.read().clone();
+    plan_sql_on(conn, pager, sql, mode, origin, prepare_options, schema)
+}
+
+/// A statement's SQL parsed and planned on `conn` with `prepare_options`, on `schema` (its
+/// statistics with it, `Schema::analyze_stats`): the exact search that follows a fast plan plans
+/// on the schema the fast plan was made on, taken as the request was handed off and never changed
+/// after (`background_search::SearchRequest::run`, lanes pl8-17 and pl8-18).
+pub(crate) fn plan_sql_on(
+    conn: &Arc<Connection>,
+    pager: Arc<Pager>,
+    sql: &str,
+    mode: QueryMode,
+    origin: StatementOrigin,
+    prepare_options: &PrepareOptions,
+    schema: Arc<crate::schema::Schema>,
+) -> Result<vdbe::Program> {
+    let (cmd, _) = conn.parse_sql(sql)?;
+    let Some(cmd) = cmd else {
+        return Err(LimboError::InternalError(
+            "a prepared statement's SQL no longer parses to a statement".to_string(),
+        ));
+    };
+    let syms = conn.syms.read();
+    #[cfg(debug_assertions)]
+    crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
+    let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
+    translate::translate(
+        &schema,
+        stmt,
+        pager,
+        conn.clone(),
+        &syms,
+        mode,
+        sql,
+        origin,
+        prepare_options,
+    )
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -346,6 +396,9 @@ pub struct Statement {
     /// Amphora (PL.13): the run under way was handed to a second prepare once already; it is not
     /// handed off again (`vdbe::ProgramState::handoff_open`).
     handed_off: bool,
+    /// Amphora (PL.8, lane pl8-17): where the exact search that follows this statement's fast plan
+    /// hands its plan back, taken as a run starts (`background_search.rs`).
+    exact_search: Option<Arc<crate::background_search::SearchSlot>>,
 }
 
 /// Amphora (PL.7): a run timed for the fitted cost model (`optimizer::cost_fit`): its counters
@@ -459,7 +512,91 @@ impl Statement {
             custom_run: None,
             cost_sample: None,
             handed_off: false,
+            exact_search: None,
         }
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): a fast plan the greedy search ordered hands its
+    /// exact search to the placement the connection's switch names (`background_search.rs`); a
+    /// request from an earlier plan is dropped with its slot.
+    pub(crate) fn hand_off_exact_search(&mut self) {
+        self.exact_search = None;
+        let conn = self.program.connection.clone();
+        let placement = conn.background_search();
+        if placement == crate::BackgroundSearch::Off || !self.program.fast_planned {
+            return;
+        }
+        let slot = Arc::new(crate::background_search::SearchSlot::default());
+        // Amphora (PL.8, T-PL.8.11, lane pl8-18): what the search plans on is taken now, on the
+        // statement's own thread, as the fast plan was made: the schema and its statistics, never
+        // changed after, and the generation of the connection's settings, which the plan must
+        // still match when the statement takes it (`take_exact_plan`).
+        let request = crate::background_search::SearchRequest {
+            conn: Arc::downgrade(&conn),
+            schema: conn.schema.read().clone(),
+            generation: conn.prepare_context_generation(),
+            pager: self.pager.clone(),
+            sql: self.program.sql.clone(),
+            mode: self.query_mode,
+            origin: self.origin,
+            expected_runs: Some(self.runs_since_planned.max(1)),
+            fast_orders: self.program.join_orders.clone(),
+            fast_cost: self.program.plan_cost,
+            slot: Arc::downgrade(&slot),
+        };
+        self.exact_search = Some(slot);
+        match placement {
+            crate::BackgroundSearch::Worker => {
+                let connections = conn.db.n_connections.load(Ordering::SeqCst);
+                conn.db.planner.enqueue(request, connections);
+            }
+            crate::BackgroundSearch::Idle => conn
+                .idle_searches
+                .enqueue(request, conn.db.planner.counters()),
+            crate::BackgroundSearch::Off => {}
+        }
+    }
+
+    /// Amphora (PL.8, T-PL.8.10, lane pl8-17): as a run starts, the exact plan its search handed
+    /// back, if it has, takes the fast plan's place (as the generic plan while a custom one runs).
+    fn take_exact_plan(&mut self) -> Result<()> {
+        let found = match &self.exact_search {
+            Some(slot) => slot.take(),
+            None => return Ok(()),
+        };
+        let Some(found) = found else {
+            return Ok(());
+        };
+        self.exact_search = None;
+        if let crate::background_search::Found::Better {
+            program,
+            generation,
+        } = found
+        {
+            // Amphora (PL.8, T-PL.8.11, lane pl8-18): the search read the connection's settings
+            // while the connection ran, and every setting that shapes a plan moves the generation
+            // as it changes. A plan whose generation is still the one taken at hand-off read the
+            // settings the fast plan was made with; past it, the fast plan stays, and the check
+            // below plans the statement again on the settings as they now are.
+            let conn = &self.program.connection;
+            if generation != conn.prepare_context_generation() {
+                conn.db.planner.counters().note_stale();
+                return Ok(());
+            }
+            if self.generic.is_some() {
+                self.generic = Some(program);
+            } else {
+                self.install_program(program)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Amphora (PL.8, lane pl8-17): whether this statement's exact search is still to come back.
+    pub fn exact_search_pending(&self) -> bool {
+        self.exact_search
+            .as_ref()
+            .is_some_and(|slot| !slot.is_filled())
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -622,6 +759,8 @@ impl Statement {
                 .fetch_sub(1, Ordering::SeqCst);
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
+                // Amphora (PL.8, lane pl8-17): the connection went idle between statements.
+                self.program.connection.went_idle();
             }
             self.counted_as_active_root = false;
         }
@@ -883,6 +1022,13 @@ impl Statement {
                 // MVCC checkpoints can publish internal schema roots without changing
                 // SQLite's schema cookie, so refresh before deciding whether to reprepare.
                 self.program.connection.maybe_update_schema();
+            }
+            // Amphora (PL.8, lane pl8-17): the exact plan first, so a stale one is planned again.
+            if self.origin == StatementOrigin::Root {
+                if let Err(err) = self.take_exact_plan() {
+                    self.release_active_root_if_counted();
+                    return Err(err);
+                }
             }
             if !self
                 .program
@@ -1339,12 +1485,31 @@ impl Statement {
         // Amphora (PL.8): a statement that ran r times since it was planned is expected to run r
         // times more: Gott's Copernican estimate, the median of what remains of a run of unknown
         // length seen at a random point in it (Nature 363, 1993).
+        // Amphora (PL.8, lane pl8-16): and it weighs the join orders its last generic plan chose
+        // (`generic` while a custom plan runs), so a plan made again on the same facts keeps them.
+        let carried_join_orders = match conn.carried_join_orders() {
+            crate::CarriedJoinOrders::WithinMargin => self
+                .generic
+                .as_ref()
+                .unwrap_or(&self.program)
+                .join_orders
+                .clone(),
+            crate::CarriedJoinOrders::Off => None,
+        };
+        let fast_search = self.origin == StatementOrigin::Root
+            && conn.background_search() != crate::BackgroundSearch::Off;
+        let expected_runs = Some(self.runs_since_planned.max(1));
         let new_program = self.plan_again(&PrepareOptions {
-            expected_runs: Some(self.runs_since_planned.max(1)),
+            expected_runs,
+            carried_join_orders,
+            fast_search,
             ..PrepareOptions::default()
         })?;
-        self.runs_since_planned = 0;
         self.install_program(new_program)?;
+        // Amphora (PL.8, lane pl8-17): the exact search of a fast plan made again is sized by the
+        // runs this one served, as the plan made in full would be.
+        self.hand_off_exact_search();
+        self.runs_since_planned = 0;
         self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
         // Amphora (PL.12): the plan made now is the generic one, on the schema and statistics as
         // they now are; the custom runs measured before are of the old ones, and start again.
@@ -1357,27 +1522,11 @@ impl Statement {
     /// The statement's SQL parsed and planned again with `prepare_options`: the generic plan
     /// without values, a custom one with a run's (PL.12).
     fn plan_again(&self, prepare_options: &PrepareOptions) -> Result<vdbe::Program> {
-        let conn = self.program.connection.clone();
-        let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-        let Some(cmd) = cmd else {
-            return Err(LimboError::InternalError(
-                "a prepared statement's SQL no longer parses to a statement".to_string(),
-            ));
-        };
-        let syms = conn.syms.read();
-        let mode = self.query_mode;
-        #[cfg(debug_assertions)]
-        crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
-        let schema = conn.schema.read().clone();
-        translate::translate(
-            &schema,
-            stmt,
+        plan_sql(
+            &self.program.connection,
             self.pager.clone(),
-            conn.clone(),
-            &syms,
-            mode,
             &self.program.sql,
+            self.query_mode,
             self.origin,
             prepare_options,
         )
@@ -2222,6 +2371,510 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect(ConnectOpts::new())
+    }
+
+    /// Amphora (T-PL.8.10, lane pl8-17): a star of a fact table and `STAR_DIMENSIONS` dimensions,
+    /// the third filtered. Its connected subsets (2^10 + 10 = 1,034) pass the fast budget (the
+    /// tables' count squared, 121) and fit the control's 10,000, so its fast plan is greedy and its
+    /// exact search is the dynamic program.
+    const STAR_DIMENSIONS: usize = 10;
+
+    fn star_sql() -> String {
+        use std::fmt::Write;
+        let mut sql = String::from("SELECT count(*) FROM f");
+        for d in 1..=STAR_DIMENSIONS {
+            write!(sql, ", d{d}").unwrap();
+        }
+        sql.push_str(" WHERE d3.v < 5");
+        for d in 1..=STAR_DIMENSIONS {
+            write!(sql, " AND f.a{d} = d{d}.id").unwrap();
+        }
+        sql
+    }
+
+    fn star_connection() -> Arc<crate::Connection> {
+        let conn = open_test_connection().unwrap();
+        let columns: Vec<String> = (1..=STAR_DIMENSIONS).map(|d| format!("a{d} INT")).collect();
+        conn.execute(format!(
+            "CREATE TABLE f(id INTEGER PRIMARY KEY, {})",
+            columns.join(", ")
+        ))
+        .unwrap();
+        let values: Vec<String> = (1..=STAR_DIMENSIONS)
+            .map(|d| format!("x % {} + 1", 20 * d))
+            .collect();
+        conn.execute(format!(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 2000) \
+             INSERT INTO f SELECT x, {} FROM n",
+            values.join(", ")
+        ))
+        .unwrap();
+        for d in 1..=STAR_DIMENSIONS {
+            conn.execute(format!("CREATE TABLE d{d}(id INTEGER PRIMARY KEY, v INT)"))
+                .unwrap();
+            conn.execute(format!(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < {}) \
+                 INSERT INTO d{d} SELECT x, x % 50 FROM n",
+                20 * d
+            ))
+            .unwrap();
+        }
+        conn.execute("ANALYZE").unwrap();
+        conn
+    }
+
+    fn count_of(stmt: &mut Statement) -> Vec<Vec<Value>> {
+        let rows = stmt.run_collect_rows().unwrap();
+        stmt.reset().unwrap();
+        rows
+    }
+
+    /// Do: under placement `Idle`, keep one statement in progress on the connection while the star
+    /// join runs three times to its end. Expect: its fast plan answers, its exact search waits and
+    /// never runs while the connection is busy (one request, no outcome); once the held statement
+    /// is reset the connection goes idle, the search runs, and the next run answers the same
+    /// (T-PL.8.10, lane pl8-17: placement `Idle`'s failure mode, a connection that never goes
+    /// idle).
+    #[test]
+    fn t_pl_8_10_a_connection_that_never_goes_idle_never_runs_its_search() {
+        let conn = star_connection();
+        let mut control = conn.prepare(star_sql()).unwrap();
+        let expected = count_of(&mut control);
+        drop(control);
+        conn.set_background_search(crate::BackgroundSearch::Idle);
+        let mut held = conn.prepare("SELECT id FROM f").unwrap();
+        assert!(held
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_some());
+        let mut stmt = conn.prepare(star_sql()).unwrap();
+        assert!(stmt.program.fast_planned, "the star's fast plan is greedy");
+        for _ in 0..3 {
+            assert_eq!(count_of(&mut stmt), expected);
+        }
+        let busy = conn.background_search_stats();
+        assert_eq!(conn.idle_searches_pending(), 1);
+        assert!(stmt.exact_search_pending());
+        assert_eq!(busy.requested, 1);
+        assert_eq!(busy.kept + busy.replaced + busy.failed + busy.dropped, 0);
+        held.reset().unwrap();
+        let idle = conn.background_search_stats();
+        assert_eq!(conn.idle_searches_pending(), 0);
+        assert!(!stmt.exact_search_pending());
+        assert_eq!(idle.kept + idle.replaced, 1, "{idle:?}");
+        assert_eq!(count_of(&mut stmt), expected);
+        assert!(
+            stmt.exact_search.is_none(),
+            "the run took what the search came to"
+        );
+    }
+
+    /// Do: under placement `Worker`, prepare the star join and run it at once, then wait for its
+    /// exact search (woken by the slot's fill). Expect: the fast plan answers, one request ends in
+    /// one outcome, and the run after it answers the same on whichever plan won (T-PL.8.10).
+    #[test]
+    fn t_pl_8_10_the_worker_hands_back_the_exact_plan() {
+        let conn = star_connection();
+        let mut control = conn.prepare(star_sql()).unwrap();
+        let expected = count_of(&mut control);
+        drop(control);
+        conn.set_background_search(crate::BackgroundSearch::Worker);
+        let mut stmt = conn.prepare(star_sql()).unwrap();
+        assert!(stmt.program.fast_planned);
+        let slot = stmt
+            .exact_search
+            .clone()
+            .expect("the fast plan handed its search off");
+        assert_eq!(count_of(&mut stmt), expected);
+        slot.wait_filled();
+        let stats = conn.background_search_stats();
+        assert_eq!(stats.requested, 1);
+        assert_eq!(stats.kept + stats.replaced, 1, "{stats:?}");
+        assert_eq!(count_of(&mut stmt), expected);
+        assert!(stmt.exact_search.is_none());
+    }
+
+    /// Do: under placement `Worker`, 64 connections each prepare the star join 4 times, dropping
+    /// each statement before its search comes back. Expect: every request ends in exactly one
+    /// outcome, the worker's queue never holds more than the connections open, and none hangs
+    /// (T-PL.8.10: placement `Worker` under many connections).
+    #[test]
+    fn t_pl_8_10_every_worker_request_ends_once_under_many_connections() {
+        let conn = star_connection();
+        conn.set_background_search(crate::BackgroundSearch::Worker);
+        let connections: Vec<_> = (0..64)
+            .map(|_| {
+                let other = conn.db.connect(ConnectOpts::new()).unwrap();
+                other.set_background_search(crate::BackgroundSearch::Worker);
+                other
+            })
+            .collect();
+        let mut last = Vec::new();
+        for _ in 0..4 {
+            last.clear();
+            for other in &connections {
+                let stmt = other.prepare(star_sql()).unwrap();
+                last.push(stmt);
+            }
+        }
+        for stmt in &last {
+            if let Some(slot) = stmt.exact_search.as_ref() {
+                slot.wait_filled();
+            }
+        }
+        let stats = conn.background_search_stats();
+        assert_eq!(stats.requested, 4 * 64);
+        assert!(stats.longest_queue <= 65, "{stats:?}");
+        // The last round's searches are all done; earlier ones may still be leaving the queue.
+        let ended = stats.dropped + stats.abandoned + stats.kept + stats.replaced + stats.failed;
+        assert!((64..=stats.requested).contains(&ended), "{stats:?}");
+    }
+
+    /// Do: under placement `Idle`, with the connection kept busy, take the star's slot and fill it
+    /// with the plan made in full, once at the generation of hand-off and once after a setting
+    /// that shapes plans was set (to the value it had). Expect: the first is taken (the statement
+    /// runs the exact plan); the second is counted stale, the fast plan stays and the statement
+    /// plans again on the settings as they are; the answers never change (T-PL.8.11, lane pl8-18).
+    #[test]
+    fn t_pl_8_11_a_plan_read_past_a_moved_setting_is_never_taken() {
+        let conn = star_connection();
+        let mut control = conn.prepare(star_sql()).unwrap();
+        let expected = count_of(&mut control);
+        drop(control);
+        conn.set_background_search(crate::BackgroundSearch::Idle);
+        let mut held = conn.prepare("SELECT id FROM f").unwrap();
+        assert!(held
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_some());
+        for moved in [false, true] {
+            let mut stmt = conn.prepare(star_sql()).unwrap();
+            assert!(stmt.program.fast_planned);
+            let slot = stmt
+                .exact_search
+                .clone()
+                .expect("the fast plan handed its search off");
+            let generation = conn.prepare_context_generation();
+            let exact = plan_sql(
+                &conn,
+                stmt.pager.clone(),
+                &stmt.program.sql,
+                stmt.query_mode,
+                stmt.origin,
+                &PrepareOptions::default(),
+            )
+            .unwrap();
+            assert!(!exact.fast_planned);
+            if moved {
+                conn.set_join_methods(conn.join_methods());
+            }
+            let before = conn.background_search_stats().stale;
+            slot.fill(crate::background_search::Found::Better {
+                program: exact,
+                generation,
+            });
+            assert_eq!(count_of(&mut stmt), expected);
+            let stale = conn.background_search_stats().stale - before;
+            if moved {
+                assert_eq!(stale, 1);
+                assert!(stmt.program.fast_planned, "the fast plan, planned again");
+            } else {
+                assert_eq!(stale, 0);
+                assert!(!stmt.program.fast_planned, "the exact plan was taken");
+            }
+        }
+        held.reset().unwrap();
+    }
+
+    /// Do: under placement `Worker`, prepare a write whose SELECT is the star join. Expect: it is
+    /// planned in full at prepare and hands nothing off: a write's plan reads the connection's
+    /// nesting and changes its stack of triggers compiling, which a search off the connection's
+    /// thread must not (T-PL.8.11, lane pl8-18).
+    #[test]
+    fn t_pl_8_11_only_a_select_hands_its_search_off() {
+        let conn = star_connection();
+        conn.execute("CREATE TABLE side_log(n INT)").unwrap();
+        conn.set_background_search(crate::BackgroundSearch::Worker);
+        let write = conn
+            .prepare(format!("INSERT INTO side_log {}", star_sql()))
+            .unwrap();
+        assert!(!write.program.fast_planned);
+        assert!(write.exact_search.is_none());
+        let read = conn.prepare(star_sql()).unwrap();
+        assert!(read.program.fast_planned);
+        assert!(read.exact_search.is_some());
+    }
+
+    /// Do: under placement `Worker`, prepare the star join and, while the worker plans it, run on
+    /// the same connection a write transaction that fires a trigger, a schema change, a setting
+    /// that shapes plans and the star itself; then wait for the search and run the star again;
+    /// 32 rounds. Expect: the star answers the same every time, no trigger firing is lost, no
+    /// search fails, and every request ends at most once (T-PL.8.11, lane pl8-18: the worker plans
+    /// on the schema and statistics taken at hand-off, while the connection runs).
+    #[test]
+    fn t_pl_8_11_statements_run_on_the_connection_while_the_worker_plans_for_it() {
+        let rounds = 32u64;
+        let conn = star_connection();
+        let mut control = conn.prepare(star_sql()).unwrap();
+        let expected = count_of(&mut control);
+        drop(control);
+        conn.execute("CREATE TABLE side(id INTEGER PRIMARY KEY, v INT)")
+            .unwrap();
+        conn.execute("CREATE TABLE side_log(id INT)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER side_t AFTER INSERT ON side BEGIN \
+             INSERT INTO side_log VALUES (new.id); END",
+        )
+        .unwrap();
+        conn.set_background_search(crate::BackgroundSearch::Worker);
+        for round in 0..rounds {
+            let mut stmt = conn.prepare(star_sql()).unwrap();
+            let slot = stmt
+                .exact_search
+                .clone()
+                .expect("the fast plan handed its search off");
+            conn.execute("BEGIN").unwrap();
+            conn.execute(format!("INSERT INTO side VALUES ({round}, {round})"))
+                .unwrap();
+            conn.execute("COMMIT").unwrap();
+            conn.execute(format!("CREATE TABLE side{round}(x INT)"))
+                .unwrap();
+            if round % 2 == 0 {
+                conn.set_join_methods(conn.join_methods());
+            }
+            assert_eq!(count_of(&mut stmt), expected);
+            slot.wait_filled();
+            assert_eq!(count_of(&mut stmt), expected);
+        }
+        let mut logged = conn.prepare("SELECT count(*) FROM side_log").unwrap();
+        assert_eq!(
+            count_of(&mut logged),
+            vec![vec![Value::from_i64(i64::try_from(rounds).unwrap())]]
+        );
+        let stats = conn.background_search_stats();
+        assert_eq!(stats.failed, 0, "{stats:?}");
+        let ended = stats.dropped + stats.abandoned + stats.kept + stats.replaced + stats.failed;
+        assert!(ended <= stats.requested, "{stats:?}");
+        assert!(stats.stale <= stats.replaced, "{stats:?}");
+    }
+
+    /// Do: under placement `Idle`, with the connection kept busy, prepare three star joins and drop
+    /// the first, then let the connection go idle twice. Expect: each time it goes idle it runs one
+    /// search, the oldest live one first, the dropped statement's request leaving as abandoned on
+    /// the way, so the call that ended its last statement is late by one search at most
+    /// (T-PL.8.12, lane pl8-18).
+    #[test]
+    fn t_pl_8_12_each_idle_runs_one_search() {
+        let conn = star_connection();
+        conn.set_background_search(crate::BackgroundSearch::Idle);
+        let mut held = conn.prepare("SELECT id FROM f").unwrap();
+        assert!(held
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_some());
+        let gone = conn.prepare(star_sql()).unwrap();
+        let first = conn.prepare(star_sql()).unwrap();
+        let second = conn
+            .prepare(format!("{} AND d1.v < 40", star_sql()))
+            .unwrap();
+        drop(gone);
+        assert!(first.exact_search_pending() && second.exact_search_pending());
+        assert_eq!(conn.idle_searches_pending(), 3);
+        let before = conn.background_search_stats();
+        held.reset().unwrap();
+        let after = conn.background_search_stats();
+        assert_eq!(
+            after.abandoned - before.abandoned,
+            1,
+            "the gone statement's, no search"
+        );
+        assert_eq!(conn.idle_searches_pending(), 1);
+        assert!(!first.exact_search_pending(), "the oldest live one first");
+        assert!(second.exact_search_pending());
+        let mut quick = conn.prepare("SELECT 1").unwrap();
+        count_of(&mut quick);
+        assert_eq!(conn.idle_searches_pending(), 0);
+        assert!(!second.exact_search_pending());
+    }
+
+    /// The harness of record (T-PL.8.10, lane pl8-17): `n` connections to one database, each on its
+    /// own thread, released together, prepare the star join and run it. Reports, over the
+    /// connections, the time to the first row, the time to the exact plan (the search's slot
+    /// filled; at prepare under `Off`, whose plan is exact) and the time of the calls that end the
+    /// statement (lane pl8-18: under `Idle` they run one waiting search; set against `Off`, the
+    /// latency `Idle` adds to them), at p50, p99 and the largest, and the searches' outcomes.
+    /// Run: `cargo test -p amphora-engine --lib -- --ignored --nocapture
+    /// t_pl_8_10_harness` (AMPHORA_BG_CONNECTIONS=1,32,512 by default).
+    fn harness(placement: crate::BackgroundSearch, n: usize) -> String {
+        let conn = star_connection();
+        let barrier = std::sync::Barrier::new(n);
+        let results: Vec<(f64, f64, f64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+                    other.set_background_search(placement);
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let started = std::time::Instant::now();
+                        let mut stmt = other.prepare(star_sql()).unwrap();
+                        let prepared = started.elapsed();
+                        let slot = stmt.exact_search.clone();
+                        assert!(stmt
+                            .run_one_step_blocking(|| Ok(()), || Ok(()))
+                            .unwrap()
+                            .is_some());
+                        let first_row = started.elapsed();
+                        // Lane pl8-18: the calls that end the statement, which under `Idle` run
+                        // one waiting search as the connection goes idle.
+                        let ending = std::time::Instant::now();
+                        stmt.run_ignore_rows().unwrap();
+                        stmt.reset().unwrap();
+                        let ended = ending.elapsed();
+                        let exact = match slot {
+                            Some(slot) => slot.wait_filled().duration_since(started),
+                            None => prepared,
+                        };
+                        (
+                            first_row.as_secs_f64() * 1e6,
+                            exact.as_secs_f64() * 1e6,
+                            ended.as_secs_f64() * 1e6,
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let quantiles = |mut values: Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            let at = |q: f64| values[((values.len() - 1) as f64 * q).round() as usize];
+            format!("p50 {:.0} p99 {:.0} max {:.0}", at(0.5), at(0.99), at(1.0))
+        };
+        format!(
+            "{placement:?} at {n}: first row (us) {}; exact plan (us) {}; the statement's ending \
+             calls (us) {}; {:?}",
+            quantiles(results.iter().map(|r| r.0).collect()),
+            quantiles(results.iter().map(|r| r.1).collect()),
+            quantiles(results.iter().map(|r| r.2).collect()),
+            conn.background_search_stats()
+        )
+    }
+
+    #[test]
+    #[ignore = "the harness of record: the coordinator's run, with --ignored --nocapture"]
+    fn t_pl_8_10_harness_time_to_first_row_and_to_the_exact_plan() {
+        let ladder = std::env::var("AMPHORA_BG_CONNECTIONS").unwrap_or_else(|_| "1,32,512".into());
+        for n in ladder
+            .split(',')
+            .filter_map(|n| n.trim().parse::<usize>().ok())
+        {
+            for placement in [
+                crate::BackgroundSearch::Off,
+                crate::BackgroundSearch::Worker,
+                crate::BackgroundSearch::Idle,
+            ] {
+                println!("{}", harness(placement, n));
+            }
+        }
+    }
+
+    /// Do: prepare a three-table join, then plan it again (`Statement::reprepare`) on the same
+    /// facts. Expect: the first plan notes the block's order under its tables, and the plan made
+    /// again, carrying it in, notes the same order (T-PL.8.9, lane pl8-16: a statement planned
+    /// again hands its join orders to the new search).
+    #[test]
+    fn t_pl_8_9_a_statement_planned_again_carries_its_join_order() {
+        let conn = open_test_connection().unwrap();
+        conn.set_carried_join_orders(crate::CarriedJoinOrders::WithinMargin);
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, b INT)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, c INT)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut stmt = conn
+            .prepare("SELECT a.id FROM a, b, c WHERE a.b = b.id AND b.c = c.id")
+            .unwrap();
+        let key: Vec<String> = ["a", "b", "c"].iter().map(|t| t.to_string()).collect();
+        let order = |stmt: &Statement| {
+            stmt.program
+                .join_orders
+                .as_ref()
+                .and_then(|orders| orders.get(&key))
+        };
+        let first = order(&stmt).expect("the first plan noted its join order");
+        assert_eq!(first.len(), 3);
+        stmt.reprepare().unwrap();
+        assert_eq!(order(&stmt), Some(first));
+    }
+
+    /// The A/B of the carried join order at the plan (T-PL.8.9, lane pl8-16): a join of two
+    /// tables of 1,000 and 1,200 rows on a key neither indexes, whose two hash-join orders differ by
+    /// `200 * (probe - build)` rows' visits, planned again 40 times with the hash build's weight
+    /// pinned 10% either side of the probe's in turn (the noise the weights carry), the database's
+    /// seek weight showing a spread between batches of `ln(110 / 90)`. Returns how often the order
+    /// changed from one plan to the next, and the margin the weights' error gave.
+    #[cfg(feature = "simulator")]
+    fn order_flips(rule: crate::CarriedJoinOrders) -> (usize, f64) {
+        use crate::translate::optimizer::learned_costs::Work;
+        let conn = open_test_connection().unwrap();
+        conn.set_carried_join_orders(rule);
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INT)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, k INT)",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 1000) \
+             INSERT INTO a SELECT x, x % 97 FROM n",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 1200) \
+             INSERT INTO b SELECT x, x % 89 FROM n",
+            "ANALYZE",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        for i in 0..64 {
+            let nanos = if i % 2 == 0 { 90.0 } else { 110.0 };
+            for _ in 0..4096 {
+                conn.db.learned_costs.observe_sampled(Work::Seek, nanos);
+            }
+        }
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM a, b WHERE a.k = b.k")
+            .unwrap();
+        let key: Vec<String> = ["a", "b"].iter().map(|t| t.to_string()).collect();
+        let order = |stmt: &Statement| {
+            stmt.program
+                .join_orders
+                .as_ref()
+                .and_then(|orders| orders.get(&key))
+        };
+        let mut last = order(&stmt);
+        let mut flips = 0;
+        for i in 0..40 {
+            let build = if i % 2 == 0 { 15.0 * 1.1 } else { 15.0 / 1.1 };
+            conn.pin_cost_weights(Some((10.0, build, 15.0)));
+            stmt.reprepare().unwrap();
+            let now = order(&stmt);
+            if now != last {
+                flips += 1;
+            }
+            last = now;
+        }
+        (flips, conn.db.learned_costs.cost_margin())
+    }
+
+    /// Do: the carried order's A/B (`order_flips`) under each rule. Expect: weighing the last
+    /// plan's order within the weights' error flips the plan no more often than searching afresh;
+    /// the counts are the report (T-PL.8.9, lane pl8-16).
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn t_pl_8_9_ab_carried_orders_flip_no_more_than_fresh_plans() {
+        let (fresh, _) = order_flips(crate::CarriedJoinOrders::Off);
+        let (carried, margin) = order_flips(crate::CarriedJoinOrders::WithinMargin);
+        println!(
+            "join order flips over 40 plans made again: afresh {fresh}, carried {carried} \
+             (margin {margin})"
+        );
+        assert!(carried <= fresh, "afresh {fresh}, carried {carried}");
     }
 
     #[test]

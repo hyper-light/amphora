@@ -3268,6 +3268,10 @@ fn find_table_access_plan(
         &mut constraints_per_table,
     )?;
 
+    // PL.8 (lane pl8-16): the order this block ran in when the statement was last planned, and
+    // the margin it keeps its place by (`join::keep_carried`).
+    let join_order_key = join::join_order_key(table_references.joined_tables());
+    let carried_order = resolver.carried_join_order(&join_order_key);
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
@@ -3277,6 +3281,9 @@ fn find_table_access_plan(
         search_budget: resolver.join_search(),
         sorted_fetches: resolver.sorted_fetches(),
         row_goal,
+        carried_order: carried_order.as_deref(),
+        carried_margin: resolver.join_margin(),
+        left_join_probes: resolver.bushy_left_join_probes(),
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
@@ -3319,6 +3326,11 @@ fn find_table_access_plan(
     } else {
         best_plan
     };
+    // PL.8 (lane pl8-16): the order chosen, for the statement's next plan to weigh; a bushy plan
+    // carries none.
+    if best_plan.is_left_deep() {
+        resolver.record_join_order(join_order_key, best_plan.table_numbers().collect());
+    }
 
     note_materialized_prefixes(
         &best_plan,
@@ -3508,6 +3520,10 @@ fn plan_unmatched_right_rows(
                 search_budget: resolver.join_search(),
                 sorted_fetches: false,
                 row_goal: None,
+                carried_order: None,
+                carried_margin: 0.0,
+                // A RIGHT or FULL JOIN plans no bushy plan (`join::bushy_core`).
+                left_join_probes: false,
             },
             &where_clause_for_unmatched_rows,
             // The result subroutine evaluates all WHERE terms after matching.
@@ -3749,10 +3765,20 @@ fn change_join_origin_to_inner(where_clause: &mut [WhereTerm], table_id: ast::Ta
 /// refused with a typed error: nested runs, a run not followed by such a hash join, a run or probe
 /// whose join keeps its position (outer, semi, anti, lateral), a RIGHT or FULL JOIN anywhere, and a
 /// plan whose order removed a sort (the run's loops no longer run in the plan's order).
+/// Lane pl8-19: a run may hold a LEFT JOIN the search moves (`join::is_movable_left_join`), read by
+/// a loop, whose ON terms read the run's tables only and hold no subquery: the build input joins
+/// and null-extends it as a left-deep plan does, and the main plan reads its rows, NULL rows
+/// included, from the payload (`join::bushy_pair_keeps_left_joins` says why that is the join's
+/// answer). Lane pl8-20: its probe may be one too, read by the outer hash join a LEFT JOIN's table
+/// gets (`HashJoinType::LeftOuter`), whose ON terms hold no subquery: each outer row's probe pass
+/// marks the run's rows it matched and the rest come out NULL-extended after it, once for that
+/// outer row (`join::bushy_pair_keeps_left_joins` says why that is the join's answer). The search
+/// plans one only behind `Connection::set_bushy_left_join_probes`.
 fn bushy_build_groups(
     plan: &JoinN,
     access_methods_arena: &[AccessMethod],
     table_references: &TableReferences,
+    where_clause: &[WhereTerm],
     sort_eliminated: bool,
 ) -> Result<Vec<(usize, TableMask)>> {
     let mut groups = Vec::new();
@@ -3788,24 +3814,29 @@ fn bushy_build_groups(
         else {
             return refuse("a run is empty");
         };
-        let probe_is_group_hash_join =
+        // The probe's hash join, built from the run's last table: an inner one, or (lane pl8-20)
+        // the outer one of a LEFT JOIN's table, which keeps the run's rows each outer row's probe
+        // pass didn't match.
+        let probe_join_type =
             access_methods_arena
                 .get(probe_method)
-                .is_some_and(|method| {
-                    matches!(
-                        method.params,
-                        AccessMethodParams::HashJoin {
-                            build_table_idx,
-                            probe_table_idx,
-                            materialize_build_input: true,
-                            join_type: HashJoinType::Inner,
-                            ..
-                        } if build_table_idx == last_table && probe_table_idx == probe_table
-                    )
+                .and_then(|method| match method.params {
+                    AccessMethodParams::HashJoin {
+                        build_table_idx,
+                        probe_table_idx,
+                        materialize_build_input: true,
+                        join_type: join_type @ (HashJoinType::Inner | HashJoinType::LeftOuter),
+                        ..
+                    } if build_table_idx == last_table && probe_table_idx == probe_table => {
+                        Some(join_type)
+                    }
+                    _ => None,
                 });
-        if !probe_is_group_hash_join {
-            return refuse("a run's probe is not an inner hash join built from its last table");
-        }
+        let Some(probe_join_type) = probe_join_type else {
+            return refuse(
+                "a run's probe is not an inner or LEFT hash join built from its last table",
+            );
+        };
         let mut group = TableMask::default();
         for &(table, _) in plan.data.get(run.start..run.end).unwrap_or_default() {
             group.set(table)?;
@@ -3829,16 +3860,94 @@ fn bushy_build_groups(
                 "a run's table probes a hash table built outside the run or from a materialized input",
             );
         }
-        let constrained = group.iter().chain([probe_table]).any(|table| {
-            table_references
-                .joined_tables()
-                .get(table)
-                .and_then(|table| table.join_info.as_ref())
+        let mut left_joins = 0usize;
+        let mut left_join_probes = 0usize;
+        let mut constrained = false;
+        for (table, method) in plan
+            .data
+            .get(run.start..run.end)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .chain([(probe_table, probe_method)])
+        {
+            let Some(joined) = table_references.joined_tables().get(table) else {
+                return refuse("a run's table is not in the query");
+            };
+            if !joined
+                .join_info
+                .as_ref()
                 .is_some_and(JoinInfo::is_ordering_constrained)
-        });
+            {
+                continue;
+            }
+            // A LEFT JOIN probe (lane pl8-20): its outer hash join makes the NULL rows, for the
+            // run's rows each outer row's probe pass didn't match; its ON terms run at the probe,
+            // which reads every table before it, so only a subquery keeps it out.
+            if table == probe_table {
+                let on_origin = JoinOrigin::Outer(joined.internal_id);
+                let on_has_subquery = where_clause.iter().any(|term| {
+                    term.origin.join_origin() == Some(on_origin)
+                        && crate::translate::expr::expr_references_any_subquery(&term.expr)
+                });
+                if probe_join_type == HashJoinType::LeftOuter
+                    && join::is_movable_left_join(joined)
+                    && !on_has_subquery
+                {
+                    left_join_probes = left_join_probes.saturating_add(1);
+                    continue;
+                }
+                constrained = true;
+                break;
+            }
+            if !join::is_movable_left_join(joined) {
+                constrained = true;
+                break;
+            }
+            let looped = !matches!(
+                access_methods_arena
+                    .get(method)
+                    .map(|method| &method.params),
+                Some(AccessMethodParams::HashJoin { .. })
+            );
+            let on_origin = JoinOrigin::Outer(joined.internal_id);
+            let mut on_in_run = true;
+            for term in where_clause {
+                if term.origin.join_origin() != Some(on_origin) {
+                    continue;
+                }
+                if crate::translate::expr::expr_references_any_subquery(&term.expr) {
+                    on_in_run = false;
+                    break;
+                }
+                let mask = table_mask_from_expr(&term.expr, table_references, &[])?;
+                if !group.contains_all_set_bits_of(&mask) {
+                    on_in_run = false;
+                    break;
+                }
+            }
+            if !looped || !on_in_run {
+                return refuse(
+                    "a run's LEFT JOIN is read by a hash join or its ON terms read past the run",
+                );
+            }
+            left_joins = left_joins.saturating_add(1);
+        }
         if constrained {
             return refuse("a table of a run or its probe keeps its place in the join");
         }
+        #[cfg(test)]
+        if left_joins > 0 {
+            bushy_search_tests::LEFT_JOINS_IN_RUNS
+                .with(|runs| runs.set(runs.get().saturating_add(left_joins)));
+        }
+        #[cfg(test)]
+        if left_join_probes > 0 {
+            bushy_search_tests::LEFT_JOIN_PROBES
+                .with(|probes| probes.set(probes.get().saturating_add(left_join_probes)));
+        }
+        #[cfg(not(test))]
+        let _ = (left_joins, left_join_probes);
         groups.push((run.end, group));
     }
     Ok(groups)
@@ -3874,6 +3983,7 @@ pub(crate) mod bushy_test_hook {
         plan: JoinN,
         access_methods_arena: &mut [AccessMethod],
         table_references: &TableReferences,
+        where_clause: &[WhereTerm],
         sort_eliminated: bool,
     ) -> JoinN {
         let Some(first_split) = SPLIT.with(Cell::get) else {
@@ -3907,6 +4017,7 @@ pub(crate) mod bushy_test_hook {
                     &bushy,
                     access_methods_arena,
                     table_references,
+                    where_clause,
                     sort_eliminated,
                 )
                 .is_ok()
@@ -4057,6 +4168,207 @@ pub(crate) mod bushy_test_hook {
             }
             assert_eq!(compared, 16);
         }
+
+        /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
+        /// holds a LEFT JOIN of `q` (as `l`) on `b`, the run's table its ON reads, matching some
+        /// of `b`'s rows and not others; with an ON term no index reads, and WHERE terms on the
+        /// padded side alone and with the probe's table, which must stay above the join. Expect:
+        /// the run built (`APPLIED`, and the LEFT JOIN counted in a group), and every answer, NULL
+        /// rows counted, the left-deep plans' and the nested loops' (the hook needs the LEFT JOIN
+        /// read by a loop, so only `ByCost`).
+        #[test]
+        fn t_pl_8_13_a_left_join_in_a_hand_built_run_answers_as_the_left_deep_plan() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE a(id INTEGER PRIMARY KEY, x INT)",
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT, qid INT)",
+                "CREATE TABLE q(id INTEGER PRIMARY KEY, y INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, y INT, z INT)",
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, z INT, w INT)",
+                "CREATE INDEX c_y ON c(y)",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            for id in 1..=6 {
+                conn.execute(format!("INSERT INTO a VALUES ({id}, {id})"))
+                    .unwrap();
+            }
+            for id in 1..=12 {
+                conn.execute(format!(
+                    "INSERT INTO b VALUES ({id}, {}, {}, {})",
+                    id % 5,
+                    id % 3,
+                    id % 4 + 1
+                ))
+                .unwrap();
+            }
+            for id in 1..=4 {
+                conn.execute(format!("INSERT INTO q VALUES ({id}, {})", id % 3))
+                    .unwrap();
+            }
+            for id in 1..=15 {
+                conn.execute(format!(
+                    "INSERT INTO c VALUES ({id}, {}, {})",
+                    id % 3,
+                    id % 4
+                ))
+                .unwrap();
+            }
+            for id in 1..=20 {
+                conn.execute(format!("INSERT INTO p VALUES ({id}, {}, {id})", id % 4))
+                    .unwrap();
+            }
+            // Statistics, so the pinned plan's build input is estimated at its few rows.
+            conn.execute("ANALYZE").unwrap();
+            let from = "FROM a JOIN b ON b.x > a.x LEFT JOIN q l ON l.id = b.qid + 2";
+            let rest = "JOIN c ON c.y = b.y JOIN p ON p.z = c.z";
+            let select = "SELECT a.id, b.id, l.id, l.y, c.id, p.id";
+            for (on_extra, filter) in [
+                ("", ""),
+                (" AND l.y <> 1", ""),
+                ("", " WHERE l.id IS NULL"),
+                ("", " WHERE l.y IS NULL OR l.y + p.w > 9"),
+            ] {
+                let sql = format!("{select} {from}{on_extra} {rest}{filter}");
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, &sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                PIN.with(|pin| pin.set(false));
+                SPLIT.with(|split| split.set(None));
+                let left_deep = rows(&conn, &sql);
+                PIN.with(|pin| pin.set(true));
+                let pinned = rows(&conn, &sql);
+                let pinned_plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                APPLIED.with(|applied| applied.set(0));
+                super::super::bushy_search_tests::LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                SPLIT.with(|split| split.set(Some(1)));
+                let bushy = rows(&conn, &sql);
+                let made_bushy = APPLIED.with(Cell::get);
+                let in_runs = super::super::bushy_search_tests::LEFT_JOINS_IN_RUNS.with(Cell::get);
+                SPLIT.with(|split| split.set(None));
+                PIN.with(|pin| pin.set(false));
+                assert!(!nested_loops.is_empty(), "{sql}");
+                assert!(
+                    made_bushy > 0,
+                    "no plan was made bushy: {sql}: {pinned_plan:?}"
+                );
+                assert!(
+                    in_runs > 0,
+                    "no LEFT JOIN in the run: {sql}: {pinned_plan:?}"
+                );
+                assert_eq!(left_deep, nested_loops, "left-deep: {sql}");
+                assert_eq!(bushy, nested_loops, "bushy: {sql}: {pinned_plan:?}");
+                // The pinned left-deep plan materializes every table before the probe, the LEFT
+                // JOIN's with them: today's path, checked last so a failure here is told apart.
+                assert_eq!(pinned, nested_loops, "pinned: {sql}: {pinned_plan:?}");
+            }
+        }
+
+        /// PL.8 (T-PL.8.14, lane pl8-20): the hand-built bushy tree `(a ((b c) LEFT JOIN p))`,
+        /// whose probe is the LEFT JOIN's table `p`, read by the outer hash join built from the
+        /// run `b c`: for each row of `a`, the run's rows the probe pass matched join `p`'s rows,
+        /// and the rest come out once with `p` NULL. `p.w = c.id` matches `c`'s ids past 8 only,
+        /// so both kinds stand; `b.x > a.x` joins the outer loop to the run, so a run's row comes
+        /// out only for the rows of `a` it joins, NULL rows included. With: an ON term no index
+        /// reads, on `p` alone and on `p` and the outer loop (each must make NULL rows, not drop
+        /// rows), `WHERE p.id IS NULL`, and a WHERE term on `p` and the run (both above the join,
+        /// on the NULL rows too). Expect: the plan made bushy around the LEFT JOIN probe
+        /// (`APPLIED`, `LEFT_JOIN_PROBES`), and every answer, NULL rows counted, the nested loops'
+        /// and the left-deep plans'.
+        #[test]
+        fn t_pl_8_14_a_left_join_probing_a_hand_built_run_answers_as_nested_loops() {
+            use super::super::bushy_search_tests::LEFT_JOIN_PROBES;
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE a(id INTEGER PRIMARY KEY, x INT)",
+                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, y INT, z INT)",
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, z INT, w INT)",
+                "CREATE INDEX c_y ON c(y)",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            for id in 1..=6 {
+                conn.execute(format!("INSERT INTO a VALUES ({id}, {id})"))
+                    .unwrap();
+            }
+            for id in 1..=12 {
+                conn.execute(format!(
+                    "INSERT INTO b VALUES ({id}, {}, {})",
+                    id % 5,
+                    id % 3
+                ))
+                .unwrap();
+            }
+            for id in 1..=15 {
+                conn.execute(format!(
+                    "INSERT INTO c VALUES ({id}, {}, {})",
+                    id % 3,
+                    id % 4
+                ))
+                .unwrap();
+            }
+            for id in 1..=20 {
+                conn.execute(format!(
+                    "INSERT INTO p VALUES ({id}, {}, {})",
+                    id % 4,
+                    id % 10 + 9
+                ))
+                .unwrap();
+            }
+            conn.execute("ANALYZE").unwrap();
+            let select = "SELECT a.id, b.id, c.id, p.id, p.z";
+            let from = "FROM a JOIN b ON b.x > a.x JOIN c ON c.y = b.y LEFT JOIN p ON p.w = c.id";
+            for (on_extra, filter) in [
+                ("", ""),
+                (" AND p.z <> 1", ""),
+                (" AND p.z + a.x > 4", ""),
+                ("", " WHERE p.id IS NULL"),
+                ("", " WHERE p.id IS NULL OR p.z + b.x > 4"),
+            ] {
+                let sql = format!("{select} {from}{on_extra}{filter}");
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, &sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                PIN.with(|pin| pin.set(false));
+                SPLIT.with(|split| split.set(None));
+                let left_deep = rows(&conn, &sql);
+                PIN.with(|pin| pin.set(true));
+                let pinned = rows(&conn, &sql);
+                let pinned_plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                APPLIED.with(|applied| applied.set(0));
+                LEFT_JOIN_PROBES.with(|probes| probes.set(0));
+                SPLIT.with(|split| split.set(Some(1)));
+                let bushy = rows(&conn, &sql);
+                let bushy_plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                let made_bushy = APPLIED.with(Cell::get);
+                let probes = LEFT_JOIN_PROBES.with(Cell::get);
+                SPLIT.with(|split| split.set(None));
+                PIN.with(|pin| pin.set(false));
+                eprintln!("bushy={made_bushy} probes={probes}: {sql}: {bushy_plan:?}");
+                assert!(!nested_loops.is_empty(), "{sql}");
+                // Non-vacuity: both kinds of row stand in the answer.
+                assert!(
+                    nested_loops.iter().any(|row| row.ends_with(",,")),
+                    "no NULL row: {sql}"
+                );
+                assert!(
+                    made_bushy > 0,
+                    "no plan was made bushy: {sql}: {pinned_plan:?}"
+                );
+                assert!(
+                    probes > 0,
+                    "the LEFT JOIN didn't probe the run: {sql}: {bushy_plan:?}"
+                );
+                assert_eq!(left_deep, nested_loops, "left-deep: {sql}");
+                assert_eq!(bushy, nested_loops, "bushy: {sql}: {bushy_plan:?}");
+                assert_eq!(pinned, nested_loops, "pinned: {sql}: {pinned_plan:?}");
+            }
+        }
     }
 }
 
@@ -4069,6 +4381,15 @@ pub(crate) mod bushy_search_tests {
         /// How many plans with a build group the planner handed to the emitter: what shows a
         /// test's query was run bushy.
         pub(crate) static BUSHY_PLANS: Cell<usize> = const { Cell::new(0) };
+        /// How many LEFT JOINs the planner handed to the emitter inside a build group (lane
+        /// pl8-19): what shows a test's LEFT JOIN was joined inside the bushy run.
+        pub(crate) static LEFT_JOINS_IN_RUNS: Cell<usize> = const { Cell::new(0) };
+        /// How many LEFT JOINs the planner handed to the emitter as a build group's probe (lane
+        /// pl8-20): what shows a test's LEFT JOIN probed the bushy run.
+        pub(crate) static LEFT_JOIN_PROBES: Cell<usize> = const { Cell::new(0) };
+        /// The estimated cost of the last join plan the planner handed to the emitter (lane
+        /// pl8-20): what the switch's report compares.
+        pub(crate) static LAST_JOIN_COST: Cell<f64> = const { Cell::new(0.0) };
     }
 
     #[cfg(test)]
@@ -4078,10 +4399,10 @@ pub(crate) mod bushy_search_tests {
             clippy::indexing_slicing,
             clippy::arithmetic_side_effects
         )]
-        use super::BUSHY_PLANS;
+        use super::{BUSHY_PLANS, LAST_JOIN_COST, LEFT_JOINS_IN_RUNS, LEFT_JOIN_PROBES};
         use crate::io::MemoryIO;
         use crate::sync::Arc;
-        use crate::{ConnectOpts, Database, JoinMethods, SqliteDialect};
+        use crate::{BushyLeftJoinProbes, ConnectOpts, Database, JoinMethods, SqliteDialect};
         use std::cell::Cell;
 
         fn rows(conn: &Arc<crate::Connection>, sql: &str) -> Vec<String> {
@@ -4101,17 +4422,28 @@ pub(crate) mod bushy_search_tests {
             rows
         }
 
-        /// PL.8 piece 2 (T-PL.8.2): two large fact tables, each cut down by a filtered dimension,
-        /// joined to each other on a key with few values. Every left-deep order joins one fact's
-        /// cut to the other whole fact first and drags the large result through the last
-        /// dimension's filter; the bushy plan builds `d1 ⋈ f1` once into a hash join's input and
-        /// probes it from `f2`, under the one row of `d2`. The search picks it, the emitter runs
-        /// it (`BUSHY_PLANS`), and it answers as the plan of nested loops does.
-        #[test]
-        fn t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest() {
+        /// The queries over `facts`: each joins `d1 ⋈ f1` to `f2` under `d2`'s filter.
+        const FACT_QUERIES: [&str; 3] = [
+            "SELECT d1.id, f1.id, f2.id, d2.id FROM d1, f1, f2, d2 \
+             WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
+            "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
+             WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
+            "SELECT count(*), sum(f1.id - f2.id) FROM d1, f1, f2, d2 \
+             WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.cat = 7",
+        ];
+
+        /// Two dimensions of 50 rows and two facts of 12,000, analyzed
+        /// (`t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest` says why that size).
+        /// The bushy tests' facts run under `AMPHORA_WEIGHT_RULE=blend`'s control rule for the
+        /// weight rules' A/B at the plan (T-PL.8.8, lane pl8-16: 20 copies at once under each
+        /// rule, `pl8-16-test.sh`); batch means otherwise.
+        fn facts() -> (Arc<Database>, Arc<crate::Connection>) {
             let io = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
+            if std::env::var("AMPHORA_WEIGHT_RULE").as_deref() == Ok("blend") {
+                conn.set_weight_rule(crate::WeightRule::Blend);
+            }
             for sql in [
                 "CREATE TABLE d1(id INTEGER PRIMARY KEY, cat INT)",
                 "CREATE TABLE d2(id INTEGER PRIMARY KEY, cat INT)",
@@ -4121,23 +4453,37 @@ pub(crate) mod bushy_search_tests {
                  INSERT INTO d1 SELECT x, x % 25 FROM n",
                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
                  INSERT INTO d2 SELECT x, x % 25 FROM n",
-                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 12000) \
                  INSERT INTO f1 SELECT x, x % 50 + 1, x % 2 FROM n",
-                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 12000) \
                  INSERT INTO f2 SELECT x, x % 50 + 1, x % 2 FROM n",
                 "ANALYZE",
             ] {
                 conn.execute(sql).unwrap();
             }
-            let queries = [
-                "SELECT d1.id, f1.id, f2.id, d2.id FROM d1, f1, f2, d2 \
-                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
-                "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
-                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
-                "SELECT count(*), sum(f1.id - f2.id) FROM d1, f1, f2, d2 \
-                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.cat = 7",
-            ];
-            for sql in queries {
+            (db, conn)
+        }
+
+        /// PL.8 piece 2 (T-PL.8.2): two large fact tables, each cut down by a filtered dimension,
+        /// joined to each other on a key with few values. Every left-deep order joins one fact's
+        /// cut to the other whole fact first and drags the large result through the last
+        /// dimension's filter; the bushy plan builds `d1 ⋈ f1` once into a hash join's input and
+        /// probes it from `f2`, under the one row of `d2`. The search picks it, the emitter runs
+        /// it (`BUSHY_PLANS`), and it answers as the plan of nested loops does.
+        ///
+        /// The facts hold 12,000 rows each (lane pl8-14), so the bushy plan is cheapest at any
+        /// hash-probe weight measured on any machine (10 to 400 rows' visits): the plan of nested
+        /// loops that wins once probes are dear visits `n * n / 50` rows (each of `f2`'s `n / 50`
+        /// rows under `d2` scans `f1`), the bushy plan's probes grow with `n` alone, and each
+        /// plan's cost is linear in the weights, so the bushy plan's lead over every other is
+        /// least at a corner of the weights' range. With 3,000 rows the plan of nested loops won at
+        /// a probe of 400 (170 with a quarter of this machine's seek and build); with 12,000, the
+        /// bushy plan won at every corner: probes of 10 and 400, seeks and builds a quarter to four
+        /// times adacachy's learned ones (kiln run r1271).
+        #[test]
+        fn t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest() {
+            let (_db, conn) = facts();
+            for sql in FACT_QUERIES {
                 conn.set_join_methods(JoinMethods::NestedLoopsOnly);
                 let nested_loops = rows(&conn, sql);
                 conn.set_join_methods(JoinMethods::ByCost);
@@ -4150,6 +4496,287 @@ pub(crate) mod bushy_search_tests {
                 assert!(!nested_loops.is_empty(), "{sql}");
                 assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
             }
+        }
+
+        /// PL.8 (T-PL.8.2, lane pl8-16): the fact query's core followed by a LEFT JOIN of a
+        /// dimension whose ON term reads the probe's table (`f2`) or a table of the run (`f1`),
+        /// matching some rows and not others (ids past 50 have no row), then two LEFT JOINs in a
+        /// row. Expect: the core still planned bushy (`BUSHY_PLANS`), the LEFT JOINs after it as
+        /// loops, and every answer, null-extended rows counted, the plan of nested loops gives.
+        #[test]
+        fn t_pl_8_2_left_joins_follow_a_bushy_plan() {
+            let (_db, conn) = facts();
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            let core = "FROM d1, f1, f2, d2";
+            let filter = "WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id \
+                          AND d2.id = 7";
+            for left in [
+                "LEFT JOIN d2 s ON s.id = f2.id % 60",
+                "LEFT JOIN d2 s ON s.id = f1.id % 60",
+                "LEFT JOIN d1 t ON t.id = f1.id % 70 LEFT JOIN d2 s ON s.id = t.id + 5",
+            ] {
+                let sql = format!("{select} {core} {left} {filter}");
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, &sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                BUSHY_PLANS.with(|plans| plans.set(0));
+                let searched = rows(&conn, &sql);
+                let made_bushy = BUSHY_PLANS.with(Cell::get);
+                let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                eprintln!("bushy={made_bushy}: {sql}: {plan:?}");
+                assert!(!nested_loops.is_empty(), "{sql}");
+                assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
+                assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
+            }
+        }
+
+        /// PL.8 (T-PL.8.13, lane pl8-19): the fact query with a LEFT JOIN of a dimension hung on
+        /// `d1` or on `d2` (each a side the bushy run can be), an inner join after it, so the LEFT
+        /// JOIN is in the bushy core: rows of the dimension stand with a match and without (ids
+        /// past 50 have no row). With each: an ON term no index reads (it must make NULL rows, not
+        /// drop rows), a WHERE term on the padded side alone and one on it and the probe's table
+        /// (both must stay above the join, on the NULL rows too). Expect: every answer, NULL rows
+        /// counted, the plan of nested loops gives; each query planned bushy; and the LEFT JOIN
+        /// read inside a build group (`LEFT_JOINS_IN_RUNS`) in every query.
+        ///
+        /// Lane pl8-20: the LEFT JOIN's dimension keeps six rows (`cat < 3`), the other one
+        /// (`id = 7` or `id = 3`). Lane pl8-22: each side reaches its fact through an index made
+        /// for the join, so the plan with the LEFT JOIN in the run and its mirror differ only by
+        /// which side is built and which probes (kiln run r124 planned both for one query, the
+        /// mirror as it ran and the LEFT JOIN in the run at the EXPLAIN after). On calibration's
+        /// weights alone the search picks the mirror (kiln run r298: an EXPLAIN before the first
+        /// run plans `d2`'s side as the run); once the query's first run has timed the seeks and
+        /// the hash joins, the learned weights make the LEFT JOIN's side the run (three runs of
+        /// three, r288). So each query runs once by cost first, its answer checked too, and the
+        /// plan's shape is checked on the run after, before the answers.
+        #[test]
+        fn t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows() {
+            let (_db, conn) = facts();
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            for (on_extra, above) in [
+                ("", ""),
+                (" AND s.cat <> 11 AND s.cat <> 17", ""),
+                ("", " AND s.id IS NULL"),
+                ("", " AND (s.id IS NULL OR s.cat + f2.k = 11)"),
+            ] {
+                for (from, filter) in [
+                    (
+                        format!(
+                            "FROM d1 LEFT JOIN d2 s ON s.id = d1.id * 12{on_extra} \
+                             JOIN f1 ON f1.d1 = d1.id JOIN f2 ON f2.k = f1.k \
+                             JOIN d2 ON f2.d2 = d2.id"
+                        ),
+                        "WHERE d1.cat < 3 AND d2.id = 7",
+                    ),
+                    (
+                        format!(
+                            "FROM d2 LEFT JOIN d1 s ON s.id = d2.id * 6{on_extra} \
+                             JOIN f2 ON f2.d2 = d2.id JOIN f1 ON f2.k = f1.k \
+                             JOIN d1 ON f1.d1 = d1.id"
+                        ),
+                        "WHERE d2.cat < 3 AND d1.id = 3",
+                    ),
+                ] {
+                    let sql = format!("{select} {from} {filter}{above}");
+                    conn.set_join_methods(JoinMethods::ByCost);
+                    let first = rows(&conn, &sql);
+                    BUSHY_PLANS.with(|plans| plans.set(0));
+                    LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                    let searched = rows(&conn, &sql);
+                    let made_bushy = BUSHY_PLANS.with(Cell::get);
+                    let in_runs = LEFT_JOINS_IN_RUNS.with(Cell::get);
+                    let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                    eprintln!("bushy={made_bushy} in_runs={in_runs}: {sql}: {plan:?}");
+                    assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
+                    assert!(in_runs > 0, "no LEFT JOIN inside a run: {sql}: {plan:?}");
+                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                    let nested_loops = rows(&conn, &sql);
+                    assert!(!nested_loops.is_empty(), "{sql}");
+                    assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
+                    assert_eq!(first, nested_loops, "{sql}: the first run's plan");
+                }
+            }
+        }
+
+        /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with
+        /// LEFT JOINs after the core and inside it, with semi and anti joins, and (lane pl8-20) a
+        /// LEFT JOIN of the second fact on the first fact and the outer dimension, followed by an
+        /// inner join, the shape a LEFT JOIN probe can take: `f1`'s rows whose `k` no row of `f2`
+        /// under `d2.id = 7` has (all of those have `k = 0`) come out NULL-extended.
+        fn bushy_queries() -> Vec<String> {
+            let mut queries: Vec<String> = FACT_QUERIES.iter().map(|sql| sql.to_string()).collect();
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            for left in [
+                "LEFT JOIN d2 s ON s.id = f2.id % 60",
+                "LEFT JOIN d2 s ON s.id = f1.id % 60",
+                "LEFT JOIN d1 t ON t.id = f1.id % 70 LEFT JOIN d2 s ON s.id = t.id + 5",
+            ] {
+                queries.push(format!(
+                    "{select} FROM d1, f1, f2, d2 {left} WHERE f1.d1 = d1.id AND d1.cat = 3 \
+                     AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7"
+                ));
+            }
+            for (on_extra, above) in [
+                ("", ""),
+                (" AND s.cat <> 11 AND s.cat <> 17", ""),
+                ("", " AND s.id IS NULL"),
+                ("", " AND (s.id IS NULL OR s.cat + f2.k = 11)"),
+            ] {
+                queries.push(format!(
+                    "{select} FROM d1 LEFT JOIN d2 s ON s.id = d1.id * 12{on_extra} \
+                     JOIN f1 ON f1.d1 = d1.id JOIN f2 ON f2.k = f1.k JOIN d2 ON f2.d2 = d2.id \
+                     WHERE d1.cat < 3 AND d2.id = 7{above}"
+                ));
+                queries.push(format!(
+                    "{select} FROM d2 LEFT JOIN d1 s ON s.id = d2.id * 6{on_extra} \
+                     JOIN f2 ON f2.d2 = d2.id JOIN f1 ON f2.k = f1.k JOIN d1 ON f1.d1 = d1.id \
+                     WHERE d2.cat < 3 AND d1.id = 3{above}"
+                ));
+            }
+            let core = "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
+                        WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id \
+                        AND d2.id = 7";
+            for tail in [
+                "EXISTS (SELECT 1 FROM d2 s WHERE s.id = f2.id % 60)",
+                "NOT EXISTS (SELECT 1 FROM d2 s WHERE s.id = f1.id % 60)",
+            ] {
+                queries.push(format!("{core} AND {tail}"));
+            }
+            queries.push(
+                "SELECT count(*), sum(f1.id), count(f2.id), sum(f2.id) FROM d2 \
+                 JOIN d1 ON d1.cat = 3 JOIN f1 ON f1.d1 = d1.id \
+                 LEFT JOIN f2 ON f2.k = f1.k AND f2.d2 = d2.id JOIN d1 t ON t.id = d1.id \
+                 WHERE d2.id = 7"
+                    .to_string(),
+            );
+            queries
+        }
+
+        /// The plan and its estimated cost (`LAST_JOIN_COST`) the search gives `sql` now.
+        fn plan_and_cost(conn: &Arc<crate::Connection>, sql: &str) -> (Vec<String>, f64) {
+            LAST_JOIN_COST.with(|cost| cost.set(0.0));
+            drop(conn.prepare(sql).unwrap());
+            let cost = LAST_JOIN_COST.with(Cell::get);
+            (rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")), cost)
+        }
+
+        /// PL.8 (T-PL.8.14, lane pl8-20): the A/B of LEFT JOIN probes at the plan. Each bushy
+        /// test query is planned with the switch off (the control, the default) and on. Expect:
+        /// with it on, every answer the plan of nested loops gives, NULL rows counted, whichever
+        /// plan the search picks; the default off; and the report: how many queries change plan
+        /// under the switch, how many of those probe with a LEFT JOIN (`LEFT_JOIN_PROBES`), and
+        /// each one's estimated cost off and on. A plan the switch changes costs no more by the
+        /// planner's estimate than the control's, as the search takes the cheapest it may plan.
+        #[test]
+        fn t_pl_8_14_ab_left_join_probes_change_bushy_plans_only_where_cheaper() {
+            let (_db, conn) = facts();
+            assert_eq!(conn.bushy_left_join_probes(), BushyLeftJoinProbes::Off);
+            let queries = bushy_queries();
+            let (mut changed, mut probing) = (0, 0);
+            for sql in &queries {
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                let (off_plan, off_cost) = plan_and_cost(&conn, sql);
+                conn.set_bushy_left_join_probes(BushyLeftJoinProbes::ByCost);
+                LEFT_JOIN_PROBES.with(|probes| probes.set(0));
+                let (on_plan, on_cost) = plan_and_cost(&conn, sql);
+                let probes = LEFT_JOIN_PROBES.with(Cell::get);
+                let searched = rows(&conn, sql);
+                conn.set_bushy_left_join_probes(BushyLeftJoinProbes::Off);
+                assert!(!nested_loops.is_empty(), "{sql}");
+                assert_eq!(searched, nested_loops, "{sql}: {on_plan:?}");
+                if on_plan != off_plan {
+                    changed += 1;
+                    if probes > 0 {
+                        probing += 1;
+                    }
+                    println!(
+                        "changed: cost {off_cost} -> {on_cost} ({:+.3}%), LEFT JOIN probes \
+                         {probes}: {sql}\n  off: {off_plan:?}\n  on: {on_plan:?}",
+                        (on_cost - off_cost) / off_cost * 100.0
+                    );
+                    assert!(on_cost <= off_cost, "{sql}: {off_cost} -> {on_cost}");
+                }
+            }
+            println!(
+                "LEFT JOIN probes: {changed} of {} bushy test queries change plan, {probing} \
+                 of them probing with a LEFT JOIN",
+                queries.len()
+            );
+        }
+
+        /// PL.8 (T-PL.8.2, lane pl8-15): the fact queries with an EXISTS and a NOT EXISTS on a
+        /// dimension, each correlated with the probe's table (`f2`) or a table of the run (`f1`):
+        /// semi and anti joins, which CD-C keeps after every table before them and the emitter runs
+        /// as the last loops. Expect: the core of inner joins still planned bushy (`BUSHY_PLANS`),
+        /// the semi and anti joins after it, and every answer the plan of nested loops gives.
+        #[test]
+        fn t_pl_8_2_semi_and_anti_joins_follow_a_bushy_plan() {
+            let (_db, conn) = facts();
+            let core = "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
+                        WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id \
+                        AND d2.id = 7";
+            for tail in [
+                "EXISTS (SELECT 1 FROM d2 s WHERE s.id = f2.id % 60)",
+                "NOT EXISTS (SELECT 1 FROM d2 s WHERE s.id = f2.id % 60)",
+                "EXISTS (SELECT 1 FROM d2 s WHERE s.id = f1.id % 60)",
+                "NOT EXISTS (SELECT 1 FROM d2 s WHERE s.id = f1.id % 60)",
+            ] {
+                let sql = format!("{core} AND {tail}");
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, &sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                BUSHY_PLANS.with(|plans| plans.set(0));
+                let searched = rows(&conn, &sql);
+                let made_bushy = BUSHY_PLANS.with(Cell::get);
+                let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                // Non-vacuity: the EXISTS was planned as a semi or anti join, not a subquery.
+                let json = rows(&conn, &format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}")).join("");
+                assert!(
+                    json.contains("\"semi\"") || json.contains("\"anti\""),
+                    "no semi or anti join: {sql}: {json}"
+                );
+                assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
+                assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
+            }
+        }
+
+        /// PL.8 (T-PL.8.2, lane pl8-15): pins the corners of the weights' range the bushy plan's
+        /// lead is argued over (`t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest`):
+        /// a hash probe of 10 and of 400 rows' visits, the least and most the probe's learned
+        /// weight was seen at (a quiet host's; adacachy's under load, kiln run r1178), each with
+        /// the seek and the hash build a quarter of and four times this machine's learned ones, the
+        /// span r1271 swept. Each plan's cost is linear in the weights, so a plan cheapest at every
+        /// corner is cheapest inside. Expect: the search plans every query bushy at every corner.
+        #[cfg(feature = "simulator")]
+        #[test]
+        fn t_pl_8_2_the_bushy_plan_is_cheapest_at_every_corner_of_the_weights() {
+            let (db, conn) = facts();
+            let learned = db.learned_costs.weights().unwrap();
+            conn.set_join_methods(JoinMethods::ByCost);
+            let mut corners = 0;
+            for probe in [10.0, 400.0] {
+                for seek in [learned.seek / 4.0, learned.seek * 4.0] {
+                    for build in [learned.hash_build / 4.0, learned.hash_build * 4.0] {
+                        conn.pin_cost_weights(Some((seek, build, probe)));
+                        for sql in FACT_QUERIES {
+                            BUSHY_PLANS.with(|plans| plans.set(0));
+                            drop(conn.prepare(sql).unwrap());
+                            let made_bushy = BUSHY_PLANS.with(Cell::get);
+                            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                            assert!(
+                                made_bushy > 0,
+                                "seek {seek}, build {build}, probe {probe}: {sql}: {plan:?}"
+                            );
+                        }
+                        corners += 1;
+                    }
+                }
+            }
+            conn.pin_cost_weights(None);
+            assert_eq!(corners, 8);
         }
     }
 }
@@ -4207,6 +4834,7 @@ fn apply_table_access_plan(
         best_plan,
         &mut access_methods_arena,
         table_references,
+        where_clause,
         sort_eliminated,
     );
     // PL.8: a bushy plan's inner joins are hash joins whose build side is the run's tables.
@@ -4214,12 +4842,15 @@ fn apply_table_access_plan(
         &best_plan,
         &access_methods_arena,
         table_references,
+        where_clause,
         sort_eliminated,
     )?;
     #[cfg(test)]
     if !build_groups.is_empty() {
         bushy_search_tests::BUSHY_PLANS.with(|plans| plans.set(plans.get() + 1));
     }
+    #[cfg(test)]
+    bushy_search_tests::LAST_JOIN_COST.with(|cost| cost.set(best_plan.cost.0));
     let (best_access_methods, best_table_numbers) = (
         best_plan.best_access_methods().collect::<Vec<_>>(),
         best_plan.table_numbers().collect::<Vec<_>>(),

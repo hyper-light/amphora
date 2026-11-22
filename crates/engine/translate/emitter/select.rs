@@ -729,6 +729,34 @@ fn prune_join_order_for_materialized_inputs(
         return Ok(());
     }
 
+    // PL.8 (lane pl8-19): the LEFT JOINs inside a bushy plan's build group, by their tables' ids.
+    // The group's materialization joins each and makes its NULL rows, its ON terms reading the
+    // group's tables only (`optimizer::bushy_build_groups`), so the main plan, which reads the
+    // group's rows from the payload, has spent those terms.
+    let mut group_left_joins: Vec<(amphora_engine_parser::ast::TableInternalId, TableMask)> =
+        Vec::new();
+    for member in plan.join_order.iter() {
+        let Some(Operation::HashJoin(hash_join_op)) = plan
+            .table_references
+            .joined_tables()
+            .get(member.original_idx)
+            .map(|table| &table.op)
+        else {
+            continue;
+        };
+        if hash_join_op.build_group.is_empty() {
+            continue;
+        }
+        for table_idx in hash_join_op.build_group.iter() {
+            let Some(table) = plan.table_references.joined_tables().get(table_idx) else {
+                continue;
+            };
+            if table.join_info.as_ref().is_some_and(|info| info.is_outer()) {
+                group_left_joins.push((table.internal_id, hash_join_op.build_group.clone()));
+            }
+        }
+    }
+
     for term in plan.where_clause.iter_mut() {
         if term.consumed {
             continue;
@@ -739,6 +767,26 @@ fn prune_join_order_for_materialized_inputs(
             // does not make those terms safe to consume here, because the
             // materialization subplan does not include the probe table that
             // determines the null-extension boundary.
+            // A bushy plan's build group holds that loop and every table the term reads
+            // (lane pl8-19): the term ran there.
+            let Some(right_table) = term.origin.join_origin().map(|origin| origin.right_table())
+            else {
+                continue;
+            };
+            let Some((_, group)) = group_left_joins
+                .iter()
+                .find(|(table_id, _)| *table_id == right_table)
+            else {
+                continue;
+            };
+            let mask = table_mask_from_expr(
+                &term.expr,
+                &plan.table_references,
+                &plan.non_from_clause_subqueries,
+            )?;
+            if group.contains_all_set_bits_of(&mask) {
+                term.consumed = true;
+            }
             continue;
         }
         let mask = table_mask_from_expr(

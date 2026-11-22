@@ -337,6 +337,10 @@ pub struct ProgramBuilder {
     pub(crate) reads_parameter_values: bool,
     /// Amphora (PL.9): the tables whose row counts the plan read (`row_changes.rs`).
     pub(crate) planned_tables: Vec<crate::row_changes::PlannedTable>,
+    /// Amphora (PL.8, lane pl8-16): the join orders the plan chose (`join::JoinOrders`).
+    pub(crate) join_orders: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    /// Amphora (PL.8, lane pl8-17): the fast plan ordered a join greedily (`background_search.rs`).
+    pub(crate) fast_planned: bool,
     /// Amphora (PL.13, lane replan-5): the filter shares the plan read (`filter_shares.rs`).
     pub(crate) planned_filters: Vec<crate::filter_shares::PlannedFilter>,
     /// Amphora (PL.13, lane replan-6): the subquery rows the plan read (`subquery_rows.rs`).
@@ -785,6 +789,8 @@ impl ProgramBuilder {
             plan_cost: None,
             reads_parameter_values: false,
             planned_tables: Vec::new(),
+            join_orders: None,
+            fast_planned: false,
             planned_filters: Vec::new(),
             planned_subqueries: Vec::new(),
             write_target: None,
@@ -2596,6 +2602,8 @@ impl ProgramBuilder {
             plan_cost: self.plan_cost,
             reads_parameter_values: self.reads_parameter_values,
             planned_tables: self.planned_tables,
+            join_orders: self.join_orders,
+            fast_planned: self.fast_planned,
             planned_filters: self.planned_filters,
             planned_subqueries: self.planned_subqueries,
             write_target: self.write_target,

@@ -1087,6 +1087,33 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lanes pl8-7 to pl8-9 (docs/design/planner.md "Decision (lane pl8-9)"): the search pairs connected
   subsets with their connected complements (DPccp) and picks the bushy plan where it costs less; a
   test's data shows it picked and answering as nested loops do (T-PL.8.2).
+  Lanes pl8-14 and pl8-15 (docs/design/planner.md "Decision (lane pl8-15)"): learned weights move
+  only past the spread between batch means (Student's t, T-PL.8.6), so a burst of load no longer
+  flips a plan; semi and anti joins after the inner joins follow a bushy plan (T-PL.8.2).
+  Lane pl8-16 (docs/design/planner.md "Decision (lane pl8-16)"): the old blend rule is back behind
+  `WeightRule` as the control for the A/B with batch means (T-PL.8.8), and a statement planned
+  again can keep its join order unless the new best is cheaper past the weights' error (T-PL.8.9,
+  behind `CarriedJoinOrders`, off by default);
+  LEFT JOINs after the inner joins follow a bushy plan as semi and anti joins do (T-PL.8.2).
+  Lane pl8-17 (docs/design/planner.md "Decision (lane pl8-17)"): the fast plan first, its exact
+  search after it on a planner worker or the idle connection, behind `BackgroundSearch` (off by
+  default) for the A/B, with a harness of the time to the first row and to the exact plan
+  (T-PL.8.10).
+  Lane pl8-18 (docs/design/planner.md "Decision (lane pl8-18)"): the exact search plans on the
+  schema and statistics taken at hand-off, a plan is taken only while the connection's settings'
+  generation is the one at hand-off, only a SELECT hands its search off (T-PL.8.11), and `Idle`
+  runs one search each time the connection goes idle (T-PL.8.12).
+  Lane pl8-19 (docs/design/planner.md "Decision (lane pl8-19)"): a LEFT JOIN with an inner join
+  after it is in the bushy core, and a bushy run takes it with every table its ON reads, its NULL
+  rows made in the build input and its ON terms spent there (T-PL.8.13).
+  Lane pl8-20 (docs/design/planner.md "Decision (lane pl8-20)"): behind
+  `Connection::set_bushy_left_join_probes` (off by default), a LEFT JOIN's table may be a bushy
+  run's probe, read by an outer hash join that NULL-extends the run's rows each outer row's probe
+  pass didn't match (T-PL.8.14); pl8-19's search test now forces its LEFT JOIN into the run.
+  Lane pl8-22 (docs/design/planner.md "Decision (lane pl8-22)"): a batch of timed runs closes at
+  its median run, so a preempted run no longer moves a weight and flips plans under load
+  (T-PL.8.2); T-PL.8.13's search test checks its plan once the query's first run has learned
+  its operators' costs (on calibration's alone the search picks the mirror plan).
   Not built: the search budget derived from a plan-time target, and semi and anti joins placed
   before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
