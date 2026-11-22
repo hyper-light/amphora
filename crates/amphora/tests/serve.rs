@@ -58,10 +58,16 @@ fn t_t1_13_1_three_members_elect_refuse_strangers_and_lose_nothing_split() {
         let tx = tx.clone();
         std::thread::spawn(move || {
             let node = c.node;
-            let _ = tx.send(format!(
-                "member {node} ended: {:?}",
-                serve::serve(&c, |_| {})
-            ));
+            // How long each open took, as data: three members in one process open one at a time
+            // (the process's owner table), so the last waits for the others' opens too.
+            let started = Instant::now();
+            let ended = serve::serve(&c, move |addr| {
+                eprintln!(
+                    "member {node} listening on {addr}, open took {:?}",
+                    started.elapsed()
+                );
+            });
+            let _ = tx.send(format!("member {node} ended: {ended:?}"));
         });
     }
     std::thread::spawn(move || {
