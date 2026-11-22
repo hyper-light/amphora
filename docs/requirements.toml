@@ -1095,7 +1095,9 @@ criteria = [
 ]
 tests = [
   { id = "T-G7.5.1", text = "storage::versioned::many_writers::g7_5_many_writers_answer_as_a_serial_replay — passes when every answer and the ending rows and index match the serial replay's, on the pager's storage and the versioned one, ids from writers' own slices and from every row" },
-  { id = "T-G8.4.1", text = "storage::versioned::elle_sql::g8_4_sql_histories_have_no_anomaly_on_* — passes when list-append and register histories recorded from N SQL connections show no G0, G1a, G1b, G1c, G-single or G2 (the versioned storage's is ignored until its SQL cursor keeps reads for validation)" },
+  { id = "T-G8.4.1", text = "storage::versioned::elle_sql::g8_4_sql_histories_have_no_anomaly_on_* — passes when list-append and register histories recorded from N SQL connections show no G0, G1a, G1b, G1c, G-single or G2" },
+  { id = "T-G8.4.2", text = "storage::versioned::conformance::g8_4_2_cursor_reads_refuse_write_skew_and_phantoms — passes when, through writing SQL cursors on the versioned storage, write skew and a phantom (forward and back scans) refuse the second commit, and reads and writes apart both commit" },
+  { id = "T-G8.4.3", text = "storage::versioned::version::tests::g8_4_3_reads_lost_to_a_refused_escalation_refuse_the_commit — passes when a transaction whose read the budget refused even as the whole-tree span has its commit refused SerializationFailure" },
 ]
 
 # lane repl-measure (G12 steps 1 and 3, CP-T1.8): no new IDs. `amphora-bench --repl` is the harness

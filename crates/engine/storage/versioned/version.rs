@@ -16,9 +16,10 @@
 //! the low watermark is the oldest open snapshot's timestamp ([`Clock::low_watermark`]).
 //!
 //! A serializable transaction reads through [`VTree::read`] and [`VTree::read_range`], which keep
-//! what it read; its commit is validated by the database's [`Validation`] under the publish lock,
-//! and refused with `SerializationFailure` where serializability asks (decision 5, and the
-//! prototypes G8 step 1 measures against each other).
+//! what it read, or through the SQL cursor (`cursor.rs`), whose every move keeps the span of keys
+//! it read past ([`Versioned::keep_read`]); its commit is validated by the database's
+//! [`Validation`] under the publish lock, and refused with `SerializationFailure` where
+//! serializability asks (decision 5, and the prototypes G8 step 1 measures against each other).
 //!
 //! Memory is bounded (decision 10, G8 step 2): collection keeps, of a row's older versions, only
 //! those some open snapshot sees (Steam's pruning, so a long reader holds one version a row, not
@@ -253,7 +254,8 @@ pub struct Txn {
     changed: Vec<(u64, Vec<u8>)>,
     /// Its changes in the order made: its redo record (decision 6).
     ops: Vec<Op>,
-    /// What it read through [`VTree::read`] and [`VTree::read_range`]: its commit's validation.
+    /// What it read through [`VTree::read`], [`VTree::read_range`] and [`Versioned::keep_read`]: its
+    /// commit's validation.
     reads: Reads,
     /// The bytes of `changed` and `ops` charged to the budget, and of `reads`.
     charged: u64,
@@ -292,6 +294,10 @@ pub enum Validation {
 struct Reads {
     points: Vec<(u64, Vec<u8>)>,
     spans: Vec<Span>,
+    /// Whether a read went unkept: the budget refused even the whole-tree span after the
+    /// narrower reads were let go ([`Reads::keep`]), so these reads no longer stand for what the
+    /// transaction read, and a commit that validates by them refuses (decision 5).
+    lost: bool,
 }
 
 /// The keys of a tree from `from` to `to`, both included (none: from the least, to the greatest).
@@ -320,7 +326,7 @@ impl Reads {
         size: usize,
         add: impl FnOnce(&mut Self),
     ) -> Result<()> {
-        if self.whole(tree) {
+        if self.lost || self.whole(tree) {
             return Ok(());
         }
         match budget.reserve("a transaction's reads", size) {
@@ -350,7 +356,13 @@ impl Reads {
                     from: None,
                     to: None,
                 };
-                let n = budget.reserve("a transaction's reads", size_of::<Span>())?;
+                let n = match budget.reserve("a transaction's reads", size_of::<Span>()) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.lost = true;
+                        return Err(e);
+                    }
+                };
                 self.spans.push(whole);
                 *bytes = bytes.saturating_add(n);
                 Ok(())
@@ -1492,6 +1504,59 @@ impl Versioned {
         Ok(ts)
     }
 
+    /// Keeps, for `txn`'s commit's validation, that it read tree `tree`'s keys from `from` to `to`,
+    /// both included (none: from the least, to the greatest), as its snapshot sees them: the rows
+    /// there and the gaps between them, as [`VTree::read_range`] keeps a scan. The SQL cursor's
+    /// reads (`cursor.rs`, T-G8.4.1): without them SQL on this storage was snapshot isolation, and
+    /// Elle's histories through SQL showed G2. A span that continues the last one kept (a cursor's
+    /// walk from row to row, either way) joins it, so a walk keeps one span.
+    pub(super) fn keep_read(
+        &self,
+        txn: &mut Txn,
+        tree: u64,
+        from: Option<&[u8]>,
+        to: Option<&[u8]>,
+    ) -> Result<()> {
+        let len = |k: Option<&[u8]>| k.map_or(0, <[u8]>::len);
+        let joined = txn
+            .reads
+            .spans
+            .last()
+            .filter(|s| s.tree == tree)
+            .and_then(|last| {
+                if from.is_some() && last.to.as_deref() == from {
+                    Some((true, len(to).saturating_sub(len(last.to.as_deref()))))
+                } else if to.is_some() && last.from.as_deref() == to {
+                    Some((false, len(from).saturating_sub(len(last.from.as_deref()))))
+                } else {
+                    None
+                }
+            });
+        if let Some((ahead, grown)) = joined {
+            return txn
+                .reads
+                .keep(&self.clock.budget, &mut txn.read_bytes, tree, grown, |r| {
+                    if let Some(last) = r.spans.last_mut() {
+                        if ahead {
+                            last.to = to.map(<[u8]>::to_vec);
+                        } else {
+                            last.from = from.map(<[u8]>::to_vec);
+                        }
+                    }
+                });
+        }
+        let span = Span {
+            tree,
+            from: from.map(<[u8]>::to_vec),
+            to: to.map(<[u8]>::to_vec),
+        };
+        let size = usize::try_from(span.bytes()).map_err(|_| LimboError::IntegerOverflow)?;
+        txn.reads
+            .keep(&self.clock.budget, &mut txn.read_bytes, tree, size, |r| {
+                r.spans.push(span);
+            })
+    }
+
     /// Whether `txn`'s commit may go ahead (decision 5), for SSI with the earliest commit it read
     /// past; refused with `SerializationFailure`. Under the publish lock, `recent` locked.
     fn validate(
@@ -1507,6 +1572,8 @@ impl Versioned {
             Validation::Snapshot => Ok(None),
             // One that only read is serialized at its snapshot, a prefix of the commit order.
             Validation::Precision | Validation::Occ if txn.changed.is_empty() => Ok(None),
+            // Reads lost to a refused escalation (`Reads::keep`) can't show what it read.
+            _ if reads.lost => Err(LimboError::SerializationFailure),
             Validation::Precision => {
                 if reads.is_empty() {
                     return Ok(None);
@@ -2445,6 +2512,42 @@ mod tests {
         v.commit(w, &mut d).unwrap();
         assert!(matches!(
             v.commit(reader, &mut d),
+            Err(LimboError::SerializationFailure)
+        ));
+    }
+
+    /// T-G8.4.3, CP-T1.4: do a transaction write a row, then read one while the budget has no room left
+    /// even for the whole-tree span its escalation keeps. Expect the read refused `MemoryBudget`
+    /// and, though no commit came since its snapshot, its commit refused `SerializationFailure`:
+    /// its reads were lost, so it can't be validated (before, it committed unvalidated).
+    #[test]
+    fn g8_4_3_reads_lost_to_a_refused_escalation_refuse_the_commit() {
+        let v = db().with_budget(64 * 1024);
+        let t = v.tree(0).unwrap();
+        let mut d = Descender::new();
+        let mut setup = v.clock.begin().unwrap();
+        for k in 0..4u8 {
+            t.put(&v.pool, &mut d, &v.clock, &mut setup, &[k], &[0])
+                .unwrap();
+        }
+        v.commit(setup, &mut d).unwrap();
+        let mut txn = v.clock.begin().unwrap();
+        t.put(&v.pool, &mut d, &v.clock, &mut txn, &[0], &[1])
+            .unwrap();
+        let room = v.clock.budget().limit() - v.clock.budget().held();
+        let filler = v
+            .clock
+            .budget
+            .reserve("test filler", usize::try_from(room).unwrap())
+            .unwrap();
+        assert!(matches!(
+            t.read(&v.pool, &mut d, &v.clock, &mut txn, &[2]),
+            Err(LimboError::MemoryBudget { .. })
+        ));
+        v.clock.budget.release(filler);
+        assert!(txn.reads.lost);
+        assert!(matches!(
+            v.commit(txn, &mut d),
             Err(LimboError::SerializationFailure)
         ));
     }

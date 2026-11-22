@@ -19,6 +19,12 @@
 //! back from its first descends again to the leaf before its lower bound, as a B-link tree links
 //! its leaves only to the right. Every walk is bounded by the pages handed out.
 //!
+//! A writing cursor keeps what it reads for its transaction's commit's validation (decision 5,
+//! T-G8.4.1): each move keeps the span of keys it read past, from where it started (a seek's key;
+//! for a probe of an index, the nearest key the leaf holds before it) to the row it stopped on, or
+//! to the end where it found none, so a commit since the snapshot that wrote a row there, or put
+//! one in a gap there, refuses it. A walk keeps one span (`Versioned::keep_read` joins them).
+//!
 //! A row larger than a page's cell keeps its tail in the database's overflow tree (`AC-NS.2.4`): the
 //! cursor puts it back after copying a leaf, its latch released. What waits for the catalog
 //! (step 2): dropping a tree, and a comparison per tree in one database.
@@ -193,6 +199,10 @@ struct Rows {
     /// Whether the copy runs to the leaf's last cell: not when copied going back from a point
     /// inside it.
     end: bool,
+    /// The nearest key the leaf holds on the point's other side (going forward, the cell just
+    /// before it, else the leaf's lower bound; going back, the cell at it, else its upper bound;
+    /// none: past every key that way): where a read from a probe is kept from, or to.
+    edge: Option<Vec<u8>>,
     bytes: Vec<u8>,
     /// Each row's start in `bytes`, its key's length and its value's length.
     at: Vec<(usize, usize, usize)>,
@@ -291,6 +301,17 @@ impl Rows {
         self.at.clear();
         let count = super::page::count(leaf.page)?;
         self.end = after || leaf.split >= count;
+        let edge = if after {
+            match leaf.split.checked_sub(1) {
+                Some(i) => Some(super::page::key(leaf.page, i)?),
+                None => leaf.low,
+            }
+        } else if leaf.split < count {
+            Some(super::page::key(leaf.page, leaf.split)?)
+        } else {
+            super::page::high(leaf.page)?
+        };
+        keep(&mut self.edge, edge);
         let cells = if after {
             leaf.split..count
         } else {
@@ -418,20 +439,30 @@ impl VersionedCursor {
             None => vt.tree().leaf_for(pool, d, &mut before)?,
         };
         let mut leaves = 0u64;
-        loop {
+        // The read kept runs from the point (for a probe, from the leaf's nearest key before it)
+        // to the row found, or to the end.
+        let mut from_key: Option<Vec<u8>> = None;
+        let found = loop {
             vt.tree().read_leaf(pool, leaf, low, &mut before, |l| {
                 rows.copy(&vt, db, snap, l, true)
             })?;
+            if leaves == 0 {
+                from_key = match point {
+                    Point::First => None,
+                    Point::Below(k) | Point::Above(k) => Some(k.to_vec()),
+                    Point::Last | Point::Probe { .. } => rows.edge.clone(),
+                };
+            }
             rows.join_chunks(db, d, snap, *tree)?;
             if !rows.is_empty() {
                 self.at = At::Row(0);
-                return Ok(true);
+                break Some(rows.key(0)?.to_vec());
             }
             // Every row of the leaves right of this one is past the point, which is below this
             // leaf's upper bound.
             let Some(right) = rows.right else {
                 self.at = At::Nowhere;
-                return Ok(false);
+                break None;
             };
             leaves = leaves.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
             if leaves > pool.allocated() {
@@ -439,7 +470,9 @@ impl VersionedCursor {
             }
             leaf = right;
             low = rows.high.take();
-        }
+        };
+        self.note(from_key.as_deref(), found.as_deref())?;
+        Ok(found.is_some())
     }
 
     /// Places the cursor on the last row before `point`; on no row if there is none. Whether it
@@ -461,7 +494,10 @@ impl VersionedCursor {
         // each lower than the last, so the walk ends within the leaves.
         let mut bound: Option<Vec<u8>> = None;
         let mut leaves = 0u64;
-        loop {
+        // The read kept runs from the row found, or the start, to the point (for a probe, to the
+        // leaf's nearest key at or past it).
+        let mut to_key: Option<Vec<u8>> = None;
+        let found = loop {
             {
                 let mut before = |key: &[u8]| match &bound {
                     None => order.before(point, key),
@@ -473,20 +509,43 @@ impl VersionedCursor {
                 })?;
                 rows.join_chunks(db, d, snap, *tree)?;
             }
+            if leaves == 0 {
+                to_key = match point {
+                    Point::Last => None,
+                    Point::Below(k) | Point::Above(k) => Some(k.to_vec()),
+                    Point::First | Point::Probe { .. } => rows.edge.clone(),
+                };
+            }
             if let Some(last) = rows.len().checked_sub(1) {
                 self.at = At::Row(last);
-                return Ok(true);
+                break Some(rows.key(last)?.to_vec());
             }
             let Some(low) = rows.low.take() else {
                 self.at = At::Nowhere;
-                return Ok(false);
+                break None;
             };
             leaves = leaves.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
             if leaves > pool.allocated() {
                 return Err(corrupt("lower bounds that don't end"));
             }
             bound = Some(low);
-        }
+        };
+        self.note(found.as_deref(), to_key.as_deref())?;
+        Ok(found.is_some())
+    }
+
+    /// Keeps, for the transaction's commit's validation, that the cursor read the keys from
+    /// `from` to `to` (none: from the least, to the greatest): `Versioned::keep_read`. A reading
+    /// cursor keeps none (a snapshot never validates), nor one whose transaction has ended.
+    fn note(&self, from: Option<&[u8]>, to: Option<&[u8]>) -> Result<()> {
+        let Some(txn) = &self.txn else {
+            return Ok(());
+        };
+        let mut guard = txn.lock();
+        let Some(txn) = guard.as_mut() else {
+            return Ok(());
+        };
+        self.db.v.keep_read(txn, self.tree, from, to)
     }
 
     /// Finds the cursor's row again by its key where its copy is no longer the leaf's rows or it
@@ -530,6 +589,7 @@ impl VersionedCursor {
                 if self.fresh()? {
                     let next = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
                     if next < self.rows.len() {
+                        self.note(Some(self.rows.key(i)?), Some(self.rows.key(next)?))?;
                         self.at = At::Row(next);
                         return Ok(());
                     }
@@ -545,7 +605,7 @@ impl VersionedCursor {
                     // Else on to the leaf right of it, whose rows are all past the copy's upper
                     // bound.
                     let Some(right) = self.rows.right else {
-                        return Ok(());
+                        return self.note(Some(self.rows.key(i)?), None);
                     };
                     let key = self.rows.key(i)?.to_vec();
                     let low = self.rows.high.take();
@@ -567,6 +627,7 @@ impl VersionedCursor {
             At::Row(i) => {
                 if self.fresh()? {
                     if let Some(prev) = i.checked_sub(1) {
+                        self.note(Some(self.rows.key(prev)?), Some(self.rows.key(i)?))?;
                         self.at = At::Row(prev);
                         return Ok(());
                     }
@@ -730,6 +791,8 @@ impl VersionedCursor {
 
     /// The rows the snapshot sees, a leaf's copy at a time.
     fn count_rows(&mut self) -> Result<usize> {
+        // A count reads every row and every gap: the whole tree, kept once.
+        self.note(None, None)?;
         let mut n = 0usize;
         let mut found = self.first_after(&Point::First, None)?;
         while found {
@@ -757,6 +820,8 @@ impl VersionedCursor {
     /// Removes every row the snapshot sees, in the cursor's transaction: how many.
     pub(crate) fn clear_rows(&mut self) -> Result<u64> {
         self.record_stale();
+        // Which rows there are to remove is a read of the whole tree.
+        self.note(None, None)?;
         let mut n = 0u64;
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut found = self.first_after(&Point::First, None)?;
