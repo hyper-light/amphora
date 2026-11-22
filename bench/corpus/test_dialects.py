@@ -472,8 +472,8 @@ class LeftOutColumns(unittest.TestCase):
                     self.assertIsNone(out[i][1], (i, out[i][1]))
                 self.assertRegex(out[16][0], r"SELECT a, b, a FROM t$")
                 for i in (21, 22):
-                    self.assertIn("inspects the columns of t, of which e is left out of its CREATE (line 0) there", out[i][1])
-                self.assertIsNone(out[23][1])
+                    self.assertIn("https://www.sqlite.org/pragma.html#", out[i][1])
+                self.assertIn("https://www.sqlite.org/pragma.html#", out[23][1])
                 if d != "mysql":  # MySQL has RTRIM's like
                     self.assertIsNone(out[19][1], out[19][1])
                     self.assertIn("reads column f of v2", out[20][1])
@@ -675,7 +675,7 @@ class FunctionsSaid(unittest.TestCase):
     module is here) gives what SQLite gives, values compared as numbers; PostgreSQL's round() digits
     guarded; a likelihood() SQLite refuses left for the engine to refuse; hex() and length() of
     a REAL not expressible on PostgreSQL, MySQL and ClickHouse; typeof() and quote() of a known
-    class said on every engine, of a REAL (quote) or an unknown class left as they are."""
+    class said on every engine, of a REAL (quote) or an unknown class not expressible with the reason."""
 
     CASES = ["likely(1 > 0)", "unlikely(3) + 1", "likelihood(2, 0.5)", "upper('héllo')", "lower('ÉaB')", "round(2.5, -1)", "round(25, -2)", "char(72, 105)", "char(NULL)", "char(97)", "format('%d-%s', 7, 'x')", "format('%05.1f', 3.14159)", "hex(1)", "hex(-7)", "hex(NULL)", "hex('ab')", "hex(x'00ff')", "hex(1 + 2)", "zeroblob(3)", "zeroblob(-1)", "zeroblob(NULL)", "length(-7)", "length(x'00ff')", "length(1 + 22)", "length('é')", "hex(2.5)", "hex(100.0)", "hex(1e20)", "hex(-0.0)", "hex(9e999)", "length(1.0 / 3)", "length(1e-5)", "length(CAST(3 AS REAL))", "length(-9e999)", "length(123456789012345678.0)", "typeof(NULL)", "typeof(-7)", "typeof(2.5)", "typeof('abc')", "typeof(x'00')", "typeof(1 / 2.0)", "typeof(CAST(1 AS TEXT))", "quote(NULL)", "quote(-7)", "quote('it''s')", "quote(x'00ff')", "quote('')", "quote(x'')", "quote(1 + 2)", "2 IS 1", "NULL IS 1", "NULL IS NULL", "2 IS NOT 2", "'a' IS 'a'", "1 IS NOT NULL", "CAST(3.9 AS INTEGER)", "CAST(-2.5 AS INT)", "CAST(3000000000 AS INTEGER)", "CAST(2.5 AS TINYINT) + 1"]
 
@@ -707,13 +707,22 @@ class FunctionsSaid(unittest.TestCase):
         self.assertEqual(dialects.translate("SELECT CAST(3.9 AS INTEGER), CAST(a AS INT) FROM t", "mysql"), ("SELECT CAST(TRUNCATE(3.9, 0) AS SIGNED), CAST(a AS SIGNED) FROM t", None))
         self.assertEqual(dialects.translate("SELECT zeroblob(2), zeroblob(2.9)", "postgres"), ("SELECT DECODE(REPEAT('00', COALESCE(2, 0)), 'hex'), ZEROBLOB(2.9)", None))
         self.assertEqual(dialects.translate("SELECT format('%d', 2), hex(1), hex(a)", "mysql"), ("SELECT PRINTF('%d', 2), COALESCE(HEX(CAST(1 AS CHAR)), ''), COALESCE(HEX(a), '')", None))
-        records = [FileRecord(0, "CREATE TABLE t(a INTEGER, b TEXT, c BLOB)"), FileRecord(1, "SELECT typeof(a), quote(a), quote(b), quote(x'01'), quote(a + 0.5), typeof(abs(NULL)), typeof(c) FROM t", "query", None)]
+        records = [FileRecord(0, "CREATE TABLE t(a INTEGER, b TEXT, c BLOB)"), FileRecord(1, "SELECT typeof(a), quote(a), quote(b), quote(x'01') FROM t", "query", None)]
         for d in ENGINES:
             with self.subTest(dialect=d):
                 out = dialects.records_in(records, d)[1][0]
                 self.assertIn("CASE WHEN a IS NULL THEN 'null' ELSE 'integer' END", out)
                 self.assertEqual(out.upper().count("COALESCE("), 3)
-                self.assertRegex(out.upper(), r"QUOTE\(A \+ 0\.5\)")
+        for sql, why in [("SELECT quote(a + 0.5) FROM t", "quote() of a REAL"), ("SELECT typeof(abs(NULL)) FROM t", "typeof() of a value whose storage class only running it shows"), ("SELECT typeof(c) FROM t", "typeof() of a value whose storage class only running it shows"), ("SELECT quote(c || 1) FROM t", None)]:
+            for d in ENGINES:
+                with self.subTest(sql=sql, dialect=d):
+                    out = dialects.records_in(records[:1] + [FileRecord(1, sql, "query", None)], d)[1]
+                    if why is None:
+                        self.assertIsNone(out[1])
+                    else:
+                        self.assertIsNone(out[0])
+                        self.assertIn(f"not expressible in {d}: {why}", out[1])
+                        self.assertIn("https://www.sqlite.org/lang_corefunc.html#", out[1])
         self.assertEqual(dialects.translate("SELECT a IS 1, a IS NOT 'x', a IS NULL FROM t", "postgres", dialects.contexts([FileRecord(0, "CREATE TABLE t(a INTEGER)")])[0])[0], "SELECT a IS NOT DISTINCT FROM 1, NOT a IS NOT DISTINCT FROM 'x', a IS NULL FROM t")
         self.assertIn("UPPER(ENCODE(CAST('\\x01' AS BYTEA), 'hex'))", dialects.records_in(records, "postgres")[1][0])
         for d in ("postgres", "mysql", "clickhouse"):
@@ -856,3 +865,32 @@ class DateFunctions(unittest.TestCase):
                     self.assertIn(f"not expressible in {d}", why)
                     self.assertIn(reason, why)
                     self.assertIn("https://www.sqlite.org/lang_datefunc.html", why)
+
+
+class SQLiteOwn(unittest.TestCase):
+    """Do: SQLite's JSON functions and operators (json(), json_extract(), -> and ->>, json_set(),
+    jsonb(), json_group_array(), json_each() ...), PRAGMAs that read and set (with a schema, with a
+    table) and pragma_ table functions. Expect: each not expressible in every dialect with its
+    reason and SQLite's doc reference (json1.html, pragma.html); a word 'json' or 'pragma' in a string or a
+    name stays; a PRAGMA record SQLite refuses is given as written, for the engine to refuse."""
+
+    JSON = ["SELECT json(' { \"a\" : 1 } ')", "SELECT json_extract('{\"a\":1}', '$.a')", "SELECT '{\"a\":1}' -> '$.a'", "SELECT '{\"a\":1}' ->> '$.a'",
+            "SELECT json_set('{}', '$.a', 1)", "SELECT jsonb('[1]')", "SELECT json_group_array(x) FROM t", "SELECT value FROM json_each('[1,2]')", "SELECT json_valid('{}')", "SELECT json_type('[1]')"]
+    PRAGMAS = ["PRAGMA foreign_keys = ON", "PRAGMA main.user_version", "PRAGMA table_info(t)", "PRAGMA integrity_check", "PRAGMA case_sensitive_like = 1", "SELECT name FROM pragma_table_info('t')"]
+
+    def test_not_expressible_everywhere(self):
+        for sql in self.JSON + self.PRAGMAS:
+            ref = "https://www.sqlite.org/json1.html" if sql in self.JSON else "https://www.sqlite.org/pragma.html#"
+            for d in ENGINES:
+                with self.subTest(sql=sql, dialect=d):
+                    out, why = dialects.translate(sql, d)
+                    self.assertIsNone(out)
+                    self.assertIn(f"not expressible in {d}", why)
+                    self.assertIn(ref, why)
+        self.assertIn("pragma.html#pragma_user_version", dialects.translate("PRAGMA main.user_version", "duckdb")[1])
+
+    def test_words_in_strings_and_names_stay(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                self.assertIsNone(dialects.translate("SELECT 'json(1)', 'PRAGMA x' AS pragma_x", d)[1])
+        self.assertEqual(dialects.record_in(Record("PRAGMA no_such_thing = 1", "statement", "error"), "duckdb"), ("PRAGMA no_such_thing = 1", None))

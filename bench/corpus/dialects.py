@@ -1132,7 +1132,7 @@ def functions_said(expression, context, dialect):
       "real", "text", or "blob"" (lang_corefunc.html#typeof), where DuckDB's and PostgreSQL's
       typeof name the engine's type ('INTEGER', 'DECIMAL(2,1)', 'VARCHAR') and ClickHouse's
       toTypeName its own: for an X whose storage class storage_classes() knows, the class's name,
-      'null' where X is NULL (a literal's name alone). Another X is left as it is.
+      'null' where X is NULL (a literal's name alone). Another X is not expressible.
     - quote(X): "the text of an SQL literal which is the value of its argument suitable for
       inclusion into an SQL statement. Strings are surrounded by single-quotes with escapes on
       interior quotes as needed. BLOBs are encoded as hexadecimal literals" (lang_corefunc.html#quote),
@@ -1140,7 +1140,7 @@ def functions_said(expression, context, dialect):
       INTEGER's text, a TEXT's with each ' doubled between quotes, a BLOB's X'..' of its upper-case
       hex (PostgreSQL's upper(encode(X, 'hex'))), each 'NULL' where X is NULL. A REAL's text is
       SQLite's own (%!.15g, more digits where that doesn't read back: quote(1.0/3) is
-      '3.333333333333333148e-01'), and another X: left as they are."""
+      '3.333333333333333148e-01'), and another X: not expressible."""
     from sqlglot import exp
 
     classes = storage_classes(expression, context.tables)
@@ -1219,7 +1219,9 @@ def functions_said(expression, context, dialect):
                 same(node, exp.Coalesce(this=summed, expressions=[exp.Literal.number("0.0")]))
         elif isinstance(node, exp.Is) and not isinstance(node.expression, (exp.Null, exp.Boolean)):
             same(node, exp.NullSafeEQ(this=node.this.copy(), expression=node.expression.copy()))
-        elif isinstance(node, exp.Typeof) and classes.get(id(node.this), UNKNOWN) != UNKNOWN:
+        elif isinstance(node, exp.Typeof) and classes.get(id(node.this), UNKNOWN) == UNKNOWN:
+            raise NotExpressible(f"not expressible in {dialect}: typeof() of a value whose storage class only running it shows (https://www.sqlite.org/lang_corefunc.html#typeof), where {dialect}'s values are of their column's or expression's type, not SQLite's classes")
+        elif isinstance(node, exp.Typeof):
             c, x = classes[id(node.this)], node.this
             if c is None or isinstance(x, exp.Literal) or (isinstance(x, exp.Neg) and isinstance(x.this, exp.Literal)):
                 same(node, exp.Literal.string((c or "null").lower()))
@@ -1239,6 +1241,9 @@ def functions_said(expression, context, dialect):
                 hexed = exp.Upper(this=exp.Anonymous(this="encode", expressions=[x.copy(), exp.Literal.string("hex")])) if dialect == "postgres" else exp.Hex(this=x.copy())
                 said = exp.DPipe(this=exp.DPipe(this=exp.Literal.string("X'"), expression=hexed), expression=exp.Literal.string("'"))
             same(node, said if c is None else exp.Coalesce(this=said, expressions=[exp.Literal.string("NULL")]))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "QUOTE" and len(node.expressions) == 1:
+            what = "a REAL, whose text is SQLite's own (%!.15g, more digits where that doesn't read back)" if classes.get(id(node.expressions[0])) == "REAL" else "a value whose storage class only running it shows"
+            raise NotExpressible(f"not expressible in {dialect}: quote() of {what} (https://www.sqlite.org/lang_corefunc.html#quote), which no {dialect} function writes alike")
         elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and affinity(node.to.sql(dialect="sqlite")) == "INTEGER":
             if classes.get(id(node.this)) == "REAL":
                 node.set("this", exp.Trunc(this=node.this.copy()))
@@ -1468,6 +1473,39 @@ def dated(expression, dialect):
             expression = said
         else:
             node.replace(said)
+    return expression
+
+
+def sqlite_own(expression, dialect):
+    """`expression` as it is, or not expressible where it uses what is SQLite's own:
+    - SQLite's JSON functions and operators (json(), json_extract(), -> and ->>, json_set(), the
+      jsonb_ functions, json_each() ...: https://www.sqlite.org/json1.html) read JSON5 ("JSON5
+      extensions", json1.html section 3.4), write SQLite's own minified text, give an SQL value of
+      each JSON type (json_extract('{"a":1}', '$.a') is the INTEGER 1, of a string its text
+      unquoted: json1.html, "The json_extract() function") and keep JSONB, SQLite's own binary
+      format: each engine's JSON functions read, write and type JSON otherwise (DuckDB's
+      json_extract() gives a JSON value, '"x"' quoted; PostgreSQL's ->> takes a key, not a path).
+    - a PRAGMA, and a pragma_ table-valued function (https://www.sqlite.org/pragma.html): it reads
+      or sets SQLite's own settings and catalog, which no engine has a statement like (DuckDB's
+      PRAGMA table_info gives other columns); case_sensitive_like's effect is carried into each
+      later LIKE's translation (liked()), the PRAGMA itself is not expressible."""
+    from sqlglot import exp
+
+    if isinstance(expression, exp.Pragma):
+        target = expression.this.this if isinstance(expression.this, exp.EQ) else expression.this
+        target = target.expression if isinstance(target, exp.Dot) else target
+        name = (target.name if isinstance(target, (exp.Column, exp.Identifier, exp.Var, exp.Anonymous)) else target.sql(dialect="sqlite").split("(")[0]).lower() if target is not None else ""
+        raise NotExpressible(f"not expressible in {dialect}: PRAGMA {name} (https://www.sqlite.org/pragma.html#pragma_{name}) reads or sets SQLite's own settings and catalog, which {dialect} has no statement like")
+    for node in expression.walk():
+        if not isinstance(node, exp.Func):
+            continue
+        name = node.name.lower() if isinstance(node, exp.Anonymous) else type(node).__name__.lower()
+        if name.startswith("pragma_"):
+            raise NotExpressible(f"not expressible in {dialect}: the table-valued {name}() (https://www.sqlite.org/pragma.html#pragfunc), which reads SQLite's own catalog, which {dialect} has nothing like")
+        if name.startswith("json"):
+            shown = node.name.lower() if isinstance(node, exp.Anonymous) else node.sql(dialect="sqlite").split("(")[0].lower()
+            shown = f"{shown}()" if shown.startswith("json") else f"JSON operator in {node.sql(dialect='sqlite')[:40]}"
+            raise NotExpressible(f"not expressible in {dialect}: SQLite's {shown} (https://www.sqlite.org/json1.html), which reads JSON5, writes SQLite's own minified text and gives an SQL value of each JSON type, where {dialect}'s JSON functions read, write and type JSON otherwise")
     return expression
 
 
@@ -1718,7 +1756,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(globbed(functions_said(extremes(dated(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
+            e = spoken(globbed(functions_said(extremes(dated(sqlite_own(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:
@@ -1927,14 +1965,6 @@ def records_in(records, dialect, around=None):
             n, m = _names(e)
             named |= n
             made.append((m, e))
-        # A PRAGMA or pragma_ table function (table_info, index_list, ...) names its table in a
-        # string or a bare word: it inspects the table's columns, which on the dialect are other.
-        if re.search(r"\bpragma", r.sql, re.I):
-            named |= {t for t in list(missing) + list(partial) if re.search(r"(?<![\w$])" + re.escape(t) + r"(?![\w$])", r.sql, re.I)}
-            inspects = sorted(t for t in named if t in partial)
-            if why is None and inspects:
-                table, gone_cols, line, reason = partial[inspects[0]]
-                why, sql = f"untranslatable in {dialect}: inspects the columns of {inspects[0].lower()}, of which {', '.join(sorted(g.lower() for g in gone_cols))} is left out of its CREATE (line {line}) there: {reason}", None
         # A table some of whose columns no type of the dialect holds (typed()) is made without
         # them, and each record that doesn't read them runs on it unchanged in meaning: a query
         # that reads none of a table's columns gives what it gives whatever other columns the
