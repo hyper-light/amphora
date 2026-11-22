@@ -7,7 +7,8 @@
 //! `bench/planner/loops.py` counts the bench's (T-PL.6.1, AC-PL.6.1).
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect,
+    ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, OpenOptions, PlatformIO,
+    SqliteDialect,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -263,6 +264,47 @@ fn a_chain_of_hash_joins_reads_each_table_once() {
     );
     // s's rows whose k is in 1..=300 (k = 0 has no r row) and whose j is in 1..=499 (j = 0 has no t
     // row): i from 1 to 2,000 with i % 300 != 0 and i % 500 != 0.
+    let want = (1..=2000)
+        .filter(|i: &i64| i % 300 != 0 && i % 500 != 0)
+        .count() as i64;
+    assert_eq!(count(&conn, sql), want);
+}
+
+/// Do: the same chain with hash joins only, so the middle table is both the first join's probe and
+/// the second's build, and its build input is materialized from the first join. Expect: the main
+/// plan neither lists nor opens the first join's build table again (the materialization read it,
+/// once), and the count right. Before the fix the main plan opened it and listed `SCAN r` beside
+/// the second join's probe, whichever weights calibration measured (PL.6, PL.5).
+#[test]
+fn a_materialized_chain_leaves_its_prefix_out_of_the_main_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    for sql in [
+        "CREATE TABLE r(id INTEGER PRIMARY KEY, k INT)",
+        "CREATE TABLE s(id INTEGER PRIMARY KEY, k INT, j INT)",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, j INT)",
+        "INSERT INTO r(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) SELECT i FROM n",
+        "INSERT INTO s(k, j) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i % 300, i % 500 FROM n",
+        "INSERT INTO t(j) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) SELECT i FROM n",
+        "ANALYZE",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+    let sql = "SELECT count(*) FROM r JOIN s ON s.k = r.k JOIN t ON t.j = s.j";
+    let plan = plan_text(&conn, sql);
+    assert!(plan.contains("MATERIALIZE hash build input"), "{plan}");
+    assert_eq!(whole_reads_in_loops(&conn, sql), Vec::<String>::new(), "{plan}");
+    let mut stmt = conn.prepare(format!("EXPLAIN {sql}")).unwrap();
+    let opens = stmt
+        .run_collect_rows()
+        .unwrap()
+        .iter()
+        .filter(|row| row[1].to_string() == "OpenRead")
+        .count();
+    // The materialization opens r and s (the hash build of r opens its own cursor) and the main
+    // plan opens t: four in all, none for a table the main plan doesn't read.
+    assert_eq!(opens, 4, "{plan}");
     let want = (1..=2000)
         .filter(|i: &i64| i % 300 != 0 && i % 500 != 0)
         .count() as i64;
