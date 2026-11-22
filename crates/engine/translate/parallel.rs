@@ -83,7 +83,11 @@ pub(crate) fn emit_morsel_hook(
             };
             (data, Some(looped))
         }
-        (None, None) => match shape_join(plan).or_else(|| shape_chain(plan)) {
+        // Which table a two-table outer join probes (lane qs6-15): `shape_join` takes the padded
+        // one, `shape_chain` the kept one, as the connection's switch says.
+        (None, None) => match shape_join(plan, resolver.outer_probe())
+            .or_else(|| shape_chain(plan, resolver.outer_probe()))
+        {
             Some((data, looped)) => (data, Some(looped)),
             None => return Ok(None),
         },
@@ -910,7 +914,10 @@ fn outputs(
 /// MIN, a MAX or a group's key values take on a tie (the serial loop's order of a probe row's
 /// matches is its hash tables') cannot change the answer, since only an INTEGER and a REAL can
 /// compare equal and differ: a REAL in such a place sends the statement to the serial loop.
-fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
+fn shape_join(
+    plan: &SelectPlan,
+    probe: crate::OuterJoinProbe,
+) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
     // A join with no aggregates returns its rows (QT.6): the workers' runs merge in order.
     let rows_mode = plan.aggregates.is_empty();
     if !(if rows_mode {
@@ -980,7 +987,8 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
             ((0..tables.len()).find(|at| !built.contains(at))?, None)
         }
         Some((at, kind)) if tables.len() == 2 => {
-            if built.contains(&at) {
+            // Probing the kept table instead is the chain's (lane qs6-15).
+            if built.contains(&at) || probe == crate::OuterJoinProbe::Kept {
                 return None;
             }
             (at, Some(kind))
@@ -1307,7 +1315,14 @@ fn reach(joined: &[JoinedTable], expr: &Expr) -> Option<usize> {
 ///   later say). There a term over one table filters that table's rows and an equality with an
 ///   earlier table keys an inner link; every other WHERE term runs over the whole joined row.
 /// - a link with no key is a cross product, which the hook declines.
-fn shape_chain(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
+///
+/// With the switch at [`crate::OuterJoinProbe::Kept`] (lane qs6-15) it takes a LEFT or FULL JOIN
+/// of two tables too: the left table probes, and its rows no match passed are padded during the
+/// walk (a FULL join's right rows that nothing matched still come from the link's bitmap).
+fn shape_chain(
+    plan: &SelectPlan,
+    probe: crate::OuterJoinProbe,
+) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
     let rows_mode = plan.aggregates.is_empty();
     if !(if rows_mode {
         plain_rows(plan)
@@ -1353,10 +1368,14 @@ fn shape_chain(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)>
         tables.push(stored(table)?);
     }
     // Only what the other join shapes don't take: two or more outer joins, or a RIGHT or FULL
-    // JOIN among three or more tables.
+    // JOIN among three or more tables; and a LEFT or FULL JOIN of two tables when the switch
+    // says its kept table probes (lane qs6-15).
     let outer = keeps.iter().filter(|k| k.left || k.right).count();
     let right = keeps.iter().any(|k| k.right);
-    if !(outer >= 2 || (right && tables.len() > 2)) {
+    let two_kept = probe == crate::OuterJoinProbe::Kept
+        && tables.len() == 2
+        && keeps.get(1).is_some_and(|k| k.left);
+    if !(outer >= 2 || (right && tables.len() > 2) || two_kept) {
         return None;
     }
     let last_right = keeps.iter().rposition(|k| k.right);

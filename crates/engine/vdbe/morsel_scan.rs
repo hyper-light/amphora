@@ -1362,6 +1362,37 @@ impl Pipeline for TableJoinRows<'_> {
     }
 }
 
+/// Amphora (QT.6, lane qs6-15): what the outer joins on morsels did, by orientation
+/// ([`crate::OuterJoinProbe`]), for the measurements that decide between them: the rows each way
+/// of padding padded, the bitmaps' size, and the statements each path ran. Counted per morsel,
+/// added once per morsel; a statement's share is the difference across it.
+#[derive(Debug, Default)]
+pub struct OuterCounters {
+    /// Rows padded during the walk: a row of the tables before a link that keeps them that no
+    /// match passed (the chain's LEFT and FULL links), or a FULL join's probe row that matched
+    /// nothing (two tables).
+    pub walk_pads: std::sync::atomic::AtomicU64,
+    /// Build rows padded once the bitmaps merged: rows of a table the join keeps that no row
+    /// matched.
+    pub bitmap_pads: std::sync::atomic::AtomicU64,
+    /// The bitmap words the workers sized, a word per 64 build rows per worker per phase: what
+    /// marking in a bitmap holds.
+    pub bitmap_words: std::sync::atomic::AtomicU64,
+    /// Statements whose outer join of two tables probed the table it pads ([`TableOuterJoin`]).
+    pub padded_probes: std::sync::atomic::AtomicU64,
+    /// Statements run as a chain in the FROM clause's order ([`TableChain`]), a two-table outer
+    /// join that probes its kept table among them.
+    pub chains: std::sync::atomic::AtomicU64,
+}
+
+impl OuterCounters {
+    fn add(counter: &std::sync::atomic::AtomicU64, by: u64) {
+        if by > 0 {
+            counter.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// An outer join of two tables on morsels (lane qs6-12): the probe is the table the join pads with
 /// NULLs, its one link the table whose every row appears. Each worker probes its own leaves; a
 /// joined row that passes the ON terms (the body from `MorselBody::on`) matched, and its build row
@@ -1384,6 +1415,8 @@ pub struct TableOuterJoin<'a> {
     pub body: &'a TableBodyAggregate<'a>,
     /// A join's rows: the sort keys, each one's place in the output row and whether it descends.
     pub order: &'a [(usize, bool)],
+    /// What the orientations did (lane qs6-15).
+    pub counts: &'a OuterCounters,
 }
 
 /// The partial of [`TableOuterJoin`] and [`TableOuterRest`]: the aggregates, or the output rows
@@ -1522,12 +1555,17 @@ impl Pipeline for TableOuterJoin<'_> {
             budget.charge(words.saturating_mul(std::mem::size_of::<u64>()))?;
             matched.try_reserve_exact(words)?;
             matched.resize(words, 0);
+            OuterCounters::add(
+                &self.counts.bitmap_words,
+                u64::try_from(words).unwrap_or(u64::MAX),
+            );
         }
         let full = self.kind == MorselOuter::Full;
         let first = leaves.start;
         let mut found: Vec<Vec<Value>> = Vec::new();
         let mut joined: Vec<Value> = Vec::new();
         let mut ran = 0u64;
+        let mut pads = 0u64;
         let scanned = self.table.scan(leaves, |rowid, row| {
             for term in self.probe_filter {
                 if !term.holds(row)? {
@@ -1564,6 +1602,7 @@ impl Pipeline for TableOuterJoin<'_> {
                 joined.extend_from_slice(row);
                 joined.resize(row.len().saturating_add(self.build_columns), Value::Null);
                 ran = ran.saturating_add(1);
+                pads = pads.saturating_add(1);
                 if self.body.padded_row(worker, Some(rowid), &joined)? {
                     self.keep(&worker.out, position(rowid)?, aggregate, &mut found, budget)?;
                 }
@@ -1574,6 +1613,7 @@ impl Pipeline for TableOuterJoin<'_> {
             self.body
                 .ran
                 .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+            OuterCounters::add(&self.counts.walk_pads, pads);
         }
         scanned?;
         if !self.order.is_empty() {
@@ -1656,6 +1696,8 @@ impl Pipeline for TableOuterRest<'_> {
         }
         body.ran
             .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+        // Every row this morsel ran was padded after the bitmaps merged.
+        OuterCounters::add(&self.join.counts.bitmap_pads, ran);
         if !self.join.order.is_empty() {
             found.sort_by(|a, b| compare_rows(self.join.order, a, b));
         }
@@ -1701,6 +1743,8 @@ pub struct TableChain<'a> {
     pub body: &'a TableBodyAggregate<'a>,
     /// A join's rows: the sort keys, each one's place in the output row and whether it descends.
     pub order: &'a [(usize, bool)],
+    /// What the orientations did (lane qs6-15).
+    pub counts: &'a OuterCounters,
 }
 
 /// A walk's place at one link: the link's matches for the row before it, the next one to take,
@@ -1728,6 +1772,8 @@ struct ChainWalk<'s, 'w> {
     joined: Vec<Value>,
     frames: Vec<ChainFrame<'s>>,
     ran: u64,
+    /// The rows padded during the walk (lane qs6-15).
+    pads: u64,
 }
 
 impl<'a> TableChain<'a> {
@@ -1849,6 +1895,7 @@ impl<'a> TableChain<'a> {
                 if let Some(top) = walk.frames.last_mut() {
                     top.3 = true;
                 }
+                walk.pads = walk.pads.saturating_add(1);
                 walk.joined.truncate(base);
                 walk.joined
                     .resize(base.saturating_add(*columns), Value::Null);
@@ -1977,6 +2024,8 @@ impl<'a> ChainPhase<'a> {
             .get(link)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        // The rows padded once the bitmaps merged (lane qs6-15).
+        let mut pads = 0u64;
         for at in rows {
             let (word, bit) = matched_bit(at)?;
             if marks.get(word).is_some_and(|w| w & bit != 0) {
@@ -1990,8 +2039,10 @@ impl<'a> ChainPhase<'a> {
                 .try_reserve(base.saturating_add(build_row.len()))?;
             walk.joined.resize(base, Value::Null);
             walk.joined.extend_from_slice(build_row);
+            pads = pads.saturating_add(1);
             chain.walk(walk, link.saturating_add(1), None, at, budget)?;
         }
+        OuterCounters::add(&chain.counts.bitmap_pads, pads);
         Ok(())
     }
 }
@@ -2046,6 +2097,10 @@ impl Pipeline for ChainPhase<'_> {
                 marks.try_reserve_exact(words)?;
                 marks.resize(words, 0);
                 matched.push(marks);
+                OuterCounters::add(
+                    &chain.counts.bitmap_words,
+                    u64::try_from(words).unwrap_or(u64::MAX),
+                );
             }
         }
         let first = rows.start;
@@ -2057,6 +2112,7 @@ impl Pipeline for ChainPhase<'_> {
             joined: Vec::new(),
             frames: Vec::new(),
             ran: 0,
+            pads: 0,
         };
         let walked = match self.from {
             None => chain.table.scan(rows, |rowid, row| {
@@ -2072,12 +2128,18 @@ impl Pipeline for ChainPhase<'_> {
             }),
             Some(link) => self.tails(&mut walk, link, rows, budget),
         };
-        let ChainWalk { mut found, ran, .. } = walk;
+        let ChainWalk {
+            mut found,
+            ran,
+            pads,
+            ..
+        } = walk;
         if walked.is_ok() {
             chain
                 .body
                 .ran
                 .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+            OuterCounters::add(&chain.counts.walk_pads, pads);
         }
         walked?;
         if !chain.order.is_empty() {

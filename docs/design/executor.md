@@ -616,9 +616,23 @@ filters that table and an equality with an earlier table keys the link. Every ot
 over the whole row. The two-table shapes and one LEFT join among more keep their own paths
 (T-QT.6.24 for FULL joins among three and four tables, T-QT.6.25 for two or more outer joins).
 
-**Not yet.** One path for LEFT joins: a two-table LEFT join keeps lane qs6-12's bitmaps, one LEFT
-join among more lane qs6-13's last-link walk, and two or more the chain; which wins is the scaling
-run's to say (the plan is in lane qs6-14's report).
+**Two orientations of a two-table outer join, behind a switch** (lane qs6-15; steps 1 and 2 of
+lane qs6-14's plan). `Connection::set_parallel_outer_probe` picks which table a two-table LEFT or
+FULL JOIN probes, for statements prepared after: `OuterJoinProbe::Padded` (the default, today's)
+probes the table the join pads and marks the kept table's matched rows in a bitmap per worker,
+padding the unmarked ones once the bitmaps merge (`TableOuterJoin`); `OuterJoinProbe::Kept` probes
+the kept table (a FULL join's left one) through the chain, padding a kept row no match passed
+during the walk (`TableChain`; a FULL join's right rows still take the link's bitmap). A LEFT join
+among more tables and the chain's joins have the one orientation the chain can state (the kept
+tables probe, the padded link pads in the walk), whatever the switch says. What each did is
+counted on the connection (`OuterCounters`: rows padded during the walk, rows padded after the
+bitmaps merged, the bitmap words the workers held, statements per path) and traced per statement
+(target `amphora.morsel`, "outer join on morsels"). Every outer-join test (T-QT.6.19, T-QT.6.22 to
+T-QT.6.25) runs at both settings; T-QT.6.19 also checks each setting ran its own path.
+
+**Not yet.** One path for LEFT joins: which orientation wins, or a choice per query from measured
+costs, is the scaling run's to say (qs6-14's plan, steps 3 and 4: the extreme-case scenario in the
+A/B harness, then the leftover paths removed).
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

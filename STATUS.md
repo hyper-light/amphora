@@ -1084,7 +1084,11 @@ three or more tables runs with its padded table as the chain's last link (T-QT.6
 FULL and RIGHT joins among three or more tables, and statements with more than one outer join, run
 on morsels as one chain in the FROM clause's order, each link's ON terms tested at that link, the
 rows a link keeps padded there, and the build rows a RIGHT or FULL link keeps that nothing matched
-walked through the rest of the chain once its bitmaps merge (T-QT.6.24, T-QT.6.25).
+walked through the rest of the chain once its bitmaps merge (T-QT.6.24, T-QT.6.25). Lane qs6-15:
+a two-table LEFT or FULL join's orientation is a switch (`Connection::set_parallel_outer_probe`:
+the padded table probed with a bitmap, today's default, or the kept table probed through the
+chain, padded during the walk), counted and traced per statement; every outer-join test runs at
+both settings, and the scaling run decides between them.
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.

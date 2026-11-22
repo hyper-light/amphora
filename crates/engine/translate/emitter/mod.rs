@@ -209,6 +209,9 @@ pub struct Resolver<'a> {
     fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
+    /// Amphora (QT.6, lane qs6-15): which table a two-table outer join on morsels probes
+    /// (`Connection::set_parallel_outer_probe`).
+    outer_probe: crate::OuterJoinProbe,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
@@ -350,6 +353,7 @@ impl<'a> Resolver<'a> {
             learned_weights: None,
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
+            outer_probe: crate::OuterJoinProbe::Padded,
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
@@ -453,6 +457,14 @@ impl<'a> Resolver<'a> {
         self.join_methods = methods;
     }
 
+    pub(crate) fn outer_probe(&self) -> crate::OuterJoinProbe {
+        self.outer_probe
+    }
+
+    pub(crate) fn set_outer_probe(&mut self, probe: crate::OuterJoinProbe) {
+        self.outer_probe = probe;
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches
     }
@@ -513,6 +525,7 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            outer_probe: self.outer_probe,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
@@ -551,6 +564,7 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            outer_probe: self.outer_probe,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,

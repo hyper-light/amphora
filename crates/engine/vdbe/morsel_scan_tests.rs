@@ -1795,7 +1795,16 @@ fn random_outer(rng: &mut ChaCha8Rng, kind: &str) -> (String, bool) {
 /// testing the padded rows. Each kind took the hook in some runs, one link built and the body run.
 #[test]
 fn t_qt_6_19_outer_joins_pad_unmatched_rows_as_the_serial_loop() {
-    let conn = open(":memory:qt-6-19");
+    // At each orientation of a two-table outer join (lane qs6-15), today's first.
+    for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+        t_qt_6_19_outer_joins_pad_unmatched_rows_as_the_serial_loop_at(probe);
+    }
+}
+
+/// T-QT.6.19 at one orientation of a two-table outer join, `probe` (lane qs6-15).
+fn t_qt_6_19_outer_joins_pad_unmatched_rows_as_the_serial_loop_at(probe: crate::OuterJoinProbe) {
+    let conn = open(&format!(":memory:qt-6-19-{probe:?}"));
+    conn.set_parallel_outer_probe(probe);
     let mut rng = ChaCha8Rng::seed_from_u64(619);
     fill(&conn, &mut rng, "t", 500);
     fill(&conn, &mut rng, "u", 150);
@@ -1803,6 +1812,17 @@ fn t_qt_6_19_outer_joins_pad_unmatched_rows_as_the_serial_loop() {
     let kinds = ["LEFT", "RIGHT", "FULL"];
     let mut hooked = [0usize; 3];
     let queries = 36usize;
+    let outer = |conn: &Arc<Connection>| {
+        let o = &conn.morsel_outer;
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        [
+            load(&o.padded_probes),
+            load(&o.chains),
+            load(&o.walk_pads),
+            load(&o.bitmap_pads),
+        ]
+    };
+    let outer_before = outer(&conn);
     for query in 0..queries {
         let at = query % kinds.len();
         let (sql, rows) = random_outer(&mut rng, kinds[at]);
@@ -1842,6 +1862,30 @@ fn t_qt_6_19_outer_joins_pad_unmatched_rows_as_the_serial_loop() {
     // Non-vacuity: every kind ran on morsels.
     for (kind, runs) in kinds.iter().zip(hooked) {
         assert!(runs > 0, "no {kind} JOIN took the hook");
+    }
+    // Each orientation ran its own path (lane qs6-15): the padded table probed with a bitmap of
+    // the kept one's rows, or the kept table probed in the chain, its rows padded in the walk.
+    let after = outer(&conn);
+    let [padded_probes, chains, walk_pads, bitmap_pads] =
+        [0, 1, 2, 3].map(|at| after[at] - outer_before[at]);
+    match probe {
+        crate::OuterJoinProbe::Padded => {
+            assert!(
+                padded_probes > 0 && chains == 0,
+                "{probe:?}: {padded_probes} padded probes, {chains} chains"
+            );
+            assert!(
+                bitmap_pads > 0,
+                "{probe:?}: no row padded after the bitmaps merged"
+            );
+        }
+        crate::OuterJoinProbe::Kept => {
+            assert!(
+                padded_probes == 0 && chains > 0,
+                "{probe:?}: {padded_probes} padded probes, {chains} chains"
+            );
+            assert!(walk_pads > 0, "{probe:?}: no row padded during the walk");
+        }
     }
 }
 
@@ -1942,7 +1986,16 @@ fn t_qt_6_21_a_join_of_reads_only_copies_its_outputs_when_switched_on() {
 /// in some runs (one link built, the body run); an order with ties under a LIMIT is declined.
 #[test]
 fn t_qt_6_22_outer_joins_under_limit_answer_as_the_serial_loop() {
-    let conn = open(":memory:qt-6-22");
+    // At each orientation of a two-table outer join (lane qs6-15), today's first.
+    for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+        t_qt_6_22_outer_joins_under_limit_answer_as_the_serial_loop_at(probe);
+    }
+}
+
+/// T-QT.6.22 at one orientation of a two-table outer join, `probe` (lane qs6-15).
+fn t_qt_6_22_outer_joins_under_limit_answer_as_the_serial_loop_at(probe: crate::OuterJoinProbe) {
+    let conn = open(&format!(":memory:qt-6-22-{probe:?}"));
+    conn.set_parallel_outer_probe(probe);
     let mut rng = ChaCha8Rng::seed_from_u64(622);
     let pad = "x".repeat(64);
     for (name, rows) in [("t", 900usize), ("u", 300)] {
@@ -2064,7 +2117,18 @@ fn t_qt_6_22_outer_joins_under_limit_answer_as_the_serial_loop() {
 /// the probe, the body run).
 #[test]
 fn t_qt_6_23_left_joins_of_three_and_four_tables_pad_the_last_link() {
-    let conn = open(":memory:qt-6-23");
+    // At each orientation of a two-table outer join (lane qs6-15), today's first.
+    for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+        t_qt_6_23_left_joins_of_three_and_four_tables_pad_the_last_link_at(probe);
+    }
+}
+
+/// T-QT.6.23 at one orientation of a two-table outer join, `probe` (lane qs6-15).
+fn t_qt_6_23_left_joins_of_three_and_four_tables_pad_the_last_link_at(
+    probe: crate::OuterJoinProbe,
+) {
+    let conn = open(&format!(":memory:qt-6-23-{probe:?}"));
+    conn.set_parallel_outer_probe(probe);
     let mut rng = ChaCha8Rng::seed_from_u64(623);
     let pad = "x".repeat(48);
     for (name, rows) in [("t", 700usize), ("u", 160), ("v", 60), ("w", 30)] {
@@ -2371,7 +2435,18 @@ fn chain_runs(conn: &Arc<Connection>, sql: &str, rows: bool, tables: usize) -> O
 /// kept as written, so only the chain takes them) took the hook.
 #[test]
 fn t_qt_6_24_full_joins_of_three_and_four_tables_answer_as_the_serial_loop() {
-    let conn = open(":memory:qt-6-24");
+    // At each orientation of a two-table outer join (lane qs6-15), today's first.
+    for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+        t_qt_6_24_full_joins_of_three_and_four_tables_answer_as_the_serial_loop_at(probe);
+    }
+}
+
+/// T-QT.6.24 at one orientation of a two-table outer join, `probe` (lane qs6-15).
+fn t_qt_6_24_full_joins_of_three_and_four_tables_answer_as_the_serial_loop_at(
+    probe: crate::OuterJoinProbe,
+) {
+    let conn = open(&format!(":memory:qt-6-24-{probe:?}"));
+    conn.set_parallel_outer_probe(probe);
     let mut rng = ChaCha8Rng::seed_from_u64(624);
     fill_with_ids(
         &conn,
@@ -2414,7 +2489,16 @@ fn t_qt_6_24_full_joins_of_three_and_four_tables_answer_as_the_serial_loop() {
 /// Joins of both sizes with no WHERE term took the hook, and so did one of LEFT joins alone.
 #[test]
 fn t_qt_6_25_more_than_one_outer_join_answers_as_the_serial_loop() {
-    let conn = open(":memory:qt-6-25");
+    // At each orientation of a two-table outer join (lane qs6-15), today's first.
+    for probe in [crate::OuterJoinProbe::Padded, crate::OuterJoinProbe::Kept] {
+        t_qt_6_25_more_than_one_outer_join_answers_as_the_serial_loop_at(probe);
+    }
+}
+
+/// T-QT.6.25 at one orientation of a two-table outer join, `probe` (lane qs6-15).
+fn t_qt_6_25_more_than_one_outer_join_answers_as_the_serial_loop_at(probe: crate::OuterJoinProbe) {
+    let conn = open(&format!(":memory:qt-6-25-{probe:?}"));
+    conn.set_parallel_outer_probe(probe);
     let mut rng = ChaCha8Rng::seed_from_u64(625);
     fill_with_ids(
         &conn,

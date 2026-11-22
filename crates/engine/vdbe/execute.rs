@@ -21053,6 +21053,39 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     }
 }
 
+/// Amphora (QT.6, lane qs6-15): runs an outer join's pipeline and traces what its orientation did
+/// (`path`: the padded table probed with a bitmap, or the chain in the FROM clause's order): the
+/// rows padded during the walk and after the bitmaps merged, and the bitmap words held. The
+/// counters are the connection's, so the differences are this statement's while it alone runs
+/// on the connection, as a connection's statements do.
+fn outer_traced<T>(
+    counts: &crate::vdbe::morsel_scan::OuterCounters,
+    path: &'static str,
+    run: impl FnOnce() -> Result<T, crate::vdbe::morsel::MorselError>,
+) -> Result<T, crate::vdbe::morsel::MorselError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let read = || {
+        (
+            counts.walk_pads.load(Relaxed),
+            counts.bitmap_pads.load(Relaxed),
+            counts.bitmap_words.load(Relaxed),
+        )
+    };
+    let before = read();
+    let answer = run();
+    let after = read();
+    tracing::debug!(
+        target: "amphora.morsel",
+        path,
+        walk_pads = after.0.saturating_sub(before.0),
+        bitmap_pads = after.1.saturating_sub(before.1),
+        bitmap_words = after.2.saturating_sub(before.2),
+        ok = answer.is_ok(),
+        "outer join on morsels"
+    );
+    answer
+}
+
 /// Amphora (QT.6): [Insn::MorselAggregate]. The statement's read transaction is open, so every
 /// worker's cursor reads its one snapshot through `pager`.
 pub fn op_morsel_aggregate(
@@ -21277,8 +21310,15 @@ pub fn op_morsel_aggregate(
                     .as_ref()
                     .map(|rows| rows.order.as_slice())
                     .unwrap_or_default(),
+                counts: &connection.morsel_outer,
             };
-            let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
+            let (mut out, _) = outer_traced(&connection.morsel_outer, "chain", || {
+                pipeline.run_mode(mode, &mut costs, &budget)
+            })?;
+            connection
+                .morsel_outer
+                .chains
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return match &data.joined_rows {
                 Some(rows) => {
                     for row in &mut out {
@@ -21310,8 +21350,15 @@ pub fn op_morsel_aggregate(
                     .as_ref()
                     .map(|rows| rows.order.as_slice())
                     .unwrap_or_default(),
+                counts: &connection.morsel_outer,
             };
-            let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
+            let (mut out, _) = outer_traced(&connection.morsel_outer, "padded probe", || {
+                pipeline.run_mode(mode, &mut costs, &budget)
+            })?;
+            connection
+                .morsel_outer
+                .padded_probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return match &data.joined_rows {
                 Some(rows) => {
                     for row in &mut out {

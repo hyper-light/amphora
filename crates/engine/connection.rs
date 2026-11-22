@@ -205,6 +205,26 @@ pub struct ReparseSchemaInner {
     phase: ReparsePhase,
 }
 
+/// Amphora (QT.6, lane qs6-15): which table an outer join of two tables probes when it runs on
+/// morsels (`Connection::set_parallel_outer_probe`): the two orientations of one join, both kept
+/// so measurements can decide between them (qs6-14's plan for unifying the outer-join paths, steps
+/// 1 and 2). A LEFT join's kept table is its left one; a FULL join keeps both, and its two
+/// orientations probe its right table or its left one. A LEFT join among more tables and the
+/// chain's joins have one orientation only (the kept tables probe and the padded link pads
+/// during the walk), whichever this says.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum OuterJoinProbe {
+    /// Probe the table the join pads with NULLs (a FULL join's right one): the kept table is the
+    /// hash table, each worker marks the rows of it that matched in a bitmap of its own, and the
+    /// rows no worker marked are padded once the bitmaps merge (lane qs6-12). Today's path, the
+    /// default.
+    Padded = 0,
+    /// Probe the kept table (a FULL join's left one): the padded table is the hash table, and a
+    /// kept row no match passed is padded during the walk, as the chain's LEFT link does (lane
+    /// qs6-14). A FULL join's right rows still take the chain's bitmap.
+    Kept = 1,
+}
+
 /// Amphora: the join methods newly prepared statements may plan (`Connection::set_join_methods`):
 /// by cost, or one method only, for the tests that run every join both ways and the measurement
 /// of each method's time (`bench/join_methods`; query-speed step 5, QT.5).
@@ -548,6 +568,8 @@ pub struct Connection {
     pub(super) parallel_cores: std::sync::atomic::AtomicUsize,
     /// Amphora: see [`Connection::set_parallel_join_direct`].
     pub(super) parallel_join_direct: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_outer_probe`].
+    pub(super) parallel_outer_probe: AtomicOuterJoinProbe,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
@@ -557,6 +579,8 @@ pub struct Connection {
     pub(crate) morsel_join_links: AtomicU64,
     /// Amphora: the joined rows whose outputs were copied, no body run (lane qs6-13).
     pub(crate) morsel_join_direct_rows: AtomicU64,
+    /// Amphora (QT.6, lane qs6-15): what the outer joins on morsels did in each orientation.
+    pub(crate) morsel_outer: crate::vdbe::morsel_scan::OuterCounters,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1053,6 +1077,19 @@ impl Connection {
     /// (the body runs on every joined row, lane qs6-12) until the A/B of T-QT.6.20 decides.
     pub fn set_parallel_join_direct(&self, on: bool) {
         self.parallel_join_direct.store(on, Ordering::Release);
+    }
+
+    /// Amphora (QT.6, lane qs6-15): which table an outer join of two tables probes on morsels,
+    /// for statements prepared after ([`OuterJoinProbe`]; `Padded`, today's, by default). Both
+    /// orientations answer alike; the switch is for the measurements that decide between them.
+    pub fn set_parallel_outer_probe(&self, probe: OuterJoinProbe) {
+        self.parallel_outer_probe.set(probe);
+        // The orientation is chosen at prepare: cached statements prepare again.
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn parallel_outer_probe(&self) -> OuterJoinProbe {
+        self.parallel_outer_probe.get()
     }
 
     pub(crate) fn parallel_join_direct(&self) -> bool {
