@@ -167,6 +167,26 @@ fn single_database_link(path: &Path) -> Result<(), Refusal> {
 /// Acquire the protected database owner lock before opening an engine or creating SQL state.
 /// A busy lease selects a client; malformed filesystem state is refused before bootstrap.
 pub(crate) fn try_lease(path: &Path) -> Result<Option<File>, Refusal> {
+    let lock = owner_lock(path)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
+    }
+}
+
+/// [`try_lease`], waiting for the owner before it to let the lock go: the operating system wakes
+/// it as that owner's last handle on the lock closes. A test's, whose owners end on threads of their
+/// own after the test drops them.
+#[cfg(test)]
+pub(crate) fn wait_lease(path: &Path) -> Result<File, Refusal> {
+    let lock = owner_lock(path)?;
+    lock.lock().map_err(unavailable)?;
+    Ok(lock)
+}
+
+/// The owner lock's file for `path`, not yet locked; malformed filesystem state is refused.
+fn owner_lock(path: &Path) -> Result<File, Refusal> {
     let canonical = database_path(path)?;
     let directory = PrivateDir::ensure(directory(&canonical)?).map_err(unavailable)?;
     single_database_link(&canonical)?;
@@ -180,12 +200,7 @@ pub(crate) fn try_lease(path: &Path) -> Result<Option<File>, Refusal> {
             },
         )
         .map_err(unavailable)?;
-    let lock = clone_lock(&private_lock)?;
-    match lock.try_lock() {
-        Ok(()) => Ok(Some(lock)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error)),
-    }
+    clone_lock(&private_lock)
 }
 
 /// A listening socket at `address`, nonblocking: the loopback endpoint's (port 0, the system's

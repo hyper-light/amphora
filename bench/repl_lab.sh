@@ -3,7 +3,8 @@
 # seeds in both commit classes). Run from a checkout of the commit to measure; the three machines
 # are its arguments, reached by ssh, each with a clone of this repository at LAB_REPO (default the
 # same path relative to its home as this checkout's to this home), bash, cargo and, for the
-# comparison set, docker and go. Nothing here picks a machine: the person running it names them.
+# comparison set, Linux with bench/servers/repl/setup.sh run once (its competitors run as processes,
+# as Amphora's members do). Nothing here picks a machine: the person running it names them.
 #
 # usage: bench/repl_lab.sh RUN HOST1 HOST2 HOST3 [-- REPL_FLAG VALUE ...]
 #   RUN       the run's name: its records go to bench/records/power-nemesis/RUN/ and
