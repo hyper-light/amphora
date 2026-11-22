@@ -510,21 +510,30 @@ while `AMPHORA_STORAGE=versioned` is set, puts the database's B-trees on the ver
 first such connection makes it (in memory for a memory database or one on the engine's memory IO,
 else in `<path>-versioned/`) and every connection after it uses it. The executor's `OpenRead` and `OpenWrite` open a
 `VersionedCursor` on the tree whose id is the root page, `CreateBtree` makes a tree, `Destroy`
-drops it once the transaction commits (a tree it made is dropped if it rolls back), and
+drops it once the transaction commits (a tree it made is dropped if it rolls back or its commit
+fails, or as the transaction ends if a failed statement or a savepoint rolled back to made it; a
+DROP so undone is forgotten), and
 `ClearBtree` removes its rows; the SQL transaction is one storage transaction, begun by
 its first cursor and committed (durable before it returns) or rolled back where the pager's
 transaction ends, and each write statement in an explicit transaction holds a savepoint of it
 (SQLite's statement journal), rolled back to if the statement fails. An index's tree (or a WITHOUT
 ROWID table's) is ordered by the key its first cursor brings (`IndexInfo` from the schema): the tree
 is empty until then, so nothing is compared before; the order is kept for the tree and every later
-cursor. The planner prices a page read as resident: the pool keeps every page in a
+cursor, and recorded in the redo log (and each checkpoint's list) before a row of the tree is
+written, so a reopened database orders the tree before it replays a row of it; at open the schema
+is read from tree 1. The planner prices a page read as resident: the pool keeps every page in a
 frame, and the pager's miss ratio, from fetches it no longer makes, would price each as read from
 the file. Tree 0 is never named (SQLite's pages
 start at 1), tree 1 is `sqlite_schema`, tree 2 the overflow tree, and each tree made later takes the
 next id, which `sqlite_schema` records as its root page. The pager still runs beside it for the
-database header (schema cookie, user version). The pool holds the pager's default page-cache bound
-(`DEFAULT_PAGE_CACHE_SIZE_IN_PAGES`), the engine's existing bound on pages kept; the redo log takes a
-lane per thread the machine runs (decision 11). Off by default: the pager's B-trees stay the engine's
+database header (schema cookie, user version). The storage holds a memory budget, its pages and
+row versions together: `ConnectOpts::with_memory_budget`, which Amphora's shell sets to a quarter of
+the memory its process may use (`amphora::memory`, as its process pool, store.md decision 26), else a
+quarter of the machine's memory (`storage::versioned::memory`: PostgreSQL's advice for
+`shared_buffers`). Half goes to the pool's frames and half to the versions, which the pool's pages
+bound (InnoDB's undo and LeanStore's versions live in buffer-pool memory); the pool makes its frames
+as pages are handed out, in runs that double, so a budget sized from the machine costs only what
+its pages use. The redo log takes a lane per thread the machine runs (decision 11). Off by default: the pager's B-trees stay the engine's
 storage until the suites pass on this one (the design's stage 5).
 
 **Why.** The executor already drives every B-tree through `CursorTrait` (decision 9), so swapping
@@ -547,11 +556,9 @@ crash between the two (the header moves into the catalog with `sqlite_schema`'s 
 (G7 step 4, `NS.4`; `crates/engine/storage/versioned/pool.rs`, tests in `evict.rs`.)
 
 **Decision.** A database's pool holds the frames its byte budget pays for (`pool::frames_within`:
-the budget over a page and its frame's state); the budget is the shell's, learned from the memory the
-process may use: store decision 26's share (`amphora::db::default_pages`) of `amphora::memory::limit`
-(the smallest of its control groups' limits and the machine's memory on Linux; that decision's
-stated fallback elsewhere), the one reader of it, so a pool in a container sizes from its group's
-limit, never the host's memory. Pages are read in as they are asked for and
+the budget over a page and its frame's state); the budget is the shell's, from the memory the process
+may use (`amphora::memory::limit`; `pool::machine_bytes` reads the machine's on Linux and refuses,
+naming the platform, where reading it needs `unsafe`). Pages are read in as they are asked for and
 evicted by CLOCK (decision 2's rule, the reach prototypes' shared eviction, G7 step 3): a frame whose
 reference bit is clear and whose latch no one holds; a clean frame is reused at once, a dirty one is
 first written to the spill file, page `n` at `n` pages in. The data file still changes only by
