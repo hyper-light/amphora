@@ -37,6 +37,9 @@ job=${JOB:-$HOME/.cache/research-src/join-order-benchmark}
 out=${OUT:-$bench/records}
 runs=${RUNS:-3}
 mkdir -p "$out"
+# Every suite target's data on one tree, so the embedded engines and the servers run on the same
+# disk, filesystem and file attributes (bench/run.sh's embedded default and servers/*.sh's differ).
+export AMPHORA_BENCH_DATA=${AMPHORA_BENCH_DATA:-$HOME/.cache/amphora-bench-data-nocow}
 # One run a file (to the second), so the leader is always from the same run.
 stem="$out/$(date -u +%Y-%m-%dT%H%M%SZ)-$(hostname -s)-baseline-$part"
 # Native Windows programs take Windows paths; elsewhere a path is itself.
