@@ -6053,6 +6053,14 @@ mod tests {
             }
             self.reap();
         }
+        /// Ends a pump whose records are never settled (fenced or stalled members'), without its
+        /// settling checks: what it holds is let go here, said so, rather than the pump forgotten.
+        fn abandon(mut self) {
+            self.records = 0;
+            self.bytes = 0;
+            self.receipts.clear();
+            self.phase = PumpPhase::Relay;
+        }
         fn finish(mut self) {
             assert!(
                 matches!(self.phase, PumpPhase::Relay),
@@ -11253,7 +11261,7 @@ mod tests {
         }
         // Records held for fenced or stalled members are never settled: the pump goes without its
         // settling checks.
-        std::mem::forget(pump);
+        pump.abandon();
         report
     }
 
@@ -14760,7 +14768,8 @@ mod tests {
                     6 => {
                         let to = (leader + 1 + usize::try_from(rng.below(2)).unwrap()) % 3;
                         if leader < 3 && to != leader {
-                            leader = driven.hand_off(&mut pump, &clients[..3], leader, to);
+                            // The next step settles the lead again (`settle_lead`).
+                            driven.hand_off(&mut pump, &clients[..3], leader, to);
                             reached.lead_handed_off += 1;
                         }
                     }
@@ -14788,7 +14797,7 @@ mod tests {
                             }
                             // Time passes, as it does after a crash: the others' leases on the old
                             // lead run out, and the group elects among its voters, four or three.
-                            leader = settle_lead(&mut driven, &mut pump, &clients);
+                            settle_lead(&mut driven, &mut pump, &clients);
                             crashed = true;
                             reached.leader_crashed += 1;
                         } else {

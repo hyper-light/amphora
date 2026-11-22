@@ -195,7 +195,7 @@ pub(crate) fn locked(
     key: &[u8],
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let key = record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(held(db, &key)?.then(|| key))
+    Ok(if held(db, &key)? { Some(key) } else { None })
 }
 
 /// Whether a transaction across groups holds a write lock here on the row of cross-group key

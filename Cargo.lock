@@ -134,6 +134,7 @@ dependencies = [
  "amphora-engine",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

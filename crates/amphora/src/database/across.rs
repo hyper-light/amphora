@@ -1560,7 +1560,9 @@ mod tests {
             page_at(&new, "n", "f", &scan, at).unwrap().unwrap().read()
         };
         let b = [("b1", "1", 20), ("b2", "1", 22), ("b3", "1", 24)];
-        let cases: [(u64, Vec<(&str, &str, Rev)>); 7] = [
+        // Each case: a time, and the rows (key, value, stamp) a read at it finds.
+        type Rows<'a> = Vec<(&'a str, &'a str, Rev)>;
+        let cases: [(u64, Rows); 7] = [
             (5, vec![]),
             (15, vec![("a1", "1", 10)]),
             (25, [vec![("a1", "1", 10)], b.to_vec()].concat()),
