@@ -536,5 +536,40 @@ class FunctionsSaid(unittest.TestCase):
         self.assertEqual(dialects.translate("SELECT format('%d', 2), hex(1), hex(2.5)", "mysql"), ("SELECT PRINTF('%d', 2), COALESCE(HEX(CAST(1 AS CHAR)), ''), COALESCE(HEX(2.5), '')", None))
 
 
+class Glob(unittest.TestCase):
+    """Do: SQLite's GLOB and glob(): wildcards, sets with ranges and negation, a backslash (no escape
+    in GLOB), regular expressions' own characters, a newline, a NULL pattern. Expect: DuckDB (when
+    its Python module is here) gives what SQLite gives; each dialect a case-sensitive regular
+    expression match; a pattern not a literal, an unclosed set or a backwards range not expressible."""
+
+    CASES = ["'abc' GLOB 'a*'", "'abc' GLOB 'a?c'", "'bx' GLOB '[a-c]x'", "'' GLOB '*'", "'abc' GLOB 'A*'", "'a' GLOB NULL", "'bc' GLOB '[^a]*'", "'f.txt' GLOB '*.txt'", "'ab' GLOB '?'", "'a*' GLOB 'a[*]'", "glob('a\\*', 'a\\b')", "'a]' GLOB 'a[]]'", "'-' GLOB '[a-c-x]'", "'x' GLOB '[a-c-x]'", "'x' || char(10) || 'y' GLOB 'x?y'", "'axb' GLOB 'a.b'", "'abc' NOT GLOB 'a*'", "'é' GLOB '?'", "'(a|b)' GLOB '(*|?)'", "'a b' GLOB 'a b'"]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                want = db.execute(f"SELECT {case}").fetchone()[0]
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                got = duckdb.sql(out).fetchone()[0]
+                self.assertEqual(None if got is None else int(got), want)
+
+    def test_each_dialect(self):
+        sql = "SELECT a GLOB '[^a]*.t?t' FROM t"
+        self.assertEqual(dialects.translate(sql, "postgres"), ("SELECT a ~ '^[^a].*\\.t.t$' FROM t", None))
+        self.assertEqual(dialects.translate(sql, "mysql"), ("SELECT REGEXP_LIKE(a, '(?s)^[^a].*\\\\.t.t\\\\z', 'c') FROM t", None))
+        self.assertEqual(dialects.translate(sql, "clickhouse"), ("SELECT match(a, '(?s)^[^a].*\\\\.t.t$') FROM t", None))
+        for sql, why in [("SELECT a GLOB b FROM t", "isn't a string literal"), ("SELECT 'a' GLOB 'a[b'", "not closed"), ("SELECT 'a' GLOB '[z-a]'", "before its start")]:
+            for d in ENGINES:
+                with self.subTest(sql=sql, dialect=d):
+                    self.assertIn(why, dialects.translate(sql, d)[1])
+
+
 if __name__ == "__main__":
     unittest.main()

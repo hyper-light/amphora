@@ -950,6 +950,88 @@ def liked(expression, context, dialect):
     return expression
 
 
+def glob_regex(pattern, dialect):
+    """SQLite's GLOB pattern `pattern` as a regular expression matching the whole string the same,
+    or NotExpressible. SQLite's GLOB (lang_expr.html#the_like_glob_regexp_match_and_extract_operators:
+    "The GLOB operator is similar to LIKE but uses the Unix file globbing syntax for its wildcards.
+    Also, GLOB is case sensitive, unlike LIKE"), as its matcher reads it (src/func.c,
+    patternCompare(), https://sqlite.org/src/file?name=src/func.c): `*` any characters, `?` one,
+    `[...]` one of a set (`^` first negates it, `]` first is itself, `a-z` a range of code points,
+    `-` first or last itself), every other character itself, a backslash too (GLOB has no escape
+    character). The expression's `.` takes a newline as any other character ((?s) for RE2 and ICU;
+    PostgreSQL's does unasked, its manual 9.7.3.5), and it is anchored at both ends (MySQL's ICU `$`
+    also matches before a final newline, so `\z` there). Only the characters a regular expression
+    reads otherwise are given a backslash (RE2 refuses one before some others)."""
+    out, i, n = [], 0, len(pattern)
+
+    def lit(c):
+        return "\\" + c if c in "\\.^$|?*+()[]{}-" else c
+
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            out.append(".*")
+        elif c == "?":
+            out.append(".")
+        elif c == "[":
+            # prior: the set's last single character, which a `-` makes a range's start; none
+            # after a range (patternCompare()'s prior_c, set to 0 there).
+            j, negate, members, prior = i + 1, False, [], None
+            if j < n and pattern[j] == "^":
+                negate, j = True, j + 1
+            if j < n and pattern[j] == "]":
+                members.append(lit("]"))
+                prior, j = "]", j + 1
+            while j < n and pattern[j] != "]":
+                if pattern[j] == "-" and prior is not None and j + 1 < n and pattern[j + 1] != "]":
+                    hi = pattern[j + 1]
+                    if ord(hi) < ord(prior):
+                        raise NotExpressible(f"not expressible in {dialect}: a GLOB range [{prior}-{hi}] whose end comes before its start, which matches nothing in SQLite and which regular expressions refuse")
+                    members[-1] = f"{lit(prior)}-{lit(hi)}"
+                    prior, j = None, j + 2
+                    continue
+                members.append(lit(pattern[j]))
+                prior, j = pattern[j], j + 1
+            if j >= n:
+                raise NotExpressible(f"not expressible in {dialect}: a GLOB pattern with a '[' not closed, which SQLite's matcher stops at")
+            out.append("[" + ("^" if negate else "") + "".join(members) + "]")
+            i = j
+        else:
+            out.append(lit(c))
+        i += 1
+    body = "".join(out)
+    if dialect == "postgres":
+        return "^" + body + "$"
+    return "(?s)^" + body + ("\\z" if dialect == "mysql" else "$")
+
+
+def globbed(expression, dialect):
+    """`expression` with each GLOB said as a regular expression match (glob_regex()), where sqlglot
+    writes GLOB, which PostgreSQL, MySQL and ClickHouse don't have and DuckDB's reads otherwise
+    (its GLOB negates a set with `!` and takes a backslash as an escape: DuckDB 1.4.2 gives
+    'bc' GLOB '[^a]*' false, SQLite true). Each engine's match: PostgreSQL's `~` (case-sensitive,
+    its manual 9.7.3), DuckDB's regexp_matches(), MySQL's REGEXP_LIKE() with match type 'c'
+    (case-sensitive: "c: Case-sensitive matching", MySQL 8.4 14.8.2, where its collation would
+    otherwise fold case), ClickHouse's match(). A NULL pattern gives NULL as SQLite's does; a pattern
+    that isn't a string literal is not expressible (its expression is made from its text)."""
+    from sqlglot import exp
+
+    for g in [n for n in reversed(list(expression.dfs())) if isinstance(n, exp.Glob)]:
+        pattern = g.expression
+        if isinstance(pattern, exp.Null):
+            regex = exp.Null()
+        elif isinstance(pattern, exp.Literal) and pattern.is_string:
+            regex = exp.Literal.string(glob_regex(pattern.this, dialect))
+        else:
+            raise NotExpressible(f"not expressible in {dialect}: GLOB with a pattern that isn't a string literal (lang_expr.html), whose regular expression is made from its text")
+        said = exp.RegexpLike(this=g.this.copy(), expression=regex, flag=exp.Literal.string("c") if dialect == "mysql" else None)
+        if g is expression:
+            expression = said
+        else:
+            g.replace(said)
+    return expression
+
+
 def functions_said(expression, context, dialect):
     """`expression` with SQLite's built-in functions that sqlglot writes as functions of the same
     name that mean otherwise, said as SQLite's (lang_corefunc.html, "Built-In Scalar SQL Functions"):
@@ -1233,7 +1315,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(functions_said(extremes(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), context or Context(), dialect), dialect)
+            e = spoken(globbed(functions_said(extremes(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:
