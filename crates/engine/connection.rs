@@ -218,6 +218,21 @@ pub enum JoinMethods {
     HashJoinsOnly = 2,
 }
 
+/// Amphora (PL.8, decision 19): the rule that sizes the join search's budget, the number of
+/// connected subsets the exact search may build before the greedy search orders the join instead.
+/// Behind this switch so the rules can be measured against each other (the coordinator's A/B);
+/// the budget only picks the algorithm, so every rule plans the whole query.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSearchBudget {
+    /// Neumann and Radke's 10,000 subsets (`JOIN_SEARCH_BUDGET`): the control.
+    Fixed = 0,
+    /// Planning may take as long as the query's estimated running time, its bound
+    /// (`search_budget::SearchBudget`), divided by the measured time a candidate takes.
+    RunShare = 1,
+    /// `RunShare` times the runs the plan is expected to serve.
+    RunShareByExecutions = 2,
+}
+
 /// Test-only control over correlated-subquery rewrites.
 #[cfg(feature = "simulator")]
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +530,7 @@ pub struct Connection {
     pub(super) subquery_unnesting_mode: AtomicSubqueryUnnestingMode,
     /// Amphora: see [`Connection::set_join_methods`].
     pub(super) join_methods: AtomicJoinMethods,
+    pub(super) join_search_budget: AtomicJoinSearchBudget,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
     /// Amphora: see [`Connection::set_adaptive_joins`].
@@ -991,6 +1007,16 @@ impl Connection {
 
     pub(crate) fn join_methods(&self) -> JoinMethods {
         self.join_methods.get()
+    }
+
+    /// Amphora (PL.8): chooses the rule that sizes the join search for newly prepared statements.
+    pub fn set_join_search_budget(&self, rule: JoinSearchBudget) {
+        self.join_search_budget.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn join_search_budget(&self) -> JoinSearchBudget {
+        self.join_search_budget.get()
     }
 
     /// Amphora (G6 step 5, a prototype behind this switch, off by default): lets newly prepared

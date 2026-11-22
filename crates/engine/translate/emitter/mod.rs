@@ -209,6 +209,8 @@ pub struct Resolver<'a> {
     fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
+    /// Amphora (PL.8): what sizes the join search (`Connection::set_join_search_budget`).
+    join_search: crate::translate::optimizer::search_budget::SearchBudget,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
@@ -350,6 +352,7 @@ impl<'a> Resolver<'a> {
             learned_weights: None,
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
+            join_search: crate::translate::optimizer::search_budget::SearchBudget::FIXED,
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
@@ -453,6 +456,17 @@ impl<'a> Resolver<'a> {
         self.join_methods = methods;
     }
 
+    pub(crate) fn join_search(&self) -> crate::translate::optimizer::search_budget::SearchBudget {
+        self.join_search
+    }
+
+    pub(crate) fn set_join_search(
+        &mut self,
+        budget: crate::translate::optimizer::search_budget::SearchBudget,
+    ) {
+        self.join_search = budget;
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches
     }
@@ -513,6 +527,7 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            join_search: self.join_search,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
@@ -551,6 +566,7 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            join_search: self.join_search,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,

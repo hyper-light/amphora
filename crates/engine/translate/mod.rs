@@ -170,6 +170,13 @@ pub fn translate(
     // Amphora: what its hash and group tables hold before they spill (executor decision 8).
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
+    // Amphora (PL.8): the join search's budget, from the rule and this database's measured rates.
+    resolver.set_join_search(
+        crate::translate::optimizer::search_budget::SearchBudget::new(
+            connection.join_search_budget(),
+            &connection.db.learned_costs,
+        ),
+    );
     resolver.set_sorted_fetches(connection.sorted_fetches());
     resolver.set_adaptive_joins(connection.adaptive_joins());
     resolver.set_automatic_indexes(connection.automatic_indexes());
@@ -230,6 +237,11 @@ pub fn translate(
     };
 
     program.epilogue(schema);
+    connection
+        .db
+        .learned_costs
+        .search()
+        .add(crate::translate::optimizer::search_budget::end_statement());
     program.reads_parameter_values = plan_values.asked();
     program.planned_tables = plan_values.take_planned();
     program.write_target = write_target;
