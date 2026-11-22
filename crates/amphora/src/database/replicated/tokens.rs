@@ -100,7 +100,7 @@ impl Client {
         let point = locked(&self.handle.shared.closed)?;
         Ok(Token {
             micros: point.time.unwrap_or(0),
-            index: point.answered,
+            index: point.applied,
         })
     }
     /// `read` on a local reader once this replica has applied `token`; `read` answers `Err` with
