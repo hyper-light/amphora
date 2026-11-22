@@ -103,8 +103,9 @@ impl Credentials {
         Ok(roots)
     }
 
-    /// The listening side: its chain presented, a client's required under the roots.
-    fn server(&self) -> Result<ServerConfig, Refusal> {
+    /// The listening side for the protocol `alpn`: its chain presented, a client's required under
+    /// the roots.
+    fn server(&self, alpn: &[u8]) -> Result<ServerConfig, Refusal> {
         let verifier = WebPkiClientVerifier::builder_with_provider(self.roots()?, &PROVIDER)
             .build()
             .map_err(refused)?;
@@ -114,20 +115,21 @@ impl Credentials {
             .with_client_cert_verifier(verifier)
             .with_single_cert(self.chain.clone(), self.key.clone_key())
             .map_err(refused)?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        config.alpn_protocols = vec![alpn.to_vec()];
         config.max_early_data_size = 0;
         Ok(config)
     }
 
-    /// The dialing side: the server verified under the roots, this node's chain presented.
-    fn client(&self) -> Result<ClientConfig, Refusal> {
+    /// The dialing side for the protocol `alpn`: the server verified under the roots, this node's
+    /// chain presented.
+    fn client(&self, alpn: &[u8]) -> Result<ClientConfig, Refusal> {
         let mut config = ClientConfig::builder_with_provider(&PROVIDER)
             .with_protocol_versions(&[&tls::version::TLS13])
             .map_err(refused)?
             .with_root_certificates(self.roots()?)
             .with_client_auth_cert(self.chain.clone(), self.key.clone_key())
             .map_err(refused)?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        config.alpn_protocols = vec![alpn.to_vec()];
         config.enable_early_data = false;
         Ok(config)
     }
@@ -156,7 +158,7 @@ impl std::fmt::Debug for Dial {
 
 impl Dial {
     pub(super) fn new(credentials: &Credentials) -> Result<Self, Refusal> {
-        credentials.client()?;
+        credentials.client(ALPN)?;
         Ok(Self(credentials.duplicate()))
     }
 }
@@ -184,10 +186,10 @@ fn handshake_error(error: std::io::Error) -> Refusal {
     }
 }
 
-/// The handshake driven to its end by `until`, then the protocol checked and the greeting's
-/// capability exported from the session.
-macro_rules! handshake {
-    ($stream:expr, $until:expr) => {{
+/// The handshake driven to its end by `until`, then the protocol `alpn` checked: a peer that
+/// speaks another is refused.
+macro_rules! agreed {
+    ($stream:expr, $until:expr, $alpn:expr) => {{
         let stream = $stream;
         while stream.conn.is_handshaking() {
             let within = remaining($until)?;
@@ -204,17 +206,98 @@ macro_rules! handshake {
                 .complete_io(&mut stream.sock, &mut stream.config)
                 .map_err(handshake_error)?;
         }
-        if stream.conn.alpn_protocol() != Some(ALPN) {
+        if stream.conn.alpn_protocol() != Some($alpn) {
             return Err(api::invalid(
                 "network handshake",
                 "the peer speaks another protocol",
             ));
         }
+    }};
+}
+
+/// The handshake driven to its end by `until`, then the protocol checked and the greeting's
+/// capability exported from the session.
+macro_rules! handshake {
+    ($stream:expr, $until:expr) => {{
+        let stream = $stream;
+        agreed!(&mut *stream, $until, ALPN);
         stream
             .conn
             .export_keying_material([0u8; 32], EXPORTER, None)
             .map_err(unavailable)?
     }};
+}
+
+/// An accepted connection inside mutual TLS ([`Listener::accept`]).
+pub type Accepted = StreamOwned<ServerConnection, std::net::TcpStream, ServerConfig>;
+
+/// A dialed connection inside mutual TLS ([`Dialer::connect`]).
+pub type Dialed = StreamOwned<ClientConnection, std::net::TcpStream, ClientConfig>;
+
+/// The listening side of mutual TLS for another protocol than the owner's, under this transport's
+/// rules (versions, groups, suites, no early data): a member's links in `amphora serve`
+/// (CP-T1.13). Each connection builds its configuration from the credentials, as [`Dial`] does.
+pub struct Listener {
+    credentials: Credentials,
+    alpn: Vec<u8>,
+}
+
+/// The dialing side of mutual TLS for another protocol than the owner's ([`Listener`]).
+pub struct Dialer {
+    credentials: Credentials,
+    alpn: Vec<u8>,
+}
+
+impl Credentials {
+    /// The listening side of mutual TLS for the protocol `alpn` (RFC 7301), these credentials
+    /// checked once here.
+    pub fn listener(&self, alpn: &[u8]) -> Result<Listener, Refusal> {
+        self.server(alpn)?;
+        Ok(Listener {
+            credentials: self.duplicate(),
+            alpn: alpn.to_vec(),
+        })
+    }
+
+    /// The dialing side of mutual TLS for the protocol `alpn` (RFC 7301), these credentials
+    /// checked once here.
+    pub fn dialer(&self, alpn: &[u8]) -> Result<Dialer, Refusal> {
+        self.client(alpn)?;
+        Ok(Dialer {
+            credentials: self.duplicate(),
+            alpn: alpn.to_vec(),
+        })
+    }
+}
+
+impl Listener {
+    /// `socket`, accepted, inside mutual TLS by `until`: the peer's certificate verified under the
+    /// roots and the protocol agreed, or refused.
+    pub fn accept(&self, socket: std::net::TcpStream, until: Instant) -> Result<Accepted, Refusal> {
+        let config = self.credentials.server(&self.alpn)?;
+        let connection = ServerConnection::new(&config).map_err(unavailable)?;
+        let mut stream = StreamOwned::new(connection, config, socket);
+        agreed!(&mut stream, until, self.alpn.as_slice());
+        Ok(stream)
+    }
+}
+
+impl Dialer {
+    /// `socket`, connected to the server whose certificate names `server` (a DNS name or an IP
+    /// address), inside mutual TLS by `until`: verified under the roots and the protocol agreed,
+    /// or refused.
+    pub fn connect(
+        &self,
+        socket: std::net::TcpStream,
+        server: &str,
+        until: Instant,
+    ) -> Result<Dialed, Refusal> {
+        let mut config = self.credentials.client(&self.alpn)?;
+        let connection = ClientConnection::new(&mut config, name(server)?).map_err(unavailable)?;
+        let mut stream = StreamOwned::new(connection, config, socket);
+        agreed!(&mut stream, until, self.alpn.as_slice());
+        Ok(stream)
+    }
 }
 
 /// A network endpoint listening at `address` (port 0: the system's choice), its connections
@@ -226,7 +309,7 @@ pub(super) fn listen(
     pulls: Option<Arc<Pulls>>,
 ) -> Result<(Owner, SocketAddr), Refusal> {
     // Checked once here; each connection builds its own (as [`Dial`] does).
-    credentials.server()?;
+    credentials.server(ALPN)?;
     let credentials = credentials.duplicate();
     let listener = endpoint::listener(address)?;
     let address = listener.local_addr().map_err(unavailable)?;
@@ -236,7 +319,7 @@ pub(super) fn listen(
         Arc::new(move |socket, _waits| {
             let started = Instant::now();
             let greeting_until = started.checked_add(GREETING_MAX).ok_or(Refusal::Timeout)?;
-            let config = credentials.server()?;
+            let config = credentials.server(ALPN)?;
             let connection = ServerConnection::new(&config).map_err(unavailable)?;
             let mut stream = StreamOwned::new(connection, config, socket);
             let token = handshake!(&mut stream, greeting_until);
@@ -307,7 +390,7 @@ pub(super) fn request(
     let socket =
         Stream::connect_timeout(&address, remaining(auth_until)?).map_err(handshake_error)?;
     socket.set_nodelay(true).map_err(unavailable)?;
-    let mut config = dial.0.client()?;
+    let mut config = dial.0.client(ALPN)?;
     let connection = ClientConnection::new(&mut config, name.clone()).map_err(unavailable)?;
     let mut stream = StreamOwned::new(connection, config, socket);
     let token = (|| -> Result<[u8; 32], Refusal> { Ok(handshake!(&mut stream, auth_until)) })()?;
@@ -440,6 +523,71 @@ mod tests {
         assert!(fooled.pull(NodeId(1), &pull(), until()).is_err());
         assert_eq!(served.load(Ordering::SeqCst), 0);
         assert_eq!(impostor_served.load(Ordering::SeqCst), 0);
+    }
+
+    /// One connection through [`Listener`] and [`Dialer`] for `alpn`s, the listener's side
+    /// echoing a byte: what each side ended with.
+    fn crossed(
+        listening: &Credentials,
+        listens: &[u8],
+        dialing: &Credentials,
+        dials: &[u8],
+        server: &str,
+    ) -> (Result<(), Refusal>, Result<u8, Refusal>) {
+        let listener = listening.listener(listens).unwrap();
+        let dialer = dialing.dialer(dials).unwrap();
+        let socket = std::net::TcpListener::bind(any()).unwrap();
+        let address = socket.local_addr().unwrap();
+        let accepted = std::thread::spawn(move || -> Result<(), Refusal> {
+            let (accepted, _) = socket.accept().unwrap();
+            let mut stream = listener.accept(accepted, until())?;
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).map_err(unavailable)?;
+            stream.write_all(&byte).map_err(unavailable)?;
+            stream.flush().map_err(unavailable)
+        });
+        let dialed = (|| -> Result<u8, Refusal> {
+            let socket = std::net::TcpStream::connect(address).map_err(unavailable)?;
+            let mut stream = dialer.connect(socket, server, until())?;
+            stream.write_all(&[7]).map_err(unavailable)?;
+            stream.flush().map_err(unavailable)?;
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).map_err(unavailable)?;
+            Ok(byte[0])
+        })();
+        (accepted.join().unwrap(), dialed)
+    }
+
+    /// CP-T1.13: another protocol's mutual TLS under these rules ([`Credentials::listener`],
+    /// [`Credentials::dialer`]): one authority's two sides that agree the protocol cross; a
+    /// protocol the other side doesn't speak, a client from another authority, and a server
+    /// whose certificate names another host are each refused.
+    #[test]
+    fn cp_t1_13_listener_and_dialer_take_their_protocol_and_the_authority() {
+        let pki = Pki::new();
+        let other = Pki::new();
+        let (server, client) = (pki.credentials("member-1"), pki.credentials("member-2"));
+        let serve: &[u8] = b"amphora-serve";
+        let (accepted, dialed) = crossed(&server, serve, &client, serve, "member-1");
+        assert!(accepted.is_ok(), "{accepted:?}");
+        assert_eq!(dialed.unwrap(), 7);
+        for (listening, listens, dialing, dials, name) in [
+            (&server, serve, &client, ALPN, "member-1"),
+            (
+                &server,
+                serve,
+                &other.credentials("member-2"),
+                serve,
+                "member-1",
+            ),
+            (&server, serve, &client, serve, "member-3"),
+        ] {
+            let (accepted, dialed) = crossed(listening, listens, dialing, dials, name);
+            assert!(
+                accepted.is_err() && dialed.is_err(),
+                "{accepted:?} {dialed:?}"
+            );
+        }
     }
 
     /// T-T1.9.R18: a network endpoint answers a node's requests only; a database request is the

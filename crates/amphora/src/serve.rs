@@ -10,14 +10,14 @@
 //!   all name the same leader, each holds the configured voters and none is fenced.
 //! - `amphora ask CONFIG NODE REQUEST`: one request to one member (`status`, `exec SQL`,
 //!   `count SQL`, `cut on|off` and `disk cut|hang|back` where the member's config says
-//!   `drills = on`,
-//!   `member …`, and
+//!   `drills = on`, `member …`, `reload` (its TLS files read again, for the links made from then
+//!   on: a certificate renewed), and
 //!   `leader WAIT_MS`: wait until the member knows its group's leader, at most WAIT_MS, and answer
 //!   `leader=ID addr=HOST:PORT term=T`; woken by the election's step, never by polling).
 //! - `amphora drill load|check`: the fire drills' writers and their loss count ([`load`], [`check`]).
 //!
-//! The config, one per member (`key = value` lines, `#` comments; every key below but `drills` and
-//! `spanning` required, none defaulted, an unknown key refused):
+//! The config, one per member (`key = value` lines, `#` comments; every key below but `drills`,
+//! `spanning`, `voters` and the TLS files required, none defaulted, an unknown key refused):
 //!
 //! ```text
 //! node = 1                                   # this member's ID
@@ -28,12 +28,22 @@
 //! deadline_ms = 5000                         # how long one request, connect or open may take
 //! drills = off                               # on: the member takes `cut` (a split at its transport)
 //!                                            # and `disk` (its log's disk cut or hung)
+//! cert_file = /home/me/.config/amphora/member-1.pem   # with key_file and roots_file, or none
+//! key_file = /home/me/.config/amphora/member-1.key
+//! roots_file = /home/me/.config/amphora/roots.pem
 //! ```
+//!
+//! With `cert_file`, `key_file` and `roots_file` (PEM: this member's certificate chain, its own
+//! first; its private key; the deployment's authority), every link runs inside mutual TLS 1.3 under
+//! the owner transport's rules ([`crate::transport::network`]): each side presents its chain and
+//! verifies the other's under the roots, a member's certificate naming the host its peers and
+//! clients reach it by, and the protocol agreed is [`ALPN`]. A client (`amphora ask`, `health`,
+//! `drill`) presents the chain of the config it reads. Without them the link is not encrypted.
 //!
 //! A connection's first byte says what it carries: `R` (a peer's Raft records) or `C` (a client's
 //! requests). The member answers with a challenge (32 random bytes) and the other side proves it
 //! holds the cluster's secret with HMAC-SHA256(secret, challenge || kind) (RFC 2104); the secret
-//! never crosses the link. The link itself is not encrypted (docs/runbook.md, "What isn't done").
+//! never crosses the link.
 //! Then `R`: the sender's node ID (u64, little endian) and records, each its length (u32, little
 //! endian, at most the replica's own record bound) and its bytes; `C`: requests, one line each,
 //! each answered by one line, `ok …` or `err …`, a line at most the API's request bound.
@@ -57,6 +67,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::database::{Database, LogDisk};
+use crate::transport::network::{self, Credentials};
 
 /// The records a peer's sender holds and one drain takes: the 4096 that
 /// `replicated::OUTGOING_MESSAGES` was until QB.1 (lanes constants) bounded the outgoing queue by
@@ -73,6 +84,9 @@ const TAG: usize = 32;
 const SECRET_MIN: usize = 32;
 /// A request or answer line's most bytes: the API's request bound.
 const LINE_MAX: usize = amphora_api::REQUEST_MAX;
+/// The protocol a member's links agree inside mutual TLS (RFC 7301), this one's own name: a peer
+/// that speaks another, the owner transport's included, is refused at the handshake. A format value.
+pub const ALPN: &[u8] = b"amphora-serve";
 
 /// One member as the config names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,9 +108,22 @@ pub struct Config {
     /// The members that vote from the start; the others named in `members` are spares, known by
     /// address and started as learners, for `amphora member` to add (default: every member).
     pub voters: BTreeSet<u64>,
+    /// The files mutual TLS takes on every link, or none: the links unencrypted.
+    pub tls: Option<TlsFiles>,
 }
 
-const KEYS: [&str; 9] = [
+/// A member's mutual TLS files, PEM each ([`Config`]'s `cert_file`, `key_file`, `roots_file`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsFiles {
+    /// This member's certificate chain, its own first.
+    pub cert: PathBuf,
+    /// Its private key.
+    pub key: PathBuf,
+    /// The deployment's authority: the roots every member's chain is verified under.
+    pub roots: PathBuf,
+}
+
+const KEYS: [&str; 12] = [
     "node",
     "members",
     "data",
@@ -106,6 +133,9 @@ const KEYS: [&str; 9] = [
     "deadline_ms",
     "drills",
     "voters",
+    "cert_file",
+    "key_file",
+    "roots_file",
 ];
 
 impl Config {
@@ -194,6 +224,19 @@ impl Config {
             Some("on") => true,
             Some(other) => bail!("drills {other}: on or off"),
         };
+        let tls = match (
+            keys.get("cert_file").copied(),
+            keys.get("key_file").copied(),
+            keys.get("roots_file").copied(),
+        ) {
+            (None, None, None) => None,
+            (Some(cert), Some(key), Some(roots)) => Some(TlsFiles {
+                cert: PathBuf::from(cert),
+                key: PathBuf::from(key),
+                roots: PathBuf::from(roots),
+            }),
+            _ => bail!("cert_file, key_file and roots_file go together: all three or none"),
+        };
         Ok(Self {
             node,
             members,
@@ -203,6 +246,7 @@ impl Config {
             deadline: Duration::from_millis(deadline_ms),
             drills,
             voters,
+            tls,
         })
     }
 
@@ -228,6 +272,22 @@ impl Config {
         Ok(bytes)
     }
 
+    /// What this config's links prove: the cluster's secret, inside mutual TLS from its files when
+    /// it names them, each file read and checked here.
+    pub fn keys(&self) -> anyhow::Result<Keys> {
+        let secret = self.secret()?;
+        let Some(files) = &self.tls else {
+            return Ok(Keys::plain(secret));
+        };
+        Ok(Keys {
+            secret,
+            tls: Some(Arc::new(Renewable {
+                now: std::sync::RwLock::new(Arc::new(Tls::read(files)?)),
+                files: files.clone(),
+            })),
+        })
+    }
+
     fn member(&self, node: u64) -> anyhow::Result<&Member> {
         self.members
             .iter()
@@ -241,6 +301,144 @@ fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("resolving {addr}"))?
         .next()
         .ok_or_else(|| anyhow!("{addr} names no address"))
+}
+
+/// What a link to a member proves ([`Config::keys`]): the cluster's secret, and mutual TLS when
+/// the config names its files.
+#[derive(Clone)]
+pub struct Keys {
+    secret: Vec<u8>,
+    tls: Option<Arc<Renewable>>,
+}
+
+/// A member's mutual TLS as its files hold it now, read again by [`Keys::reload`]: links made
+/// after a reload use what it read; links already made keep the session they agreed.
+struct Renewable {
+    files: TlsFiles,
+    now: std::sync::RwLock<Arc<Tls>>,
+}
+
+impl Renewable {
+    fn now(&self) -> anyhow::Result<Arc<Tls>> {
+        Ok(Arc::clone(
+            &*self.now.read().map_err(|_| anyhow!("TLS keys poisoned"))?,
+        ))
+    }
+}
+
+/// Both sides of a member's mutual TLS.
+struct Tls {
+    listener: network::Listener,
+    dialer: network::Dialer,
+}
+
+impl Tls {
+    /// `files` read and checked: the chain, its key and the roots, each PEM.
+    fn read(files: &TlsFiles) -> anyhow::Result<Self> {
+        let refused = |e: amphora_api::Refusal| anyhow!("mutual TLS: {e:?}");
+        let credentials = Credentials::from_pem_files(&files.cert, &files.key, &files.roots)
+            .map_err(refused)
+            .with_context(|| {
+                format!(
+                    "reading {}, {} and {}",
+                    files.cert.display(),
+                    files.key.display(),
+                    files.roots.display()
+                )
+            })?;
+        Ok(Self {
+            listener: credentials.listener(ALPN).map_err(refused)?,
+            dialer: credentials.dialer(ALPN).map_err(refused)?,
+        })
+    }
+}
+
+impl Keys {
+    /// The secret alone: the links of a cluster whose configs name no TLS files.
+    pub fn plain(secret: Vec<u8>) -> Self {
+        Self { secret, tls: None }
+    }
+
+    /// Reads the TLS files again (CP-T1.13: a certificate renewed, `scripts/cluster.sh renew`):
+    /// links made from now on present the new chain and verify under the new roots; links already
+    /// made keep theirs. Files that don't read or don't check are refused, and the keys held stay.
+    /// Woken by the request that asks for it, sent once the new files are in place: never a
+    /// poll of the files.
+    pub fn reload(&self) -> anyhow::Result<()> {
+        let Some(tls) = &self.tls else {
+            bail!("this config names no TLS files: nothing to reload");
+        };
+        let fresh = Arc::new(Tls::read(&tls.files)?);
+        *tls.now.write().map_err(|_| anyhow!("TLS keys poisoned"))? = fresh;
+        Ok(())
+    }
+
+    /// `s`, accepted, inside mutual TLS by `until` when these keys hold it.
+    fn accepted(&self, s: TcpStream, until: Instant) -> anyhow::Result<Link> {
+        match &self.tls {
+            None => Ok(Link::Plain(s)),
+            Some(tls) => Ok(Link::Accepted(Box::new(
+                tls.now()?
+                    .listener
+                    .accept(s, until)
+                    .map_err(|e| anyhow!("mutual TLS: {e:?}"))?,
+            ))),
+        }
+    }
+
+    /// `s`, connected to `addr`, inside mutual TLS by `until` when these keys hold it: the
+    /// member's certificate must name `addr`'s host.
+    fn dialed(&self, s: TcpStream, addr: &str, until: Instant) -> anyhow::Result<Link> {
+        match &self.tls {
+            None => Ok(Link::Plain(s)),
+            Some(tls) => {
+                let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+                // An IPv6 address in a member's address is bracketed ([::1]:7401).
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                Ok(Link::Dialed(Box::new(
+                    tls.now()?
+                        .dialer
+                        .connect(s, host, until)
+                        .map_err(|e| anyhow!("mutual TLS with {addr}: {e:?}"))?,
+                )))
+            }
+        }
+    }
+}
+
+/// One link's stream: the socket, or the socket inside mutual TLS.
+enum Link {
+    Plain(TcpStream),
+    Accepted(Box<network::Accepted>),
+    Dialed(Box<network::Dialed>),
+}
+
+impl Read for Link {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Accepted(s) => s.read(buf),
+            Self::Dialed(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Link {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Accepted(s) => s.write(buf),
+            Self::Dialed(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Accepted(s) => s.flush(),
+            Self::Dialed(s) => s.flush(),
+        }
+    }
 }
 
 fn keyed(secret: &[u8]) -> anyhow::Result<Hmac<Sha256>> {
@@ -260,7 +458,7 @@ struct Shared {
     db: Database,
     cut: AtomicBool,
     deadline: Duration,
-    secret: Vec<u8>,
+    keys: Keys,
     drills: bool,
     /// This member's raft log, whose disk `disk` cuts or hangs.
     log: PathBuf,
@@ -273,7 +471,7 @@ struct Shared {
 /// Runs the member `config` describes until its replica stops; `ready` is told its address once
 /// it listens.
 pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
-    let secret = config.secret()?;
+    let keys = config.keys()?;
     let me = config.member(config.node)?.clone();
     std::fs::create_dir_all(&config.data)
         .with_context(|| format!("creating {}", config.data.display()))?;
@@ -308,7 +506,7 @@ pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
         db,
         cut: AtomicBool::new(false),
         deadline: config.deadline,
-        secret,
+        keys,
         drills: config.drills,
         log: config.data.join("raft.log"),
         addrs: config
@@ -321,15 +519,15 @@ pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
     let mut peers: BTreeMap<u64, mpsc::SyncSender<Vec<u8>>> = BTreeMap::new();
     for m in config.members.iter().filter(|m| m.node != config.node) {
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTGOING_MESSAGES);
-        let (addr, node, secret, deadline) = (
+        let (addr, node, keys, deadline) = (
             m.addr.clone(),
             config.node,
-            shared.secret.clone(),
+            shared.keys.clone(),
             config.deadline,
         );
         std::thread::Builder::new()
             .name(format!("amphora-peer-{}", m.node))
-            .spawn(move || to_peer(node, &addr, &secret, deadline, &rx))?;
+            .spawn(move || to_peer(node, &addr, &keys, deadline, &rx))?;
         peers.insert(m.node, tx);
     }
     {
@@ -373,21 +571,25 @@ fn accept(shared: &Arc<Shared>, listener: &TcpListener) {
     }
 }
 
-/// One connection, as its first byte says, once it has proved the secret.
+/// One connection, as its first byte says, once it has proved the secret (inside mutual TLS when
+/// the member's keys hold it).
 fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
     s.set_nodelay(true)?;
-    s.set_read_timeout(Some(shared.deadline))?;
-    s.set_write_timeout(Some(shared.deadline))?;
-    let mut w = s.try_clone()?;
-    let mut r = BufReader::new(s);
+    // The socket under the link, for its timeouts and to close it.
+    let socket = s.try_clone()?;
+    let link = shared.keys.accepted(s, after(shared.deadline)?)?;
+    socket.set_read_timeout(Some(shared.deadline))?;
+    socket.set_write_timeout(Some(shared.deadline))?;
+    let mut r = BufReader::new(link);
     let mut kind = [0u8; 1];
     r.read_exact(&mut kind)?;
     let mut nonce = [0u8; NONCE];
     getrandom::fill(&mut nonce).map_err(|e| anyhow!("no randomness for a challenge: {e}"))?;
-    w.write_all(&nonce)?;
+    r.get_mut().write_all(&nonce)?;
+    r.get_mut().flush()?;
     let mut tag = [0u8; TAG];
     r.read_exact(&mut tag)?;
-    let mut check = keyed(&shared.secret)?;
+    let mut check = keyed(&shared.keys.secret)?;
     check.update(&nonce);
     check.update(&kind);
     check
@@ -395,7 +597,7 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
         .map_err(|_| anyhow!("a connection without the cluster's secret"))?;
     // Past the proof, a link waits as long as its other side is quiet: a peer between heartbeats, a
     // pooled client between requests. A dead peer's link is closed when it opens its next.
-    r.get_ref().set_read_timeout(None)?;
+    socket.set_read_timeout(None)?;
     match kind {
         [RECORDS] => {
             let mut from = [0u8; 8];
@@ -405,7 +607,7 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
                 from != shared.node && shared.ids.contains(&from),
                 "records from {from}, not a peer"
             );
-            let link = w.try_clone()?;
+            let link = socket.try_clone()?;
             if let Some(old) = shared
                 .links
                 .lock()
@@ -438,14 +640,15 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
             };
             let mut answer = shared.answer(&line);
             answer.push('\n');
-            w.write_all(answer.as_bytes())?;
+            r.get_mut().write_all(answer.as_bytes())?;
+            r.get_mut().flush()?;
         },
         _ => bail!("a connection opened with {kind:?}"),
     }
 }
 
 /// One line of at most [`LINE_MAX`] bytes, its end dropped; `None` at the end of the stream.
-fn read_line(r: &mut BufReader<TcpStream>) -> anyhow::Result<Option<String>> {
+fn read_line(r: &mut BufReader<Link>) -> anyhow::Result<Option<String>> {
     let mut line = String::new();
     let n = r
         .by_ref()
@@ -544,6 +747,12 @@ impl Shared {
                 self.cut.store(to, Ordering::Relaxed);
                 Ok(String::new())
             }
+            // A certificate renewed (CP-T1.13; `scripts/cluster.sh renew` asks once the new files
+            // are in place): the TLS files read again, for the links made from now on.
+            "reload" => {
+                self.keys.reload()?;
+                Ok(String::new())
+            }
             // A disk cut or hung (T-T1.13.1): cut, every read, write and flush of this member's
             // log fails as a disk gone away fails them, its replica fences on the first and the
             // process ends with the reason; hung, each waits, its network going on, until the
@@ -619,7 +828,9 @@ impl Shared {
                 ))
             }
             other => {
-                bail!("unknown request {other:?} (status, exec, count, cut, disk, member, leader)")
+                bail!(
+                    "unknown request {other:?} (status, exec, count, cut, disk, member, leader, reload)"
+                )
             }
         }
     }
@@ -630,17 +841,17 @@ impl Shared {
 fn to_peer(
     node: u64,
     addr: &str,
-    secret: &[u8],
+    keys: &Keys,
     deadline: Duration,
     records: &mpsc::Receiver<Vec<u8>>,
 ) {
-    let mut conn: Option<TcpStream> = None;
+    let mut conn: Option<BufReader<Link>> = None;
     for bytes in records {
         if conn.is_none() {
-            conn = open(addr, secret, deadline, RECORDS)
-                .and_then(|(_, mut w)| {
-                    w.write_all(&node.to_le_bytes())?;
-                    Ok(w)
+            conn = open(addr, keys, deadline, RECORDS)
+                .and_then(|(mut s, _)| {
+                    s.get_mut().write_all(&node.to_le_bytes())?;
+                    Ok(s)
                 })
                 .ok();
         }
@@ -648,8 +859,10 @@ fn to_peer(
         let Ok(len) = u32::try_from(bytes.len()) else {
             continue;
         };
+        let s = s.get_mut();
         if s.write_all(&len.to_le_bytes())
             .and_then(|()| s.write_all(&bytes))
+            .and_then(|()| s.flush())
             .is_err()
         {
             conn = None;
@@ -657,41 +870,51 @@ fn to_peer(
     }
 }
 
-/// A connection to `addr` of `kind`, the secret proved.
+/// A connection to `addr` of `kind`, inside mutual TLS when `keys` hold it, the secret proved; and
+/// the socket under it, for its timeouts.
 fn open(
     addr: &str,
-    secret: &[u8],
+    keys: &Keys,
     deadline: Duration,
     kind: u8,
-) -> anyhow::Result<(BufReader<TcpStream>, TcpStream)> {
+) -> anyhow::Result<(BufReader<Link>, TcpStream)> {
     let s = TcpStream::connect_timeout(&resolve(addr)?, deadline)
         .with_context(|| format!("connecting to {addr}"))?;
     s.set_nodelay(true)?;
-    s.set_read_timeout(Some(deadline))?;
-    s.set_write_timeout(Some(deadline))?;
-    let mut w = s.try_clone()?;
-    let mut r = BufReader::new(s);
-    w.write_all(&[kind])?;
+    let socket = s.try_clone()?;
+    let link = keys.dialed(s, addr, after(deadline)?)?;
+    socket.set_read_timeout(Some(deadline))?;
+    socket.set_write_timeout(Some(deadline))?;
+    let mut r = BufReader::new(link);
+    r.get_mut().write_all(&[kind])?;
+    r.get_mut().flush()?;
     let mut nonce = [0u8; NONCE];
     r.read_exact(&mut nonce)?;
-    let mut tag = keyed(secret)?;
+    let mut tag = keyed(&keys.secret)?;
     tag.update(&nonce);
     tag.update(&[kind]);
-    w.write_all(&tag.finalize().into_bytes())?;
-    Ok((r, w))
+    r.get_mut().write_all(&tag.finalize().into_bytes())?;
+    r.get_mut().flush()?;
+    Ok((r, socket))
 }
 
 /// A client of one member: requests one line each, answered in order.
 pub struct Client {
-    r: BufReader<TcpStream>,
-    w: TcpStream,
+    r: BufReader<Link>,
+    /// The socket under the link, for the read timeout of a request that waits.
+    socket: TcpStream,
     deadline: Duration,
 }
 
 impl Client {
-    pub fn connect(addr: &str, secret: &[u8], deadline: Duration) -> anyhow::Result<Self> {
-        let (r, w) = open(addr, secret, deadline, CLIENT)?;
-        Ok(Self { r, w, deadline })
+    /// A client of the member at `addr`, its link proving `keys`.
+    pub fn connect(addr: &str, keys: &Keys, deadline: Duration) -> anyhow::Result<Self> {
+        let (r, socket) = open(addr, keys, deadline, CLIENT)?;
+        Ok(Self {
+            r,
+            socket,
+            deadline,
+        })
     }
 
     /// The member's `leader` request: waits at most `wait` until the member knows its group's
@@ -699,11 +922,10 @@ impl Client {
     /// it doesn't name). The connection waits `wait` and its own deadline for the answer.
     pub fn leader(&mut self, wait: Duration) -> anyhow::Result<(u64, String)> {
         let millis = u64::try_from(wait.as_millis()).context("a wait past u64 milliseconds")?;
-        self.r
-            .get_ref()
+        self.socket
             .set_read_timeout(Some(wait.saturating_add(self.deadline)))?;
         let answer = self.ask(&format!("leader {millis}"));
-        self.r.get_ref().set_read_timeout(Some(self.deadline))?;
+        self.socket.set_read_timeout(Some(self.deadline))?;
         let f = fields(&answer?);
         let id = f
             .get("leader")
@@ -722,7 +944,8 @@ impl Client {
         ensure!(!request.contains(['\n', '\r']), "a request is one line");
         let mut line = request.to_owned();
         line.push('\n');
-        self.w.write_all(line.as_bytes())?;
+        self.r.get_mut().write_all(line.as_bytes())?;
+        self.r.get_mut().flush()?;
         let back =
             read_line(&mut self.r)?.ok_or_else(|| anyhow!("the member closed the connection"))?;
         if let Some(e) = back.strip_prefix("err ") {
@@ -748,7 +971,7 @@ fn fields(status: &str) -> BTreeMap<String, String> {
 /// Every member's status and the verdict: healthy when every member answers, all name one leader
 /// that is a member, each holds the configured voters and none is fenced or cut.
 pub fn health(config: &Config) -> anyhow::Result<(String, bool)> {
-    let secret = config.secret()?;
+    let keys = config.keys()?;
     // The config's voters are the cluster it wants: a spare, or a lost member removed, isn't asked.
     let mut want = config.voters.iter().map(u64::to_string).collect::<Vec<_>>();
     want.sort();
@@ -760,7 +983,7 @@ pub fn health(config: &Config) -> anyhow::Result<(String, bool)> {
         .iter()
         .filter(|m| config.voters.contains(&m.node))
     {
-        match Client::connect(&m.addr, &secret, config.deadline).and_then(|mut c| c.ask("status")) {
+        match Client::connect(&m.addr, &keys, config.deadline).and_then(|mut c| c.ask("status")) {
             Ok(s) => {
                 let f = fields(&s);
                 let mut voters: Vec<String> = f
@@ -896,13 +1119,13 @@ pub fn load(
 ) -> anyhow::Result<String> {
     let run = run_name(run)?.to_owned();
     ensure!(writers > 0, "--writers takes at least 1");
-    let secret = Arc::new(config.secret()?);
+    let keys = Arc::new(config.keys()?);
     let addrs: Arc<Vec<String>> = Arc::new(config.members.iter().map(|m| m.addr.clone()).collect());
     let made = after(config.deadline)?;
     let mut table_made = false;
     while !table_made && Instant::now() < made {
         for a in addrs.iter() {
-            if Client::connect(a, &secret, config.deadline)
+            if Client::connect(a, &keys, config.deadline)
                 .and_then(|mut c| c.ask(&format!("exec {TABLE}")))
                 .is_ok()
             {
@@ -922,8 +1145,8 @@ pub fn load(
     let retries = Arc::new(AtomicU64::new(0));
     let mut threads = Vec::new();
     for w in 1..=writers {
-        let (secret, addrs, retries, run, deadline) = (
-            Arc::clone(&secret),
+        let (keys, addrs, retries, run, deadline) = (
+            Arc::clone(&keys),
             Arc::clone(&addrs),
             Arc::clone(&retries),
             run.clone(),
@@ -936,7 +1159,7 @@ pub fn load(
             let mut conn: Option<Client> = None;
             while Instant::now() < end {
                 if conn.is_none() {
-                    conn = addrs.get(via).and_then(|a| Client::connect(a, &secret, deadline).ok());
+                    conn = addrs.get(via).and_then(|a| Client::connect(a, &keys, deadline).ok());
                 }
                 let Some(c) = conn.as_mut() else {
                     via = via.saturating_add(1).checked_rem(n).unwrap_or(0);
@@ -960,7 +1183,7 @@ pub fn load(
                         via = via.saturating_add(1).checked_rem(n).unwrap_or(0);
                         let named = addrs
                             .get(via)
-                            .and_then(|a| Client::connect(a, &secret, deadline).ok())
+                            .and_then(|a| Client::connect(a, &keys, deadline).ok())
                             .and_then(|mut c| c.leader(deadline).ok())
                             .and_then(|(_, at)| addrs.iter().position(|a| *a == at));
                         if let Some(at) = named {
@@ -996,7 +1219,7 @@ pub fn load(
 /// Lost is what a member still lacks then; the verdict holds when every member answered and none
 /// lacks any.
 pub fn check(config: &Config, ledger: &Path, catch_up: Duration) -> anyhow::Result<(String, bool)> {
-    let secret = config.secret()?;
+    let keys = config.keys()?;
     let text =
         std::fs::read_to_string(ledger).with_context(|| format!("reading {}", ledger.display()))?;
     let mut rows = Vec::new();
@@ -1030,7 +1253,7 @@ pub fn check(config: &Config, ledger: &Path, catch_up: Duration) -> anyhow::Resu
             let mut have = 0u64;
             loop {
                 if client.is_none() {
-                    client = Client::connect(&m.addr, &secret, config.deadline).ok();
+                    client = Client::connect(&m.addr, &keys, config.deadline).ok();
                 }
                 if let Some(c) = client.as_mut() {
                     match c.ask(&format!("count SELECT count(*) FROM drill WHERE run = '{run}' AND writer = {w} AND seq <= {want}")) {
@@ -1116,7 +1339,7 @@ pub fn command(args: &[String], ready: impl FnOnce(&str)) -> Option<crate::Reply
         ("ask", [config, node, request @ ..]) if !request.is_empty() => reply((|| {
             let c = Config::load(Path::new(config))?;
             let m = c.member(node.parse()?)?;
-            let mut k = Client::connect(&m.addr, &c.secret()?, c.deadline)?;
+            let mut k = Client::connect(&m.addr, &c.keys()?, c.deadline)?;
             let answer = match request {
                 [what, wait] if what == "leader" => {
                     let (id, addr) = k.leader(Duration::from_millis(wait.parse()?))?;
@@ -1130,12 +1353,11 @@ pub fn command(args: &[String], ready: impl FnOnce(&str)) -> Option<crate::Reply
         // refuses it, and a lost member doesn't answer, so a stale idea of the leader costs nothing.
         ("member", [config, what, node]) => reply((|| {
             let c = Config::load(Path::new(config))?;
-            let secret = c.secret()?;
+            let keys = c.keys()?;
             let request = format!("member {what} {node}");
             let mut refused = Vec::new();
             for m in c.members.iter().filter(|m| c.voters.contains(&m.node)) {
-                match Client::connect(&m.addr, &secret, c.deadline)
-                    .and_then(|mut k| k.ask(&request))
+                match Client::connect(&m.addr, &keys, c.deadline).and_then(|mut k| k.ask(&request))
                 {
                     Ok(answer) => {
                         return Ok((
@@ -1217,6 +1439,11 @@ mod tests {
             (format!("{GOOD}drills = maybe\n"), "on or off"),
             (format!("{GOOD}voters = 1,4\n"), "isn't among the members"),
             (format!("{GOOD}voters = 1,x\n"), "voters: x"),
+            (format!("{GOOD}cert_file = /c\n"), "go together"),
+            (
+                format!("{GOOD}cert_file = /c\nkey_file = /k\n"),
+                "go together",
+            ),
         ] {
             let e = format!("{:#}", Config::parse(&text).err().unwrap());
             assert!(e.contains(why), "{e} lacks {why}");
@@ -1226,6 +1453,38 @@ mod tests {
                 .unwrap()
                 .drills
         );
+        assert_eq!(c.tls, None, "no TLS files: the links unencrypted");
+        let tls = Config::parse(&format!(
+            "{GOOD}cert_file = /c\nkey_file = /k\nroots_file = /r\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            tls.tls,
+            Some(TlsFiles {
+                cert: "/c".into(),
+                key: "/k".into(),
+                roots: "/r".into()
+            })
+        );
+    }
+
+    /// CP-T1.13: a config's TLS files are read when its keys are made: a file that isn't there
+    /// refuses them, so a member never starts with TLS named and the links bare.
+    #[test]
+    fn cp_t1_13_keys_read_the_tls_files_or_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "0123456789abcdef0123456789abcdef-test-secret\n").unwrap();
+        let text = GOOD.replace("/s", secret.to_str().unwrap());
+        assert!(Config::parse(&text).unwrap().keys().unwrap().tls.is_none());
+        let missing = dir.path().join("missing.pem");
+        let named = Config::parse(&format!(
+            "{text}cert_file = {0}\nkey_file = {0}\nroots_file = {0}\n",
+            missing.display()
+        ))
+        .unwrap();
+        let e = format!("{:#}", named.keys().err().unwrap());
+        assert!(e.contains("missing.pem"), "{e}");
     }
 
     #[test]

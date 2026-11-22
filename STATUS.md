@@ -1207,14 +1207,26 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   (its seam's client). Lane production-2: the serve test's open timeout was the test's own (one
   process's opens take turns under its owner table; members now start one after another);
   `amphora member CONFIG add|promote|demote|remove N` with a config `voters` key (spares start as
-  learners); the region-lost drill replaces a lost member with a spare. Mutual TLS waits on the
-  split-merge listener's TLS landing on t1/group-replication.
+  learners); the region-lost drill replaces a lost member with a spare. Lanes production-3 and 4: one
+  process's opens of different databases run at once (the owner table only reserves a database's
+  slot; an open of the same file by another path, a hard link included, waits for the one in
+  flight); `cluster.sh install --spare`; with `cert_file`, `key_file` and `roots_file` (or
+  `cluster.sh install --tls DIR`) every link runs inside mutual TLS under the network transport's
+  rules (`Credentials::listener`/`dialer` for a protocol of its own). Lane production-5: a `leader WAIT_MS` request that waits
+  for the group's leader, woken by the step that names it (`Client::leader`); TLS required for
+  real services: `cluster.sh install` issues the authority and each member's certificate when no
+  `--tls DIR` is given, plain links only with `--service none`.
   Lane production-6: three more drills, `hang` (a member's log disk hung, its network going on),
   `disk` (its log disk cut: every read, write and flush of it fails, the replica fences and the
   member ends, then starts again with its disk back) and `roll` (a rolling restart, the leader
   last, each member caught up before the next); `all` runs kill, split, stall, hang, disk and roll,
-  each counted on every member. A test cuts the leader's disk
-  under load and finds every acknowledged write on the two left. Untested on Linux yet.
+  each counted on every member. Tests cut and hang the leader's disk under load and find every
+  acknowledged write on the members left. `cluster.sh renew` reissues the certificates that expire
+  within W days from the install's authority and asks each member to `reload`: new links use the
+  new files, no restart; the member wakes on that request (Amphora has no file-change source yet:
+  inotify, kqueue and ReadDirectoryChangesW are the proposal). Untested on Linux yet.
   Lane production-7: a log write the disk refuses ends the member at once: the replica fences,
   and the fence now wakes the member's sender (`drain_wait`), which used to sleep out its
-  deadline. A member with `drills = off` refuses `disk` and `cut`. Untested on Linux yet.
+  deadline. A member with `drills = off` refuses `disk` and `cut`, and `cluster.sh install`
+  refuses `--drills on` with the certificates it issues, so a production install can't hang a
+  disk. Untested on Linux yet.

@@ -11,6 +11,8 @@ taking them down. The server is `amphora serve` (`crates/amphora/src/serve.rs`);
 - ssh from the machine you run the scripts on to each of them (`ssh -o BatchMode=yes HOST true`).
 - The `amphora` binary built for those machines: `cargo build --release --locked -p amphora`
   (target/release/amphora). Linux and macOS members need their own builds.
+- `openssl` (OpenSSL or LibreSSL) on the machine you run the scripts on, unless you bring your own
+  certificates (`--tls DIR`).
 
 Nothing here touches kiln: the binary goes to `~/.local/lib/amphora/amphora`, configs to
 `~/.config/amphora/`, data to `~/.local/share/amphora/member-N/`, and the services are
@@ -21,7 +23,7 @@ Nothing here touches kiln: the binary goes to `~/.local/lib/amphora/amphora`, co
 
 ```sh
 scripts/cluster.sh install --bin target/release/amphora --class persisted --deadline-ms MS \
-  [--drills on] [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
+  --cert-days DAYS --authority-days ADAYS [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
 ```
 
 - `--class persisted`: a write is answered once a majority of members hold it on disk.
@@ -30,10 +32,36 @@ scripts/cluster.sh install --bin target/release/amphora --class persisted --dead
   machine.
 - `--deadline-ms`: how long one request, connect or open may take. Pick it from the slowest
   machine's disk and the link's round trip; nothing here picks it.
-- `--drills on`: the members take `cut` (the split drill). Leave it off in production.
+- `--drills on`: the members take `cut` and `disk` (the split, hang and disk drills). A hung disk
+  waits with no time limit, so install refuses `--drills on` with the certificates it issues
+  (`--tls issue`, the default with a service): a production install can't turn the drills on. A
+  drill cluster runs with `--tls DIR` (its own certificates) or `--service none`. A member whose
+  config says `drills = off` refuses `cut` and `disk`.
 - The script makes one secret (48 random bytes) and copies it to each machine's
   `~/.config/amphora/secret`, readable by its owner only. Every connection proves it holds the
   secret (HMAC-SHA256 over a random challenge); the secret never crosses the link.
+- `--tls DIR`: every link (peers' records, clients' requests) inside mutual TLS 1.3, under the
+  rules of Amphora's transport between machines (`transport/network.rs`). DIR holds `roots.pem`
+  (your deployment's authority) and, for each member N, `member-N.pem` (its certificate chain, its
+  own first, naming the host its peers reach it by: a DNS name or an IP address) and
+  `member-N.key` (its private key). The script copies them beside each config and sets
+  `cert_file`, `key_file` and `roots_file`, all three or none. A member refuses a link whose
+  certificate doesn't chain to the roots, and `amphora ask`, `health` and `drill` present the
+  certificate of the config they read. The secret is still proved inside.
+- TLS is required in production (below, "Why TLS is required"). With a service (the default,
+  `--service auto`) and no `--tls DIR`, the script issues the certificates itself (`--tls issue`):
+  it makes the cluster's authority on the machine you run it on, once, in
+  `~/.config/amphora/authority/` (`roots.pem` and `authority.key`, the key readable by you only,
+  and never copied off that machine), and gives each member a certificate naming its host (an IP
+  address or a DNS name, as you wrote it) with a key of its own, valid `--cert-days DAYS`; the authority is valid `--authority-days
+  ADAYS`, given to the install that makes it, past every certificate `renew` will issue. Keys
+  are ECDSA P-256 signed with SHA-256. Each member's key is made for it, copied to it and removed
+  from the machine you ran the script on. A later install (a spare, a member replaced, renewed
+  certificates) reuses the authority, so members already running still trust the new ones; keep
+  that directory, and back it up as you would any key.
+- `--service none` writes the configs and the secret only, for members you run by hand or in a
+  test. Only there are plain links allowed: without `--tls` the links aren't encrypted.
+  `--service none --tls issue --cert-days DAYS` issues certificates there too.
 - On Linux the unit stops at logout unless linger is on: `sudo loginctl enable-linger $USER`
   (the script says so when it isn't).
 
@@ -115,17 +143,52 @@ fourth (the victim killed and never started again, the spare added, caught up an
 victim removed, the count on the new voters); `cargo test -p amphora --test serve a_region_lost`
 is its test.
 
+## Renewing certificates (CP-T1.13)
+
+```sh
+scripts/cluster.sh renew --cert-days DAYS --within-days W HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]
+```
+
+Run it on the machine that holds the authority (the one you installed from), from a timer of your
+own, well inside the certificates' life. For each member whose certificate expires within W days,
+it issues a new one from the same authority, with a fresh key, valid DAYS; copies both to the
+member's host, each beside its old file and renamed over it; then asks the member to `reload`.
+The member reads its TLS files again and uses them for every link made from then on; links already
+open keep the session they agreed, and nothing restarts. Members not due are left as they are.
+It refuses when there is no authority here (renew never makes one: members wouldn't trust it) and
+when the authority itself expires within DAYS (a certificate can't outlive its root: that is a
+new authority and a new install).
+
+The member wakes on the `reload` request, sent once both new files are in place, never by polling
+its files. A member doesn't wake on its files changing by other means: Amphora has no file-change
+source yet. The source to add is the OS's own, one per platform: inotify on Linux (`IN_CLOSE_WRITE`
+and `IN_MOVED_TO` on the config folder, as a rename lands), kqueue on macOS (`EVFILT_VNODE` on the
+folder), and `ReadDirectoryChangesW` on Windows (the `notify` crate wraps all three; it isn't a
+dependency today). Until then, whatever replaces the files asks `amphora ask CONF N reload`.
+
 ## Uninstall
 
 ```sh
 scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]   # services and configs; data kept
 ```
 
+## Why TLS is required
+
+Decided 2026-11-22 (lane production-5, CP-T1.13): a member run as a service always runs its links
+inside mutual TLS. Without it, the cluster's secret keeps strangers from writing, but anyone on the
+path reads every record and every answer, and can cut or replay a link. Plain links are kept only
+for `--service none`, where members run by hand or in tests on one machine. So that requiring TLS
+costs nothing to set up, the script issues the certificates when none are given, from an authority
+it keeps on the machine you install from. Bring your own authority with `--tls DIR` when the
+deployment has one.
+
 ## What isn't done
 
-- The link isn't encrypted: run the members on a network you trust, or under a tunnel.
-- Mutual TLS on the links waits on the network listener's TLS (`transport/network.rs`, lane
-  split-merge): serve takes its credentials and rules once that lands, so there is one TLS path.
+- `cluster.sh renew` renews members' certificates, run from a timer you set up; the authority's
+  own certificate is valid for the `--authority-days` of the install that made it, and renewing it is a
+  new install. Nothing revokes a member's certificate: replace the authority (remove
+  `~/.config/amphora/authority/` and install again) to stop trusting one. Links open before a
+  renewal keep their session until they close.
 - kiln doesn't open these members yet: kiln reaches Amphora through its conversation-store seam
   (kiln branch `t1/lane-vendor-amphora-*`), in process. A client for `amphora serve` in that seam
   is the next step, and production kiln on it is Ada's word.
