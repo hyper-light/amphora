@@ -911,7 +911,9 @@ mod tests {
         let (db, _sink) =
             Database::open_backed_up(&dir.path().join("g0.db"), archive, until()).unwrap();
         let ns = db.namespace("n").unwrap();
-        for i in 0..600u64 {
+        // A longer run for the coordinator's: AMPHORA_R21_COMMITS (600 by default).
+        let commits: u64 = std::env::var("AMPHORA_R21_COMMITS").map_or(600, |n| n.parse().unwrap());
+        for i in 0..commits {
             let head = ns
                 .commit(
                     api::Tx {
