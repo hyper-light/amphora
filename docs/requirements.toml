@@ -1577,3 +1577,24 @@ tests = [
 
 # lane many-writers-7 (CP-T1.4, AC-T1.4.4): no new IDs. T-T1.4.1's harness: bench/powercut/{linux,macos}.sh,
 # amphora-bench --powercut write|check|span, and their verdict through bench/power_nemesis.sh tally.
+
+# lane many-writers-10 (kiln goal db83b2fa, under G7.5 and CP-T1.4): no new IDs. The goal's two checks:
+# the corpus on both storages (bench/corpus/storages.sh, storages.py; its tests bench/corpus/test_storages.py)
+# and durable commits from the writers' ladder on one driver (amphora-bench --powercut bench, bench/commits.sh:
+# Amphora on both storages, SQLite in WAL with synchronous = FULL, PostgreSQL). The runs of record: the coordinator's.
+
+# lane many-writers-11 (kiln goal db83b2fa, under G7.5 and CP-T1.4): no new IDs (T-T1.4.1's). The corpus's
+# reads and writes verdicts from both storages on a file on the disk under test (amphora-corpus run --disk;
+# crates/corpus/tests/amphora_runs.rs t_t1_4_1_*), the answers in memory and on the disk; every writer count
+# checked against the host before it runs and PostgreSQL sized to fit (bench/commits_fit.py, its tests
+# bench/test_commits_fit.py).
+
+# lane many-writers-12 (kiln goal db83b2fa, under G7.5 and CP-T1.4): no new IDs (T-T1.4.1's; the bars are
+# AC-T1.3.2 to AC-T1.3.5). The storages' answers SAME only over every record of the pool (storages.py,
+# PARTIAL otherwise); the commit bench's verdict at 32 writers against SQLite and PostgreSQL
+# (bench/commits_verdict.py, its tests bench/test_commits_verdict.py).
+
+# lane many-writers-13 (kiln goal db83b2fa, under G7.5 and CP-T1.4): no new IDs (T-T1.4.1's). The pool's
+# own records are counted from its files before the runs (storages.py count, called by storages.sh), and
+# SAME needs both runs to reach every one: two runs stopped at the same record are PARTIAL; an empty pool
+# or another pool's runs are refused (bench/corpus/test_storages.py).

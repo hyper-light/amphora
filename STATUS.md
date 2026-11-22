@@ -446,6 +446,21 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   checkpoint cycles by the engine's own `wal_autocheckpoint`, so cuts fall before, across and after a
   checkpoint. dm-flakey's down interval is 1 s, the least it takes (up 0 s is down at every moment).
   The 1,000 cuts on each storage and the macOS VM: the coordinator's.
+- **Many writers, verified** (kiln goal db83b2fa; `bench/corpus/storages.sh`, `bench/commits.sh`): the corpus
+  runs on both storages and `storages.py` gives one verdict each for answers, reads and writes, refusing two
+  runs from another client or platform; `amphora-bench --powercut bench` drives Amphora on both storages,
+  SQLite (WAL, `synchronous = FULL`, no busy wait) and PostgreSQL through one commit loop up the writers'
+  ladder, each record with its client's resources and platform. The reads and writes verdicts come from
+  runs on a file on the disk under test (`amphora-corpus run --disk`, the commit bench's WAL and
+  `synchronous = FULL`); the answers are compared in memory and on the disk. Each writer count's memory,
+  open files and threads are extrapolated from the counts already run and checked against the host first
+  (`bench/commits_fit.py`): one that doesn't fit is refused, saying why, and PostgreSQL's `shared_buffers`
+  and `work_mem` are sized to fit beside its backends and recorded. The answers are SAME only when every
+  one of the pool's records, counted from its files before the runs, was reached by both storages
+  (PARTIAL otherwise, so two runs stopped at the same record aren't SAME; a pool of none is refused). `bench/commits_verdict.py` reads the bench's
+  records: each count's systems side by side, Amphora's storages over SQLite's and PostgreSQL's rates, and
+  AC-T1.3.2 to AC-T1.3.5 at 32 writers, refusing records of another platform or driver. Not yet compiled
+  or run: the coordinator's.
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and

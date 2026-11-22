@@ -1,15 +1,19 @@
 //! Amphora as a corpus engine: its engine crate on a database of its own per file, opened as SQLite
 //! opens one (no store settings: the corpus's answers are a default SQLite connection's), and the
-//! renderer of REALs, SQLite's text through Amphora's own port of it.
+//! renderer of REALs, SQLite's text through Amphora's own port of it. The gate's database is in
+//! memory; [`Amphora::on_disk`] puts it on a file on the disk under test, with the commit bench's
+//! durability (`bench/src/powercut.rs`: WAL, `synchronous = FULL`), so the storages' times are a
+//! disk's (T-T1.4.1).
 
 use std::num::NonZero;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use amphora_engine::{
     ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, MemoryIO, Numeric,
-    OpenOptions, SqliteDialect, Statement, StepResult,
+    OpenOptions, PlatformIO, SqliteDialect, Statement, StepResult,
 };
 
 use crate::answer::{Render, Value};
@@ -18,12 +22,15 @@ use crate::run::{Engine, Stop};
 /// Names every in-memory database the process opens apart (the engine keeps databases by name).
 static OPENED: AtomicU64 = AtomicU64::new(0);
 
-fn fresh(io: &Arc<dyn IO>) -> Result<(Arc<Database>, Arc<Connection>), String> {
+fn fresh_name() -> String {
     let n = OPENED.fetch_add(1, Ordering::Relaxed);
-    let name = format!("corpus-{}-{n}.db", std::process::id());
+    format!("corpus-{}-{n}.db", std::process::id())
+}
+
+fn fresh(io: &Arc<dyn IO>, name: &str) -> Result<(Arc<Database>, Arc<Connection>), String> {
     let db = Database::open(
         io.clone(),
-        &name,
+        name,
         OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
     )
     .map_err(|e| e.to_string())?;
@@ -69,18 +76,70 @@ fn drain(io: &dyn IO, stmt: &mut Statement, keep: usize) -> Result<Vec<Vec<Value
     }
 }
 
-/// Amphora on an in-memory database: the gate's engine.
+/// Amphora on an in-memory database (the gate's engine), or on a file ([`Amphora::on_disk`]).
+/// Fields drop in order: the connection and the database close before their files go.
 pub struct Amphora {
     io: Arc<dyn IO>,
     conn: Arc<Connection>,
     _db: Arc<Database>,
+    _files: Option<Files>,
 }
 
 impl Amphora {
     pub fn in_memory() -> Result<Self, String> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let (db, conn) = fresh(&io)?;
-        Ok(Self { io, conn, _db: db })
+        let (db, conn) = fresh(&io, &fresh_name())?;
+        Ok(Self {
+            io,
+            conn,
+            _db: db,
+            _files: None,
+        })
+    }
+
+    /// A fresh database file in `dir` (the disk under test), with the commit bench's durability:
+    /// `PRAGMA journal_mode = WAL` and `PRAGMA synchronous = FULL`, as `amphora-bench --powercut
+    /// bench` sets them, so a commit returns once it is on the disk. The storage is the process's
+    /// (`AMPHORA_STORAGE`); the versioned one keeps its files in `<file>-versioned`. Its files are
+    /// removed when it drops, so a run's disk holds one file's database at a time.
+    pub fn on_disk(dir: &Path) -> Result<Self, String> {
+        let path = dir.join(fresh_name());
+        let name = path
+            .to_str()
+            .ok_or_else(|| format!("a path that isn't UTF-8: {}", path.display()))?
+            .to_owned();
+        let files = Files(path);
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(|e| e.to_string())?);
+        let (db, conn) = fresh(&io, &name)?;
+        let mut a = Self {
+            io,
+            conn,
+            _db: db,
+            _files: Some(files),
+        };
+        for pragma in ["PRAGMA journal_mode = WAL", "PRAGMA synchronous = FULL"] {
+            a.run(pragma, 1, None)
+                .map_err(|e| format!("{pragma}: {e:?}"))?;
+        }
+        Ok(a)
+    }
+}
+
+/// A database file's path: the file, its log, its shared memory and the versioned storage's
+/// directory are removed when it drops (whichever of them exist).
+struct Files(PathBuf);
+
+impl Drop for Files {
+    fn drop(&mut self) {
+        let base = self.0.as_os_str().to_owned();
+        for end in ["", "-wal", "-shm"] {
+            let mut p = base.clone();
+            p.push(end);
+            let _ = std::fs::remove_file(&p);
+        }
+        let mut v = base;
+        v.push("-versioned");
+        let _ = std::fs::remove_dir_all(&v);
     }
 }
 
@@ -128,7 +187,7 @@ pub struct AmphoraRender {
 impl AmphoraRender {
     pub fn new() -> Result<Self, String> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let (db, conn) = fresh(&io)?;
+        let (db, conn) = fresh(&io, &fresh_name())?;
         let real3 = conn
             .prepare("SELECT printf('%.3f', ?1)")
             .map_err(|e| e.to_string())?;
