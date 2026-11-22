@@ -1069,3 +1069,5 @@ by measured cost and a SQL switch (executor.md decision 11, "Not yet").
 Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
 11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
 skip (T-SKU.1).
+
+Lane qs5-16 (QT.5, T-QT.5.3): a star join's dimensions filter the fact scan with Bloom filters (`optimizer/lip.rs`, `main_loop/star.rs`), each kept by the planner's costs, sharing the statement's memory, behind `Connection::set_star_filters` (off is the control); `tests/star_filters.rs` holds the answers to the control's over a star, a cyclic graph and outer joins. Left: the order by selectivity is the planner's estimate, not yet re-measured as rows run; sort-merge and prefetched index joins not started.

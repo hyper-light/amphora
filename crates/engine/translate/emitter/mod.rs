@@ -209,6 +209,8 @@ pub struct Resolver<'a> {
     fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
+    /// Amphora (T-QT.5.3): when a star join's fact scan checks its dimensions' filters.
+    star_filters: crate::StarFilters,
     /// Amphora (PL.8): what sizes the join search (`Connection::set_join_search_budget`).
     join_search: crate::translate::optimizer::search_budget::SearchBudget,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
@@ -352,6 +354,7 @@ impl<'a> Resolver<'a> {
             learned_weights: None,
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
+            star_filters: crate::StarFilters::ByCost,
             join_search: crate::translate::optimizer::search_budget::SearchBudget::FIXED,
             sorted_fetches: false,
             adaptive_joins: false,
@@ -456,6 +459,14 @@ impl<'a> Resolver<'a> {
         self.join_methods = methods;
     }
 
+    pub(crate) fn star_filters(&self) -> crate::StarFilters {
+        self.star_filters
+    }
+
+    pub(crate) fn set_star_filters(&mut self, rule: crate::StarFilters) {
+        self.star_filters = rule;
+    }
+
     pub(crate) fn join_search(&self) -> crate::translate::optimizer::search_budget::SearchBudget {
         self.join_search
     }
@@ -527,6 +538,7 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            star_filters: self.star_filters,
             join_search: self.join_search,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
@@ -566,6 +578,7 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            star_filters: self.star_filters,
             join_search: self.join_search,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,

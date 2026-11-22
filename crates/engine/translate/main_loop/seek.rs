@@ -314,6 +314,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     cursor_id: self.seek_cursor_id,
                     key_reg: self.start_reg,
                     num_keys: num_regs,
+                    star: false,
                     target_pc: self.loop_end,
                 });
             }

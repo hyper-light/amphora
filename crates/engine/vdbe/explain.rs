@@ -2209,7 +2209,7 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
-            Insn::Filter{cursor_id, target_pc, key_reg, num_keys} => (
+            Insn::Filter{cursor_id, target_pc, key_reg, num_keys, ..} => (
                 "Filter",
                 *cursor_id as i64,
                 target_pc.as_debug_int() as i64,

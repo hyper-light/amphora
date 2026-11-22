@@ -236,6 +236,20 @@ pub enum JoinSearchBudget {
     RunShareByExecutions = 2,
 }
 
+/// Amphora (QT.5, T-QT.5.3): whether a star join's dimensions filter the fact table's scan with
+/// their Bloom filters (`translate/optimizer/lip.rs`, `Connection::set_star_filters`): by the
+/// planner's costs, never (the control), or wherever a filter is safe, for the tests that hold its
+/// answers to the control's.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum StarFilters {
+    /// Each filter kept when it costs less than the work it saves.
+    ByCost = 0,
+    /// No filter: today's plans.
+    Off = 1,
+    /// Every filter that is safe, whatever it costs.
+    Always = 2,
+}
+
 /// Test-only control over correlated-subquery rewrites.
 #[cfg(feature = "simulator")]
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -534,6 +548,8 @@ pub struct Connection {
     /// Amphora: see [`Connection::set_join_methods`].
     pub(super) join_methods: AtomicJoinMethods,
     pub(super) join_search_budget: AtomicJoinSearchBudget,
+    /// Amphora: see [`Connection::set_star_filters`].
+    pub(super) star_filters: AtomicStarFilters,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
     /// Amphora: see [`Connection::set_adaptive_joins`].
@@ -1021,6 +1037,17 @@ impl Connection {
 
     pub(crate) fn join_methods(&self) -> JoinMethods {
         self.join_methods.get()
+    }
+
+    /// Amphora (QT.5, T-QT.5.3): chooses when newly prepared statements filter a star join's fact
+    /// table with its dimensions' Bloom filters.
+    pub fn set_star_filters(&self, rule: StarFilters) {
+        self.star_filters.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn star_filters(&self) -> StarFilters {
+        self.star_filters.get()
     }
 
     /// Amphora (PL.8): chooses the rule that sizes the join search for newly prepared statements.

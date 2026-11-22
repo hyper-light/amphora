@@ -90,6 +90,9 @@ pub struct StatementMetrics {
     // Sort and filter operations
     pub sort_operations: u64,
     pub filter_operations: u64,
+    /// Amphora (T-QT.5.3): fact rows a star join's filters checked, and those they rejected.
+    pub star_filter_probes: u64,
+    pub star_filter_rejects: u64,
 
     // B-tree operations
     pub btree_seeks: u64,
@@ -133,6 +136,12 @@ impl StatementMetrics {
         self.index_steps = self.index_steps.wrapping_add(other.index_steps);
         self.sort_operations = self.sort_operations.wrapping_add(other.sort_operations);
         self.filter_operations = self.filter_operations.wrapping_add(other.filter_operations);
+        self.star_filter_probes = self
+            .star_filter_probes
+            .wrapping_add(other.star_filter_probes);
+        self.star_filter_rejects = self
+            .star_filter_rejects
+            .wrapping_add(other.star_filter_rejects);
         self.btree_seeks = self.btree_seeks.wrapping_add(other.btree_seeks);
         self.btree_table_seeks = self.btree_table_seeks.wrapping_add(other.btree_table_seeks);
         self.btree_index_seeks = self.btree_index_seeks.wrapping_add(other.btree_index_seeks);

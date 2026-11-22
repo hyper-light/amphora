@@ -20535,7 +20535,8 @@ pub fn op_filter(
             cursor_id,
             target_pc,
             key_reg,
-            num_keys
+            num_keys,
+            star
         },
         insn
     );
@@ -20570,6 +20571,12 @@ pub fn op_filter(
         }
     };
 
+    if *star {
+        state.metrics.star_filter_probes = state.metrics.star_filter_probes.wrapping_add(1);
+        if !contains {
+            state.metrics.star_filter_rejects = state.metrics.star_filter_rejects.wrapping_add(1);
+        }
+    }
     if !contains {
         state.pc = target_pc.as_offset_int();
     } else {

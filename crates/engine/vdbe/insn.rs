@@ -853,6 +853,9 @@ pub enum Insn {
         key_reg: usize,
         /// Number of key registers to hash together
         num_keys: usize,
+        /// Amphora (T-QT.5.3): a star join's filter at its fact scan, counted in the statement's
+        /// metrics (`star_filter_probes`, `star_filter_rejects`).
+        star: bool,
     },
     /// Compute a hash on num_keys registers starting with `r[key_reg]` and add that hash to
     /// the bloom filter associated with the cursor/hash_table.
