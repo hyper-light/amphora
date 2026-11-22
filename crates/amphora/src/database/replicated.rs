@@ -5922,7 +5922,31 @@ mod tests {
                 self.wait_if_moving(admitted, pump);
                 self.step();
             }
-            panic!("a driven operation neither answered nor stalled in {ROUNDS} rounds");
+            // What tells records going round unanswered from a group that stands still: the
+            // records admitted to each member, and where each stands.
+            let members: Vec<_> = self
+                .owners
+                .iter()
+                .flatten()
+                .map(|(owner, _)| {
+                    let id = owner.replica.id();
+                    let gate = self
+                        .gates
+                        .get(&usize::try_from(id - 1).unwrap())
+                        .map(|gate| (gate.is_held(), gate.waiting()));
+                    (
+                        id,
+                        owner.replica.term(),
+                        owner.replica.is_leader(),
+                        owner.replica.in_flight(),
+                        gate,
+                    )
+                })
+                .collect();
+            panic!(
+                "a driven operation neither answered nor stalled in {ROUNDS} rounds: records admitted by member {:?}; (member, term, leads, writes out, gate held and waited at) {members:?}",
+                pump.delivered
+            );
         }
     }
 
