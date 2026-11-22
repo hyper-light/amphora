@@ -7,7 +7,9 @@
 //! read of a line no reader writes.
 //!
 //! Every page is resident and page `n` lives in frame `n - 1`: a page number is its frame, with no
-//! table to look it up in. A page asked for past the frames is refused (`DatabaseFull`), as is a
+//! table to look it up in. Frames are made as pages are handed out, in runs that double (frame `i`
+//! in run `log2(i + 1)`), so a pool sized from the machine's memory holds only what its pages use,
+//! at most twice what they use, never past its capacity. A page asked for past the frames is refused (`DatabaseFull`), as is a
 //! new page once every frame holds one. Eviction to the file, with a table from pages to frames,
 //! comes with the storage's durability (decisions 6 and 7).
 //!
@@ -19,7 +21,7 @@
 use super::page::PAGE_SIZE;
 use crate::error::LimboError;
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::Result;
 use std::ops::{Deref, DerefMut};
 
@@ -39,7 +41,11 @@ struct Frame {
 
 /// The frames, and the next page number to hand out.
 pub struct Pool {
-    frames: Vec<Frame>,
+    /// Run `k` holds frames `2^k - 1` to `2^(k+1) - 2` (cut at the capacity), made when its first
+    /// page is handed out.
+    runs: Box<[OnceLock<Box<[Frame]>>]>,
+    /// The frames the pool holds at most.
+    capacity: usize,
     /// Pages handed out: page numbers `1..=allocated`.
     allocated: AtomicU64,
     /// The epoch writes fall in now: moved on only by a checkpoint's pause, when no page is
@@ -98,19 +104,16 @@ impl Drop for PageWrite<'_> {
 }
 
 impl Pool {
-    /// A pool of `frames` pages, all zeroed.
+    /// A pool of `frames` pages at most, each zeroed when its run is made.
     pub fn new(frames: usize) -> Self {
-        let frames = (0..frames)
-            .map(|_| Frame {
-                page: RwLock::new(vec![0u8; PAGE_SIZE].into_boxed_slice()),
-                version: AtomicU64::new(0),
-                written: AtomicU64::new(0),
-                copied: AtomicU64::new(0),
-                kept: Mutex::new(None),
-            })
+        // Runs until one starts at or past the capacity: `usize::BITS` of them cover any.
+        let runs = (0..usize::BITS)
+            .take_while(|&k| run_start(k) < frames)
+            .map(|_| OnceLock::new())
             .collect();
         Self {
-            frames,
+            runs,
+            capacity: frames,
             allocated: AtomicU64::new(0),
             epoch: AtomicU64::new(1),
             copying: AtomicU64::new(0),
@@ -119,7 +122,29 @@ impl Pool {
 
     /// The pages the pool holds at most.
     pub fn capacity(&self) -> usize {
-        self.frames.len()
+        self.capacity
+    }
+
+    /// Frame `at`, its run made if it wasn't; None past the capacity.
+    fn frame_at(&self, at: usize) -> Option<&Frame> {
+        if at >= self.capacity {
+            return None;
+        }
+        let k = usize::BITS - 1 - at.checked_add(1)?.leading_zeros();
+        let start = run_start(k);
+        let run = self.runs.get(usize::try_from(k).ok()?)?.get_or_init(|| {
+            let end = run_start(k.saturating_add(1)).min(self.capacity);
+            (start..end)
+                .map(|_| Frame {
+                    page: RwLock::new(vec![0u8; PAGE_SIZE].into_boxed_slice()),
+                    version: AtomicU64::new(0),
+                    written: AtomicU64::new(0),
+                    copied: AtomicU64::new(0),
+                    kept: Mutex::new(None),
+                })
+                .collect()
+        });
+        run.get(at.checked_sub(start)?)
     }
 
     /// The pages handed out.
@@ -130,7 +155,7 @@ impl Pool {
     /// A new page's number, its frame zeroed; `DatabaseFull` once every frame holds a page. Each
     /// failed exchange means another caller took a page, so the loop ends within the capacity.
     pub fn allocate(&self) -> Result<u64> {
-        let capacity = u64::try_from(self.frames.len()).map_err(|_| LimboError::IntegerOverflow)?;
+        let capacity = u64::try_from(self.capacity).map_err(|_| LimboError::IntegerOverflow)?;
         let mut n = self.allocated.load(Ordering::Acquire);
         loop {
             if n >= capacity {
@@ -155,7 +180,7 @@ impl Pool {
         }
         let at =
             usize::try_from(page.saturating_sub(1)).map_err(|_| LimboError::IntegerOverflow)?;
-        self.frames.get(at).ok_or_else(|| {
+        self.frame_at(at).ok_or_else(|| {
             LimboError::Corrupt(format!("versioned storage: page {page} has no frame"))
         })
     }
@@ -205,7 +230,10 @@ impl Pool {
     pub fn copy_owed(&self, epoch: u64, pages: u64) -> Result<Vec<(u64, Vec<u8>)>> {
         let mut out = Vec::new();
         let pages = usize::try_from(pages).map_err(|_| LimboError::IntegerOverflow)?;
-        for (i, frame) in self.frames.iter().take(pages).enumerate() {
+        for i in 0..pages.min(self.capacity) {
+            let Some(frame) = self.frame_at(i) else {
+                break;
+            };
             let page = u64::try_from(i)
                 .ok()
                 .and_then(|i| i.checked_add(1))
@@ -231,7 +259,7 @@ impl Pool {
             .checked_sub(1)
             .and_then(|i| usize::try_from(i).ok())
             .ok_or(LimboError::IntegerOverflow)?;
-        let frame = self.frames.get(at).ok_or(LimboError::DatabaseFull)?;
+        let frame = self.frame_at(at).ok_or(LimboError::DatabaseFull)?;
         let mut w = frame.page.write();
         if bytes.len() != w.len() {
             return Err(LimboError::Corrupt(format!(
@@ -250,6 +278,30 @@ impl Pool {
     pub fn version(&self, page: u64) -> Result<u64> {
         Ok(self.frame(page)?.version.load(Ordering::Acquire))
     }
+}
+
+/// The frames a byte budget holds: each a page and its frame's state. A budget too small for one
+/// is refused (`MemoryBudget`).
+pub fn frames_within(bytes: u64) -> Result<usize> {
+    let each = PAGE_SIZE.saturating_add(std::mem::size_of::<Frame>());
+    let each = u64::try_from(each).map_err(|_| LimboError::IntegerOverflow)?;
+    let n = bytes.checked_div(each).unwrap_or(0);
+    if n == 0 {
+        return Err(LimboError::MemoryBudget {
+            what: "a page pool's first frame",
+            asked: each,
+            held: 0,
+            limit: bytes,
+        });
+    }
+    Ok(usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// The first frame of run `k`: `2^k - 1` (saturating past the address space).
+fn run_start(k: u32) -> usize {
+    1usize
+        .checked_shl(k)
+        .map_or(usize::MAX, |n| n.saturating_sub(1))
 }
 
 #[cfg(test)]
@@ -280,5 +332,28 @@ mod tests {
         drop(r);
         assert_eq!(pool.version(2).unwrap(), before + 1);
         assert!(pool.read(0).is_err() && Pool::new(3).read(1).is_err());
+    }
+
+    /// T-NS.2.10: a pool whose capacity is far past this machine's memory hands out pages across
+    /// several runs. Expect: each page its own frame, its bytes as written; a budget too small for
+    /// a frame refused `MemoryBudget`.
+    #[test]
+    fn ns2_frames_are_made_as_pages_are_handed_out() {
+        let pool = Pool::new(1 << 40);
+        for n in 1..=40u8 {
+            let page = pool.allocate().unwrap();
+            pool.write(page).unwrap()[0] = n;
+        }
+        for n in 1..=40u8 {
+            assert_eq!(pool.read(u64::from(n)).unwrap()[0], n);
+        }
+        assert!(matches!(
+            frames_within(1),
+            Err(LimboError::MemoryBudget { .. })
+        ));
+        assert_eq!(
+            frames_within(1 << 30).unwrap(),
+            (1usize << 30) / (PAGE_SIZE + std::mem::size_of::<Frame>())
+        );
     }
 }

@@ -22,6 +22,7 @@ pub mod disk;
 pub mod durable;
 #[cfg(test)]
 mod elle;
+pub mod memory;
 pub mod overflow;
 pub mod page;
 pub mod pool;

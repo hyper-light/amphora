@@ -252,7 +252,9 @@ impl Database {
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
         Self::open_ordered(disk, frames, trees, cmp, |_, _| {
-            Err(corrupt("a tree's recorded order, which this opener doesn't read"))
+            Err(corrupt(
+                "a tree's recorded order, which this opener doesn't read",
+            ))
         })
     }
 
@@ -480,9 +482,9 @@ impl Database {
     fn tree_of(op: &Op) -> Result<u64> {
         match op {
             Op::Put { tree, .. } | Op::Remove { tree, .. } => Ok(*tree),
-            Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => {
-                Err(corrupt("a row change naming a tree made, dropped or ordered"))
-            }
+            Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => Err(corrupt(
+                "a row change naming a tree made, dropped or ordered",
+            )),
         }
     }
 
@@ -893,15 +895,10 @@ impl Database {
             // The trees' orders go in the list beside the corrections: the redo records naming
             // them are cut once the checkpoint is written.
             let mut list = self.v.corrections(ts)?;
-            list.extend(
-                self.orders
-                    .lock()
-                    .iter()
-                    .map(|(tree, order)| Op::Ordered {
-                        tree: *tree,
-                        order: order.clone(),
-                    }),
-            );
+            list.extend(self.orders.lock().iter().map(|(tree, order)| Op::Ordered {
+                tree: *tree,
+                order: order.clone(),
+            }));
             (stamp, list, self.v.pool.begin_copy()?, from)
         };
         // Off the commit path: writers go on, each keeping a page's bytes at the pause before its
@@ -1394,7 +1391,9 @@ mod tests {
         if order == b"rev" {
             Ok(reversed())
         } else {
-            Err(LimboError::Corrupt("an order this test doesn't know".into()))
+            Err(LimboError::Corrupt(
+                "an order this test doesn't know".into(),
+            ))
         }
     }
 
@@ -1435,14 +1434,20 @@ mod tests {
             }
             db.commit(txn, &mut d, db.lane(), true).unwrap();
         }
-        let want_a: Vec<Vec<u8>> = [b"k7", b"k5", b"k3", b"k1"].iter().map(|k| k.to_vec()).collect();
+        let want_a: Vec<Vec<u8>> = [b"k7", b"k5", b"k3", b"k1"]
+            .iter()
+            .map(|k| k.to_vec())
+            .collect();
         let db = Database::open_ordered(disk.clone(), 2_000, 1, cmp, recorded).unwrap();
         assert_eq!(keys(&db, a), want_a);
         let mut d = Descender::new();
         let mut txn = db.begin().unwrap();
         db.put(&mut d, &mut txn, b, b"k6", b"v").unwrap();
         db.commit(txn, &mut d, db.lane(), true).unwrap();
-        let want_b: Vec<Vec<u8>> = [b"k9", b"k6", b"k4", b"k2"].iter().map(|k| k.to_vec()).collect();
+        let want_b: Vec<Vec<u8>> = [b"k9", b"k6", b"k4", b"k2"]
+            .iter()
+            .map(|k| k.to_vec())
+            .collect();
         assert_eq!(keys(&db, b), want_b);
         drop(db);
         disk.power_cut().unwrap();

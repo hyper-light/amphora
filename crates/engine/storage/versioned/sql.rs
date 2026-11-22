@@ -234,6 +234,61 @@ fn t_ns_2_6_ddl_rolls_back_with_its_transaction() {
     assert_eq!(rows(&versioned, q), rows(&pager, q));
 }
 
+/// T-NS.2.11: in a transaction, a table and index made under a savepoint rolled back to and a DROP
+/// under a savepoint rolled back to, then COMMIT, on both storages; then a CREATE TABLE ... AS that
+/// fails after its tree is made, in a transaction committed after it. Expect: the storage holds the trees it held before (no tree no schema row names), and
+/// the table whose DROP was undone keeps its rows.
+#[test]
+fn ns_2_1_undone_ddl_leaves_no_orphan_tree() {
+    let (_pdb, pager) = connect(false);
+    let (db, versioned) = connect(true);
+    let live = || {
+        db.versioned_storage(false, None)
+            .unwrap()
+            .unwrap()
+            .live_trees()
+    };
+    let mut before = 0;
+    for conn in [&pager, &versioned] {
+        run(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY)");
+        run(conn, "INSERT INTO t VALUES (1)");
+        if std::ptr::eq(conn, &versioned) {
+            before = live();
+        }
+        for sql in [
+            "BEGIN",
+            "SAVEPOINT s",
+            "CREATE TABLE w (c)",
+            "CREATE INDEX wi ON w (c)",
+            "INSERT INTO w VALUES (1)",
+            "ROLLBACK TO s",
+            "RELEASE s",
+            "SAVEPOINT s2",
+            "DROP TABLE t",
+            "ROLLBACK TO s2",
+            "RELEASE s2",
+            "COMMIT",
+        ] {
+            let done = conn.execute(sql);
+            assert!(
+                done.is_ok(),
+                "{}: {sql}: {done:?}",
+                std::ptr::eq(conn, &versioned)
+            );
+        }
+        assert_eq!(rows(conn, "SELECT a FROM t").len(), 1);
+    }
+    assert_eq!(live(), before);
+    // A failed statement in a transaction, then COMMIT: on the versioned storage alone, as the
+    // pager's next statement after it is refused `SchemaUpdated` (the pager's, noted in STATUS).
+    run(&versioned, "BEGIN");
+    let failed = versioned.execute("CREATE TABLE u AS SELECT abs(-9223372036854775807 - 1) AS x");
+    assert!(failed.is_err(), "{failed:?}");
+    let done = versioned.execute("COMMIT");
+    assert!(done.is_ok(), "{done:?}");
+    assert_eq!(live(), before);
+}
+
 /// Do: SAVEPOINTs nested in a transaction, ROLLBACK TO the inner one twice, RELEASE the outer one,
 /// COMMIT; and a SAVEPOINT that starts a transaction, rolled back to and released. Expect: the
 /// same rows on both storages.
@@ -328,7 +383,10 @@ fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
                     (i * 37) % 101
                 ),
             );
-            run(&conn, &format!("INSERT INTO w VALUES ('k{}', {i})", 999 - i));
+            run(
+                &conn,
+                &format!("INSERT INTO w VALUES ('k{}', {i})", 999 - i),
+            );
         }
         run(&conn, "BEGIN");
         run(&conn, "DELETE FROM t WHERE a % 3 = 0");
@@ -346,7 +404,9 @@ fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
     for (q, w) in queries.iter().zip(&want) {
         assert_eq!(&rows(&conn, q), w, "after a reopen: {q}");
     }
-    assert!(conn.execute("INSERT INTO t VALUES (1000, 'apple1', 0)").is_err());
+    assert!(conn
+        .execute("INSERT INTO t VALUES (1000, 'apple1', 0)")
+        .is_err());
     run(&conn, "INSERT INTO t VALUES (1000, 'fig', 50)");
     let want: Vec<_> = queries.iter().map(|q| rows(&conn, q)).collect();
     // The crash: the files copied while the database is open, its close never run.

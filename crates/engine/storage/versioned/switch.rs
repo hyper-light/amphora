@@ -19,12 +19,11 @@ use super::disk::{Disk, Files, Simulated};
 use super::durable::Database as VDatabase;
 use super::version::Savepoint;
 use crate::error::LimboError;
-use crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES;
 use crate::sync::{Arc, Mutex, OnceLock};
 use crate::translate::collate::CollationSeq;
 use crate::types::{IndexInfo, KeyInfo};
-use amphora_engine_parser::ast::{NullsOrder, SortOrder};
 use crate::{Pager, Result};
+use amphora_engine_parser::ast::{NullsOrder, SortOrder};
 use std::collections::HashMap;
 
 /// The environment variable that turns the switch on for every connection: `versioned`.
@@ -50,10 +49,17 @@ pub struct Storage {
 }
 
 /// The versioned storage of the database at `path`: in memory for a memory database or one whose
-/// files the engine keeps in memory (`memory`), else in the directory `<path>-versioned`. Its pool holds as many pages as the pager's page cache does by
-/// default (`DEFAULT_PAGE_CACHE_SIZE_IN_PAGES`, the engine's bound on the pages it keeps), and its
-/// redo log takes a lane per thread the machine runs (decision 11).
-pub fn open(path: &str, memory: bool) -> Result<Arc<Storage>> {
+/// files the engine keeps in memory (`memory`), else in the directory `<path>-versioned`. It holds
+/// `budget` bytes at most (the shell's, else [`super::memory::default_budget`]): half for its
+/// pool's pages, half for the row versions and records beside them, which the pool's pages bound
+/// (`Versioned`'s `pool_budget`: InnoDB's undo and LeanStore's versions live in the buffer pool's
+/// memory). Its redo log takes a lane per thread the machine runs (decision 11).
+pub fn open(path: &str, memory: bool, budget: Option<u64>) -> Result<Arc<Storage>> {
+    let budget = match budget {
+        Some(b) => b,
+        None => super::memory::default_budget()?,
+    };
+    let frames = super::pool::frames_within(budget / 2)?;
     let lanes = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let disk: Arc<dyn Disk> = if memory || crate::database::is_memory_like(path) {
         Arc::new(Simulated::new(0, lanes)?)
@@ -68,7 +74,7 @@ pub fn open(path: &str, memory: bool) -> Result<Arc<Storage>> {
     let recovered: Mutex<HashMap<u64, Arc<OnceLock<KeyOrder>>>> = Mutex::new(HashMap::new());
     let db = Arc::new(VDatabase::open_ordered(
         disk,
-        DEFAULT_PAGE_CACHE_SIZE_IN_PAGES,
+        frames,
         TREES,
         || KeyOrder::rowid().comparator(),
         |tree, bytes| {
@@ -87,6 +93,14 @@ pub fn open(path: &str, memory: bool) -> Result<Arc<Storage>> {
     }))
 }
 
+impl Storage {
+    /// The trees the storage holds now, dropped ones not counted.
+    #[cfg(test)]
+    pub fn live_trees(&self) -> usize {
+        self.db.v.roots().iter().filter(|&&r| r != 0).count()
+    }
+}
+
 /// The encoding of an index's order the storage records (G7 step 2, `AC-NS.2.1`; a format of
 /// this storage's own): a version (`u8`, 1), whether the key ends in a rowid (`u8`), whether it is
 /// unique (`u8`), the column count (`u64`), the key column count (`u32`), and each key column's
@@ -95,11 +109,7 @@ pub fn open(path: &str, memory: bool) -> Result<Arc<Storage>> {
 /// those two then their name's length (`u32`) and name). A collation goes by name, not by the
 /// process's id for it.
 pub fn encode_order(info: &IndexInfo) -> Result<Vec<u8>> {
-    let mut out = vec![
-        1u8,
-        u8::from(info.has_rowid),
-        u8::from(info.is_unique),
-    ];
+    let mut out = vec![1u8, u8::from(info.has_rowid), u8::from(info.is_unique)];
     out.extend_from_slice(
         &u64::try_from(info.num_cols)
             .map_err(|_| LimboError::IntegerOverflow)?
@@ -162,7 +172,11 @@ fn take_u32(bytes: &[u8], at: &mut usize) -> Result<usize> {
 
 /// The index order [`encode_order`] encoded; damage refused (`Corrupt`).
 pub fn decode_order(bytes: &[u8]) -> Result<IndexInfo> {
-    let bad = |what: &str| LimboError::Corrupt(format!("versioned storage: a tree's recorded order: {what}"));
+    let bad = |what: &str| {
+        LimboError::Corrupt(format!(
+            "versioned storage: a tree's recorded order: {what}"
+        ))
+    };
     let mut at = 0;
     if take_u8(bytes, &mut at)? != 1 {
         return Err(bad("an encoding this build doesn't read"));
@@ -172,7 +186,8 @@ pub fn decode_order(bytes: &[u8]) -> Result<IndexInfo> {
     let num: [u8; 8] = take(bytes, &mut at, 8)?
         .try_into()
         .map_err(|_| LimboError::IntegerOverflow)?;
-    let num_cols = usize::try_from(u64::from_le_bytes(num)).map_err(|_| LimboError::IntegerOverflow)?;
+    let num_cols =
+        usize::try_from(u64::from_le_bytes(num)).map_err(|_| LimboError::IntegerOverflow)?;
     let n = take_u32(bytes, &mut at)?;
     // Each key column takes at least three bytes: a count past what the bytes hold is damage.
     if n > bytes.len() / 3 {
@@ -218,8 +233,9 @@ pub fn decode_order(bytes: &[u8]) -> Result<IndexInfo> {
     if at != bytes.len() {
         return Err(bad("bytes past its end"));
     }
-    IndexInfo::new(keys, has_rowid, num_cols, is_unique)
-        .map_err(|_| LimboError::InternalError("versioned storage: no memory for an index's order".into()))
+    IndexInfo::new(keys, has_rowid, num_cols, is_unique).map_err(|_| {
+        LimboError::InternalError("versioned storage: no memory for an index's order".into())
+    })
 }
 
 /// A comparison that orders as `slot`'s order once it is known, and by bytes before (when the tree
@@ -246,17 +262,47 @@ pub struct Switch {
     txn: Mutex<Option<SharedTxn>>,
     /// The savepoints of the write statements under way in the transaction, newest last: one a
     /// statement, so bounded by the statements nested in one another.
-    statements: Mutex<Vec<Savepoint>>,
+    statements: Mutex<Vec<(Savepoint, Mark)>>,
     /// Trees the transaction made, dropped if it rolls back, and trees it dropped, dropped once it
     /// commits (making and dropping a tree is durable alone, decision 12): one a DDL statement.
     made: Mutex<Vec<u64>>,
     dropped: Mutex<Vec<u64>>,
+    /// Trees made by a statement or savepoint since rolled back: no schema row names them, so
+    /// they are dropped as the transaction ends, however it ends (G7 step 2: no orphan trees).
+    undone: Mutex<Vec<u64>>,
     /// SQL's named savepoints (`SAVEPOINT name`), oldest first, beside the connection's frames.
-    named: Mutex<Vec<(String, Savepoint)>>,
+    named: Mutex<Vec<(String, Savepoint, Mark)>>,
     d: Mutex<Descender>,
 }
 
+/// How many trees the transaction had made and dropped when a savepoint was taken: rolling back
+/// to it undoes the DDL after it too.
+#[derive(Clone, Copy)]
+struct Mark {
+    made: usize,
+    dropped: usize,
+}
+
 impl Switch {
+    /// Where the transaction's DDL stands now.
+    fn mark(&self) -> Mark {
+        Mark {
+            made: self.made.lock().len(),
+            dropped: self.dropped.lock().len(),
+        }
+    }
+
+    /// Undoes the DDL after `mark`: the trees made since are kept to drop as the transaction ends
+    /// (a tree its rows were written to can't be dropped while the transaction is open), and the
+    /// drops asked since are forgotten, so a commit keeps those trees.
+    fn undo_to(&self, mark: Mark) {
+        let mut made = self.made.lock();
+        let from = mark.made.min(made.len());
+        let gone: Vec<u64> = made.drain(from..).collect();
+        self.undone.lock().extend(gone);
+        self.dropped.lock().truncate(mark.dropped);
+    }
+
     pub fn new(storage: Arc<Storage>) -> Self {
         Self {
             db: storage.db.clone(),
@@ -265,6 +311,7 @@ impl Switch {
             statements: Mutex::new(Vec::new()),
             made: Mutex::new(Vec::new()),
             dropped: Mutex::new(Vec::new()),
+            undone: Mutex::new(Vec::new()),
             named: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
         }
@@ -438,7 +485,8 @@ impl Switch {
             .as_ref()
             .ok_or_else(|| LimboError::TxError("versioned storage: no transaction".into()))?
             .savepoint();
-        self.statements.lock().push(sp);
+        let mark = self.mark();
+        self.statements.lock().push((sp, mark));
         Ok(())
     }
 
@@ -450,14 +498,15 @@ impl Switch {
             .as_ref()
             .ok_or_else(|| LimboError::TxError("versioned storage: no transaction".into()))?
             .savepoint();
-        self.named.lock().push((name.to_string(), sp));
+        let mark = self.mark();
+        self.named.lock().push((name.to_string(), sp, mark));
         Ok(())
     }
 
     /// Releases the newest savepoint `name` and those opened after it (`RELEASE name`).
     pub fn release_named(&self, name: &str) {
         let mut named = self.named.lock();
-        if let Some(i) = named.iter().rposition(|(n, _)| n == name) {
+        if let Some(i) = named.iter().rposition(|(n, _, _)| n == name) {
             named.truncate(i);
         }
     }
@@ -467,12 +516,15 @@ impl Switch {
     pub fn rollback_named(&self, name: &str) -> Result<()> {
         let sp = {
             let mut named = self.named.lock();
-            let Some(i) = named.iter().rposition(|(n, _)| n == name) else {
+            let Some(i) = named.iter().rposition(|(n, _, _)| n == name) else {
                 return Ok(());
             };
             named.truncate(i.checked_add(1).ok_or(LimboError::IntegerOverflow)?);
             match named.get(i) {
-                Some((_, sp)) => *sp,
+                Some((_, sp, mark)) => {
+                    self.undo_to(*mark);
+                    *sp
+                }
                 None => return Ok(()),
             }
         };
@@ -489,12 +541,13 @@ impl Switch {
     /// Ends the newest statement's savepoint: kept, or rolled back to (its changes undone, the
     /// transaction's earlier ones kept).
     pub fn end_statement(&self, rollback: bool) -> Result<()> {
-        let Some(sp) = self.statements.lock().pop() else {
+        let Some((sp, mark)) = self.statements.lock().pop() else {
             return Ok(());
         };
         if !rollback {
             return Ok(());
         }
+        self.undo_to(mark);
         let Some(shared) = self.txn.lock().clone() else {
             return Ok(());
         };
@@ -513,16 +566,32 @@ impl Switch {
         self.named.lock().clear();
         let made = std::mem::take(&mut *self.made.lock());
         let dropped = std::mem::take(&mut *self.dropped.lock());
+        let mut gone = std::mem::take(&mut *self.undone.lock());
         let shared = self.txn.lock().take();
         let txn = shared.and_then(|s| s.lock().take());
-        if let Some(txn) = txn {
-            let mut d = self.d.lock();
-            if rollback {
-                self.db.abort(txn, &mut d)?;
-            } else {
-                self.db.commit(txn, &mut d, self.db.lane(), true)?;
+        let ended = match txn {
+            Some(txn) => {
+                let mut d = self.d.lock();
+                if rollback {
+                    self.db.abort(txn, &mut d)
+                } else {
+                    self.db
+                        .commit(txn, &mut d, self.db.lane(), true)
+                        .map(|_| ())
+                }
             }
+            None => Ok(()),
+        };
+        // A transaction that didn't commit leaves the trees it made named by no schema row: they
+        // are dropped, a failed commit's too. A commit whose flush failed may be durable, but its
+        // log is then refused (the redo log is poisoned), so its trees stay for recovery to judge.
+        if rollback || ended.is_err() {
+            gone.extend(made);
+        } else {
+            gone.extend(dropped);
         }
-        self.drop_now(if rollback { made } else { dropped })
+        let dropping = self.drop_now(gone);
+        ended?;
+        dropping
     }
 }

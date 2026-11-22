@@ -975,9 +975,12 @@ impl VTree {
                 })
             }
             Op::Remove { key, .. } => self.tree.modify(pool, d, key, |_| Ok((Change::Remove, ()))),
-            Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => Err(LimboError::InternalError(
-                "versioned storage: a tree made, dropped or ordered replayed as a row change".into(),
-            )),
+            Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => {
+                Err(LimboError::InternalError(
+                    "versioned storage: a tree made, dropped or ordered replayed as a row change"
+                        .into(),
+                ))
+            }
         }
     }
 
