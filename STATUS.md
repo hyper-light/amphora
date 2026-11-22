@@ -500,6 +500,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   while held and bounded by its stream's share of the room, not the whole room taken once; a
   restore fetches each chunk in ranged parts that fit its own room (`Blobs::get_range`,
   AMPHORA-BLOBS-9), so a backup made with more room restores with less (T-T1.12.M1, M2).
+  Lane backups-8 (not yet built or run): log segments charged and read in parts too, shipping's
+  bounded by its stream's share and a refused send's commits kept for the next round; a lost
+  create's object compared in parts (T-T1.12.M3, M4); an A/B of growing a base's chunks with the
+  room against keeping them (`ChunkGrowth`, T-T1.12.M5).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and

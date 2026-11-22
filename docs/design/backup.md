@@ -56,8 +56,23 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   gets (`Blobs::get_range`, AMPHORA-BLOBS-9; S3's ranged GET, as kiln's seam's `get` takes a
   `Range`) of its own stream's share, no larger than the manifest's largest sealed chunk, one part
   held and charged at a time, the chunk's sum checked over its parts. With no room for a part it's
-  refused, typed (`Unrestorable::PastRoom`), before it makes the file. Log segments are still
-  fetched whole, each no larger than the store's objects.
+  refused, typed (`Unrestorable::PastRoom`), before it makes the file.
+- **A segment's memory** (T-T1.12.M3, M4). Shipping opens a stream of chunks for each send and
+  bounds a segment's part by half its share (its frames read, then encoded, then sealed: two copies
+  at most), charged before any part is put, so a send with no room is refused, typed, before it
+  writes, and its commits stay pending for the next round. A send that didn't end keeps its parts'
+  size when sent again, so it makes the same objects. A restore, and a shipper opening, read each
+  segment in ranged parts of half their stream's share: the segment's head (its fields before the
+  frames, as postcard lays them out) kept and charged until it decodes, then the frames written as
+  their parts come, the sum checked over the parts (no room: `Unrestorable::SegmentPastRoom`). A
+  create that finds its object there already (an earlier answer lost) compares it in ranged parts
+  that its caller's charge covers, never reading it back whole.
+- **Growing chunks** (T-T1.12.M5, an A/B; `ChunkGrowth`, Keep the control). Keeping the latest
+  base's chunk size keeps every unchanged chunk, but a backup begun with little room keeps small
+  chunks, and a restore's many requests, for good. Growing doubles the size as often as the room
+  holds, never shrinking while it fits (so a wavering room makes the chunks grow at most
+  log2(largest / first) times), and copies the whole file again each time it grows. The test forces
+  both costs; the A/B of record decides.
 - **The database's shipping thread.** `Database::open_backed_up` stamps the writer's commits as it
   opens and starts a thread woken by each commit the store makes (and once at its start), never by
   a timer: a round ships, then moves a due base on by a chunk, chunks following one another without
