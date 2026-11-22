@@ -1,0 +1,2 @@
+# A shard's cargo output stays on its machine: its record (.json) is what the repo keeps.
+*.log
