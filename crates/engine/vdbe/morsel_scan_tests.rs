@@ -2913,3 +2913,79 @@ fn t_qt_6_30_avg_and_total_run_on_morsels_as_the_serial_loop() {
     }
     conn.set_parallel_mode(ParallelMode::Off);
 }
+
+/// T-QT.6.31 (lane qs6-17): aggregates with a FILTER run on morsels: a row that fails an
+/// aggregate's FILTER gives its input NULL in the copied body, which every aggregate the pipeline
+/// folds skips. COUNT(*), COUNT, SUM, MIN, MAX, AVG and TOTAL with a FILTER, beside unfiltered
+/// ones, grouped or not, in scans and joins, with FILTERs no row passes, answer as the serial loop
+/// at 1, 2, 3, 4 and 8 stated cores, and the hook ran each.
+#[test]
+fn t_qt_6_31_filtered_aggregates_run_on_morsels_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-31");
+    let mut rng = ChaCha8Rng::seed_from_u64(631);
+    let pad = "x".repeat(64);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..2500 {
+        let a = rng.random_range(-30i64..30);
+        let b = match rng.random_range(0..5) {
+            0 => "NULL".to_string(),
+            _ => rng.random_range(-1000i64..1000).to_string(),
+        };
+        let c = ["NULL", "'x'", "'y'", "'z'"][rng.random_range(0..4)];
+        conn.execute(format!(
+            "INSERT INTO t(a, b, c, p) VALUES ({a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    for _ in 0..300 {
+        let k = rng.random_range(-30i64..30);
+        let g = rng.random_range(-7i64..7);
+        conn.execute(format!("INSERT INTO u(k, g, p) VALUES ({k}, {g}, '{pad}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let ran = |conn: &Arc<Connection>| {
+        [&conn.morsel_body_rows, &conn.morsel_join_links]
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    let queries = [
+        "SELECT count(*) FILTER (WHERE a > 0), count(*), sum(b) FILTER (WHERE c = 'x') FROM t",
+        "SELECT c, count(b) FILTER (WHERE a % 2 = 0), min(b) FILTER (WHERE b > 10), max(a) FILTER (WHERE c IS NULL) FROM t GROUP BY c",
+        "SELECT a % 4, avg(b) FILTER (WHERE b IS NOT NULL AND a < 5), total(b) FILTER (WHERE c <> 'y') FROM t GROUP BY a % 4",
+        "SELECT count(*) FILTER (WHERE a > 1000), sum(b) FILTER (WHERE a > 1000), total(a) FILTER (WHERE a > 1000), avg(a) FILTER (WHERE 0) FROM t",
+        "SELECT count(*) FILTER (WHERE b), sum(a) FILTER (WHERE c LIKE 'x%') FROM t WHERE a <> 3",
+        "SELECT t.c, count(*) FILTER (WHERE u.g > 0), sum(t.b) FILTER (WHERE u.g < 0) FROM t JOIN u ON t.a = u.k GROUP BY t.c",
+        "SELECT count(*) FILTER (WHERE t.b > u.g), max(u.g) FILTER (WHERE t.c = 'z') FROM t JOIN u ON t.a = u.k",
+        "SELECT count(t.id) FILTER (WHERE t.b > 0), count(*) FROM u LEFT JOIN t ON t.a = u.k AND t.c = 'x'",
+    ];
+    for sql in queries {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        assert!(!serial.is_empty(), "{sql}: no rows to compare");
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = ran(&conn);
+            let parallel = sql_rows(&conn, sql);
+            let after = ran(&conn);
+            assert_eq!(
+                format!("{parallel:?}"),
+                format!("{serial:?}"),
+                "{sql} on {cores} cores"
+            );
+            assert!(
+                after[0] > before[0] || after[1] > before[1],
+                "{sql} on {cores} cores: the hook didn't run"
+            );
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+}

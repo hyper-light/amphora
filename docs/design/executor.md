@@ -689,6 +689,16 @@ values goes to the serial loop as a SUM's does (`no_real`), and so does a statem
 magnitudes reach 2^53 (`MorselError::Unsupported` at the finish). T-QT.6.30 checks them bit for
 bit against the serial loop at 1, 2, 3, 4 and 8 stated cores.
 
+**Aggregates with a FILTER on morsels** (lane qs6-17). An aggregate's FILTER (WHERE c) skips the
+rows where c doesn't hold; every aggregate the pipeline folds skips a NULL input, so the copied
+body reads the input as NULL on such a row (`BodyPlan::agg_filters`: the FILTER tested as the
+serial loop tests a condition, by `translate_condition_expr`, before the input's expression), and
+COUNT(*) FILTER (WHERE c) is COUNT over c itself, which is never NULL where it holds. With no row
+passing, each aggregate gives what it gives over no rows (COUNT 0, SUM, MIN, MAX and AVG NULL,
+TOTAL 0.0), as the serial loop does. A body that is nothing but reads has no FILTER to test, so a
+FILTER keeps the statement off the direct path. T-QT.6.31 checks them in scans and joins against
+the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
 **What still runs on the serial loop** (lane qs6-16's audit, updated by lane qs6-17; each an open
 part of QT.6):
 - *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
@@ -713,8 +723,8 @@ part of QT.6):
   with a DEFAULT, which the serial loop ENCODEs at run time; a table whose short rows read a
   default, on the versioned storage's column copy, which decodes records as written; a scan through an index or a
   rowid range (`Operation::Search` on the probe: a rowid range is a run of leaves); a one-table
-  scan's rows under ORDER BY; AVG and TOTAL over REALs or past 2^53, group_concat, DISTINCT and
-  FILTER aggregates, HAVING, and
+  scan's rows under ORDER BY; AVG and TOTAL over REALs or past 2^53, group_concat and DISTINCT
+  aggregates, HAVING, and
   an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and
   other statements that don't return rows; joins with no equality of one affinity (a cross
   product, a range join).

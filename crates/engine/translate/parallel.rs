@@ -200,6 +200,7 @@ pub(crate) fn emit_morsel_hook(
 fn direct_reads(looped: &BodyPlan) -> Option<Vec<Option<usize>>> {
     if !looped.on.is_empty()
         || !looped.filter.is_empty()
+        || !looped.agg_filters.is_empty()
         || looped.links_on.iter().any(|on| !on.is_empty())
     {
         return None;
@@ -246,6 +247,8 @@ struct BodyPlan<'p> {
     aggregates: Vec<Aggregate>,
     no_real: Vec<usize>,
     result_map: Vec<usize>,
+    /// Each aggregate's FILTER and its input's place in `outs` (lane qs6-17).
+    agg_filters: Vec<(usize, &'p Expr)>,
     /// The outputs are the result columns, returned as rows (lane qs6-8).
     rows: bool,
 }
@@ -268,13 +271,15 @@ enum RowidAt {
 }
 
 /// The body's outputs: the GROUP BY values, then each aggregate's input, or the result columns
-/// when `rows`; the places a SUM reads; each result column's place in the pipeline's row.
+/// when `rows`; the places a SUM reads; each result column's place in the pipeline's row; and
+/// each aggregate's FILTER with its input's place (lane qs6-17).
 struct BodyOutputs<'p> {
     outs: Vec<&'p Expr>,
     group_by: Vec<usize>,
     aggregates: Vec<Aggregate>,
     sums: Vec<usize>,
     result_map: Vec<usize>,
+    agg_filters: Vec<(usize, &'p Expr)>,
 }
 
 fn body_outputs(plan: &SelectPlan, rows: bool) -> Option<BodyOutputs<'_>> {
@@ -291,15 +296,27 @@ fn body_outputs(plan: &SelectPlan, rows: bool) -> Option<BodyOutputs<'_>> {
     }
     let mut aggregates = Vec::new();
     let mut sums = Vec::new();
+    let mut agg_filters = Vec::new();
     for aggregate in &plan.aggregates {
-        if aggregate.filter_expr.is_some()
-            || !matches!(aggregate.distinctness, Distinctness::NonDistinct)
-        {
+        if !matches!(aggregate.distinctness, Distinctness::NonDistinct) {
             return None;
         }
         let at = outs.len();
+        // An aggregate's FILTER (lane qs6-17): its input reads NULL on a row that fails it, which
+        // every aggregate the pipeline folds skips, as the serial loop skips the row.
+        if let Some(filter) = &aggregate.filter_expr {
+            agg_filters.push((at, filter));
+        }
         aggregates.push(match (&aggregate.func, aggregate.args.as_slice()) {
-            (AggFunc::Count0, []) => Aggregate::CountStar,
+            // COUNT(*) FILTER (WHERE c) counts the rows where c holds: c itself as the input, a
+            // true value never NULL.
+            (AggFunc::Count0, []) => match &aggregate.filter_expr {
+                None => Aggregate::CountStar,
+                Some(filter) => {
+                    outs.push(filter);
+                    Aggregate::Count(at)
+                }
+            },
             (AggFunc::Count, [arg]) => {
                 outs.push(arg);
                 Aggregate::Count(at)
@@ -362,6 +379,7 @@ fn body_outputs(plan: &SelectPlan, rows: bool) -> Option<BodyOutputs<'_>> {
         aggregates,
         sums,
         result_map,
+        agg_filters,
     })
 }
 
@@ -442,6 +460,7 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         aggregates,
         sums,
         result_map,
+        agg_filters,
     } = body_outputs(plan, rows)?;
     let places = vec![BodyTable {
         id: joined.internal_id,
@@ -451,6 +470,7 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
     }];
     body_reads(&filter, &places)?;
     body_reads(&outs, &places)?;
+    body_reads(&filter_exprs(&agg_filters), &places)?;
     Some(BodyPlan {
         table,
         places,
@@ -463,8 +483,14 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         aggregates,
         no_real: sums,
         result_map,
+        agg_filters,
         rows,
     })
+}
+
+/// The FILTER expressions of `agg_filters`, for [`body_reads`] (lane qs6-17).
+fn filter_exprs<'p>(agg_filters: &[(usize, &'p Expr)]) -> Vec<&'p Expr> {
+    agg_filters.iter().map(|(_, filter)| *filter).collect()
 }
 
 /// Emits the body's copy after the hook's row loop, where the serial loop never reaches: each
@@ -601,7 +627,40 @@ fn emit_body(
             .out_start
             .checked_add(at)
             .ok_or_else(|| crate::LimboError::InternalError("register overflow".into()))?;
+        let filtered = looped
+            .agg_filters
+            .iter()
+            .find(|(place, _)| *place == at)
+            .map(|(_, filter)| *filter);
+        let Some(filter) = filtered else {
+            translate_expr(program, Some(&plan.table_references), expr, reg, &resolver)?;
+            continue;
+        };
+        // An aggregate's FILTER (lane qs6-17): a row that fails it gives its input NULL.
+        let passed = program.allocate_label();
+        let failed = program.allocate_label();
+        let done = program.allocate_label();
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            filter,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: passed,
+                jump_target_when_false: failed,
+                jump_target_when_null: failed,
+            },
+            &resolver,
+        )?;
+        program.preassign_label_to_next_insn(passed);
         translate_expr(program, Some(&plan.table_references), expr, reg, &resolver)?;
+        program.emit_insn(Insn::Goto { target_pc: done });
+        program.preassign_label_to_next_insn(failed);
+        program.emit_insn(Insn::Null {
+            dest: reg,
+            dest_end: None,
+        });
+        program.preassign_label_to_next_insn(done);
     }
     program.preassign_label_to_next_insn(body.keep);
     program.emit_insn(Insn::Noop);
@@ -1228,6 +1287,7 @@ fn shape_join(
             group_by,
             aggregates,
             result_map,
+            agg_filters,
             ..
         },
         no_real,
@@ -1236,6 +1296,7 @@ fn shape_join(
     body_reads(&on_terms, &places)?;
     body_reads(&residual, &places)?;
     body_reads(&outs, &places)?;
+    body_reads(&filter_exprs(&agg_filters), &places)?;
     let data = MorselAggregateData {
         root_page: probe_table.root_page,
         columns: probe_table.columns().len(),
@@ -1263,6 +1324,7 @@ fn shape_join(
         aggregates,
         no_real,
         result_map,
+        agg_filters,
         rows: rows_mode,
     };
     Some((data, looped))
@@ -1572,6 +1634,7 @@ fn shape_chain(
             group_by,
             aggregates,
             result_map,
+            agg_filters,
             ..
         },
         no_real,
@@ -1582,6 +1645,7 @@ fn shape_chain(
     }
     body_reads(&residual, &places)?;
     body_reads(&outs, &places)?;
+    body_reads(&filter_exprs(&agg_filters), &places)?;
     let probe_table: &BTreeTable = tables.first()?;
     let data = MorselAggregateData {
         root_page: probe_table.root_page,
@@ -1611,6 +1675,7 @@ fn shape_chain(
         aggregates,
         no_real,
         result_map,
+        agg_filters,
         rows: rows_mode,
     };
     Some((data, looped))
