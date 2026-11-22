@@ -203,7 +203,7 @@ fn one_more(n: u64) -> Result<u64, Refusal> {
 
 /// The transaction's shape, refused before anything is sent: the API's own bounds on a
 /// transaction's keys and bytes (amphora-api's `TX_MAX`, `KEY_MAX`, `VALUE_MAX`, `REQUEST_MAX`).
-fn validate(txn: &Txn) -> Result<(), Refusal> {
+pub(super) fn validate(txn: &Txn) -> Result<(), Refusal> {
     let keys = txn
         .reads
         .len()

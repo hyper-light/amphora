@@ -1000,6 +1000,10 @@ tests = [
   { id = "T-QT.6.13", text = "t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when random two-table hash joins returning rows, with or without ORDER BY, answer as the serial loop at 2, 3, 4 and 8 stated cores (in ORDER BY order, ties as sets) and the hook ran for most" },
   # lane qs6-6
   { id = "T-QT.6.14", text = "t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-6) — passes when random two-table hash joins returning rows under LIMIT and OFFSET, ordered by keys holding both tables' INTEGER PRIMARY KEYs, answer row for row as the serial loop at 2, 3, 4 and 8 stated cores, the hook ran for most, and a LIMIT over an order with ties stays serial" },
+  # lane qs6-7
+  { id = "T-QT.6.15", text = "t_qt_6_15_workers_run_a_copy_of_the_loop_body_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-7) — passes when random one-table aggregates whose filters, GROUP BY values and aggregate inputs are any expression (functions, CASE, LIKE, arithmetic) answer as the serial loop at 1, 2, 3, 4 and 8 stated cores, the workers' copy of the loop body ran over every row each time, and more than one worker ran for most" },
+  # lane qs6-8
+  { id = "T-QT.6.16", text = "t_qt_6_16_a_scans_rows_run_in_parallel_and_stop_early_under_limit (vdbe/morsel_scan_tests.rs; lane qs6-8) — passes when random one-table SELECTs with no aggregates, any filter and any result expression, return the serial loop's rows in order at 1, 2, 3, 4 and 8 stated cores; under a LIMIT with no ORDER BY the switch's control (off) answers serially without running the body, and with it on the row count is the serial one, every row is in the serial result, and for most statements the body ran over fewer rows than the table holds" },
 ]
 
 # lane g3s2
@@ -1226,6 +1230,18 @@ tests = [
   { id = "T-T1.10.X1", text = "xgroup::lan::tests::ac_t1_10_2_the_lan_harness_measures_both_protocols_over_two_endpoints — passes when both protocols commit across two groups reached only over the transport, none unknown, percentiles in order" },
   { id = "T-T1.10.X3", text = "xgroup::tests::t_t1_10_x3_a_group_failure_at_every_step_ends_committed_or_aborted_everywhere — passes when each of three groups failing at every coordinator input, its in-flight step landed or not, ends committed or aborted in every group, as answered, under both protocols, both ends reached" },
   { id = "T-T1.10.X2", text = "xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly — passes when three seeds of each protocol over the transport commit across groups with no anomaly and no unknown outcome; ac_t1_10_5_the_lan_check_finds_a_lost_update_and_an_aborted_read holds the check to finding them" },
+]
+
+# lane xgroup-sql: G13 step 3's SQL part (kiln goal 3d2c567d4a24841eb73cc0fb95b76f27; xgroup.md,
+# "A SQL session's commit")
+[[own]]
+id = "T1.10.S"
+title = "A SQL session's transaction across groups commits through the coordinator; one group's keeps its fast path (G13 step 3)"
+criteria = [
+  { id = "AC-T1.10.S1", text = "Cluster::commit commits rows all in one local group in that group's one database transaction, aborting Conflict on a row another transaction holds a lock on, and rows in several groups through the coordinator, under either protocol" },
+]
+tests = [
+  { id = "T-T1.10.S1", text = "xgroup::sql::sessions::ac_t1_10_1_a_sessions_answers_across_groups_equal_the_same_on_one_group — passes when 40 seeded transactions over three groups answer as the same over one group, some spanning groups, under both protocols, and every key reads the same after" },
 ]
 
 # lane pl8-9: no new IDs. T-PL.8.2 gains the search test of docs/design/planner.md "Decision (lane pl8-9)".

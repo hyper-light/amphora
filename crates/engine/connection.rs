@@ -542,9 +542,13 @@ pub struct Connection {
     pub(super) automatic_indexes: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_mode`].
     pub(super) parallel_mode: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_limit`].
+    pub(super) parallel_limit: AtomicBool,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
+    /// Amphora (QT.6, lane qs6-7): the rows workers ran through a copy of a statement's loop body.
+    pub(crate) morsel_body_rows: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1016,6 +1020,17 @@ impl Connection {
             Ordering::Release,
         );
         self.bump_prepare_context_generation();
+    }
+
+    /// Amphora (QT.6, lane qs6-8): whether a scan's rows under a LIMIT with no ORDER BY run on
+    /// morsels, the workers stopping once they hold the LIMIT's rows. Off (the default, the
+    /// control), the serial loop answers them. It counts only with the parallel mode on.
+    pub fn set_parallel_limit(&self, on: bool) {
+        self.parallel_limit.store(on, Ordering::Release);
+    }
+
+    pub(crate) fn parallel_limit(&self) -> bool {
+        self.parallel_limit.load(Ordering::Acquire)
     }
 
     pub(crate) fn parallel_mode(&self) -> crate::vdbe::morsel::ParallelMode {
