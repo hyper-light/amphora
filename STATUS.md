@@ -617,7 +617,12 @@ the bench's own simple-query Postgres client (bench/src/pgtext.rs), its socket's
 says how each system routes a write (CockroachDB and TiDB forward it through the node it was sent to, Amphora's client
 sends it to the leader) and that no system is given prepared statements. The in-process relay waits on one wake across
 its members (`ReplicaHandle::listen`, AC-SH.5) rather than spinning, and Amphora's schema setup (served and in-process)
-waits on a member's election instead of asking again at once.
+waits on a member's election instead of asking again at once. Nothing asks again at once (lane scaleout-harness-10):
+the read measures' warm-up is one read of the last preloaded row, waiting on Amphora's session token from that write
+(in-process) and otherwise one read at each system's strongest consistency (AC-SH.6); `regionloss` counts the
+region's own copy once a writer, each read waiting on that writer's last write by the system's own control, with
+Amphora's server's figure refused until its protocol carries tokens (AC-SH.7); schema setup asks each node in the
+configured order and gives up at `--deadline-s` (AC-SH.8).
 
 ## Measured
 

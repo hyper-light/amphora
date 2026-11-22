@@ -6,7 +6,10 @@
 //! - `write` (the scale-out write class): `--writers` closed-loop writers, each its own session of
 //!   `--batch` rows a write, through node `writer % nodes`, for `--seconds` after `--warmup-s`.
 //! - `read` (the scale-out read class): `--rows` rows written first, then `--writers` closed-loop
-//!   readers of one row each by its key, answered by its group's leader (leaseholder).
+//!   readers of one row each by its key, answered by its group's leader (leaseholder). Before they
+//!   start, one read of the last row preloaded ([`Session::read_after`]): it waits by the system's
+//!   own control for that write where the system has one (Amphora's session token from the write's
+//!   answer), else it is one read at the system's strongest consistency; never asked again.
 //! - `follower` (AC-T1.10.C2): the same rows read on a member that doesn't lead their group, at
 //!   the time it can read without waiting: Amphora's closed time, CockroachDB's
 //!   `follower_read_timestamp()`, TiDB's `tidb_replica_read = 'follower'`.
@@ -19,8 +22,11 @@
 //! - `regionloss` (G14 step 2; AC-T1.11.3, T-T1.11.1): writers run; after `--settle-s` region
 //!   `--lose`'s nodes are killed (SIGKILL; Amphora's members cut off) and a probe writes through the
 //!   rest until one write is acknowledged: the time to that acknowledgement. Writers go on for
-//!   `--after-s`, the region is started again, and its own copy is polled every `--poll-us` until
-//!   it holds every acknowledged row: the time to serve again. Every writer resends a refused write
+//!   `--after-s`, the region is started again, and its own copy is read once for each writer's
+//!   acknowledged rows ([`Session::count_own_after`]), each read waiting on that writer's last
+//!   acknowledged write by the system's own control: the time to serve again. A system with no read
+//!   that waits for a write on a node's own copy has that figure refused, typed and said why, and
+//!   the rest of the measure stands. Every writer resends a refused write
 //!   unchanged, so every row up to its last acknowledged one was acknowledged; `lost` counts those
 //!   missing, read through the leader, and must be 0.
 //! - `cutover` (G13 steps 1 and 2; AC-T1.9.2, AC-T1.9.3): writers run; after `--settle-s`, `--ops`
@@ -68,7 +74,7 @@
 //!        write, region: --batch N --text-bytes N --warmup-s N --seconds N (region: --between-ms N --poll-us N)
 //!        read, follower: --rows N --batch N --text-bytes N --warmup-s N --seconds N
 //!        xgroup:     --keys N --span N --warmup-s N --seconds N (amphora: --protocol 2pc|parallel)
-//!        regionloss: --batch N --text-bytes N --lose N --settle-s N --after-s N --poll-us N
+//!        regionloss: --batch N --text-bytes N --lose N --settle-s N --after-s N
 //!        cutover:    --batch N --text-bytes N --ops N --concurrent-ops N --settle-s N --poll-us N
 //!        amphora:    --class persisted|replicated [--spanning N]
 //!        amphora-inproc: --dir DIR --class persisted|replicated [--spanning N] --relay-records N --relay-pending N
@@ -111,6 +117,58 @@ pub trait Session {
     fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()>;
     /// Rows of `session` up to `upto`: on this node's own copy when `own`, else by the leader.
     fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64>;
+    /// [`Session::write`], and the write's [`Mark`]: what a read waits on to see it.
+    fn write_marked(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<Mark> {
+        self.write(regional, rows).map(|()| None)
+    }
+    /// The read measures' warm-up: one read of row (`session`, `seq`), written with `mark`, as
+    /// [`Session::read`] reads it. Where the system has a control that makes a read wait for a
+    /// given write, the read waits on it; else it is the system's read as it is (the leader's,
+    /// the strongest consistency the bench asks). It is asked once, never again.
+    fn read_after(
+        &mut self,
+        session: &str,
+        seq: u64,
+        follower: bool,
+        _mark: Mark,
+    ) -> anyhow::Result<bool> {
+        self.read(session, seq, follower)
+    }
+    /// Rows of `session` up to `upto` on this node's own copy, once it holds the write `mark`
+    /// names: one read that waits by the system's own control, never a poll. By default the
+    /// system's own-copy count as it is, for systems whose reads are current wherever they're
+    /// asked (CockroachDB's go to the leaseholder; TiDB's follower reads are ReadIndex reads).
+    fn count_own_after(&mut self, session: &str, upto: u64, _mark: Mark) -> anyhow::Result<u64> {
+        self.count(session, upto, true)
+    }
+}
+
+/// What a read waits on to see a given write: Amphora's session token from the write's answer
+/// (replication.md, "Decision (lane ryw-1): read-your-writes by session tokens"), None for a
+/// system that gives a client no such mark.
+pub type Mark = Option<amphora::database::Token>;
+
+/// `f` on each node in the configured order, from node 0, until one succeeds (schema setup's
+/// reach, lane scaleout-harness-10): the next node is tried only once the one before has failed,
+/// each try bounded by --deadline-s through its own client, so no node is asked again at once. Given
+/// up at `until`, or once every node failed, naming each failure.
+fn first_reachable<T>(
+    nodes: usize,
+    until: Instant,
+    mut f: impl FnMut(usize) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut failed = Vec::new();
+    for n in 0..nodes {
+        if Instant::now() >= until {
+            failed.push(format!("--deadline-s passed before node {n}"));
+            break;
+        }
+        match f(n) {
+            Ok(v) => return Ok(v),
+            Err(e) => failed.push(format!("node {n}: {e:#}")),
+        }
+    }
+    anyhow::bail!("no node answered: {}", failed.join("; "))
 }
 
 /// A cluster of `nodes()` nodes, 0 up.
@@ -335,7 +393,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             );
             need(o.settle, "--settle-s", &m)?;
             need(o.after, "--after-s", &m)?;
-            need(o.poll, "--poll-us", &m)?;
         }
     }
     if o.system != "amphora-inproc" {
@@ -696,8 +753,14 @@ fn write(sys: &dyn System, o: &Opts, regional: bool) -> anyhow::Result<serde_jso
     Ok(v)
 }
 
-/// `--rows` rows over the writers' sessions, `--batch` a write; returns each session's last seq.
-fn preload(sys: &dyn System, o: &Opts) -> anyhow::Result<Vec<u64>> {
+/// What [`preload`] wrote: each session's last seq, and the last write's session, seq and mark.
+struct Preloaded {
+    last: Vec<u64>,
+    end: (usize, u64, Mark),
+}
+
+/// `--rows` rows over the writers' sessions, `--batch` a write.
+fn preload(sys: &dyn System, o: &Opts) -> anyhow::Result<Preloaded> {
     let m = &o.measure;
     let (rows, batch, text) = (
         need(o.rows, "--rows", m)?,
@@ -711,39 +774,75 @@ fn preload(sys: &dyn System, o: &Opts) -> anyhow::Result<Vec<u64>> {
         .collect();
     let mut left = rows;
     let mut w = 0usize;
+    let mut end = (0, 0, None);
     while left > 0 {
         let n = left.min(batch);
         let wr = writers
             .get_mut(w % o.writers)
             .ok_or_else(|| anyhow::anyhow!("no writer"))?;
         let r = wr.next(n, text);
-        conn.run(o.deadline, |s| s.write(false, &r))?;
+        let mark = conn.run(o.deadline, |s| s.write_marked(false, &r))?;
+        end = (w % o.writers, wr.seq, mark);
         left -= n;
         w += 1;
     }
-    Ok(writers.iter().map(|w| w.seq).collect())
+    Ok(Preloaded {
+        last: writers.iter().map(|w| w.seq).collect(),
+        end,
+    })
+}
+
+/// What the read measures' warm-up does on each system (the same rule for all, lane
+/// scaleout-harness-10: a system's own control for reading a given write where it has one, else one
+/// read at its strongest consistency), for the record.
+fn warmup_rule(system: &str, follower: bool) -> &'static str {
+    match (system, follower) {
+        ("amphora-inproc", false) => {
+            "one read on the group's leader carrying the session token of the preload's last write (Database::query_session, ReadMode::Session): it waits until the leader has applied that write"
+        }
+        ("amphora-inproc", true) => {
+            "one follower read at the closed time of the preload's last write, from its session token (Database::query_closed): it waits until the follower's closed time passes that write. Follower reads after it read at Database::follower_read_micros (now less the replica's measured lag), so those asked within that lag of the last write can miss rows: those count in `missed`, as CockroachDB's do"
+        }
+        ("amphora", _) => {
+            "one read through the leader, which answers a write once it has applied it: amphora serve's protocol carries no session token yet, so there is no write to wait on over the wire"
+        }
+        ("cockroach", false) => {
+            "one read, served by the range's leaseholder: CockroachDB's reads are consistent (serializable), so it sees every acknowledged write"
+        }
+        ("cockroach", true) => {
+            "one read by the leaseholder, at the strongest consistency: CockroachDB has no control that makes a follower read wait for a given write (docs.cockroachlabs.com/docs/stable/follower-reads: an AS OF SYSTEM TIME not far enough in the past reads the leaseholder; bounded staleness reads the least stale time served locally without blocking). Follower reads at follower_read_timestamp() can miss rows written within its lag: those count in `missed`"
+        }
+        (_, false) => {
+            "one read by the Region's leader: TiDB's reads are consistent, so it sees every acknowledged write"
+        }
+        (_, true) => {
+            "one follower read (tidb_replica_read = 'follower'): a ReadIndex read, which asks the leader for its commit index and waits until the follower has applied it (docs.pingcap.com/tidb/stable/follower-read), so it sees every acknowledged write"
+        }
+    }
 }
 
 fn read(sys: &dyn System, o: &Opts, follower: bool) -> anyhow::Result<serde_json::Value> {
-    let last = preload(sys, o)?;
-    // Before counting: a read of the last row written finds it, so every read after can.
+    let Preloaded {
+        last,
+        end: (lw, ls, mark),
+    } = preload(sys, o)?;
+    // Before counting: one read of the last row written, waiting for it by the system's own
+    // control where it has one (`warmup_rule` says what each system's does). It is asked once: a
+    // miss is the system's answer, and an error (lane scaleout-harness-10).
     let down: Vec<AtomicBool> = (0..sys.nodes()).map(|_| AtomicBool::new(false)).collect();
     let mut conn = Conn::new(sys, &down, 1 % sys.nodes());
-    let (lw, ls) = last
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, s)| **s > 0)
-        .map(|(w, s)| (w, *s))
-        .ok_or_else(|| anyhow::anyhow!("nothing preloaded"))?;
-    let until = Instant::now() + o.deadline;
-    while !conn.run(o.deadline, |s| s.read(&session_name(lw), ls, follower))? {
-        anyhow::ensure!(
-            Instant::now() < until,
-            "the last row preloaded wasn't readable within --deadline-s"
-        );
-        std::thread::yield_now();
-    }
+    anyhow::ensure!(ls > 0, "nothing preloaded");
+    anyhow::ensure!(
+        conn.run(o.deadline, |s| s.read_after(
+            &session_name(lw),
+            ls,
+            follower,
+            mark
+        ))?,
+        "the warm-up's read didn't find the last row preloaded ({}, {ls}): {}",
+        session_name(lw),
+        warmup_rule(&o.system, follower)
+    );
     let missed = AtomicU64::new(0);
     let mut v = closed_loop(sys, o, |_, conn, rng| {
         let w = rng.below(last.len());
@@ -760,6 +859,7 @@ fn read(sys: &dyn System, o: &Opts, follower: bool) -> anyhow::Result<serde_json
     if let Some(m) = v.as_object_mut() {
         m.insert("rows".into(), need(o.rows, "--rows", &o.measure)?.into());
         m.insert("missed".into(), missed.load(Ordering::Relaxed).into());
+        m.insert("warmup".into(), warmup_rule(&o.system, follower).into());
     }
     Ok(v)
 }
@@ -806,18 +906,17 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
         need(o.text_bytes, "--text-bytes", m)?,
         need(o.lose, "--lose", m)?,
     );
-    let (settle, after, poll) = (
+    let (settle, after) = (
         need(o.settle, "--settle-s", m)?,
         need(o.after, "--after-s", m)?,
-        need(o.poll, "--poll-us", m)?,
     );
     let nodes = sys.nodes();
     let down: Vec<AtomicBool> = (0..nodes).map(|_| AtomicBool::new(false)).collect();
     let stop = AtomicBool::new(false);
-    let acked: Vec<AtomicU64> = (0..o.writers).map(|_| AtomicU64::new(0)).collect();
+    // Each writer's last acknowledged seq and that write's mark, which the region's copy waits on.
+    let acked: Vec<Mutex<(u64, Mark)>> = (0..o.writers).map(|_| Mutex::new((0, None))).collect();
     let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let mut first_ack_ms = 0.0;
-    let serve_ms;
     std::thread::scope(|scope| -> anyhow::Result<()> {
         for w in 0..o.writers {
             let (down, stop, acked, failed) = (&down, &stop, &acked, &failed);
@@ -826,10 +925,10 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
                 let mut conn = Conn::new(sys, down, w % nodes);
                 while !stop.load(Ordering::Relaxed) {
                     let rows = wr.next(batch, text);
-                    match conn.run(o.deadline, |s| s.write(false, &rows)) {
-                        Ok(()) => {
-                            if let Some(a) = acked.get(w) {
-                                a.store(wr.seq, Ordering::Relaxed);
+                    match conn.run(o.deadline, |s| s.write_marked(false, &rows)) {
+                        Ok(mark) => {
+                            if let Some(Ok(mut a)) = acked.get(w).map(Mutex::lock) {
+                                *a = (wr.seq, mark);
                             }
                         }
                         Err(e) => {
@@ -868,45 +967,73 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
     {
         return Err(e);
     }
-    // The region back: its own copy polled until it holds every acknowledged row.
+    let acked = acked
+        .into_iter()
+        .map(|a| a.into_inner())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| anyhow::anyhow!("a writer's acknowledgement was poisoned"))?;
+    // The region back (`start` returns once its node is ready): its own copy read once for each
+    // writer, each read waiting on the writer's last acknowledged write by the system's own control
+    // (Session::count_own_after), never a poll (lane scaleout-harness-10). A system with no such
+    // read has this figure refused, typed and said why; the rest of the measure stands.
     let at = Instant::now();
     sys.start(lose)?;
     if let Some(d) = down.get(lose) {
         d.store(false, Ordering::Relaxed);
     }
-    let until = Instant::now() + o.deadline;
-    loop {
-        let caught = sys.connect(lose).and_then(|mut s| {
-            for (w, a) in acked.iter().enumerate() {
-                let want = a.load(Ordering::Relaxed);
-                if s.count(&session_name(w), want, true)? < want {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        });
-        if caught.is_ok_and(|c| c) {
-            serve_ms = us(at) as f64 / 1000.0;
-            break;
+    let caught = (|| -> anyhow::Result<f64> {
+        let mut s = sys.connect(lose)?;
+        for (w, (want, mark)) in acked.iter().enumerate() {
+            let held = s.count_own_after(&session_name(w), *want, *mark)?;
+            anyhow::ensure!(
+                held >= *want,
+                "region {lose}'s copy held {held} of writer {w}'s {want} acknowledged rows once it had waited for them"
+            );
         }
-        anyhow::ensure!(
-            Instant::now() < until,
-            "region {lose} didn't serve every acknowledged row within --deadline-s"
-        );
-        std::thread::park_timeout(poll);
-    }
+        Ok(us(at) as f64 / 1000.0)
+    })();
+    let serve_ms = match caught {
+        Ok(ms) => serde_json::json!(ms),
+        Err(e) => match e.downcast_ref::<Refusal>() {
+            Some(Refusal::NoConcept(why)) => {
+                serde_json::json!({ "refused": "no-concept", "why": why })
+            }
+            Some(Refusal::Unavailable(why)) => {
+                serde_json::json!({ "refused": "unavailable", "why": why })
+            }
+            None => return Err(e),
+        },
+    };
     let mut conn = Conn::new(sys, &down, (lose + 1) % nodes);
     let (mut acknowledged, mut lost) = (0u64, 0u64);
-    for (w, a) in acked.iter().enumerate() {
-        let want = a.load(Ordering::Relaxed);
-        let held = conn.run(o.deadline, |s| s.count(&session_name(w), want, false))?;
+    for (w, (want, _)) in acked.iter().enumerate() {
+        let held = conn.run(o.deadline, |s| s.count(&session_name(w), *want, false))?;
         acknowledged += want;
         lost += want.saturating_sub(held);
     }
     Ok(serde_json::json!({
         "writers": o.writers, "batch": batch, "text_bytes": text, "lose": lose, "settle_s": settle.as_secs_f64(), "after_s": after.as_secs_f64(),
-        "first_ack_ms": first_ack_ms, "serve_again_ms": serve_ms, "acknowledged_rows": acknowledged, "lost": lost,
+        "first_ack_ms": first_ack_ms, "serve_again_ms": serve_ms, "serve_again": serve_rule(&o.system), "acknowledged_rows": acknowledged, "lost": lost,
     }))
+}
+
+/// How each system's region-loss measure waits for the region's copy to serve again, for the
+/// record (lane scaleout-harness-10).
+fn serve_rule(system: &str) -> &'static str {
+    match system {
+        "amphora-inproc" => {
+            "each writer's rows counted on the region's own member at the closed time of the writer's last acknowledged write, from its session token (Database::query_closed): the read waits until the member's closed time passes that write"
+        }
+        "amphora" => {
+            "refused: amphora serve's protocol has no read that waits for a write (no session token on the wire yet), and its count on a member's own copy (query_local) doesn't wait"
+        }
+        "cockroach" => {
+            "each writer's rows counted once through the region's node: CockroachDB reads by the leaseholder, consistent, so one read sees every acknowledged row once the node answers"
+        }
+        _ => {
+            "each writer's rows counted once through the region's tidb-server as a follower read (tidb_replica_read = 'follower', ReadIndex: it waits until the follower has applied the leader's commit index; docs.pingcap.com/tidb/stable/follower-read)"
+        }
+    }
 }
 
 /// The operations a write overlapped: it began after `ended` operations had ended and was
@@ -1346,7 +1473,7 @@ mod inproc {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
-    use amphora::database::Database;
+    use amphora::database::{Database, ReadMode};
     use amphora::xgroup;
     use amphora_api::Value;
     use amphora_api::replication::{Durability, Fates, ReplicaConfig};
@@ -1490,6 +1617,45 @@ mod inproc {
     mod tests {
         use super::*;
 
+        // Lane scaleout-harness-10 (T-SH.10): a write's session token makes the warm-up's read and
+        // the region's catch-up wait for that write, by the replica's own events. Do: three
+        // members, one group; write a row and take its mark; read it once on the leader and once
+        // as a follower read; cut a member off, write a second row, put the member back and count
+        // on its own copy once. Expect: a mark; both reads find the row; the member's one count
+        // holds both rows, no poll in between.
+        #[test]
+        fn scaleout_harness_10_a_token_read_waits_for_its_write() {
+            let dir = std::env::temp_dir().join(format!("amphora-sh10-{}", std::process::id()));
+            let o = parse(
+                &format!("--scale follower --system amphora-inproc --nodes 3 --groups 1 --writers 1 --deadline-s 60 --batch 1 --text-bytes 8 --rows 2 --warmup-s 1 --seconds 1 --class persisted --relay-records 64 --relay-pending 4096 --dir {}", dir.display())
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let a = Amphora::open(&o).unwrap();
+            a.prepare(&o).unwrap();
+            let mut w = Writer::new(0, 0);
+            let mut s = a.connect(0).unwrap();
+            let first = w.next(1, 8);
+            let mark = s.write_marked(false, &first).unwrap();
+            assert!(mark.is_some(), "a replicated write gives its session token");
+            assert!(s.read_after(&session_name(0), 1, false, mark).unwrap());
+            assert!(s.read_after(&session_name(0), 1, true, mark).unwrap());
+            let (back, _) = a.follower(0).unwrap();
+            a.kill(back).unwrap();
+            // The second write through a node still up: it goes to the group's leader.
+            let mut up = a.connect((back + 1) % 3).unwrap();
+            let second = w.next(1, 8);
+            let mark = up.write_marked(false, &second).unwrap();
+            a.start(back).unwrap();
+            let mut own = a.connect(back).unwrap();
+            assert_eq!(own.count_own_after(&session_name(0), 2, mark).unwrap(), 2);
+            drop((s, up, own));
+            drop(a);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         // Lane scaleout-harness-9 (AC-SH.5): the relay's bell keeps a ring given before its wait,
         // a due time ends a wait no ring came to, and the stop ends the relay, its own ring kept
         // as well. Do: ring then wait; wait on a due time already past; stop then wait, from
@@ -1631,15 +1797,34 @@ mod inproc {
                 .unwrap_or(0)
         }
 
-        fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<()> {
-            self.leader(g)?
+        /// `rows` on group `g`'s leader, returning the leader that took them.
+        fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<&Database> {
+            let leader = self.leader(g)?;
+            leader
                 .call(Instant::now() + self.deadline, move |c| {
                     for (sql, args) in rows {
                         c.prepare_cached(&sql)?.execute(args)?;
                     }
                     Ok(())
                 })
-                .map_err(|e| anyhow::anyhow!("group {g} refused a write: {e:?}"))
+                .map_err(|e| anyhow::anyhow!("group {g} refused a write: {e:?}"))?;
+            Ok(leader)
+        }
+
+        /// A live member of group `g` that doesn't lead it, for a follower read.
+        fn follower(&self, g: usize) -> anyhow::Result<(usize, &Database)> {
+            let leader = self
+                .leader(g)?
+                .replica()
+                .and_then(|h| h.status().ok())
+                .map(|s| s.leader)
+                .unwrap_or(0);
+            self.group(g)?
+                .members
+                .iter()
+                .enumerate()
+                .find(|(i, _)| *i as u64 + 1 != leader && !self.is_cut(*i))
+                .ok_or_else(|| anyhow::anyhow!("group {g} has no live follower"))
         }
     }
 
@@ -1675,14 +1860,30 @@ mod inproc {
             }
         };
     }
+    /// The group time a mark names, which a closed-time read waits for: every write at or before it
+    /// is applied once a replica's closed time has passed it.
+    fn closed_at(token: amphora::database::Token) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            token.micros > 0,
+            "the write's session token names no group time to wait for: {token:?}"
+        );
+        Ok(token.micros)
+    }
+
     const ONE: &str = "SELECT count(*) FROM events WHERE session = ?1 AND seq = ?2";
     const UPTO: &str = "SELECT count(*) FROM events WHERE session = ?1 AND seq <= ?2";
 
     impl Session for S<'_> {
         fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()> {
+            self.write_marked(regional, rows).map(drop)
+        }
+
+        /// The write, and the session token the leader that took it gives (taken after the
+        /// write's answer, so at or past it: Database::session_token).
+        fn write_marked(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<Mark> {
             anyhow::ensure!(!self.a.is_cut(self.node), "node {} is down", self.node);
             let Some(first) = rows.first() else {
-                return Ok(());
+                return Ok(None);
             };
             let g = self.a.group_of(&first.session);
             let stmts = rows
@@ -1696,7 +1897,10 @@ mod inproc {
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            self.a.exec(g, stmts)
+            let leader = self.a.exec(g, stmts)?;
+            leader
+                .session_token(Instant::now() + self.a.deadline)
+                .map_err(|e| anyhow::anyhow!("group {g}'s leader gave no session token: {e:?}"))
         }
 
         fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
@@ -1706,20 +1910,7 @@ mod inproc {
             let (session, seq) = (session.to_owned(), i64::try_from(seq)?);
             let n = if follower {
                 // A member that doesn't lead the group, at the time it can read without waiting.
-                let leader = self
-                    .a
-                    .leader(g)?
-                    .replica()
-                    .and_then(|h| h.status().ok())
-                    .map(|s| s.leader)
-                    .unwrap_or(0);
-                let group = self.a.group(g)?;
-                let (i, m) = group
-                    .members
-                    .iter()
-                    .enumerate()
-                    .find(|(i, _)| *i as u64 + 1 != leader && !self.a.is_cut(*i))
-                    .ok_or_else(|| anyhow::anyhow!("group {g} has no live follower"))?;
+                let (i, m) = self.a.follower(g)?;
                 let at = m
                     .follower_read_micros(until)
                     .map_err(|e| anyhow::anyhow!("member {i}: {e:?}"))?;
@@ -1733,6 +1924,65 @@ mod inproc {
                     .map_err(|e| anyhow::anyhow!("group {g} refused a read: {e:?}"))?
             };
             Ok(n > 0)
+        }
+
+        /// One read carrying the preload's last token: on the leader, once it has applied it
+        /// (ReadMode::Session); as a follower read, at the token's closed time, once the
+        /// follower's closed time has passed it. Each waits on the replica's own events.
+        fn read_after(
+            &mut self,
+            session: &str,
+            seq: u64,
+            follower: bool,
+            mark: Mark,
+        ) -> anyhow::Result<bool> {
+            anyhow::ensure!(!self.a.is_cut(self.node), "node {} is down", self.node);
+            let token = mark
+                .ok_or_else(|| anyhow::anyhow!("the preload's last write gave no session token"))?;
+            let g = self.a.group_of(session);
+            let until = Instant::now() + self.a.deadline;
+            let (session, seq) = (session.to_owned(), i64::try_from(seq)?);
+            let n = if follower {
+                let (i, m) = self.a.follower(g)?;
+                m.query_closed(closed_at(token)?, until, counted!(ONE, session, seq))
+                    .map_err(|e| anyhow::anyhow!("member {i} refused a follower read: {e:?}"))?
+                    .value
+            } else {
+                self.a
+                    .leader(g)?
+                    .query_session(
+                        ReadMode::Session,
+                        Some(token),
+                        until,
+                        counted!(ONE, session, seq),
+                    )
+                    .map_err(|e| anyhow::anyhow!("group {g} refused a read: {e:?}"))?
+            };
+            Ok(n > 0)
+        }
+
+        /// The count on this node's own member at the closed time of `mark` (the writer's last
+        /// acknowledged write): it waits until the member's closed time passes that write.
+        fn count_own_after(&mut self, session: &str, upto: u64, mark: Mark) -> anyhow::Result<u64> {
+            anyhow::ensure!(!self.a.is_cut(self.node), "node {} is down", self.node);
+            let Some(token) = mark else {
+                // Nothing acknowledged for this writer: nothing to wait for.
+                return self.count(session, upto, true);
+            };
+            let g = self.a.group_of(session);
+            let until = Instant::now() + self.a.deadline;
+            let (session, upto) = (session.to_owned(), i64::try_from(upto)?);
+            let m = self
+                .a
+                .group(g)?
+                .members
+                .get(self.node)
+                .ok_or_else(|| anyhow::anyhow!("no member {}", self.node))?;
+            let n = m
+                .query_closed(closed_at(token)?, until, counted!(UPTO, session, upto))
+                .map_err(|e| anyhow::anyhow!("member {} refused a count: {e:?}", self.node))?
+                .value;
+            Ok(u64::try_from(n)?)
         }
 
         fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()> {
@@ -1795,16 +2045,26 @@ mod inproc {
             let until = Instant::now() + o.deadline;
             for g in 0..self.groups.len() {
                 let members = &self.group(g)?.members;
-                // The schema goes to the leader a member names or, with none named yet, to the
-                // first member: a call waits in its member's queue until a leader is known, then
-                // runs or is refused naming the leader, which takes it next. Each try waits on
-                // the replica's own events, never a spin (lane scaleout-harness-9). The schema's
-                // statements are idempotent, so a try whose outcome is unknown is made again.
+                // The schema goes to the leader a member names or, with none named yet or a member
+                // out of reach, to the next member in the configured order, from the first (lane
+                // scaleout-harness-10): a call waits in its member's queue until a leader is
+                // known, then runs or is refused naming the leader, which takes it next. Each try
+                // waits on the replica's own events, never a spin (lane scaleout-harness-9), and
+                // all are given up at --deadline-s. The schema's statements are idempotent, so a
+                // try whose outcome is unknown is made again.
                 let mut to = self.leader(g).ok();
+                let (mut next, mut out) = (0usize, 0usize);
                 loop {
-                    let member = to
-                        .or_else(|| members.first())
-                        .ok_or_else(|| anyhow::anyhow!("group {g} has no members"))?;
+                    let member = match to {
+                        Some(m) => m,
+                        None => {
+                            let m = members
+                                .get(next % members.len().max(1))
+                                .ok_or_else(|| anyhow::anyhow!("group {g} has no members"))?;
+                            next += 1;
+                            m
+                        }
+                    };
                     let refused = match member.call(until, |c| Ok(c.execute_batch(EVENTS)?)) {
                         Ok(()) => break,
                         Err(e) => e,
@@ -1820,6 +2080,17 @@ mod inproc {
                             .and_then(|i| members.get(i)),
                         amphora_api::Refusal::NotLeader { leader: None }
                         | amphora_api::Refusal::UnknownOutcome => self.leader(g).ok(),
+                        // This member can't take it (out of reach or ended): the next in order,
+                        // each once; given up once every member was.
+                        e @ (amphora_api::Refusal::Unavailable(_)
+                        | amphora_api::Refusal::Fenced(_)) => {
+                            out += 1;
+                            anyhow::ensure!(
+                                out < members.len(),
+                                "group {g}: no member could take its schema: {e:?}"
+                            );
+                            None
+                        }
                         other => anyhow::bail!("group {g} refused its schema: {other:?}"),
                     };
                 }
@@ -2035,6 +2306,15 @@ mod served {
             }
             .parse()?)
         }
+
+        fn count_own_after(
+            &mut self,
+            _session: &str,
+            _upto: u64,
+            _mark: Mark,
+        ) -> anyhow::Result<u64> {
+            Err(anyhow::Error::from(Refusal::Unavailable("amphora serve's protocol has no read that waits for a write on a member's own copy (no session token on the wire yet; its count is a local read, which doesn't wait)".into())))
+        }
     }
 
     impl System for Amphora {
@@ -2048,28 +2328,24 @@ mod served {
                 "cutover" => return Err(anyhow::Error::from(Refusal::Unavailable("Amphora's splits, merges and moves are a pure core so far: the shell that carries them out over replicated groups isn't built (docs/design/reshard.md, \"What is left\")".into()))),
                 other => return Err(no_concept(&format!("the {other} measure"))),
             }
-            // The schema through the leader, asked again until --deadline-s. With no leader named
-            // yet, the member asked takes it itself: its call waits in its queue until a leader
-            // is known, then runs there or is refused, and the next try finds the leader named.
-            // Each try waits on the member's answer and its election: no timer, no spin (lane
-            // scaleout-harness-9). The schema's statements are idempotent.
+            // The schema through the leader a member names. With no leader named yet, the member
+            // asked takes it itself: its call waits in its queue until a leader is known, then
+            // runs there or is refused. Each try waits on the member's answer and its election:
+            // no timer, no spin (lane scaleout-harness-9). The members are asked in the
+            // configured order, from member 0, each only once the one before failed (it couldn't
+            // be reached, or its try was refused), all given up at --deadline-s: none is asked
+            // again at once (lane scaleout-harness-10). The schema's statements are idempotent.
             let until = Instant::now() + o.deadline;
             let exec = format!("exec {EVENTS}");
-            loop {
-                let tried = self
-                    .link(0)
-                    .and_then(|mut via| match self.leader(&mut via) {
-                        Ok(l) => self.link(l)?.ask(&exec),
-                        Err(_) => via.ask(&exec),
-                    });
-                match tried {
-                    Ok(_) => return Ok(()),
-                    Err(e) => anyhow::ensure!(
-                        Instant::now() < until,
-                        "Amphora took no schema within --deadline-s: {e}"
-                    ),
+            first_reachable(self.members.len(), until, |n| {
+                let mut via = self.link(n)?;
+                match self.leader(&mut via) {
+                    Ok(l) => self.link(l)?.ask(&exec),
+                    Err(_) => via.ask(&exec),
                 }
-            }
+            })
+            .map(drop)
+            .map_err(|e| anyhow::anyhow!("Amphora took no schema: {e}"))
         }
 
         fn connect(&self, node: usize) -> anyhow::Result<Box<dyn Session + '_>> {
@@ -2408,13 +2684,21 @@ pub mod sql {
 
         fn prepare(&self, o: &Opts) -> anyhow::Result<()> {
             let stmts = setup(self.kind, o);
+            // The schema through the first node, in the configured order, that can be reached:
+            // the next is tried once the one before failed to connect, all given up at
+            // --deadline-s (lane scaleout-harness-10).
+            let until = Instant::now() + o.deadline;
+            let nodes = self.nodes();
             match self.kind {
                 Kind::Cockroach => {
-                    let ep = self.endpoint(0)?;
-                    let mut c = ep
-                        .parse::<postgres::Config>()?
-                        .connect_timeout(self.deadline)
-                        .connect(postgres::NoTls)?;
+                    let mut c = first_reachable(nodes, until, |n| {
+                        Ok(self
+                            .endpoint(n)?
+                            .parse::<postgres::Config>()?
+                            .connect_timeout(self.deadline)
+                            .connect(postgres::NoTls)?)
+                    })
+                    .map_err(|e| anyhow::anyhow!("CockroachDB took no schema: {e}"))?;
                     for q in &stmts {
                         c.batch_execute(q)
                             .map_err(|e| anyhow::anyhow!("{q}: {e}"))?;
@@ -2422,7 +2706,16 @@ pub mod sql {
                 }
                 Kind::Tidb => {
                     use mysql::prelude::Queryable;
-                    let mut c = mysql::Conn::new(mysql::Opts::from_url(self.endpoint(0)?)?)?;
+                    let mut c = first_reachable(nodes, until, |n| {
+                        let opts = mysql::OptsBuilder::from_opts(mysql::Opts::from_url(
+                            self.endpoint(n)?,
+                        )?)
+                        .tcp_connect_timeout(Some(self.deadline))
+                        .read_timeout(Some(self.deadline))
+                        .write_timeout(Some(self.deadline));
+                        Ok(mysql::Conn::new(opts)?)
+                    })
+                    .map_err(|e| anyhow::anyhow!("TiDB took no schema: {e}"))?;
                     for q in &stmts {
                         c.query_drop(q).map_err(|e| anyhow::anyhow!("{q}: {e}"))?;
                     }
@@ -2860,6 +3153,95 @@ mod tests {
                 "{system}"
             );
         }
+    }
+
+    // Lane scaleout-harness-10 (T-SH.8): schema setup asks each node in the configured order, the
+    // next only once the one before failed, and gives up naming each failure, or at its deadline.
+    #[test]
+    fn scaleout_harness_10_schema_asks_each_node_in_turn_then_gives_up() {
+        let later = Instant::now() + Duration::from_secs(3600);
+        let mut asked = Vec::new();
+        let got = first_reachable(3, later, |n| {
+            asked.push(n);
+            if n == 1 {
+                Ok(n)
+            } else {
+                anyhow::bail!("refused")
+            }
+        });
+        assert_eq!(got.unwrap(), 1);
+        assert_eq!(
+            asked,
+            vec![0, 1],
+            "node 0 failed, so node 1 was asked, and no more"
+        );
+        let mut asked = Vec::new();
+        let e = first_reachable(3, later, |n| -> anyhow::Result<()> {
+            asked.push(n);
+            anyhow::bail!("unreachable {n}")
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(asked, vec![0, 1, 2], "each node once, none asked again");
+        for n in 0..3 {
+            assert!(e.contains(&format!("node {n}: unreachable {n}")), "{e}");
+        }
+        let mut asked = 0;
+        let e = first_reachable(3, Instant::now(), |_| -> anyhow::Result<()> {
+            asked += 1;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(asked, 0);
+        assert!(e.contains("--deadline-s passed before node 0"), "{e}");
+    }
+
+    /// A session that counts what it's asked, for the default warm-up and catch-up reads.
+    #[derive(Default)]
+    struct Asked {
+        reads: Vec<(String, u64, bool)>,
+        counts: Vec<(String, u64, bool)>,
+    }
+
+    impl Session for Asked {
+        fn write(&mut self, _regional: bool, _rows: &[Row]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
+            self.reads.push((session.to_owned(), seq, follower));
+            Ok(true)
+        }
+        fn add(&mut self, _keys: &[i64], _value: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64> {
+            self.counts.push((session.to_owned(), upto, own));
+            Ok(upto)
+        }
+    }
+
+    // Lane scaleout-harness-10 (T-SH.9): a system with no control for waiting on a write gets one
+    // read for the warm-up and one own-copy count for the region's catch-up, never asked again;
+    // regionloss takes no --poll-us; each record says what each system's warm-up and catch-up do.
+    #[test]
+    fn scaleout_harness_10_warmup_and_catch_up_read_once_by_each_systems_rule() {
+        let mut s = Asked::default();
+        assert_eq!(s.write_marked(false, &[]).unwrap(), None);
+        assert!(s.read_after("s-000001", 7, true, None).unwrap());
+        assert_eq!(s.reads, vec![("s-000001".to_owned(), 7, true)]);
+        assert_eq!(s.count_own_after("s-000002", 9, None).unwrap(), 9);
+        assert_eq!(s.counts, vec![("s-000002".to_owned(), 9, true)]);
+        assert!(parse(&args("--scale regionloss --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --lose 1 --settle-s 1 --after-s 1 --hosts local=a")).is_ok());
+        for system in ["amphora", "amphora-inproc", "cockroach", "tidb"] {
+            for follower in [false, true] {
+                assert!(!warmup_rule(system, follower).is_empty(), "{system}");
+            }
+            assert!(!serve_rule(system).is_empty(), "{system}");
+        }
+        assert!(warmup_rule("amphora-inproc", true).contains("session token"));
+        assert!(warmup_rule("tidb", true).contains("ReadIndex"));
+        assert!(serve_rule("amphora").starts_with("refused"));
     }
 
     // G13 step 1: the competitors split where Amphora's groups divide, and a key's group is the
