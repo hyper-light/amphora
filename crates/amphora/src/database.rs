@@ -198,10 +198,10 @@ pub enum LockedReads {
     Wait,
     /// As [`LockedReads::Wait`], but a waiting get waits on its own row's waiter list, rung when
     /// a resolution here drops that row's locks, not on every change in the group (T-T1.10.W9,
-    /// lane xgroup-sql-11: Wait's thundering herd at scale). The ring comes from the step that
-    /// resolves, in the process that runs it (`Database::ring_locks`); a replicated group's
-    /// replica may not be that process, so a replicated database's gets wait as under
-    /// [`LockedReads::Wait`].
+    /// lane xgroup-sql-11: Wait's thundering herd at scale). The step that resolves rings it in
+    /// the process that runs it (`Database::ring_locks`), and every replica of a replicated group
+    /// rings its own lists as it applies the resolution, whichever process ran the step
+    /// (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
     WaitOnLock,
 }
 
@@ -766,6 +766,40 @@ pub(crate) fn reload_changed(db: &Db, changed: &Changed) -> Result<(), Refusal> 
     wake_changed(changed)
 }
 
+/// Rings the waiter list of each of `keys` a get waits on ([`LockedReads::WaitOnLock`]).
+fn ring(changed: &Changed, keys: &[Vec<u8>]) -> Result<(), Refusal> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut lists = locked(&changed.lock_waiters)?;
+    for key in keys {
+        if let Some(list) = lists.get_mut(key) {
+            list.rung = list.rung.wrapping_add(1);
+            list.bell.notify_all();
+        }
+    }
+    Ok(())
+}
+
+/// A replica's ring ([`LockedReads::WaitOnLock`]; T-T1.10.W13, lane xgroup-sql-12): once its
+/// owner applied entries, on that applied state `db`, it rings the list of every row a get here
+/// waits on whose write lock is gone, so a replica applying a resolution rings its own readers,
+/// whichever process ran the resolving step. Each row is looked up once, however many gets wait
+/// on it, and only rows a get waits on: none, none looked up. A get that joins a list after the
+/// rows were taken tries its row once more first ([`Database::wait_on_lock`]), so it reads a
+/// resolution applied before that try, and the next application rings it for one after.
+pub(crate) fn ring_unlocked(db: &Db, changed: &Changed) -> Result<(), Refusal> {
+    let rows: Vec<Vec<u8>> = locked(&changed.lock_waiters)?.keys().cloned().collect();
+    let mut gone = Vec::new();
+    for row in rows {
+        // A get joined a list only after it found its row locked in these tables, so they exist.
+        if !crate::xgroup::sql::held(db, &row).map_err(|e| unavailable(format_args!("{e:#}")))? {
+            gone.push(row);
+        }
+    }
+    ring(changed, &gone)
+}
+
 pub(crate) fn wake_changed(changed: &Changed) -> Result<(), Refusal> {
     {
         let mut generation = locked(&changed.generation)?;
@@ -1314,22 +1348,52 @@ impl Database {
         R: Send + 'static,
         F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
     {
+        self.session_waiting(false, until, f)
+    }
+
+    /// [`Database::query_waiting`] as a local read ([`Database::query_local`]): on a replica, on
+    /// its owner's applied state, asking no leader, its waits rung by this replica's own
+    /// application of the resolution under [`LockedReads::WaitOnLock`] (T-T1.10.W13, lane
+    /// xgroup-sql-12).
+    pub fn query_local_waiting<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
+    {
+        self.session_waiting(true, until, f)
+    }
+
+    /// The session of [`Database::query_waiting`] (`local`: of [`Database::query_local_waiting`]).
+    fn session_waiting<R, F>(&self, local: bool, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: Fn(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + Sync + 'static,
+    {
         let reads = LockedReads::of(self.shared.changed.locked_reads.load(Ordering::Acquire));
         if reads == LockedReads::Committed {
-            return self.query(until, f);
+            return if local {
+                self.query_local(until, f)
+            } else {
+                self.query(until, f)
+            };
         }
         let database = self.resolve(until)?;
         let f = Arc::new(f);
         database.wait_locked(reads, until, || {
             let f = Arc::clone(&f);
-            database.query(until, move |c| {
+            let run = move |c: &mut crate::sql::Connection<'_>| {
                 let watch = session::Watch::begin();
                 let answer = (*f)(c);
                 match watch.met() {
                     Some(row) => Ok(Err(row)),
                     None => answer.map(Ok),
                 }
-            })
+            };
+            if local {
+                database.query_local(until, run)
+            } else {
+                database.query(until, run)
+            }
         })
     }
 
@@ -1484,17 +1548,7 @@ impl Database {
     /// cross-group key ([`LockedReads::WaitOnLock`]): called once the resolving step answered, so
     /// a get it wakes reads the resolution. A row no get waits on rings no one.
     pub(crate) fn ring_locks(&self, keys: &[Vec<u8>]) -> Result<(), Refusal> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let mut lists = locked(&self.shared.changed.lock_waiters)?;
-        for key in keys {
-            if let Some(list) = lists.get_mut(key) {
-                list.rung = list.rung.wrapping_add(1);
-                list.bell.notify_all();
-            }
-        }
-        Ok(())
+        ring(&self.shared.changed, keys)
     }
 
     /// Records gets here that met a cross-group lock and waited for it ([`LockedReads::Wait`]),
@@ -1525,17 +1579,14 @@ impl Database {
 
     /// A Records read under `reads`, [`LockedReads::Wait`] or [`LockedReads::WaitOnLock`]:
     /// `try_read` answers what it read, or the cross-group key of a row it met under a lock, and
-    /// is tried again until it reads. A replicated database's reads wait as under `Wait`: the
-    /// ring of [`LockedReads::WaitOnLock`] comes from the process that runs the resolving step,
-    /// which its replica need not be.
+    /// is tried again until it reads.
     fn wait_locked<T>(
         &self,
         reads: LockedReads,
         until: Instant,
         try_read: impl FnMut() -> Result<Result<T, Vec<u8>>, Refusal>,
     ) -> Result<T, Refusal> {
-        let replicated = matches!(self.shared.writer, Writer::Replicated { .. });
-        if reads == LockedReads::WaitOnLock && !replicated {
+        if reads == LockedReads::WaitOnLock {
             self.wait_on_lock(until, try_read)
         } else {
             self.wait_on_group(until, try_read)

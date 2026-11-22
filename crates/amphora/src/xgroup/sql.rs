@@ -165,16 +165,22 @@ pub(crate) fn locked(
     key: &[u8],
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let key = record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(held(db, &key)?.then_some(key))
+}
+
+/// Whether a transaction across groups holds a write lock here on the row of cross-group key
+/// `key` ([`record_key`]; a read lock changes no row, as [`locked`] says).
+pub(crate) fn held(db: &Db, key: &[u8]) -> anyhow::Result<bool> {
     let mut held = false;
     db.query(
         "SELECT 1 FROM __amphora_xg_lock WHERE key = ?1 AND kind <> 0 LIMIT 1",
-        [blob(&key)?],
+        [blob(key)?],
         |_| {
             held = true;
             Ok(false)
         },
     )?;
-    Ok(held.then_some(key))
+    Ok(held)
 }
 
 /// The cross-group key of the first Records row of `family` in a scan's range a transaction
@@ -3041,5 +3047,94 @@ mod sessions {
                 eprintln!("{reads:?}: the session ran {runs} times");
             });
         }
+    }
+
+    /// T-T1.10.W13 (AC-T1.10.1, lane xgroup-sql-12): under [`LockedReads::WaitOnLock`] a read on
+    /// a follower is rung by its own replica's application of the resolution, not by the process
+    /// that ran the step. Do: group 0 standalone, group 1 three replicated members relayed in
+    /// process, its leader in the cluster; the answer at the decision, group 1's resolution held
+    /// back; once the follower has the locks (a token read there), a local read of row 1 waiting
+    /// on the follower; then commits of another row of group 1 at the leader; then group 1 let
+    /// go. Expect: the read finds the transaction's row, woken once, by its row's resolution.
+    ///
+    /// [`LockedReads::WaitOnLock`]: crate::database::LockedReads::WaitOnLock
+    #[test]
+    fn t_t1_10_w13_a_follower_read_is_rung_by_its_own_replica_applying_the_resolution() {
+        use crate::database::LockedReads;
+        use amphora_api::{Records, Tx, Write};
+        const OTHERS: u8 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = Replicas::open(dir.path(), "group1", 3);
+        let leader = replicas.leader();
+        let follower = (leader + 1) % replicas.dbs.len();
+        let local = Database::open(&dir.path().join("group0.db"), until()).unwrap();
+        prepare(&local, until()).unwrap();
+        let group1 = replicas.dbs[leader].clone();
+        let dbs = [local.clone(), group1.clone()];
+        for db in dbs.iter().chain(&replicas.dbs) {
+            db.set_locked_reads(LockedReads::WaitOnLock);
+        }
+        let gate = gate(&dbs, 1, false);
+        let options = Options {
+            fault: Some(Arc::clone(&gate.fault)),
+            answer_at: AnswerAt::Decided,
+            ..Options::default()
+        };
+        let members = dbs.iter().cloned().map(Member::Local).collect();
+        let cluster = Cluster::open_with(
+            members,
+            route_of(2),
+            1,
+            Protocol::TwoPhase,
+            1,
+            options,
+            until(),
+        )
+        .unwrap();
+        let txn = Txn {
+            reads: Vec::new(),
+            writes: (0..2).map(|k| (row(k), Some(vec![6]))).collect(),
+        };
+        std::thread::scope(|scope| {
+            let answer = {
+                let cluster = &cluster;
+                scope.spawn(move || cluster.commit(txn, until()))
+            };
+            gate.reached.recv().unwrap();
+            let answer = answer.join().unwrap();
+            assert!(matches!(answer, Ok(Answer::Committed { .. })), "{answer:?}");
+            // The follower applies the locks before the read begins: a read carrying the leader's
+            // token waits for them there, on its owner's publication. Past its measured apply lag
+            // it is redirected (NotLeader), still behind, and waits again.
+            let token = group1.session_token(until()).unwrap().unwrap();
+            while let Err(refusal) = head(&replicas.dbs[follower], Some(token)) {
+                assert!(matches!(refusal, Refusal::NotLeader { .. }), "{refusal:?}");
+            }
+            let reader = &replicas.dbs[follower];
+            let read = scope.spawn(move || {
+                reader.query_local_waiting(until(), |c| {
+                    Ok(c.records_get("ns", "rows", &[1])?.map(|r| r.value))
+                })
+            });
+            reader.locked_waits_reach(1, until()).unwrap();
+            let others = group1.namespace("ns").unwrap();
+            for v in 0..OTHERS {
+                let tx = Tx {
+                    conds: Vec::new(),
+                    writes: vec![Write::Put {
+                        family: "rows".into(),
+                        key: vec![3],
+                        value: vec![v],
+                    }],
+                };
+                others.commit(tx, until()).unwrap();
+            }
+            gate.open.send(()).unwrap();
+            assert_eq!(read.join().unwrap(), Ok(Some(vec![6])));
+            let wakes = reader.locked_wakes();
+            assert_eq!(wakes, 1, "{OTHERS} other commits in the group");
+            assert_eq!(reader.locked_waits(), 1);
+        });
+        drop(cluster);
     }
 }

@@ -1885,6 +1885,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         let configuration = self.replica.configuration().clone();
         let (floor, members) = self.replica.machine_mut().read_db(|db| {
             reload_changed(db, &self.changed)?;
+            // This replica rings its own readers' waiter lists for the resolutions it just
+            // applied (LockedReads::WaitOnLock; T-T1.10.W13, lane xgroup-sql-12).
+            ring_unlocked(db, &self.changed)?;
             let floor = super::application::policy(db)?;
             let mut members = Vec::new();
             for member in crate::replication::floor::members(&configuration) {

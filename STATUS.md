@@ -27,6 +27,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `lock-wake` with wakes per read (`t_t1_10_w9_*`); scans wait on a write lock in their page's range (`w10`) and
   SQL reads through `Database::query_waiting`, which runs the session again once the lock resolves (`w11`). The
   commit stamp `at` is now one stamp, the latest clock the lock replies carried, fixed before the decision (`w12`).
+  Lane xgroup-sql-12: `WaitOnLock` on every replica, each replica's owner ringing its own readers as it applies
+  the resolution, and follower reads through `Database::query_local_waiting` (`w13`); the transport's greeting
+  negotiates its version, so version 8 and 9 nodes talk (local-owner-transport.md, "Negotiated versions").
 - **Cross-group tokens over nodes and followers behind** (CP-T1.10, AC-T1.10.1, lane xgroup-sql-9;
   docs/design/xgroup.md): a step's answer over the transport carries its group's closed time (wire version 9), so a
   group on another node adds to `commit_records`' token; tests cover a replicated group on a second node and a

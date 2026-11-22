@@ -1334,6 +1334,8 @@ tests = [
   { id = "T-T1.10.W11", text = "xgroup::sql::sessions::t_t1_10_w11_a_sql_read_of_a_held_lock_runs_again_once_it_resolves — passes when, under Wait and under WaitOnLock, with group 1's resolution held back, a SQL session reading row 1 there through Database::query reads no row unwaited, and one through Database::query_waiting waits (counted once) until group 1 resolves, then reads the transaction's row, its session run at least twice" },
   # lane xgroup-sql-11 (coordinator's 12:31Z ask): the one commit stamp, fixed before the decision.
   { id = "T-T1.10.W12", text = "xgroup::tests::ac_t1_10_1_the_commit_stamp_is_the_latest_lock_replys_clock — passes when, under both protocols, three in-memory groups whose lock replies carry clocks 30, 50 and 40 and every other reply 999 commit a transaction writing in each, answered Committed with at 50" },
+  # lane xgroup-sql-12: WaitOnLock on every replica, rung by the replica applying the resolution.
+  { id = "T-T1.10.W13", text = "xgroup::sql::sessions::t_t1_10_w13_a_follower_read_is_rung_by_its_own_replica_applying_the_resolution — passes when, with group 1 three replicated members, its resolution held back and a local read of row 1 waiting on a follower under WaitOnLock, eight commits of another row at the leader then the resolution wake the read exactly once (locked_wakes 1, locked_waits 1) and it finds the transaction's row" },
 ]
 
 # lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session

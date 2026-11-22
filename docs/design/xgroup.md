@@ -188,9 +188,14 @@ the candidate that removes it as a third setting, `LockedReads::WaitOnLock`, `Wa
 - Each wake is counted (`Database::locked_wakes`), under both settings.
 - What it costs: one more read for each get that meets a lock (the read after joining), and a list
   entry per row waited on.
-- Where it can't apply: the ring comes from the process that runs the resolving step (a local group,
-  or the owner serving a step over the transport). A replicated group's replica need not be that
-  process, so a replicated database's gets wait as under `Wait`.
+- On every replica (lane xgroup-sql-12): the process that ran the resolving step need not be the
+  replica a read waits on, so each replica's owner, once it applied entries, rings the list of every
+  row a get there waits on whose write lock is gone in its applied state (`ring_unlocked`, from the
+  owner's publication). Each waited row is looked up once per publication, whatever the number of
+  gets on it, and none when no get waits. A follower's reads wait this way through
+  `Database::query_local_waiting`, a local read on its own applied state, so the state it reads and
+  the state that rings it are one. `t_t1_10_w13_*`: a local read on a follower of a three-member
+  group 1 waits on the held resolution, eight other commits land there, and it wakes once.
 
 `t_t1_10_w9_*` holds a read waiting on group 1's held resolution while eight commits of another row
 land there: under `WaitOnLock` it wakes once, at its own resolution. `xgroup_lan ryw` runs it as
