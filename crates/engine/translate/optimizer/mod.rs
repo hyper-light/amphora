@@ -3931,14 +3931,19 @@ pub(crate) mod bushy_search_tests {
             rows
         }
 
-        /// PL.8 piece 2 (T-PL.8.2): two large fact tables, each cut down by a filtered dimension,
-        /// joined to each other on a key with few values. Every left-deep order joins one fact's
-        /// cut to the other whole fact first and drags the large result through the last
-        /// dimension's filter; the bushy plan builds `d1 ⋈ f1` once into a hash join's input and
-        /// probes it from `f2`, under the one row of `d2`. The search picks it, the emitter runs
-        /// it (`BUSHY_PLANS`), and it answers as the plan of nested loops does.
-        #[test]
-        fn t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest() {
+        /// The queries over `facts`: each joins `d1 ⋈ f1` to `f2` under `d2`'s filter.
+        const FACT_QUERIES: [&str; 3] = [
+            "SELECT d1.id, f1.id, f2.id, d2.id FROM d1, f1, f2, d2 \
+             WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
+            "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
+             WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
+            "SELECT count(*), sum(f1.id - f2.id) FROM d1, f1, f2, d2 \
+             WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.cat = 7",
+        ];
+
+        /// Two dimensions of 50 rows and two facts of 12,000, analyzed
+        /// (`t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest` says why that size).
+        fn facts() -> (Arc<Database>, Arc<crate::Connection>) {
             let io = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -3951,23 +3956,37 @@ pub(crate) mod bushy_search_tests {
                  INSERT INTO d1 SELECT x, x % 25 FROM n",
                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
                  INSERT INTO d2 SELECT x, x % 25 FROM n",
-                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 12000) \
                  INSERT INTO f1 SELECT x, x % 50 + 1, x % 2 FROM n",
-                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 12000) \
                  INSERT INTO f2 SELECT x, x % 50 + 1, x % 2 FROM n",
                 "ANALYZE",
             ] {
                 conn.execute(sql).unwrap();
             }
-            let queries = [
-                "SELECT d1.id, f1.id, f2.id, d2.id FROM d1, f1, f2, d2 \
-                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
-                "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
-                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
-                "SELECT count(*), sum(f1.id - f2.id) FROM d1, f1, f2, d2 \
-                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.cat = 7",
-            ];
-            for sql in queries {
+            (db, conn)
+        }
+
+        /// PL.8 piece 2 (T-PL.8.2): two large fact tables, each cut down by a filtered dimension,
+        /// joined to each other on a key with few values. Every left-deep order joins one fact's
+        /// cut to the other whole fact first and drags the large result through the last
+        /// dimension's filter; the bushy plan builds `d1 ⋈ f1` once into a hash join's input and
+        /// probes it from `f2`, under the one row of `d2`. The search picks it, the emitter runs
+        /// it (`BUSHY_PLANS`), and it answers as the plan of nested loops does.
+        ///
+        /// The facts hold 12,000 rows each (lane pl8-14), so the bushy plan is cheapest at any
+        /// hash-probe weight measured on any machine (10 to 400 rows' visits): the plan of nested
+        /// loops that wins once probes are dear visits `n * n / 50` rows (each of `f2`'s `n / 50`
+        /// rows under `d2` scans `f1`), the bushy plan's probes grow with `n` alone, and each
+        /// plan's cost is linear in the weights, so the bushy plan's lead over every other is
+        /// least at a corner of the weights' range. With 3,000 rows the plan of nested loops won at
+        /// a probe of 400 (170 with a quarter of this machine's seek and build); with 12,000, the
+        /// bushy plan won at every corner: probes of 10 and 400, seeks and builds a quarter to four
+        /// times adacachy's learned ones (kiln run r1271).
+        #[test]
+        fn t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest() {
+            let (_db, conn) = facts();
+            for sql in FACT_QUERIES {
                 conn.set_join_methods(JoinMethods::NestedLoopsOnly);
                 let nested_loops = rows(&conn, sql);
                 conn.set_join_methods(JoinMethods::ByCost);
@@ -3980,6 +3999,42 @@ pub(crate) mod bushy_search_tests {
                 assert!(!nested_loops.is_empty(), "{sql}");
                 assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
             }
+        }
+
+        /// PL.8 (T-PL.8.2, lane pl8-15): pins the corners of the weights' range the bushy plan's
+        /// lead is argued over (`t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest`):
+        /// a hash probe of 10 and of 400 rows' visits, the least and most the probe's learned
+        /// weight was seen at (a quiet host's; adacachy's under load, kiln run r1178), each with
+        /// the seek and the hash build a quarter of and four times this machine's learned ones, the
+        /// span r1271 swept. Each plan's cost is linear in the weights, so a plan cheapest at every
+        /// corner is cheapest inside. Expect: the search plans every query bushy at every corner.
+        #[cfg(feature = "simulator")]
+        #[test]
+        fn t_pl_8_2_the_bushy_plan_is_cheapest_at_every_corner_of_the_weights() {
+            let (db, conn) = facts();
+            let learned = db.learned_costs.weights().unwrap();
+            conn.set_join_methods(JoinMethods::ByCost);
+            let mut corners = 0;
+            for probe in [10.0, 400.0] {
+                for seek in [learned.seek / 4.0, learned.seek * 4.0] {
+                    for build in [learned.hash_build / 4.0, learned.hash_build * 4.0] {
+                        conn.pin_cost_weights(Some((seek, build, probe)));
+                        for sql in FACT_QUERIES {
+                            BUSHY_PLANS.with(|plans| plans.set(0));
+                            drop(conn.prepare(sql).unwrap());
+                            let made_bushy = BUSHY_PLANS.with(Cell::get);
+                            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                            assert!(
+                                made_bushy > 0,
+                                "seek {seek}, build {build}, probe {probe}: {sql}: {plan:?}"
+                            );
+                        }
+                        corners += 1;
+                    }
+                }
+            }
+            conn.pin_cost_weights(None);
+            assert_eq!(corners, 8);
         }
     }
 }
