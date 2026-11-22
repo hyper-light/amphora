@@ -25,8 +25,9 @@ use hyper_raft::wire::Record;
 
 // Admission limits, not throughput tuning: overflow refuses before taking ownership. The queue
 // charges a full API request for an opaque FnOnce, whose captures the API cannot inspect. The
-// queues' bytes are bounded by what their readers drain in an election timeout and the memory
-// budget's room for queues (`queue_bounds`; QB.1).
+// command queue's bytes are the memory budget's room for queues, its application calls counted to
+// what the owner takes in an election timeout; the outgoing queue holds what its host drains in
+// one (`queue_bounds`; QB.1).
 const COMMANDS: usize = 64;
 pub(crate) const MEMBERS: usize = 64;
 /// The framing a wire record adds past the entry or image it carries. Still picked (lane
@@ -279,9 +280,13 @@ pub(super) fn wall_micros() -> Result<u64, Refusal> {
 }
 struct Control {
     admitted: AtomicUsize,
-    /// Application calls in the command queue: no more than its slots less one, so that a wire
-    /// record always finds a slot while calls wait for a leader (QB.1).
+    /// Application calls in the command queue: no more than `call_bound`, so that a wire record
+    /// always finds a slot while calls wait for a leader (QB.1).
     calls: AtomicUsize,
+    /// The most application calls the command queue holds, as the owner last learned it: what it
+    /// takes in an election timeout at its learned message rate, no more than the queue's slots
+    /// less one (`queue_bounds`; QB.1).
+    call_bound: AtomicUsize,
     /// The bytes application calls hold of the command queue, held to `applications` apart from
     /// the wire records beside them (QB.1).
     called: AtomicUsize,
@@ -1075,6 +1080,8 @@ struct Bounds {
     queued: usize,
     /// The bytes application calls may hold of them.
     applications: usize,
+    /// The most application calls the command queue holds.
+    calls: usize,
     /// A wire record's most bytes: an image's, held inside the command queue's bound.
     wire: usize,
     /// The outgoing queue's bytes and messages.
@@ -1084,14 +1091,17 @@ struct Bounds {
 }
 
 /// The owner's queue bounds from what it measured (replication.md, "Decision (lane constants): the
-/// queue bounds by drain rate"; QB.1): each queue holds what its reader drains in `timeout`, the
-/// learned election timeout, no more than the memory budget's room for queues (MB.1). Before any
-/// drain is measured, the memory budget's room for queues. The command queue holds at least one
-/// wire record beside one application call, and application calls no more than what that record
-/// leaves. The image a wire record
-/// carries is the budget's room for one (SB.1), held inside the command queue's bound. Application
-/// calls hold no more than the owner takes in an election timeout, so that waiting calls leave the
-/// rest of the queue to the wire records that find a leader.
+/// queue bounds by drain rate"; QB.1). The command queue's bytes are the memory budget's room for
+/// queues (MB.1), and application calls hold that less one wire record's room, so that waiting
+/// calls cannot block the record that finds a leader. A wire record's image is the budget's room
+/// for one (SB.1), held inside the command queue's bound. Calls are counted too: no more than the
+/// owner takes in `timeout`, the learned election timeout, at its learned message rate, and never
+/// more than the queue's slots less one, so that a wire record always finds a slot. Before any
+/// intake is measured, the slots less one. A call is charged its worst case (`REQUEST_MAX`) while
+/// the intake's byte rate is learned mostly from small wire records, so calls are bounded in count
+/// by the rate and in bytes by the room, never in bytes by the rate. The outgoing queue holds what
+/// its host drains in an election timeout, at least one record and no more than the room: the room
+/// before any drain is measured.
 fn queue_bounds(
     intake: &super::drain::Drain,
     outgoing: &super::drain::Drain,
@@ -1111,22 +1121,20 @@ fn queue_bounds(
         .saturating_add(framing)
         .min(room.checked_div(2).unwrap_or(0))
         .min(room.saturating_sub(request));
-    let least = super::drain::Bound {
-        bytes: record.saturating_add(request),
-        messages: 1,
-    };
-    let queued = intake.bound(timeout, least, room).bytes;
+    // The command queue's bytes: the room, which holds one wire record beside one call.
+    let queued = room;
+    let wire = record.min(queued);
+    // A wire record's room is held back from application calls, so that waiting calls cannot
+    // block the record that finds a leader.
+    let applications = queued.saturating_sub(wire);
     let call = super::drain::Bound {
         bytes: request,
         messages: 1,
     };
-    let wire = record.min(queued);
-    // A wire record's room is held back from application calls, so that waiting calls cannot
-    // block the record that finds a leader.
-    let applications = intake
-        .bound(timeout, call, room)
-        .bytes
-        .min(queued.saturating_sub(wire));
+    // The calls the owner takes in an election timeout, at least one, the queue's last slot kept
+    // for a wire record.
+    let slots = u64::try_from(COMMANDS.saturating_sub(1)).unwrap_or(u64::MAX);
+    let calls = intake.bound(timeout, call, room).messages.min(slots);
     let one = super::drain::Bound {
         bytes: wire,
         messages: 1,
@@ -1134,6 +1142,7 @@ fn queue_bounds(
     Ok(Bounds {
         queued: usize::try_from(queued).unwrap_or(usize::MAX),
         applications: usize::try_from(applications).unwrap_or(usize::MAX),
+        calls: usize::try_from(calls).unwrap_or(usize::MAX),
         wire: usize::try_from(wire).unwrap_or(usize::MAX),
         outgoing: outgoing.bound(timeout, one, room),
         room,
@@ -1220,10 +1229,11 @@ fn answer<T>(response: Response<T>, result: Result<T, Refusal>) {
 impl ReplicaHandle {
     fn enqueue(&self, command: Input, bytes: usize) -> Result<(), Refusal> {
         // Untouched application calls can wait for leadership. They hold no more than the owner
-        // takes in an election timeout (QB.1), so that waiting calls leave the rest of the queue to
-        // the wire records that discover it.
+        // takes in an election timeout and the queue's room less a wire record's (QB.1), so that
+        // waiting calls leave the rest of the queue to the wire records that discover it.
         let limit = self.shared.queued.load(Ordering::Acquire);
         let application_limit = self.shared.applications.load(Ordering::Acquire);
+        let call_limit = self.shared.call_bound.load(Ordering::Acquire);
         let call = matches!(
             &command,
             Input::Submit { .. }
@@ -1231,19 +1241,18 @@ impl ReplicaHandle {
                 | Input::Transfer { .. }
                 | Input::CatchUp { .. }
         );
-        // A call takes a slot of the queue's own, all but its last: that one stays a wire record's.
+        // A call takes one of the calls' slots, never the queue's last: that one stays a wire
+        // record's. A call refused for its count names the count bound.
         if call
             && self
                 .shared
                 .calls
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    held.checked_add(1).filter(|next| *next < COMMANDS)
+                    held.checked_add(1).filter(|next| *next <= call_limit)
                 })
                 .is_err()
         {
-            return Err(Refusal::Full {
-                limit: application_limit,
-            });
+            return Err(Refusal::Full { limit: call_limit });
         }
         // Built before any refusal below, so that dropping it gives the call's slot back.
         let mut reservation = Reservation {
@@ -1438,6 +1447,11 @@ impl ReplicaHandle {
     #[cfg(test)]
     fn application_bound(&self) -> usize {
         self.shared.applications.load(Ordering::Acquire)
+    }
+    /// The most application calls the command queue holds in force (QB.1).
+    #[cfg(test)]
+    fn call_bound(&self) -> usize {
+        self.shared.call_bound.load(Ordering::Acquire)
     }
     /// A wire record's most bytes in force (QB.1).
     #[cfg(test)]
@@ -1786,6 +1800,7 @@ fn open_on<F: BlockFile + 'static>(
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
         calls: AtomicUsize::new(0),
+        call_bound: AtomicUsize::new(first.calls),
         called: AtomicUsize::new(0),
         queued: AtomicUsize::new(first.queued),
         applications: AtomicUsize::new(first.applications),
@@ -2642,6 +2657,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.control
             .applications
             .store(bounds.applications, Ordering::Release);
+        self.control
+            .call_bound
+            .store(bounds.calls, Ordering::Release);
         self.control.wire.store(bounds.wire, Ordering::Release);
         self.queues = None;
         self.queues = crate::memory::process()
@@ -4547,6 +4565,9 @@ mod tests {
             }
         }
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
+        // The bounds the calls were admitted under, before the step learns new ones.
+        let application = handle.application_bound();
+        let calls = handle.call_bound();
         let mut bytes = Vec::new();
         Message {
             msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
@@ -4559,17 +4580,19 @@ mod tests {
         let mut heartbeat = handle.admit_receive(2, bytes, until).unwrap();
         driven.step();
         assert!(matches!(heartbeat.try_result(), Ok(Some(()))));
-        let application = handle.application_bound();
+        assert!(
+            calls < COMMANDS,
+            "the queue's last slot stays a wire record's"
+        );
+        // Calls stop at their bytes' bound or at their count's, the fewer, and the refusal names
+        // the bound that refused (QB.1). The count is checked first.
+        let by_bytes = application / api::REQUEST_MAX;
+        let refused_by = if by_bytes < calls { application } else { calls };
         assert!(matches!(
             refusal,
-            Some(Refusal::Full { limit }) if limit == application
+            Some(Refusal::Full { limit }) if limit == refused_by
         ));
-        // Calls stop at their bytes' bound or at the queue's slots less the wire record's, the
-        // fewer (QB.1).
-        assert_eq!(
-            replies.len(),
-            (application / api::REQUEST_MAX).min(COMMANDS - 1)
-        );
+        assert_eq!(replies.len(), by_bytes.min(calls));
         assert!(!replies.is_empty());
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }

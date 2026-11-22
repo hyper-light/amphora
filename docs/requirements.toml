@@ -1130,7 +1130,7 @@ id = "QB.1"
 title = "The owner's queues hold what their readers drain in a learned election timeout, within the memory budget, not picked bounds"
 criteria = [
   { id = "AC-QB.1.1", text = "Each queue's drain rate is measured in bytes and messages over the owner's clock, the outgoing queue's in ReplicaHandle::drain and the command queue's at the owner's intake, each a decaying ratio of sums at RFC 6298's gain" },
-  { id = "AC-QB.1.2", text = "Each bound is the lesser of the rate times the learned election timeout (election_tick times the pace's period) and the memory budget's room for queues, the queues' bytes charged through Budget::take; one record before anything is measured (one call for application calls); a wire record's image is the budget's room for one, held inside the command queue's bound" },
+  { id = "AC-QB.1.2", text = "The outgoing queue's bound is the lesser of its rate times the learned election timeout (election_tick times the pace's period) and the memory budget's room for queues, the queues' bytes charged through Budget::take. The command queue's bytes are that room, and application calls hold it less one wire record's room; calls are counted to the messages the owner takes in the learned election timeout, at least one and at most the queue's slots less one (the slots less one before anything is measured), and a call refused names the bound that refused it. A wire record's image is the budget's room for one, held inside the command queue's bound" },
   { id = "AC-QB.1.3", text = "An outgoing queue past the budget's room fences at once; one past its learned bound fences only once it has stayed past it for an election timeout, so a bound that starts small grows before it fences" },
 ]
 tests = [

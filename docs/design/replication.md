@@ -2488,14 +2488,24 @@ the time in which the group elects another leader, so holding more serves no one
 in bytes and messages a second, the outgoing queue's in `ReplicaHandle::drain` (its reader the host) and the command
 queue's at the owner's intake, each a decaying ratio of sums with RFC 6298's gain of 1/8, as the compaction's costs are
 (CT.1; `database/drain.rs`). An interval counts when the queue held work at its start or its reader took some in it.
-The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). Each bound is the
-lesser of the rate times that timeout and the memory budget's room for queues (MB.1), read again at each tick of the
-pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`). Before anything is
-measured each bound is one record: the command queue, one image's wire record; the application calls in it, one
-call; the outgoing queue, one message. A wire record's image is the budget's room for one (SB.1), held inside the
-command queue's bound. Application calls hold no more than the owner takes of them in an election timeout, so that
-calls waiting for a leader leave the rest of the queue to the wire records that find one. The local writer's queue has no election: each request it admits is charged to the
-budget's room for queues, refused `Full` at that room.
+The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). The bounds are read
+again at each tick of the pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`).
+- The outgoing queue holds the lesser of its host's rate times that timeout and the memory budget's room for queues
+  (MB.1), at least one message: the room before any drain is measured.
+- The command queue's bytes are the budget's room for queues. Application calls hold that room less one wire record's,
+  so that calls waiting for a leader cannot block the wire record that finds one. A wire record's image is the
+  budget's room for one (SB.1), held inside the command queue's bound.
+- Application calls are also counted (`Control::call_bound`): no more than the inputs the owner takes in an election
+  timeout at its learned message rate (`Drain::bound(..).messages`), at least one, and never more than the queue's
+  slots less one, so that a wire record always finds a slot. Before the intake is measured, the slots less one.
+- A call is charged its worst case (`REQUEST_MAX`, 32 MiB), while the intake's byte rate is learned mostly from small
+  wire records. A byte bound learned from that rate fell to one call and refused a change of members queued beside it
+  (`every_falsifier_of_the_floor_holds_under_a_nemesis`). So calls are bounded in count by the rate and in bytes by the
+  room, never in bytes by the rate. A call refused for its count is `Full` at the count bound, one refused for its
+  bytes `Full` at the calls' byte bound.
+
+The local writer's queue has no election: each request it admits is charged to the budget's room for queues, refused
+`Full` at that room.
 
 **A bound that starts small grows before it fences.** A full outgoing queue fenced the owner. Now a queue past the
 budget's room fences at once, since memory can't be lent; one past what its host drains in an election timeout fences
@@ -2527,12 +2537,9 @@ wire records queued beside them (`Control::called`).
 - `unstable_entries` and `entries_per_message` (1024 each) override what `hyper_raft::Limits::derive` already derives:
   the memory stated over `size_of::<Entry>()`, and a message's payload over `ENTRY_FIXED_BYTES`. The fix is to drop
   the overrides and state the memory as the budget's room for queues (MB.1) in place of the picked `64 << 20`.
-- `COMMANDS` (64) is the command queue's slots. Its bytes are already learned (QB.1). The slots are what the owner
-  takes in an election timeout, counted in messages (`Drain::bound(..).messages`), at most the budget's room over the
-  smallest input's charge. This is also why `every_falsifier_of_the_floor_holds_under_a_nemesis` still fails. A call
-  is charged `REQUEST_MAX` (32 MiB, the worst case), but the byte rate is learned mostly from small wire records. The
-  learned byte bound then falls to one call, and a member change queued beside a call is refused `Full`. Calls should
-  be bounded in count by the learned message rate, and in bytes by the memory room.
+- `COMMANDS` (64) is the command queue's slots. Its bytes are the memory room and its calls are counted by the
+  learned message rate (QB.1, lane constants-19). The slots are what the owner takes in an election timeout, counted in
+  messages (`Drain::bound(..).messages`), at most the budget's room over the smallest input's charge.
 - `MEMBERS` (64) is the most members a configuration names. A leader holds up to a message's payload of votes and
   progress for each member (`Limits::vote_bytes = payload × members`), so `MEMBERS` is the budget's room for queues over
   a message's payload, at most what a `ConfState` in one wire record can name.
