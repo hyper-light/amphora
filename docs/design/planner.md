@@ -1740,12 +1740,17 @@ counted share (at least half a row's, the sample's own floor) is stored in the d
 `FilterShares`, keyed by the table and a fingerprint of the terms (order-free, never for terms
 reading a parameter), and every plan that read the old share is planned again before its next run,
 or at once by the hand-off, as one planned on a moved count is. The planner reads a stored share in
-place of the sample's for the same terms. Only with adaptive joins on; counted by
+place of the sample's for the same terms. A build filtered by one `=` or IN list of constants on a
+column the column statistics estimate (decision 20, which the sample does not run) is checked the
+same way against their share (lane replan-9, `constraints::apply_column_stats`): the planner notes
+the share it read for that term alone and reads a stored one in its place; the error is the
+sample's binomial one at the share planned on, as a common value's share is the sample's count and
+a rare value's what the sample's counts leave. Only with adaptive joins on; counted by
 `Connection::adaptive_filter_checks` and `Connection::adaptive_filter_corrections` (each also an
 `adaptive_replans`). The store holds its entries weakly, so it is bound by the plans that read them:
 a share outlives the last statement planned on it only until its entry is swept. A build whose
-terms the sample did not run together (an `=` its column statistics estimate, say) or fed by a
-materialized input is not checked. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
+terms the sample did not run together and that are not one column statistics term (an `=` beside
+a range, say), or fed by a materialized input, is not checked. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
 (`crates/engine/tests/adaptive_joins.rs`; T-PL.13.5), a range one row in a hundred passed at
 ANALYZE and every row after an UPDATE: one answer with adaptive joins off and on, one share stored,
 one re-plan, none on the second run or in a statement prepared on the stored share.
@@ -1793,6 +1798,18 @@ answer with adaptive joins off and on, one re-plan, none on the second run or in
 GROUP BY subquery read through its seek index, the same way. `t_pl_13_9_a_grouped_result_is_checked_against_its_group_counts_error`
 (T-PL.13.9): 2,000 groups read as 1,667 (3 rows a group), within the group count's error though past
 the rows' (1 / sqrt(1,024)), not planned again; 5,000 after an UPDATE, past it, planned again once.
+`t_pl_13_10_a_build_filtered_by_a_column_statistics_term_plans_again` (T-PL.13.10): a build
+filtered by `b.v = 7`, and by `b.v IN (7, 8)`, on a column every value of which was distinct as
+ANALYZE counted it, half its rows set to 7 after: one answer with adaptive joins off and on, one
+share stored, one re-plan, none on the second run or in a new statement.
+
+**Not checked yet (lane replan-9's audit of the points this decision names).** A hash join's build
+fed by a materialized input, or filtered by terms that are neither one column statistics term nor
+a set the sample ran together; a sorter fed by anything but one table's full scan (a join, an
+index range, a GROUP BY's or DISTINCT's sorter); a stored subquery result over another subquery or
+a table without statistics, and an IN subquery's ephemeral index. Each needs a store for its own
+correction (a join's or a group's rows, keyed as a filter share is), or the new plan would be the
+old one (the last falsifier below).
 
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).

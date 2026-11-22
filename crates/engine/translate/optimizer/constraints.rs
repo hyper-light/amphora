@@ -2834,6 +2834,24 @@ fn apply_column_stats(
             }
             _ => continue,
         };
+        // PL.13 (lane replan-9): a share a filtered build counted for this one term stands in for
+        // the column statistics', and the plan notes the share it read, so a build or sorter
+        // filtered by this term alone is checked against it. Its error is the sample's binomial
+        // one at the share planned on: the common values are the sample's counts, and the share
+        // left to a rare value is what the sample's counts leave (decision 20).
+        let selectivity = match (
+            params.plan_values.as_deref(),
+            sample,
+            crate::filter_shares::fingerprint(std::iter::once(&term.expr)),
+        ) {
+            (Some(values), Some((n, _)), Some(fingerprint)) => values.filter_selectivity(
+                table.table.get_name(),
+                fingerprint,
+                selectivity,
+                n as usize,
+            ),
+            _ => selectivity,
+        };
         constraint.selectivity = selectivity;
     }
 }

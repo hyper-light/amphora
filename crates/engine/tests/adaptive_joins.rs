@@ -882,3 +882,90 @@ fn t_pl_13_9_a_grouped_result_is_checked_against_its_group_counts_error() {
         assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
     }
 }
+
+/// Do: a hash join the planner chose itself (hash joins only), its build side a table filtered by
+/// one `=`, and then by one IN list, on a column whose statistics (decision 20) give the value one
+/// row in 5,000 (every value distinct as ANALYZE counted them), then updated so half the rows hold
+/// it (the count unchanged, so the row counter, PL.9, cannot tell); each run with adaptive joins
+/// off, then on in one prepared statement twice, and in a statement prepared after. Expect: one
+/// answer every way; off, no filtered build counted; on, the filtered build counted against the
+/// share the column statistics gave, past its error, the counted share stored and the statement
+/// planned again once; the second run and the new statement plan on the stored share, and nothing
+/// plans again (PL.13, lane replan-9, T-PL.13.10: a filter the column statistics estimate, which
+/// the sample does not run, at its build's materialization point).
+#[test]
+fn t_pl_13_10_a_build_filtered_by_a_column_statistics_term_plans_again() {
+    let (_dir, conn) = open("column_stats_build.db");
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO a(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100) SELECT i % 20 FROM n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 20, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE b SET v = 7 WHERE id % 2 = 0").unwrap();
+    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+    for (case, sql) in [
+        (
+            "=",
+            "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE b.v = 7",
+        ),
+        (
+            "IN",
+            "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE b.v IN (7, 8)",
+        ),
+    ] {
+        conn.set_adaptive_joins(false);
+        let (checks, corrections) = (
+            conn.adaptive_filter_checks(),
+            conn.adaptive_filter_corrections(),
+        );
+        let off = rows(&conn, sql);
+        // b's even ids hold 7 (8 is b.v of no row now): 250 of each even k, each k five rows of a.
+        assert_eq!(off.len(), 10 * 250 * 5, "{case}: the join's rows");
+        assert_eq!(
+            conn.adaptive_filter_checks(),
+            checks,
+            "{case}: counted with adaptive joins off"
+        );
+
+        conn.set_adaptive_joins(true);
+        let replans = conn.adaptive_replans();
+        let mut held = conn.prepare(sql).unwrap();
+        assert_eq!(collect(&mut held), off, "{case}: on and off differ");
+        assert!(
+            conn.adaptive_filter_checks() > checks,
+            "{case}: the filtered build was not counted"
+        );
+        assert_eq!(
+            conn.adaptive_filter_corrections() - corrections,
+            1,
+            "{case}: the counted share stored"
+        );
+        assert_eq!(
+            conn.adaptive_replans() - replans,
+            1,
+            "{case}: planned again once"
+        );
+
+        let replans = conn.adaptive_replans();
+        assert_eq!(collect(&mut held), off, "{case}: the second run's answer");
+        assert_eq!(
+            rows(&conn, sql),
+            off,
+            "{case}: a statement planned on the stored share"
+        );
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+        assert_eq!(
+            conn.adaptive_filter_corrections() - corrections,
+            1,
+            "{case}: a second share stored"
+        );
+    }
+}
