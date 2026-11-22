@@ -513,4 +513,4 @@ mod cache {
 pub(crate) mod fused;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -20,7 +20,8 @@ pub(super) fn note_fused(rows: usize) {
     FUSED.with(|fused| fused.set(fused.get() + rows));
 }
 
-fn fused() -> usize {
+/// Rows the fused loops ran on this thread so far (the skipping tests read it: lane skip-5).
+pub(crate) fn fused() -> usize {
     FUSED.with(Cell::get)
 }
 

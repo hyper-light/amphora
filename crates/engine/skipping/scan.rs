@@ -316,6 +316,13 @@ impl SkipWalks {
         Some(self.walks.swap_remove(at))
     }
 
+    /// The last rowid of the candidate run cursor `cursor_id`'s walk stands in: a fused loop runs
+    /// its body over the batch up to it (lane skip-5, T-SKU.4).
+    pub fn run_end(&self, cursor_id: usize) -> Option<i64> {
+        let walk = self.walks.iter().find(|w| w.cursor_id == cursor_id)?;
+        walk.ranges.get(walk.at).map(|range| range.last)
+    }
+
     pub fn put(&mut self, walk: SkipWalk) {
         self.walks.push(walk);
     }
