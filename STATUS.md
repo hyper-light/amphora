@@ -5,6 +5,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **Read-your-writes by session tokens** (CP-T1.10, AC-T1.10.R1-R3, lane ryw-1; docs/design/replication.md):
+  `Database::session_token` after a write, and `Database::query_session(ReadMode, token, ..)`. `Latest` is today's read
+  (the control). `Session` serves a token read on any replica that has applied the token, waits only while that replica
+  is behind, and redirects past its measured apply lag. A read without a token never waits. `session_counters` holds the
+  instruments, and `amphora-bench --cluster --shapes ryw` runs the ladder. Waits on the coordinator: the A/B on
+  adacachy2, the power-cut case (after repl-measure-8's fix), and the overlay candidate (spec only).
 - **A refusal before a cross-group step** (CP-T1.10, AC-T1.10.6, lane xgroup-sql-4; docs/design/xgroup.md): `Options::on_refused`
   retries a step a group refused before taking it (`NotLeader`, `Full`) after the learned RFC 6298 back-off, with today's
   behaviour as the control; `Cluster::counted` gives the instruments. A group failing mid-commit is tested through a session
