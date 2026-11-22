@@ -935,9 +935,14 @@ impl VersionedCursor {
             return Ok(());
         }
         let from = start.checked_add(off).ok_or(LimboError::IntegerOverflow)?;
-        let to = from.checked_add(data.len()).ok_or(LimboError::IntegerOverflow)?;
+        let to = from
+            .checked_add(data.len())
+            .ok_or(LimboError::IntegerOverflow)?;
         let (key, value) = {
-            let pin = self.blob.as_mut().ok_or_else(|| corrupt("a blob row unpinned"))?;
+            let pin = self
+                .blob
+                .as_mut()
+                .ok_or_else(|| corrupt("a blob row unpinned"))?;
             pin.value
                 .get_mut(from..to)
                 .ok_or_else(|| corrupt("a blob's range past its record"))?
