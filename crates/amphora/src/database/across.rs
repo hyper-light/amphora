@@ -1592,7 +1592,10 @@ mod tests {
             assert_eq!(seen(&page.rows), want(rows), "as of {at}");
             assert!(!page.more, "as of {at}");
             for key in ["a1", "a2", "b1", "b2", "b3"] {
-                let row = row_at(&new, "n", "f", key.as_bytes(), *at).unwrap().read();
+                let row = row_at(&new, "n", "f", key.as_bytes(), *at)
+                    .unwrap()
+                    .unwrap()
+                    .read();
                 let expected: Seen = want(rows)
                     .into_iter()
                     .filter(|(k, _, _)| k == key)
