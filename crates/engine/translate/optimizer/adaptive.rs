@@ -270,6 +270,8 @@ mod tests {
             hash_build: build,
             hash_probe: probe,
             sort: 1.0,
+            bloom_probe: 1.0,
+            where_step: 1.0,
             page_miss: None,
         }
     }

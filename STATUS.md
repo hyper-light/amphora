@@ -679,6 +679,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   chosen only where it costs less than the probes it saves; its hashes and bits stay within the join's memory budget
   (`docs/design/planner.md`, "Decision (lane qs5-9)"). LIP and predicate transfer, a measured filter-lookup weight,
   removing `rhs_has_selective_seek` and deriving `cpu_cost_per_where_step` are left.
+- **Calibration that holds under load; the filter's lookup and a WHERE step measured** (lane qs5-10): calibration
+  samples each kind of work in rounds and takes medians, stopping once each median's order-statistic standard error
+  is within the timer's cost; it also times a Bloom filter's lookup and a WHERE step, which now price the filter and
+  `cpu_cost_per_where_step` (`docs/design/planner.md`, "Decision (lane qs5-10)"). Left: `hash_bytes_per_row`, the
+  `rhs_has_selective_seek` gate, LIP and predicate transfer, sort-merge and prefetched index joins.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness

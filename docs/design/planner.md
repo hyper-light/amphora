@@ -1846,3 +1846,33 @@ twice the build's rows".
   LIP (filters from several dimensions applied to the fact scan in their measured order) and
   predicate transfer across the join graph are not built yet.
 
+## Decision (lane qs5-10): calibration from repeated samples, and the filter's lookup and a WHERE step measured
+
+**Decision.** QT.5 and PL.5, query speed step 5. `learned_costs::calibrate` timed each kind of
+work once, so a moment of host load fell on one kind and moved the planner's weights from one run
+to the next, flipping plans whose costs sat close (the planner tests that failed now and then
+under load). It now samples:
+
+- **Rounds.** One sample of each kind a round (a sample is the kind's work repeated until it
+  reaches the slowest kind's single run, as before), so a stretch of load falls on every kind
+  alike and their ratios, the weights, stay.
+- **Medians.** Each kind's rate is the median of its samples. A preempted sample is one long time:
+  it moves a mean by its whole length, a median by one rank.
+- **Stopping from the spread** (`median_settled`). Among `n` samples the count below the true
+  median is binomial, `n/2` with standard deviation `sqrt(n)/2`, so the samples at ranks
+  `n/2 -+ sqrt(n)/2` bracket the median by about one standard error whatever the times'
+  distribution (Thompson, Annals of Mathematical Statistics 7(3), 1936). A kind stops once half
+  that bracket is within the timer's own cost, a pair of clock reads: no reading resolves finer.
+  The spread is read each time the samples double. The rounds stop at a page's keys, as a
+  sample's repetitions do, so calibration's time is bounded under any load.
+- **The filter's lookup** (`Work::BloomProbe`, `bloom_lookup_cost`). Calibration builds a hash
+  join's filter over a page of keys, sized as the planner sizes one for one false positive across
+  a page of keys it doesn't hold, and times lookups of such keys, the key's hash included.
+  `bloom_filter_rate_per_key` prices each probe row's lookup at that, in place of one key hash
+  (which the learned weights had made zero).
+- **A WHERE step** (`Work::WhereStep`, `cpu_cost_per_where_step`). Two of the engine's values
+  compared, timed per key; the planner's step cost is that weight times the row's, in place of
+  0.003. The defaults of both stand only where the clock never moved.
+- **Open.** `hash_bytes_per_row` (100) and the `rhs_has_selective_seek` gate are still to remove;
+  LIP and predicate transfer across star joins (T-QT.5.3), sort-merge and prefetched index joins
+  are not built.

@@ -29,6 +29,13 @@ pub(crate) enum Work {
     /// Sorting, in rows times log2 rows, as the planner counts a sort
     /// (`cost::estimate_sort_cpu_cost`).
     Sort,
+    /// One lookup of a hash join's Bloom filter for a key it doesn't hold, the key's hash
+    /// included (PL.5: what the filter costs every probe row, measured rather than priced as one
+    /// key hash).
+    BloomProbe,
+    /// One step of a `WHERE` condition: two of the engine's values compared, as a condition's
+    /// comparison compares them (`cpu_cost_per_where_step`).
+    WhereStep,
     /// One page read from the database's file, as the pager times it from the read's submission
     /// to its completion (`sqlite3_ondisk::begin_read_page`). The planner's unit of cost.
     PageRead,
@@ -94,6 +101,8 @@ struct Rates {
     hash_build: Rate,
     hash_probe: Rate,
     sort: Rate,
+    bloom_probe: Rate,
+    where_step: Rate,
     page: Rate,
     /// What timing one run costs: a pair of clock reads (step 3a, `Sampling`).
     timing_nanos: f64,
@@ -107,6 +116,8 @@ impl Rates {
             Work::HashBuild => &mut self.hash_build,
             Work::HashProbe => &mut self.hash_probe,
             Work::Sort => &mut self.sort,
+            Work::BloomProbe => &mut self.bloom_probe,
+            Work::WhereStep => &mut self.where_step,
             Work::PageRead => &mut self.page,
         }
     }
@@ -121,6 +132,8 @@ impl Rates {
             hash_build: self.hash_build.nanos_per_unit()? / row,
             hash_probe: self.hash_probe.nanos_per_unit()? / row,
             sort: self.sort.nanos_per_unit()? / row,
+            bloom_probe: self.bloom_probe.nanos_per_unit()? / row,
+            where_step: self.where_step.nanos_per_unit()? / row,
             page_miss: miss.filter(|m| m.is_finite()).map(|m| m.clamp(0.0, 1.0)),
         })
     }
@@ -138,6 +151,10 @@ pub(crate) struct LearnedWeights {
     pub(crate) hash_build: f64,
     pub(crate) hash_probe: f64,
     pub(crate) sort: f64,
+    /// A Bloom filter's lookup of a key it doesn't hold (`Work::BloomProbe`).
+    pub(crate) bloom_probe: f64,
+    /// A `WHERE` condition's step (`Work::WhereStep`).
+    pub(crate) where_step: f64,
     /// The share of the connection's recent page fetches that read a file, None before its first
     /// fetch (`Pager::page_miss_ratio`): how many of the pages a plan would first read from a cold
     /// cache it reads from the file (`cost::file_reads`).
@@ -259,7 +276,7 @@ impl LearnedCosts {
             Work::Seek => Some(&self.seek),
             Work::HashBuild => Some(&self.hash_build),
             Work::HashProbe => Some(&self.hash_probe),
-            Work::Row | Work::Sort | Work::PageRead => None,
+            Work::Row | Work::Sort | Work::BloomProbe | Work::WhereStep | Work::PageRead => None,
         }
     }
 
@@ -420,12 +437,45 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
         sorted.sort_unstable();
         black_box(&sorted);
     };
-    let mut kinds: [(Work, f64, &mut dyn FnMut()); 5] = [
+    // A hash join's filter over the page's keys, sized as the planner sizes one (PL.5,
+    // `FilterSizing`) for one false positive expected across a page of keys it doesn't hold,
+    // and looked up for such a page: the probe rows a filter is for. Its memory is bounded by the
+    // page's keys' hashes, all it is given.
+    let fp_per_key = 1.0 / (rows * rows);
+    let mut filter =
+        crate::vdbe::bloom_filter::BloomFilter::sized(crate::vdbe::bloom_filter::FilterSizing {
+            fp_per_key,
+            max_bytes: n.saturating_mul(std::mem::size_of::<u64>()),
+        });
+    for k in &keys {
+        filter.insert_i64(*k as i64);
+    }
+    filter.seal();
+    let absent: Vec<i64> = (n as u64..2 * n as u64).map(|i| mix(i) as i64).collect();
+    let mut bloom = || {
+        for k in &absent {
+            black_box(filter.contains_i64(black_box(*k)));
+        }
+    };
+    // A condition's step: each key, as one of the engine's values, compared with another.
+    let values: Vec<crate::Value> = keys
+        .iter()
+        .map(|k| crate::Value::from_i64(*k as i64))
+        .collect();
+    let pivot = crate::Value::from_i64(0);
+    let mut step = || {
+        for v in &values {
+            black_box(black_box(v) < &pivot);
+        }
+    };
+    let mut kinds: [(Work, f64, &mut dyn FnMut()); 7] = [
         (Work::Row, rows, &mut row),
         (Work::Seek, rows, &mut seek),
         (Work::HashBuild, rows, &mut build),
         (Work::HashProbe, rows, &mut probe),
         (Work::Sort, rows * rows.log2(), &mut sort),
+        (Work::BloomProbe, rows, &mut bloom),
+        (Work::WhereStep, rows, &mut step),
     ];
     let mut target: f64 = 0.0;
     for (_, _, work) in kinds.iter_mut() {
@@ -442,7 +492,7 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
     rates.timing_nanos = nanos / reps;
     // Each kind's repetitions a sample, found as `measure` finds them; then its samples, a round
     // at a time.
-    let mut sampled: [(usize, Vec<f64>, bool); 5] = Default::default();
+    let mut sampled: [(usize, Vec<f64>, bool); 7] = Default::default();
     for ((_, _, work), (reps, _, _)) in kinds.iter_mut().zip(sampled.iter_mut()) {
         *reps = measure(clock, target, n, &mut **work).0 as usize;
     }
@@ -631,6 +681,8 @@ mod tests {
             hash_build: Rate::calibrated(100.0, 100.0 * build),
             hash_probe: Rate::calibrated(100.0, 100.0 * probe),
             sort: Rate::calibrated(100.0, 100.0 * sort),
+            bloom_probe: Rate::calibrated(100.0, 100.0 * probe / 4.0),
+            where_step: Rate::calibrated(100.0, 100.0 * row),
             page: Rate {
                 epoch: 4.0,
                 ..Rate::default()
@@ -680,6 +732,8 @@ mod tests {
             weights.hash_build,
             weights.hash_probe,
             weights.sort,
+            weights.bloom_probe,
+            weights.where_step,
         ] {
             assert!(w.is_finite() && w > 0.0, "{weights:?}");
         }
@@ -758,6 +812,8 @@ mod tests {
         assert_eq!(after.cpu_cost_per_row, 2.0 / 128.0);
         assert_eq!(after.cpu_cost_per_seek, 10.0 / 128.0);
         assert_eq!(after.hash_insert_cost, 20.0 / 128.0);
+        assert_eq!(after.bloom_lookup_cost, 15.0 / 4.0 / 128.0);
+        assert_eq!(after.cpu_cost_per_where_step, 2.0 / 128.0);
     }
 
     /// Do: weigh with no fetch yet, with a share of 0.25, and with a share out of range. Expect:
@@ -878,6 +934,8 @@ mod tests {
             (steady.hash_build, preempted.hash_build),
             (steady.hash_probe, preempted.hash_probe),
             (steady.sort, preempted.sort),
+            (steady.bloom_probe, preempted.bloom_probe),
+            (steady.where_step, preempted.where_step),
         ] {
             assert!((a - b).abs() <= 1e-12 * a.abs(), "{steady:?} {preempted:?}");
         }

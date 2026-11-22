@@ -60,7 +60,9 @@ pub struct CostModelParams {
     /// CPU cost per row processed (relative to page IO = 1.0).
     pub cpu_cost_per_row: f64,
 
-    /// CPU cost for one extra operation in a `WHERE` condition.
+    /// CPU cost for one extra operation in a `WHERE` condition. Learned where the engine runs
+    /// (`learned_costs`, `Work::WhereStep`: two of the engine's values compared) and set by
+    /// `with_learned`; the default stands only where the clock never moved.
     pub cpu_cost_per_where_step: f64,
 
     /// CPU cost per index seek (key comparisons).
@@ -97,6 +99,12 @@ pub struct CostModelParams {
 
     /// CPU cost to probe hash table.
     pub hash_lookup_cost: f64,
+
+    /// Amphora (PL.5): CPU cost of one lookup of a hash join's Bloom filter, the key's hash
+    /// included (`bloom_filter_rate_per_key`). Learned where the engine runs (`learned_costs`,
+    /// `Work::BloomProbe`) and set by `with_learned`; the default, a key's hash
+    /// (`hash_cpu_cost`'s), stands only where the clock never moved.
+    pub bloom_lookup_cost: f64,
 
     /// Estimated bytes per row for hash table spill estimation.
     pub hash_bytes_per_row: f64,
@@ -143,6 +151,7 @@ impl CostModelParams {
             hash_cpu_cost: 0.001,
             hash_insert_cost: 0.002,
             hash_lookup_cost: 0.003,
+            bloom_lookup_cost: 0.001,
             hash_bytes_per_row: 100.0,
 
             plan_values: None,
@@ -219,7 +228,8 @@ impl CostModelParams {
     /// Amphora (QT.5): these parameters with the seek's, the hash table's build and probe and the
     /// sort's weights learned where the engine runs (`learned_costs`), each its multiple of a row's
     /// visit times `cpu_cost_per_row`; and `cpu_cost_per_row` itself, the row's visit against a
-    /// page read, once the database has timed one. The learned build and probe times include
+    /// page read, once the database has timed one; and a `WHERE` step and a Bloom filter's lookup
+    /// the same way (PL.5). The learned build and probe times include
     /// hashing the key, so `hash_cpu_cost` adds nothing to them. None, a clock that never moved,
     /// leaves these.
     pub(crate) fn with_learned(
@@ -237,6 +247,8 @@ impl CostModelParams {
             hash_insert_cost: row * learned.hash_build,
             hash_lookup_cost: row * learned.hash_probe,
             sort_cpu_per_row: row * learned.sort,
+            cpu_cost_per_where_step: row * learned.where_step,
+            bloom_lookup_cost: row * learned.bloom_probe,
             page_miss: learned.page_miss.unwrap_or(1.0),
             ..self.clone()
         }
@@ -374,6 +386,7 @@ impl CostModelParams {
             ("hash_cpu_cost", self.hash_cpu_cost),
             ("hash_insert_cost", self.hash_insert_cost),
             ("hash_lookup_cost", self.hash_lookup_cost),
+            ("bloom_lookup_cost", self.bloom_lookup_cost),
         ];
 
         for (name, val) in cost_params {

@@ -323,6 +323,8 @@ tests = [
   { id = "T-PL.5.1", text = "A star join whose dimension filters keep no fact row — passes when the answer is unchanged and the filters' memory stays within their stated bound" },
   # lane qs5-9
   { id = "T-PL.5.2", text = "pl_5_star_join_filters_fire_and_answers_hold (crates/engine/tests/join_methods.rs) — passes when a star join, its filters keeping some fact rows and none, gives the model's answer with hash joins only, nested loops only and by cost, and the hash-join plans probe a Bloom filter" },
+  # lane qs5-10
+  { id = "T-PL.5.4", text = "t_qt_5_5_the_planner_takes_the_learned_row_cost (crates/engine/translate/optimizer/learned_costs.rs) — passes when the Bloom filter's lookup and a WHERE step reach the planner as the weights calibration measured for them (bloom_lookup_cost, cpu_cost_per_where_step)" },
   { id = "T-PL.5.3", text = "pl_5_sized_filter_* (crates/engine/vdbe/bloom_filter.rs) — passes when a filter sized from its build's distinct keys has no false negative and about its derived rate, and one past its memory bound or not worth its bits passes every key" },
 ]
 
@@ -824,6 +826,8 @@ tests = [
   { id = "T-QT.5.3", text = "Predicate transfer over a cyclic join graph and over an outer join (transfer in one direction only) — passes when identical results, and the filters' memory within the statement's stated bound" },
   { id = "T-QT.5.4", text = "TPC-H q01 and q06, which join nothing — passes when no filter built, times within the passes' spread of the parent's" },
   { id = "T-QT.5.5", text = "The seek, hash-build, hash-probe and sort weights, learned per database (calibrated at start, moved by operators' times) — passes when calibration alone gives finite positive weights, observed times move a weight to the observed rate, and meaningless observations leave it" },
+  # lane qs5-10
+  { id = "T-QT.5.6", text = "t_qt_5_5_calibration_weights_hold_through_preempted_samples and t_qt_5_5_a_median_settles_once_its_spread_is_within_the_resolution (crates/engine/translate/optimizer/learned_costs.rs) — passes when calibration with a clock that jumps a millisecond every eleventh reading gives the steady clock's weights, and a kind's samples stop once their median's order-statistic standard error is within the timer's cost" },
 ]
 
 # lane records-api: Amphora's own IDs for CP-T1.5's Records API (kiln goal a1f386fe, G9 step 1;
