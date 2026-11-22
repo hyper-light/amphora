@@ -542,6 +542,57 @@ cursor interface can't carry; or the header kept by the pager disagreeing with t
 crash between the two (the header moves into the catalog with `sqlite_schema`'s own tree, G7 step
 2's next piece).
 
+## 14. Eviction: CLOCK to a spill file, slots by page number, reads verified once, a typed bound
+
+(G7 step 4, `NS.4`; `crates/engine/storage/versioned/pool.rs`, tests in `evict.rs`.)
+
+**Decision.** A database's pool holds the frames its byte budget pays for (`pool::frames_within`:
+the budget over a page and its frame's state); the budget is the shell's, from the memory the process
+may use (`amphora::memory::limit`; `pool::machine_bytes` reads the machine's on Linux and refuses,
+naming the platform, where reading it needs `unsafe`). Pages are read in as they are asked for and
+evicted by CLOCK (decision 2's rule, the reach prototypes' shared eviction, G7 step 3): a frame whose
+reference bit is clear and whose latch no one holds; a clean frame is reused at once, a dirty one is
+first written to the spill file, page `n` at `n` pages in. The data file still changes only by
+checkpoints (decision 7), so the spill file is emptied as the pool opens and never read by recovery:
+eviction needs no ordering against the redo log, and recovery is decision 8's unchanged. A page's
+newest bytes out of the pool are the spill file's once it was spilled, else the data file's; a page
+read in is checked once, as it enters the pool, against the low 32 bits of XXH3 of those bytes,
+taken when the pool wrote them out or, for the data file, as it opened. Page numbers reach frames
+through a direct array, one 16-byte slot a page (frame, spilled mark, the epochs of decision 7's
+copy-on-update, checksum), in buckets that double so it grows without moving: G7 step 3's design
+(c). A page's version for decision 3's copies is its frame's, started past the highest version any
+evicted frame reached each time a page is read in, so no copy from an earlier stay matches. Every
+frame latched, or a page that left its frame on as many tries as there are frames, is refused with
+`MemoryBudget`; a pool without a disk keeps every page resident and refuses past its frames with
+`DatabaseFull`, as before.
+
+**Why.** In-place write-back between checkpoints would break decision 8: recovery starts from the
+last checkpoint's pages and replays logical row changes, and a page written home early (a split's
+half, a row of a transaction still open) leaves a file no replay can repair. Writing evicted pages
+aside keeps the checkpoint's image whole, as shadow paging does (Lorie, "Physical Integrity in a
+Large Segmented Database", TODS 1977), at the cost of a write per dirty eviction. CLOCK over
+LeanStore's cooling stage: CLOCK is what the three reach prototypes share and the model test checked
+under 32 threads; the cooling stage (Leis et al., ICDE 2018) pays off with swizzled pointers, which
+the coordinator's choice among the prototypes hasn't made. The direct array because decision 7's
+copy-on-update already needs state for every page, resident or not: the frame index rides in the
+same slot (vmcache's translation, Leis et al., SIGMOD 2023, without the virtual memory). 32-bit
+checksums: PostgreSQL keeps 16 bits a page (`src/include/storage/checksum_impl.h`).
+
+**Evidence.** `evict.rs`: a database of more than ten times its 24 frames written, rewritten across
+a checkpoint, read back and reopened; a crash at every disk operation of a workload that spills and
+checkpoints recovers a prefix of its commits at least as long as the last acknowledged durable; the
+pool's model test with eviction, 32 threads on 8 frames over 64 pages, every read whole and every
+owner reading its last write. `pool.rs`: a spilled page damaged on disk refused as corrupt; every
+frame latched refused typed.
+
+**Falsified by.** The coordinator's 10M-row corpus run in a pool a tenth of the data with resident
+memory more than 10% over the budget, or slower than the reach design chosen by the numbers. What
+isn't bounded by the pool yet, and would show there: a checkpoint builds its journal of the pages
+written since the last in memory (decision 7's copy, `Pool::copy_owed`), and a page first written
+during a checkpoint's copy keeps its old bytes in memory until the copy takes them; the slots are 16
+bytes a page of the database (0.4% of it, 3.9% of a pool a tenth of it, up to twice that in a bucket
+just made).
+
 ## Stages, each measured
 
 1. The buffer pool and the B-link tree, versioned rows, in memory: concurrent inserts and reads

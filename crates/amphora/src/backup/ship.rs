@@ -13,7 +13,9 @@ use std::time::Instant;
 
 use amphora_api::blobs::{BlobRefusal, Blobs};
 
-use super::object::{self, FORMAT, Identity, Manifest, Segment, StoredMark, Through};
+use super::object::{
+    self, FORMAT, Identity, MANIFEST_FORMAT, Manifest, Segment, StoredMark, Through,
+};
 use super::plan::{self, BaseKey, Link, Rates, SegmentKey, ThroughKey};
 use super::{Hooks, Mark, SECOND_NS, second_of};
 use crate::db::{Db, PAGE_BYTES};
@@ -38,6 +40,72 @@ pub struct Shipped {
     pub bytes: u64,
 }
 
+/// The pages a run of the log's frames wrote, a bit per page number: bounded by the database's
+/// pages, as a frame names a page of the file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Touched(Vec<u64>);
+
+impl Touched {
+    fn mark(&mut self, page: u32) -> anyhow::Result<()> {
+        let word = usize::try_from(page.checked_div(64).unwrap_or(0))?;
+        let bit = 1u64
+            .checked_shl(page.checked_rem(64).unwrap_or(0))
+            .unwrap_or(0);
+        if self.0.len() <= word {
+            self.0.resize(word.saturating_add(1), 0);
+        }
+        if let Some(w) = self.0.get_mut(word) {
+            *w |= bit;
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if self.0.len() < other.0.len() {
+            self.0.resize(other.0.len(), 0);
+        }
+        for (w, o) in self.0.iter_mut().zip(&other.0) {
+            *w |= o;
+        }
+    }
+
+    fn has(&self, page: u64) -> bool {
+        let word = usize::try_from(page.checked_div(64).unwrap_or(0)).unwrap_or(usize::MAX);
+        let bit = 1u64
+            .checked_shl(u32::try_from(page.checked_rem(64).unwrap_or(0)).unwrap_or(0))
+            .unwrap_or(0);
+        self.0.get(word).is_some_and(|w| w & bit != 0)
+    }
+
+    /// Whether any page of the bytes `from..to` of the file was written (page `n` holds bytes
+    /// `(n - 1) * PAGE_BYTES..n * PAGE_BYTES`).
+    fn any_in(&self, from: u64, to: u64) -> bool {
+        let first = from.checked_div(PAGE_BYTES).unwrap_or(0).saturating_add(1);
+        let last = to.div_ceil(PAGE_BYTES);
+        (first..=last).any(|page| self.has(page))
+    }
+}
+
+/// The latest base ended: what the next base may reuse of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LastBase {
+    id: u64,
+    start_gen: u64,
+    chunk_bytes: u64,
+    file_bytes: u64,
+    /// The base each of its chunks is stored under.
+    bases: Vec<u64>,
+}
+
+/// What an incremental base keeps of the latest: its chunks, and the pages the log changed in the
+/// generations from where it began to where this one begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reuse {
+    file_bytes: u64,
+    bases: Vec<u64>,
+    changed: Touched,
+}
+
 /// A base being copied, a chunk at a time ([`Shipper::copy_base`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseCopy {
@@ -46,6 +114,17 @@ pub struct BaseCopy {
     chunk_bytes: u64,
     file_bytes: u64,
     next: u64,
+    reuse: Option<Reuse>,
+    /// The base each chunk so far is stored under: this one's id, or the earlier base's it reuses.
+    bases: Vec<u64>,
+}
+
+impl BaseCopy {
+    /// The chunks so far kept from an earlier base rather than copied.
+    #[must_use]
+    pub fn reused(&self) -> usize {
+        self.bases.iter().filter(|b| **b != self.id).count()
+    }
 }
 
 /// Ships one database's log, and copies its bases, under `prefix` of a store.
@@ -67,6 +146,14 @@ pub struct Shipper {
     broken: bool,
     since_base: u64,
     base_bytes: Option<u64>,
+    /// Pages the frames shipped wrote: in generations before the one shipped now (since the latest
+    /// base began), and in the one shipped now. What an incremental base copies again.
+    older: Touched,
+    current: Touched,
+    /// The base whose beginning `older` and `current` trace every frame since: none after an
+    /// open (frames shipped before it weren't seen) or a gap in the log.
+    traced_from: Option<u64>,
+    last_base: Option<LastBase>,
     /// Marks of a generation that ended before they were shipped: their commits are in a gap.
     lost_marks: u64,
     /// The key of the archive's latest through mark ([`ThroughKey`]), let go once a later one or a
@@ -162,6 +249,10 @@ impl Shipper {
             broken: true,
             since_base: 0,
             base_bytes: None,
+            older: Touched::default(),
+            current: Touched::default(),
+            traced_from: None,
+            last_base: None,
             lost_marks: 0,
             through_mark: None,
         };
@@ -203,7 +294,7 @@ impl Shipper {
             .filter_map(|(k, _)| BaseKey::parse(prefix, k).ok().map(|b| (b, k)))
             .max_by_key(|(b, _)| (b.end, b.id));
         if let Some((base, key)) = latest {
-            let manifest: Manifest = object::decode(key, &blobs.get(key, until)?)?;
+            let manifest = object::manifest(key, &blobs.get(key, until)?)?;
             shipper.base_bytes = Some(manifest.file_bytes);
             shipper.broken = false;
             for (key, bytes) in &segments {
@@ -361,8 +452,13 @@ impl Shipper {
             }
             _ => Link::Gap,
         };
+        // The pages the ending generation wrote join those of the generations before it.
+        self.older.merge(&self.current);
+        self.current = Touched::default();
         if link == Link::Gap {
             self.broken = true;
+            // Frames that never reached the archive changed pages no one saw.
+            self.traced_from = None;
             if self.generation > 0 {
                 self.unknown = Some(
                     self.unknown
@@ -383,7 +479,7 @@ impl Shipper {
 
     /// Sends frames `shipped + 1..=last` with `marks`: in as few objects as the store takes.
     fn send(
-        &self,
+        &mut self,
         db: &Db,
         blobs: &dyn Blobs,
         marks: &[Mark],
@@ -432,6 +528,13 @@ impl Shipper {
                     usize::try_from(to.saturating_sub(from).saturating_mul(FRAME_BYTES))?,
                 )?
                 .ok_or_else(|| anyhow::anyhow!("the log's file is gone"))?;
+            // Each frame's header begins with its page's number, big-endian (sqlite.org/
+            // fileformat2.html, "WAL Frame Header Format").
+            for frame in body.frames.chunks(usize::try_from(FRAME_BYTES)?) {
+                if let Some(&[a, b, c, d]) = frame.get(..4) {
+                    self.current.mark(u32::from_be_bytes([a, b, c, d]))?;
+                }
+            }
             let key = SegmentKey {
                 generation: self.generation,
                 first: body.first,
@@ -473,6 +576,7 @@ impl Shipper {
             self.base_bytes,
             self.broken,
             self.since_base,
+            self.incremental_copy(),
             rates,
             RESTORE_OBJECTIVE_S,
         )
@@ -490,6 +594,25 @@ impl Shipper {
     #[must_use]
     pub fn lost_marks(&self) -> u64 {
         self.lost_marks
+    }
+
+    /// What an incremental base begun now would copy: the latest base's chunks whose pages the
+    /// log changed since it began; none when a new base would copy the whole file.
+    fn incremental_copy(&self) -> Option<u64> {
+        let last = self.last_base.as_ref()?;
+        if self.traced_from != Some(last.id) || last.start_gen >= self.generation {
+            return None;
+        }
+        let mut bytes = 0u64;
+        let mut from = 0u64;
+        while from < last.file_bytes {
+            let to = from.saturating_add(last.chunk_bytes).min(last.file_bytes);
+            if self.older.any_in(from, to) {
+                bytes = bytes.saturating_add(to.saturating_sub(from));
+            }
+            from = to;
+        }
+        Some(bytes)
     }
 
     /// Begins a copy of the database's file, in chunks as large as the store's objects and
@@ -518,12 +641,35 @@ impl Shipper {
             let mut state = self.hooks.marks.state()?;
             self.hooks.marks.stamp(&mut state)
         };
+        // An incremental base (docs/design/backup.md, "Incremental bases"): a restore replays the
+        // log from the first frame of the generation a base begins in, so a chunk of the latest
+        // base whose pages no frame of the generations from its beginning to this one's wrote is
+        // the same in both, and is kept. The frames of this generation are replayed, so they don't
+        // count. Only with every frame since the latest base began seen, and a generation since.
+        let changed = std::mem::take(&mut self.older);
+        let reuse = match &self.last_base {
+            Some(last)
+                if self.traced_from == Some(last.id)
+                    && last.start_gen < self.generation
+                    && last.chunk_bytes == chunk_bytes =>
+            {
+                Some(Reuse {
+                    file_bytes: last.file_bytes,
+                    bases: last.bases.clone(),
+                    changed,
+                })
+            }
+            _ => None,
+        };
+        self.traced_from = Some(id);
         Ok(BaseCopy {
             id,
             start_gen: self.generation,
             chunk_bytes,
             file_bytes: db.file_bytes()?,
             next: 0,
+            reuse,
+            bases: Vec::new(),
         })
     }
 
@@ -540,13 +686,31 @@ impl Shipper {
             return Ok(false);
         }
         let len = copy.chunk_bytes.min(copy.file_bytes.saturating_sub(from));
-        let bytes = object::sealed(&db.read_file(from, usize::try_from(len)?)?)?;
-        create(
-            blobs,
-            &plan::chunk_key(&self.prefix, copy.id, copy.next),
-            &bytes,
-            until,
-        )?;
+        let to = from.saturating_add(len);
+        // Kept when the latest base holds these same bytes of the file and the log changed none of
+        // their pages since it began.
+        let kept = copy.reuse.as_ref().and_then(|r| {
+            let same = r.file_bytes.saturating_sub(from).min(copy.chunk_bytes) == len;
+            let base = r.bases.get(usize::try_from(copy.next).ok()?).copied()?;
+            if same && !r.changed.any_in(from, to) {
+                Some(base)
+            } else {
+                None
+            }
+        });
+        match kept {
+            Some(base) => copy.bases.push(base),
+            None => {
+                let bytes = object::sealed(&db.read_file(from, usize::try_from(len)?)?)?;
+                create(
+                    blobs,
+                    &plan::chunk_key(&self.prefix, copy.id, copy.next),
+                    &bytes,
+                    until,
+                )?;
+                copy.bases.push(copy.id);
+            }
+        }
         copy.next = copy.next.saturating_add(1);
         Ok(copy.next.saturating_mul(copy.chunk_bytes) < copy.file_bytes)
     }
@@ -576,13 +740,14 @@ impl Shipper {
             _ => anyhow::bail!("ship the log's generation before ending a base in it"),
         };
         let manifest = Manifest {
-            format: FORMAT,
+            format: MANIFEST_FORMAT,
             id: copy.id,
             start_gen: copy.start_gen,
             end: (self.generation, end),
             file_bytes: copy.file_bytes,
             chunk_bytes: copy.chunk_bytes,
             chunks: copy.next,
+            from: object::runs(&copy.bases),
         };
         let key = BaseKey {
             end: manifest.end,
@@ -598,6 +763,13 @@ impl Shipper {
         self.base_bytes = Some(copy.file_bytes);
         self.since_base = 0;
         self.broken = false;
+        self.last_base = Some(LastBase {
+            id: copy.id,
+            start_gen: copy.start_gen,
+            chunk_bytes: copy.chunk_bytes,
+            file_bytes: copy.file_bytes,
+            bases: copy.bases,
+        });
         Ok(())
     }
 }
