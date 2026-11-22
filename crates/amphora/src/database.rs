@@ -170,6 +170,16 @@ struct LockBell {
     bell: Arc<Condvar>,
 }
 
+/// A get leaving `row`'s waiter list: the list goes with its last waiter.
+fn leave_list(lists: &mut BTreeMap<Vec<u8>, LockBell>, row: &[u8]) {
+    if let Some(list) = lists.get_mut(row) {
+        list.waiters = list.waiters.saturating_sub(1);
+        if list.waiters == 0 {
+            lists.remove(row);
+        }
+    }
+}
+
 /// What a Records get here does with a row a transaction across groups holds a lock on, between
 /// its decision and this group's resolution of it (AC-T1.10.1, lane xgroup-sql-10; option 2 of
 /// xgroup-sql-7's, the A/B sibling of the coordinator's `xgroup::sql::AnswerAt`).
@@ -189,7 +199,7 @@ pub enum LockedReads {
     /// As [`LockedReads::Wait`], but a waiting get waits on its own row's waiter list, rung when
     /// a resolution here drops that row's locks, not on every change in the group (T-T1.10.W9,
     /// lane xgroup-sql-11: Wait's thundering herd at scale). The ring comes from the step that
-    /// resolves, in the process that runs it ([`Database::ring_locks`]); a replicated group's
+    /// resolves, in the process that runs it (`Database::ring_locks`); a replicated group's
     /// replica may not be that process, so a replicated database's gets wait as under
     /// [`LockedReads::Wait`].
     WaitOnLock,
@@ -1455,6 +1465,8 @@ impl Database {
 
     /// What this database's Records gets do with a row under a cross-group lock ([`LockedReads`],
     /// the A/B switch; [`LockedReads::Committed`] until set), for every handle cloned from it.
+    /// The wait settings look the locks up in the group's cross-group tables, so the group needs
+    /// them first (`xgroup::sql::prepare`): without them its gets and scans are refused.
     pub fn set_locked_reads(&self, reads: LockedReads) {
         self.shared
             .changed
@@ -1585,74 +1597,78 @@ impl Database {
     /// ([`Database::ring_locks`]). It joins the list and tries once more before it first waits
     /// there, so a resolution between its try and joining isn't missed; from then on the list's
     /// ring count, read before each try, says whether one landed since. Meeting another row, it
-    /// moves to that row's list the same way. It leaves its list however it ends.
+    /// moves to that row's list the same way. It leaves its list however it ends. It is counted
+    /// waiting ([`Database::locked_waits`]) as it first blocks.
     fn wait_on_lock<T>(
         &self,
         until: Instant,
+        try_read: impl FnMut() -> Result<Result<T, Vec<u8>>, Refusal>,
+    ) -> Result<T, Refusal> {
+        let mut joined = None;
+        let read = self.wait_joined(until, try_read, &mut joined);
+        if let Some((row, _)) = joined {
+            leave_list(&mut *locked(&self.shared.changed.lock_waiters)?, &row);
+        }
+        read
+    }
+
+    /// [`Database::wait_on_lock`]'s tries and waits; `joined`: the row whose list it is on, and
+    /// that list's bell, for its caller to leave however it ends.
+    fn wait_joined<T>(
+        &self,
+        until: Instant,
         mut try_read: impl FnMut() -> Result<Result<T, Vec<u8>>, Refusal>,
+        joined: &mut Option<(Vec<u8>, Arc<Condvar>)>,
     ) -> Result<T, Refusal> {
         let changed = &self.shared.changed;
         let rung =
             |lists: &BTreeMap<Vec<u8>, LockBell>, row: &[u8]| lists.get(row).map_or(0, |l| l.rung);
-        let leave = |lists: &mut BTreeMap<Vec<u8>, LockBell>, row: &[u8]| {
-            if let Some(list) = lists.get_mut(row) {
-                list.waiters = list.waiters.saturating_sub(1);
-                if list.waiters == 0 {
-                    lists.remove(row);
-                }
-            }
-        };
-        let mut joined: Option<(Vec<u8>, Arc<Condvar>)> = None;
         let mut waited = false;
-        let read = (|| -> Result<T, Refusal> {
-            loop {
-                let before = match &joined {
-                    Some((row, _)) => Some(rung(&locked(&changed.lock_waiters)?, row)),
-                    None => None,
-                };
-                let row = match try_read()? {
-                    Ok(v) => return Ok(v),
-                    Err(row) => row,
-                };
-                if !waited {
-                    waited = true;
-                    self.count_locked_wait()?;
-                }
-                let lists = locked(&changed.lock_waiters)?;
-                match (&joined, before) {
-                    (Some((at, bell)), Some(before)) if *at == row => {
-                        if rung(&lists, &row) != before {
-                            changed.locked_wakes.fetch_add(1, Ordering::AcqRel);
-                            continue;
-                        }
-                        let (_lists, timeout) = bell
-                            .wait_timeout_while(
-                                lists,
-                                until.saturating_duration_since(Instant::now()),
-                                |lists| rung(lists, &row) == before,
-                            )
-                            .map_err(unavailable)?;
-                        if timeout.timed_out() {
-                            return Err(Refusal::Timeout);
-                        }
+        loop {
+            let before = match joined.as_ref() {
+                Some((row, _)) => Some(rung(&locked(&changed.lock_waiters)?, row)),
+                None => None,
+            };
+            let row = match try_read()? {
+                Ok(v) => return Ok(v),
+                Err(row) => row,
+            };
+            let mut lists = locked(&changed.lock_waiters)?;
+            match (joined.as_ref(), before) {
+                (Some((at, bell)), Some(before)) if *at == row => {
+                    if rung(&lists, &row) != before {
                         changed.locked_wakes.fetch_add(1, Ordering::AcqRel);
+                        continue;
                     }
-                    _ => {
-                        let mut lists = lists;
-                        if let Some((old, _)) = joined.take() {
-                            leave(&mut lists, &old);
-                        }
-                        let list = lists.entry(row.clone()).or_default();
-                        list.waiters = list.waiters.saturating_add(1);
-                        joined = Some((row, Arc::clone(&list.bell)));
+                    if !waited {
+                        // Counted under the list's lock, which a ring takes and the wait gives up
+                        // only once blocked: whoever waits for a read to be waiting rings it
+                        // asleep, never before it waits.
+                        waited = true;
+                        self.count_locked_wait()?;
                     }
+                    let (_lists, timeout) = bell
+                        .wait_timeout_while(
+                            lists,
+                            until.saturating_duration_since(Instant::now()),
+                            |lists| rung(lists, &row) == before,
+                        )
+                        .map_err(unavailable)?;
+                    if timeout.timed_out() {
+                        return Err(Refusal::Timeout);
+                    }
+                    changed.locked_wakes.fetch_add(1, Ordering::AcqRel);
+                }
+                _ => {
+                    if let Some((old, _)) = joined.take() {
+                        leave_list(&mut lists, &old);
+                    }
+                    let list = lists.entry(row.clone()).or_default();
+                    list.waiters = list.waiters.saturating_add(1);
+                    *joined = Some((row, Arc::clone(&list.bell)));
                 }
             }
-        })();
-        if let Some((row, _)) = joined {
-            leave(&mut *locked(&changed.lock_waiters)?, &row);
         }
-        read
     }
 
     /// This replica's token reads, counted, with its measured apply lag. None standalone and for
