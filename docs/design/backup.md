@@ -103,6 +103,33 @@ T-T1.12.C1 backs a database up to a folder through its own shipping thread and r
 **Falsified by.** A listing on a folder that differs from the simulator's; two creates of one key
 both succeeding over a mount; an object read torn after a crash.
 
+## The peer store
+
+**Decision (lane backups-6).** A backup archive may live in another process's folder, reached over
+Amphora's own owner transport rather than a mount: `transport::PeerStore` serves an object store
+(a `backup::FolderBlobs` it owns) at an endpoint, and `transport::PeerBlobs` is the seam's `Blobs`
+on the database's side. The archive then lives apart from the database it backs up with no cloud
+and no shared mount, under the transport's authentication (the endpoint's private record), as the
+folder store's decision asks of "a peer machine's folder".
+
+- **One call, one request.** Each `Blobs` call is one authenticated connection and one request
+  (`Request::Blob`, answered `Answer::Blob`), as a node's pull is; the store's refusals cross typed
+  as the seam says them. An answer lost after a create went out is `Timeout`, the seam's "a create
+  may still land", so the writer reads the object back.
+- **Bounded by the protocol.** An object holds at most the protocol's bound on a result
+  (`amphora_api::RESULT_MAX`, a format value), so its frame carries it with its key; the client's
+  `object_max()` is the smaller of that and the store's own. A listing's answer holds as many
+  entries as a result carries (a key of 1,024 bytes at most and two varints each), and says more
+  follow past them, as the seam lets any store's. The protocol's version moved to 9.
+
+**Evidence.** The seam's conformance suite through a peer store over the simulator, in one
+process; and T-T1.12.N1: a child process serves a folder store, and from the parent the suite
+passes through the client, a database backed up to it restores every row through the client and
+straight from the child's folder, and the child ends cleanly.
+
+**Falsified by.** A create acknowledged that the peer's folder doesn't hold; a refusal that crosses
+as another; an object or listing larger than a frame carries.
+
 ## Restore-and-check
 
 **Decision.** A routine restores the newest second the archive holds whole into a scratch file and

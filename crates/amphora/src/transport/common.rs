@@ -223,6 +223,14 @@ type Pulls = dyn Fn(&crate::groups::Pull, Instant, u64) -> anyhow::Result<crate:
     + Send
     + Sync;
 
+/// What an endpoint answers beyond a database's requests: a node's pulls from its groups
+/// ([`Node`]), a peer's object store ([`super::PeerStore`]); none, a database's owner.
+#[derive(Clone, Default)]
+pub(super) struct Serves {
+    pub pulls: Option<Arc<Pulls>>,
+    pub blobs: Option<Arc<dyn amphora_api::blobs::Blobs>>,
+}
+
 /// The most bytes a pull's answer holds in keys and rows: the protocol's bound on a result
 /// (`amphora_api::RESULT_MAX`, a format value), so its frame, a mebibyte more ([`FRAME_MAX`]),
 /// carries it whole.
@@ -246,7 +254,14 @@ impl Node {
         + 'static,
     ) -> Result<Self, Refusal> {
         Ok(Self {
-            _owner: Owner::listen(path, || None, Some(Arc::new(serve)))?,
+            _owner: Owner::listen(
+                path,
+                || None,
+                Serves {
+                    pulls: Some(Arc::new(serve)),
+                    blobs: None,
+                },
+            )?,
         })
     }
 }
@@ -336,15 +351,16 @@ impl Owner {
         path: &Path,
         acquire: impl Fn() -> Option<crate::database::Database> + Send + Sync + 'static,
     ) -> Result<Self, Refusal> {
-        Self::listen(path, acquire, None)
+        Self::listen(path, acquire, Serves::default())
     }
 
-    /// The listener at `path`, each connection served by `acquire`'s database, and a pull by
-    /// `pulls` (a node's endpoint, [`Node`]; none: a pull finds no group here).
-    fn listen(
+    /// The listener at `path`, each connection served by `acquire`'s database, a pull and a
+    /// request to an object store by `serves` (a node's endpoint, [`Node`], or a peer's store,
+    /// [`super::PeerStore`]; none: a pull finds no group here, and no store answers).
+    pub(super) fn listen(
         path: &Path,
         acquire: impl Fn() -> Option<crate::database::Database> + Send + Sync + 'static,
-        pulls: Option<Arc<Pulls>>,
+        serves: Serves,
     ) -> Result<Self, Refusal> {
         let endpoint::Bound {
             listener,
@@ -380,14 +396,14 @@ impl Owner {
                                 continue;
                             };
                             let acquire = Arc::clone(&acquire);
-                            let pulls = pulls.clone();
+                            let serves = serves.clone();
                             let waits = Arc::clone(&waits);
                             // Detached workers are bounded by permits and the absolute session deadline.
                             let spawned = thread::Builder::new()
                                 .name("amphora.client".into())
                                 .spawn(move || {
                                     let _permit = permit;
-                                    if let Err(error) = serve(stream, token, &*acquire, pulls.as_deref(), &waits, GREETING_MAX) {
+                                    if let Err(error) = serve(stream, token, &*acquire, &serves, &waits, GREETING_MAX) {
                                         tracing::debug!(target: "amphora.transport", event = "connection_finished", %error);
                                     }
                                 });
@@ -440,6 +456,15 @@ pub struct Client {
     application: Option<crate::database::Application>,
 }
 impl Client {
+    /// A client of the endpoint at `path`, as it was started there: a node's or a peer store's,
+    /// whose path names no file ([`Nodes`], [`super::PeerBlobs`]). Nothing is asked yet.
+    pub(super) fn at(path: PathBuf) -> Self {
+        Self {
+            path,
+            application: None,
+        }
+    }
+
     pub fn connect(path: &Path, until: Instant) -> Result<Self, Refusal> {
         remaining(until)?;
         let client = Self {
@@ -875,7 +900,7 @@ fn serve(
     mut stream: Stream,
     token: [u8; 32],
     acquire: &dyn Fn() -> Option<crate::database::Database>,
-    pulls: Option<&Pulls>,
+    serves: &Serves,
     waits: &Arc<AtomicUsize>,
     greeting: Duration,
 ) -> Result<(), Refusal> {
@@ -948,7 +973,7 @@ fn serve(
     // A node's pull needs no database: its groups answer it, a batch no larger than a frame
     // carries (CP-T1.9; reshard.md, "Moves across nodes").
     if let Request::Pull(pull) = &request {
-        let answer = match pulls {
+        let answer = match serves.pulls.as_deref() {
             Some(pulls) => pulls(pull, until, PULL_BYTES)
                 .map(Answer::Pulled)
                 .map_err(|error| unavailable(format_args!("{error:#}"))),
@@ -956,6 +981,18 @@ fn serve(
         };
         return write(&mut stream, &answer, until);
     }
+    // A request to a peer's object store needs no database either: its store answers it
+    // (CP-T1.12; backup.md, "The peer store").
+    let request = match request {
+        Request::Blob(op) => {
+            let answer = match serves.blobs.as_deref() {
+                Some(store) => Ok(Answer::Blob(super::peer::answer(store, op, until))),
+                None => Err(unavailable("no object store at this endpoint")),
+            };
+            return write(&mut stream, &answer, until);
+        }
+        other => other,
+    };
     let mut database = acquire().ok_or_else(|| unavailable("owner is draining"))?;
     if let Some(application) = application {
         database = database.for_application(&application.name, application.version)?;
@@ -1032,7 +1069,8 @@ fn serve(
         | Request::Probe
         | Request::Capabilities
         | Request::Application(_)
-        | Request::Pull(_) => Err(unavailable("unexpected session")),
+        | Request::Pull(_)
+        | Request::Blob(_) => Err(unavailable("unexpected session")),
     };
     if watch_batch {
         let encoded = match encode(&result, WATCH_REPLY_MAX) {
@@ -1542,7 +1580,7 @@ mod tests {
                     observed.fetch_add(1, Ordering::AcqRel);
                     None
                 },
-                None,
+                &Serves::default(),
                 &Arc::new(AtomicUsize::new(0)),
                 HANG,
             )
@@ -1585,7 +1623,7 @@ mod tests {
                     observed.fetch_add(1, Ordering::AcqRel);
                     None
                 },
-                None,
+                &Serves::default(),
                 &Arc::new(AtomicUsize::new(0)),
                 HANG,
             )
@@ -1627,7 +1665,7 @@ mod tests {
                         observed.fetch_add(1, Ordering::AcqRel);
                         Some(db.clone())
                     },
-                    None,
+                    &Serves::default(),
                     &Arc::new(AtomicUsize::new(0)),
                     HANG,
                 )

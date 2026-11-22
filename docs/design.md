@@ -225,6 +225,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
 | backup | – | Decision (lane pitr): backups and point-in-time recovery to Mantle (CP-T1.12, G14 step 4) | [backup.md](design/backup.md) |
 | backup | – | The folder store: keys as paths, create once by link(2), listing in key order | [backup.md](design/backup.md#the-folder-store) |
+| backup | – | The peer store: an archive in another process's folder, over the owner transport | [backup.md](design/backup.md#the-peer-store) |
 | backup | – | Restore-and-check: the newest whole second restored and checked, on the archive's cadence | [backup.md](design/backup.md#restore-and-check) |
 | backup | – | The source's own rows at a quiet second: the shipping thread checks itself against a snapshot lined up with a second's stamps | [backup.md](design/backup.md#the-sources-own-rows-at-a-quiet-second) |
 | backup | – | A base begins just after a restart, so the next base copies least | [backup.md](design/backup.md#a-base-begins-just-after-a-restart) |
