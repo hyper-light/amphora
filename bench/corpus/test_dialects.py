@@ -100,7 +100,7 @@ class SQLiteReading(unittest.TestCase):
         self.assertEqual(dialects.affinity("ANY"), "NUMERIC")
         out, why = dialects.translate("CREATE TABLE r1(x FLOATING POINT, y UNSIGNED BIG INT NOT NULL, z VARYING CHARACTER(255) DEFAULT 'a', a ANY)", "postgres")
         self.assertIsNone(why)
-        self.assertEqual(out, "CREATE TABLE r1 (x INT, y INT NOT NULL, z TEXT DEFAULT 'a', a DECIMAL)")
+        self.assertEqual(out, "CREATE TABLE r1 (x BIGINT, y BIGINT NOT NULL, z TEXT DEFAULT 'a', a DECIMAL)")
 
     def test_strict_table_is_typed_and_its_any_by_its_values(self):
         """An ANY column keeps values as written, as a column without a type does (UntypedColumns)."""
@@ -109,7 +109,7 @@ class SQLiteReading(unittest.TestCase):
             out, why = file_in(file, d)[0]
             self.assertIsNone(why)
             self.assertNotIn("STRICT", out.upper())
-        self.assertEqual(file_in(file, "postgres")[0][0], "CREATE TABLE st (i INT, a TEXT)")
+        self.assertEqual(file_in(file, "postgres")[0][0], "CREATE TABLE st (i BIGINT, a TEXT)")
 
     def test_conflict_resolutions_are_not_expressible_with_the_reason(self):
         for sql, clause in [("UPDATE OR IGNORE cf SET u = 'a' WHERE k = 2", "UPDATE OR IGNORE"), ("UPDATE OR REPLACE cf SET u = 'zz'", "UPDATE OR REPLACE"), ("CREATE TABLE cf2(a TEXT UNIQUE ON CONFLICT REPLACE)", "ON CONFLICT REPLACE")]:
@@ -763,3 +763,38 @@ class Glob(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IntegerColumns(unittest.TestCase):
+    """Do: tables whose columns are declared INT, INTEGER, SMALLINT, TINYINT, INT2, INT8 and
+    UNSIGNED BIG INT (each INTEGER affinity: SQLite's 64-bit INTEGER, datatype3.html), and ALTER
+    TABLE ADD COLUMN of one. Expect: each is the engine's 64-bit integer (BIGINT, ClickHouse's
+    Int64), and DuckDB (when its Python module is here) holds 2^62 in each as SQLite does."""
+
+    CREATE = "CREATE TABLE w(a INT, b INTEGER, c SMALLINT, d TINYINT, e INT2, f INT8, g UNSIGNED BIG INT)"
+
+    def test_every_dialect_is_64_bits(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out, why = dialects.translate(self.CREATE, d)
+                self.assertIsNone(why)
+                wide = "Int64" if d == "clickhouse" else "BIGINT"
+                self.assertEqual(out.count(wide), 7, out)
+                self.assertIn(wide, dialects.translate("ALTER TABLE w ADD COLUMN h INT", d)[0])
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        insert, select = f"INSERT INTO w VALUES ({', '.join([str(2**62)] * 7)})", "SELECT a, b, c, d, e, f, g FROM w"
+        db = sqlite3.connect(":memory:")
+        db.execute(self.CREATE)
+        db.execute(insert)
+        want = db.execute(select).fetchall()
+        con = duckdb.connect()
+        for sql in (self.CREATE, insert):
+            con.execute(dialects.translate(sql, "duckdb")[0])
+        self.assertEqual(con.execute(select).fetchall(), want)

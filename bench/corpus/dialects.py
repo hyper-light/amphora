@@ -807,6 +807,16 @@ def typed(expression, context=None, dialect="the dialect"):
         if len(classes) > 1:
             raise NotExpressible(f"not expressible in {dialect}: {where}; the file writes it values of several storage classes ({', '.join(sorted(classes))}), which no one {dialect} column type holds unchanged")
         column.set("kind", exp.DataType.build(STORAGE_TYPES[next(iter(classes))]))
+    # A column of INTEGER affinity holds SQLite's INTEGER, "a signed integer, stored in 0, 1, 2, 3,
+    # 4, 6, or 8 bytes" whatever its type's name (INT, SMALLINT, TINYINT, INT2 ...: datatype3.html,
+    # sections 2 and 3.1), where sqlglot writes those names as each engine's 8, 16 or 32-bit types
+    # (INT is 32 bits on DuckDB, PostgreSQL and MySQL, Int32 on ClickHouse), which refuse or wrap
+    # what SQLite keeps: each such column is given the engine's 64-bit integer, BIGINT (Int64 on
+    # ClickHouse), as CAST's INTEGER is (functions_said()).
+    for column in expression.find_all(exp.ColumnDef):
+        kind = column.args.get("kind")
+        if isinstance(kind, exp.DataType) and not kind.is_type(exp.DataType.Type.BIGINT) and affinity(kind.sql(dialect="sqlite")) == "INTEGER":
+            column.set("kind", exp.DataType.build("BIGINT"))
     return expression
 
 
