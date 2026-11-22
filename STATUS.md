@@ -615,6 +615,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5). Closes with:
   the VDBE's scan and join loops run through it (a cursor per worker over one snapshot), a shared hash build, loom or
   shuttle on the dispatcher, worker and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
+- **PL.5's Bloom filters sized and chosen by cost** (lane qs5-9): a hash join's filter is sized when its build ends
+  from the distinct keys it measured, at a false-positive rate derived from the learned build and probe weights, and
+  chosen only where it costs less than the probes it saves; its hashes and bits stay within the join's memory budget
+  (`docs/design/planner.md`, "Decision (lane qs5-9)"). LIP and predicate transfer, a measured filter-lookup weight,
+  removing `rhs_has_selective_seek` and deriving `cpu_cost_per_where_step` are left.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness

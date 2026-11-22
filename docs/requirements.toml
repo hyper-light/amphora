@@ -321,6 +321,9 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.5.1", text = "A star join whose dimension filters keep no fact row — passes when the answer is unchanged and the filters' memory stays within their stated bound" },
+  # lane qs5-9
+  { id = "T-PL.5.2", text = "pl_5_star_join_filters_fire_and_answers_hold (crates/engine/tests/join_methods.rs) — passes when a star join, its filters keeping some fact rows and none, gives the model's answer with hash joins only, nested loops only and by cost, and the hash-join plans probe a Bloom filter" },
+  { id = "T-PL.5.3", text = "pl_5_sized_filter_* (crates/engine/vdbe/bloom_filter.rs) — passes when a filter sized from its build's distinct keys has no false negative and about its derived rate, and one past its memory bound or not worth its bits passes every key" },
 ]
 
 [[own]]

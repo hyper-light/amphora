@@ -1575,7 +1575,8 @@ pub fn bloom_filter_rate_per_key(
     let misses = (probe_rows - matched_probe_rows.max(0.0)).max(0.0);
     let probe_cost = params.hash_cpu_cost + params.hash_lookup_cost;
     let lookup_cost = params.hash_cpu_cost;
-    let bit_cost = (params.hash_cpu_cost + params.hash_insert_cost) / (8.0 * params.hash_bytes_per_row);
+    let bit_cost =
+        (params.hash_cpu_cost + params.hash_insert_cost) / (8.0 * params.hash_bytes_per_row);
     let measured = [build_keys, misses, probe_cost, bit_cost]
         .iter()
         .all(|v| v.is_finite() && *v > 0.0);

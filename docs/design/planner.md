@@ -1807,3 +1807,38 @@ with time, counted rows in place of estimates, no higher with the switch on than
 (T-PL.7.1, the audit's 09-cost-model; `cost.rs`, lane qs5-7's), and the P-error harness
 (AC-PL.7.2), the coordinator's. External sorts and hash spills give no term yet: their work is
 folded into the others'.
+
+## Decision (lane qs5-9): a hash join's Bloom filter sized from its build's measured keys, chosen by the learned weights
+
+**Decision.** PL.5 (and QT.5, query speed step 5), first part. A hash join's Bloom filter, built
+from the build side's keys and probed before each probe row reaches the hash table, is sized when
+its build ends, from the distinct keys the build measured, at a false-positive rate the planner
+derives from the cost model's weights; whether a join gets a filter at all is the same derivation's
+answer. It replaces a filter of fixed size (1,024 keys at 1%, Turso's default, which a large build
+filled until it passed nearly everything) and the rule "a filter where the probe side has at least
+twice the build's rows".
+
+- **The rate** (`bloom_filter_rate_per_key`, `translate/optimizer/access_method.rs`). For `n` keys at
+  rate `p` a Bloom filter holds `n·(-ln p)/ln²2` bits (Broder and Mitzenmacher, "Network
+  Applications of Bloom Filters: A Survey", 2004, section 2.1). The probe rows that find no match,
+  `misses`, still pay the probe for the share `p` that passes. A filter bit is priced at the hash
+  table's own memory: a build row's cost over its bits. The total is least at
+  `p = bit_cost·n / (ln²2 · misses · probe_cost)`; the plan carries that over `n`, the rate per key,
+  so the runtime multiplies it by the keys it measured. The planner chooses the filter when the
+  total with it (every probe row's lookup, the passing misses' probes and the bits) is below the
+  misses' probes without it; a join whose probe rows all match gets none.
+- **Sizing** (`FilterSizing`, `vdbe/bloom_filter.rs`). While the build runs the filter keeps its
+  keys' 64-bit hashes; the first probe seals it: distinct hashes counted, the filter built for them.
+  A build without keys gives a filter that rejects every key; a rate of one or more, none.
+- **Bound.** The hashes and the filter stay within the hash join's memory budget (the statement's,
+  derived, executor decision 8): the hashes grow within it and the filter is dropped past it (every
+  probe row then passes, as without one), and the rate is never below what the budget's bits allow,
+  `exp(-(m/n)·ln²2)`.
+- **Answers.** A filter never rejects a key it was given, a NULL key matches nothing, and a full
+  outer join probes none, as before.
+- **Open.** The filter's own lookup is priced as one key hash (`hash_cpu_cost`); with the learned
+  weights, whose build and probe times include hashing, that price is zero, so a measured
+  filter-lookup weight (Filter ops timed like the hash probes of QT.5 step 3a) is next.
+  LIP (filters from several dimensions applied to the fact scan in their measured order) and
+  predicate transfer across the join graph are not built yet.
+

@@ -144,7 +144,10 @@ impl BloomFilter {
                 // The hashes grow within the filter's memory bound, never past it.
                 if hashes.len() == hashes.capacity() {
                     let most = sizing.max_bytes / size_of::<u64>();
-                    let more = hashes.capacity().max(1).min(most.saturating_sub(hashes.len()));
+                    let more = hashes
+                        .capacity()
+                        .max(1)
+                        .min(most.saturating_sub(hashes.len()));
                     if more == 0 || hashes.try_reserve_exact(more).is_err() {
                         self.store = Store::PassAll;
                         return;
