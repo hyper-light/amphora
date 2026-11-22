@@ -421,6 +421,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the source's digest taken by the shipping thread itself; cuts across nodes' clocks. Incremental
   bases (T-T1.12.I1 to I3): a new base keeps the latest's chunks the log left unchanged, due once the
   log outweighs what it would copy, after a reopen too.
+  Lane pitr-8: the shipping thread checks itself (`Archive::check`): the source's own rows from a
+  reader snapshot lined up with a second's stamps, checked once that second settles and the archive
+  holds it, the result in `Status::last_check` and the check counters (T-T1.12.C3); a due base waits
+  for the log's next restart, one generation at most (T-T1.12.I4).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and

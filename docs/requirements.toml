@@ -482,6 +482,9 @@ tests = [
   { id = "T-T1.12.I2", text = "Manifests of format 1 still read; format 2's runs give each chunk's base and are refused when they don't add up" },
   { id = "T-T1.12.I3", text = "An incremental base is due once the log since the latest base outweighs what it would copy" },
   { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
+  # lane pitr-8
+  { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
+  { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
