@@ -1729,6 +1729,14 @@ mod sessions {
                 }
             }
             assert!(across > 0, "{protocol:?}: no transaction spanned groups");
+            // A commit answers once decided; its groups apply its rows as they resolve it. Reading
+            // every row through the coordinator, again while a lock is still held, returns once
+            // every earlier transaction is resolved in every group.
+            let all = Txn {
+                reads: (0..keys).map(row).collect(),
+                writes: Vec::new(),
+            };
+            commit(&spread, &all);
             for g in 0..3u8 {
                 let ns = dbs[usize::from(g)].namespace("ns").unwrap();
                 let held: BTreeMap<u8, Option<Vec<u8>>> = model
