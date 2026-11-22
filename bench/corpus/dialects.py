@@ -592,7 +592,7 @@ def storage_classes(expression, tables):
     are integers and no overflow would result, or floating point arithmetic ... if either operand is
     a real value"); count() and length() INTEGER; sum(), min(), max() and abs() their argument's (max() and min() of several arguments theirs when they share one, NULL with a NULL);
     avg() and total() REAL (lang_aggfunc.html); CAST by the type's affinity (lang_expr.html "CAST
-    expressions"); anything else UNKNOWN."""
+    expressions"), to BLOB a BLOB; anything else UNKNOWN."""
     from sqlglot import exp
 
     classes = {}
@@ -637,7 +637,10 @@ def storage_classes(expression, tables):
         elif isinstance(node, exp.Avg):
             c = "REAL"
         elif isinstance(node, exp.Cast) and isinstance(node.to, exp.DataType):
-            c = _declared_class(node.to)
+            # "When casting to a BLOB, the value is first converted to TEXT ... and the resulting
+            # byte sequence is reinterpreted as a BLOB" (lang_expr.html#castexpr): a BLOB, NULL a NULL.
+            blob = affinity(node.to.sql(dialect="sqlite")) == "BLOB" and node.to.sql(dialect="sqlite").strip() != ""
+            c = (None if classes.get(id(node.this)) is None else "BLOB") if blob else _declared_class(node.to)
         classes[id(node)] = c
     return classes
 
@@ -1111,6 +1114,11 @@ def functions_said(expression, context, dialect):
       it (_real_text(): DuckDB's printf(), not expressible on the others). A BLOB X is DuckDB's octet_length() (its length() takes no BLOB) and
       ClickHouse's length(), its bytes, where sqlglot writes CHAR_LENGTH, its UTF-8 characters.
       PostgreSQL's length() of a bytea and MySQL's CHAR_LENGTH() of a binary string count bytes.
+    - CAST(X AS BLOB) of an INTEGER X: "When casting to a BLOB, the value is first converted to
+      TEXT" (lang_expr.html#castexpr), an integer's text the same on every engine, where DuckDB
+      casts no integer to a BLOB: CAST(CAST(X AS TEXT) AS BLOB). Of a TEXT X on DuckDB, encode(X)
+      ("Converts the string to BLOB", its UTF-8 bytes), where DuckDB's CAST refuses a character
+      past ASCII and reads '\\xAA' as one byte.
     - CAST(X AS <a type of INTEGER affinity>) (lang_expr.html#castexpr): SQLite's INTEGER is 64 bits
       whatever the type's name ("INTEGER ... stored in 0, 1, 2, 3, 4, 6, or 8 bytes", datatype3.html),
       where sqlglot writes INT, 32 bits on each engine: the type is given as BIGINT. "When casting a
@@ -1147,6 +1155,7 @@ def functions_said(expression, context, dialect):
 
     def same(node, said):
         nonlocal expression
+        classes[id(said)] = classes.get(id(node), UNKNOWN)  # the same value, for the functions of it said after
         if node is expression:
             expression = said
         else:
@@ -1244,6 +1253,10 @@ def functions_said(expression, context, dialect):
         elif isinstance(node, exp.Anonymous) and node.name.upper() == "QUOTE" and len(node.expressions) == 1:
             what = "a REAL, whose text is SQLite's own (%!.15g, more digits where that doesn't read back)" if classes.get(id(node.expressions[0])) == "REAL" else "a value whose storage class only running it shows"
             raise NotExpressible(f"not expressible in {dialect}: quote() of {what} (https://www.sqlite.org/lang_corefunc.html#quote), which no {dialect} function writes alike")
+        elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and node.to.sql(dialect="sqlite").strip() and affinity(node.to.sql(dialect="sqlite")) == "BLOB" and classes.get(id(node.this)) == "INTEGER":
+            node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
+        elif type(node) is exp.Cast and dialect == "duckdb" and isinstance(node.to, exp.DataType) and node.to.sql(dialect="sqlite").strip() and affinity(node.to.sql(dialect="sqlite")) == "BLOB" and classes.get(id(node.this)) == "TEXT":
+            same(node, exp.Anonymous(this="encode", expressions=[node.this.copy()]))
         elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and affinity(node.to.sql(dialect="sqlite")) == "INTEGER":
             if classes.get(id(node.this)) == "REAL":
                 node.set("this", exp.Trunc(this=node.this.copy()))
@@ -1263,7 +1276,7 @@ _ADDED = re.compile(r"\s*([+-]?)\s*([0-9]+)\s+(day|hour|minute|second|month|year
 _JD_UNIX_MS = 210866760000000  # 1970-01-01 00:00:00 as iJD: Julian day 2440587.5 times 86400000 (date.c's unixepoch)
 # strftime()'s substitutions (lang_datefunc.html#strftime's table) each dialect writes alike, as
 # the dialect's own format (DuckDB's strftime(), "Date Format Functions"; PostgreSQL's to_char(),
-# manual 9.8 Table 9.26), or an expression of the moment (None: written by _moment_text()).
+# manual 9.8 Table 9.26), or an expression of the moment (None: written by _strftime_text()).
 _STRFTIME = {
     "d": ("%d", "DD"), "F": ("%Y-%m-%d", "YYYY-MM-DD"), "H": ("%H", "HH24"), "j": ("%j", "DDD"),
     "m": ("%m", "MM"), "M": ("%M", "MI"), "R": ("%H:%M", "HH24:MI"), "S": ("%S", "SS"),

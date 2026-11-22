@@ -894,3 +894,34 @@ class SQLiteOwn(unittest.TestCase):
             with self.subTest(dialect=d):
                 self.assertIsNone(dialects.translate("SELECT 'json(1)', 'PRAGMA x' AS pragma_x", d)[1])
         self.assertEqual(dialects.record_in(Record("PRAGMA no_such_thing = 1", "statement", "error"), "duckdb"), ("PRAGMA no_such_thing = 1", None))
+
+
+class BlobCasts(unittest.TestCase):
+    """Do: CAST(X AS BLOB) of an integer, a text past ASCII, a text with a backslash, and NULL, and
+    typeof(), hex(), length() and quote() of it (lang_expr.html#castexpr: "first converted to TEXT").
+    Expect: DuckDB (when its Python module is here) gives what SQLite gives; typeof() is 'blob' or
+    'null' on every engine."""
+
+    CASES = ["typeof(CAST(7 AS BLOB))", "typeof(CAST(NULL AS BLOB))", "typeof(CAST('12' AS BLOB))", "hex(CAST(-7 AS BLOB))", "CAST(1 + 2 AS BLOB)",
+             "length(CAST('é' AS BLOB))", "CAST('\\xAA' AS BLOB)", "hex(CAST('12' AS BLOB))", "quote(CAST('é' AS BLOB))"]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                self.assertEqual(duckdb.sql(out).fetchone()[0], db.execute(f"SELECT {case}").fetchone()[0])
+
+    def test_typeof_on_every_engine(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out, why = dialects.translate("SELECT typeof(CAST(a AS BLOB)) FROM t", d, dialects.contexts([FileRecord(0, "CREATE TABLE t(a TEXT)")])[0])
+                self.assertIsNone(why)
+                self.assertIn("ELSE 'blob' END", out)
