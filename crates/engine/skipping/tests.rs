@@ -601,7 +601,8 @@ mod wired {
                 Skipping::ZoneMaps(z) => z.stats().zones_skipped > 0,
                 Skipping::Cracking(c) => c.crack_count() > 0,
                 Skipping::Measured(m) => {
-                    m.zone_map().stats().zones_skipped > 0 || m.cracker().crack_count() > 0
+                    m.zone_map().is_some_and(|z| z.stats().zones_skipped > 0)
+                        || m.cracker().is_some_and(|c| c.crack_count() > 0)
                 }
                 Skipping::Off => false,
             });
@@ -822,7 +823,8 @@ mod scans {
                 Skipping::ZoneMaps(z) => z.stats().zones_skipped > 0,
                 Skipping::Cracking(c) => c.crack_count() > 0,
                 Skipping::Measured(m) => {
-                    m.zone_map().stats().zones_skipped > 0 || m.cracker().crack_count() > 0
+                    m.zone_map().is_some_and(|z| z.stats().zones_skipped > 0)
+                        || m.cracker().is_some_and(|c| c.crack_count() > 0)
                 }
                 Skipping::Off => false,
             });
@@ -914,6 +916,7 @@ mod scans {
             (1, "t.a measured"),
             (2, "t.a ZONE_MAPS"),
             (3, "t.a cracking"),
+            (4, "t.a capped"),
         ] {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
             let (db, on) = open();
@@ -983,6 +986,63 @@ mod scans {
             skipping_counts(&on, "t").is_none(),
             "a refused setting kept a summary"
         );
+    }
+
+    /// Lane skip-5 (T-SKU.6): the setting acts when its statement runs, not when it is prepared. A
+    /// `PRAGMA skipping` prepared on an empty table and run once the rows are in skips them
+    /// (zone maps, which a summary built over no rows can't: its rows grow as one zone), and run
+    /// again after `off` turns skipping back on; answers equal the unskipped database's.
+    #[test]
+    fn t_sku_6_setting_prepared_before_the_data_skips_once_it_runs() {
+        let rows = 4000;
+        let (_db, on) = open();
+        let (_off_db, off) = open();
+        for conn in [&on, &off] {
+            conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, pad TEXT)")
+                .unwrap();
+        }
+        let mut setting = on.prepare("PRAGMA skipping = 't.a zone_maps'").unwrap();
+        let mut turn_off = on.prepare("PRAGMA skipping = 't.a off'").unwrap();
+        for conn in [&on, &off] {
+            conn.execute("BEGIN").unwrap();
+            for i in 0..rows {
+                conn.execute(format!(
+                    "INSERT INTO t VALUES ({i}, {}, '{}')",
+                    i % 7,
+                    "x".repeat(40)
+                ))
+                .unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+        }
+        let mut rng = ChaCha8Rng::seed_from_u64(6);
+        for pass in 0..2 {
+            setting.reset().unwrap();
+            setting.run_collect_rows().unwrap();
+            let (mut read_on, mut read_off) = (0u64, 0u64);
+            for _ in 0..16 {
+                let lo = rng.random_range(0..rows);
+                let hi = lo + rng.random_range(0..rows / 20);
+                let sql = format!(
+                    "SELECT rowid, a, b FROM t WHERE a BETWEEN {lo} AND {hi} ORDER BY rowid"
+                );
+                let (answer_on, r_on) = query(&on, &sql);
+                let (answer_off, r_off) = query(&off, &sql);
+                assert_eq!(answer_on, answer_off, "pass {pass}: {sql}");
+                read_on += r_on;
+                read_off += r_off;
+            }
+            assert!(
+                read_on < read_off,
+                "pass {pass}: read {read_on} rows skipping, {read_off} without"
+            );
+            turn_off.reset().unwrap();
+            turn_off.run_collect_rows().unwrap();
+            assert!(
+                skipping_counts(&on, "t").is_none(),
+                "pass {pass}: 'off' kept a summary"
+            );
+        }
     }
 
     fn run_bound(stmt: &mut crate::Statement, values: &[crate::Value]) -> (Vec<String>, u64) {
@@ -1193,8 +1253,8 @@ mod chooser {
 
     fn work_of(chooser: &Chooser, method: SkipMethod) -> u64 {
         match method {
-            SkipMethod::ZoneMaps => zone_work(chooser.zone_map()),
-            SkipMethod::Cracking => crack_work(chooser.cracker()),
+            SkipMethod::ZoneMaps => chooser.zone_map().map_or(0, zone_work),
+            SkipMethod::Cracking => chooser.cracker().map_or(0, crack_work),
         }
     }
 
@@ -1263,7 +1323,10 @@ mod chooser {
             CrackerColumn::new(table.iter().map(|(r, v)| (*r, *v))),
         );
         let (mut zone_total, mut crack_total, mut chooser_total) = (0u64, 0u64, 0u64);
-        let mut seen = [zone_work(chooser.zone_map()), crack_work(chooser.cracker())];
+        let mut seen = [
+            work_of(&chooser, SkipMethod::ZoneMaps),
+            work_of(&chooser, SkipMethod::Cracking),
+        ];
         let top = rows / 4 + 10;
         let mut upkeep = [0u64; 2];
         for _ in 0..filters {
@@ -1400,6 +1463,203 @@ mod chooser {
                 "seed {seed}: chooser {} vs zone maps alone {}",
                 run.chooser_total,
                 run.zone_total
+            );
+        }
+    }
+
+    /// A column's values for one phase of an upkeep scenario: (rng, rowid, rows).
+    type ValueOf = fn(&mut ChaCha8Rng, i64, i64) -> Option<i64>;
+
+    fn scattered(rng: &mut ChaCha8Rng, _rowid: i64, rows: i64) -> Option<i64> {
+        Some(rng.random_range(0..rows / 4))
+    }
+
+    fn following(rng: &mut ChaCha8Rng, rowid: i64, _rows: i64) -> Option<i64> {
+        Some(rowid / 4 + rng.random_range(-8..=8))
+    }
+
+    /// One phase: writes per filter, the values they write, the filters' widths (at least, at
+    /// most, in values), the filters.
+    struct Phase {
+        writes: usize,
+        value: ValueOf,
+        width: (i64, i64),
+        filters: usize,
+    }
+
+    struct UpkeepRun {
+        stats: ChooserStats,
+        /// The write upkeep both methods cost over the run.
+        upkeep: u64,
+    }
+
+    /// The work a method's writes do: zone maps' zone updates and splits, the cracker's entries
+    /// searched and moved.
+    fn upkeep_work(chooser: &Chooser, method: SkipMethod) -> u64 {
+        match method {
+            SkipMethod::ZoneMaps => chooser.zone_map().map_or(0, |z| {
+                let s = z.stats();
+                s.writes + s.zones_split
+            }),
+            SkipMethod::Cracking => chooser.cracker().map_or(0, |c| {
+                let s = c.stats();
+                s.writes + s.entries_searched + s.entries_moved
+            }),
+        }
+    }
+
+    /// Lane skip-5 (T-SKU.5): phases of writes and filters through a chooser under `upkeep`, in
+    /// the scenario's units (work done and rows read, as `lockstep`): each method's write upkeep
+    /// handed back as the work its writes did, a build costing a read of every row, a dropped
+    /// method built again when its trial is due. Every candidate set is checked against the plain
+    /// scan.
+    fn upkeep_run(seed: u64, upkeep: Upkeep, phases: &[Phase]) -> UpkeepRun {
+        let rows = 4096i64;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut table = Table::new();
+        for rowid in 1..=rows {
+            let v = (phases[0].value)(&mut rng, rowid, rows);
+            table.insert(rowid, v);
+        }
+        // The scenario's stand-in for a table's leaves, as in `lockstep`: a zone per 64 rows.
+        let mut builder = ZoneMapBuilder::new();
+        for (i, (rowid, v)) in table.iter().enumerate() {
+            if i % 64 == 0 {
+                builder.end_run();
+            }
+            builder.row(*rowid, *v).unwrap();
+        }
+        let copy = |table: &Table| CrackerColumn::new(table.iter().map(|(r, v)| (*r, *v)));
+        let build = Some(n(table.len()));
+        let mut chooser =
+            Chooser::with_upkeep(builder.finish(), copy(&table), upkeep, [build, build]);
+        let mut total = 0u64;
+        let top = rows / 4 + 10;
+        for phase in phases {
+            for _ in 0..phase.filters {
+                for _ in 0..phase.writes {
+                    let rowid = rng.random_range(1..=rows);
+                    let old = table[&rowid];
+                    let new = (phase.value)(&mut rng, rowid, rows);
+                    table.insert(rowid, new);
+                    let write = RowWrite::Update { rowid, old, new };
+                    for method in [SkipMethod::ZoneMaps, SkipMethod::Cracking] {
+                        let before = upkeep_work(&chooser, method);
+                        if chooser.write_method(method, write).unwrap() {
+                            let cost = upkeep_work(&chooser, method) - before;
+                            total += cost;
+                            chooser.record_upkeep(method, cost);
+                        }
+                    }
+                }
+                match chooser.rebuild_due() {
+                    Some(SkipMethod::ZoneMaps) => {
+                        let (size, mut clock) = (n(table.len()), 0u64);
+                        chooser
+                            .rebuild_zones(&mut || {
+                                clock += size;
+                                clock
+                            })
+                            .unwrap();
+                    }
+                    Some(SkipMethod::Cracking) => {
+                        chooser.install_cracker(copy(&table), n(table.len()));
+                    }
+                    None => {}
+                }
+                let lo = rng.random_range(-20..top - phase.width.0);
+                let hi = lo + rng.random_range(phase.width.0..=phase.width.1);
+                let before = [
+                    work_of(&chooser, SkipMethod::ZoneMaps),
+                    work_of(&chooser, SkipMethod::Cracking),
+                ];
+                let (c, method) = chooser.candidates(lo, hi).unwrap();
+                sound(&table, &c, lo, hi);
+                let at = usize::from(method == SkipMethod::Cracking);
+                let cost =
+                    work_of(&chooser, method).saturating_sub(before[at]) + rows_read(&table, &c);
+                chooser.record(method, cost);
+            }
+        }
+        UpkeepRun {
+            stats: chooser.stats(),
+            upkeep: total,
+        }
+    }
+
+    /// Do: cracking's failure mode as a write-heavy table: the column follows the rowid, every
+    /// filter comes after many writes, and filters are wide, so the cracker keeps paying to move
+    /// entries while zone maps answer about as cheaply. Expect: capped, the cracker is dropped for
+    /// its upkeep while it isn't leading and the run's write upkeep is lower than keeping both;
+    /// kept both, nothing is dropped; every answer is sound.
+    #[test]
+    fn t_sku_5_write_heavy_table_drops_the_losing_cracker() {
+        for seed in 0..4 {
+            // Filters over half the column or more: zone maps read about what matches, the
+            // cracker hands back as many rowids again.
+            let phases = [Phase {
+                writes: 64,
+                value: following,
+                width: (512, 1024),
+                filters: 160,
+            }];
+            let capped = upkeep_run(seed, Upkeep::Capped, &phases);
+            let kept = upkeep_run(seed, Upkeep::KeepBoth, &phases);
+            assert!(
+                capped.stats.cracking.dropped > 0,
+                "seed {seed}: {:?}",
+                capped.stats
+            );
+            assert_eq!(
+                kept.stats.cracking.dropped + kept.stats.zone_maps.dropped,
+                0
+            );
+            assert!(
+                capped.upkeep < kept.upkeep,
+                "seed {seed}: upkeep {} capped, {} keeping both",
+                capped.upkeep,
+                kept.upkeep
+            );
+        }
+    }
+
+    /// Do: a workload that shifts: first zone maps' failure mode (scattered values, narrow
+    /// filters, no writes), so cracking leads; then heavy writes make the column follow the rowid
+    /// and filters widen, where zone maps win, while their upkeep passes their build cost.
+    /// Expect: capped, zone maps are dropped and built again (from the cracker) when their trial
+    /// comes due; kept both, nothing is dropped; every answer is sound.
+    #[test]
+    fn t_sku_5_shifting_workload_rebuilds_the_dropped_method() {
+        for seed in 0..2 {
+            let phases = [
+                Phase {
+                    writes: 0,
+                    value: scattered,
+                    width: (0, 8),
+                    filters: 160,
+                },
+                Phase {
+                    writes: 64,
+                    value: following,
+                    width: (512, 1024),
+                    filters: 1024,
+                },
+            ];
+            let capped = upkeep_run(seed, Upkeep::Capped, &phases);
+            let kept = upkeep_run(seed, Upkeep::KeepBoth, &phases);
+            assert!(
+                capped.stats.zone_maps.dropped > 0,
+                "seed {seed}: {:?}",
+                capped.stats
+            );
+            assert!(
+                capped.stats.zone_maps.rebuilt > 0,
+                "seed {seed}: {:?}",
+                capped.stats
+            );
+            assert_eq!(
+                kept.stats.cracking.dropped + kept.stats.zone_maps.dropped,
+                0
             );
         }
     }

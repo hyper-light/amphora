@@ -2395,6 +2395,14 @@ pub enum Insn {
         cursor_id: CursorID,
         target_reg: usize,
     },
+    /// Amphora (lane skip-5, T-SKU.6): `PRAGMA skipping`'s setting, acted on when the statement
+    /// runs: keeps a skipping summary of `column` of `table` built from the rows there now
+    /// (`kind` `None`: drops it), as `skipping::set_skipping` does.
+    SetSkipping {
+        table: String,
+        column: String,
+        kind: Option<crate::skipping::SkipKind>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2648,6 +2656,7 @@ impl InsnVariants {
             InsnVariants::JoinSwitchHash => execute::op_join_switch_hash,
             InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
             InsnVariants::TreePages => execute::op_tree_pages,
+            InsnVariants::SetSkipping => execute::op_set_skipping,
         }
     }
 }
@@ -2713,6 +2722,7 @@ impl Insn {
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
+            | Self::SetSkipping { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             // A recursive foreign-key action is treated as writable while it's still being

@@ -1993,6 +1993,7 @@ fn skip_walk_for(
         _ => None,
     })?;
     let (reader_pos, committed) = conn.skipping_positions()?;
+    let writes = registry.counts(root).map(|counts| counts.writes);
     // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
     let started = std::time::Instant::now();
     let (candidates, method) = registry
@@ -2005,6 +2006,11 @@ fn skip_walk_for(
             bounds.hi,
         )
         .ok()?;
+    // Lane skip-5 (T-SKU.5): a method dropped for its upkeep whose trial is due is built again
+    // now, at the snapshot the summary just answered (so it holds what the summary holds).
+    if let Some(method) = registry.rebuild_due(root) {
+        skipping_rebuild(program, cursor_id, root, column, method, writes);
+    }
     let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
     walk.measure = method.map(|method| crate::skipping::WalkMeasure {
         root,
@@ -2012,6 +2018,51 @@ fn skip_walk_for(
         started,
     });
     Some(walk)
+}
+
+/// Lane skip-5 (T-SKU.5): builds a measured summary's dropped method again for its trial: zone
+/// maps from the cracker in memory, the cracker from the table's B-tree (a read of every row,
+/// timed: its cost to build). A build that fails, or a write that came in during it, leaves the
+/// method dropped: the leader keeps answering, and the next trial tries again.
+fn skipping_rebuild(
+    program: &Program,
+    cursor_id: crate::vdbe::CursorID,
+    root: i64,
+    column: usize,
+    method: crate::skipping::SkipMethod,
+    writes: Option<u64>,
+) {
+    let registry = &program.connection.db.skipping;
+    let origin = std::time::Instant::now();
+    match method {
+        crate::skipping::SkipMethod::ZoneMaps => {
+            registry.rebuild_zones(root, &mut || crate::skipping::nanos_since(origin))
+        }
+        crate::skipping::SkipMethod::Cracking => {
+            let (Some(writes), Some((_, super::builder::CursorType::BTreeTable(table)))) =
+                (writes, program.cursor_ref.get(cursor_id))
+            else {
+                return;
+            };
+            let built = crate::skipping::cracker_of_table(
+                program.connection.get_pager(),
+                root,
+                column,
+                table.columns().len(),
+            );
+            match built {
+                Ok(cracker) => {
+                    let cost = crate::skipping::nanos_since(origin);
+                    if !registry.install_cracker(root, writes, cracker, cost) {
+                        tracing::debug!(target: "amphora.skipping", root, "cracker built again was refused: a write came in during the build");
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not be built again")
+                }
+            }
+        }
+    }
 }
 
 /// Lane skip-3 (T-SKU.2): a measured scan's end hands its cost (nanoseconds from asking for its
@@ -12881,7 +12932,16 @@ fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite)
     let registry = &program.connection.db.skipping;
     match program.connection.skipping_positions() {
         Some((_, committed)) => {
-            registry.on_write(root, program.connection.skipping_id(), committed, write)
+            // Lane skip-5 (T-SKU.5): each measured summary's write upkeep is timed.
+            let origin = std::time::Instant::now();
+            let mut now = || crate::skipping::nanos_since(origin);
+            registry.on_write(
+                root,
+                program.connection.skipping_id(),
+                committed,
+                write,
+                &mut now,
+            )
         }
         None => registry.mark_stale(root),
     }
@@ -17253,6 +17313,28 @@ pub fn op_count(
         state.record_rows_read(count as u64);
     }
 
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (lane skip-5, T-SKU.6): [Insn::SetSkipping], the summary built from the rows the
+/// table holds when the statement runs (a statement prepared before they loaded still skips them).
+pub fn op_set_skipping(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        SetSkipping {
+            table,
+            column,
+            kind,
+        },
+        insn
+    );
+    crate::skipping::set_skipping(&program.connection, table, column, *kind)
+        .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

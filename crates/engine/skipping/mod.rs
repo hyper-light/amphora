@@ -34,8 +34,9 @@ mod registry;
 mod scan;
 mod zone_map;
 
-pub use choose::{Chooser, ChooserStats, MethodStats, SkipMethod};
+pub use choose::{Chooser, ChooserStats, MethodStats, SkipMethod, Upkeep};
 pub use cracking::{CrackerColumn, CrackerStats};
+pub(crate) use leaves::{cracker_of_table, nanos_since};
 pub use leaves::{
     set_skipping, skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,
 };
@@ -125,6 +126,18 @@ impl Skipping {
     /// The rows a filter `lo <= value <= hi` on the summarized column may need.
     pub fn candidates(&mut self, lo: i64, hi: i64) -> Result<Candidates, SkipError> {
         self.candidates_by(lo, hi).map(|(candidates, _)| candidates)
+    }
+
+    /// [`Skipping::on_write`], a measured summary's upkeep timed by `now` (lane skip-5, T-SKU.5).
+    pub fn on_write_timed(
+        &mut self,
+        write: RowWrite,
+        now: &mut dyn FnMut() -> u64,
+    ) -> Result<(), SkipError> {
+        match self {
+            Skipping::Measured(chooser) => chooser.on_write_timed(write, now),
+            other => other.on_write(write),
+        }
     }
 
     /// [`Skipping::candidates`], with the method a [`Skipping::Measured`] answered by (its scan's
