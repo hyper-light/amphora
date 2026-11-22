@@ -2733,7 +2733,13 @@ pub fn insn_to_row(
             0,
             Value::build_text(""),
             0,
-            format!("count hash_table[{}] against {}", data.hash_table_id, data.table),
+            match &data.filter {
+                None => format!("count hash_table[{}] against {}", data.hash_table_id, data.table),
+                Some(filter) => format!(
+                    "count hash_table[{}] against {} filtered to share {}",
+                    data.hash_table_id, data.table, filter.planned_share
+                ),
+            },
         ),
         Insn::MorselNext {
             dest_start,

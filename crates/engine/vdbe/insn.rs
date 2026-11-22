@@ -308,6 +308,9 @@ pub struct JoinSwitchBuiltData {
 /// table read whole (no filter of its own), counted against the rows the plan counted the table at.
 #[derive(Debug, Clone)]
 pub struct BuildCountedData {
+    /// Amphora (PL.13, lane replan-5): the build's own filter, whose share of the table is counted
+    /// in place of the table's rows; `None` for a build over the whole table.
+    pub filter: Option<FilteredBuild>,
     pub hash_table_id: usize,
     /// The build table, as its row counter (PL.9, `row_changes`) names it.
     pub table: String,
@@ -316,6 +319,17 @@ pub struct BuildCountedData {
     /// The relative standard error of the statistics that count came from
     /// (`row_changes::statistics_error`).
     pub estimate_error: f64,
+}
+
+/// Amphora (PL.13, lane replan-5): a filtered build's check: the share of its table the plan's
+/// estimate of its filter terms kept, its relative error, and where a counted share is stored.
+#[derive(Debug, Clone)]
+pub struct FilteredBuild {
+    pub share: crate::sync::Arc<crate::filter_shares::FilterShare>,
+    pub planned_share: f64,
+    /// The relative standard error of the build's estimated rows: the share's and the table
+    /// count's together.
+    pub error: f64,
 }
 
 /// Key columns of a seek that use `IS` instead of `=`, so NULL may match in

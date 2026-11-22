@@ -321,7 +321,17 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             planner.hash_join_op,
             config.uses_materialized_keys_and_payload,
         )?;
-        let filtered = !prefilter.is_empty() || materialized_input.is_some();
+        // PL.13 (lane replan-5): a build filtered by its own terms only is counted against the
+        // share of the table the plan's estimate of those terms kept; one fed by a materialized
+        // input is the input's count, not checked.
+        let filter_terms = (materialized_input.is_none()).then(|| {
+            (
+                !prefilter.is_empty(),
+                crate::filter_shares::fingerprint(prefilter.iter().filter_map(|cond_idx| {
+                    planner.predicates.get(*cond_idx).map(|term| &term.expr)
+                })),
+            )
+        });
         for cond_idx in prefilter {
             let cond = &planner.predicates[cond_idx];
             super::conditions::emit_where_term(
@@ -502,7 +512,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             planner.t_ctx,
             &btree,
             planner.hash_table_id,
-            filtered,
+            filter_terms,
         );
         planner
             .program

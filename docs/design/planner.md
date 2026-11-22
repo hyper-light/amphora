@@ -1729,8 +1729,31 @@ switch-off one; the plain join, its rows returned before the build, hands nothin
 each row once (T-PL.13.4). JOB's 20 slowest queries against the parent (AC-PL.13.1) are the
 coordinator's.
 
+**Filtered builds (lane replan-5).** A hash join's build filtered by terms of its own counts the
+share of its table those terms keep, which the table's row counter (PL.9) cannot tell: an UPDATE
+moves it without moving the count. Where the plan's estimate ran exactly those terms on the sample
+(decision 21), the planner notes the share it used (`PlanValues::filter_selectivity`) and the build
+is checked against the table's rows now times that share (`BuildCounted` with a `FilteredBuild`).
+The band is the share's binomial relative error, `sqrt((1 - p) / (p n))` for a share `p` of `n`
+sample rows, and the table count's, added in quadrature as independent errors are. Past it the
+counted share (at least half a row's, the sample's own floor) is stored in the database's
+`FilterShares`, keyed by the table and a fingerprint of the terms (order-free, never for terms
+reading a parameter), and every plan that read the old share is planned again before its next run,
+or at once by the hand-off, as one planned on a moved count is. The planner reads a stored share in
+place of the sample's for the same terms. Only with adaptive joins on; counted by
+`Connection::adaptive_filter_checks` and `Connection::adaptive_filter_corrections` (each also an
+`adaptive_replans`). The store holds its entries weakly, so it is bound by the plans that read them:
+a share outlives the last statement planned on it only until its entry is swept. A build whose
+terms the sample did not run together (an `=` its column statistics estimate, say) or fed by a
+materialized input is not checked. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
+(`crates/engine/tests/adaptive_joins.rs`; T-PL.13.5), a range one row in a hundred passed at
+ANALYZE and every row after an UPDATE: one answer with adaptive joins off and on, one share stored,
+one re-plan, none on the second run or in a statement prepared on the stored share.
+
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).
+- A filtered build's stored share planned on by a statement whose build then counts past it again,
+  run after run: the share's error band too tight for the filter.
 - A join that switched and ran slower than the nested loop it left, on the same rows: the learned
   weights wrong for the inner side's access (its pages not cached as the seek weight assumes).
 - A statement planned again whose new plan is the old one, many times over: the band too tight to

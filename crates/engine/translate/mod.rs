@@ -150,6 +150,11 @@ pub fn translate(
     resolver.set_plan_values(plan_values.clone());
     // Amphora (PL.9): the row counts read each table's changes since ANALYZE.
     plan_values.attach_row_changes(connection.db.row_changes.clone());
+    // Amphora (PL.13, lane replan-5): with adaptive joins on, the filter estimates read the shares
+    // filtered builds counted.
+    if connection.adaptive_joins() {
+        plan_values.attach_filter_shares(connection.db.filter_shares.clone());
+    }
     // Amphora (PL.9): an INSERT or DELETE of a main-database table folds its change count into
     // that table's counter when it finishes.
     let write_target = match &stmt {
@@ -232,6 +237,7 @@ pub fn translate(
     program.epilogue(schema);
     program.reads_parameter_values = plan_values.asked();
     program.planned_tables = plan_values.take_planned();
+    program.planned_filters = plan_values.take_planned_filters();
     program.write_target = write_target;
 
     program.build(connection, change_cnt_on, input)

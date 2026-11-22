@@ -35,21 +35,48 @@ fn analyzed_table(t_ctx: &TranslateCtx, table: &str) -> Option<(f64, f64)> {
 }
 
 /// Amphora (PL.13, a materialization point): after a planner-chosen hash join's build, the check
-/// of its rows against the plan's estimate, where the build holds its table whole: adaptive joins
-/// on, the table with statistics, and no filter in the build (a filtered build's count is the
-/// filter's, not the table's, and is not checked here).
+/// of its rows against the plan's estimate: adaptive joins on, the table with statistics, and its
+/// input the table itself (`filter_terms` is `None` for a materialized input). Unfiltered, the
+/// build holds the table whole and counts its rows. Filtered (lane replan-5; `filter_terms` holds
+/// whether the build has terms of its own and their fingerprint), it counts the share of the table
+/// they keep, checked where the plan's estimate read a share for exactly those terms
+/// (`PlanValues::filter_selectivity`): a build whose terms the sample did not run together, or
+/// that reads a parameter, is not checked.
 pub(super) fn emit_build_count(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
     table: &crate::schema::BTreeTable,
     hash_table_id: usize,
-    filtered: bool,
+    filter_terms: Option<(bool, Option<u64>)>,
 ) {
-    if filtered || !t_ctx.resolver.adaptive_joins() || !table.has_rowid {
+    let Some((prefiltered, fingerprint)) = filter_terms else {
+        return;
+    };
+    if !t_ctx.resolver.adaptive_joins() || !table.has_rowid {
         return;
     }
     let Some((analyzed_rows, estimate_error)) = analyzed_table(t_ctx, &table.name) else {
         return;
+    };
+    let filter = match (prefiltered, fingerprint) {
+        (false, _) => None,
+        (true, None) => return,
+        (true, Some(fingerprint)) => {
+            let Some(planned) = t_ctx
+                .resolver
+                .plan_values()
+                .and_then(|values| values.planned_filter(&table.name, fingerprint))
+            else {
+                return;
+            };
+            // The share's error and the table count's, independent, add in quadrature.
+            let error = planned.share_error().hypot(estimate_error);
+            Some(crate::vdbe::insn::FilteredBuild {
+                share: planned.share,
+                planned_share: planned.planned_share,
+                error,
+            })
+        }
     };
     program.emit_insn(Insn::BuildCounted {
         data: Box::new(crate::vdbe::insn::BuildCountedData {
@@ -57,6 +84,7 @@ pub(super) fn emit_build_count(
             table: table.name.clone(),
             analyzed_rows,
             estimate_error,
+            filter,
         }),
     });
 }

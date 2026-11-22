@@ -1994,6 +1994,9 @@ pub struct PreparedProgram {
     pub reads_parameter_values: bool,
     /// Amphora (PL.9): the tables whose row counts the plan read, so a run can tell they moved.
     pub planned_tables: Vec<crate::row_changes::PlannedTable>,
+    /// Amphora (PL.13, lane replan-5): the filter shares the plan read, so a run can tell a build
+    /// stored another.
+    pub planned_filters: Vec<crate::filter_shares::PlannedFilter>,
     /// Amphora (PL.9): the table an INSERT or DELETE folds its change count into.
     pub write_target: Option<crate::row_changes::WriteTarget>,
     pub sql: String,

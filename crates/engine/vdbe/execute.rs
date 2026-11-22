@@ -19321,21 +19321,75 @@ pub fn op_build_counted(
         .filter(|table| !table.has_spilled())
         .map(|table| table.held());
     if let Some((rows, bytes)) = held {
-        program.connection.count_adaptive_build_check();
-        let replanned = replan_on_built_rows(
-            program,
-            &data.table,
-            data.analyzed_rows,
-            data.estimate_error,
-            rows,
-            bytes,
-        );
+        let replanned = match &data.filter {
+            None => {
+                program.connection.count_adaptive_build_check();
+                replan_on_built_rows(
+                    program,
+                    &data.table,
+                    data.analyzed_rows,
+                    data.estimate_error,
+                    rows,
+                    bytes,
+                )
+            }
+            Some(filter) => {
+                program.connection.count_adaptive_filter_check();
+                correct_filter_share(program, data, filter, rows, bytes)
+            }
+        };
         if hand_off_now(program, state, replanned) {
             return Ok(InsnFunctionStepResult::Done);
         }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13, lane replan-5): a filtered build's rows set against the share of its table the
+/// plan's estimate kept (the table's rows now, by its counter, times that share). Past the
+/// estimate's error the counted share (at least half a row's, as the sample's floor) is stored for
+/// the planner, and every plan that read the old one is planned again: true when this one is.
+fn correct_filter_share(
+    program: &Program,
+    data: &crate::vdbe::insn::BuildCountedData,
+    filter: &crate::vdbe::insn::FilteredBuild,
+    rows: usize,
+    bytes: usize,
+) -> bool {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    let counter = program.connection.db.row_changes.counter(&data.table);
+    let table_rows = crate::row_changes::live_rows(
+        data.analyzed_rows,
+        counter.load(crate::sync::atomic::Ordering::Acquire),
+    );
+    let estimate = table_rows * filter.planned_share;
+    let verdict = MaterializePoint::new(estimate, filter.error, u64::MAX).and_then(|mut point| {
+        point.rows(rows as u64, bytes as u64)?;
+        Ok(point.verdict())
+    });
+    match verdict {
+        Ok(Replan::Again { rows }) => {
+            let share = ((rows as f64).max(0.5) / table_rows).min(1.0);
+            if filter.share.set(share) {
+                program.connection.count_adaptive_filter_correction();
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    table = %data.table,
+                    planned = filter.planned_share,
+                    share,
+                    "a filtered build counted past its share's estimate: planned again"
+                );
+                return true;
+            }
+            false
+        }
+        Ok(Replan::Keep) => false,
+        Err(refused) => {
+            tracing::debug!(table = %data.table, %refused, "a filtered build's rows not checked");
+            false
+        }
+    }
 }
 
 pub fn op_hash_clear(
