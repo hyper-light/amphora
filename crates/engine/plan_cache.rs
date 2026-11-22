@@ -56,6 +56,14 @@ pub(crate) struct PlanValues {
     /// tables the plan counted, so the statement can tell when they have moved past its estimates.
     row_changes: crate::sync::OnceLock<crate::sync::Arc<crate::row_changes::RowChanges>>,
     planned: crate::sync::Mutex<Vec<crate::row_changes::PlannedTable>>,
+    /// Amphora (PL.13, lane replan-5): the filter shares builds counted, attached only with
+    /// adaptive joins on, and the shares the plan read.
+    filter_shares: crate::sync::OnceLock<crate::sync::Arc<crate::filter_shares::FilterShares>>,
+    filters: crate::sync::Mutex<Vec<crate::filter_shares::PlannedFilter>>,
+    /// Amphora (PL.13, lane replan-6): the subquery results fills counted, attached only with
+    /// adaptive joins on, and the subquery rows the plan read.
+    subquery_rows: crate::sync::OnceLock<crate::sync::Arc<crate::subquery_rows::SubqueryRows>>,
+    subqueries: crate::sync::Mutex<Vec<crate::subquery_rows::PlannedSubquery>>,
 }
 
 impl PlanValues {
@@ -105,6 +113,138 @@ impl PlanValues {
         rows
     }
 
+    /// Where the filter estimates read the shares builds counted (PL.13, lane replan-5). Set once,
+    /// at translate, with adaptive joins on.
+    pub(crate) fn attach_filter_shares(
+        &self,
+        shares: crate::sync::Arc<crate::filter_shares::FilterShares>,
+    ) {
+        let _already_attached = self.filter_shares.set(shares);
+    }
+
+    /// The share of `table`'s rows the terms `fingerprint` names keep: the one a build counted
+    /// where one did, else `sampled`, the share `sample_rows` sample rows gave; noted as a share the
+    /// plan read. Without the store attached, `sampled`.
+    pub(crate) fn filter_selectivity(
+        &self,
+        table: &str,
+        fingerprint: u64,
+        sampled: f64,
+        sample_rows: usize,
+    ) -> f64 {
+        let Some(shares) = self.filter_shares.get() else {
+            return sampled;
+        };
+        let table = crate::util::normalize_ident(table);
+        let mut filters = self.filters.lock();
+        if let Some(noted) = filters
+            .iter()
+            .find(|noted| noted.table == table && noted.fingerprint == fingerprint)
+        {
+            return noted.planned_share;
+        }
+        let share = shares.share(&table, fingerprint);
+        let read = share.bits();
+        let counted = share.get();
+        let planned_share = counted.unwrap_or(sampled);
+        filters.push(crate::filter_shares::PlannedFilter {
+            table,
+            fingerprint,
+            share,
+            read,
+            planned_share,
+            sample_rows: counted.is_none().then_some(sample_rows),
+        });
+        planned_share
+    }
+
+    /// The share the plan read for `table`'s terms `fingerprint`, if it read one.
+    pub(crate) fn planned_filter(
+        &self,
+        table: &str,
+        fingerprint: u64,
+    ) -> Option<crate::filter_shares::PlannedFilter> {
+        let table = crate::util::normalize_ident(table);
+        self.filters
+            .lock()
+            .iter()
+            .find(|noted| noted.table == table && noted.fingerprint == fingerprint)
+            .cloned()
+    }
+
+    /// The filter shares the plan read (PL.13), taken once the statement is planned.
+    pub(crate) fn take_planned_filters(&self) -> Vec<crate::filter_shares::PlannedFilter> {
+        std::mem::take(&mut *self.filters.lock())
+    }
+
+    /// Where the subquery estimates read the rows stored results counted (PL.13, lane replan-6).
+    /// Set once, at translate, with adaptive joins on.
+    pub(crate) fn attach_subquery_rows(
+        &self,
+        rows: crate::sync::Arc<crate::subquery_rows::SubqueryRows>,
+    ) {
+        let _already_attached = self.subquery_rows.set(rows);
+    }
+
+    /// The rows of the subquery `identity` names: the ones a fill counted where one did, else
+    /// `estimated`, the subquery's own estimate; noted as rows the plan read. Without the store
+    /// attached, `estimated`.
+    pub(crate) fn subquery_rows(&self, identity: u64, estimated: f64) -> f64 {
+        let Some(store) = self.subquery_rows.get() else {
+            return estimated;
+        };
+        let mut subqueries = self.subqueries.lock();
+        if let Some(noted) = subqueries.iter().find(|noted| noted.identity == identity) {
+            return noted.planned_rows;
+        }
+        let rows = store.rows(identity);
+        let read = rows.bits();
+        let planned_rows = rows.get().unwrap_or(estimated);
+        subqueries.push(crate::subquery_rows::PlannedSubquery {
+            identity,
+            rows,
+            read,
+            planned_rows,
+        });
+        planned_rows
+    }
+
+    /// Whether the store of counted rows is attached (adaptive joins on, PL.13).
+    pub(crate) fn reads_subquery_rows(&self) -> bool {
+        self.subquery_rows.get().is_some()
+    }
+
+    /// Whether the plan already read rows for `identity`, or a fill has counted them (PL.13, lane
+    /// replan-11): a set of tables the join search estimates reads a count only where one is
+    /// stored, so the sets it only tries leave no entry.
+    pub(crate) fn counted_subquery(&self, identity: u64) -> bool {
+        let Some(store) = self.subquery_rows.get() else {
+            return false;
+        };
+        self.subqueries
+            .lock()
+            .iter()
+            .any(|noted| noted.identity == identity)
+            || store.counted(identity)
+    }
+
+    /// The rows the plan read for the subquery `identity`, if it read them.
+    pub(crate) fn planned_subquery(
+        &self,
+        identity: u64,
+    ) -> Option<crate::subquery_rows::PlannedSubquery> {
+        self.subqueries
+            .lock()
+            .iter()
+            .find(|noted| noted.identity == identity)
+            .cloned()
+    }
+
+    /// The subquery rows the plan read (PL.13), taken once the statement is planned.
+    pub(crate) fn take_planned_subqueries(&self) -> Vec<crate::subquery_rows::PlannedSubquery> {
+        std::mem::take(&mut *self.subqueries.lock())
+    }
+
     /// The tables the plan counted (PL.9), taken once the statement is planned.
     pub(crate) fn take_planned(&self) -> Vec<crate::row_changes::PlannedTable> {
         std::mem::take(&mut *self.planned.lock())
@@ -117,6 +257,15 @@ impl PlanValues {
         self.bound
             .get(index)
             .filter(|value| !matches!(value, Value::Null))
+    }
+
+    /// Amphora (QT.5, lane qs5-18): whether `variable` is bound to NULL (or left unbound, which
+    /// runs as NULL); `None` with no value bound to it, the generic plan's.
+    pub(crate) fn is_null(&self, variable: &ast::Variable) -> Option<bool> {
+        let index = usize::try_from(variable.index.get()).ok()?.checked_sub(1)?;
+        self.bound
+            .get(index)
+            .map(|value| matches!(value, Value::Null))
     }
 
     /// Notes that an estimate would take a parameter's value, had it one.

@@ -18480,7 +18480,10 @@ fn hash_build_run(
             track_matched: data.track_matched,
             partition_count: None,
         };
-        e.insert(HashTable::new(config, pager.io.clone())?);
+        let mut table = HashTable::new(config, pager.io.clone())?;
+        // Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's table.
+        table.set_merge(data.merge);
+        e.insert(table);
     }
 
     // Read pre-computed key values directly from registers
@@ -19212,20 +19215,17 @@ pub fn op_join_switch_built(
         }
         _ => {
             program.connection.count_adaptive_join_switch();
-            let replanned = held
-                .is_some_and(|(_, (rows, bytes))| replan_on_built_rows(program, data, rows, bytes));
-            // The in-run hand-off: a run that may start again (read-only, no row returned) stops
-            // here, and `Statement` runs it from the start on the plan made on the counted rows.
-            // An implicit transaction it would end there must be its own: no other statement on
-            // the connection is under way in it (`ProgramState::can_autocommit_now`'s siblings).
-            let txn_its_own = !program.connection.get_auto_commit()
-                || program
-                    .connection
-                    .n_active_root_statements
-                    .load(crate::sync::atomic::Ordering::SeqCst)
-                    == 1;
-            if replanned && state.handoff_open && txn_its_own {
-                state.handoff_asked = true;
+            let replanned = held.is_some_and(|(_, (rows, bytes))| {
+                replan_on_built_rows(
+                    program,
+                    &data.table,
+                    data.analyzed_rows,
+                    data.estimate_error,
+                    rows,
+                    bytes,
+                )
+            });
+            if hand_off_now(program, state, replanned) {
                 return Ok(InsnFunctionStepResult::Done);
             }
             state.pc += 1;
@@ -19244,19 +19244,21 @@ pub fn op_join_switch_built(
 /// answer right and the rows it has returned not returned again.
 fn replan_on_built_rows(
     program: &Program,
-    data: &crate::vdbe::insn::JoinSwitchBuiltData,
+    table: &str,
+    analyzed_rows: f64,
+    estimate_error: f64,
     rows: usize,
     bytes: usize,
 ) -> bool {
     use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
-    let counter = program.connection.db.row_changes.counter(&data.table);
+    let counter = program.connection.db.row_changes.counter(table);
     let estimate = crate::row_changes::live_rows(
-        data.analyzed_rows,
+        analyzed_rows,
         counter.load(crate::sync::atomic::Ordering::Acquire),
     );
     // The table's bytes are already held to its share of memory: it spills past it, checked above.
     let verdict =
-        MaterializePoint::new(estimate, data.estimate_error, u64::MAX).and_then(|mut point| {
+        MaterializePoint::new(estimate, estimate_error, u64::MAX).and_then(|mut point| {
             point.rows(rows as u64, bytes as u64)?;
             Ok(point.verdict())
         });
@@ -19264,16 +19266,16 @@ fn replan_on_built_rows(
         Ok(Replan::Again { rows }) => {
             let changes = i64::try_from(rows)
                 .unwrap_or(i64::MAX)
-                .saturating_sub(data.analyzed_rows as i64);
+                .saturating_sub(analyzed_rows as i64);
             // A count the planner floors to the estimate it already has would plan the same.
-            if crate::row_changes::live_rows(data.analyzed_rows, changes) != estimate {
+            if crate::row_changes::live_rows(analyzed_rows, changes) != estimate {
                 counter.store(changes, crate::sync::atomic::Ordering::Release);
                 program.connection.count_adaptive_replan();
                 tracing::debug!(
-                    table = %data.table,
+                    table = %table,
                     estimate,
                     rows,
-                    "adaptive join's build counted past the estimate: planned again"
+                    "a materialization point counted past the estimate: planned again"
                 );
                 return true;
             }
@@ -19281,10 +19283,233 @@ fn replan_on_built_rows(
         }
         Ok(Replan::Keep) => false,
         Err(refused) => {
-            tracing::debug!(table = %data.table, %refused, "adaptive join's rows not checked");
+            tracing::debug!(table = %table, %refused, "a materialization point's rows not checked");
             false
         }
     }
+}
+
+/// Amphora (PL.13, the in-run hand-off): true when the run stops here for `Statement` to run it
+/// from the start on the plan made on the counted rows: it was planned again, it may start again
+/// (read-only, no row returned), and the implicit transaction it would end is its own (no other
+/// statement on the connection under way in it, `ProgramState::can_autocommit_now`'s siblings).
+fn hand_off_now(program: &Program, state: &mut ProgramState, replanned: bool) -> bool {
+    let txn_its_own = !program.connection.get_auto_commit()
+        || program
+            .connection
+            .n_active_root_statements
+            .load(crate::sync::atomic::Ordering::SeqCst)
+            == 1;
+    if replanned && state.handoff_open && txn_its_own {
+        state.handoff_asked = true;
+        return true;
+    }
+    false
+}
+
+/// Amphora (PL.13, a materialization point): [Insn::BuildCounted]. A planner-chosen hash join's
+/// build over its whole table, once finished, counted against the rows the plan counted the table
+/// at ([`replan_on_built_rows`]), and the run handed off as the adaptive join's is
+/// ([`hand_off_now`]). A spilled table holds only part of its rows in memory: not checked.
+pub fn op_build_counted(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(BuildCounted { data }, insn);
+    let held = state
+        .hash_tables
+        .get(&data.hash_table_id)
+        .filter(|table| !table.has_spilled())
+        .map(|table| table.held());
+    if let Some((rows, bytes)) = held {
+        let replanned = match &data.filter {
+            None => {
+                program.connection.count_adaptive_build_check();
+                replan_on_built_rows(
+                    program,
+                    &data.table,
+                    data.analyzed_rows,
+                    data.estimate_error,
+                    rows,
+                    bytes,
+                )
+            }
+            Some(filter) => {
+                program.connection.count_adaptive_filter_check();
+                correct_filter_share(
+                    program,
+                    &data.table,
+                    data.analyzed_rows,
+                    filter,
+                    rows,
+                    bytes,
+                )
+            }
+        };
+        if hand_off_now(program, state, replanned) {
+            return Ok(InsnFunctionStepResult::Done);
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13, lane replan-5): a filtered build's rows set against the share of its table the
+/// plan's estimate kept (the table's rows now, by its counter, times that share). Past the
+/// estimate's error the counted share (at least half a row's, as the sample's floor) is stored for
+/// the planner, and every plan that read the old one is planned again: true when this one is.
+fn correct_filter_share(
+    program: &Program,
+    table: &str,
+    analyzed_rows: f64,
+    filter: &crate::vdbe::insn::FilteredBuild,
+    rows: usize,
+    bytes: usize,
+) -> bool {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    let counter = program.connection.db.row_changes.counter(table);
+    let table_rows = crate::row_changes::live_rows(
+        analyzed_rows,
+        counter.load(crate::sync::atomic::Ordering::Acquire),
+    );
+    let estimate = table_rows * filter.planned_share;
+    let verdict = MaterializePoint::new(estimate, filter.error, u64::MAX).and_then(|mut point| {
+        point.rows(rows as u64, bytes as u64)?;
+        Ok(point.verdict())
+    });
+    match verdict {
+        Ok(Replan::Again { rows }) => {
+            let share = ((rows as f64).max(0.5) / table_rows).min(1.0);
+            if filter.share.set(share) {
+                program.connection.count_adaptive_filter_correction();
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    table = %table,
+                    planned = filter.planned_share,
+                    share,
+                    "a filtered build counted past its share's estimate: planned again"
+                );
+                return true;
+            }
+            false
+        }
+        Ok(Replan::Keep) => false,
+        Err(refused) => {
+            tracing::debug!(table = %table, %refused, "a filtered build's rows not checked");
+            false
+        }
+    }
+}
+
+/// Amphora (PL.13, lane replan-5): [Insn::SorterCounted]. An ORDER BY sorter's input, all in,
+/// counted against the table's rows ([`replan_on_built_rows`]) or its WHERE terms' share of them
+/// ([`correct_filter_share`]), and the run handed off as a build's is ([`hand_off_now`]).
+pub fn op_sorter_counted(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SorterCounted { data }, insn);
+    let rows = {
+        let cursor = state.get_cursor(data.cursor_id);
+        usize::try_from(cursor.as_sorter_mut().inserted()).unwrap_or(usize::MAX)
+    };
+    program.connection.count_adaptive_sort_check();
+    let replanned = match (&data.joined, &data.filter) {
+        (Some(joined), _) => replan_on_counted_rows(
+            program,
+            &joined.rows,
+            joined.planned_rows,
+            joined.estimate_error,
+            u64::try_from(rows).unwrap_or(u64::MAX),
+        ),
+        (None, None) => replan_on_built_rows(
+            program,
+            &data.table,
+            data.analyzed_rows,
+            data.estimate_error,
+            rows,
+            0,
+        ),
+        (None, Some(filter)) => {
+            correct_filter_share(program, &data.table, data.analyzed_rows, filter, rows, 0)
+        }
+    };
+    if hand_off_now(program, state, replanned) {
+        return Ok(InsnFunctionStepResult::Done);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13, lane replan-6): a stored result's `rows` against the `planned_rows` the plan
+/// read for it; past the estimate's error the count is stored in `store` for the planner and every
+/// plan that read the old rows is planned again. True when a new count was stored.
+fn replan_on_counted_rows(
+    program: &Program,
+    store: &crate::subquery_rows::CountedRows,
+    planned_rows: f64,
+    estimate_error: f64,
+    rows: u64,
+) -> bool {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    let verdict =
+        MaterializePoint::new(planned_rows, estimate_error, u64::MAX).and_then(|mut point| {
+            point.rows(rows, 0)?;
+            Ok(point.verdict())
+        });
+    match verdict {
+        Ok(Replan::Again { rows }) => {
+            let stored = store.set(rows);
+            if stored {
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    planned = planned_rows,
+                    rows,
+                    "a stored result counted past its estimate: planned again"
+                );
+            }
+            stored
+        }
+        Ok(Replan::Keep) => false,
+        Err(refused) => {
+            tracing::debug!(%refused, "a stored result's rows not checked");
+            false
+        }
+    }
+}
+
+/// Amphora (PL.13, lane replan-6): [Insn::SubqueryCounted]. A stored subquery result, filled,
+/// counted against the rows the plan read for it; past the estimate's error the count is stored for
+/// the planner, every plan that read the old rows is planned again, and the run handed off as a
+/// build's is ([`hand_off_now`]).
+pub fn op_subquery_counted(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SubqueryCounted { data }, insn);
+    let rows = match state.get_register(data.rows_reg).get_value() {
+        Value::Numeric(Numeric::Integer(rows)) => u64::try_from(*rows).unwrap_or(0),
+        _ => 0,
+    };
+    program.connection.count_adaptive_subquery_check();
+    let replanned = replan_on_counted_rows(
+        program,
+        &data.rows,
+        data.planned_rows,
+        data.estimate_error,
+        rows,
+    );
+    if hand_off_now(program, state, replanned) {
+        return Ok(InsnFunctionStepResult::Done);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_hash_clear(
@@ -20351,30 +20576,141 @@ pub fn op_filter(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
-    let contains = if *num_keys == 1 {
+    let contains = filter_contains(filter, &state.registers, *key_reg, *num_keys);
+
+    if !contains {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Whether `filter` may hold the key in `registers[key_reg..key_reg + num_keys]`. A NULL key part
+/// matches nothing: the filter's join is an equality. A key past the registers passes, as a
+/// filter may always let a row through.
+fn filter_contains(
+    filter: &crate::vdbe::bloom_filter::BloomFilter,
+    registers: &[Register],
+    key_reg: usize,
+    num_keys: usize,
+) -> bool {
+    let key = |i: usize| {
+        key_reg
+            .checked_add(i)
+            .and_then(|reg| registers.get(reg))
+            .map(Register::get_value)
+    };
+    if num_keys == 1 {
         // Single key optimization, avoid allocating a Vec
-        let value = state.registers[*key_reg].get_value();
-        if matches!(value, Value::Null) {
+        match key(0) {
             // its always safe to fall through, so this *should* be `true` but
             // since it's always an equality predicate and we have a NULL value,
             // we can just short-circuit to false here.
-            false
-        } else {
-            filter.contains_value(value)
+            Some(Value::Null) => false,
+            Some(value) => filter.contains_value(value),
+            None => true,
         }
     } else {
-        let values: Vec<&Value> = (0..*num_keys)
-            .map(|i| state.registers[*key_reg + i].get_value())
-            .collect();
+        let Some(values) = (0..num_keys).map(key).collect::<Option<Vec<&Value>>>() else {
+            return true;
+        };
         if values.iter().any(|v| matches!(*v, Value::Null)) {
             false
         } else {
             filter.contains_values(&values)
         }
-    };
+    }
+}
 
-    if !contains {
-        state.pc = target_pc.as_offset_int();
+/// Amphora (QT.5, T-QT.5.11): [Insn::StarProbes]. At the first row that reaches a filter still
+/// building, every filter's build ends (sealed, as [Insn::Filter]'s first probe seals it) and
+/// their bytes are counted; then the row's
+/// keys are checked against each filter, in the measured order or the planner's, to the first
+/// that rejects them. A filter not built passes the row, as [Insn::Filter] lets it.
+pub fn op_star_probes(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(StarProbes { data }, insn);
+    let pc = state.pc;
+    // A filter still building ends its build at the row that first reaches it, as at a run's
+    // first row, so does one built again (a star join run again within the statement).
+    let building = data.probes.iter().any(|probe| {
+        state
+            .bloom_filters
+            .get(&probe.cursor_id)
+            .is_some_and(crate::vdbe::bloom_filter::BloomFilter::building)
+    });
+    if building {
+        // The filters are sealed one after another: while one is, it holds its hashes and its
+        // finished filter at once (`BloomFilter::seal`), the ones before it their filters and the
+        // ones after it their hashes. The most they hold together is counted (lane qs5-19).
+        // Before that, as each filter's hashes grew, a growth held its old list and its new
+        // (`BloomFilter::peak`), beside the lists of the filters built before it: counted here
+        // beside every other filter's whole list, at least what they held then (lane qs5-20).
+        let mut held = data
+            .probes
+            .iter()
+            .filter_map(|probe| state.bloom_filters.get(&probe.cursor_id))
+            .fold(0usize, |held, filter| held.saturating_add(filter.bytes()));
+        let lists = held;
+        let mut most = held;
+        for probe in data.probes.iter() {
+            if let Some(filter) = state.bloom_filters.get_mut(&probe.cursor_id) {
+                let growing = lists
+                    .saturating_sub(filter.bytes())
+                    .saturating_add(filter.peak());
+                most = most.max(growing);
+                let others = held.saturating_sub(filter.bytes());
+                let sealing = filter.seal();
+                most = most.max(others.saturating_add(sealing));
+                held = others.saturating_add(filter.bytes());
+            }
+        }
+        let most = u64::try_from(most).unwrap_or(u64::MAX);
+        state.metrics.star_filter_bytes = state.metrics.star_filter_bytes.max(most);
+    }
+    if !state.star_orders.contains_key(&pc) {
+        state.star_orders.insert(
+            pc,
+            super::star_order::StarOrder::new(data.probes.len(), data.order),
+        );
+    }
+    let Some(order) = state.star_orders.get_mut(&pc) else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let mut rejected = false;
+    let measured = data.order != crate::StarFilterOrder::Planned;
+    for nth in 0..data.probes.len() {
+        let at = if measured { order.nth(nth) } else { Some(nth) };
+        let Some((at, probe)) = at.and_then(|at| data.probes.get(at).map(|p| (at, p))) else {
+            continue;
+        };
+        let passed = state
+            .bloom_filters
+            .get(&probe.cursor_id)
+            .is_none_or(|filter| {
+                filter_contains(filter, &state.registers, probe.key_reg, probe.num_keys)
+            });
+        state.metrics.star_filter_probes = state.metrics.star_filter_probes.wrapping_add(1);
+        if measured {
+            order.observe(at, passed);
+        }
+        if !passed {
+            state.metrics.star_filter_rejects = state.metrics.star_filter_rejects.wrapping_add(1);
+            rejected = true;
+            break;
+        }
+    }
+    if measured && order.settle() {
+        state.metrics.star_filter_reorders = state.metrics.star_filter_reorders.wrapping_add(1);
+    }
+    if rejected {
+        state.pc = data.target_pc.as_offset_int();
     } else {
         state.pc += 1;
     }

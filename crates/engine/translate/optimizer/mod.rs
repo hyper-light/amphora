@@ -96,11 +96,13 @@ mod cost_params;
 pub(crate) mod join;
 pub(crate) mod learned_costs;
 pub(crate) mod lift_common_subexpressions;
+pub(crate) mod lip;
 pub(crate) mod multi_index;
 pub(crate) mod order;
 pub mod plan_hints;
 mod row_value;
 mod sample_filter;
+pub(crate) mod search_budget;
 pub(crate) mod unnest;
 
 #[derive(Debug, Default)]
@@ -978,6 +980,10 @@ struct TableAccessPlan {
     order_target: Option<OrderTarget>,
     sort_eliminated: bool,
     initial_input_rows: f64,
+    /// Amphora (T-QT.5.3): the costs the plan was found with, and each table's rows, for the star
+    /// filters chosen once the plan is applied.
+    params: cost_params::CostModelParams,
+    base_rows: Vec<f64>,
 }
 
 #[derive(Default)]
@@ -1068,7 +1074,7 @@ fn optimize_select_plan_with_cache(
     // joins. A correlated subquery left in place runs as a nested loop beneath its query, so the
     // unnested form is taken wherever it can be emitted, as the forced unnesting mode takes it,
     // rather than weighed against that loop.
-    if resolver.join_methods() == crate::JoinMethods::HashJoinsOnly {
+    if resolver.join_methods().hash_shaped_only() {
         let rewritten_table_plan =
             find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
         if !rewritten_form_is_emittable(&rewritten) {
@@ -1171,7 +1177,8 @@ fn find_select_plan_form(
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
-        .with_plan_values(resolver.plan_values());
+        .with_plan_values(resolver.plan_values())
+        .with_is_value_estimate(resolver.is_value_estimate());
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
 
@@ -1289,6 +1296,7 @@ fn find_select_plan_form(
     if let Some(table_plan) = table_plan.as_ref() {
         let rows_before_limit =
             estimate_select_output_rows(plan, table_plan.join.output_cardinality, schema);
+        let rows_before_limit = distinct_rows(plan, rows_before_limit, params);
         let mut rows = rows_before_limit;
         if let Some(limit_rows) = plan.limit.as_deref().and_then(literal_limit_rows) {
             rows = rows.min(limit_rows);
@@ -1456,6 +1464,7 @@ fn apply_select_table_plan(
     let Some(table_plan) = table_plan else {
         return Ok(());
     };
+    let (lip_params, lip_base_rows) = (table_plan.params.clone(), table_plan.base_rows.clone());
     plan.join_order = apply_table_access_plan(
         resolver,
         &mut plan.table_references,
@@ -1464,6 +1473,16 @@ fn apply_select_table_plan(
         &mut plan.group_by,
         table_plan,
     )?;
+    // Amphora (QT.5, T-QT.5.3): the star joins' filters, by cost, once the plan is fixed.
+    let filters = lip::choose(
+        resolver.star_filters(),
+        &plan.table_references,
+        &plan.where_clause,
+        &plan.join_order,
+        &lip_base_rows,
+        &lip_params,
+    );
+    plan.table_references.set_lip_filters(filters);
     Ok(())
 }
 
@@ -1859,6 +1878,7 @@ fn build_update_write_set_plan(
         window: None,
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        in_identity: None,
         estimated_cost: None,
         // For regular UPDATEs, only WHERE-clause subqueries move into the ephemeral plan.
         // For UPDATE ... FROM, SET expressions become part of the ephemeral SELECT payload,
@@ -2358,6 +2378,17 @@ fn base_row_estimate(
         Table::FromClauseSubquery(subquery) => match subquery.plan.as_ref() {
             Plan::Select(plan) => {
                 if let Some(rows) = plan.estimated_output_rows {
+                    // Amphora (PL.13, lane replan-6): the rows a fill of this very subquery counted
+                    // past its estimate stand in for the estimate, and the plan notes the rows it
+                    // read. A correlated subquery's rows are per outer row: not read.
+                    let rows = match (subquery.identity, params.plan_values.as_deref()) {
+                        (Some(identity), Some(values))
+                            if !crate::translate::plan::plan_is_correlated(&subquery.plan) =>
+                        {
+                            values.subquery_rows(identity, rows)
+                        }
+                        _ => rows,
+                    };
                     return RowCountEstimate::AnalyzeStats(rows.max(1.0));
                 }
                 RowCountEstimate::hardcoded_fallback(params)
@@ -2384,6 +2415,16 @@ fn base_row_estimate(
 /// total row count and the average rows for one key. Dividing them gives the
 /// number of groups.
 fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Schema) -> Option<f64> {
+    group_count_from_index_stats(plan, group_by, schema).map(|(groups, ..)| groups)
+}
+
+/// [group_count_from_analyze]'s group count, with the stored average rows a group of the index
+/// that gave it and the statistics of its table (PL.13, lane replan-8: the count's error).
+fn group_count_from_index_stats<'a>(
+    plan: &SelectPlan,
+    group_by: &GroupBy,
+    schema: &'a Schema,
+) -> Option<(f64, u64, &'a crate::stats::TableStat)> {
     let mut table_id = None;
     let mut columns: SmallVec<[usize; 4]> = SmallVec::new();
     for expr in &group_by.exprs {
@@ -2428,12 +2469,158 @@ fn group_count_from_analyze(plan: &SelectPlan, group_by: &GroupBy, schema: &Sche
             let total_rows = index_stats.total_rows? as f64;
             let rows_per_group = *index_stats
                 .avg_rows_per_distinct_prefix
-                .get(columns.len().checked_sub(1)?)? as f64;
-            (rows_per_group > 0.0).then_some(total_rows / rows_per_group)
+                .get(columns.len().checked_sub(1)?)?;
+            (rows_per_group > 0).then_some((total_rows / rows_per_group as f64, rows_per_group))
         })
-        .fold(None, |best: Option<f64>, groups| {
-            Some(best.map_or(groups, |best| best.max(groups)))
+        .fold(
+            None,
+            |best: Option<(f64, u64)>, (groups, rows_per_group)| {
+                Some(match best {
+                    Some(best) if best.0 >= groups => best,
+                    _ => (groups, rows_per_group),
+                })
+            },
+        )
+        .map(|(groups, rows_per_group)| (groups, rows_per_group, table_stats))
+}
+
+/// Amphora (PL.13, lane replan-12; `docs/design/planner.md`, "Stored subquery results"): a SELECT
+/// DISTINCT's output rows, where an ORDER BY sorter after the DISTINCT counted them past their
+/// estimate (`main_loop::distinct_sorter_check`), stand in for the estimate, and the rows planned
+/// on are noted under the DISTINCT's identity (`subquery_rows::distinct_identity`) for the sorter
+/// to check. The estimate itself is `rows`, the rows read, as before. Only where the plan reads
+/// such counts (adaptive joins on), for one run (`input_cardinality_hint` at most one), with no
+/// GROUP BY, aggregate or window between the read and the DISTINCT.
+fn distinct_rows(plan: &SelectPlan, rows: f64, params: &cost_params::CostModelParams) -> f64 {
+    let Some(values) = params
+        .plan_values
+        .as_deref()
+        .filter(|values| values.reads_subquery_rows())
+    else {
+        return rows;
+    };
+    if !plan.distinctness.is_distinct()
+        || plan.group_by.is_some()
+        || !plan.aggregates.is_empty()
+        || plan.window.is_some()
+        || plan.input_cardinality_hint.unwrap_or(1.0) > 1.0
+    {
+        return rows;
+    }
+    match crate::subquery_rows::distinct_identity(
+        plan.joined_tables(),
+        &plan.where_clause,
+        &plan.result_columns,
+    ) {
+        Some(identity) => values.subquery_rows(identity, rows),
+        None => rows,
+    }
+}
+
+/// Amphora (PL.13, lane replan-11; `docs/design/planner.md`, "Filtered builds"): once the join
+/// order is chosen, the rows the plan estimated for each join prefix a hash join's build input is
+/// materialized from (the tables before its probe, its build table among them) are noted under the
+/// prefix's identity (`subquery_rows::prefix_identity`, keyed as a whole join's rows are), so the
+/// materialization is checked against them (`main_loop::join_prefix_check`); a count stored there
+/// is read in their place, as the join search did (`cardinality::JoinedSetRows::rows`). The rows
+/// are the search's own for that set (`JoinN::prefix_cardinalities`). Only where the search reads
+/// such counts: adaptive joins on, a plan for one run of inner joins only, left-deep (a bushy run
+/// is joined among itself, apart from the tables before it), and a prefix of two tables or more.
+fn note_materialized_prefixes(
+    best_plan: &JoinN,
+    access_methods_arena: &[AccessMethod],
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    where_clause: &[WhereTerm],
+    initial_input_cardinality: f64,
+    params: &cost_params::CostModelParams,
+) {
+    let Some(values) = params
+        .plan_values
+        .as_deref()
+        .filter(|values| values.reads_subquery_rows())
+    else {
+        return;
+    };
+    if initial_input_cardinality > 1.0
+        || !best_plan.is_left_deep()
+        || table_references.joined_tables().iter().any(|joined| {
+            joined.join_info.as_ref().is_some_and(|info| {
+                info.is_outer() || info.is_semi_or_anti() || info.keeps_right_rows()
+            })
         })
+    {
+        return;
+    }
+    for (pos, (_, method)) in best_plan.data.iter().enumerate() {
+        let Some(AccessMethodParams::HashJoin {
+            build_table_idx,
+            materialize_build_input: true,
+            ..
+        }) = access_methods_arena
+            .get(*method)
+            .map(|method| &method.params)
+        else {
+            continue;
+        };
+        let (Some(before), Some(rows)) = (
+            best_plan.data.get(..pos),
+            pos.checked_sub(1)
+                .and_then(|last| best_plan.prefix_cardinalities.get(last)),
+        ) else {
+            continue;
+        };
+        if before.len() < 2 || before.iter().all(|(table, _)| table != build_table_idx) {
+            continue;
+        }
+        let mut prefix = TableMask::default();
+        if before.iter().any(|(table, _)| prefix.set(*table).is_err()) {
+            continue;
+        }
+        if let Some(identity) = crate::subquery_rows::prefix_identity(
+            table_references,
+            subqueries,
+            where_clause,
+            &prefix,
+        ) {
+            values.subquery_rows(identity, *rows);
+        }
+    }
+}
+
+/// Amphora (PL.13, lane replan-8; `docs/design/planner.md`, "Stored subquery results"): the
+/// relative error of a GROUP BY plan's estimated output rows where ANALYZE's group count set them
+/// ([group_count_from_analyze], the estimate being the fewer of the groups and the rows read), so
+/// a grouped result is checked against its group count's error, not its rows'. Two independent
+/// parts, in quadrature:
+/// - the stored average: sqlite_stat1 keeps `ceil(total / groups)` (`translate::analyze`, as
+///   SQLite's analyze.c), so an average `a` of two or more stands for groups between `total / a`
+///   and `total / (a - 1)`: up to `1 / (a - 1)` more than read. An average of one is exact;
+/// - the statistics' own error, as a count read from them has (`row_changes::statistics_error`).
+///
+/// `None` where the estimate did not come from ANALYZE's groups: no GROUP BY, keys that are not
+/// one table's columns an index starts with, or fewer rows read (or a LIMIT) setting it. There the
+/// estimate is the rows', and so is its error.
+pub(crate) fn group_count_error(plan: &SelectPlan, schema: &Schema) -> Option<f64> {
+    let group_by = plan
+        .group_by
+        .as_ref()
+        .filter(|group_by| !group_by.exprs.is_empty())?;
+    let (groups, rows_per_group, table_stats) =
+        group_count_from_index_stats(plan, group_by, schema)?;
+    let calls = plan.input_cardinality_hint.unwrap_or(1.0);
+    if plan.estimated_output_rows? < calls * groups.max(1.0) {
+        return None;
+    }
+    let stored_average = match rows_per_group {
+        0 | 1 => 0.0,
+        a => ((a - 1) as f64).recip(),
+    };
+    let total_rows = table_stats
+        .row_count
+        .map_or(groups * rows_per_group as f64, |rows| rows as f64);
+    let statistics = crate::row_changes::statistics_error(table_stats, total_rows);
+    Some(stored_average.hypot(statistics))
 }
 
 /// Amphora: the calls of a correlated subquery that runs where `phase` says, `loop_calls` being
@@ -2875,17 +3062,17 @@ fn find_table_access_plan(
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
-        .with_plan_values(resolver.plan_values());
+        .with_plan_values(resolver.plan_values())
+        .with_is_value_estimate(resolver.is_value_estimate());
 
     if table_references.joined_tables().is_empty() {
         return Ok(None);
     }
-    if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
-        crate::bail_parse_error!(
-            "Only up to {} tables can be joined",
-            TableReferences::MAX_JOINED_TABLES
-        );
-    }
+    // PL.8 (T-PL.8.7): no cap on the tables a join names. A table set is a `TableMask`, a bitset
+    // whose words grow to the highest table the query names (`BitSet::set`, its allocation
+    // fallible), so its size comes from the query, which the statement's length bounds; the
+    // search's subsets are bounded by its budget (`search_budget`), past which the greedy search
+    // plans the join in the tables' count squared.
 
     // A WHERE term that is never true on a NULL row lets an outer join drop
     // the NULL rows it would add, which turns it into a stricter join:
@@ -3087,6 +3274,7 @@ fn find_table_access_plan(
         allow_automatic_index: resolver.automatic_indexes()
             && resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
         join_methods: resolver.join_methods(),
+        search_budget: resolver.join_search(),
         sorted_fetches: resolver.sorted_fetches(),
         row_goal,
     };
@@ -3132,6 +3320,16 @@ fn find_table_access_plan(
         best_plan
     };
 
+    note_materialized_prefixes(
+        &best_plan,
+        &access_methods_arena,
+        table_references,
+        subqueries,
+        where_clause,
+        initial_input_cardinality,
+        params,
+    );
+
     // PL.8: a bushy plan's run reads its rows before the loops, so it keeps no order.
     let sort_eliminated = best_plan.is_left_deep()
         && maybe_order_target.as_ref().is_some_and(|order_target| {
@@ -3175,6 +3373,8 @@ fn find_table_access_plan(
         order_target: maybe_order_target,
         sort_eliminated,
         initial_input_rows: initial_input_cardinality,
+        params: params.clone(),
+        base_rows: base_table_rows.iter().map(|rows| **rows).collect(),
     }))
 }
 
@@ -3305,6 +3505,7 @@ fn plan_unmatched_right_rows(
                 // In SQLite, `WHERE_RIGHT_JOIN` mode disables automatic indexes.
                 allow_automatic_index: false,
                 join_methods: resolver.join_methods(),
+                search_budget: resolver.join_search(),
                 sorted_fetches: false,
                 row_goal: None,
             },
@@ -3974,6 +4175,8 @@ fn apply_table_access_plan(
         order_target: maybe_order_target,
         sort_eliminated,
         initial_input_rows,
+        params: _,
+        base_rows: _,
     } = plan;
 
     if sort_eliminated {
@@ -4312,6 +4515,7 @@ fn apply_table_access_plan(
                 use_bloom_filter,
                 bloom_fp_per_key,
                 join_type,
+                method,
             } => {
                 // Mark WHERE clause terms as consumed since we're using hash join
                 for join_key in join_keys.iter() {
@@ -4328,6 +4532,7 @@ fn apply_table_access_plan(
                         use_bloom_filter: *use_bloom_filter,
                         bloom_fp_per_key: *bloom_fp_per_key,
                         join_type: *join_type,
+                        method: *method,
                         build_group: build_groups
                             .iter()
                             .find(|(probe_position, _)| *probe_position == i)

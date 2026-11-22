@@ -336,6 +336,9 @@ pub struct Statement {
     generic: Option<vdbe::Program>,
     /// Amphora (PL.12): the custom runs' measurements, which choose each run's plan.
     plan_choice: PlanChoice,
+    /// Amphora (PL.8): the runs started since the statement was last planned: a plan made again
+    /// is expected to serve as many (`search_budget`, `JoinSearchBudget::RunShareByExecutions`).
+    runs_since_planned: u64,
     /// Amphora (PL.12): the custom run under way, measured until it ends.
     custom_run: Option<OpenCustomRun>,
     /// Amphora (PL.7): the run under way, when the database's fit chose to time it.
@@ -452,6 +455,7 @@ impl Statement {
             analyze_refresh: None,
             generic: None,
             plan_choice: PlanChoice::default(),
+            runs_since_planned: 0,
             custom_run: None,
             cost_sample: None,
             handed_off: false,
@@ -891,6 +895,7 @@ impl Statement {
                     return Err(err);
                 }
             }
+            self.runs_since_planned = self.runs_since_planned.saturating_add(1);
             if self.origin == StatementOrigin::Root {
                 if let Err(err) = self.choose_plan() {
                     self.release_active_root_if_counted();
@@ -1306,6 +1311,16 @@ impl Statement {
             .planned_tables
             .iter()
             .any(|table| table.moved())
+            || self
+                .program
+                .planned_filters
+                .iter()
+                .any(|filter| filter.moved())
+            || self
+                .program
+                .planned_subqueries
+                .iter()
+                .any(|subquery| subquery.moved())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1321,7 +1336,14 @@ impl Statement {
         // publish new btree roots without bumping the schema cookie, so
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
-        let new_program = self.plan_again(&PrepareOptions::default())?;
+        // Amphora (PL.8): a statement that ran r times since it was planned is expected to run r
+        // times more: Gott's Copernican estimate, the median of what remains of a run of unknown
+        // length seen at a random point in it (Nature 363, 1993).
+        let new_program = self.plan_again(&PrepareOptions {
+            expected_runs: Some(self.runs_since_planned.max(1)),
+            ..PrepareOptions::default()
+        })?;
+        self.runs_since_planned = 0;
         self.install_program(new_program)?;
         self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
         // Amphora (PL.12): the plan made now is the generic one, on the schema and statistics as

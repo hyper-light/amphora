@@ -312,6 +312,8 @@ pub struct Sorter {
     kept: Option<Kept>,
     /// Amphora: whether the first insert has decided `kept`.
     limit_decided: bool,
+    /// Amphora (PL.13, lane replan-5): every row put in, kept or not, in memory or spilled.
+    inserted: u64,
     /// Amphora (QT.5): the rows the last in-memory sort ordered and the nanoseconds it took, for
     /// the database's learned sort cost (`take_in_memory_sort`).
     in_memory_sort: Option<(usize, f64)>,
@@ -363,6 +365,7 @@ impl Sorter {
             temp_store,
             kept: None,
             limit_decided: false,
+            inserted: 0,
             in_memory_sort: None,
         };
         Ok(this)
@@ -399,6 +402,11 @@ impl Sorter {
 
     pub const fn has_more(&self) -> bool {
         self.current.is_some()
+    }
+
+    /// Amphora (PL.13, lane replan-5): the rows put in so far, whether kept, held or spilled.
+    pub fn inserted(&self) -> u64 {
+        self.inserted
     }
 
     /// Amphora (QT.5): the rows the last in-memory sort ordered and the nanoseconds it took, once.
@@ -545,6 +553,7 @@ impl Sorter {
                 &self.index_key_info,
                 &self.comparators,
             )?;
+            self.inserted = self.inserted.saturating_add(1);
             return Ok(IOResult::Done(()));
         }
         let payload_size = record.get_payload().len();
@@ -585,6 +594,7 @@ impl Sorter {
                     self.max_payload_size_in_buffer =
                         self.max_payload_size_in_buffer.max(payload_size);
                     self.insert_state = InsertState::Start;
+                    self.inserted = self.inserted.saturating_add(1);
                     return Ok(IOResult::Done(()));
                 }
             }

@@ -184,6 +184,18 @@ impl OpenLoop {
                 }
             }
 
+            // Amphora (QT.5, T-QT.5.3): the dimensions this scan's star filters read, once.
+            let star_probes = if matches!(mode, OperationMode::SELECT) {
+                super::star::emit_builds(
+                    program,
+                    t_ctx,
+                    table_references,
+                    predicates,
+                    joined_table_index,
+                )?
+            } else {
+                Vec::new()
+            };
             match &table.op {
                 Operation::HashJoin(hash_join_op) => {
                     HashProbeSetupEmitter::new(
@@ -322,6 +334,14 @@ impl OpenLoop {
                 subqueries,
             )
             .emit()?;
+            super::star::emit_probes(
+                program,
+                t_ctx,
+                table_references,
+                predicates,
+                &star_probes,
+                condition_fail_target,
+            )?;
 
             // HASH SEMI-JOIN (G6 step 5): all conditions passed means the build row matched; it
             // goes on only at its first match in this probe pass, and later matches move on to the

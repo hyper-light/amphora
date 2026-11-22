@@ -218,8 +218,13 @@ impl Display for SelectPlan {
                         index_method.definition().method_name
                     )?;
                 }
-                Operation::HashJoin(_) => {
-                    writeln!(f, "{indent}HASH JOIN")?;
+                Operation::HashJoin(op) => {
+                    // Amphora (QT.5 step 4, lane qs5-21): a sort-merge join names itself.
+                    let method = match op.method {
+                        crate::translate::plan::HashJoinMethod::Hash => "HASH",
+                        crate::translate::plan::HashJoinMethod::Merge => "MERGE",
+                    };
+                    writeln!(f, "{indent}{method} JOIN")?;
                 }
                 Operation::MultiIndexScan(multi_idx) => {
                     write_multi_index_scan(f, &indent, &reference.identifier, multi_idx)?;

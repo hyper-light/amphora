@@ -738,6 +738,10 @@ pub struct Database<
     pub(crate) learned_costs: Arc<crate::translate::optimizer::learned_costs::LearnedCosts>,
     /// Amphora (PL.9): each table's rows inserted less rows deleted since ANALYZE counted it.
     pub(crate) row_changes: Arc<crate::row_changes::RowChanges>,
+    /// Amphora (PL.13, lane replan-5): filter shares filtered hash-join builds counted.
+    pub(crate) filter_shares: Arc<crate::filter_shares::FilterShares>,
+    /// Amphora (PL.13, lane replan-6): subquery results stored results counted.
+    pub(crate) subquery_rows: Arc<crate::subquery_rows::SubqueryRows>,
     /// Amphora (PL.7): the cost weights fitted to its statements' measured times, and the switch
     /// the planner reads them behind.
     pub(crate) cost_fit: Arc<crate::translate::optimizer::cost_fit::DatabaseFit>,
@@ -919,6 +923,8 @@ impl Database {
             _shared_page_cache: shared_page_cache,
             learned_costs,
             row_changes: Arc::new(crate::row_changes::RowChanges::new()),
+            filter_shares: Arc::new(crate::filter_shares::FilterShares::new()),
+            subquery_rows: Arc::new(crate::subquery_rows::SubqueryRows::new()),
             cost_fit: Arc::new(crate::translate::optimizer::cost_fit::DatabaseFit::new()),
             shared_wal,
             #[cfg(host_shared_wal)]
@@ -2844,10 +2850,27 @@ impl Database {
             join_methods: crate::connection::AtomicJoinMethods::new(
                 crate::connection::JoinMethods::ByCost,
             ),
+            join_search_budget: crate::connection::AtomicJoinSearchBudget::new(
+                crate::connection::JoinSearchBudget::Fixed,
+            ),
+            star_filters: crate::connection::AtomicStarFilters::new(
+                crate::connection::StarFilters::ByCost,
+            ),
+            is_value_estimate: crate::connection::AtomicIsValueEstimate::new(
+                crate::connection::IsValueEstimate::Equality,
+            ),
+            star_filter_order: crate::connection::AtomicStarFilterOrder::new(
+                crate::connection::StarFilterOrder::Planned,
+            ),
             sorted_fetches: AtomicBool::new(false),
             adaptive_joins: AtomicBool::new(false),
             adaptive_join_switches: AtomicU64::new(0),
             adaptive_replans: AtomicU64::new(0),
+            adaptive_build_checks: AtomicU64::new(0),
+            adaptive_filter_checks: AtomicU64::new(0),
+            adaptive_filter_corrections: AtomicU64::new(0),
+            adaptive_sort_checks: AtomicU64::new(0),
+            adaptive_subquery_checks: AtomicU64::new(0),
             adaptive_handoff: AtomicBool::new(true),
             adaptive_handoffs: AtomicU64::new(0),
             pinned_cost_weights: crate::sync::RwLock::new(None),

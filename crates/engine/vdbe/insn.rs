@@ -268,6 +268,9 @@ pub struct HashBuildData {
     pub num_payload: usize,
     /// Whether to track which entries are matched (for FULL OUTER JOIN).
     pub track_matched: bool,
+    /// Amphora (QT.5 step 4, lane qs5-21): the join is a sort-merge (`HashJoinMethod::Merge`):
+    /// the table sorts its rows by key once built and is probed by merging (`HashTable::set_merge`).
+    pub merge: bool,
 }
 
 /// Amphora (PL.13): one adaptive join's switch (boxed to keep Insn small). The three weights are
@@ -288,6 +291,29 @@ pub struct JoinSwitchData {
     pub probe_pc: BranchOffset,
 }
 
+/// Amphora (QT.5, T-QT.5.11): one of a star probe's filters: the dimension's Bloom filter, by its
+/// cursor, and the fact row's keys for it.
+#[derive(Debug, Clone)]
+pub struct StarProbeKeys {
+    pub cursor_id: CursorID,
+    /// Start register of the keys, already given the comparison's affinities.
+    pub key_reg: usize,
+    pub num_keys: usize,
+}
+
+/// Amphora (QT.5, T-QT.5.11): a fact row's checks against its star join's filters (boxed to keep
+/// Insn small).
+#[derive(Debug, Clone)]
+pub struct StarProbesData {
+    /// The filters, in the planner's order.
+    pub probes: Box<[StarProbeKeys]>,
+    /// Where a row a filter rejects goes.
+    pub target_pc: BranchOffset,
+    /// The order the filters are checked in: the planner's, or measured as the rows run, with
+    /// counts kept whole or fading (`Connection::set_star_filter_order`).
+    pub order: crate::StarFilterOrder,
+}
+
 /// Amphora (PL.13): an adaptive join's hash table, built (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct JoinSwitchBuiltData {
@@ -301,6 +327,80 @@ pub struct JoinSwitchBuiltData {
     pub analyzed_rows: f64,
     /// The relative standard error of the statistics that count came from
     /// (`row_changes::statistics_error`).
+    pub estimate_error: f64,
+}
+
+/// Amphora (PL.13, the materialization points): a hash join the planner chose, its build over a
+/// table read whole (no filter of its own), counted against the rows the plan counted the table at.
+#[derive(Debug, Clone)]
+pub struct BuildCountedData {
+    /// Amphora (PL.13, lane replan-5): the build's own filter, whose share of the table is counted
+    /// in place of the table's rows; `None` for a build over the whole table.
+    pub filter: Option<FilteredBuild>,
+    pub hash_table_id: usize,
+    /// The build table, as its row counter (PL.9, `row_changes`) names it.
+    pub table: String,
+    /// ANALYZE's count of the build table's rows.
+    pub analyzed_rows: f64,
+    /// The relative standard error of the statistics that count came from
+    /// (`row_changes::statistics_error`).
+    pub estimate_error: f64,
+}
+
+/// Amphora (PL.13, lane replan-5): a filtered build's check: the share of its table the plan's
+/// estimate of its filter terms kept, its relative error, and where a counted share is stored.
+#[derive(Debug, Clone)]
+pub struct FilteredBuild {
+    pub share: crate::sync::Arc<crate::filter_shares::FilterShare>,
+    pub planned_share: f64,
+    /// The relative standard error of the build's estimated rows: the share's and the table
+    /// count's together.
+    pub error: f64,
+}
+
+/// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter fed by
+/// one table's full scan, its rows counted against the table's (or its filter's share of them).
+#[derive(Debug, Clone)]
+pub struct SorterCountedData {
+    pub cursor_id: CursorID,
+    /// The scanned table, as its row counter (PL.9, `row_changes`) names it.
+    pub table: String,
+    /// ANALYZE's count of the table's rows.
+    pub analyzed_rows: f64,
+    /// The relative standard error of the statistics that count came from.
+    pub estimate_error: f64,
+    /// The WHERE terms' share check; `None` for a scan with no WHERE term.
+    pub filter: Option<FilteredBuild>,
+    /// Amphora (PL.13, lane replan-10): for a sorter fed by an inner join, the check of its rows
+    /// against the rows the plan read for the whole join, in place of `table`'s and `filter`'s.
+    pub joined: Option<CountedCheck>,
+    /// Amphora (PL.13, lane replan-12): whether `joined` is a SELECT DISTINCT's rows, the sorter
+    /// after it holding them, rather than a join's.
+    pub distinct: bool,
+}
+
+/// A stored result's rows checked against the rows the plan read for it (PL.13, lane replan-10):
+/// where a count past the estimate is stored (`subquery_rows`), the rows planned on, and the
+/// relative standard error of the statistics the estimate came from.
+#[derive(Debug, Clone)]
+pub struct CountedCheck {
+    pub rows: crate::sync::Arc<crate::subquery_rows::CountedRows>,
+    pub planned_rows: f64,
+    pub estimate_error: f64,
+}
+
+/// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
+/// uncorrelated FROM-clause subquery's stored result, filled, its rows counted against the rows
+/// the plan read for it.
+#[derive(Debug, Clone)]
+pub struct SubqueryCountedData {
+    /// The register holding the rows the fill stored.
+    pub rows_reg: usize,
+    /// Where a count past the estimate is stored for the planner (`subquery_rows`).
+    pub rows: crate::sync::Arc<crate::subquery_rows::CountedRows>,
+    /// The rows the plan read for the subquery: its estimate, or a count a fill stored.
+    pub planned_rows: f64,
+    /// The relative standard error of the statistics the estimate came from.
     pub estimate_error: f64,
 }
 
@@ -2359,6 +2459,39 @@ pub enum Insn {
         cursor_id: CursorID,
         target_reg: usize,
     },
+
+    /// Amphora (PL.13, a materialization point; `docs/design/planner.md`, "Decision (lane pl13)"):
+    /// a planner-chosen hash join's build over a whole table, its rows set against the plan's
+    /// estimate. Past the estimate's error the table's count is corrected and the statement planned
+    /// again, a run that may start again handed off to the new plan (`JoinSwitchBuilt`'s rule).
+    BuildCounted {
+        data: Box<BuildCountedData>,
+    },
+
+    /// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter's
+    /// input, all in, counted against the plan's estimate of the scan that fed it, as
+    /// `BuildCounted` counts a build.
+    SorterCounted {
+        data: Box<SorterCountedData>,
+    },
+
+    /// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
+    /// uncorrelated FROM-clause subquery's stored result, once filled, counted against the plan's
+    /// estimate, as `BuildCounted` counts a build: past its error the count is stored for the
+    /// planner and the statement planned again.
+    SubqueryCounted {
+        data: Box<SubqueryCountedData>,
+    },
+
+    /// Amphora (QT.5, T-QT.5.11; `docs/design/planner.md`, "Decision (lane qs5-18): a star join's
+    /// filters checked in their measured order"): checks the fact row's keys against each of its
+    /// star join's Bloom filters, jumping to `target_pc` at the first that rejects them. In
+    /// `order`: the order the run has measured (each filter's checks and passes, kept in the
+    /// program's state, `vdbe/star_order.rs`), the filter passing the smallest share first, or the
+    /// planner's. Its first row ends every filter's build.
+    StarProbes {
+        data: Box<StarProbesData>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2612,6 +2745,10 @@ impl InsnVariants {
             InsnVariants::JoinSwitchHash => execute::op_join_switch_hash,
             InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
             InsnVariants::TreePages => execute::op_tree_pages,
+            InsnVariants::BuildCounted => execute::op_build_counted,
+            InsnVariants::SorterCounted => execute::op_sorter_counted,
+            InsnVariants::SubqueryCounted => execute::op_subquery_counted,
+            InsnVariants::StarProbes => execute::op_star_probes,
         }
     }
 }

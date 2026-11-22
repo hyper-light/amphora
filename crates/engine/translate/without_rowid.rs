@@ -571,6 +571,7 @@ fn select_plan(
         non_from_clause_subqueries: subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        in_identity: None,
         estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],

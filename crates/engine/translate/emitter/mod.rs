@@ -209,6 +209,16 @@ pub struct Resolver<'a> {
     fitted_weights: Option<crate::translate::optimizer::cost_fit::FittedWeights>,
     /// Amphora: the join methods the planner may choose (`Connection::set_join_methods`).
     join_methods: crate::JoinMethods,
+    /// Amphora (T-QT.5.3): when a star join's fact scan checks its dimensions' filters.
+    star_filters: crate::StarFilters,
+    /// Amphora (QT.5): how an `IS` of a value planning doesn't know is estimated
+    /// (`Connection::set_is_value_estimate`).
+    is_value_estimate: crate::IsValueEstimate,
+    /// Amphora (T-QT.5.11): the order a star join's fact row checks its filters in
+    /// (`Connection::set_star_filter_order`).
+    star_filter_order: crate::StarFilterOrder,
+    /// Amphora (PL.8): what sizes the join search (`Connection::set_join_search_budget`).
+    join_search: crate::translate::optimizer::search_budget::SearchBudget,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
@@ -350,6 +360,10 @@ impl<'a> Resolver<'a> {
             learned_weights: None,
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
+            star_filters: crate::StarFilters::ByCost,
+            is_value_estimate: crate::IsValueEstimate::Equality,
+            star_filter_order: crate::StarFilterOrder::Planned,
+            join_search: crate::translate::optimizer::search_budget::SearchBudget::FIXED,
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
@@ -453,6 +467,41 @@ impl<'a> Resolver<'a> {
         self.join_methods = methods;
     }
 
+    pub(crate) fn star_filters(&self) -> crate::StarFilters {
+        self.star_filters
+    }
+
+    pub(crate) fn set_star_filters(&mut self, rule: crate::StarFilters) {
+        self.star_filters = rule;
+    }
+
+    pub(crate) fn is_value_estimate(&self) -> crate::IsValueEstimate {
+        self.is_value_estimate
+    }
+
+    pub(crate) fn set_is_value_estimate(&mut self, rule: crate::IsValueEstimate) {
+        self.is_value_estimate = rule;
+    }
+
+    pub(crate) fn star_filter_order(&self) -> crate::StarFilterOrder {
+        self.star_filter_order
+    }
+
+    pub(crate) fn set_star_filter_order(&mut self, order: crate::StarFilterOrder) {
+        self.star_filter_order = order;
+    }
+
+    pub(crate) fn join_search(&self) -> crate::translate::optimizer::search_budget::SearchBudget {
+        self.join_search
+    }
+
+    pub(crate) fn set_join_search(
+        &mut self,
+        budget: crate::translate::optimizer::search_budget::SearchBudget,
+    ) {
+        self.join_search = budget;
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches
     }
@@ -513,6 +562,10 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            star_filters: self.star_filters,
+            is_value_estimate: self.is_value_estimate,
+            star_filter_order: self.star_filter_order,
+            join_search: self.join_search,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
@@ -551,6 +604,10 @@ impl<'a> Resolver<'a> {
             learned_weights: self.learned_weights,
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
+            star_filters: self.star_filters,
+            is_value_estimate: self.is_value_estimate,
+            star_filter_order: self.star_filter_order,
+            join_search: self.join_search,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
