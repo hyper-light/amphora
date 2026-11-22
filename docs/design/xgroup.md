@@ -46,7 +46,7 @@ coordinator runs at once.
 `xgroup::sql`: each step is one `Database` call (`call_internal`, the owner's own session, able to
 name `__amphora_xg_*`): one atomic commit in its group, committed by its quorum on a replicated
 group before it answers. The data the prototype's transactions act on is `__amphora_xg_data`, a
-key-value space over the groups; SQL sessions across groups are not built (AC-T1.10.1 is open).
+key-value space over the groups; a SQL session commits its rows through `Cluster::commit` (below).
 `Cluster` runs one coordinator on a driver thread; the route from key to group is the caller's, so
 the routing lanes keep it. Values introduced: none tuned. Bounds are the API's own (`TX_MAX`,
 `KEY_MAX`, `VALUE_MAX`, `REQUEST_MAX`, `SCAN_MAX` for a scan page); the transactions in flight are
@@ -64,6 +64,24 @@ A caller's next transaction often arrives while its last one still resolves, aft
 heard; refusing it `Full` would make every caller spin. At most `in_flight` begins wait, the
 callers the shell was opened for; one more is refused `Full`, and one whose caller's deadline
 passed while it waited is answered `Timeout` and never begun. Values introduced: none.
+
+## A SQL session's commit (lane xgroup-sql, AC-T1.10.1)
+
+`Cluster::commit` takes a session's transaction, the rows it read and wrote by key. Rows all in one
+group this process holds commit in that group's one database transaction, without a coordinator step:
+the fast path, one group commit and no record. A row another transaction holds a lock on (a prepare
+or a staging write not yet resolved) aborts it `Conflict`, as a lock step would, so a cross-group
+transaction's held rows are never written under it. Rows in several groups, or a group reached over
+the transport, commit through the coordinator (`Cluster::transact`), under either protocol. Answers
+are the same as the same statements on one group, reads compared as a set (the coordinator answers
+them as their groups reply): `xgroup::sql::sessions`, seeded, both protocols. Values introduced: none.
+
+What is left: the grouped database (Database over Groups, lane split-merge-13) refuses a batch with
+rows in more than one group (`Refused::Groups`); that refusal is where its SQL session hands the
+batch to `Cluster::commit`, once its row keys are the coordinator's keys. A group failing mid-commit
+is tested on the coordinator (T-T1.10.X3), not yet through a SQL session over real groups. The fast
+path refuses a row another transaction only reads; the coordinator's lock rules decide that case the
+same way today (any lock conflicts).
 
 ## A group's failure
 

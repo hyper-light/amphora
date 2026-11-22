@@ -5,6 +5,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
+  `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
+  groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
+  grouped database's SQL session hands its cross-group batch to it (lane split-merge-13's layer), and a
+  group failure tested through SQL.
 - **The bar** (kiln's CP-M1): a Cargo workspace whose lints deny panics, this repository's rules
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the

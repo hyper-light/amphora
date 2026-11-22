@@ -212,6 +212,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
 | xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |
 | xgroup | – | On a group's database: each step one atomic commit in its group, resolution timeouts learned as TCP's | [xgroup.md](design/xgroup.md#on-a-groups-database) |
+| xgroup | – | A SQL session's commit: rows in one local group commit there without a coordinator step, a held row aborting it; rows in several groups go through the coordinator | [xgroup.md](design/xgroup.md#a-sql-sessions-commit-lane-xgroup-sql-ac-t1101) |
 | xgroup | – | A group's failure mid-commit stops the incarnation as a crash; the next open finishes every transaction committed or aborted everywhere | [xgroup.md](design/xgroup.md#a-groups-failure) |
 | xgroup | – | Over the transport: a step to another node's group is one Step request through transport::Nodes, its stamp carried both ways | [xgroup.md](design/xgroup.md#over-the-transport) |
 | xgroup | – | Which protocol stays: the faster cross-group p99 on the LAN at zero anomalies over 10,000 seeds (numbers pending the coordinator's run) | [xgroup.md](design/xgroup.md#decision-lane-xgroup-lan-which-protocol-stays-the-faster-at-zero-anomalies) |
