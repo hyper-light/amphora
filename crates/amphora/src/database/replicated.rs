@@ -4739,6 +4739,61 @@ mod tests {
         clocks: Vec<Arc<AtomicU64>>,
         // Clock moves made for a write slot's end (`Driven::lapse_slots`), each asserted to end it.
         lapses: u64,
+        // What happens off the driver's thread that may let the group move: each owner's log
+        // writes ring it as they finish (`Tap`), and each gate as a flush comes to it held.
+        moved: Arc<OffThread>,
+    }
+    /// A count of what happened off a driven shell's thread that may let its group move: a
+    /// member's log write finished, or a flush come to a held gate. The driver reads the count
+    /// before it steps and waits only for a count past it, so nothing that happens between its
+    /// look and its wait is lost; it waits on these events, never on a timer.
+    #[derive(Default)]
+    struct OffThread {
+        count: Mutex<u64>,
+        rang: std::sync::Condvar,
+    }
+    impl OffThread {
+        fn ring(&self) {
+            // A poisoned count follows only a test thread's panic, which ends the test.
+            if let Ok(mut count) = self.count.lock() {
+                *count += 1;
+                self.rang.notify_all();
+            }
+        }
+        /// The count now: read before a step, for [`OffThread::wait_past`] after it.
+        fn seen(&self) -> u64 {
+            *self.count.lock().unwrap()
+        }
+        /// Waits until something happens past `seen`, up to the transport tests' hang guard: a
+        /// hang, never a verdict.
+        fn wait_past(&self, seen: u64) {
+            let count = self.count.lock().unwrap();
+            let (_count, waited) = self
+                .rang
+                .wait_timeout_while(count, crate::transport::HANG, |count| *count == seen)
+                .unwrap();
+            assert!(
+                !waited.timed_out(),
+                "a write was out and nothing finished or came to a held gate in {:?}: a hang",
+                crate::transport::HANG
+            );
+        }
+    }
+    /// A driven owner's waker: it rings the owner's own bell, as the owner's waker does, and its
+    /// shell's [`OffThread`], so a driver waiting on a member's log write wakes as it finishes.
+    struct Tap {
+        bell: Arc<Bell>,
+        moved: Arc<OffThread>,
+    }
+    impl std::task::Wake for Tap {
+        fn wake(self: Arc<Self>) {
+            self.bell.ring();
+            self.moved.ring();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.bell.ring();
+            self.moved.ring();
+        }
     }
     /// The time a driven clock reads past its shell's base.
     fn offset(clock: &AtomicU64) -> Duration {
@@ -4832,6 +4887,7 @@ mod tests {
                 clock,
             )
             .unwrap();
+            let actor = self.tapped(actor);
             self.owners.push(Some((actor, receiver)));
             self.clocks.push(reading);
             client
@@ -4868,6 +4924,7 @@ mod tests {
                 Arc::new(move || base + offset(&read)),
             )
             .unwrap();
+            let actor = self.tapped(actor);
             *self.owners.get_mut(owner).unwrap() = Some((actor, receiver));
             client
         }
@@ -4879,7 +4936,17 @@ mod tests {
                 base: Instant::now() + Duration::from_secs(3600),
                 clocks: Vec::new(),
                 lapses: 0,
+                moved: Arc::new(OffThread::default()),
             }
+        }
+        /// `actor`, its log writes ringing this shell's [`OffThread`] as they finish. Its writes
+        /// go out with its waker from its first step on, so none before is missed.
+        fn tapped(&self, mut actor: Actor<F>) -> Actor<F> {
+            actor.waker = std::task::Waker::from(Arc::new(Tap {
+                bell: Arc::clone(&actor.control.bell),
+                moved: Arc::clone(&self.moved),
+            }));
+            actor
         }
         /// A call's or a record's budget on these clocks: it runs out only if the test moves a
         /// clock past it.
@@ -5189,7 +5256,10 @@ mod tests {
             self.step();
             self.quiet(pump);
         }
-        /// Rounds until every record the relay admitted has been taken, so the pump can finish.
+        /// Rounds until every record the relay admitted has been taken, so the pump can finish. An
+        /// owner takes every record queued for it in its next step and answers its receipt there,
+        /// so each round is a step on the driver's thread: nothing here waits, on a timer or on
+        /// anything off the thread, and a held gate can't keep a receipt from its answer.
         fn drain(&mut self, pump: &mut Pump<'_>) {
             for _ in 0..ROUNDS {
                 pump.reap();
@@ -5506,7 +5576,7 @@ mod tests {
                 Arc::new(move || base + offset(&read)),
             )
             .unwrap();
-            (client, (actor, receiver))
+            (client, (self.tapped(actor), receiver))
         }
     }
 
@@ -5536,39 +5606,66 @@ mod tests {
 
     /// Holds the flushes of a member's log device while the test says so: its writes go on, and
     /// none becomes durable until the test lets them go. The log's own threads wait here, never
-    /// the test's.
+    /// the test's; each flush that comes to the gate held tells its shell at once, so the driver
+    /// sees a stall as it happens rather than by looking again.
     #[derive(Default)]
     struct Gate {
-        held: Mutex<bool>,
+        holding: Mutex<Holding>,
         moved: std::sync::Condvar,
     }
+    #[derive(Default)]
+    struct Holding {
+        held: bool,
+        // Flushes waiting at the gate now.
+        waiting: usize,
+        // The shell told as a flush comes to the gate held.
+        told: Option<Arc<OffThread>>,
+    }
     impl Gate {
+        /// The shell `moved` is told each time a flush comes to the gate while it holds.
+        fn tell(&self, moved: &Arc<OffThread>) {
+            self.holding.lock().unwrap().told = Some(Arc::clone(moved));
+        }
         fn hold(&self) {
-            *self.held.lock().unwrap() = true;
+            self.holding.lock().unwrap().held = true;
         }
         fn release(&self) {
-            *self.held.lock().unwrap() = false;
+            self.holding.lock().unwrap().held = false;
             self.moved.notify_all();
         }
         fn is_held(&self) -> bool {
-            *self.held.lock().unwrap()
+            self.holding.lock().unwrap().held
+        }
+        /// Whether a flush waits at the gate now: its member's writes out finish only once the
+        /// test lets the gate go.
+        fn waiting(&self) -> bool {
+            self.holding.lock().unwrap().waiting > 0
         }
         /// Waits while the flushes are held, up to the transport tests' hang guard: a hang,
-        /// never a verdict.
+        /// never a verdict. A flush that has to wait tells the shell first.
         fn pass(&self) -> Result<(), hyper_block::DiskError> {
             let until = Instant::now() + crate::transport::HANG;
-            let mut held = self.held.lock().unwrap();
-            while *held {
+            let mut holding = self.holding.lock().unwrap();
+            if !holding.held {
+                return Ok(());
+            }
+            holding.waiting += 1;
+            if let Some(told) = &holding.told {
+                told.ring();
+            }
+            while holding.held {
                 let left = until.saturating_duration_since(Instant::now());
                 if left.is_zero() {
+                    holding.waiting -= 1;
                     return Err(hyper_block::DiskError::Io {
                         op: "a held flush",
                         path: std::path::PathBuf::new(),
                         source: std::io::Error::from(std::io::ErrorKind::TimedOut),
                     });
                 }
-                held = self.moved.wait_timeout(held, left).unwrap().0;
+                holding = self.moved.wait_timeout(holding, left).unwrap().0;
             }
+            holding.waiting -= 1;
             Ok(())
         }
     }
@@ -5650,6 +5747,14 @@ mod tests {
         }
     }
     impl Driven<Gated> {
+        /// A log on `power`'s device behind `gate`, which tells this shell of each flush it holds.
+        fn gated_log(&self, power: &Power, gate: &Arc<Gate>) -> Gated {
+            gate.tell(&self.moved);
+            Gated {
+                log: power.log.handle().unwrap(),
+                gate: Arc::clone(gate),
+            }
+        }
         /// Member `node_id`: its database on `power`'s disk, its log on `power`'s device behind
         /// `gate`.
         fn open_gated(
@@ -5662,10 +5767,7 @@ mod tests {
             gate: &Arc<Gate>,
         ) -> Client {
             let reading = Arc::new(AtomicU64::new(0));
-            let log = Gated {
-                log: power.log.handle().unwrap(),
-                gate: Arc::clone(gate),
-            };
+            let log = self.gated_log(power, gate);
             let (client, owner) = self.owner_on(
                 dir,
                 node_id,
@@ -5699,26 +5801,30 @@ mod tests {
             power.restore(survived);
             let node_id = u64::try_from(owner + 1).unwrap();
             let reading = Arc::clone(self.clocks.get(owner).unwrap());
-            let log = Gated {
-                log: power.log.handle().unwrap(),
-                gate: Arc::clone(gate),
-            };
+            let log = self.gated_log(power, gate);
             let (client, restarted) =
                 self.owner_on(dir, node_id, vec![1, 2, 3], durability, power, log, reading);
             *self.owners.get_mut(owner).unwrap() = Some(restarted);
             client
         }
         /// Rounds, time standing still, until `answer` comes (`Some`), or until the group can move
-        /// no further while the members whose gates are held wait to flush (`None`): two rounds
-        /// running that relay nothing, with nothing in transit and no write out on the disk of a
-        /// member whose gate is open. Two, because the first round's relay takes what the step
-        /// before it sent, and only the second's shows that step sent nothing.
+        /// no further while the members whose gates are held wait to flush (`None`). A round is
+        /// still when it relays nothing and nothing is in transit.
+        /// After a still round with a write out that can finish or come to its gate on its own (one
+        /// on an open gate's member, or a held one's not yet at its gate), the driver waits for
+        /// that to happen: a member's write finished (`Tap`) or a flush come to a held gate
+        /// (`Gate::pass`), never a timer. With no such write out, two still rounds running are the
+        /// stall: the first round's relay takes what the step before it sent, and only the
+        /// second's shows that step sent nothing.
         fn answer_or_stall(
             &mut self,
             pump: &mut Pump<'_>,
             answer: &mpsc::Receiver<Result<Answer, Refusal>>,
             gates: &[Arc<Gate>],
         ) -> Option<Result<Vec<u8>, Refusal>> {
+            // The off-thread count read before the last step: what happened since may be what
+            // that step didn't see.
+            let mut seen = None;
             let mut still = 0;
             for _ in 0..ROUNDS {
                 match answer.try_recv() {
@@ -5727,23 +5833,24 @@ mod tests {
                     Err(error) => panic!("owner ended: {error}"),
                 }
                 let admitted = pump.drive_until(self.until());
-                let open_idle = self.owners.iter().zip(gates).all(|(owner, gate)| {
-                    gate.is_held()
-                        || owner
-                            .as_ref()
-                            .is_none_or(|(owner, _)| owner.replica.in_flight() == 0)
+                let quiet = admitted == 0 && pump.records == 0;
+                let out = self.owners.iter().zip(gates).any(|(owner, gate)| {
+                    owner
+                        .as_ref()
+                        .is_some_and(|(owner, _)| owner.replica.in_flight() != 0)
+                        && !(gate.is_held() && gate.waiting())
                 });
-                still = if admitted == 0 && pump.records == 0 && open_idle {
-                    still + 1
-                } else {
-                    0
-                };
+                still = if quiet && !out { still + 1 } else { 0 };
                 if still > 1 {
                     return None;
                 }
-                if admitted == 0 {
-                    std::thread::park_timeout(POLL);
+                if quiet
+                    && out
+                    && let Some(seen) = seen
+                {
+                    self.moved.wait_past(seen);
                 }
+                seen = Some(self.moved.seen());
                 self.step();
             }
             panic!("a driven operation neither answered nor stalled in {ROUNDS} rounds");
