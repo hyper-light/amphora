@@ -757,7 +757,7 @@ row that has no stamp.
 
 ## Decision (lane split-merge-19): one key and what changed, across groups
 
-`get` and `changed` on a database handed the groups' coordinator now read across groups, as
+`get`, `changed` and `wait` on a database handed the groups' coordinator now read across groups, as
 `scan`, `changes` and `head` do, each revision its commit stamp.
 - `get` reads only the group the key's row is in (the cluster's route of its row key). As of a
   fresh stamp of that group (Linearizable): the group's writer runs the read after every commit
@@ -773,15 +773,21 @@ row that has no stamp.
 **Evidence.** T-T1.9.R24: two groups, the second's clock 500 seconds behind; each key read across
 them answers its row with its stamp as its revision, a key never written none, a key as of just
 before its stamp none and as of its stamp the row; what changed after nothing is the newest stamp,
-after the head none, and after a later write its stamp, past the head.
+after the head none, and after a later write its stamp, past the head. T-T1.9.R25: a wait across
+two groups after the head, while a row is written in the second, answers that row's stamp, as
+`changed` does; a wait with nothing written is refused `Timeout` at its deadline.
 
-**Left.** `commit` and `wait` still answer from this database alone. A commit across groups goes
-through the coordinator (`Cluster::commit`) but its conditions name revisions, which across groups
-are stamps; `wait` wakes on one database's commits, and across groups it wants one event a commit
-of any group, not a poll. A waker registered in every group's watchers is that event, but the
-check it wakes for reads each group through `call_internal`, an `Operation::Call`, and every Call
-wakes every watcher (a Call may write), so the wait would wake itself without end. It needs a
-read across groups that doesn't wake, or Calls that wake only when they wrote.
+- `wait` registers one waker in every group's publisher (`Changed::watchers`, bounded as a watch
+  is) before its first check, so a change any group publishes after it wakes the wait: no timer,
+  only the caller's deadline. The check reads each group through `call_internal`, an
+  `Operation::Call`, and every Call wakes every watcher (a Call may write), so after a wake the
+  wait first compares each group's published newest revision of the family with what it read
+  before the check, and reads again only once one moved: its own reads park it again.
+
+**Left.** `commit` still answers from this database alone. A commit across groups goes through
+the coordinator (`Cluster::commit`), but its conditions name revisions, which across groups are
+stamps, and its answer carries no stamp yet. Calls that wake only when they wrote would spare a
+waiter the wakes of reads.
 
 **Falsified by.** A get across groups missing a write of the key answered before it began; a get
 as of a stamp whose answer changes later; `changed` answering none while `changes` after the same

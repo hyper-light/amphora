@@ -638,6 +638,110 @@ pub(super) fn changed(
     Ok(newest)
 }
 
+/// What wakes a wait across groups: every group's publisher wakes it as it publishes a change
+/// (`Changed::watchers`), setting the flag the parked waiter waits on.
+#[derive(Default)]
+struct Signal {
+    woken: std::sync::Mutex<bool>,
+    event: std::sync::Condvar,
+}
+
+impl std::task::Wake for Signal {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        // A poisoned flag wakes nobody; the waiter's deadline still ends its wait.
+        if let Ok(mut woken) = self.woken.lock() {
+            *woken = true;
+            self.event.notify_all();
+        }
+    }
+}
+
+/// A wait's registration in each group's publisher, removed as the wait ends, however it ends.
+struct Registered(Vec<(Arc<super::Changed>, u64)>);
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        for (changed, id) in &self.0 {
+            if let Ok(mut watchers) = changed.watchers.lock() {
+                watchers.wakers.remove(id);
+            }
+        }
+    }
+}
+
+/// `family`'s newest revision each group has published in `ns`. A wait compares it after each
+/// wake: one that published nothing new for the family (a read's own call wakes every watcher)
+/// parks it again without reading.
+fn published(registered: &Registered, ns: &str, family: &str) -> Result<Vec<Rev>, Refusal> {
+    registered
+        .0
+        .iter()
+        .map(|(changed, _)| {
+            Ok(super::locked(&changed.published)?
+                .get(ns)
+                .and_then(|p| p.families.get(family))
+                .copied()
+                .unwrap_or(0))
+        })
+        .collect()
+}
+
+/// `Records::wait` across groups (lane split-merge-19, T-T1.9.R25): the stamp of `family`'s newest
+/// change after stamp `after` in any group, once there is one, or `Timeout` at `until`. It wakes on
+/// the event, never a timer: a waker registered in every group's publisher before the first check,
+/// so a change published after it wakes the wait, which reads again only once a group published
+/// something new for the family.
+pub(super) fn wait(
+    groups: &[Member],
+    point: ReadPoint,
+    ns: &str,
+    family: &str,
+    after: Rev,
+    until: Instant,
+) -> Result<Rev, Refusal> {
+    let signal = Arc::new(Signal::default());
+    let waker = std::task::Waker::from(Arc::clone(&signal));
+    let mut registered = Registered(Vec::new());
+    for member in groups {
+        // A group on a node is refused by the check, as every read across groups refuses it.
+        if let Member::Local(group) = member {
+            let publisher = Arc::clone(&group.resolve(until)?.shared.changed);
+            let id = super::locked(&publisher.watchers)?.register(waker.clone())?;
+            registered.0.push((publisher, id));
+        }
+    }
+    loop {
+        // Read before the check: a change published after it moves what is read, and wakes.
+        let seen = published(&registered, ns, family)?;
+        if let Some(at) = changed(groups, point, ns, family, after, until)? {
+            return Ok(at);
+        }
+        loop {
+            let woken = super::locked(&signal.woken)?;
+            let (mut woken, timeout) = signal
+                .event
+                .wait_timeout_while(
+                    woken,
+                    until.saturating_duration_since(Instant::now()),
+                    |w| !*w,
+                )
+                .map_err(unavailable)?;
+            if !*woken && timeout.timed_out() {
+                return Err(Refusal::Timeout);
+            }
+            *woken = false;
+            drop(woken);
+            if published(&registered, ns, family)? != seen {
+                break;
+            }
+        }
+    }
+}
+
 /// One key's row across groups, read in the group its row is in (`group`, by the cluster's
 /// route): as of that group's fresh stamp (Linearizable), or of a stamp asked, which the group
 /// first observes, so none of its later commits is stamped at or before it. The row's revision is
@@ -1152,7 +1256,8 @@ mod tests {
     /// what changed after nothing and after the head; then 2b written, and what changed after the
     /// head again. Expect: each row with its own stamp as its revision (the changes' stamps), the
     /// key never written none, 1a before its stamp none; what changed after nothing the newest
-    /// stamp (1a's: the second group's clock is behind), after the head none, and after 2b its stamp, past the head.
+    /// stamp (1a's: the second group's clock is behind), after the head none, and after 2b its
+    /// stamp, past the head.
     #[test]
     fn t_t1_9_r24_one_key_and_what_changed_across_groups() {
         let dir = tempfile::tempdir().unwrap();
@@ -1208,6 +1313,42 @@ mod tests {
         put(&dbs[1], b"2b".to_vec());
         let later = across.changed("f", all.head, until()).unwrap().unwrap();
         assert!(later > all.head, "{later} {}", all.head);
+    }
+
+    /// T-T1.9.R25 (CP-T1.9; reshard.md, "Decision (lane split-merge-19): one key and what changed,
+    /// across groups"). Do: two backed-up groups; a row written in the first; a wait across them
+    /// after the head, on a thread of its own, while a row is written in the second; then a wait
+    /// after the newest stamp with a deadline and nothing written. Expect: the first wait answers
+    /// the second row's stamp, past the head, as `changed` does; the second is refused `Timeout`.
+    #[test]
+    fn t_t1_9_r25_a_wait_across_groups_wakes_on_any_groups_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        // Rows are written into each group directly, so the route is never asked.
+        let (dbs, _sinks, cluster) = groups_on(
+            dir.path(),
+            2,
+            |_| {
+                let read = Arc::clone(&now);
+                Arc::new(move || read.fetch_add(1, Ordering::SeqCst))
+            },
+            Arc::new(|_: &[u8]| 0),
+        );
+        put(&dbs[0], b"1a".to_vec());
+        let across = dbs[0].across(Arc::clone(&cluster)).namespace("n").unwrap();
+        let head = across.head(until()).unwrap();
+        let waiting = {
+            let across = across.clone();
+            std::thread::spawn(move || across.wait("f", head, until()))
+        };
+        put(&dbs[1], b"1b".to_vec());
+        let woke = waiting.join().unwrap().unwrap();
+        assert!(woke > head, "{woke} {head}");
+        assert_eq!(across.changed("f", head, until()).unwrap(), Some(woke));
+
+        let soon = Instant::now() + Duration::from_millis(50);
+        let refused = across.wait("f", woke, soon);
+        assert!(matches!(refused, Err(Refusal::Timeout)), "{refused:?}");
     }
 
     /// T-T1.9.R20 (CP-T1.9; reshard.md, "Decision (lane split-merge-18): reads across groups by

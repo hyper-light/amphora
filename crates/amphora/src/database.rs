@@ -1884,6 +1884,16 @@ impl Records for Namespace {
     }
     fn wait(&self, family: &str, after: Rev, until: Instant) -> Result<Rev, Refusal> {
         api::family(family)?;
+        if let Some(cluster) = &self.database.cluster {
+            return across::wait(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                family,
+                after,
+                until,
+            );
+        }
         let namespace = self.resolved(until)?;
         if let Some(remote) = namespace.remote()? {
             return remote.wait(family, after, until);
