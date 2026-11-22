@@ -146,6 +146,12 @@ impl Storage {
         self.copies.held()
     }
 
+    /// The copies let go and waiting for room, what each waits for and how long it has waited
+    /// (lane colcopy-7, AC-CB.3.2), for the bench's records.
+    pub fn copy_waiting(&self) -> Vec<super::columns_sql::Wait> {
+        self.copies.waiting()
+    }
+
     /// The versioned database under it.
     pub(crate) fn db(&self) -> &Arc<VDatabase> {
         &self.db
@@ -396,6 +402,20 @@ impl Switch {
             .lock()
             .as_ref()
             .is_some_and(|t| t.lock().as_ref().is_some_and(|t| t.wrote()))
+    }
+
+    /// The transaction an analytic statement answered by a column copy reads in (lane
+    /// colcopy-10, AC-CB.4.7): the connection's open one; with none open, in an explicit
+    /// transaction one begun now, as the statement's first cursor would begin it, so its later
+    /// statements read the same snapshot; in autocommit none (the statement reads at a snapshot
+    /// of its own).
+    pub(crate) fn reading(&self, autocommit: bool) -> Result<Option<SharedTxn>> {
+        let open = self.txn.lock().clone();
+        match open {
+            Some(txn) => Ok(Some(txn)),
+            None if autocommit => Ok(None),
+            None => self.txn().map(Some),
+        }
     }
 
     /// The connection's transaction, begun if none is open.
@@ -763,7 +783,10 @@ mod tests {
         let stopped = cursor.count();
         conn.interrupt_requested.store(false, Ordering::SeqCst);
         assert!(
-            matches!(stopped.as_ref().map_err(|e| &**e), Err(LimboError::Interrupt)),
+            matches!(
+                stopped.as_ref().map_err(|e| &**e),
+                Err(LimboError::Interrupt)
+            ),
             "{stopped:?}"
         );
         switch.finish(true).unwrap();

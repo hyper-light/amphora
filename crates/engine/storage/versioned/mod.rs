@@ -18,6 +18,7 @@ pub mod blink;
 #[cfg(test)]
 mod cancel_bench;
 pub mod columns;
+pub mod columns_ab;
 pub(crate) mod columns_path;
 pub mod columns_sql;
 #[cfg(test)]

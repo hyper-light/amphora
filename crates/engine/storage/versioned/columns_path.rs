@@ -284,10 +284,19 @@ pub(crate) fn aggregate_on_copy<B: Block>(
     let row_reads = if sources.fallbacks > 0 {
         count(built)
     } else {
-        copy.measured_scan(
-            clock().saturating_sub(start),
-            view.rows.saturating_add(view.queued),
-        );
+        // A scan that decoded granules the cache kept paid, beside the scan, their decoding once
+        // for the generation's life: the next scan reads them from the cache. Charged as the
+        // copy's cost per row, that one-time cost would price every later scan, and the copy,
+        // chosen by it no more, would never be measured again (lane colcopy-12, AC-CB.4.7: a
+        // transaction's statements after the copy's first read went to the rows). So only a
+        // scan in the state the next one finds is charged: its granules from the cache, from
+        // changed blocks, or refused by the cache (decoded again by every scan).
+        if sources.decoded <= sources.uncached {
+            copy.measured_scan(
+                clock().saturating_sub(start),
+                view.rows.saturating_add(view.queued),
+            );
+        }
         count(view.queued)
     };
     Ok(OnCopy {

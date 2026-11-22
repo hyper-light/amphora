@@ -18,8 +18,13 @@
 //! An aggregate goes by the planner's choice ([`columns_path::aggregate_choice`], by cost, with
 //! the database's learned rates): the copy, read by the vectorized scan on as many cores as the
 //! morsel executor finds pay ([`OnCores`], `Plan::run_on_cores`); or the statement's own serial
-//! loop over the rows. A statement in a transaction that changed rows, or outside autocommit,
-//! reads the rows: the copy holds commits alone.
+//! loop over the rows. A statement in a transaction that changed rows reads the rows: the copy
+//! holds commits alone. One in a transaction that only reads reads the copy at the transaction's
+//! own snapshot, which a generation of the copy answers exactly if it was made at or before it
+//! and the copy isn't behind there (the current one, or the one it replaced, kept while an older
+//! snapshot is open); if none does, the rows answer, counted as `unserved` with a trace event.
+//! What the copy answered is kept as read, the whole table, for the transaction's validation, as
+//! the rows' cursor keeps its walk (lane colcopy-10, AC-CB.4.7).
 //!
 //! A copy's queue, decoded blocks and blocks take their bytes from the storage's memory source as
 //! they grow and give them back as they go, as its pages and row versions do (AC-CS.5.5): no share
@@ -47,7 +52,7 @@ use super::cursor::key_rowid;
 use super::durable::Database as VDatabase;
 use super::memory::{self, Source};
 use super::switch::{tree_of, Switch};
-use super::version::{Snapshot, Ts};
+use super::version::{Snapshot, Ts, Txn};
 use crate::error::LimboError;
 use crate::numeric::Numeric;
 use crate::sync::{Arc, Mutex};
@@ -97,6 +102,62 @@ pub struct CopyCounts {
     /// Nanoseconds copies were absent, from being let go to being built again: absences ended
     /// ([`Copies::absent_nanos`] adds those still open).
     pub absent_nanos: u64,
+    /// Analytic statements the scan hook handed the copies with the copies on (lane colcopy-9,
+    /// AC-CB.4.6): those a copy could answer, and those [`Skip`] says none could.
+    pub handed: u64,
+    /// Of those, the statements no copy could answer, by [`Skip`]'s reason: they read the rows
+    /// under either rebuy policy, so an A/B leaves them out.
+    pub skipped_rows: u64,
+    pub skipped_body: u64,
+    pub skipped_join: u64,
+    pub skipped_transaction: u64,
+    /// Statements on a table with a copy, at a snapshot no generation of it answers exactly (none
+    /// made yet, made after it, or behind there): the rows answered (lane colcopy-10, AC-CB.4.7).
+    pub unserved: u64,
+}
+
+impl CopyCounts {
+    /// The statements handed over that no copy could answer, every reason.
+    pub fn skipped(&self) -> u64 {
+        self.skipped_rows
+            .saturating_add(self.skipped_body)
+            .saturating_add(self.skipped_join)
+            .saturating_add(self.skipped_transaction)
+    }
+
+    /// Whether the statements between `before` and `self` were all handed over and none was
+    /// skipped: a copy could answer them (lane colcopy-9, AC-CB.4.6).
+    pub fn reached_since(&self, before: &CopyCounts, statements: u64) -> bool {
+        self.handed.saturating_sub(before.handed) == statements
+            && self.skipped() == before.skipped()
+    }
+}
+
+/// Why an analytic statement the scan hook handed over can't be answered by a copy (lane
+/// colcopy-9, AC-CB.4.6): the rows answer it under either rebuy policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// It returns the table's rows, not aggregates.
+    Rows,
+    /// A filter or expression only the statement's loop body states.
+    Body,
+    /// A join.
+    Join,
+    /// In a transaction that changed rows: the copy holds commits alone. (A transaction that
+    /// only reads reads the copy at its own snapshot, lane colcopy-10.)
+    Transaction,
+}
+
+impl Skip {
+    /// The reason in the records' and trace events' words.
+    pub fn name(self) -> &'static str {
+        match self {
+            Skip::Rows => "rows",
+            Skip::Body => "body",
+            Skip::Join => "join",
+            Skip::Transaction => "transaction",
+        }
+    }
 }
 
 /// What the copies asked their memory source for (AC-CB.3.1): takes asked, granted and refused,
@@ -347,6 +408,26 @@ impl Copies {
         c.loop_rows = c.loop_rows.saturating_add(rows);
         if absent {
             c.absent = c.absent.saturating_add(1);
+        }
+    }
+
+    /// An analytic statement the scan hook handed over, and why no copy can answer it if none
+    /// can (lane colcopy-9, AC-CB.4.6).
+    fn handed(&self, skip: Option<Skip>) {
+        {
+            let mut c = self.counts.lock();
+            c.handed = c.handed.saturating_add(1);
+            let n = match skip {
+                None => return,
+                Some(Skip::Rows) => &mut c.skipped_rows,
+                Some(Skip::Body) => &mut c.skipped_body,
+                Some(Skip::Join) => &mut c.skipped_join,
+                Some(Skip::Transaction) => &mut c.skipped_transaction,
+            };
+            *n = n.saturating_add(1);
+        }
+        if let Some(skip) = skip {
+            tracing::debug!(target: "amphora::columns", reason = skip.name(), "column copy skipped: no copy can answer the statement");
         }
     }
 
@@ -714,13 +795,22 @@ pub(crate) fn aggregate(
     connection: &crate::Connection,
     statement_memory: usize,
 ) -> Result<Option<Vec<Vec<Value>>>> {
-    // A filter or expression only the loop body states: the serial loop reads the rows.
-    if data.body.as_ref().is_some_and(|body| !body.simple) {
-        return Ok(None);
-    }
     let storage = switch.storage();
     let copies = &storage.copies;
-    if !copies.on() || !data.joins.is_empty() || !connection.get_auto_commit() || switch.wrote() {
+    if !copies.on() {
+        return Ok(None);
+    }
+    // A statement no copy can answer reads the rows, counted with its reason (lane colcopy-9,
+    // AC-CB.4.6) so an A/B can leave it out: it reads the rows under either rebuy policy.
+    let skip = match &data.body {
+        Some(body) if !body.simple && body.rows => Some(Skip::Rows),
+        Some(body) if !body.simple => Some(Skip::Body),
+        _ if !data.joins.is_empty() => Some(Skip::Join),
+        _ if switch.wrote() => Some(Skip::Transaction),
+        _ => None,
+    };
+    copies.handed(skip);
+    if skip.is_some() {
         return Ok(None);
     }
     let db = storage.db();
@@ -730,13 +820,41 @@ pub(crate) fn aggregate(
         return Ok(None);
     };
     let q = query(data, statement_memory)?;
-    let snap = db.snapshot()?;
-    let answered = read(copies, db, &copy, &snap, tree, data, &q, connection);
-    db.close_snapshot(snap);
+    // At the transaction's own snapshot (lane colcopy-10, AC-CB.4.7); in autocommit with none
+    // open, at one of the statement's own.
+    let answered = match switch.reading(connection.get_auto_commit())? {
+        Some(shared) => {
+            let snap = shared
+                .lock()
+                .as_ref()
+                .map(Txn::snapshot)
+                .ok_or_else(ended)?;
+            let answered = read(copies, db, &copy, &snap, tree, data, &q, connection);
+            // What the copy answered is kept as read, the whole table, for the transaction's
+            // validation: a superset of the rows the aggregate depends on refuses more, never
+            // less, as the rows' cursor walking every row would keep.
+            if matches!(answered, Ok(Some(_))) {
+                let mut guard = shared.lock();
+                let txn = guard.as_mut().ok_or_else(ended)?;
+                db.v.keep_read(txn, tree, None, None)?;
+            }
+            answered
+        }
+        None => {
+            let snap = db.snapshot()?;
+            let answered = read(copies, db, &copy, &snap, tree, data, &q, connection);
+            db.close_snapshot(snap);
+            answered
+        }
+    };
     if matches!(answered, Ok(None)) {
         copies.by_rows(tree, !copies.has(tree));
     }
     answered
+}
+
+fn ended() -> LimboError {
+    LimboError::TxError("versioned storage: the transaction has ended".into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -804,6 +922,17 @@ fn read(
                 Err(e) => return Err(e),
             }
         }
+        Some((_, view)) if !view.exact => {
+            // No generation answers this snapshot exactly: the copy refuses it, and the rows
+            // answer (lane colcopy-10, AC-CB.4.7).
+            {
+                let mut c = copies.counts.lock();
+                c.rows += 1;
+                c.unserved = c.unserved.saturating_add(1);
+            }
+            tracing::debug!(target: "amphora::columns", tree, snapshot = snap.start, "column copy refused: no generation answers the statement's snapshot");
+            None
+        }
         _ => {
             copies.counts.lock().rows += 1;
             None
@@ -815,25 +944,46 @@ fn read(
     if copy.columns.wants_rebuild() {
         let _one = copy.rebuilding.lock();
         if copy.columns.wants_rebuild() {
-            let start = clock();
-            let all = rows.all()?;
-            let n = as_u64(all.len());
-            let read = all.iter().fold(0u64, |b, (k, v)| {
-                b.saturating_add(as_u64(k.len()))
-                    .saturating_add(as_u64(v.len()))
-            });
-            copies.read_for_build(tree, n, read);
-            // Each block's bytes granted before it is built (AC-CB.1.1); refused, the copy is let
-            // go, expecting the generation these rows make.
-            if let Err(refused) = copy.columns.rebuild(snap.start, &all, tick(base)) {
-                copies.let_go(db, tree, refused, as_u64(Plain::bytes(&all)))?;
-                return Ok(answer);
-            }
-            copy.columns.rebuilt(clock().saturating_sub(start));
-            copies.built(tree, n);
+            // Made at a snapshot of every commit now, not the statement's: a generation made at
+            // an older transaction's snapshot would lack the commits between it and the one it
+            // replaces (lane colcopy-10).
+            let now = db.snapshot()?;
+            let built = rebuild(copies, db, copy, &now, tree, &clock);
+            db.close_snapshot(now);
+            built?;
         }
     }
     Ok(answer)
+}
+
+/// Rebuilds `tree`'s copy from its rows at `snap`, under the copy's rebuild lock; let go if its
+/// memory source refuses a block.
+fn rebuild(
+    copies: &Copies,
+    db: &VDatabase,
+    copy: &TableCopy,
+    snap: &Snapshot,
+    tree: u64,
+    clock: &dyn Fn() -> u128,
+) -> Result<()> {
+    let base = copies.base;
+    let rows = At { db, snap, tree };
+    let start = clock();
+    let all = rows.all()?;
+    let n = as_u64(all.len());
+    let read = all.iter().fold(0u64, |b, (k, v)| {
+        b.saturating_add(as_u64(k.len()))
+            .saturating_add(as_u64(v.len()))
+    });
+    copies.read_for_build(tree, n, read);
+    // Each block's bytes granted before it is built (AC-CB.1.1); refused, the copy is let go,
+    // expecting the generation these rows make.
+    if let Err(refused) = copy.columns.rebuild(snap.start, &all, tick(base)) {
+        return copies.let_go(db, tree, refused, as_u64(Plain::bytes(&all)));
+    }
+    copy.columns.rebuilt(clock().saturating_sub(start));
+    copies.built(tree, n);
+    Ok(())
 }
 
 fn count_copy(copies: &Copies, counts: &Counts, _sources: &Sources) {
@@ -922,15 +1072,7 @@ mod tests {
         .unwrap();
     }
 
-    const QUERIES: [&str; 7] = [
-        "SELECT count(*), sum(v), min(v), max(v) FROM t",
-        "SELECT count(s), min(s), max(s) FROM t WHERE v >= 500",
-        "SELECT g, count(*), sum(v) FROM t GROUP BY g",
-        "SELECT s, count(*), max(id) FROM t WHERE g <> 3 GROUP BY s",
-        "SELECT g, s, sum(v) FROM t WHERE s IS NOT NULL GROUP BY g, s",
-        "SELECT count(*) FROM t WHERE s IS NULL",
-        "SELECT min(id), max(id), sum(id) FROM t WHERE v < 100",
-    ];
+    use crate::storage::versioned::columns_ab::QUERIES;
 
     /// Do: the same table on two versioned storages, one with the column copies' switch on; the
     /// analytic statements (filters, aggregates, GROUP BY) on both, with inserts, updates and
@@ -986,6 +1128,166 @@ mod tests {
         assert_eq!(copies(&conn).counts().kept, 0);
         rows(&conn, "SELECT sum(v) FROM t");
         assert_eq!(copies(&conn).counts().kept, 1);
+    }
+
+    /// T-CB.4.4 (lane colcopy-9, AC-CB.4.6): an analytic statement in autocommit, then the same
+    /// statement in a transaction that wrote and in one that only reads, then each of the A/B's
+    /// queries in autocommit. Expect: the first is handed over and reaches the copies; the one in
+    /// the transaction that wrote is counted skipped for it, and the one in the transaction that
+    /// only reads reaches the copies (lane colcopy-10, AC-CB.4.7), the rows answering alike; every
+    /// statement is handed over once, and each query's reach is printed (the A/B's records name
+    /// those that don't).
+    #[test]
+    fn cb4_statements_no_copy_can_answer_are_counted_with_their_reason() {
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        copies(&on).set_on(true);
+        for c in [&on, &off] {
+            c.execute(SCHEMA).unwrap();
+            fill(c, 1, 500);
+        }
+        let q = "SELECT count(*), sum(v) FROM t WHERE v < 700";
+        let before = copies(&on).counts();
+        assert_eq!(rows(&on, q), rows(&off, q));
+        let after = copies(&on).counts();
+        assert!(after.reached_since(&before, 1), "{after:?}");
+        for c in [&on, &off] {
+            c.execute("BEGIN").unwrap();
+            c.execute("INSERT INTO t VALUES (100000, 1, 1, 'w')")
+                .unwrap();
+        }
+        assert_eq!(rows(&on, q), rows(&off, q));
+        let wrote = copies(&on).counts();
+        assert_eq!(wrote.handed, after.handed + 1, "{wrote:?}");
+        assert_eq!(
+            wrote.skipped_transaction,
+            after.skipped_transaction + 1,
+            "{wrote:?}"
+        );
+        for c in [&on, &off] {
+            c.execute("COMMIT").unwrap();
+            c.execute("BEGIN").unwrap();
+        }
+        assert_eq!(rows(&on, q), rows(&off, q));
+        for c in [&on, &off] {
+            c.execute("COMMIT").unwrap();
+        }
+        let read = copies(&on).counts();
+        assert!(read.reached_since(&wrote, 1), "{read:?}");
+        for (i, q) in QUERIES.iter().enumerate() {
+            let before = copies(&on).counts();
+            assert_eq!(rows(&on, q), rows(&off, q), "{q}");
+            let after = copies(&on).counts();
+            assert!(after.handed <= before.handed + 1, "{q}: {after:?}");
+            eprintln!(
+                "query {i} reaches the copies: {} ({q})",
+                after.reached_since(&before, 1)
+            );
+        }
+    }
+
+    /// The statement the read-only transaction tests read by: groups, and every aggregate kind.
+    const SNAPSHOT_Q: &str = "SELECT g, count(*), sum(v), min(v), max(s) FROM t GROUP BY g";
+
+    /// A storage's reading connection with the copies on, its table filled, its copy bought and
+    /// read once; and a second connection on the same storage that writes.
+    fn reader_and_writer(
+        room: Option<Arc<dyn Source>>,
+    ) -> (
+        Arc<Database>,
+        Arc<crate::Connection>,
+        Arc<crate::Connection>,
+    ) {
+        let (db, reader) = connect_in(room);
+        let writer = db
+            .connect(ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        copies(&reader).set_on(true);
+        reader.execute(SCHEMA).unwrap();
+        fill(&reader, 1, 2000);
+        // Rent, buy (built after the statement's choice), then read.
+        for _ in 0..3 {
+            rows(&reader, SNAPSHOT_Q);
+        }
+        assert!(
+            copies(&reader).counts().copy >= 1,
+            "{:?}",
+            copies(&reader).counts()
+        );
+        (db, reader, writer)
+    }
+
+    /// T-CB.4.5 (lane colcopy-10, AC-CB.4.7): a transaction that only reads, its first statement
+    /// before another connection's update, insert and delete, then the same statement three times
+    /// after them. Expect: each statement in the transaction is handed over and none is skipped,
+    /// the copy answers them (its counts grow, none refused), and each answers as the
+    /// transaction's snapshot sees the table: what it answered before the writes, which the writer
+    /// no longer sees; after COMMIT the reader sees the writes.
+    #[test]
+    fn cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot() {
+        let (_db, reader, writer) = reader_and_writer(None);
+        reader.execute("BEGIN").unwrap();
+        let first = copies(&reader).counts();
+        let then = rows(&reader, SNAPSHOT_Q);
+        for w in [
+            "UPDATE t SET v = v + 5000, s = 'zz' WHERE g = 3",
+            "INSERT INTO t VALUES (9000, 3, 1, 'zzz')",
+            "DELETE FROM t WHERE g = 4",
+        ] {
+            writer.execute(w).unwrap();
+        }
+        let before = copies(&reader).counts();
+        assert!(before.reached_since(&first, 1), "{before:?}");
+        for _ in 0..3 {
+            assert_eq!(rows(&reader, SNAPSHOT_Q), then);
+        }
+        let after = copies(&reader).counts();
+        assert!(after.reached_since(&before, 3), "{after:?}");
+        // The copy's view and the rows' learned rates, which the planner chose by.
+        let tree = tree_of(root(&reader)).unwrap();
+        let view = copies(&reader)
+            .kept(tree)
+            .map(|c| c.columns.plan_view(Ts::MAX));
+        let rates = RowRates::learned(&reader.db.learned_costs);
+        assert!(
+            after.copy >= before.copy + 3,
+            "the copy didn't answer: {after:?}, its view {view:?}, the rows' rates {rates:?}"
+        );
+        assert_eq!(after.unserved, first.unserved, "{after:?}");
+        let now = rows(&writer, SNAPSHOT_Q);
+        assert_ne!(now, then);
+        reader.execute("COMMIT").unwrap();
+        assert_eq!(rows(&reader, SNAPSHOT_Q), now);
+    }
+
+    /// T-CB.4.6 (lane colcopy-10, AC-CB.4.7): a transaction that only reads, its first statement
+    /// before two of another connection's writes the copy can't queue (its memory source refuses
+    /// the queue), each followed by a statement that rebuilds the copy, so neither generation it
+    /// keeps was made at or before the transaction's snapshot. Expect: the copy refuses the
+    /// transaction's next statement, counted `unserved` and not skipped, and the rows answer it as
+    /// the snapshot sees the table; after COMMIT the reader sees the writes.
+    #[test]
+    fn cb4_a_snapshot_no_generation_answers_is_refused_and_the_rows_answer() {
+        let (_db, reader, writer) = reader_and_writer(refusing(super::super::columns::QUEUE));
+        reader.execute("BEGIN").unwrap();
+        let then = rows(&reader, SNAPSHOT_Q);
+        for w in [
+            "UPDATE t SET v = v + 5000, s = 'zz' WHERE g = 3",
+            "DELETE FROM t WHERE g = 4",
+        ] {
+            let built = copies(&reader).counts().rebuilds;
+            writer.execute(w).unwrap();
+            rows(&writer, SNAPSHOT_Q);
+            assert_eq!(copies(&reader).counts().rebuilds, built + 1);
+        }
+        let before = copies(&reader).counts();
+        assert_eq!(rows(&reader, SNAPSHOT_Q), then);
+        let after = copies(&reader).counts();
+        assert!(after.reached_since(&before, 1), "{after:?}");
+        assert_eq!(after.unserved, before.unserved + 1, "{after:?}");
+        assert_eq!(after.copy, before.copy, "{after:?}");
+        reader.execute("COMMIT").unwrap();
+        assert_eq!(rows(&reader, SNAPSHOT_Q), rows(&writer, SNAPSHOT_Q));
     }
 
     /// Do: a copy whose queue holds no commit (its memory source refuses the queue), read, then a
@@ -1298,44 +1600,22 @@ mod tests {
         assert!(copies(&on).waiting().is_empty());
     }
 
-    /// The A/B harness for the two rebuy policies (lane colcopy-bound, AC-CB.4.1): each scenario
-    /// forces a failure mode at its extreme, under both, and reports per policy and scenario the
-    /// statements' latency percentiles, throughput, the copies' peak and average bytes held, the
-    /// rows their builds read, rebuys, the time copies were absent, and whether every answer
-    /// equalled the row loop's. Sizes scale by `AMPHORA_AB_SCALE` (1 by default: the tiny instance
-    /// the test suite runs); `AMPHORA_AB_OUT` names the JSONL file the records go to. The run of
-    /// record is the coordinator's:
+    /// The A/B harness for the two rebuy policies (lane colcopy-bound, AC-CB.4.1; scenarios shared
+    /// with the bench's DuckDB comparison in [`columns_ab`], lane colcopy-7): each scenario forces
+    /// a failure mode at its extreme, laptop-small and many tables under heavy pressure, under
+    /// both, and reports per policy and scenario the statements' latency percentiles, throughput,
+    /// the copies' peak and average bytes held, the rows their builds read, rebuys, the time
+    /// copies were absent, the copies still waiting at the end, the last copy let go and why, the
+    /// copies' trace events by reason, the writes the memory source refused, and whether every
+    /// answer equalled the row loop's. Sizes scale by `AMPHORA_AB_SCALE` (1 by default: the tiny
+    /// instance the test suite runs); `AMPHORA_AB_OUT` names the JSONL file the records go to. The
+    /// run of record is the coordinator's:
     ///
     /// `AMPHORA_AB_SCALE=200 AMPHORA_AB_OUT=bench/records/<date>-<host>-colcopy-ab.jsonl cargo test -p amphora-engine --release --lib storage::versioned::columns_sql::tests::ab -- --nocapture`
     mod ab {
         use super::*;
+        use crate::storage::versioned::columns_ab::{scenarios, schema, Press, Scenario, Traces};
         use std::time::Instant;
-
-        /// How a scenario presses the copies' room: the bytes left them are a share of what one
-        /// table's copy needs, as measured at that scale (the scenario's definition).
-        #[derive(Clone, Copy)]
-        enum Press {
-            /// `copies` copies' worth of room, held steady.
-            Steady { copies: f64 },
-            /// Half a copy's room; each statement another use frees `piece` of a copy's need and
-            /// takes it back at the next, so the pieces never add up to one copy.
-            Bursty { piece: f64 },
-            /// Half a copy's room until half the statements have run, then a copy's worth more,
-            /// the tables growing all along.
-            Grows,
-            /// No other use: as much room as the machine's source.
-            None,
-        }
-
-        struct Scenario {
-            name: &'static str,
-            tables: usize,
-            rows: i64,
-            statements: usize,
-            press: Press,
-            /// Rows each table grows by before each statement.
-            grow: i64,
-        }
 
         fn scale() -> i64 {
             std::env::var("AMPHORA_AB_SCALE")
@@ -1345,71 +1625,12 @@ mod tests {
                 .max(1)
         }
 
-        fn scenarios(k: i64) -> Vec<Scenario> {
-            let n = |s: i64| usize::try_from(s).unwrap_or(1);
-            vec![
-                Scenario {
-                    name: "laptop_cap_one_big_table",
-                    tables: 1,
-                    rows: 2000 * k,
-                    statements: n(12 * k),
-                    press: Press::Steady { copies: 0.5 },
-                    grow: 0,
-                },
-                Scenario {
-                    name: "many_tables_small_cap",
-                    tables: 6,
-                    rows: 300 * k,
-                    statements: n(24 * k),
-                    press: Press::Steady { copies: 2.0 },
-                    grow: 0,
-                },
-                Scenario {
-                    name: "steady_pressure",
-                    tables: 2,
-                    rows: 500 * k,
-                    statements: n(16 * k),
-                    press: Press::Steady { copies: 1.5 },
-                    grow: 0,
-                },
-                Scenario {
-                    name: "bursty_pressure",
-                    tables: 2,
-                    rows: 500 * k,
-                    statements: n(16 * k),
-                    press: Press::Bursty { piece: 0.125 },
-                    grow: 0,
-                },
-                Scenario {
-                    name: "growing_while_waiting",
-                    tables: 1,
-                    rows: 500 * k,
-                    statements: n(16 * k),
-                    press: Press::Grows,
-                    grow: 20 * k,
-                },
-                Scenario {
-                    name: "huge_cap_many_tables",
-                    tables: 12,
-                    rows: 300 * k,
-                    statements: n(36 * k),
-                    press: Press::None,
-                    grow: 0,
-                },
-            ]
-        }
-
-        fn schema(i: usize) -> String {
-            format!("CREATE TABLE t{i} (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT)")
-        }
-
-        fn fill_in(conn: &Arc<crate::Connection>, i: usize, from: i64, to: i64) {
-            conn.execute(format!(
+        fn fill_sql(i: usize, from: i64, to: i64) -> String {
+            format!(
                 "INSERT INTO t{i} SELECT value, value % 7, (value * 37) % 1000, \
                  CASE WHEN value % 5 = 0 THEN NULL ELSE 'k' || (value % 11) END \
                  FROM generate_series({from}, {to})"
-            ))
-            .unwrap();
+            )
         }
 
         fn at(sorted: &[u64], p: f64) -> u64 {
@@ -1418,7 +1639,7 @@ mod tests {
             sorted.get(i).copied().unwrap_or(0)
         }
 
-        fn run(s: &Scenario, rebuy: Rebuy, need: u64) -> String {
+        fn run(s: &Scenario, rebuy: Rebuy, need: u64) -> serde_json::Value {
             let room = Arc::new(Capped::new(u64::MAX / 2));
             let shared: Arc<dyn Source> = room.clone();
             let (_a, on) = connect_in(Some(shared));
@@ -1428,54 +1649,65 @@ mod tests {
             for c in [&on, &off] {
                 for i in 0..s.tables {
                     c.execute(schema(i)).unwrap();
-                    fill_in(c, i, 1, s.rows);
+                    c.execute(fill_sql(i, 1, s.rows)).unwrap();
                 }
             }
-            let share = |f: f64| (need as f64 * f) as u64;
-            let free = match s.press {
-                Press::Steady { copies } => Some(share(copies)),
-                Press::Bursty { .. } | Press::Grows => Some(share(0.5)),
-                Press::None => None,
-            };
             let mut other = 0u64;
+            // Every statement's latency, and those of the statements a copy could answer (lane
+            // colcopy-9, AC-CB.4.6): the A/B's percentiles count only those, as the rest read
+            // the rows under either policy. The queries (`QUERIES`' places) any statement of
+            // skipped are named in the record.
             let mut latencies = Vec::with_capacity(s.statements);
+            let mut reached = Vec::with_capacity(s.statements);
+            let mut skipped_queries = std::collections::BTreeSet::new();
             let (mut held_sum, mut held_peak, mut equal, mut waited_most) =
                 (0u64, 0u64, true, 0u64);
+            let (mut writes_refused, mut write_refusal) = (0u64, None::<String>);
             let mut next = vec![s.rows + 1; s.tables];
+            let mut rounds = Vec::new();
             let (mut resident_peak, mut granted_peak) = (0u64, 0u64);
             let began = Instant::now();
             for k in 0..s.statements {
-                let i = k % s.tables;
+                let i = s.table(k);
                 if s.grow > 0 {
                     let from = next.get(i).copied().unwrap_or(s.rows + 1);
-                    for c in [&on, &off] {
-                        fill_in(c, i, from, from + s.grow - 1);
-                    }
-                    if let Some(n) = next.get_mut(i) {
-                        *n = from + s.grow;
+                    let w = fill_sql(i, from, from + s.grow - 1);
+                    // The scenario's room is the copies' (lane colcopy-8): the other use gives its
+                    // bytes back while the rows grow, so the table's growth is never what the cap
+                    // refuses, and the press after it puts the copies back at their room. A copy
+                    // that must grow with its table then meets the cap first, as the scenario
+                    // says. A write still refused is counted, and left out of the row loop's
+                    // table too, so the answers still compare.
+                    room.give(other);
+                    other = 0;
+                    match on.execute(&w) {
+                        Ok(()) => {
+                            off.execute(&w).unwrap();
+                            if let Some(n) = next.get_mut(i) {
+                                *n = from + s.grow;
+                            }
+                        }
+                        Err(e) => {
+                            writes_refused += 1;
+                            write_refusal.get_or_insert_with(|| e.to_string());
+                        }
                     }
                 }
                 // The room the copies have at this statement, by the scenario.
-                let now_free = match s.press {
-                    Press::Bursty { piece } if k % 2 == 0 => {
-                        free.map(|f| f.saturating_add(share(piece)))
-                    }
-                    Press::Grows if k >= s.statements / 2 => {
-                        free.map(|f| f.saturating_add(share(1.0)))
-                    }
-                    _ => free,
-                };
-                if let Some(f) = now_free {
+                if let Some(f) = s.free_at(k, need) {
                     press(&room, &mut other, f, &on);
                 }
-                let q = QUERIES
-                    .get(k % QUERIES.len())
-                    .copied()
-                    .unwrap_or(QUERIES[0])
-                    .replace("FROM t", &format!("FROM t{i}"));
+                let q = s.query(k);
+                let before = copies(&on).counts();
                 let t = Instant::now();
                 let got = rows(&on, &q);
-                latencies.push(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                let took = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                latencies.push(took);
+                if copies(&on).counts().reached_since(&before, 1) {
+                    reached.push(took);
+                } else {
+                    skipped_queries.insert(k % QUERIES.len());
+                }
                 equal &= got == rows(&off, &q);
                 let held = copies(&on).meter().held;
                 held_sum = held_sum.saturating_add(held);
@@ -1492,28 +1724,98 @@ mod tests {
                     .waiting()
                     .iter()
                     .fold(waited_most, |m, w| m.max(w.nanos));
+                // Each round's end (one statement on each table): what the copies did in it, so a
+                // record shows in which round the room met them.
+                if (k + 1) % s.tables.max(1) == 0 {
+                    let (c, m) = (copies(&on).counts(), copies(&on).meter());
+                    rounds.push(serde_json::json!({
+                        "kept": c.kept, "dropped": c.dropped, "rebuilds": c.rebuilds,
+                        "copy": c.copy, "rows": c.rows, "unserved": c.unserved,
+                        "asked": m.asked, "refused": m.refused, "held": m.held,
+                    }));
+                }
             }
             let elapsed = began.elapsed().as_secs_f64();
             room.give(other);
             latencies.sort_unstable();
+            reached.sort_unstable();
+            let reached_ns = reached.iter().fold(0u64, |n, t| n.saturating_add(*t));
             let c = copies(&on).counts();
             let m = copies(&on).meter();
+            let waiting = copies(&on).waiting();
             let n = s.statements.max(1) as u64;
-            format!(
-                "{{\"harness\":\"colcopy-ab\",\"policy\":\"{}\",\"scenario\":\"{}\",\"tables\":{},\"rows\":{},\"statements\":{},\"need_bytes\":{},\"free_bytes\":{},\"p50_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"statements_per_s\":{:.1},\"peak_held\":{},\"avg_held\":{},\"build_rows\":{},\"rebuy_rows\":{},\"build_bytes\":{},\"rebuy_bytes\":{},\"resident_peak\":{},\"granted_peak\":{},\"rebuys\":{},\"kept\":{},\"dropped\":{},\"resumed\":{},\"absent_ns\":{},\"longest_wait_ns\":{},\"copy_statements\":{},\"absent_statements\":{},\"copy_rows\":{},\"loop_rows\":{},\"asked\":{},\"granted\":{},\"refused\":{},\"refused_bytes\":{},\"equal\":{}}}",
-                match rebuy { Rebuy::Rent => "A_rent", Rebuy::Room => "B_room" },
-                s.name, s.tables, s.rows, s.statements, need,
-                free.map_or("null".to_string(), |f| f.to_string()),
-                at(&latencies, 0.5), at(&latencies, 0.99), at(&latencies, 0.999),
-                s.statements as f64 / elapsed.max(f64::MIN_POSITIVE),
-                held_peak, held_sum / n, c.build_rows, c.rebuy_rows, c.build_bytes, c.rebuy_bytes, resident_peak, granted_peak, c.rebuys, c.kept, c.dropped, c.resumed,
-                copies(&on).absent_nanos(), waited_most, c.copy, c.absent, c.granule_rows, c.loop_rows,
-                m.asked, m.granted, m.refused, m.refused_bytes, equal
-            )
+            let last_dropped = copies(&on).last_dropped().map(
+                |Dropped::Memory {
+                     tree,
+                     asked,
+                     held,
+                     limit,
+                 }| {
+                    serde_json::json!({"why": "memory source refused", "tree": tree, "asked": asked, "held": held, "limit": limit})
+                },
+            );
+            serde_json::json!({
+                "harness": "colcopy-ab",
+                "policy": match rebuy { Rebuy::Rent => "A_rent", Rebuy::Room => "B_room" },
+                "scenario": s.name,
+                "forces": s.forces,
+                "tables": s.tables,
+                "rows": s.rows,
+                "statements": s.statements,
+                "need_bytes": need,
+                "free_bytes": s.free(need),
+                "p50_ns": at(&reached, 0.5),
+                "p99_ns": at(&reached, 0.99),
+                "p999_ns": at(&reached, 0.999),
+                "reached_statements": reached.len(),
+                "reached_statements_per_s": reached.len() as f64 / (reached_ns as f64 / 1e9).max(f64::MIN_POSITIVE),
+                "skipped_queries": skipped_queries,
+                "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+                "unserved": c.unserved,
+                "handed": c.handed,
+                "all_p50_ns": at(&latencies, 0.5),
+                "all_p99_ns": at(&latencies, 0.99),
+                "all_p999_ns": at(&latencies, 0.999),
+                "statements_per_s": s.statements as f64 / elapsed.max(f64::MIN_POSITIVE),
+                "peak_held": held_peak,
+                "avg_held": held_sum / n,
+                "build_rows": c.build_rows,
+                "rebuy_rows": c.rebuy_rows,
+                "build_bytes": c.build_bytes,
+                "rebuy_bytes": c.rebuy_bytes,
+                "resident_peak": resident_peak,
+                "granted_peak": granted_peak,
+                "rebuys": c.rebuys,
+                "kept": c.kept,
+                "dropped": c.dropped,
+                "resumed": c.resumed,
+                "absent_ns": copies(&on).absent_nanos(),
+                "longest_wait_ns": waited_most,
+                "waiting_end": waiting.len(),
+                "waiting_bytes_end": waiting.iter().fold(0u64, |b, w| b.saturating_add(w.bytes)),
+                "last_dropped": last_dropped,
+                "copy_statements": c.copy,
+                "absent_statements": c.absent,
+                "copy_rows": c.granule_rows,
+                "loop_rows": c.loop_rows,
+                "asked": m.asked,
+                "granted": m.granted,
+                "refused": m.refused,
+                "refused_bytes": m.refused_bytes,
+                "writes_refused": writes_refused,
+                "write_refusal": write_refusal,
+                "equal": equal,
+                "rounds": rounds,
+            })
         }
 
-        /// T-CB.4.1: every scenario once under each policy. Expect: every answer equal to the row
-        /// loop's, one record per policy and scenario (written to `AMPHORA_AB_OUT` when given).
+        /// T-CB.4.1: every scenario once under each policy, the copies' trace events counted.
+        /// Expect: every answer equal to the row loop's; in a steady room under one copy on more
+        /// than one statement a table, each policy's failure mode shows (A buys again, B's copies
+        /// still wait at the end and never buy again); a growing table's writes never refused
+        /// (its copy meets the cap, not its rows); under waves copies a wave bought let go in a
+        /// round after it (T-CB.4.3); one record per policy and
+        /// scenario (written to `AMPHORA_AB_OUT` when given).
         #[test]
         fn cb4_ab_both_rebuy_policies_at_the_extremes() {
             let k = scale();
@@ -1521,8 +1823,47 @@ mod tests {
             for s in scenarios(k) {
                 let need = need_of(s.rows);
                 for rebuy in [Rebuy::Rent, Rebuy::Room] {
-                    let line = run(&s, rebuy, need);
-                    assert!(line.ends_with("\"equal\":true}"), "{line}");
+                    let traces = Traces::default();
+                    let mut line = traces.during(|| run(&s, rebuy, need));
+                    if let Some(o) = line.as_object_mut() {
+                        o.insert("traces".into(), serde_json::json!(traces.counts()));
+                        o.insert("traces_compiled".into(), Traces::compiled().into());
+                    }
+                    assert_eq!(line["equal"], true, "{line}");
+                    // Lane colcopy-9 (T-CB.4.4): the A/B counts only statements a copy could
+                    // answer, so there must be some, and each statement handed over is either
+                    // one of them or counted with its reason.
+                    let skipped = line["skipped"]
+                        .as_object()
+                        .map_or(0, |o| o.values().filter_map(|v| v.as_u64()).sum::<u64>());
+                    assert!(line["reached_statements"].as_u64() > Some(0), "{line}");
+                    assert_eq!(
+                        line["reached_statements"].as_u64().map(|r| r + skipped),
+                        line["handed"].as_u64(),
+                        "{line}"
+                    );
+                    let under_one = matches!(s.press, Press::Steady { copies } if copies < 1.0);
+                    if under_one && s.statements >= 4 * s.tables {
+                        assert!(line["dropped"].as_u64() > Some(0), "{line}");
+                        match rebuy {
+                            Rebuy::Rent => assert!(line["rebuys"].as_u64() > Some(0), "{line}"),
+                            Rebuy::Room => {
+                                assert_eq!(line["rebuys"], 0, "{line}");
+                                assert!(line["waiting_end"].as_u64() > Some(0), "{line}");
+                            }
+                        }
+                    }
+                    // Lane colcopy-8: a growing table's rows have room, so its copy, not its
+                    // rows, meets the cap; under waves no copy is bought before the first wave
+                    // (the rent comes first) nor refused in it (room for every copy twice over),
+                    // so a copy let go is one a wave bought, refused in a round after it.
+                    if s.grow > 0 {
+                        assert_eq!(line["writes_refused"], 0, "{line}");
+                    }
+                    if matches!(s.press, Press::Waves) && s.statements >= 4 * s.tables {
+                        assert!(line["dropped"].as_u64() > Some(0), "{line}");
+                    }
+                    let line = line.to_string();
                     eprintln!("{line}");
                     out.push(line);
                 }
