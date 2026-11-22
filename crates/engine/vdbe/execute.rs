@@ -2412,6 +2412,34 @@ fn op_column_fetch(
             let content_reg = pseudo.content_reg();
             return op_column_fetch_pseudo(state, content_reg, column, dest);
         }
+        Some(Some(Cursor::Dyn(dyn_cursor, ..))) => {
+            // Amphora (QT.7 on the versioned storage, G7 step 2): a versioned table cursor's
+            // column comes from its leaf copy's batch, as the pager's does from its leaf's.
+            let versioned = (dyn_cursor.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<crate::storage::versioned::cursor::VersionedCursor>();
+            if let (Some(plan), Some(versioned)) = (program.leaf_batch_plan.as_deref(), versioned) {
+                let dest_reg = state
+                    .registers
+                    .get_mut(dest)
+                    .ok_or_else(|| register_out_of_range("Column", dest))?;
+                match super::leaf_batch::serve_column(
+                    &mut state.leaf_batches,
+                    plan,
+                    cursor_id,
+                    super::leaf_batch::ScanCursor::Versioned(versioned),
+                    column,
+                    dest_reg,
+                )? {
+                    super::leaf_batch::Served::Value => return Ok(InsnFunctionStepResult::Step),
+                    super::leaf_batch::Served::PastEnd => {
+                        apply_column_default(default, dest_reg)?;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    super::leaf_batch::Served::RowAtATime => {}
+                }
+            }
+            return op_column_fetch_other(program, state, cursor_id, column, dest, default);
+        }
         Some(_) => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
         None => return Err(cursor_out_of_range("Column", cursor_id).into()),
     };
@@ -2426,7 +2454,7 @@ fn op_column_fetch(
             &mut state.leaf_batches,
             plan,
             cursor_id,
-            cursor,
+            super::leaf_batch::ScanCursor::Pager(cursor),
             column,
             dest_reg,
         )? {
@@ -2672,7 +2700,7 @@ fn op_column_range_fetch(
                 &mut state.leaf_batches,
                 plan,
                 cursor_id,
-                cursor,
+                super::leaf_batch::ScanCursor::Pager(cursor),
                 column,
                 reg,
             )? {

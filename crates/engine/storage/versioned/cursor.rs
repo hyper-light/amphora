@@ -38,7 +38,7 @@ use crate::error::LimboError;
 use crate::mvcc::cursor::CursorYieldPoint;
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeKey, CursorTrait};
-use crate::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use crate::sync::{Arc, Mutex, Weak};
 use crate::types::{
     compare_immutable_iter, find_compare, get_tie_breaker_from_seek_op, AsValueRef, IOResult,
@@ -193,6 +193,9 @@ enum Point<'a> {
 /// The rows of one leaf a cursor copied, as its snapshot sees them, in key order.
 #[derive(Default)]
 struct Rows {
+    /// Amphora (QT.7 on the versioned storage): this copy among every copy the process made, so
+    /// a column batch decoded from it is known for it alone (`vdbe/leaf_batch.rs`).
+    copy: u64,
     leaf: u64,
     version: u64,
     low: Option<Vec<u8>>,
@@ -294,6 +297,7 @@ impl Rows {
         leaf: Leaf<'_>,
         after: bool,
     ) -> Result<()> {
+        self.copy = COPIES.fetch_add(1, AtomicOrdering::Relaxed);
         self.leaf = leaf.no;
         self.version = leaf.version;
         keep(&mut self.low, leaf.low);
@@ -388,6 +392,30 @@ pub struct VersionedCursor {
     yield_instance: u64,
 }
 
+/// The leaf copies the process has made: each copy's number (`Rows::copy`).
+static COPIES: AtomicU64 = AtomicU64::new(1);
+
+/// Amphora (QT.7 on the versioned storage, G7 step 2): the copy of the table leaf a cursor stands
+/// on, for the executor's column batches (`vdbe/leaf_batch.rs`): the copy's number, the row the
+/// cursor is on, and each row's record.
+pub(crate) struct LeafUnderCursor<'a> {
+    pub(crate) copy: u64,
+    pub(crate) cell: usize,
+    rows: &'a Rows,
+}
+
+impl LeafUnderCursor<'_> {
+    /// The rows in the copy.
+    pub(crate) fn cell_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Row `i`'s record, whole (its overflow chunks were joined as the leaf was copied).
+    pub(crate) fn payload(&self, i: usize) -> Option<&[u8]> {
+        self.rows.row(i).ok().map(|(_, value)| value)
+    }
+}
+
 /// Refuses with `Interrupt` once `conn`'s statement is interrupted (`sqlite3_interrupt`); asked a
 /// leaf at a time, never a row at a time.
 fn stop_if_interrupted(conn: &Weak<Connection>) -> Result<()> {
@@ -441,6 +469,31 @@ impl VersionedCursor {
             #[cfg(any(test, injected_yields))]
             yield_instance: 0,
         })
+    }
+
+    /// The copy of the table leaf the cursor stands on (QT.7 on the versioned storage): none on
+    /// an index, a blob handle's row, a null row, a row the cursor put or removed since the copy,
+    /// or a copy no longer the leaf's rows (the row is then read again, row-at-a-time).
+    pub(crate) fn table_leaf_under_cursor(&self) -> Option<LeafUnderCursor<'_>> {
+        if self.null_flag || self.order.index.is_some() || self.blob.is_some() {
+            return None;
+        }
+        let At::Row(cell) = self.at else {
+            return None;
+        };
+        if !self.fresh().ok()? {
+            return None;
+        }
+        Some(LeafUnderCursor {
+            copy: self.rows.copy,
+            cell,
+            rows: &self.rows,
+        })
+    }
+
+    /// The pager the cursor's statement runs beside (its statement memory budget).
+    pub(crate) fn pager(&self) -> &Arc<Pager> {
+        &self.pager
     }
 
     /// The cursor watched by `conn` (G7 step 2, `AC-NS.2.7`): its long walks stop at the next leaf
