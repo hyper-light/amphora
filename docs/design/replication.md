@@ -2506,6 +2506,42 @@ waits for the host's drain to be measured and the bound to grow.
 and `COMMANDS` and `MEMBERS` (64), to be derived from the budget and the measured message sizes. The image cap set on
 the owner's machine is the wire record's room at open; the room read later bounds images through `image_room`.
 
+**Amendment (QB.2, lane constants-17, 2026-11-22, not yet landed): past the outgoing bound, shed; don't fence.**
+What the owner does once its outgoing queue is past its learned bound is one switch (`drain::Egress`) with three
+candidates: `Fence` (the rule above, the control), `Shed` (drop the oldest records until the new one fits, count each,
+and report its member unreachable, so raft sends again what the member lacks; etcd's rafthttp drops a message whose
+peer's buffer is full and reports the peer unreachable) and `Pause` (no input and no raft step while the queue is at
+its bound; the host's drain rings the owner). The default is `Shed`. In two driven tests whose relay is held while the
+leader's clock moves, both fence under `Fence`, and under `Pause` the leader never steps down, because a paused leader
+doesn't tick (`a_change_at_its_barrier_is_refused_once_the_lead_is_lost`). Both pass under `Shed`. A shed record is a
+lost packet, which raft already tolerates; a fence ends the member, and a pause keeps a stalled leader in office. The
+A/B scenario (`qb2_many_slow_one_stalled_for_good_by_egress`: every host slows at once, then the leader's host stalls
+for good) is written but its driver is unfinished. Application calls are held to their own bound apart from the
+wire records queued beside them (`Control::called`).
+
+**Derivations for the numbers still picked (proposed, not built).**
+- `FRAMING_BYTES` (2 MiB) is a format value: what a message record adds past what it carries.
+  `MESSAGE_RECORD_FIXED_BYTES + ENTRY_FIXED_BYTES` (hyper-raft `wire.rs`) for an entry, plus the entry's context (the
+  request identity `Actor::context` writes: four u64s). For an image, add the snapshot's metadata (a `ConfState` of at
+  most `MEMBERS` u64s, postcard varints of at most 10 bytes each).
+- `unstable_entries` and `entries_per_message` (1024 each) override what `hyper_raft::Limits::derive` already derives:
+  the memory stated over `size_of::<Entry>()`, and a message's payload over `ENTRY_FIXED_BYTES`. The fix is to drop
+  the overrides and state the memory as the budget's room for queues (MB.1) in place of the picked `64 << 20`.
+- `COMMANDS` (64) is the command queue's slots. Its bytes are already learned (QB.1). The slots are what the owner
+  takes in an election timeout, counted in messages (`Drain::bound(..).messages`), at most the budget's room over the
+  smallest input's charge. This is also why `every_falsifier_of_the_floor_holds_under_a_nemesis` still fails. A call
+  is charged `REQUEST_MAX` (32 MiB, the worst case), but the byte rate is learned mostly from small wire records. The
+  learned byte bound then falls to one call, and a member change queued beside a call is refused `Full`. Calls should
+  be bounded in count by the learned message rate, and in bytes by the memory room.
+- `MEMBERS` (64) is the most members a configuration names. A leader holds up to a message's payload of votes and
+  progress for each member (`Limits::vote_bytes = payload × members`), so `MEMBERS` is the budget's room for queues over
+  a message's payload, at most what a `ConfState` in one wire record can name.
+
+**To remove: event-driven (Ada, 2026-11-22).** `TICK`, `POLL` and `DRIVE_QUANTUM`, and any driver that wakes on a timer,
+are to be removed, with that work driven from events, not given better intervals. The election and heartbeat
+timeouts stay learned, since they are truly about time. Lane repl-measure-8 owns the commit path's timer waits
+(`run_loop`, `deadline`, `Bell`).
+
 **Tests.** `drain::tests::drain_nothing_measured_bounds_one_record` (T-QB.1.1),
 `drain_bound_is_rate_times_election_timeout_within_room` (T-QB.1.2), `drain_bound_follows_the_reader_and_ignores_no_time`
 (T-QB.1.3), and `replicated::tests::queue_bound_a_burst_at_start_grows_before_it_fences` (T-QB.1.4).
