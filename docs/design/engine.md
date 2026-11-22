@@ -526,14 +526,19 @@ frame, and the pager's miss ratio, from fetches it no longer makes, would price 
 the file. Tree 0 is never named (SQLite's pages
 start at 1), tree 1 is `sqlite_schema`, tree 2 the overflow tree, and each tree made later takes the
 next id, which `sqlite_schema` records as its root page. The pager still runs beside it for the
-database header (schema cookie, user version). The storage holds a memory budget, its pages and
-row versions together: `ConnectOpts::with_memory_budget`, which Amphora's shell sets to a quarter of
-the memory its process may use (`amphora::memory`, as its process pool, store.md decision 26), else a
-quarter of the machine's memory (`storage::versioned::memory`: PostgreSQL's advice for
-`shared_buffers`). Half goes to the pool's frames and half to the versions, which the pool's pages
-bound (InnoDB's undo and LeanStore's versions live in buffer-pool memory); the pool makes its frames
-as pages are handed out, in runs that double, so a budget sized from the machine costs only what
-its pages use. The redo log takes a lane per thread the machine runs (decision 11). Off by default: the pager's B-trees stay the engine's
+database header (schema cookie, user version). The storage sets no memory aside: it takes its
+pages' frames and its row versions' bytes from a memory source as they grow, and gives them back as
+it lets them go (`storage::versioned::memory::Source`, `ConnectOpts::with_memory`). Amphora's shell
+gives its process memory budget (`amphora::memory::StorageMemory`, as caches; store.md, "Decision
+(lane constants): one process memory budget", MB.1), which every database of the process shares and
+which grants a use what the rest of the process leaves it, by measured use; without one, the
+storages of the process share the machine's memory (`memory::machine`). No fraction is picked, and
+none is split between pages and versions. The pool makes its frames as pages need them, in runs
+that double, each run's bytes taken from the source; a run refused, the pool evicts among the
+frames it has (decision 14). The versions take from the source as a dynamic table grows: doubled
+when full, halved down to twice what is held once that falls under a quarter (Cormen et al.,
+*Introduction to Algorithms*, section 17.4), so the source is asked once per doubling, not per row.
+The redo log takes a lane per thread the machine runs (decision 11). Off by default: the pager's B-trees stay the engine's
 storage until the suites pass on this one (the design's stage 5).
 
 **Why.** The executor already drives every B-tree through `CursorTrait` (decision 9), so swapping
@@ -555,10 +560,8 @@ crash between the two (the header moves into the catalog with `sqlite_schema`'s 
 
 (G7 step 4, `NS.4`; `crates/engine/storage/versioned/pool.rs`, tests in `evict.rs`.)
 
-**Decision.** A database's pool holds the frames its byte budget pays for (`pool::frames_within`:
-the budget over a page and its frame's state); the budget is the shell's, from the memory the process
-may use (`amphora::memory::limit`; `pool::machine_bytes` reads the machine's on Linux and refuses,
-naming the platform, where reading it needs `unsafe`). Pages are read in as they are asked for and
+**Decision.** A database's pool holds the frames its room grants (`pool::Room`): a fixed count, or
+as many as its memory source grants, a run at a time (decision 13). Pages are read in as they are asked for and
 evicted by CLOCK (decision 2's rule, the reach prototypes' shared eviction, G7 step 3): a frame whose
 reference bit is clear and whose latch no one holds; a clean frame is reused at once, a dirty one is
 first written to the spill file, page `n` at `n` pages in. The data file still changes only by

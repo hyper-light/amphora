@@ -219,11 +219,13 @@ deterministic simulator:
    its writer, through `groups::Peers` when that node is another; a node starts only the groups the
    directory places on it (decision "Moves across nodes", T-T1.9.R10).
 
+   Built (lane split-merge-10): a pull over the owner transport, its appended request and answer,
+   between a node's endpoint and its peers (decision "Pulls over the owner transport", T-T1.9.R12).
+
    Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
    which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
-   one group), with a split and merge of it under writes through `carry`; `Peers` over a socket
-   between machines (the owner transport speaks to one owner; the pull would be its appended
-   request variants); a retired group's files, which the shell's caller deletes.
+   one group), with a split and merge of it under writes through `carry`; the transport off
+   loopback, between machines; a retired group's files, which the shell's caller deletes.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.
@@ -392,3 +394,33 @@ piece of this item.
 
 **Falsified by.** A move under writes that loses an acknowledged write or leaves a key in two
 groups; or a pull's batch larger than the old group's writer's learned batch.
+
+## Decision (lane split-merge-10): pulls over the owner transport
+
+A move's pull now crosses processes on the owner transport (local-owner-transport.md), with its
+listener, its protected record and its authentication unchanged. Two variants are appended, after
+every existing one: `Request::Pull` and `Answer::Pulled`, and the protocol's version goes to 7.
+- A node's endpoint (`transport::Node`) is an owner listener with no database: it answers a pull with
+  `Groups::serve_within` at its node's groups, and any other request finds no database. A database's
+  owner answers a pull `Pulled::NoGroup`.
+- A node's peers over it (`transport::Nodes`) know each node's endpoint by its path, and implement
+  `groups::Peers`: one authenticated connection and one request a pull. A pull refused, cut off or
+  unanswered is an error, and the driver asks the action again, as before.
+- An answer must fit in one frame. So the endpoint serves a batch held to the protocol's bound on a
+  result (`amphora_api::RESULT_MAX`, a format value) at the most bytes a unit of that work has held
+  there, as the memory bound does (decision "A batch bounded by the process's memory"); the frame is
+  a mebibyte larger, for the answer's own fields. A batch the channel can't carry is never read.
+
+**Evidence.** `tests/groups.rs`, T-T1.9.R12: the move of T-T1.9.R10 with each pull over the
+transport between two endpoints, every fourth pull asked while the other node's endpoint is down
+(a partition: the pull never reaches it; it is started again after) and every third answer dropped
+after it arrived (a loss after the node acted). Both faults are met; the move ends flipped, every
+acknowledged write reads back at its group's node, and every key is in exactly one group's file.
+
+**Left.** The owner transport listens on loopback, its record in a protected directory beside the
+database: it reaches another process on the same machine. A node on another machine needs that
+listener on a network address with an authentication that doesn't rest on a shared file (the
+replicated transport's, hyper-transport); `Nodes` is the seam it plugs into.
+
+**Falsified by.** A pull answered through a partition; a move over the transport that loses an
+acknowledged write or leaves a key in two groups; a pull's answer larger than a frame.

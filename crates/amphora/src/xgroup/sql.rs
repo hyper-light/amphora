@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -549,6 +550,7 @@ impl Cluster {
             times: StepTimes::default(),
             open_until: until,
             ready: Some(ready),
+            carried: Arc::default(),
         };
         let driver = std::thread::Builder::new()
             .name("amphora-xgroup".into())
@@ -593,6 +595,32 @@ impl Drop for Cluster {
     }
 }
 
+/// Runs one step on `group`, its stamps carried (T-T1.12.X2): the group takes in the latest stamp
+/// the coordinator heard of before its commit, and answers with its own latest after it. Groups not
+/// backed up here make no stamps and carry none.
+fn step<R, F>(group: &Database, carried: &AtomicU64, until: Instant, f: F) -> Result<R, Refusal>
+where
+    R: Send + 'static,
+    F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
+{
+    let stamps = group.stamps();
+    if let Some(hooks) = stamps {
+        hooks
+            .marks
+            .observe(carried.load(Ordering::Acquire))
+            .map_err(|e| Refusal::Unavailable(format!("{e:#}")))?;
+    }
+    let reply = group.call_internal(until, f)?;
+    if let Some(hooks) = stamps {
+        let latest = hooks
+            .marks
+            .latest()
+            .map_err(|e| Refusal::Unavailable(format!("{e:#}")))?;
+        carried.fetch_max(latest, Ordering::AcqRel);
+    }
+    Ok(reply)
+}
+
 struct Driver {
     groups: Arc<Vec<Database>>,
     route: Route,
@@ -607,6 +635,10 @@ struct Driver {
     times: StepTimes,
     open_until: Instant,
     ready: Option<SyncSender<Result<(), Refusal>>>,
+    /// The latest commit stamp any step's group answered with, carried into every step sent after
+    /// (T-T1.12.X2, docs/design/backup.md, "Cuts across machines"): a group a step reaches stamps
+    /// its commit after every commit the coordinator heard of before sending it.
+    carried: Arc<AtomicU64>,
 }
 
 impl Driver {
@@ -718,12 +750,13 @@ impl Driver {
                             amphora_api::invalid("cross-group step", "no such group")
                         })?;
                     let inputs = self.inputs.clone();
+                    let carried = Arc::clone(&self.carried);
                     let (id, here, envelope) = (send.id, send.group, send.envelope);
                     self.out.insert(id, (send.txn, Instant::now(), first));
                     std::thread::Builder::new()
                         .name("amphora-xgroup-step".into())
                         .spawn(move || {
-                            let reply = group.call_internal(until, move |db| {
+                            let reply = step(&group, &carried, until, move |db| {
                                 apply(here, &mut SqlTablet::new(db), &envelope)
                             });
                             // A driver gone by now has stopped: its successor recovers the step.
