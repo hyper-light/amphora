@@ -171,6 +171,7 @@ pub fn translate(
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
     resolver.set_sorted_fetches(connection.sorted_fetches());
+    resolver.set_adaptive_joins(connection.adaptive_joins());
     resolver.set_automatic_indexes(connection.automatic_indexes());
     // Amphora (QT.6): leaf-page morsels read the pager's b-trees, which MVCC and the versioned
     // storage don't keep a table's rows in.
@@ -197,6 +198,19 @@ pub fn translate(
         connection.get_pager().page_miss_ratio()
     };
     resolver.set_learned_weights(connection.db.learned_costs.weights_at(page_miss));
+    // Amphora (PL.13): a test's pinned weights in their place (`Connection::pin_cost_weights`).
+    if let Some((seek, hash_build, hash_probe)) = connection.pinned_cost_weights() {
+        let pinned = match connection.db.learned_costs.weights_at(page_miss) {
+            Some(learned) => crate::translate::optimizer::learned_costs::LearnedWeights {
+                seek,
+                hash_build,
+                hash_probe,
+                ..learned
+            },
+            None => crate::translate::optimizer::adaptive::weights(seek, hash_build, hash_probe),
+        };
+        resolver.set_learned_weights(Some(pinned));
+    }
     // Amphora (PL.7): and, with its switch on, as its statements' measured times fit them.
     resolver.set_fitted_weights(connection.db.cost_fit.weights());
 

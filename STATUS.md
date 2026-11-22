@@ -855,11 +855,13 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   costs say the generic plan does as well; one whose estimates read none keeps its generic plan. Its
   TPC-H prepared measurement (AC-PL.12.1; its harness, `amphora-bench --planner --prepared` with
   qgen's parameters, is written: bench/planner/README.md) and the suite's (AC-PL.12.2) are open.
-  PL.13 is started (lane pl13, docs/design/planner.md "Decision (lane pl13)"): its two run-time
-  checks are built as pure cores with their tests (`optimizer/adaptive.rs`): a nested loop that turns
-  into a hash join at the learned costs' break-even, refused over its memory budget, and a
-  materialization point that asks for a new plan only past its estimate's own error. The executor's
-  shell that drives them, and JOB's 20 slowest queries against the parent (AC-PL.13.1), are open.
+  PL.13 is wired (lane pl13, docs/design/planner.md "Decision (lane pl13)"): with
+  `Connection::set_adaptive_joins` on, an inner join's index seek is emitted with a hash join beside
+  it and switches at the learned costs' break-even; the hash table's build, the inner table whole,
+  is checked against the plan's estimate and, past its error, the table's count is corrected and the
+  statement planned again; a read-only run that has returned no row yet starts again on the new plan
+  at once (the in-run hand-off, `Connection::set_adaptive_handoff`), any other at its next run. The
+  engine's own tests (T-PL.13.1, T-PL.13.3, T-PL.13.4) pass on pinned weights. JOB's 20 slowest queries against the parent (AC-PL.13.1) are open.
   PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
   longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);
