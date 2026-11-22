@@ -14,8 +14,12 @@
 #   commit.
 # - The strongest it offers is Strong (FULL; Extra is "no different from FULL in WAL mode", the same
 #   page), set per database through the admin API: POST /v1/namespaces/<ns>/config with
-#   durability_mode (http/admin/mod.rs:145-148, 296-345; block_reads and block_writes are required
-#   fields of that body). Here: Strong on the default namespace, set before the first measured
+#   durability_mode (http/admin/mod.rs:145-148, 296-345). That POST sets every field of the
+#   namespace's config from its body (block_reads, block_writes, block_reason, allow_attach,
+#   txn_timeout_s, jwt_key: mod.rs:330-342), so the harness reads the config first (GET, mod.rs:
+#   244-265) and posts it back with only durability_mode changed; max_db_size is left out, which
+#   keeps the namespace's own (mod.rs:336-338) rather than round-trip it through ByteSize's text.
+#   Here: Strong on the default namespace, set before the first measured
 #   connection exists (sqld keeps it in its metastore database, namespace/meta_store.rs:113 and 366,
 #   and the primary is restarted after setting it, so every connection is opened under it), and `up`
 #   refuses unless the primary answers PRAGMA synchronous = 2.
@@ -53,9 +57,12 @@ after_ready() { curl -sf --max-time "$BRINGUP_S" "http://127.0.0.1:$(port "$1")/
 before_up() {
   run_node 0
   ready_node 0 || { echo "libsql primary didn't come up to set its durability; its log ends:" >&2; tail -n 40 "$(dir 0)/log" >&2; return 1; }
-  curl -sf --max-time "$BRINGUP_S" -X POST -H 'content-type: application/json' \
-    -d '{"block_reads": false, "block_writes": false, "durability_mode": "strong"}' \
-    "http://127.0.0.1:$(admin_port)/v1/namespaces/default/config" >/dev/null \
+  local url="http://127.0.0.1:$(admin_port)/v1/namespaces/default/config" config
+  # The namespace's own config, durability_mode alone changed (see the header).
+  config=$(curl -sf --max-time "$BRINGUP_S" "$url" | python3 -I -c 'import json, sys
+c = json.load(sys.stdin); c.pop("max_db_size", None); c["durability_mode"] = "strong"; print(json.dumps(c))') \
+    || { echo "libsql: the admin API didn't give the default namespace's config" >&2; return 1; }
+  curl -sf --max-time "$BRINGUP_S" -X POST -H 'content-type: application/json' -d "$config" "$url" >/dev/null \
     || { echo "libsql: the admin API refused durability_mode=strong" >&2; return 1; }
   kill_node 0
 }

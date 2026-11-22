@@ -44,6 +44,21 @@ leader() {
   done
 }
 
+# The leader's configuration as the shim reads it (its /voters): go-dqlite's app can call a node
+# ready while it's still a spare (../shim/main.go), so `up` refuses unless all three vote, and
+# each record carries what the cluster said.
+voters() {
+  curl -sf --max-time "$BRINGUP_S" "http://127.0.0.1:$(port 0)/voters" | python3 -I -c 'import json, sys; c = json.load(sys.stdin); print(c["voters"], c["members"])'
+}
+
+after_up() {
+  local v m
+  read -r v m < <(voters) || { echo "dqlite: the shim didn't give the cluster's voters" >&2; return 1; }
+  [[ "$v" == 3 && "$m" == 3 ]] || { echo "dqlite: $v of $m members vote once every node is ready, not 3 of 3: a commit's quorum isn't 2 of 3" >&2; return 1; }
+}
+
+durability_check() { voters | { read -r v m && echo "voters=$v of members=$m"; } || echo "voters unread"; }
+
 version() { cat "$BIN/dqlite.version"; }
 
 help_text() { :; }

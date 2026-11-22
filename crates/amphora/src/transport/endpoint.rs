@@ -161,8 +161,8 @@ pub(crate) fn try_lease(path: &Path) -> Result<Option<File>, Refusal> {
     }
 }
 
-/// [`try_lease`], waiting for the owner before to let the lock go: the operating system wakes it
-/// as that owner's last handle on the lock closes. A test's, whose owners end on threads of their
+/// [`try_lease`], waiting for the owner before it to let the lock go: the operating system wakes
+/// it as that owner's last handle on the lock closes. A test's, whose owners end on threads of their
 /// own after the test drops them.
 #[cfg(test)]
 pub(crate) fn wait_lease(path: &Path) -> Result<File, Refusal> {

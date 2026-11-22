@@ -11,11 +11,15 @@
 #            else canonical/dqlite's release source built here with its own raft (needs a C
 #            compiler, autotools, libuv and sqlite3 headers). go-dqlite goes with the libdqlite it
 #            builds against, as each states: libdqlite 1.18 and later drop
-#            dqlite_node_enable_disk_mode, which go-dqlite v1 and v2 call (internal/bindings/server.go),
-#            and go-dqlite v3 refuses a libdqlite older than 1.18 (its bindings check
-#            DQLITE_VERSION_NUMBER < 11800). So libdqlite 1.18+ takes go-dqlite v3's newest release
-#            (the shim's import moved to v3's module path), and an older one v1.22.0, as
-#            ../shim/Dockerfile pairs with Ubuntu 24.04's libdqlite 1.16.
+#            dqlite_node_enable_disk_mode, which go-dqlite v1.22.0 calls outright
+#            (internal/bindings/server.go:190), and go-dqlite v3 links it weakly but refuses, as a
+#            node starts, a libdqlite older than 1.17 (v3.0.4 internal/bindings/build.go:
+#            DqliteMinSupportedVersion = 1_17_00, checked in server.go:160). So libdqlite 1.17+
+#            takes go-dqlite v3's newest release (the shim's import moved to v3's module path), and
+#            an older one (Ubuntu 24.04's is 1.16) v1.22.0.
+#            go-dqlite's bindings name libdqlite as -ldqlite and <dqlite.h>, not through pkg-config
+#            (internal/bindings/build.go), so a libdqlite built here is handed to cgo by its
+#            pkg-config flags (CGO_CFLAGS, CGO_LDFLAGS).
 # Versions: the newest release of each at the time this runs, unless pinned in the environment
 # (RQLITE_TAG, LIBSQL_TAG, LITEFS_TAG, CONSUL_VERSION, GO_VERSION, DQLITE_TAG, GO_DQLITE: the shim's
 # go-dqlite, by default as above). The versions fetched go to $BIN/versions.txt, and each cluster's
@@ -150,7 +154,7 @@ if [[ ! -x "$BIN/shim" && -x "$BIN/go/bin/go" && -n "${DQ_VERSION:-}" ]]; then
   cp "$HERE/../shim/main.go" "$s/"
   # go-dqlite for this libdqlite (the header's comment says why): v3's module path is .../v3.
   IFS=. read -r dq_major dq_minor _ <<<"$DQ_VERSION"
-  if ((dq_major > 1 || (dq_major == 1 && dq_minor >= 18))); then
+  if ((dq_major > 1 || (dq_major == 1 && dq_minor >= 17))); then
     gdq_mod=github.com/canonical/go-dqlite/v3
     gdq=${GO_DQLITE:-$(curl -fsSL 'https://api.github.com/repos/canonical/go-dqlite/releases?per_page=100' | python3 -I -c '
 import json, sys
@@ -160,6 +164,7 @@ print(next((r["tag_name"] for r in json.load(sys.stdin) if not r["draft"] and no
     gdq_mod=github.com/canonical/go-dqlite gdq=${GO_DQLITE:-v1.22.0}
   fi
   if [[ -n "$gdq" ]] && (cd "$s" && export PATH="$BIN/go/bin:$PATH" GOPATH="$WORK/gopath" GOCACHE="$WORK/gocache" PKG_CONFIG_PATH="${DQ_PC}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+      && export CGO_CFLAGS="$(pkg-config --cflags dqlite) ${CGO_CFLAGS:-}" CGO_LDFLAGS="$(pkg-config --libs-only-L dqlite) ${CGO_LDFLAGS:-}" \
       && go mod init shim >/dev/null 2>&1 && go get "$gdq_mod@$gdq" github.com/mattn/go-sqlite3 >&2 && go mod tidy >&2 \
       && CGO_LDFLAGS_ALLOW="-Wl,-z,now" go build -tags libsqlite3 -o "$BIN/shim" .); then
     note go-dqlite "$gdq (libdqlite $DQ_VERSION)"

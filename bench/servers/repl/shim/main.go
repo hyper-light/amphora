@@ -6,6 +6,8 @@
 //   GET  /leader                                 dqlite's leader address; on LiteFS the lease holder's
 //                                                hostname: this node's when it takes a write
 //                                                transaction, else its .primary file's
+//   GET  /voters                                 dqlite: {"voters": n, "members": m}, as the leader's
+//                                                configuration has them
 // Once it listens and its database takes statements, it prints "shim ready: listening on ADDR" on
 // stderr: the ready signal native/lib.sh waits for.
 package main
@@ -172,6 +174,33 @@ func main() {
 			}
 		}
 		_, _ = w.Write([]byte(addr))
+	})
+	// go-dqlite's app joins a node as a spare and promotes voters only once three nodes are in
+	// the cluster (app/roles.go, RolesChanges.Assume): a node can be Ready before it votes. The
+	// cluster script reads this once every node is ready, so a commit's quorum is known, not assumed.
+	http.HandleFunc("/voters", func(w http.ResponseWriter, r *http.Request) {
+		if dq == nil {
+			http.Error(w, "dqlite only", http.StatusNotFound)
+			return
+		}
+		cli, err := dq.Leader(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		defer cli.Close()
+		nodes, err := cli.Cluster(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		voters := 0
+		for _, n := range nodes {
+			if n.Role.String() == "voter" {
+				voters++
+			}
+		}
+		reply(w, map[string]any{"voters": voters, "members": len(nodes)})
 	})
 	http.HandleFunc("/exec", func(w http.ResponseWriter, r *http.Request) {
 		req, err := decode(r)
