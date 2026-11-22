@@ -546,6 +546,8 @@ pub struct Connection {
     pub(super) parallel_limit: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_cores`]; 0 is the machine's every core.
     pub(super) parallel_cores: std::sync::atomic::AtomicUsize,
+    /// Amphora: see [`Connection::set_parallel_join_direct`].
+    pub(super) parallel_join_direct: AtomicBool,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
@@ -553,6 +555,8 @@ pub struct Connection {
     pub(crate) morsel_body_rows: AtomicU64,
     /// Amphora (QT.6, lane qs6-10): the hash tables the hook built for joins, a chain's links each.
     pub(crate) morsel_join_links: AtomicU64,
+    /// Amphora: the joined rows whose outputs were copied, no body run (lane qs6-13).
+    pub(crate) morsel_join_direct_rows: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1041,6 +1045,18 @@ impl Connection {
             cores.map_or(0, std::num::NonZeroUsize::get),
             Ordering::Release,
         );
+    }
+
+    /// Amphora (QT.6, lane qs6-13, T-QT.6.21): whether a join's workers copy the outputs of a
+    /// loop body that is nothing but reads (no ON or WHERE term past the keys, every output a
+    /// column or rowid) straight from the joined row instead of running the body's code. Off
+    /// (the body runs on every joined row, lane qs6-12) until the A/B of T-QT.6.20 decides.
+    pub fn set_parallel_join_direct(&self, on: bool) {
+        self.parallel_join_direct.store(on, Ordering::Release);
+    }
+
+    pub(crate) fn parallel_join_direct(&self) -> bool {
+        self.parallel_join_direct.load(Ordering::Acquire)
     }
 
     pub(crate) fn parallel_cores(&self) -> Option<std::num::NonZeroUsize> {

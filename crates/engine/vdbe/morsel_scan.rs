@@ -338,6 +338,9 @@ pub struct TableBodyAggregate<'a> {
     pub shape: &'a ScanAggregate<'a>,
     /// Counts the rows the copied body ran over.
     pub ran: &'a std::sync::atomic::AtomicU64,
+    /// The body's direct reads when the connection's switch takes them (lane qs6-13,
+    /// T-QT.6.21): a joined row's outputs copied from it, no code run.
+    pub direct: Option<&'a [Option<usize>]>,
 }
 
 /// A worker's own state for [`TableBodyAggregate`]: its registers, cursors and program counter,
@@ -376,6 +379,25 @@ impl TableBodyAggregate<'_> {
 
     /// Runs the body over one row; true when the row passed, its values then in `worker.out`.
     fn row(&self, worker: &mut BodyWorker, rowid: i64, row: &[Value]) -> Result<bool, MorselError> {
+        if let Some(direct) = self.direct {
+            // Nothing but reads (lane qs6-13): the values the body's copy would read, every row
+            // passing, a REAL where `no_real` names still sending the statement back.
+            worker.out.clear();
+            for at in direct {
+                worker.out.push(match at {
+                    Some(at) => row
+                        .get(*at)
+                        .ok_or(MorselError::NoColumn {
+                            column: *at,
+                            width: row.len(),
+                        })?
+                        .clone(),
+                    None => Value::from_i64(rowid),
+                });
+            }
+            self.no_real(worker)?;
+            return Ok(true);
+        }
         self.load(worker, Some(rowid), row)?;
         self.passes(worker, self.body.start, self.body.keep)
     }
@@ -525,6 +547,11 @@ impl TableBodyAggregate<'_> {
             };
             worker.out.push(value.clone());
         }
+        self.no_real(worker)
+    }
+
+    /// A REAL where `no_real` names sends the statement to the serial loop.
+    fn no_real(&self, worker: &BodyWorker) -> Result<(), MorselError> {
         for at in &self.body.no_real {
             if let Some(Value::Numeric(crate::numeric::Numeric::Float(_))) = worker.out.get(*at) {
                 return Err(MorselError::Unsupported { kind: "REAL" });

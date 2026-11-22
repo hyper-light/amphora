@@ -1075,7 +1075,10 @@ filter or output the serial loop runs runs in a join's workers too; a REAL where
 an INTEGER sends the statement to the serial loop (T-QT.6.18). LEFT, RIGHT and FULL joins of two
 tables run on morsels: ON terms decide matches and WHERE terms test the padded rows; each worker
 marks the build rows it matched in its own bitmap, the bitmaps merge by OR, and the unmatched build
-rows run padded with NULLs in morsels of their own (T-QT.6.19).
+rows run padded with NULLs in morsels of their own (T-QT.6.19). Lane qs6-13: a join whose body is nothing but
+reads can copy its outputs from the joined row without running the body, behind
+`set_parallel_join_direct` (off) until the A/B of simple joins against 054ace65 decides (T-QT.6.20,
+T-QT.6.21); ClickHouse loads JOB's backslash-escaped CSV as TabSeparated.
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.

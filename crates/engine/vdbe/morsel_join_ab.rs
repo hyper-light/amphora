@@ -114,7 +114,15 @@ fn t_qt_6_20_simple_join_latency_old_against_new() {
         conn.set_parallel_mode(ParallelMode::Off);
         let serial = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
         conn.set_parallel_mode(ParallelMode::On);
-        for &c in &cores {
+        // Lane qs6-13's switch (T-QT.6.21): each rung with the body run on every joined row and
+        // with a body of nothing but reads copied; this side of the A/B only (054ace65 has no
+        // switch, its fold path its one).
+        for (direct, &c) in [false, true]
+            .into_iter()
+            .flat_map(|d| cores.iter().map(move |c| (d, c)))
+        {
+            conn.set_parallel_join_direct(direct);
+            let label = format!("{label}-{}", if direct { "direct" } else { "body" });
             *conn.morsel_costs.lock() = Some(MachineCosts::stated(
                 NonZeroUsize::new(c).unwrap(),
                 worker_start,

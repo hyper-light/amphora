@@ -112,6 +112,11 @@ pub(crate) fn emit_morsel_hook(
         } else {
             None
         },
+        direct: if data.joins.is_empty() {
+            None
+        } else {
+            direct_reads(looped)
+        },
     });
     let serial = program.allocate_label();
     let end = program.allocate_label();
@@ -168,6 +173,33 @@ pub(crate) fn emit_morsel_hook(
     }
     program.preassign_label_to_next_insn(serial);
     Ok(Some(MorselHook { end }))
+}
+
+/// A join's body that is nothing but reads (lane qs6-13, T-QT.6.21): with no ON or WHERE term
+/// left, each output a column of a table in the row or its rowid, the place each output's value
+/// has in the joined row (`None`: the probe's own rowid), the very register the body's copy would
+/// read (`emit_body`); otherwise none.
+fn direct_reads(looped: &BodyPlan) -> Option<Vec<Option<usize>>> {
+    if !looped.on.is_empty() || !looped.filter.is_empty() {
+        return None;
+    }
+    let place = |id: TableInternalId| looped.places.iter().find(|p| p.id == id);
+    let mut direct = Vec::new();
+    for expr in &looped.outs {
+        direct.push(match expr {
+            Expr::Column { table, column, .. } => Some(place(*table)?.offset.checked_add(*column)?),
+            Expr::RowId { table, .. } => {
+                let p = place(*table)?;
+                match p.rowid {
+                    RowidAt::Own => None,
+                    RowidAt::Column(column) => Some(p.offset.checked_add(column)?),
+                    RowidAt::Nowhere => return None,
+                }
+            }
+            _ => return None,
+        });
+    }
+    Some(direct)
 }
 
 /// The loop body as the workers run it (QT.6, lane qs6-7): its filter terms, and the expressions

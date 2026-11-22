@@ -21156,6 +21156,7 @@ pub fn op_morsel_aggregate(
                     parameters: &parameters,
                     shape: &shape,
                     ran: &connection.morsel_body_rows,
+                    direct: None,
                 };
                 // A scan's rows: kept in leaf order, the result columns as they stand (lane qs6-8).
                 if body.rows {
@@ -21232,6 +21233,13 @@ pub fn op_morsel_aggregate(
             group_by: &body.group_by,
             aggregates: &body.aggregates,
         };
+        // A join's body of nothing but reads is copied without running it when the switch says so
+        // (lane qs6-13, T-QT.6.21); its rows are counted apart.
+        let direct = if connection.parallel_join_direct() && data.outer.is_none() {
+            body.direct.as_deref()
+        } else {
+            None
+        };
         let looped = TableBodyAggregate {
             table: &table,
             body,
@@ -21240,7 +21248,12 @@ pub fn op_morsel_aggregate(
             registers: &registers,
             parameters: &parameters,
             shape: &shape,
-            ran: &connection.morsel_body_rows,
+            ran: if direct.is_some() {
+                &connection.morsel_join_direct_rows
+            } else {
+                &connection.morsel_body_rows
+            },
+            direct,
         };
         // An outer join of two tables: the probe's morsels mark the build rows they match, the
         // bitmaps merge, then the unmatched build rows run padded (lane qs6-12).

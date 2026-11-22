@@ -1844,3 +1844,92 @@ fn t_qt_6_19_outer_joins_pad_unmatched_rows_as_the_serial_loop() {
         assert!(runs > 0, "no {kind} JOIN took the hook");
     }
 }
+
+/// T-QT.6.21 (lane qs6-13): a join whose loop body is nothing but reads (no ON or WHERE term past
+/// the keys and the tables' own filters, every output a column) has its outputs copied straight
+/// from the joined row when `set_parallel_join_direct` is on, no body run. Simple equi-joins of
+/// two tables, with aggregates (count, sum, min, max, GROUP BY) and returning rows, answer as the
+/// serial loop at 1, 2, 3, 4 and 8 stated cores with the switch on and off; with it on their rows
+/// are counted as copied, and with it off, or with an output or a WHERE term only the body can
+/// compute, none is.
+#[test]
+fn t_qt_6_21_a_join_of_reads_only_copies_its_outputs_when_switched_on() {
+    let conn = open(":memory:qt-6-21");
+    let mut rng = ChaCha8Rng::seed_from_u64(621);
+    fill(&conn, &mut rng, "t", 600);
+    fill(&conn, &mut rng, "u", 150);
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    // (the query, whether it returns rows, whether its body is nothing but reads)
+    let queries = [
+        (
+            "SELECT count(*), sum(t.b), min(u.c), max(t.a) FROM t JOIN u ON t.a = u.a",
+            false,
+            true,
+        ),
+        (
+            "SELECT t.c, count(*), sum(u.b) FROM t JOIN u ON t.a = u.a GROUP BY t.c",
+            false,
+            true,
+        ),
+        (
+            "SELECT count(*), min(t.b) FROM t JOIN u ON t.a = u.a WHERE t.b > 0",
+            false,
+            true,
+        ),
+        ("SELECT t.b, u.c FROM t JOIN u ON t.a = u.a", true, true),
+        (
+            "SELECT count(*), sum(t.b + u.b) FROM t JOIN u ON t.a = u.a",
+            false,
+            false,
+        ),
+        (
+            "SELECT count(*) FROM t JOIN u ON t.a = u.a WHERE t.b < u.b",
+            false,
+            false,
+        ),
+    ];
+    let mut copied_any = false;
+    for (sql, rows, reads_only) in queries {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for direct in [false, true] {
+            conn.set_parallel_join_direct(direct);
+            for cores in [1usize, 2, 3, 4, 8] {
+                *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                    NonZeroUsize::new(cores).unwrap(),
+                    1.0,
+                    1.0,
+                ));
+                let links_before = conn
+                    .morsel_join_links
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let copied_before = conn
+                    .morsel_join_direct_rows
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let parallel = sql_rows(&conn, sql);
+                let links = conn
+                    .morsel_join_links
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    - links_before;
+                let copied = conn
+                    .morsel_join_direct_rows
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    - copied_before;
+                let what = format!("on {cores} cores, direct {direct}");
+                same_answer(sql, rows, &parallel, &serial, &what);
+                if !(direct && reads_only) {
+                    assert_eq!(copied, 0, "{sql} {what} copied {copied} rows");
+                } else if links == 1 {
+                    assert!(copied > 0, "{sql} {what} took the hook and copied nothing");
+                    copied_any = true;
+                }
+            }
+        }
+    }
+    conn.set_parallel_join_direct(false);
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: some run took the hook and copied its outputs.
+    assert!(copied_any, "no reads-only join copied its outputs");
+}

@@ -514,6 +514,12 @@ pub struct MorselBody {
     /// that many are kept, and a morsel stops once it alone holds that many; the morsels run are
     /// then a prefix of the table, so the first rows are the serial loop's.
     pub want: Option<u64>,
+    /// A join's body that is nothing but reads (lane qs6-13, T-QT.6.21): no ON or WHERE term left
+    /// past the hash keys and the tables' own `Predicate`s, every output a column or a rowid of
+    /// the joined row. Each output's place in the joined row (`None`: the probe row's rowid), so
+    /// a worker copies them and runs no code, when the connection's switch says so
+    /// ([`crate::Connection::set_parallel_join_direct`]).
+    pub direct: Option<Vec<Option<usize>>>,
 }
 
 /// Amphora: how [MorselAggregateData]'s joined rows come out (QT.6).

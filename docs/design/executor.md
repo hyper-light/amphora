@@ -569,6 +569,17 @@ RIGHT join the planner keeps as one, and semi and anti joins stay serial. T-QT.6
 LEFT, RIGHT and FULL joins, ON terms on either table or both beside the keys and WHERE terms that
 read the padded side's NULLs, against the serial loop at 1, 2, 3, 4 and 8 stated cores.
 
+**A body of nothing but reads** (lane qs6-13). Running the copied body on every joined row costs
+a simple join what the direct fold of lanes qs6-9 and qs6-10 did not: every column of every table
+written into registers and the body's code stepped, where the fold read only the columns its
+aggregates named. A join's body with no ON or WHERE term left past the hash keys and the tables'
+own `Predicate`s, and every output a column or a rowid of the joined row, gets `MorselBody::direct`,
+each output's place in the joined row (the very register the body's copy reads); with
+`Connection::set_parallel_join_direct` on, a worker copies those values and runs no code, `no_real`
+still checked. Off by default (the body runs, as lane qs6-12 left it) until the A/B decides:
+T-QT.6.20 times simple joins on 054ace65 (the fold) and here (body, and direct) at 1 to 32 cores,
+p50, p99 and p99.9; T-QT.6.21 checks direct against the serial loop. An outer join never copies.
+
 **Not yet.** Outer joins of more than two tables, and an outer join under a LIMIT.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
