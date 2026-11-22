@@ -53,7 +53,7 @@ mod watch;
 pub use guards::Guards;
 pub(crate) use guards::Owned;
 pub use online::SchemaChange;
-pub use replicated::{ReadMode, SessionCounters, Token};
+pub use replicated::{LogDisk, ReadMode, SessionCounters, Token};
 pub use restore::Restore;
 pub use watch::Watch;
 
@@ -125,6 +125,15 @@ struct Owner {
     key: Option<[u8; 32]>,
 }
 static OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Owner>>> = OnceLock::new();
+/// The opens of this process in flight: each took its lease under [`OWNERS`] and makes its
+/// database outside it, so opens of other databases run beside it (CP-T1.13). An open of a file
+/// one of them reserved, by its path or by another (a hard link, a second mount, a name the
+/// filesystem folds to the same), waits on [`OPENED`] until that open ends, then looks again: two
+/// opens of one database still take turns. One reservation holds one lease, a descriptor of the
+/// process's descriptor budget, so they are at most that budget's bound.
+static OPENING: Mutex<Vec<Reservation>> = Mutex::new(Vec::new());
+/// Signalled each time a reservation in [`OPENING`] ends, or an open starts waiting for one.
+static OPENED: Condvar = Condvar::new();
 /// The paths whose owner this process drained, the latest last. A lease there may still read held
 /// for a moment: a child this process forked shares it until its exec (local-owner-transport.md,
 /// "Owner guards", J1). A mark names a lease this process held, one descriptor of the process's
@@ -580,6 +589,129 @@ fn locked<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     m.lock()
         .map_err(|_| unavailable("a database response lock was poisoned"))
 }
+/// The owner table, locked once no open of this process in flight has reserved the file at
+/// `path`, and that file's identity: an open in flight there is waited for, woken when it ends, to
+/// the deadline (CP-T1.13).
+fn owners_unreserved(
+    path: &Path,
+    until: Instant,
+) -> Result<
+    (
+        std::sync::MutexGuard<'static, BTreeMap<PathBuf, Owner>>,
+        Option<amphora_engine::io::FileId>,
+    ),
+    Refusal,
+> {
+    loop {
+        let owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
+        let file = file_identity(path)?;
+        let lease = file_identity(&crate::transport::lease_file(path))?;
+        let mut opening = locked(&OPENING)?;
+        let mut reserved = None;
+        for reservation in opening.iter() {
+            if reservation.names(path, file, lease)? {
+                reserved = Some(reservation.path.clone());
+                break;
+            }
+        }
+        let Some(reserved) = reserved else {
+            return Ok((owners, file));
+        };
+        drop(owners);
+        let mut waiting = 0;
+        if let Some(reservation) = ongoing(&mut opening, &reserved) {
+            reservation.waiting = reservation.waiting.saturating_add(1);
+            waiting = reservation.waiting;
+        }
+        tracing::debug!(target: "amphora.records", event = "records.open_waits_for_open_in_flight", path = %path.display(), reserved = %reserved.display(), waiting, "an open of this file is in flight in this process: this one waits for it to end");
+        OPENED.notify_all();
+        while ongoing(&mut opening, &reserved).is_some() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                if let Some(reservation) = ongoing(&mut opening, &reserved) {
+                    reservation.waiting = reservation.waiting.saturating_sub(1);
+                }
+                return Err(Refusal::Timeout);
+            }
+            opening = OPENED
+                .wait_timeout(opening, left)
+                .map_err(|_| unavailable("a database response lock was poisoned"))?
+                .0;
+        }
+    }
+}
+
+/// The reservation of `path` in [`OPENING`], while its open is in flight.
+fn ongoing<'a>(opening: &'a mut [Reservation], path: &Path) -> Option<&'a mut Reservation> {
+    opening
+        .iter_mut()
+        .find(|reservation| reservation.path == path)
+}
+
+/// An open in flight, in [`OPENING`]: the path it reserved and what else names its file.
+struct Reservation {
+    path: PathBuf,
+    /// The database file's identity as it was reserved; None for one its open makes.
+    file: Option<amphora_engine::io::FileId>,
+    /// The identity of its lease's file, which every path to this database shares.
+    lease: Option<amphora_engine::io::FileId>,
+    /// The opens waiting for this one to end (records.open_waits_for_open_in_flight).
+    waiting: usize,
+}
+
+impl Reservation {
+    /// Whether an open of `path`, whose file and lease have these identities, reaches this
+    /// reservation's database: by its path, its lease, or its file, which the open in flight may
+    /// have made since it reserved it (a hard link to it made meanwhile).
+    fn names(
+        &self,
+        path: &Path,
+        file: Option<amphora_engine::io::FileId>,
+        lease: Option<amphora_engine::io::FileId>,
+    ) -> Result<bool, Refusal> {
+        if self.path == path || (lease.is_some() && lease == self.lease) {
+            return Ok(true);
+        }
+        let Some(file) = file else {
+            return Ok(false);
+        };
+        let reserved = match self.file {
+            Some(reserved) => Some(reserved),
+            None => file_identity(&self.path)?,
+        };
+        Ok(reserved == Some(file))
+    }
+}
+
+/// A path reserved in [`OPENING`] while its database is made; dropping it ends the reservation
+/// and wakes the opens waiting for it.
+struct Reserved(PathBuf);
+
+impl Reserved {
+    /// Reserves `path`, the lease of which the caller just took; the caller holds the owner table
+    /// and found no reservation naming the path's file.
+    fn take(path: &Path) -> Result<Self, Refusal> {
+        let reservation = Reservation {
+            path: path.to_path_buf(),
+            file: file_identity(path)?,
+            lease: file_identity(&crate::transport::lease_file(path))?,
+            waiting: 0,
+        };
+        locked(&OPENING)?.push(reservation);
+        Ok(Self(path.to_path_buf()))
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        OPENING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|reservation| reservation.path != self.0);
+        OPENED.notify_all();
+    }
+}
+
 fn locked_until<T>(m: &Mutex<T>, until: Instant) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     loop {
         if Instant::now() >= until {
@@ -745,9 +877,8 @@ impl Database {
                 }
                 return Err(Refusal::Timeout);
             }
-            let mut owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
+            let (mut owners, identity) = owners_unreserved(&path, until)?;
             forget_drained(&mut owners)?;
-            let identity = file_identity(&path)?;
             if let Some(owner) = owners.get(&path).or_else(|| {
                 identity.and_then(|id| owners.values().find(|owner| owner.identity == Some(id)))
             }) {
@@ -881,9 +1012,14 @@ impl Database {
             }
             let key = guards.as_ref().map(Guards::key);
             let owner = Owned::new(Arc::new(lease), descriptor, guards);
+            // The lease is this open's: reserve the path and make the database outside the owner
+            // table, so other databases' opens go on meanwhile (CP-T1.13).
+            let reserved = Reserved::take(&path)?;
+            drop(owners);
             let database = create(&path, owner.clone())?;
             remote::publish(&database, &path)?;
             let identity = file_identity(&path)?;
+            let mut owners = locked(OWNERS.get_or_init(Mutex::default))?;
             owners.insert(
                 path,
                 Owner {
@@ -893,6 +1029,7 @@ impl Database {
                     key,
                 },
             );
+            drop(reserved);
             return Ok(database);
         }
     }
@@ -1056,6 +1193,17 @@ impl Database {
                 })
             },
         )
+    }
+
+    /// Sets the disk under the replicated log open at `log_path` as a fire drill says (CP-T1.13,
+    /// T-T1.13.1; `amphora serve`'s `disk cut|hang|back`): cut, every read, write and flush of that
+    /// log fails with an I/O error and its replica fences on the first, as when a real disk goes
+    /// away; hung, each waits until the disk is back or cut, as when a disk stops answering; a
+    /// member opened again finds its disk back. The member's database files aren't touched: every
+    /// write is made durable in the log first. Refused when no replicated log of this process is
+    /// open at `log_path`.
+    pub fn set_log_disk(log_path: &Path, disk: LogDisk) -> Result<(), Refusal> {
+        replicated::set_disk(&resolved_path(log_path)?, disk)
     }
 
     pub fn replica(&self) -> Option<crate::replication::ReplicaHandle> {
@@ -2593,6 +2741,109 @@ pub(crate) fn in_child(test: &str) -> bool {
         .unwrap();
     assert!(status.success(), "{test} in a child process: {status}");
     false
+}
+
+#[cfg(test)]
+mod owner_table {
+    use super::*;
+
+    /// The opens in flight that have reached their database's making, and the event of one more.
+    #[derive(Default)]
+    struct Meeting {
+        arrived: Mutex<usize>,
+        event: Condvar,
+    }
+
+    impl Meeting {
+        /// Counts this open in, then waits, to `until`, for `all` opens to be making their
+        /// databases at once: whether they all were.
+        fn meet(&self, all: usize, until: Instant) -> bool {
+            let mut arrived = self.arrived.lock().unwrap();
+            *arrived += 1;
+            self.event.notify_all();
+            while *arrived < all {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                arrived = self.event.wait_timeout(arrived, left).unwrap().0;
+            }
+            true
+        }
+    }
+
+    /// Do: open N databases at once in one process, each open waiting, while it makes its
+    /// database, for every other to be making its own. Expect: they all meet, so the opens ran
+    /// at the same time; with the owner table held through an open, the first would wait alone
+    /// (CP-T1.13: one process's opens no longer take turns).
+    #[test]
+    fn cp_t1_13_opens_of_different_databases_overlap() {
+        const N: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let meeting = Arc::new(Meeting::default());
+        let until = Instant::now() + crate::transport::HANG;
+        let opens: Vec<_> = (0..N)
+            .map(|i| {
+                let path = dir.path().join(format!("db-{i}"));
+                let meeting = Arc::clone(&meeting);
+                std::thread::spawn(move || {
+                    let mut met = false;
+                    let database = Database::open_owned(&path, until, false, None, |_| {
+                        met = meeting.meet(N, until);
+                        Ok(())
+                    });
+                    (database.is_ok(), met)
+                })
+            })
+            .collect();
+        for open in opens {
+            assert_eq!(open.join().unwrap(), (true, true));
+        }
+    }
+
+    /// Do: while an open of a database is in flight, link its file under a second name and open
+    /// it by that name. Expect: the second open waits for the first, then shares its owner; it is
+    /// neither refused as a hard-linked file nor a second owner of one file (CP-T1.13: a
+    /// reservation names the file, not only the path the first open took).
+    #[test]
+    fn cp_t1_13_an_open_by_a_hard_link_waits_for_the_open_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let link = dir.path().join("link");
+        let until = Instant::now() + crate::transport::HANG;
+        let second_done = Arc::new(AtomicBool::new(false));
+        let mut second = None;
+        let mut waited = false;
+        let first = Database::open_owned(&path, until, false, None, |_| {
+            std::fs::hard_link(&path, &link).map_err(unavailable)?;
+            let reserved = resolved_path(&path)?;
+            let (link, done) = (link.clone(), Arc::clone(&second_done));
+            second = Some(std::thread::spawn(move || {
+                let database = Database::open(&link, until);
+                done.store(true, Ordering::Release);
+                OPENED.notify_all();
+                database
+            }));
+            // Wait for the second open to wait on this one's reservation, or to end without.
+            let mut opening = locked(&OPENING)?;
+            loop {
+                let waiting = ongoing(&mut opening, &reserved).map_or(0, |r| r.waiting);
+                if waiting > 0 || second_done.load(Ordering::Acquire) {
+                    waited = waiting > 0;
+                    return Ok(());
+                }
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(());
+                }
+                opening = OPENED.wait_timeout(opening, left).unwrap().0;
+            }
+        })
+        .unwrap();
+        let second = second.unwrap().join().unwrap().unwrap();
+        assert!(waited, "the second open did not wait for the first");
+        assert!(Arc::ptr_eq(&first.shared, &second.shared));
+    }
 }
 
 #[cfg(test)]

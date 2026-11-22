@@ -14,10 +14,6 @@ use std::time::{Duration, Instant};
 
 use amphora::serve::{self, Client, Config};
 
-/// One test's members at a time: one process's opens take turns under its owner table, so two
-/// tests' members opening together would spend each other's deadlines.
-static ONE_CLUSTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -55,16 +51,11 @@ fn healthy(c: &Config) -> String {
 
 #[test]
 fn t_t1_13_1_three_members_elect_refuse_strangers_and_lose_nothing_split() {
-    let _one = ONE_CLUSTER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let configs = three(dir.path());
     let (tx, rx) = std::sync::mpsc::channel();
-    // Each member starts once the one before it listens. One process's opens take turns (its owner
-    // table is held across each open), so started together the last would spend its own deadline
-    // on the others' opens; started on the event, each open has its whole deadline, as one member
-    // per process does in production.
+    // Each member starts once the one before it listens, as one member per process does in
+    // production. (One process's opens of different databases no longer take turns, CP-T1.13.)
     for c in configs.clone() {
         let tx = tx.clone();
         let (up, listening) = std::sync::mpsc::channel();
@@ -123,9 +114,6 @@ fn t_t1_13_1_three_members_elect_refuse_strangers_and_lose_nothing_split() {
 /// two left keep the majority. The cluster the config then names is healthy and holds every write.
 #[test]
 fn t_t1_13_1_a_region_lost_is_replaced_by_a_spare() {
-    let _one = ONE_CLUSTER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let secret = dir.path().join("secret");
     std::fs::write(
@@ -218,4 +206,291 @@ deadline_ms = 5000
         assert!(Instant::now() < until, "the spare never held both writes");
         std::thread::yield_now();
     }
+}
+
+/// One member started on its own, and a client's `leader` request to it (CP-T1.13): with one of
+/// three voters up there is no leader, so a request whose deadline passes is refused, and one made
+/// then is answered, with the leader's ID and address, once the other two start and the group
+/// elects. The answer comes from the step that names the leader: no client retries, no polling.
+#[test]
+fn cp_t1_13_a_leader_request_made_during_an_election_is_answered_once_it_is_chosen() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    let start = |c: Config| {
+        let (up, listening) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let node = c.node;
+            let ended = serve::serve(&c, move |_| {
+                let _ = up.send(());
+            });
+            eprintln!("member {node} ended: {ended:?}");
+        });
+        listening.recv().unwrap();
+    };
+    start(configs[0].clone());
+    let c = &configs[0];
+    let secret = c.secret().unwrap();
+
+    // One voter of three can't elect: a wait that ends first is refused with its reason.
+    let alone = Client::connect(&c.members[0].addr, &secret, c.deadline)
+        .unwrap()
+        .leader(Duration::from_millis(1));
+    let why = format!("{:#}", alone.unwrap_err());
+    assert!(why.contains("no leader within 1 ms"), "{why}");
+
+    // A request made while no leader can be chosen, answered once one is.
+    let mut waiting = Client::connect(&c.members[0].addr, &secret, c.deadline).unwrap();
+    let (sent, answered) = std::sync::mpsc::channel();
+    let (asking, asked) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = asking.send(());
+        let _ = sent.send(waiting.leader(Duration::from_secs(60)));
+    });
+    asked.recv().unwrap();
+    assert!(
+        answered.try_recv().is_err(),
+        "answered before a majority was up"
+    );
+    for m in configs[1..].iter().cloned() {
+        start(m);
+    }
+    let (id, addr) = answered.recv().unwrap().unwrap();
+    let leader = c
+        .members
+        .iter()
+        .find(|m| m.node == id)
+        .unwrap_or_else(|| panic!("leader {id} isn't a member"));
+    assert_eq!(addr, leader.addr);
+
+    // Another member, asked once the group has a leader, names the one it follows.
+    let (again, _) = Client::connect(&c.members[1].addr, &secret, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+    assert!(configs.iter().any(|m| m.node == again), "{again}");
+}
+
+/// A disk cut under load (T-T1.13.1, AC-T1.13.5): the leader's log disk goes away while writers
+/// write; its replica fences on the first refused write or flush and the member ends, naming the
+/// disk; the two left elect, keep taking writes, and hold every write acknowledged before, during
+/// and after the cut. (Started again, a member finds its disk back and catches up from its own
+/// durable log: scripts/drills.sh's `disk` drill, one member per process.)
+#[test]
+fn t_t1_13_1_a_leaders_disk_cut_under_load_loses_no_acknowledged_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    let mut ended = std::collections::BTreeMap::new();
+    for c in configs.clone() {
+        let (up, listening) = std::sync::mpsc::channel();
+        let (end, ends) = std::sync::mpsc::channel();
+        let node = c.node;
+        std::thread::spawn(move || {
+            let _ = end.send(serve::serve(&c, move |_| {
+                let _ = up.send(());
+            }));
+        });
+        listening.recv().unwrap();
+        ended.insert(node, ends);
+    }
+    let c = &configs[0];
+    healthy(c);
+    let secret = c.secret().unwrap();
+    let (leader, addr) = Client::connect(&c.members[0].addr, &secret, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+
+    // Writes before the cut, then the leader's disk cut while two writers write through it.
+    let before = dir.path().join("before");
+    serve::load(c, "before", 2, Duration::from_millis(200), &before).unwrap();
+    Client::connect(&addr, &secret, c.deadline)
+        .unwrap()
+        .ask("disk cut")
+        .unwrap();
+    let during = dir.path().join("during");
+    let summary = serve::load(c, "during", 2, Duration::from_secs(2), &during).unwrap();
+
+    // The cut member ended on its own, fenced (the receive's bound is a hang guard).
+    let why = ended[&leader]
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the member whose disk was cut never ended");
+    let why = why.expect_err("a member whose disk was cut ran on");
+    eprintln!("member {leader} ended: {why:#}");
+
+    // Every acknowledged write, before and during the cut, on both members left.
+    let mut left = c.clone();
+    left.voters = configs
+        .iter()
+        .map(|m| m.node)
+        .filter(|n| *n != leader)
+        .collect();
+    for ledger in [&before, &during] {
+        let (report, ok) = serve::check(&left, ledger, Duration::from_secs(60)).unwrap();
+        assert!(ok, "{summary}{report}");
+        assert!(report.contains("nothing lost"), "{report}");
+    }
+    let acked: u64 = std::fs::read_to_string(&during)
+        .unwrap()
+        .lines()
+        .map(|l| l.split_whitespace().nth(2).unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert!(acked > 0, "the two left took no writes: {summary}");
+}
+
+/// A disk hung under load (T-T1.13.1, AC-T1.13.5): the leader's log disk stops answering while
+/// writers write, its network going on (so it can keep its lease while nothing it takes becomes
+/// durable), then comes back; every acknowledged write is then on every member.
+#[test]
+fn t_t1_13_1_a_leaders_disk_hung_under_load_loses_no_acknowledged_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    for c in configs.clone() {
+        let (up, listening) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let node = c.node;
+            let ended = serve::serve(&c, move |_| {
+                let _ = up.send(());
+            });
+            eprintln!("member {node} ended: {ended:?}");
+        });
+        listening.recv().unwrap();
+    }
+    let c = configs[0].clone();
+    healthy(&c);
+    let secret = c.secret().unwrap();
+    let (_, addr) = Client::connect(&c.members[0].addr, &secret, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+    let mut leader = Client::connect(&addr, &secret, c.deadline).unwrap();
+    let ledger = dir.path().join("hang");
+    let load = {
+        let (c, ledger) = (c.clone(), ledger.clone());
+        std::thread::spawn(move || serve::load(&c, "hang", 2, Duration::from_secs(3), &ledger))
+    };
+    leader.ask("disk hang").unwrap();
+    // The fault's length, not an assertion: the disk stays hung for one second of the load.
+    std::thread::sleep(Duration::from_secs(1));
+    leader.ask("disk back").unwrap();
+    let summary = load.join().unwrap().unwrap();
+    healthy(&c);
+    let (report, ok) = serve::check(&c, &ledger, Duration::from_secs(60)).unwrap();
+    assert!(ok, "{summary}{report}");
+    assert!(report.contains("nothing lost"), "{report}");
+}
+
+/// A refused log write ends the member (CP-T1.13, T-T1.13.1), traced through the replica: a lone
+/// voter's log disk cut, its next write fails at hyper-log (the device's I/O error, `Fault::Failed`),
+/// hyper-durable fences the replica on it, the owner ends on the fence, and the drain the member's
+/// sender waits in (`ReplicaHandle::drain_wait`, `serve`'s loop) answers Fenced at once, woken by
+/// the fence, not at its deadline, so `serve` returns and the process ends.
+#[test]
+fn t_t1_13_1_a_refused_log_write_ends_the_replica_and_wakes_its_drain() {
+    use amphora::database::{Database, LogDisk};
+    use amphora_api::{Refusal, replication::ReplicaConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("raft.log");
+    // A hang guard on the calls; the drain's deadline is the one the verdict reads.
+    let until = || Instant::now() + Duration::from_secs(600);
+    let config = ReplicaConfig {
+        node_id: 1,
+        voters: vec![1],
+        learners: vec![],
+        bootstrap: None,
+    };
+    let db =
+        Database::open_replicated(&dir.path().join("state.db"), &log, config, until()).unwrap();
+    let handle = db.replica().unwrap();
+    handle.wait_leader(0, until()).unwrap();
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t(v INTEGER); INSERT INTO t VALUES(1)")?;
+        Ok(())
+    })
+    .unwrap();
+
+    // The member's sender waits for its next record; a lone voter sends none.
+    let drain_until = until();
+    let (waiting, waits) = std::sync::mpsc::channel();
+    let drain = {
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            waiting.send(()).unwrap();
+            let drained = handle.drain_wait(1, drain_until);
+            (drained, Instant::now())
+        })
+    };
+    waits.recv().unwrap();
+
+    Database::set_log_disk(&log, LogDisk::Cut).unwrap();
+    let refused = db.call(until(), |c| {
+        c.execute_batch("INSERT INTO t VALUES(2)")?;
+        Ok(())
+    });
+    // Fenced, or UnknownOutcome when the fence ends the owner with the write pending.
+    assert!(
+        matches!(refused, Err(Refusal::Fenced(_) | Refusal::UnknownOutcome)),
+        "a write on a cut disk: {refused:?}"
+    );
+    let (drained, at) = drain.join().unwrap();
+    assert!(
+        matches!(&drained, Err(Refusal::Fenced(_))),
+        "the drain of a fenced replica: {drained:?}"
+    );
+    assert!(
+        at < drain_until,
+        "the drain waited out its deadline: the fence didn't wake it"
+    );
+    let ended = handle.status();
+    assert!(
+        matches!(&ended, Err(Refusal::Fenced(_))),
+        "the replica's status after the refused write: {ended:?}"
+    );
+}
+
+/// A hung disk waits with no time limit, so only a drill cluster may ask for one (CP-T1.13,
+/// T-T1.13.1): a member whose config says `drills = off` refuses `disk` (and `cut`), naming the
+/// switch, and its log's disk is untouched: its writes go on.
+#[test]
+fn t_t1_13_1_a_member_without_drills_refuses_the_disk_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret");
+    std::fs::write(&secret, "0123456789abcdef0123456789abcdef-test-secret\n").unwrap();
+    let text = format!(
+        "node = 1\nmembers = 1@127.0.0.1:{}\ndata = {}\nclass = persisted\nsecret_file = {}\ndeadline_ms = 5000\ndrills = off\n",
+        free_port(),
+        dir.path().join("m1").display(),
+        secret.display()
+    );
+    let c = Config::parse(&text).unwrap();
+    assert!(!c.drills);
+    let (up, listening) = std::sync::mpsc::channel();
+    {
+        let c = c.clone();
+        std::thread::spawn(move || {
+            let ended = serve::serve(&c, move |_| {
+                let _ = up.send(());
+            });
+            eprintln!("member 1 ended: {ended:?}");
+        });
+    }
+    listening.recv().unwrap();
+    let secret = c.secret().unwrap();
+    let mut member = Client::connect(&c.members[0].addr, &secret, c.deadline).unwrap();
+    member.leader(Duration::from_secs(60)).unwrap();
+    for request in ["disk hang", "disk cut", "disk back", "cut on"] {
+        let refused = member
+            .ask(request)
+            .expect_err("a member without drills took a drill's request");
+        assert!(
+            format!("{refused:#}").contains("drills are off"),
+            "{request}: {refused:#}"
+        );
+    }
+    member
+        .ask("exec CREATE TABLE t(v INTEGER); INSERT INTO t VALUES(1)")
+        .unwrap();
+    assert_eq!(
+        member.ask("count SELECT count(*) FROM t").unwrap().trim(),
+        "1"
+    );
 }

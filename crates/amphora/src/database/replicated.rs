@@ -58,7 +58,7 @@ pub use tokens::{ReadMode, Served, SessionCounters, Token};
 
 /// One of the floor's own sessions: the work it does on the database at its base.
 type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
-type Durable<F = DeviceFile> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
+type Durable<F = LogDevice> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
 type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 
 /// A bounded ingress and egress handle. Clones share one product-owned Raft actor.
@@ -331,6 +331,16 @@ impl Control {
             .and_then(|listener| listener.clone());
         if let Some(waker) = waker {
             waker.wake();
+        }
+    }
+    /// Wakes the senders waiting in [`ReplicaHandle::drain_wait`] for a status just published that
+    /// fenced or ended (CP-T1.13): under the outgoing lock, which a drain holds as it reads the
+    /// status, so none misses it. Called with the status lock released (a drain takes the two in
+    /// that order). A poisoned lock leaves no waiter: its drain fails on that poison.
+    fn fenced_to_senders(&self) {
+        if let Ok(outgoing) = self.outgoing.lock() {
+            self.sent.notify_all();
+            drop(outgoing);
         }
     }
 }
@@ -766,7 +776,7 @@ enum Phase {
         index: u64,
     },
 }
-struct Actor<F: BlockFile + 'static = DeviceFile> {
+struct Actor<F: BlockFile + 'static = LogDevice> {
     replica: Durable<F>,
     // Keep the log owner and its exclusive lease until the replica has drained/dropped.
     _log: hyper_log::Log<F>,
@@ -1302,11 +1312,22 @@ impl ReplicaHandle {
     }
 
     /// As [`Self::drain`], waiting until `until` for a record when none waits: a host's sender
-    /// waits here rather than spinning (`crate::serve`, CP-T1.13).
+    /// waits here rather than spinning (`crate::serve`, CP-T1.13). With none waiting, refused
+    /// Fenced at once while the replica is fenced, and with the owner's reason once it ended: the
+    /// owner rings `sent` when it publishes either (`Control::fenced_to_senders`), so a fenced
+    /// member's sender hears it then, not at `until`.
     pub fn drain_wait(&self, limit: usize, until: Instant) -> Result<Vec<Outbound>, Refusal> {
         {
             let mut outgoing = locked(&self.shared.outgoing)?;
-            while outgoing.messages.is_empty() && locked(&self.shared.status)?.is_ok() {
+            while outgoing.messages.is_empty() {
+                match &*locked(&self.shared.status)? {
+                    Err(ended) => return Err(ended.clone()),
+                    Ok(s) => {
+                        if let Some(reason) = &s.fenced {
+                            return Err(fenced(reason));
+                        }
+                    }
+                }
                 let left = until.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     break;
@@ -1614,9 +1635,209 @@ fn open(
         hyper_block::buf::Alignment::new(4096).map_err(unavailable)?,
     )
     .map_err(unavailable)?;
+    let file = LogDevice {
+        file,
+        disk: disk_switch(log_path)?,
+    };
     open_on(
         machine, log_owner, file, config, durability, changed, lease, until, clock,
     )
+}
+
+/// Each open replicated log's disk switch, by its path as the open resolved it (CP-T1.13,
+/// T-T1.13.1: the fire drills' cut and hung disks). An open puts a fresh switch, the disk there, in
+/// place of its path's last: a member started again finds its disk back. Bounded by the logs open
+/// now: a switch no log holds any more is dropped when the next is put in.
+static DISKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<DiskSwitch>>>> = OnceLock::new();
+
+/// What a fire drill does to a member's log disk ([`Database::set_log_disk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDisk {
+    /// The disk there: every operation the file's own.
+    Back,
+    /// The disk hung: every operation waits, its thread with it, until the disk is back or cut,
+    /// as a disk that stops answering holds them; the member's network and clock go on.
+    Hung,
+    /// The disk gone: every operation fails with an I/O error, and the replica fences on the
+    /// first, as it does when a real disk goes away.
+    Cut,
+}
+
+/// One log's disk as a drill set it: read with one relaxed load per operation, waited on only
+/// while hung, woken when it is set again.
+struct DiskSwitch {
+    now: std::sync::atomic::AtomicU8,
+    set: Mutex<()>,
+    moved: Condvar,
+}
+
+impl DiskSwitch {
+    const BACK: u8 = 0;
+    const HUNG: u8 = 1;
+    const CUT: u8 = 2;
+
+    fn set(&self, disk: LogDisk) -> Result<(), Refusal> {
+        let held = locked(&self.set)?;
+        self.now.store(
+            match disk {
+                LogDisk::Back => Self::BACK,
+                LogDisk::Hung => Self::HUNG,
+                LogDisk::Cut => Self::CUT,
+            },
+            Ordering::Release,
+        );
+        // Under the lock, so no operation that saw the disk hung misses its change.
+        self.moved.notify_all();
+        drop(held);
+        Ok(())
+    }
+
+    /// Whether `op` may go to the disk now: at once while it is there, an error once it is cut,
+    /// and while it hangs, a wait for the next setting.
+    fn pass(&self, op: &'static str) -> Result<(), hyper_block::DiskError> {
+        let cut = || hyper_block::DiskError::Io {
+            op,
+            path: PathBuf::new(),
+            source: std::io::Error::other("the disk is cut (a fire drill)"),
+        };
+        let poisoned = || hyper_block::DiskError::Io {
+            op,
+            path: PathBuf::new(),
+            source: std::io::Error::other("a disk switch's lock was poisoned"),
+        };
+        match self.now.load(Ordering::Acquire) {
+            Self::BACK => return Ok(()),
+            Self::CUT => return Err(cut()),
+            _ => {}
+        }
+        let mut held = self.set.lock().map_err(|_| poisoned())?;
+        while self.now.load(Ordering::Acquire) == Self::HUNG {
+            held = self.moved.wait(held).map_err(|_| poisoned())?;
+        }
+        drop(held);
+        match self.now.load(Ordering::Acquire) {
+            Self::CUT => Err(cut()),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn disk_switch(log_path: &Path) -> Result<Arc<DiskSwitch>, Refusal> {
+    let mut disks = locked(DISKS.get_or_init(Mutex::default))?;
+    disks.retain(|_, disk| Arc::strong_count(&*disk) > 1);
+    let disk = Arc::new(DiskSwitch {
+        now: std::sync::atomic::AtomicU8::new(DiskSwitch::BACK),
+        set: Mutex::new(()),
+        moved: Condvar::new(),
+    });
+    disks.insert(log_path.to_path_buf(), Arc::clone(&disk));
+    Ok(disk)
+}
+
+/// Sets the disk under the replicated log open at `log_path` (resolved as its open resolved it).
+/// Refused when no log is open there.
+pub(super) fn set_disk(log_path: &Path, disk: LogDisk) -> Result<(), Refusal> {
+    let switch = {
+        let disks = locked(DISKS.get_or_init(Mutex::default))?;
+        disks
+            .get(log_path)
+            .filter(|switch| Arc::strong_count(*switch) > 1)
+            .cloned()
+            .ok_or_else(|| api::invalid("log path", "no replicated log is open there"))?
+    };
+    switch.set(disk)
+}
+
+/// The system's device file under a member's log, and its disk switch ([`set_disk`]): every
+/// operation the file's own while the disk is there, one relaxed load past it.
+pub(super) struct LogDevice {
+    file: DeviceFile,
+    disk: Arc<DiskSwitch>,
+}
+
+impl LogDevice {
+    fn up(&self, op: &'static str) -> Result<(), hyper_block::DiskError> {
+        self.disk.pass(op)
+    }
+}
+
+impl BlockFile for LogDevice {
+    fn alignment(&self) -> hyper_block::buf::Alignment {
+        self.file.alignment()
+    }
+    fn layout_block(&self) -> hyper_block::buf::Alignment {
+        BlockFile::layout_block(&self.file)
+    }
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        self.up("a length")?;
+        BlockFile::len(&self.file)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.up("a read")?;
+        BlockFile::read_exact_at(&self.file, buf, offset)
+    }
+    fn read_resident_at(
+        &mut self,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<bool, hyper_block::DiskError> {
+        self.up("a read")?;
+        BlockFile::read_resident_at(&mut self.file, buf, offset)
+    }
+    fn reads_resident(&self) -> bool {
+        BlockFile::reads_resident(&self.file)
+    }
+    fn residency(&self) -> hyper_block::Residency {
+        BlockFile::residency(&self.file)
+    }
+    fn set_residency_shadow(&mut self, on: bool) {
+        BlockFile::set_residency_shadow(&mut self.file, on);
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.up("a write")?;
+        BlockFile::write_all_at(&self.file, buf, offset)
+    }
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+        self.up("a flush")?;
+        BlockFile::sync_data(&self.file)
+    }
+    fn fills_new_space(&self) -> bool {
+        BlockFile::fills_new_space(&self.file)
+    }
+    fn grows_by_segments(&self) -> bool {
+        BlockFile::grows_by_segments(&self.file)
+    }
+    fn grow(&self, len: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+        self.up("a growth")?;
+        BlockFile::grow(&self.file, len)
+    }
+    fn write_whole(
+        &self,
+        offset: u64,
+        copies: u64,
+        fill: &[u8],
+    ) -> Result<(), hyper_block::DiskError> {
+        self.up("a write")?;
+        BlockFile::write_whole(&self.file, offset, copies, fill)
+    }
+    fn segment_end(&self, offset: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+        self.up("a segment's end")?;
+        BlockFile::segment_end(&self.file, offset)
+    }
+    fn write_durable_at(
+        &self,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<hyper_block::block::Durable, hyper_block::DiskError> {
+        self.up("a durable write")?;
+        BlockFile::write_durable_at(&self.file, buf, offset)
+    }
+    fn try_clone(&self) -> Result<Self, hyper_block::DiskError> {
+        Ok(Self {
+            file: BlockFile::try_clone(&self.file)?,
+            disk: Arc::clone(&self.disk),
+        })
+    }
 }
 
 /// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
@@ -2080,6 +2301,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         // A host waiting on its listener hears the owner ended: its drain now answers the reason.
         self.control.listened();
+        // So do the member's senders, waiting for its next record (CP-T1.13).
+        self.control.fenced_to_senders();
         // Local reads end with the owner: none opens again, and the idle readers let its lease go.
         self.control.local.release();
         // Reads waiting for a closed time hear it ended (under the lock, so none misses it).
@@ -2346,16 +2569,23 @@ impl<F: BlockFile + 'static> Actor<F> {
         let entries = self.replica.applied().index.saturating_sub(applied);
         let took = (self.clock)().saturating_duration_since(at);
         self.spacing.stepped(entries, took, queued)?;
-        {
-            let now = status(&self.replica);
+        let now = status(&self.replica);
+        let fencing = {
             let mut published = locked(&self.control.status)?;
             let led = leads_otherwise(&published, &now);
+            let fencing =
+                now.fenced.is_some() && !matches!(&*published, Ok(was) if was.fenced.is_some());
             *published = Ok(now);
             // Leader waiters wake on the step that names another leader, term or fence, never on
             // a timer.
             if led {
                 self.control.led.notify_all();
             }
+            fencing
+        };
+        // The member's senders wake on the step that fences, as on the owner's end (CP-T1.13).
+        if fencing {
+            self.control.fenced_to_senders();
         }
         self.publish_closed()?;
         let commits = self.replica.core().raft.commit_stats();
@@ -4916,7 +5146,7 @@ mod tests {
     /// steps, or from a call's work while the owner runs it. Its instants start an hour past the
     /// real clock, so a real-clock check of a test deadline (a receipt's poll) holds for an hour:
     /// a hang guard, never a verdict.
-    struct Driven<F: BlockFile + 'static = DeviceFile> {
+    struct Driven<F: BlockFile + 'static = LogDevice> {
         // Each member's owner, by member order; none while a test has cut its power.
         owners: Vec<Option<(Actor<F>, mpsc::Receiver<Envelope>)>>,
         base: Instant,
