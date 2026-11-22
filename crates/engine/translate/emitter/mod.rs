@@ -214,7 +214,7 @@ pub struct Resolver<'a> {
     outer_probe: crate::OuterJoinProbe,
     /// Amphora (QT.6, lane qs6-16): whether a table read by a seek may be a morsel join's hash
     /// link (`Connection::set_parallel_searched_links`).
-    searched_links: bool,
+    searched_links: crate::SearchedLinks,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
@@ -357,7 +357,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
             outer_probe: crate::OuterJoinProbe::Padded,
-            searched_links: false,
+            searched_links: crate::SearchedLinks::Off,
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
@@ -469,12 +469,12 @@ impl<'a> Resolver<'a> {
         self.outer_probe = probe;
     }
 
-    pub(crate) fn searched_links(&self) -> bool {
+    pub(crate) fn searched_links(&self) -> crate::SearchedLinks {
         self.searched_links
     }
 
-    pub(crate) fn set_searched_links(&mut self, on: bool) {
-        self.searched_links = on;
+    pub(crate) fn set_searched_links(&mut self, links: crate::SearchedLinks) {
+        self.searched_links = links;
     }
 
     pub(crate) fn sorted_fetches(&self) -> bool {

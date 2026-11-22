@@ -2864,8 +2864,11 @@ impl Database {
             morsel_join_links: AtomicU64::new(0),
             morsel_join_direct_rows: AtomicU64::new(0),
             morsel_outer: crate::vdbe::morsel_scan::OuterCounters::default(),
-            parallel_searched_links: AtomicBool::new(false),
+            parallel_searched_links: crate::connection::AtomicSearchedLinks::new(
+                crate::connection::SearchedLinks::Off,
+            ),
             morsel_searched_links: AtomicU64::new(0),
+            morsel_seek_links: AtomicU64::new(0),
             vectorized_scans: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),

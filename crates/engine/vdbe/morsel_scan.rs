@@ -17,8 +17,9 @@
 use std::ops::Range;
 
 use super::morsel::{
-    execute, execute_at, Degree, HashProbe, MachineCosts, MemoryBudget, MorselError, ParallelMode,
-    PartitionedTable, Partitioner, Pipeline, Predicate, RunStats, ScanAggregate, Scattered,
+    execute, execute_at, key_part, Degree, HashProbe, KeyPart, MachineCosts, MemoryBudget,
+    MorselError, ParallelMode, PartitionedTable, Partitioner, Pipeline, Predicate, RunStats,
+    ScanAggregate, Scattered,
 };
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::{PageRef, Pager};
@@ -224,6 +225,53 @@ impl TableSource {
             io.block(|| cursor.next()).map_err(storage)?;
         }
         Ok(())
+    }
+
+    /// A cursor of the caller's own on the table, for [`TableSource::seek_row`] (lane qs6-16).
+    pub fn cursor(&self) -> BTreeCursor {
+        BTreeCursor::new_table(self.pager.clone(), self.root, self.columns)
+    }
+
+    /// Reads the row `rowid` into `row` through `cursor` (one of [`TableSource::cursor`]'s), its
+    /// columns as [`TableSource::scan`] gives them; false when the table has no such row.
+    pub fn seek_row(
+        &self,
+        cursor: &mut BTreeCursor,
+        rowid: i64,
+        row: &mut Vec<Value>,
+    ) -> Result<bool, MorselError> {
+        let io = &self.pager.io;
+        let found = io
+            .block(|| cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }))
+            .map_err(storage)?;
+        if !matches!(found, SeekResult::Found) {
+            return Ok(false);
+        }
+        let values = io
+            .block(|| {
+                Ok(match cursor.record()? {
+                    IOResult::Done(Some(record)) => {
+                        IOResult::Done(Some(record.get_values_owned()?))
+                    }
+                    IOResult::Done(None) => IOResult::Done(None),
+                    IOResult::IO(wait) => IOResult::IO(wait),
+                })
+            })
+            .map_err(storage)?
+            .ok_or(MorselError::Corrupt("a row has no record"))?;
+        row.clear();
+        row.try_reserve(self.columns)?;
+        row.extend(values.into_iter().take(self.columns));
+        // A column added after the row was written reads as NULL.
+        row.resize(self.columns, Value::Null);
+        if let Some(at) = self.rowid_alias {
+            let slot = row.get_mut(at).ok_or(MorselError::NoColumn {
+                column: at,
+                width: self.columns,
+            })?;
+            *slot = Value::from_i64(rowid);
+        }
+        Ok(true)
     }
 
     /// Every row in rowid order, read on the caller's thread: a hash join's build side.
@@ -1016,6 +1064,97 @@ impl TableBuild<'_> {
 pub struct JoinStage<'a> {
     pub probe: HashProbe<'a>,
     pub rows: Vec<Vec<Value>>,
+    /// A link read by a rowid seek per joined row instead of its hash table (lane qs6-16,
+    /// `SearchedLinks::Seek`); `probe` and `rows` are then empty. Inner joins only.
+    pub seek: Option<SeekLink>,
+}
+
+/// A link read by a seek per joined row (lane qs6-16): its table's row whose rowid is the joined
+/// row's value at `rowid_at`, a match when its other key pairs are equal as the hash table's keys
+/// are (`key_part`: no NULL matches, an integral REAL is its INTEGER) and its own terms hold. A
+/// rowid is unique, so a joined row has one match at most.
+pub struct SeekLink {
+    pub table: TableSource,
+    pub rowid_at: usize,
+    /// The other key pairs: a place in the joined row and the link's column.
+    pub also: Vec<(usize, usize)>,
+    pub filter: Vec<Predicate>,
+}
+
+/// A worker's cursor and row for each seek link of a chain, by the link's place (lane qs6-16).
+pub struct SeekSlot {
+    cursor: Option<BTreeCursor>,
+    row: Vec<Value>,
+}
+
+/// One empty slot per link of `stages`.
+fn seek_slots(stages: &[JoinStage<'_>]) -> Result<Vec<SeekSlot>, MorselError> {
+    let mut slots = Vec::new();
+    slots.try_reserve_exact(stages.len())?;
+    slots.extend(stages.iter().map(|_| SeekSlot {
+        cursor: None,
+        row: Vec::new(),
+    }));
+    Ok(slots)
+}
+
+const ONE_MATCH: &[usize] = &[0];
+const NO_MATCH: &[usize] = &[];
+
+impl SeekLink {
+    /// Whether the joined row `joined` has its match, read into `slot.row`.
+    fn find(&self, slot: &mut SeekSlot, joined: &[Value]) -> Result<bool, MorselError> {
+        let sought = joined.get(self.rowid_at).ok_or(MorselError::NoColumn {
+            column: self.rowid_at,
+            width: joined.len(),
+        })?;
+        let KeyPart::Int(rowid) = key_part(sought) else {
+            return Ok(false);
+        };
+        let cursor = slot.cursor.get_or_insert_with(|| self.table.cursor());
+        if !self.table.seek_row(cursor, rowid, &mut slot.row)? {
+            return Ok(false);
+        }
+        for (at, column) in &self.also {
+            let (Some(a), Some(b)) = (joined.get(*at), slot.row.get(*column)) else {
+                return Err(MorselError::NoColumn {
+                    column: *column,
+                    width: slot.row.len(),
+                });
+            };
+            let a = key_part(a);
+            if matches!(a, KeyPart::Null) || a != key_part(b) {
+                return Ok(false);
+            }
+        }
+        for term in &self.filter {
+            if !term.holds(&slot.row)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// The matches of link `level` (`stage`) for the joined row so far: its hash table's, or its
+/// seek's one (lane qs6-16).
+fn stage_matches<'s>(
+    stage: &'s JoinStage<'_>,
+    level: usize,
+    joined: &[Value],
+    seeks: &mut [SeekSlot],
+) -> Result<&'s [usize], MorselError> {
+    let Some(link) = &stage.seek else {
+        return stage.probe.matches(joined);
+    };
+    let slot = seeks.get_mut(level).ok_or(MorselError::Overflow {
+        what: "a join's seek link",
+    })?;
+    Ok(if link.find(slot, joined)? {
+        ONE_MATCH
+    } else {
+        NO_MATCH
+    })
 }
 
 /// A link's place in a probe row's walk through the chain: its matches, the next one to take, and
@@ -1030,7 +1169,7 @@ fn each_joined<'s>(
     stages: &'s [JoinStage<'_>],
     row: &[Value],
     joined: &mut Vec<Value>,
-    walk: &mut Vec<Step<'s>>,
+    (walk, seeks): (&mut Vec<Step<'s>>, &mut [SeekSlot]),
     mut visit: impl FnMut(&[Value]) -> Result<(), MorselError>,
 ) -> Result<(), MorselError> {
     joined.clear();
@@ -1041,7 +1180,7 @@ fn each_joined<'s>(
         return visit(joined);
     };
     walk.try_reserve(stages.len())?;
-    walk.push((first.probe.matches(joined)?, 0, joined.len()));
+    walk.push((stage_matches(first, 0, joined, seeks)?, 0, joined.len()));
     while let Some(top) = walk.last_mut() {
         let (matches, next, base) = *top;
         let Some(build) = matches.get(next) else {
@@ -1053,16 +1192,22 @@ fn each_joined<'s>(
         let stage = stages.get(level).ok_or(MorselError::Overflow {
             what: "a join's link",
         })?;
-        let build_row = stage.rows.get(*build).ok_or(MorselError::Overflow {
+        // A seek link's one match is the row its slot holds (lane qs6-16).
+        let build_row = match &stage.seek {
+            None => stage.rows.get(*build).map(Vec::as_slice),
+            Some(_) => seeks.get(level).map(|slot| slot.row.as_slice()),
+        }
+        .ok_or(MorselError::Overflow {
             what: "a match's build row",
         })?;
         joined.truncate(base);
         joined.try_reserve(build_row.len())?;
         joined.extend_from_slice(build_row);
-        match stages.get(level.saturating_add(1)) {
+        let deeper = level.saturating_add(1);
+        match stages.get(deeper) {
             None => visit(joined)?,
             Some(link) => {
-                let found = link.probe.matches(joined)?;
+                let found = stage_matches(link, deeper, joined, seeks)?;
                 walk.push((found, 0, joined.len()));
             }
         }
@@ -1076,19 +1221,29 @@ fn each_joined<'s>(
 /// joined row matched (passed the ON terms), and a row of the others that no match passed, or that
 /// has none, is visited once more padded with NULLs for the last link's columns (`padded` true).
 /// The scratch rows and the walk are the worker's, reused from row to row.
+#[allow(clippy::type_complexity)]
 fn each_row<'s>(
     stages: &'s [JoinStage<'_>],
     pad_last: Option<usize>,
     row: &[Value],
-    (joined, last_row, walk): (&mut Vec<Value>, &mut Vec<Value>, &mut Vec<Step<'s>>),
+    (joined, last_row, walk, seeks): (
+        &mut Vec<Value>,
+        &mut Vec<Value>,
+        &mut Vec<Step<'s>>,
+        &mut [SeekSlot],
+    ),
     mut visit: impl FnMut(&[Value], bool) -> Result<bool, MorselError>,
 ) -> Result<(), MorselError> {
     let (Some(width), Some((last, before))) = (pad_last, stages.split_last()) else {
-        return each_joined(stages, row, joined, walk, |joined| {
+        return each_joined(stages, row, joined, (walk, seeks), |joined| {
             visit(joined, false).map(|_| ())
         });
     };
-    each_joined(before, row, joined, walk, |prefix| {
+    // The padded last link is a hash link: a seek link is an inner join's only (lane qs6-16).
+    if last.seek.is_some() {
+        return Err(MorselError::Corrupt("a padded link read by a seek"));
+    }
+    each_joined(before, row, joined, (walk, seeks), |prefix| {
         let mut matched = false;
         for build in last.probe.matches(prefix)? {
             let build_row = last.rows.get(*build).ok_or(MorselError::Overflow {
@@ -1157,6 +1312,7 @@ impl Pipeline for TableJoinAggregate<'_> {
         let mut joined: Vec<Value> = Vec::new();
         let mut last: Vec<Value> = Vec::new();
         let mut walk = Vec::new();
+        let mut seeks = seek_slots(self.stages)?;
         let mut ran = 0u64;
         let scanned = self.table.scan(leaves, |rowid, row| {
             for term in self.probe_filter {
@@ -1171,7 +1327,7 @@ impl Pipeline for TableJoinAggregate<'_> {
                 self.stages,
                 self.pad_last,
                 row,
-                (&mut joined, &mut last, &mut walk),
+                (&mut joined, &mut last, &mut walk, seeks.as_mut_slice()),
                 |joined, padded| {
                     ran = ran.saturating_add(1);
                     let (matched, passed) =
@@ -1311,6 +1467,7 @@ impl Pipeline for TableJoinRows<'_> {
         let mut joined: Vec<Value> = Vec::new();
         let mut last: Vec<Value> = Vec::new();
         let mut walk = Vec::new();
+        let mut seeks = seek_slots(self.stages)?;
         let mut ran = 0u64;
         let scanned = self.table.scan(leaves, |rowid, row| {
             for term in self.probe_filter {
@@ -1322,7 +1479,7 @@ impl Pipeline for TableJoinRows<'_> {
                 self.stages,
                 self.pad_last,
                 row,
-                (&mut joined, &mut last, &mut walk),
+                (&mut joined, &mut last, &mut walk, seeks.as_mut_slice()),
                 |joined, padded| {
                     ran = ran.saturating_add(1);
                     let (matched, passed) =

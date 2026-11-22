@@ -661,7 +661,7 @@ pub(crate) enum KeyPart {
 const I64_LOW: f64 = -9_223_372_036_854_775_808.0;
 const I64_HIGH: f64 = 9_223_372_036_854_775_808.0;
 
-fn key_part(value: &Value) -> KeyPart {
+pub(crate) fn key_part(value: &Value) -> KeyPart {
     match value {
         Value::Null => KeyPart::Null,
         Value::Numeric(Numeric::Integer(i)) => KeyPart::Int(*i),

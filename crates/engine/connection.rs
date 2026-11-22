@@ -225,6 +225,23 @@ pub enum OuterJoinProbe {
     Kept = 1,
 }
 
+/// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row of
+/// the tables before it (a rowid lookup, or a seek in one of its indexes) runs on morsels
+/// (`Connection::set_parallel_searched_links`): the candidates, kept so measurements decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum SearchedLinks {
+    /// Today's, the default: the hook declines such a join unless the planner chose a hash join
+    /// somewhere in it, and the serial loop answers.
+    Off = 0,
+    /// The table is a hash link, read whole once and keyed by its equalities with the tables
+    /// before it: pays against a large probe, loses against a small one.
+    Hash = 1,
+    /// Each worker seeks the table's row by its rowid per joined row, with a cursor of its own,
+    /// as the serial loop does, no table built: an inner join keyed by the table's INTEGER
+    /// PRIMARY KEY only; any other such link is a hash link, as with `Hash`.
+    Seek = 2,
+}
+
 /// Amphora: the join methods newly prepared statements may plan (`Connection::set_join_methods`):
 /// by cost, or one method only, for the tests that run every join both ways and the measurement
 /// of each method's time (`bench/join_methods`; query-speed step 5, QT.5).
@@ -571,7 +588,7 @@ pub struct Connection {
     /// Amphora: see [`Connection::set_parallel_outer_probe`].
     pub(super) parallel_outer_probe: AtomicOuterJoinProbe,
     /// Amphora: see [`Connection::set_parallel_searched_links`].
-    pub(super) parallel_searched_links: AtomicBool,
+    pub(super) parallel_searched_links: AtomicSearchedLinks,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
@@ -583,8 +600,10 @@ pub struct Connection {
     pub(crate) morsel_join_direct_rows: AtomicU64,
     /// Amphora (QT.6, lane qs6-15): what the outer joins on morsels did in each orientation.
     pub(crate) morsel_outer: crate::vdbe::morsel_scan::OuterCounters,
-    /// Amphora (QT.6, lane qs6-16): the links built from a table the planner reads by a seek.
+    /// Amphora (QT.6, lane qs6-16): the links built from a table the planner reads by a seek,
+    /// and of those, the ones read by a seek per joined row.
     pub(crate) morsel_searched_links: AtomicU64,
+    pub(crate) morsel_seek_links: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1096,20 +1115,19 @@ impl Connection {
         self.parallel_outer_probe.get()
     }
 
-    /// Amphora (QT.6, lane qs6-16): whether a join's table that the planner reads by a seek per
-    /// row of the tables before it (a rowid lookup, or a seek in one of its indexes) runs on
-    /// morsels as a hash link, read whole and keyed by its equalities with those tables, for
-    /// statements prepared after. Off (today's: such a join, the commonest of foreign key to
-    /// primary key, runs on the serial loop unless the planner chose a hash join somewhere in it)
-    /// until measurements decide; a seek per row in the workers is the other candidate.
-    pub fn set_parallel_searched_links(&self, on: bool) {
-        self.parallel_searched_links.store(on, Ordering::Release);
+    /// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row
+    /// of the tables before it runs on morsels, for statements prepared after ([`SearchedLinks`];
+    /// `Off`, today's, by default: such a join, the commonest of foreign key to primary key, runs
+    /// on the serial loop unless the planner chose a hash join somewhere in it). Every setting
+    /// answers alike; the switch is for the measurements that decide between them.
+    pub fn set_parallel_searched_links(&self, links: SearchedLinks) {
+        self.parallel_searched_links.set(links);
         // The shape is chosen at prepare: cached statements prepare again.
         self.bump_prepare_context_generation();
     }
 
-    pub(crate) fn parallel_searched_links(&self) -> bool {
-        self.parallel_searched_links.load(Ordering::Acquire)
+    pub(crate) fn parallel_searched_links(&self) -> SearchedLinks {
+        self.parallel_searched_links.get()
     }
 
     pub(crate) fn parallel_join_direct(&self) -> bool {

@@ -21106,8 +21106,8 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        JoinStage, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild, TableChain,
-        TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
+        JoinStage, SeekLink, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
+        TableChain, TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -21246,6 +21246,50 @@ pub fn op_morsel_aggregate(
                 join.columns,
                 join.rowid_alias,
             )?;
+            // A searched table of an inner join keyed by its INTEGER PRIMARY KEY is read by a
+            // seek per joined row when the switch says so (lane qs6-16): no table built.
+            let seek_pair = if join.searched
+                && data.outer.is_none()
+                && connection.parallel_searched_links() == crate::SearchedLinks::Seek
+            {
+                join.rowid_alias
+                    .and_then(|alias| join.build_key.iter().position(|key| *key == alias))
+            } else {
+                None
+            };
+            if let Some(pair) = seek_pair {
+                let rowid_at = *join
+                    .probe_key
+                    .get(pair)
+                    .ok_or(MorselError::Corrupt("a seek link's key without its pair"))?;
+                let mut also = Vec::new();
+                also.try_reserve_exact(join.build_key.len())?;
+                for (at, (probe_at, build_at)) in
+                    join.probe_key.iter().zip(&join.build_key).enumerate()
+                {
+                    if at != pair {
+                        also.push((*probe_at, *build_at));
+                    }
+                }
+                stages.push(JoinStage {
+                    probe: HashProbe::build(&[], &join.build_key, &[], &join.probe_key, &budget)?,
+                    rows: Vec::new(),
+                    seek: Some(SeekLink {
+                        table: build_table,
+                        rowid_at,
+                        also,
+                        filter: join.filter.clone(),
+                    }),
+                });
+                for counter in [
+                    &connection.morsel_join_links,
+                    &connection.morsel_searched_links,
+                    &connection.morsel_seek_links,
+                ] {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                continue;
+            }
             let (rows, hash_table, _) = TableBuild {
                 table: &build_table,
                 filter: &join.filter,
@@ -21261,6 +21305,7 @@ pub fn op_morsel_aggregate(
             stages.push(JoinStage {
                 probe: HashProbe::over(hash_table, &[], &join.probe_key),
                 rows,
+                seek: None,
             });
             connection
                 .morsel_join_links

@@ -64,6 +64,9 @@ pub(crate) fn emit_morsel_hook(
     // for the versioned storage's column copy.
     let simple = shape(plan);
     let is_simple = simple.is_some();
+    // Whether a table the planner reads by a seek may be a link; how it is read (a hash table,
+    // or a seek per joined row) is the executor's (lane qs6-16).
+    let searched_links = resolver.searched_links() != crate::SearchedLinks::Off;
     let (data, looped) = match (body_plan(plan), simple) {
         (looped, Some(data)) => (data, looped),
         (Some(looped), None) => {
@@ -87,8 +90,8 @@ pub(crate) fn emit_morsel_hook(
         // one, `shape_chain` the kept one, as the connection's switch says.
         // A table the planner reads by a seek is a hash link when the switch says so (lane
         // qs6-16).
-        (None, None) => match shape_join(plan, resolver.outer_probe(), resolver.searched_links())
-            .or_else(|| shape_chain(plan, resolver.outer_probe(), resolver.searched_links()))
+        (None, None) => match shape_join(plan, resolver.outer_probe(), searched_links)
+            .or_else(|| shape_chain(plan, resolver.outer_probe(), searched_links))
         {
             Some((data, looped)) => (data, Some(looped)),
             None => return Ok(None),

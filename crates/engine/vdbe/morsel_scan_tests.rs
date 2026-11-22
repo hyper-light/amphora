@@ -2570,21 +2570,23 @@ fn t_qt_6_25_more_than_one_outer_join_answers_as_the_serial_loop_at(probe: crate
     );
 }
 
-/// T-QT.6.27 (lane qs6-16): with `Connection::set_parallel_searched_links` on, a join whose table
-/// the planner reads by a seek per row of the tables before it (a foreign key to an INTEGER
-/// PRIMARY KEY, a seek in an index on the joined column), planned by cost as it is outside the
-/// tests, runs on morsels with that table a hash link read whole. Inner joins of two and three
-/// tables, a LEFT JOIN onto a primary key (an ON term beside it too), with aggregates, GROUP BY,
-/// rows, and rows ordered by both ids under a LIMIT and an OFFSET, answer as the serial loop at 1,
-/// 2, 3, 4 and 8 stated cores with the switch off and on; with it on some links were built from
-/// a searched table, and with it off none was (today's: such a join stays on the serial loop).
+/// T-QT.6.27 (lane qs6-16): a join whose table the planner reads by a seek per row of the tables
+/// before it (a foreign key to an INTEGER PRIMARY KEY, a seek in an index on the joined column),
+/// planned by cost as it is outside the tests, runs on morsels at each candidate of
+/// `Connection::set_parallel_searched_links`: `Hash`, that table a hash link read whole; `Seek`,
+/// an inner join's primary-key link read by a seek per joined row. Inner joins of two and three
+/// tables (a key beside the primary key too), a LEFT JOIN onto a primary key (an ON term beside
+/// it), with aggregates, GROUP BY, rows, and rows ordered by both ids under a LIMIT and an OFFSET,
+/// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores at `Off`, `Hash` and `Seek`; `Hash`
+/// built links from searched tables and no seek link, `Seek` built seek links, and `Off` (today's:
+/// such a join stays on the serial loop) built neither.
 #[test]
 fn t_qt_6_27_joins_through_seeks_run_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-27");
     let mut rng = ChaCha8Rng::seed_from_u64(627);
     fill_with_ids(&conn, &mut rng, &[("f", 400), ("d", 60), ("e", 30)]);
     conn.execute("CREATE INDEX d_b ON d(b)").unwrap();
-    let queries: [(&str, bool); 9] = [
+    let queries: [(&str, bool); 10] = [
         (
             "SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.id",
             false,
@@ -2611,6 +2613,10 @@ fn t_qt_6_27_joins_through_seeks_run_on_morsels_as_the_serial_loop() {
             false,
         ),
         (
+            "SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.id AND f.c = d.c",
+            false,
+        ),
+        (
             "SELECT count(*), count(d.id), sum(d.b) FROM f LEFT JOIN d ON f.a = d.id",
             false,
         ),
@@ -2624,13 +2630,17 @@ fn t_qt_6_27_joins_through_seeks_run_on_morsels_as_the_serial_loop() {
             true,
         ),
     ];
-    let searched = |conn: &Arc<Connection>| {
-        conn.morsel_searched_links
-            .load(std::sync::atomic::Ordering::Relaxed)
+    let counts = |conn: &Arc<Connection>| {
+        [&conn.morsel_searched_links, &conn.morsel_seek_links]
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     };
-    for on in [false, true] {
-        conn.set_parallel_searched_links(on);
-        let before = searched(&conn);
+    for links in [
+        crate::SearchedLinks::Off,
+        crate::SearchedLinks::Hash,
+        crate::SearchedLinks::Seek,
+    ] {
+        conn.set_parallel_searched_links(links);
+        let before = counts(&conn);
         for (sql, rows) in queries {
             conn.set_parallel_mode(ParallelMode::Off);
             let serial = sql_rows(&conn, sql);
@@ -2647,20 +2657,27 @@ fn t_qt_6_27_joins_through_seeks_run_on_morsels_as_the_serial_loop() {
                     rows,
                     &parallel,
                     &serial,
-                    &format!("on {cores} cores, searched links {on}"),
+                    &format!("on {cores} cores, searched links {links:?}"),
                 );
             }
         }
         conn.set_parallel_mode(ParallelMode::Off);
-        let built = searched(&conn) - before;
-        if on {
-            assert!(built > 0, "no link was built from a searched table");
-        } else {
-            assert_eq!(
-                built, 0,
-                "a searched table was read whole with the switch off"
-            );
+        let after = counts(&conn);
+        let [searched, seeks] = [0, 1].map(|at| after[at] - before[at]);
+        match links {
+            crate::SearchedLinks::Off => assert_eq!(
+                (searched, seeks),
+                (0, 0),
+                "{links:?}: a searched table was linked"
+            ),
+            crate::SearchedLinks::Hash => {
+                assert!(searched > 0, "{links:?}: no link from a searched table");
+                assert_eq!(seeks, 0, "{links:?}: a link was read by seeks");
+            }
+            crate::SearchedLinks::Seek => {
+                assert!(seeks > 0, "{links:?}: no link was read by seeks")
+            }
         }
     }
-    conn.set_parallel_searched_links(false);
+    conn.set_parallel_searched_links(crate::SearchedLinks::Off);
 }

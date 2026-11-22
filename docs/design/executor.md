@@ -642,19 +642,23 @@ words per statement, and the bytes charged to the statement's memory budget, the
 (`OuterCounters::charged_bytes`, `charged_peak`; a budget is not credited back within its
 statement, so a statement's charge bounds what it held at once).
 
-**A table the planner reads by a seek, as a hash link, behind a switch** (lane qs6-16).
+**A table the planner reads by a seek, as a link, behind a switch** (lane qs6-16).
 Planned by cost, a join onto a primary key or an indexed column is an index nested loop: the
 joined table is read by a seek per row of the tables before it (`Search::RowidEq`, `Search::Seek`),
 and the hook declined it, so the commonest join of all ran on the serial loop unless the planner
-chose a hash join somewhere in it. `Connection::set_parallel_searched_links` (off, today's, the
-control) lets `shape_join` and `shape_chain` take such a table past the first as a hash link read
-whole and keyed by its equalities with the tables before it, as they already take a seek in an
-index the statement builds. It is correct because the hook tests every term, consumed or not,
-on the joined row: the rows a seek skips fail the terms it was made from. Its cost is not a seek's:
-the whole table is read once, which pays against a large probe and loses against a small one (a
-probe of a few rows, or a seek on a constant), so the switch stays off until measured; a seek per
-row in each worker, its own cursor, is the other candidate. `MorselJoinData::searched` marks such
-a link and `morsel_searched_links` counts it (T-QT.6.27).
+chose a hash join somewhere in it. `Connection::set_parallel_searched_links` (`SearchedLinks::Off`,
+today's, the control) lets `shape_join` and `shape_chain` take such a table past the first as a
+link keyed by its equalities with the tables before it, as they already take a seek in an index
+the statement builds. It is correct because the hook tests every term, consumed or not, on the
+joined row: the rows a seek skips fail the terms it was made from. Two candidates, for the
+measurements to decide between: `Hash` reads the table whole into a hash link, which pays
+against a large probe and loses against a small one (a probe of a few rows, or a seek on a
+constant); `Seek` reads an inner join's link keyed by the table's INTEGER PRIMARY KEY by a seek per
+joined row, each worker with a cursor of its own (`SeekLink`, `TableSource::seek_row`; its other
+key pairs compared as the hash table compares keys, its own terms tested on the row found), no
+table built and nothing charged, as the serial loop reads it; any other searched link is a hash
+link there too. `MorselJoinData::searched` marks such a link; `morsel_searched_links` and
+`morsel_seek_links` count them (T-QT.6.27).
 
 **What still runs on the serial loop** (lane qs6-16's audit; each an open part of QT.6):
 - *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
