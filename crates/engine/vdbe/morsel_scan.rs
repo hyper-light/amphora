@@ -1680,6 +1680,439 @@ impl Pipeline for TableOuterRest<'_> {
     }
 }
 
+/// Joins of three or more tables with a RIGHT or FULL JOIN among them, or with more than one outer
+/// join (lane qs6-14, T-QT.6.24 and T-QT.6.25; [`MorselOuter::Chain`]): the probe is the FROM
+/// clause's first table and each link the next one in turn. A probe row walks the chain depth
+/// first; at each link a match that passes the link's own ON terms goes on to the next link, and
+/// a row of the tables before it that no match passed goes on padded with NULLs when the link
+/// keeps the left rows. A link that keeps the right rows marks each build row matched in the
+/// worker's own bitmap. The walk runs in phases: the probe's leaves first, then for each link
+/// that keeps the right rows, in the chain's order, its build rows that no worker marked (the
+/// bitmaps merged once every earlier phase ran, so every row that can reach the link has), padded
+/// with NULLs for the tables before it, walk the rest of the chain. Every row that reaches the
+/// chain's end runs the WHERE terms and the outputs.
+pub struct TableChain<'a> {
+    pub table: &'a TableSource,
+    /// Terms over the probe row alone, tested before it walks (WHERE terms, only when no link
+    /// keeps the right rows: those links' padded rows don't pass the probe's test).
+    pub probe_filter: &'a [Predicate],
+    /// The chain of hash tables, one link per table after the probe.
+    pub stages: &'a [JoinStage<'a>],
+    /// Each link's keeps and its table's columns, the NULLs a padded row takes for it.
+    pub links: &'a [(super::insn::MorselKeeps, usize)],
+    /// The probe table's columns.
+    pub probe_columns: usize,
+    /// The loop body: each link's ON code (`MorselBody::links_on`), then the WHERE terms and
+    /// the outputs over the whole joined row.
+    pub body: &'a TableBodyAggregate<'a>,
+    /// A join's rows: the sort keys, each one's place in the output row and whether it descends.
+    pub order: &'a [(usize, bool)],
+}
+
+/// A walk's place at one link: the link's matches for the row before it, the next one to take,
+/// the joined row's length before the link's columns, and whether any match passed.
+type ChainFrame<'s> = (&'s [usize], usize, usize, bool);
+
+/// The partial of a [`TableChain`]'s phase: the aggregates, or the output rows tagged with their
+/// morsel's first leaf or build row; per link, the build rows its rows matched, a bit per row
+/// (empty for a link that keeps no right rows); and the worker that runs the body.
+#[derive(Default)]
+pub struct ChainPartial {
+    aggregate: super::morsel::AggregatePartial,
+    runs: Vec<(usize, Vec<Vec<Value>>)>,
+    matched: Vec<Vec<u64>>,
+    worker: Option<Box<BodyWorker>>,
+}
+
+/// A worker's walk through a [`TableChain`]: its body worker, what it keeps, its marks, the
+/// joined row and the walk's frames (reused from row to row), and the joined rows it ran.
+struct ChainWalk<'s, 'w> {
+    worker: &'w mut BodyWorker,
+    aggregate: &'w mut super::morsel::AggregatePartial,
+    matched: &'w mut [Vec<u64>],
+    found: Vec<Vec<Value>>,
+    joined: Vec<Value>,
+    frames: Vec<ChainFrame<'s>>,
+    ran: u64,
+}
+
+impl<'a> TableChain<'a> {
+    /// The joined row's width before link `link`: the probe's columns and each earlier link's.
+    fn before(&self, link: usize) -> Result<usize, MorselError> {
+        self.links
+            .iter()
+            .take(link)
+            .try_fold(self.probe_columns, |sum, (_, columns)| {
+                sum.checked_add(*columns)
+            })
+            .ok_or(MorselError::Overflow {
+                what: "a joined row's width",
+            })
+    }
+
+    /// Whether the joined row passes link `link`'s own ON code (none: it does).
+    fn link_on(
+        &self,
+        worker: &mut BodyWorker,
+        link: usize,
+        rowid: Option<i64>,
+        row: &[Value],
+    ) -> Result<bool, MorselError> {
+        let Some(Some((from, pass))) = self.body.body.links_on.get(link) else {
+            return Ok(true);
+        };
+        self.body.load(worker, rowid, row)?;
+        self.body.run_to(worker, *from, *pass)
+    }
+
+    /// The joined row in `walk.joined` (the tables before link `link`) at link `link`: its
+    /// matches there pushed for the walk, or, past the last link, the WHERE terms and the outputs
+    /// run over it and the outputs kept.
+    fn enter(
+        &self,
+        walk: &mut ChainWalk<'a, '_>,
+        link: usize,
+        rowid: Option<i64>,
+        position: usize,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let Some(stage) = self.stages.get(link) else {
+            walk.ran = walk.ran.saturating_add(1);
+            self.body.load(walk.worker, rowid, &walk.joined)?;
+            if !self
+                .body
+                .passes(walk.worker, self.body.body.start, self.body.body.keep)?
+            {
+                return Ok(());
+            }
+            return if self.body.body.rows {
+                walk.found.try_reserve(1)?;
+                walk.found.push(kept(&walk.worker.out, budget)?);
+                Ok(())
+            } else {
+                self.body
+                    .shape
+                    .fold(&walk.worker.out, position, walk.aggregate, budget)
+            };
+        };
+        let matches = stage.probe.matches(&walk.joined)?;
+        walk.frames.try_reserve(1)?;
+        walk.frames.push((matches, 0, walk.joined.len(), false));
+        Ok(())
+    }
+
+    /// Walks the joined row in `walk.joined` (the tables before link `from`) through the links
+    /// from `from` on, depth first, an explicit stack as deep as the chain (no recursion).
+    fn walk(
+        &self,
+        walk: &mut ChainWalk<'a, '_>,
+        from: usize,
+        rowid: Option<i64>,
+        position: usize,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        walk.frames.clear();
+        self.enter(walk, from, rowid, position, budget)?;
+        while let Some(&(matches, next, base, any)) = walk.frames.last() {
+            let link = from.saturating_add(walk.frames.len().saturating_sub(1));
+            let (Some(stage), Some((keeps, columns))) =
+                (self.stages.get(link), self.links.get(link))
+            else {
+                return Err(MorselError::Overflow {
+                    what: "a join's link",
+                });
+            };
+            if let Some(build) = matches.get(next) {
+                if let Some(top) = walk.frames.last_mut() {
+                    top.1 = next.saturating_add(1);
+                }
+                let build_row = stage.rows.get(*build).ok_or(MorselError::Overflow {
+                    what: "a match's build row",
+                })?;
+                walk.joined.truncate(base);
+                walk.joined.try_reserve(build_row.len())?;
+                walk.joined.extend_from_slice(build_row);
+                if !self.link_on(walk.worker, link, rowid, &walk.joined)? {
+                    continue;
+                }
+                if let Some(top) = walk.frames.last_mut() {
+                    top.3 = true;
+                }
+                if keeps.right {
+                    let (word, bit) = matched_bit(*build)?;
+                    let at = walk
+                        .matched
+                        .get_mut(link)
+                        .and_then(|marks| marks.get_mut(word))
+                        .ok_or(MorselError::Overflow {
+                            what: "a matched row's word",
+                        })?;
+                    *at |= bit;
+                }
+                self.enter(walk, link.saturating_add(1), rowid, position, budget)?;
+            } else if !any && keeps.left {
+                // No match passed: the row goes on once, padded with NULLs for this link.
+                if let Some(top) = walk.frames.last_mut() {
+                    top.3 = true;
+                }
+                walk.joined.truncate(base);
+                walk.joined
+                    .resize(base.saturating_add(*columns), Value::Null);
+                self.enter(walk, link.saturating_add(1), rowid, position, budget)?;
+            } else {
+                walk.frames.pop();
+            }
+        }
+        Ok(())
+    }
+
+    /// The answer: the probe's phase, then each link's that keeps the right rows, in the chain's
+    /// order, the bitmaps merged between phases, as the switch and the measured costs pick each
+    /// phase's degree. A join's rows: each phase's in its morsels' order, phase after phase, then
+    /// sorted (stably) when the query asks.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let mut matched: Vec<Vec<u64>> = Vec::new();
+        let mut aggregate = super::morsel::AggregatePartial::default();
+        let mut runs: Vec<(usize, usize, Vec<Vec<Value>>)> = Vec::new();
+        let mut stats = None;
+        let tails = self
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, (keeps, _))| keeps.right)
+            .map(|(link, _)| Some(link));
+        for (phase, from) in std::iter::once(None).chain(tails).enumerate() {
+            let (partial, ran) = {
+                let pipeline = ChainPhase {
+                    chain: self,
+                    from,
+                    matched: &matched,
+                };
+                execute(&pipeline, mode, costs, budget)?
+            };
+            // The probe's phase's run stands for the statement's.
+            if stats.is_none() {
+                stats = Some(ran);
+            }
+            let ChainPartial {
+                aggregate: more,
+                runs: rows,
+                matched: marks,
+                ..
+            } = partial;
+            if matched.len() < marks.len() {
+                matched.try_reserve_exact(marks.len().saturating_sub(matched.len()))?;
+                matched.resize(marks.len(), Vec::new());
+            }
+            for (into, other) in matched.iter_mut().zip(marks) {
+                or_into(into, &other)?;
+            }
+            self.body.shape.merge(&mut aggregate, more, budget)?;
+            runs.try_reserve(rows.len())?;
+            runs.extend(rows.into_iter().map(|(first, run)| (phase, first, run)));
+        }
+        let stats = stats.unwrap_or_default();
+        if !self.body.body.rows {
+            return Ok((self.body.shape.finish(aggregate)?, stats));
+        }
+        runs.sort_by_key(|(phase, first, _)| (*phase, *first));
+        let total = runs
+            .iter()
+            .map(|(_, _, run)| run.len())
+            .fold(0usize, usize::saturating_add);
+        let mut out = Vec::new();
+        out.try_reserve_exact(total)?;
+        for (_, _, run) in runs {
+            out.extend(run);
+        }
+        if !self.order.is_empty() {
+            out.sort_by(|a, b| compare_rows(self.order, a, b));
+        }
+        Ok((out, stats))
+    }
+}
+
+/// ORs one matched-row bitmap into another.
+fn or_into(into: &mut Vec<u64>, from: &[u64]) -> Result<(), MorselError> {
+    if into.len() < from.len() {
+        into.try_reserve_exact(from.len().saturating_sub(into.len()))?;
+        into.resize(from.len(), 0);
+    }
+    for (word, other) in into.iter_mut().zip(from) {
+        *word |= *other;
+    }
+    Ok(())
+}
+
+/// One phase of a [`TableChain`] (lane qs6-14): the probe's leaves (`from` none), or the build
+/// rows of link `from` that no row of the phases before matched (`matched`, merged), each padded
+/// with NULLs for the tables before the link and walked through the links after it.
+pub struct ChainPhase<'a> {
+    pub chain: &'a TableChain<'a>,
+    pub from: Option<usize>,
+    pub matched: &'a [Vec<u64>],
+}
+
+impl<'a> ChainPhase<'a> {
+    /// Walks the build rows `rows` of link `link` that no row of the phases before matched, each
+    /// padded with NULLs for the tables before the link, through the links after it.
+    fn tails(
+        &self,
+        walk: &mut ChainWalk<'a, '_>,
+        link: usize,
+        rows: Range<usize>,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let chain = self.chain;
+        let stage = chain.stages.get(link).ok_or(MorselError::Overflow {
+            what: "a join's link",
+        })?;
+        let base = chain.before(link)?;
+        let marks = self
+            .matched
+            .get(link)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for at in rows {
+            let (word, bit) = matched_bit(at)?;
+            if marks.get(word).is_some_and(|w| w & bit != 0) {
+                continue;
+            }
+            let build_row = stage.rows.get(at).ok_or(MorselError::Overflow {
+                what: "an unmatched build row",
+            })?;
+            walk.joined.clear();
+            walk.joined
+                .try_reserve(base.saturating_add(build_row.len()))?;
+            walk.joined.resize(base, Value::Null);
+            walk.joined.extend_from_slice(build_row);
+            chain.walk(walk, link.saturating_add(1), None, at, budget)?;
+        }
+        Ok(())
+    }
+}
+
+impl Pipeline for ChainPhase<'_> {
+    type Partial = ChainPartial;
+
+    fn rows(&self) -> usize {
+        match self.from {
+            None => self.chain.table.leaves(),
+            Some(link) => self
+                .chain
+                .stages
+                .get(link)
+                .map_or(0, |stage| stage.rows.len()),
+        }
+    }
+
+    fn empty(&self) -> Self::Partial {
+        ChainPartial::default()
+    }
+
+    fn run(
+        &self,
+        rows: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let chain = self.chain;
+        let ChainPartial {
+            aggregate,
+            runs,
+            matched,
+            worker,
+        } = partial;
+        let worker = match worker {
+            Some(worker) => worker,
+            None => worker.insert(Box::new(chain.body.worker()?)),
+        };
+        // The worker's bitmaps, a bit per build row of each link that keeps the right rows,
+        // charged to the statement's budget.
+        if matched.is_empty() {
+            matched.try_reserve_exact(chain.links.len())?;
+            for ((keeps, _), stage) in chain.links.iter().zip(chain.stages) {
+                let words = if keeps.right {
+                    stage.rows.len().div_ceil(64)
+                } else {
+                    0
+                };
+                budget.charge(words.saturating_mul(std::mem::size_of::<u64>()))?;
+                let mut marks = Vec::new();
+                marks.try_reserve_exact(words)?;
+                marks.resize(words, 0);
+                matched.push(marks);
+            }
+        }
+        let first = rows.start;
+        let mut walk = ChainWalk {
+            worker,
+            aggregate,
+            matched,
+            found: Vec::new(),
+            joined: Vec::new(),
+            frames: Vec::new(),
+            ran: 0,
+        };
+        let walked = match self.from {
+            None => chain.table.scan(rows, |rowid, row| {
+                for term in chain.probe_filter {
+                    if !term.holds(row)? {
+                        return Ok(());
+                    }
+                }
+                walk.joined.clear();
+                walk.joined.try_reserve(row.len())?;
+                walk.joined.extend_from_slice(row);
+                chain.walk(&mut walk, 0, Some(rowid), position(rowid)?, budget)
+            }),
+            Some(link) => self.tails(&mut walk, link, rows, budget),
+        };
+        let ChainWalk { mut found, ran, .. } = walk;
+        if walked.is_ok() {
+            chain
+                .body
+                .ran
+                .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+        }
+        walked?;
+        if !chain.order.is_empty() {
+            found.sort_by(|a, b| compare_rows(chain.order, a, b));
+        }
+        runs.try_reserve(1)?;
+        runs.push((first, found));
+        Ok(())
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        if into.matched.len() < from.matched.len() {
+            into.matched
+                .try_reserve_exact(from.matched.len().saturating_sub(into.matched.len()))?;
+            into.matched.resize(from.matched.len(), Vec::new());
+        }
+        for (marks, other) in into.matched.iter_mut().zip(&from.matched) {
+            or_into(marks, other)?;
+        }
+        self.chain
+            .body
+            .shape
+            .merge(&mut into.aggregate, from.aggregate, budget)?;
+        into.runs.try_reserve(from.runs.len())?;
+        into.runs.extend(from.runs);
+        Ok(())
+    }
+}
+
 /// Orders two output rows by the sort keys: each one's place in the row, and whether it descends.
 fn compare_rows(order: &[(usize, bool)], a: &[Value], b: &[Value]) -> std::cmp::Ordering {
     for (at, descending) in order {

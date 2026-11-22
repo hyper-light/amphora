@@ -1080,7 +1080,11 @@ reads can copy its outputs from the joined row without running the body, behind
 `set_parallel_join_direct` (off) until the A/B of simple joins against 054ace65 decides (T-QT.6.20,
 T-QT.6.21); ClickHouse loads JOB's backslash-escaped CSV as TabSeparated. Outer joins run on
 morsels under a LIMIT when the ORDER BY tells every row apart (T-QT.6.22), and a LEFT join among
-three or more tables runs with its padded table as the chain's last link (T-QT.6.23).
+three or more tables runs with its padded table as the chain's last link (T-QT.6.23). Lane qs6-14:
+FULL and RIGHT joins among three or more tables, and statements with more than one outer join, run
+on morsels as one chain in the FROM clause's order, each link's ON terms tested at that link, the
+rows a link keeps padded there, and the build rows a RIGHT or FULL link keeps that nothing matched
+walked through the rest of the chain once its bitmaps merge (T-QT.6.24, T-QT.6.25).
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.

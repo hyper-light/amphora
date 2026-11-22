@@ -21067,7 +21067,7 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        JoinStage, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
+        JoinStage, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild, TableChain,
         TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
@@ -21213,8 +21213,10 @@ pub fn op_morsel_aggregate(
                 key: &join.build_key,
                 partitioner: &partitioner,
                 // An outer join's build rows with a NULL key match nothing, and still appear.
-                // (A LEFT join's last link among more tables pads only the others' rows.)
-                keep_unkeyed: matches!(data.outer, Some(MorselOuter::Left | MorselOuter::Full)),
+                // (A LEFT join's last link among more tables pads only the others' rows; a
+                // chain's link keeps them when it keeps its right rows, lane qs6-14.)
+                keep_unkeyed: matches!(data.outer, Some(MorselOuter::Left | MorselOuter::Full))
+                    || join.keeps.right,
             }
             .run_mode(mode, &mut costs, &budget)?;
             stages.push(JoinStage {
@@ -21257,6 +21259,36 @@ pub fn op_morsel_aggregate(
             },
             direct,
         };
+        // A RIGHT or FULL JOIN among three or more tables, or more than one outer join (lane
+        // qs6-14): the chain walks in phases, its links' bitmaps merged between them.
+        if data.outer == Some(MorselOuter::Chain) {
+            let mut links = Vec::new();
+            links.try_reserve_exact(data.joins.len())?;
+            links.extend(data.joins.iter().map(|join| (join.keeps, join.columns)));
+            let pipeline = TableChain {
+                table: &table,
+                probe_filter: &data.filter,
+                stages: &stages,
+                links: &links,
+                probe_columns: data.columns,
+                body: &looped,
+                order: data
+                    .joined_rows
+                    .as_ref()
+                    .map(|rows| rows.order.as_slice())
+                    .unwrap_or_default(),
+            };
+            let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
+            return match &data.joined_rows {
+                Some(rows) => {
+                    for row in &mut out {
+                        row.truncate(rows.width);
+                    }
+                    Ok((out, true))
+                }
+                None => Ok((out, false)),
+            };
+        }
         // An outer join of two tables: the probe's morsels mark the build rows they match, the
         // bitmaps merge, then the unmatched build rows run padded (lane qs6-12).
         if let Some(kind @ (MorselOuter::Left | MorselOuter::Full)) = data.outer {

@@ -38,7 +38,7 @@ use crate::types::Value;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{
-    Insn, MorselAggregateData, MorselBody, MorselJoinData, MorselOuter, MorselRows,
+    Insn, MorselAggregateData, MorselBody, MorselJoinData, MorselKeeps, MorselOuter, MorselRows,
 };
 use crate::vdbe::morsel::{Aggregate, CmpOp, Predicate};
 use amphora_engine_parser::ast::{
@@ -83,13 +83,20 @@ pub(crate) fn emit_morsel_hook(
             };
             (data, Some(looped))
         }
-        (None, None) => match shape_join(plan) {
+        (None, None) => match shape_join(plan).or_else(|| shape_chain(plan)) {
             Some((data, looped)) => (data, Some(looped)),
             None => return Ok(None),
         },
     };
     let body = looped.as_ref().map(|looped| MorselBody {
         on: (!looped.on.is_empty()).then(|| program.allocate_label()),
+        links_on: looped
+            .links_on
+            .iter()
+            .map(|on| {
+                (!on.is_empty()).then(|| (program.allocate_label(), program.allocate_label()))
+            })
+            .collect(),
         start: program.allocate_label(),
         keep: program.allocate_label(),
         skip: program.allocate_label(),
@@ -180,7 +187,10 @@ pub(crate) fn emit_morsel_hook(
 /// has in the joined row (`None`: the probe's own rowid), the very register the body's copy would
 /// read (`emit_body`); otherwise none.
 fn direct_reads(looped: &BodyPlan) -> Option<Vec<Option<usize>>> {
-    if !looped.on.is_empty() || !looped.filter.is_empty() {
+    if !looped.on.is_empty()
+        || !looped.filter.is_empty()
+        || looped.links_on.iter().any(|on| !on.is_empty())
+    {
         return None;
     }
     let place = |id: TableInternalId| looped.places.iter().find(|p| p.id == id);
@@ -216,6 +226,9 @@ struct BodyPlan<'p> {
     /// An outer join's ON terms the hash keys and the probe's own `Predicate`s don't hold (lane
     /// qs6-12): a joined row that fails them did not match.
     on: Vec<&'p Expr>,
+    /// A [`MorselOuter::Chain`]'s links' own ON terms (lane qs6-14), a list per link: a joined
+    /// row up to the link that fails them did not match there.
+    links_on: Vec<Vec<&'p Expr>>,
     filter: Vec<&'p Expr>,
     outs: Vec<&'p Expr>,
     group_by: Vec<usize>,
@@ -420,6 +433,7 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         places,
         width: table.columns().len(),
         on: Vec::new(),
+        links_on: Vec::new(),
         filter,
         outs,
         group_by,
@@ -446,8 +460,10 @@ fn emit_body(
     let overflow = || crate::LimboError::InternalError("register overflow".into());
     let place = |id: TableInternalId| looped.places.iter().find(|p| p.id == id);
     for expr in looped
-        .on
+        .links_on
         .iter()
+        .flatten()
+        .chain(looped.on.iter())
         .chain(looped.filter.iter())
         .chain(looped.outs.iter())
     {
@@ -493,6 +509,32 @@ fn emit_body(
             false,
             &plan.table_references,
         )?;
+    }
+    // A chain's links' ON code (lane qs6-14), each its own block: a row up to the link that
+    // reaches the block's end matched there.
+    for (terms, labels) in looped.links_on.iter().zip(&body.links_on) {
+        let Some((from, pass)) = labels else {
+            continue;
+        };
+        program.preassign_label_to_next_insn(*from);
+        for term in terms {
+            let passed = program.allocate_label();
+            translate_condition_expr(
+                program,
+                &plan.table_references,
+                term,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: passed,
+                    jump_target_when_false: body.skip,
+                    jump_target_when_null: body.skip,
+                },
+                &resolver,
+            )?;
+            program.preassign_label_to_next_insn(passed);
+        }
+        program.preassign_label_to_next_insn(*pass);
+        program.emit_insn(Insn::Noop);
     }
     // An outer join's ON terms come first: a row that reaches `start` matched (lane qs6-12).
     if let Some(on) = body.on {
@@ -1080,6 +1122,7 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
             filter: std::mem::take(filters.get_mut(next)?),
             probe_key,
             build_key,
+            keeps: MorselKeeps::default(),
         });
     }
     // The body's row: each table's columns at its place in the chain, the probe's rowid its own,
@@ -1098,58 +1141,17 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
             },
         });
     }
-    let BodyOutputs {
-        mut outs,
-        group_by,
-        aggregates,
-        sums,
-        result_map,
-    } = body_outputs(plan, rows_mode)?;
-    // Where a REAL could tie with an INTEGER and differ: a SUM's input, a group's key values, a
-    // MIN's or a MAX's input.
-    let mut no_real = sums;
-    no_real.extend(group_by.iter().copied());
-    for aggregate in &aggregates {
-        if let Aggregate::Min(at) | Aggregate::Max(at) = aggregate {
-            no_real.push(*at);
-        }
-    }
-    let joined_rows = if rows_mode {
-        // A LIMIT or OFFSET cuts rows in order, so the hook takes one only when its rows' order is
-        // the serial loop's to the row: the ORDER BY keys hold every table's INTEGER PRIMARY KEY,
-        // which tell every joined row apart (QT.6, lanes qs6-6 and qs6-10).
-        if plan.limit.is_some() || plan.offset.is_some() {
-            let ordered = (0..tables.len()).all(|at| {
-                tables
-                    .get(at)
-                    .and_then(|table| rowid_alias(table))
-                    .is_some_and(|alias| {
-                        plan.order_by
-                            .iter()
-                            .any(|(expr, _, _)| side(expr) == Some((at, alias)))
-                    })
-            });
-            if !ordered {
-                return None;
-            }
-        }
-        // The ORDER BY keys follow the result columns among the outputs: each a column of INTEGER
-        // or TEXT affinity and BINARY collation, no NULLS FIRST or LAST named (SQLite's default,
-        // NULLs least, is the values' own order), so the workers' sort is the serial sorter's.
-        let width = outs.len();
-        let mut order = Vec::new();
-        for (expr, sort, nulls) in &plan.order_by {
-            if nulls.is_some() {
-                return None;
-            }
-            side(expr)?;
-            order.push((outs.len(), matches!(sort, SortOrder::Desc)));
-            outs.push(expr);
-        }
-        Some(MorselRows { order, width })
-    } else {
-        None
-    };
+    let (
+        BodyOutputs {
+            outs,
+            group_by,
+            aggregates,
+            result_map,
+            ..
+        },
+        no_real,
+        joined_rows,
+    ) = join_outputs(plan, &tables, &side)?;
     body_reads(&on_terms, &places)?;
     body_reads(&residual, &places)?;
     body_reads(&outs, &places)?;
@@ -1172,6 +1174,337 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
         places,
         width,
         on: on_terms,
+        links_on: Vec::new(),
+        filter: residual,
+        outs,
+        group_by,
+        aggregates,
+        no_real,
+        result_map,
+        rows: rows_mode,
+    };
+    Some((data, looped))
+}
+
+/// A join's outputs (QT.6): the body's, the ORDER BY keys after the result columns when it
+/// returns rows; the places where a REAL sends the statement to the serial loop (where a REAL
+/// could tie with an INTEGER and differ: a SUM's input, a group's key values, a MIN's or a MAX's
+/// input); and how its rows come out. `side` places a column in the join: its table's place in
+/// `tables` and its own.
+fn join_outputs<'p>(
+    plan: &'p SelectPlan,
+    tables: &[&BTreeTable],
+    side: &dyn Fn(&Expr) -> Option<(usize, usize)>,
+) -> Option<(BodyOutputs<'p>, Vec<usize>, Option<MorselRows>)> {
+    let rows_mode = plan.aggregates.is_empty();
+    let mut outputs = body_outputs(plan, rows_mode)?;
+    let mut no_real = outputs.sums.clone();
+    no_real.extend(outputs.group_by.iter().copied());
+    for aggregate in &outputs.aggregates {
+        if let Aggregate::Min(at) | Aggregate::Max(at) = aggregate {
+            no_real.push(*at);
+        }
+    }
+    if !rows_mode {
+        return Some((outputs, no_real, None));
+    }
+    // A LIMIT or OFFSET cuts rows in order, so the hook takes one only when its rows' order is
+    // the serial loop's to the row: the ORDER BY keys hold every table's INTEGER PRIMARY KEY,
+    // which tell every joined row apart (QT.6, lanes qs6-6 and qs6-10), a padded row's NULL keys
+    // too, since an outer join pads a row of the tables it keeps at most once (lane qs6-13).
+    if plan.limit.is_some() || plan.offset.is_some() {
+        let ordered = (0..tables.len()).all(|at| {
+            tables
+                .get(at)
+                .and_then(|table| rowid_alias(table))
+                .is_some_and(|alias| {
+                    plan.order_by
+                        .iter()
+                        .any(|(expr, _, _)| side(expr) == Some((at, alias)))
+                })
+        });
+        if !ordered {
+            return None;
+        }
+    }
+    // The ORDER BY keys follow the result columns among the outputs: each a column of INTEGER or
+    // TEXT affinity and BINARY collation, no NULLS FIRST or LAST named (SQLite's default, NULLs
+    // least, is the values' own order), so the workers' sort is the serial sorter's.
+    let width = outputs.outs.len();
+    let mut order = Vec::new();
+    for (expr, sort, nulls) in &plan.order_by {
+        if nulls.is_some() {
+            return None;
+        }
+        side(expr)?;
+        order.push((outputs.outs.len(), matches!(sort, SortOrder::Desc)));
+        outputs.outs.push(expr);
+    }
+    Some((outputs, no_real, Some(MorselRows { order, width })))
+}
+
+/// A column a join's hook reads (QT.6): its table's place in the FROM clause and its own place,
+/// a rowid read as its table's INTEGER PRIMARY KEY column; only a column of INTEGER or TEXT
+/// affinity and BINARY collation.
+fn join_side(
+    joined: &[JoinedTable],
+    tables: &[&BTreeTable],
+    expr: &Expr,
+) -> Option<(usize, usize)> {
+    let (id, column) = match expr {
+        Expr::Column {
+            table: t, column, ..
+        } => (*t, Some(*column)),
+        Expr::RowId { table: t, .. } => (*t, None),
+        _ => return None,
+    };
+    let at = joined.iter().position(|t| t.internal_id == id)?;
+    let table = tables.get(at)?;
+    let column = match column {
+        Some(column) => column,
+        None => rowid_alias(table)?,
+    };
+    let col = table.columns().get(column)?;
+    let plain = matches!(col.affinity(), Affinity::Integer | Affinity::Text)
+        && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
+    plain.then_some((at, column))
+}
+
+/// The last place in the FROM clause among the tables `expr` reads (0 when it reads none); none
+/// when it reads a table the join doesn't hold.
+fn reach(joined: &[JoinedTable], expr: &Expr) -> Option<usize> {
+    let mut last = 0usize;
+    let mut known = true;
+    walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        if let Expr::Column { table, .. } | Expr::RowId { table, .. } = e {
+            match joined.iter().position(|t| t.internal_id == *table) {
+                Some(at) => last = last.max(at),
+                None => known = false,
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .ok()?;
+    known.then_some(last)
+}
+
+/// Joins of three or more tables with a RIGHT or FULL JOIN among them, or with more than one outer
+/// join (lane qs6-14, T-QT.6.24 and T-QT.6.25; [`MorselOuter::Chain`]), with their aggregates or
+/// their rows. The tables are joined in the FROM clause's order, as SQL states the joins: the
+/// probe is the first, each other a link keyed by its own ON equalities with the tables before it
+/// (columns of one affinity), what it keeps the join's (LEFT the left rows, RIGHT the right rows,
+/// FULL both). Each table is a rowid table read whole (a scan, the planner's hash join, or a seek
+/// in an index the statement builds from it).
+///
+/// Where each term runs:
+/// - a link's own ON term over its table alone filters its build rows, unless the link keeps its
+///   right rows (those that fail it still appear, padded); any other ON term of the link runs in
+///   its ON code (`MorselBody::links_on`), over the row up to the link, and decides whether a
+///   match passed. An ON term reading a table after its link declines the hook.
+/// - a WHERE term acts where it can't change the joined rows a link sees: at the probe or an
+///   inner link with no link after it that keeps its right rows (such a link's padded rows skip
+///   the earlier tests, and every row reaching it marks its build rows whatever the WHERE terms
+///   later say). There a term over one table filters that table's rows and an equality with an
+///   earlier table keys an inner link; every other WHERE term runs over the whole joined row.
+/// - a link with no key is a cross product, which the hook declines.
+fn shape_chain(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> {
+    let rows_mode = plan.aggregates.is_empty();
+    if !(if rows_mode {
+        plain_rows(plan)
+    } else {
+        plain(plan)
+    }) {
+        return None;
+    }
+    let joined = plan.table_references.joined_tables();
+    let mut keeps = Vec::new();
+    let mut tables: Vec<&BTreeTable> = Vec::new();
+    for (at, table) in joined.iter().enumerate() {
+        let kept = match table.join_info.as_ref().map(|j| &j.join_type) {
+            None | Some(JoinType::Inner) => MorselKeeps::default(),
+            Some(JoinType::LeftOuter) => MorselKeeps {
+                left: true,
+                right: false,
+            },
+            Some(JoinType::RightOuter) => MorselKeeps {
+                left: false,
+                right: true,
+            },
+            Some(JoinType::FullOuter) => MorselKeeps {
+                left: true,
+                right: true,
+            },
+            Some(_) => return None,
+        };
+        // The first table joins nothing: it is the probe.
+        if (at == 0 && kept != MorselKeeps::default())
+            || table.join_info.as_ref().is_some_and(|j| j.lateral)
+        {
+            return None;
+        }
+        match &table.op {
+            Operation::Scan(Scan::BTreeTable { index: None, .. }) | Operation::HashJoin(_) => {}
+            Operation::Search(Search::Seek {
+                index: Some(index), ..
+            }) if index.ephemeral => {}
+            _ => return None,
+        }
+        keeps.push(kept);
+        tables.push(stored(table)?);
+    }
+    // Only what the other join shapes don't take: two or more outer joins, or a RIGHT or FULL
+    // JOIN among three or more tables.
+    let outer = keeps.iter().filter(|k| k.left || k.right).count();
+    let right = keeps.iter().any(|k| k.right);
+    if !(outer >= 2 || (right && tables.len() > 2)) {
+        return None;
+    }
+    let last_right = keeps.iter().rposition(|k| k.right);
+    // Where a WHERE term may act: the probe or an inner link, with no link after it that keeps
+    // its right rows.
+    let where_at = |at: usize| {
+        keeps.get(at).is_some_and(|k| !k.left && !k.right)
+            && last_right.is_none_or(|last| at > last)
+    };
+    let side = |expr: &Expr| join_side(joined, &tables, expr);
+    let affinity = |(at, column): (usize, usize)| {
+        tables
+            .get(at)
+            .and_then(|t| t.columns().get(column))
+            .map(|c| c.affinity())
+    };
+    // (the later table's column, the earlier table's) for each key.
+    let mut edges: Vec<((usize, usize), (usize, usize))> = Vec::new();
+    let mut filters: Vec<Vec<Predicate>> = tables.iter().map(|_| Vec::new()).collect();
+    let mut links_on: Vec<Vec<&Expr>> = tables.iter().map(|_| Vec::new()).collect();
+    let mut residual: Vec<&Expr> = Vec::new();
+    for term in &plan.where_clause {
+        if matches!(term.origin, WhereTermOrigin::TableFunction(_)) {
+            return None;
+        }
+        // An ON term's link: its join's right table; a WHERE term has none.
+        let link = match term.origin.join_origin() {
+            Some(origin) => {
+                let at = joined
+                    .iter()
+                    .position(|t| t.internal_id == origin.right_table())?;
+                if at == 0 || reach(joined, &term.expr)? > at {
+                    return None;
+                }
+                Some(at)
+            }
+            None => None,
+        };
+        if let Expr::Binary(left, Operator::Equals, right) = &term.expr {
+            if let (Some(l), Some(r)) = (side(left), side(right)) {
+                let (later, earlier) = if l.0 > r.0 { (l, r) } else { (r, l) };
+                let keys = match link {
+                    Some(link) => link == later.0,
+                    None => where_at(later.0),
+                };
+                if later.0 != earlier.0 && affinity(l)? == affinity(r)? && keys {
+                    edges.push((later, earlier));
+                    continue;
+                }
+            }
+        }
+        let found = (0..tables.len()).find_map(|at| {
+            let on = |expr: &Expr| side(expr).and_then(|(t, c)| (t == at).then_some(c));
+            let table: &BTreeTable = tables.get(at)?;
+            predicate(&term.expr, &on, table).map(|p| (at, p))
+        });
+        let pushed = found.filter(|(at, _)| match link {
+            Some(link) => link == *at && !keeps.get(*at).is_some_and(|k| k.right),
+            None => where_at(*at),
+        });
+        match (pushed, link) {
+            (Some((at, found)), _) => filters.get_mut(at)?.push(found),
+            (None, Some(link)) => links_on.get_mut(link)?.push(&term.expr),
+            (None, None) => residual.push(&term.expr),
+        }
+    }
+    // The chain: the tables in the FROM clause's order, each one's columns after the last's.
+    let mut offsets = Vec::new();
+    let mut width = 0usize;
+    for table in &tables {
+        offsets.push(width);
+        width = width.checked_add(table.columns().len())?;
+    }
+    let mut joins = Vec::new();
+    for (at, table) in tables.iter().enumerate().skip(1) {
+        let mut probe_key = Vec::new();
+        let mut build_key = Vec::new();
+        for (later, earlier) in edges.iter().filter(|(later, _)| later.0 == at) {
+            probe_key.push(offsets.get(earlier.0)?.checked_add(earlier.1)?);
+            build_key.push(later.1);
+        }
+        if probe_key.is_empty() {
+            return None;
+        }
+        joins.push(MorselJoinData {
+            root_page: table.root_page,
+            columns: table.columns().len(),
+            rowid_alias: rowid_alias(table),
+            filter: std::mem::take(filters.get_mut(at)?),
+            probe_key,
+            build_key,
+            keeps: *keeps.get(at)?,
+        });
+    }
+    // The body's row: each table's columns at its place, the probe's rowid its own (NULL in a
+    // row padded for it), a link's its INTEGER PRIMARY KEY.
+    let mut places = Vec::new();
+    for (at, table) in joined.iter().enumerate() {
+        let own: &BTreeTable = tables.get(at)?;
+        places.push(BodyTable {
+            id: table.internal_id,
+            table: own,
+            offset: *offsets.get(at)?,
+            rowid: if at == 0 {
+                RowidAt::Own
+            } else {
+                rowid_alias(own).map_or(RowidAt::Nowhere, RowidAt::Column)
+            },
+        });
+    }
+    let (
+        BodyOutputs {
+            outs,
+            group_by,
+            aggregates,
+            result_map,
+            ..
+        },
+        no_real,
+        joined_rows,
+    ) = join_outputs(plan, &tables, &side)?;
+    for on in &links_on {
+        body_reads(on, &places)?;
+    }
+    body_reads(&residual, &places)?;
+    body_reads(&outs, &places)?;
+    let probe_table: &BTreeTable = tables.first()?;
+    let data = MorselAggregateData {
+        root_page: probe_table.root_page,
+        columns: probe_table.columns().len(),
+        rowid_alias: rowid_alias(probe_table),
+        filter: std::mem::take(filters.first_mut()?),
+        group_by: group_by.clone(),
+        aggregates: aggregates.clone(),
+        result_map: result_map.clone(),
+        joins,
+        joined_rows,
+        body: None,
+        outer: Some(MorselOuter::Chain),
+        target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
+    };
+    let looped = BodyPlan {
+        table: probe_table,
+        places,
+        width,
+        on: Vec::new(),
+        // A list per link: the probe's place holds none.
+        links_on: links_on.into_iter().skip(1).collect(),
         filter: residual,
         outs,
         group_by,

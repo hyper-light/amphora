@@ -2195,3 +2195,285 @@ fn t_qt_6_23_left_joins_of_three_and_four_tables_pad_the_last_link() {
     assert!(hooked[0] > 0, "no LEFT join of three tables took the hook");
     assert!(hooked[1] > 0, "no LEFT join of four tables took the hook");
 }
+
+/// Tables `name(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)` of the given sizes
+/// (lane qs6-14): `a` in -20..20 or NULL, `b` in -1000..1000, `c` one of twelve texts, `p` a pad so
+/// each spans many leaf pages.
+fn fill_with_ids(conn: &Arc<Connection>, rng: &mut ChaCha8Rng, tables: &[(&str, usize)]) {
+    let pad = "x".repeat(48);
+    for (name, rows) in tables {
+        conn.execute(format!(
+            "CREATE TABLE {name}(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)"
+        ))
+        .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for _ in 0..*rows {
+            let a = if rng.random_range(0..10) == 0 {
+                "NULL".to_string()
+            } else {
+                rng.random_range(-20i64..20).to_string()
+            };
+            let b = rng.random_range(-1000i64..1000);
+            let c = rng.random_range(0..12);
+            conn.execute(format!(
+                "INSERT INTO {name}(a, b, c, p) VALUES ({a}, {b}, 't{c}', '{pad}')"
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+}
+
+/// A random join of `names` in that order (lane qs6-14), the table after each `kinds[k]` (`JOIN`,
+/// `LEFT JOIN`, `RIGHT JOIN` or `FULL JOIN`) joined to a random earlier table on `a` (or `c`),
+/// with ON terms beside the key over its own table, the earlier one or both, WHERE terms that
+/// read a padded side's NULLs, and aggregates, rows, or rows ordered by every table's id under a
+/// LIMIT and an OFFSET. Says whether it returns rows in no stated order (compared as sets).
+fn random_outer_chain(rng: &mut ChaCha8Rng, names: &[&str], kinds: &[&str]) -> (String, bool) {
+    let mut from = names[0].to_string();
+    for (at, kind) in kinds.iter().enumerate() {
+        let x = names[at + 1];
+        let p = names[rng.random_range(0..=at)];
+        let key = if rng.random_bool(0.8) { "a" } else { "c" };
+        let mut on = vec![format!("{x}.{key} = {p}.{key}")];
+        for _ in 0..rng.random_range(0..2) {
+            let n = rng.random_range(-1000i64..1000);
+            let k = rng.random_range(0..12);
+            on.push(match rng.random_range(0..4) {
+                0 => format!("{x}.b > {n}"),
+                1 => format!("{p}.b < {n}"),
+                2 => format!("{x}.b + {p}.b > 0"),
+                _ => format!("{x}.c <> 't{k}'"),
+            });
+        }
+        from.push_str(&format!(" {kind} {x} ON {}", on.join(" AND ")));
+    }
+    let pick = |rng: &mut ChaCha8Rng| names[rng.random_range(0..names.len())];
+    let filter = match rng.random_range(0..5) {
+        0..=2 => String::new(),
+        3 => {
+            let x = pick(rng);
+            format!(" WHERE {x}.id IS NULL OR {x}.b > 0")
+        }
+        _ => format!(
+            " WHERE coalesce({}.a, 0) >= {}",
+            pick(rng),
+            rng.random_range(-20i64..20)
+        ),
+    };
+    match rng.random_range(0..3) {
+        0 => {
+            let g = pick(rng);
+            let (x, y, z, w) = (pick(rng), pick(rng), pick(rng), pick(rng));
+            (
+                format!(
+                    "SELECT {g}.id IS NULL, count(*), count({x}.a), sum({y}.b), min({z}.c), max({w}.b) FROM {from}{filter} GROUP BY {g}.id IS NULL"
+                ),
+                false,
+            )
+        }
+        1 => {
+            let (x, y, z, w) = (pick(rng), pick(rng), pick(rng), pick(rng));
+            (
+                format!(
+                    "SELECT {x}.a, {y}.c, coalesce({z}.b, -1) + coalesce({w}.b, 0) FROM {from}{filter}"
+                ),
+                true,
+            )
+        }
+        _ => {
+            let ids: Vec<String> = names.iter().map(|name| format!("{name}.id")).collect();
+            let mut keys: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    let dir = if rng.random_bool(0.5) { " DESC" } else { "" };
+                    format!("{id}{dir}")
+                })
+                .collect();
+            if rng.random_bool(0.5) {
+                keys.reverse();
+            }
+            (
+                format!(
+                    "SELECT {}, {}.b FROM {from}{filter} ORDER BY {} LIMIT {} OFFSET {}",
+                    ids.join(", "),
+                    pick(rng),
+                    keys.join(", "),
+                    rng.random_range(1i64..150),
+                    rng.random_range(0i64..100)
+                ),
+                false,
+            )
+        }
+    }
+}
+
+/// Runs `sql` with `ParallelMode` off (the serial loop) and on at 1, 2, 3, 4 and 8 stated cores
+/// (lane qs6-14) and checks the answers agree; says how many of the parallel runs took the hook
+/// (a link built per table past the probe, the body run), or none when the serial loop refuses
+/// the statement (its error printed: the morsels don't answer what the serial loop can't).
+fn chain_runs(conn: &Arc<Connection>, sql: &str, rows: bool, tables: usize) -> Option<usize> {
+    conn.set_parallel_mode(ParallelMode::Off);
+    let serial = match conn
+        .prepare(sql)
+        .and_then(|mut stmt| stmt.run_collect_rows())
+    {
+        Ok(serial) => serial,
+        Err(error) => {
+            eprintln!("the serial loop refused {sql}: {error}");
+            return None;
+        }
+    };
+    conn.set_parallel_mode(ParallelMode::On);
+    let want = u64::try_from(tables - 1).unwrap();
+    let mut hooked = 0usize;
+    for cores in [1usize, 2, 3, 4, 8] {
+        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+            NonZeroUsize::new(cores).unwrap(),
+            1.0,
+            1.0,
+        ));
+        let links_before = conn
+            .morsel_join_links
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let body_before = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let parallel = sql_rows(conn, sql);
+        let links = conn
+            .morsel_join_links
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - links_before;
+        let body = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - body_before;
+        same_answer(sql, rows, &parallel, &serial, &format!("on {cores} cores"));
+        assert!(
+            links == 0 || links == want,
+            "{sql} on {cores} cores built {links} links"
+        );
+        if links == want && body > 0 {
+            hooked += 1;
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    Some(hooked)
+}
+
+/// T-QT.6.24 (lane qs6-14): a FULL JOIN among three and four tables runs on morsels, the chain in
+/// the FROM clause's order. Random joins with a FULL JOIN at a random link and inner, LEFT, RIGHT
+/// or FULL joins at the others, keyed on an INTEGER or a TEXT column of a random earlier table, ON
+/// terms beside the keys, WHERE terms that read the padded sides' NULLs, with aggregates,
+/// returning rows, or ordered by every table's INTEGER PRIMARY KEY under a LIMIT and an OFFSET,
+/// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores (row for row with aggregates or a
+/// LIMIT; as the same rows otherwise). Joins of both sizes took the hook.
+#[test]
+fn t_qt_6_24_full_joins_of_three_and_four_tables_answer_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-24");
+    let mut rng = ChaCha8Rng::seed_from_u64(624);
+    fill_with_ids(
+        &conn,
+        &mut rng,
+        &[("t", 400), ("u", 120), ("v", 50), ("w", 30)],
+    );
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let kinds = ["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"];
+    let mut hooked = [0usize; 2];
+    let queries = 40usize;
+    for query in 0..queries {
+        let names: &[&str] = if query % 2 == 0 {
+            &["t", "u", "v"]
+        } else {
+            &["t", "u", "v", "w"]
+        };
+        let mut link_kinds: Vec<&str> = (1..names.len())
+            .map(|_| kinds[rng.random_range(0..kinds.len())])
+            .collect();
+        let full = rng.random_range(0..link_kinds.len());
+        link_kinds[full] = "FULL JOIN";
+        let (sql, rows) = random_outer_chain(&mut rng, names, &link_kinds);
+        if let Some(runs) = chain_runs(&conn, &sql, rows, names.len()) {
+            hooked[names.len() - 3] += runs;
+        }
+    }
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: FULL joins of three and of four tables ran on morsels.
+    assert!(hooked[0] > 0, "no FULL join of three tables took the hook");
+    assert!(hooked[1] > 0, "no FULL join of four tables took the hook");
+}
+
+/// T-QT.6.25 (lane qs6-14): more than one outer join in a statement runs on morsels. Random joins
+/// of three and four tables with two or more LEFT, RIGHT or FULL joins (at random links, an inner
+/// join at the rest), as T-QT.6.24's, answer as the serial loop at 1, 2, 3, 4 and 8 stated cores.
+/// Joins of both sizes took the hook, and so did a statement of LEFT joins alone.
+#[test]
+fn t_qt_6_25_more_than_one_outer_join_answers_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-25");
+    let mut rng = ChaCha8Rng::seed_from_u64(625);
+    fill_with_ids(
+        &conn,
+        &mut rng,
+        &[("t", 400), ("u", 120), ("v", 50), ("w", 30)],
+    );
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let outer = ["LEFT JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"];
+    let mut hooked = [0usize; 2];
+    let mut left_only = 0usize;
+    let queries = 40usize;
+    for query in 0..queries {
+        let names: &[&str] = if query % 2 == 0 {
+            &["t", "u", "v"]
+        } else {
+            &["t", "u", "v", "w"]
+        };
+        let links = names.len() - 1;
+        // Two links (all of a three-table join's) outer, the rest inner or outer.
+        let mut link_kinds: Vec<&str> = (0..links)
+            .map(|_| {
+                if rng.random_bool(0.5) {
+                    "JOIN"
+                } else {
+                    outer[rng.random_range(0..outer.len())]
+                }
+            })
+            .collect();
+        let first = rng.random_range(0..links);
+        let second = (first + rng.random_range(1..links)) % links;
+        for at in [first, second] {
+            if link_kinds[at] == "JOIN" {
+                link_kinds[at] = outer[rng.random_range(0..outer.len())];
+            }
+        }
+        // Every fourth statement: LEFT joins alone.
+        if query % 4 == 3 {
+            for kind in link_kinds.iter_mut().filter(|kind| **kind != "JOIN") {
+                *kind = "LEFT JOIN";
+            }
+        }
+        let lefts = link_kinds
+            .iter()
+            .all(|kind| *kind != "RIGHT JOIN" && *kind != "FULL JOIN");
+        let (sql, rows) = random_outer_chain(&mut rng, names, &link_kinds);
+        if let Some(runs) = chain_runs(&conn, &sql, rows, names.len()) {
+            hooked[names.len() - 3] += runs;
+            if lefts {
+                left_only += runs;
+            }
+        }
+    }
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: joins of three and of four tables ran on morsels, LEFT joins alone among them.
+    assert!(
+        hooked[0] > 0,
+        "no join of three tables with two outer joins took the hook"
+    );
+    assert!(
+        hooked[1] > 0,
+        "no join of four tables with two outer joins took the hook"
+    );
+    assert!(
+        left_only > 0,
+        "no statement of LEFT joins alone took the hook"
+    );
+}

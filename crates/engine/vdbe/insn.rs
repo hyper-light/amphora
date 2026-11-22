@@ -480,6 +480,28 @@ pub enum MorselOuter {
     /// all fail the ON terms, or that has none, runs once padded with NULLs for that link's
     /// columns. No bitmaps: the rows it keeps are the probe's walk itself.
     LeftLink,
+    /// Joins of three or more tables with a FULL or RIGHT JOIN among them, or more than one outer
+    /// join of any kind (lane qs6-14, T-QT.6.24 and T-QT.6.25): the chain's links are the tables in
+    /// the FROM clause's order, the probe its first, and each link says what it keeps
+    /// ([`MorselJoinData::keeps`]). A probe row walks the chain depth first; at each link a match
+    /// that passes the link's own ON terms ([`MorselBody::links_on`]) goes on to the next, and a
+    /// row of the tables before it that no match passed goes on padded with NULLs for the link
+    /// when it keeps the left rows. A link that keeps the right rows marks the build rows matched
+    /// in each worker's own bitmap; once every row that can reach the link has walked (the
+    /// probe's, then each earlier such link's padded rows), the bitmaps merge and the build rows
+    /// no worker marked walk the rest of the chain, padded with NULLs for the tables before it.
+    Chain,
+}
+
+/// Amphora (QT.6, lane qs6-14): what a link of a [`MorselOuter::Chain`] keeps that matches
+/// nothing. Neither for an inner join; `left` for a LEFT JOIN; `right` for a RIGHT JOIN; both for
+/// a FULL JOIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MorselKeeps {
+    /// A row of the tables before the link that no match passed goes on padded with NULLs.
+    pub left: bool,
+    /// A build row no joined row matched goes on padded with NULLs for the tables before it.
+    pub right: bool,
 }
 
 /// Amphora (QT.6, lane qs6-7): a one-table scan's loop body, emitted as its own range of the
@@ -494,6 +516,11 @@ pub struct MorselBody {
     /// An outer join's ON terms the hash keys don't hold (lane qs6-12): their code runs from here
     /// and falls through to `start` when they hold (the row matched), else jumps to `skip`.
     pub on: Option<BranchOffset>,
+    /// A [`MorselOuter::Chain`]'s links' own ON terms the keys and the build filters don't hold
+    /// (lane qs6-14), a place per link: none, or where its code starts and the place it reaches
+    /// when they hold (it jumps to `skip` when they don't). Each reads only the tables up to its
+    /// link. Empty for any other shape.
+    pub links_on: Vec<Option<(BranchOffset, BranchOffset)>>,
     pub start: BranchOffset,
     pub keep: BranchOffset,
     pub skip: BranchOffset,
@@ -548,6 +575,9 @@ pub struct MorselJoinData {
     /// each earlier link's) and in the build table.
     pub probe_key: Vec<usize>,
     pub build_key: Vec<usize>,
+    /// What the link keeps that matches nothing, in a [`MorselOuter::Chain`] (lane qs6-14);
+    /// neither for any other shape.
+    pub keeps: MorselKeeps,
 }
 
 /// Amphora: data for [Insn::GroupSort].

@@ -593,9 +593,32 @@ with the padded table keys its link; an equality with it in the WHERE clause, or
 between the tables it keeps, is the body's; an ON term on the padded table alone filters its
 build, a WHERE term on it does not (T-QT.6.23).
 
-**Not yet.** FULL joins among more than two tables, more than one outer join in a statement, and
-a two-table LEFT join through the last-link walk (it keeps lane qs6-12's bitmaps: one path for
-both is the next step once the scaling run says which is faster).
+**Outer joins of any kind among any number of tables** (lane qs6-14). A RIGHT or FULL JOIN among
+three or more tables, or more than one outer join in a statement, runs as `MorselOuter::Chain`
+(`TableChain`): the tables joined in the FROM clause's order, as SQL states the joins, the first
+the probe and each other a link of the chain, keyed by its own ON equalities with the tables before
+it and marked with what it keeps (`MorselKeeps`: LEFT the left rows, RIGHT the right rows, FULL
+both). A probe row walks the chain depth first, an explicit stack as deep as the chain. At each
+link a match runs the link's own ON code (`MorselBody::links_on`, a block per link, over the row
+up to it); one that passes goes on to the next link, and a row of the tables before it that no
+match passed goes on once padded with NULLs when the link keeps the left rows. A link that keeps
+the right rows marks the build rows matched in each worker's own bitmap. The walk runs in phases:
+the probe's leaves, then for each link that keeps the right rows, in the chain's order, its build
+rows no worker marked, padded with NULLs for the tables before it, walk the rest of the chain. A
+link's bitmaps are merged only once every phase that can reach it has run: the probe's, and each
+earlier such link's padded rows. Every row at the chain's end runs the WHERE terms and the
+outputs. Where terms run: a link's own ON term over its table alone filters its build unless the
+link keeps its right rows; its other ON terms run in its ON code (an ON term reading a table after
+its link declines). A WHERE term acts early only at the probe or an inner link with no link after
+it that keeps its right rows (such a link's padded rows skip the earlier tests, and every row that
+reaches it marks its build rows whatever the WHERE terms later say): there a term over one table
+filters that table and an equality with an earlier table keys the link. Every other WHERE term runs
+over the whole row. The two-table shapes and one LEFT join among more keep their own paths
+(T-QT.6.24 for FULL joins among three and four tables, T-QT.6.25 for two or more outer joins).
+
+**Not yet.** One path for LEFT joins: a two-table LEFT join keeps lane qs6-12's bitmaps, one LEFT
+join among more lane qs6-13's last-link walk, and two or more the chain; which wins is the scaling
+run's to say (the plan is in lane qs6-14's report).
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

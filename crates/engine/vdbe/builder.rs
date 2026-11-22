@@ -2006,6 +2006,14 @@ impl ProgramBuilder {
                 Insn::MorselAggregate { data } => {
                     resolve(&mut data.target_pc_serial, "MorselAggregate")?;
                     if let Some(body) = data.body.as_mut() {
+                        // An outer join's ON code (lane qs6-12) and a chain's links' (lane qs6-14).
+                        if let Some(on) = body.on.as_mut() {
+                            resolve(on, "MorselAggregate")?;
+                        }
+                        for (from, pass) in body.links_on.iter_mut().flatten() {
+                            resolve(from, "MorselAggregate")?;
+                            resolve(pass, "MorselAggregate")?;
+                        }
                         resolve(&mut body.start, "MorselAggregate")?;
                         resolve(&mut body.keep, "MorselAggregate")?;
                         resolve(&mut body.skip, "MorselAggregate")?;
