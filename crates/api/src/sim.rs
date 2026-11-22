@@ -521,10 +521,13 @@ mod tests {
         }
     }
 
+    /// The most any case writes: one row past a page (SCAN_MAX + 1, to show a scan's limit served
+    /// as SCAN_MAX) or past a transaction (a row, then TX_MAX in one commit).
     fn roomy() -> SimLimits {
+        let most = TX_MAX.max(crate::SCAN_MAX).saturating_add(1);
         SimLimits {
-            rows: TX_MAX,
-            versions: TX_MAX,
+            rows: most,
+            versions: most,
         }
     }
 

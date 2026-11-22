@@ -404,3 +404,12 @@ fn the_records_suite_answers_alike_at_one_voter_and_three() {
         assert_eq!(a, b, "one voter and three answered differently");
     }
 }
+
+/// CP-T1.5: the suite holds more than 200 cases, each id once.
+#[test]
+fn cp_t1_5_the_records_suite_is_past_200_cases_each_id_once() {
+    let all = cases();
+    let ids: std::collections::BTreeSet<&str> = all.iter().map(|c| c.id).collect();
+    assert!(all.len() > 200, "{} cases", all.len());
+    assert_eq!(ids.len(), all.len(), "an id used twice");
+}
