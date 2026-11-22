@@ -1523,9 +1523,8 @@ impl<S: Storage> Raft<S> {
     /// bound an owner's group states in its log and raised there before a configuration that
     /// passes it ([`Config::stated_members`]; Amphora's QB.1, lane constants-21), so a group's
     /// members, each opened for the bound its log named then, take every configuration the group
-    /// commits. Each of the core's
-    /// parts bounded by it (the tracker, the fast votes and the pending reads) takes the new
-    /// bound with it. Returns whether it rose.
+    /// commits. Each of the core's parts bounded by it (the tracker, the fast votes and the
+    /// pending reads) takes the new bound with it. Returns whether it rose.
     pub fn grow_members(&mut self, members: usize) -> bool {
         if members <= self.config.limits.members {
             return false;

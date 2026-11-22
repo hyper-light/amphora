@@ -64,7 +64,7 @@ index 27ac5f9d907827bbb7f8d1e3e2b95012f78e6137..67bd072c2aba49c4ffd829a981b40655
      /// join: its fixed bytes and `max_size_per_msg` of entries.
      pub fn set_page(&mut self, max_size_per_msg: u64) {
 diff --git a/crates/hyper-raft/src/raft.rs b/crates/hyper-raft/src/raft.rs
-index 4baa0af2c48605001223dff83915b9254b5ee830..4062ff7d2791a5f8a64b2fdd28813ba7a3373315 100644
+index 4baa0af2c48605001223dff83915b9254b5ee830..493c154146d0c2a2ce686eccbd2f366e8673c464 100644
 --- a/crates/hyper-raft/src/raft.rs
 +++ b/crates/hyper-raft/src/raft.rs
 @@ -326,6 +326,31 @@ pub struct Config {
@@ -107,7 +107,7 @@ index 4baa0af2c48605001223dff83915b9254b5ee830..4062ff7d2791a5f8a64b2fdd28813ba7
          }
      }
      /// Whether the settings describe a member that can run: an identity, an
-@@ -1493,6 +1519,23 @@ impl<S: Storage> Raft<S> {
+@@ -1493,6 +1519,22 @@ impl<S: Storage> Raft<S> {
      pub fn config(&self) -> &Config {
          &self.config
      }
@@ -115,9 +115,8 @@ index 4baa0af2c48605001223dff83915b9254b5ee830..4062ff7d2791a5f8a64b2fdd28813ba7
 +    /// bound an owner's group states in its log and raised there before a configuration that
 +    /// passes it ([`Config::stated_members`]; Amphora's QB.1, lane constants-21), so a group's
 +    /// members, each opened for the bound its log named then, take every configuration the group
-+    /// commits. Each of the core's
-+    /// parts bounded by it (the tracker, the fast votes and the pending reads) takes the new
-+    /// bound with it. Returns whether it rose.
++    /// commits. Each of the core's parts bounded by it (the tracker, the fast votes and the
++    /// pending reads) takes the new bound with it. Returns whether it rose.
 +    pub fn grow_members(&mut self, members: usize) -> bool {
 +        if members <= self.config.limits.members {
 +            return false;
@@ -131,7 +130,7 @@ index 4baa0af2c48605001223dff83915b9254b5ee830..4062ff7d2791a5f8a64b2fdd28813ba7
      /// This member's identity.
      pub fn id(&self) -> NodeId {
          self.id
-@@ -4645,10 +4688,18 @@ impl<S: Storage> Raft<S> {
+@@ -4645,10 +4687,18 @@ impl<S: Storage> Raft<S> {
              renewed: Vec::new(),
              error: None,
          };
@@ -150,7 +149,7 @@ index 4baa0af2c48605001223dff83915b9254b5ee830..4062ff7d2791a5f8a64b2fdd28813ba7
                  fold.entry(start, entry).is_err_and(|error| {
                      fold.error = Some(error);
                      true
-@@ -4658,6 +4709,7 @@ impl<S: Storage> Raft<S> {
+@@ -4658,6 +4708,7 @@ impl<S: Storage> Raft<S> {
          if let Some(error) = fold.error {
              return Err(error);
          }
