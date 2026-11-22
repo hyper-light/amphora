@@ -1883,8 +1883,12 @@ fn open_on<F: BlockFile + 'static>(
         log
     };
     let group = GroupStore::claim(&log, 1).map_err(unavailable)?;
+    // The replica's resident bytes (its core's and its shell's) are held to the memory budget's
+    // room for queues, the memory its core's limits are derived from (lane constants-20; was a
+    // picked 512 MiB).
+    let resident = crate::memory::process().room(crate::memory::Use::Queues)?;
     let replica =
-        Replica::open(&settings, group, machine, Bytes::new(512 << 20)).map_err(unavailable)?;
+        Replica::open(&settings, group, machine, Bytes::new(resident)).map_err(unavailable)?;
     let local = Local::new(
         reader,
         Arc::clone(&meter),
