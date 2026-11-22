@@ -84,6 +84,27 @@ pub trait Disk: Send + Sync {
     fn read_at(&self, file: File, offset: u64, buf: &mut [u8]) -> Result<usize>;
     /// Writes `data` at `offset`, growing the file if it ends before.
     fn write_at(&self, file: File, offset: u64, data: &[u8]) -> Result<()>;
+    /// Whether [`Disk::read_run`] reads a run in one I/O: the buffer pool reads runs ahead only
+    /// where it does (query speed step 2).
+    fn reads_runs(&self) -> bool {
+        false
+    }
+    /// Reads into `bufs`, back to back from `offset`: the bytes read, fewer past the file's end.
+    /// Here a read for each buffer, stopping at a short one.
+    fn read_run(&self, file: File, offset: u64, bufs: &mut [&mut [u8]]) -> Result<usize> {
+        let mut done = 0usize;
+        for buf in bufs.iter_mut() {
+            let at = offset
+                .checked_add(u64::try_from(done).map_err(|_| LimboError::IntegerOverflow)?)
+                .ok_or(LimboError::IntegerOverflow)?;
+            let got = self.read_at(file, at, buf)?;
+            done = done.checked_add(got).ok_or(LimboError::IntegerOverflow)?;
+            if got < buf.len() {
+                break;
+            }
+        }
+        Ok(done)
+    }
     /// Makes every write to `file` so far durable.
     fn sync(&self, file: File) -> Result<()>;
     fn len(&self, file: File) -> Result<u64>;
@@ -176,6 +197,36 @@ fn pread(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> std::io::Result<usiz
     Ok(done)
 }
 
+/// `bufs` read back to back from `offset` with one `preadv`; a read the kernel ends short (a
+/// signal, the file's end) finished buffer by buffer: the bytes read, fewer past the file's end.
+#[cfg(unix)]
+fn preadv(f: &std::fs::File, offset: u64, bufs: &mut [&mut [u8]]) -> std::io::Result<usize> {
+    let got = {
+        let mut slices: Vec<std::io::IoSliceMut<'_>> = bufs
+            .iter_mut()
+            .map(|b| std::io::IoSliceMut::new(b))
+            .collect();
+        rustix::io::preadv(f, &mut slices, offset)?
+    };
+    let mut done = 0usize;
+    for buf in bufs.iter_mut() {
+        let len = buf.len();
+        let have = got.saturating_sub(done).min(len);
+        let more = if have < len {
+            let at =
+                offset.saturating_add(u64::try_from(done.saturating_add(have)).unwrap_or(u64::MAX));
+            pread(f, at, buf.get_mut(have..).unwrap_or_default())?
+        } else {
+            0
+        };
+        done = done.saturating_add(have).saturating_add(more);
+        if have.saturating_add(more) < len {
+            break;
+        }
+    }
+    Ok(done)
+}
+
 #[cfg(unix)]
 fn pwrite(f: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
@@ -239,6 +290,16 @@ impl Disk for Files {
 
     fn write_at(&self, file: File, offset: u64, data: &[u8]) -> Result<()> {
         pwrite(self.file(file)?, offset, data).map_err(|e| io("a write", e))
+    }
+
+    fn reads_runs(&self) -> bool {
+        cfg!(unix)
+    }
+
+    /// One `preadv` (Unix): the kernel scatters the run into the buffers.
+    #[cfg(unix)]
+    fn read_run(&self, file: File, offset: u64, bufs: &mut [&mut [u8]]) -> Result<usize> {
+        preadv(self.file(file)?, offset, bufs).map_err(|e| io("a read of a run", e))
     }
 
     fn sync(&self, file: File) -> Result<()> {
@@ -426,6 +487,32 @@ impl Disk for Simulated {
             .ok_or(LimboError::IntegerOverflow)?
             .copy_from_slice(have.get(..n).unwrap_or_default());
         Ok(n)
+    }
+
+    fn reads_runs(&self) -> bool {
+        true
+    }
+
+    /// One operation, as `preadv` is one.
+    fn read_run(&self, file: File, offset: u64, bufs: &mut [&mut [u8]]) -> Result<usize> {
+        let mut s = self.state.lock();
+        Self::spend(&mut s)?;
+        let f = Self::file(&mut s, self.lanes, file)?;
+        let mut at = usize::try_from(offset).map_err(|_| LimboError::IntegerOverflow)?;
+        let mut done = 0usize;
+        for buf in bufs.iter_mut() {
+            let have = f.now.get(at..).unwrap_or_default();
+            let n = have.len().min(buf.len());
+            buf.get_mut(..n)
+                .ok_or(LimboError::IntegerOverflow)?
+                .copy_from_slice(have.get(..n).unwrap_or_default());
+            done = done.saturating_add(n);
+            at = at.saturating_add(n);
+            if n < buf.len() {
+                break;
+            }
+        }
+        Ok(done)
     }
 
     fn write_at(&self, file: File, offset: u64, data: &[u8]) -> Result<()> {

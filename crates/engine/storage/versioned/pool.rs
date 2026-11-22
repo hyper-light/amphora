@@ -34,6 +34,7 @@ use crate::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuar
 use crate::Result;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::time::Instant;
 
 /// A frame: one page's bytes behind its latch.
 struct Frame {
@@ -170,6 +171,78 @@ pub struct Counts {
     pub evictions: u64,
     /// Dirty pages written to the spill file as they were evicted.
     pub spilled: u64,
+    /// Reads issued for the pages read in: fewer than `misses` when runs were read ahead.
+    pub reads: u64,
+    /// Pages read in ahead of being asked for, in a run (query speed step 2).
+    pub ahead: u64,
+    /// The most pages one read brought in.
+    pub longest: u64,
+}
+
+/// Read-ahead's switch for the pools a process opens (query speed step 2):
+/// `AMPHORA_READ_AHEAD=runs`, read once. Off unless set, until the coordinator's measurements
+/// decide; [`Pool::set_read_ahead`] sets one pool's.
+fn read_ahead_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AMPHORA_READ_AHEAD").is_some_and(|v| v == "runs"))
+}
+
+/// What a read of a run of pages costs where the pool runs: the least-squares line through each
+/// read's time against its pages, `time = fixed + pages * each`: `fixed` what an I/O costs
+/// whatever it carries (a system call, the device's latency), `each` what a page more costs (the
+/// sequential bandwidth's inverse). Every read in with read-ahead on feeds it, a miss of one page
+/// and a run alike, each with the same weight, so it holds what this machine and these files have
+/// shown, no rate or window picked.
+#[derive(Default)]
+struct Fit {
+    /// Reads measured, and the sums of their pages, nanoseconds, pages squared and pages times
+    /// nanoseconds.
+    k: f64,
+    n: f64,
+    t: f64,
+    nn: f64,
+    nt: f64,
+    /// The most pages one read measured carried.
+    largest: u64,
+}
+
+impl Fit {
+    fn add(&mut self, pages: u64, nanos: f64) {
+        let n = pages as f64;
+        self.k += 1.0;
+        self.n += n;
+        self.t += nanos;
+        self.nn += n * n;
+        self.nt += n * nanos;
+        self.largest = self.largest.max(pages);
+    }
+
+    /// `(fixed, each)`, once reads of two sizes or more were measured and both come out positive.
+    fn line(&self) -> Option<(f64, f64)> {
+        let det = self.k * self.nn - self.n * self.n;
+        if det.is_nan() || det <= 0.0 {
+            return None;
+        }
+        let each = (self.k * self.nt - self.n * self.t) / det;
+        let fixed = (self.t - each * self.n) / self.k;
+        (each.is_finite() && fixed.is_finite() && each > 0.0 && fixed > 0.0)
+            .then_some((fixed, each))
+    }
+
+    /// The pages a run reads: `ceil(fixed / each)`, the run whose transfer takes as long as the
+    /// I/O's fixed cost. There a page costs `fixed / n + each`, twice an endless run's `each`, and
+    /// each page more saves less than the page itself costs to read, a page the walk may never
+    /// reach (the break-even of Gray and Graefe, "The Five-Minute Rule Ten Years Later", SIGMOD
+    /// Record 26(4), 1997, between an access's fixed cost and its transfer). Until the line is
+    /// measured (one size read so far, or a slope the noise hides), twice the largest read so far,
+    /// so each run measures a size not measured yet; a pool bounds it ([`Pool::read_run`]).
+    fn target(&self) -> u64 {
+        match self.line() {
+            // A float's cast saturates: past `u64::MAX`, `u64::MAX`.
+            Some((fixed, each)) => (fixed / each).ceil() as u64,
+            None => self.largest.max(1).saturating_mul(2),
+        }
+    }
 }
 
 /// The frames, the slots, and the next page number to hand out.
@@ -204,7 +277,24 @@ pub struct Pool {
     misses: AtomicU64,
     evictions: AtomicU64,
     spilled: AtomicU64,
+    reads: AtomicU64,
+    ahead: AtomicU64,
+    longest: AtomicU64,
+    /// Pages in the data file when the pool was opened: a page past them never spilled has no
+    /// bytes on disk to read ahead.
+    opened: u64,
+    /// Read-ahead runs on (query speed step 2).
+    read_ahead: AtomicBool,
+    /// The last page read in (0: none): a miss on the page after it is a sequential walk's.
+    last_in: AtomicU64,
+    fit: Mutex<Fit>,
+    /// Tests' run length, in place of the fit's (0: the fit's).
+    #[cfg(test)]
+    run_pages: AtomicU64,
 }
+
+/// A frame's index and its exclusive latch.
+type Latched<'a> = (usize, RwLockWriteGuard<'a, Box<[u8]>>);
 
 /// A page read under its frame's shared latch.
 pub struct PageRead<'a> {
@@ -287,7 +377,8 @@ impl Pool {
             )));
         }
         disk.truncate(File::Spill, 0)?;
-        let pool = Self::make(frames, Some(disk.clone()));
+        let mut pool = Self::make(frames, Some(disk.clone()));
+        pool.opened = allocated;
         let mut buf = vec![0u8; PAGE_SIZE];
         for page in 1..=allocated {
             if disk.read_at(File::Data, page_offset(page)?, &mut buf)? != PAGE_SIZE {
@@ -329,6 +420,15 @@ impl Pool {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             spilled: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            ahead: AtomicU64::new(0),
+            longest: AtomicU64::new(0),
+            opened: 0,
+            read_ahead: AtomicBool::new(read_ahead_switch()),
+            last_in: AtomicU64::new(0),
+            fit: Mutex::new(Fit::default()),
+            #[cfg(test)]
+            run_pages: AtomicU64::new(0),
         }
     }
 
@@ -348,7 +448,15 @@ impl Pool {
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             spilled: self.spilled.load(Ordering::Relaxed),
+            reads: self.reads.load(Ordering::Relaxed),
+            ahead: self.ahead.load(Ordering::Relaxed),
+            longest: self.longest.load(Ordering::Relaxed),
         }
+    }
+
+    /// Turns this pool's read-ahead runs on or off ([`read_ahead_switch`] gives where it starts).
+    pub fn set_read_ahead(&self, on: bool) {
+        self.read_ahead.store(on, Ordering::Relaxed);
     }
 
     /// A new page's number, its frame zeroed. Without a disk, `DatabaseFull` once every frame
@@ -496,50 +604,93 @@ impl Pool {
     }
 
     fn stripe(&self, page: u64) -> Result<&Mutex<()>> {
+        self.loading
+            .get(self.stripe_of(page)?)
+            .ok_or(LimboError::IntegerOverflow)
+    }
+
+    fn stripe_of(&self, page: u64) -> Result<usize> {
         let n = u64::try_from(self.loading.len()).map_err(|_| LimboError::IntegerOverflow)?;
-        let s = page
-            .checked_rem(n)
+        page.checked_rem(n)
             .and_then(|s| usize::try_from(s).ok())
-            .ok_or(LimboError::IntegerOverflow)?;
-        self.loading.get(s).ok_or(LimboError::IntegerOverflow)
+            .ok_or(LimboError::IntegerOverflow)
     }
 
     /// Page `page` put in a frame unless one holds it by now: zeroed and dirty if `zero` (a new
-    /// page), else read in and verified. Under the page's stripe it only tries latches, never
-    /// waits on one, so a holder of a latch waiting on the stripe can't wait on it in turn.
+    /// page), else read in and verified, with the pages after it if a sequential walk reached it
+    /// and read-ahead is on ([`Pool::read_run`]). Under the page's stripe it only tries latches,
+    /// never waits on one, so a holder of a latch waiting on the stripe can't wait on it in turn.
+    /// A miss allocates nothing: the page is read into its frame, checked against its checksum
+    /// once, and the read ends inline, with no completion to call back.
     fn bring(&self, page: u64, slot: &Slot, zero: bool) -> Result<()> {
-        let _loading = self.stripe(page)?.lock();
+        let held = self.stripe_of(page)?;
+        let _loading = self
+            .loading
+            .get(held)
+            .ok_or(LimboError::IntegerOverflow)?
+            .lock();
         if slot.frame().is_some() {
             return Ok(());
         }
         let (i, mut g) = self.victim()?;
         let fr = self.frame(i)?;
-        let old = fr.tag.load(Ordering::Acquire);
-        if old != 0 {
-            let old_slot = self.slots.get(old).ok_or_else(|| {
-                LimboError::InternalError(format!("versioned storage: page {old} has no slot"))
-            })?;
-            if fr.dirty.load(Ordering::Relaxed) {
-                let disk = self.disk.as_ref().ok_or(LimboError::DatabaseFull)?;
-                disk.write_at(File::Spill, page_offset(old)?, &g)?;
-                old_slot.sum.store(checksum(&g), Ordering::Relaxed);
-                old_slot.flags.fetch_or(SPILLED, Ordering::Release);
-                self.spilled.fetch_add(1, Ordering::Relaxed);
-            }
-            self.evicted_version
-                .fetch_max(fr.version.load(Ordering::Acquire), Ordering::AcqRel);
-            old_slot.frame.store(0, Ordering::Release);
-            fr.tag.store(0, Ordering::Release);
-            fr.dirty.store(false, Ordering::Relaxed);
-            self.evictions.fetch_add(1, Ordering::Relaxed);
-        }
+        self.evict(fr, &g)?;
         if zero {
             g.fill(0);
             fr.dirty.store(true, Ordering::Relaxed);
-        } else {
-            self.read_in(page, slot, &mut g)?;
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            return self.install(page, slot, i, fr, g, true);
         }
+        if self.sequential(page) {
+            return self.read_run(page, slot, held, i, g);
+        }
+        let started = self.read_ahead.load(Ordering::Relaxed).then(Instant::now);
+        self.read_in(page, slot, &mut g)?;
+        if let Some(started) = started {
+            self.fit.lock().add(1, started.elapsed().as_nanos() as f64);
+            self.last_in.store(page, Ordering::Relaxed);
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.longest.fetch_max(1, Ordering::Relaxed);
+        self.install(page, slot, i, fr, g, true)
+    }
+
+    /// Frame `fr`'s page put out, under its exclusive latch (`held`, its bytes): written to the
+    /// spill file first if dirty.
+    fn evict(&self, fr: &Frame, held: &[u8]) -> Result<()> {
+        let old = fr.tag.load(Ordering::Acquire);
+        if old == 0 {
+            return Ok(());
+        }
+        let old_slot = self.slots.get(old).ok_or_else(|| {
+            LimboError::InternalError(format!("versioned storage: page {old} has no slot"))
+        })?;
+        if fr.dirty.load(Ordering::Relaxed) {
+            let disk = self.disk.as_ref().ok_or(LimboError::DatabaseFull)?;
+            disk.write_at(File::Spill, page_offset(old)?, held)?;
+            old_slot.sum.store(checksum(held), Ordering::Relaxed);
+            old_slot.flags.fetch_or(SPILLED, Ordering::Release);
+            self.spilled.fetch_add(1, Ordering::Relaxed);
+        }
+        self.evicted_version
+            .fetch_max(fr.version.load(Ordering::Acquire), Ordering::AcqRel);
+        old_slot.frame.store(0, Ordering::Release);
+        fr.tag.store(0, Ordering::Release);
+        fr.dirty.store(false, Ordering::Relaxed);
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Page `page` made frame `i`'s, its bytes in place under the latch `g`, which ends here.
+    fn install(
+        &self,
+        page: u64,
+        slot: &Slot,
+        i: usize,
+        fr: &Frame,
+        g: RwLockWriteGuard<'_, Box<[u8]>>,
+        referenced: bool,
+    ) -> Result<()> {
         let start = self
             .evicted_version
             .load(Ordering::Acquire)
@@ -547,12 +698,169 @@ impl Pool {
             .ok_or(LimboError::IntegerOverflow)?;
         fr.version.fetch_max(start, Ordering::AcqRel);
         fr.tag.store(page, Ordering::Release);
-        fr.referenced.store(true, Ordering::Relaxed);
+        fr.referenced.store(referenced, Ordering::Relaxed);
         let at = u32::try_from(i.checked_add(1).ok_or(LimboError::IntegerOverflow)?)
             .map_err(|_| LimboError::IntegerOverflow)?;
         slot.frame.store(at, Ordering::Release);
         drop(g);
         Ok(())
+    }
+
+    /// A miss on the page after the last one read in, with read-ahead on, over a disk that reads
+    /// a run in one I/O ([`Disk::reads_runs`]).
+    fn sequential(&self, page: u64) -> bool {
+        self.read_ahead.load(Ordering::Relaxed)
+            && self.disk.as_ref().is_some_and(|d| d.reads_runs())
+            && page
+                .checked_sub(1)
+                .is_some_and(|p| p != 0 && p == self.last_in.load(Ordering::Relaxed))
+    }
+
+    /// A sequential walk's miss on `page`: it and the pages after it, as many as the fit's run
+    /// ([`Fit::target`]), read in one read into frames found for them. A page joins the run while
+    /// it isn't resident, comes from the same file as `page` and has bytes there, and its stripe
+    /// can be had without waiting; the run stops at the first that can't. The pool's budget bounds
+    /// it: a page read ahead takes only a frame never used, or one whose reference bit is clear
+    /// and which no one latches (one sweep at most, the bits left as they are), and a run holds at
+    /// most `capacity - 1` frames; so a run never evicts a page CLOCK hasn't found cold, never
+    /// latches every frame, and holds no memory past the frames but the list of its buffers. A run
+    /// shrinks to what the budget gives, down to `page` alone. Each page is checked against its
+    /// checksum once as it comes in: `page` failing is refused as a plain miss's is; a page after
+    /// it failing, or past a short read, isn't kept (its own read meets it). Pages read ahead come
+    /// in with their reference bits clear: CLOCK's first to go if the walk doesn't reach them.
+    fn read_run(
+        &self,
+        page: u64,
+        slot: &Slot,
+        held: usize,
+        i: usize,
+        g: RwLockWriteGuard<'_, Box<[u8]>>,
+    ) -> Result<()> {
+        let disk = self.disk.as_ref().ok_or_else(|| {
+            LimboError::Corrupt(format!("versioned storage: page {page} isn't resident"))
+        })?;
+        #[cfg(test)]
+        let fixed = self.run_pages.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let fixed = 0u64;
+        let want = if fixed != 0 {
+            fixed
+        } else {
+            self.fit.lock().target()
+        };
+        let want = want.min(u64::try_from(self.capacity.saturating_sub(1)).unwrap_or(u64::MAX));
+        let spilled = slot.flags.load(Ordering::Acquire) & SPILLED != 0;
+        let (file, name) = if spilled {
+            (File::Spill, "spill")
+        } else {
+            (File::Data, "data")
+        };
+        let allocated = self.allocated();
+        let mut run = vec![(page, slot, i, self.frame(i)?, g)];
+        let mut stripes: Vec<(usize, _)> = Vec::new();
+        let (mut at, mut looked) = (self.hand.load(Ordering::Relaxed), 0usize);
+        let mut q = page;
+        while u64::try_from(run.len()).unwrap_or(u64::MAX) < want {
+            q = match q.checked_add(1) {
+                Some(next) if next <= allocated => next,
+                _ => break,
+            };
+            let Some(s) = self.slots.get(q) else {
+                break;
+            };
+            let si = self.stripe_of(q)?;
+            if si != held && !stripes.iter().any(|(h, _)| *h == si) {
+                let Some(guard) = self.loading.get(si).and_then(|m| m.try_lock()) else {
+                    break;
+                };
+                stripes.push((si, guard));
+            }
+            // Under its stripe, a page not resident stays so, and its flags as they are.
+            let theirs = s.flags.load(Ordering::Acquire) & SPILLED != 0;
+            if s.frame().is_some() || theirs != spilled || (!spilled && q > self.opened) {
+                break;
+            }
+            let Some((j, gj)) = self.cold_victim(&mut at, &mut looked)? else {
+                break;
+            };
+            let fj = self.frame(j)?;
+            self.evict(fj, &gj)?;
+            run.push((q, s, j, fj, gj));
+        }
+        let pages = u64::try_from(run.len()).map_err(|_| LimboError::IntegerOverflow)?;
+        let started = Instant::now();
+        let bytes = {
+            let mut bufs: Vec<&mut [u8]> = run.iter_mut().map(|(.., g)| &mut g[..]).collect();
+            disk.read_run(file, page_offset(page)?, &mut bufs)?
+        };
+        self.fit
+            .lock()
+            .add(pages, started.elapsed().as_nanos() as f64);
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let whole = bytes.checked_div(PAGE_SIZE).unwrap_or(0);
+        let mut kept = 0u64;
+        for (k, (q, s, j, fj, gj)) in run.into_iter().enumerate() {
+            if k >= whole || checksum(&gj) != s.sum.load(Ordering::Relaxed) {
+                if k == 0 {
+                    return Err(LimboError::Corrupt(if whole == 0 {
+                        format!("versioned storage: page {page} past the {name} file's end")
+                    } else {
+                        format!(
+                            "versioned storage: page {page} read from the {name} file fails its \
+                             checksum"
+                        )
+                    }));
+                }
+                break;
+            }
+            self.install(q, s, j, fj, gj, k == 0)?;
+            kept = kept.saturating_add(1);
+        }
+        self.misses.fetch_add(kept, Ordering::Relaxed);
+        self.ahead
+            .fetch_add(kept.saturating_sub(1), Ordering::Relaxed);
+        self.longest.fetch_max(kept, Ordering::Relaxed);
+        self.last_in.store(
+            page.saturating_add(kept.saturating_sub(1)),
+            Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
+    /// A frame for a page read ahead: a never-used one, else the next frame from `at` whose
+    /// reference bit is clear and which no one latches, its bit left as it is; `looked` counts
+    /// the frames a run has looked at, one sweep at most, and None after it.
+    fn cold_victim(&self, at: &mut usize, looked: &mut usize) -> Result<Option<Latched<'_>>> {
+        let n = self.capacity;
+        let mut u = self.unused.load(Ordering::Relaxed);
+        while u < n {
+            match self.unused.compare_exchange(
+                u,
+                u.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(Some((u, self.frame(u)?.page.write()))),
+                Err(now) => u = now,
+            }
+        }
+        while *looked < n {
+            *looked = looked.saturating_add(1);
+            let i = at.checked_rem(n).unwrap_or(0);
+            *at = at.wrapping_add(1);
+            let fr = self.frame(i)?;
+            if fr.referenced.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Some(g) = fr.page.try_write() else {
+                continue;
+            };
+            if fr.referenced.load(Ordering::Relaxed) {
+                continue;
+            }
+            return Ok(Some((i, g)));
+        }
+        Ok(None)
     }
 
     /// Page `page`'s bytes from where they were last written out, checked against their checksum.
@@ -864,6 +1172,158 @@ mod tests {
         assert_eq!(pool.version(pages[0]).unwrap(), u64::MAX);
         assert!(holds(&pool.read(pages[0]).unwrap(), pages[0], 2));
         assert_ne!(pool.version(pages[0]).unwrap(), v1);
+    }
+
+    /// A disk whose data file holds pages 1 to `pages`, page `n`'s bytes `fill(n, 0)`.
+    fn data_disk(pages: u64) -> Arc<Simulated> {
+        let sim = Arc::new(Simulated::new(3, 1).unwrap());
+        let mut buf = vec![0u8; PAGE_SIZE];
+        for p in 1..=pages {
+            fill(p, 0)(&mut buf);
+            sim.write_at(File::Data, page_offset(p).unwrap(), &buf)
+                .unwrap();
+        }
+        sim
+    }
+
+    /// Do: the same reads (sequential, backwards, strided, sequential again, across pages in the
+    /// data file, pages written since and spilled, and pages handed out since) with read-ahead off
+    /// and on. Expect: the same bytes, each page's as last written; with it off one read a page,
+    /// with it on pages read ahead and fewer reads than pages (query speed step 2).
+    #[test]
+    fn qs2_answers_are_identical_with_read_ahead_on_and_off() {
+        let mut order: Vec<u64> = (1..=64).collect();
+        order.extend((1..=64).rev());
+        order.extend((0..64).map(|k| (k * 7) % 64 + 1));
+        order.extend(1..=64);
+        let mut seen = Vec::new();
+        for on in [false, true] {
+            let disk: Arc<dyn Disk> = data_disk(64);
+            let pool = Pool::backed(8, disk, 64).unwrap();
+            pool.set_read_ahead(on);
+            pool.run_pages.store(5, Ordering::Relaxed);
+            let extra: Vec<u64> = (0..16).map(|_| pool.allocate().unwrap()).collect();
+            for &p in &extra {
+                fill(p, 3)(&mut pool.write(p).unwrap());
+            }
+            for p in (1..=64).step_by(9) {
+                fill(p, 5)(&mut pool.write(p).unwrap());
+            }
+            let round = |p: u64| match p {
+                65.. => 3,
+                p if (p - 1) % 9 == 0 => 5,
+                _ => 0,
+            };
+            let mut got = Vec::new();
+            for &p in order.iter().chain(&extra).chain(&extra) {
+                let r = pool.read(p).unwrap();
+                assert!(holds(&r, p, round(p)), "page {p}, read-ahead {on}");
+                got.push(r.to_vec());
+            }
+            seen.push((got, pool.counts()));
+        }
+        assert!(seen[0].0 == seen[1].0);
+        let (off, on) = (seen[0].1, seen[1].1);
+        assert_eq!(
+            (off.reads, off.ahead, off.longest),
+            (off.misses, 0, 1),
+            "{off:?}"
+        );
+        assert!(
+            on.ahead > 0 && on.reads < on.misses && on.longest > 1,
+            "{on:?}"
+        );
+    }
+
+    /// Do: a pool of 6 frames, one held latched, asked for runs of 1,000 pages over a walk of 100.
+    /// Expect: every page as written; runs read, none longer than the frames less one, and no
+    /// frame made past the 6 (query speed step 2: read-ahead never reads past the budget).
+    #[test]
+    fn qs2_read_ahead_never_reads_past_the_budget() {
+        let disk: Arc<dyn Disk> = data_disk(200);
+        let pool = Pool::backed(6, disk, 200).unwrap();
+        pool.set_read_ahead(true);
+        pool.run_pages.store(1_000, Ordering::Relaxed);
+        let hot = pool.read(150).unwrap();
+        for p in 1..=100 {
+            assert!(holds(&pool.read(p).unwrap(), p, 0), "page {p}");
+        }
+        drop(hot);
+        let c = pool.counts();
+        assert!(
+            c.longest > 1 && c.longest <= 5 && c.reads < c.misses,
+            "{c:?}"
+        );
+        assert!(pool.unused.load(Ordering::Relaxed) <= pool.capacity());
+        // A pool of one frame reads no runs.
+        let one = Pool::backed(1, data_disk(8), 8).unwrap();
+        one.set_read_ahead(true);
+        one.run_pages.store(8, Ordering::Relaxed);
+        for p in 1..=8 {
+            assert!(holds(&one.read(p).unwrap(), p, 0));
+        }
+        assert_eq!(one.counts().longest, 1);
+    }
+
+    /// Do: damage page 6 in the data file after the pool opened, then walk pages 1 to 12 with runs
+    /// of 8. Expect: pages 1 to 5 and 7 to 12 as written, page 6 refused as corrupt (a page read
+    /// ahead is checked once as it comes in, and one that fails is never served).
+    #[test]
+    fn qs2_a_page_read_ahead_that_fails_its_checksum_is_not_served() {
+        let sim = data_disk(32);
+        let disk: Arc<dyn Disk> = sim.clone();
+        let pool = Pool::backed(16, disk, 32).unwrap();
+        pool.set_read_ahead(true);
+        pool.run_pages.store(8, Ordering::Relaxed);
+        sim.write_at(File::Data, page_offset(6).unwrap() + 3, &[0xEE])
+            .unwrap();
+        for p in 1..=5 {
+            assert!(holds(&pool.read(p).unwrap(), p, 0), "page {p}");
+        }
+        assert!(matches!(pool.read(6), Err(LimboError::Corrupt(_))));
+        for p in 7..=12 {
+            assert!(holds(&pool.read(p).unwrap(), p, 0), "page {p}");
+        }
+        assert!(pool.counts().ahead > 0, "{:?}", pool.counts());
+    }
+
+    /// Do: a walk over a directory's files (one `preadv` a run on Unix). Expect: every page as
+    /// written, in fewer reads than pages where the disk reads runs whole, one a page elsewhere.
+    #[test]
+    fn qs2_runs_over_files_read_each_page_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = super::super::disk::Files::open(dir.path(), 1).unwrap();
+        let mut buf = vec![0u8; PAGE_SIZE];
+        for p in 1..=40 {
+            fill(p, 0)(&mut buf);
+            files
+                .write_at(File::Data, page_offset(p).unwrap(), &buf)
+                .unwrap();
+        }
+        let whole = files.reads_runs();
+        let pool = Pool::backed(16, Arc::new(files), 40).unwrap();
+        pool.set_read_ahead(true);
+        pool.run_pages.store(8, Ordering::Relaxed);
+        for p in 1..=40 {
+            assert!(holds(&pool.read(p).unwrap(), p, 0), "page {p}");
+        }
+        let c = pool.counts();
+        assert_eq!(c.reads < c.misses, whole, "{c:?}");
+    }
+
+    /// The fit: `ceil(fixed / each)` once two sizes were read, twice the largest read before.
+    #[test]
+    fn qs2_a_run_is_the_measured_fixed_cost_over_the_cost_of_a_page() {
+        let mut f = Fit::default();
+        assert_eq!(f.target(), 2);
+        f.add(1, 10_100.0);
+        assert_eq!(f.target(), 2);
+        f.add(2, 10_200.0);
+        assert_eq!(f.target(), 100);
+        let mut flat = Fit::default();
+        flat.add(1, 500.0);
+        flat.add(4, 500.0);
+        assert_eq!(flat.target(), 8);
     }
 
     /// T-NS.2.10: a pool whose capacity is far past this machine's memory hands out pages across
