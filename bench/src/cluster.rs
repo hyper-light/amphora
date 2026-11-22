@@ -188,7 +188,8 @@ fn load(partitions: &[Partition], o: &Opts) -> anyhow::Result<()> {
                     let events = (0..n)
                         .map(|_| {
                             seq += 1;
-                            crate::event(&mut rng, p * sessions + rng.below(sessions), seq, o.text_bytes)
+                            let session = p * sessions + rng.below(sessions);
+                            crate::event(&mut rng, session, seq, o.text_bytes)
                         })
                         .collect();
                     write(partition, events)?;
