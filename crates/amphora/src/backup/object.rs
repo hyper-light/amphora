@@ -159,19 +159,13 @@ pub(super) fn opened<'a>(key: &str, object: &'a [u8]) -> anyhow::Result<&'a [u8]
 
 /// A sealed object read in parts (T-T1.12.M2): its sum from its first bytes, its body hashed as
 /// the parts come, and the sum checked once the last is in ([`Opening::finish`]).
+#[derive(Default)]
 pub(super) struct Opening {
     sum: Vec<u8>,
     hasher: Sha256,
 }
 
 impl Opening {
-    pub(super) fn new() -> Self {
-        Self {
-            sum: Vec::with_capacity(SUM_BYTES),
-            hasher: Sha256::new(),
-        }
-    }
-
     /// The body's bytes in the next part, in order: what of it follows the sum.
     pub(super) fn feed<'a>(&mut self, part: &'a [u8]) -> &'a [u8] {
         let want = SUM_BYTES.saturating_sub(self.sum.len()).min(part.len());
@@ -240,6 +234,34 @@ mod tests {
         bytes[last] ^= 1;
         assert!(decode::<Manifest>("k", &bytes).is_err());
         assert!(opened("k", &[0; 3]).is_err());
+    }
+
+    /// T-T1.12.M2: a sealed object read in parts of any size gives its body in order and checks
+    /// its sum; an altered body, or parts that end within the sum, are refused.
+    #[test]
+    fn t_t1_12_m2_opening_in_parts() {
+        let body: Vec<u8> = (0..100u8).collect();
+        let sealed = sealed(&body).unwrap();
+        for size in [1, 7, SUM_BYTES, SUM_BYTES + 1, sealed.len()] {
+            let mut opening = Opening::default();
+            let mut out = Vec::new();
+            for part in sealed.chunks(size) {
+                out.extend_from_slice(opening.feed(part));
+            }
+            opening.finish("k").unwrap();
+            assert_eq!(out, body, "parts of {size}");
+        }
+        let mut altered = sealed.clone();
+        let last = altered.len() - 1;
+        altered[last] ^= 1;
+        let mut opening = Opening::default();
+        for part in altered.chunks(9) {
+            opening.feed(part);
+        }
+        assert!(opening.finish("k").is_err());
+        let mut short = Opening::default();
+        short.feed(&sealed[..SUM_BYTES - 1]);
+        assert!(short.finish("k").is_err());
     }
 
     /// T-T1.12.I2: a manifest of format 1 still reads, every chunk its own base's; a format 2

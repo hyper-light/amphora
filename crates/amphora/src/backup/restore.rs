@@ -162,7 +162,7 @@ pub fn restore_within(
                     .saturating_sub(chunk.saturating_mul(manifest.chunk_bytes)),
             );
             let sealed = fetch_charge(len);
-            let mut opening = object::Opening::new();
+            let mut opening = object::Opening::default();
             let mut at = 0u64;
             while at < sealed {
                 let want = usize::try_from(sealed.saturating_sub(at))
