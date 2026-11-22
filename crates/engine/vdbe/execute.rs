@@ -18871,8 +18871,13 @@ pub fn op_join_switch_built(
         }
         _ => {
             program.connection.count_adaptive_join_switch();
-            if let Some((_, (rows, bytes))) = held {
-                replan_on_built_rows(program, data, rows, bytes);
+            let replanned = held
+                .is_some_and(|(_, (rows, bytes))| replan_on_built_rows(program, data, rows, bytes));
+            // The in-run hand-off: a run that may start again (read-only, no row returned) stops
+            // here, and `Statement` runs it from the start on the plan made on the counted rows.
+            if replanned && state.handoff_open {
+                state.handoff_asked = true;
+                return Ok(InsnFunctionStepResult::Done);
             }
             state.pc += 1;
         }
@@ -18884,15 +18889,16 @@ pub fn op_join_switch_built(
 /// table, set against the rows the plan counted it at (ANALYZE's with the changes since, PL.9).
 /// Within the estimate's own error the plan stands. Past it the table's row counter is set to the
 /// rows counted, so the statement's planned table has moved and the statement is handed to a
-/// second prepare, on the counted rows, before its next run (`Statement::statistics_moved`); every
-/// other statement planned on the table is too. This run goes on as planned: its answer is right,
-/// and the rows it may have returned already are not returned again.
+/// second prepare, on the counted rows (`Statement::statistics_moved`); every other statement
+/// planned on the table is too. True when it did: the caller hands the rest of a run that may
+/// start again to that prepare (`op_join_switch_built`); any other run goes on as planned, its
+/// answer right and the rows it has returned not returned again.
 fn replan_on_built_rows(
     program: &Program,
     data: &crate::vdbe::insn::JoinSwitchBuiltData,
     rows: usize,
     bytes: usize,
-) {
+) -> bool {
     use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
     let counter = program.connection.db.row_changes.counter(&data.table);
     let estimate = crate::row_changes::live_rows(
@@ -18920,11 +18926,14 @@ fn replan_on_built_rows(
                     rows,
                     "adaptive join's build counted past the estimate: planned again"
                 );
+                return true;
             }
+            false
         }
-        Ok(Replan::Keep) => {}
+        Ok(Replan::Keep) => false,
         Err(refused) => {
             tracing::debug!(table = %data.table, %refused, "adaptive join's rows not checked");
+            false
         }
     }
 }

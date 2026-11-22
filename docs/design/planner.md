@@ -1635,9 +1635,19 @@ whole inner table. `JoinSwitchBuilt` sets its rows against the rows the plan cou
 (ANALYZE's with the changes since, decision "lane pl9"). Past the band, the table's row counter is
 set to the rows counted, so the statement's planned table has moved: it is prepared again on the
 counted rows before its next run (`Statement::statistics_moved`), as is every other statement
-planned on the table. The run under way goes on as planned: rows it has returned are not returned
-again, and its answer is right. Restarting a statement that has returned no row yet, and the other
-materialization points (a sorter, a materialized subquery), are not built.
+planned on the table.
+
+**The in-run hand-off** (`Statement::hand_off`, `Connection::set_adaptive_handoff`, on wherever
+adaptive joins are). The rest of the run goes to that second prepare where it can start again
+without a row twice: a read-only root statement that has returned no row yet. As such a run starts,
+`Statement` opens the hand-off; its first row shuts it. With it open, `JoinSwitchBuilt` stops the
+run past the band, and the statement starts it again on the plan made now, the way a schema change
+part way through restarts one: its implicit transaction ended, the statement prepared again, the
+same bound values. Nothing was written and nothing returned, so the new run's rows are the run's only
+rows. A run is handed off once at most: the new plan is made on the counted rows, so its own build
+falls within the band, and were it not, it goes on as planned. A run that has returned rows, or
+writes, goes on as planned and the new plan waits for its next run: its answer is right and no row
+comes twice. The other materialization points (a sorter, a materialized subquery) are not built.
 
 **Why.** Audit row 13 (`bench/planner/audit/10-no-adaptive.sql`): a nested loop chosen for an
 estimate ran on however many rows came, and an estimate wrong by orders of magnitude was never
@@ -1660,8 +1670,12 @@ filters, three tables, an aggregate) give one answer with the switch off and on 
 model's for the plain join, and every plan whose point came under its outer rows switched
 (T-PL.13.1); one join switches at the point its plan states and not one row before; an inner table
 counted far past its rows (inserted, counted, rolled back) is counted at its build, planned again
-once, and the second plan's point comes sooner with no further re-plan (T-PL.13.3). JOB's 20
-slowest queries against the parent (AC-PL.13.1) are the coordinator's.
+once, and the second plan's point comes sooner with no further re-plan (T-PL.13.3). The same
+build in an aggregate's run, which returns no row before its end, hands the run off once with the
+hand-off on and switches again on the new plan, none with it off, one answer both ways and the
+switch-off one; the plain join, its rows returned before the build, hands nothing off and returns
+each row once (T-PL.13.4). JOB's 20 slowest queries against the parent (AC-PL.13.1) are the
+coordinator's.
 
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).

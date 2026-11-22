@@ -975,6 +975,13 @@ pub struct ProgramState {
     /// Amphora (PL.13): each adaptive join's switch, by switch id; None for one that cannot
     /// switch (`optimizer::adaptive::JoinSwitch`).
     join_switches: HashMap<usize, Option<crate::translate::optimizer::adaptive::JoinSwitch>>,
+    /// Amphora (PL.13, the in-run hand-off): this run may still be handed to a second prepare.
+    /// `Statement` opens it as a read-only root statement's run starts and shuts it at the run's
+    /// first row, so a run that has returned a row is never started again.
+    pub(crate) handoff_open: bool,
+    /// Amphora (PL.13): an adaptive join's build counted past its estimate's band while the
+    /// hand-off was open, and stopped the run so `Statement` starts it again on a new plan.
+    pub(crate) handoff_asked: bool,
     /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
     group_tables: HashMap<usize, group_table::GroupTable>,
     /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
@@ -1128,6 +1135,8 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             join_switches: HashMap::default(),
+            handoff_open: false,
+            handoff_asked: false,
             group_tables: HashMap::default(),
             morsel_rows: None,
             ephemeral_temp_files: HashMap::default(),
@@ -1322,6 +1331,8 @@ impl ProgramState {
         if !self.join_switches.is_empty() {
             self.join_switches.clear();
         }
+        self.handoff_open = false;
+        self.handoff_asked = false;
         if !self.group_tables.is_empty() {
             self.group_tables.clear();
         }

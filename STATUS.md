@@ -842,8 +842,9 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   `Connection::set_adaptive_joins` on, an inner join's index seek is emitted with a hash join beside
   it and switches at the learned costs' break-even; the hash table's build, the inner table whole,
   is checked against the plan's estimate and, past its error, the table's count is corrected and the
-  statement planned again before its next run. The engine's own tests (T-PL.13.1, T-PL.13.3) pass on
-  pinned weights. JOB's 20 slowest queries against the parent (AC-PL.13.1) are open.
+  statement planned again; a read-only run that has returned no row yet starts again on the new plan
+  at once (the in-run hand-off, `Connection::set_adaptive_handoff`), any other at its next run. The
+  engine's own tests (T-PL.13.1, T-PL.13.3, T-PL.13.4) pass on pinned weights. JOB's 20 slowest queries against the parent (AC-PL.13.1) are open.
   PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no
   longer held behind its right table and the audit's 03-right-full-barrier reads tiny first (T-PL.8.1);

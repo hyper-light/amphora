@@ -525,6 +525,11 @@ pub struct Connection {
     /// Amphora (PL.13): how many adaptive joins' hash tables held rows past their estimate's
     /// error, so their statements are prepared again; see [`Connection::adaptive_replans`].
     pub(super) adaptive_replans: AtomicU64,
+    /// Amphora: see [`Connection::set_adaptive_handoff`].
+    pub(super) adaptive_handoff: AtomicBool,
+    /// Amphora (PL.13): how many runs an adaptive join's build handed to a second prepare; see
+    /// [`Connection::adaptive_handoffs`].
+    pub(super) adaptive_handoffs: AtomicU64,
     /// Amphora (PL.13): the seek's, hash build's and hash probe's weights a test pins in place of
     /// the learned ones (`Connection::pin_cost_weights`, the simulator's); None: the learned ones.
     pub(super) pinned_cost_weights: crate::sync::RwLock<Option<(f64, f64, f64)>>,
@@ -1060,6 +1065,29 @@ impl Connection {
 
     pub(crate) fn count_adaptive_replan(&self) {
         self.adaptive_replans.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): when
+    /// an adaptive join's build counts past its estimate's band in a read-only statement's run that
+    /// has returned no row yet, the run stops and starts again on a plan made on the counted rows.
+    /// On by default: it acts only where adaptive joins do (`set_adaptive_joins`). Off, the new plan
+    /// waits for the statement's next run.
+    pub fn set_adaptive_handoff(&self, on: bool) {
+        self.adaptive_handoff.store(on, Ordering::Release);
+    }
+
+    pub(crate) fn adaptive_handoff(&self) -> bool {
+        self.adaptive_handoff.load(Ordering::Acquire)
+    }
+
+    /// Amphora (PL.13): how many runs on this connection an adaptive join's build handed to a
+    /// second prepare part way through.
+    pub fn adaptive_handoffs(&self) -> u64 {
+        self.adaptive_handoffs.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_handoff(&self) {
+        self.adaptive_handoffs.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Amphora (PL.13, T-PL.13.1): plans newly prepared statements with these weights of a seek, a

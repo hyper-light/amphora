@@ -2822,6 +2822,8 @@ impl Database {
             adaptive_joins: AtomicBool::new(false),
             adaptive_join_switches: AtomicU64::new(0),
             adaptive_replans: AtomicU64::new(0),
+            adaptive_handoff: AtomicBool::new(true),
+            adaptive_handoffs: AtomicU64::new(0),
             pinned_cost_weights: crate::sync::RwLock::new(None),
             automatic_indexes: AtomicBool::new(true),
             parallel_mode: AtomicBool::new(false),

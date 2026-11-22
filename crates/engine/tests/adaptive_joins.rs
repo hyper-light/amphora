@@ -255,15 +255,11 @@ fn t_pl_13_1_switch_fires_past_the_point_and_not_before() {
     }
 }
 
-/// Do: an inner table whose count the planner holds far past its rows (a transaction inserted rows
-/// into it, its count took them, and it rolled back), joined with the switch on past the point its
-/// plan states; then the same join again. Expect: the hash table's build counts the true rows, past
-/// the estimate's error, and hands the statement to a second prepare (one re-plan counted) with the
-/// answer the switch-off one; run again, the statement is planned on the counted rows and no
-/// re-plan comes (T-PL.13.3).
-#[test]
-fn t_pl_13_3_a_build_past_the_estimate_plans_again() {
-    let (_dir, conn) = open("replan.db");
+/// An inner table `b` of 50 rows whose count the planner holds far past them (a transaction
+/// inserted 2,000 rows into it, its count took them, and it rolled back), and an outer table `a`
+/// with ten rows more than the switch point the plain join's plan states, the point returned.
+fn inflated_inner(name: &str) -> (tempfile::TempDir, Arc<Connection>, u64) {
+    let (dir, conn) = open(name);
     let mut state = 0xd1b5_4a32_d192_ed03_u64;
     conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
         .unwrap();
@@ -301,6 +297,19 @@ fn t_pl_13_3_a_build_past_the_estimate_plans_again() {
         .unwrap();
     }
     conn.execute("COMMIT").unwrap();
+    (dir, conn, point)
+}
+
+/// Do: an inner table whose count the planner holds far past its rows (a transaction inserted rows
+/// into it, its count took them, and it rolled back), joined with the switch on past the point its
+/// plan states; then the same join again. Expect: the hash table's build counts the true rows, past
+/// the estimate's error, and hands the statement to a second prepare (one re-plan counted) with the
+/// answer the switch-off one; run again, the statement is planned on the counted rows and no
+/// re-plan comes (T-PL.13.3).
+#[test]
+fn t_pl_13_3_a_build_past_the_estimate_plans_again() {
+    let (_dir, conn, point) = inflated_inner("replan.db");
+    let sql = "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k";
 
     conn.set_adaptive_joins(false);
     let off = rows(&conn, sql);
@@ -335,5 +344,71 @@ fn t_pl_13_3_a_build_past_the_estimate_plans_again() {
         conn.adaptive_replans(),
         replans,
         "a second re-plan on the counted rows"
+    );
+}
+
+/// Do: T-PL.13.3's join, its build counted past the estimate's band, each time on its own copy of
+/// the tables: an aggregate over it, which returns no row before its end, with the in-run hand-off
+/// on and off (`Connection::set_adaptive_handoff`); and the plain join, whose rows come before the
+/// build, with it on. Expect: every answer the switch-off one, each row once; the aggregate's run
+/// handed off once with it on (planned once again, and switched again on the new plan before its
+/// one answer), none with it off; the plain join hands nothing off, as it has returned rows
+/// (T-PL.13.4).
+#[test]
+fn t_pl_13_4_a_run_past_the_estimate_starts_again_on_the_new_plan() {
+    let aggregate =
+        "SELECT count(*), sum(a.id * 1000 + b.id), min(b.id), max(a.id) FROM a JOIN b ON b.k = a.k";
+    let plain = "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k";
+    let mut aggregates = Vec::new();
+    for (sql, handoff, handed_off) in [
+        (aggregate, true, 1),
+        (aggregate, false, 0),
+        (plain, true, 0),
+    ] {
+        let (_dir, conn, point) = inflated_inner("handoff.db");
+        let case = format!(
+            "{sql} with the hand-off {}",
+            if handoff { "on" } else { "off" }
+        );
+        conn.set_adaptive_joins(false);
+        let off = rows(&conn, sql);
+        conn.set_adaptive_joins(true);
+        conn.set_adaptive_handoff(handoff);
+        assert_eq!(switch_point(&conn, sql), Some(point), "{case}: the point");
+        let (switches, replans, handoffs) = (
+            conn.adaptive_join_switches(),
+            conn.adaptive_replans(),
+            conn.adaptive_handoffs(),
+        );
+        let on = rows(&conn, sql);
+        assert_eq!(on, off, "{case}: switch on and off differ");
+        assert_eq!(
+            conn.adaptive_handoffs() - handoffs,
+            handed_off,
+            "{case}: hand-offs"
+        );
+        assert_eq!(conn.adaptive_replans() - replans, 1, "{case}: re-plans");
+        assert_eq!(
+            conn.adaptive_join_switches() - switches,
+            1 + handed_off,
+            "{case}: switches"
+        );
+        if sql == aggregate {
+            assert_eq!(on.len(), 1, "{case}: one answer row");
+            aggregates.push(on);
+        }
+        // Run again: planned on the counted rows already, nothing hands off or plans again.
+        let (replans, handoffs) = (conn.adaptive_replans(), conn.adaptive_handoffs());
+        assert_eq!(rows(&conn, sql), off, "{case}: the second run's answer");
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+        assert_eq!(
+            conn.adaptive_handoffs(),
+            handoffs,
+            "{case}: a second hand-off"
+        );
+    }
+    assert_eq!(
+        aggregates[0], aggregates[1],
+        "the hand-off on and off differ"
     );
 }
