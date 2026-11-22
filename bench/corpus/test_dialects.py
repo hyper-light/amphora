@@ -426,5 +426,38 @@ class HexIntegers(unittest.TestCase):
         self.assertIn("BIGINT", file_in(["CREATE TABLE t(a)", "INSERT INTO t VALUES (0x10), (2)"], "duckdb")[0][0])
 
 
+class ScalarExtremes(unittest.TestCase):
+    """Do: SQLite's max() and min() of several arguments, with and without a NULL, nested, and
+    beside the aggregate max(). Expect: each said with SQLite's NULL (NULL if any argument is,
+    lang_corefunc.html#max_scalar), which SQLite gives the same answers to when it runs the CASE
+    (written in its spelling); the aggregate untouched; one of random() not expressible."""
+
+    CASES = ["max(1, NULL, 3)", "min(2, 7)", "max(min(5, 9), 2)", "min(NULL, 1)", "max(1, 3) / 2", "min(-0.25, -7)"]
+
+    def test_null_if_any_argument_is(self):
+        import sqlite3
+
+        import sqlglot
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            for d in ENGINES:
+                with self.subTest(case=case, dialect=d):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    self.assertIsNone(why)
+                    self.assertIn("IS NULL THEN NULL", out)
+                    self.assertNotRegex(out.upper(), r"\b(MAX|MIN)\(")
+            # What every dialect is written from, said in SQLite's spelling for SQLite to run.
+            said = dialects.extremes(sqlglot.parse_one(f"SELECT {case}", read=dialects.reader()), "duckdb")
+            with self.subTest(case=case):
+                self.assertEqual(db.execute(said.sql(dialect="sqlite")).fetchone(), db.execute(f"SELECT {case}").fetchone())
+
+    def test_aggregate_and_random(self):
+        self.assertEqual(dialects.translate("SELECT max(a), min(a) OVER () FROM t", "postgres"), ("SELECT MAX(a), MIN(a) OVER () FROM t", None))
+        out, why = dialects.translate("SELECT max(random(), 1)", "postgres")
+        self.assertIsNone(out)
+        self.assertIn("random()", why)
+
+
 if __name__ == "__main__":
     unittest.main()

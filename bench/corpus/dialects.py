@@ -572,7 +572,7 @@ def storage_classes(expression, tables):
     0); columns by their table (_column_class); `||` is TEXT; +, -, *, / and % of two INTEGERs are
     INTEGER and with a REAL REAL (lang_expr.html, "Operators": "integer arithmetic if both operands
     are integers and no overflow would result, or floating point arithmetic ... if either operand is
-    a real value"); count() and length() INTEGER; sum(), min(), max() and abs() their argument's;
+    a real value"); count() and length() INTEGER; sum(), min(), max() and abs() their argument's (max() and min() of several arguments theirs when they share one, NULL with a NULL);
     avg() and total() REAL (lang_aggfunc.html); CAST by the type's affinity (lang_expr.html "CAST
     expressions"); anything else UNKNOWN."""
     from sqlglot import exp
@@ -612,6 +612,10 @@ def storage_classes(expression, tables):
         elif isinstance(node, (exp.Sum, exp.Min, exp.Max, exp.Abs)) and not node.expressions:
             arg = classes.get(id(node.this), UNKNOWN)
             c = arg if arg in ("INTEGER", "REAL") else UNKNOWN
+        elif isinstance(node, (exp.Min, exp.Max)):
+            # max(X, Y, ...) and min(): one of its arguments, NULL if any is (lang_corefunc.html#max_scalar).
+            args = {classes.get(id(a), UNKNOWN) for a in [node.this] + list(node.expressions)}
+            c = None if None in args else next(iter(args)) if len(args) == 1 and args <= {"INTEGER", "REAL"} else UNKNOWN
         elif isinstance(node, exp.Avg):
             c = "REAL"
         elif isinstance(node, exp.Cast) and isinstance(node.to, exp.DataType):
@@ -872,6 +876,37 @@ def keyed(expression, dialect):
 MYSQL_COLLATIONS = {"BINARY": "utf8mb4_0900_bin", "NOCASE": "utf8mb4_0900_as_ci", "RTRIM": "utf8mb4_bin"}
 
 
+def extremes(expression, dialect):
+    """`expression` with each multi-argument max() and min() said as the dialect's GREATEST and LEAST
+    with SQLite's NULL. SQLite's "Built-In Scalar SQL Functions" (https://www.sqlite.org/lang_corefunc.html#max_scalar):
+    "The multi-argument max() function returns the argument with the maximum value, or return NULL
+    if any argument is NULL" (min() the same, lang_corefunc.html#min_scalar). PostgreSQL's GREATEST
+    and LEAST ignore NULLs ("NULL values in the argument list are ignored. The result will be NULL
+    only if all the expressions evaluate to NULL", its manual, 9.18.4), as DuckDB's and ClickHouse's
+    (24.12 on) do; MySQL's return NULL "if any argument is NULL" (MySQL 8.4 manual, 14.4.2). So each
+    is said as CASE WHEN an argument IS NULL THEN NULL ELSE GREATEST(...) END, exact on every engine
+    whichever way its GREATEST takes NULLs. That names each argument twice, which is the same only
+    when an argument gives the same value each time: one that calls random() or randomblob()
+    (lang_corefunc.html: "a pseudo-random integer", "random bytes") is not expressible. sqlglot
+    otherwise writes PostgreSQL's GREATEST unguarded, and DuckDB's and ClickHouse's max() of
+    several arguments, which is their aggregate's top-N or an error."""
+    from sqlglot import exp
+
+    # Innermost first, so one inside another's argument is said before that argument is copied.
+    for node in [n for n in reversed(list(expression.dfs())) if isinstance(n, (exp.Max, exp.Min)) and n.expressions]:
+        args = [node.this] + list(node.expressions)
+        if any(isinstance(n, exp.Rand) or (isinstance(n, exp.Anonymous) and n.name.upper() == "RANDOMBLOB") for a in args for n in a.walk()):
+            raise NotExpressible(f"not expressible in {dialect}: a multi-argument {node.key}() of a random() or randomblob() argument (lang_corefunc.html), which SQLite's NULL rule would have to evaluate twice")
+        pick = (exp.Greatest if isinstance(node, exp.Max) else exp.Least)(this=args[0].copy(), expressions=[a.copy() for a in args[1:]], ignore_nulls=True)
+        nulls = [exp.Is(this=a.copy(), expression=exp.Null()) for a in args]
+        said = exp.Case(ifs=[exp.If(this=exp.or_(*nulls), true=exp.Null())], default=pick)
+        if node is expression:
+            expression = said
+        else:
+            node.replace(said)
+    return expression
+
+
 def spoken(expression, dialect):
     """`expression` with what sqlglot writes in SQLite's spelling, which `dialect` reads otherwise,
     given that dialect's spelling of it:
@@ -1040,7 +1075,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(keyed(typed(divided(e, context or Context(), dialect), context, dialect), dialect), dialect)
+            e = spoken(extremes(keyed(typed(divided(e, context or Context(), dialect), context, dialect), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:
