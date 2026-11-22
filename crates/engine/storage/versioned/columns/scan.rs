@@ -2201,7 +2201,7 @@ mod tests {
             Box::new(|| 0),
         ));
         db.keep_columns(feed.clone()).unwrap();
-        let copy = Columns::<B>::new(feed);
+        let copy = Columns::<B>::new(feed, crate::storage::versioned::memory::machine());
         let cache = Cache::new(crate::storage::versioned::memory::capped(u64::MAX));
         let mut x = seed | 1;
         let mut d = Descender::new();
@@ -2373,7 +2373,7 @@ mod tests {
             Box::new(|| 0),
         ));
         db.keep_columns(feed.clone()).unwrap();
-        let copy = Columns::<Plain>::new(feed);
+        let copy = Columns::<Plain>::new(feed, crate::storage::versioned::memory::machine());
         let mut x = 9u64;
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();

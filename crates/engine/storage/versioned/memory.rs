@@ -22,6 +22,10 @@ pub trait Source: Send + Sync {
     fn take(&self, what: &'static str, bytes: u64) -> Result<()>;
     /// `bytes` taken given back.
     fn give(&self, bytes: u64);
+    /// The bytes a take could be granted now, by the source's own measure: the signal a use it
+    /// refused waits on before asking again (lane colcopy-bound, AC-CB.2.2), rather than asking
+    /// on a picked schedule.
+    fn room(&self) -> Result<u64>;
 }
 
 /// The source every storage opened without one shares: the machine's memory, read again at every
@@ -72,6 +76,10 @@ impl Source for Machine {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(bytes))
             });
+    }
+
+    fn room(&self) -> Result<u64> {
+        Ok(machine_bytes()?.saturating_sub(self.held()))
     }
 }
 
@@ -127,6 +135,10 @@ impl Source for Capped {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(bytes))
             });
+    }
+
+    fn room(&self) -> Result<u64> {
+        Ok(self.limit.saturating_sub(self.held()))
     }
 }
 

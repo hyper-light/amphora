@@ -431,7 +431,7 @@ mod tests {
     /// A copy with rows in blocks, applied deltas, and queued keys not applied yet.
     fn kept<B: Block>(seed: u64) -> (Database, Columns<B>) {
         let (db, feed) = open(seed, usize::MAX);
-        let copy = Columns::<B>::new(feed);
+        let copy = Columns::<B>::new(feed, crate::storage::versioned::memory::machine());
         commit(&db, 0..N, 1, 0);
         rebuild(&db, &copy);
         commit(&db, (0..N).step_by(7), 2, 3);
@@ -575,7 +575,7 @@ mod tests {
     fn cs5_vectorized_aggregates_identical_and_chosen_by_cost() {
         use crate::storage::versioned::columns::scan::Records;
         let (db, feed) = open(16, usize::MAX);
-        let copy = Columns::<Plain>::new(feed);
+        let copy = Columns::<Plain>::new(feed, crate::storage::versioned::memory::machine());
         commit_records(&db, 0..N, 0);
         rebuild(&db, &copy);
         commit_records(&db, (0..N).step_by(7), 3);
@@ -630,7 +630,7 @@ mod tests {
 
         // Behind: a queue that holds nothing drops the commits after the rebuild.
         let (db, feed) = open(17, 0);
-        let copy = Columns::<Packed>::new(feed);
+        let copy = Columns::<Packed>::new(feed, crate::storage::versioned::memory::machine());
         commit_records(&db, 0..N, 0);
         rebuild(&db, &copy);
         commit_records(&db, (0..N).step_by(5), 2);
@@ -696,7 +696,7 @@ mod tests {
             calls: std::cell::Cell::new(0),
         };
         let (db, feed) = open(18, usize::MAX);
-        let copy = Columns::<Plain>::new(feed);
+        let copy = Columns::<Plain>::new(feed, crate::storage::versioned::memory::machine());
         commit_records(&db, 0..N, 0);
         rebuild(&db, &copy);
         commit_records(&db, (0..N).step_by(9), 4);
@@ -727,7 +727,7 @@ mod tests {
         db.close_snapshot(snap);
 
         let (db, feed) = open(19, 0);
-        let copy = Columns::<Packed>::new(feed);
+        let copy = Columns::<Packed>::new(feed, crate::storage::versioned::memory::machine());
         commit_records(&db, 0..N, 0);
         rebuild(&db, &copy);
         commit_records(&db, (0..N).step_by(5), 2);
@@ -837,7 +837,7 @@ mod tests {
     fn cs5_stale_copy_never_read_past_its_snapshot() {
         // A queue that holds nothing: every commit after the rebuild is dropped, the copy behind.
         let (db, feed) = open(14, 0);
-        let copy = Columns::<Plain>::new(feed);
+        let copy = Columns::<Plain>::new(feed, crate::storage::versioned::memory::machine());
         commit(&db, 0..N, 1, 0);
         let early = db.snapshot().unwrap();
         commit(&db, (0..N).step_by(3), 2, 5);
