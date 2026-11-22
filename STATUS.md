@@ -716,6 +716,13 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   failover until its script runs a Consul lease (lane repl-measure-2: it does now; `bench/repl.sh RECORDS FLAGS...`
   runs every measure on every system, and all four clusters came up on jupiter). Closes with: the comparison set and Amphora's classes measured on
   adacachy, fedora and jupiter, best of 3, and Amphora's members across machines for the LAN p99.
+- **Replication measured: sharded seeds and the lab** (CP-T1.8, AC-T1.8.5; lane repl-measure-4): the power-cut
+  nemesis runs a seed range a machine in either class (`bench/power_nemesis.sh run CLASS FROM COUNT DIR`), one
+  record a shard, and `merge` checks the shards cover the seeds once each on one commit; seeds 2k and 2k + 1 no
+  longer share a schedule. 100 seeds a class in two shards passed on jupiter
+  (bench/records/power-nemesis/2026-11-22-jupiter-tiny). `bench/repl_lab.sh RUN HOST1 HOST2 HOST3` splits the
+  10,000 seeds a class across three named machines and runs the comparison set on each. Not yet: Amphora's
+  members on three machines (the LAN p99); the harness runs them in one process.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
