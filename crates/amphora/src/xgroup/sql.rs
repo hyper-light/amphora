@@ -155,8 +155,14 @@ fn name_at(bytes: &[u8]) -> Option<(&str, &[u8])> {
     Some((std::str::from_utf8(name).ok()?, rest))
 }
 
-/// Whether a transaction across groups holds a lock on a Records row here.
-pub(crate) fn locked(db: &Db, namespace: &str, family: &str, key: &[u8]) -> anyhow::Result<bool> {
+/// The cross-group key of a Records row here a transaction across groups holds a lock on: the
+/// row's own, if it is locked (`LockedReads::Wait` and `WaitOnLock` wait on it).
+pub(crate) fn locked(
+    db: &Db,
+    namespace: &str,
+    family: &str,
+    key: &[u8],
+) -> anyhow::Result<Option<Vec<u8>>> {
     let key = record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut held = false;
     db.query(
@@ -164,6 +170,50 @@ pub(crate) fn locked(db: &Db, namespace: &str, family: &str, key: &[u8]) -> anyh
         [blob(&key)?],
         |_| {
             held = true;
+            Ok(false)
+        },
+    )?;
+    Ok(held.then_some(key))
+}
+
+/// The cross-group key of the first Records row of `family` in a scan's range a transaction
+/// across groups holds a lock on, if one is (T-T1.10.W10): rows from `lower` (past it when
+/// `continued`) below `upper` (none: the family's end), and no further than `last` when the
+/// page stopped there (none: it covered the range). A lock on a row the page doesn't show yet (a
+/// put of a new row) counts as one on a row it shows: either changes what it answers.
+pub(crate) fn locked_in(
+    db: &Db,
+    namespace: &str,
+    family: &str,
+    lower: &[u8],
+    continued: bool,
+    upper: Option<&[u8]>,
+    last: Option<&[u8]>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let at = |key: &[u8]| record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"));
+    let base = at(&[])?;
+    let from = at(lower)?;
+    let to = match upper {
+        Some(upper) => at(upper)?,
+        None => crate::database::successor(&base)
+            .ok_or_else(|| anyhow::anyhow!("a family's cross-group keys have no end"))?,
+    };
+    let last = last.map(at).transpose()?;
+    let mut held = None;
+    db.query(
+        "SELECT key FROM __amphora_xg_lock WHERE key >= ?1 AND key < ?2 ORDER BY key",
+        [blob(&from)?, blob(&to)?],
+        |row| {
+            let Some(key) = bytes_at(row, 0) else {
+                return Ok(true);
+            };
+            if continued && key == from {
+                return Ok(true);
+            }
+            if last.as_ref().is_some_and(|last| key > *last) {
+                return Ok(false);
+            }
+            held = Some(key);
             Ok(false)
         },
     )?;
@@ -2810,6 +2860,92 @@ mod sessions {
                     _ => assert!(wakes >= 1, "{reads:?}: {wakes}"),
                 }
                 eprintln!("{reads:?}: {wakes} wakes, {OTHERS} other commits in the group");
+            });
+        }
+    }
+
+    /// T-T1.10.W10 (AC-T1.10.1, lane xgroup-sql-11): a Records scan waits on a held lock in the
+    /// range its page covers, under [`LockedReads::Wait`] and [`LockedReads::WaitOnLock`]. Do:
+    /// three standalone groups, the answer at the decision, group 1's resolution held back, rows
+    /// 0 and 2 already in group 1; scans of group 1 there: one of prefix 9, one of a page of one
+    /// row (it stops at row 0, before the locked row 1), then one of the whole family, group 1
+    /// let go once it waits. Expect: the first two answer at once, unwaited (rows none, then row
+    /// 0 with more); the whole-family scan waits (counted once) and answers rows 0, 1 and 2, row
+    /// 1 the transaction's.
+    ///
+    /// [`LockedReads::WaitOnLock`]: crate::database::LockedReads::WaitOnLock
+    /// [`LockedReads::Wait`]: crate::database::LockedReads::Wait
+    #[test]
+    fn t_t1_10_w10_a_scan_waits_on_a_held_lock_in_its_range_only() {
+        use crate::database::LockedReads;
+        use amphora_api::{Consistency, Records, Scan, Tx, Write};
+        let scan = |db: &Database, prefix: Vec<u8>, limit: usize| {
+            db.namespace("ns")
+                .unwrap()
+                .scan(
+                    "rows",
+                    Scan {
+                        prefix,
+                        after: None,
+                        limit,
+                        at: Consistency::Linearizable,
+                    },
+                    until(),
+                )
+                .unwrap()
+        };
+        for reads in [LockedReads::Wait, LockedReads::WaitOnLock] {
+            let dir = tempfile::tempdir().unwrap();
+            let dbs = databases(dir.path(), 3);
+            for db in &dbs {
+                db.set_locked_reads(reads);
+            }
+            let tx = Tx {
+                conds: Vec::new(),
+                writes: [0u8, 2]
+                    .map(|k| Write::Put {
+                        family: "rows".into(),
+                        key: vec![k],
+                        value: vec![k],
+                    })
+                    .to_vec(),
+            };
+            dbs[1].namespace("ns").unwrap().commit(tx, until()).unwrap();
+            let gate = gate(&dbs, 1, false);
+            let cluster = open_gated(&dbs, Protocol::TwoPhase, &gate, AnswerAt::Decided, 1);
+            std::thread::scope(|scope| {
+                let answer = {
+                    let cluster = &cluster;
+                    scope.spawn(move || cluster.commit(across(7), until()))
+                };
+                gate.reached.recv().unwrap();
+                let answer = answer.join().unwrap();
+                assert!(
+                    matches!(answer, Ok(Answer::Committed { .. })),
+                    "{reads:?}: {answer:?}"
+                );
+                let reader = &dbs[1];
+                let outside = scan(reader, vec![9], 10);
+                assert!(outside.rows.is_empty() && !outside.more, "{reads:?}");
+                let short = scan(reader, Vec::new(), 1);
+                let keys: Vec<_> = short.rows.iter().map(|r| r.key.clone()).collect();
+                assert_eq!((keys, short.more), (vec![vec![0]], true), "{reads:?}");
+                assert_eq!(reader.locked_waits(), 0, "{reads:?}");
+                let whole = scope.spawn(move || scan(reader, Vec::new(), 10));
+                reader.locked_waits_reach(1, until()).unwrap();
+                gate.open.send(()).unwrap();
+                let whole = whole.join().unwrap();
+                let rows: Vec<_> = whole
+                    .rows
+                    .iter()
+                    .map(|r| (r.key.clone(), r.value.clone()))
+                    .collect();
+                assert_eq!(
+                    rows,
+                    vec![(vec![0], vec![0]), (vec![1], vec![7]), (vec![2], vec![2])],
+                    "{reads:?}"
+                );
+                assert_eq!(reader.locked_waits(), 1, "{reads:?}");
             });
         }
     }

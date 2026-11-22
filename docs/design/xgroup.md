@@ -182,6 +182,14 @@ land there: under `WaitOnLock` it wakes once, at its own resolution. `xgroup_lan
 `lock-wake` beside `locked-wait`, reporting each one's wakes, wakes per waiting read and per read;
 the A/B of record is the ladder at 1, 128 and 4096 callers.
 
+Scans wait the same way (lane xgroup-sql-11, `t_t1_10_w10_*`): a scan of the latest rows under
+either wait setting looks for a lock in the range its page covers (from its cursor to its last row
+when it stopped short, else the whole range, so a put of a row it doesn't show yet counts) with one
+range lookup in `__amphora_xg_lock`, and waits on the first locked row it meets, then scans again.
+SQL reads are not covered: a SQL session reads one snapshot from when it began, inside the writer or
+on a reader, so it can't wait inside itself for a resolution to land; it would have to be run again
+after it, which `Database::query`'s run-once session can't be.
+
 ## A refusal before the step (lane xgroup-sql-4, AC-T1.10.6)
 
 A group that refuses a step before taking it (`NotLeader`: its leader moved; `Full`: its writer
