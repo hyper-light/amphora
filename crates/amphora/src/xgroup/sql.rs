@@ -710,8 +710,11 @@ fn step_on(
             if resolving {
                 group.locks_resolved(until)?;
             }
-            // Read after the step answered, the group's clock is at or past the step's commit.
-            let clock = group.session_token(until)?.map(|token| token.micros);
+            // Read after the step answered, the group's clock is at or past the step's commit:
+            // the one cross-group clock as this group keeps it (lane split-merge-21,
+            // `Database::cross_clock`), so a standalone backed-up group's lock reply carries its
+            // writer's clock, which a session token never had.
+            let clock = group.cross_clock(until)?;
             Ok((reply, clock))
         }
         Member::Node { nodes, node } => {
@@ -2389,7 +2392,7 @@ mod sessions {
                         })
                         .unwrap();
                 }
-                crate::xgroup::Step::Resolve { .. }
+                crate::xgroup::Step::Resolve { .. } | crate::xgroup::Step::ResolveAt { .. }
                     if here == at && !held.swap(true, Ordering::AcqRel) =>
                 {
                     reach.send(()).unwrap();

@@ -641,9 +641,16 @@ impl Coordinator {
             .ok_or_else(|| broken("a step came back twice"))?;
         let mut next: Vec<(GroupId, Kind, Step)> = Vec::new();
         let mut answer = None;
+        // A committed transaction with a commit stamp writes its rows at it in every group
+        // (lane split-merge-21, `Step::ResolveAt`): the stamp `Answer::Committed` answers as `at`.
+        // An aborted one writes nothing, and one whose groups carried no clock has no stamp.
         let resolve_all = |run: &Run, outcome: Outcome, next: &mut Vec<(GroupId, Kind, Step)>| {
             for group in &run.groups {
-                next.push((*group, Kind::Resolve, Step::Resolve { txn, outcome }));
+                let step = match (outcome, run.at) {
+                    (Outcome::Committed, Some(at)) => Step::ResolveAt { txn, outcome, at },
+                    _ => Step::Resolve { txn, outcome },
+                };
+                next.push((*group, Kind::Resolve, step));
             }
         };
         match (sent.kind, reply) {

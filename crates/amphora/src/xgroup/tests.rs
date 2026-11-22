@@ -621,8 +621,10 @@ impl Sim {
                     .get_mut(usize::try_from(send.group).unwrap())
                     .unwrap();
                 let reply = apply(send.group, group, &send.envelope).unwrap();
-                if let (Step::Resolve { txn, outcome }, Reply::Resolved) =
-                    (&send.envelope.step, &reply)
+                if let (
+                    Step::Resolve { txn, outcome } | Step::ResolveAt { txn, outcome, .. },
+                    Reply::Resolved,
+                ) = (&send.envelope.step, &reply)
                     && *self.resolved.entry(*txn).or_insert(*outcome) != *outcome
                 {
                     self.split.insert(*txn);
