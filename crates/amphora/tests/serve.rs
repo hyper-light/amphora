@@ -54,21 +54,27 @@ fn t_t1_13_1_three_members_elect_refuse_strangers_and_lose_nothing_split() {
     let dir = tempfile::tempdir().unwrap();
     let configs = three(dir.path());
     let (tx, rx) = std::sync::mpsc::channel();
+    // Each member starts once the one before it listens. One process's opens take turns (its owner
+    // table is held across each open), so started together the last would spend its own deadline
+    // on the others' opens; started on the event, each open has its whole deadline, as one member
+    // per process does in production.
     for c in configs.clone() {
         let tx = tx.clone();
+        let (up, listening) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let node = c.node;
-            // How long each open took, as data: three members in one process open one at a time
-            // (the process's owner table), so the last waits for the others' opens too.
             let started = Instant::now();
             let ended = serve::serve(&c, move |addr| {
                 eprintln!(
                     "member {node} listening on {addr}, open took {:?}",
                     started.elapsed()
                 );
+                let _ = up.send(());
             });
             let _ = tx.send(format!("member {node} ended: {ended:?}"));
         });
+        // A member whose open failed drops `up` unsent: its end is reported below, and health fails.
+        let _ = listening.recv();
     }
     std::thread::spawn(move || {
         for line in rx {
