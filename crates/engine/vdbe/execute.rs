@@ -19812,6 +19812,10 @@ pub fn op_filter(
         },
         insn
     );
+    // Amphora (PL.5): the first probe ends a sized filter's build.
+    if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
+        filter.seal();
+    }
     let Some(filter) = state.get_bloom_filter(*cursor_id) else {
         // always safe to fall though, no filter present
         state.pc += 1;
@@ -19857,21 +19861,23 @@ pub fn op_filter_add(
         FilterAdd {
             cursor_id,
             key_reg,
-            num_keys
+            num_keys,
+            sizing
         },
         insn
     );
+    let sizing = *sizing;
 
     if *num_keys == 1 {
         let reg: *const Register = &state.registers[*key_reg];
         let value = unsafe { &*reg }.get_value();
-        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        let filter = state.get_or_create_bloom_filter_for(*cursor_id, sizing);
         filter.insert_value(value);
     } else {
         let values: Vec<Value> = (0..*num_keys)
             .map(|i| state.registers[*key_reg + i].get_value().clone())
             .collect();
-        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        let filter = state.get_or_create_bloom_filter_for(*cursor_id, sizing);
         let value_refs: Vec<&Value> = values.iter().collect();
         filter.insert_values(&value_refs);
     }
@@ -20371,8 +20377,9 @@ pub fn op_morsel_aggregate(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    use crate::vdbe::morsel::HashProbe;
     use crate::vdbe::morsel::{MachineCosts, MemoryBudget, MorselError, ScanAggregate};
-    use crate::vdbe::morsel_scan::{TableAggregate, TableSource};
+    use crate::vdbe::morsel_scan::{TableAggregate, TableJoinAggregate, TableSource};
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
         Box::new(LimboError::InternalError(format!(
@@ -20393,17 +20400,43 @@ pub fn op_morsel_aggregate(
             data.columns,
             data.rowid_alias,
         )?;
+        let budget = MemoryBudget::new(pager.statement_memory_budget());
+        let Some(join) = &data.join else {
+            let shape = ScanAggregate {
+                rows: &[],
+                filter: &data.filter,
+                group_by: &data.group_by,
+                aggregates: &data.aggregates,
+            };
+            let pipeline = TableAggregate {
+                table: &table,
+                shape: &shape,
+            };
+            return pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget);
+        };
+        // A hash join's probe: the build side read and its table built once, on this thread,
+        // charged to the statement's one budget; the joined rows' filter is the probe's.
+        let build_table = TableSource::open(
+            pager.clone(),
+            join.root_page,
+            join.columns,
+            join.rowid_alias,
+        )?;
+        let build = build_table.filtered_rows(&join.filter, &budget)?;
+        let probe = HashProbe::build(&build, &join.build_key, &[], &join.probe_key, &budget)?;
         let shape = ScanAggregate {
             rows: &[],
-            filter: &data.filter,
+            filter: &[],
             group_by: &data.group_by,
             aggregates: &data.aggregates,
         };
-        let pipeline = TableAggregate {
+        let pipeline = TableJoinAggregate {
             table: &table,
+            probe_filter: &data.filter,
+            probe: &probe,
+            build: &build,
             shape: &shape,
         };
-        let budget = MemoryBudget::new(pager.statement_memory_budget());
         pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget)
     })();
     *connection.morsel_costs.lock() = Some(costs);
