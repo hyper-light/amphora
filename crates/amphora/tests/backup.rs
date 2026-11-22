@@ -628,7 +628,8 @@ fn put(
 
 /// T-T1.12.I1 (AC-T1.12.3, AC-T1.12.4): an incremental base. Do: write 400 rows, start the log
 /// again and copy a base;
-/// change 5 rows over two generations of the log; copy a second base; write on; restore seconds
+/// change 5 rows over two generations of the log, the shipper opened again between; copy a
+/// second base; write on; restore seconds
 /// across both; then let the first base expire and restore again. Expect: the second base keeps
 /// most of the first's chunks and copies the changed ones; every second restored has every row
 /// equal, from both bases; once the first base expires, the chunks the second keeps of it stay and
@@ -672,6 +673,8 @@ fn t_t1_12_i1_incremental_bases_keep_unchanged_chunks() {
     // Five rows changed in one generation of the log, then the log started again.
     put(&mut db, &now, 0..5, "b", &mut model, &mut history);
     shipper.ship(&db, &blobs, until()).unwrap();
+    // The shipper opens again on the archive: it reads back what the log changed since the base.
+    shipper = Shipper::open("db", Arc::clone(&hooks), &blobs, &db, until()).unwrap();
     assert!(db.restart_log().unwrap());
     put(&mut db, &now, 401..402, "c", &mut model, &mut history);
     shipper.ship(&db, &blobs, until()).unwrap();

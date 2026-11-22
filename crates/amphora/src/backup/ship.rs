@@ -60,6 +60,17 @@ impl Touched {
         Ok(())
     }
 
+    /// Marks the pages of a run of whole frames: each frame's header begins with its page's
+    /// number, big-endian (sqlite.org/fileformat2.html, "WAL Frame Header Format").
+    fn mark_frames(&mut self, frames: &[u8]) -> anyhow::Result<()> {
+        for frame in frames.chunks(usize::try_from(FRAME_BYTES)?) {
+            if let Some(&[a, b, c, d]) = frame.get(..4) {
+                self.mark(u32::from_be_bytes([a, b, c, d]))?;
+            }
+        }
+        Ok(())
+    }
+
     fn merge(&mut self, other: &Self) {
         if self.0.len() < other.0.len() {
             self.0.resize(other.0.len(), 0);
@@ -306,6 +317,31 @@ impl Shipper {
                     shipper.broken = true;
                 }
             }
+            // The pages the archived log wrote since the latest base began, read back from its
+            // segments (what the log since a base holds is bounded by `base_due`), so the next base
+            // is incremental after an open too. A gap since leaves it whole.
+            if !shipper.broken {
+                for (key, _) in &segments {
+                    let s = SegmentKey::parse(prefix, key)?;
+                    if s.generation < manifest.start_gen {
+                        continue;
+                    }
+                    let body: Segment = object::decode(key, &blobs.get(key, until)?)?;
+                    if s.generation == shipper.generation {
+                        shipper.current.mark_frames(&body.frames)?;
+                    } else {
+                        shipper.older.mark_frames(&body.frames)?;
+                    }
+                }
+                shipper.last_base = Some(LastBase {
+                    id: manifest.id,
+                    start_gen: manifest.start_gen,
+                    chunk_bytes: manifest.chunk_bytes,
+                    file_bytes: manifest.file_bytes,
+                    bases: manifest.chunk_bases()?,
+                });
+                shipper.traced_from = Some(manifest.id);
+            }
         }
         let (seq, end) = db.log_end();
         if end > shipper.shipped {
@@ -528,13 +564,7 @@ impl Shipper {
                     usize::try_from(to.saturating_sub(from).saturating_mul(FRAME_BYTES))?,
                 )?
                 .ok_or_else(|| anyhow::anyhow!("the log's file is gone"))?;
-            // Each frame's header begins with its page's number, big-endian (sqlite.org/
-            // fileformat2.html, "WAL Frame Header Format").
-            for frame in body.frames.chunks(usize::try_from(FRAME_BYTES)?) {
-                if let Some(&[a, b, c, d]) = frame.get(..4) {
-                    self.current.mark(u32::from_be_bytes([a, b, c, d]))?;
-                }
-            }
+            self.current.mark_frames(&body.frames)?;
             let key = SegmentKey {
                 generation: self.generation,
                 first: body.first,
