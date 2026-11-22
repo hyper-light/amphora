@@ -1152,6 +1152,10 @@ fn t_t1_9_l1_automatic_operations_lose_no_write() {
 struct Wire<'a> {
     node: NodeId,
     groups: &'a Groups<Events>,
+    /// The pulls answered so far, and, if some, every how many an answer is lost on the way back
+    /// (after the other node acted on it).
+    pulls: &'a std::cell::Cell<u64>,
+    lose_every: Option<u64>,
 }
 
 impl Peers for Wire<'_> {
@@ -1162,6 +1166,11 @@ impl Peers for Wire<'_> {
         let bytes = postcard::to_allocvec(pull).map_err(|e| anyhow::anyhow!("{e}"))?;
         let asked: Pull = postcard::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
         let answer = self.groups.serve(&asked, until)?;
+        let n = self.pulls.get() + 1;
+        self.pulls.set(n);
+        if self.lose_every.is_some_and(|every| n.is_multiple_of(every)) {
+            anyhow::bail!("the pull's answer lost on the way back");
+        }
         let bytes = postcard::to_allocvec(&answer).map_err(|e| anyhow::anyhow!("{e}"))?;
         postcard::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -1196,6 +1205,22 @@ fn put_at(nodes: &[Groups<Events>; 2], key: &str, seq: i64) -> bool {
 /// at the node its group is on, and every key in exactly one group's file.
 #[test]
 fn t_t1_9_r10_a_group_moves_to_another_node_under_writes_and_loses_no_acknowledged_write() {
+    assert_eq!(move_under_writes(None), 0);
+}
+
+/// T-T1.9.R11 (CP-T1.9; docs/design/reshard.md, "Moves across nodes": correctness never rests on
+/// the channel): the move of T-T1.9.R10 with every third pull's answer lost on the way back, after
+/// the old group's node acted on it; each loss an error of the action, which the driver asks again
+/// ([`Driver::restarted`]); expect some answers lost and the same outcome: the move flipped, every
+/// acknowledged write at its group's node, every key in exactly one group's file.
+#[test]
+fn t_t1_9_r11_a_move_whose_pull_answers_are_lost_asks_again_and_loses_no_acknowledged_write() {
+    assert!(move_under_writes(Some(3)) > 0);
+}
+
+/// The move of T-T1.9.R10, every `lose_every`th pull's answer lost if some: how many were lost.
+fn move_under_writes(lose_every: Option<u64>) -> u64 {
+    let (pulls, mut lost) = (std::cell::Cell::new(0u64), 0u64);
     let dir = tempfile::tempdir().unwrap();
     let dirs = [dir.path().join("n0"), dir.path().join("n1")];
     for d in &dirs {
@@ -1262,12 +1287,23 @@ fn t_t1_9_r10_a_group_moves_to_another_node_under_writes_and_loses_no_acknowledg
                 let peers = Wire {
                     node: NodeId(u64::try_from(there).unwrap()),
                     groups: &nodes[there],
+                    pulls: &pulls,
+                    lose_every,
                 };
-                let reply = nodes[here]
-                    .carry(&a, soon(), &peers, |g| {
-                        events(&dirs[here], &g.0.to_string())
-                    })
-                    .unwrap();
+                let carried = nodes[here].carry(&a, soon(), &peers, |g| {
+                    events(&dirs[here], &g.0.to_string())
+                });
+                let reply = match carried {
+                    Ok(reply) => reply,
+                    // The answer lost: the action's error, asked again by the driver.
+                    Err(e) if lose_every.is_some() => {
+                        assert!(e.to_string().contains("lost on the way back"), "{e}");
+                        lost += 1;
+                        pending.extend(driver.restarted(group).unwrap());
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
                 pending.extend(
                     driver
                         .answer(Answer {
@@ -1329,4 +1365,5 @@ fn t_t1_9_r10_a_group_moves_to_another_node_under_writes_and_loses_no_acknowledg
         }
     }
     assert_eq!(seen.len(), keys.len());
+    lost
 }
