@@ -4539,15 +4539,13 @@ pub(crate) mod bushy_search_tests {
         /// counted, the plan of nested loops gives; each query planned bushy; and the LEFT JOIN
         /// read inside a build group (`LEFT_JOINS_IN_RUNS`) in every query.
         ///
-        /// Lane pl8-22: the filters make the plan with the LEFT JOIN in the run the cheaper
-        /// mirror. Each side reaches its fact through an index made for the join (no side scans
-        /// the 12,000 rows, as lane pl8-20 had it), so the mirrors differ by which side is built:
-        /// a row built costs more than a row probed, and the search builds the side with fewer
-        /// rows (kiln run r124: with the LEFT JOIN's dimension at six rows and the other at one,
-        /// it built the other side, 240 fact rows, and probed with the LEFT JOIN's 1,440). So
-        /// the LEFT JOIN's dimension keeps two rows (`cat = 1`: ids 1 and 26, one with a match
-        /// and one without), 480 fact rows to build, and the other six (`cat < 3`), 1,440 to
-        /// probe with. The plan's shape is checked before the answers.
+        /// Lane pl8-20: the LEFT JOIN's dimension keeps six rows (`cat < 3`), the other one
+        /// (`id = 7` or `id = 3`). Lane pl8-22: each side reaches its fact through an index made
+        /// for the join, so the plan with the LEFT JOIN in the run and its mirror differ only by
+        /// which side is built and which probes (kiln run r124 planned both for one query, the
+        /// mirror as it ran and the LEFT JOIN in the run at the EXPLAIN after, its weights moved
+        /// in between by a preempted timed run, T-PL.8.2). The plan's shape is checked before the
+        /// answers.
         #[test]
         fn t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows() {
             let (_db, conn) = facts();
@@ -4565,7 +4563,7 @@ pub(crate) mod bushy_search_tests {
                              JOIN f1 ON f1.d1 = d1.id JOIN f2 ON f2.k = f1.k \
                              JOIN d2 ON f2.d2 = d2.id"
                         ),
-                        "WHERE d1.cat = 1 AND d2.cat < 3",
+                        "WHERE d1.cat < 3 AND d2.id = 7",
                     ),
                     (
                         format!(
@@ -4573,7 +4571,7 @@ pub(crate) mod bushy_search_tests {
                              JOIN f2 ON f2.d2 = d2.id JOIN f1 ON f2.k = f1.k \
                              JOIN d1 ON f1.d1 = d1.id"
                         ),
-                        "WHERE d2.cat = 1 AND d1.cat < 3",
+                        "WHERE d2.cat < 3 AND d1.id = 3",
                     ),
                 ] {
                     let sql = format!("{select} {from} {filter}{above}");
