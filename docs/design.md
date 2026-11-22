@@ -155,6 +155,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-9): moves across nodes | [reshard.md](design/reshard.md#decision-lane-split-merge-9-moves-across-nodes) |
 | reshard | – | Decision (lane split-merge-10): pulls over the owner transport | [reshard.md](design/reshard.md#decision-lane-split-merge-10-pulls-over-the-owner-transport) |
 | reshard | – | Decision (lane split-merge-11): the routing key is bytes | [reshard.md](design/reshard.md#decision-lane-split-merge-11-the-routing-key-is-bytes) |
+| reshard | – | Decision (lane split-merge-12): load from the store's meter | [reshard.md](design/reshard.md#decision-lane-split-merge-12-load-from-the-stores-meter) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |

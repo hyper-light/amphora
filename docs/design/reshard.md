@@ -233,6 +233,13 @@ deterministic simulator:
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.
+
+   Built (lane split-merge-12): load from the store's meter (decision "Load from the store's
+   meter", T-T1.9.R14, T-T1.9.R15). `Groups::measure` gives each group's load (its writer's commit
+   time over the window) and its load cut (where the keys written to it fall), and `groups::room`
+   this machine's cores; the operations' lab plans from them. Still left of this item: a group's
+   size and its size cut from the B-tree's middle key (`Groups::measure` gives no bytes yet, so a
+   group splits and merges by its load alone).
 3. **`bench reshard`.** The cutover pause on a 10 GB partition under load (AC-T1.9.2), and the
    three-machine lab's 1,000 operations (AC-T1.9.3).
 4. **Metrics.** Operations by kind and outcome, and the fence lag. Their names still need
@@ -464,3 +471,40 @@ its scans, changes, heads and SQL need the answers above across groups before it
 
 **Falsified by.** A Records transaction committed with keys in two groups; a write acknowledged
 through `Groups<Local>` that doesn't read back after a split or merge.
+
+## Decision (lane split-merge-12): load from the store's meter
+
+The planner (`plan::plan`) compares each group's share of the load with one core's share, but the
+shell didn't measure the load: the lab counted its own writes. Now the shell does
+(`Groups::measure`, one call a planner run):
+- a group's **load** is the time its writer spent committing since the last call (the store's
+  meter, `Counters::apply_us`). Time adds up across groups and weighs a costly write more than a
+  cheap one, which a count of writes doesn't;
+- its **load cut** is where the keys handed to it since the last call fall half each side
+  (`plan::Weights`, one weight a key at its position, cut by `plan::cut`);
+- this machine's **cores** are what the operating system lets the process run on
+  (`groups::room`, `std::thread::available_parallelism`).
+
+Each call starts the next window, so the window is the time between planner runs; the plan
+compares shares, which don't depend on its length. None of this is a picked number: the split,
+merge and move rules stay those of "When: from what is measured", now fed what the store measured.
+
+The positions are kept bounded. A group's weights hold at most as many entries as the process's
+memory for batches holds (decision "A batch bounded by the process's memory"), shared among this
+node's groups. Past that, each pair of neighbouring entries folds into one at the first's position,
+so the total stays exact and a cut still falls at a position written, at the resolution the bound
+leaves. A fold halves the entries, so it runs no more than once every half-bound adds.
+
+**Evidence.** `plan::tests`, T-T1.9.R14: a thousand weights kept to eight entries stay within eight,
+their total exact, and cut with weight on each side; four single weights cut exactly in the middle.
+`tests/groups.rs`, T-T1.9.R15: a group measured with nothing written has no load cut; after
+sixty-four keys are written its load is above zero, its cut counts every key on the side its
+position falls, and the plan on two cores splits it there; the next window starts empty. The
+operations' lab (T-T1.9.L1) plans from `Groups::measure` and `groups::room`.
+
+**Left.** A group's size and size cut (from the B-tree's middle key, without reading every row on
+the writer). A write takes the group's window lock once a batch; if that shows in a profile, the
+weights can be kept per writer thread and gathered at `measure`.
+
+**Falsified by.** A plan from `Groups::measure` that splits a group with no load or misses one with
+more than a core's share; a group's weights growing past their bound.
