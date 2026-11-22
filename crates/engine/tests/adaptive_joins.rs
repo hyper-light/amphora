@@ -1388,8 +1388,8 @@ fn t_pl_13_17_a_stored_subquery_over_a_subquery_plans_again() {
     );
 }
 
-/// Do: three tables chained by hash joins only (`r.k = s.k`, `s.j = t.j`), so the third join's build
-/// input is materialized from the first two (`MATERIALIZE hash build input`: `s` both the first
+/// Do: three tables chained by hash joins only (`r.k = s.k`, `s.j = t.j`), so the third join's
+/// build input is materialized from the first two (`MATERIALIZE hash build input`: `s` both the first
 /// join's probe and the second's build, the materialization PL.6 requires). At ANALYZE no row of
 /// `s` meets `r` (its keys distinct, `r`'s two values among none of them: 20 estimated for the
 /// pair); then every `s.k` is set to 1, so each of `r`'s ten rows with 1 meets all 200 of `s`
@@ -1522,7 +1522,8 @@ fn t_pl_13_19_a_sorter_fed_by_a_left_join_past_the_estimate_plans_again() {
 }
 
 /// Do: an EXISTS and a NOT EXISTS of `b` on `a`'s key, planned by hash joins only (each unnested
-/// to a hash semi or anti join), ORDER BY `a.k` DESC (no index on it: a sorter holds the rows kept).
+/// to a hash semi or anti join), ORDER BY `a.k` DESC (no index on it: a sorter holds the rows
+/// kept).
 /// At ANALYZE `b`'s 5,000 keys are ten values none of `a`'s 1,000 holds, which the estimate takes
 /// for ten of them (each distinct value of the fewer among the more): 10 rows kept by the EXISTS,
 /// 990 by the NOT EXISTS; then `b`'s keys set to cover all of `a`'s (1,000 kept and none), the

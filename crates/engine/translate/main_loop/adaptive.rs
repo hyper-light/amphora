@@ -193,13 +193,13 @@ pub(crate) fn emit_sorter_count(
 /// Amphora (PL.13, lane replan-10: a sorter fed by a join): an ORDER BY or GROUP BY sorter fed by
 /// an inner join of two tables or more, or a LEFT, semi or anti join (lane replan-11: a LEFT
 /// JOIN's unmatched rows kept, null-extended; the rows an EXISTS or NOT EXISTS keeps), holds the
-/// join's rows its WHERE and ON terms keep, one a row. They are checked against the rows the plan read for the whole join
-/// (`cardinality::JoinedSetRows::rows`), noted under the join's identity
+/// join's rows its WHERE and ON terms keep, one a row. They are checked against the rows the plan
+/// read for the whole join (`cardinality::JoinedSetRows::rows`), noted under the join's identity
 /// (`subquery_rows::join_identity`), where a count past them is stored for the planner. The band
 /// is the statistics' error of each table joined, independent, in quadrature, as a stored
 /// subquery result's over several tables is. `None` where it is not checked: adaptive joins off,
-/// a RIGHT or FULL JOIN, a table without statistics, terms reading a parameter, or no rows
-/// noted for the join. With the check, the name of the first table, for EXPLAIN.
+/// a RIGHT or FULL JOIN, a table without statistics, terms reading a parameter, or no rows noted
+/// for the join. With the check, the name of the first table, for EXPLAIN.
 fn joined_sorter_check(
     t_ctx: &TranslateCtx,
     plan: &crate::translate::plan::SelectPlan,

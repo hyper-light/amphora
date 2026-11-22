@@ -207,8 +207,8 @@ pub(super) struct JoinedSetRows<'a> {
     bound: DegreeBound,
     /// PL.13 (lane replan-10): the identity of the whole join's rows, where a sorter fed by the
     /// join may have counted them (`subquery_rows::join_identity`): a join of two tables or more,
-    /// inner, LEFT, semi or anti (lane replan-11), planned for one run (`initial` at most one row); `None`
-    /// otherwise.
+    /// inner, LEFT, semi or anti (lane replan-11), planned for one run (`initial` at most one
+    /// row); `None` otherwise.
     joined: Option<u64>,
     /// PL.13 (lane replan-10): each table's own filter terms, where it has a sample.
     own_filters: Vec<Option<OwnFilter>>,
@@ -218,11 +218,12 @@ pub(super) struct JoinedSetRows<'a> {
 }
 
 /// The parts of a set of tables' identity as a join prefix (PL.13, lane replan-11), taken once:
-/// each table's normalized name, and each WHERE term's tables with its fingerprint (`None` for a
-/// term reading a parameter). A set's identity is its tables' names and the terms reading only
-/// them ([PrefixKeys::identity]), the same value `subquery_rows::prefix_identity` gives the plan.
+/// each table's part (`subquery_rows::table_part`, from its normalized name), and each WHERE
+/// term's tables with its fingerprint (`None` for a term reading a parameter). A set's identity is
+/// its tables' parts and the terms reading only them ([PrefixKeys::identity]), the same value
+/// `subquery_rows::prefix_identity` gives the plan.
 struct PrefixKeys {
-    names: Vec<String>,
+    names: Vec<u64>,
     terms: Vec<(TableMask, Option<u64>)>,
 }
 
@@ -230,7 +231,7 @@ impl PrefixKeys {
     fn identity(&self, set: &TableMask) -> Option<u64> {
         let mut names = Vec::new();
         for table in set.iter() {
-            names.push(self.names.get(table)?.clone());
+            names.push(*self.names.get(table)?);
         }
         let mut terms = Vec::new();
         for (mask, fingerprint) in &self.terms {
@@ -699,7 +700,11 @@ impl<'a> JoinedSetRows<'a> {
             Some(PrefixKeys {
                 names: joined_tables
                     .iter()
-                    .map(|joined| crate::util::normalize_ident(joined.table.get_name()))
+                    .map(|joined| {
+                        crate::subquery_rows::table_part(&crate::util::normalize_ident(
+                            joined.table.get_name(),
+                        ))
+                    })
                     .collect(),
                 terms,
             })

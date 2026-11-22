@@ -145,7 +145,7 @@ pub(crate) fn join_identity(
     for term in where_clause {
         let fingerprint = crate::filter_shares::term_fingerprint(&term.expr)?;
         each.push(if term.origin.is_outer_join() {
-            identity(&("ON", fingerprint))?
+            part(("ON", fingerprint))
         } else {
             fingerprint
         });
@@ -154,22 +154,37 @@ pub(crate) fn join_identity(
     for joined in tables {
         let name = crate::util::normalize_ident(joined.table.get_name());
         match joined.join_info.as_ref() {
-            Some(info) if info.is_outer() => each.push(identity(&("LEFT", &name))?),
-            Some(info) if info.is_semi() => each.push(identity(&("SEMI", &name))?),
-            Some(info) if info.is_anti() => each.push(identity(&("ANTI", &name))?),
+            Some(info) if info.is_outer() => each.push(part(("LEFT", &name))),
+            Some(info) if info.is_semi() => each.push(part(("SEMI", &name))),
+            Some(info) if info.is_anti() => each.push(part(("ANTI", &name))),
             _ => {}
         }
-        names.push(name);
+        names.push(table_part(&name));
     }
     join_identity_of(names, each)
 }
 
-/// [join_identity] of the tables named `names` (normalized) and the terms whose
+/// A part of a join's identity: the hash of `value`.
+fn part(value: impl Hash) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A table's part of a join's identity, from its normalized name.
+pub(crate) fn table_part(normalized_name: &str) -> u64 {
+    part(("TABLE", normalized_name))
+}
+
+/// [join_identity] of the tables whose [table_part]s are `tables` and the terms whose
 /// [`term_fingerprint`](crate::filter_shares::term_fingerprint)s are `terms`, both in any order.
-pub(crate) fn join_identity_of(mut names: Vec<String>, terms: Vec<u64>) -> Option<u64> {
+/// Hashed directly, not through a printed form: the join search takes it for every set of tables
+/// it estimates (`cardinality::PrefixKeys`), and the parts hold no parameter (a term reading one
+/// has no fingerprint).
+pub(crate) fn join_identity_of(mut tables: Vec<u64>, terms: Vec<u64>) -> Option<u64> {
     let terms = crate::filter_shares::combine(terms)?;
-    names.sort_unstable();
-    identity(&("JOIN", names, terms))
+    tables.sort_unstable();
+    Some(part(("JOIN", tables, terms)))
 }
 
 /// The identity of the rows of a join prefix (PL.13, lane replan-11: a build fed by a materialized
@@ -189,9 +204,9 @@ pub(crate) fn prefix_identity(
     let joined = table_references.joined_tables();
     let mut names = Vec::new();
     for table_idx in set.iter() {
-        names.push(crate::util::normalize_ident(
+        names.push(table_part(&crate::util::normalize_ident(
             joined.get(table_idx)?.table.get_name(),
-        ));
+        )));
     }
     let mut terms = Vec::new();
     for term in where_clause {
@@ -260,5 +275,28 @@ mod tests {
             drop(store.rows(identity));
         }
         assert!(store.len() <= 2, "dead entries kept: {}", store.len());
+    }
+
+    /// PL.13 (lane replan-11): a join's identity is the same whatever the order of its tables and
+    /// terms, differs with either, and has none without a term; asking whether a count is stored
+    /// makes no entry, and says so only once one is.
+    #[test]
+    fn pl_13_join_identities_and_a_read_that_makes_no_entry() {
+        let (r, s, t) = (table_part("r"), table_part("s"), table_part("t"));
+        let both = join_identity_of(vec![r, s], vec![1, 2]);
+        assert!(both.is_some());
+        assert_eq!(both, join_identity_of(vec![s, r], vec![2, 1]));
+        assert_ne!(both, join_identity_of(vec![r, t], vec![1, 2]));
+        assert_ne!(both, join_identity_of(vec![r, s], vec![1]));
+        assert_eq!(join_identity_of(vec![r, s], vec![]), None);
+        let store = SubqueryRows::new();
+        assert!(!store.counted(9));
+        assert_eq!(store.len(), 0, "a read made an entry");
+        let rows = store.rows(9);
+        assert!(!store.counted(9), "an unset count read as stored");
+        assert!(rows.set(40));
+        assert!(store.counted(9));
+        drop(rows);
+        assert!(!store.counted(9), "a dead entry read as stored");
     }
 }
