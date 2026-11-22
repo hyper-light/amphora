@@ -5809,6 +5809,15 @@ impl Connection {
             pager.rollback_tx(self);
             self.auto_commit.store(true, Ordering::SeqCst);
         }
+        // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction rolls back with
+        // the pager's, so a statement abandoned or failed mid-write leaves nothing for the next
+        // statement's commit to make durable. The pager's rollback reports no error either; one
+        // here is logged, and the storage refuses the ended transaction's cursors their writes.
+        if let Some(switch) = self.versioned.as_ref() {
+            if let Err(e) = switch.finish(true) {
+                tracing::error!("versioned storage: rolling back the transaction: {e}");
+            }
+        }
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
