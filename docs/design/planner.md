@@ -1764,7 +1764,11 @@ rules. The sorter counts every row put in, kept by a LIMIT or not, in memory or 
 (`Sorter::inserted`). Counted by `Connection::adaptive_sort_checks`. Evidence:
 `pl_13_a_sorters_input_past_the_estimate_plans_again` (T-PL.13.6): a table counted far past its rows
 and a range whose share an UPDATE moved, each one answer in order with adaptive joins off and on,
-one re-plan, none on the second run.
+one re-plan, none on the second run. A sorter fed by an index seek on one table (lane replan-9) is
+checked the same way against the share the plan read for every WHERE term, the seek's own among
+them: `t_pl_13_11_a_sorter_fed_by_an_index_seek_plans_again` (T-PL.13.11), a seek by `v = 7`, and
+by `v IN (7, 8)`, on an index whose values were all distinct at ANALYZE, half the rows set to 7
+after.
 
 **Stored subquery results (lane replan-6).** An uncorrelated FROM-clause subquery stored whole in
 an ephemeral table (a CTE read more than once, or one declared `MATERIALIZED`, or a source a
@@ -1805,8 +1809,9 @@ share stored, one re-plan, none on the second run or in a new statement.
 
 **Not checked yet (lane replan-9's audit of the points this decision names).** A hash join's build
 fed by a materialized input, or filtered by terms that are neither one column statistics term nor
-a set the sample ran together; a sorter fed by anything but one table's full scan (a join, an
-index range, a GROUP BY's or DISTINCT's sorter); a stored subquery result over another subquery or
+a set the sample ran together; a sorter fed by anything but one table's full scan or index seek
+(a join, a GROUP BY's or DISTINCT's sorter), or by a seek whose terms the plan read no one share
+for (an `=` its column statistics price beside a range the sample runs, say); a stored subquery result over another subquery or
 a table without statistics, and an IN subquery's ephemeral index. Each needs a store for its own
 correction (a join's or a group's rows, keyed as a filter share is), or the new plan would be the
 old one (the last falsifier below).

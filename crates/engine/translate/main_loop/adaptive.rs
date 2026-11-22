@@ -107,13 +107,17 @@ fn counted_check(
 /// the rows of that table its WHERE terms keep. Once the scan has put them all in, ahead of the
 /// sort, their count is checked as a hash join's build is: against the table's rows, or with WHERE
 /// terms against the share the plan read for exactly those terms (`counted_check`).
+///
+/// Fed by an index seek on the table (lane replan-9), it holds the rows the seek's terms and the
+/// rest keep: every WHERE term counts, the seek's (consumed by it) among them, so a seek by one
+/// `=` or IN list the column statistics estimate is checked against the share they gave.
 pub(crate) fn emit_sorter_count(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
     plan: &crate::translate::plan::SelectPlan,
     cursor_id: CursorID,
 ) {
-    use crate::translate::plan::{Distinctness, Operation, Scan};
+    use crate::translate::plan::{Distinctness, Operation, Scan, Search};
     let [joined] = plan.joined_tables() else {
         return;
     };
@@ -125,15 +129,22 @@ pub(crate) fn emit_sorter_count(
     {
         return;
     }
-    let (Operation::Scan(Scan::BTreeTable { index: None, .. }), Table::BTree(btree)) =
-        (&joined.op, &joined.table)
-    else {
-        return;
+    let (seek, btree) = match (&joined.op, &joined.table) {
+        (Operation::Scan(Scan::BTreeTable { index: None, .. }), Table::BTree(btree)) => {
+            (false, btree)
+        }
+        (
+            Operation::Search(
+                Search::Seek { index: Some(_), .. } | Search::InSeek { index: Some(_), .. },
+            ),
+            Table::BTree(btree),
+        ) => (true, btree),
+        _ => return,
     };
     let mut terms = plan
         .where_clause
         .iter()
-        .filter(|term| !term.consumed)
+        .filter(|term| seek || !term.consumed)
         .peekable();
     let prefiltered = terms.peek().is_some();
     let fingerprint = crate::filter_shares::fingerprint(terms.map(|term| &term.expr));

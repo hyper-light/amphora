@@ -969,3 +969,63 @@ fn t_pl_13_10_a_build_filtered_by_a_column_statistics_term_plans_again() {
         );
     }
 }
+
+/// Do: an ORDER BY over one table read by an index seek on one `=`, and then one IN list, on a
+/// column whose statistics gave the value one row in 5,000 (every value distinct as ANALYZE counted
+/// them), then updated so half the rows hold it; each run with adaptive joins off, then on twice in
+/// one prepared statement, and once more prepared anew. Expect: one answer, in order, every way;
+/// off, no sorter counted; on, the sorter's input counted against the share the column statistics
+/// gave, past its error, the counted share stored and the statement planned again once; the second
+/// run and a new statement plan on the stored share, and nothing plans again (PL.13, lane
+/// replan-9, T-PL.13.11: a sorter fed by an index seek, at its materialization point).
+#[test]
+fn t_pl_13_11_a_sorter_fed_by_an_index_seek_plans_again() {
+    let (_dir, conn) = open("seek_sorter.db");
+    conn.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute("CREATE INDEX c_v ON c (v)").unwrap();
+    conn.execute(
+        "INSERT INTO c(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 20, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE c SET v = 7 WHERE id % 2 = 0").unwrap();
+    for (case, sql) in [
+        ("=", "SELECT id, k FROM c WHERE v = 7 ORDER BY k, id"),
+        ("IN", "SELECT id, k FROM c WHERE v IN (7, 8) ORDER BY k, id"),
+    ] {
+        conn.set_adaptive_joins(false);
+        let checks = conn.adaptive_sort_checks();
+        let off = run_rows(&mut conn.prepare(sql).unwrap());
+        assert_eq!(off.len(), 2500, "{case}: the rows");
+        assert_eq!(conn.adaptive_sort_checks(), checks, "{case}: counted off");
+
+        conn.set_adaptive_joins(true);
+        let (replans, corrections) = (conn.adaptive_replans(), conn.adaptive_filter_corrections());
+        let mut held = conn.prepare(sql).unwrap();
+        assert_eq!(run_rows(&mut held), off, "{case}: on and off differ");
+        assert!(
+            conn.adaptive_sort_checks() > checks,
+            "{case}: the sorter was not counted"
+        );
+        assert_eq!(
+            conn.adaptive_filter_corrections() - corrections,
+            1,
+            "{case}: the counted share stored"
+        );
+        assert_eq!(
+            conn.adaptive_replans() - replans,
+            1,
+            "{case}: planned again once"
+        );
+
+        let replans = conn.adaptive_replans();
+        assert_eq!(run_rows(&mut held), off, "{case}: the second run's answer");
+        assert_eq!(
+            run_rows(&mut conn.prepare(sql).unwrap()),
+            off,
+            "{case}: a statement planned on the stored share"
+        );
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+    }
+}
