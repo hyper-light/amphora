@@ -2528,7 +2528,8 @@ doesn't tick (`a_change_at_its_barrier_is_refused_once_the_lead_is_lost`). Both 
 lost packet, which raft already tolerates; a fence ends the member, and a pause keeps a stalled leader in office.
 A shed is made good by events (lane constants-19): a report of unreachable gives up the member's window, but a probe
 already out waits for an answer, so raft would send again only on its next heartbeat tick, and never while a driven
-test keeps time still (`a_change_past_its_deadline_answers_what_its_stage_knows` hung on it). Now a shed marks a
+test keeps time still (the likely cause of `a_change_past_its_deadline_answers_what_its_stage_knows` never
+settling; not yet confirmed by a run). Now a shed marks a
 resend owed (`Outgoing::owed`); the host's next drain rings the owner, and once the queue has room for a record to
 each peer the leader beats (`Actor::resend`). Each member's heartbeat answer resumes its probe and brings the entries
 it lacks. A follower's shed record is a lost answer, which its leader's heartbeat timeout makes good, as on a lossy
