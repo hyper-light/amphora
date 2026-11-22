@@ -55,6 +55,58 @@ def typed(expression):
     return expression
 
 
+# SQLite's built-in collations (https://www.sqlite.org/datatype3.html#collating_sequences, section
+# 7.1: BINARY "compares string data using memcmp()", NOCASE "is the same as binary, except the 26
+# upper case characters of ASCII are folded to their lower case equivalents", RTRIM "is the same as
+# binary, except that trailing space characters are ignored") by the MySQL collation that compares as
+# each does (MySQL 8.4 Reference Manual, 12.10.1 "Unicode Character Sets", which says: "For
+# utf8mb4_0900_bin, the weight is the utf8mb4 encoding bytes", so memcmp's order on UTF-8; "The pad
+# attribute for utf8mb4_bin is PAD SPACE, whereas for utf8mb4_0900_bin it is NO PAD", so utf8mb4_bin
+# ignores trailing spaces; and 12.3.1 "Collation Naming Conventions": _as accent-sensitive, _ci
+# case-insensitive). MySQL has no collation that folds ASCII's letters only: utf8mb4_0900_as_ci folds
+# every letter's case, so NOCASE's answers differ there on letters outside ASCII, a difference of the
+# engines, which the corpus shows as such. MySQL refuses the names it doesn't know ("Unknown
+# collation: 'NOCASE'").
+MYSQL_COLLATIONS = {"BINARY": "utf8mb4_0900_bin", "NOCASE": "utf8mb4_0900_as_ci", "RTRIM": "utf8mb4_bin"}
+
+
+def spoken(expression, dialect):
+    """`expression` with what sqlglot writes in SQLite's spelling, which `dialect` reads otherwise,
+    given that dialect's spelling of it:
+    - a blob literal X'hh..' (SQLite's "Literal Values", https://www.sqlite.org/lang_expr.html#literal_values_constants_:
+      "BLOB literals are string literals containing hexadecimal data and preceded by a single "x" or
+      "X" character") is a bit string in PostgreSQL's dialect (its manual, 4.1.2.5 "Bit-String
+      Constants": "bit-string constants can be specified in hexadecimal notation, using a leading X
+      (upper or lower case), e.g., X'1FF'"), which a BYTEA column refuses; PostgreSQL's bytea is
+      written '\\xhh..' (8.4.1 "bytea Hex Format": "The entire string is preceded by the sequence
+      \\x"), cast to BYTEA. OrioleDB and CedarDB speak PostgreSQL's dialect.
+      ClickHouse: sqlglot refuses it ("Unsupported transpilation from BINARY/BLOB hex string");
+      ClickHouse's unhex (its reference, "Encoding Functions": unhex "performs the opposite
+      operation of hex. It interprets each pair of hexadecimal digits (in the argument) as a number
+      and converts it to the byte represented by the number") gives the bytes as a String, the type a
+      BLOB column is there.
+    - a collation SQLite names (NOCASE, RTRIM, BINARY) is MySQL's that compares the same
+      (MYSQL_COLLATIONS)."""
+    from sqlglot import exp
+
+    if dialect in ("postgres", "clickhouse"):
+        for blob in list(expression.find_all(exp.HexString)):
+            digits = blob.this or ""
+            if dialect == "postgres":
+                blob.replace(exp.cast(exp.Literal.string("\\x" + digits), exp.DataType.build("BLOB")))
+            else:
+                blob.replace(exp.Unhex(this=exp.Literal.string(digits)))
+    if dialect == "mysql":
+        # sqlglot holds an expression's collation as Collate's `expression`, a column's as its
+        # CollateColumnConstraint's `this`.
+        for node, arg in [(c, "expression") for c in expression.find_all(exp.Collate)] + [(c, "this") for c in expression.find_all(exp.CollateColumnConstraint)]:
+            name = node.args.get(arg)
+            mysql = MYSQL_COLLATIONS.get(name.name.upper()) if isinstance(name, (exp.Var, exp.Column, exp.Identifier)) else None
+            if mysql:
+                node.set(arg, exp.Var(this=mysql))
+    return expression
+
+
 def translate(sql, dialect):
     """`sql`, in SQLite's dialect, in `dialect`: (text, None), or (None, why) when sqlglot can't say
     it there. The one translation the corpus's tools share (probe.py's too)."""
@@ -65,7 +117,7 @@ def translate(sql, dialect):
     try:
         # sqlglot.transpile's steps, each statement given its untyped columns' types between them.
         out = [
-            typed(e).sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE) if e else ""
+            spoken(typed(e), dialect).sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE) if e else ""
             for e in sqlglot.parse(sql, read="sqlite")
         ]
     except Exception as e:  # sqlglot can't say it in this dialect
