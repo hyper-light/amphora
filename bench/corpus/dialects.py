@@ -1518,6 +1518,69 @@ def _names(e):
     return named - {made}, made
 
 
+def _untypable(table):
+    """The columns of `table` (a Table) without a type that typed() can't give one: those the file
+    writes values of several storage classes, of one only running it shows, or none but NULL."""
+    out = set()
+    for name in table.columns:
+        if table.kinds.get(name) is None and name in table.written:
+            classes = table.written[name] - {None}
+            if UNKNOWN in classes or len(classes) != 1:
+                out.add(name)
+    return out
+
+
+def _left_out(e, table, gone):
+    """Statement `e` (sqlglot, SQLite's reading) with columns `gone` of `table` (upper-cased names)
+    left out, or None when it reads one of them: a CREATE TABLE of `table` without them (None
+    when a table constraint names one); an INSERT into it without their values (VALUES rows and
+    a SELECT's columns at their places; None for SELECT *); any statement with a column of one of
+    their names anywhere, a `*` (count(*)'s aside), a NATURAL join or USING reads them: None."""
+    from sqlglot import exp
+
+    e = e.copy()
+    if isinstance(e, exp.Create):
+        schema = e.this
+        for c in list(schema.expressions):
+            if isinstance(c, (exp.Identifier, exp.ColumnDef)):
+                if c.name.upper() in gone:
+                    c.pop()
+            elif any(i.name.upper() in gone for i in c.find_all(exp.Identifier, exp.Column)):
+                return None
+        return e
+    if isinstance(e, exp.Insert):
+        target = e.this
+        names = [i.name.upper() for i in target.expressions] if isinstance(target, exp.Schema) else list(table.columns)
+        drop = [k for k, n in enumerate(names) if n in gone]
+        if drop:
+            source = e.expression
+            if isinstance(source, exp.Values):
+                rows = [row.expressions if isinstance(row, exp.Tuple) else None for row in source.expressions]
+            elif isinstance(source, exp.Select) and not any(isinstance(p, exp.Star) for p in source.selects):
+                rows = [source.expressions]
+            else:
+                return None
+            if any(r is None or len(r) != len(names) for r in rows):
+                return None
+            for r in rows:
+                for k in reversed(drop):
+                    r[k].pop()
+            kept = [exp.to_identifier(n.lower()) for k, n in enumerate(names) if k not in drop]
+            e.set("this", exp.Schema(this=target.this.copy() if isinstance(target, exp.Schema) else target.copy(), expressions=kept))
+    if any(c.name.upper() in gone for c in e.find_all(exp.Column)) or any(not isinstance(st.parent, exp.Count) for st in e.find_all(exp.Star)):
+        return None
+    if any(j.args.get("method") == "NATURAL" or j.args.get("using") for j in e.find_all(exp.Join)):
+        return None
+    return e
+
+
+class _Said:
+    """A record's kind and expectation with other SQL: what records_in() translates in its place."""
+
+    def __init__(self, sql, record):
+        self.sql, self.kind, self.expect, self.line = sql, record.kind, record.expect, record.line
+
+
 def records_in(records, dialect, around=None):
     """Each of a file's records in `dialect` (record_in()), in order, where a record that names a
     table or view whose CREATE the dialect couldn't say (one SQLite ran: not a `statement error`)
@@ -1530,7 +1593,7 @@ def records_in(records, dialect, around=None):
     from sqlglot import exp
 
     around = around if around is not None else contexts(records)
-    missing, out = {}, []
+    missing, partial, out = {}, {}, []
     for r, c in zip(records, around):
         sql, why = record_in(r, dialect, c)
         try:
@@ -1543,6 +1606,29 @@ def records_in(records, dialect, around=None):
             n, m = _names(e)
             named |= n
             made.append((m, e))
+        # A table some of whose columns no type of the dialect holds (typed()) is made without
+        # them, and each record that doesn't read them runs on it unchanged in meaning: a query
+        # that reads none of a table's columns gives what it gives whatever other columns the
+        # table has. One that reads them is untranslatable, with the reason.
+        lean = [m for m, e in made if ran and m is not None and why is not None and "has no type" in why and isinstance(e, exp.Create)
+                and e.args.get("kind") == "TABLE" and m in c.created and _untypable(c.created[m]) and _untypable(c.created[m]) != set(c.created[m].columns)]
+        touched = sorted(n for n in named if n in partial) if why is None else []
+        if (lean or touched) and len(statements) == 1:
+            t = lean[0] if lean else touched[0]
+            table, gone_cols = (c.created[t], _untypable(c.created[t])) if lean else (partial[t][0], partial[t][1])
+            e = _left_out(statements[0], table, gone_cols)
+            if e is not None:
+                lean_sql, lean_why = record_in(_Said(e.sql(dialect="sqlite"), r), dialect, c)
+                if lean_why is None:
+                    if lean:
+                        partial[t] = (table, gone_cols, r.line, why)
+                        missing.pop(t, None)
+                        out.append((lean_sql, None))
+                        continue
+                    sql = lean_sql
+            if touched and e is None:
+                table, gone_cols, line, reason = partial[t]
+                why, sql = f"untranslatable in {dialect}: reads column {', '.join(sorted(g.lower() for g in gone_cols))} of {t.lower()}, left out of its CREATE (line {line}) there: {reason}", None
         gone = sorted(n for n in named if n in missing)
         if why is None and gone:
             line, reason = missing[gone[0]]
@@ -1555,10 +1641,14 @@ def records_in(records, dialect, around=None):
                 missing.pop(m, None)
             elif not (e.args.get("exists") and m in c.tables and m not in missing):
                 missing[m] = (r.line, why)
+        for m, e in made:
+            if m is not None and ran and why is None:
+                partial.pop(m, None)
         if ran:
             for e in statements:
                 if isinstance(e, exp.Drop) and e.args.get("kind") in ("TABLE", "VIEW") and isinstance(e.this, exp.Table):
                     missing.pop(e.this.name.upper(), None)
+                    partial.pop(e.this.name.upper(), None)
         out.append((sql, why))
     return out
 

@@ -344,20 +344,21 @@ class UntypedColumns(unittest.TestCase):
 
 
 class MissingTables(unittest.TestCase):
-    """Do: a table whose CREATE a dialect can't say (an untyped column of several storage classes),
-    then records that read it, write it, index it, view it, name it in a CTE's place, drop it and
-    make it again. Expect: each record naming it (or a view of it) untranslatable with the CREATE's
-    line and reason, where it would have failed on the engine for want of the table; one naming a
-    CTE of the same name, or another table, translated; after the DROP, a translated CREATE makes
-    it again; a CREATE SQLite refuses, or IF NOT EXISTS of a table already made, leaves it be."""
+    """Do: a table whose CREATE a dialect can't say (its one column without a type holds values of
+    several storage classes), then records that read it, write it, index it, view it, name it in a
+    CTE's place, drop it and make it again. Expect: each record naming it (or a view of it)
+    untranslatable with the CREATE's line and reason, where it would have failed on the engine for
+    want of the table; one naming a CTE of the same name, or another table, translated; after the
+    DROP, a translated CREATE makes it again; a CREATE SQLite refuses, or IF NOT EXISTS of a table
+    already made, leaves it be."""
 
     def test_records_naming_it_are_untranslatable(self):
         for d in ENGINES:
             with self.subTest(dialect=d):
                 out = file_in([
-                    "CREATE TABLE t(a INTEGER, e)", "INSERT INTO t VALUES (1, 1), (2, 'two')", "CREATE TABLE u(x INTEGER)",
-                    "SELECT a FROM t", "SELECT x FROM u", "CREATE INDEX ti ON t(a)", "CREATE VIEW v AS SELECT a FROM t", "SELECT * FROM v",
-                    "WITH t(a) AS (SELECT 1) SELECT a FROM t", "SELECT x FROM u WHERE x IN (SELECT a FROM t)",
+                    "CREATE TABLE t(e)", "INSERT INTO t VALUES (1), ('two')", "CREATE TABLE u(x INTEGER)",
+                    "SELECT e FROM t", "SELECT x FROM u", "CREATE INDEX ti ON t(e)", "CREATE VIEW v AS SELECT e FROM t", "SELECT * FROM v",
+                    "WITH t(a) AS (SELECT 1) SELECT a FROM t", "SELECT x FROM u WHERE x IN (SELECT e FROM t)",
                     "DROP TABLE t", "CREATE TABLE t(a INTEGER)", "SELECT a FROM t",
                 ], d)
                 self.assertIsNone(out[0][0])
@@ -371,6 +372,60 @@ class MissingTables(unittest.TestCase):
     def test_refused_create_and_if_not_exists(self):
         out = file_in(["CREATE TABLE t(a INTEGER)", ("CREATE TABLE t(e)", "error"), "CREATE TABLE IF NOT EXISTS t(e)", "SELECT a FROM t"], "duckdb")
         self.assertIsNone(out[3][1])
+
+
+class LeftOutColumns(unittest.TestCase):
+    """Do: a table with typed columns and one without a type that holds values of several storage
+    classes (the written files' shared t1), then inserts with and without a column list, an
+    INSERT ... SELECT, queries that read the typed columns only, and ones that read the untyped
+    one, `*`, NATURAL and USING joins, an UPDATE of it. Expect: the table made without that
+    column; inserts without its values; the queries that don't read it translated; the rest
+    untranslatable, naming the column and the CREATE's reason; on DuckDB (when its Python module
+    is here) the translated queries give what SQLite gives."""
+
+    FILE = ["CREATE TABLE t(a INTEGER, b TEXT, e)", "INSERT INTO t VALUES (1, 'one', 1), (2, 'two', 'x')", "INSERT INTO t(e, a) VALUES (x'07', 3)",
+            "CREATE TABLE s(a INTEGER, e INTEGER)", "INSERT INTO s VALUES (4, 5)", "INSERT INTO t SELECT a, 'four', e FROM s",
+            ("SELECT a, b FROM t ORDER BY a", "query"), ("SELECT count(*), sum(a) FROM t WHERE b IS NOT NULL", "query"),
+            ("SELECT e FROM t", "query"), ("SELECT * FROM t", "query"), ("SELECT a FROM t NATURAL JOIN s", "query"), ("SELECT a FROM t JOIN s USING (a)", "query"),
+            "UPDATE t SET e = 2 WHERE a = 1", "UPDATE t SET b = 'uno' WHERE a = 1", ("SELECT b FROM t WHERE a = 1", "query")]
+
+    def records(self):
+        out = []
+        for i, q in enumerate(self.FILE):
+            sql, kind = q if isinstance(q, tuple) else (q, "statement")
+            out.append(FileRecord(i, sql, kind, "ok" if kind == "statement" else None))
+        return out
+
+    def test_left_out_where_not_read(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = dialects.records_in(self.records(), d)
+                self.assertNotRegex(out[0][0], r"\be\b")
+                self.assertIn("'one'", out[1][0])
+                self.assertNotIn("7", out[2][0].replace("'\\x07'", "").replace("x'07'", ""))
+                self.assertRegex(out[5][0], r"SELECT a, 'four' FROM s$")
+                for i in (6, 7, 13, 14):
+                    self.assertIsNone(out[i][1], (i, out[i][1]))
+                for i in (8, 9, 10, 11, 12):
+                    self.assertIsNone(out[i][0], i)
+                    self.assertIn("reads column e of t, left out of its CREATE (line 0) there: not expressible", out[i][1])
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        s, d = sqlite3.connect(":memory:"), duckdb.connect()
+        for r, (sql, why) in zip(self.records(), dialects.records_in(self.records(), "duckdb")):
+            want = s.execute(r.sql).fetchall()
+            if why is None and r.kind != "query":
+                d.execute(sql)
+            elif why is None:
+                with self.subTest(sql=r.sql):
+                    got = d.execute(sql).fetchall()
+                    self.assertEqual([tuple(x) for x in got], want)
 
 
 class IntegerDivision(unittest.TestCase):
