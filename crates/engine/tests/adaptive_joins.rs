@@ -1388,17 +1388,40 @@ fn t_pl_13_17_a_stored_subquery_over_a_subquery_plans_again() {
     );
 }
 
+/// The rows each `opcode` of the statement's program is checked against, as its EXPLAIN comment
+/// states them: the number after the comment's last `marker`, up to " rows".
+fn planned_rows(conn: &Arc<Connection>, sql: &str, opcode: &str, marker: &str) -> Vec<f64> {
+    let mut stmt = conn.prepare(format!("EXPLAIN {sql}")).unwrap();
+    let program = stmt.run_collect_rows().unwrap();
+    program
+        .into_iter()
+        .filter(|row| row[1].to_string() == opcode)
+        .map(|row| {
+            let comment = row[7].to_string();
+            let after = comment.rsplit(marker).next().unwrap_or_default();
+            let rows = after.split(" rows").next().unwrap_or_default();
+            rows.trim()
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("{opcode}'s planned rows in {comment:?}"))
+        })
+        .collect()
+}
+
 /// Do: three tables chained by hash joins only (`r.k = s.k`, `s.j = t.j`), so the third join's
-/// build input is materialized from the first two (`MATERIALIZE hash build input`: `s` both the first
-/// join's probe and the second's build, the materialization PL.6 requires). At ANALYZE no row of
-/// `s` meets `r` (its keys distinct, `r`'s two values among none of them: 20 estimated for the
-/// pair); then every `s.k` is set to 1, so each of `r`'s ten rows with 1 meets all 200 of `s`
-/// (2,000), the tables' counts unchanged; `s` meets `t` as estimated (each `s.j` ten rows of `t`).
-/// Run with adaptive joins off, then on twice in one prepared statement, and in a statement
-/// prepared after. Expect: one answer every way; off, nothing counted; on, the plan materializes
-/// the prefix and counts it (`SubqueryCounted`), past its error the count stored and the statement
-/// planned again once; nothing plans again after (PL.13, lane replan-11, T-PL.13.18: a build fed by
-/// a materialized input, at its materialization point).
+/// build input is materialized from a two-table prefix (`MATERIALIZE hash build input`, the
+/// materialization PL.6 requires): `{r, s}` (estimated at 20 rows: `r`'s 20 rows hold two values of
+/// `k`, `s`'s 200 rows distinct ones, none of them `r`'s) or `{s, t}` (2,000: each of `s`'s 200
+/// values of `j` ten rows of `t`). Which one the first plan holds is read from its EXPLAIN (the rows
+/// its `SubqueryCounted` checks), and only then the data changed, the tables' counts unchanged, so
+/// that prefix's rows are ten times or more off its estimate and the other's on it: for `{r, s}`
+/// every `s.k` set to 1 (2,000 rows; `{s, t}` 1,990), for `{s, t}` two of `s`'s keys set to 1 (`{r,
+/// s}` 20 rows) and `t`'s values of `j` past 20 moved off `s`'s (`{s, t}` 200). Whatever the planner
+/// picks, the test's premise is forced, not guessed. Run with adaptive joins off, then on twice in
+/// one prepared statement, and in a statement prepared after. Expect: one answer every way; off,
+/// nothing counted; on, the prefix counted, past its error the count stored and the statement
+/// planned again once; nothing plans again after, whichever prefix the new plan holds (PL.13, lane
+/// replan-11, robust in lane replan-12, T-PL.13.18: a build fed by a materialized input, at its
+/// materialization point).
 #[test]
 fn t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again() {
     let (_dir, conn) = open("materialized_prefix.db");
@@ -1410,35 +1433,58 @@ fn t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again() {
         "INSERT INTO s(k, j) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) SELECT i + 1000, i FROM n",
         "INSERT INTO t(j) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i % 200 FROM n",
         "ANALYZE",
-        "UPDATE s SET k = 1",
     ] {
         conn.execute(sql).unwrap();
     }
     conn.set_join_methods(JoinMethods::HashJoinsOnly);
     let sql = "SELECT count(*) FROM r JOIN s ON s.k = r.k JOIN t ON t.j = s.j";
 
-    conn.set_adaptive_joins(false);
-    let checks = conn.adaptive_subquery_checks();
-    let off = run_rows(&mut conn.prepare(sql).unwrap());
-    // r's ten rows with k = 1, each with all of s; s.j 1 to 199 ten rows of t each, 200 none.
-    assert_eq!(off.len(), 1, "the count's row");
-    assert!(
-        off[0].contains(&(10 * 199 * 10).to_string()),
-        "the count: {off:?}"
-    );
-    assert_eq!(conn.adaptive_subquery_checks(), checks, "counted off");
-
+    // The plan first, on the statistics alone: the UPDATEs below change no table's count.
     conn.set_adaptive_joins(true);
-    let (steps, opcodes) = steps_and_opcodes(&conn, sql);
+    let (steps, _) = steps_and_opcodes(&conn, sql);
     assert!(
         steps
             .iter()
             .any(|step| step.contains("MATERIALIZE hash build input")),
         "the prefix is not materialized: {steps:?}"
     );
+    let planned = planned_rows(&conn, sql, "SubqueryCounted", "subquery's ");
+    let [estimate] = planned[..] else {
+        panic!("one materialized prefix counted: {planned:?} in {steps:?}");
+    };
+    // `{r, s}`'s 20 rows or `{s, t}`'s 2,000: the nearer, by ratio.
+    let (updates, count): (&[&str], u64) = if estimate * estimate < 20.0 * 2000.0 {
+        // r's ten rows with k = 1, each with all of s; s.j 1 to 199 ten rows of t each, 200 none.
+        (&["UPDATE s SET k = 1"], 10 * 199 * 10)
+    } else {
+        // s's ids 1 and 2 (j 1 and 2) with r's ten rows with k = 1, each with t's ten rows of its j.
+        (
+            &[
+                "UPDATE s SET k = 1 WHERE id <= 2",
+                "UPDATE t SET j = j + 1000 WHERE j > 20",
+            ],
+            2 * 10 * 10,
+        )
+    };
+    for update in updates {
+        conn.execute(update).unwrap();
+    }
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_subquery_checks();
+    let off = run_rows(&mut conn.prepare(sql).unwrap());
+    assert_eq!(off.len(), 1, "the count's row");
     assert!(
-        opcodes.iter().any(|op| op == "SubqueryCounted"),
-        "the materialized prefix is not counted: {steps:?}"
+        off[0].contains(&count.to_string()),
+        "the count (the prefix at {estimate} rows): {off:?}"
+    );
+    assert_eq!(conn.adaptive_subquery_checks(), checks, "counted off");
+
+    conn.set_adaptive_joins(true);
+    assert_eq!(
+        planned_rows(&conn, sql, "SubqueryCounted", "subquery's "),
+        planned,
+        "the plan after the UPDATEs"
     );
     let replans = conn.adaptive_replans();
     let mut held = conn.prepare(sql).unwrap();
@@ -1447,7 +1493,11 @@ fn t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again() {
         conn.adaptive_subquery_checks() > checks,
         "the materialized prefix was not counted"
     );
-    assert_eq!(conn.adaptive_replans() - replans, 1, "planned again once");
+    assert_eq!(
+        conn.adaptive_replans() - replans,
+        1,
+        "planned again once (the prefix at {estimate} rows)"
+    );
     let replans = conn.adaptive_replans();
     assert_eq!(run_rows(&mut held), off, "the second run's answer");
     assert_eq!(conn.adaptive_replans(), replans, "a second re-plan");
@@ -1523,15 +1573,16 @@ fn t_pl_13_19_a_sorter_fed_by_a_left_join_past_the_estimate_plans_again() {
 
 /// Do: an EXISTS and a NOT EXISTS of `b` on `a`'s key, planned by hash joins only (each unnested
 /// to a hash semi or anti join), ORDER BY `a.k` DESC (no index on it: a sorter holds the rows
-/// kept).
-/// At ANALYZE `b`'s 5,000 keys are ten values none of `a`'s 1,000 holds, which the estimate takes
-/// for ten of them (each distinct value of the fewer among the more): 10 rows kept by the EXISTS,
-/// 990 by the NOT EXISTS; then `b`'s keys set to cover all of `a`'s (1,000 kept and none), the
-/// tables' counts unchanged. Run each with adaptive joins off, then on twice in one prepared
-/// statement, and in a statement prepared after. Expect: one answer, in order, every way; on, the
-/// sorter counted against the rows the plan read for the whole join, past its error the count
-/// stored and the statement planned again once; nothing plans again after (PL.13, lane replan-11,
-/// T-PL.13.20: a semi or anti join feeding a sorter, at its materialization point).
+/// kept). At ANALYZE `b`'s 5,000 keys are ten values none of `a`'s 1,000 holds. For each, the rows
+/// the plan checks its sorter against are read from its EXPLAIN first, and only then `b`'s keys
+/// set, the tables' counts unchanged, so the rows kept are the farther of none and all 1,000 from
+/// that estimate (`b`'s keys covering all of `a`'s, or none): at least twice or half of it, past
+/// any band of statistics' error under one, whatever the planner estimates. Run each with adaptive
+/// joins off, then on twice in one prepared statement, and in a statement prepared after. Expect:
+/// one answer, in order, every way; on, the sorter counted against the rows the plan read for the
+/// whole join, past its error the count stored and the statement planned again once; nothing plans
+/// again after (PL.13, lane replan-11, robust in lane replan-12, T-PL.13.20: a semi or anti join
+/// feeding a sorter, at its materialization point).
 #[test]
 fn t_pl_13_20_a_sorter_fed_by_a_semi_or_anti_join_past_the_estimate_plans_again() {
     let (_dir, conn) = open("semi_joined_sorter.db");
@@ -1541,23 +1592,43 @@ fn t_pl_13_20_a_sorter_fed_by_a_semi_or_anti_join_past_the_estimate_plans_again(
         "INSERT INTO a(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) SELECT i FROM n",
         "INSERT INTO b(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT 2000 + i % 10 FROM n",
         "ANALYZE",
-        "UPDATE b SET k = id % 1000 + 1",
     ] {
         conn.execute(sql).unwrap();
     }
     conn.set_join_methods(JoinMethods::HashJoinsOnly);
-    for (case, sql, rows_expected) in [
+    // Whether the case keeps a's rows where b's keys cover a's.
+    for (case, sql, kept_when_covered) in [
         (
             "an EXISTS",
             "SELECT a.id, a.k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY a.k DESC",
-            1000,
+            true,
         ),
         (
             "a NOT EXISTS",
             "SELECT a.id, a.k FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY a.k DESC",
-            0,
+            false,
         ),
     ] {
+        conn.set_adaptive_joins(true);
+        let planned = planned_rows(&conn, sql, "SorterCounted", " at ");
+        let [estimate] = planned[..] else {
+            panic!("{case}: one sorter counted against the join: {planned:?}");
+        };
+        let all = estimate < 500.0;
+        let rows_expected = if all { 1000 } else { 0 };
+        let cover = all == kept_when_covered;
+        conn.execute(if cover {
+            "UPDATE b SET k = id % 1000 + 1"
+        } else {
+            "UPDATE b SET k = 2000 + id % 10"
+        })
+        .unwrap();
+        assert_eq!(
+            planned_rows(&conn, sql, "SorterCounted", " at "),
+            planned,
+            "{case}: the plan after the UPDATE"
+        );
+
         conn.set_adaptive_joins(false);
         let checks = conn.adaptive_sort_checks();
         let off = run_rows(&mut conn.prepare(sql).unwrap());
