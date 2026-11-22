@@ -338,7 +338,14 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   read from tree 1); the storage's budget is `ConnectOpts::with_memory_budget` (the shell's quarter
   of its process's memory), else a quarter of the machine's, its frames made as pages are handed
   out (`T-NS.2.10`); DDL undone by a failed statement, a savepoint or a failed commit leaves no
-  orphan tree (`T-NS.2.11`). Not yet: the header (schema cookie, user version) on the versioned
+  orphan tree (`T-NS.2.11`). Incremental blob I/O runs on it, a handle expiring once another
+  statement writes its row; SQL there is serializable: the cursor keeps each leaf span it copies as
+  read for its commit's precision-locking validation, and Elle's histories through SQL show no
+  anomaly on either storage (`T-G8.4.1`); an in-memory IO keeps a database's storage beside its
+  file, so a database reopened on it finds its trees. With the switch on, 55 of the engine's lib
+  tests still fail (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
+  batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and
+  page-codec tests). Not yet: the header (schema cookie, user version) on the versioned
   storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
   budget shared by a process's databases. On the pager as on the switch, `nested_loops`'
   chain of hash joins, `row_counts`' hash join and `sample_filters`' outer join fail (planner
@@ -726,6 +733,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   chosen only where it costs less than the probes it saves; its hashes and bits stay within the join's memory budget
   (`docs/design/planner.md`, "Decision (lane qs5-9)"). LIP and predicate transfer, a measured filter-lookup weight,
   removing `rhs_has_selective_seek` and deriving `cpu_cost_per_where_step` are left.
+- **Calibration that holds under load; the filter's lookup and a WHERE step measured** (lane qs5-10): calibration
+  samples each kind of work in rounds and takes medians, stopping once each median's order-statistic standard error
+  is within the timer's cost; it also times a Bloom filter's lookup and a WHERE step, which now price the filter and
+  `cpu_cost_per_where_step` (`docs/design/planner.md`, "Decision (lane qs5-10)"). Left: `hash_bytes_per_row`, the
+  `rhs_has_selective_seek` gate, LIP and predicate transfer, sort-merge and prefetched index joins.
+- **A chained hash join's materialized prefix leaves the main plan** (lane qs5-12): where a hash join's build table
+  was an earlier join's probe, the build input is materialized from the join prefix, and the main plan no longer
+  opens or lists the earlier join's build table (`main_loop/init.rs`, `subquery.rs` walk the join order).
+  `nested_loops::a_chain_of_hash_joins_reads_each_table_once` failed whenever calibration chose the chained plan.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
@@ -748,6 +764,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   repeated search for its path below the root; multi-index fetches go through `file_reads`. Seeks, hash builds and
   hash probes time sampled runs into the learned rates, one run in k with k set by each one's spread against the
   timing's own cost (step 3a). Left: SQLite's skip-scan factor 1.375 (Ada's call), the row visit's own observed time.
+- **Query speed step 2 (QT.2), started** (lane qs2; engine.md decision 15): behind `AMPHORA_READ_AHEAD=runs` (off by
+  default), the versioned storage's pool reads a sequential walk's next pages in one `preadv`, the run's length from
+  the line it fits through its own measured reads (`ceil(fixed / each)`), bounded by its frames (cold frames only, at
+  most the frames less one). Misses already allocate nothing and check their checksum once. Tests T-QT.2.1 to .5.
+  Open: a cursor's own hint, reads in flight, Windows' scatter read; the TPC-H and JOB measurements are the
+  coordinator's.
 - **Query speed step 7 (QT.7), started** (lane qs7; also G5 step 2): behind `Connection::set_vectorized_scans`
   (off by default), a read-only statement's scanned tables decode each leaf once into column batches
   (`vdbe/leaf_batch.rs`, executor.md decision 9): one header parse a row, only the columns the statement reads, the
@@ -942,9 +964,20 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Aggregates run on the copy through one
   hook, `CopyScan`: step 4's vectorized scan as main has it (`Vectorized`, granules and `Plan`),
   which a later scan replaces by implementing the trait, the choice unchanged; on the rows row by
-  row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
-  SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
-  coordinator's.
+  row, with the same answer (T-CS.5.5, T-CS.5.6). SQL reaches the copy (lane g11s5c): with the
+  switch on, a SQL table on the versioned storage keeps a copy once analytic statements use it,
+  by renting before buying (Karlin et al. 1988): the first aggregate on a table reads the rows,
+  paying a whole-table read, what a copy costs to build; the second makes the copy, fed from the
+  commit stream (`Database::commit` now feeds one copy a tree). An aggregate the executor's scan
+  hook takes (`translate/parallel.rs`) reads the copy when the planner chooses it, on as many
+  cores as the morsel executor finds pay (`Plan::run_on_cores`), else its own serial loop; a
+  copy behind its snapshot is rebuilt after the statement's choice, never read
+  (`storage/versioned/columns_sql.rs`, T-CS.5.7 to T-CS.5.9). A copy's queue, decoded
+  blocks and blocks take their bytes from the storage's memory source as they grow and give them
+  back as they go (lane g11s5e, AC-CS.5.5); a copy the source refuses is let go with the source's
+  typed refusal kept, and the rows answer. A SUM over a column holding text or blobs is declined to
+  the rows, which sum them as SQLite does (T-CS.5.10, T-CS.5.11). Open: the classes against
+  CedarDB and ClickHouse (AC-CS.5.2) are the coordinator's.
 - **G5 step 4, skipping rows** (docs/design/executor.md decision 11; AC-G5.4.1, T-G5.4.1; lanes
   g5s4, g5s4b): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf
   runs and database cracking behind one switch, each kept from the write path through one hook;

@@ -82,6 +82,60 @@ pub fn machine() -> Arc<dyn Source> {
     m
 }
 
+/// A source of a stated room, `limit` bytes, counting what it holds: for a use given its room by
+/// its caller (a test's, a fixed bound of the caller's own) rather than the machine's or the
+/// process's.
+pub struct Capped {
+    limit: u64,
+    held: AtomicU64,
+}
+
+impl Capped {
+    /// A source of `limit` bytes with nothing held.
+    pub fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            held: AtomicU64::new(0),
+        }
+    }
+
+    /// The bytes held now.
+    pub fn held(&self) -> u64 {
+        self.held.load(Ordering::Acquire)
+    }
+}
+
+impl Source for Capped {
+    fn take(&self, what: &'static str, bytes: u64) -> Result<()> {
+        let limit = self.limit;
+        self.held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(bytes).filter(|after| *after <= limit)
+            })
+            .map(|_| ())
+            .map_err(|held| LimboError::MemoryBudget {
+                what,
+                asked: bytes,
+                held,
+                limit,
+            })
+    }
+
+    fn give(&self, bytes: u64) {
+        let _ = self
+            .held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(bytes))
+            });
+    }
+}
+
+/// A source of `limit` bytes of its own.
+pub fn capped(limit: u64) -> Arc<dyn Source> {
+    let c: Arc<Capped> = Arc::new(Capped::new(limit));
+    c
+}
+
 /// The machine's physical memory in bytes: its pages times their size.
 #[cfg(unix)]
 #[expect(

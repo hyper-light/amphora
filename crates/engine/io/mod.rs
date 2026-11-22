@@ -474,6 +474,19 @@ pub trait IO: Clock + Send + Sync {
         false
     }
 
+    /// Amphora (G7 step 2, `AC-NS.2.1`): for an IO whose files live in memory, the versioned
+    /// storage of the database at `path`, kept beside its file for as long as the IO keeps the
+    /// file, so a database reopened on the same IO finds its trees as it finds its file: made by
+    /// `make` the first time. `None` for an IO whose files are the host's (the storage is then in
+    /// its own directory beside the file).
+    fn versioned_beside(
+        &self,
+        _path: &str,
+        _make: &mut dyn FnMut() -> Result<Arc<crate::storage::versioned::switch::Storage>>,
+    ) -> Result<Option<Arc<crate::storage::versioned::switch::Storage>>> {
+        Ok(None)
+    }
+
     fn step(&self) -> Result<()> {
         Ok(())
     }

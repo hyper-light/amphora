@@ -20627,6 +20627,21 @@ pub fn op_morsel_aggregate(
         )))
     };
     let connection = &program.connection;
+    // G11 step 5 (CS.5): on the versioned storage the pager holds no table's rows; the table's
+    // column copy answers when the planner chooses it, else the serial loop reads the rows.
+    if let Some(switch) = connection.versioned.as_ref() {
+        let copied = crate::storage::versioned::columns_sql::aggregate(
+            switch,
+            data,
+            connection,
+            pager.statement_memory_budget(),
+        )?;
+        let Some(rows) = copied else {
+            state.pc = data.target_pc_serial.as_offset_int();
+            return Ok(InsnFunctionStepResult::Step);
+        };
+        return morsel_rows(state, data, rows);
+    }
     // The costs are taken for the run and put back after, so a statement learns from the last.
     let taken = connection.morsel_costs.lock().take();
     let mut costs = match taken {
@@ -20713,7 +20728,7 @@ pub fn op_morsel_aggregate(
             .map(|(rows, _)| (rows, false))
     })();
     *connection.morsel_costs.lock() = Some(costs);
-    let mut rows = match answered {
+    let rows = match answered {
         Ok((rows, true)) => {
             state.morsel_rows = Some(rows.into_iter());
             state.pc = next_pc(state)?;
@@ -20727,6 +20742,22 @@ pub fn op_morsel_aggregate(
             return Ok(InsnFunctionStepResult::Step);
         }
         Err(error) => return Err(refused(error)),
+    };
+    morsel_rows(state, data, rows)
+}
+
+/// Amphora (QT.6): the hook's answer, `rows`, handed to [Insn::MorselNext] in the order and shape
+/// the serial loop gives them.
+fn morsel_rows(
+    state: &mut ProgramState,
+    data: &crate::vdbe::insn::MorselAggregateData,
+    mut rows: Vec<Vec<Value>>,
+) -> InsnResult {
+    use crate::vdbe::morsel::MorselError;
+    let refused = |error: MorselError| -> Box<LimboError> {
+        Box::new(LimboError::InternalError(format!(
+            "parallel aggregate: {error}"
+        )))
     };
     // Groups in the order the serial GROUP BY gives them: by their key values as SQLite orders
     // them (the pipeline's own key order puts kinds apart).
