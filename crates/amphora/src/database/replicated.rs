@@ -9355,7 +9355,7 @@ mod tests {
     /// under the default candidate: no member fenced, and the group writes again after its
     /// leader's host stalls.
     #[test]
-    #[ignore = "QB.2 harness unfinished (lane constants-17): the first write at the leader goes unanswered once every clock ticks each round; QB2_TRACE=1 shows the leader holding"]
+    #[ignore = "QB.2's A/B, the coordinator's run of record: cargo test -p amphora --locked --lib -- --ignored --nocapture qb2_many_slow_one_stalled_for_good_by_egress"]
     fn qb2_many_slow_one_stalled_for_good_by_egress() {
         use super::super::drain::Egress;
         let members: u64 = std::env::var("QB2_MEMBERS")
@@ -9366,14 +9366,18 @@ mod tests {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(8);
+        // Every candidate runs and prints its numbers before the default's verdict.
+        let mut default = None;
         for egress in [Egress::Fence, Egress::Shed, Egress::Pause] {
             let report = qb2_scenario(egress, members, writes);
             println!("QB.2 egress={egress:?} members={members} writes={writes} {report}");
             if egress == Egress::DEFAULT {
-                assert_eq!(report.fenced, 0, "{report}");
-                assert!(report.after > 0, "{report}");
+                default = Some(report);
             }
         }
+        let report = default.unwrap();
+        assert_eq!(report.fenced, 0, "{report}");
+        assert!(report.after > 0, "{report}");
     }
     /// What [`qb2_scenario`] measured.
     #[derive(Default)]
@@ -9417,7 +9421,9 @@ mod tests {
         }
     }
     /// One driven tick of [`qb2_scenario`]: every clock a tick on, then relay rounds and steps until
-    /// the group is quiet but for what its hosts hold.
+    /// the group is quiet but for what its hosts hold. Driven by events, not by a poll: with nothing
+    /// to relay and no owner with more to drive, the round waits for a write out on an owner's disk
+    /// to end, whose end rings that owner's bell (its log's waker; its flushing thread's too).
     fn qb2_round(
         driven: &mut Driven,
         pump: &mut Pump<'_>,
@@ -9429,20 +9435,36 @@ mod tests {
             driven.advance_tick(owner);
         }
         // Rounds at this tick until the group is quiet but for what its hosts hold: nothing to
-        // relay, and no write out on the disk of an owner that runs (one fenced or paused waits).
+        // relay, no owner that runs with more to drive, and no write out on its disk (one fenced
+        // or paused waits).
         for _ in 0..ROUNDS {
             let admitted = pump.drive_until(driven.until());
-            let writing = driven.owners.iter().enumerate().any(|(index, slot)| {
-                !fenced.contains(&index)
-                    && slot.as_ref().is_some_and(|(owner, _)| {
-                        !owner.paused().unwrap_or(false) && owner.replica.in_flight() != 0
-                    })
+            let running = |index: usize, owner: &Actor<DeviceFile>| {
+                !fenced.contains(&index) && !owner.paused().unwrap_or(false)
+            };
+            let driving = driven.owners.iter().enumerate().any(|(index, slot)| {
+                slot.as_ref()
+                    .is_some_and(|(owner, _)| running(index, owner) && owner.driving)
             });
-            if admitted == 0 && !writing {
-                break;
-            }
-            if admitted == 0 {
-                std::thread::park_timeout(POLL);
+            let writing = driven
+                .owners
+                .iter()
+                .enumerate()
+                .find_map(|(index, slot)| {
+                    slot.as_ref().filter(|(owner, _)| {
+                        running(index, owner)
+                            && (owner.replica.in_flight() != 0
+                                || matches!(owner.flushing, Flushing::Thread { out: true, .. }))
+                    })
+                })
+                .map(|(owner, _)| Arc::clone(&owner.control.bell));
+            if admitted == 0 && !driving {
+                let Some(bell) = writing else {
+                    break;
+                };
+                // The write's end rings the bell, and a ring before the wait is kept: no wake is
+                // lost, and the wait has no bound of its own, since a write out always ends.
+                bell.wait(Duration::MAX).unwrap();
             }
             qb2_steps(driven, pump, fenced);
         }
