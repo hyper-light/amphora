@@ -79,6 +79,41 @@ def _reader():
 
     class Parser(SQLite.Parser):
         FUNCTIONS = {**SQLite.Parser.FUNCTIONS, "IIF": _iif, "IF": _iif}
+        PRIMARY_PARSERS = {**SQLite.Parser.PRIMARY_PARSERS, TokenType.HEX_STRING: lambda self, token: self._parse_hex(token)}
+        UNARY_PARSERS = {**SQLite.Parser.UNARY_PARSERS, TokenType.DASH: lambda self: self._parse_negated()}
+
+        def _parse_hex(self, token):
+            # 0x10 is an integer, X'10' a blob: sqlglot's SQLite tokenizer makes both one HEX_STRING
+            # token of the digits alone, so the text it was read from tells them apart. SQLite's
+            # "Literal Values" (https://www.sqlite.org/lang_expr.html#literal_values_constants_):
+            # "Hexadecimal integer literals follow the C-language notation of "0x" or "0X" followed
+            # by hexadecimal digits. For example, 0x1234 means the same as 4660 and
+            # 0x8000000000000000 means the same as -9223372036854775808. Hexadecimal literals are
+            # interpreted as 64-bit two's-complement integers and are thus limited to sixteen
+            # significant digits of precision." So it is written as the decimal integer it means;
+            # one of more than sixteen significant digits SQLite refuses ("hex literal too big").
+            if self.sql[token.start : token.start + 2].upper() != "0X":
+                return SQLite.Parser.PRIMARY_PARSERS[TokenType.HEX_STRING](self, token)
+            value = int(token.text, 16)
+            if value >= 2**64:
+                self.raise_error(f"hex literal too big: 0x{token.text} (SQLite takes at most sixteen significant hexadecimal digits, lang_expr.html)", token)
+            value = value - 2**64 if value >= 2**63 else value
+            said = exp.Literal.number(value)
+            said.meta["sqlite_hex"] = value
+            return said
+
+        def _parse_negated(self):
+            # A minus before a hex literal (through parentheses, which SQLite's parser drops: "expr
+            # ::= LP expr RP", src/parse.y) negates its 64-bit value, and SQLite refuses the one
+            # value whose negation has none, -0x8000000000000000 ("hex literal too big", src/expr.c
+            # codeInteger), rather than make it a floating point value as it does a decimal one.
+            negated = self.expression(exp.Neg(this=self._parse_unary()))
+            inner = negated.this
+            while isinstance(inner, exp.Paren):
+                inner = inner.this
+            if inner is not None and inner.meta.get("sqlite_hex") == -(2**63):
+                self.raise_error("hex literal too big: -0x8000000000000000 (its negation is no 64-bit integer, and SQLite refuses it)")
+            return negated
         # char(X1,...,XN): "a string composed of characters having the unicode code point values of
         # integers X1 through XN" (lang_corefunc.html#char): of none, the empty string.
         FUNCTION_PARSERS = {**SQLite.Parser.FUNCTION_PARSERS, "CHAR": lambda self: exp.Literal.string("") if self._curr and self._curr.token_type == TokenType.R_PAREN else self._parse_char()}

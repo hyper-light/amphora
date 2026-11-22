@@ -386,5 +386,45 @@ class ClickHouseAutoincrement(unittest.TestCase):
                 self.assertIn("not expressible in clickhouse: AUTOINCREMENT", why)
 
 
+class HexIntegers(unittest.TestCase):
+    """Do: SQLite's hexadecimal integer literals (0x10, 0X1f; lang_expr.html "Literal Values": "0x1234
+    means the same as 4660"), beside a blob literal X'10'. Expect: each hex literal written as the
+    decimal integer SQLite gives it (64-bit two's complement), the same value and an integer when
+    SQLite itself runs the written text; the blob still a blob; one SQLite refuses ("hex literal too
+    big") untranslatable."""
+
+    CASES = ["0x10", "0X1f", "0x7FFFFFFFFFFFFFFF", "0x8000000000000000", "0xFFFFFFFFFFFFFFFF", "-0x10", "-0xFFFFFFFFFFFFFFFF", "0x00000000000000000001", "0x10 / 3", "(0xff)"]
+
+    def test_written_as_the_integer_sqlite_gives(self):
+        import sqlite3
+
+        import sqlglot
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            want = db.execute(f"SELECT {case}, typeof({case})").fetchone()
+            # The reading every dialect is written from, written back in SQLite's spelling for SQLite to run.
+            said = sqlglot.parse_one(f"SELECT {case}", read=dialects.reader()).expressions[0].sql(dialect="sqlite")
+            with self.subTest(case=case):
+                self.assertEqual(db.execute(f"SELECT {said}, typeof({said})").fetchone(), want)
+            for d in ENGINES:
+                with self.subTest(case=case, dialect=d):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    self.assertIsNone(why)
+                    self.assertNotRegex(out.upper(), r"0X|UNHEX|BYTEA|X'")
+        self.assertEqual(dialects.translate("SELECT 0x10, X'10'", "postgres"), ("SELECT 16, CAST('\\x10' AS BYTEA)", None))
+
+    def test_too_big_is_untranslatable(self):
+        for case in ["0x1FFFFFFFFFFFFFFFF", "-0x8000000000000000", "-(0x8000000000000000)"]:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "postgres")
+                self.assertIsNone(out)
+                self.assertIn("hex literal too big", why)
+
+    def test_untyped_column_takes_integer(self):
+        """Do: a hex literal written to a column without a type. Expect: the column an integer one."""
+        self.assertIn("BIGINT", file_in(["CREATE TABLE t(a)", "INSERT INTO t VALUES (0x10), (2)"], "duckdb")[0][0])
+
+
 if __name__ == "__main__":
     unittest.main()
