@@ -942,8 +942,20 @@ pub fn load(
                     }
                     Err(_) => {
                         conn = None;
-                        via = via.saturating_add(1).checked_rem(n).unwrap_or(0);
                         retries.fetch_add(1, Ordering::Relaxed);
+                        // Sent again where the leader is: the next member asked for it (the
+                        // `leader` request, answered once the group has one, woken by the
+                        // election), as the bench's client finds it; that member itself when it
+                        // can't say.
+                        via = via.saturating_add(1).checked_rem(n).unwrap_or(0);
+                        let named = addrs
+                            .get(via)
+                            .and_then(|a| Client::connect(a, &secret, deadline).ok())
+                            .and_then(|mut c| c.leader(deadline).ok())
+                            .and_then(|(_, at)| addrs.iter().position(|a| *a == at));
+                        if let Some(at) = named {
+                            via = at;
+                        }
                     }
                 }
             }
