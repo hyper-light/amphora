@@ -736,6 +736,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   by default. Index-only reads were already planned (covering indexes, expression indexes included). Left: the 2x
   measurements on order_by_sort, exists_subquery and left_join_anti, and the sorted fetch's measurement against the
   plain read (the coordinator's).
+- **G6 step 3, learned plan hints, built as a prototype** (lane g6s3; planner.md, decision of lane g6s3): Bao's
+  hint sets over the planner (`optimizer/plan_hints.rs`), ten on/off masks of hash joins, nested loops, automatic
+  indexes (`Connection::set_automatic_indexes`, new) and sorted fetches, applied with `HintSet::apply`. A Bayesian
+  linear model over sixteen plan features, its precisions learned from the runs, chooses a training run's mask by
+  Thompson sampling; a guard keeps a query class on the cost model's plan until a mask's held-out runs beat it, and
+  drops it when they show it slower. Memory is fixed for the model and bounded by the caller's class count for the
+  guard. `tests/plan_hints.rs` runs every mask's answers against the unhinted plan's; `bench/plan_hints` trains and
+  checks held-out queries, answers against SQLite's. Left: held-out JOB and corpus times (AC-G6.3.1, the
+  coordinator's), and hints in the engine's own prepare path (today the caller applies them).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -892,6 +901,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
   SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
   coordinator's.
+- **G5 step 4, skipping rows** (docs/design/executor.md decision 11; AC-G5.4.1, T-G5.4.1; lanes
+  g5s4, g5s4b): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf
+  runs and database cracking behind one switch, each kept from the write path through one hook;
+  zone maps are built from the table's own leaves (`zone_map_of_table`), one zone a leaf. With
+  writes between scans each names exactly what a plain scan finds, in the model and on a real table
+  through SQL (T-G5.4.1). Open: the scan and write costs (`crates/engine/tests/skipping_bench.rs`,
+  through the engine), the choice they make, and the VDBE's scan and write opcodes calling the
+  switch.
 
 ## Open
 

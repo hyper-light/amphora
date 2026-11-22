@@ -519,3 +519,59 @@ PVLDB 11(13), 2018 (f30).
 T-QT.7.4 and T-QT.7.5); a fused loop running a row the batch left out; or AC-QT.7.1 not met with
 it.
 
+## 11. Skipping rows: zone maps over leaf runs against cracking, behind one switch
+
+G5 step 4 (kiln plan `01a16b0f46ab717ea1e3c87c7f5e0b92`, AC-G5.4.1, T-G5.4.1; lanes g5s4 and
+g5s4b). A filter no index serves (filter_no_index: `qty = ? AND price < ?`, 0.6 a second against CedarDB's
+2,608 at ten million rows) reads every row. Two ways to read fewer, built as prototypes behind one
+switch (`crates/engine/skipping`, `Skipping::{Off, ZoneMaps, Cracking}`), each a pure core kept
+from the write path through one hook (`Skipping::on_write`, one call per row written):
+
+- **Zone maps over leaf runs** (`ZoneMap`): a zone per table leaf, its rowid span and the min and
+  max of its integer values, with counts. A filter reads only the rowid ranges whose zone can match.
+  A write widens its zone or lowers its counts; it never narrows one, so a stale bound is loose,
+  never wrong. A zone's size is its leaf's: `zone_map_of_table` walks the table's B-tree and ends
+  a zone where the cursor reaches a leaf's first cell, so the file's page size and its rows' bytes
+  set it. Rows appended past the last zone start a new zone once the tail holds as many rows as the
+  built leaves held on average (their measured fill); a table built empty grows one tail zone
+  until built again.
+- **Cracking** (`CrackerColumn`): a (value, rowid) copy of the column that each filter partitions at
+  its two bounds, so a repeated filter reads only its piece. Inserts and deletes ripple, one move per
+  crack above the value, at the write.
+
+Either summary names candidates, never answers: the scan evaluates the filter on every candidate as
+a plain scan does. Only integer values are summarized; any other value makes its zone, or its row,
+a candidate for every filter, so SQLite's affinity and mixed-type comparisons stay the scan's.
+
+**Sources.** ClickHouse's `minmax` data-skipping index, one summary per granule of index rows
+(`src/Storages/MergeTree/MergeTreeIndexMinMax.cpp`); DuckDB's zone maps, per-segment min/max
+statistics checked before a row group is scanned (`src/storage/table/row_group.cpp`,
+`CheckZonemap`); Idreos, Kersten and Manegold, "Database Cracking" (CIDR 2007) and "Updating a
+Cracked Database" (SIGMOD 2007, the Ripple algorithm); the plan's research f2, f10.
+
+**Evidence.** T-G5.4.1 (`skipping::tests`): 64 seeds of 600 random inserts (appended, into gaps,
+below every rowid), deletes and updates over tables of up to 400 rows with NULL-like values, filters
+between writes, repeated half the time and reaching both ends of i64. Zone maps: the candidate
+ranges hold exactly the plain scan's rows, every live row stays inside its zone after every write,
+zones were skipped and appended tails started zones (non-vacuity). Cracking: the candidates hold
+exactly the plain scan's rows, every matching entry carries the row's current value, the copy holds
+every row once, and repeated filters found their bounds cracked. On a real table: zones built from
+its leaves hold every row, larger rows make more zones (one a leaf), and with SQL writes fed to the
+hook between scans the candidate ranges, read through the engine, return exactly the plain scan's
+rows; a view, a missing column and the rowid's alias are refused. The costs (candidates and time per
+scan through the engine, the hook's time per write, the summary's build time and size) are the
+harness's (`crates/engine/tests/skipping_bench.rs`: an Amphora file, writes through SQL, zones from
+its leaves), run by the coordinator; until recorded the prototypes are unmeasured and neither is chosen.
+
+**Not yet.** The switch is a pure core: the VDBE's table scan doesn't yet ask it for candidates,
+and the Insert and Delete opcodes don't yet call the hook (the scan operators are lane qs7's while
+it builds column batches). Readers at older snapshots: a zone map is safe (a write only widens), the
+cracker is kept at the write and would need its writes held to commit for an older reader.
+
+**Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
+own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's
+leaves. If the column copy becomes the scan's source, its summaries replace these.
+
+**Falsified by.** A row a plain scan finds that the candidates miss, or a value outside its zone's
+bounds after any write; zone maps skipping nothing on time-ordered columns at the suite's size;
+cracking's write cost per row above the scan cost it saves at the suite's mix of reads and writes.
