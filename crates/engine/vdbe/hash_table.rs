@@ -2642,6 +2642,11 @@ impl HashTable {
         self.spill_state.is_some()
     }
 
+    /// Amphora (PL.13): the entries the table holds, and the bytes they take in memory.
+    pub fn held(&self) -> (usize, usize) {
+        (self.num_entries, self.mem_used)
+    }
+
     /// Approximate memory used by a partition's buckets.
     fn partition_bucket_mem(buckets: &[HashBucket]) -> usize {
         buckets.iter().map(|b| b.size_bytes()).sum()

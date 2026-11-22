@@ -2069,6 +2069,7 @@ pub fn emit_from_clause_subquery(
                     agg_leaf_columns: Vec::new(),
                     cdc_cursor_id: None,
                     meta_window: None,
+                    adaptive_joins: Default::default(),
                     meta_in_seeks: (0..select_plan.joined_tables().len())
                         .map(|_| None)
                         .collect(),
@@ -2170,6 +2171,7 @@ fn emit_indexed_materialized_subquery(
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
+                adaptive_joins: Default::default(),
                 meta_in_seeks: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
@@ -2301,6 +2303,7 @@ fn emit_materialized_subquery_table(
                 agg_leaf_columns: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
+                adaptive_joins: Default::default(),
                 meta_in_seeks: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
