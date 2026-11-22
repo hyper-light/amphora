@@ -146,6 +146,22 @@ impl Touched {
     }
 }
 
+/// Whether a new base's chunks grow where its room holds more than the latest base's did: lane
+/// backups-8's A/B (T-T1.12.M5), today's behaviour the control.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChunkGrowth {
+    /// The latest base's chunk size while it still fits: every chunk the log didn't change is kept,
+    /// but a backup begun with little room keeps its small chunks, and so a restore's many requests,
+    /// for good.
+    #[default]
+    Keep,
+    /// The latest base's chunk size doubled as often as the room holds: a restore waits on fewer
+    /// requests, but a base whose chunks grow copies the whole file again, as no chunk of another
+    /// size is kept. Doubling, never shrinking while the latest size fits, so a room that wavers
+    /// doesn't make each base whole: a backup's chunks grow at most log2(largest / first) times.
+    Grow,
+}
+
 /// The latest base ended: what the next base may reuse of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LastBase {
@@ -240,6 +256,8 @@ pub struct Shipper {
     /// The key of the archive's latest through mark ([`ThroughKey`]), let go once a later one or a
     /// segment says more.
     through_mark: Option<String>,
+    /// Whether a new base's chunks grow with the room ([`ChunkGrowth`]).
+    growth: ChunkGrowth,
     /// The budget each part of a segment is charged to while it's shipped (T-T1.12.M3).
     memory: Arc<Memory>,
     /// A send that didn't end: the frame it began after, and the frames in each of its parts, so
@@ -381,6 +399,7 @@ impl Shipper {
             last_base: None,
             lost_marks: 0,
             through_mark: None,
+            growth: ChunkGrowth::default(),
             memory: Arc::clone(memory),
             unfinished: None,
         };
@@ -805,6 +824,11 @@ impl Shipper {
         self.identity.is_some_and(|i| i.seq == seq)
     }
 
+    /// Whether the bases begun from now grow their chunks with the room (T-T1.12.M5).
+    pub fn set_chunk_growth(&mut self, growth: ChunkGrowth) {
+        self.growth = growth;
+    }
+
     /// The latest base's id, if the archive holds one.
     #[must_use]
     pub fn latest_base(&self) -> Option<u64> {
@@ -894,8 +918,19 @@ impl Shipper {
         }
         // The latest base's chunks keep their size while it still fits, so an incremental base can
         // keep the ones the log didn't change: a chunk of another size covers other pages.
+        // Grown ([`ChunkGrowth::Grow`]): doubled while twice it still fits.
         let chunk_bytes = match &self.last_base {
-            Some(last) if last.chunk_bytes > 0 && last.chunk_bytes <= bound => last.chunk_bytes,
+            Some(last) if last.chunk_bytes > 0 && last.chunk_bytes <= bound => {
+                let mut size = last.chunk_bytes;
+                if self.growth == ChunkGrowth::Grow {
+                    while let Some(twice) = size.checked_mul(2)
+                        && twice <= bound
+                    {
+                        size = twice;
+                    }
+                }
+                size
+            }
             _ => bound,
         };
         let id = {

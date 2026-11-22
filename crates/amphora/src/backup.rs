@@ -43,7 +43,7 @@ pub use drill::{
 };
 pub use folder::FolderBlobs;
 pub use restore::{Restored, expire, restore, restore_paced, restore_within};
-pub use ship::{BaseCopy, Shipped, Shipper};
+pub use ship::{BaseCopy, ChunkGrowth, Shipped, Shipper};
 pub(crate) use shipping::Prepared;
 pub use shipping::{Archive, Shipping, Status, system_clock};
 

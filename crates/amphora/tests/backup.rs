@@ -1628,6 +1628,8 @@ struct Reads<'a> {
     inner: &'a dyn Blobs,
     largest: AtomicU64,
     wholes: AtomicU64,
+    /// Ranged gets of a base's chunks.
+    chunk_gets: AtomicU64,
 }
 
 impl<'a> Reads<'a> {
@@ -1636,6 +1638,7 @@ impl<'a> Reads<'a> {
             inner,
             largest: AtomicU64::new(0),
             wholes: AtomicU64::new(0),
+            chunk_gets: AtomicU64::new(0),
         }
     }
 }
@@ -1666,6 +1669,9 @@ impl Blobs for Reads<'_> {
         until: Instant,
     ) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
         let got = self.inner.get_range(key, offset, len, until)?;
+        if key.contains("/pages/") {
+            self.chunk_gets.fetch_add(1, Ordering::SeqCst);
+        }
         if key.contains("/log/") {
             self.largest.fetch_max(got.len() as u64, Ordering::SeqCst);
         }
@@ -1794,4 +1800,101 @@ fn t_t1_12_m3_shipping_charges_its_parts() {
     )
     .unwrap();
     assert_eq!(rows(&Db::open(&target).unwrap()), model);
+}
+
+/// What a second base cost under a policy for its chunks' size (T-T1.12.M5).
+#[derive(Debug)]
+struct Grown {
+    first_chunk: u64,
+    chunk: u64,
+    chunks: u64,
+    reused: u64,
+    file: u64,
+    restore_gets: u64,
+}
+
+/// A base copied under a 64 KiB room, two rows written over two generations of the log, then a
+/// second base under a 1 GiB room with `growth`, and a restore under that room.
+fn grown(growth: backup::ChunkGrowth) -> Grown {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
+    let (mut db, mut shipper, mut model, now, _) =
+        written_within(dir.path(), 300, &blobs, &room(1 << 30));
+    shipper.set_chunk_growth(growth);
+    let (first_chunk, _) = copy_whole(&mut shipper, &db, &blobs, &room(64 * 1024));
+    one_commit(&mut db, &now, 1000, 1, &mut model);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    assert!(db.restart_log().unwrap());
+    one_commit(&mut db, &now, 1001, 1, &mut model);
+    shipper.ship(&db, &blobs, until()).unwrap();
+
+    let large = room(1 << 30);
+    let mut copy = shipper.begin_base(&db, &blobs, &large, usize::MAX).unwrap();
+    let chunk = copy.chunk_bytes();
+    let mut chunks = 0u64;
+    loop {
+        chunks += 1;
+        if !shipper.copy_base(&db, &blobs, &mut copy, until()).unwrap() {
+            break;
+        }
+    }
+    let reused = copy.reused() as u64;
+    shipper.end_base(&db, &blobs, copy, until()).unwrap();
+    let file = std::fs::metadata(dir.path().join("source.db"))
+        .unwrap()
+        .len();
+    let second = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    archive_through(&mut shipper, &db, &blobs, &now);
+    let reads = Reads::new(&blobs);
+    let target = dir.path().join("restored.db");
+    let restored = backup::restore_within(
+        &reads,
+        "db",
+        second,
+        &target,
+        &mut backup::Unpaced,
+        &large,
+        until(),
+    )
+    .unwrap();
+    assert_eq!(rows(&Db::open(&target).unwrap()), model);
+    assert_ne!(restored.base, 0);
+    Grown {
+        first_chunk,
+        chunk,
+        chunks,
+        reused,
+        file,
+        restore_gets: reads.chunk_gets.load(Ordering::SeqCst),
+    }
+}
+
+/// T-T1.12.M5 (lane backups-8's A/B): a backup begun with little room, its next base made with
+/// far more. Do: the same writes under each policy for the chunks' size. Expect each one's cost:
+/// kept, the second base copies only the chunks the log changed but a restore fetches each of its
+/// many small chunks; grown, the second base copies the whole file again but a restore fetches it
+/// in one request. Both restore whole. Prints both for the record (the A/B of record, at the
+/// ladder's sizes, is the coordinator's).
+#[test]
+fn t_t1_12_m5_chunks_kept_or_grown() {
+    let keep = grown(backup::ChunkGrowth::Keep);
+    let grow = grown(backup::ChunkGrowth::Grow);
+    println!("chunk growth A/B: keep {keep:?}");
+    println!("chunk growth A/B: grow {grow:?}");
+
+    assert_eq!(keep.chunk, keep.first_chunk, "kept: the first base's size");
+    assert!(keep.chunks > 16, "kept: {} chunks", keep.chunks);
+    assert!(keep.reused > 0, "kept: unchanged chunks kept");
+    let keep_copied = (keep.chunks - keep.reused) * keep.chunk;
+    assert!(
+        keep_copied < keep.file / 2,
+        "kept: {keep_copied} bytes copied of {}",
+        keep.file
+    );
+    assert_eq!(keep.restore_gets, keep.chunks, "kept: a request per chunk");
+
+    assert!(grow.chunk > grow.first_chunk && grow.chunk % grow.first_chunk == 0);
+    assert!(grow.chunk >= grow.file, "grown: one chunk holds the file");
+    assert_eq!(grow.reused, 0, "grown: the whole file copied again");
+    assert_eq!(grow.restore_gets, 1, "grown: one request");
 }
