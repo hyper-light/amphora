@@ -216,6 +216,12 @@ fn degrees(leaves: usize) -> Vec<Degree> {
 /// sizes, and through `ParallelMode::On` and `Off`, equal the VDBE's serial answer row for row.
 #[test]
 fn t_qt_6_7_leaf_morsels_answer_as_the_serial_vdbe() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaves.
+    if crate::storage::versioned::switch::pager_only(
+        "it reads the pager's leaf pages at the table's root page (TableSource::open), which on the versioned storage is a tree's id, not a page; there a parallel aggregate is answered by the table's column copy or the serial loop (G11 step 5, CS.5)",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-7");
     let mut rng = ChaCha8Rng::seed_from_u64(67);
     fill(&conn, &mut rng, "t", 3000);
@@ -268,6 +274,12 @@ fn t_qt_6_7_leaf_morsels_answer_as_the_serial_vdbe() {
 /// VDBE's join, match for match and in its order (probe rowid, then build rowid).
 #[test]
 fn t_qt_6_8_leaf_morsel_probe_matches_the_serial_vdbe_join() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaves.
+    if crate::storage::versioned::switch::pager_only(
+        "it reads the pager's leaf pages at the table's root page (TableSource::open), which on the versioned storage is a tree's id, not a page; there a parallel aggregate is answered by the table's column copy or the serial loop (G11 step 5, CS.5)",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-8");
     let mut rng = ChaCha8Rng::seed_from_u64(68);
     fill(&conn, &mut rng, "t", 2500);
@@ -329,6 +341,12 @@ fn t_qt_6_8_leaf_morsel_probe_matches_the_serial_vdbe_join() {
 /// and an empty table is one leaf with no rows.
 #[test]
 fn t_qt_6_9_rowid_alias_and_empty_table() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaves.
+    if crate::storage::versioned::switch::pager_only(
+        "it reads the pager's leaf pages at the table's root page (TableSource::open), which on the versioned storage is a tree's id, not a page; there a parallel aggregate is answered by the table's column copy or the serial loop (G11 step 5, CS.5)",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-9");
     conn.execute("CREATE TABLE e(id INTEGER PRIMARY KEY, v INTEGER)")
         .unwrap();
@@ -394,6 +412,12 @@ fn t_qt_6_9_rowid_alias_and_empty_table() {
 /// the hook really ran (the parallel run measured the connection's costs).
 #[test]
 fn t_qt_6_10_vdbe_hook_answers_as_the_serial_loop() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaf morsels.
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran); on the versioned storage the hook hands the statement to the table's column copy or the serial loop (G11 step 5, CS.5), so with parallel mode on it would compare the serial loop with itself",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-10");
     let mut rng = ChaCha8Rng::seed_from_u64(610);
     fill(&conn, &mut rng, "t", 3000);
@@ -496,6 +520,12 @@ fn random_join(rng: &mut ChaCha8Rng) -> String {
 /// most of them (the planner held to hash joins).
 #[test]
 fn t_qt_6_11_vdbe_hook_probes_a_hash_join_as_the_serial_loop() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaf morsels.
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran); on the versioned storage the hook hands the statement to the table's column copy or the serial loop (G11 step 5, CS.5), so with parallel mode on it would compare the serial loop with itself",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-11");
     let mut rng = ChaCha8Rng::seed_from_u64(611);
     fill(&conn, &mut rng, "t", 1500);
@@ -542,6 +572,12 @@ fn t_qt_6_11_vdbe_hook_probes_a_hash_join_as_the_serial_loop() {
 /// too small for the table is a typed refusal, never a partial table.
 #[test]
 fn t_qt_6_12_partitioned_parallel_build_matches_the_serial_join() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaves.
+    if crate::storage::versioned::switch::pager_only(
+        "it reads the pager's leaf pages at the table's root page (TableSource::open), which on the versioned storage is a tree's id, not a page; there a parallel aggregate is answered by the table's column copy or the serial loop (G11 step 5, CS.5)",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-12");
     let mut rng = ChaCha8Rng::seed_from_u64(612);
     fill(&conn, &mut rng, "t", 1500);
@@ -730,6 +766,12 @@ fn order_keys(sql: &str) -> Option<usize> {
 /// one; and the hook ran for most of them.
 #[test]
 fn t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaf morsels.
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran); on the versioned storage the hook hands the statement to the table's column copy or the serial loop (G11 step 5, CS.5), so with parallel mode on it would compare the serial loop with itself",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-13");
     let mut rng = ChaCha8Rng::seed_from_u64(613);
     fill(&conn, &mut rng, "t", 1500);
@@ -800,6 +842,12 @@ fn t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop() {
 /// order with ties stays serial.
 #[test]
 fn t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaf morsels.
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran); on the versioned storage the hook hands the statement to the table's column copy or the serial loop (G11 step 5, CS.5), so with parallel mode on it would compare the serial loop with itself",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-14");
     let mut rng = ChaCha8Rng::seed_from_u64(614);
     let pad = "x".repeat(64);
@@ -894,6 +942,12 @@ fn t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop() {
 /// and 8 stated cores; the body ran over every row of the table each time.
 #[test]
 fn t_qt_6_15_workers_run_a_copy_of_the_loop_body_as_the_serial_loop() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaf morsels.
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran); on the versioned storage the hook hands the statement to the table's column copy or the serial loop (G11 step 5, CS.5), so with parallel mode on it would compare the serial loop with itself",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-15");
     let mut rng = ChaCha8Rng::seed_from_u64(615);
     let pad = "x".repeat(64);
@@ -1030,6 +1084,12 @@ fn t_qt_6_15_workers_run_a_copy_of_the_loop_body_as_the_serial_loop() {
 /// table), and the workers stopped early: the body ran over fewer rows than the table holds.
 #[test]
 fn t_qt_6_16_a_scans_rows_run_in_parallel_and_stop_early_under_limit() {
+    // G7 step 2 (`AC-NS.2.1`): a test of the pager's leaf morsels.
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran); on the versioned storage the hook hands the statement to the table's column copy or the serial loop (G11 step 5, CS.5), so with parallel mode on it would compare the serial loop with itself",
+    ) {
+        return;
+    }
     let conn = open(":memory:qt-6-16");
     let mut rng = ChaCha8Rng::seed_from_u64(616);
     let pad = "x".repeat(64);
