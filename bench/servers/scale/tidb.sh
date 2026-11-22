@@ -49,4 +49,7 @@ ready_node() { curl -sf --max-time 2 "http://$(at "$1" 5)/status" >/dev/null; }
 
 endpoint() { echo "mysql://root@$(at "$1" 4)/test"; }
 
+# The TiKV client's Region errors among them (bench/src/scale.rs's stale routes).
+metrics_url() { echo "http://$(at "$1" 5)/metrics"; }
+
 main "$@"

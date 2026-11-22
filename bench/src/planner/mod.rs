@@ -336,7 +336,7 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
 
 fn outcome_json(outcome: &Outcome, load: Option<f64>) -> serde_json::Value {
     match outcome {
-        Outcome::Done(r) => serde_json::json!({ "status": "done", "rows": r.rows, "first": r.first, "prepare_ms": r.prepare_ms, "exec_ms": r.exec_ms, "ms": r.prepare_ms + r.exec_ms, "load": load }),
+        Outcome::Done(r) => serde_json::json!({ "status": "done", "rows": r.rows, "first": r.first, "prepare_ms": r.prepare_ms, "exec_ms": r.exec_ms, "search_ms": r.search_ms, "ms": r.prepare_ms + r.exec_ms, "load": load }),
         Outcome::TimedOut => serde_json::json!({ "status": "timed_out", "load": load }),
         Outcome::Failed(e) => serde_json::json!({ "status": "failed", "error": e, "load": load }),
     }
@@ -407,10 +407,18 @@ pub fn main() -> anyhow::Result<()> {
     for t in &mut targets {
         engines.push(t.about()?);
     }
+    let h = host(&o.dir);
     write(serde_json::json!({
         "record": "run",
         "date": utc_now(),
-        "host": host(&o.dir),
+        // Who drove the engines and where they ran (Ada's fair comparisons, 2026-11-21; goal
+        // 63c98840): this one program for every engine, each in its process, no container.
+        "client": { "program": "amphora-bench --planner", "commit": commit, "timing": "amphora-bench's own, one code path for every engine" },
+        "platform": {
+            "host": h["host"], "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "kernel": h["kernel"], "cpu": h["cpu"],
+            "engine_runs": "in the driver's process", "container": null, "data_dir": o.dir.display().to_string(), "fs": h["fs"], "disk": h["disk"],
+        },
+        "host": h,
         "cores": std::thread::available_parallelism().map(usize::from).unwrap_or(0),
         "commit": commit,
         "dirty_files": git(&["status", "--porcelain"]).lines().count(),

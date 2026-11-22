@@ -82,10 +82,6 @@ fn dsn(engine: &str, default: &str) -> String {
 /// may take, the run's budget (G2 step 7): a server that doesn't answer within it is Unreachable,
 /// and None waits on it as long as it takes.
 pub fn open(name: &str, bound: Option<Duration>) -> Result<Box<dyn Engine>, Unavailable> {
-    let bin = |engine: &str, default: &str| {
-        std::env::var(format!("CORPUS_BIN_{}", engine.to_ascii_uppercase()))
-            .unwrap_or_else(|_| default.to_owned())
-    };
     let shell = |spec: ShellSpec| Shell::open(spec, bound).map(boxed);
     match name {
         "amphora" => crate::amphora::Amphora::in_memory()
@@ -97,35 +93,67 @@ pub fn open(name: &str, bound: Option<Duration>) -> Result<Box<dyn Engine>, Unav
         "sqlite" => shell(sqlite_shell("sqlite", bin("sqlite", "sqlite3"))),
         "duckdb" => shell(duckdb(bin("duckdb", "duckdb"))),
         "turso" => shell(turso(bin("turso", "tursodb"))),
-        // Run.sh's addresses for the bench's containers (bench/servers/<engine>.sh).
         "postgres" => shell(postgres(
             "postgres",
             bin("postgres", "psql"),
-            dsn("postgres", "postgres://postgres@127.0.0.1:55432/postgres"),
+            dsn("postgres", POSTGRES),
         )),
         "orioledb" => shell(postgres(
             "orioledb",
             bin("orioledb", "psql"),
-            dsn("orioledb", "postgres://postgres@127.0.0.1:55433/postgres"),
+            dsn("orioledb", ORIOLEDB),
         )),
         "cedardb" => shell(postgres(
             "cedardb",
             bin("cedardb", "psql"),
-            dsn(
-                "cedardb",
-                "postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres",
-            ),
+            dsn("cedardb", CEDARDB),
         )),
-        "mysql" => shell(mysql(
-            bin("mysql", "mysql"),
-            &dsn("mysql", "mysql://root@127.0.0.1:33306/convo"),
-        )?),
-        "clickhouse" => {
-            ClickHouse::open(&dsn("clickhouse", "http://127.0.0.1:58123"), bound).map(boxed)
-        }
+        "mysql" => shell(mysql(bin("mysql", "mysql"), &dsn("mysql", MYSQL))?),
+        "clickhouse" => ClickHouse::open(&dsn("clickhouse", CLICKHOUSE), bound).map(boxed),
         other => Err(Unavailable::Unknown(other.to_owned())),
     }
 }
+
+fn bin(engine: &str, default: &str) -> String {
+    std::env::var(format!("CORPUS_BIN_{}", engine.to_ascii_uppercase()))
+        .unwrap_or_else(|_| default.to_owned())
+}
+
+/// The client `open(name)` runs: its program (or in-process library) and the address it reaches,
+/// as each record of a run names it. A comparison holds only between records of the same client on
+/// the same platform (`platform()`); one from another is experiment error, not a result.
+pub fn client(name: &str) -> String {
+    let at = |program: String, engine: &str, default: &str| {
+        format!("{program} at {}", dsn(engine, default))
+    };
+    match name {
+        "amphora" => "in process (the amphora crate, in memory)".to_owned(),
+        "sqlite" => bin("sqlite", "sqlite3"),
+        "duckdb" => bin("duckdb", "duckdb"),
+        "turso" => bin("turso", "tursodb"),
+        "postgres" => at(bin("postgres", "psql"), "postgres", POSTGRES),
+        "orioledb" => at(bin("orioledb", "psql"), "orioledb", ORIOLEDB),
+        "cedardb" => at(bin("cedardb", "psql"), "cedardb", CEDARDB),
+        "mysql" => at(bin("mysql", "mysql"), "mysql", MYSQL),
+        "clickhouse" => format!(
+            "amphora-corpus's HTTP client at {}",
+            dsn("clickhouse", CLICKHOUSE)
+        ),
+        other => format!("unknown engine {other}"),
+    }
+}
+
+/// This machine's operating system and architecture, as each record of a run names them.
+pub fn platform() -> String {
+    format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+// Run.sh's addresses for the bench's containers (bench/servers/<engine>.sh).
+const POSTGRES: &str = "postgres://postgres@127.0.0.1:55432/postgres";
+const ORIOLEDB: &str = "postgres://postgres@127.0.0.1:55433/postgres";
+const CEDARDB: &str = "postgres://postgres:amphorabenchlocalonly2026@127.0.0.1:55434/postgres";
+const MYSQL: &str = "mysql://root@127.0.0.1:33306/convo";
+const CLICKHOUSE: &str = "http://127.0.0.1:58123";
 
 fn boxed<E: Engine + 'static>(e: E) -> Box<dyn Engine> {
     Box::new(e)
@@ -272,6 +300,10 @@ pub fn postgres(engine: &'static str, program: String, dsn: String) -> ShellSpec
             format!("null={NULL_MARK}"),
             "-v".into(),
             "ON_ERROR_STOP=0".into(),
+            // Its errors with their SQLSTATE ("ERROR:  42601: syntax error ..."), which
+            // crate::refusal reads for the error's kind (psql's documentation of VERBOSITY).
+            "-v".into(),
+            "VERBOSITY=verbose".into(),
             // Its statements from `-f -` (standard input) rather than from standard input as such:
             // only a file's errors are written `psql:<file>:<line>: ERROR:`, which is how a refusal
             // is told from a row (psql's documentation of -f; its log_locus_callback).

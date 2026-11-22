@@ -412,18 +412,294 @@ def excluded(window, dialect):
     return exp.Paren(this=exp.Add(this=exp.Sub(this=whole, expression=peers), expression=own))
 
 
-def typed(expression):
-    """`expression` with each column declared without a type given the type SQLite's affinity rules
-    give it, so engines that require a column's type (DuckDB, PostgreSQL, MySQL, ClickHouse) take the
-    table. SQLite's "Datatypes In SQLite", section 3.1 "Determination Of Column Affinity", rule 3:
-    "If the declared type for a column contains the string "BLOB" or if no type is specified then
-    the column has affinity BLOB" (https://www.sqlite.org/datatype3.html#determination_of_column_affinity);
+# SQLite's storage classes ("Datatypes In SQLite" 2, https://www.sqlite.org/datatype3.html#storage_classes_and_datatypes):
+# "INTEGER. The value is a signed integer, stored in 0, 1, 2, 3, 4, 6, or 8 bytes", "REAL. The value
+# is a floating point value, stored as an 8-byte IEEE floating point number", "TEXT. The value is a
+# text string", "BLOB. The value is a blob of data, stored exactly as it was input": each declared
+# as the type that holds every value of the class whole (sqlglot writes each in each dialect).
+STORAGE_TYPES = {"INTEGER": "BIGINT", "REAL": "DOUBLE", "TEXT": "TEXT", "BLOB": "BLOB"}
+
+# What a value is when the file alone can't say which storage class it has (a value read from a
+# column of mixed classes, a function's result, a subquery's).
+UNKNOWN = "?"
+
+
+class Table:
+    """A table as a file defines it: its columns in order (upper-cased: SQLite's names are
+    case-insensitive), each one's declared type (a sqlglot DataType; None for a column without a
+    type, or an ANY column of a STRICT table: no affinity, values kept as written) and default, and,
+    for each column without a type, the storage classes of the values the file writes to it."""
+
+    def __init__(self, name):
+        self.name, self.columns, self.kinds, self.defaults, self.written = name, [], {}, {}, {}
+
+    def write(self, column, cls):
+        if column in self.written and cls is not None:
+            self.written[column].add(cls)
+
+    def storage(self, column):
+        """The storage class every value of `column` has, as far as the file has written it, else UNKNOWN."""
+        kind = self.kinds.get(column, False)
+        if kind is False:
+            return UNKNOWN
+        if kind is None:
+            classes = self.written.get(column, set())
+            return next(iter(classes)) if len(classes) == 1 else UNKNOWN
+        return _declared_class(kind)
+
+
+def _declared_class(kind):
+    """The storage class of the values a column declared `kind` holds in SQLite and in every
+    dialect alike: its affinity (affinity() above) where the dialect's type is of the same class,
+    else UNKNOWN (NUMERIC affinity keeps 7 an INTEGER where DECIMAL makes it 7.00)."""
+    from sqlglot import exp
+
+    a = affinity(kind.sql(dialect="sqlite"))
+    if a == "INTEGER" and kind.is_type(*exp.DataType.INTEGER_TYPES):
+        return "INTEGER"
+    if a == "REAL" and kind.is_type(*exp.DataType.REAL_TYPES) and not kind.is_type(exp.DataType.Type.DECIMAL):
+        return "REAL"
+    if a == "TEXT" and kind.is_type(*exp.DataType.TEXT_TYPES):
+        return "TEXT"
+    return UNKNOWN
+
+
+class Context:
+    """What translate() needs of the file around a record: the tables defined once it has run, and
+    those it creates (by upper-cased name), their columns typed by what the whole file writes."""
+
+    def __init__(self, tables=None, created=None):
+        self.tables, self.created = tables or {}, created or {}
+
+
+def _number_class(text, negative=False):
+    """SQLite's "Literal Values" (https://www.sqlite.org/lang_expr.html#literal_values_constants_):
+    "If a numeric literal has a decimal point or an exponentiation clause or if it is less than
+    -9223372036854775808 or greater than 9223372036854775807, then it is a floating point literal.
+    Otherwise it is an integer literal."
+    """
+    if not text.isdigit():
+        return "REAL"
+    return "INTEGER" if int(text) <= 2**63 - (0 if negative else 1) else "REAL"
+
+
+def _sources(scope):
+    """The tables a SELECT, UPDATE or DELETE reads, by the name its columns qualify them with (None
+    for a source that isn't a table: a subquery, a CTE, a table function)."""
+    from sqlglot import exp
+
+    found = []
+    if isinstance(scope, (exp.Update, exp.Delete)):
+        found.append(scope.this)
+    f = scope.args.get("from_") or scope.args.get("from")
+    if isinstance(f, exp.From):
+        found.append(f.this)
+    found += [j.this for j in scope.args.get("joins") or []]
+    out = {}
+    for t in found:
+        if isinstance(t, exp.Table) and isinstance(t.this, exp.Identifier):
+            out[t.alias_or_name.upper()] = t.name.upper()
+        else:
+            out[getattr(t, "alias_or_name", "").upper() or id(t)] = None
+    return out
+
+
+def _column_class(column, tables):
+    """The storage class of `column`'s values: from the table it names, or the one table of the
+    nearest enclosing statement that has a column of its name; UNKNOWN when that's not one table."""
+    from sqlglot import exp
+
+    name, qualifier = column.name.upper(), column.table.upper()
+    node = column.parent
+    while node is not None:
+        if isinstance(node, (exp.Select, exp.Update, exp.Delete)):
+            sources = _sources(node)
+            if qualifier:
+                if qualifier in sources:
+                    t = tables.get(sources[qualifier]) if sources[qualifier] else None
+                    return t.storage(name) if t is not None else UNKNOWN
+            else:
+                if any(v is None for v in sources.values()):
+                    return UNKNOWN
+                having = [tables[v] for v in set(sources.values()) if v in tables and name in tables[v].kinds]
+                if len(having) == 1:
+                    return having[0].storage(name)
+                if len(having) > 1 or any(v not in tables for v in sources.values()):
+                    return UNKNOWN
+        node = node.parent
+    return UNKNOWN
+
+
+def storage_classes(expression, tables):
+    """Each node of `expression` (by id) with the storage class SQLite gives its value, or UNKNOWN,
+    worked out children first over sqlglot's iterative walk (no recursion here): NULL is None (it
+    fits every type); literals as lang_expr.html's "Literal Values" says (TRUE and FALSE are 1 and
+    0); columns by their table (_column_class); `||` is TEXT; +, -, *, / and % of two INTEGERs are
+    INTEGER and with a REAL REAL (lang_expr.html, "Operators": "integer arithmetic if both operands
+    are integers and no overflow would result, or floating point arithmetic ... if either operand is
+    a real value"); count() and length() INTEGER; sum(), min(), max() and abs() their argument's;
+    avg() and total() REAL (lang_aggfunc.html); CAST by the type's affinity (lang_expr.html "CAST
+    expressions"); anything else UNKNOWN."""
+    from sqlglot import exp
+
+    classes = {}
+    nodes = list(expression.dfs())
+    for node in reversed(nodes):
+        c = UNKNOWN
+        if isinstance(node, exp.Paren):
+            c = classes.get(id(node.this), UNKNOWN)
+        elif isinstance(node, exp.Null):
+            c = None
+        elif isinstance(node, exp.Boolean):
+            c = "INTEGER"
+        elif isinstance(node, exp.HexString):
+            c = "BLOB"
+        elif isinstance(node, exp.Literal):
+            c = "TEXT" if node.is_string else _number_class(node.this)
+        elif isinstance(node, exp.Neg):
+            inner = node.this
+            if isinstance(inner, exp.Literal) and not inner.is_string:
+                c = _number_class(inner.this, negative=True)
+            elif classes.get(id(inner)) in ("INTEGER", "REAL"):
+                c = classes[id(inner)]
+        elif isinstance(node, exp.Column):
+            c = _column_class(node, tables)
+        elif isinstance(node, exp.DPipe):
+            c = "TEXT"
+        elif isinstance(node, (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv)):
+            pair = {classes.get(id(node.this), UNKNOWN), classes.get(id(node.expression), UNKNOWN)}
+            if pair == {"INTEGER"}:
+                c = "INTEGER"
+            elif pair <= {"INTEGER", "REAL"} and not isinstance(node, (exp.Mod, exp.IntDiv)):
+                c = "REAL"
+        elif isinstance(node, (exp.Count, exp.Length)):
+            c = "INTEGER"
+        elif isinstance(node, (exp.Sum, exp.Min, exp.Max, exp.Abs)) and not node.expressions:
+            arg = classes.get(id(node.this), UNKNOWN)
+            c = arg if arg in ("INTEGER", "REAL") else UNKNOWN
+        elif isinstance(node, exp.Avg):
+            c = "REAL"
+        elif isinstance(node, exp.Cast) and isinstance(node.to, exp.DataType):
+            c = _declared_class(node.to)
+        classes[id(node)] = c
+    return classes
+
+
+def contexts(records):
+    """Each record's Context, the file's records read in order as SQLite runs them: a CREATE TABLE
+    defines its table (one of IF NOT EXISTS whose table is there leaves it), DROP TABLE removes it,
+    and each INSERT (its VALUES or SELECT, its columns' defaults, its upsert's SET), UPDATE ... SET
+    writes values to its columns. A `statement error` record SQLite refuses writes nothing."""
+    import sqlglot
+    from sqlglot import exp
+
+    tables, out = {}, []
+    for r in records:
+        created = {}
+        try:
+            statements = sqlglot.parse(comment_closed(defaults_dropped(r.sql)), read=reader())
+        except Exception:  # sqlglot can't read it: translate() says why
+            statements = []
+        ran = not (r.kind == "statement" and r.expect == "error")
+        for e in statements:
+            if isinstance(e, exp.Create) and e.args.get("kind") == "TABLE" and isinstance(e.this, exp.Schema) and isinstance(e.this.this, exp.Table):
+                t = _table(e)
+                if e.args.get("exists") and t.name in tables:
+                    created[t.name] = tables[t.name]
+                    continue
+                created[t.name] = t
+                if ran:
+                    tables[t.name] = t
+            elif not ran:
+                continue
+            elif isinstance(e, exp.Drop) and e.args.get("kind") == "TABLE" and isinstance(e.this, exp.Table):
+                tables.pop(e.this.name.upper(), None)
+            elif isinstance(e, (exp.Insert, exp.Update)):
+                _writes(e, tables)
+        out.append(Context(dict(tables), created))
+    return out
+
+
+def _table(create):
+    from sqlglot import exp
+
+    strict = any(True for _ in create.find_all(exp.StrictProperty))
+    t = Table(create.this.this.name.upper())
+    for c in create.this.expressions:
+        if isinstance(c, exp.Identifier):
+            name, kind, default = c.name.upper(), None, None
+        elif isinstance(c, exp.ColumnDef):
+            name, kind = c.name.upper(), c.args.get("kind")
+            if strict and isinstance(kind, exp.DataType) and kind.meta.get("sqlite_any"):
+                kind = None
+            default = next((k.args["kind"].this for k in c.args.get("constraints") or [] if isinstance(k.args.get("kind"), exp.DefaultColumnConstraint)), None)
+        else:
+            continue
+        t.columns.append(name)
+        t.kinds[name], t.defaults[name] = kind, default
+        if kind is None:
+            t.written[name] = set()
+    return t
+
+
+def _writes(e, tables):
+    """The values INSERT or UPDATE `e` writes, by storage class, into each untyped column."""
+    from sqlglot import exp
+
+    target = e.this
+    names = None
+    if isinstance(target, exp.Schema):
+        names = [i.name.upper() for i in target.expressions]
+        target = target.this
+    t = tables.get(target.name.upper()) if isinstance(target, exp.Table) else None
+    if t is None:
+        return
+    sets = []
+    if isinstance(e, exp.Update):
+        sets = list(e.expressions)
+    else:
+        names = names or t.columns
+        source = e.expression
+        if e.args.get("default"):
+            rows = [[]]
+        elif isinstance(source, exp.Values):
+            rows = [list(row.expressions) if isinstance(row, exp.Tuple) else [row] for row in source.expressions]
+        elif isinstance(source, exp.Select) and not any(isinstance(p, exp.Star) for p in source.selects):
+            rows = [list(source.selects)]
+        else:
+            rows = None
+        if rows is None:
+            for n in names:
+                t.write(n, UNKNOWN)
+        else:
+            for row in rows:
+                for n, value in zip(names, row):
+                    t.write(n, storage_classes(value, tables).get(id(value), UNKNOWN))
+                for n in t.columns:
+                    if n not in names and t.defaults.get(n) is not None:
+                        d = t.defaults[n]
+                        t.write(n, storage_classes(d, tables).get(id(d), UNKNOWN))
+        conflict = e.args.get("conflict")
+        if isinstance(conflict, exp.OnConflict):
+            sets = list(conflict.expressions or [])
+    for eq in sets:
+        if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column):
+            t.write(eq.this.name.upper(), storage_classes(eq.expression, tables).get(id(eq.expression), UNKNOWN))
+
+
+def typed(expression, context=None, dialect="the dialect"):
+    """`expression` with each column declared without a type given the type of the values the
+    file writes to it. SQLite's "Datatypes In SQLite", section 3.1 "Determination Of Column
+    Affinity", rule 3: "If the declared type for a column contains the string "BLOB" or if no type
+    is specified then the column has affinity BLOB" (https://www.sqlite.org/datatype3.html#determination_of_column_affinity);
     section 3: "A column with affinity BLOB does not prefer one storage class over another and no
-    attempt is made to coerce data from one storage class into another." So an untyped column is
-    declared BLOB, as SQLite's own declared BLOB reads, which sqlglot writes as each dialect's
-    binary type (DuckDB's BLOB, PostgreSQL's BYTEA, MySQL's BLOB, ClickHouse's String: a column
-    declared BLOB in the corpus is written the same). A value of another storage class written to it is
-    then each engine's to take or refuse, as a BLOB column's would be: no type is picked here.
+    attempt is made to coerce data from one storage class into another." So such a column holds
+    each value as written, and the engines that require a column's type (DuckDB, PostgreSQL, MySQL,
+    ClickHouse) hold it the same only in a column of that value's type: where every value the file
+    writes to it (contexts()) has one storage class, the column is declared that class's type
+    (STORAGE_TYPES); where they're of several, or of one the file alone doesn't show, or there is
+    none, no one type holds them as SQLite does: not expressible, with the reason. Never BLOB by
+    default: a BLOB column of those engines converts or refuses what SQLite keeps.
 
     A STRICT table ("STRICT Tables", https://www.sqlite.org/stricttables.html) is one whose columns
     hold only their declared type: "SQLite attempts to coerce the data into the appropriate type ...
@@ -432,9 +708,10 @@ def typed(expression):
     its type, so the table is declared without STRICT (DuckDB has no such word, and PostgreSQL, MySQL
     and ClickHouse refuse it); how each engine converts a value is its type system's, which the
     oracle classifies as such. Its ANY columns take any value unchanged ("no type coercion"), as a
-    BLOB column does: declared BLOB, as above."""
+    column without a type does: typed by their values, as above."""
     from sqlglot import exp
 
+    context = context or Context()
     # sqlglot reads a column with neither type nor constraint as a bare name in CREATE TABLE's
     # schema, one with constraints only as a ColumnDef without a kind.
     for create in expression.find_all(exp.Create):
@@ -453,10 +730,57 @@ def typed(expression):
                 for column in schema.find_all(exp.ColumnDef):
                     kind = column.args.get("kind")
                     if isinstance(kind, exp.DataType) and kind.meta.get("sqlite_any"):
-                        column.set("kind", exp.DataType(this=exp.DataType.Type.BLOB))
+                        column.set("kind", None)
     for column in expression.find_all(exp.ColumnDef):
-        if column.args.get("kind") is None:
-            column.set("kind", exp.DataType(this=exp.DataType.Type.BLOB))
+        if column.args.get("kind") is not None:
+            continue
+        create = column.find_ancestor(exp.Create)
+        name = create.this.this.name.upper() if create is not None and isinstance(create.this, exp.Schema) and isinstance(create.this.this, exp.Table) else ""
+        table = context.created.get(name) or context.tables.get(name)
+        where = f"column {column.name} of {name.lower() or 'the table'} has no type, so no affinity (https://www.sqlite.org/datatype3.html#determination_of_column_affinity), and SQLite keeps each value written to it as written"
+        if table is None or column.name.upper() not in table.written:
+            raise NotExpressible(f"not expressible in {dialect}: {where}; the values the file writes to it weren't read")
+        classes = table.written[column.name.upper()] - {None}
+        if UNKNOWN in classes:
+            raise NotExpressible(f"not expressible in {dialect}: {where}; the file writes it a value whose storage class only running it shows")
+        if not classes:
+            raise NotExpressible(f"not expressible in {dialect}: {where}; the file writes it no value but NULL, so no one type is its")
+        if len(classes) > 1:
+            raise NotExpressible(f"not expressible in {dialect}: {where}; the file writes it values of several storage classes ({', '.join(sorted(classes))}), which no one {dialect} column type holds unchanged")
+        column.set("kind", exp.DataType.build(STORAGE_TYPES[next(iter(classes))]))
+    return expression
+
+
+def divided(expression, context, dialect):
+    """`expression` with each `/` whose operands are both INTEGER (storage_classes()) said as each
+    dialect's integer division. SQLite's "Operators" (https://www.sqlite.org/lang_expr.html#operators_and_parse_affecting_attributes):
+    "The other arithmetic operators perform integer arithmetic if both operands are integers and no
+    overflow would result ... Integer divide yields an integer result, truncated toward zero."
+    DuckDB's `/` always divides as floating point; its `//` is integer division ("Numeric Operators",
+    https://duckdb.org/docs/stable/sql/functions/numeric: `//` "Integer division"), which truncates
+    toward zero and gives NULL for a zero divisor as SQLite's does (DuckDB 1.4: -7 // 2 is -3, 7 // 0
+    NULL). PostgreSQL's div(y, x) is the "integer quotient of y/x (truncates towards zero)" for any
+    numeric operands (PostgreSQL manual, 9.3 "Mathematical Functions and Operators", Table 9.5),
+    where its `/` keeps a fraction once an operand is numeric (sum() of a bigint is), and its divisor
+    is given NULLIF(x, 0) as sqlglot gives `/`'s, for SQLite's NULL on a zero divisor. MySQL's
+    `DIV` is "Integer division. Discards from the division result any fractional part to the right
+    of the decimal point" (MySQL 8.4 manual, 14.6.1 "Arithmetic Operators"). ClickHouse is left as
+    it is: its intDiv throws on a zero divisor ("Division by zero"), which SQLite's NULL isn't."""
+    from sqlglot import exp
+
+    if dialect not in ("duckdb", "postgres", "mysql"):
+        return expression
+    classes = storage_classes(expression, context.tables)
+    whole = [d for d in reversed(list(expression.dfs())) if isinstance(d, exp.Div) and classes.get(id(d.this)) == "INTEGER" and classes.get(id(d.expression)) == "INTEGER"]
+    for d in whole:
+        divisor = d.expression
+        if dialect == "postgres":
+            divisor = exp.Nullif(this=divisor, expression=exp.Literal.number(0))
+        replaced = exp.IntDiv(this=d.this, expression=divisor)
+        if d is expression:
+            expression = replaced
+        else:
+            d.replace(replaced)
     return expression
 
 
@@ -564,6 +888,13 @@ def spoken(expression, dialect):
         # (CREATE SEQUENCE, a column's DEFAULT nextval()) count on their own and don't move past a
         # key written explicitly, so the next key differs: not expressible.
         raise NotExpressible("not expressible in duckdb: AUTOINCREMENT (https://www.sqlite.org/autoinc.html: one more than the largest key the table has held), which DuckDB's CREATE TABLE has no spelling of and its sequences don't count the same")
+    if dialect == "clickhouse" and any(True for _ in expression.find_all(exp.AutoIncrementColumnConstraint)):
+        # ClickHouse's CREATE TABLE has no AUTO_INCREMENT (its column expressions are DEFAULT,
+        # MATERIALIZED, EPHEMERAL and ALIAS: https://clickhouse.com/docs/sql-reference/statements/create/table),
+        # and generateSerialID() (25.1 on, a Keeper counter: "Generates and returns sequential numbers
+        # starting from the previous counter value") counts on its own, past no key written
+        # explicitly and back on no failed insert, so the next key differs: not expressible.
+        raise NotExpressible("not expressible in clickhouse: AUTOINCREMENT (https://www.sqlite.org/autoinc.html: one more than the largest key the table has held), which ClickHouse's CREATE TABLE has no spelling of and its generateSerialID() counter doesn't count the same")
     if dialect in ("postgres", "clickhouse"):
         for blob in list(expression.find_all(exp.HexString)):
             digits = blob.this or ""
@@ -649,10 +980,11 @@ def defaults_dropped(sql):
     return "".join(out)
 
 
-def translate(sql, dialect):
+def translate(sql, dialect, context=None):
     """`sql`, in SQLite's dialect, in `dialect`: (text, None), or (None, why) when sqlglot can't say
-    it there or the dialect has nothing that means the same. The one translation the corpus's tools
-    share (probe.py's too)."""
+    it there or the dialect has nothing that means the same. `context` is the file around it
+    (contexts()): its tables, for the types of untyped columns and integer division; without it a
+    column without a type is not expressible. The one translation the corpus's tools share (probe.py's too)."""
     if dialect == "sqlite":
         return sql, None
     import sqlglot
@@ -668,7 +1000,14 @@ def translate(sql, dialect):
         return None, f"not expressible in {dialect}: several upsert clauses (https://www.sqlite.org/lang_upsert.html) where {dialect} takes at most one"
     try:
         # sqlglot.transpile's steps, each statement given its untyped columns' types between them.
-        out = [spoken(keyed(typed(e), dialect), dialect).sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE) if e else "" for e in sqlglot.parse(text, read=reader())]
+        out = []
+        for e in sqlglot.parse(text, read=reader()):
+            if not e:
+                out.append("")
+                continue
+            e = spoken(keyed(typed(divided(e, context or Context(), dialect), context, dialect), dialect), dialect)
+            after = autoincremented(e) if dialect == "postgres" else []
+            out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:
         return None, str(e)
     except Exception as e:  # sqlglot can't say it in this dialect
@@ -688,22 +1027,95 @@ def translate(sql, dialect):
     return ";\n".join(out), None
 
 
-def record_in(record, dialect):
+def autoincremented(expression):
+    """`expression` (in PostgreSQL's dialect) with each AUTOINCREMENT column's keys given as SQLite
+    gives them, and the statements that do it after it. SQLite's "AUTOINCREMENT"
+    (https://www.sqlite.org/autoinc.html): a new row's key is "one larger than the largest ROWID
+    that has ever before existed in that same table", kept in the table sqlite_sequence, which
+    "is updated ... whenever a normal table that contains an AUTOINCREMENT column is created"
+    and written with each insert, in the inserting statement's transaction; a key written
+    explicitly counts too, and NULL is "the next" key. sqlglot writes it as an identity column,
+    whose sequence moves past neither an explicitly written key nor back on a failed or
+    rolled-back insert (PostgreSQL's manual, 9.17 "Sequence Manipulation Functions": "nextval
+    operations are never rolled back"), so its next key can differ. So the key is given as SQLite
+    gives it: a table `<table>_autoincrement` holds the largest key the table has held (as
+    sqlite_sequence does, transactional as it is), and a BEFORE INSERT trigger (PostgreSQL's
+    CREATE TRIGGER, its PL/pgSQL "Triggers on Data Changes": "a row-level trigger fired before an
+    operation ... can return NEW" changed) gives a row without a key one more than the larger of
+    that and the table's largest key, then records the row's key there. Its UPDATE runs in the
+    inserting statement, so a refused insert leaves it as it was, as SQLite's does. A CREATE TABLE
+    without IF NOT EXISTS starts a fresh count (a table dropped and made again forgets its keys:
+    autoinc.html, "the sqlite_sequence row for an AUTOINCREMENT table is automatically deleted when
+    the table is dropped"). A TEMPORARY table's would need the function in pg_temp, which a
+    trigger can't name without its schema: not expressible."""
+    from sqlglot import exp
+
+    out = []
+    for create in list(expression.find_all(exp.Create)):
+        schema = create.this
+        if create.args.get("kind") != "TABLE" or not isinstance(schema, exp.Schema) or not isinstance(schema.this, exp.Table):
+            continue
+        for column in [c for c in schema.expressions if isinstance(c, exp.ColumnDef)]:
+            auto = [c for c in column.args.get("constraints") or [] if isinstance(c.args.get("kind"), exp.AutoIncrementColumnConstraint)]
+            if not auto:
+                continue
+            properties = create.args.get("properties")
+            if properties is not None and any(isinstance(p, exp.TemporaryProperty) for p in properties.expressions):
+                raise NotExpressible("not expressible in postgres: AUTOINCREMENT on a TEMPORARY table (https://www.sqlite.org/autoinc.html), whose trigger function would be pg_temp's")
+            for c in auto:
+                c.pop()
+            table = schema.this
+            side = table.copy()
+            side.set("this", exp.Identifier(this=table.name + "_autoincrement", quoted=table.this.quoted))
+            t, s, k = table.sql(dialect="postgres"), side.sql(dialect="postgres"), column.this.sql(dialect="postgres")
+            body = (
+                f"BEGIN IF NEW.{k} IS NULL THEN NEW.{k} := greatest((SELECT max({k}) FROM {t}), (SELECT seq FROM {s})) + 1; END IF; "
+                f"UPDATE {s} SET seq = greatest(seq, NEW.{k}); RETURN NEW; END"
+            )
+            if not create.args.get("exists"):
+                out.append(f"DROP TABLE IF EXISTS {s}")
+            out += [
+                f"CREATE TABLE IF NOT EXISTS {s} (seq BIGINT NOT NULL)",
+                f"INSERT INTO {s} SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM {s})",
+                "CREATE OR REPLACE FUNCTION " + s + "() RETURNS trigger LANGUAGE plpgsql AS '" + body.replace("'", "''") + "'",
+                f"CREATE OR REPLACE TRIGGER {s} BEFORE INSERT ON {t} FOR EACH ROW EXECUTE FUNCTION {s}()",
+            ]
+    return out
+
+
+def record_in(record, dialect, context=None):
     """`record` (slt.Record) in `dialect`, as translate() says it. A record SQLite refuses
     (`statement error`) that sqlglot can't read either is given as SQLite holds it, its default
     clauses left out: what the record asks of an engine is that it refuse the statement too, and an
     engine that can't read it refuses it (the corpus's records, as sqllogictest's, don't say which
     error). One sqlglot can read is translated, so an engine that refuses it does so for the
     statement's sake, not its spelling."""
-    sql, why = translate(record.sql, dialect)
+    sql, why = translate(record.sql, dialect, context)
     if why is not None and record.kind == "statement" and record.expect == "error":
         return defaults_dropped(record.sql), None
     return sql, why
 
 
+def refusals(pool, rel):
+    """SQLite's error for each `statement error` record of `<pool>/<rel>` (run as the corpus's
+    runner runs it, after its fixture `<pool>/<source>/base.test` when it has one): a JSON-ready
+    dict each, its line, SQLite's extended result code and name (Python's sqlite3.Error
+    `sqlite_errorcode` and `sqlite_errorname`, Python 3.11 on: None before) and its message, which
+    the harness (crates/corpus/src/refusal.rs) reads for the error's kind."""
+    path = os.path.join(pool, rel)
+    fixture = os.path.join(pool, rel.split(os.sep)[0], "base.test")
+    kept = []
+
+    def refused(rec, e):
+        kept.append({"line": rec.line, "code": getattr(e, "sqlite_errorcode", None), "name": getattr(e, "sqlite_errorname", None), "message": str(e)})
+
+    slt.run_file(path, fixture=fixture if os.path.exists(fixture) and os.path.abspath(fixture) != os.path.abspath(path) else None, refused=refused)
+    return kept
+
+
 def files(pool):
     for root, _dirs, names in os.walk(pool, followlinks=True):
-        if os.path.relpath(root, pool).split(os.sep)[0] == "translations":
+        if os.path.relpath(root, pool).split(os.sep)[0] in ("translations", "refusals"):
             continue
         for n in sorted(names):
             if n.endswith(".test"):
@@ -716,18 +1128,29 @@ def main():
     pool = sys.argv[1]
     dialects = sys.argv[2:] or DIALECTS
     counts = {d: [0, 0] for d in dialects}
+    refused = 0
     for rel in files(pool):
         records = [r for kind, r in slt.parse(os.path.join(pool, rel)) if kind == "record"]
+        around = contexts(records)
         for d in dialects:
             out = os.path.join(pool, "translations", d, rel + ".jsonl")
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "w", encoding="utf-8") as f:
-                for r in records:
-                    sql, why = record_in(r, d)
+                for r, c in zip(records, around):
+                    sql, why = record_in(r, d, c)
                     counts[d][why is not None] += 1
                     f.write(json.dumps({"line": r.line, "sql": sql} if why is None else {"line": r.line, "untranslatable": why}) + "\n")
+        # SQLite's error for each record it refuses, for comparing refusals by kind.
+        out = os.path.join(pool, "refusals", rel + ".jsonl")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        kept = refusals(pool, rel)
+        with open(out, "w", encoding="utf-8") as f:
+            for k in kept:
+                f.write(json.dumps(k) + "\n")
+        refused += len(kept)
     for d, (ok, no) in counts.items():
         print(f"{d}: {ok} records translated, {no} untranslatable")
+    print(f"sqlite: {refused} refusals kept (pool/refusals)")
 
 
 if __name__ == "__main__":

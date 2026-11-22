@@ -27,6 +27,7 @@ mod oracle;
 mod pg;
 mod planner;
 mod pool;
+mod powercut;
 mod probe;
 mod query;
 mod reach;
@@ -531,6 +532,11 @@ fn main() -> anyhow::Result<()> {
     // The versioned storage's log: one group-committed log against per-thread logs (`vlog.rs`).
     if std::env::args().any(|a| a == "--vlog") {
         return vlog::main();
+    }
+    // T-T1.4.1's writer and check: the power-cut harnesses' database side (`powercut.rs`,
+    // bench/powercut/; CP-T1.4, G8 step 4).
+    if std::env::args().any(|a| a == "--powercut") {
+        return powercut::main();
     }
     // G7 step 3's three ways to reach a cached page (`reach.rs`).
     if std::env::args().any(|a| a == "--reach") {
