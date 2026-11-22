@@ -53,9 +53,22 @@ fn healthy(c: &Config) -> String {
 fn t_t1_13_1_three_members_elect_refuse_strangers_and_lose_nothing_split() {
     let dir = tempfile::tempdir().unwrap();
     let configs = three(dir.path());
+    let (tx, rx) = std::sync::mpsc::channel();
     for c in configs.clone() {
-        std::thread::spawn(move || serve::serve(&c, |_| {}));
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let node = c.node;
+            let _ = tx.send(format!(
+                "member {node} ended: {:?}",
+                serve::serve(&c, |_| {})
+            ));
+        });
     }
+    std::thread::spawn(move || {
+        for line in rx {
+            eprintln!("{line}");
+        }
+    });
     let c = &configs[0];
     let text = healthy(c);
     assert!(text.ends_with("healthy\n"), "{text}");
