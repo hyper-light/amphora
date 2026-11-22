@@ -876,7 +876,7 @@ class SQLiteOwn(unittest.TestCase):
 
     JSON = ["SELECT json(' { \"a\" : 1 } ')", "SELECT json_extract('{\"a\":1}', '$.a')", "SELECT '{\"a\":1}' -> '$.a'", "SELECT '{\"a\":1}' ->> '$.a'",
             "SELECT json_set('{}', '$.a', 1)", "SELECT jsonb('[1]')", "SELECT json_group_array(x) FROM t", "SELECT value FROM json_each('[1,2]')", "SELECT json_valid('{}')", "SELECT json_type('[1]')"]
-    PRAGMAS = ["PRAGMA foreign_keys = ON", "PRAGMA main.user_version", "PRAGMA table_info(t)", "PRAGMA integrity_check", "PRAGMA case_sensitive_like = 1", "SELECT name FROM pragma_table_info('t')"]
+    PRAGMAS = ["PRAGMA foreign_keys = ON", "PRAGMA main.user_version", "PRAGMA table_info(t)", "PRAGMA integrity_check", "PRAGMA case_sensitive_like = 1", "SELECT name FROM pragma_table_info('t')", "SELECT strict FROM pragma_table_list WHERE name = 'st'"]
 
     def test_not_expressible_everywhere(self):
         for sql in self.JSON + self.PRAGMAS:

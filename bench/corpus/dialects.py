@@ -1510,6 +1510,9 @@ def sqlite_own(expression, dialect):
         name = (target.name if isinstance(target, (exp.Column, exp.Identifier, exp.Var, exp.Anonymous)) else target.sql(dialect="sqlite").split("(")[0]).lower() if target is not None else ""
         raise NotExpressible(f"not expressible in {dialect}: PRAGMA {name} (https://www.sqlite.org/pragma.html#pragma_{name}) reads or sets SQLite's own settings and catalog, which {dialect} has no statement like")
     for node in expression.walk():
+        if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier) and node.name.lower().startswith("pragma_"):
+            # A pragma_ table function without arguments, which sqlglot reads as a table.
+            raise NotExpressible(f"not expressible in {dialect}: the table-valued {node.name.lower()} (https://www.sqlite.org/pragma.html#pragfunc), which reads SQLite's own catalog, which {dialect} has nothing like")
         if not isinstance(node, exp.Func):
             continue
         name = node.name.lower() if isinstance(node, exp.Anonymous) else type(node).__name__.lower()
