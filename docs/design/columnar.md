@@ -242,6 +242,15 @@ moving rows out of blocks over positional deltas, which complicate reads [c80].
    ways and on DuckDB, both in process and in memory, each statement timed the same way. DuckDB's
    cap is `SET memory_limit` to the bytes it holds before the statement plus the scenario's free
    bytes: its table is its columns, so it gets the same room for the analytic work as Amphora's copies.
+   The scenario's room is the analytic work's alone (lane colcopy-8, AC-CB.4.4): while a table's rows
+   grow, each engine's cap is lifted (Amphora's other use gives its bytes back, DuckDB's limit is
+   reset) and set again after, so a copy that must grow with its table meets the cap, not the rows;
+   the A/B test checks that no growing table's write is refused and that, under waves, copies a wave
+   bought are let go in a round after it (T-CB.4.3). The same driver
+   runs the concurrency ladder (`--ladder`, AC-CB.4.5): 1, 8, 32, 128, 512, 2048 and 4096 clients at
+   once on each engine, each its own connection and thread, one record a step with p50, p99 and
+   p99.9, and the client's threads, connections, peak resident bytes and own share of the time, to
+   show whether the client bounds the top step.
 
 ## What the next steps prototype and measure
 

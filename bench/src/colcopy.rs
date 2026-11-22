@@ -24,8 +24,16 @@
 //! reason (`columns_ab::Traces`). A write the cap refuses is counted (`writes_refused`) and left
 //! out of the reference too, so the answers still compare.
 //!
+//! `--ladder` runs the concurrency ladder instead (lane colcopy-8, AC-CB.4.5): each scenario on
+//! each engine at 1, 8, 32, 128, 512, 2048 and 4096 clients at once (`--clients` for fewer; a
+//! tiny instance may stop at 128), each client its own connection and thread, all through the
+//! same driver and timed the same way; one JSON line a step with its p50, p99 and p99.9, and what
+//! says whether the client bounds it: its threads and connections, the process's peak resident
+//! bytes in the step (Linux), the cores, and the client's own share of the clients' time. A step
+//! runs `clients` times the scenario's statements.
+//!
 //! usage: amphora-bench --colcopy --dir DIR [--scale K] [--engines rent,room,duckdb]
-//!        [--duckdb-threads N] [--out FILE]
+//!        [--duckdb-threads N] [--ladder [--clients 1,8,32,...]] [--out FILE]
 //!
 //! `--duckdb-threads` defaults to 1, the threads one Amphora statement runs on.
 
@@ -76,7 +84,7 @@ fn amphora_text(v: &Value) -> String {
 /// One Amphora database on the versioned storage, in memory.
 struct Amphora {
     io: Arc<dyn amphora_engine::IO>,
-    _db: Arc<Database>,
+    db: Arc<Database>,
     conn: Arc<amphora_engine::Connection>,
     storage: Arc<Storage>,
 }
@@ -100,7 +108,7 @@ impl Amphora {
         }
         Ok(Self {
             io,
-            _db: db,
+            db,
             conn,
             storage,
         })
@@ -138,6 +146,9 @@ impl Amphora {
     }
 }
 
+/// The bytes DuckDB's buffer manager holds now, every tag.
+const MEMORY_SQL: &str = "SELECT coalesce(sum(memory_usage_bytes), 0)::BIGINT FROM duckdb_memory()";
+
 /// One in-memory DuckDB, spilling to `dir`.
 struct Duck {
     conn: duckdb::Connection,
@@ -157,8 +168,13 @@ impl Duck {
     }
 
     fn rows(&self, sql: &str) -> anyhow::Result<Answer> {
+        Self::rows_on(&self.conn, sql)
+    }
+
+    /// [`Self::rows`] on any connection of the database (a ladder's client's).
+    fn rows_on(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<Answer> {
         use duckdb::types::ValueRef;
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -184,13 +200,17 @@ impl Duck {
     }
 
     fn one(&self, sql: &str) -> anyhow::Result<u64> {
-        let n: i64 = self.conn.query_row(sql, [], |r| r.get(0))?;
+        Self::one_on(&self.conn, sql)
+    }
+
+    fn one_on(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<u64> {
+        let n: i64 = conn.query_row(sql, [], |r| r.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
     /// The bytes DuckDB's buffer manager holds now, every tag.
     fn memory(&self) -> anyhow::Result<u64> {
-        self.one("SELECT coalesce(sum(memory_usage_bytes), 0)::BIGINT FROM duckdb_memory()")
+        self.one(MEMORY_SQL)
     }
 
     /// The bytes it has spilled to its temporary files now.
@@ -289,11 +309,22 @@ fn run(
         if s.grow > 0 {
             let from = next.get(i).copied().unwrap_or(s.rows + 1);
             let to = from + s.grow - 1;
-            // The engine's write first: one the cap refuses is counted and left out of the
-            // reference too, so the answers still compare.
+            // The engine's write first. The scenario's room is the analytic work's (lane
+            // colcopy-8): each engine's cap is lifted while its rows grow (Amphora's other use
+            // gives its bytes back, DuckDB's limit is reset to its default) and set again after,
+            // so a copy that must grow with its table meets the cap, not the table's rows. A write
+            // still refused is counted and left out of the reference too, so the answers still
+            // compare.
             let wrote = match (&amphora, &duck) {
-                (Some(a), _) => a.exec(&fill(false, i, from, to)),
-                (_, Some(d)) => d.conn.execute_batch(&fill(true, i, from, to)).map_err(e),
+                (Some(a), _) => {
+                    room.give(other);
+                    other = 0;
+                    a.exec(&fill(false, i, from, to))
+                }
+                (_, Some(d)) => d
+                    .conn
+                    .execute_batch(&format!("RESET memory_limit; {}", fill(true, i, from, to)))
+                    .map_err(e),
                 _ => Ok(()),
             };
             match wrote {
@@ -448,6 +479,374 @@ fn run(
     }))
 }
 
+/// The concurrency ladder (Ada's, 2026-11-21): the clients each step runs at once.
+const LADDER: [usize; 7] = [1, 8, 32, 128, 512, 2048, 4096];
+
+/// One client's connection, on either engine.
+enum Client {
+    Amphora(Arc<amphora_engine::Connection>),
+    Duck(duckdb::Connection),
+}
+
+/// What a client's thread opens its connection from: Amphora's database (the connection is made
+/// on the client's own thread, as the engine's many-writer tests make theirs) or a DuckDB
+/// connection cloned from the database's first.
+enum Opener<'a> {
+    Amphora(&'a Arc<Database>),
+    Duck(duckdb::Connection),
+}
+
+impl Opener<'_> {
+    fn open(self) -> anyhow::Result<Client> {
+        Ok(match self {
+            Opener::Amphora(db) => Client::Amphora(
+                db.connect(ConnectOpts::new().with_versioned_storage())
+                    .map_err(e)?,
+            ),
+            Opener::Duck(conn) => Client::Duck(conn),
+        })
+    }
+}
+
+/// The clients' start: every client waits here until all are made, so a step measures them at
+/// once, not their ramp; called off when one can't be made, so none waits for ever.
+struct Gate {
+    open: std::sync::Mutex<Option<bool>>,
+    turned: std::sync::Condvar,
+}
+
+impl Gate {
+    fn set(&self, go: bool) {
+        if let Ok(mut g) = self.open.lock() {
+            *g = Some(go);
+        }
+        self.turned.notify_all();
+    }
+
+    /// Whether the step goes ahead.
+    fn wait(&self) -> bool {
+        let Ok(mut g) = self.open.lock() else {
+            return false;
+        };
+        loop {
+            let state = *g;
+            match state {
+                Some(go) => return go,
+                None => match self.turned.wait(g) {
+                    Ok(next) => g = next,
+                    Err(_) => return false,
+                },
+            }
+        }
+    }
+}
+
+impl Client {
+    /// A statement's rows as text, sorted, read as [`Amphora::rows`] and [`Duck::rows`] read
+    /// them (the I/O and a sleep stepped alike, inside the timed region).
+    fn rows(&self, sql: &str) -> anyhow::Result<Answer> {
+        match self {
+            Client::Amphora(conn) => {
+                let mut stmt = conn.prepare(sql).map_err(e)?;
+                let mut out = Vec::new();
+                stmt.run_with_row_callback(|r| {
+                    out.push(r.get_values().map(amphora_text).collect());
+                    Ok(())
+                })
+                .map_err(e)?;
+                out.sort_unstable();
+                Ok(out)
+            }
+            Client::Duck(conn) => Duck::rows_on(conn, sql),
+        }
+    }
+}
+
+/// What a client brings back from a step.
+#[derive(Default)]
+struct Taken {
+    latencies: Vec<u64>,
+    refused: u64,
+    refusal: Option<String>,
+    unequal: u64,
+    /// The client's own time outside the timed statements (comparing answers, counting,
+    /// pressing): with the statements' time, whether the client is what bounds the step.
+    client_ns: u64,
+    statement_ns: u64,
+}
+
+/// The room, set by whichever client first finishes a statement that moves the scenario to a
+/// room it hadn't: Amphora's other use (the A/B's `press`) or DuckDB's limit. An event (a
+/// statement's end), never a timer.
+struct Room {
+    capped: Arc<Capped>,
+    /// Amphora's other use's bytes, and the free bytes last set (`u64::MAX`: none yet).
+    other: std::sync::Mutex<(u64, u64)>,
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl Room {
+    /// Sets the room for `free` bytes if it isn't set for them yet: Amphora's through its
+    /// `storage`'s copies, DuckDB's through `duck`, a connection of its database.
+    fn set(
+        &self,
+        duck: Option<&duckdb::Connection>,
+        storage: Option<&Storage>,
+        free: Option<u64>,
+    ) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let Some(f) = free else { return Ok(()) };
+        if self.last.load(Ordering::Acquire) == f {
+            return Ok(());
+        }
+        let mut g = self
+            .other
+            .lock()
+            .map_err(|_| anyhow::anyhow!("a client panicked"))?;
+        if g.1 == f {
+            return Ok(());
+        }
+        match (duck, storage) {
+            (None, Some(st)) => {
+                let want = f.saturating_sub(st.copy_meter().held);
+                let now = self.capped.room().map_err(e)?;
+                if now > want {
+                    self.capped
+                        .take("the driver's other use", now - want)
+                        .map_err(e)?;
+                    g.0 = g.0.saturating_add(now - want);
+                } else {
+                    let back = (want - now).min(g.0);
+                    self.capped.give(back);
+                    g.0 = g.0.saturating_sub(back);
+                }
+            }
+            (Some(conn), _) => {
+                let held = Duck::one_on(conn, MEMORY_SQL)?;
+                conn.execute_batch(&format!("SET memory_limit = '{}B'", held.saturating_add(f)))?;
+            }
+            (None, None) => anyhow::bail!("no engine to set the room of"),
+        }
+        g.1 = f;
+        self.last.store(f, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// The bytes the process has held at most since the last [`rss_reset`]: Linux's `VmHWM`
+/// (proc(5)); None elsewhere.
+fn rss_peak() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib.saturating_mul(1024))
+}
+
+/// Resets Linux's `VmHWM` to the bytes resident now (proc(5), `clear_refs` value 5), so each
+/// step's peak is its own.
+fn rss_reset() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+}
+
+/// One step of the ladder (lane colcopy-8, AC-CB.4.5): `clients` clients at once, each its own
+/// connection and thread, started together, each running the scenario's statements from its
+/// own place in them, through the one driver for every engine. The scenario's room moves with
+/// the step's progress, one scenario statement for every `clients` statements finished; the
+/// tables don't grow here (concurrent writers would give each statement its own snapshot, with
+/// no one reference to compare it to), so every answer is checked against Amphora's row loop.
+fn ladder_step(
+    cx: &Context<'_>,
+    s: &Scenario,
+    engine: Engine,
+    need: u64,
+    clients: usize,
+) -> anyhow::Result<serde_json::Value> {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let reference = Amphora::open(None, None)?;
+    let capped = Arc::new(Capped::new(u64::MAX / 2));
+    let shared: Arc<dyn Source> = capped.clone();
+    let (amphora, duck) = match engine {
+        Engine::Amphora(rebuy) => (Some(Amphora::open(Some(shared), Some(rebuy))?), None),
+        Engine::Duck => (None, Some(Duck::open(cx.dir, cx.threads)?)),
+    };
+    for i in 0..s.tables {
+        reference.exec(&schema(i))?;
+        reference.exec(&fill(false, i, 1, s.rows))?;
+        if let Some(a) = &amphora {
+            a.exec(&schema(i))?;
+            a.exec(&fill(false, i, 1, s.rows))?;
+        }
+        if let Some(d) = &duck {
+            d.conn.execute_batch(&schema(i))?;
+            d.conn.execute_batch(&fill(true, i, 1, s.rows))?;
+        }
+    }
+    // Every statement's answer, from the row loop, before the step.
+    let mut answers: HashMap<String, Answer> = HashMap::new();
+    for k in 0..s.statements {
+        let q = s.query(k);
+        if !answers.contains_key(&q) {
+            let a = reference.rows(&q)?;
+            answers.insert(q, a);
+        }
+    }
+    let mut openers = Vec::with_capacity(clients);
+    for _ in 0..clients {
+        openers.push(match (&amphora, &duck) {
+            (Some(a), _) => Opener::Amphora(&a.db),
+            (_, Some(d)) => Opener::Duck(d.conn.try_clone()?),
+            _ => anyhow::bail!("no engine"),
+        });
+    }
+    let room = Room {
+        capped: capped.clone(),
+        other: std::sync::Mutex::new((0, u64::MAX)),
+        last: AtomicU64::new(u64::MAX),
+    };
+    let storage = amphora.as_ref().map(|a| a.storage.clone());
+    room.set(
+        duck.as_ref().map(|d| &d.conn),
+        storage.as_deref(),
+        s.free_at(0, need),
+    )?;
+    let done = AtomicUsize::new(0);
+    let gate = Gate {
+        open: std::sync::Mutex::new(None),
+        turned: std::sync::Condvar::new(),
+    };
+    rss_reset();
+    let mut began = None::<Instant>;
+    let taken = std::thread::scope(|sc| -> anyhow::Result<Vec<Taken>> {
+        let mut handles = Vec::with_capacity(clients);
+        for (c, opener) in openers.into_iter().enumerate() {
+            let (room, storage, done, gate, answers) =
+                (&room, storage.as_deref(), &done, &gate, &answers);
+            let spawned = std::thread::Builder::new()
+                .name(format!("colcopy-client-{c}"))
+                .spawn_scoped(sc, move || -> anyhow::Result<Taken> {
+                    let mut t = Taken {
+                        latencies: Vec::with_capacity(s.statements),
+                        ..Taken::default()
+                    };
+                    let opened = opener.open();
+                    if !gate.wait() {
+                        return Ok(t);
+                    }
+                    let client = opened?;
+                    let duck = match &client {
+                        Client::Duck(conn) => Some(conn),
+                        Client::Amphora(_) => None,
+                    };
+                    for j in 0..s.statements {
+                        let q = s.query((c + j) % s.statements.max(1));
+                        let clock = Instant::now();
+                        let got = client.rows(&q);
+                        let took = u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        let own = Instant::now();
+                        match got {
+                            Ok(got) => {
+                                t.latencies.push(took);
+                                t.statement_ns = t.statement_ns.saturating_add(took);
+                                if answers.get(&q) != Some(&got) {
+                                    t.unequal += 1;
+                                }
+                            }
+                            Err(err) => {
+                                t.refused += 1;
+                                t.refusal.get_or_insert_with(|| err.to_string());
+                            }
+                        }
+                        let d = done.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+                        room.set(duck, storage, s.free_at(d / clients.max(1), need))?;
+                        t.client_ns = t.client_ns.saturating_add(
+                            u64::try_from(own.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                    }
+                    Ok(t)
+                });
+            match spawned {
+                Ok(h) => handles.push(h),
+                Err(err) => {
+                    gate.set(false);
+                    return Err(anyhow::anyhow!("client {c} of {clients}: {err}"));
+                }
+            }
+        }
+        began = Some(Instant::now());
+        gate.set(true);
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(
+                h.join()
+                    .map_err(|_| anyhow::anyhow!("a client panicked"))??,
+            );
+        }
+        Ok(out)
+    })?;
+    let elapsed = began.map_or(0.0, |b| b.elapsed().as_secs_f64());
+    let rss = rss_peak();
+    let mut latencies = Vec::with_capacity(clients.saturating_mul(s.statements));
+    let (mut refused, mut refusal, mut unequal, mut client_ns, mut statement_ns) =
+        (0u64, None::<String>, 0u64, 0u64, 0u64);
+    for t in taken {
+        latencies.extend(t.latencies);
+        refused += t.refused;
+        unequal += t.unequal;
+        client_ns = client_ns.saturating_add(t.client_ns);
+        statement_ns = statement_ns.saturating_add(t.statement_ns);
+        if refusal.is_none() {
+            refusal = t.refusal;
+        }
+    }
+    latencies.sort_unstable();
+    let analytic = match (&amphora, &duck) {
+        (Some(a), _) => a.copies().1,
+        (_, Some(d)) => d.memory()?,
+        _ => 0,
+    };
+    if let Ok(g) = room.other.lock() {
+        capped.give(g.0);
+    }
+    let total = clients.saturating_mul(s.statements);
+    let (engine_name, policy) = match engine {
+        Engine::Amphora(Rebuy::Rent) => ("amphora", Some("A_rent")),
+        Engine::Amphora(Rebuy::Room) => ("amphora", Some("B_room")),
+        Engine::Duck => ("duckdb", None),
+    };
+    Ok(serde_json::json!({
+        "harness": "colcopy-ladder",
+        "engine": engine_name,
+        "policy": policy,
+        "scenario": s.name,
+        "forces": s.forces,
+        "tables": s.tables,
+        "rows": s.rows,
+        "grow": 0,
+        "clients": clients,
+        "connections": clients,
+        "client_threads": clients,
+        "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        "statements": total,
+        "need_bytes": need,
+        "free_bytes": s.free(need),
+        "p50_ns": at(&latencies, 0.5),
+        "p99_ns": at(&latencies, 0.99),
+        "p999_ns": at(&latencies, 0.999),
+        "statements_per_s": total as f64 / elapsed.max(f64::MIN_POSITIVE),
+        "analytic_bytes_end": analytic,
+        "rss_peak_bytes": rss,
+        "client_share": client_ns as f64 / (client_ns.saturating_add(statement_ns)).max(1) as f64,
+        "refused": refused,
+        "refusal": refusal,
+        "unequal": unequal,
+        "equal": unequal == 0,
+        "threads": match engine { Engine::Duck => cx.threads, Engine::Amphora(_) => 1 },
+        "client": cx.client,
+        "platform": cx.platform,
+    }))
+}
+
 fn host() -> String {
     ["/proc/sys/kernel/hostname", "/etc/hostname"]
         .iter()
@@ -466,6 +865,7 @@ pub fn main() -> anyhow::Result<()> {
         None::<std::path::PathBuf>,
     );
     let mut engines = vec!["rent".to_string(), "room".into(), "duckdb".into()];
+    let (mut ladder, mut clients) = (false, LADDER.to_vec());
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || {
@@ -479,6 +879,13 @@ pub fn main() -> anyhow::Result<()> {
             "--engines" => engines = v()?.split(',').map(str::to_owned).collect(),
             "--duckdb-threads" => threads = v()?.parse::<usize>()?.max(1),
             "--out" => out = Some(v()?.into()),
+            "--ladder" => ladder = true,
+            "--clients" => {
+                clients = v()?
+                    .split(',')
+                    .map(|n| n.parse::<usize>().map(|n| n.max(1)))
+                    .collect::<Result<_, _>>()?
+            }
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -514,6 +921,14 @@ pub fn main() -> anyhow::Result<()> {
     for s in scenarios(scale) {
         let need = need(s.rows)?;
         for &engine in &engines {
+            if ladder {
+                for &n in &clients {
+                    let line = ladder_step(&cx, &s, engine, need, n)?.to_string();
+                    println!("{line}");
+                    lines.push(line);
+                }
+                continue;
+            }
             let traces = Traces::default();
             let mut line = traces.during(|| run(&cx, &s, engine, need))?;
             if let (Engine::Amphora(_), Some(o)) = (engine, line.as_object_mut()) {

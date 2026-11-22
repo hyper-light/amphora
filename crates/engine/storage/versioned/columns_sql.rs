@@ -1355,9 +1355,14 @@ mod tests {
                 if s.grow > 0 {
                     let from = next.get(i).copied().unwrap_or(s.rows + 1);
                     let w = fill_sql(i, from, from + s.grow - 1);
-                    // A write the memory source refuses (the copies crowding out the rows) is
-                    // counted, and left out of the row loop's table too, so the answers still
-                    // compare.
+                    // The scenario's room is the copies' (lane colcopy-8): the other use gives its
+                    // bytes back while the rows grow, so the table's growth is never what the cap
+                    // refuses, and the press after it puts the copies back at their room. A copy
+                    // that must grow with its table then meets the cap first, as the scenario
+                    // says. A write still refused is counted, and left out of the row loop's
+                    // table too, so the answers still compare.
+                    room.give(other);
+                    other = 0;
                     match on.execute(&w) {
                         Ok(()) => {
                             off.execute(&w).unwrap();
@@ -1461,8 +1466,10 @@ mod tests {
         /// T-CB.4.1: every scenario once under each policy, the copies' trace events counted.
         /// Expect: every answer equal to the row loop's; in a steady room under one copy on more
         /// than one statement a table, each policy's failure mode shows (A buys again, B's copies
-        /// still wait at the end and never buy again); one record per policy and scenario
-        /// (written to `AMPHORA_AB_OUT` when given).
+        /// still wait at the end and never buy again); a growing table's writes never refused
+        /// (its copy meets the cap, not its rows); under waves copies a wave bought let go in a
+        /// round after it (T-CB.4.3); one record per policy and
+        /// scenario (written to `AMPHORA_AB_OUT` when given).
         #[test]
         fn cb4_ab_both_rebuy_policies_at_the_extremes() {
             let k = scale();
@@ -1487,6 +1494,16 @@ mod tests {
                                 assert!(line["waiting_end"].as_u64() > Some(0), "{line}");
                             }
                         }
+                    }
+                    // Lane colcopy-8: a growing table's rows have room, so its copy, not its
+                    // rows, meets the cap; under waves no copy is bought before the first wave
+                    // (the rent comes first) nor refused in it (room for every copy twice over),
+                    // so a copy let go is one a wave bought, refused in a round after it.
+                    if s.grow > 0 {
+                        assert_eq!(line["writes_refused"], 0, "{line}");
+                    }
+                    if matches!(s.press, Press::Waves) && s.statements >= 4 * s.tables {
+                        assert!(line["dropped"].as_u64() > Some(0), "{line}");
                     }
                     let line = line.to_string();
                     eprintln!("{line}");
