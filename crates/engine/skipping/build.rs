@@ -182,7 +182,6 @@ fn build_cracker(
             (conn, Some(ReadTx(pager)))
         }
     };
-    let pager = conn.get_pager();
     let Some((builder_pos, committed)) = conn.skipping_positions() else {
         return BuildEnd::Failed;
     };
@@ -197,7 +196,7 @@ fn build_cracker(
     {
         return BuildEnd::OlderSnapshot;
     }
-    let cracker = match cracker_of_table(Arc::clone(&pager), root, column, columns) {
+    let cracker = match cracker_of_table(&conn, root, column, columns) {
         Ok(cracker) => cracker,
         Err(error) => {
             tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not be built again");
