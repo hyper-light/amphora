@@ -522,6 +522,18 @@ pub fn base_due(
     took > objective_s
 }
 
+/// Whether a due base begins now (T-T1.12.I4): a base's own generation counts as changed for the
+/// next base, frames before it began included, so one begun just after the log started again
+/// leaves the next the least to copy. A due base waits for that restart, unless no base restores
+/// the log yet (`needed`: none, or the log broke since the latest), the log has just started again
+/// (`restarted`), or its generation already holds the frames a restart keeps (`frames`, `kept`;
+/// decision 31), past which the log starts again whether shipped or not: the wait is at most one
+/// generation.
+#[must_use]
+pub fn base_begins_now(needed: bool, restarted: bool, frames: u64, kept: u64) -> bool {
+    needed || restarted || frames >= kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,5 +796,27 @@ mod tests {
         assert!(base_due(Some(1000), false, 100, Some(100), None, 1800.0));
         assert!(!base_due(Some(1000), false, 99, Some(100), None, 1800.0));
         assert!(base_due(Some(1000), true, 0, Some(100), None, 1800.0));
+    }
+
+    /// T-T1.12.I4: a due base waits for the log to start again, unless no base restores the log
+    /// yet or the generation holds what a restart keeps.
+    #[test]
+    fn t_t1_12_i4_base_begins_after_a_restart() {
+        assert!(
+            base_begins_now(true, false, 5, 100),
+            "no base restores the log"
+        );
+        assert!(
+            base_begins_now(false, true, 5, 100),
+            "the log just started again"
+        );
+        assert!(
+            !base_begins_now(false, false, 5, 100),
+            "waits for the restart"
+        );
+        assert!(
+            base_begins_now(false, false, 100, 100),
+            "the generation is full"
+        );
     }
 }

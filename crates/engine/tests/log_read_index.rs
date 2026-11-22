@@ -255,6 +255,16 @@ fn run(path: &Path, crash: &Arc<Crash>) -> (Vec<Rows>, usize) {
             std::fs::copy(&from, &to).unwrap();
         }
     }
+    // The versioned storage's files, with its switch on (G7 step 2, `AC-NS.2.1`): its directory
+    // beside the database's.
+    let (from, to) = (versioned(path), versioned(&copy));
+    if from.is_dir() {
+        std::fs::create_dir_all(&to).unwrap();
+        for entry in std::fs::read_dir(&from).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
     std::mem::forget(conn);
     std::mem::forget(db);
     (states, steps)
@@ -268,6 +278,10 @@ fn put_model(rows: &mut Rows, ids: &[i64], version: u8) {
 
 fn wal(path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}-wal", path.display()))
+}
+
+fn versioned(path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}-versioned", path.display()))
 }
 
 /// Do (T-G3.2.2): for each lock-free way, crash at every write of a TRUNCATE checkpoint (which
