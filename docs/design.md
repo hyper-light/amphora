@@ -165,6 +165,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-15): the size cut from the B-tree's middle key | [reshard.md](design/reshard.md#decision-lane-split-merge-15-the-size-cut-from-the-b-trees-middle-key) |
 | reshard | – | Decision (lane split-merge-18): reads across groups by commit stamp | [reshard.md](design/reshard.md#decision-lane-split-merge-18-reads-across-groups-by-commit-stamp) |
 | reshard | – | Decision (lane split-merge-19): compaction trims the commit stamps | [reshard.md](design/reshard.md#decision-lane-split-merge-19-compaction-trims-the-commit-stamps) |
+| reshard | – | Decision (lane split-merge-19): the read point, A/B | [reshard.md](design/reshard.md#decision-lane-split-merge-19-the-read-point-ab) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |

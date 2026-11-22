@@ -108,6 +108,7 @@ pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
                 shared,
                 application: None,
                 cluster: None,
+                read_point: super::ReadPoint::Latest,
             })
         })?);
     }
@@ -147,6 +148,7 @@ pub(super) fn attach(
     Ok(Database {
         application: None,
         cluster: None,
+        read_point: super::ReadPoint::Latest,
         shared: Arc::new(Shared {
             transport: Mutex::new(None),
             path: OnceLock::new(),
@@ -334,6 +336,7 @@ impl Database {
                                 shared,
                                 application: None,
                                 cluster: None,
+                                read_point: super::ReadPoint::Latest,
                             }));
                         }
                         Err(
@@ -351,6 +354,7 @@ impl Database {
                             shared,
                             application: None,
                             cluster: None,
+                            read_point: super::ReadPoint::Latest,
                         }));
                     }
                     _ => {
@@ -572,6 +576,7 @@ impl Database {
                 shared,
                 application: None,
                 cluster: None,
+                read_point: super::ReadPoint::Latest,
             })
         })
     }

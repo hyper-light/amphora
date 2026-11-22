@@ -637,7 +637,8 @@ them come in the order written, in pages of one alike, a scan merges them by key
 after the head is stamped past it.
 
 **Left.**
-- One candidate is built. Its rival is the earliest of the groups' stamps, with no observe: no
+- One candidate is built (now both, behind a switch: decision "Decision (lane split-merge-19):
+  the read point, A/B"). Its rival is the earliest of the groups' stamps, with no observe: no
   group's clock is pushed forward, but the head trails by the widest skew between the groups'
   clocks, and a write a group with a clock ahead just answered is missing from a read begun after
   it. They want a switch and the lab's numbers (head latency p50/p99/p99.9, how far the head
@@ -682,3 +683,39 @@ far).
 
 **Falsified by.** A stamps table that grows with the commits under compaction; a kept row whose
 stamp is gone; a read of the changes after a trimmed stamp that is answered rather than refused.
+
+## Decision (lane split-merge-19): the read point, A/B
+
+Two ways to take a read's cut across groups are built, behind a switch (`ReadPoint`, chosen by
+`Database::across_at`; `Database::across` takes the control). Each takes a fresh stamp from every
+group, and each cut is closed: a group stamps all it makes from then on after its own fresh stamp,
+so after either cut, and a cursor at either head never passes a change.
+- `Latest`, the control: the latest of the stamps, which every group then observes. A read holds
+  every write answered before it began. Its cost is the push: a second lock of every group's
+  clock a read, and a group whose clock lags has its stamps held at the pushed clock (counted in
+  the marks' `held_back`) until its own clock passes.
+- `Earliest`, the rival: the earliest of the stamps, observed by none, so no clock is pushed. A
+  write answered by a group whose clock runs ahead of the slowest is missing from reads begun
+  after it, until the slowest clock passes its stamp: the head trails by the widest skew between
+  the groups' clocks, not by a quiet group (each group's fresh stamp is its clock's now).
+
+Neither is kept until the lab's numbers decide. The lab, `database::across::tests::lab_read_point_a_b`,
+forces each failure mode: many groups for the push, and one group whose clock lags the rest for
+the staleness. Each round writes a row in every group, then reads the changes from the last cursor;
+it prints the read's and the cut's latency (p50, p99, p99.9), the rows answered before the read
+that it missed, and how far its head trailed the newest stamp. The run of record (the
+coordinator's, on one machine for both candidates):
+
+    AMPHORA_AB_GROUPS=2,16,128 AMPHORA_AB_ROUNDS=2000 AMPHORA_AB_LAG_NS=1000000000 \
+      cargo test -p amphora --locked --release --lib -- --ignored --nocapture lab_read_point_a_b
+
+The lag is the scenario's input, not a tuning: it stands for a machine whose clock is a second
+behind, and the staleness the rival shows scales with it.
+
+**Evidence.** T-T1.9.R22: two groups, the second's clock 500 seconds behind; a row written in the
+first is missing from a read at the earliest point begun after it, whose head is behind the row,
+and held by one at the latest point; both points' heads are closed.
+
+**Falsified by.** A read at the latest point missing a write answered before it began; a change
+answered at or before a head either point answered; the lab showing the push's latency growing
+faster than the reads' own one call a group.

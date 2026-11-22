@@ -192,14 +192,38 @@ fn stamped(groups: &[Member]) -> Result<Vec<(Database, Arc<Hooks>)>, Refusal> {
         .collect()
 }
 
-/// The cut: the latest of a stamp taken from every group, observed by every group.
-fn cut(groups: &[(Database, Arc<Hooks>)]) -> Result<u64, Refusal> {
-    let mut cut = 0;
-    for (_, hooks) in groups {
-        cut = cut.max(hooks.marks.next().map_err(unavailable)?);
+/// Where a read across groups takes its cut (lane split-merge-19, T-T1.9.R22; reshard.md,
+/// "Decision (lane split-merge-19): the read point, A/B"). Each takes a fresh stamp from every
+/// group, and each cut is closed: every group stamps all it makes from then on after its own fresh
+/// stamp, so after the cut. They differ in what a read begun after a write holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReadPoint {
+    /// The latest of the stamps, which every group then observes, pushing its clock past it: a
+    /// read holds every write answered before it began. The control.
+    #[default]
+    Latest,
+    /// The earliest of the stamps, observed by none: no group's clock is pushed, but a write a
+    /// group whose clock runs ahead of the slowest one answered is missing from the reads begun
+    /// after it, until the slowest group's clock passes its stamp.
+    Earliest,
+}
+
+/// The cut, by `point`.
+fn cut(groups: &[(Database, Arc<Hooks>)], point: ReadPoint) -> Result<u64, Refusal> {
+    let mut stamps = groups.iter().map(|(_, hooks)| hooks.marks.next());
+    let cut = match point {
+        ReadPoint::Latest => stamps.try_fold(0, |cut, stamp| stamp.map(|s| cut.max(s))),
+        ReadPoint::Earliest => stamps
+            .try_fold(None, |cut: Option<u64>, stamp| {
+                stamp.map(|s| Some(cut.map_or(s, |c| c.min(s))))
+            })
+            .map(Option::unwrap_or_default),
     }
-    for (_, hooks) in groups {
-        hooks.marks.observe(cut).map_err(unavailable)?;
+    .map_err(unavailable)?;
+    if point == ReadPoint::Latest {
+        for (_, hooks) in groups {
+            hooks.marks.observe(cut).map_err(unavailable)?;
+        }
     }
     Ok(cut)
 }
@@ -248,9 +272,14 @@ fn stamp_of(db: &Db, ns: &str, at: Rev) -> anyhow::Result<Option<u64>> {
 
 /// The namespace's head across groups: the cut, a stamp every group has made all its revisions
 /// at or before by the time this answers.
-pub(super) fn head(groups: &[Member], _ns: &str, until: Instant) -> Result<Rev, Refusal> {
+pub(super) fn head(
+    groups: &[Member],
+    point: ReadPoint,
+    _ns: &str,
+    until: Instant,
+) -> Result<Rev, Refusal> {
     let groups = stamped(groups)?;
-    let cut = cut(&groups)?;
+    let cut = cut(&groups, point)?;
     // Each writer's commits that took their stamps before the cut end before this call runs.
     for (group, _) in &groups {
         group.call_internal(until, |_| Ok(()))?;
@@ -263,13 +292,14 @@ pub(super) fn head(groups: &[Member], _ns: &str, until: Instant) -> Result<Rev, 
 /// key. Each row's revision is its stamp (0 for one made before its group stamped its commits).
 pub(super) fn scan(
     groups: &[Member],
+    point: ReadPoint,
     ns: &str,
     family: &str,
     scan: &Scan,
     until: Instant,
 ) -> Result<Page, Refusal> {
     let groups = stamped(groups)?;
-    let cut = cut(&groups)?;
+    let cut = cut(&groups, point)?;
     let at = match scan.at {
         Consistency::Linearizable => cut,
         Consistency::Snapshot(asked) if asked > cut => {
@@ -414,6 +444,7 @@ fn whole(mut changes: Vec<Change>, limit: usize) -> Result<Vec<Change>, Refusal>
 /// than `limit` bounds the answer at its last stamp returned, so no group's later change is passed.
 pub(super) fn changes(
     groups: &[Member],
+    point: ReadPoint,
     ns: &str,
     family: &str,
     after: Rev,
@@ -421,7 +452,7 @@ pub(super) fn changes(
     until: Instant,
 ) -> Result<Changes, Refusal> {
     let groups = stamped(groups)?;
-    let cut = cut(&groups)?;
+    let cut = cut(&groups, point)?;
     if after >= cut {
         return Ok(Changes {
             changes: Vec::new(),
@@ -548,6 +579,201 @@ mod tests {
                 u64::try_from(versions.len()).unwrap() <= KEYS,
                 "{versions:?}"
             );
+        }
+    }
+
+    /// `groups` backed-up groups in `dir`, each read by `clock(group)`, under one coordinator
+    /// routing a row by its key's first byte.
+    fn groups_on(
+        dir: &std::path::Path,
+        groups: u64,
+        clock: impl Fn(u64) -> crate::backup::Clock,
+    ) -> (Vec<Database>, Vec<crate::backup::Shipping>, Arc<Cluster>) {
+        let blobs = Arc::new(FolderBlobs::open(&dir.join("archive"), 64 * 1024).unwrap());
+        let (mut dbs, mut sinks) = (Vec::new(), Vec::new());
+        for group in 0..groups {
+            let archive = Archive {
+                blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+                prefix: format!("g{group}"),
+                clock: clock(group),
+                memory: 32 * 1024,
+                patience: Duration::from_secs(60),
+                check: CheckPolicy::Off,
+            };
+            let (db, sink) =
+                Database::open_backed_up(&dir.join(format!("g{group}.db")), archive, until())
+                    .unwrap();
+            dbs.push(db);
+            sinks.push(sink);
+        }
+        let route: crate::xgroup::Route =
+            Arc::new(|key: &[u8]| u32::from(key.first().copied().unwrap_or(0)));
+        let cluster =
+            Arc::new(Cluster::open(dbs.clone(), route, 5, Protocol::TwoPhase, 1, until()).unwrap());
+        (dbs, sinks, cluster)
+    }
+
+    /// One row `key` written into `group`'s own Records, as a single-group commit.
+    fn put(group: &Database, key: Vec<u8>) {
+        group
+            .namespace("n")
+            .unwrap()
+            .commit(
+                api::Tx {
+                    conds: vec![],
+                    writes: vec![api::Write::Put {
+                        family: "f".into(),
+                        key,
+                        value: vec![1],
+                    }],
+                },
+                until(),
+            )
+            .unwrap();
+    }
+
+    /// T-T1.9.R22 (CP-T1.9; reshard.md, "Decision (lane split-merge-19): the read point, A/B").
+    /// Do: two backed-up groups, the second's clock 500 seconds behind the first's; a row written
+    /// in the first; the changes across them read at the earliest point, then at the latest; then
+    /// a row written in each group, and read again from each read's head. Expect: the earliest
+    /// misses the row (the slow group's stamp is the cut, 500 seconds before the row's) and its
+    /// head is behind the row's stamp; the latest holds it; after its head, the latest point finds
+    /// both later rows (its cut is closed); the earliest never answers a change at or before a
+    /// head it answered, nor a head behind one.
+    #[test]
+    fn t_t1_9_r22_the_read_points_a_write_answered_before_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        let (dbs, _sinks, cluster) = groups_on(dir.path(), 2, |group| {
+            let read = Arc::clone(&now);
+            let behind = group * 500 * SECOND_NS;
+            Arc::new(move || read.fetch_add(1, Ordering::SeqCst) - behind)
+        });
+        let latest = dbs[0]
+            .across_at(Arc::clone(&cluster), ReadPoint::Latest)
+            .namespace("n")
+            .unwrap();
+        let earliest = dbs[0]
+            .across_at(Arc::clone(&cluster), ReadPoint::Earliest)
+            .namespace("n")
+            .unwrap();
+        put(&dbs[0], vec![0, b'a']);
+
+        // The earliest point first: the latest's read pushes the slow group's clock past the row.
+        let stale = earliest.changes("f", 0, 100, until()).unwrap();
+        assert!(stale.changes.is_empty(), "{stale:?}");
+        let held = latest.changes("f", 0, 100, until()).unwrap();
+        assert_eq!(held.changes.len(), 1, "{held:?}");
+        assert!(stale.head < held.changes[0].rev, "{stale:?} {held:?}");
+
+        put(&dbs[0], vec![0, b'b']);
+        put(&dbs[1], vec![1, b'b']);
+        let after = latest.changes("f", held.head, 100, until()).unwrap();
+        assert_eq!(after.changes.len(), 2, "{after:?}");
+        let again = earliest.changes("f", stale.head, 100, until()).unwrap();
+        assert!(
+            again.changes.iter().all(|c| c.rev > stale.head),
+            "{again:?}"
+        );
+        assert!(again.head >= stale.head, "{again:?} {stale:?}");
+    }
+
+    /// The A/B lab of the read point (T-T1.9.R22; reshard.md, "Decision (lane split-merge-19):
+    /// the read point, A/B"), each candidate's failure mode forced: many groups, for the latest
+    /// point's clock push, and one group whose clock lags the rest by `AMPHORA_AB_LAG_NS`, for the
+    /// earliest point's staleness. Every group's clock is the machine's, the lagging one's behind
+    /// by the lag. Each round writes a row in every group, then reads the changes across them
+    /// from the last cursor, timed, as the cut alone is. It prints, a line a candidate and count
+    /// of groups: the read's and the cut's latency p50, p99 and p99.9, and the staleness: the rows
+    /// answered before the read began that it missed, at the median and worst, and how far the cut
+    /// trailed the newest stamp. No assertion on time: this measures; the run of record is the
+    /// coordinator's (the command is in the decision record).
+    #[test]
+    #[ignore = "lab: AMPHORA_AB_GROUPS, AMPHORA_AB_ROUNDS, AMPHORA_AB_LAG_NS"]
+    fn lab_read_point_a_b() {
+        let env = |name: &str| std::env::var(name).ok();
+        let counts: Vec<u64> = env("AMPHORA_AB_GROUPS")
+            .unwrap_or_else(|| "2,16,128".into())
+            .split(',')
+            .map(|n| n.trim().parse().unwrap())
+            .collect();
+        let rounds: usize = env("AMPHORA_AB_ROUNDS").map_or(200, |n| n.parse().unwrap());
+        let lag: u64 = env("AMPHORA_AB_LAG_NS").map_or(SECOND_NS, |n| n.parse().unwrap());
+        let wall = || {
+            u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            )
+            .unwrap()
+        };
+        // The per-mille'th smallest: the nearest-rank percentile.
+        let pct = |sorted: &[u128], per_mille: usize| -> u128 {
+            let at = (sorted.len() * per_mille).div_ceil(1000);
+            sorted[at.clamp(1, sorted.len()) - 1]
+        };
+        println!(
+            "point groups rounds lag_ns | read_us p50 p99 p99.9 | cut_us p50 p99 p99.9 | missed p50 max | trail_ns p50 max"
+        );
+        for &groups in &counts {
+            for point in [ReadPoint::Latest, ReadPoint::Earliest] {
+                let dir = tempfile::tempdir().unwrap();
+                let (dbs, _sinks, cluster) = groups_on(dir.path(), groups, |group| {
+                    let behind = if group == 0 { lag } else { 0 };
+                    Arc::new(move || wall() - behind)
+                });
+                let across = dbs[0]
+                    .across_at(Arc::clone(&cluster), point)
+                    .namespace("n")
+                    .unwrap();
+                let hooks = stamped(cluster.groups()).unwrap();
+                let (mut reads, mut cuts, mut missed, mut trail) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let (mut cursor, mut written, mut seen) = (0, 0usize, 0usize);
+                for round in 0..rounds {
+                    for (g, db) in dbs.iter().enumerate() {
+                        let mut key = vec![u8::try_from(g).unwrap()];
+                        key.extend_from_slice(&round.to_be_bytes());
+                        put(db, key);
+                        written += 1;
+                    }
+                    let newest = hooks
+                        .iter()
+                        .map(|(_, h)| h.marks.latest().unwrap())
+                        .max()
+                        .unwrap_or(0);
+                    let began = Instant::now();
+                    let page = across.changes("f", cursor, api::TX_MAX, until()).unwrap();
+                    reads.push(began.elapsed().as_micros());
+                    seen += page.changes.len();
+                    missed.push(written - seen);
+                    trail.push(newest.saturating_sub(page.head));
+                    if let Some(last) = page.changes.last() {
+                        cursor = last.rev;
+                    }
+                    let began = Instant::now();
+                    cut(&hooks, point).unwrap();
+                    cuts.push(began.elapsed().as_micros());
+                }
+                reads.sort_unstable();
+                cuts.sort_unstable();
+                missed.sort_unstable();
+                trail.sort_unstable();
+                println!(
+                    "{point:?} {groups} {rounds} {lag} | {} {} {} | {} {} {} | {} {} | {} {}",
+                    pct(&reads, 500),
+                    pct(&reads, 990),
+                    pct(&reads, 999),
+                    pct(&cuts, 500),
+                    pct(&cuts, 990),
+                    pct(&cuts, 999),
+                    missed[missed.len() / 2],
+                    missed.last().unwrap(),
+                    trail[trail.len() / 2],
+                    trail.last().unwrap(),
+                );
+            }
         }
     }
 

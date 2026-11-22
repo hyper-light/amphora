@@ -51,6 +51,7 @@ mod restore;
 pub(crate) mod session;
 mod slot;
 mod watch;
+pub use across::ReadPoint;
 pub use guards::Guards;
 pub(crate) use guards::Owned;
 pub use online::SchemaChange;
@@ -97,6 +98,8 @@ pub struct Database {
     /// agreed with lane xgroup-sql-6): with one, a namespace's scans, changes and head are read
     /// across every group, in the order of their commit stamps ([`Database::across`]).
     cluster: Option<Arc<crate::xgroup::sql::Cluster>>,
+    /// Where a read across `cluster`'s groups takes its cut (lane split-merge-19, T-T1.9.R22).
+    read_point: ReadPoint,
 }
 
 struct Shared {
@@ -777,6 +780,7 @@ impl Database {
                                     shared,
                                     application: None,
                                     cluster: None,
+                                    read_point: ReadPoint::Latest,
                                 });
                             }
                             // Identity probes cannot submit application work. Only a successful
@@ -811,12 +815,14 @@ impl Database {
                             shared,
                             application: None,
                             cluster: None,
+                            read_point: ReadPoint::Latest,
                         });
                     } else {
                         return Ok(Self {
                             shared,
                             application: None,
                             cluster: None,
+                            read_point: ReadPoint::Latest,
                         });
                     }
                 }
@@ -1048,6 +1054,7 @@ impl Database {
                 Ok(Self {
                     application: None,
                     cluster: None,
+                    read_point: ReadPoint::Latest,
                     shared: Arc::new(Shared {
                         transport: Mutex::new(None),
                         path: OnceLock::new(),
@@ -1124,6 +1131,7 @@ impl Database {
         let database = Self {
             application: None,
             cluster: None,
+            read_point: ReadPoint::Latest,
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
@@ -1151,8 +1159,17 @@ impl Database {
     /// handles are the ones the cluster was opened over, without it.
     #[must_use]
     pub fn across(&self, cluster: Arc<crate::xgroup::sql::Cluster>) -> Self {
+        self.across_at(cluster, ReadPoint::Latest)
+    }
+
+    /// [`Database::across`], each read's cut taken at `point` (lane split-merge-19, T-T1.9.R22):
+    /// the A/B of decision "Decision (lane split-merge-19): the read point, A/B", until the lab's
+    /// numbers keep one.
+    #[must_use]
+    pub fn across_at(&self, cluster: Arc<crate::xgroup::sql::Cluster>, point: ReadPoint) -> Self {
         Self {
             cluster: Some(cluster),
+            read_point: point,
             ..self.clone()
         }
     }
@@ -1742,7 +1759,14 @@ impl Records for Namespace {
             api::key(k)?;
         }
         if let Some(cluster) = &self.database.cluster {
-            return across::scan(cluster.groups(), &self.name, family, &scan, until);
+            return across::scan(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                family,
+                &scan,
+                until,
+            );
         }
         match self
             .database
@@ -1776,7 +1800,15 @@ impl Records for Namespace {
         api::family(family)?;
         let limit = api::limit(limit)?;
         if let Some(cluster) = &self.database.cluster {
-            return across::changes(cluster.groups(), &self.name, family, after, limit, until);
+            return across::changes(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                family,
+                after,
+                limit,
+                until,
+            );
         }
         match self.database.submit(
             &self.name,
@@ -1793,7 +1825,12 @@ impl Records for Namespace {
     }
     fn head(&self, until: Instant) -> Result<Rev, Refusal> {
         if let Some(cluster) = &self.database.cluster {
-            return across::head(cluster.groups(), &self.name, until);
+            return across::head(
+                cluster.groups(),
+                self.database.read_point,
+                &self.name,
+                until,
+            );
         }
         match self.database.submit(&self.name, Operation::Head, until)? {
             Answer::Rev(v) => Ok(v),

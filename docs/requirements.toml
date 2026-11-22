@@ -835,6 +835,7 @@ tests = [
   { id = "T-T1.9.R20", text = "Two backed-up groups, the second's clock 500 seconds behind the first's, rows written in turn through their coordinator, then read across groups — passes when the changes come in the order written, in pages of one alike, after a row's stamp the rows after it, the head at or past the last, a scan merged by key with more until its last page, a row written after the head stamped past it, and a group that stamps nothing refused" },
   # lane split-merge-19
   { id = "T-T1.9.R21", text = "One backed-up database, 600 commits each overwriting the next of 8 keys, compacted to the head after every 50 — passes when after each compaction every revision with a kept version is still stamped and the stamps number at most the kept revisions plus one" },
+  { id = "T-T1.9.R22", text = "Two backed-up groups, the second's clock 500 seconds behind the first's, a row written in the first, then the changes read at the earliest read point and at the latest — passes when the earliest misses the row with its head behind it, the latest holds it, and after each head the later rows are found and no change at or before it" },
 ]
 
 # lane qs5
