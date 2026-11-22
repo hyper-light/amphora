@@ -20,7 +20,9 @@
 #   bench/power_nemesis.sh merge DIR CLASS TOTAL
 #       every DIR/CLASS-*.json together: exit 1 unless they cover seeds 0..TOTAL exactly once, on
 #       one commit, with no failed seed, some write acknowledged and some cut of a leader holding
-#       a write unflushed. Writes DIR/CLASS.json, the sums and every failing seed.
+#       a write unflushed; the replicated class with some write acknowledged while a majority's
+#       raft logs held it unflushed, the persisted class with none. Writes DIR/CLASS.json, the
+#       sums and every failing seed.
 set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$HERE/.." && pwd)"
@@ -52,8 +54,9 @@ with open(path, encoding="utf-8") as f:
 r.update(host=host, commit=commit)
 with open(path, "w", encoding="utf-8", newline="\n") as f:
     f.write(json.dumps(r) + "\n")
-print(f"{r['class']} seeds {r['from']}..{r['from'] + r['count']}: {r['acknowledged']} acknowledged, {r['cuts']} cuts, "
-      f"{r['unflushed_leader']} of a leader holding a write unflushed, {len(r['failed'])} failed")
+print(f"{r['class']} seeds {r['from']}..{r['from'] + r['count']}: {r['acknowledged']} acknowledged ({r['acknowledged_held']} with a "
+      f"majority's raft logs held), {r['cuts']} cuts, {r['unflushed_leader']} of a leader holding a write unflushed in its "
+      f"database and {r['unflushed_log_leader']} in its raft log, {len(r['failed'])} failed")
 PY
     exit "$status"
     ;;
@@ -101,19 +104,26 @@ commits = sorted({s.get("commit", "") for s in shards})
 if len(commits) > 1:
     problems.append(f"shards on {len(commits)} commits: {commits}")
 failed = sorted((f for s in shards for f in s["failed"]), key=lambda f: f["seed"])
-sums = {k: sum(s[k] for s in shards) for k in ("acknowledged", "cuts", "unflushed_leader")}
+sums = {k: sum(s.get(k, 0) for s in shards) for k in ("acknowledged", "acknowledged_held", "cuts", "unflushed_leader", "unflushed_log_leader")}
 if failed:
     problems.append(f"{len(failed)} seeds failed, the first {failed[0]['seed']}")
 if sums["acknowledged"] == 0 or sums["cuts"] == 0:
     problems.append("nothing was acknowledged or cut")
 if sums["unflushed_leader"] == 0:
     problems.append("no cut hit a leader holding a write unflushed")
+# The classes part at the raft log: the replicated class answers some write no majority's log held
+# durable, the persisted class none (replication.md, "Fast acknowledgement").
+if cls == "replicated" and sums["acknowledged_held"] == 0:
+    problems.append("the replicated class acknowledged no write while a majority's raft logs held it unflushed")
+if cls == "persisted" and sums["acknowledged_held"] != 0:
+    problems.append(f"the persisted class acknowledged {sums['acknowledged_held']} writes while a majority's raft logs held them unflushed")
 merged = {"class": cls, "seeds": total, "shards": len(shards), "commits": commits,
           "hosts": sorted({s.get("host", "") for s in shards}), **sums, "failed": failed, "problems": problems}
 with open(os.path.join(d, f"{cls}.json"), "w", encoding="utf-8", newline="\n") as f:
     f.write(json.dumps(merged, indent=1) + "\n")
-print(f"{cls}: {total} seeds in {len(shards)} shards, {sums['acknowledged']} acknowledged, {sums['cuts']} cuts, "
-      f"{sums['unflushed_leader']} of a leader holding a write unflushed, {len(failed)} failed")
+print(f"{cls}: {total} seeds in {len(shards)} shards, {sums['acknowledged']} acknowledged ({sums['acknowledged_held']} with a majority's "
+      f"raft logs held), {sums['cuts']} cuts, {sums['unflushed_leader']} of a leader holding a write unflushed in its database and "
+      f"{sums['unflushed_log_leader']} in its raft log, {len(failed)} failed")
 for p in problems:
     print(f"  {p}", file=sys.stderr)
 sys.exit(1 if problems else 0)

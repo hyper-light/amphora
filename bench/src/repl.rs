@@ -19,7 +19,8 @@
 //!
 //! Amphora's three members run in this process, relayed by the host's part as `cluster.rs` does; a
 //! killed member is cut off from the relay, which its peers can't tell from kill -9 (nothing more
-//! comes from it, nothing reaches it). The competitors run as containers through their scripts,
+//! comes from it, nothing reaches it). `amphora-procs` runs each member as its own process, on the
+//! machines bench/repl_members.sh is given, over TCP (`procs`), a kill the same cut. The competitors run as containers through their scripts,
 //! `bench/servers/repl/<system>.sh up|down|kill N|start N|leader|endpoint N` (a kill is
 //! `docker kill`, SIGKILL). A system without a measure's concept, or one whose cluster can't be
 //! brought up here, is refused, typed, and the refusal is recorded beside the measures.
@@ -31,7 +32,9 @@
 //!        catchup:  --behind N --poll-us N
 //!        amphora:  --dir DIR --class persisted|replicated [--spanning N] --relay-records N (records the relay
 //!                  moves from a member at a time)
+//!        amphora-procs: --members A1,A2,A3 (each member's address; [--class C] names the record)
 //!        others:   [--scripts DIR (bench/servers/repl)] [--shell PROGRAM (bash)]
+//!        a member: amphora-bench --repl-member ... (`procs`)
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -129,6 +132,7 @@ struct Opts {
     class: Option<String>,
     spanning: Option<u32>,
     relay_records: Option<usize>,
+    members: Option<Vec<String>>,
     scripts: PathBuf,
     shell: String,
 }
@@ -158,6 +162,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
         class: None,
         spanning: None,
         relay_records: None,
+        members: None,
         scripts: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/servers/repl")),
         shell: "bash".into(),
     };
@@ -183,6 +188,7 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--class" => o.class = Some(v()?),
             "--spanning" => o.spanning = Some(v()?.parse()?),
             "--relay-records" => o.relay_records = Some(v()?.parse()?),
+            "--members" => o.members = Some(v()?.split(',').map(str::to_owned).collect()),
             "--scripts" => o.scripts = PathBuf::from(v()?),
             "--shell" => o.shell = v()?,
             other => anyhow::bail!("unknown argument {other}"),
@@ -211,6 +217,9 @@ fn parse(args: &[String]) -> anyhow::Result<Opts> {
             need(o.poll, "--poll-us", &m)?;
         }
         other => anyhow::bail!("unknown measure {other} (commit, failover, catchup)"),
+    }
+    if o.system == "amphora-procs" {
+        anyhow::ensure!(need(o.members.as_ref(), "--members", &m)?.len() == NODES, "--members names {NODES} members");
     }
     if o.system == "amphora" {
         need(o.dir.as_ref(), "--dir", &m)?;
@@ -496,16 +505,20 @@ fn catchup(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
 fn open(o: &Opts) -> anyhow::Result<Box<dyn Cluster>> {
     Ok(match o.system.as_str() {
         "amphora" => Box::new(inproc::Amphora::open(o)?),
+        "amphora-procs" => Box::new(procs::Procs::open(o)?),
         "rqlite" | "dqlite" | "litefs" | "libsql" => Box::new(http::Http::up(&o.system, &o.scripts, &o.shell, o.deadline)?),
-        other => anyhow::bail!("unknown system {other} (amphora, rqlite, dqlite, litefs, libsql)"),
+        other => anyhow::bail!("unknown system {other} (amphora, amphora-procs, rqlite, dqlite, litefs, libsql)"),
     })
 }
+
+pub use procs::member_main;
 
 pub fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let o = parse(&args)?;
     let label = match (&o.system[..], &o.class) {
         ("amphora", Some(class)) => format!("amphora-{class}"),
+        ("amphora-procs", Some(class)) => format!("amphora-procs-{class}"),
         (s, _) => s.to_owned(),
     };
     let ran = open(&o).and_then(|c| {
@@ -871,6 +884,398 @@ mod http {
                 "dqlite" => Some("dqlite serves every read through its leader: a member's own copy can't be read, so its catch-up can't be seen".into()),
                 _ => None,
             }
+        }
+    }
+}
+
+/// Amphora's three members each its own process, on machines given as arguments (CP-T1.8; the LAN
+/// p99 that `inproc` can't give). `--repl-member` runs one member: its replica's records go to its
+/// peers over TCP and theirs come in the same way, and it answers the bench's writes, reads and
+/// leader questions on the same port. `--system amphora-procs --members A,B,C` drives three such
+/// members as `inproc` drives its three: a kill is the member's cut (every record in or out of it
+/// dropped, which its peers can't tell from kill -9), a start its end. bench/repl_members.sh starts
+/// the members, here or by ssh, and runs the measures.
+///
+/// A connection's first byte says what it carries: `R`, then the sender's node ID (u64, little
+/// endian), then records, each its length (u32, little endian) and its bytes; or `C`, then
+/// requests, one JSON object a line, each answered by one JSON line.
+///
+/// usage: amphora-bench --repl-member --node N --peers A1,A2,A3 --dir DIR --class persisted|replicated
+///        [--spanning N] --relay-records N --deadline-s N
+///        (--peers: every member's address, as its peers reach it, this one's the Nth: it listens there)
+mod procs {
+    use super::*;
+    use amphora::database::Database;
+    use amphora_api::replication::{Durability, Fates, ReplicaConfig};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+    use std::sync::mpsc;
+
+    const RECORDS: u8 = b'R';
+    const CLIENT: u8 = b'C';
+
+    struct MemberOpts {
+        node: u64,
+        peers: Vec<String>,
+        dir: PathBuf,
+        durability: Durability,
+        relay_records: usize,
+        deadline: Duration,
+    }
+
+    fn member_opts(args: &[String]) -> anyhow::Result<MemberOpts> {
+        let (mut node, mut peers, mut dir, mut class, mut spanning, mut relay_records, mut deadline) = (None, None, None, None, None, None, None);
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let mut v = || it.next().cloned().ok_or_else(|| anyhow::anyhow!("{a} takes a value"));
+            match a.as_str() {
+                "--repl-member" => {}
+                "--node" => node = Some(v()?.parse::<u64>()?),
+                "--peers" => peers = Some(v()?.split(',').map(str::to_owned).collect::<Vec<_>>()),
+                "--dir" => dir = Some(PathBuf::from(v()?)),
+                "--class" => class = Some(v()?),
+                "--spanning" => spanning = Some(v()?.parse::<u32>()?),
+                "--relay-records" => relay_records = Some(v()?.parse::<usize>()?),
+                "--deadline-s" => deadline = Some(Duration::try_from_secs_f64(v()?.parse::<f64>()?)?),
+                other => anyhow::bail!("unknown argument {other}"),
+            }
+        }
+        let m = "--repl-member";
+        let peers = need(peers, "--peers", m)?;
+        anyhow::ensure!(peers.len() == NODES, "--peers names {NODES} members, not {}", peers.len());
+        let node = need(node, "--node", m)?;
+        anyhow::ensure!((1..=NODES as u64).contains(&node), "--node takes 1 to {NODES}");
+        let ids: Vec<u64> = (1..=NODES as u64).collect();
+        let durability = match need(class, "--class", m)?.as_str() {
+            // Each member its own fate, as `inproc`'s: three members on three fates.
+            "replicated" => Durability::Replicated(Fates { of: ids.iter().map(|&i| (i, i)).collect(), spanning: need(spanning, "--spanning", m)? }),
+            "persisted" => Durability::Persisted,
+            other => anyhow::bail!("unknown class {other} (persisted, replicated)"),
+        };
+        let relay_records = need(relay_records, "--relay-records", m)?;
+        anyhow::ensure!(relay_records > 0, "--relay-records takes at least 1");
+        Ok(MemberOpts { node, peers, dir: need(dir, "--dir", m)?, durability, relay_records, deadline: need(deadline, "--deadline-s", m)? })
+    }
+
+    fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
+        addr.to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("{addr} names no address"))
+    }
+
+    fn arg_of(v: &serde_json::Value) -> anyhow::Result<amphora_api::Value> {
+        Ok(match v {
+            serde_json::Value::String(s) => amphora_api::Value::Text(s.clone()),
+            serde_json::Value::Number(n) => amphora_api::Value::Integer(n.as_i64().ok_or_else(|| anyhow::anyhow!("{n} isn't an integer"))?),
+            serde_json::Value::Null => amphora_api::Value::Null,
+            other => anyhow::bail!("{other} isn't an argument"),
+        })
+    }
+
+    /// `[[sql, arg, ...], ...]` (rqlite's body, as `http::rqlite_body` writes it) as statements.
+    fn stmts_of(v: Option<&serde_json::Value>) -> anyhow::Result<Vec<(String, Vec<amphora_api::Value>)>> {
+        let list = v.and_then(|v| v.as_array()).ok_or_else(|| anyhow::anyhow!("no stmts"))?;
+        list.iter()
+            .map(|s| {
+                let parts = s.as_array().ok_or_else(|| anyhow::anyhow!("a statement isn't an array"))?;
+                let (sql, args) = parts.split_first().ok_or_else(|| anyhow::anyhow!("an empty statement"))?;
+                let sql = sql.as_str().ok_or_else(|| anyhow::anyhow!("a statement's SQL isn't text"))?.to_owned();
+                Ok((sql, args.iter().map(arg_of).collect::<anyhow::Result<Vec<_>>>()?))
+            })
+            .collect()
+    }
+
+    struct Member {
+        db: Database,
+        cut: AtomicBool,
+        deadline: Duration,
+        stop: Mutex<mpsc::Sender<()>>,
+    }
+
+    impl Member {
+        fn answer(&self, line: &str) -> serde_json::Value {
+            match self.request(line) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+            }
+        }
+
+        fn request(&self, line: &str) -> anyhow::Result<serde_json::Value> {
+            let r: serde_json::Value = serde_json::from_str(line)?;
+            let until = Instant::now() + self.deadline;
+            match r.get("op").and_then(|o| o.as_str()) {
+                Some("exec") => {
+                    anyhow::ensure!(!self.cut.load(Ordering::Relaxed), "this member is cut");
+                    let stmts = stmts_of(r.get("stmts"))?;
+                    self.db
+                        .call(until, move |c| {
+                            for (sql, args) in stmts {
+                                if args.is_empty() {
+                                    c.execute_batch(&sql)?;
+                                } else {
+                                    c.prepare_cached(&sql)?.execute(args)?;
+                                }
+                            }
+                            Ok(())
+                        })
+                        .map_err(|e| anyhow::anyhow!("refused a write: {e:?}"))?;
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+                Some("count") => {
+                    let mut stmts = stmts_of(r.get("stmts"))?;
+                    anyhow::ensure!(stmts.len() == 1, "count takes one statement");
+                    let (sql, args) = stmts.pop().ok_or_else(|| anyhow::anyhow!("no statement"))?;
+                    let n = self
+                        .db
+                        .query_local(until, move |c| {
+                            let mut s = c.prepare_cached(&sql)?;
+                            let mut rows = s.query_map(args, |r| r.get::<_, i64>(0usize))?;
+                            Ok(rows.next().transpose()?.unwrap_or(0))
+                        })
+                        .map_err(|e| anyhow::anyhow!("refused a read: {e:?}"))?;
+                    Ok(serde_json::json!({ "count": n }))
+                }
+                Some("leader") => {
+                    let status = self.db.replica().ok_or_else(|| anyhow::anyhow!("no replica"))?.status().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    Ok(serde_json::json!({ "leader": status.leader }))
+                }
+                Some("cut") => {
+                    self.cut.store(r.get("to").and_then(|t| t.as_bool()).ok_or_else(|| anyhow::anyhow!("cut takes to"))?, Ordering::Relaxed);
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+                Some("stop") => {
+                    let _ = self.stop.lock().map_err(|_| anyhow::anyhow!("poisoned"))?.send(());
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+                other => anyhow::bail!("unknown op {other:?}"),
+            }
+        }
+    }
+
+    /// One connection, as its first byte says.
+    fn serve(member: &Member, s: TcpStream) -> anyhow::Result<()> {
+        s.set_nodelay(true)?;
+        let mut r = BufReader::new(s.try_clone()?);
+        let mut kind = [0u8; 1];
+        r.read_exact(&mut kind)?;
+        match kind {
+            [RECORDS] => {
+                let mut from = [0u8; 8];
+                r.read_exact(&mut from)?;
+                let from = u64::from_le_bytes(from);
+                let handle = member.db.replica().ok_or_else(|| anyhow::anyhow!("no replica"))?;
+                loop {
+                    let mut len = [0u8; 4];
+                    r.read_exact(&mut len)?;
+                    let mut bytes = vec![0u8; usize::try_from(u32::from_le_bytes(len))?];
+                    r.read_exact(&mut bytes)?;
+                    if !member.cut.load(Ordering::Relaxed) {
+                        let _ = handle.receive(from, bytes, Instant::now() + member.deadline);
+                    }
+                }
+            }
+            [CLIENT] => {
+                let mut w = s;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if r.read_line(&mut line)? == 0 {
+                        return Ok(());
+                    }
+                    let mut out = member.answer(line.trim()).to_string();
+                    out.push('\n');
+                    w.write_all(out.as_bytes())?;
+                }
+            }
+            _ => anyhow::bail!("a connection opened with {kind:?}"),
+        }
+    }
+
+    /// A peer's records, in the order the member sent them, over one connection opened when the
+    /// first comes and again after a failure: a record that can't be written is lost, as a
+    /// network loses it, and Raft sends again what it needs.
+    fn to_peer(node: u64, addr: &str, records: &mpsc::Receiver<Vec<u8>>, deadline: Duration) {
+        let mut conn: Option<TcpStream> = None;
+        for bytes in records {
+            if conn.is_none() {
+                conn = (|| -> anyhow::Result<TcpStream> {
+                    let mut s = TcpStream::connect_timeout(&resolve(addr)?, deadline)?;
+                    s.set_nodelay(true)?;
+                    s.write_all(&[RECORDS])?;
+                    s.write_all(&node.to_le_bytes())?;
+                    Ok(s)
+                })()
+                .ok();
+            }
+            let Some(s) = conn.as_mut() else { continue };
+            let Ok(len) = u32::try_from(bytes.len()) else { continue };
+            if s.write_all(&len.to_le_bytes()).and_then(|()| s.write_all(&bytes)).is_err() {
+                conn = None;
+            }
+        }
+    }
+
+    pub fn member_main() -> anyhow::Result<()> {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let m = member_opts(&args)?;
+        let at = usize::try_from(m.node)? - 1;
+        let listen = m.peers.get(at).ok_or_else(|| anyhow::anyhow!("no peer {}", m.node))?.clone();
+        let _ = std::fs::remove_dir_all(&m.dir);
+        std::fs::create_dir_all(&m.dir)?;
+        let ids: Vec<u64> = (1..=NODES as u64).collect();
+        let config = ReplicaConfig { node_id: m.node, voters: ids, learners: Vec::new(), bootstrap: None };
+        let db = Database::open_replicated_with(&m.dir.join(format!("state-{}.db", m.node)), &m.dir.join(format!("raft-{}.log", m.node)), config, m.durability.clone(), Instant::now() + m.deadline)
+            .map_err(|e| anyhow::anyhow!("member {}: {e:?}", m.node))?;
+        let handle = db.replica().ok_or_else(|| anyhow::anyhow!("member {} has no replica handle", m.node))?;
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let member = Arc::new(Member { db, cut: AtomicBool::new(false), deadline: m.deadline, stop: Mutex::new(stop_tx) });
+        let listener = TcpListener::bind(resolve(&listen)?)?;
+        // Each peer's records wait at most --relay-records deep; past that they're lost, as a
+        // congested link's are.
+        let mut peers = Vec::new();
+        for (i, addr) in m.peers.iter().enumerate() {
+            if i == at {
+                peers.push(None);
+                continue;
+            }
+            let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(m.relay_records);
+            let (addr, node, deadline) = (addr.clone(), m.node, m.deadline);
+            std::thread::spawn(move || to_peer(node, &addr, &rx, deadline));
+            peers.push(Some(tx));
+        }
+        {
+            let member = Arc::clone(&member);
+            std::thread::spawn(move || {
+                for s in listener.incoming().flatten() {
+                    let member = Arc::clone(&member);
+                    std::thread::spawn(move || {
+                        let _ = serve(&member, s);
+                    });
+                }
+            });
+        }
+        {
+            let member = Arc::clone(&member);
+            let records = m.relay_records;
+            // As `inproc`'s relay: when nothing moved it yields its core and looks again, no
+            // sleep of a picked length between a record and its sending.
+            std::thread::spawn(move || {
+                loop {
+                    let out = handle.drain(records).unwrap_or_default();
+                    let moved = out.len();
+                    for record in out {
+                        if member.cut.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let to = usize::try_from(record.to).unwrap_or(0).saturating_sub(1);
+                        if let Some(Some(tx)) = peers.get(to) {
+                            let _ = tx.try_send(record.bytes);
+                        }
+                    }
+                    if moved == 0 {
+                        std::thread::yield_now();
+                    }
+                }
+            });
+        }
+        println!("member {} ready on {listen}", m.node);
+        let _ = stop_rx.recv();
+        Ok(())
+    }
+
+    /// The three members over TCP, each request on a connection of the member's pool: a writer
+    /// takes one, or opens one, and gives it back, so writers never queue behind each other here.
+    pub struct Procs {
+        members: Vec<String>,
+        pools: Vec<Mutex<Vec<BufReader<TcpStream>>>>,
+        cut: [AtomicBool; NODES],
+        deadline: Duration,
+    }
+
+    impl Procs {
+        pub fn open(o: &Opts) -> anyhow::Result<Self> {
+            let members = need(o.members.clone(), "--members", &o.measure)?;
+            anyhow::ensure!(members.len() == NODES, "--members names {NODES} members, not {}", members.len());
+            Ok(Self { pools: members.iter().map(|_| Mutex::new(Vec::new())).collect(), members, cut: Default::default(), deadline: o.deadline })
+        }
+
+        fn ask(&self, n: usize, req: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+            let pool = self.pools.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?;
+            let taken = pool.lock().map_err(|_| anyhow::anyhow!("pool poisoned"))?.pop();
+            let mut conn = match taken {
+                Some(c) => c,
+                None => {
+                    let addr = self.members.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?;
+                    let mut s = TcpStream::connect_timeout(&resolve(addr)?, self.deadline)?;
+                    s.set_nodelay(true)?;
+                    s.set_read_timeout(Some(self.deadline))?;
+                    s.write_all(&[CLIENT])?;
+                    BufReader::new(s)
+                }
+            };
+            let mut line = req.to_string();
+            line.push('\n');
+            conn.get_mut().write_all(line.as_bytes())?;
+            let mut back = String::new();
+            anyhow::ensure!(conn.read_line(&mut back)? > 0, "node {n} closed the connection");
+            pool.lock().map_err(|_| anyhow::anyhow!("pool poisoned"))?.push(conn);
+            let v: serde_json::Value = serde_json::from_str(&back)?;
+            if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+                anyhow::bail!("node {n}: {e}");
+            }
+            Ok(v)
+        }
+
+        fn is_cut(&self, n: usize) -> bool {
+            self.cut.get(n).is_some_and(|c| c.load(Ordering::Relaxed))
+        }
+
+        fn set_cut(&self, n: usize, to: bool) -> anyhow::Result<()> {
+            self.ask(n, &serde_json::json!({ "op": "cut", "to": to }))?;
+            self.cut.get(n).ok_or_else(|| anyhow::anyhow!("no node {n}"))?.store(to, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl Drop for Procs {
+        fn drop(&mut self) {
+            for n in 0..NODES {
+                if let Err(e) = self.ask(n, &serde_json::json!({ "op": "stop" })) {
+                    eprintln!("node {n} stop: {e}");
+                }
+            }
+        }
+    }
+
+    impl Cluster for Procs {
+        fn exec(&self, via: usize, stmts: &[(String, Vec<Arg>)], _until: Instant) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.is_cut(via), "node {via} is down");
+            self.ask(via, &serde_json::json!({ "op": "exec", "stmts": http::rqlite_body(stmts) })).map(|_| ())
+        }
+
+        fn count(&self, on: usize, sql: &str, args: Vec<Arg>, _until: Instant) -> anyhow::Result<u64> {
+            let v = self.ask(on, &serde_json::json!({ "op": "count", "stmts": http::rqlite_body(&[(sql.to_owned(), args)]) }))?;
+            v.get("count").and_then(|c| c.as_u64()).ok_or_else(|| anyhow::anyhow!("node {on}: no count in {v}"))
+        }
+
+        fn leader(&self, _until: Instant) -> anyhow::Result<Option<usize>> {
+            for n in 0..NODES {
+                if self.is_cut(n) {
+                    continue;
+                }
+                let Ok(v) = self.ask(n, &serde_json::json!({ "op": "leader" })) else { continue };
+                let l = v.get("leader").and_then(|l| l.as_u64()).and_then(|l| usize::try_from(l).ok()).unwrap_or(0);
+                if l >= 1 && !self.is_cut(l - 1) {
+                    return Ok(Some(l - 1));
+                }
+            }
+            Ok(None)
+        }
+
+        fn kill(&self, n: usize) -> anyhow::Result<()> {
+            self.set_cut(n, true)
+        }
+
+        fn start(&self, n: usize) -> anyhow::Result<()> {
+            self.set_cut(n, false)
         }
     }
 }
