@@ -549,6 +549,8 @@ pub struct Connection {
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
     /// Amphora (QT.6, lane qs6-7): the rows workers ran through a copy of a statement's loop body.
     pub(crate) morsel_body_rows: AtomicU64,
+    /// Amphora (QT.6, lane qs6-10): the hash tables the hook built for joins, a chain's links each.
+    pub(crate) morsel_join_links: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1049,6 +1051,12 @@ impl Connection {
     pub fn set_fitted_costs(&self, on: bool) {
         self.db.cost_fit.set_on(on);
         self.bump_prepare_context_generation();
+    }
+
+    /// Amphora (lane colcopy-5, AC-CB.4.2): the versioned storage the connection's B-trees are on
+    /// (None: the pager's), for its column copies' switch, rebuy policy and instruments.
+    pub fn versioned_storage(&self) -> Option<Arc<crate::storage::versioned::switch::Storage>> {
+        self.versioned.as_ref().map(|s| s.storage().clone())
     }
 
     pub(crate) fn sorted_fetches(&self) -> bool {

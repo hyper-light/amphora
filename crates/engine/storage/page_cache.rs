@@ -170,6 +170,11 @@ pub enum CacheError {
     Full,
     #[error("key already exists")]
     KeyExists,
+    /// Amphora (QT.6): the key holds another copy of the page, which a reader that also missed
+    /// read and inserted first (two morsel workers loading one page at once).
+    /// [`PageCache::insert_or_get`] hands that copy back.
+    #[error("the page is cached as another copy")]
+    KeyHeld,
 }
 
 /// What a lookup under the cache's shared lock found (`PageCache::get_shared`).
@@ -270,6 +275,37 @@ impl PageCache {
         self._insert(key, value, false, false)
     }
 
+    /// Amphora (QT.6): inserts `value` under `key`, or, when another copy of the page holds the
+    /// key already (a reader that missed too read it and inserted first), leaves that copy and
+    /// returns it, so every reader of the page shares one frame. One call under the cache's
+    /// exclusive lock, so no reader sees the key change between its miss and its insert. `force`
+    /// admits the page over capacity, as [`PageCache::force_insert_page`] does.
+    pub fn insert_or_get(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+        force: bool,
+    ) -> Result<Option<PageRef>, CacheError> {
+        let inserted = if force {
+            self.force_insert_page(key, value)
+        } else {
+            self.insert(key, value)
+        };
+        match inserted {
+            Ok(()) | Err(CacheError::KeyExists) => Ok(None),
+            Err(CacheError::KeyHeld) => {
+                let slot = self
+                    .map
+                    .get(&key)
+                    .ok_or_else(|| CacheError::InternalError("a held key has no entry".into()))?;
+                // SAFETY: a slot's entry points into `queue`, which holds it while the map does.
+                let entry = unsafe { &*slot.entry };
+                Ok(Some(entry.page.clone()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[inline]
     fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
         self._insert(key, value, true, false)
@@ -347,10 +383,10 @@ impl PageCache {
                     entry.page = value;
                     return Ok(());
                 } else {
-                    turso_assert!(
-                        Arc::ptr_eq(&entry.page, &value),
-                        "Attempted to insert different page with same key: {key:?}"
-                    );
+                    // Amphora (QT.6): a typed refusal, not a panic: the first copy stays.
+                    if !Arc::ptr_eq(&entry.page, &value) {
+                        return Err(CacheError::KeyHeld);
+                    }
                     return Err(CacheError::KeyExists);
                 }
             }
@@ -1142,20 +1178,31 @@ mod tests {
         cache.verify_cache_integrity();
     }
 
+    /// Amphora (QT.6): a second copy of a cached page is refused, typed, and `insert_or_get`
+    /// hands back the first copy (two morsel workers that both missed the page).
     #[test]
-    #[should_panic(expected = "Attempted to insert different page with same key")]
-    fn test_insert_different_page_same_key_panics() {
+    fn test_insert_different_page_same_key_keeps_the_first() {
         let mut cache = PageCache::default();
         let key1 = create_key(1);
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1); // Different Arc instance
 
-        assert!(cache.insert(key1, page1_v1).is_ok());
+        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_cache_integrity();
 
-        // This should panic because it's a different page instance
-        let _ = cache.insert(key1, page1_v2);
+        assert_eq!(
+            cache.insert(key1, page1_v2.clone()),
+            Err(CacheError::KeyHeld)
+        );
+        let resident = cache.insert_or_get(key1, page1_v2, false).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&resident, &page1_v1));
+        assert!(cache
+            .insert_or_get(key1, page1_v1, false)
+            .unwrap()
+            .is_none());
+        assert_eq!(cache.len(), 1);
+        cache.verify_cache_integrity();
     }
 
     #[test]

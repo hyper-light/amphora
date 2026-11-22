@@ -123,6 +123,29 @@ impl Storage {
         self.copies.last_dropped()
     }
 
+    /// Turns the SQL tables' column copies on or off, as `AMPHORA_COLUMN_PATH=on` does at open,
+    /// for a driver outside the crate: the bench's comparison against DuckDB (lane colcopy-5,
+    /// AC-CB.4.2).
+    pub fn set_copies_on(&self, on: bool) {
+        self.copies.set_on(on);
+    }
+
+    /// Sets how a copy the memory source refused is bought again, as `AMPHORA_COLUMN_REBUY` does
+    /// at open (lane colcopy-5, AC-CB.4.2).
+    pub fn set_copy_rebuy(&self, rebuy: super::columns_sql::Rebuy) {
+        self.copies.set_rebuy(rebuy);
+    }
+
+    /// What the copies asked their memory source for (lane colcopy-5, AC-CB.4.2).
+    pub fn copy_meter(&self) -> super::columns_sql::Meter {
+        self.copies.meter()
+    }
+
+    /// The copies' resident bytes and the bytes granted them (lane colcopy-5, AC-CB.4.2).
+    pub fn copy_held(&self) -> (u64, u64) {
+        self.copies.held()
+    }
+
     /// The versioned database under it.
     pub(crate) fn db(&self) -> &Arc<VDatabase> {
         &self.db

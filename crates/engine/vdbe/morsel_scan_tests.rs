@@ -1176,3 +1176,304 @@ fn t_qt_6_16_a_scans_rows_run_in_parallel_and_stop_early_under_limit() {
         "the workers stopped early {stopped} times of {limited}"
     );
 }
+
+/// A random inner equi-join of `tables` (lane qs6-10): each table after the first joined to a
+/// random one before it (a chain, a star or between), on `a` or on `a` and `c`; filters on any
+/// table; aggregates over a grouping, or the rows with an ORDER BY or none. Says whether it
+/// returns rows.
+fn random_chain(rng: &mut ChaCha8Rng, tables: &[&str]) -> (String, bool) {
+    let ops = ["<", "<=", "=", "<>", ">", ">="];
+    let mut terms = Vec::new();
+    for (at, table) in tables.iter().enumerate().skip(1) {
+        let other = tables[rng.random_range(0..at)];
+        let keys: &[&str] = if rng.random_bool(0.5) {
+            &["a"]
+        } else {
+            &["a", "c"]
+        };
+        for key in keys {
+            terms.push(format!("{other}.{key} = {table}.{key}"));
+        }
+    }
+    for _ in 0..rng.random_range(0..3) {
+        let table = tables[rng.random_range(0..tables.len())];
+        let op = ops[rng.random_range(0..ops.len())];
+        terms.push(match rng.random_range(0..4) {
+            0 => format!("{table}.a {op} {}", rng.random_range(-20i64..20)),
+            1 => format!("{table}.c {op} 't{}'", rng.random_range(0..12)),
+            2 => format!("{table}.c IS NULL"),
+            _ => format!("{table}.a IS NOT NULL"),
+        });
+    }
+    let column = |rng: &mut ChaCha8Rng| {
+        format!(
+            "{}.{}",
+            tables[rng.random_range(0..tables.len())],
+            ["a", "b", "c"][rng.random_range(0..3)]
+        )
+    };
+    let rows = rng.random_bool(0.4);
+    let mut group_by = Vec::new();
+    let mut select: Vec<String>;
+    if rows {
+        select = (0..rng.random_range(1..5)).map(|_| column(rng)).collect();
+    } else {
+        group_by = (0..rng.random_range(0..3)).map(|_| column(rng)).collect();
+        select = group_by.clone();
+        for _ in 0..rng.random_range(1..4) {
+            select.push(match rng.random_range(0..5) {
+                0 => "count(*)".to_string(),
+                1 => format!("count({})", column(rng)),
+                2 => format!(
+                    "sum({}.{})",
+                    tables[rng.random_range(0..tables.len())],
+                    ["a", "b"][rng.random_range(0..2)]
+                ),
+                3 => format!("min({})", column(rng)),
+                _ => format!("max({})", column(rng)),
+            });
+        }
+    }
+    let mut sql = format!(
+        "SELECT {} FROM {} WHERE {}",
+        select.join(", "),
+        tables.join(", "),
+        terms.join(" AND ")
+    );
+    if !group_by.is_empty() {
+        sql.push_str(&format!(" GROUP BY {}", group_by.join(", ")));
+    }
+    if rows && rng.random_bool(0.5) {
+        // The ORDER BY keys lead the select list, so a tie's rows can be told apart below.
+        let keys = rng.random_range(1..=select.len().min(2));
+        let order: Vec<String> = select[..keys]
+            .iter()
+            .map(|key| {
+                let dir = if rng.random_bool(0.5) { " DESC" } else { "" };
+                format!("{key}{dir}")
+            })
+            .collect();
+        sql.push_str(&format!(" ORDER BY {} -- keys {keys}", order.join(", ")));
+    }
+    (sql, rows)
+}
+
+/// T-QT.6.17 (lane qs6-10): joins of three and four tables run on morsels through a chain of hash
+/// tables. Random inner equi-joins (chains, stars and between, on one or two columns, with filters
+/// on any table), with aggregates or returning rows, answer the same with `ParallelMode` off (the
+/// serial loop) and on, the machine stated as 1, 2, 3, 4 and 8 cores: row for row with
+/// aggregates, in ORDER BY order with ties compared as sets, as the same rows without one. The
+/// hook's counter of hash tables built shows each run that took it built one link per table past
+/// the probe, and most runs took it.
+#[test]
+fn t_qt_6_17_joins_of_three_and_four_tables_probe_a_chain_of_hash_tables() {
+    let conn = open(":memory:qt-6-17");
+    let mut rng = ChaCha8Rng::seed_from_u64(617);
+    fill(&conn, &mut rng, "t", 600);
+    fill(&conn, &mut rng, "u", 120);
+    fill(&conn, &mut rng, "v", 50);
+    fill(&conn, &mut rng, "w", 30);
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let queries = 30usize;
+    let mut chained = 0usize;
+    let mut chained_rows = 0usize;
+    for query in 0..queries {
+        let tables: &[&str] = if query % 2 == 0 {
+            &["t", "u", "v"]
+        } else {
+            &["t", "u", "v", "w"]
+        };
+        let (sql, rows) = random_chain(&mut rng, tables);
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, &sql);
+            let links = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - before;
+            if !rows {
+                assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            } else {
+                if let Some(keys) = order_keys(&sql) {
+                    let key = |row: &Vec<Value>| format!("{:?}", &row[..keys]);
+                    let serial_keys: Vec<String> = serial.iter().map(key).collect();
+                    let parallel_keys: Vec<String> = parallel.iter().map(key).collect();
+                    assert_eq!(parallel_keys, serial_keys, "{sql} on {cores} cores");
+                }
+                assert_eq!(
+                    canonical(&parallel),
+                    canonical(&serial),
+                    "{sql} on {cores} cores"
+                );
+            }
+            // A run either took the hook, building a link for every table past the probe, or
+            // left the statement to the serial loop before building any.
+            let expected = u64::try_from(tables.len() - 1).unwrap();
+            assert!(
+                links == 0 || links == expected,
+                "{sql} on {cores} cores built {links} links"
+            );
+            if links == expected {
+                chained += 1;
+                if rows {
+                    chained_rows += 1;
+                }
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: most runs took the chain, row-returning ones among them.
+    assert!(
+        chained > queries * 5 / 2,
+        "the chain ran {chained} times of {}",
+        queries * 5
+    );
+    assert!(chained_rows > 0, "no row-returning join took the chain");
+}
+
+/// Live test of record for T-QT.6.16's switch (coordinator, 2026-11-22): a large table, the
+/// machine's own measured costs (not stated cores), many random LIMIT/OFFSET queries with no
+/// ORDER BY. Each limited answer, parallel, must have the serial count and be a sub-multiset of
+/// the full serial answer; latency is reported per mode (serial, switch off, switch on).
+/// Sizes: QT616_ROWS, QT616_QUERIES (env). Run: --release --ignored --nocapture.
+#[test]
+#[ignore]
+fn t_qt_6_16_live_parallel_limit_matches_serial_at_scale() {
+    use std::collections::HashMap;
+    use std::time::Instant;
+    let rows: u64 = std::env::var("QT616_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let queries: usize = std::env::var("QT616_QUERIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let conn = open(":memory:qt-6-16-live");
+    let mut rng = ChaCha8Rng::seed_from_u64(61616);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let pad = "x".repeat(64);
+    for _ in 0..rows {
+        let a = rng.random_range(-500i64..500);
+        let b = if rng.random_range(0..5) == 0 {
+            "NULL".to_string()
+        } else {
+            rng.random_range(-9i64..9).to_string()
+        };
+        let c = match rng.random_range(0..8) {
+            0 => "NULL".to_string(),
+            k => format!("'t{k}{}'", ["", "a", "Ab", "_%"][rng.random_range(0..4)]),
+        };
+        conn.execute(format!(
+            "INSERT INTO t(a, b, c, p) VALUES ({a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let filters = [
+        "a > {n}",
+        "abs(a) < {n}",
+        "a % 3 = {k}",
+        "c LIKE 't{k}%'",
+        "a + b * 2 > {n}",
+        "coalesce(b, 0) <> {k}",
+        "id % 7 = {k}",
+    ];
+    let outputs = ["id", "a", "c", "a * 2 + b", "upper(c)", "coalesce(b, -1)"];
+    let fill = |t: &str, rng: &mut ChaCha8Rng| {
+        t.replace("{n}", &rng.random_range(-400i64..400).to_string())
+            .replace("{k}", &rng.random_range(0i64..4).to_string())
+    };
+    let (mut t_serial, mut t_off, mut t_on) = (Vec::new(), Vec::new(), Vec::new());
+    let mut ran_parallel = 0usize;
+    for _ in 0..queries {
+        let mut terms = Vec::new();
+        for _ in 0..rng.random_range(0..3) {
+            terms.push(fill(filters[rng.random_range(0..filters.len())], &mut rng));
+        }
+        let mut outs = Vec::new();
+        for _ in 0..rng.random_range(1..4) {
+            outs.push(outputs[rng.random_range(0..outputs.len())]);
+        }
+        let filter = if terms.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", terms.join(" AND "))
+        };
+        let (lim, off) = (rng.random_range(1i64..2000), rng.random_range(0i64..500));
+        let base = format!("SELECT {} FROM t{filter}", outs.join(", "));
+        let sql = format!("{base} LIMIT {lim} OFFSET {off}");
+        conn.set_parallel_mode(ParallelMode::Off);
+        let full = sql_rows(&conn, &base);
+        let s0 = Instant::now();
+        let serial = sql_rows(&conn, &sql);
+        t_serial.push(s0.elapsed());
+        conn.set_parallel_mode(ParallelMode::On);
+        conn.set_parallel_limit(false);
+        let s1 = Instant::now();
+        let control = sql_rows(&conn, &sql);
+        t_off.push(s1.elapsed());
+        assert_eq!(control, serial, "{sql}: switch off differs from serial");
+        conn.set_parallel_limit(true);
+        let before = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let s2 = Instant::now();
+        let parallel = sql_rows(&conn, &sql);
+        t_on.push(s2.elapsed());
+        if conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > before
+        {
+            ran_parallel += 1;
+        }
+        let want = (full.len() as i64 - off).clamp(0, lim) as usize;
+        assert_eq!(parallel.len(), want, "{sql}: row count");
+        let mut pool: HashMap<String, usize> = HashMap::new();
+        for r in &full {
+            *pool.entry(format!("{r:?}")).or_default() += 1;
+        }
+        for r in &parallel {
+            let k = format!("{r:?}");
+            let n = pool
+                .get_mut(&k)
+                .unwrap_or_else(|| panic!("{sql}: row {k} not in the serial result"));
+            assert!(
+                *n > 0,
+                "{sql}: row {k} returned more times than the serial result holds it"
+            );
+            *n -= 1;
+        }
+    }
+    let pct = |v: &mut Vec<std::time::Duration>, q: f64| {
+        v.sort();
+        v[((v.len() as f64 - 1.0) * q).round() as usize]
+    };
+    for (name, v) in [
+        ("serial", &mut t_serial),
+        ("switch off", &mut t_off),
+        ("switch on", &mut t_on),
+    ] {
+        eprintln!(
+            "QT616 {name}: p50 {:?} p99 {:?} p99.9 {:?}",
+            pct(v, 0.5),
+            pct(v, 0.99),
+            pct(v, 0.999)
+        );
+    }
+    eprintln!("QT616 rows {rows} queries {queries} ran_parallel {ran_parallel}");
+}

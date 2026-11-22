@@ -9,7 +9,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   colcopy-4; docs/design/columnar.md decision 2): each block and change of a copy asks the memory
   source for its bytes before it is built or applied, a refused build gives back what it took, and a
   refused copy is bought again by A (rent and rebuy) or B (wait for room) behind
-  `AMPHORA_COLUMN_REBUY`, counted and traced. Open: the A/B run of record and the default it picks.
+  `AMPHORA_COLUMN_REBUY`, counted and traced. `amphora-bench --colcopy` (lane colcopy-5) runs the
+  same scenarios on both ways and on DuckDB from one driver, in process, under the same cap. Open: the
+  A/B and DuckDB runs of record and the default they pick.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
@@ -1064,8 +1066,9 @@ are the serial loop's to the row (T-QT.6.14). Lane qs6-7: workers run a copy of 
 body, each with its own registers, so any filter or expression runs in parallel (T-QT.6.15).
 Lane qs6-8: a scan's rows run through the copy too, and under a LIMIT with no ORDER BY
 (behind its switch, serial the control) the workers stop once they hold the LIMIT's rows (T-QT.6.16).
-Still open: the copy for joins, joins of three or more tables, outer joins, a LIMIT that stops
-the workers early.
+Lane qs6-10: inner joins of any number of tables run on morsels: every table but the probe is a
+link of a chain of hash tables, each keyed by its equalities with the tables before it, and each
+probe row walks the chain (T-QT.6.17). Still open: the copy of the loop body for joins, outer joins.
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.
@@ -1084,5 +1087,9 @@ Lanes skip-3 and skip-4 (kiln goal 623adc1c): `PRAGMA skipping = 'table.column'`
 on (T-SKU.3), and by default it keeps both kinds and answers each filter with whichever measured
 cheaper on that column's own scans, measuring the other again on a doubling schedule (T-SKU.2).
 Lane skip-5: a skipping scan runs its body over the fused column batches up to each candidate
-run's end (T-SKU.4).
+run's end (T-SKU.4). `PRAGMA skipping = 't.a capped'` keeps the measured choice but drops the
+method not leading once its write upkeep passes its measured build cost (ski rental's break-even),
+building it again when its doubling-schedule trial comes due; `measured` (keep both) is the
+control (T-SKU.5). The setting now acts when its statement runs, by its own instruction, so a
+statement prepared before the data loads still skips it (T-SKU.6).
 Open: the benchmark against DuckDB and ClickHouse.

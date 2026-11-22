@@ -19,6 +19,7 @@ mod blink;
 mod cc;
 mod clickhouse;
 mod cluster;
+mod colcopy;
 mod columns;
 mod eqp;
 mod mysql;
@@ -546,6 +547,10 @@ fn main() -> anyhow::Result<()> {
     // G11 step 2's column copies, A and B, against none (`columns.rs`).
     if std::env::args().any(|a| a == "--columns") {
         return columns::main();
+    }
+    // Column copies within a fixed memory limit against DuckDB, one driver for both (`colcopy.rs`).
+    if std::env::args().any(|a| a == "--colcopy") {
+        return colcopy::main();
     }
     let o = opts()?;
     let (k, q) = (o.connections, o.queue);

@@ -515,8 +515,24 @@ under a LIMIT, that the row count is the serial one, that every row is in the se
 the control never runs the body, and that the body ran over fewer rows than the table holds (the
 workers stopped early) for most statements.
 
+**Joins of any number of tables** (lane qs6-10). An inner join of two or more rowid tables, each
+read whole (a scan, the planner's hash join, or a seek in an ephemeral index the statement builds
+from the whole table), at least one of them a hash join, runs as a chain of hash tables. The probe
+is the first table in the join order that no hash join builds from. Every other table is a link
+(`MorselJoinData`), taken in the join order among the tables an equality links to those already in
+the chain; each equality of two tables' columns is a key of the link that joins the later of its
+two tables, so no join term is left to test, and every other term is a filter on one table. Each
+link's table is read and built once by the workers together, as a two-table join's build side is.
+Each worker walks a probe row through the chain depth first (`each_joined`, an explicit stack as
+deep as the chain, no recursion): the first link's matches in build order, each one's matches in
+the next link, and so on; the joined row is the probe row's columns, then each link's. A join with
+no equality linking a table to the rest (a cross product) stays serial, and a LIMIT or OFFSET is
+taken only when the ORDER BY holds every table's INTEGER PRIMARY KEY. The counter
+`morsel_join_links` counts the hash tables built. T-QT.6.17 checks random joins of three and four
+tables against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
 **Not yet.** Joins still run the pipeline's own probe loop, so only the filters `Predicate` holds
-run in a join's workers; joins of more than two tables and outer joins stay serial.
+run in a join's workers; outer joins stay serial.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

@@ -1004,6 +1004,8 @@ tests = [
   { id = "T-QT.6.15", text = "t_qt_6_15_workers_run_a_copy_of_the_loop_body_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-7) — passes when random one-table aggregates whose filters, GROUP BY values and aggregate inputs are any expression (functions, CASE, LIKE, arithmetic) answer as the serial loop at 1, 2, 3, 4 and 8 stated cores, the workers' copy of the loop body ran over every row each time, and more than one worker ran for most" },
   # lane qs6-8
   { id = "T-QT.6.16", text = "t_qt_6_16_a_scans_rows_run_in_parallel_and_stop_early_under_limit (vdbe/morsel_scan_tests.rs; lane qs6-8) — passes when random one-table SELECTs with no aggregates, any filter and any result expression, return the serial loop's rows in order at 1, 2, 3, 4 and 8 stated cores; under a LIMIT with no ORDER BY the switch's control (off) answers serially without running the body, and with it on the row count is the serial one, every row is in the serial result, and for most statements the body ran over fewer rows than the table holds" },
+  # lane qs6-10
+  { id = "T-QT.6.17", text = "t_qt_6_17_joins_of_three_and_four_tables_probe_a_chain_of_hash_tables (vdbe/morsel_scan_tests.rs; lane qs6-10) — passes when random inner equi-joins of three and four tables (chains, stars and between, on one or two columns, with filters on any table), with aggregates or returning rows, answer as the serial loop at 1, 2, 3, 4 and 8 stated cores (row for row with aggregates; in ORDER BY order with ties as sets, or as the same rows without one), every run that took the hook built one hash table per table past the probe (the counter `morsel_join_links`), and most runs took it, row-returning ones among them" },
 ]
 
 # lane g3s2
@@ -1258,6 +1260,8 @@ tests = [
   { id = "T-SKU.3", text = "skipping::tests::scans::t_sku_3_* — passes when PRAGMA skipping = 'table.column [measured|zone_maps|cracking]' turns skipping on so filters under random writes answer as without it, every filter consults the summary and rows_read sums lower; 'off' drops it; a setting naming no table, no stored column or no known kind is refused and keeps nothing; PRAGMA skipping with no value is refused" },
   # lane skip-5 (fused batches, the losing kind's upkeep, the setting at run time)
   { id = "T-SKU.4", text = "skipping::tests::scans::t_sku_4_* — passes when, for each kind, four databases (column batches on and off by skipping on and off) take the same random writes and answer every filtered aggregate, GROUP BY and row query alike; with batches on the skipping scan's fused loops ran rows, and with batches on and off skipping read fewer rows than without" },
+  { id = "T-SKU.5", text = "skipping::tests::chooser::t_sku_5_* — passes when, behind the upkeep switch (keep both, the control, or capped), a write-heavy table whose filters zone maps answer best drops the cracker once its write upkeep since it last answered passes its build cost, the run's write upkeep is lower than keeping both, and keeping both drops nothing; a workload that shifts from cracking's to zone maps' drops zone maps, builds them again from the cracker when their trial is due, and ends led by zone maps as keeping both does; every candidate set holds every row the plain scan finds" },
+  { id = "T-SKU.6", text = "skipping::tests::scans::t_sku_6_* — passes when a PRAGMA skipping statement prepared on an empty table and run once its rows are in skips them (zone maps), answers as the database without a summary, and run again after 'off' turns skipping back on: the setting acts when its statement runs, by its own instruction (SetSkipping)" },
 ]
 
 # lane colcopy-4 (with colcopy-bound to colcopy-3): column copies within a fixed memory limit
@@ -1273,6 +1277,8 @@ criteria = [
   { id = "AC-CB.3.1", text = "Counted: state changes with reasons, takes asked, granted and refused, bytes held against bytes granted, rows and bytes rebuys read, rows the copy served against the row loop's" },
   { id = "AC-CB.3.2", text = "Counted: time copies were absent and time they waited" },
   { id = "AC-CB.4.1", text = "An A/B harness forces each way's failure mode at the extremes and records latency percentiles, throughput, memory, bytes read, rebuys and answer equality as JSONL" },
+  # lane colcopy-5
+  { id = "AC-CB.4.2", text = "One driver runs the six scenarios on Amphora under each way and on DuckDB, both in process, in memory, timed alike, under the same cap (the engine's bytes for its rows and the scenario's free bytes); each record names its client and platform" },
 ]
 tests = [
   { id = "T-CB.1.1", text = "columns::tests::cb1_blocks_are_granted_before_they_are_built — each format's bytes before a block is made equal the made block's resident bytes; the source holds exactly what the generations and queue were granted" },

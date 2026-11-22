@@ -158,6 +158,11 @@ impl ZoneMap {
         self.stats
     }
 
+    /// Each zone's first rowid, ascending (lane skip-5: a zone map built again keeps its zones).
+    pub fn starts(&self) -> Vec<i64> {
+        self.zones.iter().map(|zone| zone.start).collect()
+    }
+
     pub fn zone_count(&self) -> usize {
         self.zones.len()
     }

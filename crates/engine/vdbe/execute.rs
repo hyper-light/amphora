@@ -1993,6 +1993,7 @@ fn skip_walk_for(
         _ => None,
     })?;
     let (reader_pos, committed) = conn.skipping_positions()?;
+    let writes = registry.counts(root).map(|counts| counts.writes);
     // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
     let started = std::time::Instant::now();
     let (candidates, method) = registry
@@ -2005,6 +2006,11 @@ fn skip_walk_for(
             bounds.hi,
         )
         .ok()?;
+    // Lane skip-5 (T-SKU.5): a method dropped for its upkeep whose trial is due is built again
+    // now, at the snapshot the summary just answered (so it holds what the summary holds).
+    if let Some(method) = registry.rebuild_due(root) {
+        skipping_rebuild(program, cursor_id, root, column, method, writes);
+    }
     let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
     walk.measure = method.map(|method| crate::skipping::WalkMeasure {
         root,
@@ -2012,6 +2018,51 @@ fn skip_walk_for(
         started,
     });
     Some(walk)
+}
+
+/// Lane skip-5 (T-SKU.5): builds a measured summary's dropped method again for its trial: zone
+/// maps from the cracker in memory, the cracker from the table's B-tree (a read of every row,
+/// timed: its cost to build). A build that fails, or a write that came in during it, leaves the
+/// method dropped: the leader keeps answering, and the next trial tries again.
+fn skipping_rebuild(
+    program: &Program,
+    cursor_id: crate::vdbe::CursorID,
+    root: i64,
+    column: usize,
+    method: crate::skipping::SkipMethod,
+    writes: Option<u64>,
+) {
+    let registry = &program.connection.db.skipping;
+    let origin = std::time::Instant::now();
+    match method {
+        crate::skipping::SkipMethod::ZoneMaps => {
+            registry.rebuild_zones(root, &mut || crate::skipping::nanos_since(origin))
+        }
+        crate::skipping::SkipMethod::Cracking => {
+            let (Some(writes), Some((_, super::builder::CursorType::BTreeTable(table)))) =
+                (writes, program.cursor_ref.get(cursor_id))
+            else {
+                return;
+            };
+            let built = crate::skipping::cracker_of_table(
+                &program.connection,
+                root,
+                column,
+                table.columns().len(),
+            );
+            match built {
+                Ok(cracker) => {
+                    let cost = crate::skipping::nanos_since(origin);
+                    if !registry.install_cracker(root, writes, cracker, cost) {
+                        tracing::debug!(target: "amphora.skipping", root, "cracker built again was refused: a write came in during the build");
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not be built again")
+                }
+            }
+        }
+    }
 }
 
 /// Lane skip-3 (T-SKU.2): a measured scan's end hands its cost (nanoseconds from asking for its
@@ -12909,7 +12960,16 @@ fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite)
     let registry = &program.connection.db.skipping;
     match program.connection.skipping_positions() {
         Some((_, committed)) => {
-            registry.on_write(root, program.connection.skipping_id(), committed, write)
+            // Lane skip-5 (T-SKU.5): each measured summary's write upkeep is timed.
+            let origin = std::time::Instant::now();
+            let mut now = || crate::skipping::nanos_since(origin);
+            registry.on_write(
+                root,
+                program.connection.skipping_id(),
+                committed,
+                write,
+                &mut now,
+            )
         }
         None => registry.mark_stale(root),
     }
@@ -17285,6 +17345,28 @@ pub fn op_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Amphora (lane skip-5, T-SKU.6): [Insn::SetSkipping], the summary built from the rows the
+/// table holds when the statement runs (a statement prepared before they loaded still skips them).
+pub fn op_set_skipping(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        SetSkipping {
+            table,
+            column,
+            kind,
+        },
+        insn
+    );
+    crate::skipping::set_skipping(&program.connection, table, column, *kind)
+        .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Amphora (PL.7, T-PL.7.1): [Insn::TreePages], the walk [Insn::Count] makes, its pages kept.
 pub fn op_tree_pages(
     program: &Program,
@@ -20984,8 +21066,8 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild, TableJoinAggregate,
-        TableJoinRows, TableSource,
+        JoinStage, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
+        TableJoinAggregate, TableJoinRows, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -21054,7 +21136,7 @@ pub fn op_morsel_aggregate(
             data.rowid_alias,
         )?;
         let budget = MemoryBudget::new(pager.statement_memory_budget());
-        let Some(join) = &data.join else {
+        if data.joins.is_empty() {
             // A copy of the serial loop's body, run per row by each worker (lane qs6-7).
             if let Some(body) = &data.body {
                 let shape = ScanAggregate {
@@ -21103,37 +21185,46 @@ pub fn op_morsel_aggregate(
             return pipeline
                 .run_mode(connection.parallel_mode(), &mut costs, &budget)
                 .map(|(rows, _)| (rows, false));
-        };
-        // A hash join's probe: the build side read and its table built once, by the workers
+        }
+        // A join's probe: each build side read and its hash table built once, by the workers
         // together (a partition per core the switch lets run), charged to the statement's one
-        // budget; the joined rows' filter is the probe's.
-        let build_table = TableSource::open(
-            pager.clone(),
-            join.root_page,
-            join.columns,
-            join.rowid_alias,
-        )?;
+        // budget, a chain's links in turn (lane qs6-10); the joined rows' filter is the probe's.
         let mode = connection.parallel_mode();
         let partitioner = Partitioner::new(match mode {
             ParallelMode::On => costs.cores(),
             ParallelMode::Off => std::num::NonZeroUsize::MIN,
         });
-        let (build, hash_table, _) = TableBuild {
-            table: &build_table,
-            filter: &join.filter,
-            key: &join.build_key,
-            partitioner: &partitioner,
+        let mut stages = Vec::new();
+        stages.try_reserve_exact(data.joins.len())?;
+        for join in &data.joins {
+            let build_table = TableSource::open(
+                pager.clone(),
+                join.root_page,
+                join.columns,
+                join.rowid_alias,
+            )?;
+            let (rows, hash_table, _) = TableBuild {
+                table: &build_table,
+                filter: &join.filter,
+                key: &join.build_key,
+                partitioner: &partitioner,
+            }
+            .run_mode(mode, &mut costs, &budget)?;
+            stages.push(JoinStage {
+                probe: HashProbe::over(hash_table, &[], &join.probe_key),
+                rows,
+            });
+            connection
+                .morsel_join_links
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        .run_mode(mode, &mut costs, &budget)?;
-        let probe = HashProbe::over(hash_table, &[], &join.probe_key);
         // A join's rows, no aggregates: each worker keeps its own leaves' joined rows, merged
         // in order; they are the answer's rows as they stand.
         if let Some(rows) = &data.joined_rows {
             let pipeline = TableJoinRows {
                 table: &table,
                 probe_filter: &data.filter,
-                probe: &probe,
-                build: &build,
+                stages: &stages,
                 project: &data.result_map,
                 order: &rows.order,
             };
@@ -21152,8 +21243,7 @@ pub fn op_morsel_aggregate(
         let pipeline = TableJoinAggregate {
             table: &table,
             probe_filter: &data.filter,
-            probe: &probe,
-            build: &build,
+            stages: &stages,
             shape: &shape,
         };
         pipeline

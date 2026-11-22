@@ -444,9 +444,11 @@ pub struct MorselAggregateData {
     /// For each result column, its place in the pipeline's row (the GROUP BY values, then the
     /// aggregates).
     pub result_map: Vec<usize>,
-    /// A hash join's build side when the scan is the join's probe: the pipeline's row is the probe
-    /// table's columns, then the build's; `filter` is then over the probe table's alone.
-    pub join: Option<MorselJoinData>,
+    /// A join's build sides when the scan is its probe, a chain of hash tables (lane qs6-10): the
+    /// pipeline's row is the probe table's columns, then each link's build row's in turn; each
+    /// link's `probe_key` names places in the row joined before it. `filter` is then over the
+    /// probe table's columns alone. Empty for a scan.
+    pub joins: Vec<MorselJoinData>,
     /// A join's rows rather than groups: `result_map` then names the joined row's columns each
     /// output row takes (the result columns, then the ORDER BY keys), and there are no aggregates.
     pub joined_rows: Option<MorselRows>,
@@ -506,7 +508,8 @@ pub struct MorselJoinData {
     pub rowid_alias: Option<usize>,
     /// Terms over the build table's columns, tested before a row goes into the hash table.
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
-    /// The key's columns, pair by pair, in the probe table and in the build table.
+    /// The key's columns, pair by pair, in the row joined so far (the probe table's columns, then
+    /// each earlier link's) and in the build table.
     pub probe_key: Vec<usize>,
     pub build_key: Vec<usize>,
 }
@@ -2395,6 +2398,14 @@ pub enum Insn {
         cursor_id: CursorID,
         target_reg: usize,
     },
+    /// Amphora (lane skip-5, T-SKU.6): `PRAGMA skipping`'s setting, acted on when the statement
+    /// runs: keeps a skipping summary of `column` of `table` built from the rows there now
+    /// (`kind` `None`: drops it), as `skipping::set_skipping` does.
+    SetSkipping {
+        table: String,
+        column: String,
+        kind: Option<crate::skipping::SkipKind>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2648,6 +2659,7 @@ impl InsnVariants {
             InsnVariants::JoinSwitchHash => execute::op_join_switch_hash,
             InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
             InsnVariants::TreePages => execute::op_tree_pages,
+            InsnVariants::SetSkipping => execute::op_set_skipping,
         }
     }
 }
@@ -2713,6 +2725,7 @@ impl Insn {
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
+            | Self::SetSkipping { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             // A recursive foreign-key action is treated as writable while it's still being

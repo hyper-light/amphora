@@ -221,7 +221,7 @@ fn parse_skipping_setting(
     use crate::skipping::SkipKind;
     let refuse = || {
         LimboError::InvalidArgument(format!(
-            "PRAGMA skipping expects 'table.column [measured|zone_maps|cracking|off]', got '{value}'"
+            "PRAGMA skipping expects 'table.column [measured|capped|zone_maps|cracking|off]', got '{value}'"
         ))
     };
     let mut words = value.split_whitespace();
@@ -234,6 +234,7 @@ fn parse_skipping_setting(
         None | Some("measured") => Some(SkipKind::Measured),
         Some("zone_maps") => Some(SkipKind::ZoneMaps),
         Some("cracking") => Some(SkipKind::Cracking),
+        Some("capped") => Some(SkipKind::MeasuredCapped),
         Some("off") => None,
         Some(_) => return Err(refuse()),
     };
@@ -770,11 +771,16 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Skipping => {
-            // Amphora (lane skip-4, T-SKU.3): the summary is built now, holding the write lock,
-            // as `set_skipping` builds it; the statement itself does nothing when run.
+            // Amphora (lane skip-4, T-SKU.3; lane skip-5, T-SKU.6): the setting is read now and
+            // acted on when the statement runs, by its own instruction: the summary is built
+            // from the rows the table holds then, holding the write lock, as `set_skipping`
+            // builds it.
             let (table, column, kind) = parse_skipping_setting(&parse_string(&value)?)?;
-            crate::skipping::set_skipping(&connection, &table, &column, kind)
-                .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
+            program.emit_insn(Insn::SetSkipping {
+                table,
+                column,
+                kind,
+            });
             Ok(TransactionMode::None)
         }
         PragmaName::FtsMergeThreshold => {
@@ -1728,7 +1734,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Skipping => Err(LimboError::InvalidArgument(
-            "skipping is set, not read: PRAGMA skipping = 'table.column [measured|zone_maps|cracking|off]'"
+            "skipping is set, not read: PRAGMA skipping = 'table.column [measured|capped|zone_maps|cracking|off]'"
                 .to_owned(),
         )),
         PragmaName::FtsMergeThreshold => {
