@@ -612,7 +612,12 @@ read and transaction as one SQL statement in text, one round trip (AC-SH.3): Amp
 others get Postgres's simple query protocol and MySQL's text protocol, not a transaction of a statement a row. `amphora-inproc` keeps the
 in-process groups for the measures the server doesn't serve (follower, xgroup, region). Not yet: the smoke on
 adacachy2 end to end; Amphora's server serves one database (`--groups 1`) and refuses cutover until the reshard
-shell is built.
+shell is built. Every client gives a request up after `--deadline-s` (AC-SH.4): CockroachDB's through
+the bench's own simple-query Postgres client (bench/src/pgtext.rs), its socket's read timeout the give-up; each record
+says how each system routes a write (CockroachDB and TiDB forward it through the node it was sent to, Amphora's client
+sends it to the leader) and that no system is given prepared statements. The in-process relay waits on one wake across
+its members (`ReplicaHandle::listen`, AC-SH.5) rather than spinning, and Amphora's schema setup (served and in-process)
+waits on a member's election instead of asking again at once.
 
 ## Measured
 

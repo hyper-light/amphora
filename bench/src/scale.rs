@@ -1196,7 +1196,7 @@ fn record_head(o: &Opts) -> serde_json::Value {
         "amphora-inproc" => ("in the bench's process".to_owned(), "in-process calls"),
         "cockroach" => (
             format!("{mode}: cockroach start, one process a node"),
-            "Postgres wire, simple query protocol: rust-postgres (postgres crate, sync)",
+            "Postgres wire, simple query protocol: the bench's own client (bench/src/pgtext.rs), over std's TcpStream",
         ),
         _ => (
             format!("{mode}: pd-server, tikv-server, tidb-server a node"),
@@ -1218,16 +1218,39 @@ fn record_head(o: &Opts) -> serde_json::Value {
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_owned());
-    // How each request is sent ([`Session`]).
+    // How each request is sent ([`Session`]): no system over a wire is given prepared statements,
+    // as Amphora's protocol is text only (lane scaleout-harness-9).
     let statements = if o.system == "amphora-inproc" {
-        "in-process calls, parameters bound"
+        "in-process calls, each statement prepared and its parameters bound (no wire)"
     } else {
-        "one SQL statement a write, read or transaction, as text with literals: one round trip, committed on its own"
+        "one SQL statement a write, read or transaction, as text with literals: one round trip, committed on its own; no prepared statements, on any system"
+    };
+    // How each system routes a write: forwarded by the node it was sent to, or sent straight to
+    // the leader. Each is how that system is built to be used, stated so the paths are compared
+    // as they are (lane scaleout-harness-9).
+    let routes = match o.system.as_str() {
+        "amphora" => {
+            "straight to the leader: the session asks the member it was given which member leads, then sends each write on its own link to the leader (asked again after a refusal)"
+        }
+        "amphora-inproc" => "straight to the leader: each write is a call on the group's leader",
+        "cockroach" => {
+            "forwarded: each write goes to the node the session connected to (its gateway), which sends it on to the range's leaseholder"
+        }
+        _ => {
+            "forwarded: each write goes to the tidb-server the session connected to, which sends it on to the Region's leader on TiKV"
+        }
+    };
+    // What gives a request up: --deadline-s for every system, through its client's own bound.
+    let deadline = match o.system.as_str() {
+        "amphora" => "--deadline-s: amphora::serve::Client's deadline on each request",
+        "amphora-inproc" => "--deadline-s: each call's deadline",
+        "cockroach" => "--deadline-s: the socket's read and write timeouts",
+        _ => "--deadline-s: rust-mysql-simple's read and write timeouts",
     };
     if let Some(h) = head.as_object_mut() {
         h.insert(
             "platform".into(),
-            serde_json::json!({ "os": os, "kernel": kernel, "arch": std::env::consts::ARCH, "ran": ran, "client": client, "driver": "amphora-bench --scale: closed-loop writers, Instant-timed per acknowledgement", "statements": statements }),
+            serde_json::json!({ "os": os, "kernel": kernel, "arch": std::env::consts::ARCH, "ran": ran, "client": client, "driver": "amphora-bench --scale: closed-loop writers, Instant-timed per acknowledgement", "statements": statements, "routes": routes, "deadline": deadline }),
         );
         if let Ok(b) = std::env::var("AMPHORA_BENCH_SCALE_BIN") {
             h.insert("binaries".into(), b.into());
@@ -1330,8 +1353,72 @@ mod inproc {
 
     struct Group {
         members: Vec<Database>,
-        stop: Arc<AtomicBool>,
+        bell: Arc<Bell>,
         relay: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// The relay's one wake across a group's members: each member's listener rings it when a
+    /// record joins that member's outgoing queue or its owner ends (`ReplicaHandle::listen`), and
+    /// the group's drop stops it. A ring given before the relay waits is kept, so none is missed
+    /// between its last drain and its wait.
+    #[derive(Default)]
+    struct Bell {
+        rung: Mutex<Rung>,
+        ringing: std::sync::Condvar,
+    }
+    #[derive(Default)]
+    struct Rung {
+        rung: bool,
+        stopped: bool,
+    }
+    impl Bell {
+        fn ring(&self) {
+            if let Ok(mut r) = self.rung.lock() {
+                r.rung = true;
+                self.ringing.notify_one();
+            }
+        }
+        fn stop(&self) {
+            if let Ok(mut r) = self.rung.lock() {
+                r.stopped = true;
+                self.ringing.notify_one();
+            }
+        }
+        /// Whether the relay goes on: not stopped, and the bell not poisoned.
+        fn going(&self) -> bool {
+            self.rung.lock().is_ok_and(|r| !r.stopped)
+        }
+        /// Waits for a ring or the stop, and no later than `due` when it's given, then takes the
+        /// ring: whether the relay goes on.
+        fn wait(&self, due: Option<Instant>) -> bool {
+            let Ok(r) = self.rung.lock() else {
+                return false;
+            };
+            let idle = |r: &mut Rung| !r.rung && !r.stopped;
+            let r = match due {
+                None => self.ringing.wait_while(r, idle).ok(),
+                Some(due) => self
+                    .ringing
+                    .wait_timeout_while(r, due.saturating_duration_since(Instant::now()), idle)
+                    .ok()
+                    .map(|(r, _)| r),
+            };
+            match r {
+                Some(mut r) => {
+                    r.rung = false;
+                    !r.stopped
+                }
+                None => false,
+            }
+        }
+    }
+    impl std::task::Wake for Bell {
+        fn wake(self: Arc<Self>) {
+            self.ring();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.ring();
+        }
     }
 
     pub struct Amphora {
@@ -1347,13 +1434,15 @@ mod inproc {
         CREATE TABLE IF NOT EXISTS regional(region TEXT NOT NULL, session TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(region, session, seq));";
 
     /// Every member's outgoing records to the member they name, held `between` first (the
-    /// region measure's one-way time; zero elsewhere), until `stop`. A cut member's records, out
+    /// region measure's one-way time; zero elsewhere), until `bell` is stopped. A cut member's records, out
     /// or in, are lost as a dead node's are. At most `pending` records are held: past it the relay
-    /// takes no more from the members until the oldest are delivered.
+    /// takes no more from the members until the oldest are delivered. With nothing to move it
+    /// waits on `bell` (a member's record or end, or the stop), and while records are held, no
+    /// later than the oldest's due time: it never spins (Ada's event-driven rule).
     fn relay(
         handles: &[amphora::replication::ReplicaHandle],
         cut: &[AtomicBool],
-        stop: &AtomicBool,
+        bell: &Bell,
         wait: Duration,
         records: usize,
         between: Duration,
@@ -1361,7 +1450,7 @@ mod inproc {
     ) {
         let is_cut = |i: usize| cut.get(i).is_some_and(|c| c.load(Ordering::Relaxed));
         let mut held = VecDeque::new();
-        while !stop.load(Ordering::Relaxed) {
+        while bell.going() {
             let mut moved = 0usize;
             for (from, handle) in handles.iter().enumerate() {
                 let room = pending.saturating_sub(held.len());
@@ -1387,14 +1476,39 @@ mod inproc {
                     let _ = target.receive(from as u64 + 1, record.bytes, Instant::now() + wait);
                 }
             }
-            if moved == 0 {
-                std::thread::yield_now();
+            if moved == 0 && !bell.wait(held.front().map(|(due, _, _)| *due)) {
+                break;
             }
         }
     }
 
     fn value_of(v: &str) -> Value {
         Value::Text(v.to_owned())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Lane scaleout-harness-9 (AC-SH.5): the relay's bell keeps a ring given before its wait,
+        // a due time ends a wait no ring came to, and the stop ends the relay, its own ring kept
+        // as well. Do: ring then wait; wait on a due time already past; stop then wait, from
+        // another thread too. Expect: go on, go on, then stopped.
+        #[test]
+        fn scaleout_harness_9_the_relays_bell_keeps_a_ring_and_stops() {
+            let bell = Arc::new(Bell::default());
+            bell.ring();
+            assert!(bell.wait(None), "a ring before the wait is kept");
+            assert!(bell.wait(Some(Instant::now())), "a due time ends the wait");
+            assert!(bell.going());
+            let b = Arc::clone(&bell);
+            let stopper = std::thread::spawn(move || b.stop());
+            assert!(!bell.wait(None), "the stop ends the wait");
+            stopper.join().unwrap();
+            assert!(!bell.going());
+            std::task::Waker::from(Arc::clone(&bell)).wake();
+            assert!(!bell.wait(None), "a ring after the stop doesn't undo it");
+        }
     }
 
     impl Amphora {
@@ -1450,14 +1564,18 @@ mod inproc {
                     handles.len() == o.nodes,
                     "a member of group {g} has no replica handle"
                 );
-                let stop = Arc::new(AtomicBool::new(false));
-                let (c, s, wait) = (cut.clone(), stop.clone(), o.deadline);
+                let bell = Arc::new(Bell::default());
+                for h in &handles {
+                    h.listen(std::task::Waker::from(Arc::clone(&bell)))
+                        .map_err(|e| anyhow::anyhow!("group {g}'s relay can't listen: {e:?}"))?;
+                }
+                let (c, b, wait) = (cut.clone(), bell.clone(), o.deadline);
                 let relay = std::thread::spawn(move || {
-                    relay(&handles, &c, &s, wait, records, between, pending)
+                    relay(&handles, &c, &b, wait, records, between, pending)
                 });
                 groups.push(Group {
                     members,
-                    stop,
+                    bell,
                     relay: Some(relay),
                 });
             }
@@ -1531,7 +1649,7 @@ mod inproc {
                 xg.take();
             }
             for g in &mut self.groups {
-                g.stop.store(true, Ordering::Relaxed);
+                g.bell.stop();
                 if let Some(r) = g.relay.take() {
                     let _ = r.join();
                 }
@@ -1676,19 +1794,34 @@ mod inproc {
             }
             let until = Instant::now() + o.deadline;
             for g in 0..self.groups.len() {
+                let members = &self.group(g)?.members;
+                // The schema goes to the leader a member names or, with none named yet, to the
+                // first member: a call waits in its member's queue until a leader is known, then
+                // runs or is refused naming the leader, which takes it next. Each try waits on
+                // the replica's own events, never a spin (lane scaleout-harness-9). The schema's
+                // statements are idempotent, so a try whose outcome is unknown is made again.
+                let mut to = self.leader(g).ok();
                 loop {
-                    let done = self.leader(g).and_then(|l| {
-                        l.call(until, |c| Ok(c.execute_batch(EVENTS)?))
-                            .map_err(|e| anyhow::anyhow!("{e:?}"))
-                    });
-                    match done {
+                    let member = to
+                        .or_else(|| members.first())
+                        .ok_or_else(|| anyhow::anyhow!("group {g} has no members"))?;
+                    let refused = match member.call(until, |c| Ok(c.execute_batch(EVENTS)?)) {
                         Ok(()) => break,
-                        Err(e) => anyhow::ensure!(
-                            Instant::now() < until,
-                            "group {g} took no schema within --deadline-s: {e}"
-                        ),
-                    }
-                    std::thread::yield_now();
+                        Err(e) => e,
+                    };
+                    anyhow::ensure!(
+                        Instant::now() < until,
+                        "group {g} took no schema within --deadline-s: {refused:?}"
+                    );
+                    to = match refused {
+                        amphora_api::Refusal::NotLeader { leader: Some(l) } => usize::try_from(l)
+                            .ok()
+                            .and_then(|l| l.checked_sub(1))
+                            .and_then(|i| members.get(i)),
+                        amphora_api::Refusal::NotLeader { leader: None }
+                        | amphora_api::Refusal::UnknownOutcome => self.leader(g).ok(),
+                        other => anyhow::bail!("group {g} refused its schema: {other:?}"),
+                    };
                 }
             }
             if o.measure == "xgroup" {
@@ -1915,15 +2048,20 @@ mod served {
                 "cutover" => return Err(anyhow::Error::from(Refusal::Unavailable("Amphora's splits, merges and moves are a pure core so far: the shell that carries them out over replicated groups isn't built (docs/design/reshard.md, \"What is left\")".into()))),
                 other => return Err(no_concept(&format!("the {other} measure"))),
             }
-            // The schema through the leader, once one is elected: each refusal is an election
-            // still under way, asked again until --deadline-s.
+            // The schema through the leader, asked again until --deadline-s. With no leader named
+            // yet, the member asked takes it itself: its call waits in its queue until a leader
+            // is known, then runs there or is refused, and the next try finds the leader named.
+            // Each try waits on the member's answer and its election: no timer, no spin (lane
+            // scaleout-harness-9). The schema's statements are idempotent.
             let until = Instant::now() + o.deadline;
-            // Each try waits on the member's answer: no timer between them.
+            let exec = format!("exec {EVENTS}");
             loop {
-                let tried = self.link(0).and_then(|mut via| {
-                    let l = self.leader(&mut via)?;
-                    self.link(l)?.ask(&format!("exec {EVENTS}"))
-                });
+                let tried = self
+                    .link(0)
+                    .and_then(|mut via| match self.leader(&mut via) {
+                        Ok(l) => self.link(l)?.ask(&exec),
+                        Err(_) => via.ask(&exec),
+                    });
                 match tried {
                     Ok(_) => return Ok(()),
                     Err(e) => anyhow::ensure!(
@@ -2162,7 +2300,7 @@ pub mod sql {
     }
 
     struct Pg {
-        c: postgres::Client,
+        c: crate::pgtext::Client,
     }
 
     struct My {
@@ -2174,15 +2312,15 @@ pub mod sql {
         /// A count's one row, by the simple query protocol (one round trip, the text parsed by the
         /// server as Amphora's is).
         fn counted(&mut self, sql: &str) -> anyhow::Result<u64> {
-            for m in self.c.simple_query(sql)? {
-                if let postgres::SimpleQueryMessage::Row(r) = m {
-                    let n = r
-                        .try_get(0)?
-                        .ok_or_else(|| anyhow::anyhow!("{sql}: a NULL count"))?;
-                    return Ok(n.parse()?);
-                }
-            }
-            anyhow::bail!("{sql}: no row")
+            let rows = self.c.simple_query(sql)?;
+            let n = rows
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("{sql}: no row"))?
+                .first()
+                .cloned()
+                .flatten()
+                .ok_or_else(|| anyhow::anyhow!("{sql}: a NULL count"))?;
+            Ok(n.parse()?)
         }
     }
 
@@ -2191,9 +2329,9 @@ pub mod sql {
             if rows.is_empty() {
                 return Ok(());
             }
-            Ok(self
-                .c
-                .batch_execute(&Dialect::Standard.upsert(regional, rows))?)
+            self.c
+                .simple_query(&Dialect::Standard.upsert(regional, rows))
+                .map(drop)
         }
 
         fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
@@ -2206,9 +2344,9 @@ pub mod sql {
         }
 
         fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()> {
-            Ok(self
-                .c
-                .batch_execute(&Dialect::Standard.kv_upsert(keys, value))?)
+            self.c
+                .simple_query(&Dialect::Standard.kv_upsert(keys, value))
+                .map(drop)
         }
 
         fn count(&mut self, session: &str, upto: u64, _own: bool) -> anyhow::Result<u64> {
@@ -2318,11 +2456,9 @@ pub mod sql {
         fn connect(&self, node: usize) -> anyhow::Result<Box<dyn Session + '_>> {
             let ep = self.endpoint(node)?;
             Ok(match self.kind {
+                // Each read and write given up after --deadline-s, as TiDB's below.
                 Kind::Cockroach => Box::new(Pg {
-                    c: ep
-                        .parse::<postgres::Config>()?
-                        .connect_timeout(self.deadline)
-                        .connect(postgres::NoTls)?,
+                    c: crate::pgtext::Client::connect(ep, self.deadline)?,
                 }),
                 Kind::Tidb => {
                     let opts = mysql::OptsBuilder::from_opts(mysql::Opts::from_url(ep)?)
@@ -2695,6 +2831,35 @@ mod tests {
             Dialect::Mysql.count("events", "s-000001", 9, true),
             "SELECT count(*) FROM events WHERE session = 's-000001' AND seq <= 9"
         );
+    }
+
+    // Lane scaleout-harness-9 (G13): each system's record says how it routes a write (forwarded
+    // or straight to the leader), what gives a request up, and that no system over a wire is
+    // given prepared statements.
+    #[test]
+    fn scaleout_harness_9_records_name_routes_deadlines_and_statements() {
+        let tail = "--nodes 3 --groups 1 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1 --class persisted --hosts local=127.0.0.1";
+        for (system, route) in [
+            ("amphora", "straight to the leader"),
+            ("cockroach", "forwarded"),
+            ("tidb", "forwarded"),
+        ] {
+            let o = parse(&args(&format!("--scale write --system {system} {tail}"))).unwrap();
+            let p = &record_head(&o)["platform"];
+            let routes = p["routes"].as_str().unwrap();
+            assert!(routes.starts_with(route), "{system}: {routes}");
+            assert!(
+                p["deadline"].as_str().unwrap().starts_with("--deadline-s"),
+                "{system}"
+            );
+            assert!(
+                p["statements"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no prepared statements"),
+                "{system}"
+            );
+        }
     }
 
     // G13 step 1: the competitors split where Amphora's groups divide, and a key's group is the

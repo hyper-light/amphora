@@ -300,6 +300,9 @@ struct Control {
     outgoing: Mutex<Outgoing>,
     /// Rung when a record joins `outgoing` ([`ReplicaHandle::drain_wait`]).
     sent: std::sync::Condvar,
+    /// The host's one listener ([`ReplicaHandle::listen`]): woken when a record joins `outgoing`
+    /// and when the owner ends.
+    listener: Mutex<Option<std::task::Waker>>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
     local: Local,
@@ -311,6 +314,18 @@ struct Control {
     moved: std::sync::Condvar,
     // This replica's token reads, counted (`tokens`).
     sessions: tokens::SessionMeter,
+}
+impl Control {
+    /// Wakes the host's listener, if one is set ([`ReplicaHandle::listen`]). The slot is poisoned
+    /// only by a panic while a listener was set, which the workspace denies; one poisoned wakes
+    /// no one, and the host's next `listen` is refused.
+    fn listened(&self) {
+        if let Ok(listener) = self.listener.lock()
+            && let Some(waker) = listener.as_ref()
+        {
+            waker.wake_by_ref();
+        }
+    }
 }
 /// What a replica's owner published of its closed time, and of its applied and answered points
 /// (the session tokens', `tokens`).
@@ -1280,6 +1295,15 @@ impl ReplicaHandle {
         self.drain(limit)
     }
 
+    /// Sets the one listener woken whenever a record joins this replica's outgoing queue and
+    /// when its owner ends (a later call replaces it). A host that carries many replicas' records
+    /// from one thread waits on its own wake across all of them, rather than on one replica's
+    /// [`Self::drain_wait`] at a time, then drains each (lane scaleout-harness-9, G13).
+    pub fn listen(&self, waker: std::task::Waker) -> Result<(), Refusal> {
+        *locked(&self.shared.listener)? = Some(waker);
+        Ok(())
+    }
+
     pub fn status(&self) -> Result<ReplicaStatus, Refusal> {
         locked(&self.shared.status)?.clone()
     }
@@ -1600,6 +1624,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_meter: FloorMeter::default(),
         outgoing: Mutex::default(),
         sent: std::sync::Condvar::new(),
+        listener: Mutex::new(None),
         status: Mutex::new(Ok(status(&replica))),
         meter,
         local,
@@ -1869,6 +1894,7 @@ impl<F: BlockFile + 'static> Drop for Actor<F> {
             self.control.moved.notify_all();
             drop(closed);
         }
+        self.control.listened();
     }
 }
 impl<F: BlockFile + 'static> Actor<F> {
@@ -1969,6 +1995,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         if let Ok(mut status) = self.control.status.lock() {
             *status = Err(reason.clone());
         }
+        // A host waiting on its listener hears the owner ended: its drain now answers the reason.
+        self.control.listened();
         // Local reads end with the owner: none opens again, and the idle readers let its lease go.
         self.control.local.release();
         // Reads waiting for a closed time hear it ended (under the lock, so none misses it).
@@ -3470,6 +3498,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             .and_then(|beats| u32::try_from(beats).ok())
             .unwrap_or(u32::MAX);
         let now = self.now()?;
+        let sending = !output.messages.is_empty();
         let mut outgoing = locked(&self.control.outgoing)?;
         for message in output.messages {
             self.pace.sent(&message, now, lost);
@@ -3492,6 +3521,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             });
         }
         self.control.sent.notify_all();
+        drop(outgoing);
+        if sending {
+            self.control.listened();
+        }
         Ok(())
     }
     /// The replicated class at a follower (replication.md, "A write made at a follower is answered
@@ -6700,6 +6733,52 @@ mod tests {
         );
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// A waker that counts its wakes.
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+    impl std::task::Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Lane scaleout-harness-9 (G13): a replica's listener wakes for its outgoing records and its
+    /// owner's end, so a host carrying many replicas' records from one thread waits on one wake
+    /// across them. Do: three voters, each with a counting listener; the first elected; then the
+    /// owners dropped. Expect: every listener woken by the election's records, and each woken
+    /// again as its owner goes.
+    #[test]
+    fn scaleout_harness_9_a_listener_wakes_for_records_and_the_owners_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let wakes: Vec<Arc<Wakes>> = clients
+            .iter()
+            .map(|c| {
+                let wakes = Arc::new(Wakes::default());
+                c.handle()
+                    .listen(std::task::Waker::from(Arc::clone(&wakes)))
+                    .unwrap();
+                wakes
+            })
+            .collect();
+        let mut pump = Pump::new(&clients);
+        driven.elect(&mut pump, &clients, 0, 1);
+        driven.drain(&mut pump);
+        pump.finish();
+        let woken: Vec<usize> = wakes.iter().map(|w| w.0.load(Ordering::Acquire)).collect();
+        assert!(woken.iter().all(|&n| n > 0), "woken by records: {woken:?}");
+        drop(driven);
+        for (w, before) in wakes.iter().zip(woken) {
+            assert!(w.0.load(Ordering::Acquire) > before, "woken by the end");
+        }
     }
 
     /// How many tables named cancelled_actor_write the database has.
