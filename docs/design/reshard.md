@@ -923,10 +923,9 @@ transaction by its own clock as it resolved it.
   (`__amphora_xg_lock_at`: its clock as it takes the first lock, after the coordinator's carried
   stamp). A get or scan as of a stamp at or past a write lock's stamp in its range can't answer:
   the commit stamp may be at or before it. It waits for the lock's resolution and reads again. One
-  before the lock's stamp never waits: the commit stamp is past it. The wait is event-driven: a
-  waker in the group's publisher, then the read again, and it reads again only once the group's
-  count of resolutions moved (`Database::locks_resolved`, after each resolving step, local or served
-  over the transport), so other calls' wakes don't send it reading. `Timeout` at the read's deadline.
+  before the lock's stamp never waits: the commit stamp is past it. The wait is event-driven: at
+  first on the group's change event and its count of resolutions; since lane split-merge-22, on the
+  held row's own waiter list (below). `Timeout` at the read's deadline.
 - **The change feed** (`changes`, `changed`, so `wait`) takes a group's own versions by their
   revisions' stamps in the range, not by a range of revisions, and waits as a scan does on a write
   lock anywhere in the family whose stamp is at or before its cut: otherwise its rows could land
@@ -954,3 +953,56 @@ on one branch. Stamp tables written before this change hold nanoseconds: none is
 **Falsified by.** A read across groups answering a transaction's rows in one group and not another;
 one transaction's rows answering two stamps; a read as of a stamp before a lock's stamp waiting; a
 group's commit after a resolution stamped at or before its commit stamp.
+
+## Decision (lane split-merge-22): Records::commit and recovery on the one stamp
+
+The two sides of the one stamp (lane split-merge-21's rows and reads, lane xgroup-sql-11's
+coordinator) are now one branch, and three pieces of split-merge-21's "Left" are done.
+- **`Records::commit` across groups.** A namespace over `Database::across` commits through the
+  coordinator (`xgroup::sql::commit_stamp`) and answers `Answer::Committed`'s `at`: the latest
+  clock the lock replies carried, the stamp the coordinator resolves every group at
+  (`Step::ResolveAt`, lane xgroup-sql-12), so the revision it answers is the one reads across
+  groups give its rows. Its conditions are carried into the lock steps (`commit_records` refused
+  them): `Cond::At`'s `rev` names a commit stamp, as reads across groups answer them, and holds
+  while the row's newest version is at or before it; `Cond::Absent` while it has none. A failed one
+  is refused `Conflict` on its row and writes nothing. Every reading of a group's clock for a stamp
+  is `Database::cross_clock` (the step a node serves, a commit in one group), so standalone
+  backed-up groups, which have no session token, give stamps too. A commit in one group answers
+  its clock read once it committed: at or past its rows' stamp, not equal to it.
+- **Recovery resolves at the one stamp.** Recovery sent `Step::Resolve`, so a recovered
+  transaction's rows took each group's own stamp, and one that some groups had resolved at the
+  coordinator's stamp ended with two. The stamp is now kept where a recovery looks:
+  - a decision with a stamp is `Step::DecideAt`, which keeps it with the anchor's record. Under
+    two-phase commit the decision lands before any resolution, so a recovery that finds it decided
+    (`Step::RecoverAt`, answered `Reply::DecidedAt`) resolves every group left at it;
+  - each group keeps the stamp it resolved a commit at (`__amphora_xg_commit_at`, forgotten below the
+    coordinator's floor with the done rows). Under Parallel Commits the resolutions go out with the
+    explicit commit, so a recovery that finds the record still staging asks each participant
+    (`Step::PreventAt`, answered `Reply::PresentAt`) for that stamp, or its lock stamp while it
+    holds its locks. The stamp is the resolved one if any group resolved it (they all resolved at
+    the same one), else the latest lock stamp, which is at or past every group's lock stamp; the
+    decision then keeps it.
+  The new steps and replies come after every existing one; the plain ones stay for a coordinator
+  whose groups keep no clock.
+- **Held reads wake for their own row.** A read across groups held by a lock (get, scan, the
+  change feed) waits on the waiter list of the row it met (`xgroup::sql::held_at` answers the
+  first held row), rung only by the step that drops that row's locks (`Database::ring_locks`),
+  as a Records get under `LockedReads::WaitOnLock` does; a replicated group's reads wait on its
+  change event. The group's resolution counter is gone, and with it the wake every resolving step
+  sent to every held read.
+
+**Evidence.** Not yet run (kiln was down; nothing compiled). T-T1.9.R29, T-T1.9.R30 and T-T1.9.R31
+(`docs/requirements.toml`, lane split-merge-22).
+
+**Left.** In one recovery case the stamp differs from the one the client heard: under Parallel
+Commits, with every lock in place and nothing decided or resolved, the client heard the latest lock
+reply's clock, which each group reads after its lock step, and the recovery uses the latest lock
+stamp, which is at or before it. Lock replies that carry the lock stamp itself would close it.
+A replicated group's rows are still not in the stamp table. Lane xgroup-sql-12's version
+negotiation (15c2dc14) isn't taken: it conflicts with the network listener's greeting in
+`transport/common.rs`, and belongs on the group branch after this lane's merge.
+
+**Falsified by.** A `Records::commit` across groups answering a stamp its rows don't carry; a
+condition naming a stamp at or past its row's newest version failing, or one before it holding; a
+recovered transaction's rows carrying two stamps; a read held by one row's lock woken by another
+row's resolution.

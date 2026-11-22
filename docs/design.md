@@ -72,6 +72,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | executor | 10 | A scan loop's filters and aggregates run over a whole batch by selection | [executor.md](design/executor.md#10-a-scan-loops-filters-and-aggregates-run-over-a-whole-batch-by-selection) |
 | executor | 11 | Skipping rows: zone maps over leaf runs against cracking, behind one switch | [executor.md](design/executor.md#11-skipping-rows-zone-maps-over-leaf-runs-against-cracking-behind-one-switch) |
 | local-owner-transport | – | Versions (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#versions-2026-11-06) |
+| local-owner-transport | – | Negotiated versions (2026-11-22) | [local-owner-transport.md](design/local-owner-transport.md#negotiated-versions-2026-11-22) |
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
 | local-owner-transport | – | Owner guards (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#owner-guards-2026-11-06) |
 | local-owner-transport | – | Decision (lane constants): one descriptor budget (2026-11-21) | [local-owner-transport.md](design/local-owner-transport.md#decision-lane-constants-one-descriptor-budget-2026-11-21) |
@@ -171,6 +172,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-20): a read as of a stamp places moved rows by their stamps | [reshard.md](design/reshard.md#decision-lane-split-merge-20-a-read-as-of-a-stamp-places-moved-rows-by-their-stamps) |
 | reshard | – | Decision (lane split-merge-20): conditions across groups name commit stamps | [reshard.md](design/reshard.md#decision-lane-split-merge-20-conditions-across-groups-name-commit-stamps) |
 | reshard | – | Decision (lane split-merge-21): one clock, one commit stamp | [reshard.md](design/reshard.md#decision-lane-split-merge-21-one-clock-one-commit-stamp) |
+| reshard | – | Decision (lane split-merge-22): Records::commit and recovery on the one stamp | [reshard.md](design/reshard.md#decision-lane-split-merge-22-recordscommit-and-recovery-on-the-one-stamp) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |

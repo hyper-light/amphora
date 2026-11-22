@@ -265,7 +265,7 @@ fn serve<S: Wire>(
     pulls: Option<&Pulls>,
     started: Instant,
 ) -> Result<(), Refusal> {
-    let until = common::greet_owner(stream, token, started, GREETING_MAX)?;
+    let (until, version) = common::greet_owner(stream, token, started, GREETING_MAX)?;
     let answer = match common::read(stream, until)? {
         Request::Probe => Ok(Answer::Done),
         Request::Pull(pull) => common::pulled(pulls, &pull, until),
@@ -274,7 +274,7 @@ fn serve<S: Wire>(
             carried,
             envelope,
         } => match acquire() {
-            Some(database) => common::stepped(&database, here, carried, envelope, until),
+            Some(database) => common::stepped(&database, here, carried, envelope, version, until),
             None => Err(unavailable("owner is draining")),
         },
         _ => Err(api::invalid(
@@ -311,8 +311,8 @@ pub(super) fn request(
     let connection = ClientConnection::new(&mut config, name.clone()).map_err(unavailable)?;
     let mut stream = StreamOwned::new(connection, config, socket);
     let token = (|| -> Result<[u8; 32], Refusal> { Ok(handshake!(&mut stream, auth_until)) })()?;
-    common::greet_client(&mut stream, &token, until, auth_until)?;
-    common::exchange(&mut stream, request, until)
+    let version = common::greet_client(&mut stream, &token, until, auth_until)?;
+    common::exchange(&mut stream, request, version, until)
 }
 
 /// A server name as a certificate carries it: a DNS name or an IP address.
