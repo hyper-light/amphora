@@ -30,8 +30,8 @@ use crate::{
             },
             cost::{
                 constraints_selectivity, estimate_rows_per_seek,
-                index_access_is_unique_point_lookup, rows_per_leaf_page_for_index,
-                where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate, RowGoal,
+                index_access_is_unique_point_lookup, index_rows_per_page, where_expr_steps,
+                AnalyzeCtx, Cost, IndexInfo, RowCountEstimate, RowGoal,
             },
             order::{access_method_is_one_row, plan_satisfies_order_target},
         },
@@ -943,7 +943,8 @@ fn join_lhs_and_rhs<'a>(
                     hash_can_replace_build_index,
                     subqueries,
                     joined_tables,
-                    params,
+                    // Amphora (PL.7): the probe table's scan costs its own pages.
+                    &params.for_table(rhs_table_reference, analyze_stats),
                     !pinned_hash_here
                         && planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
@@ -1056,7 +1057,7 @@ fn join_lhs_and_rhs<'a>(
                                     *join_type,
                                     mem_budget,
                                     hash_probe_multiplier,
-                                    params,
+                                    &params.for_table(rhs_table_reference, analyze_stats),
                                 );
                             }
                             if should_materialize {
@@ -2402,6 +2403,8 @@ fn get_best_seek_score(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> f64 {
+    // Amphora (PL.7, T-PL.7.1): the table's reads cost its own pages.
+    let params = &params.for_table(rhs_table, analyze_stats);
     let mut best_score = 0.0;
     for candidate in &rhs_constraints.candidates {
         let usable_constraint_refs = usable_constraints_for_lhs_mask(
@@ -2419,11 +2422,7 @@ fn get_best_seek_score(
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
+                rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,
@@ -2753,7 +2752,11 @@ mod tests {
             + 1_000.0 * params.cpu_cost_per_row
             + 1_000.0 * (params.hash_cpu_cost + params.hash_lookup_cost)
             + 250.0 * params.cpu_cost_per_row;
-        assert!((cost.0 - expected).abs() < f64::EPSILON);
+        assert!(
+            (cost.0 - expected).abs() < 1e-9 * expected,
+            "{} {expected}",
+            cost.0
+        );
     }
 
     fn default_base_rows(n: usize) -> Vec<RowCountEstimate> {
@@ -4976,13 +4979,16 @@ mod tests {
 
     /// Do: join t1 to the whole composite unique key of t2 (t1.a = t2.a AND t1.b = t2.b), the
     /// tables on root pages of their own, first without statistics (each at the fallback's million
-    /// rows), then with ANALYZE's million rows each. Expect: without statistics, t1 scanned and t2
+    /// rows), then with ANALYZE's million rows each, fifty to a counted page (PL.7). Expect: without statistics, t1 scanned and t2
     /// searched by its unique key, not a hash join whose cost rests on the fallback (decision 11);
     /// with statistics the costs decide, and a hash join of a million rows each beats a million
     /// searches of pages the cache can't hold (AC-T1.5.4, AC-T1.13.4).
     #[test]
     fn a_unique_key_join_is_searched_without_statistics() {
-        fn best_plan(base_table_rows: &[RowCountEstimate]) -> (Vec<usize>, Vec<String>) {
+        fn best_plan(
+            base_table_rows: &[RowCountEstimate],
+            stats: &AnalyzeStats,
+        ) -> (Vec<usize>, Vec<String>) {
             let table = |name: &str, root_page: i64| {
                 Arc::new(BTreeTable::new(
                     root_page,
@@ -5058,7 +5064,7 @@ mod tests {
                 &[],
                 &[],
                 &DEFAULT_PARAMS,
-                &AnalyzeStats::default(),
+                stats,
                 &available_indexes,
                 &table_references,
                 &schema,
@@ -5085,16 +5091,27 @@ mod tests {
         }
 
         assert_eq!(
-            best_plan(&default_base_rows(2)),
+            best_plan(&default_base_rows(2), &AnalyzeStats::default()),
             (
                 vec![0, 1],
                 vec!["scan".to_owned(), "search t2_ab".to_owned()]
             )
         );
-        let (_, loops) = best_plan(&[
-            RowCountEstimate::AnalyzeStats(1_000_000.0),
-            RowCountEstimate::AnalyzeStats(1_000_000.0),
-        ]);
+        // PL.7: the trees' pages as ANALYZE would count them, fifty rows a page, so their index
+        // passes the cache.
+        let mut stats = AnalyzeStats::default();
+        for name in ["t1", "t2"] {
+            let table = stats.table_stats_mut(name);
+            table.row_count = Some(1_000_000);
+            table.pages = Some(20_000);
+        }
+        let (_, loops) = best_plan(
+            &[
+                RowCountEstimate::AnalyzeStats(1_000_000.0),
+                RowCountEstimate::AnalyzeStats(1_000_000.0),
+            ],
+            &stats,
+        );
         assert!(loops.iter().any(|step| step == "hash join"), "{loops:?}");
     }
 

@@ -192,6 +192,9 @@ pub struct Resolver<'a> {
     /// costs (`docs/design/planner.md`, decision 5): the connection's, set at prepare; the engine's
     /// default page cache until then.
     cache_pages: usize,
+    /// Amphora (PL.7): the usable bytes of the connection's pages, where its pager knows them; set
+    /// at prepare.
+    page_bytes: Option<usize>,
     /// Amphora (PL.12): the values the estimates may read for the statement's parameters (none for
     /// the generic plan), and where they note that one asked; set at prepare.
     plan_values: Option<Arc<crate::plan_cache::PlanValues>>,
@@ -338,6 +341,7 @@ impl<'a> Resolver<'a> {
             dialect,
             trigger_context: None,
             cache_pages: crate::storage::page_cache::DEFAULT_PAGE_CACHE_SIZE_IN_PAGES,
+            page_bytes: None,
             plan_values: None,
             statement_memory: 0,
             learned_weights: None,
@@ -378,6 +382,16 @@ impl<'a> Resolver<'a> {
     /// Amphora: sets the pages a read finds without reading the file: the connection's.
     pub(crate) fn set_cache_pages(&mut self, pages: usize) {
         self.cache_pages = pages;
+    }
+
+    /// Amphora (PL.7): the usable bytes of the connection's pages, where its pager knows them.
+    pub fn page_bytes(&self) -> Option<usize> {
+        self.page_bytes
+    }
+
+    /// Amphora (PL.7): sets the usable bytes of the connection's pages.
+    pub(crate) fn set_page_bytes(&mut self, bytes: Option<usize>) {
+        self.page_bytes = bytes;
     }
 
     /// Amphora (PL.12): the values the statement's estimates may read, if any were set.
@@ -481,6 +495,7 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            page_bytes: self.page_bytes,
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,
@@ -517,6 +532,7 @@ impl<'a> Resolver<'a> {
             dialect: self.dialect.clone(),
             trigger_context: self.trigger_context.clone(),
             cache_pages: self.cache_pages,
+            page_bytes: self.page_bytes,
             plan_values: self.plan_values.clone(),
             statement_memory: self.statement_memory,
             learned_weights: self.learned_weights,

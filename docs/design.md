@@ -112,6 +112,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl7): cost weights fitted to measured statement times, behind a switch | [planner.md](design/planner.md#decision-lane-pl7-cost-weights-fitted-to-measured-statement-times-behind-a-switch) |
 | planner | – | Decision (lane qs5-9): a hash join's Bloom filter sized from its build's measured keys, chosen by the learned weights | [planner.md](design/planner.md#decision-lane-qs5-9-a-hash-joins-bloom-filter-sized-from-its-builds-measured-keys-chosen-by-the-learned-weights) |
 | planner | – | Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model | [planner.md](design/planner.md#decision-lane-g6s3-learned-plan-hints-kept-for-a-query-class-only-where-its-held-out-runs-beat-the-cost-model) |
+| planner | – | Decision (lane pl7c): a table's pages counted by ANALYZE, else derived from its page and records | [planner.md](design/planner.md#decision-lane-pl7c-a-tables-pages-counted-by-analyze-else-derived-from-its-page-and-records) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |

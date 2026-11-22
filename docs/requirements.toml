@@ -345,6 +345,8 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.7.1", text = "The audit's 09-cost-model — passes when its tables of 8 and 1,011 pages no longer both scan at one cost" },
+  # lane pl7c: T-PL.7.1's focused tests are tests/column_stats.rs t_pl_7_1_* (ANALYZE keeps each
+  # tree's real pages; a full read of a table of more pages costs more) and cost::tests::t_pl_7_1_*.
   # lane pl7
   { id = "T-PL.7.2", text = "cost_fit::tests::t_pl_7_2_* — passes when the fit of synthetic samples from known weights with 5% noise lands within four standard errors and 5% of each, and a tenfold stall one sample in ten still leaves each within 5%" },
   { id = "T-PL.7.3", text = "cost_fit::tests::t_pl_7_3_* — passes when terms never sampled have no fitted weight and the planner keeps their learned value, and the fit follows weights that move" },
