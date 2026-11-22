@@ -2290,15 +2290,17 @@ mod served {
             Link::connect(addr, secret, self.deadline)
         }
 
-        /// The node that leads, as node `via` names it.
+        /// The node that leads, as node `via` names it, waiting up to --deadline-s for one: the
+        /// member's `leader` request wakes on its election, no polling (CP-T1.13's, lane
+        /// production-5; lane scaleout-harness-9).
         fn leader(&self, via: &mut Link) -> anyhow::Result<usize> {
-            let status = via.ask("status")?;
-            let l: usize = status
-                .split_whitespace()
-                .find_map(|f| f.strip_prefix("leader="))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            anyhow::ensure!(l >= 1 && l <= self.members.len(), "no leader yet: {status}");
+            let (l, _) = via.leader(self.deadline)?;
+            let l = usize::try_from(l)?;
+            anyhow::ensure!(
+                l >= 1 && l <= self.members.len(),
+                "member {l} leads, past the {} the bench was given",
+                self.members.len()
+            );
             Ok(l - 1)
         }
     }
@@ -2390,21 +2392,18 @@ mod served {
                 "cutover" => return Err(anyhow::Error::from(Refusal::Unavailable("Amphora's splits, merges and moves are a pure core so far: the shell that carries them out over replicated groups isn't built (docs/design/reshard.md, \"What is left\")".into()))),
                 other => return Err(no_concept(&format!("the {other} measure"))),
             }
-            // The schema through the leader a member names. With no leader named yet, the member
-            // asked takes it itself: its call waits in its queue until a leader is known, then
-            // runs there or is refused. Each try waits on the member's answer and its election:
-            // no timer, no spin (lane scaleout-harness-9). The members are asked in the
-            // configured order, from member 0, each only once the one before failed (it couldn't
-            // be reached, or its try was refused), all given up at --deadline-s: none is asked
-            // again at once (lane scaleout-harness-10). The schema's statements are idempotent.
+            // The schema through the leader, once one is elected: the leader request waits for
+            // the election, and each try waits on the member's answer: no timer, no spin. The
+            // members are asked in the configured order, from member 0, each only once the one
+            // before failed (it couldn't be reached, or its try was refused: the lead moved
+            // before the schema reached it), all given up at --deadline-s: none is asked again at
+            // once (lane scaleout-harness-10). The schema's statements are idempotent.
             let until = Instant::now() + o.deadline;
             let exec = format!("exec {EVENTS}");
             first_reachable(self.members.len(), until, |n| {
                 let mut via = self.link(n)?;
-                match self.leader(&mut via) {
-                    Ok(l) => self.link(l)?.ask(&exec),
-                    Err(_) => via.ask(&exec),
-                }
+                let l = self.leader(&mut via)?;
+                self.link(l)?.ask(&exec)
             })
             .map(drop)
             .map_err(|e| anyhow::anyhow!("Amphora took no schema: {e}"))
