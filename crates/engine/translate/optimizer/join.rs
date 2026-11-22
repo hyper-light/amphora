@@ -186,7 +186,9 @@ fn keep_carried(
     } else {
         0.0
     };
-    if carried.data == result.best_plan.data && carried.inner_joins == result.best_plan.inner_joins
+    // The search found the carried order itself: its own plan stands as it is.
+    if result.best_plan.is_left_deep()
+        && carried.table_numbers().eq(result.best_plan.table_numbers())
     {
         return result;
     }
