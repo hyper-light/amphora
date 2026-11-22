@@ -2583,8 +2583,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             }
             fencing
         };
-        // The member's senders wake on the step that fences, as on the owner's end (CP-T1.13).
+        // The member's senders and its host's listener wake on the step that fences, as on the
+        // owner's end (CP-T1.13).
         if fencing {
+            self.control.listened();
             self.control.fenced_to_senders();
         }
         self.publish_closed()?;
