@@ -269,3 +269,70 @@ fn cp_t1_13_a_leader_request_made_during_an_election_is_answered_once_it_is_chos
         .unwrap();
     assert!(configs.iter().any(|m| m.node == again), "{again}");
 }
+
+/// A disk cut under load (T-T1.13.1, AC-T1.13.5): the leader's log disk goes away while writers
+/// write; its replica fences on the first refused write or flush and the member ends, naming the
+/// disk; the two left elect, keep taking writes, and hold every write acknowledged before, during
+/// and after the cut. (Started again, a member finds its disk back and catches up from its own
+/// durable log: scripts/drills.sh's `disk` drill, one member per process.)
+#[test]
+fn t_t1_13_1_a_leaders_disk_cut_under_load_loses_no_acknowledged_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    let mut ended = std::collections::BTreeMap::new();
+    for c in configs.clone() {
+        let (up, listening) = std::sync::mpsc::channel();
+        let (end, ends) = std::sync::mpsc::channel();
+        let node = c.node;
+        std::thread::spawn(move || {
+            let _ = end.send(serve::serve(&c, move |_| {
+                let _ = up.send(());
+            }));
+        });
+        listening.recv().unwrap();
+        ended.insert(node, ends);
+    }
+    let c = &configs[0];
+    healthy(c);
+    let secret = c.secret().unwrap();
+    let (leader, addr) = Client::connect(&c.members[0].addr, &secret, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+
+    // Writes before the cut, then the leader's disk cut while two writers write through it.
+    let before = dir.path().join("before");
+    serve::load(c, "before", 2, Duration::from_millis(200), &before).unwrap();
+    Client::connect(&addr, &secret, c.deadline)
+        .unwrap()
+        .ask("disk on")
+        .unwrap();
+    let during = dir.path().join("during");
+    let summary = serve::load(c, "during", 2, Duration::from_secs(2), &during).unwrap();
+
+    // The cut member ended on its own, fenced (the receive's bound is a hang guard).
+    let why = ended[&leader]
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the member whose disk was cut never ended");
+    let why = why.expect_err("a member whose disk was cut ran on");
+    eprintln!("member {leader} ended: {why:#}");
+
+    // Every acknowledged write, before and during the cut, on both members left.
+    let mut left = c.clone();
+    left.voters = configs
+        .iter()
+        .map(|m| m.node)
+        .filter(|n| *n != leader)
+        .collect();
+    for ledger in [&before, &during] {
+        let (report, ok) = serve::check(&left, ledger, Duration::from_secs(60)).unwrap();
+        assert!(ok, "{summary}{report}");
+        assert!(report.contains("nothing lost"), "{report}");
+    }
+    let acked: u64 = std::fs::read_to_string(&during)
+        .unwrap()
+        .lines()
+        .map(|l| l.split_whitespace().nth(2).unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert!(acked > 0, "the two left took no writes: {summary}");
+}

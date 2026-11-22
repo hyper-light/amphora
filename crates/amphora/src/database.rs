@@ -1195,6 +1195,16 @@ impl Database {
         )
     }
 
+    /// Cuts the disk under the replicated log open at `log_path`, or gives it back (CP-T1.13,
+    /// T-T1.13.1: the fire drills' cut disk, `amphora serve`'s `disk on|off`). While cut, every read,
+    /// write and flush of that log fails with an I/O error and its replica fences on the first, as
+    /// it does when a real disk goes away; a member opened again finds its disk back. The member's
+    /// database files are its own and aren't cut: every write is made durable in the log first.
+    /// Refused when no replicated log of this process is open at `log_path`.
+    pub fn cut_log_disk(log_path: &Path, on: bool) -> Result<(), Refusal> {
+        replicated::cut_disk(&resolved_path(log_path)?, on)
+    }
+
     pub fn replica(&self) -> Option<crate::replication::ReplicaHandle> {
         match &self.shared.writer {
             Writer::Replicated { client, .. } => Some(client.handle()),

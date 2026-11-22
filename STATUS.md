@@ -1122,3 +1122,8 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   `amphora member CONFIG add|promote|demote|remove N` with a config `voters` key (spares start as
   learners); the region-lost drill replaces a lost member with a spare. Mutual TLS waits on the
   split-merge listener's TLS landing on t1/group-replication.
+  Lane production-6: two more drills, `disk` (a member's log disk cut: every read, write and flush
+  of it fails, the replica fences and the member ends, then starts again with its disk back) and
+  `roll` (a rolling restart, the leader last, each member caught up before the next); `all` runs
+  kill, split, stall, disk and roll, each counted on every member. A test cuts the leader's disk
+  under load and finds every acknowledged write on the two left. Untested on Linux yet.
