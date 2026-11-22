@@ -1933,3 +1933,123 @@ fn t_qt_6_21_a_join_of_reads_only_copies_its_outputs_when_switched_on() {
     // Non-vacuity: some run took the hook and copied its outputs.
     assert!(copied_any, "no reads-only join copied its outputs");
 }
+
+/// T-QT.6.22 (lane qs6-13): outer joins under LIMIT and OFFSET run on morsels. Random LEFT, RIGHT
+/// and FULL joins of two tables with INTEGER PRIMARY KEYs, ON terms beside the key and WHERE terms
+/// that read the padded side's NULLs, their rows ordered by both keys (each either way, after an
+/// optional lead key) under a LIMIT and an OFFSET, answer row for row as the serial loop at 1, 2,
+/// 3, 4 and 8 stated cores: a padded row's NULL key still tells it apart. Each kind took the hook
+/// in some runs (one link built, the body run); an order with ties under a LIMIT is declined.
+#[test]
+fn t_qt_6_22_outer_joins_under_limit_answer_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-22");
+    let mut rng = ChaCha8Rng::seed_from_u64(622);
+    let pad = "x".repeat(64);
+    for (name, rows) in [("t", 900usize), ("u", 300)] {
+        conn.execute(format!(
+            "CREATE TABLE {name}(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)"
+        ))
+        .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for _ in 0..rows {
+            let a = if rng.random_range(0..10) == 0 {
+                "NULL".to_string()
+            } else {
+                rng.random_range(-20i64..20).to_string()
+            };
+            let b = rng.random_range(-1000i64..1000);
+            let c = rng.random_range(0..12);
+            conn.execute(format!(
+                "INSERT INTO {name}(a, b, c, p) VALUES ({a}, {b}, 't{c}', '{pad}')"
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let run = |sql: &str, cores: usize| {
+        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+            NonZeroUsize::new(cores).unwrap(),
+            1.0,
+            1.0,
+        ));
+        let links_before = conn
+            .morsel_join_links
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let body_before = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let rows = sql_rows(&conn, sql);
+        let links = conn
+            .morsel_join_links
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - links_before;
+        let body = conn
+            .morsel_body_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - body_before;
+        (rows, links == 1 && body > 0)
+    };
+    let kinds = ["LEFT", "RIGHT", "FULL"];
+    let mut hooked = [0usize; 3];
+    let queries = 36usize;
+    for query in 0..queries {
+        let at = query % kinds.len();
+        let kind = kinds[at];
+        let dir = |rng: &mut ChaCha8Rng| if rng.random_bool(0.5) { " DESC" } else { "" };
+        let lead = ["", "t.a, ", "u.c DESC, "][rng.random_range(0..3)];
+        let (dt, du) = (dir(&mut rng), dir(&mut rng));
+        let order = if rng.random_bool(0.5) {
+            format!("{lead}t.id{dt}, u.id{du}")
+        } else {
+            format!("{lead}u.id{du}, t.id{dt}")
+        };
+        let on = match rng.random_range(0..4) {
+            0 => String::new(),
+            1 => format!(" AND u.b > {}", rng.random_range(-1000i64..1000)),
+            2 => format!(" AND t.b < {}", rng.random_range(-1000i64..1000)),
+            _ => " AND t.b + u.b > 0".to_string(),
+        };
+        let filter = match rng.random_range(0..4) {
+            0 | 1 => String::new(),
+            2 => " WHERE u.a IS NULL OR u.b > 0".to_string(),
+            _ => format!(" WHERE coalesce(t.a, 0) > {}", rng.random_range(-20i64..20)),
+        };
+        let limit = if rng.random_range(0..6) == 0 {
+            -1
+        } else {
+            rng.random_range(1i64..200)
+        };
+        let offset = match rng.random_range(0..3) {
+            0 => String::new(),
+            1 => format!(" OFFSET {}", rng.random_range(0..300)),
+            _ => " OFFSET -3".to_string(),
+        };
+        let sql = format!(
+            "SELECT t.id, u.id, t.c, u.a FROM t {kind} JOIN u ON t.a = u.a{on}{filter} ORDER BY {order} LIMIT {limit}{offset}"
+        );
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            let (parallel, ran) = run(&sql, cores);
+            assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            if ran {
+                hooked[at] += 1;
+            }
+        }
+    }
+    // An order with ties under a LIMIT could cut a different tie: the hook declines it.
+    for kind in kinds {
+        let tied =
+            format!("SELECT t.a, u.c FROM t {kind} JOIN u ON t.a = u.a ORDER BY t.a LIMIT 10");
+        let (_, ran) = run(&tied, 4);
+        assert!(!ran, "{tied} took the hook");
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: every kind ran on morsels under a LIMIT.
+    for (kind, runs) in kinds.iter().zip(hooked) {
+        assert!(runs > 0, "no {kind} JOIN under a LIMIT took the hook");
+    }
+}

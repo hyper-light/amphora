@@ -924,7 +924,10 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
     }
     // An outer join of two tables (lane qs6-12): the probe is the table the join pads, the
     // other the build, whatever loop the planner chose (it makes no FULL hash join); the hook keys
-    // its hash table by the ON equalities. A LIMIT or OFFSET stays serial.
+    // its hash table by the ON equalities. Under a LIMIT or OFFSET (lane qs6-13) its rows are cut
+    // as an inner join's are, only when the ORDER BY holds every table's INTEGER PRIMARY KEY
+    // (below): a padded row's NULL key still tells it apart, since a probe row is padded at most
+    // once and a build row too, so the order is the serial loop's to the row.
     let (probe_at, outer) = match outer {
         None => {
             if built.is_empty() {
@@ -933,11 +936,7 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
             ((0..tables.len()).find(|at| !built.contains(at))?, None)
         }
         Some((at, kind)) => {
-            if tables.len() != 2
-                || built.contains(&at)
-                || plan.limit.is_some()
-                || plan.offset.is_some()
-            {
+            if tables.len() != 2 || built.contains(&at) {
                 return None;
             }
             (at, Some(kind))
