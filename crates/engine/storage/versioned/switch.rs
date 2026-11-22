@@ -791,6 +791,21 @@ impl Switch {
     /// or rolls it back. A cursor still holding it is refused its next write.
     /// Trees the transaction made are dropped if it rolls back; trees it dropped, once it commits.
     pub fn finish(&self, rollback: bool) -> Result<()> {
+        self.end(rollback, || Ok(()))
+    }
+
+    /// Commits the connection's transaction with `with` (the pager's commit of its header, the
+    /// schema cookie among it), atomically (lane g7s2-18, `AC-NS.2.1`): `with` runs once the
+    /// storage's verdict is in and before its commit is published, so a refusal (a conflict, a
+    /// `SchemaConflict`) refuses before `with` runs and leaves the pager's transaction to roll
+    /// back, and a failure of `with` rolls the storage's back. With no transaction open here,
+    /// `with` alone runs.
+    pub fn commit_with(&self, with: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.end(false, with)
+    }
+
+    /// [`Switch::finish`] and [`Switch::commit_with`]: `with` runs only on a commit.
+    fn end(&self, rollback: bool, with: impl FnOnce() -> Result<()>) -> Result<()> {
         self.statements.lock().clear();
         self.named.lock().clear();
         let made = std::mem::take(&mut *self.made.lock());
@@ -805,11 +820,12 @@ impl Switch {
                     self.db.abort(txn, &mut d)
                 } else {
                     self.db
-                        .commit(txn, &mut d, self.db.lane(), true)
+                        .commit_with(txn, &mut d, self.db.lane(), true, with)
                         .map(|_| ())
                 }
             }
-            None => Ok(()),
+            None if rollback => Ok(()),
+            None => with(),
         };
         // A transaction that didn't commit leaves the trees it made named by no schema row: they
         // are dropped, a failed commit's too. A commit whose flush failed may be durable, but its

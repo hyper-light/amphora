@@ -241,6 +241,13 @@ struct Lane {
     durable: AtomicU64,
 }
 
+/// A commit's redo record, made and checked, to append ([`Redo::ready`], [`Redo::push`]).
+pub struct Ready {
+    lane: LaneId,
+    ts: u64,
+    record: Vec<u8>,
+}
+
 /// A writer's lane, as [`Redo::lane`] hands them out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LaneId(usize);
@@ -316,8 +323,27 @@ impl Redo {
     /// Appends the record of commit `ts` to `lane` (call in timestamp order, every timestamp: under
     /// the clock's publish lock).
     pub fn append(&self, lane: LaneId, ts: u64, ops: &[Op]) -> Result<()> {
+        let record = self.ready(lane, ts, ops)?;
+        self.push(record)
+    }
+
+    /// Commit `ts`'s record for `lane`, made but not yet appended: everything that can refuse an
+    /// append (a poisoned log, a record too large, no such lane) refuses here, so a commit that
+    /// must not fail once something outside the storage committed with it (the pager's header,
+    /// lane g7s2-18, `AC-NS.2.1`) asks here first and [`Redo::push`]es after.
+    pub fn ready(&self, lane: LaneId, ts: u64, ops: &[Op]) -> Result<Ready> {
         self.usable()?;
-        let record = encode(ts, ops)?;
+        self.get(lane.0)?;
+        Ok(Ready {
+            lane,
+            ts,
+            record: encode(ts, ops)?,
+        })
+    }
+
+    /// Appends a record [`Redo::ready`] made (under the same publish lock).
+    pub fn push(&self, ready: Ready) -> Result<()> {
+        let Ready { lane, ts, record } = ready;
         let turn = self.turn.load(Ordering::Acquire);
         {
             let mut p = self.get(lane.0)?.pending.lock();

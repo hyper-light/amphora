@@ -646,3 +646,67 @@ fn ac_ns_2_1_a_writer_against_an_older_schema_is_refused_at_commit() {
         );
     }
 }
+
+/// The schema cookie (`PRAGMA schema_version`) as `conn` reads it.
+fn cookie(conn: &Arc<Connection>) -> Vec<Vec<Value>> {
+    rows(conn, "PRAGMA schema_version")
+}
+
+/// The names `sqlite_schema` holds, as `conn` reads them.
+fn names(conn: &Arc<Connection>) -> Vec<Vec<Value>> {
+    rows(conn, "SELECT name FROM sqlite_schema ORDER BY name")
+}
+
+/// AC-NS.2.1 (lane g7s2-18): a commit is one across the pager and the versioned storage. Do open
+/// a transaction that builds an index of `t` (it reads the table and writes its schema row, its
+/// index rows and the pager's header, the cookie), let another connection insert a row of `t` and
+/// commit, then commit the index; expect it refused (it read the table the insert changed), and
+/// nothing of it anywhere: the cookie and the schema rows as before on its own connection, on the
+/// other and on a new one, and no connection knowing the index. Run again, the index stands on
+/// every connection, the cookie one past. The pager committed first: its cookie stood, and its
+/// schema, the index naming a tree the storage dropped, was every connection's.
+#[test]
+fn ac_ns_2_1_a_schema_change_the_storage_refuses_leaves_nothing() {
+    let (db, a, b) = two_writers();
+    let (cookie_before, names_before) = (cookie(&a), names(&a));
+    run(&a, "BEGIN");
+    run(&a, "CREATE INDEX tv ON t (v)");
+    run(&b, "INSERT INTO t VALUES (3, 0)");
+    let e = a
+        .execute("COMMIT")
+        .expect_err("an index built over rows changed beside it commits");
+    assert!(
+        matches!(
+            e,
+            crate::LimboError::SerializationFailure | crate::LimboError::WriteWriteConflict
+        ),
+        "the schema change's refusal: {e:?}"
+    );
+    if !a.get_auto_commit() {
+        run(&a, "ROLLBACK");
+    }
+    let c = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    for (who, conn) in [("its own", &a), ("the other", &b), ("a new one", &c)] {
+        assert_eq!(cookie(conn), cookie_before, "{who} connection's cookie");
+        assert_eq!(names(conn), names_before, "{who} connection's schema rows");
+        assert!(
+            conn.prepare("SELECT id FROM t INDEXED BY tv WHERE v = 0")
+                .is_err(),
+            "{who} connection knows the refused index"
+        );
+    }
+    run(&a, "CREATE INDEX tv ON t (v)");
+    let all = vec![
+        vec![Value::from_i64(1)],
+        vec![Value::from_i64(2)],
+        vec![Value::from_i64(3)],
+    ];
+    for (who, conn) in [("its own", &a), ("the other", &b), ("a new one", &c)] {
+        assert_ne!(cookie(conn), cookie_before, "{who} connection's cookie");
+        let (by_tv, by_table) = by_index(conn, 0);
+        assert_eq!(by_tv, all, "{who} connection, through the index");
+        assert_eq!(by_table, all, "{who} connection, through the table");
+    }
+}

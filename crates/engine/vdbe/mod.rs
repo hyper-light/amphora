@@ -3015,6 +3015,24 @@ impl Program {
             // We don't want to commit on nested statements. Let parent handle it.
             return Ok(IOResult::Done(()));
         }
+        // Amphora (lane g7s2-18, `AC-NS.2.1`): on the versioned storage a transaction that wrote
+        // the pager's header (a schema change's cookie, a pragma) commits it inside the storage's
+        // commit, once the storage's verdict is in and before its rows are published. A refusal
+        // (a conflict, `SchemaConflict`) comes before the pager commits, so the abort that
+        // follows rolls both back; the pager's failure rolls the storage's back. The pager's
+        // commit was first and the storage's after: a refused schema change left its cookie
+        // committed and its rows not.
+        if !rollback
+            && mv_store.is_none()
+            && matches!(program_state.commit_state, CommitState::Ready)
+            && matches!(tx_state, TransactionState::Write { .. })
+            && self.connection.auto_commit.load(Ordering::SeqCst)
+            && pager.holds_write_lock()
+        {
+            if let Some(switch) = self.connection.versioned_for(crate::MAIN_DB_ID) {
+                self.commit_versioned_with_header(&switch, &pager)?;
+            }
+        }
         let res = if let Some(mv_store) = mv_store {
             self.commit_txn_mvcc(pager, program_state, mv_store, rollback)
         } else {
@@ -3060,6 +3078,40 @@ impl Program {
             }
         }
         Ok(res)
+    }
+
+    /// The pager's commit of its header inside the versioned storage's ([`Switch::commit_with`],
+    /// lane g7s2-18, `AC-NS.2.1`), run to its end there: the storage's publish lock is held
+    /// across it, which only a transaction that wrote the header (DDL, a pragma) pays. The
+    /// transaction stays `Write`, so the commit goes on as it would and finds the pager's part
+    /// done. A schema change is published to the database's shared schema only once the
+    /// storage's rows are, so a connection that takes the new schema reads them.
+    ///
+    /// [`Switch::commit_with`]: crate::storage::versioned::switch::Switch::commit_with
+    fn commit_versioned_with_header(
+        &self,
+        switch: &crate::storage::versioned::switch::Switch,
+        pager: &Arc<Pager>,
+    ) -> Result<()> {
+        use crate::util::IOExt;
+        let connection = &self.connection;
+        let schema_did_change = matches!(
+            connection.get_tx_state(),
+            TransactionState::Write {
+                schema_did_change: true
+            }
+        );
+        let sync_mode = connection.get_sync_mode();
+        switch.commit_with(|| {
+            pager
+                .io
+                .block(|| pager.commit_tx(connection, sync_mode, false))
+        })?;
+        if schema_did_change {
+            let schema = connection.schema.read().clone();
+            connection.db.update_schema_if_newer(schema);
+        }
+        Ok(())
     }
 
     fn commit_txn_wal(

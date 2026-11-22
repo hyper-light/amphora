@@ -538,7 +538,15 @@ under the publish lock), and a transaction that changed rows and began before it
 commit with `SchemaConflict` and rolls back (lane g7s2-17), as the MVCC store refuses it and as
 PostgreSQL's DDL locks hold writers off: never committed against a catalog it didn't compile
 against (an index it left its rows out of). It refuses every writer begun before any schema
-change; a rule at a table's grain is a later A/B. The storage sets no memory aside: it takes its
+change; a rule at a table's grain is a later A/B. A transaction that wrote the header commits it
+inside the storage's commit (lane g7s2-18): once the storage has validated it and made its redo
+record, under the publish lock and before its rows are published, the pager commits the header, so
+a refusal (a conflict, `SchemaConflict`) comes before the pager commits and rolls both back, and
+the pager's failure rolls the storage's back; the shared schema takes the change only once the
+rows are published. The pager committed first before: a schema change the storage then refused
+left its cookie committed, and its schema, naming a tree the storage dropped, every connection's.
+The storage's publish lock is held across the pager's commit of its header, which only DDL and
+pragmas pay. The storage sets no memory aside: it takes its
 pages' frames and its row versions' bytes from a memory source as they grow, and gives them back as
 it lets them go (`storage::versioned::memory::Source`, `ConnectOpts::with_memory`). Amphora's shell
 gives its process memory budget (`amphora::memory::StorageMemory`, as caches; store.md, "Decision
@@ -563,7 +571,11 @@ means to every reader of the schema.
 them), SELECT, explicit transactions, rollback, UPDATE and DELETE through both storages answer alike,
 and the versioned run's table sits on tree 3. `sql.rs`'s `ac_ns_2_1_*` tests: two connections'
 open transactions writing different rows both commit (BEGIN and BEGIN IMMEDIATE), two writing one
-row see the second refused with a conflict, and two schema changes still run one at a time.
+row see the second refused with a conflict, and two schema changes still run one at a time;
+`ac_ns_2_1_a_schema_change_the_storage_refuses_leaves_nothing`: an index build the storage refuses
+leaves the cookie and the schema rows as they were on every connection. The validations' control,
+`Validation::Snapshot`, refuses no index build over rows changed beside it, and is set only on
+storages the Elle checks and the validations' bench make, never on SQL's.
 
 **Falsified by.** An engine suite that passes on the pager and fails on the switch for a reason the
 cursor interface can't carry; or the header kept by the pager disagreeing with the trees after a

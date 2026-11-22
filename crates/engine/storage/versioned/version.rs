@@ -314,7 +314,13 @@ pub struct Txn {
 /// serializable against each other on the same commit path, and keeps one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Validation {
-    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control.
+    /// Nothing: snapshot isolation, which allows write skew. The Elle checks' control, set only
+    /// by [`Versioned::with_validation`], which the Elle checks, this file's tests and the
+    /// validations' bench (`amphora-bench --cc`) call on a storage of their own: SQL's storage
+    /// (`durable::Database`, through the switch) is never opened with it. So its gap stays a
+    /// control's (lane g7s2-18, `AC-NS.2.1`): a `CREATE INDEX` that read its table while a writer
+    /// of the table committed beside it is not refused here, and its index lacks that writer's
+    /// rows; every other validation refuses it.
     Snapshot,
     /// Precision locking as HyPer adapts it (Neumann, Mühlbauer, Kemper, SIGMOD 2015): a
     /// transaction that wrote checks the rows and spans it read against the rows written by the

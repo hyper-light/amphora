@@ -906,15 +906,38 @@ impl Database {
     /// Commits `txn`, logged to `lane`; durable before it returns if `durable` (every commit up to
     /// it durable), else once a later [`Database::sync`] returns. Its timestamp.
     pub fn commit(&self, txn: Txn, d: &mut Descender, lane: LaneId, durable: bool) -> Result<Ts> {
+        self.commit_with(txn, d, lane, durable, || Ok(()))
+    }
+
+    /// [`Database::commit`], with `with` run once the commit's verdict is in and before it is
+    /// published, under the publish lock (lane g7s2-18, `AC-NS.2.1`): the commit was validated,
+    /// its redo record made and checked, and nothing after `with` refuses it. A refusal before
+    /// `with` never runs it; a failure of `with` rolls `txn` back. What else must commit with
+    /// these rows (the pager's header, its schema cookie) commits in `with`, so both commit or
+    /// neither does.
+    pub fn commit_with(
+        &self,
+        txn: Txn,
+        d: &mut Descender,
+        lane: LaneId,
+        durable: bool,
+        with: impl FnOnce() -> Result<()>,
+    ) -> Result<Ts> {
         // Shared for the publish, which a checkpoint's timestamp must not split, and for a
         // rollback a failed append makes, which changes pages.
         let ts = {
             let _changing = self.gate.read();
             self.v.commit_logged(txn, d, |ts, ops| {
-                self.redo.append(lane, ts, ops)?;
+                let ready = self.redo.ready(lane, ts, ops)?;
                 let feeds = self.columns.read();
-                if !feeds.is_empty() {
-                    let whole = self.whole(ops)?;
+                let whole = if feeds.is_empty() {
+                    None
+                } else {
+                    Some(self.whole(ops)?)
+                };
+                with()?;
+                self.redo.push(ready)?;
+                if let Some(whole) = whole {
                     for feed in feeds.iter() {
                         feed.offer(ts, &whole);
                     }

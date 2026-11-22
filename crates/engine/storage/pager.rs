@@ -3897,7 +3897,10 @@ impl Pager {
                     wal.end_read_tx();
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
-                    if schema_did_change {
+                    // On the versioned storage the schema's rows are the storage's: the schema is
+                    // published once they are (`Program::commit_versioned_with_header`, lane
+                    // g7s2-18, `AC-NS.2.1`), not here, inside the storage's commit.
+                    if schema_did_change && connection.versioned.is_none() {
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }
