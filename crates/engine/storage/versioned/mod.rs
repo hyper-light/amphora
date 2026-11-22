@@ -27,6 +27,8 @@ mod elle;
 #[cfg(test)]
 mod elle_sql;
 #[cfg(test)]
+mod evict;
+#[cfg(test)]
 mod many_writers;
 pub mod overflow;
 pub mod page;
