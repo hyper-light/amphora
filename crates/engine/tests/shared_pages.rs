@@ -11,6 +11,18 @@ use amphora_engine::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// These tests exercise the pager's shared page pool (which page versions its connections share),
+/// which the versioned storage doesn't have: with its switch on (`AMPHORA_STORAGE=versioned`, G7
+/// step 2, `AC-NS.2.1`) they say so and pass over, and aren't ported. The versioned storage's own
+/// pool is tested in `storage::versioned`.
+fn pager_only() -> bool {
+    let on = amphora_engine::storage::versioned::switch::asked();
+    if on {
+        eprintln!("pager-only: this test exercises the pager's shared page pool (which page versions its connections share); the versioned storage has none");
+    }
+    on
+}
+
 fn open(dir: &std::path::Path, share: bool) -> Arc<Database> {
     let io = Arc::new(PlatformIO::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
@@ -67,6 +79,9 @@ fn table(conn: &Arc<Connection>, n: i64) {
 /// shared pages' hits grow by at least the pages the first added), and reads what the first read.
 #[test]
 fn a_page_one_reader_read_in_the_others_read_from_memory() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
     let writer = connect(&db);
@@ -103,6 +118,9 @@ fn a_page_one_reader_read_in_the_others_read_from_memory() {
 /// is open and after it is rolled back, and the new row once a write of it commits.
 #[test]
 fn a_writer_copies_a_shared_page_before_it_writes_it() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
     table(&connect(&db), 500);
@@ -152,6 +170,9 @@ fn a_writer_copies_a_shared_page_before_it_writes_it() {
 /// the new ones after (decision 27: a writer reads committed versions from memory too).
 #[test]
 fn a_writer_in_a_transaction_reads_committed_pages_from_memory() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
     table(&connect(&db), 2000);
@@ -202,6 +223,9 @@ fn a_writer_in_a_transaction_reads_committed_pages_from_memory() {
 /// (decision 27).
 #[test]
 fn a_writer_keeps_nothing_it_reads_in_the_shared_pages() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
     table(&connect(&db), 2000);
@@ -233,6 +257,9 @@ fn a_writer_keeps_nothing_it_reads_in_the_shared_pages() {
 /// Expect: a reader that reads afterwards, from the file, reads every new row.
 #[test]
 fn a_checkpoint_drops_the_file_versions_it_writes_over() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
     let writer = connect(&db);
@@ -265,6 +292,9 @@ fn a_checkpoint_drops_the_file_versions_it_writes_over() {
 /// never a rolled-back one kept from a frame used again.
 #[test]
 fn a_write_rolled_back_leaves_no_shared_page() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), true);
     table(&connect(&db), 10_000);
@@ -450,6 +480,9 @@ fn model_on(seed: u64, format: LogFormat, path: PagePath) {
 /// Do: the model's 300 steps for 16 seeds. Expect: every read the model's, and pages shared.
 #[test]
 fn readers_sharing_pages_never_read_a_version_they_dont_see() {
+    if pager_only() {
+        return;
+    }
     for seed in 0..16 {
         model(seed, LogFormat::Pages);
     }
@@ -459,6 +492,9 @@ fn readers_sharing_pages_never_read_a_version_they_dont_see() {
 /// rollbacks among page frames, shared as a page frame's are.
 #[test]
 fn readers_sharing_a_mixed_logs_pages_never_read_a_version_they_dont_see() {
+    if pager_only() {
+        return;
+    }
     for seed in 0..16 {
         model(seed, LogFormat::Mixed);
     }
@@ -485,6 +521,9 @@ fn table_of(conn: &Arc<Connection>, n: i64, prefix: &str) {
 /// from memory, and the pool keeps no more than its bound (decision 20).
 #[test]
 fn databases_sharing_one_pool_read_only_their_own_pages() {
+    if pager_only() {
+        return;
+    }
     use amphora_engine::storage::shared_pages::SharedPages;
     let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let pool = Arc::new(SharedPages::new(4096));
@@ -528,6 +567,9 @@ fn databases_sharing_one_pool_read_only_their_own_pages() {
 /// line). Expect: every read the model's, and pages shared.
 #[test]
 fn g3s3_readers_on_the_plain_page_path_never_read_a_version_they_dont_see() {
+    if pager_only() {
+        return;
+    }
     for seed in 0..16 {
         model_on(seed, LogFormat::Pages, PagePath::Plain);
     }
@@ -536,6 +578,9 @@ fn g3s3_readers_on_the_plain_page_path_never_read_a_version_they_dont_see() {
 /// The same on a mixed log.
 #[test]
 fn g3s3_readers_on_the_plain_page_path_read_a_mixed_log_as_the_model_says() {
+    if pager_only() {
+        return;
+    }
     for seed in 0..16 {
         model_on(seed, LogFormat::Mixed, PagePath::Plain);
     }
@@ -546,6 +591,9 @@ fn g3s3_readers_on_the_plain_page_path_read_a_mixed_log_as_the_model_says() {
 /// reads the same rows as today's.
 #[test]
 fn g3s3_each_page_path_reads_the_pages_todays_path_reads() {
+    if pager_only() {
+        return;
+    }
     for share in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = open(dir.path(), share);
@@ -585,6 +633,9 @@ fn g3s3_each_page_path_reads_the_pages_todays_path_reads() {
 /// checksum error each time.
 #[test]
 fn g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     {
         let db = open(dir.path(), false);
@@ -629,6 +680,9 @@ fn g3s3_a_byte_flipped_on_disk_is_refused_on_each_page_path() {
 /// recycled pages) rather than new ones.
 #[test]
 fn g3s3_plain_misses_read_into_the_pages_evictions_leave() {
+    if pager_only() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), false);
     table(&connect(&db), 16000);

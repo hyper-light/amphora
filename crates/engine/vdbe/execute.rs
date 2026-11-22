@@ -16951,6 +16951,24 @@ pub fn op_integrity_check(
         message_register,
     } = data.as_ref();
 
+    // Amphora (G7 step 2, `AC-NS.2.1`): the main database's trees on the versioned storage are
+    // checked there; the pager's pages hold none of them.
+    if *db == MAIN_DB_ID {
+        if let Some(switch) = program.connection.versioned.as_ref() {
+            let found = switch.check(roots, *max_errors)?;
+            let register = state
+                .registers
+                .get_mut(*message_register)
+                .ok_or_else(|| LimboError::InternalError("integrity_check: no register".into()))?;
+            if found.is_empty() {
+                register.set_null();
+            } else {
+                register.set_text(Text::new(found.join("\n")))?;
+            }
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
     let target_pager = if *db == MAIN_DB_ID {

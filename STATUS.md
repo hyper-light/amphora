@@ -330,11 +330,17 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
   run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
-  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
-  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), SQL's
-  named SAVEPOINT, a database past the pool's frames or a transaction past
-  its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
-  switch on are the coordinator's run.
+  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. A file database
+  reopens and recovers from a crash with its indexes (each tree's order in the redo log, the schema
+  read from tree 1); the storage's budget is `ConnectOpts::with_memory_budget` (the shell's quarter
+  of its process's memory), else a quarter of the machine's, its frames made as pages are handed
+  out (`T-NS.2.10`); DDL undone by a failed statement, a savepoint or a failed commit leaves no
+  orphan tree (`T-NS.2.11`). Not yet: the header (schema cookie, user version) on the versioned
+  storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
+  budget shared by a process's databases. On the pager as on the switch, `nested_loops`'
+  chain of hash joins, `row_counts`' hash join and `sample_filters`' outer join fail (planner
+  work in flight on main), and a failed CREATE TABLE ... AS in a transaction leaves the pager's
+  next statement refused `SchemaUpdated`.
 - **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
   `amphora-bench --reach`): behind one trait, sharing frames, CLOCK eviction and one miss path, (a) a
   page table in shards with pins and a private pin on a client's current page (PostgreSQL), (b)

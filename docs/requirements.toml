@@ -528,6 +528,9 @@ tests = [
   { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
   # lane g7s2-3
   { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
+  # lane g7s2-5
+  { id = "T-NS.2.10", text = "The versioned storage holds the shell's budget, else a quarter of the machine's memory, its pages and versions together; its pool's frames are made as pages are handed out" },
+  { id = "T-NS.2.11", text = "DDL undone by a failed statement, a savepoint rolled back to or a failed commit leaves no tree that no schema row names; a DROP undone keeps its tree" },
 ]
 
 # lane g7s3
