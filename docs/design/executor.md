@@ -657,8 +657,8 @@ summaries that took its writes `Stale` until built again; MVCC is refused (`Skip
 **The scan (lane g5s4d, T-G5.4.3).** At translation a SELECT's plain forward scan of a rowid
 table (no index, no outer join in the query) carries a `SkipHint`: each column's integer bounds
 that its WHERE terms put on every result row (`a BETWEEN 10 AND 20`, `a >= 10 AND a < 20`,
-`5 < a`, `a = 7`; a real, text or parameter constant, a COLLATE, an IN list or NOT BETWEEN gives no
-bound: loose, never wrong). At run time the Rewind asks the registry for the hinted column's
+`5 < a`, `a = 7`, `a BETWEEN ? AND ?`; a real or text constant, a COLLATE, an IN list or NOT
+BETWEEN gives no bound: loose, never wrong). At run time the Rewind asks the registry for the hinted column's
 candidates only when a summary is kept for it and the reader may consult it (the rule above); a
 refusal is counted (`SkipCounts`) and the scan reads every row. With candidates, a `SkipWalk` on
 the cursor seeks past each run of rows they leave out (a zone map's rowid ranges, or the cracker's
@@ -669,9 +669,19 @@ table seek. No size is picked: a zone is a table leaf (the page size and the rec
 how many rows it holds), the tail zone grows to the leaves' measured fill, and the cracker's pieces
 are cut where filters asked.
 
-**Not yet.** Neither kind is chosen by measured cost (the harness's numbers aren't recorded), a
-summary is turned on by `skipping::set_skipping` (no SQL), and bounds from parameters
-(`a BETWEEN ? AND ?`) aren't read.
+### Bounds from parameters (lane skip-usable, T-SKU.1)
+
+Real callers prepare a statement once and bind it on each run (`a BETWEEN ? AND ?`, `a >= :lo`), so
+a hint holds terms, not resolved bounds: each `BoundTerm` is a column, an operator and either an
+integer constant or a parameter's index (`BoundValue`). The Rewind reads each parameter's bound
+value from the run's own bindings as the scan starts (`SkipHint::bounds`) and intersects the terms
+then, so one prepared statement skips by whatever it is bound to each time. A parameter bound to
+anything but an integer (NULL, a real, a text, a blob) gives its term no bound: loose, never wrong,
+the same rule as the summaries' (a bound parameter has no affinity, as a numeric literal has none,
+so the comparison it makes is the constant's).
+
+**Not yet.** Neither kind is chosen by measured cost (the harness's numbers aren't recorded), and a
+summary is turned on by `skipping::set_skipping` (no SQL).
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's

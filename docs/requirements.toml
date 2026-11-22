@@ -1231,3 +1231,12 @@ tests = [
 ]
 
 # lane pl8-9: no new IDs. T-PL.8.2 gains the search test of docs/design/planner.md "Decision (lane pl8-9)".
+
+# lane skip-usable: row skipping usable by real statements (kiln goal 99e6cc88; executor.md decision 11).
+[[own]]
+id = "SKU"
+title = "Row skipping usable by real statements: bounds from parameters, a measured choice of kind, SQL to switch it on, fused batches"
+criteria = []
+tests = [
+  { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
+]

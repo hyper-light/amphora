@@ -1049,4 +1049,8 @@ registry of skipping summaries (zone maps or cracking), and a SELECT's scan with
 a summarized column seeks past the rows the summary leaves out, consulting it only at the snapshot
 it holds (an older reader, or a rolled-back summary, is refused, counted, and reads every row).
 Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). Open: choosing a kind
-by measured cost, a SQL switch, parameter bounds (executor.md decision 11, "Not yet").
+by measured cost and a SQL switch (executor.md decision 11, "Not yet").
+
+Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
+11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
+skip (T-SKU.1).
