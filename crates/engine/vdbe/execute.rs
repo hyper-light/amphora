@@ -21176,6 +21176,7 @@ pub fn op_morsel_aggregate(
             data.root_page,
             data.columns,
             data.rowid_alias,
+            data.defaults.clone(),
         )?;
         let budget = MemoryBudget::new(pager.statement_memory_budget());
         if data.joins.is_empty() {
@@ -21245,6 +21246,7 @@ pub fn op_morsel_aggregate(
                 join.root_page,
                 join.columns,
                 join.rowid_alias,
+                join.defaults.clone(),
             )?;
             // A searched table of an inner join keyed by its INTEGER PRIMARY KEY is read by a
             // seek per joined row when the switch says so (lane qs6-16): no table built.

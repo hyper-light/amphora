@@ -402,8 +402,8 @@ VDBE's join in its order (T-QT.6.8); an INTEGER PRIMARY KEY reads its rowid (T-Q
 whose whole work is one rowid table read whole with its filter and aggregates is emitted as
 `Insn::MorselAggregate` and a row loop over `Insn::MorselNext`, ahead of the statement's serial
 loop (`translate/parallel.rs`). Only shapes whose answers equal the serial loop's qualify: columns
-stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no defaults, no generated
-columns), terms comparing a column with a literal of its own kind or testing it for NULL,
+stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no generated columns, a
+short row padded with its columns' defaults), terms comparing a column with a literal of its own kind or testing it for NULL,
 plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX, and no HAVING, ORDER BY,
 LIMIT, DISTINCT, window or subquery; MVCC and the versioned storage, whose rows are not in the
 pager's b-trees, never qualify. When the run meets a value its aggregates don't take (a SUM over
@@ -664,7 +664,21 @@ reads it all), a huge probe against a tiny one (`Seek` seeks per row where a sma
 would do), and equal sizes, with p50, p99 and p99.9 and the links per statement at each setting
 and stated cores.
 
-**What still runs on the serial loop** (lane qs6-16's audit; each an open part of QT.6):
+**A table with a DEFAULT on morsels** (lane qs6-17). A row written before ALTER TABLE ADD COLUMN
+is shorter than its table, and the serial loop's Column reads the missing column as its default,
+folded with the column's affinity (`vdbe/builder.rs`'s `folded_default`, SQLite's
+sqlite3ColumnDefault; NULL where there is none or it doesn't fold). `stored` refused every table
+with a default, so a table that had ever gained a column ran serially. Now `parallel.rs`'s
+`defaults` takes each column's value from the same `folded_default`, into
+`MorselAggregateData::defaults` and `MorselJoinData::defaults` (empty when all are NULL, so the
+common table pads nothing), and `TableSource` pads a short row with them, on scans and seeks
+alike. Left serial: a STRICT table's custom-typed column with a default (the serial loop ENCODEs
+it at run time), generated columns, and the versioned storage's column copy of such a table.
+T-QT.6.29 checks scans' aggregates, groups and rows and joins with such columns on either side
+against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**What still runs on the serial loop** (lane qs6-16's audit, updated by lane qs6-17; each an open
+part of QT.6):
 - *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
   answer is the serial loop's rows exactly, and a probe row's matches come in its hash tables'
   order, not the hook's. Parallel needs an order the hook can reproduce (or a check of any rows of
@@ -683,8 +697,9 @@ and stated cores.
   copy doesn't take (joins, expressions only the body states, rows, a statement in a transaction
   that wrote, a table with no copy yet, or the planner's choice of the rows) runs on the serial
   loop. Needs a morsel source over the row versions at the statement's snapshot, cut by key ranges.
-- Also found: a table with a DEFAULT value or a generated column (`stored`; padding a short row
-  with its constant default instead of NULL would take the first); a scan through an index or a
+- Also found: a table with a generated column (`stored`); a STRICT table's custom-typed column
+  with a DEFAULT, which the serial loop ENCODEs at run time; a table whose short rows read a
+  default, on the versioned storage's column copy, which decodes records as written; a scan through an index or a
   rowid range (`Operation::Search` on the probe: a rowid range is a run of leaves); a one-table
   scan's rows under ORDER BY; AVG, TOTAL, group_concat, DISTINCT and FILTER aggregates, HAVING, and
   an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and

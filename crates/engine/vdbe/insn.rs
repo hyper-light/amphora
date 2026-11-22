@@ -438,6 +438,9 @@ pub struct MorselAggregateData {
     /// The table's stored columns, and the one its rowid stands in for (an INTEGER PRIMARY KEY).
     pub columns: usize,
     pub rowid_alias: Option<usize>,
+    /// Each column's value in a row written before the column was added (ALTER TABLE ADD COLUMN),
+    /// as the serial loop's Column reads it; empty when every one is NULL (lane qs6-17).
+    pub defaults: Vec<crate::types::Value>,
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
     pub group_by: Vec<usize>,
     pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
@@ -569,6 +572,8 @@ pub struct MorselJoinData {
     pub root_page: i64,
     pub columns: usize,
     pub rowid_alias: Option<usize>,
+    /// As [`MorselAggregateData::defaults`], for the build table (lane qs6-17).
+    pub defaults: Vec<crate::types::Value>,
     /// Terms over the build table's columns, tested before a row goes into the hash table.
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
     /// The key's columns, pair by pair, in the row joined so far (the probe table's columns, then

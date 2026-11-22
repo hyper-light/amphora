@@ -2491,39 +2491,12 @@ impl ProgramBuilder {
             let Some(ref default_expr) = default else {
                 break 'value None;
             };
-
-            // Try to constant-fold the default expression into a Value for the
-            // Column instruction. Non-constant defaults (e.g. DEFAULT (ABS(-5)))
-            // can't be folded and yield None here — that's correct: they are
-            // evaluated at INSERT time via translate_expr. The Column default
-            // only matters for pre-existing rows after ALTER TABLE ADD COLUMN,
-            // and ALTER TABLE already validates that the default is constant.
-            let mut value = match crate::translate::alter::eval_constant_default_value(default_expr)
-            {
-                Ok(v) => v,
-                Err(_) => break 'value None,
-            };
-
-            // Apply column affinity to the default value, matching SQLite's
-            // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
-            // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
-            // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
             let affinity = match cursor_type {
                 CursorType::BTreeTable(btree) => btree.columns()[column].affinity(),
                 CursorType::MaterializedView(btree, _) => btree.columns()[column].affinity(),
                 _ => Affinity::Blob,
             };
-            if let Some(converted) = affinity.convert(&value) {
-                value = match converted {
-                    either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
-                    either::Either::Left(_) => {
-                        unreachable!("affinity conversion returned an unexpected borrowed value")
-                    }
-                    either::Either::Right(val) => val,
-                };
-            }
-
-            Some(value)
+            folded_default(default_expr, affinity)
         };
 
         let default = if self.flags.suppress_column_default() {
@@ -2679,6 +2652,35 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Sorter
         )
     }
+}
+
+/// The value a short row (one written before ALTER TABLE ADD COLUMN) reads for a column whose
+/// DEFAULT is `default_expr`: the default constant-folded, with the column's affinity applied, as
+/// SQLite's sqlite3ColumnDefault reads it; `None` (NULL) for a default that doesn't fold. The
+/// serial loop's Column and the morsel scans' padding (QT.6, lane qs6-17) both take it from here.
+pub(crate) fn folded_default(default_expr: &ast::Expr, affinity: Affinity) -> Option<Value> {
+    // Try to constant-fold the default expression into a Value for the
+    // Column instruction. Non-constant defaults (e.g. DEFAULT (ABS(-5)))
+    // can't be folded and yield None here — that's correct: they are
+    // evaluated at INSERT time via translate_expr. The Column default
+    // only matters for pre-existing rows after ALTER TABLE ADD COLUMN,
+    // and ALTER TABLE already validates that the default is constant.
+    let mut value = crate::translate::alter::eval_constant_default_value(default_expr).ok()?;
+
+    // Apply column affinity to the default value, matching SQLite's
+    // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
+    // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
+    // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
+    if let Some(converted) = affinity.convert(&value) {
+        value = match converted {
+            either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+            either::Either::Left(_) => {
+                unreachable!("affinity conversion returned an unexpected borrowed value")
+            }
+            either::Either::Right(val) => val,
+        };
+    }
+    Some(value)
 }
 
 #[cfg(test)]

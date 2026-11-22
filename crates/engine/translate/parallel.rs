@@ -7,7 +7,7 @@
 //!
 //! Only the shapes whose answers equal the serial loop's value for value qualify: one rowid
 //! table read whole, no index, every column it reads stored as written (INTEGER, TEXT or BLOB
-//! affinity, BINARY collation, no default a short row would read, no generated column); terms
+//! affinity, BINARY collation, no generated column, a short row padded with its defaults); terms
 //! comparing a column with an integer or text literal of its own kind, or testing it for NULL;
 //! plain-column GROUP BY keys; COUNT, SUM over INTEGER columns, MIN and MAX; no HAVING, ORDER
 //! BY, LIMIT, DISTINCT, window or subquery.
@@ -74,6 +74,7 @@ pub(crate) fn emit_morsel_hook(
                 root_page: looped.table.root_page,
                 columns: looped.table.columns().len(),
                 rowid_alias: rowid_alias(looped.table),
+                defaults: defaults(looped.table),
                 filter: Vec::new(),
                 group_by: looped.group_by.clone(),
                 aggregates: looped.aggregates.clone(),
@@ -683,6 +684,7 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         root_page: table.root_page,
         columns: columns.len(),
         rowid_alias: rowid_alias(table),
+        defaults: defaults(table),
         filter,
         group_by,
         aggregates,
@@ -824,24 +826,51 @@ fn plain_any(plan: &SelectPlan) -> bool {
         || !plan.table_references.outer_query_refs().is_empty())
 }
 
-/// A rowid table whose rows the morsels read as stored: no default a short row would read, no
-/// generated column.
+/// A rowid table whose rows the morsels read as stored, no generated column. A row written
+/// before a column was added (ALTER TABLE ADD COLUMN) reads that column's default, as the serial
+/// loop's Column reads it ([`defaults`], lane qs6-17), except where the serial loop computes it
+/// at run time: a STRICT table's custom type, whose ENCODE the default goes through.
 fn stored(joined: &JoinedTable) -> Option<&BTreeTable> {
     let Table::BTree(table) = &joined.table else {
         return None;
     };
     let table: &BTreeTable = table;
+    // A STRICT table's column names one of SQLite's six datatypes or a custom type (SQLite's
+    // STRICT tables, section 2: INT, INTEGER, REAL, TEXT, BLOB, ANY).
+    let custom = |ty: &str| {
+        !["INT", "INTEGER", "REAL", "TEXT", "BLOB", "ANY"]
+            .iter()
+            .any(|builtin| ty.eq_ignore_ascii_case(builtin))
+    };
     if !table.has_rowid
         || table.root_page <= 0
         || table.has_virtual_columns()
-        || table
-            .columns()
-            .iter()
-            .any(|c| c.default.is_some() || c.is_generated())
+        || table.columns().iter().any(|c| {
+            c.is_generated() || (c.default.is_some() && table.is_strict() && custom(&c.ty_str))
+        })
     {
         return None;
     }
     Some(table)
+}
+
+/// Each column's value in a row written before the column was added: its DEFAULT folded with its
+/// affinity, as the serial loop's Column has it (`folded_default`), NULL where it has none or
+/// doesn't fold. Empty when every one is NULL, the common table, so its scans pad nothing.
+fn defaults(table: &BTreeTable) -> Vec<Value> {
+    let folded = |c: &crate::schema::Column| {
+        c.default
+            .as_ref()
+            .and_then(|d| crate::vdbe::builder::folded_default(d, c.affinity()))
+    };
+    if table.columns().iter().all(|c| folded(c).is_none()) {
+        return Vec::new();
+    }
+    table
+        .columns()
+        .iter()
+        .map(|c| folded(c).unwrap_or(Value::Null))
+        .collect()
 }
 
 /// The GROUP BY keys, the aggregates and each result column's place in the pipeline's row (the
@@ -1156,6 +1185,7 @@ fn shape_join(
             root_page: table.root_page,
             columns: table.columns().len(),
             rowid_alias: rowid_alias(table),
+            defaults: defaults(table),
             filter: std::mem::take(filters.get_mut(next)?),
             probe_key,
             build_key,
@@ -1197,6 +1227,7 @@ fn shape_join(
         root_page: probe_table.root_page,
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
+        defaults: defaults(probe_table),
         filter: std::mem::take(filters.get_mut(probe_at)?),
         group_by: group_by.clone(),
         aggregates: aggregates.clone(),
@@ -1498,6 +1529,7 @@ fn shape_chain(
             root_page: table.root_page,
             columns: table.columns().len(),
             rowid_alias: rowid_alias(table),
+            defaults: defaults(table),
             filter: std::mem::take(filters.get_mut(at)?),
             probe_key,
             build_key,
@@ -1542,6 +1574,7 @@ fn shape_chain(
         root_page: probe_table.root_page,
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
+        defaults: defaults(probe_table),
         filter: std::mem::take(filters.first_mut()?),
         group_by: group_by.clone(),
         aggregates: aggregates.clone(),

@@ -86,7 +86,7 @@ fn source(conn: &Arc<Connection>, name: &str) -> TableSource {
         .unwrap()
         .get_root_page()
         .unwrap();
-    TableSource::open(conn.get_pager(), root, COLUMNS.len(), None).unwrap()
+    TableSource::open(conn.get_pager(), root, COLUMNS.len(), None, Vec::new()).unwrap()
 }
 
 fn random_query(rng: &mut ChaCha8Rng) -> (Vec<Predicate>, Vec<usize>, Vec<Aggregate>) {
@@ -340,7 +340,7 @@ fn t_qt_6_9_rowid_alias_and_empty_table() {
         .unwrap()
         .get_root_page()
         .unwrap();
-    let empty = TableSource::open(conn.get_pager(), root, 2, Some(0)).unwrap();
+    let empty = TableSource::open(conn.get_pager(), root, 2, Some(0), Vec::new()).unwrap();
     assert_eq!(empty.leaves(), 1);
     assert!(empty.rows().unwrap().is_empty());
     conn.execute("COMMIT").unwrap();
@@ -357,7 +357,7 @@ fn t_qt_6_9_rowid_alias_and_empty_table() {
         &conn,
         "SELECT sum(id), min(id), max(id), count(*) FROM e WHERE v > 4",
     );
-    let table = TableSource::open(conn.get_pager(), root, 2, Some(0)).unwrap();
+    let table = TableSource::open(conn.get_pager(), root, 2, Some(0), Vec::new()).unwrap();
     assert!(table.leaves() > 2);
     let filter = [Predicate::Compare {
         column: 1,
@@ -2680,4 +2680,143 @@ fn t_qt_6_27_joins_through_seeks_run_on_morsels_as_the_serial_loop() {
         }
     }
     conn.set_parallel_searched_links(crate::SearchedLinks::Off);
+}
+
+/// T-QT.6.29 (lane qs6-17): a table with columns added by ALTER TABLE ADD COLUMN, each with a
+/// DEFAULT, runs on morsels: a row written before a column was added reads its default (folded with
+/// the column's affinity: TEXT DEFAULT 0 reads as the text '0'), as the serial loop's Column reads
+/// it. Scans' aggregates, groups and rows, and joins whose either side has such a column, answer
+/// as the serial loop at 1, 2, 3, 4 and 8 stated cores, and the hook ran each (its body's rows or
+/// its links counted), where before it refused every table with a default.
+#[test]
+fn t_qt_6_29_short_rows_read_their_columns_defaults_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-29");
+    let mut rng = ChaCha8Rng::seed_from_u64(629);
+    let pad = "x".repeat(64);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, p TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, k INTEGER, p TEXT)")
+        .unwrap();
+    let insert = |conn: &Arc<Connection>, rng: &mut ChaCha8Rng, sql: &str, rows: usize| {
+        conn.execute("BEGIN").unwrap();
+        for _ in 0..rows {
+            let a = rng.random_range(-20i64..20);
+            let d = match rng.random_range(0..4) {
+                0 => "NULL".to_string(),
+                _ => rng.random_range(0i64..9).to_string(),
+            };
+            let e = ["NULL", "'y'", "'z'", "'zz'"][rng.random_range(0..4)];
+            conn.execute(
+                sql.replace("{a}", &a.to_string())
+                    .replace("{d}", &d)
+                    .replace("{e}", e)
+                    .replace("{pad}", &pad),
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    };
+    // Rows written before the columns exist: short rows, which read the defaults.
+    insert(
+        &conn,
+        &mut rng,
+        "INSERT INTO t(a, p) VALUES ({a}, '{pad}')",
+        1500,
+    );
+    insert(
+        &conn,
+        &mut rng,
+        "INSERT INTO u(k, p) VALUES ({a}, '{pad}')",
+        300,
+    );
+    conn.execute("ALTER TABLE t ADD COLUMN d INTEGER DEFAULT 7")
+        .unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN e TEXT DEFAULT 'z'")
+        .unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN f TEXT DEFAULT 0")
+        .unwrap();
+    conn.execute("ALTER TABLE u ADD COLUMN g INTEGER DEFAULT -3")
+        .unwrap();
+    // Rows written after: whole rows, their own values (NULL among them).
+    insert(
+        &conn,
+        &mut rng,
+        "INSERT INTO t(a, p, d, e, f) VALUES ({a}, '{pad}', {d}, {e}, {d})",
+        1000,
+    );
+    insert(
+        &conn,
+        &mut rng,
+        "INSERT INTO u(k, p, g) VALUES ({a}, '{pad}', {d})",
+        200,
+    );
+    let queries: [(&str, bool); 12] = [
+        ("SELECT count(*), sum(d), min(e), max(f) FROM t", false),
+        ("SELECT d, count(*) FROM t GROUP BY d", false),
+        (
+            "SELECT e, sum(a), count(d) FROM t WHERE d = 7 GROUP BY e",
+            false,
+        ),
+        ("SELECT count(*) FROM t WHERE e = 'z'", false),
+        ("SELECT f, count(*) FROM t WHERE f = '0' GROUP BY f", false),
+        (
+            "SELECT count(*), sum(d + a) FROM t WHERE e IS NOT NULL AND d > 3",
+            false,
+        ),
+        ("SELECT id, d, e, f FROM t WHERE a > 10", true),
+        ("SELECT id, d || e, f FROM t WHERE e = 'z' AND a < 0", true),
+        (
+            "SELECT t.d, count(*), sum(u.g) FROM t JOIN u ON t.a = u.k GROUP BY t.d",
+            false,
+        ),
+        (
+            "SELECT u.g, count(*), max(t.e) FROM t JOIN u ON t.a = u.k WHERE u.g = -3 GROUP BY u.g",
+            false,
+        ),
+        (
+            "SELECT t.id, u.id, t.d, u.g FROM t JOIN u ON t.a = u.k WHERE t.d = 7",
+            true,
+        ),
+        (
+            "SELECT t.id, u.id, u.g FROM t JOIN u ON t.d = u.g ORDER BY t.id, u.id -- keys 2",
+            true,
+        ),
+    ];
+    let ran = |conn: &Arc<Connection>| {
+        [&conn.morsel_body_rows, &conn.morsel_join_links]
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    for (sql, rows) in queries {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        assert!(!serial.is_empty(), "{sql}: no rows to compare");
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = ran(&conn);
+            let parallel = sql_rows(&conn, sql);
+            let after = ran(&conn);
+            same_answer(sql, rows, &parallel, &serial, &format!("on {cores} cores"));
+            // Non-vacuity: the hook took the statement (it refused every such table before).
+            assert!(
+                after[0] > before[0] || after[1] > before[1],
+                "{sql} on {cores} cores: the hook didn't run"
+            );
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    // The defaults the short rows read are the ones asked: the test isn't vacuous on them.
+    let short = sql_rows(&conn, "SELECT d, e, f FROM t WHERE id = 1");
+    assert_eq!(
+        short,
+        vec![vec![
+            Value::from_i64(7),
+            Value::build_text("z"),
+            Value::build_text("0"),
+        ]]
+    );
 }

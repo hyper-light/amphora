@@ -718,6 +718,11 @@ pub(crate) fn aggregate(
     if data.body.as_ref().is_some_and(|body| !body.simple) {
         return Ok(None);
     }
+    // A column with a default a short row reads: the copy decodes the records as written, so the
+    // serial loop reads the rows (lane qs6-17; the copy's own padding is open, executor.md 8).
+    if !data.defaults.is_empty() {
+        return Ok(None);
+    }
     let storage = switch.storage();
     let copies = &storage.copies;
     if !copies.on() || !data.joins.is_empty() || !connection.get_auto_commit() || switch.wrote() {

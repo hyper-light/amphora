@@ -39,6 +39,8 @@ pub struct TableSource {
     root: i64,
     columns: usize,
     rowid_alias: Option<usize>,
+    /// Each column's value in a row written before it was added; empty when every one is NULL.
+    defaults: Vec<Value>,
     /// Each leaf's greatest rowid in key order; `None` for the last leaf, which has no bound.
     upper: Vec<Option<i64>>,
 }
@@ -49,12 +51,14 @@ type LevelPage = (i64, Option<i64>, bool);
 
 impl TableSource {
     /// Finds the leaves of the table b-tree rooted at `root` (a table of `columns` columns, the
-    /// rowid standing in for column `rowid_alias` when it is an INTEGER PRIMARY KEY).
+    /// rowid standing in for column `rowid_alias` when it is an INTEGER PRIMARY KEY, a short row's
+    /// missing columns read as `defaults` has them, NULL past its end).
     pub fn open(
         pager: Arc<Pager>,
         root: i64,
         columns: usize,
         rowid_alias: Option<usize>,
+        defaults: Vec<Value>,
     ) -> Result<Self, MorselError> {
         // The bound is the format's: no b-tree has more pages than the database may hold.
         let most_pages =
@@ -124,8 +128,20 @@ impl TableSource {
             root,
             columns,
             rowid_alias,
+            defaults,
             upper,
         })
+    }
+
+    /// Fills a short row out to the table's columns: a column added after the row was written
+    /// reads as its default, as the serial loop's Column reads it (NULL when it has none; lane
+    /// qs6-17).
+    fn pad(&self, row: &mut Vec<Value>) {
+        let written = row.len();
+        row.resize(self.columns, Value::Null);
+        for (slot, default) in row.iter_mut().zip(&self.defaults).skip(written) {
+            slot.clone_from(default);
+        }
     }
 
     /// How many leaf pages the table has: the units its morsels are cut in.
@@ -210,8 +226,7 @@ impl TableSource {
                 .ok_or(MorselError::Corrupt("a row has no record"))?;
             row.clear();
             row.extend(values.into_iter().take(self.columns));
-            // A column added after the row was written reads as NULL.
-            row.resize(self.columns, Value::Null);
+            self.pad(&mut row);
             if let Some(at) = self.rowid_alias {
                 let slot = row.get_mut(at).ok_or(MorselError::NoColumn {
                     column: at,
@@ -262,8 +277,7 @@ impl TableSource {
         row.clear();
         row.try_reserve(self.columns)?;
         row.extend(values.into_iter().take(self.columns));
-        // A column added after the row was written reads as NULL.
-        row.resize(self.columns, Value::Null);
+        self.pad(&mut row);
         if let Some(at) = self.rowid_alias {
             let slot = row.get_mut(at).ok_or(MorselError::NoColumn {
                 column: at,
