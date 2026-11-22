@@ -46,7 +46,8 @@ impl HintSet {
 
     /// The planner as it plans without hints: every join method by cost, automatic indexes on,
     /// sorted fetches off (their own prototype's default, `Connection::set_sorted_fetches`).
-    pub const UNHINTED: HintSet = HintSet(Self::HASH_JOIN | Self::NESTED_LOOP | Self::AUTOMATIC_INDEX);
+    pub const UNHINTED: HintSet =
+        HintSet(Self::HASH_JOIN | Self::NESTED_LOOP | Self::AUTOMATIC_INDEX);
 
     /// Every mask the planner can obey, the unhinted one first. A mask needs a join method, and
     /// nested loops alone (`JoinMethods::NestedLoopsOnly`) build no automatic index, so the masks
@@ -71,7 +72,10 @@ impl HintSet {
 
     /// The join methods the mask allows, as the planner's switch has them.
     fn join_methods(self) -> JoinMethods {
-        match (self.0 & Self::HASH_JOIN != 0, self.0 & Self::NESTED_LOOP != 0) {
+        match (
+            self.0 & Self::HASH_JOIN != 0,
+            self.0 & Self::NESTED_LOOP != 0,
+        ) {
             (true, false) => JoinMethods::HashJoinsOnly,
             (false, true) => JoinMethods::NestedLoopsOnly,
             _ => JoinMethods::ByCost,
@@ -524,7 +528,8 @@ impl HintModel {
     /// The posterior mean's predicted log time (natural log of nanoseconds) of a plan, None before
     /// the model is fit.
     pub fn predict(&self, features: &PlanFeatures) -> Option<f64> {
-        self.posterior.map(|p| p.mean_y + dot(&p.mean, &features.0) - dot(&p.mean, &p.mean_x))
+        self.posterior
+            .map(|p| p.mean_y + dot(&p.mean, &features.0) - dot(&p.mean, &p.mean_x))
     }
 
     /// Weights drawn from the posterior (Thompson sampling), None before the model is fit.
@@ -793,12 +798,17 @@ impl HintChooser {
         if self.model.posterior.is_none() {
             return HintSet::UNHINTED;
         }
-        fastest(candidates, |f| self.model.predict(f).unwrap_or(f64::INFINITY))
+        fastest(candidates, |f| {
+            self.model.predict(f).unwrap_or(f64::INFINITY)
+        })
     }
 }
 
 /// The candidate predicted fastest; a plan equal to the unhinted one's is the unhinted set.
-fn fastest(candidates: &[(HintSet, PlanFeatures)], predict: impl Fn(&PlanFeatures) -> f64) -> HintSet {
+fn fastest(
+    candidates: &[(HintSet, PlanFeatures)],
+    predict: impl Fn(&PlanFeatures) -> f64,
+) -> HintSet {
     let unhinted = candidates
         .iter()
         .find(|(hint, _)| *hint == HintSet::UNHINTED)
@@ -810,7 +820,10 @@ fn fastest(candidates: &[(HintSet, PlanFeatures)], predict: impl Fn(&PlanFeature
             best = (*hint, time);
         }
     }
-    match (candidates.iter().find(|(hint, _)| *hint == best.0), unhinted) {
+    match (
+        candidates.iter().find(|(hint, _)| *hint == best.0),
+        unhinted,
+    ) {
         (Some((_, features)), Some(base)) if *features == base => HintSet::UNHINTED,
         _ => best.0,
     }
@@ -838,7 +851,9 @@ mod tests {
         let mut rng = SplitMix64(7);
         let mut jitter = || 1.0 + 0.01 * rng.unit();
         for _ in 0..4 {
-            guard.record(1, HintSet::UNHINTED, 1000.0 * jitter()).unwrap();
+            guard
+                .record(1, HintSet::UNHINTED, 1000.0 * jitter())
+                .unwrap();
             guard.record(1, hint, 500.0 * jitter()).unwrap();
         }
         assert_eq!(guard.use_for(1), hint);
@@ -869,7 +884,9 @@ mod tests {
         for _ in 0..32 {
             let noise = 1.0 + 0.2 * rng.unit();
             guard.record(9, HintSet::UNHINTED, 1000.0 * noise).unwrap();
-            let verdict = guard.record(9, hint, 1000.0 * (1.05 + 0.2 * rng.unit())).unwrap();
+            let verdict = guard
+                .record(9, hint, 1000.0 * (1.05 + 0.2 * rng.unit()))
+                .unwrap();
             assert_ne!(verdict, Verdict::Admitted);
         }
         assert_eq!(guard.use_for(9), HintSet::UNHINTED);
@@ -882,8 +899,15 @@ mod tests {
         let mut chooser = HintChooser::new(3, 8).unwrap();
         let model_bytes = std::mem::size_of_val(&chooser.model);
         for i in 0..10_000u64 {
-            let f = plan(&[(1, (i % 3) as f64), (7, (i % 2) as f64), (13, (i % 17) as f64)]);
-            chooser.model.observe(&f, 1000.0 + (i % 17) as f64 * 50.0).unwrap();
+            let f = plan(&[
+                (1, (i % 3) as f64),
+                (7, (i % 2) as f64),
+                (13, (i % 17) as f64),
+            ]);
+            chooser
+                .model
+                .observe(&f, 1000.0 + (i % 17) as f64 * 50.0)
+                .unwrap();
             chooser.guard.record(i, HintSet::UNHINTED, 1000.0).unwrap();
             assert!(chooser.guard.len() <= 8);
         }
@@ -927,7 +951,10 @@ mod tests {
         let chosen = (0..100)
             .filter(|_| chooser.explore(&candidates) == HintSet::ARMS[6])
             .count();
-        assert!(chosen > 50, "sampling chose the hash join {chosen} times of 100");
+        assert!(
+            chosen > 50,
+            "sampling chose the hash join {chosen} times of 100"
+        );
     }
 
     /// A plan equal to the unhinted one's is the unhinted set, so a hint never stands for the
