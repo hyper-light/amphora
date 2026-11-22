@@ -736,6 +736,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   by default. Index-only reads were already planned (covering indexes, expression indexes included). Left: the 2x
   measurements on order_by_sort, exists_subquery and left_join_anti, and the sorted fetch's measurement against the
   plain read (the coordinator's).
+- **G6 step 3, learned plan hints, built as a prototype** (lane g6s3; planner.md, decision of lane g6s3): Bao's
+  hint sets over the planner (`optimizer/plan_hints.rs`), ten on/off masks of hash joins, nested loops, automatic
+  indexes (`Connection::set_automatic_indexes`, new) and sorted fetches, applied with `HintSet::apply`. A Bayesian
+  linear model over sixteen plan features, its precisions learned from the runs, chooses a training run's mask by
+  Thompson sampling; a guard keeps a query class on the cost model's plan until a mask's held-out runs beat it, and
+  drops it when they show it slower. Memory is fixed for the model and bounded by the caller's class count for the
+  guard. `tests/plan_hints.rs` runs every mask's answers against the unhinted plan's; `bench/plan_hints` trains and
+  checks held-out queries, answers against SQLite's. Left: held-out JOB and corpus times (AC-G6.3.1, the
+  coordinator's), and hints in the engine's own prepare path (today the caller applies them).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates

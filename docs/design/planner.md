@@ -1881,3 +1881,66 @@ twice the build's rows".
   LIP (filters from several dimensions applied to the fact scan in their measured order) and
   predicate transfer across the join graph are not built yet.
 
+
+## Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model
+
+**Decision.** G6 step 3, a prototype behind its own switch (`optimizer/plan_hints.rs`). Bao's
+approach over Amphora's planner: a hint set says which operators the planner may choose (hash joins,
+nested loops, automatic indexes, sorted fetches), as on/off masks the connection's switches carry
+(`HintSet::apply`: `set_join_methods`, `set_automatic_indexes`, new here, and `set_sorted_fetches`);
+the cost model still chooses among what a mask allows. Ten masks are obeyable (a join method must be
+allowed; nested loops alone build no automatic index). For a query, each mask's plan is prepared,
+not run, and read into sixteen features from its `EXPLAIN QUERY PLAN` nodes: a count of each
+operator and the planner's own row and cost estimates (Bao's per-node operator and cardinality
+features, summed over the plan rather than convolved over its tree).
+
+The model is Bayesian linear regression of a run's log time on those features, in constant memory
+(the sufficient statistics: a 16 x 16 matrix, a vector and two sums, whatever the number of runs).
+Features and times are centered on the runs' means before the fit, so the intercept is the mean
+time rather than a weight the prior shrinks (Bishop §3.1.1); uncentered, the features every plan
+shares (a join's row estimates) set the prior's scale and the evidence shrank the differences
+between plans to nothing (lane g6s3b found the fixed point stuck there on a test's two plans).
+Its two precisions are learned from the runs, not picked: the evidence approximation's fixed point,
+one step a run, from the unit-information prior. A training run's mask is chosen by Thompson
+sampling from the posterior; its measured time trains the model, every run, none chosen out.
+
+The guard keeps the cost model's plan for each query class until a hint set's held-out runs (runs
+that never train the model) beat it: the hinted mean log time plus its standard error below the
+unhinted mean less its standard error (the one-standard-error rule, Breiman, Friedman, Olshen and
+Stone, "Classification and Regression Trees", 1984, §3.4.3). It drops the hint set when its held-out mean lies above the
+unhinted mean plus that standard error, and a dropped set stays dropped. A plan equal to the
+unhinted one is no hint. The guard holds as many classes as its caller gives it room for, the least
+recently used evicted past it.
+
+`bench/plan_hints` is the harness: queries sorted by name and split in turn into training and held
+out, training by sampling, then each held-out query's guard trial and its final plan timed against
+the unhinted one, answers against SQLite's.
+
+**Why.** The step: hints learned from measured executions, kept only where they beat the cost model
+on held-out queries without regressions. A linear model with an exact Gaussian posterior gives
+Thompson sampling without the ensemble Bao trains, in fixed memory; the guard, not the model, is
+what bounds a regression.
+
+**Sources.**
+- Marcus, Negi, Mao, Tatbul, Alizadeh, Kraska, "Bao: Making Learned Query Optimization Practical",
+  SIGMOD 2021 (f8): hint sets as operator masks, a model over plan features, Thompson sampling, its
+  training data the executions themselves.
+- Agrawal and Goyal, "Thompson Sampling for Contextual Bandits with Linear Payoffs", ICML 2013:
+  sampling a linear model's Gaussian posterior.
+- MacKay, "Bayesian Interpolation", Neural Computation 1992; Bishop, "Pattern Recognition and
+  Machine Learning" §3.5.2: the evidence approximation's precisions.
+- Kass and Wasserman, "A Reference Bayesian Test for Nested Hypotheses...", JASA 1995: the
+  unit-information prior the fixed point starts from.
+- Breiman, Friedman, Olshen and Stone, "Classification and Regression Trees", 1984: the
+  one-standard-error rule the guard compares held-out means by.
+
+**Evidence.** `optimizer::plan_hints::tests` (the guard admits then drops a regressing hint,
+T-G6.3.2; memory bounded over 20,000 runs and classes, T-G6.3.3; the model learns the faster plan)
+and `crates/engine/tests/plan_hints.rs` (every mask's answers equal the unhinted plan's and a
+computed nested loop's, the planner obeys each mask, T-G6.3.1). Held-out JOB and corpus times are
+the coordinator's (AC-G6.3.1).
+
+**Falsified by.**
+- A held-out query more than 10% slower with hints on than with the cost model alone (AC-G6.3.1).
+- A hinted plan's answer that differs from SQLite's (T-G6.3.1).
+- The model's or the guard's memory growing with the runs past the classes it was given.
