@@ -65,6 +65,58 @@ pub fn cut(points: &[(Pos, u64)]) -> Option<Cut> {
     })
 }
 
+/// Weights at positions, kept to at most `most` entries however many are added (CP-T1.9; decision
+/// "Load from the store's meter"): past that, each pair of neighbours folds into one, at the
+/// first's position, so the total is exact and every cut falls at a position written, at the
+/// resolution the bound leaves. One fold halves the entries, so an add costs a fold of `most`
+/// entries no more than once every `most / 2` adds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Weights {
+    at: BTreeMap<Pos, u64>,
+}
+
+impl Weights {
+    /// `weight` at `pos`, the entries kept to `most` (at least two, so a cut can still fall).
+    pub fn add(&mut self, pos: Pos, weight: u64, most: usize) {
+        let w = self.at.entry(pos).or_insert(0);
+        *w = w.saturating_add(weight);
+        if self.at.len() > most.max(2) {
+            let mut folded = BTreeMap::new();
+            let mut each = std::mem::take(&mut self.at).into_iter();
+            while let Some((p, w)) = each.next() {
+                let next = each.next().map_or(0, |(_, n)| n);
+                folded.insert(p, w.saturating_add(next));
+            }
+            self.at = folded;
+        }
+    }
+
+    /// Every weight added.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.at.values().fold(0u64, |t, w| t.saturating_add(*w))
+    }
+
+    /// How many entries are kept.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.at.len()
+    }
+
+    /// Whether none is.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.at.is_empty()
+    }
+
+    /// The [`cut`] of what was added.
+    #[must_use]
+    pub fn cut(&self) -> Option<Cut> {
+        let points: Vec<(Pos, u64)> = self.at.iter().map(|(p, w)| (*p, *w)).collect();
+        cut(&points)
+    }
+}
+
 /// What was measured of one group over the shell's last window: its bytes, its load (any measure
 /// that adds up over groups: writes, or its writer's busy time), and where its rows and its load
 /// fall half each side.
@@ -295,6 +347,38 @@ fn free_on<'a>(
 mod tests {
     use super::super::directory::Change;
     use super::*;
+
+    /// T-T1.9.R14 (decision "Load from the store's meter"): a thousand weights, three quarters of
+    /// them below position 1,000 and the rest above 1,000,000, kept to eight entries. Expect: never
+    /// more than eight kept, the total exact, and a cut with weight on each side; four single
+    /// weights cut exactly at the middle; nothing added, no cut.
+    #[test]
+    fn t_t1_9_r14_weights_stay_bounded_and_cut_where_the_writes_fall() {
+        let mut w = Weights::default();
+        for i in 0..1000u64 {
+            let pos = if i % 4 == 3 { 1_000_000 + i } else { i };
+            w.add(pos, 1, 8);
+            assert!(w.len() <= 8);
+        }
+        assert_eq!(w.total(), 1000);
+        let c = w.cut().unwrap();
+        assert_eq!(c.left + c.right, 1000);
+        assert!(c.left > 0 && c.right > 0);
+        // One position a weight: the cut is exact.
+        let mut exact = Weights::default();
+        for pos in [10, 20, 30, 40] {
+            exact.add(pos, 1, 8);
+        }
+        assert_eq!(
+            exact.cut(),
+            Some(Cut {
+                at: 30,
+                left: 2,
+                right: 2
+            })
+        );
+        assert_eq!(Weights::default().cut(), None);
+    }
 
     fn measure(group: u64, bytes: u64, load: u64) -> GroupLoad {
         GroupLoad {

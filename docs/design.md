@@ -154,6 +154,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-8): a row routes by its namespace, family and key | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-row-routes-by-its-namespace-family-and-key) |
 | reshard | – | Decision (lane split-merge-9): moves across nodes | [reshard.md](design/reshard.md#decision-lane-split-merge-9-moves-across-nodes) |
 | reshard | – | Decision (lane split-merge-10): pulls over the owner transport | [reshard.md](design/reshard.md#decision-lane-split-merge-10-pulls-over-the-owner-transport) |
+| reshard | – | Decision (lane split-merge-11): the routing key is bytes | [reshard.md](design/reshard.md#decision-lane-split-merge-11-the-routing-key-is-bytes) |
+| reshard | – | Decision (lane split-merge-12): load from the store's meter | [reshard.md](design/reshard.md#decision-lane-split-merge-12-load-from-the-stores-meter) |
+| reshard | – | Decision (lane split-merge-12): a retired group's files | [reshard.md](design/reshard.md#decision-lane-split-merge-12-a-retired-groups-files) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
@@ -206,6 +209,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
 | xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |
 | xgroup | – | On a group's database: each step one atomic commit in its group, resolution timeouts learned as TCP's | [xgroup.md](design/xgroup.md#on-a-groups-database) |
+| xgroup | – | A group's failure mid-commit stops the incarnation as a crash; the next open finishes every transaction committed or aborted everywhere | [xgroup.md](design/xgroup.md#a-groups-failure) |
+| xgroup | – | Over the transport: a step to another node's group is one Step request through transport::Nodes, its stamp carried both ways | [xgroup.md](design/xgroup.md#over-the-transport) |
+| xgroup | – | Which protocol stays: the faster cross-group p99 on the LAN at zero anomalies over 10,000 seeds (numbers pending the coordinator's run) | [xgroup.md](design/xgroup.md#decision-lane-xgroup-lan-which-protocol-stays-the-faster-at-zero-anomalies) |
 | local-owner-transport | – | Embedded local owner transport: one owner process, an authenticated local client for the rest | [local-owner-transport.md](design/local-owner-transport.md) |
 | records-compaction | – | Bounded Records compaction on the namespace writer, step by recoverable step | [records-compaction.md](design/records-compaction.md) |
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
