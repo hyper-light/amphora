@@ -257,7 +257,14 @@ moving rows out of blocks over positional deltas, which complicate reads [c80].
    statement from the copies' counts; the driver runs each query once on a probe table first, and
    leaves the same ones out on DuckDB and in the ladder. Each record's percentiles count only the
    statements that reached the copies, every statement's beside them, and it names the queries
-   left out and why.
+   left out and why. A transaction that only reads reads the copy at its own snapshot (lane
+   colcopy-10, AC-CB.4.7): a generation made at or before the snapshot and not behind there answers
+   it, the current one or the one it replaced, which is kept while an older snapshot is open; a
+   rebuild is made at a snapshot of every commit now, never at an older transaction's, which would
+   lack the commits between them. A snapshot no generation answers is refused, counted `unserved`
+   and traced, and the rows answer it. What the copy answered is kept as read, the whole table, for
+   the transaction's validation, as the rows' cursor walking every row would keep it. Only a
+   transaction that changed rows still skips the copy.
 
 ## What the next steps prototype and measure
 

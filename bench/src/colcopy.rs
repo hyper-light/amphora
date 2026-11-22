@@ -498,6 +498,7 @@ fn run(
             "last_dropped": last,
             "handed": c.handed,
             "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+            "unserved": c.unserved,
             "probe_agrees": own == left_out,
         })
     });

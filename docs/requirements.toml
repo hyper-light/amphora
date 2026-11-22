@@ -1286,6 +1286,8 @@ criteria = [
   { id = "AC-CB.4.5", text = "The same driver runs a concurrency ladder (1, 8, 32, 128, 512, 2048, 4096 clients, each its own connection and thread, started together) on Amphora under each way and on DuckDB; one record a step with p50, p99 and p99.9, every answer checked, and the client's threads, connections, peak resident bytes and own share of the time" },
   # lane colcopy-9
   { id = "AC-CB.4.6", text = "The A/B and the DuckDB comparison weigh only statements a copy could answer: each statement the scan hook hands over and no copy can answer is counted with its reason (rows, body, join, transaction) and traced; each record's percentiles count only the statements that reached the copies, every statement's percentiles beside them, and it names the queries left out and why" },
+  # lane colcopy-10
+  { id = "AC-CB.4.7", text = "A transaction that only reads reads the column copy at its own snapshot: a generation made at or before it and not behind there answers, and what it answered is kept as read for the transaction's validation; a snapshot no generation answers is refused, counted (unserved) and traced, and the rows answer; rebuilds are made at a snapshot of every commit now; only a transaction that changed rows skips the copy" },
 ]
 tests = [
   { id = "T-CB.1.1", text = "columns::tests::cb1_blocks_are_granted_before_they_are_built — each format's bytes before a block is made equal the made block's resident bytes; the source holds exactly what the generations and queue were granted" },
@@ -1299,5 +1301,8 @@ tests = [
   # lane colcopy-8
   { id = "T-CB.4.3", text = "columns_sql::tests::ab::cb4_ab_both_rebuy_policies_at_the_extremes — no growing table's write is refused; under waves, copies a wave bought are let go in a round after it (AC-CB.4.4)" },
   # lane colcopy-9
-  { id = "T-CB.4.4", text = "columns_sql::tests::cb4_statements_no_copy_can_answer_are_counted_with_their_reason — an autocommit aggregate reaches the copies; the same in a transaction that wrote and in one that only reads is handed over and counted skipped for it, answers equal; and in cb4_ab_both_rebuy_policies_at_the_extremes every scenario has statements that reached the copies, and those plus the skipped equal the statements handed over (AC-CB.4.6)" },
+  { id = "T-CB.4.4", text = "columns_sql::tests::cb4_statements_no_copy_can_answer_are_counted_with_their_reason — an autocommit aggregate reaches the copies; the same in a transaction that wrote and in one that only reads is handed over and counted skipped for it, answers equal; and in cb4_ab_both_rebuy_policies_at_the_extremes every scenario has statements that reached the copies, and those plus the skipped equal the statements handed over (AC-CB.4.6); lane colcopy-10: the one in a transaction that only reads reaches the copies (AC-CB.4.7)" },
+  # lane colcopy-10
+  { id = "T-CB.4.5", text = "columns_sql::tests::cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot — a read-only transaction's statements before and after another connection's update, insert and delete are handed over, none skipped, answered by the copy with none refused, each equal to the snapshot's answer before the writes; after COMMIT the writes show (AC-CB.4.7)" },
+  { id = "T-CB.4.6", text = "columns_sql::tests::cb4_a_snapshot_no_generation_answers_is_refused_and_the_rows_answer — two writes the copy can't queue, each rebuilding the copy, leave no generation at or before a read-only transaction's snapshot: its statement is refused (unserved +1, not skipped, not read from the copy) and the rows answer as its snapshot sees the table (AC-CB.4.7)" },
 ]

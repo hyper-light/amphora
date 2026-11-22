@@ -404,6 +404,20 @@ impl Switch {
             .is_some_and(|t| t.lock().as_ref().is_some_and(|t| t.wrote()))
     }
 
+    /// The transaction an analytic statement answered by a column copy reads in (lane
+    /// colcopy-10, AC-CB.4.7): the connection's open one; with none open, in an explicit
+    /// transaction one begun now, as the statement's first cursor would begin it, so its later
+    /// statements read the same snapshot; in autocommit none (the statement reads at a snapshot
+    /// of its own).
+    pub(crate) fn reading(&self, autocommit: bool) -> Result<Option<SharedTxn>> {
+        let open = self.txn.lock().clone();
+        match open {
+            Some(txn) => Ok(Some(txn)),
+            None if autocommit => Ok(None),
+            None => self.txn().map(Some),
+        }
+    }
+
     /// The connection's transaction, begun if none is open.
     fn txn(&self) -> Result<SharedTxn> {
         let mut slot = self.txn.lock();
