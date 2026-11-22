@@ -373,8 +373,20 @@ fn measure(
 }
 
 /// Times each kind of work over one page of 8-byte keys, the unit a b-tree reads
-/// (`BufferPool::DEFAULT_PAGE_SIZE`). Each kind is repeated, up to once per key, until its time
-/// reaches the slowest kind's single run, so the clock's step weighs on each about equally.
+/// (`BufferPool::DEFAULT_PAGE_SIZE`), from repeated samples whose spread says when to stop.
+///
+/// A sample is one kind's work repeated, up to once per key, until its time reaches the slowest
+/// kind's single run (`measure`), so the clock's step weighs on each about equally. The kinds are
+/// sampled in rounds, one sample of each kind a round, so a stretch of host load falls on every
+/// kind alike and leaves their ratios, the planner's weights, where they were. Each kind's rate is
+/// the median of its samples: a preempted sample is one long time, which moves a mean by its whole
+/// length and a median by one rank.
+///
+/// A kind stops being sampled once its median's standard error is no larger than the timer's own
+/// cost, a pair of clock reads: the median is then known as finely as one reading resolves, and
+/// more samples can't sharpen it (`median_settled`). Its spread sets how many samples that takes:
+/// few on a quiet host, more under load. The rounds stop at a page's keys, as each sample's
+/// repetitions do, so calibration's time stays bounded however loaded the host is.
 fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
     let n = crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE / std::mem::size_of::<u64>();
     let keys: Vec<u64> = (0..n as u64).map(mix).collect();
@@ -420,17 +432,45 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
         target = target.max(measure(clock, 0.0, 1, &mut **work).1);
     }
     let mut rates = Rates::default();
-    for (kind, units, work) in kinds.iter_mut() {
-        let (reps, nanos) = measure(clock, target, n, &mut **work);
-        *rates.rate_mut(*kind) = Rate::calibrated(reps * *units, nanos);
-    }
-    // A pair of clock reads, timed as the kinds are, a page's keys' worth of times at most.
+    // A pair of clock reads, timed as the kinds are, a page's keys' worth of times at most: what
+    // timing one run costs (step 3a), and the finest a sample's reading resolves.
     let mut timing = || {
         let start = Instant::now();
         black_box(start.elapsed());
     };
     let (reps, nanos) = measure(clock, target, n, &mut timing);
     rates.timing_nanos = nanos / reps;
+    // Each kind's repetitions a sample, found as `measure` finds them; then its samples, a round
+    // at a time.
+    let mut sampled: [(usize, Vec<f64>, bool); 5] = Default::default();
+    for ((_, _, work), (reps, _, _)) in kinds.iter_mut().zip(sampled.iter_mut()) {
+        *reps = measure(clock, target, n, &mut **work).0 as usize;
+    }
+    for round in 1..=n {
+        for ((_, _, work), (reps, samples, settled)) in kinds.iter_mut().zip(sampled.iter_mut()) {
+            if *settled {
+                continue;
+            }
+            let start = clock();
+            for _ in 0..*reps {
+                work();
+            }
+            samples.push(clock() - start);
+        }
+        // The spread is read each time the samples double, as `measure` doubles repetitions.
+        if round.is_power_of_two() {
+            for (_, samples, settled) in sampled.iter_mut() {
+                *settled = *settled || median_settled(samples, rates.timing_nanos);
+            }
+            if sampled.iter().all(|(_, _, settled)| *settled) {
+                break;
+            }
+        }
+    }
+    for ((kind, units, _), (reps, samples, _)) in kinds.iter().zip(sampled.iter_mut()) {
+        let nanos = median(samples).unwrap_or(0.0);
+        *rates.rate_mut(*kind) = Rate::calibrated(*reps as f64 * *units, nanos);
+    }
     // A page read can't be timed here: there's no file yet. Each database anchors it at open
     // (`time_page_read`, `LearnedCosts::anchor_page_read`), then its own reads move it
     // (`LearnedCosts::observe`), its epoch the pages whose rows calibration visited.
@@ -439,6 +479,44 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
         ..Rate::default()
     };
     rates
+}
+
+/// The middle of `samples`, sorting them; None for none.
+fn median(samples: &mut [f64]) -> Option<f64> {
+    samples.sort_unstable_by(f64::total_cmp);
+    let mid = samples.len() / 2;
+    let upper = *samples.get(mid)?;
+    if samples.len().is_multiple_of(2) {
+        let lower = *samples.get(mid.checked_sub(1)?)?;
+        Some((lower + upper) / 2.0)
+    } else {
+        Some(upper)
+    }
+}
+
+/// Whether the median of `samples` (sorted here) is known to within `resolution`: half the
+/// distance between the order statistics a standard error either side of the middle rank, no
+/// wider. Among `n` samples the count below the true median is binomial, n/2 with standard
+/// deviation sqrt(n)/2, so the samples at ranks n/2 -+ sqrt(n)/2 bracket the median by about one
+/// standard error whatever the times' distribution (the order-statistic interval for a median:
+/// Thompson, "On confidence ranges for the median and other expectation distributions for
+/// populations of unknown distribution form", Annals of Mathematical Statistics 7(3), 1936).
+/// Under two samples there's no spread to read.
+fn median_settled(samples: &mut [f64], resolution: f64) -> bool {
+    let count = samples.len();
+    if count < 2 {
+        return false;
+    }
+    samples.sort_unstable_by(f64::total_cmp);
+    let half = count as f64 / 2.0;
+    let reach = (count as f64).sqrt() / 2.0;
+    let last = (count - 1) as f64;
+    let low = (half - reach).floor().clamp(0.0, last) as usize;
+    let high = (half + reach).ceil().clamp(0.0, last) as usize;
+    match (samples.get(low), samples.get(high)) {
+        (Some(low), Some(high)) => (high - low) / 2.0 <= resolution,
+        _ => false,
+    }
 }
 
 /// Times page reads at a database's open, before it has read a page of its own (QT.5): a scratch
@@ -750,6 +828,59 @@ mod tests {
         .unwrap();
         let row = db.learned_costs.weights().unwrap().row_in_pages.unwrap();
         assert!(row.is_finite() && row > 0.0, "{row}");
+    }
+
+    /// Do: ask whether medians are settled: four equal samples against no resolution, samples
+    /// spread over 0 to 100 against 1 and against 50, and a single sample. Expect: settled, not,
+    /// settled, and not (qs5-10: calibration samples each kind until its median is known to the
+    /// timer's resolution, read from the samples' own spread, not a picked count).
+    #[test]
+    fn t_qt_5_5_a_median_settles_once_its_spread_is_within_the_resolution() {
+        assert!(median_settled(&mut [10.0; 4], 0.0));
+        let mut spread: Vec<f64> = (0..=100).map(f64::from).collect();
+        assert!(!median_settled(&mut spread, 1.0));
+        assert!(median_settled(&mut spread, 50.0));
+        assert!(!median_settled(&mut [10.0], 10.0));
+        assert_eq!(median(&mut [3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), Some(2.5));
+        assert_eq!(median(&mut []), None);
+    }
+
+    /// Do: calibrate with a clock that moves 1,000 ns a reading, and with one that also jumps a
+    /// millisecond every eleventh reading, as a preempted thread's does. Expect: the same weights
+    /// from both (qs5-10: each kind's rate is the median of samples taken in rounds, so the host's
+    /// load doesn't move the planner's weights).
+    #[test]
+    fn t_qt_5_5_calibration_weights_hold_through_preempted_samples() {
+        let steady = {
+            let mut t = 0.0;
+            calibrate(&mut || {
+                t += 1_000.0;
+                t
+            })
+        };
+        let preempted = {
+            let (mut t, mut reads) = (0.0, 0u64);
+            calibrate(&mut || {
+                reads += 1;
+                t += if reads.is_multiple_of(11) {
+                    1_001_000.0
+                } else {
+                    1_000.0
+                };
+                t
+            })
+        };
+        let steady = steady.weights(None).unwrap();
+        let preempted = preempted.weights(None).unwrap();
+        for (a, b) in [
+            (steady.seek, preempted.seek),
+            (steady.hash_build, preempted.hash_build),
+            (steady.hash_probe, preempted.hash_probe),
+            (steady.sort, preempted.sort),
+        ] {
+            assert!((a - b).abs() <= 1e-12 * a.abs(), "{steady:?} {preempted:?}");
+        }
     }
 
     /// Do: calibrate with a clock that never moves. Expect: no weights, so the planner is told it
