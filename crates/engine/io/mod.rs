@@ -479,6 +479,11 @@ pub trait IO: Clock + Send + Sync {
     /// file, so a database reopened on the same IO finds its trees as it finds its file: made by
     /// `make` the first time. `None` for an IO whose files are the host's (the storage is then in
     /// its own directory beside the file).
+    /// Whether a versioned storage is kept beside the file at `path` (`versioned_beside`).
+    fn versioned_kept(&self, _path: &str) -> bool {
+        false
+    }
+
     fn versioned_beside(
         &self,
         _path: &str,

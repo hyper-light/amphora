@@ -875,4 +875,83 @@ mod scans {
     fn t_g5_4_3_cracking_transactions_and_older_snapshots_answer_as_unswitched() {
         transactions_answer_as_unswitched(SkipKind::Cracking);
     }
+
+    /// One run of a prepared statement bound to `values`: its rows, printed, and the rows it read.
+    fn run_bound(stmt: &mut crate::Statement, values: &[crate::Value]) -> (Vec<String>, u64) {
+        stmt.reset().unwrap();
+        stmt.reset_metrics();
+        for (i, value) in values.iter().enumerate() {
+            let index = std::num::NonZero::new(i + 1).unwrap();
+            stmt.bind_at(index, value.clone()).unwrap();
+        }
+        let rows = stmt.run_collect_rows().unwrap();
+        let rows = rows.into_iter().map(|row| format!("{row:?}")).collect();
+        (rows, stmt.metrics().rows_read)
+    }
+
+    /// Lane skip-usable (T-SKU.1): a prepared statement's parameters bound its scan. Prepared
+    /// once and bound again before each run, between random writes, it skips and answers as the
+    /// database without a summary; a parameter bound to a real gives no bound and still answers.
+    fn prepared_parameters_skip(kind: SkipKind) {
+        use crate::Value;
+        let rows = 4000;
+        let (_db, on) = open();
+        let (_off_db, off) = open();
+        fill([&on, &off], rows);
+        set_skipping(&on, "t", "a", Some(kind)).unwrap();
+        let sqls = [
+            "SELECT rowid, a, b FROM t WHERE a BETWEEN ? AND ? ORDER BY rowid",
+            "SELECT rowid, a, b FROM t WHERE a >= ?1 AND ?2 >= a AND b <> 3 ORDER BY rowid",
+            "SELECT rowid, a, b FROM t WHERE a > :lo AND a < :hi ORDER BY rowid",
+        ];
+        let mut stmts: Vec<_> = sqls
+            .iter()
+            .map(|sql| (on.prepare(sql).unwrap(), off.prepare(sql).unwrap()))
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        let (mut read_on, mut read_off) = (0u64, 0u64);
+        let runs = 24u64;
+        for round in 0..runs {
+            for _ in 0..rng.random_range(0..15) {
+                let sql = random_write(&mut rng, rows);
+                on.execute(&sql).unwrap();
+                off.execute(&sql).unwrap();
+            }
+            let lo = rng.random_range(-10..rows);
+            let hi = lo.saturating_add(rng.random_range(0..rows / 20));
+            let lo_value = if round % 6 == 5 {
+                Value::from_f64(lo as f64 + 0.5)
+            } else {
+                Value::from_i64(lo)
+            };
+            let values = [lo_value, Value::from_i64(hi)];
+            let at = usize::try_from(round).unwrap() % stmts.len();
+            let (stmt_on, stmt_off) = &mut stmts[at];
+            let (answer_on, r_on) = run_bound(stmt_on, &values);
+            let (answer_off, r_off) = run_bound(stmt_off, &values);
+            assert_eq!(
+                answer_on, answer_off,
+                "{kind:?} round {round}: {}",
+                sqls[at]
+            );
+            read_on += r_on;
+            read_off += r_off;
+        }
+        let counts = skipping_counts(&on, "t").unwrap();
+        assert_eq!(counts.consulted, runs, "{kind:?}: {counts:?}");
+        assert!(
+            read_on < read_off,
+            "{kind:?}: read {read_on} rows skipping, {read_off} without"
+        );
+    }
+
+    #[test]
+    fn t_sku_1_zone_maps_prepared_parameters_skip_and_answer_as_unswitched() {
+        prepared_parameters_skip(SkipKind::ZoneMaps);
+    }
+
+    #[test]
+    fn t_sku_1_cracking_prepared_parameters_skip_and_answer_as_unswitched() {
+        prepared_parameters_skip(SkipKind::Cracking);
+    }
 }
