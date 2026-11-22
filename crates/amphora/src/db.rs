@@ -1127,6 +1127,24 @@ impl Db {
 
     /// Runs `sql` with `params`, its statement prepared the first time and kept, handing each row
     /// to `each` until it says stop (false).
+    /// The bytes of page `pgno` of the database as its pager holds them (CP-T1.9, T-T1.9.R19: a
+    /// group's size cut reads its position index's root page alone). Asked inside a transaction
+    /// that has read, so the page is that transaction's.
+    pub(crate) fn page(&self, pgno: i64) -> anyhow::Result<Vec<u8>> {
+        let pager = self.conn.get_pager();
+        let (page, completion) = pager
+            .io
+            .block(|| pager.read_page(pgno))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(completion) = completion {
+            pager
+                .io
+                .wait_for_completion(completion)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(page.get_contents().as_ptr().to_vec())
+    }
+
     pub fn query(
         &self,
         sql: &'static str,

@@ -824,6 +824,8 @@ tests = [
   { id = "T-T1.9.R15", text = "One group measured by the shell with nothing written, after sixty-four keys are written, and again after — passes when the first has no load cut, the second has load above zero and a cut that counts each key on the side its position falls, the plan on two cores splits the group at that cut, and the third has no load" },
   { id = "T-T1.9.R16", text = "A split and a merge back, then a restart, the groups whose files are found asked of the node before and after — passes when only the retired group is named both times, never the group held nor an id never given out, and once its files are deleted every key still reads back from its group" },
   { id = "T-T1.9.R17", text = "Local databases as groups, one split by the driver, then measured by the shell — passes when each group's size is above zero" },
+  # lane split-merge-15
+  { id = "T-T1.9.R19", text = "A local database made a group's, with one key, then eight, then more keys than one page of its position index holds — passes when it has no size cut with one key, and after that a cut with weight on each side and keys on each side of it, read from the index's root page alone" },
 ]
 
 # lane qs5

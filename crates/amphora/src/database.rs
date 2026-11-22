@@ -1937,6 +1937,11 @@ impl Engine for Local {
         group::used_bytes(&self.db).map(Some)
     }
 
+    fn size_cut(&mut self) -> anyhow::Result<Option<reshard::plan::Cut>> {
+        // In a transaction of its own, so the root page read is the one its schema read named.
+        self.db.transaction(|db| group::size_cut(db))
+    }
+
     fn export(&mut self, span: reshard::Span, positions: usize) -> anyhow::Result<store::Exported> {
         group::export(&self.db, span, positions)
     }
@@ -2521,6 +2526,49 @@ mod group_holding {
             )
             .unwrap();
         (rows, live, head)
+    }
+
+    /// T-T1.9.R19 (CP-T1.9; docs/design/reshard.md, decision "The size cut from the B-tree's middle
+    /// key"): a local database made a group's, then its Records keys written. Expect: with one key,
+    /// no size cut; with eight, and again with more than one page of its position index holds (a
+    /// page over 16 bytes a key, each key's cell being longer), a cut with weight on each side, and
+    /// keys on each side of it.
+    #[test]
+    fn t_t1_9_r19_a_local_databases_size_cut_is_its_position_index_middle_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = local(&dir.path().join("g.db")).unwrap();
+        db.keep_holding(&postcard::to_allocvec(&Holding::owning(Some(Span::ALL))).unwrap())
+            .unwrap();
+        write(&mut db, "k0", Some(b"v"));
+        assert_eq!(db.size_cut().unwrap(), None);
+        let mut page = 0;
+        db.db
+            .query("PRAGMA page_size", [], |r| {
+                page = rev(r, 0)?;
+                Ok(false)
+            })
+            .unwrap();
+        let past_a_page = usize::try_from(page / 16 + 1).unwrap();
+        let mut written = 1;
+        for target in [8, past_a_page] {
+            while written < target {
+                write(&mut db, &format!("k{written}"), Some(b"v"));
+                written += 1;
+            }
+            let cut = db.size_cut().unwrap().unwrap();
+            assert!(cut.left > 0 && cut.right > 0, "{cut:?}");
+            let below = (0..target)
+                .filter(|i| {
+                    let id =
+                        crate::reshard::row_key("ns", "f", format!("k{i}").as_bytes()).unwrap();
+                    crate::reshard::position_of(&id) < cut.at
+                })
+                .count();
+            assert!(
+                below > 0 && below < target,
+                "{below} of {target} below {cut:?}"
+            );
+        }
     }
 
     /// T-T1.9.R9 (CP-T1.9; docs/design/reshard.md, "A row routes by its namespace, family and

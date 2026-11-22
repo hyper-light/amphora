@@ -9,6 +9,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   retries a step a group refused before taking it (`NotLeader`, `Full`) after the learned RFC 6298 back-off, with today's
   behaviour as the control; `Cluster::counted` gives the instruments. A group failing mid-commit is tested through a session
   over real groups. Waits on the coordinator: which setting stays, from live runs; the LAN p99 and 10,000-seed runs.
+  At scale (lane xgroup-sql-5): `xgroup_lan refusals` runs Stop against Retry under many callers and correlated
+  refusals, one JSON line a run; the SQL hookup waits on a Database over Groups and a Tablet over the records tables.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
@@ -480,6 +482,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Lane backups-3: restore checks are on by default (`backup::CheckPolicy`: off, scratch, continuous),
   within a budget measured on the machine (idle time, free disk), at seconds drawn uniformly from
   every quiet snapshot, every row compared, with deferral and cost instruments (T-T1.12.C4 to C6).
+  The restore benchmark against PostgreSQL+pgBackRest and SQLite+Litestream: `bench/backup_restore.sh`
+  (AC-T1.12.3; one tiny instance run, the measurement is the coordinator's).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -565,7 +569,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   T-T1.9.R15, T-T1.9.R17). Left: that transport off loopback
   (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
   full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
-  them (T-T1.9.R16).
+  them (T-T1.9.R16). Size cut (lane split-merge-15): a group's size cut is its position index's middle key, read
+  from the index's root page alone (T-T1.9.R19).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

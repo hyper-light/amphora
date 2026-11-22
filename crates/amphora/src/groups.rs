@@ -1067,8 +1067,9 @@ impl<E: Engine> Groups<E> {
     /// the load's cut, where the keys written to it fall half each side; and its size, the bytes
     /// its engine says its rows hold ([`Engine::bytes`], asked on its writer; none: 0). Each call
     /// starts the next window, so the window is the time between planner runs, and the shares the
-    /// plan compares don't depend on its length. A group has no size cut yet, so it splits by its
-    /// load alone.
+    /// plan compares don't depend on its length. Its size cut is where its engine's rows fall about
+    /// half each side ([`Engine::size_cut`], asked on its writer with its size; decision "The size
+    /// cut from the B-tree's middle key").
     pub fn measure(&self, until: Instant) -> anyhow::Result<Vec<GroupLoad>> {
         type Measured<E> = (GroupId, Store<E>, Arc<Mutex<Window>>);
         let held: Vec<Measured<E>> = {
@@ -1081,7 +1082,8 @@ impl<E: Engine> Groups<E> {
         };
         let mut out = Vec::with_capacity(held.len());
         for (group, store, window) in held {
-            let bytes = store.run(until, |e| e.bytes())?.unwrap_or(0);
+            let (bytes, by_size) = store.run(until, |e| Ok((e.bytes()?, e.size_cut()?)))?;
+            let bytes = bytes.unwrap_or(0);
             let now = store.counters().apply_us;
             let mut window = window.lock().unwrap_or_else(PoisonError::into_inner);
             let load = now.saturating_sub(window.apply_us);
@@ -1091,7 +1093,7 @@ impl<E: Engine> Groups<E> {
                 group,
                 bytes,
                 load,
-                by_size: None,
+                by_size,
                 by_load: written.cut(),
             });
         }

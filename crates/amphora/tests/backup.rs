@@ -1000,3 +1000,72 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
         );
     }
 }
+
+/// The restore benchmark's Amphora leg (AC-T1.12.3; bench/backup_restore.sh runs it beside
+/// PostgreSQL with pgBackRest and SQLite with Litestream on the same machine). Do: back a database
+/// up to a folder (`AMPHORA_RESTORE_BENCH_DIR`, else a temporary one), write
+/// `AMPHORA_RESTORE_BENCH_BYTES` of 4096-byte rows (a page's worth, the engine's page size: a
+/// format value), a commit of `AMPHORA_RESTORE_BENCH_BATCH` rows each second, close it, then
+/// restore its last second. Expect: every row restored. Prints the bytes and the restore's
+/// nanoseconds. The sizes are the caller's; the defaults are a tiny instance.
+#[test]
+#[ignore = "a benchmark: run by bench/backup_restore.sh"]
+fn restore_bench_amphora() {
+    let var = |name: &str, default: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let bytes = var("AMPHORA_RESTORE_BENCH_BYTES", 4 << 20);
+    let batch = var("AMPHORA_RESTORE_BENCH_BATCH", 256).max(1);
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::env::var("AMPHORA_RESTORE_BENCH_DIR")
+        .map_or_else(|_| temp.path().to_path_buf(), std::path::PathBuf::from);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("source.db");
+    let blobs = Arc::new(backup::FolderBlobs::open(&root.join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let (database, shipping) = open_backed_up(&path, &blobs, &now);
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    let rows = bytes.div_ceil(4096);
+    let mut id = 0u64;
+    while id < rows {
+        let end = (id + batch).min(rows);
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        let first = id;
+        database
+            .call(until(), move |c| {
+                for i in first..end {
+                    c.execute(
+                        "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                        vec![
+                            amphora_api::Value::Integer(i64::try_from(i).unwrap()),
+                            amphora_api::Value::Text("x".repeat(4096)),
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        id = end;
+    }
+    let last = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    let source = std::fs::metadata(&path).unwrap().len();
+    let target = root.join("restored.db");
+    let began = Instant::now();
+    backup::restore(blobs.as_ref(), "db", last, &target, until()).unwrap();
+    let took = began.elapsed().as_nanos();
+    let restored = Db::open(&target).unwrap();
+    assert_eq!(self::rows(&restored).len(), usize::try_from(rows).unwrap());
+    println!("restore system=amphora rows={rows} source_bytes={source} ns={took}");
+}
