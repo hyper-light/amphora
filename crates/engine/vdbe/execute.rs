@@ -20912,8 +20912,8 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        TableAggregate, TableBodyAggregate, TableBuild, TableJoinAggregate, TableJoinRows,
-        TableSource,
+        TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild, TableJoinAggregate,
+        TableJoinRows, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -20936,6 +20936,17 @@ pub fn op_morsel_aggregate(
             return Ok(InsnFunctionStepResult::Step);
         };
         return morsel_rows(state, data, rows);
+    }
+    // A scan's rows under a LIMIT with no ORDER BY run on morsels only behind their switch; off,
+    // the control, the serial loop answers (lane qs6-8).
+    if data
+        .body
+        .as_ref()
+        .is_some_and(|body| body.rows && body.want.is_some())
+        && !connection.parallel_limit()
+    {
+        state.pc = data.target_pc_serial.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
     }
     // The costs are taken for the run and put back after, so a statement learns from the last.
     let taken = connection.morsel_costs.lock().take();
@@ -20990,6 +21001,19 @@ pub fn op_morsel_aggregate(
                     shape: &shape,
                     ran: &connection.morsel_body_rows,
                 };
+                // A scan's rows: kept in leaf order, the result columns as they stand (lane qs6-8).
+                if body.rows {
+                    let rows = TableBodyRows {
+                        body: &pipeline,
+                        want: body
+                            .want
+                            .map(|want| usize::try_from(want).unwrap_or(usize::MAX)),
+                        kept: std::sync::atomic::AtomicUsize::new(0),
+                    };
+                    return rows
+                        .run_mode(connection.parallel_mode(), &mut costs, &budget)
+                        .map(|(rows, _)| (rows, true));
+                }
                 return pipeline
                     .run_mode(connection.parallel_mode(), &mut costs, &budget)
                     .map(|(rows, _)| (rows, false));

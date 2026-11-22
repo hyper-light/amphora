@@ -2852,6 +2852,7 @@ impl Database {
             pinned_cost_weights: crate::sync::RwLock::new(None),
             automatic_indexes: AtomicBool::new(true),
             parallel_mode: AtomicBool::new(false),
+            parallel_limit: AtomicBool::new(false),
             morsel_costs: crate::sync::Mutex::new(None),
             morsel_body_rows: AtomicU64::new(0),
             vectorized_scans: AtomicBool::new(false),

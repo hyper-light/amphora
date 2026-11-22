@@ -480,6 +480,13 @@ pub struct MorselBody {
     /// Whether `MorselAggregateData`'s own filter and aggregates state the same query over the
     /// table's columns (the versioned storage's column copy reads those, not the body).
     pub simple: bool,
+    /// Amphora (QT.6, lane qs6-8): the outputs are the statement's result columns, kept as rows
+    /// in leaf order rather than folded into aggregates.
+    pub rows: bool,
+    /// With `rows`, under a LIMIT: the rows the LIMIT and OFFSET take. No morsel is claimed once
+    /// that many are kept, and a morsel stops once it alone holds that many; the morsels run are
+    /// then a prefix of the table, so the first rows are the serial loop's.
+    pub want: Option<u64>,
 }
 
 /// Amphora: how [MorselAggregateData]'s joined rows come out (QT.6).

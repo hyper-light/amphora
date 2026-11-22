@@ -496,9 +496,27 @@ versioned storage's column copy still reads the simple shape's own filter and ag
 declines a body only the bytecode states. T-QT.6.15 checks random filters and inputs against the
 serial loop at 1, 2, 3, 4 and 8 stated cores, and that the body ran over every row.
 
+**A scan's rows run through the copy too** (lane qs6-8). A one-table SELECT with no aggregates,
+no GROUP BY and no ORDER BY emits the same copy of the loop body with the result columns as its
+outputs (`MorselBody::rows`); each worker (`TableBodyRows`) keeps the output rows of the rows that
+pass, tagged with its morsel's first leaf, and the runs are joined in leaf order, so the rows come
+out as the serial loop gives them. An ORDER BY stays serial: its sorter orders ties its own way.
+
+**Workers stop early under a LIMIT** (lane qs6-8). With a LIMIT, the body carries the rows the
+LIMIT and OFFSET take (`want`). A shared count of the rows kept is checked before each morsel is
+claimed (`Pipeline::done`), so no morsel is claimed once that many are kept, and a morsel stops
+scanning once it alone holds that many. A morsel claimed always runs, and morsels are claimed in
+leaf order, so the morsels run are a prefix of the table and the first `want` rows in leaf order
+are exactly the serial loop's; the hook's row loop then counts the OFFSET and LIMIT down as it
+does for joins. This runs behind its own switch, `Connection::set_parallel_limit`, off by default:
+off is the control, and the serial loop answers. T-QT.6.16 checks random filters and result
+expressions against the serial loop at 1, 2, 3, 4 and 8 stated cores, with and without a LIMIT;
+under a LIMIT, that the row count is the serial one, that every row is in the serial result, that
+the control never runs the body, and that the body ran over fewer rows than the table holds (the
+workers stopped early) for most statements.
+
 **Not yet.** Joins still run the pipeline's own probe loop, so only the filters `Predicate` holds
-run in a join's workers; joins of more than two tables and outer joins stay serial, and a LIMIT
-doesn't yet stop the workers early.
+run in a join's workers; joins of more than two tables and outer joins stay serial.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

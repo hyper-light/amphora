@@ -138,6 +138,15 @@ impl TableSource {
         leaves: Range<usize>,
         mut each: impl FnMut(i64, &[Value]) -> Result<(), MorselError>,
     ) -> Result<(), MorselError> {
+        self.scan_while(leaves, |rowid, row| each(rowid, row).map(|()| true))
+    }
+
+    /// As [`TableSource::scan`], stopping after the row for which `each` says false.
+    pub fn scan_while(
+        &self,
+        leaves: Range<usize>,
+        mut each: impl FnMut(i64, &[Value]) -> Result<bool, MorselError>,
+    ) -> Result<(), MorselError> {
         if leaves.start >= leaves.end {
             return Ok(());
         }
@@ -208,7 +217,9 @@ impl TableSource {
                 })?;
                 *slot = Value::from_i64(rowid);
             }
-            each(rowid, &row)?;
+            if !each(rowid, &row)? {
+                break;
+            }
             io.block(|| cursor.next()).map_err(storage)?;
         }
         Ok(())
@@ -503,6 +514,136 @@ impl Pipeline for TableBodyAggregate<'_> {
     ) -> Result<(), MorselError> {
         self.shape
             .merge(&mut into.aggregate, from.aggregate, budget)
+    }
+}
+
+/// A one-table scan's rows through the copy of the serial loop's body (lane qs6-8): each worker
+/// runs the body per row as [`TableBodyAggregate`] does and keeps the outputs of the rows that
+/// pass; the runs are joined in leaf order, so the rows come out in the serial loop's order. Under
+/// a LIMIT (`want`) no morsel is claimed once that many rows are kept, and a morsel stops once it
+/// alone holds that many.
+pub struct TableBodyRows<'a> {
+    pub body: &'a TableBodyAggregate<'a>,
+    pub want: Option<usize>,
+    /// The rows kept so far, by every worker.
+    pub kept: std::sync::atomic::AtomicUsize,
+}
+
+/// The partial of [`TableBodyRows`]: each morsel's rows tagged with its first leaf, and the
+/// worker that runs the body.
+#[derive(Default)]
+pub struct BodyRowsPartial {
+    runs: Vec<(usize, Vec<Vec<Value>>)>,
+    worker: Option<Box<BodyWorker>>,
+}
+
+impl TableBodyRows<'_> {
+    /// The rows in leaf order, the first `want` of them under a LIMIT.
+    pub fn finish(&self, mut partial: BodyRowsPartial) -> Result<Vec<Vec<Value>>, MorselError> {
+        partial.runs.sort_by_key(|(first, _)| *first);
+        let total = partial
+            .runs
+            .iter()
+            .map(|(_, run)| run.len())
+            .fold(0usize, usize::saturating_add);
+        let take = self.want.map_or(total, |want| want.min(total));
+        let mut out = Vec::new();
+        out.try_reserve_exact(take)?;
+        for (_, run) in partial.runs {
+            let room = take.saturating_sub(out.len());
+            out.extend(run.into_iter().take(room));
+        }
+        Ok(out)
+    }
+
+    /// The rows as the switch and the measured costs pick the degree.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let (partial, stats) = execute(self, mode, costs, budget)?;
+        Ok((self.finish(partial)?, stats))
+    }
+}
+
+impl Pipeline for TableBodyRows<'_> {
+    type Partial = BodyRowsPartial;
+
+    fn rows(&self) -> usize {
+        self.body.table.leaves()
+    }
+
+    fn empty(&self) -> Self::Partial {
+        BodyRowsPartial::default()
+    }
+
+    fn done(&self) -> bool {
+        self.want
+            .is_some_and(|want| self.kept.load(std::sync::atomic::Ordering::Relaxed) >= want)
+    }
+
+    fn run(
+        &self,
+        leaves: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let BodyRowsPartial { runs, worker } = partial;
+        let worker = match worker {
+            Some(worker) => worker,
+            None => worker.insert(Box::new(self.body.worker()?)),
+        };
+        let first = leaves.start;
+        let mut found: Vec<Vec<Value>> = Vec::new();
+        let mut ran = 0u64;
+        let scanned = self.body.table.scan_while(leaves, |rowid, row| {
+            ran = ran.saturating_add(1);
+            if !self.body.row(worker, rowid, row)? {
+                return Ok(true);
+            }
+            let mut bytes = std::mem::size_of::<Value>().saturating_mul(worker.out.len());
+            for value in &worker.out {
+                bytes = bytes.saturating_add(match value {
+                    Value::Text(text) => text.as_str().len(),
+                    Value::Blob(blob) => blob.len(),
+                    _ => 0,
+                });
+            }
+            budget.charge(bytes)?;
+            let mut out = Vec::new();
+            out.try_reserve_exact(worker.out.len())?;
+            out.extend(worker.out.iter().cloned());
+            found.try_reserve(1)?;
+            found.push(out);
+            self.kept.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // This morsel alone holds the rows the LIMIT takes: none after them is among those.
+            Ok(match self.want {
+                Some(want) => found.len() < want,
+                None => true,
+            })
+        });
+        if scanned.is_ok() {
+            self.body
+                .ran
+                .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+        }
+        scanned?;
+        runs.try_reserve(1)?;
+        runs.push((first, found));
+        Ok(())
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        _budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        into.runs.try_reserve(from.runs.len())?;
+        into.runs.extend(from.runs);
+        Ok(())
     }
 }
 

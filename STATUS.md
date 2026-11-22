@@ -1038,6 +1038,8 @@ order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Lane qs6-6: such a
 OFFSET runs on morsels too when its ORDER BY holds both tables' INTEGER PRIMARY KEYs, so its rows
 are the serial loop's to the row (T-QT.6.14). Lane qs6-7: workers run a copy of a one-table scan's loop
 body, each with its own registers, so any filter or expression runs in parallel (T-QT.6.15).
+Lane qs6-8: a scan's rows run through the copy too, and under a LIMIT with no ORDER BY
+(behind its switch, serial the control) the workers stop once they hold the LIMIT's rows (T-QT.6.16).
 Still open: the copy for joins, joins of three or more tables, outer joins, a LIMIT that stops
 the workers early.
 

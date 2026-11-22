@@ -91,6 +91,15 @@ pub(crate) fn emit_morsel_hook(
         aggregates: looped.aggregates.clone(),
         sums: looped.sums.clone(),
         simple: is_simple,
+        rows: looped.rows,
+        want: if looped.rows {
+            window
+                .limit
+                .map(|limit| limit.saturating_add(window.offset))
+                .and_then(|want| u64::try_from(want).ok())
+        } else {
+            None
+        },
     });
     let serial = program.allocate_label();
     let end = program.allocate_label();
@@ -161,10 +170,19 @@ struct BodyPlan<'p> {
     aggregates: Vec<Aggregate>,
     sums: Vec<usize>,
     result_map: Vec<usize>,
+    /// The outputs are the result columns, returned as rows (lane qs6-8).
+    rows: bool,
 }
 
 fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
-    if !plain(plan) {
+    // A scan with no aggregates returns its rows (lane qs6-8). No ORDER BY: the serial loop's
+    // sorter orders ties its own way. A LIMIT and OFFSET cut the rows in scan order.
+    let rows = plan.aggregates.is_empty();
+    if !(if rows {
+        plain_rows(plan) && plan.order_by.is_empty()
+    } else {
+        plain(plan)
+    }) {
         return None;
     }
     let [joined] = plan.table_references.joined_tables() else {
@@ -225,7 +243,13 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
     }
     let keys = group_by.len();
     let mut result_map = Vec::new();
-    for result in &plan.result_columns {
+    if rows {
+        for result in &plan.result_columns {
+            result_map.push(outs.len());
+            outs.push(&result.expr);
+        }
+    }
+    for result in plan.result_columns.iter().filter(|_| !rows) {
         let key = if result.contains_aggregates {
             None
         } else {
@@ -289,6 +313,7 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         aggregates,
         sums,
         result_map,
+        rows,
     })
 }
 

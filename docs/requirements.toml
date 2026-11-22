@@ -1002,6 +1002,8 @@ tests = [
   { id = "T-QT.6.14", text = "t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-6) — passes when random two-table hash joins returning rows under LIMIT and OFFSET, ordered by keys holding both tables' INTEGER PRIMARY KEYs, answer row for row as the serial loop at 2, 3, 4 and 8 stated cores, the hook ran for most, and a LIMIT over an order with ties stays serial" },
   # lane qs6-7
   { id = "T-QT.6.15", text = "t_qt_6_15_workers_run_a_copy_of_the_loop_body_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-7) — passes when random one-table aggregates whose filters, GROUP BY values and aggregate inputs are any expression (functions, CASE, LIKE, arithmetic) answer as the serial loop at 1, 2, 3, 4 and 8 stated cores, the workers' copy of the loop body ran over every row each time, and more than one worker ran for most" },
+  # lane qs6-8
+  { id = "T-QT.6.16", text = "t_qt_6_16_a_scans_rows_run_in_parallel_and_stop_early_under_limit (vdbe/morsel_scan_tests.rs; lane qs6-8) — passes when random one-table SELECTs with no aggregates, any filter and any result expression, return the serial loop's rows in order at 1, 2, 3, 4 and 8 stated cores; under a LIMIT with no ORDER BY the switch's control (off) answers serially without running the body, and with it on the row count is the serial one, every row is in the serial result, and for most statements the body ran over fewer rows than the table holds" },
 ]
 
 # lane g3s2
