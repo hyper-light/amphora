@@ -973,8 +973,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lanes pl8-7 to pl8-9 (docs/design/planner.md "Decision (lane pl8-9)"): the search pairs connected
   subsets with their connected complements (DPccp) and picks the bushy plan where it costs less; a
   test's data shows it picked and answering as nested loops do (T-PL.8.2).
-  Not built: the search budget derived from a plan-time target, and semi and anti joins placed
-  before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
+  Lanes pl8-14 and pl8-15 (docs/design/planner.md "Decision (lane pl8-15)"): learned weights move
+  only past the spread between batch means (Student's t, T-PL.8.6), so a burst of load no longer
+  flips a plan; semi and anti joins after the inner joins follow a bushy plan (T-PL.8.2).
+  Not built: the search budget derived from a plan-time target, outer joins inside a bushy plan,
+  and semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1
+  is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted

@@ -1495,8 +1495,9 @@ each row of the run materialized, the terms a left-deep plan's materialized buil
 bushy plan replaces the left-deep one only when it costs less. The pairs are walked on loops over
 the subsets found, not recursion (CLAUDE.md section 11), and each pair counts against what the
 subsets left of `JOIN_SEARCH_BUDGET` (decision 19): past it the left-deep plan stands. No bushy plan
-is tried for a join with an outer, semi or anti join, a RIGHT or FULL JOIN, or a table that must
-follow another (`bushy_plans_allowed`), and a bushy plan keeps no order, so it removes no sort.
+is tried for a join with an outer join, a RIGHT or FULL JOIN, or a table that must follow another
+(`bushy_core`; semi and anti joins after the inner ones follow a bushy plan, decision pl8-15), and a
+bushy plan keeps no order, so it removes no sort.
 
 **Why.** A left-deep order joins one table at a time, so two selective joins whose small results
 meet only through each other force it to join one side's small result to the other side's whole
@@ -1516,12 +1517,65 @@ a WHERE term between the run and the loop before it, a probe term reading the lo
 
 **Not yet built.** `JOIN_SEARCH_BUDGET` is still decision 19's 10,000 subsets from Neumann and Radke;
 deriving it from a plan-time target (the measured time a candidate takes against the planning time a
-query may take) needs that target defined first. Semi and anti joins placed before other loops. The
-probe is read whole; a probe that keeps its own access method would let the run's result join a loop
+query may take) needs that target defined first. The probe is read whole; a probe that keeps its own access method would let the run's result join a loop
 read by a key.
 
 **Falsified by.** A bushy plan's answer that differs from the nested loops'; a JOB query whose plan
 turns bushy and runs slower than on its parent (AC-PL.8.1).
+
+## Decision (lane pl8-15): weights judged between batches; semi and anti joins after a bushy plan
+
+**Decision.** PL.8, two pieces (lanes pl8-14 and pl8-15).
+
+- *Learned weights* (`optimizer/learned_costs.rs`, T-PL.8.6). A rate's batch (an epoch: as much
+  work as calibration timed) replaces the standing rate only when the two differ by more than the
+  spread between batch means allows. That spread is the root mean square of successive differences
+  of the batch means' logarithms (von Neumann, Kent, Bellinson and Hart, Annals of Mathematical
+  Statistics 12(2), 1941); the jump into a batch that moved the rate is left out. The gap over the
+  spread is tested against Student's t with as many degrees of freedom as differences, at the
+  two-sided 95% level split over the eight kinds of work (Dunn, JASA 56(293), 1961). The test's
+  cost stays bounded however long a process runs: the ratio's probability by Abramowitz and Stegun
+  26.7.3/26.7.4 while there are few differences, then the quantile's Cornish-Fisher expansion
+  (26.7.5) once its last term is under an f64's resolution (about 13,000 differences). The first
+  batch the database times replaces calibration's rate or the open's page-read anchor; calibration's
+  own error estimate is gone.
+- *Semi and anti joins* (`optimizer/join.rs`, `bushy_core`, T-PL.8.2). When a join's tables are
+  inner joins free to move followed only by semi and anti joins (EXISTS, NOT EXISTS) that need
+  only tables before them, the search pairs the inner joins as decision pl8-9 does, then adds the
+  semi and anti joins to each bushy plan as loops in their order, as the left-deep search adds a
+  table. The whole plan replaces the left-deep one only if it costs less. A hash join is not
+  tried for them: it would build from the run's probe.
+
+**Why.** A burst of load slows a whole batch at once, so the times inside one batch agree however
+far the batch sits from the last. Judged by that inner spread (lane pl8-13's ratio estimator), each
+burst was evidence: on a loaded adacachy the hash probe's weight climbed in significant steps
+through one run (10, 170, 220, 280 rows' visits) and flipped `t_pl_8_2`'s plan from run to run. The
+spread between batches holds those bursts, as the method of batch means reads a correlated series'
+error (Schmeiser, Operations Research 30(3), 1982). CD-C keeps every table before a semi or anti
+join ahead of it and the emitter runs those tables as the last loops (`required_lhs_by_table`), so
+a bushy plan of the tables before them is followed by them unchanged.
+
+**Evidence.** `learned_costs::tests::t_pl_8_6_*`: a burst within the spread moves nothing, nor do
+two batches alone or one observation alone; a batch past Student's t moves the weight and one just
+inside does not; Student's t matches Abramowitz and Stegun's table 26.10; the expansion takes over
+only where it agrees with the exact quantile. `bushy_search_tests`: the fact tables hold 12,000 rows,
+so the bushy plan is cheapest at every hash-probe weight seen (with 3,000 the nested loops won at a
+probe of 400, kiln run r1178; with 12,000 the bushy plan won at every corner, r1271);
+`t_pl_8_2_the_bushy_plan_is_cheapest_at_every_corner_of_the_weights` pins those corners (probe 10
+and 400 rows' visits, seek and build a quarter of and four times the learned ones; each plan's cost
+is linear in the weights, so the corners bound the range);
+`t_pl_8_2_semi_and_anti_joins_follow_a_bushy_plan` plans EXISTS and NOT EXISTS, correlated with the
+probe's table and with a run's table, bushy and answers as nested loops do. The run of record is
+the coordinator's: `t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest` passing 20 of
+20 copies run at once.
+
+**Not yet built.** Outer joins in a bushy plan: a LEFT JOIN's right table inside the run or after
+the probe. Semi and anti joins read by a hash join after a bushy plan. Right after a process
+starts, with few batches, Student's t is large, so the weights move slowly until batches gather.
+
+**Falsified by.** A plan of `t_pl_8_2` that differs between two of the 20 copies run at once; a
+weight that moves on a batch within the spread between batch means; a semi or anti join's answer
+after a bushy plan that differs from the nested loops'.
 
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
