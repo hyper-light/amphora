@@ -448,6 +448,11 @@ fn t_pl_13_4_a_run_past_the_estimate_starts_again_on_the_new_plan() {
 #[test]
 fn pl_13_a_chosen_hash_joins_build_past_the_estimate_plans_again() {
     let (_dir, conn) = open("chosen_build.db");
+    // A build row priced past a probe row: with the two equal, building a or b costs the same and
+    // the machine's timed weights (a page's, the fitted ones) pick the side, b about one run in five,
+    // whose count is right and plans nothing again. Priced apart, the plan builds the side it counts
+    // smaller, a, whatever the machine.
+    conn.pin_cost_weights(Some((4.0, 3.0, 1.0)));
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
         .unwrap();
