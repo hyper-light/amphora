@@ -858,6 +858,20 @@ tests = [
   { id = "T-RA.1.2", text = "index_keys_keep_term_order_and_prefixes_reach_one_term over every term of up to three bytes from {0x00, 0x01, 0xFF, a} — passes when keys sort as (term, key) and a prefix reaches its own term only" },
 ]
 
+# lane kiln-records: the Records suite past 200 cases (CP-T1.5's AC-T1.5.3; kiln goal 0d717247,
+# G9 step 2). AC-T1.5.3 is the goal's criterion; RA.2 is this lane's evidence for it.
+[[own]]
+id = "RA.2"
+title = "The Records suite past 200 cases, every case passed by Amphora and the simulator alike"
+criteria = [
+  { id = "AC-RA.2.1", text = "amphora_api::conformance holds more than 200 cases, each id once: kiln-seams' RECORDS-1 to 14, Amphora's own, and one case per row of crates/api/src/conformance/table.rs" },
+  { id = "AC-RA.2.2", text = "Amphora's Namespace (in memory, on a file, through the local owner, at one voter and three) and SimRecords pass every case, and no answer differs between them" },
+]
+tests = [
+  { id = "T-RA.2.1", text = "cp_t1_5_the_records_suite_is_past_200_cases_each_id_once (crates/amphora/tests/records_conformance.rs) — passes when the suite holds more than 200 cases and no id twice (209 at 556910e7)" },
+  { id = "T-RA.2.2", text = "records_conformance's per-implementation suites and the_simulator_answers_as_amphora_does — passes when every case passes on each implementation and every answer equals the simulator's" },
+]
+
 # lane columnar-decision
 # Amphora's own IDs for G11, analytics at column-store speed (kiln plan
 # 01a16b0f477676d5a7ce168b80aa29f5, research 01a16b0f477676d5a7ce168c89606fd2): CS.n for its step n.
@@ -1121,7 +1135,9 @@ criteria = [
 ]
 tests = [
   { id = "T-G7.5.1", text = "storage::versioned::many_writers::g7_5_many_writers_answer_as_a_serial_replay — passes when every answer and the ending rows and index match the serial replay's, on the pager's storage and the versioned one, ids from writers' own slices and from every row" },
-  { id = "T-G8.4.1", text = "storage::versioned::elle_sql::g8_4_sql_histories_have_no_anomaly_on_* — passes when list-append and register histories recorded from N SQL connections show no G0, G1a, G1b, G1c, G-single or G2 (the versioned storage's is ignored until its SQL cursor keeps reads for validation)" },
+  { id = "T-G8.4.1", text = "storage::versioned::elle_sql::g8_4_sql_histories_have_no_anomaly_on_* — passes when list-append and register histories recorded from N SQL connections show no G0, G1a, G1b, G1c, G-single or G2" },
+  { id = "T-G8.4.2", text = "storage::versioned::conformance::g8_4_2_cursor_reads_refuse_write_skew_and_phantoms — passes when, through writing SQL cursors on the versioned storage, write skew and a phantom (forward and back scans) refuse the second commit, and reads and writes apart both commit" },
+  { id = "T-G8.4.3", text = "storage::versioned::version::tests::g8_4_3_reads_lost_to_a_refused_escalation_refuse_the_commit — passes when a transaction whose read the budget refused even as the whole-tree span has its commit refused SerializationFailure" },
 ]
 
 # lane repl-measure (G12 steps 1 and 3, CP-T1.8): no new IDs. `amphora-bench --repl` is the harness
@@ -1130,10 +1146,25 @@ tests = [
 # G12 step 1's comparison set (dqlite, rqlite, LiteFS and libSQL through bench/servers/repl/). Its
 # tests: bench/src/repl.rs g12_repl_*. The measurements are the coordinator's.
 
+# lane g5s4c: G5 step 4 wired in (executor.md decision 11, "Wired").
+[[own]]
+id = "G5.4w"
+title = "Skipping rows wired into the engine's writes, read at the summary's snapshot only (G5 step 4)"
+criteria = []
+tests = [
+  { id = "T-G5.4.2", text = "skipping::tests::wired::t_g5_4_2_* — passes when, with SQL inserts, updates and deletes between scans, each kind's candidates read through SQL answer exactly as a plain scan and something was skipped; a reader at an older snapshot, or beside an open writer, is refused (OlderSnapshot) and its plain scan keeps its rows; a rollback makes the summary Stale until built again" },
+  { id = "T-G5.4.3", text = "skipping::tests::scans::t_g5_4_3_* (lane g5s4d) — passes when, for each kind, SQL filters (BETWEEN, >= and <=, a flipped <, =) on a summarized column answer exactly as the same SQL on a database without the summary, with random SQL inserts, updates and deletes between queries; every query consulted the summary, the statement's rows_read summed lower than without it, and zones were skipped or the column cracked; an open writer reads its own writes through it, a rollback makes it Stale (counted, every row read, right answer), and a reader at an older snapshot is refused (counted) and keeps its snapshot's rows" },
+]
+
 # lane repl-measure-2 (G12 steps 1 and 3-5, CP-T1.8): no new IDs. bench/repl.sh runs every measure on
 # every system with one command; LiteFS fails over on Consul's lease (servers/repl/litefs.sh); dqlite's
 # shim builds and its cluster comes up. libSQL's failover and dqlite's member catch-up stay refused,
 # typed: sqld has no election, and dqlite reads only through its leader.
+
+# lane repl-measure-4 (CP-T1.8, AC-T1.8.5): no new IDs. bench/power_nemesis.sh shards the 10,000-seed
+# power-cut nemesis by seed range in both classes, a record a shard, merged with a coverage check;
+# records under bench/records/power-nemesis/<run>/. bench/repl_lab.sh runs the seeds and the
+# comparison set on three machines named as its arguments. The runs of record are the coordinator's.
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]
@@ -1194,3 +1225,5 @@ tests = [
   { id = "T-T1.10.X3", text = "xgroup::tests::t_t1_10_x3_a_group_failure_at_every_step_ends_committed_or_aborted_everywhere — passes when each of three groups failing at every coordinator input, its in-flight step landed or not, ends committed or aborted in every group, as answered, under both protocols, both ends reached" },
   { id = "T-T1.10.X2", text = "xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly — passes when three seeds of each protocol over the transport commit across groups with no anomaly and no unknown outcome; ac_t1_10_5_the_lan_check_finds_a_lost_update_and_an_aborted_read holds the check to finding them" },
 ]
+
+# lane pl8-9: no new IDs. T-PL.8.2 gains the search test of docs/design/planner.md "Decision (lane pl8-9)".

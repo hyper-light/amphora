@@ -1323,6 +1323,17 @@ impl Connection {
         sql: impl AsRef<str>,
         origin: StatementOrigin,
     ) -> Result<Statement> {
+        let dialect = self.db.dialect();
+        self.prepare_with_parser(sql, origin, |sql| dialect.parse(sql))
+    }
+
+    /// [`Self::prepare_with_origin`], the SQL parsed by `parse`.
+    fn prepare_with_parser(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        origin: StatementOrigin,
+        parse: impl Fn(&str) -> Result<(Option<Cmd>, usize)>,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1342,7 +1353,7 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
+                parse(sql)?
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1787,7 +1798,14 @@ impl Connection {
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        // The engine's own query, SQLite's SQL: parsed by SQLite's parser, never the database's
+        // dialect, which may not read it (G7 step 2: the versioned storage reads its schema
+        // this way at open, where the pager reads page 1 without SQL).
+        let stmt = self.prepare_with_parser(
+            "SELECT * FROM sqlite_schema",
+            StatementOrigin::Root,
+            crate::dialect::sqlite::parse,
+        )?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -3540,6 +3558,24 @@ impl Connection {
 
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
+    }
+
+    /// Amphora (G5 step 4): this connection's identity in the skipping registry.
+    pub(crate) fn skipping_id(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
+    /// Amphora (G5 step 4): this connection's snapshot and the newest commit, as WAL positions;
+    /// `None` without a WAL.
+    pub(crate) fn skipping_positions(
+        &self,
+    ) -> Option<(crate::skipping::WalPos, crate::skipping::WalPos)> {
+        let pager = self.get_pager();
+        let wal = pager.wal.as_ref()?;
+        Some((
+            wal.connection_wal_pos(),
+            (wal.get_checkpoint_seq(), wal.get_max_frame_in_wal()),
+        ))
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
@@ -5681,6 +5717,8 @@ impl Connection {
     }
 
     pub(crate) fn rollback_named_savepoint_frame(&self, name: &str) -> Option<RollbackFrameInfo> {
+        // Amphora (G5 step 4): a summary that took the undone writes is stale.
+        self.db.skipping.rolled_back(self.skipping_id());
         let mut savepoints = self.named_savepoints.write();
         let target_idx = savepoints
             .iter()

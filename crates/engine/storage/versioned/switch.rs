@@ -307,6 +307,10 @@ pub struct Switch {
     /// SQL's named savepoints (`SAVEPOINT name`), oldest first, beside the connection's frames.
     named: Mutex<Vec<(String, Savepoint, Mark)>>,
     d: Mutex<Descender>,
+    /// A rollback that failed where nothing could return its error (the pager's
+    /// `rollback_tx`, ending an aborted statement): the next transaction begun on this
+    /// connection is refused with it, once (G7 step 2, `AC-NS.2.1`: not only logged).
+    failed: Mutex<Option<LimboError>>,
 }
 
 /// How many trees the transaction had made and dropped when a savepoint was taken: rolling back
@@ -348,7 +352,14 @@ impl Switch {
             undone: Mutex::new(Vec::new()),
             named: Mutex::new(Vec::new()),
             d: Mutex::new(Descender::new()),
+            failed: Mutex::new(None),
         }
+    }
+
+    /// Keeps a rollback's failure that no caller could be given: the connection's next
+    /// transaction is refused with it. A later failure kept before one is seen replaces it.
+    pub(crate) fn rollback_failed(&self, error: LimboError) {
+        *self.failed.lock() = Some(error);
     }
 
     /// The storage the connection shares.
@@ -369,6 +380,9 @@ impl Switch {
         let mut slot = self.txn.lock();
         if let Some(txn) = slot.as_ref() {
             return Ok(txn.clone());
+        }
+        if let Some(error) = self.failed.lock().take() {
+            return Err(error);
         }
         let txn = Arc::new(Mutex::new(Some(self.db.begin()?)));
         *slot = Some(txn.clone());
@@ -641,5 +655,40 @@ impl Switch {
         let dropping = self.drop_now(gone);
         ended?;
         dropping
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::io::{MemoryIO, IO};
+    use crate::sync::Arc;
+    use crate::{ConnectOpts, Database, LimboError, SqliteDialect};
+
+    /// AC-NS.2.1: a rollback of the versioned storage that failed where no caller could be given
+    /// its error (the pager's `rollback_tx`, ending an aborted statement) is not only logged: the
+    /// connection's next statement is refused with it, once, and the one after runs.
+    #[test]
+    fn ns_2_1_a_failed_rollback_refuses_the_next_statement_once() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        let switch = conn.versioned.as_ref().unwrap();
+        switch.rollback_failed(LimboError::InternalError("rollback refused".into()));
+        let refused = conn.execute("INSERT INTO t VALUES (2)");
+        assert!(
+            matches!(&refused, Err(LimboError::InternalError(m)) if m == "rollback refused"),
+            "{refused:?}"
+        );
+        conn.execute("INSERT INTO t VALUES (3)").unwrap();
+        let mut stmt = conn.prepare("SELECT count(*), sum(x) FROM t").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![crate::Value::from_i64(2), crate::Value::from_i64(4)]]
+        );
     }
 }
