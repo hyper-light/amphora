@@ -1106,7 +1106,20 @@ def functions_said(expression, context, dialect):
       where sqlglot writes INT, 32 bits on each engine: the type is given as BIGINT. "When casting a
       REAL value into an INTEGER, the result is the integer between the REAL value and zero that is
       closest to the REAL value", where DuckDB's, PostgreSQL's and MySQL's casts round (DuckDB 1.4.2
-      gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first."""
+      gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first.
+    - typeof(X): "a string that indicates the datatype of the expression X: "null", "integer",
+      "real", "text", or "blob"" (lang_corefunc.html#typeof), where DuckDB's and PostgreSQL's
+      typeof name the engine's type ('INTEGER', 'DECIMAL(2,1)', 'VARCHAR') and ClickHouse's
+      toTypeName its own: for an X whose storage class storage_classes() knows, the class's name,
+      'null' where X is NULL (a literal's name alone). Another X is left as it is.
+    - quote(X): "the text of an SQL literal which is the value of its argument suitable for
+      inclusion into an SQL statement. Strings are surrounded by single-quotes with escapes on
+      interior quotes as needed. BLOBs are encoded as hexadecimal literals" (lang_corefunc.html#quote),
+      NULL as NULL; no other engine has it. For an X of a class storage_classes() knows: an
+      INTEGER's text, a TEXT's with each ' doubled between quotes, a BLOB's X'..' of its upper-case
+      hex (PostgreSQL's upper(encode(X, 'hex'))), each 'NULL' where X is NULL. A REAL's text is
+      SQLite's own (%!.15g, more digits where that doesn't read back: quote(1.0/3) is
+      '3.333333333333333148e-01'), and another X: left as they are."""
     from sqlglot import exp
 
     classes = storage_classes(expression, context.tables)
@@ -1174,6 +1187,26 @@ def functions_said(expression, context, dialect):
                 node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
             elif arg == "BLOB" and dialect != "postgres":
                 same(node, exp.Anonymous(this="octet_length" if dialect == "duckdb" else "length", expressions=[node.this.copy()]))
+        elif isinstance(node, exp.Typeof) and classes.get(id(node.this), UNKNOWN) != UNKNOWN:
+            c, x = classes[id(node.this)], node.this
+            if c is None or isinstance(x, exp.Literal) or (isinstance(x, exp.Neg) and isinstance(x.this, exp.Literal)):
+                same(node, exp.Literal.string((c or "null").lower()))
+            else:
+                same(node, exp.Case(ifs=[exp.If(this=exp.Is(this=x.copy(), expression=exp.Null()), true=exp.Literal.string("null"))], default=exp.Literal.string(c.lower())))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "QUOTE" and len(node.expressions) == 1 and classes.get(id(node.expressions[0]), UNKNOWN) in (None, "INTEGER", "TEXT", "BLOB"):
+            x = node.expressions[0]
+            c = classes[id(x)]
+            if c is None:
+                said = exp.Literal.string("NULL")
+            elif c == "INTEGER":
+                said = exp.cast(x.copy(), exp.DataType.build("TEXT"))
+            elif c == "TEXT":
+                q = exp.Literal.string("'")
+                said = exp.DPipe(this=exp.DPipe(this=q, expression=exp.Anonymous(this="replace", expressions=[x.copy(), q.copy(), exp.Literal.string("''")])), expression=q.copy())
+            else:
+                hexed = exp.Upper(this=exp.Anonymous(this="encode", expressions=[x.copy(), exp.Literal.string("hex")])) if dialect == "postgres" else exp.Hex(this=x.copy())
+                said = exp.DPipe(this=exp.DPipe(this=exp.Literal.string("X'"), expression=hexed), expression=exp.Literal.string("'"))
+            same(node, said if c is None else exp.Coalesce(this=said, expressions=[exp.Literal.string("NULL")]))
         elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and affinity(node.to.sql(dialect="sqlite")) == "INTEGER":
             if classes.get(id(node.this)) == "REAL":
                 node.set("this", exp.Trunc(this=node.this.copy()))
