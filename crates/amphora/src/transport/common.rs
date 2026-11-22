@@ -87,6 +87,9 @@ pub(super) fn read_limit<T: DeserializeOwned>(
     until: Instant,
     max: usize,
 ) -> Result<T, Refusal> {
+    postcard::from_bytes(&read_frame(stream, until, max)?).map_err(unavailable)
+}
+fn read_frame(stream: &mut Stream, until: Instant, max: usize) -> Result<Vec<u8>, Refusal> {
     let mut size = [0u8; 4];
     transfer(stream, &mut size, until)?;
     let size = usize::try_from(u32::from_be_bytes(size)).map_err(unavailable)?;
@@ -95,7 +98,72 @@ pub(super) fn read_limit<T: DeserializeOwned>(
     bytes.try_reserve_exact(size).map_err(unavailable)?;
     bytes.resize(size, 0);
     transfer(stream, &mut bytes, until)?;
-    postcard::from_bytes(&bytes).map_err(unavailable)
+    Ok(bytes)
+}
+/// One greeting frame (local-owner-transport.md, "Negotiated versions"): its leading value, as a
+/// version-8 peer sends and reads it, and the value a version-9 peer puts after it, if any.
+fn read_greeting<T: DeserializeOwned, Next: DeserializeOwned>(
+    stream: &mut Stream,
+    until: Instant,
+) -> Result<(T, Option<Next>), Refusal> {
+    let bytes = read_frame(stream, until, GREETING_FRAME_MAX)?;
+    let (head, rest) = postcard::take_from_bytes::<T>(&bytes).map_err(unavailable)?;
+    if rest.is_empty() {
+        return Ok((head, None));
+    }
+    // Whatever a newer peer puts after `Next` is left unread, as this side's is by a version-8 one.
+    Ok((head, Some(postcard::from_bytes(rest).map_err(unavailable)?)))
+}
+/// One greeting frame: `head`, which a version-8 peer reads alone, and `next` after it.
+fn write_greeting<T: Serialize, Next: Serialize>(
+    stream: &mut Stream,
+    head: &T,
+    next: &Next,
+    until: Instant,
+) -> Result<(), Refusal> {
+    let mut bytes = encode(head, GREETING_FRAME_MAX)?;
+    let next = encode(next, GREETING_FRAME_MAX)?;
+    let size = bytes
+        .len()
+        .checked_add(next.len())
+        .ok_or_else(|| api::invalid("transport frame", "size overflow"))?;
+    api::bound("transport frame", size, GREETING_FRAME_MAX)?;
+    bytes.try_reserve_exact(next.len()).map_err(unavailable)?;
+    bytes.extend_from_slice(&next);
+    send(stream, &bytes, until)
+}
+/// A step's answer at the agreed `version`: only a peer that speaks [`Answer::SteppedClosed`] is
+/// sent it, and an older one the version-8 [`Answer::Stepped`], which has no closed time.
+fn stepped(
+    version: u32,
+    reply: crate::xgroup::Reply,
+    latest: Option<u64>,
+    closed: Option<u64>,
+) -> Answer {
+    if version >= VERSION_STEPPED_CLOSED {
+        Answer::SteppedClosed {
+            reply,
+            latest,
+            closed,
+        }
+    } else {
+        Answer::Stepped { reply, latest }
+    }
+}
+/// The version both ends use (local-owner-transport.md, "Negotiated versions"): the newest both
+/// speak, a peer speaking `oldest` to `newest` and this side [`VERSION_MIN`] to [`VERSION`]. None
+/// in common is refused, `Invalid`, naming both ranges.
+pub(super) fn agree(oldest: u32, newest: u32) -> Result<u32, Refusal> {
+    let version = newest.min(VERSION);
+    if oldest > newest || version < oldest.max(VERSION_MIN) {
+        return Err(api::invalid(
+            "owner greeting",
+            &format!(
+                "the peer speaks versions {oldest} to {newest}, this owner speaks {VERSION_MIN} to {VERSION}"
+            ),
+        ));
+    }
+    Ok(version)
 }
 struct FrameBuffer<'a> {
     bytes: Vec<u8>,
@@ -182,7 +250,7 @@ fn write<T: Serialize>(stream: &mut Stream, value: &T, until: Instant) -> Result
     send(stream, &encode(value, FRAME_MAX)?, until)
 }
 fn write_auth<T: Serialize>(stream: &mut Stream, value: &T, until: Instant) -> Result<(), Refusal> {
-    send(stream, &encode(value, 256)?, until)
+    send(stream, &encode(value, GREETING_FRAME_MAX)?, until)
 }
 struct Permit(Arc<AtomicUsize>);
 impl Permit {
@@ -294,7 +362,10 @@ impl Nodes {
             envelope,
         };
         match client.request(request, until)? {
-            Answer::Stepped {
+            // A version-8 owner's answer carries no closed time: its group adds none to the
+            // token until its node speaks 9 (local-owner-transport.md, "Negotiated versions").
+            Answer::Stepped { reply, latest } => Ok((reply, latest, None)),
+            Answer::SteppedClosed {
                 reply,
                 latest,
                 closed,
@@ -470,6 +541,13 @@ impl Client {
         client
     }
     pub(super) fn stream(&self, until: Instant) -> Result<Stream, Refusal> {
+        self.greet(until).map(|(stream, _)| stream)
+    }
+    /// An authenticated connection and the version both ends agreed on (local-owner-transport.md,
+    /// "Negotiated versions"): the greeting says this side speaks [`VERSION_MIN`] to [`VERSION`],
+    /// and the owner answers the newest both speak; a version-8 owner answers nothing, having
+    /// taken the greeting as its own version 8.
+    pub(super) fn greet(&self, until: Instant) -> Result<(Stream, u32), Refusal> {
         remaining(until)?;
         let auth_until = until.min(
             Instant::now()
@@ -480,14 +558,41 @@ impl Client {
         let millis =
             u64::try_from(remaining(until)?.min(SESSION_MAX).as_millis()).map_err(unavailable)?;
         let hello = Hello {
-            version: VERSION,
+            version: VERSION_MIN,
             nonce: auth::nonce()?,
             millis,
         };
-        write_auth(&mut stream, &hello, auth_until)?;
-        let challenge: Challenge = read_limit(&mut stream, auth_until, 256)?;
-        auth::verify(&token, true, &hello, &challenge.nonce, &challenge.proof)?;
-        let proof = auth::proof(&token, false, &hello, &challenge.nonce)?;
+        write_greeting(&mut stream, &hello, &Speaks { newest: VERSION }, auth_until)?;
+        let (challenge, agreed): (Challenge, Option<Agreed>) =
+            read_greeting(&mut stream, auth_until)?;
+        let agreement = match agreed {
+            // A version-8 owner: it took the greeting as its own version, this side's oldest.
+            None => None,
+            Some(Agreed { version }) => {
+                if !(VERSION_MIN..=VERSION).contains(&version) {
+                    return Err(api::invalid(
+                        "owner greeting",
+                        &format!(
+                            "the owner chose version {version}, this client speaks {VERSION_MIN} to {VERSION}"
+                        ),
+                    ));
+                }
+                Some(auth::Agreement {
+                    newest: VERSION,
+                    version,
+                })
+            }
+        };
+        let version = agreement.map_or(hello.version, |agreement| agreement.version);
+        auth::verify(
+            &token,
+            true,
+            &hello,
+            &challenge.nonce,
+            agreement,
+            &challenge.proof,
+        )?;
+        let proof = auth::proof(&token, false, &hello, &challenge.nonce, agreement)?;
         write_auth(&mut stream, &proof, auth_until)?;
         match read_limit::<Response>(&mut stream, auth_until, 256)?? {
             Answer::Ready => (),
@@ -505,7 +610,7 @@ impl Client {
                 _ => return Err(unavailable("application declaration refused")),
             }
         }
-        Ok(stream)
+        Ok((stream, version))
     }
     pub(super) fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
         let encoded = encode(&request, FRAME_MAX)?;
@@ -886,31 +991,31 @@ fn serve(
 ) -> Result<(), Refusal> {
     let started = Instant::now();
     let greeting_until = started.checked_add(greeting).ok_or(Refusal::Timeout)?;
-    let hello: Hello = read_limit(&mut stream, greeting_until, 256)?;
-    // A peer of another version is refused here, before any frame whose shape differs.
-    if hello.version != VERSION {
-        return Err(api::invalid(
-            "owner greeting",
-            &format!(
-                "the peer speaks version {}, this owner speaks {VERSION}",
-                hello.version
-            ),
-        ));
-    }
+    let (hello, speaks): (Hello, Option<Speaks>) = read_greeting(&mut stream, greeting_until)?;
+    // A version-8 client says only the one version it speaks. One with no version in common is
+    // refused here, before any frame whose shape differs.
+    let newest = speaks
+        .as_ref()
+        .map_or(hello.version, |speaks| speaks.newest);
+    let version = agree(hello.version, newest)?;
+    // The proofs bind what was agreed only with a client that said what it speaks: a version-8
+    // client's proofs are version 8's, and one whose Speaks was cut off fails them (auth::Agreement).
+    let agreement = speaks.map(|_| auth::Agreement { newest, version });
     if hello.millis == 0 || Duration::from_millis(hello.millis) > SESSION_MAX {
         return Err(api::invalid("owner greeting", "deadline"));
     }
     let nonce = auth::nonce()?;
-    write_auth(
+    write_greeting(
         &mut stream,
         &Challenge {
             nonce,
-            proof: auth::proof(&token, true, &hello, &nonce)?,
+            proof: auth::proof(&token, true, &hello, &nonce, agreement)?,
         },
+        &Agreed { version },
         greeting_until,
     )?;
-    let proof: [u8; 32] = read_limit(&mut stream, greeting_until, 256)?;
-    auth::verify(&token, false, &hello, &nonce, &proof)?;
+    let proof: [u8; 32] = read_limit(&mut stream, greeting_until, GREETING_FRAME_MAX)?;
+    auth::verify(&token, false, &hello, &nonce, agreement, &proof)?;
     let until = started
         .checked_add(Duration::from_millis(hello.millis))
         .ok_or(Refusal::Timeout)?;
@@ -1005,13 +1110,8 @@ fn serve(
             here,
             carried,
             envelope,
-        } => crate::xgroup::sql::serve(&database, here, carried, envelope, until).map(
-            |(reply, latest, closed)| Answer::Stepped {
-                reply,
-                latest,
-                closed,
-            },
-        ),
+        } => crate::xgroup::sql::serve(&database, here, carried, envelope, until)
+            .map(|(reply, latest, closed)| stepped(version, reply, latest, closed)),
         Request::Records { namespace, op } => (|| {
             let ns = database.namespace(&namespace)?;
             Ok(match op {
@@ -1535,10 +1635,11 @@ mod tests {
         fake.join().unwrap();
     }
 
-    /// CP-T1.8 (local-owner-transport.md, "Versions"): a peer of another protocol version is
-    /// refused at the greeting, typed, naming both versions, before any challenge or database.
-    /// Do: a client greets with the version before this one. Expect: Invalid naming it and this
-    /// owner's version, no challenge sent, nothing acquired.
+    /// CP-T1.8 (local-owner-transport.md, "Versions", "Negotiated versions"): a peer with no
+    /// version in common is refused at the greeting, typed, naming both ranges, before any
+    /// challenge or database. Do: a client greets with only the version before this owner's
+    /// oldest. Expect: Invalid naming its range and this owner's, no challenge sent, nothing
+    /// acquired.
     #[test]
     fn a_peer_of_another_version_is_refused_at_the_greeting() {
         let (mut client, server) = pair();
@@ -1557,7 +1658,7 @@ mod tests {
                 HANG,
             )
         });
-        let previous = VERSION - 1;
+        let previous = VERSION_MIN - 1;
         let hello = Hello {
             version: previous,
             nonce: [2; 32],
@@ -1570,8 +1671,8 @@ mod tests {
                 &refused,
                 Err(Refusal::Invalid { what, why })
                     if what == "owner greeting"
-                        && why.contains(&format!("version {previous}"))
-                        && why.contains(&format!("speaks {VERSION}"))
+                        && why.contains(&format!("versions {previous} to {previous}"))
+                        && why.contains(&format!("speaks {VERSION_MIN} to {VERSION}"))
             ),
             "{refused:?}"
         );
@@ -1616,7 +1717,7 @@ mod tests {
             nonce: [2; 32],
             millis,
         };
-        let proof = auth::proof(&[9; 32], false, &hello, &challenge.nonce).unwrap();
+        let proof = auth::proof(&[9; 32], false, &hello, &challenge.nonce, None).unwrap();
         write(&mut client, &proof, until()).unwrap();
         assert!(matches!(task.join().unwrap(), Err(Refusal::Invalid { .. })));
         assert_eq!(accessed.load(Ordering::Acquire), 0);
@@ -1649,7 +1750,7 @@ mod tests {
             };
             write(&mut client, &hello, until()).unwrap();
             let challenge: Challenge = read(&mut client, until()).unwrap();
-            let proof = auth::proof(&[1; 32], false, &hello, &challenge.nonce).unwrap();
+            let proof = auth::proof(&[1; 32], false, &hello, &challenge.nonce, None).unwrap();
             write(&mut client, &proof, until()).unwrap();
             assert!(matches!(
                 read::<Response>(&mut client, until()).unwrap().unwrap(),
@@ -1671,6 +1772,225 @@ mod tests {
                 assert!(task.join().unwrap().is_ok());
                 assert_eq!(accessed.load(Ordering::Acquire), 1);
             }
+        }
+    }
+
+    /// The rolling upgrade's greeting (local-owner-transport.md, "Negotiated versions"): the
+    /// version both ends use is the newest both speak, and none in common is refused.
+    #[test]
+    fn negotiated_versions_take_the_newest_both_speak() {
+        assert_eq!(agree(VERSION_MIN, VERSION_MIN).unwrap(), VERSION_MIN);
+        assert_eq!(agree(VERSION_MIN, VERSION).unwrap(), VERSION);
+        assert_eq!(agree(VERSION, VERSION + 3).unwrap(), VERSION);
+        assert!(agree(VERSION + 1, VERSION + 3).is_err());
+        assert!(agree(VERSION_MIN - 2, VERSION_MIN - 1).is_err());
+        assert!(agree(VERSION, VERSION_MIN).is_err());
+        // A step's answer: version 8's shape at 8, the closed time from 9.
+        let reply = crate::xgroup::Reply::Resolved;
+        assert!(matches!(
+            stepped(VERSION_MIN, reply.clone(), Some(3), Some(5)),
+            Answer::Stepped {
+                latest: Some(3),
+                ..
+            }
+        ));
+        assert!(matches!(
+            stepped(VERSION_STEPPED_CLOSED, reply, Some(3), Some(5)),
+            Answer::SteppedClosed {
+                latest: Some(3),
+                closed: Some(5),
+                ..
+            }
+        ));
+    }
+
+    /// The frames of version 8 as its peers wrote them: Hello alone, Challenge alone.
+    fn v8_hello(millis: u64) -> Hello {
+        Hello {
+            version: VERSION_MIN,
+            nonce: [4; 32],
+            millis,
+        }
+    }
+
+    /// A version-8 client and a version-9 owner (local-owner-transport.md, "Negotiated versions"):
+    /// Do: a client that greets as version 8 did (its Hello alone, version-8 proofs, reading the
+    /// Challenge as its leading value), then asks a Probe and, on a second connection, an Identity.
+    /// Expect: the owner agrees on 8, authenticates it, answers both, and acquires the database
+    /// only for the Identity.
+    #[test]
+    fn a_version_8_client_and_a_version_9_owner_exchange_what_both_know() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::database::Database::open(&dir.path().join("v8.db"), until()).unwrap();
+        let millis = u64::try_from(SESSION_MAX.as_millis()).unwrap();
+        for (request, acquires) in [(Request::Probe, 0), (Request::Identity, 1)] {
+            let (mut client, server) = pair();
+            let accessed = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&accessed);
+            let db = db.clone();
+            let task = thread::spawn(move || {
+                serve(
+                    server,
+                    [1; 32],
+                    &|| {
+                        observed.fetch_add(1, Ordering::AcqRel);
+                        Some(db.clone())
+                    },
+                    None,
+                    &Arc::new(AtomicUsize::new(0)),
+                    HANG,
+                )
+            });
+            let hello = v8_hello(millis);
+            write(&mut client, &hello, until()).unwrap();
+            let challenge: Challenge = read(&mut client, until()).unwrap();
+            auth::verify(
+                &[1; 32],
+                true,
+                &hello,
+                &challenge.nonce,
+                None,
+                &challenge.proof,
+            )
+            .unwrap();
+            let proof = auth::proof(&[1; 32], false, &hello, &challenge.nonce, None).unwrap();
+            write(&mut client, &proof, until()).unwrap();
+            assert!(matches!(
+                read::<Response>(&mut client, until()).unwrap().unwrap(),
+                Answer::Ready
+            ));
+            let probe = matches!(request, Request::Probe);
+            write(&mut client, &request, until()).unwrap();
+            let answer = read::<Response>(&mut client, until()).unwrap().unwrap();
+            if probe {
+                assert!(matches!(answer, Answer::Done));
+            } else {
+                assert!(matches!(answer, Answer::Identity(_)));
+            }
+            assert!(task.join().unwrap().is_ok());
+            assert_eq!(accessed.load(Ordering::Acquire), acquires);
+        }
+    }
+
+    /// A version-9 client and a version-8 owner (local-owner-transport.md, "Negotiated versions"):
+    /// Do: an owner that serves as version 8 did (it takes a Hello of exactly 8, read as its
+    /// leading value, answers a Challenge alone with version-8 proofs, then a Probe), and a client
+    /// of this version connects. Expect: the greeting agrees on 8 and the Probe is answered.
+    #[test]
+    fn a_version_9_client_and_a_version_8_owner_exchange_what_both_know() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("db");
+        std::fs::File::create(&path).unwrap();
+        let owner = endpoint::bind(&path).unwrap();
+        let token = owner.token;
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        owner
+            .name_port(listener.local_addr().unwrap().port())
+            .unwrap();
+        let v8 = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let hello: Hello = read_limit(&mut stream, until(), 256).unwrap();
+                assert_eq!(hello.version, 8, "a version-8 owner takes only 8");
+                let nonce = [6; 32];
+                write_auth(
+                    &mut stream,
+                    &Challenge {
+                        nonce,
+                        proof: auth::proof(&token, true, &hello, &nonce, None).unwrap(),
+                    },
+                    until(),
+                )
+                .unwrap();
+                let proof: [u8; 32] = read_limit(&mut stream, until(), 256).unwrap();
+                auth::verify(&token, false, &hello, &nonce, None, &proof).unwrap();
+                write(&mut stream, &Ok::<_, Refusal>(Answer::Ready), until()).unwrap();
+                let request: Request = read(&mut stream, until()).unwrap();
+                assert!(matches!(request, Request::Probe));
+                write(&mut stream, &Ok::<_, Refusal>(Answer::Done), until()).unwrap();
+            }
+        });
+        let client = Client::connect(&path, until()).unwrap();
+        let (mut stream, version) = client.greet(until()).unwrap();
+        assert_eq!(version, VERSION_MIN);
+        write(&mut stream, &Request::Probe, until()).unwrap();
+        assert!(matches!(
+            read::<Response>(&mut stream, until()).unwrap().unwrap(),
+            Answer::Done
+        ));
+        drop(stream);
+        v8.join().unwrap();
+        drop(owner);
+    }
+
+    /// Two version-9 ends agree on 9, and a greeting whose Speaks was cut off on the way fails
+    /// authentication rather than agreeing on 8 (auth::Agreement). Do: a client greets with
+    /// Speaks, then, on a second connection, a client sends the same Hello without it but proves
+    /// as one that sent it. Expect: Agreed 9 and Ready; then Invalid, nothing acquired.
+    #[test]
+    fn a_version_9_greeting_agrees_on_9_and_binds_it() {
+        let millis = u64::try_from(SESSION_MAX.as_millis()).unwrap();
+        for cut in [false, true] {
+            let (mut client, server) = pair();
+            let accessed = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&accessed);
+            let task = thread::spawn(move || {
+                serve(
+                    server,
+                    [1; 32],
+                    &|| {
+                        observed.fetch_add(1, Ordering::AcqRel);
+                        None
+                    },
+                    None,
+                    &Arc::new(AtomicUsize::new(0)),
+                    HANG,
+                )
+            });
+            let hello = v8_hello(millis);
+            if cut {
+                write(&mut client, &hello, until()).unwrap();
+            } else {
+                write_greeting(&mut client, &hello, &Speaks { newest: VERSION }, until()).unwrap();
+            }
+            let (challenge, agreed): (Challenge, Option<Agreed>) =
+                read_greeting(&mut client, until()).unwrap();
+            let agreed = agreed.unwrap().version;
+            assert_eq!(agreed, if cut { VERSION_MIN } else { VERSION });
+            // The client, which sent Speaks, binds what it said and what it was told.
+            let agreement = Some(auth::Agreement {
+                newest: VERSION,
+                version: agreed,
+            });
+            assert_eq!(
+                auth::verify(
+                    &[1; 32],
+                    true,
+                    &hello,
+                    &challenge.nonce,
+                    agreement,
+                    &challenge.proof
+                )
+                .is_ok(),
+                !cut
+            );
+            let proof = auth::proof(&[1; 32], false, &hello, &challenge.nonce, agreement).unwrap();
+            write(&mut client, &proof, until()).unwrap();
+            if cut {
+                assert!(matches!(task.join().unwrap(), Err(Refusal::Invalid { .. })));
+            } else {
+                assert!(matches!(
+                    read::<Response>(&mut client, until()).unwrap().unwrap(),
+                    Answer::Ready
+                ));
+                write(&mut client, &Request::Probe, until()).unwrap();
+                assert!(matches!(
+                    read::<Response>(&mut client, until()).unwrap().unwrap(),
+                    Answer::Done
+                ));
+                assert!(task.join().unwrap().is_ok());
+            }
+            assert_eq!(accessed.load(Ordering::Acquire), 0);
         }
     }
 }

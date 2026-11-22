@@ -14,26 +14,53 @@ pub(super) const SESSION_MAX: std::time::Duration = std::time::Duration::from_se
 /// claim (local-owner-transport.md, its resource limits).
 pub(super) const GREETING_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
-/// The protocol both ends speak. Postcard is not self-describing, so a field added to any message
-/// changes it (local-owner-transport.md, "Versions"). 3: ReplicaStatus gained voters_outgoing; 4: the owner's Identity gained durability.
+/// The bound on a greeting's frames: the 256 bytes they have always had, past the largest one, a
+/// Hello and its Speaks (at most 52 bytes as postcard's varints encode them).
+pub(super) const GREETING_FRAME_MAX: usize = 256;
+/// The newest protocol this side speaks. Postcard is not self-describing, so a field added to any
+/// message changes it (local-owner-transport.md, "Versions"). 3: ReplicaStatus gained voters_outgoing; 4: the owner's Identity gained durability.
 /// 5: Request gained Application, the client's claim before its ordinary request. 6: Request gained
 /// LocalSession, a local read. 7: Request gained Pull and Answer Pulled, a node's half of a copy
 /// or catch-up batch for another node's new group (CP-T1.9; reshard.md, "Moves across nodes"). 8: Request gained
 /// Step and Answer Stepped, one step of a transaction across groups (CP-T1.10; xgroup.md, "Over the transport"). 9: Answer
-/// Stepped gained closed, the group's closed time after the step (AC-T1.10.1, T-T1.10.W4; xgroup.md, "Reading its own
-/// writes across groups").
+/// gained SteppedClosed, a step's answer with the group's closed time after it (AC-T1.10.1, T-T1.10.W4; xgroup.md,
+/// "Reading its own writes across groups"), and the greeting negotiates the version both ends use
+/// (local-owner-transport.md, "Negotiated versions").
 pub(super) const VERSION: u32 = 9;
+/// The oldest protocol this side still speaks: 8, the version before negotiation, whose owners
+/// take only a greeting of exactly 8 (local-owner-transport.md, "Negotiated versions"). A format
+/// value: every message of version 8 keeps its shape here, and nothing newer is sent at 8.
+pub(super) const VERSION_MIN: u32 = 8;
+/// The first version whose peers take [`Answer::SteppedClosed`]; an owner answers a step at an
+/// older agreed version with [`Answer::Stepped`].
+pub(super) const VERSION_STEPPED_CLOSED: u32 = 9;
 
+/// A client's greeting. Since version 9 `version` is the oldest version the client speaks, and
+/// [`Speaks`] follows it in the same frame; a version-8 client sends 8 and nothing after it.
 #[derive(Serialize, Deserialize)]
 pub(super) struct Hello {
     pub version: u32,
     pub nonce: [u8; 32],
     pub millis: u64,
 }
+/// Follows a [`Hello`] in its frame since version 9: the newest version the client speaks. A
+/// version-8 owner decodes the Hello alone and leaves this unread (postcard decodes a frame's
+/// leading value and ignores what follows it).
+#[derive(Serialize, Deserialize)]
+pub(super) struct Speaks {
+    pub newest: u32,
+}
 #[derive(Serialize, Deserialize)]
 pub(super) struct Challenge {
     pub nonce: [u8; 32],
     pub proof: [u8; 32],
+}
+/// Follows a [`Challenge`] in its frame since version 9: the version the owner chose, the newest
+/// both ends speak. A version-8 client leaves it unread; a client that finds none greeted a
+/// version-8 owner, which took the greeting only because its oldest version is 8.
+#[derive(Serialize, Deserialize)]
+pub(super) struct Agreed {
+    pub version: u32,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Request {
@@ -145,9 +172,15 @@ pub(super) enum Answer {
     // Appended: a Pull's answer.
     Pulled(crate::groups::Pulled),
     // Appended: a Step's answer, with the group's newest commit stamp after it (none: the group
-    // makes no stamps) and, since version 9, its closed time after it, the microseconds of its
-    // session token (none: the group keeps no closed time, its reads see every write).
+    // makes no stamps). Its shape is version 8's, kept for a peer that agreed on 8.
     Stepped {
+        reply: crate::xgroup::Reply,
+        latest: Option<u64>,
+    },
+    // Appended (version 9): a Step's answer to a peer that agreed on 9 or later, Stepped with the
+    // group's closed time after the step, the microseconds of its session token (none: the group
+    // keeps no closed time, its reads see every write).
+    SteppedClosed {
         reply: crate::xgroup::Reply,
         latest: Option<u64>,
         closed: Option<u64>,

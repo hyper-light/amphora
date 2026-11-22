@@ -72,6 +72,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | executor | 10 | A scan loop's filters and aggregates run over a whole batch by selection | [executor.md](design/executor.md#10-a-scan-loops-filters-and-aggregates-run-over-a-whole-batch-by-selection) |
 | executor | 11 | Skipping rows: zone maps over leaf runs against cracking, behind one switch | [executor.md](design/executor.md#11-skipping-rows-zone-maps-over-leaf-runs-against-cracking-behind-one-switch) |
 | local-owner-transport | – | Versions (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#versions-2026-11-06) |
+| local-owner-transport | – | Negotiated versions (2026-11-22) | [local-owner-transport.md](design/local-owner-transport.md#negotiated-versions-2026-11-22) |
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
 | local-owner-transport | – | Owner guards (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#owner-guards-2026-11-06) |
 | local-owner-transport | – | Decision (lane constants): one descriptor budget (2026-11-21) | [local-owner-transport.md](design/local-owner-transport.md#decision-lane-constants-one-descriptor-budget-2026-11-21) |
