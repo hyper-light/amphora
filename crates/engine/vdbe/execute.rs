@@ -20425,8 +20425,12 @@ pub fn op_morsel_aggregate(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     use crate::vdbe::morsel::HashProbe;
-    use crate::vdbe::morsel::{MachineCosts, MemoryBudget, MorselError, ScanAggregate};
-    use crate::vdbe::morsel_scan::{TableAggregate, TableJoinAggregate, TableSource};
+    use crate::vdbe::morsel::{
+        MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
+    };
+    use crate::vdbe::morsel_scan::{
+        TableAggregate, TableBuild, TableJoinAggregate, TableJoinRows, TableSource,
+    };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
         Box::new(LimboError::InternalError(format!(
@@ -20459,18 +20463,49 @@ pub fn op_morsel_aggregate(
                 table: &table,
                 shape: &shape,
             };
-            return pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget);
+            return pipeline
+                .run_mode(connection.parallel_mode(), &mut costs, &budget)
+                .map(|(rows, _)| (rows, false));
         };
-        // A hash join's probe: the build side read and its table built once, on this thread,
-        // charged to the statement's one budget; the joined rows' filter is the probe's.
+        // A hash join's probe: the build side read and its table built once, by the workers
+        // together (a partition per core the switch lets run), charged to the statement's one
+        // budget; the joined rows' filter is the probe's.
         let build_table = TableSource::open(
             pager.clone(),
             join.root_page,
             join.columns,
             join.rowid_alias,
         )?;
-        let build = build_table.filtered_rows(&join.filter, &budget)?;
-        let probe = HashProbe::build(&build, &join.build_key, &[], &join.probe_key, &budget)?;
+        let mode = connection.parallel_mode();
+        let partitioner = Partitioner::new(match mode {
+            ParallelMode::On => costs.cores(),
+            ParallelMode::Off => std::num::NonZeroUsize::MIN,
+        });
+        let (build, hash_table, _) = TableBuild {
+            table: &build_table,
+            filter: &join.filter,
+            key: &join.build_key,
+            partitioner: &partitioner,
+        }
+        .run_mode(mode, &mut costs, &budget)?;
+        let probe = HashProbe::over(hash_table, &[], &join.probe_key);
+        // A join's rows, no aggregates: each worker keeps its own leaves' joined rows, merged
+        // in order; they are the answer's rows as they stand.
+        if let Some(rows) = &data.joined_rows {
+            let pipeline = TableJoinRows {
+                table: &table,
+                probe_filter: &data.filter,
+                probe: &probe,
+                build: &build,
+                project: &data.result_map,
+                order: &rows.order,
+            };
+            let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
+            for row in &mut out {
+                row.truncate(rows.width);
+            }
+            return Ok((out, true));
+        }
         let shape = ScanAggregate {
             rows: &[],
             filter: &[],
@@ -20484,11 +20519,18 @@ pub fn op_morsel_aggregate(
             build: &build,
             shape: &shape,
         };
-        pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget)
+        pipeline
+            .run_mode(mode, &mut costs, &budget)
+            .map(|(rows, _)| (rows, false))
     })();
     *connection.morsel_costs.lock() = Some(costs);
     let mut rows = match answered {
-        Ok((rows, _)) => rows,
+        Ok((rows, true)) => {
+            state.morsel_rows = Some(rows.into_iter());
+            state.pc = next_pc(state)?;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        Ok((rows, false)) => rows,
         // A value the parallel aggregates don't take (a SUM over text), or groups past the
         // statement's memory that the serial loop's spilling GROUP BY can hold: it answers.
         Err(MorselError::Unsupported { .. } | MorselError::MemoryBudget { .. }) => {
