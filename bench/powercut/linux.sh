@@ -18,21 +18,28 @@
 #   sudo bench/powercut/linux.sh <amphora-bench binary> [cuts]    (cuts: the AC's 1,000 unless set)
 # Env: STORAGE=versioned (the versioned storage; unset: the pager's); WRITERS (the step's 32);
 #   ACKS_MAX (a cut lands after a uniformly drawn count of acknowledgements from 1 to ACKS_MAX:
-#   Elle's 256 transactions a writer unless set, as storage::versioned::many_writers sizes a run);
+#   unless set, `amphora-bench --powercut span`, two of the WAL's checkpoint cycles by the engine's
+#   own wal_autocheckpoint, so cuts land before, across and after a checkpoint);
 #   WORK (the image, the acknowledgements and results.jsonl: ~/.cache/amphora-powercut unless set,
 #   never /tmp, a RAM disk on some hosts).
 set -euo pipefail
 bin=$(realpath "$1")
 cuts=${2:-1000}
 writers=${WRITERS:-32}
-acks_max=${ACKS_MAX:-$((256 * writers))}
 work=${WORK:-$HOME/.cache/amphora-powercut}
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 name=amphora-powercut-$$
 mnt=$work/mnt
 img=$work/disk.img
 mkdir -p "$mnt"
 storage=()
 [ -n "${STORAGE:-}" ] && storage=(AMPHORA_STORAGE="$STORAGE")
+acks_max=${ACKS_MAX:-}
+if [ -z "$acks_max" ]; then
+  rm -rf "$work/span" && mkdir -p "$work/span"
+  acks_max=$(env "${storage[@]}" "$bin" --powercut span --dir "$work/span")
+  rm -rf "$work/span"
+fi
 
 loop=
 cleanup() {
@@ -50,9 +57,11 @@ truncate -s $((avail / 2)) "$img"
 loop=$(losetup -f --show "$img")
 sectors=$(blockdev --getsz "$loop")
 linear="0 $sectors linear $loop 0"
-# dm-flakey's table: up 0 s, then down (writes dropped) for 180 s, xfstests' value; the table is
-# replaced long before the down interval could end, so it only has to outlast one cut.
-flakey="0 $sectors flakey $loop 0 0 180 1 drop_writes"
+# dm-flakey's table: up 0 s, down 1 s, writes dropped (xfstests' FLAKEY_TABLE_DROP shape, common/dmflakey).
+# With no up interval the device is down at every moment (dm-flakey is down while the seconds since
+# the table loaded, modulo up + down, are at least up: always, when up is 0), so the down length
+# only has to be one that dm-flakey takes: it refuses up + down = 0, and 1 is the smallest.
+flakey="0 $sectors flakey $loop 0 0 1 1 drop_writes"
 : > "$work/results.jsonl"
 failed=0
 for cut in $(seq 1 "$cuts"); do
@@ -90,6 +99,4 @@ for cut in $(seq 1 "$cuts"); do
   umount "$mnt"
   dmsetup remove "$name"
 done
-lost=$(awk -F'"lost":' 'NF > 1 { split($2, a, /[,}]/); s += a[1] } END { print s + 0 }' "$work/results.jsonl")
-echo "{\"harness\":\"dm-flakey\",\"storage\":\"${STORAGE:-pager}\",\"writers\":$writers,\"cuts\":$cuts,\"cuts_failed\":$failed,\"lost\":$lost}"
-[ "$failed" -eq 0 ]
+"$here/../power_nemesis.sh" tally dm-flakey "${STORAGE:-pager}" "$writers" "$cuts" "$failed" "$work/results.jsonl"

@@ -11,14 +11,15 @@
 #
 #   bench/powercut/macos.sh <vm> <amphora-bench path in the guest> [cuts]   (cuts: 1,000 unless set)
 # The guest: amphora-bench built for it, ssh by key as GUEST_USER (tart's images: admin).
-# Env: STORAGE=versioned (unset: the pager's); WRITERS (the step's 32); ACKS_MAX (as linux.sh);
+# Env: STORAGE=versioned (unset: the pager's); WRITERS (the step's 32); ACKS_MAX (as linux.sh: the guest's span unless set);
 #   GUEST_USER; WORK (~/.cache/amphora-powercut unless set).
 set -euo pipefail
 vm=$1
 gbin=$2
 cuts=${3:-1000}
 writers=${WRITERS:-32}
-acks_max=${ACKS_MAX:-$((256 * writers))}
+acks_max=${ACKS_MAX:-}
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 user=${GUEST_USER:-admin}
 work=${WORK:-$HOME/.cache/amphora-powercut}
 mkdir -p "$work"
@@ -52,6 +53,8 @@ for cut in $(seq 1 "$cuts"); do
   start_vm
   dest="$user@$ip"
   ssh "${ssh_opts[@]}" "$dest" 'rm -rf ~/amphora-powercut && mkdir ~/amphora-powercut'
+  # Unless set, the span the guest's engine gives (linux.sh's ACKS_MAX), asked once.
+  [ -n "$acks_max" ] || acks_max=$(ssh "${ssh_opts[@]}" "$dest" "mkdir -p ~/amphora-powercut-span && ${env_prefix}$gbin --powercut span --dir ~/amphora-powercut-span && rm -rf ~/amphora-powercut-span")
   target=$((RANDOM * 32768 + RANDOM))
   target=$((target % acks_max + 1))
   # The acknowledgements stream to the host; once the target's are in, the power goes (bash 3.2,
@@ -73,6 +76,4 @@ for cut in $(seq 1 "$cuts"); do
   fi
   stop_vm
 done
-lost=$(awk -F'"lost":' 'NF > 1 { split($2, a, /[,}]/); s += a[1] } END { print s + 0 }' "$work/results.jsonl")
-echo "{\"harness\":\"vm-power-off\",\"storage\":\"${STORAGE:-pager}\",\"writers\":$writers,\"cuts\":$cuts,\"cuts_failed\":$failed,\"lost\":$lost}"
-[ "$failed" -eq 0 ]
+"$here/../power_nemesis.sh" tally vm-power-off "${STORAGE:-pager}" "$writers" "$cuts" "$failed" "$work/results.jsonl"

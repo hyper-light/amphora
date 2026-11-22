@@ -1238,3 +1238,6 @@ criteria = []
 tests = [
   { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
 ]
+
+# lane many-writers-7 (CP-T1.4, AC-T1.4.4): no new IDs. T-T1.4.1's harness: bench/powercut/{linux,macos}.sh,
+# amphora-bench --powercut write|check|span, and their verdict through bench/power_nemesis.sh tally.

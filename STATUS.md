@@ -383,7 +383,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   for its commit's validation (`Versioned::keep_read`; before, SQL there was snapshot isolation and
   Elle found G2), refusing write skew and phantoms (`T-G8.4.2`), and reads the budget refused refuse
   the commit (`T-G8.4.3`). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the
-  coordinator's; the power-cut harness (`T-T1.4.1`).
+  coordinator's; the power-cut harness (`T-T1.4.1`) runs below.
+- **Power cuts on a real device** (CP-T1.4, AC-T1.4.4, `T-T1.4.1`; `bench/powercut/`, `bench/src/powercut.rs`):
+  32 writers commit single-row transactions with `synchronous = FULL`, each acknowledgement printed once
+  its commit returned; Linux cuts the device's writes (dm-flakey), macOS powers a VM off; a check
+  after recovery counts acknowledged ids missing, and `bench/power_nemesis.sh tally` gives both
+  harnesses' one verdict. A cut lands after 1 to `--powercut span` acknowledgements: two of the WAL's
+  checkpoint cycles by the engine's own `wal_autocheckpoint`, so cuts fall before, across and after a
+  checkpoint. dm-flakey's down interval is 1 s, the least it takes (up 0 s is down at every moment).
+  The 1,000 cuts on each storage and the macOS VM: the coordinator's.
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and

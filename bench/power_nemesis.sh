@@ -12,6 +12,11 @@
 #       DIR/CLASS-FROM-COUNT.json with this machine's name and the commit added, and the test's
 #       output to DIR/CLASS-FROM-COUNT.log. Exit: the test's (1 when any seed failed; the record
 #       names each failing seed with its account either way).
+#   bench/power_nemesis.sh tally HARNESS STORAGE WRITERS CUTS FAILED RESULTS
+#       the device power-cut harnesses' verdict (bench/powercut/linux.sh and macos.sh, T-T1.4.1,
+#       AC-T1.4.4): sums the acknowledged and lost of RESULTS (a `--powercut check` line a cut) and
+#       prints one JSON line with HOSTNAME and the commit. Exit 1 when a cut failed, an
+#       acknowledged write was lost, or nothing was acknowledged.
 #   bench/power_nemesis.sh merge DIR CLASS TOTAL
 #       every DIR/CLASS-*.json together: exit 1 unless they cover seeds 0..TOTAL exactly once, on
 #       one commit, with no failed seed, some write acknowledged and some cut of a leader holding
@@ -51,6 +56,23 @@ print(f"{r['class']} seeds {r['from']}..{r['from'] + r['count']}: {r['acknowledg
       f"{r['unflushed_leader']} of a leader holding a write unflushed, {len(r['failed'])} failed")
 PY
     exit "$status"
+    ;;
+  tally)
+    [[ $# -eq 7 ]] || { echo "usage: $0 tally HARNESS STORAGE WRITERS CUTS FAILED RESULTS" >&2; exit 2; }
+    "$PY" - "$@" "$(hostname)" "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)" <<'PY'
+import json, sys
+_, harness, storage, writers, cuts, failed, path, host, commit = sys.argv[1:]
+acked = lost = 0
+with open(path, encoding="utf-8") as f:
+    for line in f:
+        if line.strip():
+            r = json.loads(line)
+            acked += r["acked"]
+            lost += r["lost"]
+print(json.dumps({"harness": harness, "storage": storage, "writers": int(writers), "cuts": int(cuts),
+                  "cuts_failed": int(failed), "acked": acked, "lost": lost, "host": host, "commit": commit}))
+sys.exit(1 if int(failed) or lost or acked == 0 else 0)
+PY
     ;;
   merge)
     [[ $# -eq 4 ]] || { echo "usage: $0 merge DIR CLASS TOTAL" >&2; exit 2; }
@@ -98,7 +120,7 @@ sys.exit(1 if problems else 0)
 PY
     ;;
   *)
-    echo "usage: $0 run CLASS FROM COUNT DIR | merge DIR CLASS TOTAL" >&2
+    echo "usage: $0 run CLASS FROM COUNT DIR | tally HARNESS STORAGE WRITERS CUTS FAILED RESULTS | merge DIR CLASS TOTAL" >&2
     exit 2
     ;;
 esac

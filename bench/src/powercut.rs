@@ -14,10 +14,17 @@
 //!   line without its newline was torn, not acknowledged) that are missing: lost. Prints one JSON
 //!   line, `{"acked", "present", "lost"}`, and fails when any is lost.
 //!
+//! - `amphora-bench --powercut span --dir <dir>`: prints how many acknowledgements a harness draws
+//!   its cut point from (1 to that, uniformly): two of the WAL's checkpoint cycles, from the engine's
+//!   own `wal_autocheckpoint` read where it runs ([`span`]).
+//!
 //! The storage is the process's: `AMPHORA_STORAGE=versioned` puts the database on the versioned
 //! storage (`storage::versioned::switch`), so each harness runs on either storage unchanged.
 
-use amphora_engine::{ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, Numeric, OpenOptions, PlatformIO, SqliteDialect, Statement, StepResult, Value};
+use amphora_engine::{
+    ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, Numeric, OpenOptions,
+    PlatformIO, SqliteDialect, Statement, StepResult, Value,
+};
 use std::collections::HashSet;
 use std::io::Write;
 use std::num::NonZero;
@@ -25,25 +32,43 @@ use std::sync::{Arc, Mutex};
 
 pub fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     let dir = flag("--dir").ok_or_else(|| anyhow::anyhow!("--dir <dir>: where the database is"))?;
     let path = std::path::Path::new(&dir).join("powercut.db");
-    let name = path.to_str().ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8: {}", path.display()))?;
-    let mode = args.iter().skip_while(|a| *a != "--powercut").nth(1).map(String::as_str);
+    let name = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("a path that isn't UTF-8: {}", path.display()))?;
+    let mode = args
+        .iter()
+        .skip_while(|a| *a != "--powercut")
+        .nth(1)
+        .map(String::as_str);
     match mode {
         Some("write") => {
             // The step's 32 writers (G8 step 5's bar) unless set.
-            let writers = flag("--writers").map(|w| w.parse::<u64>()).transpose()?.unwrap_or(32);
+            let writers = flag("--writers")
+                .map(|w| w.parse::<u64>())
+                .transpose()?
+                .unwrap_or(32);
             if writers == 0 {
                 anyhow::bail!("--writers: at least one");
             }
             write(name, writers)
         }
         Some("check") => {
-            let acks = flag("--acks").ok_or_else(|| anyhow::anyhow!("--acks <file>: the acknowledged ids"))?;
+            let acks = flag("--acks")
+                .ok_or_else(|| anyhow::anyhow!("--acks <file>: the acknowledged ids"))?;
             check(name, &acks)
         }
-        other => anyhow::bail!("usage: amphora-bench --powercut write|check --dir <dir> [--writers <n>] [--acks <file>] (got {other:?})"),
+        Some("span") => span(name),
+        other => anyhow::bail!(
+            "usage: amphora-bench --powercut write|check|span --dir <dir> [--writers <n>] [--acks <file>] (got {other:?})"
+        ),
     }
 }
 
@@ -53,7 +78,12 @@ fn e(err: impl std::fmt::Display) -> anyhow::Error {
 
 fn open(name: &str) -> anyhow::Result<(Arc<dyn IO>, Arc<Database>)> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(e)?);
-    let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(e)?;
+    let db = Database::open(
+        io.clone(),
+        name,
+        OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+    )
+    .map_err(e)?;
     Ok((io, db))
 }
 
@@ -65,8 +95,15 @@ fn connect(io: &Arc<dyn IO>, db: &Arc<Database>) -> anyhow::Result<Arc<Connectio
 }
 
 /// Runs `stmt` to its end, giving `row` each row's values.
-fn run(io: &Arc<dyn IO>, stmt: &mut Statement, mut row: impl FnMut(&[Value])) -> Result<(), LimboError> {
-    let step_io = || io.step().map_err(|err| LimboError::InternalError(err.to_string()));
+fn run(
+    io: &Arc<dyn IO>,
+    stmt: &mut Statement,
+    mut row: impl FnMut(&[Value]),
+) -> Result<(), LimboError> {
+    let step_io = || {
+        io.step()
+            .map_err(|err| LimboError::InternalError(err.to_string()))
+    };
     loop {
         match stmt.step()? {
             StepResult::Row => {
@@ -94,36 +131,65 @@ fn exec(io: &Arc<dyn IO>, conn: &Arc<Connection>, sql: &str) -> Result<(), Limbo
 
 /// What refuses a commit under many writers, for the writer to roll back and try again.
 fn refused(err: &LimboError) -> bool {
-    matches!(err, LimboError::Busy | LimboError::BusySnapshot | LimboError::WriteWriteConflict | LimboError::SerializationFailure)
+    matches!(
+        err,
+        LimboError::Busy
+            | LimboError::BusySnapshot
+            | LimboError::WriteWriteConflict
+            | LimboError::SerializationFailure
+    )
 }
 
 fn write(name: &str, writers: u64) -> anyhow::Result<()> {
     let (io, db) = open(name)?;
     let conn = connect(&io, &db)?;
     exec(&io, &conn, "PRAGMA journal_mode = WAL").map_err(e)?;
-    exec(&io, &conn, "CREATE TABLE IF NOT EXISTS acked (id INTEGER PRIMARY KEY, writer INTEGER NOT NULL)").map_err(e)?;
+    exec(
+        &io,
+        &conn,
+        "CREATE TABLE IF NOT EXISTS acked (id INTEGER PRIMARY KEY, writer INTEGER NOT NULL)",
+    )
+    .map_err(e)?;
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let mut threads = Vec::new();
     for w in 0..writers {
         let (io, db, out) = (io.clone(), db.clone(), out.clone());
-        threads.push(std::thread::Builder::new().name(format!("powercut-{w}")).spawn(move || writer(&io, &db, &out, w, writers))?);
+        threads.push(
+            std::thread::Builder::new()
+                .name(format!("powercut-{w}"))
+                .spawn(move || writer(&io, &db, &out, w, writers))?,
+        );
     }
     for t in threads {
-        t.join().map_err(|_| anyhow::anyhow!("a writer's thread panicked"))??;
+        t.join()
+            .map_err(|_| anyhow::anyhow!("a writer's thread panicked"))??;
     }
     Ok(())
 }
 
 /// Writer `w` of `n`: its ids committed one a transaction, each printed once acknowledged.
-fn writer(io: &Arc<dyn IO>, db: &Arc<Database>, out: &Mutex<std::io::Stdout>, w: u64, n: u64) -> anyhow::Result<()> {
+fn writer(
+    io: &Arc<dyn IO>,
+    db: &Arc<Database>,
+    out: &Mutex<std::io::Stdout>,
+    w: u64,
+    n: u64,
+) -> anyhow::Result<()> {
     let conn = connect(io, db)?;
-    let mut insert = conn.prepare("INSERT INTO acked (id, writer) VALUES (?1, ?2)").map_err(e)?;
-    let (first, second) = (NonZero::new(1).ok_or_else(|| e("parameter 0"))?, NonZero::new(2).ok_or_else(|| e("parameter 0"))?);
+    let mut insert = conn
+        .prepare("INSERT INTO acked (id, writer) VALUES (?1, ?2)")
+        .map_err(e)?;
+    let (first, second) = (
+        NonZero::new(1).ok_or_else(|| e("parameter 0"))?,
+        NonZero::new(2).ok_or_else(|| e("parameter 0"))?,
+    );
     let writer = Value::from_i64(i64::try_from(w)?);
     let mut id = w;
     loop {
         insert.reset().map_err(e)?;
-        insert.bind_at(first, Value::from_i64(i64::try_from(id)?)).map_err(e)?;
+        insert
+            .bind_at(first, Value::from_i64(i64::try_from(id)?))
+            .map_err(e)?;
         insert.bind_at(second, writer.clone()).map_err(e)?;
         match run(io, &mut insert, |_| {}) {
             Ok(()) => {
@@ -145,6 +211,37 @@ fn writer(io: &Arc<dyn IO>, db: &Arc<Database>, out: &Mutex<std::io::Stdout>, w:
     }
 }
 
+/// The acknowledgements a cut point is drawn from, so cuts land in every state the durable path
+/// goes through: two of the WAL's checkpoint cycles. A commit appends at least one frame, so the WAL
+/// is checkpointed within `wal_autocheckpoint` commits (the engine's own setting, read from the
+/// database, not chosen here); cuts drawn over two cycles land before the first checkpoint, across
+/// it, and in the WAL written again after it. The versioned storage checkpoints only when asked,
+/// which no SQL commit does, so its redo log only grows and the pager's cycle is the only one.
+fn span(name: &str) -> anyhow::Result<()> {
+    let (io, db) = open(name)?;
+    let conn = connect(&io, &db)?;
+    exec(&io, &conn, "PRAGMA journal_mode = WAL").map_err(e)?;
+    let mut frames = None;
+    let mut stmt = conn.prepare("PRAGMA wal_autocheckpoint").map_err(e)?;
+    run(&io, &mut stmt, |r| {
+        if let Some(Value::Numeric(Numeric::Integer(i))) = r.first() {
+            frames = Some(*i);
+        }
+    })
+    .map_err(e)?;
+    let frames = frames.ok_or_else(|| e("PRAGMA wal_autocheckpoint gave no number"))?;
+    if frames <= 0 {
+        anyhow::bail!(
+            "the WAL is never checkpointed (wal_autocheckpoint = {frames}): no cycle to span"
+        );
+    }
+    println!(
+        "{}",
+        frames.checked_mul(2).ok_or_else(|| e("a span past 2^63"))?
+    );
+    Ok(())
+}
+
 fn check(name: &str, acks: &str) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(acks).map_err(|err| anyhow::anyhow!("{acks}: {err}"))?;
     let mut lines: Vec<&str> = text.lines().collect();
@@ -152,7 +249,14 @@ fn check(name: &str, acks: &str) -> anyhow::Result<()> {
     if !text.is_empty() && !text.ends_with('\n') {
         lines.pop();
     }
-    let acked = lines.iter().map(|l| l.trim().parse::<i64>().map_err(|err| anyhow::anyhow!("{acks}: {l:?}: {err}"))).collect::<anyhow::Result<Vec<i64>>>()?;
+    let acked = lines
+        .iter()
+        .map(|l| {
+            l.trim()
+                .parse::<i64>()
+                .map_err(|err| anyhow::anyhow!("{acks}: {l:?}: {err}"))
+        })
+        .collect::<anyhow::Result<Vec<i64>>>()?;
     let (io, db) = open(name)?;
     let conn = connect(&io, &db)?;
     let mut present = HashSet::new();
@@ -169,7 +273,10 @@ fn check(name: &str, acks: &str) -> anyhow::Result<()> {
         anyhow::bail!("{odd} rows whose id isn't an integer");
     }
     let lost = acked.iter().filter(|id| !present.contains(id)).count();
-    println!("{}", serde_json::json!({ "acked": acked.len(), "present": present.len(), "lost": lost }));
+    println!(
+        "{}",
+        serde_json::json!({ "acked": acked.len(), "present": present.len(), "lost": lost })
+    );
     if lost > 0 {
         anyhow::bail!("{lost} acknowledged commits lost");
     }
