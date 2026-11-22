@@ -1012,6 +1012,9 @@ tests = [
   { id = "T-QT.7.1", text = "Batched against row-at-a-time on random tables and predicates: NULLs, every storage class, affinities, a collation, overflow pages, deleted rows, columns added after rows were written, ascending and descending scans — passes when identical results and rows were read from batches" },
   { id = "T-QT.7.2", text = "A batch budget smaller than one page's cells, and one below a single row's charge — passes when the scan decodes several windows a leaf, or falls back to row-at-a-time by its stated rule, with identical results and nothing batched past the budget" },
   { id = "T-QT.7.3", text = "A program that writes the table it scans, and a statement prepared before the switch turns on — passes when the writing program reads row-at-a-time and the statement is prepared again with batches" },
+  # lane qs7-3
+  { id = "T-QT.7.4", text = "Filters (comparisons, ranges, IN, IS NULL, AND, OR) and aggregates (COUNT, SUM with its overflow error, TOTAL, AVG, MIN, MAX, with and without GROUP BY) over random tables of every storage class, NULLs, a collation, overflow rows and added columns, switch on against off — passes when answers and errors are identical and the fused loops ran rows" },
+  { id = "T-QT.7.5", text = "A fused loop over rows with overflow records amid the batch and the scan's end — passes when its answer is exact and matches row-at-a-time, and the fused loop ran" },
 ]
 
 # lane g11s5

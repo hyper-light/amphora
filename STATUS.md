@@ -693,9 +693,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   overflow row or one over the budget is read row-at-a-time. Filters and aggregates read the batch through the
   VDBE's own evaluator. COUNT(*) over a table already reads only the leaves' cell counts (`Count`).
   `vdbe/leaf_batch/tests.rs` (T-QT.7.1 to .3) checks switch on against off on random tables. `amphora-bench
-  --planner` runs it as the target `amphora-vectorized`. Left: AC-QT.7.1 to .3 measured (the coordinator's);
-  filter and aggregate kernels over a batch with a selection vector (and, if G5 measures them better, compiled
-  pipelines instead); Windows's cache size, which needs an OS call this crate makes only with unsafe code.
+  --planner` runs it as the target `amphora-vectorized`. Lane qs7-3: a scan loop whose body only filters and
+  steps COUNT, SUM, TOTAL, AVG, MIN or MAX runs over the whole batch by selection vectors
+  (`vdbe/leaf_batch/fused.rs`, executor.md decision 10), through the opcodes' own comparison and aggregate code
+  (T-QT.7.4, .5). Left: AC-QT.7.1 to .3 measured (the coordinator's); GROUP BY bodies still run row-at-a-time
+  from the batch (a batch group lookup is the next piece); compiled pipelines if G5 measures them better;
+  Windows's cache size, which needs an OS call this crate makes only with unsafe code.
 - **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
   `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
