@@ -380,9 +380,11 @@ pub struct Database {
     gate: RwLock<()>,
     /// The last checkpoint's sequence number; held by the checkpoint under way.
     last: Mutex<u64>,
-    /// A column copy's feed, handed each commit's record under the publish lock (G11 decision 1,
-    /// part 2): set once, by [`Database::keep_columns`].
-    columns: std::sync::OnceLock<Arc<Feed>>,
+    /// The column copies' feeds, one a tree, each handed every commit's record under the publish
+    /// lock (G11 decision 1, part 2): added by [`Database::keep_columns`], taken away by
+    /// [`Database::drop_columns`] (G11 step 5, CS.5: a SQL table's copy is made while the
+    /// database runs).
+    columns: RwLock<Vec<Arc<Feed>>>,
     /// The tree that holds large values' chunks ([`overflow`], `AC-NS.2.4`): the one after the
     /// `trees` the database was made with, ordered by bytes.
     overflow: u64,
@@ -519,7 +521,7 @@ impl Database {
             redo: Redo::new(replay.ends, turn, replay.newest)?,
             gate: RwLock::new(()),
             last: Mutex::new(stamp.seq),
-            columns: std::sync::OnceLock::new(),
+            columns: RwLock::new(Vec::new()),
             overflow,
             orders: Mutex::new(orders),
         })
@@ -637,7 +639,7 @@ impl Database {
             redo: Redo::new(ends, 0, 0)?,
             gate: RwLock::new(()),
             last: Mutex::new(0),
-            columns: std::sync::OnceLock::new(),
+            columns: RwLock::new(Vec::new()),
             overflow: u64::try_from(trees).map_err(|_| LimboError::IntegerOverflow)?,
             orders: Mutex::new(HashMap::new()),
         })
@@ -910,8 +912,12 @@ impl Database {
             let _changing = self.gate.read();
             self.v.commit_logged(txn, d, |ts, ops| {
                 self.redo.append(lane, ts, ops)?;
-                if let Some(feed) = self.columns.get() {
-                    feed.offer(ts, &self.whole(ops)?);
+                let feeds = self.columns.read();
+                if !feeds.is_empty() {
+                    let whole = self.whole(ops)?;
+                    for feed in feeds.iter() {
+                        feed.offer(ts, &whole);
+                    }
                 }
                 Ok(())
             })?
@@ -972,9 +978,23 @@ impl Database {
     /// From the next commit on, hands each commit's record to `feed` as it is appended to the redo
     /// log (G11 decision 1, part 2). One feed a database: a second is refused.
     pub fn keep_columns(&self, feed: Arc<Feed>) -> Result<()> {
-        self.columns.set(feed).map_err(|_| {
-            LimboError::InternalError("versioned storage: a column copy is already kept".into())
-        })
+        let mut feeds = self.columns.write();
+        if feeds.iter().any(|f| f.tree() == feed.tree()) {
+            return Err(LimboError::InternalError(format!(
+                "versioned storage: tree {} already keeps a column copy",
+                feed.tree()
+            )));
+        }
+        feeds.push(feed);
+        Ok(())
+    }
+
+    /// Stops feeding tree `tree`'s column copy (its table dropped, G11 step 5): whether it kept one.
+    pub fn drop_columns(&self, tree: u64) -> bool {
+        let mut feeds = self.columns.write();
+        let before = feeds.len();
+        feeds.retain(|f| f.tree() != tree);
+        feeds.len() != before
     }
 
     /// The newest commit published: what a column copy kept as a file must be current as of.
@@ -1700,7 +1720,11 @@ mod tests {
     #[test]
     fn ns2_4_a_column_feed_gets_large_values_whole() {
         let db = Database::open(Arc::new(Simulated::new(24, 1).unwrap()), 2_000, 1, cmp).unwrap();
-        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        let feed = Arc::new(Feed::new(
+            0,
+            crate::storage::versioned::memory::capped(u64::MAX),
+            Box::new(|| 0),
+        ));
         db.keep_columns(feed.clone()).unwrap();
         let mut d = Descender::new();
         let key = b"k".to_vec();

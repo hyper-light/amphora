@@ -335,6 +335,9 @@ pub struct Statement {
     custom_run: Option<OpenCustomRun>,
     /// Amphora (PL.7): the run under way, when the database's fit chose to time it.
     cost_sample: Option<CostSample>,
+    /// Amphora (PL.13): the run under way was handed to a second prepare once already; it is not
+    /// handed off again (`vdbe::ProgramState::handoff_open`).
+    handed_off: bool,
 }
 
 /// Amphora (PL.7): a run timed for the fitted cost model (`optimizer::cost_fit`): its counters
@@ -444,6 +447,7 @@ impl Statement {
             plan_choice: PlanChoice::default(),
             custom_run: None,
             cost_sample: None,
+            handed_off: false,
         }
     }
 
@@ -626,6 +630,15 @@ impl Statement {
         if self.custom_run.is_some() && matches!(result, Ok(StepResult::Done) | Err(_)) {
             self.close_custom_run();
         }
+        // Amphora (PL.13): the run ends, and with it its one hand-off.
+        if self.handed_off
+            && matches!(
+                result,
+                Ok(StepResult::Done | StepResult::Interrupt) | Err(_)
+            )
+        {
+            self.handed_off = false;
+        }
         result
     }
 
@@ -731,33 +744,63 @@ impl Statement {
         if self.analyze_refresh.is_some() {
             return self.drive_analyze_refresh(waker);
         }
-        if matches!(self.state.execution_state, ProgramExecutionState::Init)
-            || !self.counted_as_active_root
-            || self.busy_handler_state.is_some()
-        {
-            if let Some(result) = self.prepare_step(waker)? {
-                return Ok(result);
-            }
-        }
-        let res = match self.query_mode {
-            QueryMode::Normal => {
-                match self
-                    .program
-                    .normal_step(&mut self.state, &self.pager, waker)
-                {
-                    ProgramStep::Row => {
-                        self.busy = true;
-                        self.has_returned_row = true;
-                        return Ok(StepResult::Row);
-                    }
-                    step => step.into(),
+        // Amphora (PL.13): a run handed to a second prepare starts again here, once.
+        let res = loop {
+            if matches!(self.state.execution_state, ProgramExecutionState::Init)
+                || !self.counted_as_active_root
+                || self.busy_handler_state.is_some()
+            {
+                if let Some(result) = self.prepare_step(waker)? {
+                    return Ok(result);
                 }
             }
-            _ => self
-                .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker),
+            match self.query_mode {
+                QueryMode::Normal => {
+                    match self
+                        .program
+                        .normal_step(&mut self.state, &self.pager, waker)
+                    {
+                        ProgramStep::Row => {
+                            self.busy = true;
+                            self.has_returned_row = true;
+                            self.state.handoff_open = false;
+                            return Ok(StepResult::Row);
+                        }
+                        ProgramStep::Done if self.state.handoff_asked => self.hand_off()?,
+                        step => break step.into(),
+                    }
+                }
+                _ => {
+                    break self
+                        .program
+                        .step(&mut self.state, &self.pager, self.query_mode, waker)
+                }
+            }
         };
         self.finish_step(res, waker)
+    }
+
+    /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): an
+    /// adaptive join's build counted its inner table past the estimate's band and corrected the
+    /// table's count, and the run, read-only with no row returned, stopped for it. The run starts
+    /// again on a plan made now on the counted rows, as a schema change mid-run restarts one
+    /// (`finish_step`): its implicit transaction ended, the statement prepared again. Nothing was
+    /// written and nothing returned, so the new run's rows are the run's only rows.
+    #[inline(never)]
+    fn hand_off(&mut self) -> Result<()> {
+        self.handed_off = true;
+        self.program.connection.count_adaptive_handoff();
+        tracing::debug!(
+            "adaptive join's build past its estimate: the run starts again on a new plan"
+        );
+        if let Err(err) = self
+            .rollback_autocommit_txn()
+            .and_then(|()| self.reprepare())
+        {
+            self.release_active_root_if_counted();
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Advance the post-ANALYZE stats refresh. Returns `IO`/`Yield` while the
@@ -842,6 +885,13 @@ impl Statement {
                     return Err(err);
                 }
             }
+            // Amphora (PL.13): a read-only root run, not handed off yet, may be started again
+            // until it returns a row.
+            self.state.handoff_open = self.origin == StatementOrigin::Root
+                && matches!(self.query_mode, QueryMode::Normal)
+                && !self.handed_off
+                && self.program.is_readonly()
+                && self.program.connection.adaptive_handoff();
         }
 
         self.arm_query_timeout_if_needed();
@@ -1775,6 +1825,7 @@ impl Statement {
 
     pub fn reset(&mut self) -> Result<()> {
         self.close_custom_run();
+        self.handed_off = false;
         self.reset_internal(None, None, false)
     }
 

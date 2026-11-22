@@ -1765,6 +1765,32 @@ impl Engine for Local {
     fn key(_: &Command) -> &str {
         "database"
     }
+    /// A Records transaction routes by every key its conditions and writes name, and a get by
+    /// its key, each as its row key ([`reshard::row_key`] of the namespace, family and key), so a
+    /// transaction stays within one group (CP-T1.9; docs/design/reshard.md, decision "The routing
+    /// key is bytes"). A row key too long to make has no route here, and its write is refused
+    /// where the group indexes it (`group::position`). Any other command routes by none.
+    fn routes(row: &Command, each: &mut dyn FnMut(&[u8])) {
+        let mut route = |family: &str, key: &[u8]| {
+            if let Some(k) = reshard::row_key(&row.namespace, family, key) {
+                each(&k);
+            }
+        };
+        match &row.operation {
+            Operation::Mutation(Mutation::Records { tx, .. }) => {
+                for cond in &tx.conds {
+                    let (Cond::Absent { family, key } | Cond::At { family, key, .. }) = cond;
+                    route(family, key);
+                }
+                for write in &tx.writes {
+                    let (Write::Put { family, key, .. } | Write::Delete { family, key }) = write;
+                    route(family, key);
+                }
+            }
+            Operation::Get(family, key, _) => route(family, key),
+            _ => {}
+        }
+    }
     fn apply(&mut self, rows: &[Command]) -> anyhow::Result<usize> {
         let restoring = self.restoring;
         // An adaptive session contains an FnOnce: the pipeline must never retry it. Its own
@@ -1921,6 +1947,10 @@ impl Engine for Local {
 
     fn head(&mut self) -> anyhow::Result<reshard::Seq> {
         group::head(&self.db)
+    }
+
+    fn bytes(&mut self) -> anyhow::Result<Option<u64>> {
+        group::used_bytes(&self.db).map(Some)
     }
 
     fn export(&mut self, span: reshard::Span, positions: usize) -> anyhow::Result<store::Exported> {
@@ -2585,6 +2615,247 @@ mod group_holding {
         assert!(gone.iter().all(Option::is_none));
         assert_eq!(gone_live, 0);
         assert!(old.export(Span::ALL, usize::MAX).unwrap().keys.is_empty());
+    }
+
+    /// `operation` as a command of namespace `ns`, and where its answer goes.
+    fn command(operation: Operation) -> (Command, Reply) {
+        let answer: Reply = Arc::new(Mutex::new(None));
+        let command = Command {
+            namespace: "ns".into(),
+            application: None,
+            operation,
+            answer: Arc::clone(&answer),
+            publication: Arc::new(Mutex::new(None)),
+            until: Instant::now() + Duration::from_secs(60),
+        };
+        (command, answer)
+    }
+
+    /// A Records transaction of `ns` putting each of `puts` (family `f`).
+    fn puts(puts: &[(&str, &str)]) -> Operation {
+        let writes = puts
+            .iter()
+            .map(|(k, v)| Write::Put {
+                family: "f".into(),
+                key: k.as_bytes().to_vec(),
+                value: v.as_bytes().to_vec(),
+            })
+            .collect();
+        Operation::Mutation(Mutation::Records {
+            namespace: "ns".into(),
+            tx: Tx {
+                conds: Vec::new(),
+                writes,
+            },
+        })
+    }
+
+    /// `operation` handed to the group its keys route to and durable there: its answer, or the
+    /// group's refusal.
+    fn submit(groups: &Groups<Local>, operation: Operation) -> Result<Answer, store::Refused> {
+        let until = Instant::now() + Duration::from_secs(60);
+        let (command, answer) = command(operation);
+        let ticket = groups.put_wait(vec![command], until)?;
+        groups.durable(&ticket, until)?;
+        match answer.lock().unwrap().take() {
+            Some(Ok(answer)) => Ok(answer),
+            Some(Err(e)) => panic!("refused by the engine: {e:?}"),
+            None => panic!("no answer"),
+        }
+    }
+
+    /// `key`'s value (family `f` of `ns`) as its group answers it now.
+    fn value(groups: &Groups<Local>, key: &str) -> Option<Vec<u8>> {
+        let get = Operation::Get(
+            "f".into(),
+            key.as_bytes().to_vec(),
+            Consistency::Linearizable,
+        );
+        match submit(groups, get) {
+            Ok(Answer::Row(row)) => row.map(|r| r.value),
+            _ => panic!("{key} not read"),
+        }
+    }
+
+    /// `key`'s routing key.
+    fn routing(key: &str) -> Vec<u8> {
+        reshard::row_key("ns", "f", key.as_bytes()).unwrap()
+    }
+
+    /// Carries `out` and every action and answer after it to `groups` until the driver is idle,
+    /// writing the next of `keys` in a Records transaction before each action, its value kept in
+    /// `acked` once it is durable (a write refused while its span is fenced, or flipped to a
+    /// group that hasn't taken it up, isn't acknowledged): the operations ended, each done.
+    fn drive(
+        dir: &Path,
+        groups: &Groups<Local>,
+        driver: &mut crate::reshard::driver::Driver,
+        out: Vec<crate::reshard::driver::Out>,
+        keys: &[String],
+        acked: &mut [Option<String>],
+        next: &mut usize,
+    ) -> usize {
+        use crate::reshard::driver::{Answer as Answered, Out};
+        let until = Instant::now() + Duration::from_secs(60);
+        let mut pending: std::collections::VecDeque<Out> = out.into();
+        let mut ended = 0;
+        while let Some(o) = pending.pop_front() {
+            match o {
+                Out::Commit(_) => groups.route(driver.directory()).unwrap(),
+                Out::Send(a) => {
+                    let i = *next % keys.len();
+                    let v = format!("v{next}");
+                    *next += 1;
+                    match submit(groups, puts(&[(&keys[i], &v)])) {
+                        Ok(Answer::Rev(_)) => acked[i] = Some(v),
+                        Ok(_) => panic!("a commit answered with no revision"),
+                        Err(store::Refused::Away(_)) => {}
+                        Err(e) => panic!("a write refused: {e:?}"),
+                    }
+                    let reply = groups
+                        .carry(&a, until, &crate::groups::Alone, |g| {
+                            local(&dir.join(format!("g{}.db", g.0)))
+                        })
+                        .unwrap();
+                    pending.extend(
+                        driver
+                            .answer(Answered {
+                                ask: a.ask,
+                                op: a.op,
+                                reply,
+                            })
+                            .unwrap(),
+                    );
+                }
+                Out::Ended(e) => {
+                    assert!(e.done, "operation given up: {e:?}");
+                    ended += 1;
+                }
+            }
+        }
+        assert!(driver.idle());
+        ended
+    }
+
+    /// T-T1.9.R13 (CP-T1.9; docs/design/reshard.md, decision "The routing key is bytes"): local
+    /// databases as groups (`Groups<Local>`), Records commands routed by their row keys; one
+    /// group split by the driver through the shell while a Records transaction is written before
+    /// every action, then merged back the same way. Expect each operation done, some keys in the
+    /// split's new group and not all, every acknowledged write read back through its group after
+    /// each, writes acknowledged during both, and, while split, a transaction whose keys are in
+    /// one group committed there and one whose keys (written or only a condition's) span both
+    /// groups refused whole.
+    #[test]
+    fn t_t1_9_r13_r17_records_through_groups_of_local_databases_split_and_merge_under_writes() {
+        use crate::reshard::directory::Proposal;
+        use crate::reshard::driver::Driver;
+        let dir = tempfile::tempdir().unwrap();
+        let directory = Directory::new(NodeId(0));
+        let groups = Groups::on(
+            NodeId(0),
+            &directory,
+            store::Config::default(),
+            &dir.path().join("retired"),
+            |g| local(&dir.path().join(format!("g{}.db", g.0))),
+        )
+        .unwrap();
+        let keys: Vec<String> = (0..48).map(|i| format!("k{i}")).collect();
+        let mut acked: Vec<Option<String>> = vec![None; keys.len()];
+        for (i, k) in keys.iter().enumerate() {
+            assert!(matches!(
+                submit(&groups, puts(&[(k, "first")])),
+                Ok(Answer::Rev(_))
+            ));
+            acked[i] = Some("first".into());
+        }
+        let every_write_reads_back = |acked: &[Option<String>]| {
+            for (k, want) in keys.iter().zip(acked) {
+                let want = want.as_ref().map(|v| v.as_bytes().to_vec());
+                assert_eq!(value(&groups, k), want, "{k}");
+            }
+        };
+        let (mut driver, out) = Driver::recover(directory, 1).unwrap();
+        assert!(out.is_empty());
+        let mut next = 0;
+
+        let out = driver
+            .begin(&Proposal::Split {
+                group: GroupId(0),
+                at: 1 << 63,
+            })
+            .unwrap();
+        let ended = drive(
+            dir.path(),
+            &groups,
+            &mut driver,
+            out,
+            &keys,
+            &mut acked,
+            &mut next,
+        );
+        assert_eq!(ended, 1);
+        assert_eq!(groups.len(), 2);
+        // T-T1.9.R17: each local database's size, as the shell measures it, is its pages in use.
+        let measured = groups
+            .measure(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(measured.len(), 2);
+        assert!(measured.iter().all(|m| m.bytes > 0));
+        let (old, new): (Vec<&String>, Vec<&String>) = keys
+            .iter()
+            .partition(|k| groups.group_of(&routing(k)) == Some(GroupId(0)));
+        assert!(!old.is_empty() && !new.is_empty());
+        every_write_reads_back(&acked);
+        assert!(acked.iter().any(|v| v.as_deref() != Some("first")));
+
+        // A transaction within one group commits there; one across both is refused whole.
+        let (a, b) = (new[0].as_str(), new[1].as_str());
+        assert!(matches!(
+            submit(&groups, puts(&[(a, "pair"), (b, "pair")])),
+            Ok(Answer::Rev(_))
+        ));
+        for k in [a, b] {
+            let i = keys.iter().position(|x| x == k).unwrap();
+            acked[i] = Some("pair".into());
+        }
+        let across = puts(&[(a, "across"), (old[0].as_str(), "across")]);
+        assert_eq!(submit(&groups, across).err(), Some(store::Refused::Groups));
+        let Operation::Mutation(Mutation::Records { namespace, mut tx }) = puts(&[(a, "cond")])
+        else {
+            panic!("a Records transaction")
+        };
+        tx.conds.push(Cond::Absent {
+            family: "f".into(),
+            key: old[0].as_bytes().to_vec(),
+        });
+        let cond = Operation::Mutation(Mutation::Records { namespace, tx });
+        assert_eq!(submit(&groups, cond).err(), Some(store::Refused::Groups));
+        every_write_reads_back(&acked);
+
+        let out = driver
+            .begin(&Proposal::Merge {
+                from: GroupId(1),
+                into: GroupId(0),
+            })
+            .unwrap();
+        let before = next;
+        let ended = drive(
+            dir.path(),
+            &groups,
+            &mut driver,
+            out,
+            &keys,
+            &mut acked,
+            &mut next,
+        );
+        assert_eq!(ended, 1);
+        assert!(next > before);
+        assert_eq!(groups.len(), 1);
+        assert!(
+            keys.iter()
+                .all(|k| groups.group_of(&routing(k)) == Some(GroupId(0)))
+        );
+        every_write_reads_back(&acked);
     }
 
     /// T-T1.9.R7 (CP-T1.9; docs/design/reshard.md, "A local database keeps its holding through

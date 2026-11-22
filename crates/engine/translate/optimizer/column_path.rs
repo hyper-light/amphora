@@ -20,9 +20,9 @@
 //! (`Columns::scan`); once G11 step 4's vectorized scan lands, the rows of the granules its
 //! summaries keep, which the caller passes as [`CopyView::reads`] with nothing else here changing.
 //!
-//! Behind a switch until step 4's scan is on main: [`asked`], `AMPHORA_COLUMN_PATH=on`. Nothing
-//! outside the tests calls this yet: the copy is not yet kept for SQL tables, and the storage's
-//! reader (`storage::versioned::columns_path`) is where it plugs in.
+//! Behind a switch: [`asked`], `AMPHORA_COLUMN_PATH=on`. SQL's aggregates reach it through the
+//! storage's reader (`storage::versioned::columns_path`) for the SQL tables that keep a copy
+//! (`storage::versioned::columns_sql`).
 #![cfg_attr(not(test), allow(dead_code))]
 
 /// The environment variable that turns the copy's access path on: `on`.

@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use amphora::db::Db;
-use amphora::groups::{Alone, Groups, Peers, Pull, Pulled};
+use amphora::groups::{Alone, Groups, Peers, Pull, Pulled, room};
 use amphora::reshard::directory::{Directory, Proposal};
 use amphora::reshard::driver::{Answer, Do, Driver, Failure, Out, Reply};
 use amphora::reshard::holding::{Away, Fenced, replays};
@@ -541,6 +541,49 @@ fn on(dir: &std::path::Path, directory: &Directory) -> Groups<Events> {
     .unwrap()
 }
 
+/// T-T1.9.R15 (CP-T1.9; docs/design/reshard.md, decision "Load from the store's meter"): one group,
+/// nothing written, then sixty-four keys written one batch each, then nothing again, measured by
+/// the shell after each. Expect: no load cut while nothing is written; then load (its writer's
+/// commit time), a cut with every written key on one side of it or the other as their positions
+/// fall, and the plan on two cores splitting the group there; then a new window with no load.
+#[test]
+fn t_t1_9_r15_the_shell_measures_each_groups_load_and_the_plan_splits_the_hot_one() {
+    use amphora::reshard::plan::{NodeRoom, plan};
+    let dir = tempfile::tempdir().unwrap();
+    let directory = Directory::new(NodeId(0));
+    let groups = on(dir.path(), &directory);
+    let first = groups.measure(soon()).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].by_load, None);
+    let keys: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+    for k in &keys {
+        let t = groups.put_wait(vec![row(k, 0)], soon()).unwrap();
+        groups.durable(&t, soon()).unwrap();
+    }
+    let measured = groups.measure(soon()).unwrap();
+    assert_eq!(measured.len(), 1);
+    assert!(measured[0].load > 0);
+    let c = measured[0].by_load.unwrap();
+    assert_eq!(c.left + c.right, 64);
+    let left = keys.iter().filter(|k| position(k) < c.at).count();
+    assert_eq!(left as u64, c.left);
+    let two = [NodeRoom {
+        node: NodeId(0),
+        cores: 2,
+    }];
+    assert_eq!(
+        plan(&directory, &two, &measured),
+        vec![Proposal::Split {
+            group: GroupId(0),
+            at: c.at
+        }]
+    );
+    let after = groups.measure(soon()).unwrap();
+    assert_eq!(after[0].load, 0);
+    assert_eq!(after[0].by_load, None);
+    assert!(room(NodeId(0)).cores >= 1);
+}
+
 /// Carries `out` and every action and answer after it to `groups` until the driver is idle,
 /// writing a row to the next of `keys` before each action, and counting each write acknowledged
 /// in `acked` (a write refused while its span is fenced is not acknowledged).
@@ -705,7 +748,7 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
 /// driver); expect the retired group neither started nor made again, empty, but the Create refused
 /// as of an operation that ended, and every acknowledged row still in the one group left.
 #[test]
-fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
+fn t_t1_9_r6_r16_a_retired_group_stays_retired_across_a_restart_and_its_files_go() {
     let dir = tempfile::tempdir().unwrap();
     let directory = Directory::new(NodeId(0));
     let groups = on(dir.path(), &directory);
@@ -757,6 +800,10 @@ fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
     );
     assert_eq!(ended, 2);
     assert!(groups.holding_of(GroupId(1)).is_none());
+    // T-T1.9.R16: of the groups whose files are found, the retired one is named, not the one
+    // held nor one never given out.
+    let found = [GroupId(0), GroupId(1), GroupId(2)];
+    assert_eq!(groups.retired_of(found), vec![GroupId(1)]);
     groups.sync(soon()).unwrap();
     drop(groups);
 
@@ -774,8 +821,21 @@ fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
         )))
     );
     assert_eq!(again.len(), 1);
+    // T-T1.9.R16: still named after the restart; its files deleted, the node goes on without them.
+    assert_eq!(again.retired_of(found), vec![GroupId(1)]);
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("events-1.db") {
+            std::fs::remove_file(&path).unwrap();
+            deleted += 1;
+        }
+    }
+    assert!(deleted > 0);
     again.route(driver.directory()).unwrap();
     every_key_in_its_group(&again, &keys, &acked);
+    assert!(!dir.path().join("events-1.db").exists());
 }
 
 /// T-T1.9.R5 (CP-T1.9 step 3; the driver's contract, docs/design/reshard.md): the split and merge
@@ -903,7 +963,7 @@ fn env(name: &str, default: u64) -> u64 {
 /// are written before the clients start (the partition's size). Every write acknowledged is
 /// checked at the end: read back from its key's group, and every key in exactly one group's file.
 fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
-    use amphora::reshard::plan::{GroupLoad, NodeRoom, cut, plan};
+    use amphora::reshard::plan::plan;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -928,7 +988,6 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
             groups.durable(&t, soon()).unwrap();
         }
     }
-    let window: Arc<Mutex<std::collections::BTreeMap<Pos, u64>>> = Arc::default();
     let stop = Arc::new(AtomicBool::new(false));
     let hot = Arc::new(AtomicUsize::new(0));
     let longest = Arc::new(Mutex::new(Duration::ZERO));
@@ -936,11 +995,10 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
     let total = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
     let threads: Vec<_> = (0..clients)
         .map(|t| {
-            let (groups, keys, acked, window, stop, hot, longest, total) = (
+            let (groups, keys, acked, stop, hot, longest, total) = (
                 groups.clone(),
                 Arc::clone(&keys),
                 Arc::clone(&acked),
-                Arc::clone(&window),
                 Arc::clone(&stop),
                 Arc::clone(&hot),
                 Arc::clone(&longest),
@@ -980,7 +1038,6 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
                         *l = (*l).max(waited);
                     }
                     acked.lock().unwrap()[i] += 1;
-                    *window.lock().unwrap().entry(position(key)).or_default() += 1;
                     *total.0.lock().unwrap() += 1;
                     total.1.notify_all();
                 }
@@ -988,7 +1045,6 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
         })
         .collect();
 
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u64);
     let (mut driver, _) = Driver::recover(directory, 1).unwrap();
     let mut run = LabRun {
         ended: 0,
@@ -1006,42 +1062,9 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
             .wait_while(total.0.lock().unwrap(), |n| *n < planned_at + keys.len())
             .unwrap();
         planned_at = seen;
+        // What the shell measured of each group this window, and this machine's cores.
         let dirc = driver.directory().clone();
-        let w: Vec<(Pos, u64)> = std::mem::take(&mut *window.lock().unwrap())
-            .into_iter()
-            .collect();
-        let mut loads = Vec::new();
-        for (g, _) in dirc.groups() {
-            let Some(span) = groups.holding_of(g).and_then(|h| h.owned()) else {
-                continue;
-            };
-            let rows: Vec<(Pos, u64)> = keys
-                .iter()
-                .map(|k| position(k))
-                .filter(|p| span.contains(*p))
-                .map(|p| (p, 1))
-                .collect();
-            let load: Vec<(Pos, u64)> = w
-                .iter()
-                .copied()
-                .filter(|(p, _)| span.contains(*p))
-                .collect();
-            loads.push(GroupLoad {
-                group: g,
-                bytes: rows.len() as u64,
-                load: load.iter().map(|(_, c)| c).sum(),
-                by_size: cut(&rows),
-                by_load: cut(&load),
-            });
-        }
-        let proposals = plan(
-            &dirc,
-            &[NodeRoom {
-                node: NodeId(0),
-                cores,
-            }],
-            &loads,
-        );
+        let proposals = plan(&dirc, &[room(NodeId(0))], &groups.measure(soon()).unwrap());
         if proposals.is_empty() {
             hot.fetch_add(keys.len() / 7 + 1, Ordering::Relaxed);
         }

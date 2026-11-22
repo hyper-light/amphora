@@ -6207,7 +6207,9 @@ mod tests {
     fn power_seed(seed: u64, durability: &Durability) -> Cuts {
         const ROUNDS_PER_SEED: u64 = 3;
         let dir = tempfile::tempdir().unwrap();
-        let mut rng = Rng(seed | 1);
+        // Seeds apart draw apart (AC-T1.8.5): `Rng(seed | 1)` alone gave seeds 2k and 2k + 1 one
+        // schedule of writes, flushes and cuts, so 10,000 seeds ran 5,000. SplitMix64 spreads them.
+        let mut rng = Rng(mix(&mut { seed }) | 1);
         let durability = durability.clone();
         let voters = vec![1, 2, 3];
         let mut power: Vec<Power> = (0..3u64).map(|n| Power::new(seed * 4 + n)).collect();
@@ -6315,10 +6317,33 @@ mod tests {
         done
     }
 
+    /// A string as JSON writes it: a shard's record carries each failing seed's account.
+    fn json_string(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
     /// Runs seeds `from..from + n` of the power-cut nemesis on `workers` threads, its members of
     /// `durability`. Every seed runs, and the run fails naming each failing seed with its account,
-    /// whatever panicked in it.
-    fn power_seeds(n: u64, from: u64, workers: usize, durability: &Durability) {
+    /// whatever panicked in it. With `record`, a class's name and a file, it first writes the
+    /// shard's record there, one JSON object: the class, the seed range, the totals and each
+    /// failing seed with its account (bench/power_nemesis.sh merges the shards).
+    fn power_seeds(
+        n: u64,
+        from: u64,
+        workers: usize,
+        durability: &Durability,
+        record: Option<(&str, &std::path::Path)>,
+    ) {
         let next = AtomicU64::new(from);
         let total = Mutex::new(Cuts::default());
         let failed = Mutex::new(Vec::new());
@@ -6352,12 +6377,29 @@ mod tests {
         });
         let mut failed = failed.into_inner().unwrap();
         failed.sort();
+        let total = total.into_inner().unwrap();
+        if let Some((class, path)) = record {
+            let failures: Vec<String> = failed
+                .iter()
+                .map(|(seed, account)| {
+                    format!("{{\"seed\":{seed},\"account\":{}}}", json_string(account))
+                })
+                .collect();
+            let line = format!(
+                "{{\"class\":{},\"from\":{from},\"count\":{n},\"acknowledged\":{},\"cuts\":{},\"unflushed_leader\":{},\"failed\":[{}]}}\n",
+                json_string(class),
+                total.acknowledged,
+                total.cuts,
+                total.unflushed_leader,
+                failures.join(",")
+            );
+            std::fs::write(path, line).unwrap();
+        }
         assert!(
             failed.is_empty(),
             "{} of the seeds failed: {failed:#?}",
             failed.len()
         );
-        let total = total.into_inner().unwrap();
         println!(
             "power-cut nemesis: seeds {from}..{}, {} writes acknowledged, {} cuts, {} of them of a leader holding a write unflushed, none lost",
             from + n,
@@ -6421,7 +6463,7 @@ mod tests {
     /// with cuts of leaders holding writes unflushed among them.
     #[test]
     fn a_member_power_cut_loses_no_acknowledged_replicated_write() {
-        power_seeds(12, 0, 4, &three_fates());
+        power_seeds(12, 0, 4, &three_fates(), None);
     }
 
     /// AC-T1.8.D2 (AC-T1.8.5), the persisted class under the same nemesis (replication.md, "A
@@ -6432,22 +6474,44 @@ mod tests {
     /// among them.
     #[test]
     fn a_member_power_cut_loses_no_acknowledged_persisted_write() {
-        power_seeds(12, 0, 4, &Durability::Persisted);
+        power_seeds(12, 0, 4, &Durability::Persisted, None);
     }
 
-    /// The same nemesis over 10,000 seeds, the plan's measure, run by hand or nightly. A machine can
-    /// take a share: `AMPHORA_POWER_SEEDS=from:count` (default 0:10000).
-    #[test]
-    #[ignore = "10,000 seeds: run with --ignored"]
-    fn a_member_power_cut_loses_no_acknowledged_replicated_write_over_10000_seeds() {
+    /// One share of the 10,000-seed nemesis in `class`, as the environment names it, sharded across
+    /// machines by bench/power_nemesis.sh: `AMPHORA_POWER_SEEDS=from:count` (default 0:10000),
+    /// `AMPHORA_POWER_WORKERS` threads (default the machine's cores) and `AMPHORA_POWER_RECORD`, the
+    /// file for the shard's record.
+    fn power_share(class: &str, durability: &Durability) {
         let share = std::env::var("AMPHORA_POWER_SEEDS").unwrap_or_else(|_| "0:10000".into());
         let (from, count) = share.split_once(':').unwrap();
+        let workers = std::env::var("AMPHORA_POWER_WORKERS").map_or_else(
+            |_| std::thread::available_parallelism().map_or(1, usize::from),
+            |w| w.parse().unwrap(),
+        );
+        let record = std::env::var_os("AMPHORA_POWER_RECORD").map(std::path::PathBuf::from);
         power_seeds(
             count.parse().unwrap(),
             from.parse().unwrap(),
-            8,
-            &three_fates(),
+            workers,
+            durability,
+            record.as_deref().map(|path| (class, path)),
         );
+    }
+
+    /// The replicated class's nemesis over 10,000 seeds, AC-T1.8.5's simulator half, run by hand
+    /// or nightly, a share a machine (`power_share`).
+    #[test]
+    #[ignore = "10,000 seeds: run with --ignored"]
+    fn a_member_power_cut_loses_no_acknowledged_replicated_write_over_10000_seeds() {
+        power_share("replicated", &three_fates());
+    }
+
+    /// The persisted class's nemesis over 10,000 seeds, AC-T1.8.5's simulator half, as the
+    /// replicated class's.
+    #[test]
+    #[ignore = "10,000 seeds: run with --ignored"]
+    fn a_member_power_cut_loses_no_acknowledged_persisted_write_over_10000_seeds() {
+        power_share("persisted", &Durability::Persisted);
     }
 
     /// Enqueues `operation` at `client` without waiting: its answer comes on the returned receiver.

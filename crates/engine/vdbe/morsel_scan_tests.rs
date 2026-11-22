@@ -793,3 +793,97 @@ fn t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop() {
     );
     assert!(ordered > 0, "no ordered join took the hook");
 }
+
+/// T-QT.6.14 (lane qs6-6): a hash join's rows under LIMIT and OFFSET run on morsels when the ORDER
+/// BY tells every joined row apart (both tables' INTEGER PRIMARY KEYs among its keys) and answer
+/// row for row as the serial loop, the machine stated as 2, 3, 4 and 8 cores; a LIMIT over an
+/// order with ties stays serial.
+#[test]
+fn t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-14");
+    let mut rng = ChaCha8Rng::seed_from_u64(614);
+    let pad = "x".repeat(64);
+    for (name, rows) in [("t", 1500usize), ("u", 400)] {
+        conn.execute(format!(
+            "CREATE TABLE {name}(id INTEGER PRIMARY KEY, a INTEGER, c TEXT, p TEXT)"
+        ))
+        .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for _ in 0..rows {
+            let a = rng.random_range(-20i64..20);
+            let c = rng.random_range(0..12);
+            conn.execute(format!(
+                "INSERT INTO {name}(a, c, p) VALUES ({a}, 't{c}', '{pad}')"
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let run = |sql: &str, cores: usize| {
+        *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+            NonZeroUsize::new(cores).unwrap(),
+            1.0,
+            1.0,
+        ));
+        let rows = sql_rows(&conn, sql);
+        let ran = conn
+            .morsel_costs
+            .lock()
+            .as_ref()
+            .is_some_and(|costs| costs.worker_start().samples() > 1);
+        (rows, ran)
+    };
+    let queries = 30usize;
+    let mut hooked = 0usize;
+    for _ in 0..queries {
+        let dir = |rng: &mut ChaCha8Rng| if rng.random_bool(0.5) { " DESC" } else { "" };
+        let lead = ["", "t.a, ", "u.c DESC, "][rng.random_range(0..3)];
+        let (dt, du) = (dir(&mut rng), dir(&mut rng));
+        let order = if rng.random_bool(0.5) {
+            format!("{lead}t.id{dt}, u.id{du}")
+        } else {
+            format!("{lead}u.id{du}, t.id{dt}")
+        };
+        let limit = if rng.random_range(0..6) == 0 {
+            -1
+        } else {
+            rng.random_range(1i64..200)
+        };
+        let offset = match rng.random_range(0..3) {
+            0 => String::new(),
+            1 => format!(" OFFSET {}", rng.random_range(0..300)),
+            _ => " OFFSET -3".to_string(),
+        };
+        let filter = if rng.random_bool(0.5) {
+            format!(" WHERE t.a > {}", rng.random_range(-20i64..20))
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT t.id, u.id, t.c, u.a FROM t JOIN u ON t.a = u.a{filter} ORDER BY {order} LIMIT {limit}{offset}"
+        );
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [2usize, 3, 4, 8] {
+            let (parallel, ran) = run(&sql, cores);
+            assert_eq!(parallel, serial, "{sql} on {cores} cores");
+            if ran {
+                hooked += 1;
+            }
+        }
+    }
+    // An order with ties under a LIMIT could cut a different tie: the hook declines it.
+    let tied = "SELECT t.a, u.c FROM t JOIN u ON t.a = u.a ORDER BY t.a LIMIT 10";
+    let (_, ran) = run(tied, 4);
+    assert!(!ran, "{tied} took the hook");
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: most limited joins took the hook.
+    assert!(
+        hooked > queries * 2,
+        "the hook ran {hooked} times of {}",
+        queries * 4
+    );
+}

@@ -1548,7 +1548,8 @@ fn find_hash_join_keys(
 /// per distinct build key of a hash join's Bloom filter, or none where a filter costs more than
 /// it saves. Every weight is the cost model's, learned per database:
 /// - a probe row the filter passes is hashed and probed (`hash_cpu_cost + hash_lookup_cost`);
-/// - a filter lookup hashes the key once (`hash_cpu_cost`), for every probe row;
+/// - a filter lookup, for every probe row, costs what calibration measured one to cost, the
+///   key's hash included (`bloom_lookup_cost`, `learned_costs::Work::BloomProbe`);
 /// - a filter bit is priced at the hash table's own memory: a build row's cost over its bits
 ///   (`(hash_cpu_cost + hash_insert_cost) / (8 · hash_bytes_per_row)`).
 ///
@@ -1565,7 +1566,7 @@ pub fn bloom_filter_rate_per_key(
 ) -> Option<f64> {
     let misses = (probe_rows - matched_probe_rows.max(0.0)).max(0.0);
     let probe_cost = params.hash_cpu_cost + params.hash_lookup_cost;
-    let lookup_cost = params.hash_cpu_cost;
+    let lookup_cost = params.bloom_lookup_cost;
     let bit_cost =
         (params.hash_cpu_cost + params.hash_insert_cost) / (8.0 * params.hash_bytes_per_row);
     let measured = [build_keys, misses, probe_cost, bit_cost]
