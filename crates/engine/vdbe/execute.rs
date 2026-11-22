@@ -16951,6 +16951,24 @@ pub fn op_integrity_check(
         message_register,
     } = data.as_ref();
 
+    // Amphora (G7 step 2, `AC-NS.2.1`): the main database's trees on the versioned storage are
+    // checked there; the pager's pages hold none of them.
+    if *db == MAIN_DB_ID {
+        if let Some(switch) = program.connection.versioned.as_ref() {
+            let found = switch.check(roots, *max_errors)?;
+            let register = state
+                .registers
+                .get_mut(*message_register)
+                .ok_or_else(|| LimboError::InternalError("integrity_check: no register".into()))?;
+            if found.is_empty() {
+                register.set_null();
+            } else {
+                register.set_text(Text::new(found.join("\n")))?;
+            }
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
     let target_pager = if *db == MAIN_DB_ID {
@@ -20359,8 +20377,9 @@ pub fn op_morsel_aggregate(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    use crate::vdbe::morsel::HashProbe;
     use crate::vdbe::morsel::{MachineCosts, MemoryBudget, MorselError, ScanAggregate};
-    use crate::vdbe::morsel_scan::{TableAggregate, TableSource};
+    use crate::vdbe::morsel_scan::{TableAggregate, TableJoinAggregate, TableSource};
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
         Box::new(LimboError::InternalError(format!(
@@ -20381,17 +20400,43 @@ pub fn op_morsel_aggregate(
             data.columns,
             data.rowid_alias,
         )?;
+        let budget = MemoryBudget::new(pager.statement_memory_budget());
+        let Some(join) = &data.join else {
+            let shape = ScanAggregate {
+                rows: &[],
+                filter: &data.filter,
+                group_by: &data.group_by,
+                aggregates: &data.aggregates,
+            };
+            let pipeline = TableAggregate {
+                table: &table,
+                shape: &shape,
+            };
+            return pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget);
+        };
+        // A hash join's probe: the build side read and its table built once, on this thread,
+        // charged to the statement's one budget; the joined rows' filter is the probe's.
+        let build_table = TableSource::open(
+            pager.clone(),
+            join.root_page,
+            join.columns,
+            join.rowid_alias,
+        )?;
+        let build = build_table.filtered_rows(&join.filter, &budget)?;
+        let probe = HashProbe::build(&build, &join.build_key, &[], &join.probe_key, &budget)?;
         let shape = ScanAggregate {
             rows: &[],
-            filter: &data.filter,
+            filter: &[],
             group_by: &data.group_by,
             aggregates: &data.aggregates,
         };
-        let pipeline = TableAggregate {
+        let pipeline = TableJoinAggregate {
             table: &table,
+            probe_filter: &data.filter,
+            probe: &probe,
+            build: &build,
             shape: &shape,
         };
-        let budget = MemoryBudget::new(pager.statement_memory_budget());
         pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget)
     })();
     *connection.morsel_costs.lock() = Some(costs);

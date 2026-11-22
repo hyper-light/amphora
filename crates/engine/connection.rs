@@ -1466,6 +1466,21 @@ impl Connection {
         self.force_reparse_schema_inner(false)
     }
 
+    /// Amphora (G7 step 2, `AC-NS.2.1`): reads the schema from the versioned storage's
+    /// `sqlite_schema` (its tree 1) and makes it the database's, so every connection made after
+    /// sees the tables a reopened database holds. Its read ends the storage's transaction it began.
+    pub(crate) fn load_versioned_schema(self: &Arc<Connection>) -> Result<()> {
+        let read = self.force_reparse_schema_inner(false);
+        let ended = self
+            .versioned
+            .as_ref()
+            .map_or(Ok(()), |switch| switch.finish(true));
+        read?;
+        ended?;
+        self.db.replace_schema(self.schema.read().clone());
+        Ok(())
+    }
+
     /// Amphora: rebuild this writer's schema after importing unresolved-commit page images.
     /// The caller owns an explicit write transaction. Unlike an external committed restore,
     /// this must keep that transaction and its private WAL suffix, without publishing a schema

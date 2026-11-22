@@ -531,6 +531,9 @@ tests = [
   { id = "T-NS.2.5", text = "Trees made and dropped survive reopens and power cuts; a crash at each write of a workload that makes, fills and drops trees recovers a prefix of its steps" },
   # lane g7s2-3
   { id = "T-NS.2.6", text = "SQL end to end through the switch and without it (CREATE TABLE, INSERT, SELECT, transactions) answers alike" },
+  # lane g7s2-5
+  { id = "T-NS.2.10", text = "The versioned storage holds the shell's budget, else a quarter of the machine's memory, its pages and versions together; its pool's frames are made as pages are handed out" },
+  { id = "T-NS.2.11", text = "DDL undone by a failed statement, a savepoint rolled back to or a failed commit leaves no tree that no schema row names; a DROP undone keeps its tree" },
 ]
 
 # lane g7s3
@@ -673,6 +676,35 @@ tests = [
   { id = "T-EN.1.1", text = "The widest prepared transaction at its whole budget — passes when it encodes within its bound, short only by the list length's unused varint bytes" },
   { id = "T-EN.1.2", text = "The widest image at a lowered budget, and the full budget's arithmetic — passes the same" },
   { id = "T-EN.1.3", text = "Postcard's varint widths and the declaration's — passes when each matches the encoder" },
+]
+
+# lane constants-10 (2026-11-21): MB.1, the process memory budget (store.md, "Decision (lane constants): one process
+# memory budget"); SB.1, an image bounded by its room for one (replication.md, "Decision (lane constants): an image is
+# bounded by the memory budget's room for one").
+[[own]]
+id = "MB.1"
+title = "One process memory budget, learned where it runs and shared out by measured use, not picked bounds"
+criteria = [
+  { id = "AC-MB.1.1", text = "The limit is the smallest the platform states (Linux: cgroup v2 or v1 limits and MemTotal; macOS: hw.memsize; Windows: GlobalMemoryStatusEx; Unix: soft RLIMIT_AS, RLIMIT_DATA, RLIMIT_RSS), read again at every ask; where none can be read the budget refuses Unavailable naming the platform, with no fallback" },
+  { id = "AC-MB.1.2", text = "A use's room is the limit less what the rest of the process holds: the larger of its resident bytes and every charge counted, its own charge given back; a take past it is refused TooLarge naming the use and its room; a charge is given back when it drops" },
+]
+tests = [
+  { id = "T-MB.1.1", text = "A 1 GiB limit, 100 MiB resident, queue then image bytes taken and the queue's dropped: passes when each room is the limit less the rest's hold, a take past it is refused TooLarge at that room, and a dropped charge is given back" },
+  { id = "T-MB.1.2", text = "A limit unread, then read, then lowered, then below the resident bytes: passes when unread is Unavailable naming the platform, the room follows the limit, and is zero, never negative" },
+  { id = "T-MB.1.3", text = "Resident bytes unread: passes when the charges counted stand for the rest's use" },
+  { id = "T-MB.1.4", text = "This process on Linux, macOS and Windows: passes when its limit and resident bytes are both read and the image's room is not refused" },
+]
+
+[[own]]
+id = "SB.1"
+title = "An image is bounded by the memory budget's room for one, not a picked 256 MiB"
+criteria = [
+  { id = "AC-SB.1.1", text = "Every image made, fitted, installed, captured or received as a baseline, or kept by the reshard directory, is bounded by the memory budget's room for an image read at that moment, no more than its carrier's bound; unread, it is refused Unavailable" },
+  { id = "AC-SB.1.2", text = "A replica's database log leaves the image's room free on its filesystem, passed to log_room" },
+]
+tests = [
+  { id = "T-SB.1.1", text = "A machine over a 128 KiB row, its budget fed room to spare, 64 KiB of room, an unread limit, then a 32 KiB carrier: passes when the image fits and a joiner is admitted, then refused TooLarge at 64 KiB, then Unavailable, then refused at 32 KiB" },
+  { id = "T-SB.1.2", text = "log_room with the image's room passed: passes when each log has its file and an equal share of what is free past one image" },
 ]
 
 [[own]]
@@ -926,6 +958,8 @@ tests = [
   { id = "T-QT.6.8", text = "One- and two-column equi-joins whose probe side workers read over the probe table's leaves (vdbe/morsel_scan_tests.rs) — passes when the matches equal the VDBE's join, match for match and in its order" },
   { id = "T-QT.6.9", text = "A table whose INTEGER PRIMARY KEY is its rowid, and an empty table, read in leaf morsels (vdbe/morsel_scan_tests.rs) — passes when the rowid reads into its column, the aggregates equal the VDBE's, and the empty table is one leaf with no rows" },
   { id = "T-QT.6.10", text = "Random filters, groupings and aggregates in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook ran for most of them" },
+  # lane qs6-3
+  { id = "T-QT.6.11", text = "Random inner equi-joins of two tables of many leaf pages on one or two columns, with filters on either table and groupings and aggregates over both, in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores and the planner held to hash joins (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook probed for most of them" },
 ]
 
 # lane g3s2
@@ -1030,4 +1064,6 @@ tests = [
   { id = "T-CS.5.2", text = "cs5_wide_aggregate_reads_the_copy_point_read_the_rows — passes when, by counts, the whole table comes from the copy (only queued keys from the rows) and a point read from one row read with the copy untouched" },
   { id = "T-CS.5.3", text = "cs5_stale_copy_never_read_past_its_snapshot — passes when, at snapshots after commits a full queue dropped and before the copy's only generation, the rows are chosen, the copy is not read, and the answers equal the rows" },
   { id = "T-CS.5.4", text = "cs5_* in translate/optimizer/column_path.rs — passes when the choice follows the costs: copy for wide shapes, rows for point reads and short ranges, no path when off or stale, queued keys priced, an unmeasured copy tried only for whole tables" },
+  { id = "T-CS.5.5", text = "cs5_vectorized_aggregates_identical_and_chosen_by_cost (crates/engine/storage/versioned/columns_path.rs) — passes when whole-table, grouped and key-range aggregates equal the rows' at the snapshot by either path, with the switch on the copy is read by step 4's vectorized scan (granules read, only queued keys from the rows), off every row is read, and a copy behind its snapshot reads no granule" },
+  { id = "T-CS.5.6", text = "cs5_scan_hook_runs_only_when_the_copy_is_chosen — passes when a scan given to the CopyScan hook runs once per aggregate the copy is chosen for and answers it, never with the switch off or on a stale copy" },
 ]

@@ -39,8 +39,14 @@ struct BaselineSnapshot {
 const META: &str = "CREATE TABLE IF NOT EXISTS __amphora_replica (id INTEGER PRIMARY KEY CHECK(id = 1), applied TEXT NOT NULL, term TEXT NOT NULL, configuration BLOB NOT NULL)";
 /// One resolved transaction's page budget. Oversize transactions are refused before proposal.
 pub const COMMAND_BYTES: usize = api::REQUEST_MAX;
-/// Images are bounded until streaming snapshots are implemented; compaction refuses larger ones.
-pub const SNAPSHOT_BYTES: usize = 256 << 20;
+/// The room for one image now: the process memory budget's room for an image (the seam owner's
+/// ruling (c): an image is held whole in memory until snapshots stream, so the memory it may take
+/// bounds it; docs/design/replication.md, "Decision (lane constants): an image is bounded by the
+/// memory budget's room for one"; SB.1). Read again at every image made or installed; refused,
+/// typed, where the process's memory can't be read.
+pub(crate) fn image_room() -> Result<usize, Refusal> {
+    crate::memory::process().image_room()
+}
 /// Format: a database page's bytes, the only page size `validate_pages` admits.
 const PAGE_BYTES: usize = 4096;
 /// Format (postcard's wire format, "Varint encoded integers"): a `u64` or `usize` takes at most
@@ -244,8 +250,10 @@ pub struct Machine {
     // A test's count of the class entries this machine applied that changed its record.
     #[cfg(test)]
     class_changes: u64,
-    // The largest image this machine makes or installs: SNAPSHOT_BYTES, lowered only by a test.
-    snapshot_bytes: usize,
+    // The most an image of this machine's carrier holds (its owner's transport, or a test's lower
+    // bound): usize::MAX where nothing carries it but memory. The image's room is the memory
+    // budget's room for one, no more than this (SB.1).
+    image_cap: usize,
     // A test's stand-in for the filesystem's free bytes, read in place of the filesystem's own.
     #[cfg(test)]
     free_bytes: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
@@ -552,7 +560,7 @@ impl Machine {
             stated: None,
             #[cfg(test)]
             class_changes: 0,
-            snapshot_bytes: SNAPSHOT_BYTES,
+            image_cap: usize::MAX,
             #[cfg(test)]
             free_bytes: std::sync::Arc::default(),
             #[cfg(test)]
@@ -578,7 +586,7 @@ impl Machine {
     /// `image` refuses, and a compaction, which needs one, waits (CT.1).
     pub(crate) fn image_fits(&mut self) -> Result<bool, Refusal> {
         let size = self.db.image_bytes().map_err(unavailable)?;
-        Ok(size <= self.snapshot_bytes)
+        Ok(size <= self.snapshot_bytes()?)
     }
     /// The bytes of the last image this machine made (CT.1).
     pub(crate) fn imaged_bytes(&self) -> u64 {
@@ -595,7 +603,7 @@ impl Machine {
         api::bound(
             "database a joiner installs as a snapshot",
             size,
-            self.snapshot_bytes,
+            self.snapshot_bytes()?,
         )
     }
     /// Makes the filesystem's free bytes read `bytes` from now, as its owner's flushing thread
@@ -604,9 +612,15 @@ impl Machine {
     pub(crate) fn set_free_bytes(&self, bytes: u64) {
         *self.free_bytes.lock().unwrap() = Some(bytes);
     }
-    #[cfg(test)]
+    /// Bounds this machine's images to `bytes` beside the memory budget's room: its carrier's
+    /// most (the replicated owner's transport), or a test's.
     pub(crate) fn set_snapshot_bytes(&mut self, bytes: usize) {
-        self.snapshot_bytes = bytes;
+        self.image_cap = bytes;
+    }
+    /// The most an image of this machine may take now: the memory budget's room for one, no more
+    /// than its carrier holds (SB.1).
+    fn snapshot_bytes(&self) -> Result<usize, Refusal> {
+        Ok(image_room()?.min(self.image_cap))
     }
 
     /// The class this member's owner states, held to the group's record from now on: refused,
@@ -724,7 +738,8 @@ impl Machine {
         if self.digests.is_none() {
             return Ok(());
         }
-        let pages = self.db.image_pages(self.snapshot_bytes).map_err(failed)?;
+        let room = self.snapshot_bytes().map_err(failed)?;
+        let pages = self.db.image_pages(room).map_err(failed)?;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for (id, page) in &pages {
             // A page's last eight bytes are the engine's checksum of the rest, written when the
@@ -1211,7 +1226,8 @@ impl StateMachine for Machine {
 
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
         self.require_baseline().map_err(failed)?;
-        let pages = self.db.image_pages(self.snapshot_bytes).map_err(failed)?;
+        let room = self.snapshot_bytes().map_err(failed)?;
+        let pages = self.db.image_pages(room).map_err(failed)?;
         let bytes = if let Some(declaration) = self.baseline.declaration() {
             let mut bytes = BASELINE_SNAPSHOT.to_vec();
             bytes.extend(
@@ -1228,8 +1244,7 @@ impl StateMachine for Machine {
         api::bound(
             "snapshot",
             bytes.len(),
-            self.snapshot_bytes
-                .saturating_add(image_envelope(self.snapshot_bytes)),
+            room.saturating_add(image_envelope(room)),
         )
         .map_err(failed)?;
         into.extend_from_slice(&bytes);
@@ -1243,11 +1258,11 @@ impl StateMachine for Machine {
         Some(self.opened_bytes)
     }
     fn install(&mut self, image: &[u8], at: Point, configuration: &ConfState) -> Result<(), Fatal> {
+        let room = self.snapshot_bytes().map_err(failed)?;
         api::bound(
             "snapshot",
             image.len(),
-            self.snapshot_bytes
-                .saturating_add(image_envelope(self.snapshot_bytes)),
+            room.saturating_add(image_envelope(room)),
         )
         .map_err(failed)?;
         let pages: Vec<(u32, Vec<u8>)> =
@@ -1263,7 +1278,7 @@ impl StateMachine for Machine {
                 }
                 postcard::from_bytes(image).map_err(failed)?
             };
-        validate_pages(&pages, self.snapshot_bytes).map_err(failed)?;
+        validate_pages(&pages, room).map_err(failed)?;
         if pages.first().map(|p| p.0) != Some(1) {
             return Err(failed("snapshot lacks its database header"));
         }
@@ -1363,9 +1378,10 @@ mod envelope_tests {
         assert_eq!(bound - bytes.len(), U64_MOST - varint_bytes(count));
         // The full budget's envelope: its pages' ids and lengths, a few bytes a page, not a
         // mebibyte.
-        let pages = SNAPSHOT_BYTES / PAGE_BYTES;
+        let full = 256 << 20;
+        let pages = full / PAGE_BYTES;
         assert_eq!(
-            image_envelope(SNAPSHOT_BYTES),
+            image_envelope(full),
             BASELINE_SNAPSHOT.len() + BOOTSTRAP_MOST + U64_MOST + pages * (U32_MOST + 2)
         );
     }
@@ -1390,5 +1406,55 @@ mod envelope_tests {
         );
         assert_eq!(postcard::to_allocvec(&u32::MAX).unwrap().len(), U32_MOST);
         assert_eq!(postcard::to_allocvec(&u64::MAX).unwrap().len(), U64_MOST);
+    }
+}
+
+#[cfg(test)]
+mod image_room_tests {
+    use super::*;
+    use crate::memory::tests::{Fed, budget};
+
+    /// SB.1: do open a machine over a database of a 128 KiB row, its process budget fed: room to
+    /// spare, then 64 KiB of room, then a limit that can't be read, then room to spare under a
+    /// carrier that holds 32 KiB. Expect: the image fits and a joiner is admitted while there is
+    /// room; with 64 KiB, it doesn't fit and a joiner is refused naming that room; unread, the
+    /// refusal is typed (no fallback); under the carrier, its bound (AC-SB.1.1).
+    #[test]
+    fn sb1_an_image_is_bounded_by_the_memory_budgets_room_for_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut machine = Machine::open(&dir.path().join("m.db"), ConfState::default()).unwrap();
+        machine.db.exec("CREATE TABLE t(b)").unwrap();
+        machine
+            .db
+            .exec("INSERT INTO t VALUES(randomblob(131072))")
+            .unwrap();
+        let fed = Fed::new(Some(1 << 30), Some(1 << 20));
+        let (_budget, _unset) = budget(&fed);
+        assert!(machine.image_fits().unwrap());
+        machine.admits_joiner().unwrap();
+
+        fed.set(Some((1 << 20) + (64 << 10)), Some(1 << 20));
+        assert!(!machine.image_fits().unwrap());
+        let refused = machine.admits_joiner();
+        assert!(
+            matches!(&refused, Err(Refusal::TooLarge { what, size, limit })
+                if what.contains("joiner") && *size > 128 << 10 && *limit == 64 << 10),
+            "{refused:?}"
+        );
+
+        fed.set(None, Some(1 << 20));
+        assert!(matches!(machine.image_fits(), Err(Refusal::Unavailable(_))));
+        assert!(matches!(
+            machine.admits_joiner(),
+            Err(Refusal::Unavailable(_))
+        ));
+
+        fed.set(Some(1 << 30), Some(1 << 20));
+        machine.set_snapshot_bytes(32 << 10);
+        let refused = machine.admits_joiner();
+        assert!(
+            matches!(&refused, Err(Refusal::TooLarge { limit, .. }) if *limit == 32 << 10),
+            "{refused:?}"
+        );
     }
 }

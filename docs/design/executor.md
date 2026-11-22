@@ -412,8 +412,25 @@ their keys' SQLite order, as the serial GROUP BY gives them. The machine's costs
 connection's first parallel statement and learned by each after. Evidence: random queries answer
 the same row for row and in order with the switch off and on at 2, 3, 4 and 8 cores (T-QT.6.10).
 
-**Left.** The hash join's probe loop handed over the same way; expressions beyond a column against
-a literal (each worker running its own copy of the program's loop body), a hash table built by all
+**The hash join's probe through the hook.** A SELECT whose work is two rowid tables the planner
+joins inner by a hash join, with aggregates over the joined rows, is handed over the same way
+(`shape_join`): `Insn::MorselAggregate` then carries the build side (`MorselJoinData`). The
+build table is read once on the statement's thread, its own filter terms applied and every kept
+row charged to the statement's budget, and its hash table built; each worker then reads its run
+of the probe table's leaves with its own cursor, tests the probe's own terms, probes, and folds
+each joined row (the probe row's columns, then the build row's) into its partial aggregates
+(`vdbe/morsel_scan.rs`, `TableJoinAggregate`). It qualifies when the join keys are equalities of
+columns of one affinity, every other term is a filter on one table's columns, and every column
+read has INTEGER or TEXT affinity and BINARY collation: two such values that compare equal are
+the same value, so the order of a probe row's matches, which in the serial loop is its hash
+table's, cannot change a MIN, a MAX or a group's key values. A build side past the statement's
+memory hands the statement to its serial loop. Evidence: random inner equi-joins on one or two
+columns, with filters on either table and groupings and aggregates over both, answer the same
+row for row and in order with the switch off and on at 2, 3, 4 and 8 cores, the planner held to
+hash joins (T-QT.6.11).
+
+**Left.** A join's own rows (no aggregates) and joins of more than two tables handed over;
+expressions beyond a column against a literal (each worker running its own copy of the program's loop body), a hash table built by all
 workers, the page cache's miss path sharded, loom
 or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.
 
