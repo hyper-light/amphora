@@ -2153,15 +2153,20 @@ fn settings(id: u64, durability: &Durability) -> Result<hyper_durable::Settings,
         }
     };
     let apply_unpersisted = fates.is_some();
+    // What a leader holds uncommitted and a ready gives committed are held in memory beside the
+    // queues: the same room, and one message at least, which hyper-raft asks of the first and
+    // gives alone past the second (lane constants-20; were a picked 64 MiB each).
+    let message = u64::try_from(MESSAGE_BYTES).map_err(unavailable)?;
+    let held = memory.max(message);
     Ok(hyper_durable::Settings {
         core: hyper_raft::Config {
             fates,
             apply_unpersisted,
             check_quorum: true,
             pre_vote: true,
-            max_size_per_msg: u64::try_from(MESSAGE_BYTES).map_err(unavailable)?,
-            max_uncommitted_size: 64 << 20,
-            max_committed_size_per_ready: 64 << 20,
+            max_size_per_msg: message,
+            max_uncommitted_size: held,
+            max_committed_size_per_ready: held,
             max_inflight_msgs: 4,
             max_inflight_bytes: 64 << 20,
             seed: id,
@@ -4701,6 +4706,20 @@ mod tests {
         for receipt in &mut receipts {
             assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
         }
+    }
+
+    /// QB.1 (lane constants-20): a leader's uncommitted bytes and a ready's committed bytes are
+    /// the memory budget's room for queues, at least one message, not a picked 64 MiB. Do: state a
+    /// persisted member's settings. Expect: both one value, a message at least, which the core's
+    /// settings take. (The room moves with the process's resident bytes, so its value is not
+    /// compared: other tests hold memory meanwhile.)
+    #[test]
+    fn qb_1_held_bytes_are_the_queues_room() {
+        let core = settings(1, &Durability::Persisted).unwrap().core;
+        assert_eq!(core.max_uncommitted_size, core.max_committed_size_per_ready);
+        assert!(core.max_uncommitted_size >= core.max_size_per_msg);
+        assert_eq!(core.max_size_per_msg, u64::try_from(MESSAGE_BYTES).unwrap());
+        core.validate().unwrap();
     }
 
     /// T-QB.1.6 (QB.1, lane constants-20): the command queue's inputs are counted, not picked. Do:
