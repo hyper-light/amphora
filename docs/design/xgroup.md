@@ -88,9 +88,10 @@ with the step and the group's newest comes back with the reply, so the hybrid lo
 step carries (T-T1.12.X2) crosses nodes as it crosses threads. A reply lost after the request went
 out is `UnknownOutcome`, which the protocol already treats as a step that may have landed. The node
 makes its group's tables before it serves (`sql::prepare`). Values introduced: none; a step's size
-is held by the frame's bound, as every request's is. The listener is still loopback: reaching
-another machine waits on split-merge-11's network listener, which `Nodes` addresses through
-unchanged.
+is held by the frame's bound, as every request's is. Between machines, a group's owner
+also listens at a network address under mutual TLS (`Database::listen`, `Nodes::network`;
+reshard.md, "The transport between machines"); the harness's `--listen`, `--cert`, `--key` and
+`--roots` use it.
 
 The harness that chooses the protocol is `xgroup::lan` with its command line,
 `crates/amphora/examples/xgroup_lan.rs`: `node` serves one group at an endpoint; `bench` runs

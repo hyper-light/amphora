@@ -668,6 +668,59 @@ mod tests {
         Instant::now() + crate::transport::HANG
     }
 
+    /// T-T1.9.R18: the harness over two groups' network endpoints, each its database owner's
+    /// listener at a network address under mutual TLS, the coordinator dialing both.
+    #[test]
+    fn t_t1_9_r18_the_lan_harness_runs_over_network_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = crate::transport::network::Pki::new();
+        let databases: Vec<Database> = (0..2)
+            .map(|g| Database::open(&dir.path().join(format!("group{g}.db")), until()).unwrap())
+            .collect();
+        for database in &databases {
+            super::super::sql::prepare(database, until()).unwrap();
+        }
+        let listening: Vec<_> = databases
+            .iter()
+            .enumerate()
+            .map(|(g, d)| {
+                d.listen(
+                    "127.0.0.1:0".parse().unwrap(),
+                    &pki.credentials(&format!("node-{g}")),
+                )
+                .unwrap()
+            })
+            .collect();
+        let nodes = Arc::new(
+            Nodes::network(
+                listening.iter().enumerate().map(|(g, l)| {
+                    (
+                        NodeId(u64::try_from(g).unwrap()),
+                        l.address().unwrap(),
+                        format!("node-{g}"),
+                    )
+                }),
+                &pki.credentials("coordinator"),
+            )
+            .unwrap(),
+        );
+        let members: Vec<Member> = (0..2)
+            .map(|g| Member::Node {
+                nodes: Arc::clone(&nodes),
+                node: NodeId(g),
+            })
+            .collect();
+        let load = Load {
+            clients: 2,
+            keys: 8,
+            span: 2,
+            duration: Duration::from_millis(200),
+        };
+        let measured = measure(members, 1, Protocol::Parallel, load, until()).unwrap();
+        assert!(measured.committed > 0, "{measured:?}");
+        assert_eq!(measured.unknown, 0);
+    }
+
     #[test]
     fn ac_t1_10_2_the_lan_harness_measures_both_protocols_over_two_endpoints() {
         let dir = tempfile::tempdir().unwrap();
