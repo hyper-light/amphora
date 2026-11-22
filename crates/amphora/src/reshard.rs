@@ -64,12 +64,56 @@ pub struct OpId(pub u64);
 /// didn't already.
 #[must_use]
 pub fn position(key: &str) -> Pos {
-    let mut h = crate::groups::fnv(key);
+    position_of(key.as_bytes())
+}
+
+/// [`position`] of a key of bytes: a Records row's routing key ([`row_key`]) as well as a string.
+#[must_use]
+pub fn position_of(key: &[u8]) -> Pos {
+    let mut h = crate::groups::fnv_bytes(key);
     h ^= h.wrapping_shr(33);
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h.wrapping_shr(33);
     h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     h ^ h.wrapping_shr(33)
+}
+
+/// A Records row's routing key: its namespace, family and key, as Records addresses a row
+/// (docs/design/reshard.md, decision "A row routes by its namespace, family and key"). Each of the
+/// first two is preceded by its length as a little-endian u32 (a format value: it makes the
+/// three parts one unambiguous string of bytes), and the key ends it. None for a namespace or
+/// family longer than a u32 counts, which Records' own bounds refuse long before.
+#[must_use]
+pub fn row_key(namespace: &str, family: &str, key: &[u8]) -> Option<Vec<u8>> {
+    let ns = u32::try_from(namespace.len()).ok()?;
+    let fam = u32::try_from(family.len()).ok()?;
+    let mut out = Vec::with_capacity(
+        namespace
+            .len()
+            .checked_add(family.len())?
+            .checked_add(key.len())?
+            .checked_add(8)?,
+    );
+    out.extend_from_slice(&ns.to_le_bytes());
+    out.extend_from_slice(namespace.as_bytes());
+    out.extend_from_slice(&fam.to_le_bytes());
+    out.extend_from_slice(family.as_bytes());
+    out.extend_from_slice(key);
+    Some(out)
+}
+
+/// The namespace, family and key of a [`row_key`] (None: bytes no `row_key` made).
+#[must_use]
+pub fn row_parts(row_key: &[u8]) -> Option<(String, String, Vec<u8>)> {
+    fn part(at: &[u8]) -> Option<(String, &[u8])> {
+        let (len, rest) = at.split_first_chunk::<4>()?;
+        let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
+        let (text, rest) = rest.split_at_checked(len)?;
+        Some((String::from_utf8(text.to_vec()).ok()?, rest))
+    }
+    let (namespace, rest) = part(row_key)?;
+    let (family, key) = part(rest)?;
+    Some((namespace, family, key.to_vec()))
 }
 
 /// Positions `lo` to `hi`, both included: never empty.

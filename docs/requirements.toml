@@ -347,6 +347,8 @@ tests = [
   { id = "T-PL.7.3", text = "cost_fit::tests::t_pl_7_3_* — passes when terms never sampled have no fitted weight and the planner keeps their learned value, and the fit follows weights that move" },
   { id = "T-PL.7.4", text = "cost_fit::tests::t_pl_7_4_* — passes when two hundred thousand samples leave the fit's size unchanged and its window longer than its least" },
   { id = "T-PL.7.5", text = "cost_fit::tests::t_pl_7_5_* and tests/planner.rs, records_plans.rs, join_methods.rs with AMPHORA_FITTED_COSTS=1 — passes when the sample rate follows the timer's cost and the spread, a planner run with the switch on fits weights, and the planner suites pass with the switch on and off" },
+  # lane pl7b
+  { id = "T-PL.7.6", text = "cost_fit::tests::t_pl_7_6_* — passes when a fitted weight within its standard error times the 95% Bonferroni quantile of zero, or with an unbounded error, is not given to the planner and its learned value stands" },
 ]
 
 [[own]]
@@ -759,6 +761,11 @@ tests = [
   # lane split-merge-7
   { id = "T-T1.9.R6", text = "A split and a merge back through the shell, the node started again by the directory from before both and the split's Create asked again — passes when the retired group is neither started nor made again but the Create is refused as of an ended operation, and every acknowledged row is in the one group left" },
   { id = "T-T1.9.R7", text = "A local database as a group's engine, its holding fenced through the shell, then the group started again on the same file — passes when the fenced holding is answered after the restart, kept in the file as the Holding command left it" },
+  # lane split-merge-8
+  { id = "T-T1.9.R8", text = "Copy-path batches on a node with no commit measured, and batches learned from time with large units — passes when no batch holds more units than the process's memory budget takes at the most bytes a unit has held, and at least one" },
+  { id = "T-T1.9.R9", text = "A local database holding Records rows made a group's, its keys copied by position in batches into another local database, changed and caught up from its log, then swept — passes when the second answers every key as the first, with the same live count and a head no older than every revision moved, a catch-up from before the log was held is refused, and the sweep leaves the first with no key" },
+  # lane split-merge-9
+  { id = "T-T1.9.R10", text = "Two nodes, the second of two groups on the first moved to the second by the driver while a row is written before every action, each pull of its copy and catch-up and its answer carried as bytes — passes when the move ends flipped, the first node keeps one group and has retired the moved one, the second holds its span, every key's acknowledged rows read back at its group's node, and every key is in exactly one group's file" },
 ]
 
 # lane qs5
@@ -885,6 +892,7 @@ tests = [
   { id = "T-CS.4.2", text = "cs4_min_max_summaries_skip_granules — passes when a filter outside granules' min/max skips them unread and the answer equals the rows'" },
   { id = "T-CS.4.4", text = "cs4_granule_cache_keeps_to_its_bound — passes when a cache whose bound holds no granule keeps none, every untouched granule is decoded again and counted, and answers still equal the rows'" },
   { id = "T-CS.4.3", text = "cs4_vectors_equal_rows_every_class_{plain,packed}, over key ranges — passes when a range scan skips blocks outside the range undecoded (by the blocks' key bounds), its granules hold every key of the range, and each class over the range equals the rows'" },
+  { id = "T-CS.4.5", text = "cs4_grouped_aggregates_fold_whole_vectors (crates/engine/storage/versioned/columns/scan.rs) — passes when grouped aggregates, folded column vector by column vector by each row's group slot, over keys mixing integers with equal reals, nulls and text, at every granule size from one row to all and merged one granule at a time from the last, equal the statement row by row, each group showing its earliest row's key" },
 ]
 
 # lane groupcommit (G8 step 3, the versioned storage's log; docs/design/engine.md decision 11): no new
@@ -970,6 +978,21 @@ tests = [
   { id = "T-G3.3.4", text = "storage::pager::tests::g3s3_plain_pins_count_as_atomic_pins_do — passes when plain pins count as atomic pins do" },
   { id = "T-G3.3.5", text = "crates/engine/tests/shared_pages.rs g3s3_plain_misses_read_into_the_pages_evictions_leave — passes when a table four times the cache reads today's rows on the plain path and its misses read into recycled pages" },
   { id = "T-G3.3.6", text = "crates/engine/tests/page_path_allocs.rs — passes when the plain path's point lookups that miss allocate less than today's and its hits no more (a counting allocator; --nocapture prints allocations per lookup, AC-G3.3.2's harness)" },
+]
+
+# lane g3s6
+
+[[own]]
+id = "G3.6"
+title = "Point reads scale to 32 clients without shared writes (G3 step 6, prototype F; store.md decision 43)"
+criteria = [
+  { id = "AC-G3.6.1", text = "point_pk at 32 clients over 1 client is at least 12x, with AMPHORA_READ_CHECKOUT=slots and AMPHORA_SHARED_PAGE_READS=optimistic (the suite; measured by the coordinator)" },
+  { id = "AC-G3.6.2", text = "contended cache lines on the read path at 32 clients are at most 1, by perf c2c HITM records per million lookups (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G3.6.1", text = "storage::optimistic_pages::tests::g3_s6_32_readers_and_a_writer_see_no_unsnapshotted_version_and_no_torn_page — passes when 32 readers beside a writer and a checkpoint's nemesis get only whole images of the versions their snapshots asked for, some of them without a lock (AMPHORA_G3S6_SECONDS=60 for the 60 s run)" },
+  { id = "T-G3.6.2", text = "storage::optimistic_pages::tests::g3_s6_frames_give_back_what_was_offered_until_forgotten and g3_s6_only_the_optimistic_pool_reads_without_its_lock — pass when the frames return what they were offered until it is forgotten, and only the optimistic pool makes them, charged to its budget" },
+  { id = "T-G3.6.3", text = "store::checkout::tests::g3_s6_* — pass when slot readers never serve two reads at once, a reader waiting for a slot is woken when one is given back or when the log's restart gives every slot back, and a release lets every slot reader go" },
 ]
 
 # lane qs7

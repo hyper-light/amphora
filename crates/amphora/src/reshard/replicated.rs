@@ -415,8 +415,10 @@ mod tests {
         let stale = log.members[0].directory().clone();
         let book = tempfile::tempdir().unwrap();
         let retired = book.path().join("retired");
-        let groups =
-            Groups::on(&stale, Config::default(), &retired, |g| Ok(mem(&disks, g))).unwrap();
+        let groups = Groups::on(NodeId(0), &stale, Config::default(), &retired, |g| {
+            Ok(mem(&disks, g))
+        })
+        .unwrap();
         let at = 1u64 << 63;
         let (low, high) = (key(|p| p < at), key(|p| p >= at));
         let t = groups.put(vec![(low.clone(), 1)]).unwrap();
@@ -511,8 +513,10 @@ mod tests {
         // Started again by the directory from before the split: the old group answers from the
         // holding it kept, which no longer holds the range, so the stale route is refused.
         drop(groups);
-        let again =
-            Groups::on(&stale, Config::default(), &retired, |g| Ok(mem(&disks, g))).unwrap();
+        let again = Groups::on(NodeId(0), &stale, Config::default(), &retired, |g| {
+            Ok(mem(&disks, g))
+        })
+        .unwrap();
         assert_eq!(
             again.put(vec![(high.clone(), 6)]).err(),
             Some(Store::Away(Away::Elsewhere))
