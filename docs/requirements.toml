@@ -323,6 +323,8 @@ tests = [
   { id = "T-PL.5.1", text = "A star join whose dimension filters keep no fact row — passes when the answer is unchanged and the filters' memory stays within their stated bound" },
   # lane qs5-9
   { id = "T-PL.5.2", text = "pl_5_star_join_filters_fire_and_answers_hold (crates/engine/tests/join_methods.rs) — passes when a star join, its filters keeping some fact rows and none, gives the model's answer with hash joins only, nested loops only and by cost, and the hash-join plans probe a Bloom filter" },
+  # lane qs5-10
+  { id = "T-PL.5.4", text = "t_qt_5_5_the_planner_takes_the_learned_row_cost (crates/engine/translate/optimizer/learned_costs.rs) — passes when the Bloom filter's lookup and a WHERE step reach the planner as the weights calibration measured for them (bloom_lookup_cost, cpu_cost_per_where_step)" },
   { id = "T-PL.5.3", text = "pl_5_sized_filter_* (crates/engine/vdbe/bloom_filter.rs) — passes when a filter sized from its build's distinct keys has no false negative and about its derived rate, and one past its memory bound or not worth its bits passes every key" },
 ]
 
@@ -837,6 +839,8 @@ tests = [
   { id = "T-QT.5.3", text = "Predicate transfer over a cyclic join graph and over an outer join (transfer in one direction only) — passes when identical results, and the filters' memory within the statement's stated bound" },
   { id = "T-QT.5.4", text = "TPC-H q01 and q06, which join nothing — passes when no filter built, times within the passes' spread of the parent's" },
   { id = "T-QT.5.5", text = "The seek, hash-build, hash-probe and sort weights, learned per database (calibrated at start, moved by operators' times) — passes when calibration alone gives finite positive weights, observed times move a weight to the observed rate, and meaningless observations leave it" },
+  # lane qs5-10
+  { id = "T-QT.5.6", text = "t_qt_5_5_calibration_weights_hold_through_preempted_samples and t_qt_5_5_a_median_settles_once_its_spread_is_within_the_resolution (crates/engine/translate/optimizer/learned_costs.rs) — passes when calibration with a clock that jumps a millisecond every eleventh reading gives the steady clock's weights, and a kind's samples stop once their median's order-statistic standard error is within the timer's cost" },
 ]
 
 # lane records-api: Amphora's own IDs for CP-T1.5's Records API (kiln goal a1f386fe, G9 step 1;
@@ -1079,6 +1083,11 @@ title = "The planner chooses the column copy or the rows for each scan by measur
 criteria = [
   { id = "AC-CS.5.1", text = "An access path 'scan the column copy' costed from the copy's measured scan cost per row and its freshness (queued keys merged from the rows), chosen against the row path's learned rates; a copy that can't answer the snapshot exactly is no path (translate/optimizer/column_path.rs, storage/versioned/columns_path.rs; behind AMPHORA_COLUMN_PATH=on until step 4's scan lands)" },
   { id = "AC-CS.5.2", text = "Each analytic class against the best of CedarDB and ClickHouse is at least 1.0x (measured by the coordinator)" },
+  # lane g11s5c
+  { id = "AC-CS.5.3", text = "SQL tables on the versioned storage keep a column copy behind AMPHORA_COLUMN_PATH=on, fed from the commit stream through Database::commit's feeds (one a tree), chosen by measured use: rent before buying (Karlin et al. 1988), a table's first analytic statement read by the rows, its second making the copy; a dropped table's copy goes with it (storage/versioned/columns_sql.rs)" },
+  { id = "AC-CS.5.4", text = "A SQL aggregate the executor's scan hook takes (translate/parallel.rs) reads its table's copy when the planner chooses it, on as many cores as the morsel executor finds pay (Plan::run_on_cores), else its serial loop reads the rows; never in a transaction that changed rows or outside autocommit (vdbe/execute.rs op_morsel_aggregate)" },
+  # lane g11s5e
+  { id = "AC-CS.5.5", text = "A SQL table's column copy takes the bytes of its queue, its decoded blocks and its blocks from the storage's memory source as they grow and gives them back as they go, no share set aside; a copy whose blocks the source refuses is let go with the refusal kept as its reason (columns_sql::Dropped) and the rows answer; a SUM over a column holding text or blobs is declined to the rows (storage/versioned/columns_sql.rs)" },
 ]
 tests = [
   { id = "T-CS.5.1", text = "cs5_answers_identical_whichever_path_{plain,packed} (crates/engine/storage/versioned/columns_path.rs) — passes when every whole-table and point read, by either path, from a copy with deltas and queued keys, equals the rows at its snapshot" },
@@ -1087,6 +1096,13 @@ tests = [
   { id = "T-CS.5.4", text = "cs5_* in translate/optimizer/column_path.rs — passes when the choice follows the costs: copy for wide shapes, rows for point reads and short ranges, no path when off or stale, queued keys priced, an unmeasured copy tried only for whole tables" },
   { id = "T-CS.5.5", text = "cs5_vectorized_aggregates_identical_and_chosen_by_cost (crates/engine/storage/versioned/columns_path.rs) — passes when whole-table, grouped and key-range aggregates equal the rows' at the snapshot by either path, with the switch on the copy is read by step 4's vectorized scan (granules read, only queued keys from the rows), off every row is read, and a copy behind its snapshot reads no granule" },
   { id = "T-CS.5.6", text = "cs5_scan_hook_runs_only_when_the_copy_is_chosen — passes when a scan given to the CopyScan hook runs once per aggregate the copy is chosen for and answers it, never with the switch off or on a stale copy" },
+  # lane g11s5c
+  { id = "T-CS.5.7", text = "cs5_sql_aggregates_answer_alike_on_copy_and_rows (crates/engine/storage/versioned/columns_sql.rs) — passes when SQL filters, aggregates and GROUP BY answer the same with the copies' switch on and off, with inserts, updates and deletes between rounds, and the counts show one copy kept and statements read from it" },
+  { id = "T-CS.5.8", text = "cs5_a_copy_is_kept_only_for_tables_analytic_statements_read — passes when a table only point-read and a table read by one analytic statement keep no copy, and a second analytic statement makes one" },
+  { id = "T-CS.5.9", text = "cs5_a_copy_behind_its_snapshot_is_never_read — passes when, after a commit its full queue dropped, the next statement is answered by the rows with the copy unread, the copy is rebuilt, and the statement after reads it, every answer the rows'" },
+  # lane g11s5e
+  { id = "T-CS.5.10", text = "cs5_a_copy_its_memory_refuses_is_let_go_and_the_rows_answer (crates/engine/storage/versioned/columns_sql.rs) — passes when each copy whose blocks the memory source refuses is let go with the source's typed refusal kept and counted, none is read, and every answer is the rows'; cs5_a_feeds_queue_takes_from_its_memory_source (columns.rs) — passes when a queued record's bytes are held by the source and given back when the feed goes, and a record the source refuses is lost, not queued" },
+  { id = "T-CS.5.11", text = "cs5_sum_over_text_in_an_integer_column_answers_as_sqlite (crates/engine/storage/versioned/columns_sql.rs) — passes when a SUM over an INTEGER column holding text and a blob answers the same with the copies' switch on and off, as a real, and no such SUM is read from the copy" },
 ]
 
 # lane many-writers
