@@ -315,6 +315,18 @@ struct Control {
     // This replica's token reads, counted (`tokens`).
     sessions: tokens::SessionMeter,
 }
+impl Control {
+    /// Wakes the senders waiting in [`ReplicaHandle::drain_wait`] for a status just published that
+    /// fenced or ended (CP-T1.13): under the outgoing lock, which a drain holds as it reads the
+    /// status, so none misses it. Called with the status lock released (a drain takes the two in
+    /// that order). A poisoned lock leaves no waiter: its drain fails on that poison.
+    fn fenced_to_senders(&self) {
+        if let Ok(outgoing) = self.outgoing.lock() {
+            self.sent.notify_all();
+            drop(outgoing);
+        }
+    }
+}
 /// What a replica's owner published of its closed time, and of its applied and answered points
 /// (the session tokens', `tokens`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1263,11 +1275,22 @@ impl ReplicaHandle {
     }
 
     /// As [`Self::drain`], waiting until `until` for a record when none waits: a host's sender
-    /// waits here rather than spinning (`crate::serve`, CP-T1.13).
+    /// waits here rather than spinning (`crate::serve`, CP-T1.13). With none waiting, refused
+    /// Fenced at once while the replica is fenced, and with the owner's reason once it ended: the
+    /// owner rings `sent` when it publishes either (`Control::fenced_to_senders`), so a fenced
+    /// member's sender hears it then, not at `until`.
     pub fn drain_wait(&self, limit: usize, until: Instant) -> Result<Vec<Outbound>, Refusal> {
         {
             let mut outgoing = locked(&self.shared.outgoing)?;
-            while outgoing.messages.is_empty() && locked(&self.shared.status)?.is_ok() {
+            while outgoing.messages.is_empty() {
+                match &*locked(&self.shared.status)? {
+                    Err(ended) => return Err(ended.clone()),
+                    Ok(s) => {
+                        if let Some(reason) = &s.fenced {
+                            return Err(fenced(reason));
+                        }
+                    }
+                }
                 let left = until.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     break;
@@ -2207,6 +2230,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             // Waiters for a leader hear it ended (under the lock, so none misses it).
             self.control.led.notify_all();
         }
+        // So do the member's senders, waiting for its next record (CP-T1.13).
+        self.control.fenced_to_senders();
         // Local reads end with the owner: none opens again, and the idle readers let its lease go.
         self.control.local.release();
         // Reads waiting for a closed time hear it ended (under the lock, so none misses it).
@@ -2474,16 +2499,23 @@ impl<F: BlockFile + 'static> Actor<F> {
         let took = (self.clock)().saturating_duration_since(at);
         self.spacing.stepped(entries, took, queued)?;
         let now = status(&self.replica);
-        {
+        let fencing = {
             let mut published = locked(&self.control.status)?;
             let led = !matches!(&*published,
                 Ok(was) if was.leader == now.leader && was.fenced == now.fenced);
+            let fencing =
+                now.fenced.is_some() && !matches!(&*published, Ok(was) if was.fenced.is_some());
             *published = Ok(now);
             // Waiters for a leader wake on the step that names a new one or fences, never on a
             // timer.
             if led {
                 self.control.led.notify_all();
             }
+            fencing
+        };
+        // The member's senders wake on the step that fences, as on the owner's end (CP-T1.13).
+        if fencing {
+            self.control.fenced_to_senders();
         }
         self.publish_closed()?;
         let commits = self.replica.core().raft.commit_stats();

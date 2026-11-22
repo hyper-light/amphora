@@ -532,3 +532,119 @@ fn t_t1_13_1_a_leaders_disk_hung_under_load_loses_no_acknowledged_write() {
     assert!(ok, "{summary}{report}");
     assert!(report.contains("nothing lost"), "{report}");
 }
+
+/// A refused log write ends the member (CP-T1.13, T-T1.13.1), traced through the replica: a lone
+/// voter's log disk cut, its next write fails at hyper-log (the device's I/O error, `Fault::Failed`),
+/// hyper-durable fences the replica on it, the owner ends on the fence, and the drain the member's
+/// sender waits in (`ReplicaHandle::drain_wait`, `serve`'s loop) answers Fenced at once, woken by
+/// the fence, not at its deadline, so `serve` returns and the process ends.
+#[test]
+fn t_t1_13_1_a_refused_log_write_ends_the_replica_and_wakes_its_drain() {
+    use amphora::database::{Database, LogDisk};
+    use amphora_api::{Refusal, replication::ReplicaConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("raft.log");
+    // A hang guard on the calls; the drain's deadline is the one the verdict reads.
+    let until = || Instant::now() + Duration::from_secs(600);
+    let config = ReplicaConfig {
+        node_id: 1,
+        voters: vec![1],
+        learners: vec![],
+        bootstrap: None,
+    };
+    let db =
+        Database::open_replicated(&dir.path().join("state.db"), &log, config, until()).unwrap();
+    let handle = db.replica().unwrap();
+    handle.wait_leader(until()).unwrap();
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t(v INTEGER); INSERT INTO t VALUES(1)")?;
+        Ok(())
+    })
+    .unwrap();
+
+    // The member's sender waits for its next record; a lone voter sends none.
+    let drain_until = until();
+    let (waiting, waits) = std::sync::mpsc::channel();
+    let drain = {
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            waiting.send(()).unwrap();
+            let drained = handle.drain_wait(1, drain_until);
+            (drained, Instant::now())
+        })
+    };
+    waits.recv().unwrap();
+
+    Database::set_log_disk(&log, LogDisk::Cut).unwrap();
+    let refused = db.call(until(), |c| {
+        c.execute_batch("INSERT INTO t VALUES(2)")?;
+        Ok(())
+    });
+    // Fenced, or UnknownOutcome when the fence ends the owner with the write pending.
+    assert!(
+        matches!(refused, Err(Refusal::Fenced(_) | Refusal::UnknownOutcome)),
+        "a write on a cut disk: {refused:?}"
+    );
+    let (drained, at) = drain.join().unwrap();
+    assert!(
+        matches!(&drained, Err(Refusal::Fenced(_))),
+        "the drain of a fenced replica: {drained:?}"
+    );
+    assert!(
+        at < drain_until,
+        "the drain waited out its deadline: the fence didn't wake it"
+    );
+    let ended = handle.status();
+    assert!(
+        matches!(&ended, Err(Refusal::Fenced(_))),
+        "the replica's status after the refused write: {ended:?}"
+    );
+}
+
+/// A hung disk waits with no time limit, so only a drill cluster may ask for one (CP-T1.13,
+/// T-T1.13.1): a member whose config says `drills = off` refuses `disk` (and `cut`), naming the
+/// switch, and its log's disk is untouched: its writes go on.
+#[test]
+fn t_t1_13_1_a_member_without_drills_refuses_the_disk_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret");
+    std::fs::write(&secret, "0123456789abcdef0123456789abcdef-test-secret\n").unwrap();
+    let text = format!(
+        "node = 1\nmembers = 1@127.0.0.1:{}\ndata = {}\nclass = persisted\nsecret_file = {}\ndeadline_ms = 5000\ndrills = off\n",
+        free_port(),
+        dir.path().join("m1").display(),
+        secret.display()
+    );
+    let c = Config::parse(&text).unwrap();
+    assert!(!c.drills);
+    let (up, listening) = std::sync::mpsc::channel();
+    {
+        let c = c.clone();
+        std::thread::spawn(move || {
+            let ended = serve::serve(&c, move |_| {
+                let _ = up.send(());
+            });
+            eprintln!("member 1 ended: {ended:?}");
+        });
+    }
+    listening.recv().unwrap();
+    let secret = c.secret().unwrap();
+    let mut member = Client::connect(&c.members[0].addr, &secret, c.deadline).unwrap();
+    member.leader(Duration::from_secs(60)).unwrap();
+    for request in ["disk hang", "disk cut", "disk back", "cut on"] {
+        let refused = member
+            .ask(request)
+            .expect_err("a member without drills took a drill's request");
+        assert!(
+            format!("{refused:#}").contains("drills are off"),
+            "{request}: {refused:#}"
+        );
+    }
+    member
+        .ask("exec CREATE TABLE t(v INTEGER); INSERT INTO t VALUES(1)")
+        .unwrap();
+    assert_eq!(
+        member.ask("count SELECT count(*) FROM t").unwrap().trim(),
+        "1"
+    );
+}
