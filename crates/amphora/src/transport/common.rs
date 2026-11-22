@@ -270,8 +270,9 @@ impl Nodes {
     /// One step of a transaction across groups on group `here`, whose owner is `node`'s endpoint
     /// (CP-T1.10; xgroup.md, "Over the transport"): one authenticated connection and one request,
     /// as a pull is. `carried` is the newest commit stamp the coordinator heard of; the answer
-    /// carries the group's newest after the step (none: it makes no stamps). An answer lost after
-    /// the request went out is [`Error::UnknownOutcome`]: the step may have landed.
+    /// carries the group's newest after the step (none: it makes no stamps), and its closed time
+    /// after the step in a session token's microseconds (none: it keeps none). An answer lost
+    /// after the request went out is [`Error::UnknownOutcome`]: the step may have landed.
     pub fn step(
         &self,
         node: crate::reshard::NodeId,
@@ -279,7 +280,7 @@ impl Nodes {
         carried: u64,
         envelope: crate::xgroup::Envelope,
         until: Instant,
-    ) -> Result<(crate::xgroup::Reply, Option<u64>), Error> {
+    ) -> Result<(crate::xgroup::Reply, Option<u64>, Option<u64>), Error> {
         let Some(path) = self.endpoints.get(&node) else {
             return Err(unavailable(format_args!("no endpoint known for node {}", node.0)).into());
         };
@@ -293,7 +294,11 @@ impl Nodes {
             envelope,
         };
         match client.request(request, until)? {
-            Answer::Stepped { reply, latest } => Ok((reply, latest)),
+            Answer::Stepped {
+                reply,
+                latest,
+                closed,
+            } => Ok((reply, latest, closed)),
             _ => Err(unavailable(format_args!(
                 "node {}'s answer to a step is not a step's",
                 node.0
@@ -1000,8 +1005,13 @@ fn serve(
             here,
             carried,
             envelope,
-        } => crate::xgroup::sql::serve(&database, here, carried, envelope, until)
-            .map(|(reply, latest)| Answer::Stepped { reply, latest }),
+        } => crate::xgroup::sql::serve(&database, here, carried, envelope, until).map(
+            |(reply, latest, closed)| Answer::Stepped {
+                reply,
+                latest,
+                closed,
+            },
+        ),
         Request::Records { namespace, op } => (|| {
             let ns = database.namespace(&namespace)?;
             Ok(match op {

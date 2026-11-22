@@ -1291,6 +1291,20 @@ tests = [
   { id = "T-T1.10.W3", text = "xgroup::sql::sessions::ac_t1_10_1_commit_records_writes_rows_in_every_group — passes when a Records transaction over three groups through commit_records, answered once resolved, reads back in every group straight after its answer, both protocols" },
 ]
 
+# lane xgroup-sql-9: a group on another node adds its closed time to a cross-group commit's token, and a session
+# reads at a follower behind the commit (kiln goal e25ba5fe; xgroup.md, "Reading its own writes across groups").
+[[own]]
+id = "T1.10.WN"
+title = "A cross-group commit's token covers groups on other nodes, and a session reading at a follower behind it waits or is redirected"
+criteria = [
+  { id = "AC-T1.10.W3", text = "A step's answer from a group on a node carries the group's closed time after the step (Answer::Stepped's closed, wire version 9; none for a group that keeps none), and commit_records folds the newest heard from each touched group on a node into its token" },
+  { id = "AC-T1.10.W4", text = "A session read carrying a cross-group commit's token at a follower behind it never answers without the commit: it waits on the follower's publication until it has applied the token's time, or is redirected to the leader" },
+]
+tests = [
+  { id = "T-T1.10.W4", text = "xgroup::sql::sessions::t_t1_10_w4_a_group_on_a_second_node_adds_its_closed_time_to_the_token — passes when a Records transaction across a local standalone group and a replicated group reached only over the transport answers a token past 0 and no later than that group's own token after it, and a read carrying it there sees the commit, both protocols" },
+  { id = "T-T1.10.W5", text = "xgroup::sql::sessions::t_t1_10_w5_a_token_read_at_a_follower_behind_waits_or_is_redirected — passes when, with one of group 1's three members cut off before a cross-group commit, a read with no token there misses it and a read carrying the token, begun while it is cut off, either sees the commit once it is reached again or is redirected to the leader, where the token sees it, both protocols" },
+]
+
 # lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session
 # tokens"). Ada's order 2026-11-22: built behind ReadMode, today's read the control.
 [[own]]

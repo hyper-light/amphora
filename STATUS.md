@@ -17,6 +17,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   over real groups. Waits on the coordinator: which setting stays, from live runs; the LAN p99 and 10,000-seed runs.
   At scale (lane xgroup-sql-5): `xgroup_lan refusals` runs Stop against Retry under many callers and correlated
   refusals, one JSON line a run; the SQL hookup waits on a Database over Groups and a Tablet over the records tables.
+- **Cross-group tokens over nodes and followers behind** (CP-T1.10, AC-T1.10.1, lane xgroup-sql-9;
+  docs/design/xgroup.md): a step's answer over the transport carries its group's closed time (wire version 9), so a
+  group on another node adds to `commit_records`' token; tests cover a replicated group on a second node and a
+  session reading at a follower cut off before the commit (it waits or is redirected, never misses).
 - **Reading its own writes across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql-8; docs/design/xgroup.md):
   `Options::answer_at` holds a cross-group answer, aborts included, until every touched group resolved it
   (`Resolved`), with today's answer at the decision as the control; `commit_records` answers the touched groups'

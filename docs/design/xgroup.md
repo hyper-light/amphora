@@ -109,8 +109,15 @@ the caller hears decides what it can rely on, and `Options::answer_at` switches 
 answered (`Database::session_token`; Ada's decision: the commit's revision across groups is the
 cross-group hybrid-logical-clock timestamp, the same one the read-your-writes tokens use, `Token::at`).
 Under `Resolved` every group's resolution is in its closed time by then, so a read that carries the
-token reads the rows on any replica. A group on a node adds nothing to the token yet: its step's
-reply doesn't carry its closed time.
+token reads the rows on any replica. A group on a node adds its closed time too (lane xgroup-sql-9,
+wire version 9): its owner answers each step with the group's closed time after it, a session
+token's microseconds (`Answer::Stepped`'s `closed`, none for a group that keeps none), and the
+cluster keeps the newest heard from each group on a node. Its last step resolved the commit there
+before a `Resolved` answer comes, so that time is at or past the commit's rows in that group
+(`t_t1_10_w4_*`). A session reading at a follower behind the commit waits, on its owner's
+publication, until the follower has applied the token's time, or is redirected to the leader past
+the follower's measured apply lag; it never answers without the commit (`t_t1_10_w5_*`, a follower
+cut off before the commit and reached again while the read waits).
 
 Each mode's failure mode is forced in `xgroup::sql::sessions`: one group's resolution held back (a
 group behind the decision), a read of it straight after the answer
@@ -175,7 +182,8 @@ in flight landing first or not, under both protocols (T-T1.10.X3).
 
 A group on another node is reached as `Member::Node` (`xgroup::sql`): each step is one request over
 the owner transport, `Request::Step { here, carried, envelope }`, answered `Answer::Stepped { reply,
-latest }` (wire version 8; both variants appended after every existing one). `transport::Nodes`
+latest, closed }` (wire version 8; both variants appended after every existing one; version 9 added
+`closed`, below in "Reading its own writes across groups"). `transport::Nodes`
 (CP-T1.9, lane split-merge-10's) carries it as it carries a pull: one authenticated connection and
 one request, to the endpoint of the group's database, whose owner applies the step as a local one
 is applied, one `call_internal` and one atomic commit. The coordinator's newest commit stamp goes

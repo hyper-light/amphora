@@ -495,26 +495,37 @@ pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
 }
 
 /// A step that came over the transport for this owner's group `here` (`Request::Step`): applied as
-/// a local one is, the coordinator's stamp `carried` taken in first; answers the reply and the
-/// group's newest stamp after it (none: the group makes no stamps).
+/// a local one is, the coordinator's stamp `carried` taken in first; answers the reply, the group's
+/// newest stamp after it (none: the group makes no stamps), and its closed time after it, a session
+/// token's microseconds (none: the group keeps no closed time; AC-T1.10.1, T-T1.10.W4). Taken
+/// after the step answered, the closed time is at or past the step's own commit, as a token taken
+/// after a write's answer is ([`Database::session_token`]).
 pub(crate) fn serve(
     group: &Database,
     here: GroupId,
     carried: u64,
     envelope: Envelope,
     until: Instant,
-) -> Result<(Reply, Option<u64>), Refusal> {
+) -> Result<(Reply, Option<u64>, Option<u64>), Refusal> {
     let stamp = AtomicU64::new(carried);
     let reply = step(group, &stamp, until, move |db| {
         apply(here, &mut SqlTablet::new(db), &envelope)
     })?;
-    Ok((reply, group.stamps().map(|_| stamp.load(Ordering::Acquire))))
+    let closed = group.session_token(until)?.map(|token| token.micros);
+    Ok((
+        reply,
+        group.stamps().map(|_| stamp.load(Ordering::Acquire)),
+        closed,
+    ))
 }
 
-/// Runs one step on `member`, its stamps carried either way.
+/// Runs one step on `member`, its stamps carried either way. A group on a node answers its closed
+/// time after the step too, kept in `closed` as the newest heard from it ([`closed_after`]); a
+/// local group's is read where it is.
 fn step_on(
     member: &Member,
     carried: &AtomicU64,
+    closed: Option<&AtomicU64>,
     until: Instant,
     here: GroupId,
     envelope: Envelope,
@@ -524,7 +535,7 @@ fn step_on(
             apply(here, &mut SqlTablet::new(db), &envelope)
         }),
         Member::Node { nodes, node } => {
-            let (reply, latest) = nodes
+            let (reply, latest, micros) = nodes
                 .step(
                     *node,
                     here,
@@ -535,6 +546,9 @@ fn step_on(
                 .map_err(Refusal::from)?;
             if let Some(latest) = latest {
                 carried.fetch_max(latest, Ordering::AcqRel);
+            }
+            if let (Some(closed), Some(micros)) = (closed, micros) {
+                closed.fetch_max(micros, Ordering::AcqRel);
             }
             Ok(reply)
         }
@@ -672,6 +686,9 @@ pub struct Cluster {
     groups: Arc<Vec<Member>>,
     route: Route,
     carried: Arc<AtomicU64>,
+    /// Each group's newest closed time a step on it answered with, by group: only groups on a
+    /// node fill theirs ([`closed_after`]); 0, none heard.
+    closed: Arc<Vec<AtomicU64>>,
     instruments: Instruments,
 }
 
@@ -836,6 +853,8 @@ impl Cluster {
         let (ready, is_ready) = mpsc::sync_channel(1);
         let groups = Arc::new(groups);
         let carried: Arc<AtomicU64> = Arc::default();
+        let closed: Arc<Vec<AtomicU64>> =
+            Arc::new(groups.iter().map(|_| AtomicU64::new(0)).collect());
         let instruments: Instruments = Arc::default();
         let driver = Driver {
             groups: Arc::clone(&groups),
@@ -851,6 +870,7 @@ impl Cluster {
             open_until: until,
             ready: Some(ready),
             carried: Arc::clone(&carried),
+            closed: Arc::clone(&closed),
             options,
             held: BTreeMap::new(),
             answers: BTreeMap::new(),
@@ -868,6 +888,7 @@ impl Cluster {
             groups,
             route,
             carried,
+            closed,
             instruments,
         };
         match is_ready.recv_timeout(until.saturating_duration_since(Instant::now())) {
@@ -995,23 +1016,28 @@ pub fn commit_records(
 /// time any of them published ([`Database::session_token`], microseconds since the Unix epoch, the
 /// groups' one hybrid logical clock), so a replica of any of them serves a read that carries it
 /// once it has applied everything up to that time. A group that keeps no closed time (standalone:
-/// its reads see every write) adds nothing. A group on a node adds nothing yet: its step's reply
-/// doesn't carry its closed time.
+/// its reads see every write) adds nothing. A group on a node adds the newest closed time its
+/// steps answered with (T-T1.10.W4): under [`AnswerAt::Resolved`] its last step resolved the
+/// commit there before the answer came, so that time is at or past the commit's rows.
 fn closed_after(
     cluster: &Cluster,
     touched: &BTreeSet<GroupId>,
     until: Instant,
 ) -> Result<Token, Refusal> {
     let mut micros = 0;
-    for group in touched {
-        let member = usize::try_from(*group)
-            .ok()
-            .and_then(|i| cluster.groups.get(i));
-        if let Some(Member::Local(database)) = member
-            && let Some(token) = database.session_token(until)?
-        {
-            micros = micros.max(token.micros);
-        }
+    for i in touched
+        .iter()
+        .filter_map(|group| usize::try_from(*group).ok())
+    {
+        let heard = match cluster.groups.get(i) {
+            Some(Member::Local(database)) => database.session_token(until)?.map(|t| t.micros),
+            Some(Member::Node { .. }) => cluster
+                .closed
+                .get(i)
+                .map(|closed| closed.load(Ordering::Acquire)),
+            None => None,
+        };
+        micros = micros.max(heard.unwrap_or(0));
     }
     Ok(Token::at(micros))
 }
@@ -1118,6 +1144,8 @@ struct Driver {
     /// (T-T1.12.X2, docs/design/backup.md, "Cuts across machines"): a group a step reaches stamps
     /// its commit after every commit the coordinator heard of before sending it.
     carried: Arc<AtomicU64>,
+    /// Each group's newest closed time a step on it answered with ([`Cluster`]'s, shared).
+    closed: Arc<Vec<AtomicU64>>,
     options: Options,
     /// Steps a group refused before taking, each to be sent again at its instant
     /// ([`OnRefused::Retry`]): its group, transaction, envelope and refusals so far. At most the
@@ -1354,6 +1382,7 @@ impl Driver {
             .ok_or_else(|| amphora_api::invalid("cross-group step", "no such group"))?;
         let inputs = self.inputs.clone();
         let carried = Arc::clone(&self.carried);
+        let closed = Arc::clone(&self.closed);
         let fault = self.options.fault.clone();
         let again = (self.options.on_refused == OnRefused::Retry)
             .then(|| (here, envelope.clone(), refusals));
@@ -1371,7 +1400,7 @@ impl Driver {
             .spawn(move || {
                 let reply = match fault.and_then(|fault| fault(here, &envelope)) {
                     Some(refusal) => Err(refusal),
-                    None => step_on(&group, &carried, until, here, envelope),
+                    None => step_on(&group, &carried, closed.get(index), until, here, envelope),
                 };
                 // A driver gone by now has stopped: its successor recovers the step.
                 let _ = inputs.send(Input::Reply { id, reply });
@@ -1532,7 +1561,6 @@ mod step_times {
 #[cfg(test)]
 mod sessions {
     use super::*;
-    use std::collections::BTreeSet;
 
     fn until() -> Instant {
         Instant::now() + crate::transport::HANG
@@ -2217,6 +2245,236 @@ mod sessions {
                     }
                 }
             });
+        }
+    }
+
+    /// A replicated group in this process, each member its own database whose owner listens at
+    /// its own endpoint, their records relayed in process: each member's records taken as they are
+    /// sent ([`crate::replication::ReplicaHandle::drain_wait`], woken by the send, never a timer),
+    /// and every record to the member `cut` names (0: none) dropped, as a network that lost it.
+    struct Replicas {
+        paths: Vec<std::path::PathBuf>,
+        dbs: Vec<Database>,
+        cut: Arc<AtomicU64>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Replicas {
+        fn open(dir: &std::path::Path, name: &str, voters: u64) -> Self {
+            let paths: Vec<_> = (1..=voters)
+                .map(|n| dir.join(format!("{name}-{n}.db")))
+                .collect();
+            let dbs: Vec<Database> = (1..=voters)
+                .zip(&paths)
+                .map(|(node_id, path)| {
+                    let config = amphora_api::replication::ReplicaConfig {
+                        node_id,
+                        voters: (1..=voters).collect(),
+                        learners: Vec::new(),
+                        bootstrap: None,
+                    };
+                    Database::open_replicated(path, &path.with_extension("log"), config, until())
+                        .unwrap()
+                })
+                .collect();
+            let cut = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            for from in 1..=voters {
+                let handles: Vec<_> = dbs.iter().map(|d| d.replica().unwrap()).collect();
+                let (cut, stop) = (Arc::clone(&cut), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mine = &handles[usize::try_from(from - 1).unwrap()];
+                    while !stop.load(Ordering::Acquire) {
+                        // An owner gone ends its relay.
+                        let Ok(records) = mine.drain_wait(64, until()) else {
+                            return;
+                        };
+                        for record in records {
+                            if record.to == cut.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            let to = usize::try_from(record.to - 1).unwrap();
+                            // A record a member can't take now is lost, as on a network: Raft
+                            // sends it again.
+                            let _ = handles[to].receive(from, record.bytes, until());
+                        }
+                    }
+                });
+            }
+            Self {
+                paths,
+                dbs,
+                cut,
+                stop,
+            }
+        }
+
+        /// The member that leads, found by the group's first write: the cross-group tables
+        /// ([`prepare`]), made through whichever member it is asked of. A write before any member
+        /// leads waits for one (an owner holds a submit for want of a leader); one off the leader
+        /// is refused naming it.
+        fn leader(&self) -> usize {
+            let mut at = 0;
+            for _ in 0..=self.dbs.len() {
+                match prepare(&self.dbs[at], until()) {
+                    Ok(()) => {
+                        let status = self.dbs[at].replica_status(until()).unwrap().unwrap();
+                        return usize::try_from(status.leader - 1).unwrap();
+                    }
+                    Err(Refusal::NotLeader { leader: Some(id) }) => {
+                        at = usize::try_from(id - 1).unwrap();
+                    }
+                    Err(refusal) => panic!("{refusal:?}"),
+                }
+            }
+            panic!("no member led");
+        }
+    }
+
+    impl Drop for Replicas {
+        fn drop(&mut self) {
+            // Each relay ends at its member's next record, or once its owner is gone.
+            self.stop.store(true, Ordering::Release);
+        }
+    }
+
+    /// A cluster over group 0, `local`, in this process, and group 1, `replicas` reached only
+    /// over the transport at member `at`'s endpoint; answering once resolved.
+    fn across_nodes(
+        local: &Database,
+        replicas: &Replicas,
+        at: usize,
+        protocol: Protocol,
+    ) -> Cluster {
+        prepare(local, until()).unwrap();
+        let node = crate::reshard::NodeId(1);
+        let nodes = Arc::new(crate::transport::Nodes::new([(
+            node,
+            replicas.paths[at].clone(),
+        )]));
+        let members = vec![Member::Local(local.clone()), Member::Node { nodes, node }];
+        let options = Options {
+            answer_at: AnswerAt::Resolved,
+            ..Options::default()
+        };
+        Cluster::open_with(members, route_of(2), 1, protocol, 1, options, until()).unwrap()
+    }
+
+    /// Rows 0 and 1 of namespace `ns`'s family `rows` put to `v`: one in each of two groups.
+    fn puts(v: u8) -> amphora_api::Tx {
+        amphora_api::Tx {
+            conds: Vec::new(),
+            writes: (0..2u8)
+                .map(|k| amphora_api::Write::Put {
+                    family: "rows".into(),
+                    key: vec![k],
+                    value: vec![v],
+                })
+                .collect(),
+        }
+    }
+
+    /// Namespace `ns`'s head as `db` reads it in a session carrying `token` (none: a local read,
+    /// which waits for nothing); none before its first commit is there.
+    fn head(db: &Database, token: Option<Token>) -> Result<Option<i64>, Refusal> {
+        use crate::sql::OptionalExtension;
+        db.query_session(crate::database::ReadMode::Session, token, until(), |c| {
+            Ok(c.query_row(
+                "SELECT head FROM __amphora_namespaces WHERE name = ?1",
+                ["ns"],
+                |r| r.get::<_, i64>(0usize),
+            )
+            .optional()?)
+        })
+    }
+
+    /// T-T1.10.W4 (AC-T1.10.1, lane xgroup-sql-9): a group on a second node adds its closed time
+    /// to the token. Do: group 0 standalone in this process (the registry), group 1 one replicated
+    /// member whose owner listens at its own endpoint, reached only over the transport; a Records
+    /// transaction across both through [`commit_records`], answered once resolved, both protocols.
+    /// Expect: the token is past 0 (only group 1 keeps a closed time, and only its steps' replies
+    /// carry it here) and no later than group 1's own token taken after it; a read carrying it on
+    /// group 1 sees the commit.
+    #[test]
+    fn t_t1_10_w4_a_group_on_a_second_node_adds_its_closed_time_to_the_token() {
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            let dir = tempfile::tempdir().unwrap();
+            let replicas = Replicas::open(dir.path(), "group1", 1);
+            let leader = replicas.leader();
+            let local = Database::open(&dir.path().join("group0.db"), until()).unwrap();
+            let cluster = across_nodes(&local, &replicas, leader, protocol);
+            let token = commit_records(&cluster, "ns", &puts(5), until()).unwrap();
+            let after = replicas.dbs[leader]
+                .session_token(until())
+                .unwrap()
+                .unwrap();
+            assert!(
+                token.micros > 0 && token.micros <= after.micros,
+                "{protocol:?}: {token:?} after {after:?}"
+            );
+            let seen = head(&replicas.dbs[leader], Some(token)).unwrap();
+            assert!(seen.is_some_and(|h| h >= 1), "{protocol:?}: {seen:?}");
+            drop(cluster);
+        }
+    }
+
+    /// T-T1.10.W5 (AC-T1.10.1, lane xgroup-sql-9): a session reads at a follower that is behind,
+    /// straight after a commit across groups. Do: group 1 three replicated members relayed in
+    /// process, reached over the transport at its leader; one follower cut off (every record to it
+    /// lost); a Records transaction across groups 0 and 1 through [`commit_records`], answered once
+    /// resolved, both protocols; a read with no token on the follower; a read carrying the token
+    /// on the follower, begun while it is cut off; then the follower reached again. Expect: the
+    /// read with no token misses the commit (the follower is behind); the token read never answers
+    /// without it: it waits for the follower (on its owner's publication) and sees it, or it is
+    /// redirected to the leader (NotLeader naming it), where the same token sees it; counted once.
+    #[test]
+    fn t_t1_10_w5_a_token_read_at_a_follower_behind_waits_or_is_redirected() {
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            let dir = tempfile::tempdir().unwrap();
+            let replicas = Replicas::open(dir.path(), "group1", 3);
+            let leader = replicas.leader();
+            let follower = (leader + 1) % replicas.dbs.len();
+            let local = Database::open(&dir.path().join("group0.db"), until()).unwrap();
+            let cluster = across_nodes(&local, &replicas, leader, protocol);
+            replicas
+                .cut
+                .store(u64::try_from(follower + 1).unwrap(), Ordering::Release);
+            let token = commit_records(&cluster, "ns", &puts(7), until()).unwrap();
+            assert!(token.micros > 0, "{protocol:?}: {token:?}");
+            let want = head(&replicas.dbs[leader], Some(token)).unwrap();
+            assert!(want.is_some_and(|h| h >= 1), "{protocol:?}: {want:?}");
+            // Cut off since before the commit, the follower can't have it.
+            let stale = head(&replicas.dbs[follower], None);
+            assert!(
+                !matches!(&stale, Ok(h) if *h == want),
+                "{protocol:?}: the follower wasn't behind: {stale:?}"
+            );
+            let reader = replicas.dbs[follower].clone();
+            let (begun, began) = mpsc::sync_channel(1);
+            let read = std::thread::spawn(move || {
+                begun.send(()).unwrap();
+                head(&reader, Some(token))
+            });
+            began.recv().unwrap();
+            replicas.cut.store(0, Ordering::Release);
+            match read.join().unwrap() {
+                Ok(seen) => assert_eq!(seen, want, "{protocol:?}: served without the commit"),
+                Err(Refusal::NotLeader { leader: Some(id) }) => {
+                    assert_eq!(usize::try_from(id - 1).unwrap(), leader, "{protocol:?}");
+                    assert_eq!(head(&replicas.dbs[leader], Some(token)).unwrap(), want);
+                }
+                Err(refusal) => panic!("{protocol:?}: {refusal:?}"),
+            }
+            let counted = replicas.dbs[follower]
+                .session_counters(until())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                counted.at_once + counted.waited + counted.redirects,
+                1,
+                "{protocol:?}: {counted:?}"
+            );
+            drop(cluster);
         }
     }
 }
