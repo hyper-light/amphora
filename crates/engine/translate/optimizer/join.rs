@@ -876,12 +876,24 @@ fn join_lhs_and_rhs<'a>(
             // build input is materialized from the join prefix.
             // Amphora: one method only when the connection asks (QT.5);
             // the structural conditions below hold whichever it asks for.
-            let preferred_over_seek = match planning_context.join_methods {
-                crate::JoinMethods::ByCost => {
-                    !rhs_has_selective_seek && !build_unique_key_search_without_statistics
+            // PL.8's test hook pins the plan: loops in the FROM order and one hash join, at the last
+            // table (`bushy_test_hook::PIN`).
+            #[cfg(test)]
+            let pinned = super::bushy_test_hook::PIN.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let pinned = false;
+            let pinned_hash_here =
+                pinned && joined_tables.len().checked_sub(1) == Some(rhs_table_idx);
+            let preferred_over_seek = if pinned {
+                pinned_hash_here
+            } else {
+                match planning_context.join_methods {
+                    crate::JoinMethods::ByCost => {
+                        !rhs_has_selective_seek && !build_unique_key_search_without_statistics
+                    }
+                    crate::JoinMethods::NestedLoopsOnly => false,
+                    crate::JoinMethods::HashJoinsOnly => true,
                 }
-                crate::JoinMethods::NestedLoopsOnly => false,
-                crate::JoinMethods::HashJoinsOnly => true,
             };
             let allow_hash_join = preferred_over_seek
                 && !probe_table_is_prior_build
@@ -933,7 +945,8 @@ fn join_lhs_and_rhs<'a>(
                     joined_tables,
                     // Amphora (PL.7): the probe table's scan costs its own pages.
                     &params.for_table(rhs_table_reference, analyze_stats),
-                    planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
+                    !pinned_hash_here
+                        && planning_context.join_methods != crate::JoinMethods::HashJoinsOnly,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -1094,7 +1107,9 @@ fn join_lhs_and_rhs<'a>(
                         input_cardinality,
                         params,
                     );
-                    let forced = planning_context.join_methods == crate::JoinMethods::HashJoinsOnly;
+                    let forced = pinned_hash_here
+                        || (!pinned
+                            && planning_context.join_methods == crate::JoinMethods::HashJoinsOnly);
                     if hash_join_allowed
                         && (forced
                             || hash_join_method.cost < best_access_method.cost
@@ -1486,6 +1501,17 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             ),
             _ => false,
         };
+
+    // PL.8's test hook pins the plan to the FROM order (`bushy_test_hook::PIN`).
+    #[cfg(test)]
+    if super::bushy_test_hook::PIN.with(std::cell::Cell::get) {
+        if let Some(plan) = naive_plan {
+            return Ok(Some(BestJoinOrderResult {
+                best_plan: plan,
+                best_ordered_plan: None,
+            }));
+        }
+    }
 
     // If we have one table, then the "naive left-to-right plan" is always the best.
     if joined_tables.len() == 1 {
