@@ -776,7 +776,10 @@ after the head none, and after a later write its stamp, past the head.
 **Left.** `commit` and `wait` still answer from this database alone. A commit across groups goes
 through the coordinator (`Cluster::commit`) but its conditions name revisions, which across groups
 are stamps; `wait` wakes on one database's commits, and across groups it wants one event a commit
-of any group, not a poll.
+of any group, not a poll. A waker registered in every group's watchers is that event, but the
+check it wakes for reads each group through `call_internal`, an `Operation::Call`, and every Call
+wakes every watcher (a Call may write), so the wait would wake itself without end. It needs a
+read across groups that doesn't wake, or Calls that wake only when they wrote.
 
 **Falsified by.** A get across groups missing a write of the key answered before it began; a get
 as of a stamp whose answer changes later; `changed` answering none while `changes` after the same
