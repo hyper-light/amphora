@@ -1259,3 +1259,26 @@ tests = [
   # lane skip-5 (fused batches, the losing kind's upkeep, the setting at run time)
   { id = "T-SKU.4", text = "skipping::tests::scans::t_sku_4_* — passes when, for each kind, four databases (column batches on and off by skipping on and off) take the same random writes and answer every filtered aggregate, GROUP BY and row query alike; with batches on the skipping scan's fused loops ran rows, and with batches on and off skipping read fewer rows than without" },
 ]
+
+# lane colcopy-4 (with colcopy-bound to colcopy-3): column copies within a fixed memory limit
+# (kiln goal c436eeb51c2c891ea1208618a490677f; columnar.md decision 2).
+[[own]]
+id = "CB"
+title = "Column copies granted their memory before they are built; a refused copy bought again by a switch, measured A against B"
+criteria = [
+  { id = "AC-CB.1.1", text = "Each block's bytes are asked of the memory source, sized from its format, before it is built, and each change's before it is applied: a copy never holds a byte it was not granted" },
+  { id = "AC-CB.1.2", text = "A build refused part way gives back every byte it took and leaves the copy as it was" },
+  { id = "AC-CB.2.1", text = "Both rebuy ways behind one switch (AMPHORA_COLUMN_REBUY): A rents and buys again; B waits for room" },
+  { id = "AC-CB.2.2", text = "Under B a refused copy is not bought again, nor its table read whole, until the source reports room for its expected size, re-estimated as its table grows" },
+  { id = "AC-CB.3.1", text = "Counted: state changes with reasons, takes asked, granted and refused, bytes held against bytes granted, rows and bytes rebuys read, rows the copy served against the row loop's" },
+  { id = "AC-CB.3.2", text = "Counted: time copies were absent and time they waited" },
+  { id = "AC-CB.4.1", text = "An A/B harness forces each way's failure mode at the extremes and records latency percentiles, throughput, memory, bytes read, rebuys and answer equality as JSONL" },
+]
+tests = [
+  { id = "T-CB.1.1", text = "columns::tests::cb1_blocks_are_granted_before_they_are_built — each format's bytes before a block is made equal the made block's resident bytes; the source holds exactly what the generations and queue were granted" },
+  { id = "T-CB.1.2", text = "columns::tests::cb1_blocks_are_granted_before_they_are_built — a build refused part way gives back all it took and leaves the copy as it was; all given back when it goes" },
+  { id = "T-CB.1.3", text = "columns_sql::tests::cb1_a_copy_never_holds_bytes_it_was_not_granted — under both ways, through writes, rebuilds and refusals, resident never above granted and every answer equal to the rows'" },
+  { id = "T-CB.2.1", text = "columns_sql::tests::cb2_a_refused_copy_waits_for_room_then_is_bought — under B no rebuy and no whole-table read without room; the expected size grows with the table; bought at the first statement after room appears" },
+  { id = "T-CB.2.2", text = "columns_sql::tests::cb2_policy_a_rebuys_under_steady_pressure — under A the table rents and buys again and again, each buy a refused whole-table read; answers equal" },
+  { id = "T-CB.4.1", text = "columns_sql::tests::ab::cb4_ab_both_rebuy_policies_at_the_extremes — every scenario once under each way, every answer equal to the row loop's, resident never above granted, one record each" },
+]
