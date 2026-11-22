@@ -284,8 +284,9 @@ fn run() -> Result<bool, String> {
         HintSet::UNHINTED.apply(&conn);
         let ratio = final_best / base_best;
         admitted += usize::from(fin != HintSet::UNHINTED);
-        // AC-G6.3.1's bound: no held-out query slower by more than 10% with hints on.
-        slower += usize::from(ratio > 1.10);
+        // AC-G6.3.1's bound: no held-out query slower by more than 10% with hints on. A class the
+        // guard leaves on the unhinted plan runs without hints: its two timings differ by noise.
+        slower += usize::from(fin != HintSet::UNHINTED && ratio > 1.10);
         differ += usize::from(!same);
         println!(
             "{{\"query\":{},\"proposed\":{},\"verdict\":\"{verdict:?}\",\"final\":{},\"unhinted_ns\":{base_best:.0},\"final_ns\":{final_best:.0},\"ratio\":{ratio:.4},\"answers\":\"{}\"}}",
