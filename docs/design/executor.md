@@ -563,10 +563,22 @@ scan through the engine, the hook's time per write, the summary's build time and
 harness's (`crates/engine/tests/skipping_bench.rs`: an Amphora file, writes through SQL, zones from
 its leaves), run by the coordinator; until recorded the prototypes are unmeasured and neither is chosen.
 
-**Not yet.** The switch is a pure core: the VDBE's table scan doesn't yet ask it for candidates,
-and the Insert and Delete opcodes don't yet call the hook (the scan operators are lane qs7's while
-it builds column batches). Readers at older snapshots: a zone map is safe (a write only widens), the
-cracker is kept at the write and would need its writes held to commit for an older reader.
+**Wired (lane g5s4c, T-G5.4.2).** A database keeps its summaries in one registry its connections
+share (`skipping::SkipRegistry`, on `Database`), one per table, set by `skipping::set_skipping`
+(built holding the write lock, so it holds exactly the newest commit). The Insert and Delete
+opcodes call the hook for a watched main-database table, capturing the old row first (as they do
+for materialized views), so an update is one `RowWrite::Update`. A summary changes at the write,
+before commit, and a delete or update lowers counts (a zone left empty is skipped) or moves a row
+in the cracker, so neither kind is safe for an older reader. The rule, for both: a reader may
+consult a summary only when it is the open writer, or no writer is open and its WAL snapshot is the
+newest commit (`connection_wal_pos` against the shared position); any other reader gets
+`SkipRefusal::OlderSnapshot` and scans every row. A rolled-back transaction or statement makes the
+summaries that took its writes `Stale` until built again; MVCC is refused (`SkipRefusal::Mvcc`).
+`skipping::skipping_candidates` is the scan's question and `skipping_counts` what each summary did.
+
+**Not yet.** The VDBE's table scan doesn't yet ask `skipping_candidates` (a planner hint for an
+integer-bounded term on the summarized column, and a rowid-range walk in the scan cursor), and
+neither kind is chosen by measured cost until the harness's numbers are recorded.
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's

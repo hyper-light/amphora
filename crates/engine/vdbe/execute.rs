@@ -12576,6 +12576,8 @@ pub fn op_yield(
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
     pub has_dependent_views: bool,
+    /// Amphora (G5 step 4): a skipping summary watches the table, so the old row is captured.
+    pub skip_on: bool,
     pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
@@ -12610,6 +12612,88 @@ pub enum OpInsertSubState {
     ApplyViewChange,
 }
 
+/// Amphora (G5 step 4): the root page of the main-database table `cursor_id` writes, when a
+/// skipping summary watches it (executor.md decision 11).
+fn skipping_watched_root(program: &Program, state: &mut ProgramState, cursor_id: crate::vdbe::CursorID) -> Option<i64> {
+    let cursor = state.get_cursor(cursor_id);
+    let cursor = cursor.as_btree_mut();
+    if !cursor.has_rowid() || !Arc::ptr_eq(&Arc::clone(&cursor.get_pager()), &program.connection.get_pager()) {
+        return None;
+    }
+    let root = cursor.root_page();
+    program.connection.db.skipping.column_of(root).map(|_| root)
+}
+
+fn skipping_integer(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Numeric(Numeric::Integer(v))) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Hands the write hook the summarized column's value of the written row and, if it overwrote one,
+/// of the old row (captured before the write).
+fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite) {
+    let registry = &program.connection.db.skipping;
+    match program.connection.skipping_positions() {
+        Some((_, committed)) => registry.on_write(root, program.connection.skipping_id(), committed, write),
+        None => registry.mark_stale(root),
+    }
+}
+
+fn skipping_on_insert(program: &Program, state: &mut ProgramState, cursor_id: crate::vdbe::CursorID, key_reg: usize, record_reg: usize) {
+    let Some(root) = skipping_watched_root(program, state, cursor_id) else {
+        return;
+    };
+    let Some(column) = program.connection.db.skipping.column_of(root) else {
+        return;
+    };
+    let Value::Numeric(Numeric::Integer(rowid)) = state.registers[key_reg].get_value() else {
+        program.connection.db.skipping.mark_stale(root);
+        return;
+    };
+    let rowid = *rowid;
+    let new = match &state.registers[record_reg] {
+        Register::Record(record) => match record.get_value_opt(column) {
+            Some(ValueRef::Numeric(Numeric::Integer(v))) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    };
+    let old = state
+        .active_op_state
+        .insert()
+        .old_record
+        .as_ref()
+        .filter(|(key, _)| *key == rowid)
+        .map(|(_, values)| skipping_integer(values.get(column)));
+    let write = match old {
+        Some(old) => crate::skipping::RowWrite::Update { rowid, old, new },
+        None => crate::skipping::RowWrite::Insert { rowid, value: new },
+    };
+    skipping_hand(program, root, write);
+}
+
+fn skipping_on_delete(program: &Program, state: &mut ProgramState, cursor_id: crate::vdbe::CursorID) {
+    let Some(root) = skipping_watched_root(program, state, cursor_id) else {
+        return;
+    };
+    let Some(column) = program.connection.db.skipping.column_of(root) else {
+        return;
+    };
+    let write = match state.active_op_state.delete().deleted_record.as_ref() {
+        Some((rowid, values)) => crate::skipping::RowWrite::Delete {
+            rowid: *rowid,
+            old: skipping_integer(values.get(column)),
+        },
+        None => {
+            program.connection.db.skipping.mark_stale(root);
+            return;
+        }
+    };
+    skipping_hand(program, root, write);
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -12637,12 +12721,15 @@ pub fn op_insert(
                         .is_empty()
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
+                let skip_on = !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+                    && skipping_watched_root(program, state, *cursor_id).is_some();
+                state.active_op_state.insert().skip_on = skip_on;
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
                 // record the new row (which ApplyViewChange handles without old_record).
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                let needs_capture = (has_dependent_views || state.active_op_state.insert().skip_on)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -12679,8 +12766,8 @@ pub fn op_insert(
                     return Ok(state.suspend_on_io(io));
                 }
                 let has_dependent_views = state.active_op_state.insert().has_dependent_views;
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                let needs_capture = (has_dependent_views || state.active_op_state.insert().skip_on)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -12812,6 +12899,9 @@ pub fn op_insert(
                             state,
                             cursor.insert(&BTreeKey::new_index_key(record.as_record_ref()))
                         );
+                    }
+                    if state.active_op_state.insert().skip_on {
+                        skipping_on_insert(program, state, *cursor_id, *key_reg, *record_reg);
                     }
                     state.record_rows_written(1);
                 }
@@ -13002,9 +13092,10 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
+                let skip_on = skipping_watched_root(program, state, *cursor_id).is_some();
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                if dependent_views.is_empty() && !skip_on {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 }
@@ -13046,6 +13137,7 @@ pub fn op_delete(
                     return_if_io!(state, cursor.delete());
                 }
                 // Increment metrics for row write (DELETE is a write operation)
+                skipping_on_delete(program, state, *cursor_id);
                 state.record_rows_written(1);
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);

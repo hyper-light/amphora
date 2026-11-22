@@ -779,6 +779,7 @@ impl ActiveOpStateSlot {
         OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
             has_dependent_views: false,
+            skip_on: false,
             old_record: None,
             is_noop_update: false,
         }
@@ -1701,6 +1702,8 @@ impl ProgramState {
                 }
             }
             EndStatement::RollbackSavepoint => {
+                // Amphora (G5 step 4): a skipping summary that took the undone writes is stale.
+                connection.db.skipping.rolled_back(connection.skipping_id());
                 // Amphora: a statement kept no journal to undo it by: only rolling back the whole
                 // transaction undoes it, so COMMIT must not go through.
                 if self.skipped_subjournal {
@@ -4525,6 +4528,7 @@ mod tests {
         *state.active_op_state.insert() = OpInsertState {
             sub_state: OpInsertSubState::Seek,
             has_dependent_views: false,
+            skip_on: false,
             old_record: None,
             is_noop_update: false,
         };

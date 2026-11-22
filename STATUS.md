@@ -922,3 +922,8 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 Everything else the track's plan names (kiln plan `01a157fdefba746a94a5fcd920a80d5a`): each goal, its criteria and how each is
 measured are in `docs/requirements.toml`.
+
+Lane g5s4c (G5 step 4, wiring): the engine's Insert and Delete opcodes feed a per-database registry
+of skipping summaries (zone maps or cracking), consulted only at the snapshot a summary holds (an
+older reader is refused, typed, and scans every row; a rollback makes it stale). The scan doesn't
+ask it yet; see executor.md decision 11, "Not yet".

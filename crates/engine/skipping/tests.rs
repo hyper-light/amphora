@@ -474,3 +474,163 @@ mod leaves {
         assert!(skipped_any, "the zones skipped some leaves");
     }
 }
+
+/// G5 step 4 wired in (T-G5.4.2): the Insert and Delete opcodes feed the database's summaries, and
+/// a reader skips only at the snapshot a summary holds.
+mod wired {
+    use super::super::{
+        set_skipping, skipping_candidates, skipping_counts, Candidates, SkipKind, SkipRefusal,
+        Skipping,
+    };
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+    use crate::{Connection, Database, SqliteDialect, Value};
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+
+    fn open() -> (Arc<Database>, Arc<Connection>) {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        (db, conn)
+    }
+
+    fn rowids(conn: &Arc<Connection>, sql: &str) -> Vec<i64> {
+        let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        stmt.run_collect_rows()
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .into_iter()
+            .map(|row| match row.first() {
+                Some(Value::Numeric(crate::Numeric::Integer(rowid))) => *rowid,
+                other => panic!("{sql}: rowid {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The rows a filter's candidates let through, read through SQL: what a scan that skips
+    /// answers.
+    fn skipped_answer(conn: &Arc<Connection>, candidates: &Candidates, lo: i64, hi: i64) -> Vec<i64> {
+        let filter = format!("a BETWEEN {lo} AND {hi}");
+        match candidates {
+            Candidates::All => rowids(conn, &format!("SELECT rowid FROM t WHERE {filter} ORDER BY rowid")),
+            Candidates::Ranges(ranges) => ranges
+                .iter()
+                .flat_map(|r| {
+                    rowids(
+                        conn,
+                        &format!(
+                            "SELECT rowid FROM t WHERE rowid BETWEEN {} AND {} AND {filter} ORDER BY rowid",
+                            r.first, r.last
+                        ),
+                    )
+                })
+                .collect(),
+            Candidates::Rowids(ids) => ids
+                .iter()
+                .flat_map(|id| rowids(conn, &format!("SELECT rowid FROM t WHERE rowid = {id} AND {filter}")))
+                .collect(),
+        }
+    }
+
+    fn fill(conn: &Arc<Connection>, rows: i64) {
+        conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..rows {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(40))).unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+
+    fn random_write(rng: &mut ChaCha8Rng, conn: &Arc<Connection>, rows: i64) {
+        let a = rng.random_range(0..rows);
+        let sql = match rng.random_range(0..5) {
+            0 => format!("INSERT INTO t VALUES ({a}, 'new')"),
+            1 => "INSERT INTO t VALUES (NULL, 'null')".to_string(),
+            2 => format!("UPDATE t SET a = {} WHERE rowid = {}", rng.random_range(0..rows), rng.random_range(1..rows)),
+            3 => format!("UPDATE t SET a = 'text' WHERE rowid = {}", rng.random_range(1..rows)),
+            _ => format!("DELETE FROM t WHERE rowid = {}", rng.random_range(1..rows)),
+        };
+        conn.execute(sql).unwrap();
+    }
+
+    fn writes_between_scans(kind: SkipKind) {
+        let rows = 3000;
+        for seed in 0..4u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let (db, conn) = open();
+            fill(&conn, rows);
+            set_skipping(&conn, "t", "a", Some(kind)).unwrap();
+            for _ in 0..30 {
+                for _ in 0..rng.random_range(0..20) {
+                    random_write(&mut rng, &conn, rows);
+                }
+                let lo = rng.random_range(-10..rows);
+                let hi = lo.saturating_add(rng.random_range(0..rows / 10));
+                let plain = rowids(&conn, &format!("SELECT rowid FROM t WHERE a BETWEEN {lo} AND {hi} ORDER BY rowid"));
+                let candidates = skipping_candidates(&conn, "t", lo, hi).unwrap();
+                let mut skipped = skipped_answer(&conn, &candidates, lo, hi);
+                skipped.sort_unstable();
+                assert_eq!(skipped, plain, "seed {seed} {kind:?} filter {lo}..={hi}");
+            }
+            let counts = skipping_counts(&conn, "t").unwrap();
+            assert!(counts.writes > 0 && counts.consulted == 30, "{counts:?}");
+            let root = conn.with_schema_mut(|s| s.get_btree_table("t")).unwrap().unwrap().root_page;
+            let skipped_any = db.skipping.with_summary(root, |s| match s {
+                Skipping::ZoneMaps(z) => z.stats().zones_skipped > 0,
+                Skipping::Cracking(c) => c.crack_count() > 0,
+                Skipping::Off => false,
+            });
+            assert_eq!(skipped_any, Some(true), "seed {seed} {kind:?}: nothing skipped");
+        }
+    }
+
+    #[test]
+    fn t_g5_4_2_zone_maps_sql_writes_between_scans_answer_as_plain() {
+        writes_between_scans(SkipKind::ZoneMaps);
+    }
+
+    #[test]
+    fn t_g5_4_2_cracking_sql_writes_between_scans_answer_as_plain() {
+        writes_between_scans(SkipKind::Cracking);
+    }
+
+    fn older_snapshot_refused(kind: SkipKind) {
+        let (db, writer) = open();
+        fill(&writer, 2000);
+        set_skipping(&writer, "t", "a", Some(kind)).unwrap();
+        let reader = db.connect(crate::ConnectOpts::new()).unwrap();
+        // The reader's snapshot is taken, then the writer deletes and commits.
+        reader.execute("BEGIN").unwrap();
+        let before = rowids(&reader, "SELECT rowid FROM t WHERE a BETWEEN 0 AND 99 ORDER BY rowid");
+        writer.execute("DELETE FROM t WHERE a < 100").unwrap();
+        assert_eq!(skipping_candidates(&reader, "t", 0, 99), Err(SkipRefusal::OlderSnapshot));
+        // Its plain scan still sees every row of its snapshot.
+        assert_eq!(rowids(&reader, "SELECT rowid FROM t WHERE a BETWEEN 0 AND 99 ORDER BY rowid"), before);
+        reader.execute("COMMIT").unwrap();
+        assert!(skipping_candidates(&reader, "t", 0, 99).is_ok());
+        // An open writer's rows are the summary's but not another reader's.
+        writer.execute("BEGIN").unwrap();
+        writer.execute("INSERT INTO t VALUES (50, 'open')").unwrap();
+        assert_eq!(skipping_candidates(&reader, "t", 0, 99), Err(SkipRefusal::OlderSnapshot));
+        let own = skipping_candidates(&writer, "t", 0, 99).unwrap();
+        assert_eq!(skipped_answer(&writer, &own, 0, 99).len(), 1);
+        // Rolled back, the summary is ahead of the table: stale until built again.
+        writer.execute("ROLLBACK").unwrap();
+        assert_eq!(skipping_candidates(&reader, "t", 0, 99), Err(SkipRefusal::Stale));
+        set_skipping(&writer, "t", "a", Some(kind)).unwrap();
+        let fresh = skipping_candidates(&reader, "t", 0, 99).unwrap();
+        assert!(skipped_answer(&reader, &fresh, 0, 99).is_empty());
+        let counts = skipping_counts(&reader, "t").unwrap();
+        assert_eq!(counts.refused_older, 0, "rebuilt: counts start again");
+    }
+
+    #[test]
+    fn t_g5_4_2_zone_maps_older_snapshot_never_skips_stale() {
+        older_snapshot_refused(SkipKind::ZoneMaps);
+    }
+
+    #[test]
+    fn t_g5_4_2_cracking_older_snapshot_never_skips_stale() {
+        older_snapshot_refused(SkipKind::Cracking);
+    }
+}

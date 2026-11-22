@@ -1082,6 +1082,15 @@ tests = [
 # G12 step 1's comparison set (dqlite, rqlite, LiteFS and libSQL through bench/servers/repl/). Its
 # tests: bench/src/repl.rs g12_repl_*. The measurements are the coordinator's.
 
+# lane g5s4c: G5 step 4 wired in (executor.md decision 11, "Wired").
+[[own]]
+id = "G5.4w"
+title = "Skipping rows wired into the engine's writes, read at the summary's snapshot only (G5 step 4)"
+criteria = []
+tests = [
+  { id = "T-G5.4.2", text = "skipping::tests::wired::t_g5_4_2_* — passes when, with SQL inserts, updates and deletes between scans, each kind's candidates read through SQL answer exactly as a plain scan and something was skipped; a reader at an older snapshot, or beside an open writer, is refused (OlderSnapshot) and its plain scan keeps its rows; a rollback makes the summary Stale until built again" },
+]
+
 # lane repl-measure-2 (G12 steps 1 and 3-5, CP-T1.8): no new IDs. bench/repl.sh runs every measure on
 # every system with one command; LiteFS fails over on Consul's lease (servers/repl/litefs.sh); dqlite's
 # shim builds and its cluster comes up. libSQL's failover and dqlite's member catch-up stay refused,
