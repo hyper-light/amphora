@@ -121,10 +121,25 @@ cut off before the commit and reached again while the read waits).
 
 Every committed answer carries that stamp (lane xgroup-sql-10, for lane split-merge-20's conditional
 commits across groups): `Answer::Committed`'s `at`, an `Option<u64>` of the same microseconds, the
-last field. The sans-IO coordinator has no clock, so its shell stamps the answer (`Cluster::stamped`),
-the cross-group path and the one-group fast path alike, from the groups the transaction touched, read
-once it answered; none when no group it touched keeps a closed time. `commit_records` answers
-`Token::at` of it. A stamp that can't be read by the caller's deadline leaves the caller no token past
+last field. Lane xgroup-sql-11 makes it the one commit stamp (Ada's decision, 2026-11-22: the commit's
+revision across groups is the cross-group HLC timestamp, the read-your-writes tokens' clock), fixed
+before the answer: each lock reply carries its group's clock, read by the shell once the group took
+the step (a local group's session token, a node's `Answer::Stepped` `closed`), and the sans-IO
+coordinator, which reads no clock, keeps the latest of them (`Coordinator::reply`'s `clock`). So the
+stamp is at or past every group's lock and comes before the decision is sent. None when no group it
+touched keeps a clock, and for a transaction an incarnation only recovered. The one-group fast path
+stamps the group's clock after its commit (`Cluster::stamped`). `commit_records` answers `Token::at`
+of the later of the stamp and the touched groups' newest closed time read once it answered: until
+rows are written at the commit stamp itself and reads past a held lock's stamp wait for it (lane
+split-merge-21), that closed time is what covers the rows each group wrote as it resolved.
+
+The clock is the groups' time, microseconds since the Unix epoch, as session tokens carry it
+(replication.md, "Follower reads at a closed time"): written into each replicated group's log, the
+same on every member, rising strictly along it. Not the backup's commit stamps (`backup::Marks`,
+nanoseconds, kept in the owner's process for backed-up groups only, `docs/design/backup.md`, "Cuts
+across machines"), which are an HLC with Kulkarni's receive rule but no replica holds. To be the one
+HLC the groups' time needs that receive rule: a group takes in the stamp a step carries, so its next
+entry's time is past it. That belongs with writing rows at the stamp (split-merge-21). A stamp that can't be read by the caller's deadline leaves the caller no token past
 the commit's rows, so the caller hears `UnknownOutcome`, as for a commit whose answer was lost
 (counted, `Counted::stamps_unread`; `t_t1_10_w6_*`).
 

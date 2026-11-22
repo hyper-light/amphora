@@ -606,14 +606,16 @@ fn step_on(
     until: Instant,
     here: GroupId,
     envelope: Envelope,
-) -> Result<Reply, Refusal> {
+) -> Result<(Reply, Option<u64>), Refusal> {
     match member {
         Member::Local(group) => {
             let (reply, dropped) = step(group, carried, until, move |db| {
                 apply_step(db, here, &envelope)
             })?;
             group.ring_locks(&dropped)?;
-            Ok(reply)
+            // Read after the step answered, the group's clock is at or past the step's commit.
+            let clock = group.session_token(until)?.map(|token| token.micros);
+            Ok((reply, clock))
         }
         Member::Node { nodes, node } => {
             let (reply, latest, micros) = nodes
@@ -631,7 +633,7 @@ fn step_on(
             if let (Some(closed), Some(micros)) = (closed, micros) {
                 closed.fetch_max(micros, Ordering::AcqRel);
             }
-            Ok(reply)
+            Ok((reply, micros))
         }
     }
 }
@@ -697,7 +699,8 @@ pub struct Counted {
     /// Answers decided and held for their resolution ([`AnswerAt::Resolved`]): now, and at most.
     pub answers_held: u64,
     pub answers_held_most: u64,
-    /// Commits answered unknown because their commit stamp couldn't be read ([`Cluster::stamped`]).
+    /// Commits answered unknown because their token or fast-path stamp couldn't be read
+    /// ([`commit_records`], [`Cluster::stamped`]).
     pub stamps_unread: u64,
     pub latencies: Latencies,
 }
@@ -754,6 +757,8 @@ enum Input {
     Reply {
         id: u64,
         reply: Result<Reply, Refusal>,
+        /// The group's clock once it took the step ([`step_on`]).
+        clock: Option<u64>,
     },
     Stop,
 }
@@ -984,7 +989,8 @@ impl Cluster {
 
     /// Runs `txn`: committed in every group or aborted in every group, as the answer says.
     /// Unanswered by `until`, its outcome is unknown ([`Refusal::UnknownOutcome`]).
-    /// A committed answer carries its commit stamp ([`Cluster::stamped`]).
+    /// A committed answer carries its commit stamp, fixed by the coordinator from its lock
+    /// replies' clocks ([`Coordinator::reply`]).
     pub fn transact(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
         let began = Instant::now();
         let touched = self.touched(&txn);
@@ -997,7 +1003,6 @@ impl Cluster {
             Err(RecvTimeoutError::Timeout) => Err(Refusal::UnknownOutcome),
             Err(RecvTimeoutError::Disconnected) => Err(stopped()),
         };
-        let result = self.stamped(result, &touched, until);
         if result.is_ok() {
             counted(&self.instruments, |c| c.latencies.record(began.elapsed()));
         }
@@ -1013,8 +1018,8 @@ impl Cluster {
             .collect()
     }
 
-    /// `answer` with its commit stamp when it committed (AC-T1.10.1, lane xgroup-sql-10): the
-    /// newest closed time of the `touched` groups, read once it answered ([`closed_at`]). Read
+    /// `answer` with its commit stamp when it committed in one group on the fast path (AC-T1.10.1,
+    /// lane xgroup-sql-10): the group's closed time, read once it answered ([`closed_at`]). Read
     /// after the answer, it is at or past the commit in every group that resolved it by then:
     /// every one under [`AnswerAt::Resolved`]. A stamp that can't be read by `until` leaves the
     /// caller no token past the commit's rows, so it hears the outcome as unknown, as a commit
@@ -1079,9 +1084,9 @@ impl Cluster {
 /// (AC-T1.10.1, lane xgroup-sql-6): its writes as [`record_key`]s, in every group or none, each
 /// group's rows at one revision there; a row written twice keeps its last write, as a single-group
 /// commit does. Answers the cross-group timestamp, a hybrid logical clock's (Ada's decision: the
-/// commit's revision across groups is the one the session tokens use, [`Token::at`]): the newest
-/// closed time of every group it touched, taken once the commit answered: the answer's commit stamp
-/// ([`Cluster::stamped`]). Under
+/// commit's revision across groups is the one the session tokens use, [`Token::at`]): the later of
+/// the answer's commit stamp and the newest closed time of every group it touched, taken once the
+/// commit answered. Under
 /// [`AnswerAt::Resolved`] every group has applied its rows by then, so a read that carries the
 /// token reads them in any group; under the control a group may not have yet.
 /// Conditions aren't carried into the coordinator's prepare yet: a transaction with any is refused.
@@ -1112,9 +1117,25 @@ pub fn commit_records(
         reads: Vec::new(),
         writes: writes.into_iter().collect(),
     };
+    let touched = cluster.touched(&txn);
     match cluster.commit(txn, until)? {
-        // No group it touched keeps a closed time: its reads see every write, at any token.
-        Answer::Committed { at, .. } => Ok(Token::at(at.unwrap_or(0))),
+        // The token is the commit stamp, or the newest closed time of the groups it touched read
+        // once it answered when that is later: under AnswerAt::Resolved that covers the rows each
+        // group wrote as it resolved, until rows are written at the commit stamp itself (lane
+        // split-merge-21). No group it touched keeps a closed time: its reads see every write, at
+        // any token. Unread by `until`, the caller has no token past its rows, so it hears the
+        // outcome as unknown, as a commit whose answer was lost (Counted::stamps_unread).
+        Answer::Committed { at, .. } => {
+            match closed_at(&cluster.groups, &cluster.closed, &touched, until) {
+                Ok(closed) => Ok(Token::at(at.max(closed).unwrap_or(0))),
+                Err(_) => {
+                    counted(&cluster.instruments, |c| {
+                        c.stamps_unread = c.stamps_unread.saturating_add(1);
+                    });
+                    Err(Refusal::UnknownOutcome)
+                }
+            }
+        }
         Answer::Aborted(Why::Conflict(key)) => Err(match record_of(&key) {
             Ok(Some((_, family, row))) => Refusal::Conflict {
                 family: family.into(),
@@ -1187,7 +1208,7 @@ fn one_group(tablet: &mut impl Tablet, txn: &Txn) -> anyhow::Result<Answer> {
     }
     Ok(Answer::Committed {
         reads: reads.into_iter().collect(),
-        // Stamped by its shell ([`Cluster::stamped`]).
+        // Stamped by its shell on the fast path ([`Cluster::stamped`]).
         at: None,
     })
 }
@@ -1324,7 +1345,7 @@ impl Driver {
                         self.begin(txn, until, answer)
                     }
                 }
-                Ok(Input::Reply { id, reply }) => {
+                Ok(Input::Reply { id, reply, clock }) => {
                     let (txn, sent_at, first, again) = match self.out.remove(&id) {
                         Some(out) => (out.txn, Some(out.at), out.first, out.again),
                         None => (None, None, false, None),
@@ -1385,7 +1406,7 @@ impl Driver {
                             return;
                         }
                     };
-                    match self.coordinator.reply(id, reply) {
+                    match self.coordinator.reply(id, reply, clock) {
                         Ok(events) => events,
                         Err(refusal) => {
                             self.stop(&refusal);
@@ -1521,12 +1542,17 @@ impl Driver {
         std::thread::Builder::new()
             .name("amphora-xgroup-step".into())
             .spawn(move || {
-                let reply = match fault.and_then(|fault| fault(here, &envelope)) {
-                    Some(refusal) => Err(refusal),
-                    None => step_on(&group, &carried, closed.get(index), until, here, envelope),
+                let (reply, clock) = match fault.and_then(|fault| fault(here, &envelope)) {
+                    Some(refusal) => (Err(refusal), None),
+                    None => {
+                        match step_on(&group, &carried, closed.get(index), until, here, envelope) {
+                            Ok((reply, clock)) => (Ok(reply), clock),
+                            Err(refusal) => (Err(refusal), None),
+                        }
+                    }
                 };
                 // A driver gone by now has stopped: its successor recovers the step.
-                let _ = inputs.send(Input::Reply { id, reply });
+                let _ = inputs.send(Input::Reply { id, reply, clock });
             })
             .map_err(|e| Refusal::Unavailable(format!("a cross-group step's thread: {e}")))?;
         Ok(())

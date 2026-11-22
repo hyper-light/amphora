@@ -47,13 +47,14 @@ pub enum Answer {
     /// Committed in every group; the reads' values, as committed before it.
     Committed {
         reads: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-        /// Its commit stamp across groups (AC-T1.10.1, lane xgroup-sql-10; for conditional commits
-        /// across groups, lane split-merge-20): microseconds since the Unix epoch on the groups'
-        /// one hybrid logical clock, a session token's ([`crate::database::Token::at`]), at or past
-        /// the commit in every group it touched once they resolved it. This sans-IO coordinator
-        /// has no clock and answers none; its shell stamps the answer ([`super::sql::Cluster`]).
-        /// None there too when no group it touched keeps a closed time (standalone groups, whose
-        /// reads see every write).
+        /// Its one commit stamp across groups (AC-T1.10.1; Ada's decision: the commit's revision
+        /// across groups is the cross-group hybrid-logical-clock timestamp, the read-your-writes
+        /// tokens' own): microseconds since the Unix epoch on the groups' clock, a session token's
+        /// ([`crate::database::Token::at`]). Lane xgroup-sql-11 fixes it before the answer as the
+        /// latest of the clocks the lock replies carried ([`Coordinator::reply`]), each read by
+        /// the shell after its group took the lock step, so it is at or past every group's lock.
+        /// None when no group it touched keeps a clock (standalone groups, whose reads see every
+        /// write), and for a transaction this incarnation only recovered (no lock reply of it).
         at: Option<u64>,
     },
     /// Aborted in every group.
@@ -182,6 +183,8 @@ struct Run {
     reads: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     rounds: u32,
     why: Option<Why>,
+    /// Its commit stamp so far: the latest clock its lock replies carried ([`Answer::Committed`]).
+    at: Option<u64>,
 }
 
 /// One incarnation of a coordinator.
@@ -424,6 +427,7 @@ impl Coordinator {
                 reads: Vec::new(),
                 rounds: 1,
                 why: None,
+                at: None,
             },
         );
         let mut out = Vec::new();
@@ -444,7 +448,15 @@ impl Coordinator {
 
     /// Step `id`'s reply. A reply no run waits for (after fencing) is dropped: nothing needs it.
     /// An error is a broken invariant (a group answering what the protocol can't), never a vote.
-    pub fn reply(&mut self, id: u64, reply: Result<Reply, Lost>) -> Result<Vec<Event>, Refusal> {
+    /// `clock`: the group's clock read once it took the step, in the commit stamp's unit (none: the
+    /// group keeps none); a lock reply's goes into the transaction's commit stamp, the latest of
+    /// them ([`Answer::Committed`]'s `at`). This coordinator reads no clock of its own.
+    pub fn reply(
+        &mut self,
+        id: u64,
+        reply: Result<Reply, Lost>,
+        clock: Option<u64>,
+    ) -> Result<Vec<Event>, Refusal> {
         let mut out = Vec::new();
         let Some(sent) = self.sent.remove(&id) else {
             return Ok(out);
@@ -556,6 +568,7 @@ impl Coordinator {
                     reads: Vec::new(),
                     rounds: 0,
                     why: None,
+                    at: None,
                 },
             );
             self.send(out, anchor, Some(txn), Kind::Recover, Step::Recover { txn })?;
@@ -610,6 +623,7 @@ impl Coordinator {
                 let failed = match reply {
                     Ok(Reply::Locked { reads }) => {
                         run.reads.extend(reads);
+                        run.at = run.at.max(clock);
                         None
                     }
                     Ok(Reply::Conflict { key }) => Some(Why::Conflict(key)),
@@ -656,7 +670,7 @@ impl Coordinator {
                         // its committed done row) and commits too.
                         answer = Some(Answer::Committed {
                             reads: std::mem::take(&mut run.reads),
-                            at: None,
+                            at: run.at,
                         });
                         run.phase = Phase::Resolving {
                             outcome: Outcome::Committed,
@@ -691,7 +705,7 @@ impl Coordinator {
                         answer = Some(match outcome {
                             Outcome::Committed => Answer::Committed {
                                 reads: std::mem::take(&mut run.reads),
-                                at: None,
+                                at: run.at,
                             },
                             Outcome::Aborted => {
                                 Answer::Aborted(run.why.take().unwrap_or(Why::Late))
