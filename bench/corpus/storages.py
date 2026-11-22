@@ -18,6 +18,10 @@ record counts once whatever its size), and the ratio of the totals beside it. A 
 interval says so: reads miss only when the interval lies wholly above 1 (shown slower); writes meet
 when it lies wholly at or above 3, miss when wholly below, and are unsettled between (run again).
 
+Both runs must name one client and one platform, the same (each --times line names them): two runs
+from another client or machine aren't a comparison but experiment error, refused with exit 2 before
+anything is compared. Their client and platform head the verdicts.
+
 usage: storages.py <pool dir> <pager run dir> <versioned run dir>
   each run dir holds out.txt (the run's stdout) and times.jsonl (its --times)
 """
@@ -36,14 +40,16 @@ HEAD = re.compile(r"^(\S.*?):(\d+): ")
 
 
 def outcomes(run):
-    """(file, line) -> outcome, from --times' record lines (a file's own line has `file_ns`)."""
-    got = {}
+    """((file, line) -> (outcome, ns), {(client, platform)}), from --times' record lines (a file's
+    own line has `file_ns`) and the client and platform every line names."""
+    got, where = {}, set()
     with open(os.path.join(run, "times.jsonl"), encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
+            where.add((r.get("client"), r.get("platform")))
             if "outcome" in r:
                 got[(r["file"], r["line"])] = (r["outcome"], r["ns"])
-    return got
+    return got, where
 
 
 def shown(run):
@@ -99,7 +105,13 @@ def main():
     if len(sys.argv) != 4:
         sys.exit(__doc__)
     pool, pager_dir, versioned_dir = sys.argv[1:]
-    pager, versioned = outcomes(pager_dir), outcomes(versioned_dir)
+    (pager, pager_where), (versioned, versioned_where) = outcomes(pager_dir), outcomes(versioned_dir)
+    if len(pager_where) != 1 or pager_where != versioned_where:
+        print(f"refused: the runs' clients and platforms differ (pager {sorted(pager_where, key=str)},"
+              f" versioned {sorted(versioned_where, key=str)}): not a comparison")
+        return 2
+    (client, platform), = pager_where
+    print(f"client {client}, platform {platform}, both runs")
     pager_shown, versioned_shown = shown(pager_dir), shown(versioned_dir)
     both = sorted(set(pager) & set(versioned))
     one_side = len(set(pager) ^ set(versioned))

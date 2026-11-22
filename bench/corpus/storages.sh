@@ -8,7 +8,10 @@
 #
 # usage: bench/corpus/storages.sh <amphora-corpus binary> <pool dir> <out dir> [run flags...]
 #   e.g. bench/corpus/storages.sh target/release/amphora-corpus bench/corpus/subset ~/.cache/storages
-# Exits 0 when the answers are the same, 1 when they differ, 2 when a run itself failed.
+# The corpus's Amphora is in memory (engines::client), so the versioned storage runs on its memory
+# disk (storage::versioned::switch::open): the times compare the two storages' code, not a disk's.
+# Exits 0 when the answers are the same, 1 when they differ, 2 when a run itself failed or the two
+# runs name another client or platform (storages.py refuses to compare them).
 set -uo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 bin=$(realpath -- "$1")
