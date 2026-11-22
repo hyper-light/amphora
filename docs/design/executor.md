@@ -465,9 +465,20 @@ tied on the keys keep the probe order; without one the runs are concatenated in 
 (probe-row order, a probe row's matches in build order). T-QT.6.13 checks it against the serial
 hash join at 2, 3, 4 and 8 stated cores.
 
+**A join's rows under LIMIT** (lane qs6-6). A LIMIT or OFFSET cuts the rows in order, so the hook
+takes one only when its rows come out in the serial loop's order to the row: the ORDER BY keys hold
+both tables' INTEGER PRIMARY KEYs (as columns or as `rowid`), which tell every joined row apart, so
+no tie can be cut differently. Both must be integer literals, read as SQLite reads them (a negative
+LIMIT is none, a negative OFFSET is none); LIMIT 0 and any other expression stay serial. The hook's
+row loop counts them down as the serial loop does (`IfPos` skips the OFFSET's rows, `DecrJumpZero`
+ends at the LIMIT); the workers still produce every joined row, so the LIMIT saves output, not
+probing. A LIMIT over an order with ties stays serial. T-QT.6.14 checks it row for row against the
+serial loop at 2, 3, 4 and 8 stated cores.
+
 **Not yet.** Workers still run the pipeline's own loop body, not a copy of the VDBE program's,
 so only the filters `Predicate` holds (a column against a literal of its kind, a NULL test) run in
-parallel; joins of more than two tables, outer joins and joins under LIMIT stay serial.
+parallel; joins of more than two tables and outer joins stay serial, and a LIMIT doesn't yet stop
+the workers early.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

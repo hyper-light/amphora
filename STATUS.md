@@ -108,9 +108,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   run, perf c2c and the 32-client suite are the coordinator's).
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
-  commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
-  statements now match the page-a-frame log (`AMPHORA_PAGE_LOG=1` in the bench) waits on the
-  interleaved bench.
+  commit's pages, and deltas are found a word at a time. Merged. Then (decision 44, lane
+  wal-read-2) a commit lays its chains' pages out in the buffer pool's frames, as page-a-frame
+  does, and finds its deltas in one buffer it reuses: no buffer of the commit's images, no page
+  allocated a delta. `bench/log_ab.sh` runs the mixed log against page-a-frame in one binary,
+  interleaved; a tiny check has the bulk statements within its noise (0.93-0.98). The run of record
+  is the coordinator's. Left: a page's log base and each record's payload still allocate.
 - **The planner where the suite found it choosing far more work** (docs/design/planner.md,
   `crates/engine/tests/planner.rs`): a closed range with unknown bounds is 0.5% of its table whether
   it drives a seek or filters one, so a join from a key range looks each row's partner up by key; a
@@ -534,8 +537,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   routes by (`Engine::routes`); a local database's Records transaction routes by every key it names
   and stays within one group, and local databases as groups split and merge under Records writes
   (T-T1.9.R13). Load from the store's meter (lane split-merge-12): the shell measures each
-  group's load (its writer's commit time) and where its writes fall, and the machine's cores, and
-  the planner decides from them (T-T1.9.R14, T-T1.9.R15). Left: that transport off loopback
+  group's load (its writer's commit time) and where its writes fall, its size (a local database's
+  pages in use) and the machine's cores, and the planner decides from them (T-T1.9.R14,
+  T-T1.9.R15, T-T1.9.R17). Left: that transport off loopback
   (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
   full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
   them (T-T1.9.R16).
@@ -993,5 +997,8 @@ QT.6 (lane qs6-4): a hash join's table is now built by the workers together, par
 worker scans its own build leaves and scatters entries by partition, each partition filled by one
 worker), charged to the statement's memory budget with a typed refusal that falls back to the
 serial loop; two-table hash joins that return rows (no aggregates) run on morsels, with an
-order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
-the VDBE loop body (any expression in parallel), joins of three or more tables.
+order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Lane qs6-6: such a join under LIMIT and
+OFFSET runs on morsels too when its ORDER BY holds both tables' INTEGER PRIMARY KEYs, so its rows
+are the serial loop's to the row (T-QT.6.14). Still open: workers running a copy of the VDBE loop
+body (any expression in parallel), joins of three or more tables, outer joins, a LIMIT that stops
+the workers early.

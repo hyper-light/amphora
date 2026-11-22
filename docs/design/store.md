@@ -2072,3 +2072,56 @@ list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
 `mb1_no_limit_read_is_a_typed_refusal_and_the_limit_is_read_again` (T-MB.1.2),
 `mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
 (T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.
+
+## 44. A commit lays its chains' pages out in the buffer pool's frames, and finds its deltas in one buffer it reuses
+
+**Decision.** A mixed log's commit (`WalFile::lay_out`, decision 39) takes no buffer of its own for
+the images of the pages it chains. Each such page is transformed into a frame from the log's buffer
+pool, as a page frame is (`prepare_wal_frame_header`); its delta is found against that frame's
+body; and an image the packing leaves a page frame (`OneSlot::frames`) is written from that frame as
+it is, where it was copied from the commit's buffer into a new frame. The images that become
+records' entries are read from their frames while the records are packed, and the frames go back to
+the pool when the commit is laid out. A delta's runs are written into one buffer the commit reuses
+from page to page (`packed::diff_into`), and each delta keeps a copy of its own length, where each
+took a buffer of the most a delta may hold, up to a page, and used a few bytes of it. The log's
+format, layout and size are unchanged: the same frames and records, byte for byte. No size is
+picked: a frame is the page size and its header (the format's), and the reused buffer grows to the
+largest delta the commit finds.
+
+**Why.** A profile of the suite's `insert_batch_100` at 32 clients on adas-mac-studio-3 (an Apple
+M-series Mac Studio, 2026-11-22, AMPHORA_PROFILE, 20,000 items, 4 s; checks, not records) put 21%
+of the process's samples in `lay_out`, and most of that in the allocator rather than the packing:
+- growing the commit's buffer of images a page at a time (`Vec::resize`) and freeing it: 409 of
+  `lay_out`'s 723 samples, a buffer of up to `IOV_MAX` pages made and dropped every commit;
+- each delta's buffer of up to a page (`packed::diff`): 78;
+- each record's encoding: 109 (left as it is, below).
+
+The page-a-frame log takes its frames from the pool and writes each page into its frame once, so
+the mixed log's writer paid for allocation that page-a-frame's never did. After this decision the
+same profile at 1 client shows no sample of `lay_out` in the images' buffer or the deltas'.
+
+**What is left.** The same profile at 1 client puts 227 of `lay_out`'s 283 samples in freeing a
+page's log base (`pager::LogBase`, the page's bytes as the log holds them, kept from its first
+change in a transaction so its delta can be found), an allocation of a page made for each page a
+transaction changes and dropped at its commit; and each record's encoding still allocates its
+payload. Both are the next costs to take to the pool.
+
+**Sources.** Decision 39's profile and this one's. SQLite's WAL writer (`walWriteOneFrame` in
+`wal.c`) writes each page from the pager's own buffer into the log, with no copy of the commit's
+pages of its own. The page-a-frame path here (`WalFile::prepare_frames`) takes its frames from the
+buffer pool.
+
+**Evidence.** The mixed log's tests pass unchanged (`packed_log.rs` 16, `shared_pages.rs` 6,
+`spilled_log.rs` 14, `reader_cache.rs` 2), as do `storage::packed`'s 19 and `storage::wal`'s 103
+unit tests, among them the delta that rebuilds 400 pages changed at random (through `diff`, which
+now writes through `diff_into`). A tiny interleaved check on adas-mac-studio-3 (`bench/log_ab.sh 2
+insert_batch_100,delete_range_insert --items 20000 --clients 1,32 --seconds 2 --warmup 1`, best of
+2, with three CI jobs on the host; not a record), mixed over page-a-frame, before and after:
+`insert_batch_100` 0.858 and 1.076 at 1 and 32 clients before, 0.983 and 0.930 after;
+`delete_range_insert` 1.060 and 1.392 before, 0.971 and 0.965 after. At this size the rounds
+differ by more than the logs do: the run of record is the coordinator's.
+
+**Falsified by.** The comprehensive bench's `insert_batch_100` or `delete_range_insert` slower on the
+mixed log than on the page-a-frame log of the same binary (`bench/log_ab.sh`, interleaved, best of
+3); a profile of the mixed log's writer still showing the commit's images' buffer or a delta's
+buffer of a page; a row read back other than as committed (the tests above).

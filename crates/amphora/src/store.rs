@@ -139,6 +139,12 @@ pub trait Engine: Send + 'static {
     // and the log's head is the last entry's number. By default an engine keeps none, and a span
     // can't be copied out of it or into it.
 
+    /// The bytes its rows hold now, for the planner's share of size (CP-T1.9; docs/design/reshard.md,
+    /// decision "Load from the store's meter"): none if it can't say.
+    fn bytes(&mut self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// The number of the last entry in its log (0: none yet).
     fn head(&mut self) -> anyhow::Result<Seq> {
         Err(no_copy_path())
