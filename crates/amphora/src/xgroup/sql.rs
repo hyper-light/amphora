@@ -110,19 +110,87 @@ fn intent_of(kind: i64, value: Option<Vec<u8>>) -> anyhow::Result<Intent> {
     }
 }
 
+/// The prefix of a Records row's key among a transaction's keys (AC-T1.10.1, lane xgroup-sql-6).
+/// A format, only ever appended to: [`RECORD`], then the namespace and the family, each as its
+/// length (four bytes, big-endian) and its UTF-8 bytes, then the row's key. A key without the
+/// prefix is a row of `__amphora_xg_data`'s key-value space.
+pub const RECORD: &[u8] = b"\xffamphora-record\x00";
+
+/// A Records row of `namespace`'s `family` as a transaction's key: what a cross-group commit
+/// writes is read back through Records' get, scan and feed.
+pub fn record_key(namespace: &str, family: &str, key: &[u8]) -> Result<Vec<u8>, Refusal> {
+    let length = |name: &str| {
+        u32::try_from(name.len())
+            .map(u32::to_be_bytes)
+            .map_err(|_| amphora_api::invalid("cross-group key", "a name past four bytes' length"))
+    };
+    let mut out = RECORD.to_vec();
+    out.extend(length(namespace)?);
+    out.extend(namespace.as_bytes());
+    out.extend(length(family)?);
+    out.extend(family.as_bytes());
+    out.extend(key);
+    Ok(out)
+}
+
+/// A transaction's key as the Records row it names: its namespace, family and key; none for a
+/// key of the key-value space. A key with the prefix that doesn't decode is refused.
+pub fn record_of(bytes: &[u8]) -> anyhow::Result<Option<(&str, &str, &[u8])>> {
+    let Some(rest) = bytes.strip_prefix(RECORD) else {
+        return Ok(None);
+    };
+    let decoded = name_at(rest).and_then(|(namespace, rest)| {
+        let (family, key) = name_at(rest)?;
+        Some((namespace, family, key))
+    });
+    decoded
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("a Records key across groups doesn't decode"))
+}
+
+/// A name as [`record_key`] writes it, and what follows it.
+fn name_at(bytes: &[u8]) -> Option<(&str, &[u8])> {
+    let (length, rest) = bytes.split_first_chunk::<4>()?;
+    let (name, rest) = rest.split_at_checked(usize::try_from(u32::from_be_bytes(*length)).ok()?)?;
+    Some((std::str::from_utf8(name).ok()?, rest))
+}
+
+/// Whether a transaction across groups holds a lock on a Records row here.
+pub(crate) fn locked(db: &Db, namespace: &str, family: &str, key: &[u8]) -> anyhow::Result<bool> {
+    let key = record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut held = false;
+    db.query(
+        "SELECT 1 FROM __amphora_xg_lock WHERE key = ?1 LIMIT 1",
+        [blob(&key)?],
+        |_| {
+            held = true;
+            Ok(false)
+        },
+    )?;
+    Ok(held)
+}
+
 /// A group's database as a [`Tablet`], inside the step's one transaction.
 pub(crate) struct SqlTablet<'a> {
     db: &'a Db,
+    /// Each namespace's revision this step writes its Records rows at, and the next row's place.
+    revs: BTreeMap<String, (amphora_api::Rev, u64)>,
 }
 
 impl<'a> SqlTablet<'a> {
     pub(crate) fn new(db: &'a Db) -> Self {
-        Self { db }
+        Self {
+            db,
+            revs: BTreeMap::new(),
+        }
     }
 }
 
 impl Tablet for SqlTablet<'_> {
     fn value(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        if let Some((namespace, family, row)) = record_of(key)? {
+            return crate::database::newest(self.db, namespace, family, row);
+        }
         let mut value = None;
         self.db.query(
             "SELECT value FROM __amphora_xg_data WHERE key = ?1",
@@ -136,6 +204,19 @@ impl Tablet for SqlTablet<'_> {
     }
 
     fn set_value(&mut self, key: &[u8], value: Option<&[u8]>) -> anyhow::Result<()> {
+        if let Some((namespace, family, row)) = record_of(key)? {
+            let (at, seq) = match self.revs.get(namespace) {
+                Some(&(at, seq)) => (Some(at), seq),
+                None => (None, 0),
+            };
+            let at =
+                crate::database::write_across(self.db, namespace, family, row, value, at, seq)?;
+            let next = seq
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("a step's rows ran out of places"))?;
+            self.revs.insert(namespace.to_owned(), (at, next));
+            return Ok(());
+        }
         match value {
             Some(value) => self.db.query(
                 "INSERT INTO __amphora_xg_data(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -893,6 +974,9 @@ where
     Ok(reply)
 }
 
+/// A step held to be sent again: its group, transaction, envelope and the refusals of it so far.
+type Held = (GroupId, Option<TxnId>, Envelope, u32);
+
 /// Where a caller waits for its transaction's answer.
 type Waiter = SyncSender<Result<Answer, Refusal>>;
 
@@ -932,7 +1016,7 @@ struct Driver {
     /// Steps a group refused before taking, each to be sent again at its instant
     /// ([`OnRefused::Retry`]): its group, transaction, envelope and refusals so far. At most the
     /// steps the coordinator has out.
-    held: BTreeMap<(Instant, u64), (GroupId, Option<TxnId>, Envelope, u32)>,
+    held: BTreeMap<(Instant, u64), Held>,
     instruments: Instruments,
 }
 
@@ -987,9 +1071,13 @@ impl Driver {
                     };
                     if let Err(refusal) = &reply {
                         counted(&self.instruments, |c| match refusal {
-                            Refusal::NotLeader { .. } => c.refused_not_leader += 1,
-                            Refusal::Full { .. } => c.refused_full += 1,
-                            _ => c.refused_other += 1,
+                            Refusal::NotLeader { .. } => {
+                                c.refused_not_leader = c.refused_not_leader.saturating_add(1);
+                            }
+                            Refusal::Full { .. } => {
+                                c.refused_full = c.refused_full.saturating_add(1)
+                            }
+                            _ => c.refused_other = c.refused_other.saturating_add(1),
                         });
                     }
                     if let (Err(refusal), Some((group, envelope, refusals))) = (&reply, again)
@@ -1205,7 +1293,7 @@ impl Driver {
             .collect();
         let txns = u64::try_from(txns.len()).unwrap_or(u64::MAX);
         counted(&self.instruments, |c| {
-            c.retries += u64::from(retry);
+            c.retries = c.retries.saturating_add(u64::from(retry));
             c.held_steps = steps;
             c.held_txns = txns;
             c.held_txns_most = c.held_txns_most.max(txns);
@@ -1252,7 +1340,7 @@ impl Driver {
     }
 
     fn stop(&mut self, refusal: &Refusal) {
-        counted(&self.instruments, |c| c.stops += 1);
+        counted(&self.instruments, |c| c.stops = c.stops.saturating_add(1));
         for (_, waiter) in std::mem::take(&mut self.waiters) {
             let _ = waiter.send(Err(refusal.clone()));
         }
@@ -1368,12 +1456,24 @@ mod sessions {
         }
     }
 
+    /// Routes by the row's first byte: a Records row's own key, or a key of the key-value space.
+    fn route_of(groups: u32) -> Route {
+        Arc::new(move |key: &[u8]| {
+            let row = record_of(key).ok().flatten().map_or(key, |(_, _, row)| row);
+            row.first().map_or(0, |b| GroupId::from(*b) % groups)
+        })
+    }
+
+    /// Records row `k` of namespace `ns`'s family `rows`, as a transaction's key.
+    fn row(k: u8) -> Vec<u8> {
+        record_key("ns", "rows", &[k]).unwrap()
+    }
+
     fn open(dir: &std::path::Path, groups: u32, id: u64, protocol: Protocol) -> Cluster {
         let databases = (0..groups)
             .map(|g| Database::open(&dir.join(format!("group{g}.db")), until()).unwrap())
             .collect();
-        let route: Route =
-            Arc::new(move |key: &[u8]| key.first().map_or(0, |b| GroupId::from(*b) % groups));
+        let route = route_of(groups);
         Cluster::open(databases, route, id, protocol, 1, until()).unwrap()
     }
 
@@ -1420,8 +1520,7 @@ mod sessions {
         for group in databases {
             prepare(group, until()).unwrap();
         }
-        let route: Route =
-            Arc::new(move |key: &[u8]| key.first().map_or(0, |b| GroupId::from(*b) % groups));
+        let route = route_of(groups);
         let members = databases.iter().cloned().map(Member::Local).collect();
         Cluster::open_with(members, route, id, protocol, 1, options, until()).unwrap()
     }
@@ -1430,20 +1529,26 @@ mod sessions {
     fn refusing(groups: &[GroupId], times: u64, refusal: fn() -> Refusal) -> Fault {
         let calls: Arc<Vec<AtomicU64>> = Arc::new((0..3).map(|_| AtomicU64::new(0)).collect());
         let groups = groups.to_vec();
-        // Only a transaction's steps: an open's recovery scans aren't the scenario's.
+        // Only the steps of transactions this incarnation began: an open's recovery scans, and its
+        // finishing of what the last incarnation left (whose resolution may still have been under
+        // way when it stopped), aren't the scenario's and would spend its refusals.
         Arc::new(move |here, envelope: &Envelope| {
             let calls = calls.get(usize::try_from(here).ok()?)?;
-            (envelope.step.txn().is_some()
+            (envelope
+                .step
+                .txn()
+                .is_some_and(|txn| txn.epoch == envelope.epoch)
                 && groups.contains(&here)
                 && calls.fetch_add(1, Ordering::AcqRel) < times)
                 .then(refusal)
         })
     }
 
+    /// Records rows 0, 1 and 2, one in each of three groups.
     fn across(i: u8) -> Txn {
         Txn {
-            reads: vec![vec![0]],
-            writes: (0..3).map(|k| (vec![k], Some(vec![i]))).collect(),
+            reads: vec![row(0)],
+            writes: (0..3).map(|k| (row(k), Some(vec![i]))).collect(),
         }
     }
 
@@ -1540,7 +1645,7 @@ mod sessions {
                     drop(failing);
                     let recovered = open_over(&dbs, 1, protocol, Options::default());
                     let all = Txn {
-                        reads: (0..3).map(|k| vec![k]).collect(),
+                        reads: (0..3).map(row).collect(),
                         writes: Vec::new(),
                     };
                     let got = commit(&recovered, &all);
@@ -1576,6 +1681,139 @@ mod sessions {
                 committed > 0 && aborted > 0,
                 "{protocol:?}: {committed} committed, {aborted} aborted"
             );
+        }
+    }
+
+    /// AC-T1.10.1 (lane xgroup-sql-6): seeded transactions over Records rows in three groups,
+    /// under both protocols: every row reads back through Records' get, scan and feed in its own
+    /// group as the committed transactions left it, and every answer equals a one-group run's.
+    #[test]
+    fn ac_t1_10_1_a_cross_group_commit_reads_back_through_records() {
+        use amphora_api::{Consistency, Records, Scan};
+        for (seed, protocol) in [(3, Protocol::TwoPhase), (4, Protocol::Parallel)] {
+            let dir = tempfile::tempdir().unwrap();
+            let dbs = databases(dir.path(), 3);
+            let spread = open_over(&dbs, 1, protocol, Options::default());
+            let one_dir = tempfile::tempdir().unwrap();
+            let one = open_over(
+                &databases(one_dir.path(), 1),
+                1,
+                protocol,
+                Options::default(),
+            );
+            let keys = 6u8;
+            let mut model: BTreeMap<u8, Option<Vec<u8>>> = BTreeMap::new();
+            let mut across = 0;
+            for raw in txns(seed, 30, u64::from(keys)) {
+                let txn = Txn {
+                    reads: raw.reads.iter().map(|k| row(k[0])).collect(),
+                    writes: raw
+                        .writes
+                        .iter()
+                        .map(|(k, v)| (row(k[0]), v.clone()))
+                        .collect(),
+                };
+                let groups: BTreeSet<u8> = raw
+                    .reads
+                    .iter()
+                    .chain(raw.writes.iter().map(|(k, _)| k))
+                    .map(|k| k[0] % 3)
+                    .collect();
+                across += usize::from(groups.len() > 1);
+                let answer = commit(&spread, &txn);
+                assert_eq!(answer, commit(&one, &txn), "{protocol:?} {raw:?}");
+                if matches!(answer, Answer::Committed { .. }) {
+                    for (k, v) in &raw.writes {
+                        model.insert(k[0], v.clone());
+                    }
+                }
+            }
+            assert!(across > 0, "{protocol:?}: no transaction spanned groups");
+            for g in 0..3u8 {
+                let ns = dbs[usize::from(g)].namespace("ns").unwrap();
+                let held: BTreeMap<u8, Option<Vec<u8>>> = model
+                    .iter()
+                    .filter(|(k, _)| *k % 3 == g)
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
+                for k in (0..keys).filter(|k| k % 3 == g) {
+                    let got = ns
+                        .get("rows", &[k], Consistency::Linearizable, until())
+                        .unwrap()
+                        .map(|r| r.value);
+                    assert_eq!(got, held.get(&k).cloned().flatten(), "{protocol:?} get {k}");
+                }
+                let scan = Scan {
+                    prefix: Vec::new(),
+                    after: None,
+                    limit: 100,
+                    at: Consistency::Linearizable,
+                };
+                let scanned: Vec<(u8, Vec<u8>)> = ns
+                    .scan("rows", scan, until())
+                    .unwrap()
+                    .rows
+                    .into_iter()
+                    .map(|r| (r.key[0], r.value))
+                    .collect();
+                let live: Vec<(u8, Vec<u8>)> = held
+                    .iter()
+                    .filter_map(|(k, v)| Some((*k, v.clone()?)))
+                    .collect();
+                assert_eq!(scanned, live, "{protocol:?} scan of group {g}");
+                // The feed's last change of each row is what the row holds; revisions never fall.
+                let mut last = BTreeMap::new();
+                let mut newest = 0;
+                for change in ns.changes("rows", 0, 1000, until()).unwrap().changes {
+                    assert!(change.rev >= newest, "{protocol:?} feed of group {g}");
+                    newest = change.rev;
+                    last.insert(change.key[0], change.value);
+                }
+                assert_eq!(last, held, "{protocol:?} feed of group {g}");
+            }
+        }
+    }
+
+    /// AC-T1.10.1 (lane xgroup-sql-6): a single-group Records commit on a row a transaction across
+    /// groups holds a lock on, a read's or a write's, is refused as a conflict; once the lock is
+    /// resolved it commits.
+    #[test]
+    fn ac_t1_10_1_a_single_group_commit_respects_a_cross_group_lock() {
+        use amphora_api::{Records, Tx, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("group.db"), until()).unwrap();
+        let ns = db.namespace("ns").unwrap();
+        let put = |v: u8| Tx {
+            conds: Vec::new(),
+            writes: vec![Write::Put {
+                family: "rows".into(),
+                key: vec![1],
+                value: vec![v],
+            }],
+        };
+        ns.commit(put(1), until()).unwrap();
+        let txn = TxnId {
+            coordinator: 9,
+            epoch: 1,
+            seq: 1,
+        };
+        for intent in [Intent::Read, Intent::Put(vec![2])] {
+            let lock = Lock {
+                txn,
+                anchor: 0,
+                intent,
+            };
+            let key = row(1);
+            db.call_internal(until(), move |db| SqlTablet::new(db).put_lock(&key, &lock))
+                .unwrap();
+            let refused = ns.commit(put(3), until());
+            assert!(
+                matches!(refused, Err(Refusal::Conflict { .. })),
+                "{refused:?}"
+            );
+            db.call_internal(until(), move |db| SqlTablet::new(db).drop_locks_of(txn))
+                .unwrap();
+            assert!(ns.commit(put(3), until()).is_ok());
         }
     }
 }

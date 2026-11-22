@@ -625,6 +625,9 @@ pub(crate) fn bootstrap_db(db: &Db) -> Result<(), Refusal> {
     db.exec(restore::SCHEMA).map_err(unavailable)?;
     db.exec(import::SCHEMA).map_err(unavailable)?;
     db.exec(group::SCHEMA).map_err(unavailable)?;
+    // Every group keeps the tables of transactions across groups, so a single-group commit can
+    // respect their locks (AC-T1.10.1, lane xgroup-sql-6).
+    db.exec(crate::xgroup::sql::SCHEMA).map_err(unavailable)?;
     Ok(())
 }
 
@@ -2356,6 +2359,82 @@ fn get(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<O
     db.query("SELECT rev, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev <= ?4 ORDER BY rev DESC LIMIT 1", [text(ns), text(family), blob(key)?, integer(at)?], |r| { out = bytes(r, 1)?.map(|value| Ok::<_, anyhow::Error>(Row { key: key.into(), value, rev: rev(r, 0)? })).transpose()?; Ok(false) })?;
     Ok(out)
 }
+
+/// A Records row's newest value, as a transaction across groups reads it under its lock
+/// (AC-T1.10.1, lane xgroup-sql-6).
+pub(crate) fn newest(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut head = 0;
+    db.query(
+        "SELECT head FROM __amphora_namespaces WHERE name = ?1",
+        [text(ns)],
+        |r| {
+            head = rev(r, 0)?;
+            Ok(false)
+        },
+    )?;
+    Ok(get(db, ns, family, key, head)?.map(|row| row.value))
+}
+
+/// Writes one row a transaction across groups committed into this group's Records, inside the
+/// step that resolves it (AC-T1.10.1, lane xgroup-sql-6): a revision and a feed row as a
+/// single-group commit writes them. The step's rows in a namespace share one revision, `at` (none:
+/// the first of them takes the namespace's next), each at its own `seq`; answers the revision.
+pub(crate) fn write_across(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+    value: Option<&[u8]>,
+    at: Option<Rev>,
+    seq: u64,
+) -> anyhow::Result<Rev> {
+    db.query("INSERT OR IGNORE INTO __amphora_namespaces(name, head, horizon, feed, live) VALUES (?1, 0, 0, 0, 0)", [text(ns)], |_| Ok(true))?;
+    let (mut head, mut live) = (0, 0);
+    db.query(
+        "SELECT head, live FROM __amphora_namespaces WHERE name = ?1",
+        [text(ns)],
+        |r| {
+            head = rev(r, 0)?;
+            live = rev(r, 1)?;
+            Ok(false)
+        },
+    )?;
+    let at = match at {
+        Some(at) => at,
+        None => head
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("revision overflow"))?,
+    };
+    let before = get(db, ns, family, key, head)?.is_some();
+    live = match (before, value.is_some()) {
+        (false, true) => live
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("live rows overflow"))?,
+        (true, false) => live
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("live rows underflow"))?,
+        _ => live,
+    };
+    let stored = match value {
+        Some(value) => blob(value)?,
+        None => EValue::Null,
+    };
+    db.query("INSERT INTO __amphora_versions(namespace, family, key, rev, seq, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", [text(ns), text(family), blob(key)?, integer(at)?, integer(seq)?, stored], |_| Ok(true))?;
+    group::wrote(db, ns, family, key)?;
+    db.query("INSERT INTO __amphora_families(namespace, family, newest) VALUES (?1, ?2, ?3) ON CONFLICT(namespace, family) DO UPDATE SET newest = excluded.newest", [text(ns), text(family), integer(at)?], |_| Ok(true))?;
+    db.query(
+        "UPDATE __amphora_namespaces SET head = ?2, live = ?3 WHERE name = ?1",
+        [text(ns), integer(at)?, integer(live)?],
+        |_| Ok(true),
+    )?;
+    Ok(at)
+}
+
 fn commit(
     db: &Db,
     ns: &str,
@@ -2363,6 +2442,26 @@ fn commit(
     head: Rev,
     live: u64,
 ) -> anyhow::Result<Result<Answer, Refusal>> {
+    // A row a transaction across groups holds a lock on is refused as a conflict until that
+    // transaction resolves, as its own lock step would refuse this one (AC-T1.10.1, lane
+    // xgroup-sql-6): the caller retries, as after any conflict.
+    let conds = tx.conds.iter().map(|c| {
+        let (Cond::Absent { family, key } | Cond::At { family, key, .. }) = c;
+        (family, key)
+    });
+    let writes = tx.writes.iter().map(|w| {
+        let (Write::Put { family, key, .. } | Write::Delete { family, key }) = w;
+        (family, key)
+    });
+    for (family, key) in conds.chain(writes) {
+        if crate::xgroup::sql::locked(db, ns, family, key)? {
+            return Ok(Err(Refusal::Conflict {
+                family: family.clone(),
+                key: key.clone(),
+                at: get(db, ns, family, key, head)?.map(|r| r.rev),
+            }));
+        }
+    }
     for c in &tx.conds {
         let (Cond::Absent { family, key } | Cond::At { family, key, .. }) = c;
         let now = get(db, ns, family, key, head)?.map(|r| r.rev);
