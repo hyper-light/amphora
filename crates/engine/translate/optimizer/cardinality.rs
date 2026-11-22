@@ -215,6 +215,54 @@ pub(super) struct JoinedSetRows<'a> {
     /// PL.13 (lane replan-11): what keys a set's rows as a join prefix's
     /// (`subquery_rows::prefix_identity`), under the same conditions as `joined`.
     prefixes: Option<PrefixKeys>,
+    /// PL.13 (lane replan-12): the join prefixes whose counted rows stood in for their estimate,
+    /// each with its correction, carried into the sets that hold it ([Corrections]).
+    corrected: Corrections,
+}
+
+/// The join prefixes a fill counted (PL.13, lane replan-12: a corrected prefix's count carried
+/// upward), each with its correction: its counted rows over its own estimate. A set of tables
+/// that holds one is joined from it, so the model's error on it is in the set's estimate too: the
+/// set's estimate is scaled by the correction of the largest corrected set it holds (the earliest
+/// recorded of the largest), whose count already holds any smaller one's. Two disjoint corrected
+/// sets are not multiplied together; only the largest is carried. A set is recorded where the
+/// search estimates it ([JoinedSetRows::rows]), before the sets built on it: the exact search goes
+/// by size, the greedy one prefix by prefix. Bound: one entry for each set with a count, at most
+/// as many as the memo holds (`MEMO_SETS`).
+#[derive(Debug, Default)]
+struct Corrections {
+    sets: Vec<(TableMask, usize, f64)>,
+}
+
+impl Corrections {
+    /// Records `set`'s correction, `counted` rows against its `own` estimate; none for an
+    /// estimate of no rows, which no ratio scales, or for a set held already.
+    fn record(&mut self, set: &TableMask, counted: f64, own: f64) {
+        if !own.is_finite() || own <= 0.0 || !counted.is_finite() || self.sets.len() >= MEMO_SETS {
+            return;
+        }
+        if self.sets.iter().any(|(held, ..)| held == set) {
+            return;
+        }
+        let Ok(held) = crate::alloc::TryClone::try_clone(set) else {
+            return;
+        };
+        self.sets.push((held, set.count(), counted / own));
+    }
+
+    /// The correction `set` carries: the largest recorded set it holds, other than itself.
+    fn carried(&self, set: &TableMask) -> Option<f64> {
+        let mut best: Option<(usize, f64)> = None;
+        for (held, tables, ratio) in &self.sets {
+            if held != set
+                && set.contains_all_set_bits_of(held)
+                && best.is_none_or(|(most, _)| *tables > most)
+            {
+                best = Some((*tables, *ratio));
+            }
+        }
+        best.map(|(_, ratio)| ratio)
+    }
 }
 
 /// The parts of a set of tables' identity as a join prefix (PL.13, lane replan-11), taken once:
@@ -723,6 +771,7 @@ impl<'a> JoinedSetRows<'a> {
             joined,
             own_filters,
             prefixes,
+            corrected: Corrections::default(),
         }
     }
 
@@ -733,7 +782,13 @@ impl<'a> JoinedSetRows<'a> {
         }
         // PL.11: an estimate above the set's proven bound is cut to it; one below is left.
         // The bound is a join's for one row of its input, as `initial` counts them.
-        let rows = self.bound.cap(set, self.capped(set), self.initial);
+        let own = self.bound.cap(set, self.capped(set), self.initial);
+        // PL.13 (lane replan-12): a set holding a counted prefix carries its correction. Not cut to
+        // the bound again: the count is the rows, where the statistics the bound read are stale.
+        let rows = match self.corrected.carried(set) {
+            Some(ratio) => own * ratio,
+            None => own,
+        };
         // PL.13 (lane replan-10): the whole join's rows a sorter fed by it counted past their
         // estimate stand in for it, noted as the rows the plan read, so the sorter is checked
         // against them and the plan made again when a count is stored.
@@ -751,7 +806,9 @@ impl<'a> JoinedSetRows<'a> {
             (Some(prefixes), Some(values)) if tables >= 2 && tables < self.tables.len() => {
                 match prefixes.identity(set) {
                     Some(identity) if values.counted_subquery(identity) => {
-                        values.subquery_rows(identity, rows)
+                        let counted = values.subquery_rows(identity, rows);
+                        self.corrected.record(set, counted, own);
+                        counted
                     }
                     _ => rows,
                 }
@@ -2261,6 +2318,40 @@ mod degree_bound_tests {
         assert_eq!(bound.upper_bound(&both), 5_000.0);
         bound.tables[1].role = Role::Unbounded;
         assert_eq!(bound.cap(&both, 1e9, 1.0), 1e9);
+    }
+
+    /// Do: record `{0, 1}` counted at 2,000 rows against its own 20, then `{0, 1, 2}` at 300
+    /// against 100, a set estimated at no rows, and `{0, 1}` again. Expect: a set carries the
+    /// correction of the largest recorded set it holds other than itself, none without one, none
+    /// from an estimate of no rows, and the first count kept (PL.13, lane replan-12, T-PL.13.22).
+    #[test]
+    fn pl_13_a_corrected_prefix_is_carried_into_the_sets_holding_it() {
+        let mut corrections = Corrections::default();
+        assert_eq!(corrections.carried(&mask(&[0, 1, 2, 3])), None);
+        corrections.record(&mask(&[0, 1]), 2_000.0, 20.0);
+        assert_eq!(corrections.carried(&mask(&[0, 1])), None, "its own");
+        assert_eq!(corrections.carried(&mask(&[0, 1, 2])), Some(100.0));
+        assert_eq!(corrections.carried(&mask(&[0, 1, 2, 3])), Some(100.0));
+        assert_eq!(corrections.carried(&mask(&[1, 2, 3])), None, "not held");
+        corrections.record(&mask(&[0, 1, 2]), 300.0, 100.0);
+        assert_eq!(
+            corrections.carried(&mask(&[0, 1, 2, 3])),
+            Some(3.0),
+            "the largest"
+        );
+        assert_eq!(corrections.carried(&mask(&[0, 1, 3])), Some(100.0));
+        corrections.record(&mask(&[2, 3]), 5.0, 0.0);
+        assert_eq!(
+            corrections.carried(&mask(&[1, 2, 3])),
+            None,
+            "no rows estimated"
+        );
+        corrections.record(&mask(&[0, 1]), 7.0, 1.0);
+        assert_eq!(
+            corrections.carried(&mask(&[0, 1, 3])),
+            Some(100.0),
+            "the first count"
+        );
     }
 
     /// Do: push an index's sorted values (a: 1 1 1 2 3 3; b distinct under each a) through

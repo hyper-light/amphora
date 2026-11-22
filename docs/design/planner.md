@@ -1782,9 +1782,21 @@ materialized from a two-table prefix: the prefix the first plan holds is read fr
 (`{r, s}`: every `s.k` set to `r`'s common value, 20 rows estimated, 2,000 counted; `{s, t}`: 2,000
 estimated, 200 counted) and the other left on its own, so the test forces its premise whichever
 prefix the planner picks: one answer with adaptive joins off and on, the prefix counted, one
-re-plan, none after. A superset of a corrected prefix keeps its own estimate (the
-whole join's store corrects the whole join only); carrying a prefix's correction into the sets
-that hold it is not built. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
+re-plan, none after. A set of tables that holds a corrected prefix (lane replan-12) is
+joined from it, so the model's error on the prefix is in its estimate too: the join search scales
+the set's own estimate by the prefix's correction, its counted rows over its own estimate
+(`cardinality::Corrections`), the largest corrected set it holds winning (its count holds any
+smaller one's), not cut to the PL.11 bound again (the count is the rows, where the statistics the
+bound read are stale). A prefix is recorded where the search estimates it, before the sets built
+on it (the exact search goes by size, the greedy one prefix by prefix); two disjoint corrected
+sets are not multiplied together. A whole join's count, stored by a sorter, corrects a prefix of
+the same tables and terms in another query, and is carried the same way.
+`t_pl_13_22_a_corrected_prefix_is_carried_into_the_whole_chain` (T-PL.13.22): a chain of four
+tables whose first pair alone is off its estimate (20 estimated, 2,000 counted, stored by a sorter
+over the pair alone): the chain's whole-join estimate after it is the one before times the pair's
+correction, and the chain runs with one answer off and on, its sorter within the band of the
+carried estimate, nothing planned again; `pl_13_a_corrected_prefix_is_carried_into_the_sets_holding_it`
+holds the rule (largest set, none from a set estimated at no rows). Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
 (`crates/engine/tests/adaptive_joins.rs`; T-PL.13.5), a range one row in a hundred passed at
 ANALYZE and every row after an UPDATE: one answer with adaptive joins off and on, one share stored,
 one re-plan, none on the second run or in a statement prepared on the stored share.

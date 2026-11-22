@@ -1744,3 +1744,90 @@ fn t_pl_13_21_a_distinct_sorters_rows_past_the_estimate_plan_again() {
         );
     }
 }
+
+/// Do: a chain of four tables, `r.k = s.k`, `s.j = t.j`, `t.m = u.m`, ORDER BY columns of all four
+/// (a sorter holds the whole join's rows). At ANALYZE no row of `s` meets `r` (20 rows estimated for
+/// the pair); then every `s.k` is set to 1 (2,000), the tables' counts unchanged; `s` meets `t` and
+/// `t` meets `u` as estimated. The pair's count is stored by a sorter over `r JOIN s` alone (a whole
+/// join's identity is the one the same tables and terms have as a prefix), so the pair is the only
+/// set corrected. The chain's whole-join estimate is read from its EXPLAIN before and after. Expect:
+/// the pair's own query planned again once; after it, the chain's estimate scaled by the pair's
+/// correction (its count over the pair's estimate, as that query's EXPLAIN stated it); and the
+/// chain, run with adaptive joins off and on, one answer in order, its sorter counted within the
+/// band of the carried estimate, nothing planned again (PL.13, lane replan-12, T-PL.13.22: a
+/// corrected prefix's count carried into the sets that hold it).
+#[test]
+fn t_pl_13_22_a_corrected_prefix_is_carried_into_the_whole_chain() {
+    let (_dir, conn) = open("carried_prefix.db");
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k, j)",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, j, m)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, m)",
+        "INSERT INTO r(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) SELECT i % 2 FROM n",
+        "INSERT INTO s(k, j) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) SELECT i + 1000, i FROM n",
+        "INSERT INTO t(j, m) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i % 200, i FROM n",
+        "INSERT INTO u(m) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i FROM n",
+        "ANALYZE",
+        "UPDATE s SET k = 1",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let pair = "SELECT r.id, s.id FROM r JOIN s ON s.k = r.k ORDER BY s.id, r.id";
+    let chain = "SELECT r.id, s.id, t.id, u.id FROM r JOIN s ON s.k = r.k JOIN t ON t.j = s.j JOIN u ON u.m = t.m ORDER BY u.id, t.id, s.id, r.id";
+    let whole = |sql: &str| -> f64 {
+        let planned = planned_rows(&conn, sql, "SorterCounted", " at ");
+        let [rows] = planned[..] else {
+            panic!("one sorter counted against the join: {planned:?} for {sql}");
+        };
+        rows
+    };
+    conn.set_adaptive_joins(true);
+    let before = whole(chain);
+    let pair_estimate = whole(pair);
+    // r's ten rows with k = 1, each with all 200 of s.
+    let pair_rows = 10.0 * 200.0;
+    assert!(
+        pair_estimate * 2.0 <= pair_rows,
+        "the pair estimated at {pair_estimate} rows, near its {pair_rows}"
+    );
+
+    // Held to the end: the store keeps a count only while a plan or a fill holds it.
+    let mut pair_held = conn.prepare(pair).unwrap();
+    let replans = conn.adaptive_replans();
+    assert_eq!(run_rows(&mut pair_held).len(), 2000, "the pair's rows");
+    assert_eq!(
+        conn.adaptive_replans() - replans,
+        1,
+        "the pair planned again once"
+    );
+    let after = whole(chain);
+    let carried = before * pair_rows / pair_estimate;
+    assert!(
+        (after - carried).abs() <= carried * 1e-6,
+        "the chain at {after} rows, not its {before} carried to {carried}"
+    );
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_sort_checks();
+    let off = run_rows(&mut conn.prepare(chain).unwrap());
+    // The pair's 2,000 rows; s.j 1 to 199 ten rows of t each, 200 none; each t one row of u.
+    assert_eq!(off.len(), 10 * 199 * 10, "the chain's rows");
+    conn.set_adaptive_joins(true);
+    let replans = conn.adaptive_replans();
+    assert_eq!(
+        run_rows(&mut conn.prepare(chain).unwrap()),
+        off,
+        "on and off differ"
+    );
+    assert!(
+        conn.adaptive_sort_checks() > checks,
+        "the chain's sorter was not counted"
+    );
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "the chain planned again on the carried estimate"
+    );
+    drop(pair_held);
+}
