@@ -369,7 +369,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   44 of the engine's lib tests still fail (2866 pass, lane g7s2-11, before the pause points; 6 more
   pass after) (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
   batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and
-  page-codec tests). Not yet: the header (schema cookie, user version) on the versioned
+  page-codec tests). The skipping summaries are built and asked on the versioned storage, a
+  writer's end told to them as its transaction ends (lane g7s2-14, executor.md decision 11); the
+  pager's leaf-morsel and MVCC-store tests say why they stand aside there. Not yet: the header (schema cookie, user version) on the versioned
   storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
   budget shared by a process's databases. On the pager as on the switch, `nested_loops`'
   chain of hash joins, `row_counts`' hash join and `sample_filters`' outer join fail (planner

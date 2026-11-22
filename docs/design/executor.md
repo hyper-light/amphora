@@ -703,6 +703,18 @@ table seek. No size is picked: a zone is a table leaf (the page size and the rec
 how many rows it holds), the tail zone grows to the leaves' measured fill, and the cracker's pieces
 are cut where filters asked.
 
+**On the versioned storage (lane g7s2-14, G7 step 2, `AC-NS.2.1`).** A summary is built, built
+again for a trial, and asked through the versioned storage's own cursor (its root page is the
+tree's id). The positions are commit timestamps: a connection's snapshot is its transaction's
+start (the newest commit when none is open), against the newest commit published. Writers there
+take no single write lock, so another may commit while one is open and a newer commit no longer
+means the open writer committed: its writes are taken with `SkipRegistry::on_write_told`, and its
+end is told as its transaction ends (`committed`, or `rolled_back`, which makes the summary
+`Stale`). A write while another writer's is open, or by a writer whose snapshot isn't the newest
+commit, makes the summary `Stale`; a build whose snapshot a commit passed is refused
+(`OlderSnapshot`). Not covered yet: a writer that wrote the table before a build and commits after
+it (the build can't see that writer's open rows); the pager's write lock rules that out there.
+
 ### Bounds from parameters (lane skip-usable, T-SKU.1)
 
 Real callers prepare a statement once and bind it on each run (`a BETWEEN ? AND ?`, `a >= :lo`), so
