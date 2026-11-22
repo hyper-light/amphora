@@ -12022,6 +12022,32 @@ mod tests {
             })
         });
     }
+    /// Rounds until each of the first `owners` owners has applied all that the leader has
+    /// committed: what a comparison of their rows waits on, since a calm configuration and a round
+    /// with nothing to relay say nothing of a follower whose records were lost or whose disk still
+    /// writes. Time stands still while anything is relayed or written; once nothing is and an owner
+    /// still lags, only the leader's heartbeat finds the lag and sends again, so every clock moves
+    /// a tick, as real time would.
+    fn caught_up(driven: &mut Driven, pump: &mut Pump<'_>, clients: &[Client], owners: usize) {
+        for _ in 0..ROUNDS {
+            let leader = settle_lead(driven, pump, clients);
+            let committed = driven.owner(leader).replica.core().raft.log().committed();
+            if (0..owners).all(|owner| driven.owner(owner).replica.applied().index >= committed) {
+                return;
+            }
+            if pump.drive_until(driven.until()) == 0 {
+                if (0..4).any(|owner| driven.owner(owner).replica.in_flight() > 0) {
+                    std::thread::park_timeout(POLL);
+                } else {
+                    for owner in 0..4 {
+                        driven.advance_tick(owner);
+                    }
+                }
+            }
+            driven.step();
+        }
+        panic!("the first {owners} owners did not apply the leader's commit in {ROUNDS} rounds");
+    }
     /// The member the group follows, as owner `asked` sees it, by its index; None while it knows
     /// none.
     fn leading(clients: &[Client], asked: usize) -> Option<usize> {
@@ -12468,9 +12494,11 @@ mod tests {
             }
 
             // Calm: join rows equal, every write recorded at or above the floor at its base, and
-            // members' digests equal at every applied index they share.
+            // members' digests equal at every applied index they share, once each voter has
+            // applied all the leader committed.
             quiet(&mut driven, &mut pump);
             calm(&mut driven, &mut pump, 3);
+            caught_up(&mut driven, &mut pump, &clients, 3);
             let rows = floor_rows(&mut driven, 0);
             for owner in 1..3 {
                 assert_eq!(
