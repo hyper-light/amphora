@@ -812,8 +812,11 @@ class DateFunctions(unittest.TestCase):
     the day is 28 or less, and 'subsec' (lang_datefunc.html). Expect: DuckDB (when its Python module
     is here) gives what SQLite gives; PostgreSQL is given to_char() and extract(epoch) of the same
     TIMESTAMP; what isn't exact ('now', 'localtime', a month added past the 28th, a fractional
-    amount, %W, timediff(), a value read as it runs) is not expressible with the reason, and MySQL
-    and ClickHouse refuse each, saying theirs isn't written yet."""
+    amount, %W, timediff(), a value read as it runs) is not expressible with the reason on every
+    engine; MySQL is given DATE_FORMAT() and TIMESTAMPDIFF() of a DATETIME(3), ClickHouse
+    formatDateTime() and toUnixTimestamp64Milli() of a DateTime64(3) in UTC, each output reading
+    back in its dialect, and a moment outside the years each holds is not expressible there
+    (unverified on the engines until the jupiter run)."""
 
     CASES = [
         "date('2024-01-31')", "date('2024-02-30')", "datetime('2024-02-29 12:30:00', 'subsec')", "datetime('2024-01-01 10:00:00+05:00')",
@@ -852,13 +855,25 @@ class DateFunctions(unittest.TestCase):
                 self.assertIsNone(why)
                 self.assertNotRegex(out.upper(), r"\b(STRFTIME|JULIANDAY|UNIXEPOCH|DATETIME)\(")
                 for d in ("mysql", "clickhouse"):
-                    self.assertIn("written for DuckDB and PostgreSQL only", dialects.translate(f"SELECT {case}", d)[1])
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    if case in ("date('0099-06-01')", "julianday('0001-01-01')"):
+                        self.assertIn("outside the years", why)
+                        continue
+                    self.assertIsNone(why, f"{d}: {case}")
+                    self.assertNotRegex(out.upper(), r"\b(STRFTIME|JULIANDAY|UNIXEPOCH|TO_CHAR|EPOCH_MS)\(|\bDATETIME\((?!3\))")
+                    import sqlglot
+
+                    sqlglot.parse_one(out, read=d)
         self.assertEqual(dialects.translate("SELECT datetime('2024-02-29 12:30:00', 'subsec')", "postgres")[0], "SELECT TO_CHAR(CAST('2024-02-29 12:30:00.000' AS TIMESTAMP), 'YYYY-MM-DD HH24:MI:SS.MS')")
         self.assertIn("EXTRACT(DOW FROM", dialects.translate("SELECT strftime('%w', '2024-01-01')", "postgres")[0])
+        self.assertEqual(dialects.translate("SELECT datetime('2024-02-29 12:30:00', '+1 day')", "mysql")[0], "SELECT DATE_FORMAT(CAST('2024-02-29 12:30:00.000' AS DATETIME(3)) + INTERVAL 1 DAY, '%Y-%m-%d %H:%i:%s')")
+        self.assertEqual(dialects.translate("SELECT date('2024-02-29', 'start of month', '-2 days')", "clickhouse")[0],
+                         "SELECT formatDateTime(addDays(toDateTime64(toStartOfMonth(toDateTime64('2024-02-29 00:00:00.000', 3, 'UTC')), 3, 'UTC'), -2), '%Y-%m-%d', 'UTC')")
+        self.assertIn("outside the years 1900 to 2299", dialects.translate("SELECT date('2299-12-31', '+1 day')", "clickhouse")[1])
 
     def test_not_exact_is_not_expressible(self):
         for case, reason in self.REFUSED:
-            for d in ("duckdb", "postgres"):
+            for d in ENGINES:
                 with self.subTest(case=case, dialect=d):
                     out, why = dialects.translate(f"SELECT {case}", d)
                     self.assertIsNone(out)

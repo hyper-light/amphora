@@ -1487,17 +1487,164 @@ def _time_value(args, dialect, name):
     return text, rest
 
 
-def _moment(text):
+# MySQL's and ClickHouse's dates (unverified here: no MySQL or ClickHouse on this machine; the
+# jupiter run checks them). Sources: MySQL 8.4 Reference Manual, "Date and Time Functions"
+# (https://dev.mysql.com/doc/refman/8.4/en/date-and-time-functions.html: DATE_FORMAT()'s
+# specifiers, DATE_ADD()'s "date + INTERVAL expr unit", TIMESTAMPDIFF()) and "The DATE, DATETIME,
+# and TIMESTAMP Types" (https://dev.mysql.com/doc/refman/8.4/en/datetime.html: DATETIME(3) keeps
+# milliseconds, "The supported range is '1000-01-01 00:00:00.000000' to '9999-12-31
+# 23:59:59.499999'", no time zone); ClickHouse's "Dates and Times" functions
+# (https://clickhouse.com/docs/sql-reference/functions/date-time-functions: formatDateTime()'s
+# specifiers and time zone argument, toStartOfDay(), toStartOfMonth(), toStartOfYear(), addDays()
+# and the rest), "DateTime64" (https://clickhouse.com/docs/sql-reference/data-types/datetime64:
+# "Supported range of values: [1900-01-01 00:00:00, 2299-12-31 23:59:59.99999999]"), and
+# toUnixTimestamp64Milli() (https://clickhouse.com/docs/sql-reference/functions/type-conversion-functions).
+# Each moment is UTC on ClickHouse (given with every function) and zoneless on MySQL, as SQLite's are.
+# Years each holds: (first, last).
+_YEARS = {"mysql": (1000, 9999), "clickhouse": (1900, 2299)}
+# strftime()'s substitutions as DATE_FORMAT() and formatDateTime() write them ('%f' and '%s' are
+# _other_text()'s): MySQL's minutes are %i and seconds %s, ClickHouse's %i and %S; %j is the day
+# of the year 001-366 and %w the day of the week, Sunday 0, on both.
+_OTHER_STRFTIME = {
+    "mysql": {"d": "%d", "F": "%Y-%m-%d", "H": "%H", "j": "%j", "m": "%m", "M": "%i", "R": "%H:%i", "S": "%s", "T": "%H:%i:%s", "Y": "%Y", "w": "%w"},
+    "clickhouse": {"d": "%d", "F": "%Y-%m-%d", "H": "%H", "j": "%j", "m": "%m", "M": "%i", "R": "%H:%i", "S": "%S", "T": "%H:%i:%S", "Y": "%Y", "w": "%w"},
+}
+
+
+def _moment(text, dialect="duckdb"):
+    """Moment `text` ('YYYY-MM-DD HH:MM:SS.SSS') as the dialect's: a TIMESTAMP; MySQL's
+    DATETIME(3); ClickHouse's toDateTime64(text, 3, 'UTC')."""
     from sqlglot import exp
 
-    return exp.cast(exp.Literal.string(text), exp.DataType.build("TIMESTAMP"))
+    lit = exp.Literal.string(text)
+    if dialect == "mysql":
+        return exp.cast(lit, exp.DataType.build("DATETIME(3)", dialect="mysql"))
+    if dialect == "clickhouse":
+        return _utc(exp.Anonymous(this="toDateTime64", expressions=[lit, exp.Literal.number(3)]))
+    return exp.cast(lit, exp.DataType.build("TIMESTAMP"))
+
+
+def _utc(call):
+    """ClickHouse's `call` with its time zone argument 'UTC' last."""
+    from sqlglot import exp
+
+    call.append("expressions", exp.Literal.string("UTC"))
+    return call
+
+
+def _started(ts, unit, dialect):
+    """'start of day', 'start of month', 'start of year' of `ts`: date_trunc(); MySQL's DATETIME of
+    DATE_FORMAT()'s day, month or year; ClickHouse's toStartOfDay(), toStartOfMonth(),
+    toStartOfYear() (a Date for a month or a year) made a DateTime64(3) in UTC again."""
+    from sqlglot import exp
+
+    if dialect == "mysql":
+        fmt = {"day": "%Y-%m-%d 00:00:00", "month": "%Y-%m-01 00:00:00", "year": "%Y-01-01 00:00:00"}[unit]
+        return exp.cast(exp.Anonymous(this="DATE_FORMAT", expressions=[ts, exp.Literal.string(fmt)]), exp.DataType.build("DATETIME(3)", dialect="mysql"))
+    if dialect == "clickhouse":
+        return _utc(exp.Anonymous(this="toDateTime64", expressions=[exp.Anonymous(this=f"toStartOf{unit.capitalize()}", expressions=[ts]), exp.Literal.number(3)]))
+    return exp.cast(exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string(unit), ts]), exp.DataType.build("TIMESTAMP"))
+
+
+def _added(ts, unit, n, dialect):
+    """`ts` with `n` (text of a whole number, maybe negative) of `unit` (DAY ... YEAR) added: the
+    INTERVAL; ClickHouse's addDays(), addHours(), ... addYears(). Months and years end on the new
+    month's last day on every engine (MySQL: "the day is adjusted to the maximum days in the new
+    month"); dated() says them only where that can't happen."""
+    from sqlglot import exp
+
+    if dialect == "clickhouse":
+        return exp.Anonymous(this=f"add{unit.capitalize()}s", expressions=[ts, exp.Literal.number(n)])
+    if dialect == "mysql":
+        return exp.Add(this=ts, expression=exp.Interval(this=exp.Literal.number(n), unit=exp.var(unit)))
+    return exp.Add(this=ts, expression=exp.Interval(this=exp.Literal.string(n), unit=exp.var(unit)))
+
+
+def _other_text(fmt, ts, dialect):
+    """strftime(`fmt`)'s text of `ts` on MySQL (DATE_FORMAT()) and ClickHouse (formatDateTime(...,
+    'UTC')): each run of _OTHER_STRFTIME's substitutions and the text between them ('%' as '%%')
+    one format; '%f' (SS.SSS) MySQL's first six characters of '%s.%f' (microseconds, of a moment
+    of whole milliseconds), ClickHouse's '%S', '.' and the milliseconds of toUnixTimestamp64Milli()
+    padded to three; '%s' unixepoch()'s. Another substitution is not expressible."""
+    from sqlglot import exp
+
+    table = _OTHER_STRFTIME[dialect]
+
+    def call(f, at=None):
+        at = at if at is not None else ts.copy()
+        if dialect == "mysql":
+            return exp.Anonymous(this="DATE_FORMAT", expressions=[at, exp.Literal.string(f)])
+        return _utc(exp.Anonymous(this="formatDateTime", expressions=[at, exp.Literal.string(f)]))
+
+    def written(run):
+        # A run without a substitution is its text, '%%' a '%'.
+        return call(run) if "%" in run.replace("%%", "") else exp.Literal.string(run.replace("%%", "%"))
+
+    parts, run, i = [], "", 0
+    while i < len(fmt):
+        ch = fmt[i]
+        if ch != "%":
+            run += ch
+            i += 1
+            continue
+        spec = fmt[i + 1] if i + 1 < len(fmt) else ""
+        i += 2
+        if spec == "%":
+            run += "%%"
+        elif spec in table:
+            run += table[spec]
+        elif spec in ("f", "s"):
+            if run:
+                parts.append(written(run))
+                run = ""
+            if spec == "s":
+                parts.append(exp.cast(_unix(ts.copy(), dialect, False), exp.DataType.build("TEXT")))
+            elif dialect == "mysql":
+                parts.append(exp.Substring(this=call("%s.%f"), start=exp.Literal.number(1), length=exp.Literal.number(6)))
+            else:
+                ms = exp.Mod(this=exp.Paren(this=exp.Add(this=exp.Mod(this=_epoch_ms(ts.copy(), dialect), expression=exp.Literal.number(1000)), expression=exp.Literal.number(1000))), expression=exp.Literal.number(1000))
+                padded = exp.Anonymous(this="leftPad", expressions=[exp.Anonymous(this="toString", expressions=[ms]), exp.Literal.number(3), exp.Literal.string("0")])
+                parts.append(exp.DPipe(this=exp.DPipe(this=call("%S"), expression=exp.Literal.string(".")), expression=padded))
+        else:
+            raise NotExpressible(f"not expressible in {dialect}: strftime()'s %{spec} (https://www.sqlite.org/lang_datefunc.html#strftime), which {dialect} has nothing that writes alike")
+    if run or not parts:
+        parts.append(written(run))
+    said = parts[0]
+    for p in parts[1:]:
+        said = exp.DPipe(this=said, expression=p)
+    return exp.Paren(this=said) if len(parts) > 1 else said
+
+
+def _in_years(args, dialect, name):
+    """Not expressible where SQLite's moment of time value and modifiers `args` (literals, read
+    by Python's sqlite3), as read or once modified, is outside the years the dialect holds (_YEARS)."""
+    import sqlite3
+
+    if dialect not in _YEARS:
+        return
+    first, last = _YEARS[dialect]
+    shown = [a.sql(dialect="sqlite") for a in args]
+    db = sqlite3.connect(":memory:")
+    try:
+        years = [db.execute(f"SELECT strftime('%Y', {', '.join(shown[:k])})").fetchone()[0] for k in (1, len(shown))]
+    finally:
+        db.close()
+    for y in years:
+        if y is not None and not first <= int(y) <= last:
+            raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of a moment in the year {y}, outside the years {first} to {last} {dialect}'s dates hold")
 
 
 def _epoch_ms(ts, dialect):
     """The moment `ts` as whole milliseconds since 1970 (BIGINT): DuckDB's epoch_ms(), PostgreSQL's
-    extract(epoch) (a numeric, exact) times 1000."""
+    extract(epoch) (a numeric, exact) times 1000, MySQL's TIMESTAMPDIFF() in microseconds from
+    1970 DIV 1000 (exact: whole milliseconds), ClickHouse's toUnixTimestamp64Milli()."""
     from sqlglot import exp
 
+    if dialect == "mysql":
+        epoch = exp.cast(exp.Literal.string("1970-01-01 00:00:00"), exp.DataType.build("DATETIME(3)", dialect="mysql"))
+        return exp.IntDiv(this=exp.Anonymous(this="TIMESTAMPDIFF", expressions=[exp.var("MICROSECOND"), epoch, ts]), expression=exp.Literal.number(1000))
+    if dialect == "clickhouse":
+        return exp.Anonymous(this="toUnixTimestamp64Milli", expressions=[ts])
     if dialect == "duckdb":
         return exp.Anonymous(this="epoch_ms", expressions=[ts])
     return exp.cast(exp.Floor(this=exp.Mul(this=exp.Extract(this=exp.var("EPOCH"), expression=ts), expression=exp.Literal.number(1000))), exp.DataType.build("BIGINT"))
@@ -1582,7 +1729,9 @@ def dated(expression, dialect):
       '.SSS' after the seconds), strftime() its format (_strftime_text()), julianday() the moment's
       milliseconds over 86400000.0 from Julian day 0 (date.c's iJD/86400000.0: one exact BIGINT,
       one IEEE division, so the same REAL), unixepoch() _unix()'s.
-    MySQL's and ClickHouse's are not written yet: not expressible there, with that reason.
+    MySQL and ClickHouse: the same, with _moment(), _started(), _added(), _epoch_ms() and
+    _other_text() of theirs, where SQLite's moment read and modified is in the years they hold
+    (_in_years()); unverified until the jupiter run.
     timediff() (a span written '+YYYY-MM-DD HH:MM:SS.SSS') has no like on any engine."""
     from sqlglot import exp
 
@@ -1599,8 +1748,6 @@ def dated(expression, dialect):
         doc = f"https://www.sqlite.org/lang_datefunc.html#{name.lower() if name != 'STRFTIME' else 'strftime'}"
         if name == "TIMEDIFF":
             raise NotExpressible(f"not expressible in {dialect}: timediff() ({doc}), whose '+YYYY-MM-DD HH:MM:SS.SSS' span no {dialect} function writes")
-        if dialect not in ("duckdb", "postgres"):
-            raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() ({doc}): its translation is written for DuckDB and PostgreSQL only so far")
         fmt = None
         if name == "STRFTIME":
             if not args or not (isinstance(args[0], exp.Literal) and args[0].is_string):
@@ -1610,7 +1757,7 @@ def dated(expression, dialect):
         if text is None:
             said = exp.Null()
         else:
-            ts, subsec, day_ok = _moment(text), False, int(text[8:10]) <= 28
+            ts, subsec, day_ok = _moment(text, dialect), False, int(text[8:10]) <= 28
             for m in mods:
                 word = m.this.strip().lower() if isinstance(m, exp.Literal) and m.is_string else None
                 added = _ADDED.match(word) if word is not None else None
@@ -1618,21 +1765,25 @@ def dated(expression, dialect):
                     subsec = True
                 elif word in ("start of day", "start of month", "start of year"):
                     unit = word.split()[-1]
-                    ts = exp.cast(exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string(unit), ts]), exp.DataType.build("TIMESTAMP"))
+                    ts = _started(ts, unit, dialect)
                     day_ok = day_ok or unit != "day"
                 elif added is not None and (added.group(3).lower() not in ("month", "year") or day_ok):
                     unit = added.group(3).upper()
                     n = ("-" if added.group(1) == "-" else "") + added.group(2)
-                    ts = exp.Add(this=ts, expression=exp.Interval(this=exp.Literal.string(n), unit=exp.var(unit)))
+                    ts = _added(ts, unit, n, dialect)
                     day_ok = day_ok and unit in ("MONTH", "YEAR")
                 elif added is not None:
                     raise NotExpressible(f"not expressible in {dialect}: {name.lower()}()'s '{word}' after a day past the 28th may be ({doc} and #modifiers: SQLite carries a day past the month's end into the next month, {dialect} gives the month's last day)")
                 else:
                     shown = m.sql(dialect="sqlite")
                     raise NotExpressible(f"not expressible in {dialect}: {name.lower()}()'s modifier {shown} (https://www.sqlite.org/lang_datefunc.html#modifiers), which {dialect}'s dates have nothing alike of, or which is read as it runs")
+            _in_years(args, dialect, name)
             sec = "%S.%g" if dialect == "duckdb" else "SS.MS"
             sec = sec if subsec else ("%S" if dialect == "duckdb" else "SS")
-            if name == "DATE":
+            other = {"DATE": "%Y-%m-%d", "TIME": "%H:%M:" + ("%f" if subsec else "%S"), "DATETIME": "%Y-%m-%d %H:%M:" + ("%f" if subsec else "%S"), "STRFTIME": fmt}
+            if dialect in _YEARS and name in other:
+                said = _other_text(other[name], ts, dialect)
+            elif name == "DATE":
                 said = _formatted(ts, "%Y-%m-%d" if dialect == "duckdb" else "YYYY-MM-DD", dialect)
             elif name == "TIME":
                 said = _formatted(ts, ("%H:%M:" if dialect == "duckdb" else "HH24:MI:") + sec, dialect)
