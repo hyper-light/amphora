@@ -412,8 +412,25 @@ their keys' SQLite order, as the serial GROUP BY gives them. The machine's costs
 connection's first parallel statement and learned by each after. Evidence: random queries answer
 the same row for row and in order with the switch off and on at 2, 3, 4 and 8 cores (T-QT.6.10).
 
-**Left.** The hash join's probe loop handed over the same way; expressions beyond a column against
-a literal (each worker running its own copy of the program's loop body), a hash table built by all
+**The hash join's probe through the hook.** A SELECT whose work is two rowid tables the planner
+joins inner by a hash join, with aggregates over the joined rows, is handed over the same way
+(`shape_join`): `Insn::MorselAggregate` then carries the build side (`MorselJoinData`). The
+build table is read once on the statement's thread, its own filter terms applied and every kept
+row charged to the statement's budget, and its hash table built; each worker then reads its run
+of the probe table's leaves with its own cursor, tests the probe's own terms, probes, and folds
+each joined row (the probe row's columns, then the build row's) into its partial aggregates
+(`vdbe/morsel_scan.rs`, `TableJoinAggregate`). It qualifies when the join keys are equalities of
+columns of one affinity, every other term is a filter on one table's columns, and every column
+read has INTEGER or TEXT affinity and BINARY collation: two such values that compare equal are
+the same value, so the order of a probe row's matches, which in the serial loop is its hash
+table's, cannot change a MIN, a MAX or a group's key values. A build side past the statement's
+memory hands the statement to its serial loop. Evidence: random inner equi-joins on one or two
+columns, with filters on either table and groupings and aggregates over both, answer the same
+row for row and in order with the switch off and on at 2, 3, 4 and 8 cores, the planner held to
+hash joins (T-QT.6.11).
+
+**Left.** A join's own rows (no aggregates) and joins of more than two tables handed over;
+expressions beyond a column against a literal (each worker running its own copy of the program's loop body), a hash table built by all
 workers, the page cache's miss path sharded, loom
 or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.
 
@@ -466,3 +483,39 @@ T-QT.7.1 to T-QT.7.3); a batch holding more than its budget; q06 at SF 1 not fas
 the switch on than off (AC-QT.7.1, the coordinator's run with `amphora-bench --planner` targets
 `amphora,amphora-vectorized`); or G5 step 2 measuring compiled pipelines faster on the same scans,
 in which case they replace this.
+
+## 10. A scan loop's filters and aggregates run over a whole batch by selection
+
+**Decision.** With the switch of decision 9 on, a scan loop (`Rewind`, a body, `Next` back to it)
+whose body only reads the scanned cursor's columns, filters them and steps COUNT, SUM, TOTAL, AVG,
+MIN or MAX is fused (`vdbe/leaf_batch/fused.rs`, found once as the program is built). When its Next
+lands on a row of a decoded batch, the body runs over the rest of the batch at once: each body
+instruction gets the set of rows that reach it, a bit per row (a selection vector); a comparison,
+IS NULL or IS NOT NULL splits its rows between its jump target and the next instruction, so
+ranges, IN lists, AND and OR, which the code generator lowers to comparisons and forward jumps,
+need nothing of their own; an aggregate step folds its whole selection into its accumulator. The
+cursor is then moved to the last row run, where that many Next steps would have put it, and the
+Next runs again. Rows reach each instruction in ascending order, so order-sensitive aggregates (a
+float sum, the first of equal minima under a collation) fold as they do row-at-a-time.
+
+SQL's semantics stay in one place (CLAUDE.md §13): a comparison is the comparison opcodes' own
+`comparison_jumps` (NULLs, affinity, collations, arrays), a REAL column's affinity is
+`apply_real_affinity`, and an aggregate step is the opcode's own `agg_step_fast` with its slow path
+`op_agg_step_slow` for what that doesn't take (a first row, text, SUM's exact integer overflow,
+which ends the statement with the same error). A row the batch left out (its record spills to
+overflow pages) ends the fused run before it and is read row-at-a-time. Any other instruction in
+the body (an expression, a GROUP BY's group lookup, a result row) leaves the loop row-at-a-time,
+reading its columns from the batch as decision 9 does.
+
+**Why.** Decision 9 decodes each leaf once, but the interpreter still dispatches every filter and
+aggregate instruction once a row. Run by selection, a body instruction is dispatched once a batch
+and loops over its rows, the interpretation cost Boncz et al. amortize over a vector.
+
+**Sources.** Boncz, Zukowski and Nes, CIDR 2005 (selection vectors: a filter's output is the
+positions of the rows that pass, read by the next operator; research finding f29); Kersten et al.,
+PVLDB 11(13), 2018 (f30).
+
+**Falsified by.** Any answer or error that differs with the switch on (`vdbe/leaf_batch/tests.rs`,
+T-QT.7.4 and T-QT.7.5); a fused loop running a row the batch left out; or AC-QT.7.1 not met with
+it.
+

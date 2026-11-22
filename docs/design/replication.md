@@ -2448,12 +2448,34 @@ a command's entry leaves of its bound, or the write goes without one, as before:
 goes without one sooner.
 
 **What is left.** `SNAPSHOT_BYTES`, the image's own budget (256 MiB), is the seam owner's ruling (c): a memory bound
-from the process memory budget's room for one image, once a learned budget exists. The transport's own framing past
+from the process memory budget's room for one image (done: "Decision (lane constants): an image is bounded by the
+memory budget's room for one", below; SB.1). The transport's own framing past
 an entry (`replicated.rs`'s `MESSAGE_BYTES` and `WIRE_BYTES`, two mebibytes each) is the owner's queue piece's.
 
 **Tests.** `envelope_a_command_at_its_widest_fits_its_bound_exactly` (T-EN.1.1),
 `envelope_an_image_at_its_widest_fits_its_bound_exactly` (T-EN.1.2), `envelope_varints_take_seven_bits_a_byte`
 (T-EN.1.3), in `replication::envelope_tests`.
+
+## Decision (lane constants): an image is bounded by the memory budget's room for one (2026-11-21)
+
+`SNAPSHOT_BYTES`, a picked 256 MiB, bounded every image a replica made, fitted, installed or took as a baseline, and
+the reshard directory's images. The seam owner's ruling (c): an image is held whole in memory until snapshots
+stream, so the memory it may take bounds it.
+
+**The decision (SB.1).** `replication::image_room` is the process memory budget's room for an image (store.md,
+"Decision (lane constants): one process memory budget"; MB.1), read again at every image made, fitted, installed,
+captured or received as a baseline, and kept by the directory. Where the budget can't be read the image is refused
+typed (`Unavailable`), or the directory's machine fails, never a fallback. A replica's database log leaves that room
+free on its filesystem (`log_bound::log_room` takes it as an argument). A machine's carrier may bound it lower
+(`Machine::set_snapshot_bytes`): the replicated owner's command queue holds back room for one wire record's image
+(`WIRE_IMAGE_BYTES`), so that owner's image is the smaller of the two.
+
+**What is left.** `WIRE_IMAGE_BYTES` (256 MiB) is the owner's queue's split, picked with `QUEUED_BYTES`, and goes
+with it when the queue is sized from the budget and its measured drain.
+
+**Tests.** `image_room_tests::sb1_an_image_is_bounded_by_the_memory_budgets_room_for_one` (T-SB.1.1);
+`log_bound::tests::a_log_takes_its_file_and_an_equal_share_of_what_is_free_past_one_image`, the image's room passed in
+(T-SB.1.2).
 
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 

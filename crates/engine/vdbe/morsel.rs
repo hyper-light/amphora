@@ -716,7 +716,7 @@ pub enum Predicate {
 }
 
 impl Predicate {
-    fn holds(&self, row: &[Value]) -> Result<bool, MorselError> {
+    pub(crate) fn holds(&self, row: &[Value]) -> Result<bool, MorselError> {
         Ok(match self {
             Predicate::Compare {
                 column: at,

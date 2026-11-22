@@ -21,6 +21,8 @@ pub struct Restored {
     pub cut: (u64, u64),
     pub base: u64,
     pub bytes: u64,
+    /// The bytes of log it fetched ([`super::check_due`]'s measure).
+    pub log_bytes: u64,
 }
 
 fn wal_path(path: &Path) -> std::path::PathBuf {
@@ -87,6 +89,7 @@ pub fn restore(
     let frame = plan::cut_in(&marks, second)?;
     let plan = plan::chain(&segments, &bases, at, frame, second)?;
     let mut bytes = 0u64;
+    let mut log_bytes = 0u64;
 
     // The base's pages, as the file.
     let manifest_key = plan.base.key(prefix);
@@ -127,10 +130,12 @@ pub fn restore(
             }
             index = index.saturating_add(1);
             let body: Segment = if *i == at {
+                log_bytes = log_bytes.saturating_add(u64::try_from(located.frames.len())?);
                 located.clone()
             } else {
                 let got = blobs.get(name, until)?;
                 bytes = bytes.saturating_add(u64::try_from(got.len())?);
+                log_bytes = log_bytes.saturating_add(u64::try_from(got.len())?);
                 object::decode(name, &got)?
             };
             if body.first != written.saturating_add(1) {
@@ -175,6 +180,7 @@ pub fn restore(
         cut: plan.cut,
         base: plan.base.id,
         bytes,
+        log_bytes,
     })
 }
 
