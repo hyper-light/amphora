@@ -17,8 +17,20 @@ pub struct CostModelParams {
     /// Assumed rows per table when statistics unavailable.
     pub rows_per_table_fallback: f64,
 
-    /// Estimated rows per table B-tree page.
+    /// Rows a page of the table being costed: set for each table by [Self::for_table] from what
+    /// ANALYZE counted or the connection's page size (PL.7, T-PL.7.1); until then, the format's
+    /// default page of the fewest-byte one-column records (`cost::table_rows_per_page`).
     pub rows_per_table_page: f64,
+
+    /// Amphora (PL.7): the usable bytes of a page, the connection's once planned for it; the
+    /// format's default page until then (`cost::FORMAT_DEFAULT_PAGE_BYTES`).
+    pub page_bytes: f64,
+
+    /// Amphora (PL.7, T-PL.7.1): the rows a page of each index of the table being costed, as
+    /// ANALYZE counted its tree, keyed by normalized name; set by [Self::for_table]. Not a tuning
+    /// parameter.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) index_rows_per_page: Option<crate::sync::Arc<rustc_hash::FxHashMap<String, f64>>>,
 
     // === Selectivity Fallbacks ===
     /// Selectivity for equality predicate on unindexed column (e.g., `x = 5`).
@@ -114,7 +126,13 @@ impl CostModelParams {
         Self {
             // Cardinality fallbacks
             rows_per_table_fallback: 1_000_000.0,
-            rows_per_table_page: 50.0,
+            rows_per_table_page: super::cost::rows_per_leaf_page(
+                super::cost::FORMAT_DEFAULT_PAGE_BYTES,
+                super::cost::least_record_bytes(1.0),
+                super::cost::varint_bytes(1_000_000.0),
+            ),
+            page_bytes: super::cost::FORMAT_DEFAULT_PAGE_BYTES,
+            index_rows_per_page: None,
 
             // Selectivity fallbacks
             sel_eq_unindexed: 0.1,
@@ -168,6 +186,46 @@ impl CostModelParams {
     pub fn with_cache_pages(&self, pages: usize) -> Self {
         Self {
             cache_pages: pages as f64,
+            ..self.clone()
+        }
+    }
+
+    /// Amphora (PL.7): these parameters with the connection's usable page bytes, where known.
+    pub(crate) fn with_page_bytes(self, bytes: Option<usize>) -> Self {
+        match bytes {
+            Some(bytes) => Self {
+                page_bytes: bytes as f64,
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    /// Amphora (PL.7, T-PL.7.1): these parameters for costing reads of `table`: its rows a page and
+    /// its indexes', as ANALYZE counted its trees' pages, else from the page size and its records
+    /// (`cost::table_rows_per_page`). A table that is no B-tree keeps them as they are.
+    pub(crate) fn for_table(
+        &self,
+        table: &crate::translate::plan::JoinedTable,
+        analyze_stats: &crate::stats::AnalyzeStats,
+    ) -> Self {
+        let crate::schema::Table::BTree(btree) = &table.table else {
+            return self.clone();
+        };
+        let stats = analyze_stats.table_stats(&btree.name);
+        let rows = stats
+            .and_then(|s| s.row_count)
+            .map_or(self.rows_per_table_fallback, |r| r as f64);
+        Self {
+            rows_per_table_page: super::cost::table_rows_per_page(
+                stats,
+                btree.columns().len(),
+                rows,
+                self.page_bytes,
+            ),
+            index_rows_per_page: stats
+                .map(|s| s.index_rows_per_page.clone())
+                .filter(|m| !m.is_empty()),
             ..self.clone()
         }
     }

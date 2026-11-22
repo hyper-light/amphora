@@ -171,10 +171,24 @@ pub fn restore_and_check(
     counters: &CheckCounters,
     until: Instant,
 ) -> anyhow::Result<Check> {
-    let check = match newest_second(blobs, prefix, until)? {
-        None => Check::Empty,
-        Some(second) => check_second(blobs, prefix, second, scratch, source, until)?,
+    let Some(second) = newest_second(blobs, prefix, until)? else {
+        return Ok(Check::Empty);
     };
+    restore_and_check_at(blobs, prefix, second, scratch, source, counters, until)
+}
+
+/// [`restore_and_check`] at `second`, one the archive holds whole: the shipping thread checks the
+/// second its source's quiet snapshot holds ([`super::Marks::quiet_second`]).
+pub fn restore_and_check_at(
+    blobs: &dyn Blobs,
+    prefix: &str,
+    second: u64,
+    scratch: &Path,
+    source: &dyn Fn(u64) -> anyhow::Result<Option<RowDigest>>,
+    counters: &CheckCounters,
+    until: Instant,
+) -> anyhow::Result<Check> {
+    let check = check_second(blobs, prefix, second, scratch, source, until)?;
     counters.count(&check);
     match &check {
         Check::Failed { second, why } => tracing::error!(

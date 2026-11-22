@@ -119,9 +119,8 @@ owner).
   the last check outweighs the log that check replayed, so the log a restore replays is checked as
   fast as it grows.
 - **The source's rows at the second** are the caller's to give (`source(second)`), none when it can
-  no longer say them, which counts as `source_moved`, never as a pass. Open: the shipping thread
-  taking the source's digest while it writes a through mark (the source quiet, its rows those of
-  that second), so a running database checks itself; not built.
+  no longer say them, which counts as `source_moved`, never as a pass. The shipping thread gives
+  its own: the next section.
 
 **Evidence.** T-T1.12.C1: a database backed up to a folder, written a row a second and closed;
 restore-and-check passes at its newest second against the model's rows and fails naming the rows
@@ -129,6 +128,62 @@ against rows that differ; the counters say one of each. T-T1.12.C2: the cadence 
 
 **Falsified by.** A check that passes on an archive whose restore differs from the source at that
 second; a check that never comes due while bases land.
+
+## The source's own rows at a quiet second
+
+**Decision.** Given a scratch path (`Archive::check`), the shipping thread checks its own archive on
+the cadence above, against the database's own rows: no caller and no model supplies them. It takes
+them from a reader of its own (apart from the shipping reader, which never waits on a digest) whose
+snapshot holds exactly the commits stamped by one second's end, so the check compares the restore
+with the source at that very second.
+
+- **Lining the snapshot up with a stamp** (`Marks::quiet_second`). Under the lock commits are
+  stamped by, the reader begins its snapshot (a deferred `BEGIN` takes none until its first read,
+  which runs there) and reads where the log ends. If that is the newest commit stamped, no commit
+  lies between the snapshot and the stamps: a commit not yet stamped would have moved the log's end
+  past it, and none can be stamped while the lock is held. The snapshot then holds every commit
+  stamped at or before that commit's stamp and none after; it is not quiet otherwise (a commit
+  between its write and its stamp, a log just started again) and the next round tries again.
+- **Settling the second** (`Marks::settled`). The snapshot is the rows of the newest commit's second
+  only if no later commit is stamped in that second. The marks watch it: a commit stamped in it
+  says no, and the clock past the second's end with none says yes (stamps never go back, so every
+  later commit is in a later second). The digest waits, a few dozen bytes a table, until it
+  settles and the archive holds the second whole, then the thread restores that second and checks
+  it (`restore_and_check_at`).
+- **Where the result goes.** `Status::last_check` (the typed `Check`) and `Shipping::checks()`, the
+  counters behind `amphora_backup_checks_total`. A check that can't run (the store, the scratch
+  disk) is a failed round, logged and counted, leaving a base under way as it was. A passed check's
+  scratch file is removed; a failed one's stays to look into until the next check.
+- **What it costs.** One full read of the database a check, the snapshot held meanwhile, so the log
+  can't start again until the digest ends (`Db::restart_log` waits, as for any reader); checks come
+  as often as bases land or the log doubles, never on a timer. The scratch path is the caller's:
+  the restore takes as much disk as the database. A database whose commits never leave a second
+  quiet (one commit stamped in each second, every second, with the next always unstamped at the
+  round) is never checked; each round tries.
+
+**Evidence.** T-T1.12.C3 (unit): a snapshot lines up only at the newest stamp; its second settles
+past its end, and never once a commit is stamped in it. T-T1.12.C3 (`tests/backup.rs`): a database
+backed up to a folder with a scratch path, written a row a second, checks itself and passes with no
+failure counted; the second it passed restores equal to the model's rows at that second.
+
+**Falsified by.** A passed check at a second whose restore differs from the model's rows then; a
+check counted `source_moved` or failed on an archive that restores the source exactly.
+
+## A base begins just after a restart
+
+**Decision.** A base due waits for the log to start again before it begins (`plan::base_begins_now`):
+a base's own generation counts as changed for the next base, frames from before the base began
+included ("Incremental bases"), so a base begun as its generation starts leaves the next the least
+to copy. It begins at once when no base restores the log (none yet, or the log broke since the
+latest), in the round the log started again, or once its generation holds the frames a restart
+keeps (decision 31): past that the log starts again whether shipped or not, so the wait is one
+generation at most, and no number is picked for it.
+
+**Evidence.** T-T1.12.I4: the rule's cases. T-T1.12.C1, C3, D2 and X1 still take their first bases
+through the thread.
+
+**Falsified by.** A base that waits past a generation the size a restart keeps; a later base copying
+more chunks after a base begun just after a restart than after one begun late in a generation.
 
 ## One cut across groups
 
@@ -143,11 +198,9 @@ every step. This is the consistent cut Chandy and Lamport define ("Distributed S
 3(1), 1985): no group holds the effect of a decision another group's cut has not yet reached once the
 records finish it.
 
-- **The groups' clocks.** A cut is one second in every group, so every group's commits must be
-  stamped by one clock. Groups on one node share it. Across nodes, a participant's intent stamped
-  later than its anchor's decision by clock skew would be cut away while the decision stays: open,
-  not built (the stamps would need a bound on skew, as Spanner's commit wait gives, or a hybrid
-  logical clock carried in each step).
+- **The groups' clocks.** A cut is one second in every group, so a commit made after another must
+  be stamped after it in whichever group each is. Groups on one node share a clock; across nodes
+  the next section carries one in each cross-group step.
 
 **Evidence.** T-T1.12.X1: two groups backed up to one folder under a clock that moves a second at
 every reading, so every commit in either group has its own second; two transactions across both
@@ -158,6 +211,38 @@ cut between the two (non-vacuous).
 
 **Falsified by.** A cut at which one group holds a transaction's write and another doesn't after
 `restore_cut`; a cut whose restore is refused while each group's archive holds the second whole.
+
+## Cuts across machines
+
+**Decision.** Groups on different nodes stamp commits by different clocks, and a participant whose
+clock runs ahead stamps its prepared write later than the anchor's decision that followed it: a cut
+between the two would keep the decision and lose the write. Each cross-group step therefore carries
+a hybrid logical clock (Kulkarni, Demirbas et al., "Logical Physical Clocks", OPODIS 2014): a group
+takes in the latest stamp the coordinator heard of before the step (`Marks::observe`), so its
+commit is stamped later than that, and answers with its own latest (`Marks::latest`), which the
+coordinator keeps as the most it has heard of. A stamp stays the clock's reading, or one nanosecond
+past the latest stamp made or seen when that is later, as `Marks` already held a clock stepping
+back. Every decision is sent after the replies it rests on, so it is stamped after every write it
+decides on, whatever the clocks read, and a cut keeping it keeps them.
+
+- **Why not a bound on skew.** Spanner's commit wait sleeps out a measured uncertainty (TrueTime),
+  which needs clocks with a bound measured and kept (GPS and atomic references); Amphora's nodes are
+  any machines, with no such bound to measure. The carried clock needs no bound, and costs no wait.
+- **What a stamp then means.** Stamps stay close to real time: a stamp runs ahead of a group's
+  clock only by as much as another group's clock ran ahead of it, the HLC's bound. A restore target
+  is a second in the stamps, so a second asked for on a group whose clock lags is that much later in
+  its own clock; each group's archive still restores exactly the commits stamped at or before it.
+- **Where it is carried.** In the coordinator's process (`xgroup::sql`'s step), for groups backed
+  up there; a step over the wire would carry the same number in its envelope (not built: groups are
+  in-process `Database`s today).
+
+**Evidence.** T-T1.12.X2: as T-T1.12.X1, the participant's clock 5 seconds ahead of the anchor's,
+under both protocols: at every cut both keys or neither, never moving back. With the carried clock
+taken out (the step observing 0), it fails: "second 1037: one group without the other". The unit
+case: an observed stamp orders every later commit after it.
+
+**Falsified by.** A cut that keeps a decision and loses a write it decided on, with any clocks; a
+stamp further ahead of its group's clock than the furthest-ahead clock of a group it heard from.
 
 ## Incremental bases
 

@@ -99,6 +99,8 @@ struct Shared {
     changed: Arc<Changed>,
     restoring: AtomicBool,
     admitted: Arc<AtomicUsize>,
+    /// A backed-up writer's stamps ([`Database::open_backed_up`]): what cross-group steps carry.
+    stamps: OnceLock<Arc<crate::backup::Hooks>>,
     // The engine, readers and flusher retain the same lease until asynchronous drain ends.
     _owner: Option<Owned>,
 }
@@ -917,10 +919,17 @@ impl Database {
                 "a live owner of this database isn't backed up: it must drain first",
             ));
         };
+        // A second set can't happen: the database was made just now, once.
+        let _ = database.shared.stamps.set(prepared.hooks());
         let shipping = prepared
             .start(|watcher| store.on_commit(watcher))
             .map_err(|e| refused(&e))?;
         Ok((database, shipping))
+    }
+
+    /// The stamps of this database's commits, if it is backed up here (T-T1.12.X2).
+    pub(crate) fn stamps(&self) -> Option<&Arc<crate::backup::Hooks>> {
+        self.shared.stamps.get()
     }
 
     /// [`Database::open`], this process owning the database with `guards` kept beside its lease
@@ -1036,6 +1045,7 @@ impl Database {
                         changed,
                         restoring: AtomicBool::new(false),
                         admitted: Arc::new(AtomicUsize::new(0)),
+                        stamps: OnceLock::new(),
                         _owner: Some(owner),
                     }),
                 })
@@ -1107,6 +1117,7 @@ impl Database {
                 changed: Arc::new(changed),
                 restoring: AtomicBool::new(restoring),
                 admitted: Arc::new(AtomicUsize::new(0)),
+                stamps: OnceLock::new(),
                 _owner: owner,
             }),
         };

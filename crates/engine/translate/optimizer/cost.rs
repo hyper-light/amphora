@@ -112,6 +112,86 @@ pub fn rows_per_leaf_page_for_index(
     )
 }
 
+/// Amphora (PL.7, T-PL.7.1): an index's rows a page: as ANALYZE counted its tree's pages where it
+/// did (`params.index_rows_per_page`, set by [CostModelParams::for_table]), else its entries' width
+/// against its table's rows a page ([rows_per_leaf_page_for_index]).
+pub fn index_rows_per_page(
+    index: &Index,
+    rhs_table: &JoinedTable,
+    params: &CostModelParams,
+) -> f64 {
+    params
+        .index_rows_per_page
+        .as_ref()
+        .and_then(|measured| measured.get(&crate::util::normalize_ident(&index.name)))
+        .copied()
+        .unwrap_or_else(|| {
+            rows_per_leaf_page_for_index(index.columns.len(), rhs_table, params.rows_per_table_page)
+        })
+}
+
+/// SQLite's default page size, 4096 bytes (file format, section 1.3.2; `SQLITE_DEFAULT_PAGE_SIZE`):
+/// a format value, the page a plan assumes until it is planned for a connection's own.
+pub const FORMAT_DEFAULT_PAGE_BYTES: f64 = 4096.0;
+/// A B-tree leaf page's header, 8 bytes (file format, section 1.6).
+const LEAF_HEADER_BYTES: f64 = 8.0;
+/// A cell's entry in its page's cell pointer array, 2 bytes (file format, section 1.6).
+const CELL_POINTER_BYTES: f64 = 2.0;
+
+/// The bytes a varint of `value` takes, 1 to 9 (file format, section 1.6: 7 bits a byte, the
+/// ninth byte 8).
+pub const fn varint_bytes(value: f64) -> f64 {
+    let mut bytes = 1.0;
+    let mut limit = 128.0;
+    while bytes < 9.0 && value >= limit {
+        bytes += 1.0;
+        limit *= 128.0;
+    }
+    bytes
+}
+
+/// The fewest bytes a record of `columns` columns takes (file format, section 2.1): its header's
+/// size varint and a serial type a column, each one byte, with no body (serial types 0, 8 and 9:
+/// NULL, 0 and 1). A lower bound on a record, so the rows a page it gives are an upper bound.
+pub const fn least_record_bytes(columns: f64) -> f64 {
+    1.0 + columns
+}
+
+/// The rows a table leaf page of `page_bytes` usable bytes holds of records of `record_bytes`
+/// each, its rowids `rowid_bytes` as varints: its cells, each a payload-size varint, the rowid and
+/// the record, with each one's cell pointer, in the space past the page's header (file format,
+/// section 1.6). At least one.
+pub const fn rows_per_leaf_page(page_bytes: f64, record_bytes: f64, rowid_bytes: f64) -> f64 {
+    let cell = CELL_POINTER_BYTES + varint_bytes(record_bytes) + rowid_bytes + record_bytes;
+    let rows = (page_bytes - LEAF_HEADER_BYTES) / cell;
+    if rows < 1.0 {
+        1.0
+    } else {
+        rows
+    }
+}
+
+/// Amphora (PL.7, T-PL.7.1): a table's rows a page. After ANALYZE, its rows over its tree's pages
+/// as ANALYZE's walk counted them. Else from `page_bytes`, the connection's usable page, and the
+/// average record of the table's sample as ANALYZE measured it; with no ANALYZE at all, the
+/// format's fewest bytes for a record of its `columns` ([least_record_bytes]). Rowids are taken as
+/// large as the rows counted, `rows`.
+pub fn table_rows_per_page(
+    stats: Option<&crate::stats::TableStat>,
+    columns: usize,
+    rows: f64,
+    page_bytes: f64,
+) -> f64 {
+    let counted = stats.and_then(|s| Some((s.row_count.filter(|r| *r > 0)?, s.pages?)));
+    if let Some((rows, pages)) = counted {
+        return (rows as f64 / pages as f64).max(1.0);
+    }
+    let record = stats
+        .and_then(|s| s.record_bytes)
+        .unwrap_or_else(|| least_record_bytes(columns as f64));
+    rows_per_leaf_page(page_bytes, record, varint_bytes(rows.max(1.0)))
+}
+
 /// Estimate IO and CPU cost for a full table scan.
 ///
 /// # Arguments
@@ -989,6 +1069,66 @@ mod tests {
         assert!(
             estimate_scan_cost(100_000.0, 10.0, &held)
                 < estimate_scan_cost(100_000.0, 10.0, &small)
+        );
+    }
+
+    /// T-PL.7.1: after ANALYZE, a table's rows a page are its rows over the pages ANALYZE's walk
+    /// counted, whatever its records' bytes; the picked 50 is gone.
+    #[test]
+    fn t_pl_7_1_counted_pages_give_rows_a_page() {
+        let stats = crate::stats::TableStat {
+            row_count: Some(12_000),
+            pages: Some(400),
+            record_bytes: Some(10.0),
+            ..Default::default()
+        };
+        assert_eq!(table_rows_per_page(Some(&stats), 2, 12_000.0, 4096.0), 30.0);
+    }
+
+    /// T-PL.7.1: with no pages counted, a measured record's bytes and the page's give the rows a
+    /// page as the file format lays cells: 4,088 bytes past the leaf header, each cell its pointer
+    /// (2), payload size (1), rowid (2 for 1,000 rows) and its 100-byte record.
+    #[test]
+    fn t_pl_7_1_measured_records_give_rows_a_page_without_pages() {
+        let stats = crate::stats::TableStat {
+            row_count: Some(1_000),
+            record_bytes: Some(100.0),
+            ..Default::default()
+        };
+        let rows = table_rows_per_page(Some(&stats), 3, 1_000.0, 4096.0);
+        assert!((rows - 4088.0 / 105.0).abs() < 1e-9, "{rows}");
+        // A larger page holds more of them: the connection's page size counts.
+        assert!(table_rows_per_page(Some(&stats), 3, 1_000.0, 8192.0) > 2.0 * rows - 1.0);
+    }
+
+    /// T-PL.7.1: before any ANALYZE, the rows a page come from the page and the fewest bytes the
+    /// format lets a record of the table's columns take: an upper bound, wider tables fewer.
+    #[test]
+    fn t_pl_7_1_no_analyze_derives_rows_a_page_from_the_format() {
+        let narrow = table_rows_per_page(None, 2, 1_000_000.0, 4096.0);
+        let wide = table_rows_per_page(None, 20, 1_000_000.0, 4096.0);
+        // 2 columns: a 3-byte record, cell 2 + 1 + 3 (rowid varint of a million) + 3.
+        assert!((narrow - 4088.0 / 9.0).abs() < 1e-9, "{narrow}");
+        assert!(wide < narrow);
+        assert_eq!(varint_bytes(127.0), 1.0);
+        assert_eq!(varint_bytes(128.0), 2.0);
+        assert_eq!(varint_bytes(f64::MAX), 9.0);
+    }
+
+    /// T-PL.7.1: a full scan's reads follow the rows a page the table was given.
+    #[test]
+    fn t_pl_7_1_scan_cost_reads_the_tables_pages() {
+        let few = CostModelParams {
+            rows_per_table_page: 300.0,
+            ..CostModelParams::default()
+        };
+        let many = CostModelParams {
+            rows_per_table_page: 3.0,
+            ..CostModelParams::default()
+        };
+        assert!(
+            estimate_scan_cost(30_000.0, 1.0, &many).0
+                > estimate_scan_cost(30_000.0, 1.0, &few).0 + 9_000.0
         );
     }
 }

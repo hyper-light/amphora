@@ -823,6 +823,12 @@ pub trait CursorTrait: Any + Send + Sync {
     ///
     /// Only supposed to be used in the context of a simple Count Select Statement
     fn count(&mut self) -> IOResultOr<usize>;
+    /// Amphora (PL.7, T-PL.7.1): the pages of the tree the last whole [Self::count] walked, its
+    /// interior and leaf pages, each once; `None` before a count finished, or for a cursor over
+    /// no B-tree of its own.
+    fn counted_pages(&self) -> Option<usize> {
+        None
+    }
     fn is_empty(&self) -> bool;
     fn root_page(&self) -> i64;
     fn set_root_page(&mut self, _root_page: i64) {}
@@ -927,6 +933,8 @@ pub struct BTreeCursor {
     pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
     count: usize,
+    /// Amphora (PL.7): the pages the walk `count` makes has entered, each once.
+    pages: usize,
     /// Stores the cursor context before rebalancing so that a seek can be done later
     context: Option<CursorContext>,
     /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
@@ -1272,6 +1280,7 @@ impl BTreeCursor {
             row_header: RowHeader::new(num_columns),
             index_info,
             count: 0,
+            pages: 0,
             context: None,
             valid_state,
             seek_state: CursorSeekState::Start,
@@ -1395,6 +1404,23 @@ impl BTreeCursor {
     /// False, and the cursor unmoved, when it can't: a pending advance, another page type, or
     /// a cell behind it or past the leaf.
     pub(crate) fn advance_within_leaf_to(&mut self, cell: usize) -> bool {
+        if !self.can_advance_within_leaf_to(cell) {
+            return false;
+        }
+        let Ok(target) = i32::try_from(cell) else {
+            return false;
+        };
+        let (_, cell_idx) = self.stack.top_and_cell_index();
+        if target != cell_idx {
+            self.stack.set_cell_index(target);
+            self.invalidate_record();
+        }
+        true
+    }
+
+    /// Whether `advance_within_leaf_to(cell)` would move the cursor (QT.7: a fused run checks
+    /// before its body runs and moves once it knows where the run ends).
+    pub(crate) fn can_advance_within_leaf_to(&self, cell: usize) -> bool {
         if self.has_pending_advance_state() {
             return false;
         }
@@ -1403,14 +1429,7 @@ impl BTreeCursor {
         };
         let (page, cell_idx) = self.stack.top_and_cell_index();
         let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
-        if !is_leaf || cell_idx < 0 || target < cell_idx || cell >= cell_count {
-            return false;
-        }
-        if target != cell_idx {
-            self.stack.set_cell_index(target);
-            self.invalidate_record();
-        }
-        true
+        is_leaf && cell_idx >= 0 && target >= cell_idx && cell < cell_count
     }
 
     pub(crate) fn table_leaf_under_cursor(&self) -> Option<TableLeafUnderCursor<'_>> {
@@ -1655,6 +1674,7 @@ impl BTreeCursor {
     fn invalidate_count_cache(&mut self) {
         self.count_state = CountState::Start;
         self.count = 0;
+        self.pages = 0;
     }
 
     /// Check if the table is empty.
@@ -7791,6 +7811,9 @@ impl CursorTrait for BTreeCursor {
                     if !matches!(contents.page_type()?, PageType::TableInterior) {
                         self.count += contents.cell_count();
                     }
+                    // Each pass of this arm stands on a page just entered: the root, then each
+                    // child the descents below push (PL.7).
+                    self.pages += 1;
 
                     let cell_idx = self.stack.current_cell_index() as usize;
 
@@ -7906,6 +7929,10 @@ impl CursorTrait for BTreeCursor {
                 }
             }
         }
+    }
+
+    fn counted_pages(&self) -> Option<usize> {
+        matches!(self.count_state, CountState::Finish).then_some(self.pages)
     }
 
     #[inline]

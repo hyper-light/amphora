@@ -32,7 +32,7 @@ use super::columns::Feed;
 use super::disk::{Disk, File};
 use super::overflow;
 use super::page::PAGE_SIZE;
-use super::pool::Pool;
+use super::pool::{Pool, Room};
 use super::redo::{self, LaneId, Op, Redo};
 use super::version::{Savepoint, Snapshot, Ts, Txn, Versioned};
 use crate::error::LimboError;
@@ -400,8 +400,7 @@ fn bytes_order() -> Comparator {
 
 impl Database {
     /// The database `disk` holds, recovered (or made, with `trees` empty trees, if it holds
-    /// none), in a pool of `frames` pages resident at most (the shell's budget,
-    /// [`super::pool::frames_within`]), the rest evicted to the file; its trees ordered by `cmp`, and after them the
+    /// none), in a pool of `frames` pages resident at most, the rest evicted to the file; its trees ordered by `cmp`, and after them the
     /// overflow tree (`AC-NS.2.4`). Reopened with the `trees` it was made with.
     pub fn open(
         disk: Arc<dyn Disk>,
@@ -422,6 +421,18 @@ impl Database {
     pub fn open_ordered(
         disk: Arc<dyn Disk>,
         frames: usize,
+        trees: usize,
+        cmp: impl Fn() -> Comparator,
+        order: impl Fn(u64, &[u8]) -> Result<Comparator>,
+    ) -> Result<Self> {
+        Self::open_in(disk, Room::Frames(frames), trees, cmp, order)
+    }
+
+    /// [`Database::open_ordered`], its pool's frames within `room`: a shared one's taken from its
+    /// memory source as pages need them, its versions' bytes too (G7 step 2, `AC-NS.2.1`).
+    pub fn open_in(
+        disk: Arc<dyn Disk>,
+        room: Room,
         trees: usize,
         cmp: impl Fn() -> Comparator,
         order: impl Fn(u64, &[u8]) -> Result<Comparator>,
@@ -449,7 +460,7 @@ impl Database {
             // and no commit logged, it was never made.
             let logged = redo::read(&*disk)?;
             if header.is_none() && n == 0 && logged.iter().all(redo::Found::is_empty) {
-                return Self::create(disk, frames, trees, cmp);
+                return Self::create(disk, room, trees, cmp);
             }
             return Err(corrupt(
                 "no complete checkpoint journal at or after the data file's header",
@@ -461,7 +472,7 @@ impl Database {
         let replay = redo::merge(redo::read(&*disk)?, disk.lanes(), stamp.ts)?;
         redo::trim(&*disk, &replay.ends)?;
         // Pages are read in as they are asked for, evicted past the frames (G7 step 4).
-        let pool = Pool::backed(frames, disk.clone(), stamp.allocated)?;
+        let pool = Pool::backed_in(room, disk.clone(), stamp.allocated)?;
         if stamp.roots.len() <= trees {
             return Err(corrupt("fewer trees than the database was opened with"));
         }
@@ -595,12 +606,12 @@ impl Database {
     /// A new database of `trees` empty trees: checkpoint 0.
     fn create(
         disk: Arc<dyn Disk>,
-        frames: usize,
+        room: Room,
         trees: usize,
         cmp: impl Fn() -> Comparator,
     ) -> Result<Self> {
         let all = trees.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
-        let v = Versioned::new_in(Pool::backed(frames, disk.clone(), 0)?, all, |i| {
+        let v = Versioned::new_in(Pool::backed_in(room, disk.clone(), 0)?, all, |i| {
             if i == trees {
                 bytes_order()
             } else {

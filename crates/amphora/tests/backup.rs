@@ -264,6 +264,7 @@ fn open_backed_up<B: Blobs + 'static>(
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
+        check: None,
     };
     Database::open_backed_up(path, archive, until()).unwrap()
 }
@@ -372,6 +373,72 @@ fn oracle_digest(dir: &std::path::Path, name: &str, rows: &Rows) -> backup::RowD
     backup::digest(&Db::open(&path).unwrap()).unwrap()
 }
 
+/// T-T1.12.C3 (AC-T1.12.4): the shipping thread checks its own archive. Do: back a database up
+/// to a folder with a scratch path for checks, then write a row a second, each commit waking a
+/// round. Expect: a check runs on its own and passes, against the source's own rows at a quiet
+/// second; that second restores equal to the model's rows at it (so the snapshot the thread
+/// digested held exactly that second's rows); the counters say one pass or more and no failure,
+/// and the passed check's scratch file is gone.
+#[test]
+fn t_t1_12_c3_the_shipping_thread_checks_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let scratch = dir.path().join("check.db");
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let read = Arc::clone(&now);
+    let archive = Archive {
+        blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+        prefix: "db".into(),
+        clock: Arc::new(move || read.load(Ordering::SeqCst)),
+        memory: 32 * 1024,
+        patience: Duration::from_secs(60),
+        check: Some(scratch.clone()),
+    };
+    let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = vec![(now.load(Ordering::SeqCst), model.clone())];
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    // A row a second until a check passed: a check needs a quiet second, then a round after it.
+    let mut id = 1;
+    let passed = loop {
+        write_seconds(&database, &now, id..id + 1, &mut model, &mut history);
+        id += 1;
+        let status = shipping.status().unwrap();
+        if let Some(backup::Check::Passed { second, .. }) = status.last_check {
+            break second;
+        }
+        assert!(id < 400, "no check passed: {status:?}");
+    };
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    assert!(shipping.checks().passed.load(Ordering::Relaxed) >= 1);
+    assert_eq!(shipping.checks().failed.load(Ordering::Relaxed), 0);
+    assert_eq!(shipping.checks().source_moved.load(Ordering::Relaxed), 0);
+    if matches!(status.last_check, Some(backup::Check::Passed { .. })) {
+        assert!(!scratch.exists(), "a passed check's scratch file stays");
+    }
+
+    let again = dir.path().join("again.db");
+    backup::restore(blobs.as_ref(), "db", passed, &again, until()).unwrap();
+    let oracle_dir = tempfile::tempdir().unwrap();
+    let want = at(&history, passed).cloned().unwrap_or_default();
+    assert_eq!(
+        backup::digest(&Db::open(&again).unwrap()).unwrap(),
+        oracle_digest(oracle_dir.path(), "o.db", &want),
+        "second {passed}"
+    );
+}
+
 /// T-T1.12.C1 (AC-T1.12.4): restore-and-check on the folder store. Do: back a database up to a
 /// folder (AMPHORA-BLOBS-8), write a row a second, close it; restore-and-check the newest second
 /// against the model's rows, then against rows that differ. Expect: the newest second is the last
@@ -473,11 +540,25 @@ fn t_t1_12_x1_cross_group_cut_at_every_second() {
         amphora::xgroup::Protocol::TwoPhase,
         amphora::xgroup::Protocol::Parallel,
     ] {
-        cross_group_cut(protocol);
+        cross_group_cut(protocol, 0);
     }
 }
 
-fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
+/// T-T1.12.X2 (AC-T1.12.4): cuts across machines. Do: as T-T1.12.X1, but the two groups' clocks
+/// differ as two nodes' do: the participant's reads 5 seconds ahead of the anchor's, so without a
+/// carried clock its prepared write is stamped later than the anchor's decision. Expect: as
+/// T-T1.12.X1 at every cut: never the decision kept and the participant's write lost.
+#[test]
+fn t_t1_12_x2_cross_group_cut_across_skewed_clocks() {
+    for protocol in [
+        amphora::xgroup::Protocol::TwoPhase,
+        amphora::xgroup::Protocol::Parallel,
+    ] {
+        cross_group_cut(protocol, 5 * SECOND_NS);
+    }
+}
+
+fn cross_group_cut(protocol: amphora::xgroup::Protocol, skew: u64) {
     use amphora::xgroup::{Answer, Cluster, Txn};
     let dir = tempfile::tempdir().unwrap();
     let blobs =
@@ -488,9 +569,12 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
         let archive = Archive {
             blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
             prefix: format!("g{group}"),
-            clock: Arc::new(move || read.fetch_add(SECOND_NS, Ordering::SeqCst) + SECOND_NS),
+            clock: Arc::new(move || {
+                read.fetch_add(SECOND_NS, Ordering::SeqCst) + SECOND_NS + skew * group as u64
+            }),
             memory: 32 * 1024,
             patience: Duration::from_secs(60),
+            check: None,
         };
         Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
             .unwrap()
@@ -510,7 +594,10 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
     for shipping in &shippings {
         shipping.wait(until(), |s| s.bases >= 1).unwrap();
     }
-    let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    // Cuts begin once every group's clock is past its first base; the transactions come later
+    // than that by the skew again, so the seconds between a decision and a skewed write are cut.
+    let based = (now.load(Ordering::SeqCst) + skew).div_ceil(SECOND_NS);
+    now.fetch_add(2 * skew, Ordering::SeqCst);
     let mut ended = Vec::new();
     for v in [b"1", b"2"] {
         let txn = Txn {

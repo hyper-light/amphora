@@ -434,6 +434,41 @@ expressions beyond a column against a literal (each worker running its own copy 
 workers, the page cache's miss path sharded, loom
 or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.
 
+
+### The build side filled together, and a join's rows (QT.6, lane qs6-4)
+
+**The build.** A hash join's table is no longer built on the statement's thread. `TableBuild`
+(`vdbe/morsel_scan.rs`) hands the build table's leaves out in morsels like the probe's: each worker
+keeps the rows of its leaves that pass the build filter and whose key holds no NULL, and scatters
+each row's entry (its key and its place in the worker's run) into one list per partition. Then
+`Partitioner::fill` (`vdbe/morsel.rs`) gives each partition to one worker, which fills that
+partition's map from every run, runs in leaf order: a key's build rows stay in build order
+whatever worker read them, and no lock is taken on the table (Leis et al. 2014, section 4.2, build
+in the same two phases). The partition count is not picked: it is the machine's measured core
+count when parallel mode is on (one partition per worker that may fill), one when it is off. Both
+phases run through `execute`, so the pilot and `choose_degree` pick their workers.
+
+**Bounded memory, typed refusals.** Every kept row (its values and their text or blob bytes) and
+every scattered entry (its key's parts and bytes, its place) is charged to the statement's one
+`MemoryBudget` as it is made; the fill moves the keys, it does not copy them. A build past the
+budget is refused as `MorselError::MemoryBudget`, never a partial table, and the VDBE hook then
+runs the statement's serial loop, whose hash join spills. T-QT.6.12 checks the refusal at every
+degree.
+
+**A join's rows.** A two-table inner hash join with no aggregates, no GROUP BY, LIMIT or
+DISTINCT, whose result columns and ORDER BY keys are columns of either table (INTEGER or TEXT
+affinity, BINARY collation, no NULLS FIRST or LAST named), runs on morsels too (`TableJoinRows`):
+each worker probes its own leaves and keeps each joined row's projected values (the result
+columns, then any ORDER BY key not among them), charged to the budget. With an ORDER BY each
+worker sorts its morsel's rows and the runs are merged by a stable merge in leaf order, so rows
+tied on the keys keep the probe order; without one the runs are concatenated in leaf order
+(probe-row order, a probe row's matches in build order). T-QT.6.13 checks it against the serial
+hash join at 2, 3, 4 and 8 stated cores.
+
+**Not yet.** Workers still run the pipeline's own loop body, not a copy of the VDBE program's,
+so only the filters `Predicate` holds (a column against a literal of its kind, a NULL test) run in
+parallel; joins of more than two tables, outer joins and joins under LIMIT stay serial.
+
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 
 **Decision.** With `Connection::set_vectorized_scans` on (off by default; QT.7, the query-time
@@ -504,8 +539,20 @@ SQL's semantics stay in one place (CLAUDE.md §13): a comparison is the comparis
 `op_agg_step_slow` for what that doesn't take (a first row, text, SUM's exact integer overflow,
 which ends the statement with the same error). A row the batch left out (its record spills to
 overflow pages) ends the fused run before it and is read row-at-a-time. Any other instruction in
-the body (an expression, a GROUP BY's group lookup, a result row) leaves the loop row-at-a-time,
-reading its columns from the batch as decision 9 does.
+the body (an expression, a result row) leaves the loop row-at-a-time, reading its columns from the
+batch as decision 9 does.
+
+A hash GROUP BY's step (decision 4: `GroupFind`, the aggregate steps, `GroupSave`) is one step of
+the fused body. It takes its selection row by row in order and runs the opcodes' own
+`op_group_find` and `op_group_save` for each, so the group table, its budget and its refusals stay
+in one place. Between consecutive rows of one group, their keys identical value for value (then
+equal under any collation the GROUP BY compares with), the save and the next find are skipped and
+the group's accumulators stay in their registers. When the full table refuses a row's new group,
+the run ends before that row: the cursor stops on the row before it, and the refused row runs
+row-at-a-time on to the sorter's insert, which no batch runs. Filters before the group step have no
+effect, so having judged rows past the end costs nothing; a fused body with a group step may hold
+no other aggregate step, nor a jump into the step or the sorter's insert. A ColumnRange (several
+columns into consecutive registers, as multi-key GROUP BYs read them) is one vector a column.
 
 **Why.** Decision 9 decodes each leaf once, but the interpreter still dispatches every filter and
 aggregate instruction once a row. Run by selection, a body instruction is dispatched once a batch
@@ -516,6 +563,62 @@ positions of the rows that pass, read by the next operator; research finding f29
 PVLDB 11(13), 2018 (f30).
 
 **Falsified by.** Any answer or error that differs with the switch on (`vdbe/leaf_batch/tests.rs`,
-T-QT.7.4 and T-QT.7.5); a fused loop running a row the batch left out; or AC-QT.7.1 not met with
-it.
+T-QT.7.4 to T-QT.7.7, the group table whole and filling mid-batch); a fused loop running a row the
+batch left out or a row the group table refused; or AC-QT.7.1 not met with it.
 
+## 11. Skipping rows: zone maps over leaf runs against cracking, behind one switch
+
+G5 step 4 (kiln plan `01a16b0f46ab717ea1e3c87c7f5e0b92`, AC-G5.4.1, T-G5.4.1; lanes g5s4 and
+g5s4b). A filter no index serves (filter_no_index: `qty = ? AND price < ?`, 0.6 a second against CedarDB's
+2,608 at ten million rows) reads every row. Two ways to read fewer, built as prototypes behind one
+switch (`crates/engine/skipping`, `Skipping::{Off, ZoneMaps, Cracking}`), each a pure core kept
+from the write path through one hook (`Skipping::on_write`, one call per row written):
+
+- **Zone maps over leaf runs** (`ZoneMap`): a zone per table leaf, its rowid span and the min and
+  max of its integer values, with counts. A filter reads only the rowid ranges whose zone can match.
+  A write widens its zone or lowers its counts; it never narrows one, so a stale bound is loose,
+  never wrong. A zone's size is its leaf's: `zone_map_of_table` walks the table's B-tree and ends
+  a zone where the cursor reaches a leaf's first cell, so the file's page size and its rows' bytes
+  set it. Rows appended past the last zone start a new zone once the tail holds as many rows as the
+  built leaves held on average (their measured fill); a table built empty grows one tail zone
+  until built again.
+- **Cracking** (`CrackerColumn`): a (value, rowid) copy of the column that each filter partitions at
+  its two bounds, so a repeated filter reads only its piece. Inserts and deletes ripple, one move per
+  crack above the value, at the write.
+
+Either summary names candidates, never answers: the scan evaluates the filter on every candidate as
+a plain scan does. Only integer values are summarized; any other value makes its zone, or its row,
+a candidate for every filter, so SQLite's affinity and mixed-type comparisons stay the scan's.
+
+**Sources.** ClickHouse's `minmax` data-skipping index, one summary per granule of index rows
+(`src/Storages/MergeTree/MergeTreeIndexMinMax.cpp`); DuckDB's zone maps, per-segment min/max
+statistics checked before a row group is scanned (`src/storage/table/row_group.cpp`,
+`CheckZonemap`); Idreos, Kersten and Manegold, "Database Cracking" (CIDR 2007) and "Updating a
+Cracked Database" (SIGMOD 2007, the Ripple algorithm); the plan's research f2, f10.
+
+**Evidence.** T-G5.4.1 (`skipping::tests`): 64 seeds of 600 random inserts (appended, into gaps,
+below every rowid), deletes and updates over tables of up to 400 rows with NULL-like values, filters
+between writes, repeated half the time and reaching both ends of i64. Zone maps: the candidate
+ranges hold exactly the plain scan's rows, every live row stays inside its zone after every write,
+zones were skipped and appended tails started zones (non-vacuity). Cracking: the candidates hold
+exactly the plain scan's rows, every matching entry carries the row's current value, the copy holds
+every row once, and repeated filters found their bounds cracked. On a real table: zones built from
+its leaves hold every row, larger rows make more zones (one a leaf), and with SQL writes fed to the
+hook between scans the candidate ranges, read through the engine, return exactly the plain scan's
+rows; a view, a missing column and the rowid's alias are refused. The costs (candidates and time per
+scan through the engine, the hook's time per write, the summary's build time and size) are the
+harness's (`crates/engine/tests/skipping_bench.rs`: an Amphora file, writes through SQL, zones from
+its leaves), run by the coordinator; until recorded the prototypes are unmeasured and neither is chosen.
+
+**Not yet.** The switch is a pure core: the VDBE's table scan doesn't yet ask it for candidates,
+and the Insert and Delete opcodes don't yet call the hook (the scan operators are lane qs7's while
+it builds column batches). Readers at older snapshots: a zone map is safe (a write only widens), the
+cracker is kept at the write and would need its writes held to commit for an older reader.
+
+**Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
+own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's
+leaves. If the column copy becomes the scan's source, its summaries replace these.
+
+**Falsified by.** A row a plain scan finds that the candidates miss, or a value outside its zone's
+bounds after any write; zone maps skipping nothing on time-ordered columns at the suite's size;
+cracking's write cost per row above the scan cost it saves at the suite's mix of reads and writes.

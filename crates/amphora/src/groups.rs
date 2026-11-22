@@ -758,6 +758,13 @@ impl<E: Engine> Groups<E> {
     /// old group's writes wait no longer for it whichever node asks. A group not here is
     /// [`Pulled::NoGroup`].
     pub fn serve(&self, pull: &Pull, until: Instant) -> anyhow::Result<Pulled> {
+        self.serve_within(pull, until, u64::MAX)
+    }
+
+    /// [`Groups::serve`], its batch also no more units than `bytes` hold at the most a unit of
+    /// that work has held here: a channel's bound on one answer (the owner transport's frame,
+    /// [`crate::transport::Node`]), so a batch the channel can't carry is never read.
+    pub fn serve_within(&self, pull: &Pull, until: Instant, bytes: u64) -> anyhow::Result<Pulled> {
         let from = pull.from();
         let Some(src) = self.store_of(from) else {
             return Ok(Pulled::NoGroup);
@@ -769,7 +776,7 @@ impl<E: Engine> Groups<E> {
                 positions,
                 ..
             } => {
-                let batch = positions.min(self.batch(from, Work::Export));
+                let batch = positions.min(self.batch_within(from, Work::Export, bytes));
                 let positions = usize::try_from(batch).unwrap_or(usize::MAX);
                 let (exported, took) = src.run(until, move |e| {
                     let began = Instant::now();
@@ -801,7 +808,7 @@ impl<E: Engine> Groups<E> {
                 entries,
                 ..
             } => {
-                let entries = entries.min(self.batch(from, Work::Changed));
+                let entries = entries.min(self.batch_within(from, Work::Changed, bytes));
                 let (changed, took) = src.run(until, move |e| {
                     let began = Instant::now();
                     let changed = e.changed(after, upto, span, entries)?;
@@ -875,6 +882,11 @@ impl<E: Engine> Groups<E> {
     /// about as long as a commit of its own does, or, if it has committed nothing yet, a commit
     /// of this node's groups (one disk, one machine).
     fn batch(&self, group: GroupId, work: Work) -> u64 {
+        self.batch_within(group, work, u64::MAX)
+    }
+
+    /// [`Groups::batch`], held to `bytes` as well as to the process's memory.
+    fn batch_within(&self, group: GroupId, work: Work, bytes: u64) -> u64 {
         let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
         let mean = |c: &Counters| {
             u128::from(c.apply_us)
@@ -904,7 +916,9 @@ impl<E: Engine> Groups<E> {
             Work::Sweep => costs.unit_bytes(),
             _ => costs.of(work).unit_bytes,
         };
-        costs.of(work).within(target, self.memory, unit_bytes)
+        costs
+            .of(work)
+            .within(target, self.memory.min(bytes), unit_bytes)
     }
 
     /// `units` of `work`, holding `bytes` in memory, held `group`'s writer for `took`.
