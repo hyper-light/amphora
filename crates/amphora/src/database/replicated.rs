@@ -77,12 +77,18 @@ pub struct ReplicaHandle {
 struct Bell {
     rung: Mutex<bool>,
     ringing: std::sync::Condvar,
+    // A driven test's shell, which steps the owner itself and so waits where the owner would: on
+    // this bell's rings (`tests::Driven::tapped`).
+    #[cfg(test)]
+    told: std::sync::OnceLock<std::task::Waker>,
 }
 impl Bell {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             rung: Mutex::new(false),
             ringing: std::sync::Condvar::new(),
+            #[cfg(test)]
+            told: std::sync::OnceLock::new(),
         })
     }
     /// Wakes the owner, or its next wait if it isn't waiting. A poisoned bell only rings for an
@@ -91,6 +97,10 @@ impl Bell {
         if let Ok(mut rung) = self.rung.lock() {
             *rung = true;
             self.ringing.notify_one();
+        }
+        #[cfg(test)]
+        if let Some(told) = self.told.get() {
+            told.wake_by_ref();
         }
     }
     /// Waits until the bell rings or `wait` passes, whichever is first, and takes the ring:
@@ -4463,41 +4473,46 @@ mod tests {
                 }
             }
         }
+        /// Takes every receipt answered or expired.
         fn reap(&mut self) {
-            for slot in &mut self.receipts {
-                let Some(pending) = slot.as_mut() else {
+            for at in 0..COMMANDS {
+                let Some(pending) = self.receipts.get_mut(at).unwrap().as_mut() else {
                     continue;
                 };
                 let result = pending.receipt.try_result();
                 if matches!(result, Ok(None)) {
                     continue;
                 }
-                let pending = slot.take().unwrap();
-                self.records -= 1;
-                self.bytes -= pending.bytes;
-                if let (Some(refusals), true, Err(Refusal::Unavailable(why))) =
-                    (self.refusals.as_mut(), pending.proposal, &result)
-                    && [
-                        hyper_raft::Dropped::Transferring,
-                        hyper_raft::Dropped::NoLeader,
-                    ]
-                    .iter()
-                    .any(|cause| why.ends_with(&cause.to_string()))
-                {
-                    *refusals += 1;
-                    continue;
-                }
-                if let Err(Refusal::Invalid { why, .. }) = &result
-                    && why == "sender is not a current member"
-                    && self.departed.contains(&pending.from)
-                {
-                    continue;
-                }
-                // Admission was not an ACK: expiry, validation and fencing must fail the test.
-                match result {
-                    Ok(answered) => assert_eq!(answered, Some(())),
-                    Err(refusal) => panic!("{} refused: {refusal:?}", pending.record),
-                }
+                let pending = self.receipts.get_mut(at).unwrap().take().unwrap();
+                self.settle(pending, result);
+            }
+        }
+        /// A receipt's end, `result`: counted off the bounds, and checked.
+        fn settle(&mut self, pending: PumpReceipt, result: Result<Option<()>, Refusal>) {
+            self.records -= 1;
+            self.bytes -= pending.bytes;
+            if let (Some(refusals), true, Err(Refusal::Unavailable(why))) =
+                (self.refusals.as_mut(), pending.proposal, &result)
+                && [
+                    hyper_raft::Dropped::Transferring,
+                    hyper_raft::Dropped::NoLeader,
+                ]
+                .iter()
+                .any(|cause| why.ends_with(&cause.to_string()))
+            {
+                *refusals += 1;
+                return;
+            }
+            if let Err(Refusal::Invalid { why, .. }) = &result
+                && why == "sender is not a current member"
+                && self.departed.contains(&pending.from)
+            {
+                return;
+            }
+            // Admission was not an ACK: expiry, validation and fencing must fail the test.
+            match result {
+                Ok(answered) => assert_eq!(answered, Some(())),
+                Err(refusal) => panic!("{} refused: {refusal:?}", pending.record),
             }
         }
         fn admit(&mut self, packet: PumpPacket) {
@@ -4695,15 +4710,44 @@ mod tests {
                 "retained proposals were not released"
             );
             assert!(self.durable.is_none(), "durable answers were kept back");
-            // No new records or grace deadline: try_result enforces each admitted until.
-            while self.records != 0 {
-                self.reap();
-                if self.records != 0 {
-                    std::thread::park_timeout(POLL);
+            // No new records or grace deadline: each receipt is waited on until its answer comes
+            // or its own until passes.
+            for at in 0..COMMANDS {
+                if let Some(mut pending) = self.receipts.get_mut(at).unwrap().take() {
+                    let result = answered(&mut pending.receipt);
+                    self.settle(pending, result);
                 }
             }
+            assert_eq!(self.records, 0);
             assert_eq!(self.bytes, 0);
             assert!(self.receipts.iter().all(Option::is_none));
+        }
+    }
+    /// `receipt`'s end, waited on: its answer, which its owner sends as it takes the record, or
+    /// its until passed, up to the transport tests' hang guard (a hang, never a verdict). What
+    /// the wait doesn't settle (its until passed, its owner ended) [`ReceiveReceipt::try_result`]
+    /// says.
+    fn answered(receipt: &mut ReceiveReceipt) -> Result<Option<()>, Refusal> {
+        let left = receipt.until.saturating_duration_since(Instant::now());
+        let waited = receipt
+            .receiver
+            .get_mut()
+            .map(|receiver| receiver.recv_timeout(left.min(crate::transport::HANG)))
+            .map_err(|_| ());
+        match waited {
+            Ok(Ok(result)) => {
+                receipt.completed = true;
+                result.map(Some)
+            }
+            Ok(Err(mpsc::RecvTimeoutError::Timeout)) => {
+                assert!(
+                    left <= crate::transport::HANG,
+                    "a receipt was unanswered for {:?}: a hang",
+                    crate::transport::HANG
+                );
+                receipt.try_result()
+            }
+            Ok(Err(mpsc::RecvTimeoutError::Disconnected)) | Err(_) => receipt.try_result(),
         }
     }
     impl Drop for Pump<'_> {
@@ -4722,8 +4766,9 @@ mod tests {
     }
 
     /// Rounds a driven group may take for one call, election or settling before the test calls
-    /// it hung. A round with nothing to relay yields `POLL` to the disk, so this is a counted hang
-    /// guard of about a minute of disk waits (CLAUDE.md section 2), never a verdict on time.
+    /// it hung: a counted hang guard (CLAUDE.md section 2), never a verdict on time. A round with
+    /// nothing to relay waits for the work out off the driver's thread (`Driven::wait_if_moving`),
+    /// so rounds count steps that could move the group, not waits on a timer.
     const ROUNDS: usize = 60_000;
 
     /// A test's own clocks and the owners it steps (replication.md, "The owner's time"). Each
@@ -4739,14 +4784,19 @@ mod tests {
         clocks: Vec<Arc<AtomicU64>>,
         // Clock moves made for a write slot's end (`Driven::lapse_slots`), each asserted to end it.
         lapses: u64,
-        // What happens off the driver's thread that may let the group move: each owner's log
-        // writes ring it as they finish (`Tap`), and each gate as a flush comes to it held.
+        // What happens off the driver's thread that may let the group move: each owner's bell
+        // rings it (`Driven::tapped`), and each gate as a flush comes to it held.
         moved: Arc<OffThread>,
+        // The count `moved` stood at as the last step began (`Driven::step`).
+        looked: u64,
+        // Each gated member's gate, by member order (`Driven::gated_log`).
+        gates: BTreeMap<usize, Arc<Gate>>,
     }
-    /// A count of what happened off a driven shell's thread that may let its group move: a
-    /// member's log write finished, or a flush come to a held gate. The driver reads the count
-    /// before it steps and waits only for a count past it, so nothing that happens between its
-    /// look and its wait is lost; it waits on these events, never on a timer.
+    /// A count of what happened off a driven shell's thread that may let its group move: anything
+    /// that rings an owner's bell (its log's write or compaction done, its database's flush done,
+    /// an input queued, a handle dropped), or a flush come to a held gate. The driver reads the
+    /// count before it steps and waits only for a count past it, so nothing that happens between
+    /// its look and its wait is lost; it waits on these events, never on a timer.
     #[derive(Default)]
     struct OffThread {
         count: Mutex<u64>,
@@ -4774,25 +4824,18 @@ mod tests {
                 .unwrap();
             assert!(
                 !waited.timed_out(),
-                "a write was out and nothing finished or came to a held gate in {:?}: a hang",
+                "work was out off the driver's thread and none ended or came to a held gate in {:?}: a hang",
                 crate::transport::HANG
             );
         }
     }
-    /// A driven owner's waker: it rings the owner's own bell, as the owner's waker does, and its
-    /// shell's [`OffThread`], so a driver waiting on a member's log write wakes as it finishes.
-    struct Tap {
-        bell: Arc<Bell>,
-        moved: Arc<OffThread>,
-    }
-    impl std::task::Wake for Tap {
+    /// Each driven owner's bell rings its shell's count too (`Bell::told`).
+    impl std::task::Wake for OffThread {
         fn wake(self: Arc<Self>) {
-            self.bell.ring();
-            self.moved.ring();
+            self.ring();
         }
         fn wake_by_ref(self: &Arc<Self>) {
-            self.bell.ring();
-            self.moved.ring();
+            self.ring();
         }
     }
     /// The time a driven clock reads past its shell's base.
@@ -4804,16 +4847,25 @@ mod tests {
         let nanos = u64::try_from(to.duration_since(base).as_nanos()).unwrap();
         clock.store(nanos, Ordering::Release);
     }
-    /// The lease on a member's state file: the previous owner of the path lets go of it as its
-    /// owner drops, which a test waits for, its rounds counted.
+    /// The lease on a member's file. The previous owner of the path lets go of it once its last
+    /// holder ends: its owner as the test drops it, then the threads it ran (its log's, its
+    /// flushing thread), which end on their own after. So this waits on the lock itself, which the
+    /// operating system hands over as its last holder closes it, up to the transport tests' hang
+    /// guard: a hang, never a verdict.
     fn lease(path: &Path) -> Arc<File> {
-        for _ in 0..ROUNDS {
-            match exclusive_file(path) {
-                Ok(file) => return Arc::new(file),
-                Err(_) => std::thread::park_timeout(POLL),
-            }
+        let path = crate::database::canonical_path(path).unwrap();
+        let (leased, lease) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            // The test gave up waiting only if the receiver is gone.
+            let _ = leased.send(crate::transport::wait_lease(&path));
+        });
+        match lease.recv_timeout(crate::transport::HANG) {
+            Ok(file) => Arc::new(file.unwrap()),
+            Err(_) => panic!(
+                "the previous owner kept its lease for {:?}: a hang",
+                crate::transport::HANG
+            ),
         }
-        panic!("the previous owner kept its lease");
     }
     impl Driven {
         /// A shell whose members run on the system's files.
@@ -4937,16 +4989,45 @@ mod tests {
                 clocks: Vec::new(),
                 lapses: 0,
                 moved: Arc::new(OffThread::default()),
+                looked: 0,
+                gates: BTreeMap::new(),
             }
         }
-        /// `actor`, its log writes ringing this shell's [`OffThread`] as they finish. Its writes
-        /// go out with its waker from its first step on, so none before is missed.
-        fn tapped(&self, mut actor: Actor<F>) -> Actor<F> {
-            actor.waker = std::task::Waker::from(Arc::new(Tap {
-                bell: Arc::clone(&actor.control.bell),
-                moved: Arc::clone(&self.moved),
-            }));
+        /// `actor`, its bell ringing this shell's [`OffThread`] too: whatever would wake the owner
+        /// on a thread of its own wakes the driver that steps it. The bell is told before the
+        /// owner's first step, so no ring after it is missed.
+        fn tapped(&self, actor: Actor<F>) -> Actor<F> {
+            let told = actor
+                .control
+                .bell
+                .told
+                .set(std::task::Waker::from(Arc::clone(&self.moved)));
+            assert!(told.is_ok(), "an owner's bell told twice");
             actor
+        }
+        /// Whether work is out off the driver's thread that ends, or comes to a held gate, on its
+        /// own, and so rings [`OffThread`]: a log write or compaction on a member whose gate is
+        /// open, or held with no flush at it yet; or a flush of a member's database on its
+        /// flushing thread. Only such work can move a group whose round relayed nothing.
+        fn moving(&self) -> bool {
+            self.owners.iter().enumerate().any(|(at, owner)| {
+                owner.as_ref().is_some_and(|(owner, _)| {
+                    let parked = self
+                        .gates
+                        .get(&at)
+                        .is_some_and(|gate| gate.is_held() && gate.waiting());
+                    (owner.replica.in_flight() != 0 && !parked)
+                        || matches!(owner.flushing, Flushing::Thread { out: true, .. })
+                })
+            })
+        }
+        /// After a round that relayed nothing and left nothing in transit, the driver waits for
+        /// work out off its thread to end or come to a held gate ([`Driven::moving`]); with none
+        /// out it waits for nothing, as only its own steps can move the group.
+        fn wait_if_moving(&self, relayed: usize, pump: &Pump<'_>) {
+            if relayed == 0 && pump.records == 0 && self.moving() {
+                self.moved.wait_past(self.looked);
+            }
         }
         /// A call's or a record's budget on these clocks: it runs out only if the test moves a
         /// clock past it.
@@ -5024,8 +5105,10 @@ mod tests {
             (reading, Arc::new(move || base + offset(&read)))
         }
         /// One round: every owner takes each input waiting for it, then steps once more, each at
-        /// its own clock's reading.
+        /// its own clock's reading. What happens off the driver's thread from here on is past
+        /// `looked`.
         fn step(&mut self) {
+            self.looked = self.moved.seen();
             for (owner, inputs) in self.owners.iter_mut().flatten() {
                 while let Ok(input) = inputs.try_recv() {
                     owner.run_step(Some(input)).unwrap();
@@ -5033,11 +5116,11 @@ mod tests {
                 owner.run_step(None).unwrap();
             }
         }
-        /// One relay round and one step; a round with nothing to relay yields `POLL` to the disk.
+        /// One relay round and one step; a round with nothing to relay waits for work out off the
+        /// driver's thread, if there is any ([`Driven::wait_if_moving`]).
         fn round(&mut self, pump: &mut Pump<'_>) {
-            if pump.drive_until(self.until()) == 0 {
-                std::thread::park_timeout(POLL);
-            }
+            let relayed = pump.drive_until(self.until());
+            self.wait_if_moving(relayed, pump);
             self.step();
         }
         /// Owner `first` campaigns now, every clock standing still, and rounds go on until every
@@ -5122,9 +5205,7 @@ mod tests {
             let (mut still, mut voter) = (0, 0);
             for _ in 0..ROUNDS {
                 let relayed = pump.drive_until(self.until());
-                if relayed == 0 {
-                    std::thread::park_timeout(POLL);
-                }
+                self.wait_if_moving(relayed, pump);
                 self.step();
                 let states: Vec<_> = clients
                     .iter()
@@ -5241,9 +5322,7 @@ mod tests {
                 {
                     return;
                 }
-                if admitted == 0 {
-                    std::thread::park_timeout(POLL);
-                }
+                self.wait_if_moving(admitted, pump);
                 self.step();
             }
             panic!("the group was not quiet after {ROUNDS} driven rounds");
@@ -5747,9 +5826,11 @@ mod tests {
         }
     }
     impl Driven<Gated> {
-        /// A log on `power`'s device behind `gate`, which tells this shell of each flush it holds.
-        fn gated_log(&self, power: &Power, gate: &Arc<Gate>) -> Gated {
+        /// Member `owner`'s log on `power`'s device behind `gate`, which tells this shell of each
+        /// flush it holds.
+        fn gated_log(&mut self, owner: usize, power: &Power, gate: &Arc<Gate>) -> Gated {
             gate.tell(&self.moved);
+            self.gates.insert(owner, Arc::clone(gate));
             Gated {
                 log: power.log.handle().unwrap(),
                 gate: Arc::clone(gate),
@@ -5767,7 +5848,7 @@ mod tests {
             gate: &Arc<Gate>,
         ) -> Client {
             let reading = Arc::new(AtomicU64::new(0));
-            let log = self.gated_log(power, gate);
+            let log = self.gated_log(self.owners.len(), power, gate);
             let (client, owner) = self.owner_on(
                 dir,
                 node_id,
@@ -5801,7 +5882,7 @@ mod tests {
             power.restore(survived);
             let node_id = u64::try_from(owner + 1).unwrap();
             let reading = Arc::clone(self.clocks.get(owner).unwrap());
-            let log = self.gated_log(power, gate);
+            let log = self.gated_log(owner, power, gate);
             let (client, restarted) =
                 self.owner_on(dir, node_id, vec![1, 2, 3], durability, power, log, reading);
             *self.owners.get_mut(owner).unwrap() = Some(restarted);
@@ -5810,21 +5891,17 @@ mod tests {
         /// Rounds, time standing still, until `answer` comes (`Some`), or until the group can move
         /// no further while the members whose gates are held wait to flush (`None`). A round is
         /// still when it relays nothing and nothing is in transit.
-        /// After a still round with a write out that can finish or come to its gate on its own (one
-        /// on an open gate's member, or a held one's not yet at its gate), the driver waits for
-        /// that to happen: a member's write finished (`Tap`) or a flush come to a held gate
-        /// (`Gate::pass`), never a timer. With no such write out, two still rounds running are the
-        /// stall: the first round's relay takes what the step before it sent, and only the
+        /// After a still round with work out that ends or comes to its gate on its own
+        /// ([`Driven::moving`]: a write on an open gate's member, or a held one's not yet at its
+        /// gate), the driver waits for that to happen: an owner's bell rung or a flush come to a
+        /// held gate (`Gate::pass`), never a timer. With no such work out, two still rounds running
+        /// are the stall: the first round's relay takes what the step before it sent, and only the
         /// second's shows that step sent nothing.
         fn answer_or_stall(
             &mut self,
             pump: &mut Pump<'_>,
             answer: &mpsc::Receiver<Result<Answer, Refusal>>,
-            gates: &[Arc<Gate>],
         ) -> Option<Result<Vec<u8>, Refusal>> {
-            // The off-thread count read before the last step: what happened since may be what
-            // that step didn't see.
-            let mut seen = None;
             let mut still = 0;
             for _ in 0..ROUNDS {
                 match answer.try_recv() {
@@ -5834,23 +5911,15 @@ mod tests {
                 }
                 let admitted = pump.drive_until(self.until());
                 let quiet = admitted == 0 && pump.records == 0;
-                let out = self.owners.iter().zip(gates).any(|(owner, gate)| {
-                    owner
-                        .as_ref()
-                        .is_some_and(|(owner, _)| owner.replica.in_flight() != 0)
-                        && !(gate.is_held() && gate.waiting())
-                });
-                still = if quiet && !out { still + 1 } else { 0 };
+                still = if quiet && !self.moving() {
+                    still + 1
+                } else {
+                    0
+                };
                 if still > 1 {
                     return None;
                 }
-                if quiet
-                    && out
-                    && let Some(seen) = seen
-                {
-                    self.moved.wait_past(seen);
-                }
-                seen = Some(self.moved.seen());
+                self.wait_if_moving(admitted, pump);
                 self.step();
             }
             panic!("a driven operation neither answered nor stalled in {ROUNDS} rounds");
@@ -6296,7 +6365,7 @@ mod tests {
                     db.exec(&format!("INSERT INTO kept VALUES ({v})"))?;
                     Ok(Vec::new())
                 });
-                let result = match driven.answer_or_stall(&mut pump, &write, &gates) {
+                let result = match driven.answer_or_stall(&mut pump, &write) {
                     Some(result) => {
                         if result.is_ok() {
                             for at in &held {
@@ -6615,7 +6684,7 @@ mod tests {
             db.exec("INSERT INTO warm0 VALUES (1)")?;
             Ok(vec![1])
         });
-        let held = driven.answer_or_stall(&mut pump, &write, &gates);
+        let held = driven.answer_or_stall(&mut pump, &write);
         for gate in &gates {
             gate.release();
         }
@@ -7461,6 +7530,7 @@ mod tests {
             Ok(_) => panic!("the member opened stating another class than its group's"),
         }
         let (client, actor, receiver) = reopen(&driven, group).unwrap();
+        let actor = driven.tapped(actor);
         *driven.owners.get_mut(2).unwrap() = Some((actor, receiver));
         let clients = vec![
             clients.first().unwrap().clone(),
@@ -7634,6 +7704,7 @@ mod tests {
             clock,
         )
         .unwrap();
+        let actor = driven.tapped(actor);
         *driven.owners.get_mut(follower).unwrap() = Some((actor, receiver));
         let mut clients = clients;
         *clients.get_mut(follower).unwrap() = client;
