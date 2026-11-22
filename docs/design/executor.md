@@ -837,7 +837,10 @@ builds it: holding the write lock, refused inside an open
 transaction, under MVCC, or for a column the record doesn't hold, with the reason. `PRAGMA skipping`
 with no value is refused: the setting is set, not read.
 
-**Not yet.** Rows read and latency against DuckDB and ClickHouse are not measured. A dropped kind
+**Not yet.** Rows read and latency against DuckDB and ClickHouse are not measured. The driver for
+DuckDB is `amphora-bench --skipping` (lane skip-7: both engines in this process, the same prepared
+statements and bound values, one timing method); ClickHouse needs both engines behind one server
+client, which it doesn't have yet. A dropped kind
 is built again inside the scan whose trial is due, so that scan waits for the build (its measured
 cost leaves the build out, lane skip-7: the leader isn't charged for it).
 

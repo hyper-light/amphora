@@ -417,10 +417,20 @@ pub fn main() -> anyhow::Result<()> {
                     };
                     t.filters.sort_unstable();
                     t.writes.sort_unstable();
+                    let name = if engine == "duckdb" {
+                        "duckdb"
+                    } else {
+                        "amphora"
+                    };
+                    let rate = if t.seconds > 0.0 {
+                        filters as f64 / t.seconds
+                    } else {
+                        0.0
+                    };
                     let line = serde_json::json!({
                         "bench": "skipping",
                         "scenario": sc.name(),
-                        "engine": if engine == "duckdb" { "duckdb" } else { "amphora" },
+                        "engine": name,
                         "setting": engine,
                         "rows": rows,
                         "filters": filters,
@@ -430,7 +440,7 @@ pub fn main() -> anyhow::Result<()> {
                         "write_p50_ns": pct(&t.writes, 0.50),
                         "write_p99_ns": pct(&t.writes, 0.99),
                         "write_p999_ns": pct(&t.writes, 0.999),
-                        "filters_per_s": if t.seconds > 0.0 { filters as f64 / t.seconds } else { 0.0 },
+                        "filters_per_s": rate,
                         "rows_read": t.rows_read,
                         "equal": equal,
                         "client": client,
