@@ -171,12 +171,13 @@ fn order_is_legal(
 /// Amphora (PL.8, lane pl8-16): the search's result with the carried plan in the best plan's
 /// place where the best is not cheaper past the margin: `carried.cost <= best.cost * (1 + margin)`.
 /// A best plan that kept the order target stays as the ordered plan, so the caller still weighs a
-/// sort against it.
+/// sort against it; `best_is_ordered` says it kept it (an unordered best is never passed off as
+/// ordered, which would weigh a sort the plan still needs against the carried plan).
 fn keep_carried(
     result: BestJoinOrderResult,
     carried: Option<JoinN>,
     margin: f64,
-    has_order_target: bool,
+    best_is_ordered: bool,
 ) -> BestJoinOrderResult {
     let Some(carried) = carried else {
         return result;
@@ -202,7 +203,7 @@ fn keep_carried(
         margin,
         "the carried join order stands"
     );
-    let best_ordered_plan = match (result.best_ordered_plan, has_order_target) {
+    let best_ordered_plan = match (result.best_ordered_plan, best_is_ordered) {
         (Some(ordered), _) => Some(ordered),
         (None, true) => Some(result.best_plan),
         (None, false) => None,
@@ -1594,14 +1595,16 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         }
         _ => None,
     };
-    let carry = |result: Result<Option<BestJoinOrderResult>>, carried: Option<JoinN>| {
+    let carry = |result: Result<Option<BestJoinOrderResult>>,
+                 carried: Option<JoinN>,
+                 best_is_ordered: bool| {
         result.map(|result| {
             result.map(|result| {
                 keep_carried(
                     result,
                     carried,
                     planning_context.carried_margin,
-                    planning_context.maybe_order_target.is_some(),
+                    best_is_ordered && planning_context.maybe_order_target.is_some(),
                 )
             })
         })
@@ -1652,7 +1655,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             0,
             search_started.elapsed(),
         );
-        return carry(greedy, carried_plan);
+        // The greedy search keeps no ordered plan: its best is not known to be ordered.
+        return carry(greedy, carried_plan, false);
     };
     let subsets_built: usize = subsets.iter().map(Vec::len).sum();
     let mut pairs_tried = 0usize;
@@ -2246,7 +2250,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         })),
         None => Err(LimboError::PlanningError("no query solution".to_string())),
     };
-    carry(result, carried_plan)
+    carry(result, carried_plan, best_plan_is_also_ordered)
 }
 
 /// PL.8: the tables the search may plan bushy, `joined_tables[..core]`, None where it tries no
