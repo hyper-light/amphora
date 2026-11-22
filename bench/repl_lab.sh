@@ -16,8 +16,8 @@
 #             one a machine, each run with bench/power_nemesis.sh; then merged per class.
 #   CLASSES   (default "replicated persisted"). STEPS (default "nemesis repl").
 #   SYSTEMS, MEASURES: passed to bench/repl.sh on every machine.
-# What it doesn't do: Amphora's three members on three machines (the LAN p99). amphora-bench --repl
-# runs Amphora's members in one process; members across machines need a harness that doesn't exist yet.
+# Amphora's three members on three machines (the LAN p99) are bench/repl_members.sh's, each member
+# its own process at an address given as an argument.
 # Exit: 0 when every step on every machine gave its records and both merges passed; 1 otherwise.
 set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

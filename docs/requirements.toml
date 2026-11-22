@@ -824,6 +824,8 @@ tests = [
   { id = "T-T1.9.R15", text = "One group measured by the shell with nothing written, after sixty-four keys are written, and again after — passes when the first has no load cut, the second has load above zero and a cut that counts each key on the side its position falls, the plan on two cores splits the group at that cut, and the third has no load" },
   { id = "T-T1.9.R16", text = "A split and a merge back, then a restart, the groups whose files are found asked of the node before and after — passes when only the retired group is named both times, never the group held nor an id never given out, and once its files are deleted every key still reads back from its group" },
   { id = "T-T1.9.R17", text = "Local databases as groups, one split by the driver, then measured by the shell — passes when each group's size is above zero" },
+  # lane split-merge-15
+  { id = "T-T1.9.R19", text = "A local database made a group's, with one key, then eight, then more keys than one page of its position index holds — passes when it has no size cut with one key, and after that a cut with weight on each side and keys on each side of it, read from the index's root page alone" },
 ]
 
 # lane qs5
@@ -1171,6 +1173,9 @@ tests = [
 # power-cut nemesis by seed range in both classes, a record a shard, merged with a coverage check;
 # records under bench/records/power-nemesis/<run>/. bench/repl_lab.sh runs the seeds and the
 # comparison set on three machines named as its arguments. The runs of record are the coordinator's.
+# lane repl-measure-7 (CP-T1.8, AC-T1.8.5): no new IDs. The nemesis's classes part at the raft log
+# (`the_classes_acknowledge_apart_under_a_held_flush`); bench/repl_members.sh runs each member its own
+# process on the machines it is given (`amphora-bench --repl-member`, system `amphora-procs`).
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]
@@ -1253,4 +1258,17 @@ title = "Row skipping usable by real statements: bounds from parameters, a measu
 criteria = []
 tests = [
   { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
+]
+
+# lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,
+# "A refusal before the step")
+[[own]]
+id = "T1.10.R"
+title = "A step refused before it was taken is retried with the learned back-off, behind a switch whose control is today's"
+criteria = [
+  { id = "AC-T1.10.6", text = "Under OnRefused::Retry a step refused NotLeader or Full is sent again after the RFC 6298 timeout, doubled per refusal, within its deadline; under Stop it counts as lost; Cluster::counted gives refusals by kind, retries, held steps and transactions, stops and p50/p99/p99.9" },
+]
+tests = [
+  { id = "T-T1.10.R1", text = "xgroup::sql::sessions::ac_t1_10_6_refusals_before_a_step_retried_commit_and_the_control_aborts — passes when one group refusing three times and all three refusing twice commit with no stop under Retry, and abort under Stop, both protocols" },
+  { id = "T-T1.10.R2", text = "xgroup::sql::sessions::ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing — passes when a group failing at each of a session transaction's steps leaves its rows all written or none after recovery, equal to one group's, both protocols, both ends reached" },
 ]

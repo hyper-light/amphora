@@ -540,6 +540,9 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--scale") {
         return scale::main();
     }
+    if std::env::args().any(|a| a == "--repl-member") {
+        return repl::member_main();
+    }
     if std::env::args().any(|a| a == "--repl") {
         return repl::main();
     }
