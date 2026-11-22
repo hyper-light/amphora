@@ -450,7 +450,43 @@ pub struct MorselAggregateData {
     /// A join's rows rather than groups: `result_map` then names the joined row's columns each
     /// output row takes (the result columns, then the ORDER BY keys), and there are no aggregates.
     pub joined_rows: Option<MorselRows>,
+    /// A copy of a one-table scan's loop body that each worker runs per row (lane qs6-7): when
+    /// present, the workers' filter, GROUP BY values and aggregate inputs are the statement's own
+    /// bytecode, and `group_by`, `aggregates` and `result_map` name places in its output row.
+    pub body: Option<Box<MorselBody>>,
     pub target_pc_serial: BranchOffset,
+}
+
+/// Amphora (QT.6, lane qs6-7): a one-table scan's loop body, emitted as its own range of the
+/// program, which the serial loop never runs. A worker runs it per row with its own registers
+/// (`ProgramState`): the row's stored columns go into `columns_start..`, its rowid into `rowid`,
+/// then the code runs from `start` until it reaches `keep` (the row passed every filter, its
+/// values in `out_start..out_start + out_count`) or `skip` (it did not).
+#[derive(Debug, Clone)]
+pub struct MorselBody {
+    pub start: BranchOffset,
+    pub keep: BranchOffset,
+    pub skip: BranchOffset,
+    pub columns_start: usize,
+    pub rowid: usize,
+    pub out_start: usize,
+    pub out_count: usize,
+    /// The output row's GROUP BY values (its first places) and the aggregates over its places.
+    pub group_by: Vec<usize>,
+    pub aggregates: Vec<crate::vdbe::morsel::Aggregate>,
+    /// The places a SUM reads: a REAL there sends the statement to the serial loop, whose
+    /// rounding the parallel sum's single exact rounding would not repeat.
+    pub sums: Vec<usize>,
+    /// Whether `MorselAggregateData`'s own filter and aggregates state the same query over the
+    /// table's columns (the versioned storage's column copy reads those, not the body).
+    pub simple: bool,
+    /// Amphora (QT.6, lane qs6-8): the outputs are the statement's result columns, kept as rows
+    /// in leaf order rather than folded into aggregates.
+    pub rows: bool,
+    /// With `rows`, under a LIMIT: the rows the LIMIT and OFFSET take. No morsel is claimed once
+    /// that many are kept, and a morsel stops once it alone holds that many; the morsels run are
+    /// then a prefix of the table, so the first rows are the serial loop's.
+    pub want: Option<u64>,
 }
 
 /// Amphora: how [MorselAggregateData]'s joined rows come out (QT.6).

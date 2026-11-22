@@ -3910,12 +3910,13 @@ impl Pager {
         // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction rolls back with
         // the pager's, on every path that ends one. This returns no error, so a failed rollback
         // is logged and kept: the connection's next transaction is refused with it.
-        if let Some(switch) = connection.versioned.as_ref() {
+        let _ = connection.each_versioned(|switch| {
             if let Err(e) = switch.finish(true) {
                 tracing::error!(target: "amphora.versioned", event = "rollback_failed", error = %e);
                 switch.rollback_failed(e);
             }
-        }
+            Ok(())
+        });
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;
@@ -7465,6 +7466,11 @@ mod tests {
     /// each time it reads the rows as committed.
     #[test]
     fn a_reader_forgets_only_the_pages_written_since_its_last_read() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's page cache and its log; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
             crate::Database::open_file(io, "forget.db", Arc::new(crate::SqliteDialect)).unwrap();
@@ -8231,6 +8237,11 @@ mod checkpoint_phase_tests {
 
     #[test]
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's page cache and its log; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
         let conn = db.connect(ConnectOpts::new()).unwrap();

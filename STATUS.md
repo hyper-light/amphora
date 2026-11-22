@@ -5,6 +5,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
+  `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
+  groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
+  grouped database's SQL session hands its cross-group batch to it (lane split-merge-13's layer), and a
+  group failure tested through SQL.
 - **The bar** (kiln's CP-M1): a Cargo workspace whose lints deny panics, this repository's rules
   (`CLAUDE.md`), the requirement registry (`docs/requirements.toml`), the design's starting point
   (`docs/design/README.md`), the gate (`scripts/gates.sh`, run by kiln CI from `.kiln/ci.yaml`), and the
@@ -667,6 +672,17 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   PRIMARY KEY with COLLATE or AUTOINCREMENT, two CHECKs without a comma, two upsert clauses), and
   sqlglot fails on MySQL's NATURAL FULL JOIN (3). Left: refusals compared by kind beside "any error
   matches" (the coordinator's decision), DuckDB's 6 disagreements and its refused INSERT unclassified.
+  Lane corpus-dialects-5 (`bench/corpus/dialects.py`, `test_dialects.py`): the last parse gaps read
+  as SQLite's documentation says they mean: VALUES after WITH as its SELECTs (lang_select.html 2.6),
+  table constraints without a comma (parse.y's empty `tconscomma`), a table PRIMARY KEY's ASC or DESC
+  left out and its AUTOINCREMENT moved onto its one column (autoinc.html); not expressible, with the
+  reason: a PRIMARY KEY collation other than its column's, several upsert clauses (lang_upsert.html),
+  AUTOINCREMENT on DuckDB, a NATURAL FULL JOIN on MySQL. min, max, first_value and last_value with
+  EXCLUDE CURRENT ROW on a ROWS frame holding the row are said on MySQL and ClickHouse as the frame's
+  two parts around it (6,720 windows on random rows agree with DuckDB 2.0.1's EXCLUDE). On the gate's
+  pool (26,980 records) the untranslatable records go from 10, 10, 116 and 113 (DuckDB, PostgreSQL,
+  MySQL, ClickHouse) to 8, 7, 109 and 106, every one "not expressible" with its reason: none fails to
+  parse. Left: refusals compared by kind, DuckDB's disagreements classified, the tiny run on every engine.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
@@ -1036,8 +1052,11 @@ worker), charged to the statement's memory budget with a typed refusal that fall
 serial loop; two-table hash joins that return rows (no aggregates) run on morsels, with an
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Lane qs6-6: such a join under LIMIT and
 OFFSET runs on morsels too when its ORDER BY holds both tables' INTEGER PRIMARY KEYs, so its rows
-are the serial loop's to the row (T-QT.6.14). Still open: workers running a copy of the VDBE loop
-body (any expression in parallel), joins of three or more tables, outer joins, a LIMIT that stops
+are the serial loop's to the row (T-QT.6.14). Lane qs6-7: workers run a copy of a one-table scan's loop
+body, each with its own registers, so any filter or expression runs in parallel (T-QT.6.15).
+Lane qs6-8: a scan's rows run through the copy too, and under a LIMIT with no ORDER BY
+(behind its switch, serial the control) the workers stop once they hold the LIMIT's rows (T-QT.6.16).
+Still open: the copy for joins, joins of three or more tables, outer joins, a LIMIT that stops
 the workers early.
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
