@@ -212,24 +212,26 @@ pub enum ReadPoint {
     Earliest,
 }
 
-/// The cut, by `point`.
+/// The cut, by `point`, with a trace event of how far apart the groups' clocks read: what the
+/// latest point pushes the slow ones by, and how far the earliest point's reads trail.
 fn cut(groups: &[(Database, Arc<Hooks>)], point: ReadPoint) -> Result<u64, Refusal> {
-    let mut stamps = groups.iter().map(|(_, hooks)| hooks.marks.next());
-    let cut = match point {
-        ReadPoint::Latest => stamps.try_fold(0, |cut, stamp| stamp.map(|s| cut.max(s))),
-        ReadPoint::Earliest => stamps
-            .try_fold(None, |cut: Option<u64>, stamp| {
-                stamp.map(|s| Some(cut.map_or(s, |c| c.min(s))))
-            })
-            .map(Option::unwrap_or_default),
+    let (mut earliest, mut latest) = (None::<u64>, 0u64);
+    for (_, hooks) in groups {
+        let stamp = hooks.marks.next().map_err(unavailable)?;
+        earliest = Some(earliest.map_or(stamp, |e| e.min(stamp)));
+        latest = latest.max(stamp);
     }
-    .map_err(unavailable)?;
-    if point == ReadPoint::Latest {
-        for (_, hooks) in groups {
-            hooks.marks.observe(cut).map_err(unavailable)?;
+    let earliest = earliest.unwrap_or_default();
+    tracing::trace!(target: "amphora.records", event = "read_point_cut", point = ?point, groups = groups.len(), spread_ns = latest.saturating_sub(earliest), "a read across groups took its cut");
+    match point {
+        ReadPoint::Latest => {
+            for (_, hooks) in groups {
+                hooks.marks.observe(latest).map_err(unavailable)?;
+            }
+            Ok(latest)
         }
+        ReadPoint::Earliest => Ok(earliest),
     }
-    Ok(cut)
 }
 
 /// The newest revision of `ns` here stamped at or before `at`: one below the first stamped after
