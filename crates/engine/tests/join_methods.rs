@@ -143,6 +143,9 @@ fn t_qt_5_1_every_join_run_both_ways_gives_one_answer() {
             JoinMethods::NestedLoopsOnly,
             JoinMethods::HashJoinsOnly,
             JoinMethods::ByCost,
+            // QT.5 step 4 (lane qs5-21): sort-merge joins, always and by cost.
+            JoinMethods::MergeJoinsOnly,
+            JoinMethods::ByCostWithMerge,
         ] {
             conn.set_join_methods(methods);
             answers.push((methods, plan(&conn, sql), rows(&conn, sql)));
@@ -269,6 +272,8 @@ fn pl_5_star_join_filters_fire_and_answers_hold() {
             JoinMethods::HashJoinsOnly,
             JoinMethods::NestedLoopsOnly,
             JoinMethods::ByCost,
+            JoinMethods::MergeJoinsOnly,
+            JoinMethods::ByCostWithMerge,
         ] {
             conn.set_join_methods(methods);
             assert_eq!(rows(&conn, &sql), want, "{methods:?}: {sql}");
@@ -285,7 +290,13 @@ fn pl_5_star_join_filters_fire_and_answers_hold() {
                 }
                 JoinMethods::HashJoinsOnly => {}
                 JoinMethods::NestedLoopsOnly => assert_eq!(filters, 0, "{}", plan(&conn, &sql)),
-                JoinMethods::ByCost => {}
+                // A merge keeps the hash join's filters (lane qs5-21).
+                JoinMethods::MergeJoinsOnly if !star && d1_cat == 3 => {
+                    assert!(filters > 0, "no filter: {}", plan(&conn, &sql))
+                }
+                JoinMethods::ByCost
+                | JoinMethods::MergeJoinsOnly
+                | JoinMethods::ByCostWithMerge => {}
             }
         }
     }
@@ -334,13 +345,16 @@ impl Key {
 /// (1, 1.0 and '1'; the largest integer and 2^63 as a real; the smallest integer), and the two
 /// sides' keys meet only at their ends. Expect: one answer under every method, the inner and left
 /// joins equal to the model computed here; hash joins only plans a hash join where both sides have
-/// rows. A sort-merge join's switch value joins `METHODS` when its operator lands.
+/// rows, and merge joins only a merge join (lane qs5-21, T-QT.5.18: the sort-merge join's switch
+/// values are in `METHODS`).
 #[test]
 fn qt_5_15_equi_joins_over_empty_null_repeated_and_mixed_keys_give_one_answer() {
-    const METHODS: [JoinMethods; 3] = [
+    const METHODS: [JoinMethods; 5] = [
         JoinMethods::NestedLoopsOnly,
         JoinMethods::HashJoinsOnly,
         JoinMethods::ByCost,
+        JoinMethods::MergeJoinsOnly,
+        JoinMethods::ByCostWithMerge,
     ];
     let dir = tempfile::tempdir().unwrap();
     let io = Arc::new(PlatformIO::new().unwrap());
@@ -460,6 +474,11 @@ fn qt_5_15_equi_joins_over_empty_null_repeated_and_mixed_keys_give_one_answer() 
             let hashed = plan(&conn, queries[0]);
             if !hashed.contains("HASH JOIN") {
                 wrong.push(format!("{name}: hash joins only plans {hashed}"));
+            }
+            conn.set_join_methods(JoinMethods::MergeJoinsOnly);
+            let merged = plan(&conn, queries[0]);
+            if !merged.contains("MERGE JOIN") {
+                wrong.push(format!("{name}: merge joins only plans {merged}"));
             }
         }
     }
