@@ -58,7 +58,7 @@ pub use tokens::{ReadMode, Served, SessionCounters, Token};
 
 /// One of the floor's own sessions: the work it does on the database at its base.
 type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
-type Durable<F = DeviceFile> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
+type Durable<F = LogDevice> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
 type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 
 /// A bounded ingress and egress handle. Clones share one product-owned Raft actor.
@@ -742,7 +742,7 @@ enum Phase {
         index: u64,
     },
 }
-struct Actor<F: BlockFile + 'static = DeviceFile> {
+struct Actor<F: BlockFile + 'static = LogDevice> {
     replica: Durable<F>,
     // Keep the log owner and its exclusive lease until the replica has drained/dropped.
     _log: hyper_log::Log<F>,
@@ -1551,9 +1551,140 @@ fn open(
         hyper_block::buf::Alignment::new(4096).map_err(unavailable)?,
     )
     .map_err(unavailable)?;
+    let file = LogDevice {
+        file,
+        cut: disk_switch(log_path)?,
+    };
     open_on(
         machine, log_owner, file, config, durability, changed, lease, until, clock,
     )
+}
+
+/// Each open replicated log's disk switch, by its path as the open resolved it (CP-T1.13,
+/// T-T1.13.1: the fire drills' cut disk). An open puts a fresh switch, off, in place of its path's
+/// last: a member started again finds its disk back. Bounded by the logs open now: a switch no
+/// log holds any more is dropped when the next is put in.
+static DISKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn disk_switch(log_path: &Path) -> Result<Arc<AtomicBool>, Refusal> {
+    let mut disks = locked(DISKS.get_or_init(Mutex::default))?;
+    disks.retain(|_, cut| Arc::strong_count(cut) > 1);
+    let cut = Arc::new(AtomicBool::new(false));
+    disks.insert(log_path.to_path_buf(), Arc::clone(&cut));
+    Ok(cut)
+}
+
+/// Cuts the disk under the replicated log open at `log_path` (resolved as its open resolved it),
+/// or gives it back: while cut, every read, write and flush of the log fails as a disk that has gone
+/// away fails them (an I/O error), and the replica fences on the first, as it does on a real one.
+/// Refused when no log is open there.
+pub(super) fn cut_disk(log_path: &Path, on: bool) -> Result<(), Refusal> {
+    let disks = locked(DISKS.get_or_init(Mutex::default))?;
+    let cut = disks
+        .get(log_path)
+        .filter(|cut| Arc::strong_count(cut) > 1)
+        .ok_or_else(|| api::invalid("log path", "no replicated log is open there"))?;
+    cut.store(on, Ordering::Relaxed);
+    Ok(())
+}
+
+/// The system's device file under a member's log, and its disk switch ([`cut_disk`]): every
+/// operation the file's own while the switch is off, one relaxed load past it.
+pub(super) struct LogDevice {
+    file: DeviceFile,
+    cut: Arc<AtomicBool>,
+}
+
+impl LogDevice {
+    fn up(&self, op: &'static str) -> Result<(), hyper_block::DiskError> {
+        if self.cut.load(Ordering::Relaxed) {
+            return Err(hyper_block::DiskError::Io {
+                op,
+                path: PathBuf::new(),
+                source: std::io::Error::other("the disk is cut (a fire drill)"),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl BlockFile for LogDevice {
+    fn alignment(&self) -> hyper_block::buf::Alignment {
+        self.file.alignment()
+    }
+    fn layout_block(&self) -> hyper_block::buf::Alignment {
+        BlockFile::layout_block(&self.file)
+    }
+    fn len(&self) -> Result<u64, hyper_block::DiskError> {
+        self.up("a length")?;
+        BlockFile::len(&self.file)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.up("a read")?;
+        BlockFile::read_exact_at(&self.file, buf, offset)
+    }
+    fn read_resident_at(
+        &mut self,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<bool, hyper_block::DiskError> {
+        self.up("a read")?;
+        BlockFile::read_resident_at(&mut self.file, buf, offset)
+    }
+    fn reads_resident(&self) -> bool {
+        BlockFile::reads_resident(&self.file)
+    }
+    fn residency(&self) -> hyper_block::Residency {
+        BlockFile::residency(&self.file)
+    }
+    fn set_residency_shadow(&mut self, on: bool) {
+        BlockFile::set_residency_shadow(&mut self.file, on);
+    }
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
+        self.up("a write")?;
+        BlockFile::write_all_at(&self.file, buf, offset)
+    }
+    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
+        self.up("a flush")?;
+        BlockFile::sync_data(&self.file)
+    }
+    fn fills_new_space(&self) -> bool {
+        BlockFile::fills_new_space(&self.file)
+    }
+    fn grows_by_segments(&self) -> bool {
+        BlockFile::grows_by_segments(&self.file)
+    }
+    fn grow(&self, len: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+        self.up("a growth")?;
+        BlockFile::grow(&self.file, len)
+    }
+    fn write_whole(
+        &self,
+        offset: u64,
+        copies: u64,
+        fill: &[u8],
+    ) -> Result<(), hyper_block::DiskError> {
+        self.up("a write")?;
+        BlockFile::write_whole(&self.file, offset, copies, fill)
+    }
+    fn segment_end(&self, offset: u64) -> Result<Option<u64>, hyper_block::DiskError> {
+        self.up("a segment's end")?;
+        BlockFile::segment_end(&self.file, offset)
+    }
+    fn write_durable_at(
+        &self,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<hyper_block::block::Durable, hyper_block::DiskError> {
+        self.up("a durable write")?;
+        BlockFile::write_durable_at(&self.file, buf, offset)
+    }
+    fn try_clone(&self) -> Result<Self, hyper_block::DiskError> {
+        Ok(Self {
+            file: BlockFile::try_clone(&self.file)?,
+            cut: Arc::clone(&self.cut),
+        })
+    }
 }
 
 /// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
@@ -4780,7 +4911,7 @@ mod tests {
     /// steps, or from a call's work while the owner runs it. Its instants start an hour past the
     /// real clock, so a real-clock check of a test deadline (a receipt's poll) holds for an hour:
     /// a hang guard, never a verdict.
-    struct Driven<F: BlockFile + 'static = DeviceFile> {
+    struct Driven<F: BlockFile + 'static = LogDevice> {
         // Each member's owner, by member order; none while a test has cut its power.
         owners: Vec<Option<(Actor<F>, mpsc::Receiver<Envelope>)>>,
         base: Instant,

@@ -9,7 +9,8 @@
 //! - `amphora health CONFIG`: asks every member for its status; healthy when every member answers,
 //!   all name the same leader, each holds the configured voters and none is fenced.
 //! - `amphora ask CONFIG NODE REQUEST`: one request to one member (`status`, `exec SQL`,
-//!   `count SQL`, `cut on|off` where the member's config says `drills = on`, `member …`, and
+//!   `count SQL`, `cut on|off` and `disk on|off` where the member's config says `drills = on`,
+//!   `member …`, and
 //!   `leader WAIT_MS`: wait until the member knows its group's leader, at most WAIT_MS, and answer
 //!   `leader=ID addr=HOST:PORT term=T`; woken by the election's step, never by polling).
 //! - `amphora drill load|check`: the fire drills' writers and their loss count ([`load`], [`check`]).
@@ -25,6 +26,7 @@
 //! secret_file = /home/me/.config/amphora/secret
 //! deadline_ms = 5000                         # how long one request, connect or open may take
 //! drills = off                               # on: the member takes `cut` (a split at its transport)
+//!                                            # and `disk` (its log's disk cut)
 //! cert_file = /home/me/.config/amphora/member-1.pem   # with key_file and roots_file, or none
 //! key_file = /home/me/.config/amphora/member-1.key
 //! roots_file = /home/me/.config/amphora/roots.pem
@@ -412,6 +414,8 @@ struct Shared {
     deadline: Duration,
     keys: Keys,
     drills: bool,
+    /// This member's raft log, whose disk `disk on` cuts.
+    log: PathBuf,
     /// Each member's address as the config names it, for the `leader` request's answer.
     addrs: BTreeMap<u64, String>,
     /// Each peer's records connection, to close it when the peer opens another.
@@ -458,6 +462,7 @@ pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
         deadline: config.deadline,
         keys,
         drills: config.drills,
+        log: config.data.join("raft.log"),
         addrs: config
             .members
             .iter()
@@ -694,6 +699,22 @@ impl Shared {
                 self.cut.store(to, Ordering::Relaxed);
                 Ok(String::new())
             }
+            // A disk cut (T-T1.13.1): every read, write and flush of this member's log fails as a
+            // disk gone away fails them, and its replica fences on the first, ending the process
+            // with the reason; the member started again finds its disk back.
+            "disk" => {
+                ensure!(
+                    self.drills,
+                    "drills are off in this member's config (drills = on takes disk)"
+                );
+                let to = match rest {
+                    "on" => true,
+                    "off" => false,
+                    other => bail!("disk {other}: on or off"),
+                };
+                Database::cut_log_disk(&self.log, to).map_err(|e| anyhow!("disk {rest}: {e:?}"))?;
+                Ok(String::new())
+            }
             // A membership change, made by the leader (T-T1.13.1): a spare added as a learner,
             // promoted once it holds the log, a lost member demoted or removed.
             "member" => {
@@ -749,7 +770,9 @@ impl Shared {
                     s.term
                 ))
             }
-            other => bail!("unknown request {other:?} (status, exec, count, cut, member, leader)"),
+            other => {
+                bail!("unknown request {other:?} (status, exec, count, cut, disk, member, leader)")
+            }
         }
     }
 }
@@ -1093,8 +1116,20 @@ pub fn load(
                     }
                     Err(_) => {
                         conn = None;
-                        via = via.saturating_add(1).checked_rem(n).unwrap_or(0);
                         retries.fetch_add(1, Ordering::Relaxed);
+                        // Sent again where the leader is: the next member asked for it (the
+                        // `leader` request, answered once the group has one, woken by the
+                        // election), as the bench's client finds it; that member itself when it
+                        // can't say.
+                        via = via.saturating_add(1).checked_rem(n).unwrap_or(0);
+                        let named = addrs
+                            .get(via)
+                            .and_then(|a| Client::connect(a, &keys, deadline).ok())
+                            .and_then(|mut c| c.leader(deadline).ok())
+                            .and_then(|(_, at)| addrs.iter().position(|a| *a == at));
+                        if let Some(at) = named {
+                            via = at;
+                        }
                     }
                 }
             }
