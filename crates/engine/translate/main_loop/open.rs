@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::main_loop::adaptive::AdaptiveSeek;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 use crate::translate::{
     main_loop::close::AutoIndexBuild,
@@ -218,6 +219,8 @@ impl OpenLoop {
                         loop_end,
                         next,
                     },
+                    // Amphora (PL.13): a join's inner side, in a query.
+                    join_index > 0 && matches!(mode, OperationMode::SELECT),
                 )?,
             }
 
@@ -433,6 +436,7 @@ pub(super) fn emit_table_read_start(
     joined_table_index: usize,
     cursors: TableReadCursors,
     labels: LoopLabels,
+    adaptive: bool,
 ) -> Result<()> {
     let TableReadCursors {
         table_cursor_id,
@@ -647,6 +651,27 @@ pub(super) fn emit_table_read_start(
                         }
                     }
 
+                    // Amphora (PL.13): an inner equality seek that may switch to a hash join.
+                    let adaptive_body = match adaptive
+                        .then(|| AdaptiveSeek::eligible(t_ctx, table, search, index_cursor_id))
+                        .flatten()
+                    {
+                        Some(switch)
+                            if materialized_subquery_storage.is_none()
+                                && temp_cursor_id.is_none() =>
+                        {
+                            Some(switch.emit_prelude(
+                                program,
+                                t_ctx,
+                                table_references,
+                                table,
+                                joined_table_index,
+                                loop_end,
+                            )?)
+                        }
+                        _ => None,
+                    };
+
                     let seek_cursor_id = if materialized_subquery_storage.is_some() {
                         index_cursor_id.expect("materialized subquery must have index cursor")
                     } else {
@@ -699,6 +724,10 @@ pub(super) fn emit_table_read_start(
                             MaterializedFromClauseSubqueryStorage::DirectIndex => {}
                         }
                     } else {
+                        // Amphora (PL.13): a hash probe's match enters here, the index positioned.
+                        if let Some(body) = adaptive_body {
+                            program.preassign_label_to_next_insn(body);
+                        }
                         // Only emit DeferredSeek for non-subquery tables
                         if let Some(index_cursor_id) = index_cursor_id {
                             if let Some(table_cursor_id) = table_cursor_id {

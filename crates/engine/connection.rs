@@ -517,6 +517,22 @@ pub struct Connection {
     pub(super) join_methods: AtomicJoinMethods,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
+    /// Amphora: see [`Connection::set_adaptive_joins`].
+    pub(super) adaptive_joins: AtomicBool,
+    /// Amphora (PL.13): how many joins switched from seeks to a hash table while running; see
+    /// [`Connection::adaptive_join_switches`].
+    pub(super) adaptive_join_switches: AtomicU64,
+    /// Amphora (PL.13): how many adaptive joins' hash tables held rows past their estimate's
+    /// error, so their statements are prepared again; see [`Connection::adaptive_replans`].
+    pub(super) adaptive_replans: AtomicU64,
+    /// Amphora: see [`Connection::set_adaptive_handoff`].
+    pub(super) adaptive_handoff: AtomicBool,
+    /// Amphora (PL.13): how many runs an adaptive join's build handed to a second prepare; see
+    /// [`Connection::adaptive_handoffs`].
+    pub(super) adaptive_handoffs: AtomicU64,
+    /// Amphora (PL.13): the seek's, hash build's and hash probe's weights a test pins in place of
+    /// the learned ones (`Connection::pin_cost_weights`, the simulator's); None: the learned ones.
+    pub(super) pinned_cost_weights: crate::sync::RwLock<Option<(f64, f64, f64)>>,
     /// Amphora: see [`Connection::set_automatic_indexes`].
     pub(super) automatic_indexes: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_mode`].
@@ -1017,6 +1033,74 @@ impl Connection {
 
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches.load(Ordering::Acquire)
+    }
+
+    /// Amphora (PL.13, `docs/design/planner.md`, "Decision (lane pl13)"): lets newly prepared
+    /// statements emit an index nested-loop join with a hash join beside it, switching to the hash
+    /// join at the learned costs' break-even when the outer rows outgrow the estimate. Off by
+    /// default until the coordinator's measurement of it says otherwise.
+    pub fn set_adaptive_joins(&self, on: bool) {
+        self.adaptive_joins.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn adaptive_joins(&self) -> bool {
+        self.adaptive_joins.load(Ordering::Acquire)
+    }
+
+    /// Amphora (PL.13): how many adaptive joins on this connection have switched to a hash join.
+    pub fn adaptive_join_switches(&self) -> u64 {
+        self.adaptive_join_switches.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_join_switch(&self) {
+        self.adaptive_join_switches.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13): how many adaptive joins on this connection built a hash table whose rows
+    /// were past the estimate's error, handing their statements to a second prepare.
+    pub fn adaptive_replans(&self) -> u64 {
+        self.adaptive_replans.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_replan(&self) {
+        self.adaptive_replans.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): when
+    /// an adaptive join's build counts past its estimate's band in a read-only statement's run that
+    /// has returned no row yet, the run stops and starts again on a plan made on the counted rows.
+    /// On by default: it acts only where adaptive joins do (`set_adaptive_joins`). Off, the new plan
+    /// waits for the statement's next run.
+    pub fn set_adaptive_handoff(&self, on: bool) {
+        self.adaptive_handoff.store(on, Ordering::Release);
+    }
+
+    pub(crate) fn adaptive_handoff(&self) -> bool {
+        self.adaptive_handoff.load(Ordering::Acquire)
+    }
+
+    /// Amphora (PL.13): how many runs on this connection an adaptive join's build handed to a
+    /// second prepare part way through.
+    pub fn adaptive_handoffs(&self) -> u64 {
+        self.adaptive_handoffs.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_handoff(&self) {
+        self.adaptive_handoffs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, T-PL.13.1): plans newly prepared statements with these weights of a seek, a
+    /// hash table's build and its probe (in rows' visits) in place of the learned ones, so a test's
+    /// switch point does not move with the machine's timings. None: the learned ones again.
+    #[cfg(feature = "simulator")]
+    pub fn pin_cost_weights(&self, weights: Option<(f64, f64, f64)>) {
+        *self.pinned_cost_weights.write() = weights;
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn pinned_cost_weights(&self) -> Option<(f64, f64, f64)> {
+        *self.pinned_cost_weights.read()
     }
 
     /// Amphora (G6 step 3, learned plan hints; `optimizer::plan_hints`): lets newly prepared

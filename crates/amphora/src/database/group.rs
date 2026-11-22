@@ -178,6 +178,22 @@ pub(super) fn wrote(db: &Db, ns: &str, family: &str, key: &[u8]) -> anyhow::Resu
     Ok(())
 }
 
+/// The bytes the database's pages in use hold: its pages less its free ones, at its page size
+/// (CP-T1.9; docs/design/reshard.md, decision "Load from the store's meter"). A file doesn't
+/// shrink when rows leave it, so its length would count a swept range's pages long after.
+pub(super) fn used_bytes(db: &Db) -> anyhow::Result<u64> {
+    let one = |sql: &'static str| -> anyhow::Result<u64> {
+        let mut out = 0;
+        db.query(sql, [], |r| {
+            out = rev(r, 0)?;
+            Ok(false)
+        })?;
+        Ok(out)
+    };
+    let used = one("PRAGMA page_count")?.saturating_sub(one("PRAGMA freelist_count")?);
+    Ok(used.saturating_mul(one("PRAGMA page_size")?))
+}
+
 /// The log's head (0: no entry yet, or no group's).
 pub(super) fn head(db: &Db) -> anyhow::Result<Seq> {
     Ok(log(db)?.map_or(0, |l| l.head))
