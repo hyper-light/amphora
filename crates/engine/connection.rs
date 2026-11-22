@@ -528,6 +528,11 @@ pub struct Connection {
     /// Amphora (PL.13): the seek's, hash build's and hash probe's weights a test pins in place of
     /// the learned ones (`Connection::pin_cost_weights`, the simulator's); None: the learned ones.
     pub(super) pinned_cost_weights: crate::sync::RwLock<Option<(f64, f64, f64)>>,
+    /// Amphora: see [`Connection::set_parallel_mode`].
+    pub(super) parallel_mode: AtomicBool,
+    /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
+    /// first parallel statement and learned by every one after.
+    pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -988,6 +993,25 @@ impl Connection {
     pub fn set_sorted_fetches(&self, on: bool) {
         self.sorted_fetches.store(on, Ordering::Release);
         self.bump_prepare_context_generation();
+    }
+
+    /// Amphora (QT.6, a prototype behind this switch, off by default): lets newly prepared
+    /// statements run a qualifying scan with its filter and aggregates in morsels of leaf pages,
+    /// a cursor per worker (`vdbe/morsel_scan.rs`, docs/design/executor.md section 8).
+    pub fn set_parallel_mode(&self, mode: crate::vdbe::morsel::ParallelMode) {
+        self.parallel_mode.store(
+            mode == crate::vdbe::morsel::ParallelMode::On,
+            Ordering::Release,
+        );
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn parallel_mode(&self) -> crate::vdbe::morsel::ParallelMode {
+        if self.parallel_mode.load(Ordering::Acquire) {
+            crate::vdbe::morsel::ParallelMode::On
+        } else {
+            crate::vdbe::morsel::ParallelMode::Off
+        }
     }
 
     /// Amphora (PL.7, a prototype behind this switch, off by default; `AMPHORA_FITTED_COSTS=1`

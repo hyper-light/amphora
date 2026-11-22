@@ -211,6 +211,9 @@ pub struct Resolver<'a> {
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
     /// (`Connection::set_adaptive_joins`).
     adaptive_joins: bool,
+    /// Amphora: whether a qualifying scan's aggregates run in leaf-page morsels
+    /// (`Connection::set_parallel_mode`, QT.6).
+    parallel: bool,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -342,6 +345,7 @@ impl<'a> Resolver<'a> {
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
             adaptive_joins: false,
+            parallel: false,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -447,6 +451,14 @@ impl<'a> Resolver<'a> {
         self.adaptive_joins = on;
     }
 
+    pub(crate) fn parallel(&self) -> bool {
+        self.parallel
+    }
+
+    pub(crate) fn set_parallel(&mut self, on: bool) {
+        self.parallel = on;
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
@@ -476,6 +488,7 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
+            parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -511,6 +524,7 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
+            parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),

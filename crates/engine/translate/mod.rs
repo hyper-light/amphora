@@ -28,6 +28,7 @@ pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
+pub(crate) mod parallel;
 pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
@@ -165,6 +166,13 @@ pub fn translate(
     resolver.set_join_methods(connection.join_methods());
     resolver.set_sorted_fetches(connection.sorted_fetches());
     resolver.set_adaptive_joins(connection.adaptive_joins());
+    // Amphora (QT.6): leaf-page morsels read the pager's b-trees, which MVCC and the versioned
+    // storage don't keep a table's rows in.
+    resolver.set_parallel(
+        connection.parallel_mode() == crate::vdbe::morsel::ParallelMode::On
+            && connection.versioned.is_none()
+            && !connection.mvcc_enabled(),
+    );
     // Amphora: what a seek, a hash table and a sort cost, as this database has timed them (QT.5).
     // A page is priced by how often the connection's recent fetches read a file (QT.5).
     // On the versioned storage (G7 step 2) every page is resident in its pool (`pool.rs`: a page

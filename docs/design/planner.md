@@ -1783,7 +1783,11 @@ learned value. Nothing is picked.
   on the normal equations, each sample weighted by Huber's function of its residual against the fit
   as it stood (constant 1.345 scales; scale from the residuals' mean absolute value). Terms whose
   columns the others explain to within the arithmetic's precision, and terms the fit holds at zero
-  (the constraint, not a measurement), are not determined, and keep the learned value.
+  (the constraint, not a measurement), are not determined, and keep the learned value. Nor does a
+  weight the samples can't tell from nothing: the planner reads a fitted weight only when it
+  stands above zero by more than its standard error times the same 95% Bonferroni quantile the
+  epochs are compared by (T-PL.7.6). Without this, a few samples timed on a loaded host moved
+  plans at the margin: `tests/planner.rs` failed one run in seven with the switch on.
 - **Memory.** The fit keeps two epochs' normal equations, never samples: fixed-size arrays. An
   epoch closes once it alone determines what the previous one did and holds its length; the length
   doubles while consecutive epochs' fits agree within their standard errors (a 95% test,

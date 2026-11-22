@@ -2791,6 +2791,8 @@ impl Database {
             adaptive_join_switches: AtomicU64::new(0),
             adaptive_replans: AtomicU64::new(0),
             pinned_cost_weights: crate::sync::RwLock::new(None),
+            parallel_mode: AtomicBool::new(false),
+            morsel_costs: crate::sync::Mutex::new(None),
             vectorized_scans: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),

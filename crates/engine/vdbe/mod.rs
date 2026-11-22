@@ -37,6 +37,7 @@ pub mod insn;
 pub mod leaf_batch;
 pub mod metrics;
 pub mod morsel;
+pub mod morsel_scan;
 #[cfg(test)]
 mod native_extension_tests;
 pub mod row_counts;
@@ -976,6 +977,8 @@ pub struct ProgramState {
     join_switches: HashMap<usize, Option<crate::translate::optimizer::adaptive::JoinSwitch>>,
     /// Amphora: each hash-aggregated GROUP BY's groups (`group_table.rs`), by table id.
     group_tables: HashMap<usize, group_table::GroupTable>,
+    /// Amphora (QT.6): the rows [Insn::MorselAggregate] answered, read out by [Insn::MorselNext].
+    morsel_rows: Option<std::vec::IntoIter<Vec<Value>>>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
@@ -1126,6 +1129,7 @@ impl ProgramState {
             hash_tables: HashMap::default(),
             join_switches: HashMap::default(),
             group_tables: HashMap::default(),
+            morsel_rows: None,
             ephemeral_temp_files: HashMap::default(),
             ephemeral_kept: HashMap::default(),
             uses_subjournal: false,
@@ -1321,6 +1325,7 @@ impl ProgramState {
         if !self.group_tables.is_empty() {
             self.group_tables.clear();
         }
+        self.morsel_rows = None;
         if !self.ephemeral_temp_files.is_empty() {
             let kept = &self.ephemeral_kept;
             self.ephemeral_temp_files

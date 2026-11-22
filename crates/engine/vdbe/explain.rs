@@ -2698,6 +2698,34 @@ pub fn insn_to_row(
             0,
             format!("table {}", data.table_id),
         ),
+        Insn::MorselAggregate { data } => (
+            "MorselAggregate",
+            data.root_page,
+            i64::from(data.target_pc_serial.as_debug_int()),
+            0,
+            Value::build_text(""),
+            0,
+            format!(
+                "root={} filter={} group_by={:?} aggregates={:?}",
+                data.root_page,
+                data.filter.len(),
+                data.group_by,
+                data.aggregates
+            ),
+        ),
+        Insn::MorselNext {
+            dest_start,
+            count,
+            target_pc_done,
+        } => (
+            "MorselNext",
+            i64::try_from(*dest_start).unwrap_or(i64::MAX),
+            i64::try_from(*count).unwrap_or(i64::MAX),
+            i64::from(target_pc_done.as_debug_int()),
+            Value::build_text(""),
+            0,
+            format!("r[{dest_start}..+{count}] = next parallel row"),
+        ),
         Insn::GroupDrain { data } => (
             "GroupDrain",
             i64::try_from(data.table_id).unwrap_or(i64::MAX),

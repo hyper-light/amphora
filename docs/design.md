@@ -58,6 +58,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 11 | The log in lanes: one group-committed log, or a log a writer | [engine.md](design/engine.md#11-the-log-in-lanes-one-group-committed-log-or-a-log-a-writer) |
 | engine | 12 | Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own | [engine.md](design/engine.md#12-large-rows-as-chunk-rows-of-an-overflow-tree-trees-made-and-dropped-as-records-of-their-own) |
 | engine | 13 | The switch: a connection's B-trees on the versioned storage, the pager beside it | [engine.md](design/engine.md#13-the-switch-a-connections-b-trees-on-the-versioned-storage-the-pager-beside-it) |
+| engine | 14 | Eviction: CLOCK to a spill file, slots by page number, reads verified once, a typed bound | [engine.md](design/engine.md#14-eviction-clock-to-a-spill-file-slots-by-page-number-reads-verified-once-a-typed-bound) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |
@@ -142,6 +143,9 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-7): batches learned where they run | [reshard.md](design/reshard.md#decision-lane-split-merge-7-batches-learned-where-they-run) |
 | reshard | – | Decision (lane split-merge-7): retired groups kept | [reshard.md](design/reshard.md#decision-lane-split-merge-7-retired-groups-kept) |
 | reshard | – | Decision (lane split-merge-7): a local database keeps its holding through its command | [reshard.md](design/reshard.md#decision-lane-split-merge-7-a-local-database-keeps-its-holding-through-its-command) |
+| reshard | – | Decision (lane split-merge-8): a batch bounded by the process's memory | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-batch-bounded-by-the-processs-memory) |
+| reshard | – | Decision (lane split-merge-8): a row routes by its namespace, family and key | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-row-routes-by-its-namespace-family-and-key) |
+| reshard | – | Decision (lane split-merge-9): moves across nodes | [reshard.md](design/reshard.md#decision-lane-split-merge-9-moves-across-nodes) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
@@ -188,6 +192,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | 41 | Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, behind a switch) | [store.md](design/store.md#41-skipping-the-descent-an-adaptive-hash-against-a-learned-leaf-locator-prototypes-behind-a-switch) |
 | store | – | Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time | [store.md](design/store.md#decision-lane-wal-read-a-commits-records-published-at-a-lookups-cost-its-deltas-found-a-word-at-a-time) |
 | store | 42 | The page path SQLite takes: plain pins, the pool's buffer counted once, misses read in line, checksums once (prototype, behind a switch) | [store.md](design/store.md#42-the-page-path-sqlite-takes-plain-pins-the-pools-buffer-counted-once-misses-read-in-line-checksums-once-prototype-behind-a-switch) |
+| store | 43 | Point readers write no line another reader writes: the reader taken from a slot of its own, shared pages read under a version check (prototype, behind a switch) | [store.md](design/store.md#43-point-readers-write-no-line-another-reader-writes-the-reader-taken-from-a-slot-of-its-own-shared-pages-read-under-a-version-check-prototype-behind-a-switch) |
 | without-rowid | – | Native primary-root query access | [without-rowid.md](design/without-rowid.md#native-primary-root-query-access) |
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
 | xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |
@@ -196,6 +201,10 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | records-compaction | – | Bounded Records compaction on the namespace writer, step by recoverable step | [records-compaction.md](design/records-compaction.md) |
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
 | backup | – | Decision (lane pitr): backups and point-in-time recovery to Mantle (CP-T1.12, G14 step 4) | [backup.md](design/backup.md) |
+| backup | – | The folder store: keys as paths, create once by link(2), listing in key order | [backup.md](design/backup.md#the-folder-store) |
+| backup | – | Restore-and-check: the newest whole second restored and checked, on the archive's cadence | [backup.md](design/backup.md#restore-and-check) |
+| backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
+| backup | – | Incremental bases: a new base keeps the latest's chunks the log left unchanged | [backup.md](design/backup.md#incremental-bases) |
 
 ## Sections that are not decisions
 
