@@ -96,3 +96,4 @@ hyper-raft = { path = "vendor/hyper-raft/crates/hyper-raft" }
 hyper-log = { path = "vendor/hyper-raft/crates/hyper-log" }
 hyper-block = { path = "vendor/hyper-raft/crates/hyper-block" }
 hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
+hyper-tls = { path = "vendor/hyper-raft/crates/hyper-tls" }

@@ -161,6 +161,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-11): the routing key is bytes | [reshard.md](design/reshard.md#decision-lane-split-merge-11-the-routing-key-is-bytes) |
 | reshard | – | Decision (lane split-merge-12): load from the store's meter | [reshard.md](design/reshard.md#decision-lane-split-merge-12-load-from-the-stores-meter) |
 | reshard | – | Decision (lane split-merge-12): a retired group's files | [reshard.md](design/reshard.md#decision-lane-split-merge-12-a-retired-groups-files) |
+| reshard | – | Decision (lane split-merge-13): the transport between machines | [reshard.md](design/reshard.md#decision-lane-split-merge-13-the-transport-between-machines) |
 | reshard | – | Decision (lane split-merge-15): the size cut from the B-tree's middle key | [reshard.md](design/reshard.md#decision-lane-split-merge-15-the-size-cut-from-the-b-trees-middle-key) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |

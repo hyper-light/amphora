@@ -228,8 +228,8 @@ deterministic simulator:
 
    Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
    which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
-   one group), with a split and merge of it under writes through `carry`; the transport off
-   loopback, between machines. Built (lane split-merge-12): a retired group's files, named to
+   one group), with a split and merge of it under writes through `carry`. Built (lane split-merge-13):
+   the transport between machines (decision "The transport between machines", T-T1.9.R18). Built (lane split-merge-12): a retired group's files, named to
    the shell's caller, who deletes them (decision "A retired group's files", T-T1.9.R16).
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
@@ -433,7 +433,8 @@ acknowledged write reads back at its group's node, and every key is in exactly o
 **Left.** The owner transport listens on loopback, its record in a protected directory beside the
 database: it reaches another process on the same machine. A node on another machine needs that
 listener on a network address with an authentication that doesn't rest on a shared file (the
-replicated transport's, hyper-transport); `Nodes` is the seam it plugs into.
+replicated transport's, hyper-transport); `Nodes` is the seam it plugs into. Built since (lane
+split-merge-13): decision "The transport between machines".
 
 **Falsified by.** A pull answered through a partition; a move over the transport that loses an
 acknowledged write or leaves a key in two groups; a pull's answer larger than a frame.
@@ -534,6 +535,48 @@ every key still reads back from its group.
 
 **Falsified by.** A group named whose files are still read or written by this node; a retired
 group's files left after the caller has deleted those named.
+
+## Decision (lane split-merge-13): the transport between machines
+
+A move's new group pulls from the old group's node, and a transaction across groups steps each
+group's owner, through `transport::Nodes`. Until now every endpoint listened on loopback,
+authenticated by a capability in a protected file beside the database: it reached another process
+on the same machine, never another machine.
+
+Now a node's endpoint (`Node::listen`) and a group's database owner (`Database::listen`) also listen
+at a network address, and `Nodes::network` dials them:
+- Authentication is the replicated transport's: mutual TLS 1.3 as hyper-transport's `Tls::mutual`
+  builds it. Each side presents a certificate chain from the deployment's authority and verifies the
+  other's against the authority's roots, and the dialer checks that the server's certificate carries
+  the name it was given for that node. Key exchange is by the hybrid post-quantum groups only and
+  the suites are the 256-bit ones only, as hyper-quic's `node_provider` names them; no early data (a
+  first message may be a write). The TLS is hyper-tls, the rustls the replicated transport already
+  vendors. Nothing rests on a shared file.
+- The owner protocol runs inside the TLS stream unchanged. Its greeting's capability is exported
+  from the TLS session (RFC 8446 §7.5), so the proofs bind each connection to its session and one
+  greeting serves both endpoints. Frames, deadlines, the descriptor budget and the accept loop are
+  the loopback endpoint's (`Owner::accept`, `endpoint::listener`).
+- A network endpoint answers only what a node asks: a pull, a step or a probe. Sessions, Records and
+  SQL requests stay on the loopback endpoint, and a network one refuses them.
+- Each connection builds its TLS configuration from the credentials (hyper-tls drives a connection
+  with its configuration borrowed mutably), checked once when the endpoint or the peers are made.
+  So no connection resumes a TLS session: every pull and step is a full handshake.
+
+Values introduced: the protocol name `amphora-owner` and the exporter label, format values.
+
+**Evidence.** `transport::network`'s tests (T-T1.9.R18): pulls over a network address under mutual
+TLS; a client from another authority, a server from another authority and a server whose
+certificate names another node, each refused with no pull served; a database request refused at a
+network endpoint. `xgroup::lan`'s harness over two databases' network endpoints commits with no
+unknown outcome. The LAN harness (`examples/xgroup_lan.rs`) runs it between machines: `node
+--listen`, and `bench` or `elle` with `--cert`, `--key` and `--roots`.
+
+**Falsified by.** A request served to a peer whose certificate isn't under the roots, or by a node
+other than the one the dialer named; a network endpoint serving a database session.
+
+**Left.** One connection a request, each a full handshake: if the LAN runs show the handshake
+dominating a step's or a pull's time, connections are kept and reused. The coordinator's numbers
+decide it.
 
 ## Decision (lane split-merge-15): the size cut from the B-tree's middle key
 

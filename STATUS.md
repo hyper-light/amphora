@@ -572,8 +572,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (T-T1.9.R13). Load from the store's meter (lane split-merge-12): the shell measures each
   group's load (its writer's commit time) and where its writes fall, its size (a local database's
   pages in use) and the machine's cores, and the planner decides from them (T-T1.9.R14,
-  T-T1.9.R15, T-T1.9.R17). Left: that transport off loopback
-  (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
+  T-T1.9.R15, T-T1.9.R17). Between machines (lane split-merge-13): a node's endpoint and a group's database owner listen at
+  a network address under the replicated transport's mutual TLS (T-T1.9.R18). Left: a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
   full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
   them (T-T1.9.R16). Size cut (lane split-merge-15): a group's size cut is its position index's middle key, read
   from the index's root page alone (T-T1.9.R19).
