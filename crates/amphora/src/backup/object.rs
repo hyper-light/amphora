@@ -206,12 +206,6 @@ pub(super) fn encode<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
     sealed(&postcard::to_allocvec(value)?)
 }
 
-pub(super) fn decode<T: for<'de> Deserialize<'de>>(key: &str, object: &[u8]) -> anyhow::Result<T> {
-    let value: T = postcard::from_bytes(opened(key, object)?)
-        .map_err(|e| anyhow::anyhow!("archive object {key} doesn't decode: {e}"))?;
-    Ok(value)
-}
-
 /// The bytes a sealed segment takes beyond its frames: what is left of an object for frames.
 pub(super) fn segment_overhead(segment: &Segment) -> anyhow::Result<usize> {
     let empty = Segment {
@@ -247,7 +241,7 @@ mod tests {
         assert_eq!(manifest("k", &bytes).unwrap(), m);
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
-        assert!(decode::<Manifest>("k", &bytes).is_err());
+        assert!(manifest("k", &bytes).is_err());
         assert!(opened("k", &[0; 3]).is_err());
     }
 
