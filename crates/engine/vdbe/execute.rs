@@ -1984,7 +1984,12 @@ fn skip_walk_for(
     };
     let registry = &conn.db.skipping;
     let column = registry.column_of(root)?;
-    let bounds = hint.bounds.iter().find(|b| b.column == column)?;
+    // Lane skip-usable (T-SKU.1): a parameter's bound value is read as the scan starts.
+    let parameters = &state.parameters;
+    let bounds = hint.bounds(column, |index| match parameters.get(index.get() - 1) {
+        Some(Value::Numeric(Numeric::Integer(value))) => Some(*value),
+        _ => None,
+    })?;
     let (reader_pos, committed) = conn.skipping_positions()?;
     let candidates = registry
         .candidates(

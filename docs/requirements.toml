@@ -1223,3 +1223,12 @@ tests = [
   { id = "T-T1.10.X3", text = "xgroup::tests::t_t1_10_x3_a_group_failure_at_every_step_ends_committed_or_aborted_everywhere — passes when each of three groups failing at every coordinator input, its in-flight step landed or not, ends committed or aborted in every group, as answered, under both protocols, both ends reached" },
   { id = "T-T1.10.X2", text = "xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly — passes when three seeds of each protocol over the transport commit across groups with no anomaly and no unknown outcome; ac_t1_10_5_the_lan_check_finds_a_lost_update_and_an_aborted_read holds the check to finding them" },
 ]
+
+# lane skip-usable: row skipping usable by real statements (kiln goal 99e6cc88; executor.md decision 11).
+[[own]]
+id = "SKU"
+title = "Row skipping usable by real statements: bounds from parameters, a measured choice of kind, SQL to switch it on, fused batches"
+criteria = []
+tests = [
+  { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
+]

@@ -39,7 +39,8 @@ pub use leaves::{
 };
 pub use registry::{SkipCounts, SkipRefusal, SkipRegistry, WalPos};
 pub use scan::{
-    integer_bounds, ColumnBounds, SkipHint, SkipWalk, SkipWalks, WalkPhase, WalkTarget,
+    bound_terms, BoundOp, BoundTerm, BoundValue, ColumnBounds, SkipHint, SkipWalk, SkipWalks,
+    WalkPhase, WalkTarget,
 };
 pub use zone_map::{RowidRange, ZoneMap, ZoneMapBuilder, ZoneStats};
 
