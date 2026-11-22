@@ -1178,20 +1178,31 @@ mod tests {
         cache.verify_cache_integrity();
     }
 
+    /// Amphora (QT.6): a second copy of a cached page is refused, typed, and `insert_or_get`
+    /// hands back the first copy (two morsel workers that both missed the page).
     #[test]
-    #[should_panic(expected = "Attempted to insert different page with same key")]
-    fn test_insert_different_page_same_key_panics() {
+    fn test_insert_different_page_same_key_keeps_the_first() {
         let mut cache = PageCache::default();
         let key1 = create_key(1);
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1); // Different Arc instance
 
-        assert!(cache.insert(key1, page1_v1).is_ok());
+        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_cache_integrity();
 
-        // This should panic because it's a different page instance
-        let _ = cache.insert(key1, page1_v2);
+        assert_eq!(
+            cache.insert(key1, page1_v2.clone()),
+            Err(CacheError::KeyHeld)
+        );
+        let resident = cache.insert_or_get(key1, page1_v2, false).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&resident, &page1_v1));
+        assert!(cache
+            .insert_or_get(key1, page1_v1, false)
+            .unwrap()
+            .is_none());
+        assert_eq!(cache.len(), 1);
+        cache.verify_cache_integrity();
     }
 
     #[test]
