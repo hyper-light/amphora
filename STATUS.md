@@ -721,7 +721,7 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   means them: hex() and length() of a REAL (SQLite's %!.15g text of it on DuckDB, not expressible on the
   others), typeof() and quote() of a value of known storage class, `X IS Y` of values (IS NOT DISTINCT
   FROM), BINARY and NOCASE collations (DuckDB's "binary" and "nocase", PostgreSQL's "C"; RTRIM not
-  expressible but on MySQL), and total() of numbers. Untranslatable on the gate's pool: 201, 306, 272, 407
+  expressible but on MySQL), and total() of numbers. Untranslatable on the gate's pool: 200, 322, 271, 423
   (DuckDB, PostgreSQL, MySQL, ClickHouse), from 381, 381, 483, 480. The local check (as lane 9's, every
   written file now, DuckDB's Python replacement scans off, each statement given up after 10 s): of 3,544
   queries 2,129 answered differently before and 1,306 now, none newly; 120 are untranslatable with their
