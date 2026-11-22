@@ -721,9 +721,15 @@ searches over the leaves' bounds the open already found), its first morsel seeki
 leaf before. The morsels are cut from those leaves as from a whole table. The rows of the end
 leaves past the bounds are still read, so the terms the search was made from are tested on every
 row, consumed or not. A backward search (its rows come out in the other order), a bound that is
-no integer literal (a parameter, an expression), a seek through an index and a search on a
-join's table stay serial. T-QT.6.33 checks ranges against the serial loop at 1, 2, 3, 4 and 8
-stated cores, and that the body ran over fewer rows than the table holds.
+no integer literal (a parameter, an expression) and a seek through an index stay serial.
+T-QT.6.33 checks ranges against the serial loop at 1, 2, 3, 4 and 8
+stated cores, and that the body ran over fewer rows than the table holds. A join's tables take
+the same ranges (`shape_join` and `shape_chain`; `MorselJoinData::rowid_range` for a link, whose
+build reads only its leaves too), since the hook tests every term, consumed or not, on the joined
+row. Leaves drop the rows outside the range before the join, which is right only where each such
+row fails a term of an inner join, so in a statement with an outer join every range is read
+whole and the terms decide (a kept table's row outside an ON term's range is still kept).
+T-QT.6.35 checks inner and outer joins over ranges against the serial loop.
 
 **A scan's rows under ORDER BY on morsels** (lane qs6-17). A one-table scan's rows under an ORDER
 BY ran serially. They now sort as a join's rows do: `scan_order` takes keys that are the table's
@@ -761,8 +767,8 @@ part of QT.6):
 - Also found: a table with a generated column (`stored`); a STRICT table's custom-typed column
   with a DEFAULT, which the serial loop ENCODEs at run time; a table whose short rows read a
   default, on the versioned storage's column copy, which decodes records as written; a scan
-  through an index, a rowid range whose bounds aren't integer literals, or one on a join's probe
-  (`Operation::Search`; a rowid range is a run of leaves, `TableSource::restrict`); a one-table
+  through an index or a rowid range whose bounds aren't integer literals (`Operation::Search`;
+  a rowid range is a run of leaves, `TableSource::restrict`); a one-table
   scan's rows under an ORDER BY on an expression, with NULLS FIRST or LAST, or with a LIMIT whose
   keys don't hold the rowid, and a backward scan; AVG and TOTAL over REALs or past 2^53, group_concat and DISTINCT
   aggregates, a HAVING over a group key or a bare column, and

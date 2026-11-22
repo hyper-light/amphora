@@ -21249,13 +21249,16 @@ pub fn op_morsel_aggregate(
         let mut stages = Vec::new();
         stages.try_reserve_exact(data.joins.len())?;
         for join in &data.joins {
-            let build_table = TableSource::open(
+            let mut build_table = TableSource::open(
                 pager.clone(),
                 join.root_page,
                 join.columns,
                 join.rowid_alias,
                 join.defaults.clone(),
             )?;
+            // A link read by a rowid range reads the leaves that hold it (lane qs6-17).
+            let (lower, upper) = join.rowid_range;
+            build_table.restrict(lower, upper);
             // A searched table of an inner join keyed by its INTEGER PRIMARY KEY is read by a
             // seek per joined row when the switch says so (lane qs6-16): no table built.
             let seek_pair = if join.searched

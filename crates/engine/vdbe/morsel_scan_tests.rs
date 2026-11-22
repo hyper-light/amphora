@@ -3287,3 +3287,52 @@ fn t_qt_6_34_a_scans_rows_under_order_by_sort_on_morsels_as_the_serial_loop() {
     }
     conn.set_parallel_mode(ParallelMode::Off);
 }
+
+/// T-QT.6.35 (lane qs6-17): a join whose tables the planner reads by a rowid range runs on
+/// morsels: an inner join's probe and links read only the leaves that hold their ranges, and an
+/// outer join's are read whole, every term tested on the joined row. Inner joins of two and three
+/// tables with ranges on the probe, a link or both, with aggregates, groups and rows (ordered by
+/// the ids under a LIMIT too), and LEFT and FULL joins with ranges in their WHERE and ON terms,
+/// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores, and the hook built links for each.
+#[test]
+fn t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-35");
+    let mut rng = ChaCha8Rng::seed_from_u64(635);
+    fill_with_ids(&conn, &mut rng, &[("f", 3000), ("d", 600), ("e", 300)]);
+    let queries: [(&str, bool); 9] = [
+        ("SELECT count(*), sum(d.b) FROM f JOIN d ON f.a = d.a WHERE f.id > 2000", false),
+        ("SELECT d.c, count(*), min(f.b) FROM f JOIN d ON f.c = d.c WHERE f.id BETWEEN 500 AND 1500 AND d.id < 300 GROUP BY d.c", false),
+        ("SELECT f.id, d.id, d.b FROM f JOIN d ON f.a = d.a WHERE f.id >= 2900 AND d.id > 550", true),
+        ("SELECT count(*), sum(e.b) FROM f JOIN d ON f.a = d.a JOIN e ON d.c = e.c WHERE d.id <= 100 AND e.id > 200", false),
+        ("SELECT f.id, d.id FROM f JOIN d ON f.a = d.a WHERE f.id < 400 ORDER BY f.id, d.id LIMIT 9 OFFSET 2 -- keys 2", true),
+        ("SELECT count(*), count(d.id), sum(d.b) FROM f LEFT JOIN d ON f.a = d.a AND d.id > 500 WHERE f.id > 2500", false),
+        ("SELECT f.id, d.b FROM f LEFT JOIN d ON f.a = d.a WHERE f.id > 2950", true),
+        ("SELECT count(*), count(f.id), count(d.id) FROM f FULL JOIN d ON f.a = d.a AND d.id > 590", false),
+        ("SELECT count(*), sum(f.b) FROM f JOIN d ON f.a = d.a AND d.id < 50 WHERE f.id > 100", false),
+    ];
+    for (sql, rows) in queries {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, sql);
+            let after = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed);
+            same_answer(sql, rows, &parallel, &serial, &format!("on {cores} cores"));
+            assert!(
+                after > before,
+                "{sql} on {cores} cores: the hook built no link"
+            );
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+}

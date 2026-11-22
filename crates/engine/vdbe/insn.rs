@@ -577,6 +577,8 @@ pub struct MorselJoinData {
     pub rowid_alias: Option<usize>,
     /// As [`MorselAggregateData::defaults`], for the build table (lane qs6-17).
     pub defaults: Vec<crate::types::Value>,
+    /// As [`MorselAggregateData::rowid_range`], for the build table (lane qs6-17).
+    pub rowid_range: (Option<i64>, Option<i64>),
     /// Terms over the build table's columns, tested before a row goes into the hash table.
     pub filter: Vec<crate::vdbe::morsel::Predicate>,
     /// The key's columns, pair by pair, in the row joined so far (the probe table's columns, then

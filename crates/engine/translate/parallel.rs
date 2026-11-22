@@ -1249,6 +1249,8 @@ fn shape_join(
     // The tables the planner reads by a seek, links read whole (lane qs6-16).
     let mut searched = Vec::new();
     let mut tables: Vec<&BTreeTable> = Vec::new();
+    // Each table's rowid range, `(None, None)` where it is read whole (lane qs6-17).
+    let mut ranges: Vec<(Option<i64>, Option<i64>)> = Vec::new();
     // An outer join (lane qs6-12): its table and which rows it keeps that match nothing.
     let mut outer: Option<(usize, MorselOuter)> = None;
     for (at, table) in joined.iter().enumerate() {
@@ -1266,6 +1268,9 @@ fn shape_join(
         }
         match &table.op {
             Operation::Scan(Scan::BTreeTable { index: None, .. }) => {}
+            // A forward search by a rowid range between literals reads the leaves that hold it
+            // (lane qs6-17); every term is tested on the joined row, the range's among them.
+            op if scanned_rowids(op).is_some() => {}
             // A seek in an index the statement builds from the whole table reads it whole too.
             Operation::Search(Search::Seek {
                 index: Some(index), ..
@@ -1287,6 +1292,13 @@ fn shape_join(
             _ => return None,
         }
         tables.push(stored(table)?);
+        ranges.push(scanned_rowids(&table.op).unwrap_or((None, None)));
+    }
+    // A range's leaves drop the rows it leaves out before the join, right only where each would
+    // fail a term of an inner join; in an outer join the range is read whole, and the terms decide
+    // (a kept table's row outside an ON term's range is still kept).
+    if outer.is_some() {
+        ranges.fill((None, None));
     }
     // An outer join of two tables (lane qs6-12): the probe is the table the join pads, the
     // other the build, whatever loop the planner chose (it makes no FULL hash join); the hook keys
@@ -1448,6 +1460,7 @@ fn shape_join(
             columns: table.columns().len(),
             rowid_alias: rowid_alias(table),
             defaults: defaults(table),
+            rowid_range: *ranges.get(next)?,
             filter: std::mem::take(filters.get_mut(next)?),
             probe_key,
             build_key,
@@ -1492,7 +1505,7 @@ fn shape_join(
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
         defaults: defaults(probe_table),
-        rowid_range: (None, None),
+        rowid_range: *ranges.get(probe_at)?,
         filter: std::mem::take(filters.get_mut(probe_at)?),
         group_by: group_by.clone(),
         aggregates: aggregates.clone(),
@@ -1664,6 +1677,8 @@ fn shape_chain(
     let joined = plan.table_references.joined_tables();
     let mut keeps = Vec::new();
     let mut tables: Vec<&BTreeTable> = Vec::new();
+    // Each table's rowid range, `(None, None)` where it is read whole (lane qs6-17).
+    let mut ranges: Vec<(Option<i64>, Option<i64>)> = Vec::new();
     // The tables the planner reads by a seek, links read whole (lane qs6-16).
     let mut searched = Vec::new();
     for (at, table) in joined.iter().enumerate() {
@@ -1691,6 +1706,8 @@ fn shape_chain(
         }
         match &table.op {
             Operation::Scan(Scan::BTreeTable { index: None, .. }) | Operation::HashJoin(_) => {}
+            // As in `shape_join` (lane qs6-17).
+            op if scanned_rowids(op).is_some() => {}
             Operation::Search(Search::Seek {
                 index: Some(index), ..
             }) if index.ephemeral => {}
@@ -1699,6 +1716,11 @@ fn shape_chain(
         }
         keeps.push(kept);
         tables.push(stored(table)?);
+        ranges.push(scanned_rowids(&table.op).unwrap_or((None, None)));
+    }
+    // As in `shape_join`: in an outer join a range is read whole.
+    if keeps.iter().any(|kept| *kept != MorselKeeps::default()) {
+        ranges.fill((None, None));
     }
     // Only what the other join shapes don't take: two or more outer joins, or a RIGHT or FULL
     // JOIN among three or more tables; and a LEFT or FULL JOIN of two tables when the switch
@@ -1798,6 +1820,7 @@ fn shape_chain(
             columns: table.columns().len(),
             rowid_alias: rowid_alias(table),
             defaults: defaults(table),
+            rowid_range: *ranges.get(at)?,
             filter: std::mem::take(filters.get_mut(at)?),
             probe_key,
             build_key,
@@ -1845,7 +1868,7 @@ fn shape_chain(
         columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
         defaults: defaults(probe_table),
-        rowid_range: (None, None),
+        rowid_range: *ranges.first()?,
         filter: std::mem::take(filters.first_mut()?),
         group_by: group_by.clone(),
         aggregates: aggregates.clone(),
