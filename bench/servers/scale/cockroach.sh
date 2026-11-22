@@ -36,4 +36,7 @@ ready_node() { node_exec "$1" sql -e "SELECT 1" >/dev/null; }
 
 endpoint() { echo "host=$(addr "$1") port=$(port "$1" 0) user=root dbname=defaultdb sslmode=disable"; }
 
+# The DistSender's counters among them (bench/src/scale.rs's stale routes).
+metrics_url() { echo "http://$(addr "$1"):$(port "$1" 1)/_status/vars"; }
+
 main "$@"

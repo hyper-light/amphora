@@ -26,11 +26,22 @@
 //! - `cutover` (G13 steps 1 and 2; AC-T1.9.2, AC-T1.9.3): writers run; after `--settle-s`, `--ops`
 //!   range operations one after another, cycling split, leader move and (when a node holds no copy
 //!   of the range) replica move: CockroachDB's `SPLIT AT` and `EXPERIMENTAL_RELOCATE`, TiDB's
-//!   `SPLIT TABLE` and PD's `transfer-leader` and `transfer-peer` operators. An operation's pause is
-//!   the longest acknowledgement of any write in flight while it ran (an upper bound on the pause
-//!   of the writes it moved: every write it overlapped counts); `cutover_ms` summarises the pauses
-//!   over the operations (the goal's cutover p99 is its p99), and `lost` counts acknowledged rows
-//!   missing at the end, read through the leader, and must be 0. Amphora's is refused until the
+//!   `SPLIT TABLE` and PD's `transfer-leader` and `transfer-peer` operators; `--concurrent-ops`
+//!   of them at once. Operation `k` works on the range that takes session `(k / 3) % writers`'s new
+//!   rows; its moved writers are that session's group (by [`session_splits`]: pass `--groups` equal
+//!   to `--writers` for a range a session), the rest are the other ranges. Four figures (G13 step 2):
+//!   `unavailable_ms`, each operation's longest gap between two acknowledgements of its moved
+//!   writers that overlaps it; `moved_ms` against `baseline_ms`, the latency of the moved writers'
+//!   writes that overlapped their operation against every write acknowledged before the first
+//!   operation began; `others_ms`, the other writers' writes that overlapped an operation (the
+//!   interference); and `stale_routes`, the writes the bench sent again after a refusal
+//!   (`resends`, moved and others) beside the system's own count of requests it sent on a stale
+//!   route (`system`: CockroachDB's DistSender not-leaseholder and range-key-mismatch errors,
+//!   TiDB's TiKV client Region errors, summed over the nodes, the change over the operations).
+//!   Beside them stays the upper bound: an operation's pause is the longest acknowledgement of
+//!   any write in flight while it ran (every write it overlapped counts); `cutover_ms` summarises
+//!   the pauses over the operations. `lost` counts acknowledged rows missing at the end, read
+//!   through the leader, and must be 0. Amphora's is refused until the
 //!   shell that carries out its splits, merges and moves over replicated groups is built
 //!   (docs/design/reshard.md, "What is left").
 //!
@@ -52,7 +63,7 @@
 //!        read, follower: --rows N --batch N --text-bytes N --warmup-s N --seconds N
 //!        xgroup:     --keys N --span N --warmup-s N --seconds N (amphora: --protocol 2pc|parallel)
 //!        regionloss: --batch N --text-bytes N --lose N --settle-s N --after-s N --poll-us N
-//!        cutover:    --batch N --text-bytes N --ops N --settle-s N --poll-us N
+//!        cutover:    --batch N --text-bytes N --ops N --concurrent-ops N --settle-s N --poll-us N
 //!        amphora:    --dir DIR --class persisted|replicated [--spanning N] --relay-records N --relay-pending N
 //!        others:     --hosts ENDPOINT=ADDR,... [--scripts DIR (bench/servers/scale)] [--shell PROGRAM (bash)]
 
@@ -95,6 +106,8 @@ pub trait System: Sync {
     fn start(&self, node: usize) -> anyhow::Result<()>;
     /// Range operation `op` of the cutover measure, returning once it has taken effect.
     fn reshard(&self, op: usize, o: &Opts) -> anyhow::Result<()>;
+    /// The system's own count, summed over its nodes, of requests it sent on a stale route.
+    fn stale_routes(&self) -> anyhow::Result<u64>;
 }
 
 pub struct Opts {
@@ -124,6 +137,7 @@ pub struct Opts {
     pub relay_records: Option<usize>,
     pub relay_pending: Option<usize>,
     pub ops: Option<usize>,
+    pub concurrent_ops: Option<usize>,
     pub hosts: Option<String>,
     pub scripts: PathBuf,
     pub shell: String,
@@ -173,6 +187,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
         relay_records: None,
         relay_pending: None,
         ops: None,
+        concurrent_ops: None,
         hosts: None,
         scripts: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/servers/scale")),
         shell: "bash".into(),
@@ -216,6 +231,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--relay-records" => o.relay_records = Some(v()?.parse()?),
             "--relay-pending" => o.relay_pending = Some(v()?.parse()?),
             "--ops" => o.ops = Some(v()?.parse()?),
+            "--concurrent-ops" => o.concurrent_ops = Some(v()?.parse()?),
             "--hosts" => o.hosts = Some(v()?),
             "--scripts" => o.scripts = PathBuf::from(v()?),
             "--shell" => o.shell = v()?,
@@ -287,6 +303,10 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
         "cutover" => {
             rows(&o)?;
             anyhow::ensure!(need(o.ops, "--ops", &m)? > 0, "--ops takes at least 1");
+            anyhow::ensure!(
+                need(o.concurrent_ops, "--concurrent-ops", &m)? > 0,
+                "--concurrent-ops takes at least 1"
+            );
             need(o.settle, "--settle-s", &m)?;
             need(o.poll, "--poll-us", &m)?;
         }
@@ -425,9 +445,19 @@ impl<'a> Conn<'a> {
     fn run<T>(
         &mut self,
         deadline: Duration,
-        mut f: impl FnMut(&mut dyn Session) -> anyhow::Result<T>,
+        f: impl FnMut(&mut dyn Session) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.counted(deadline, f).map(|(v, _)| v)
+    }
+
+    /// [`Conn::run`], and how many times `f` was refused before it succeeded.
+    fn counted<T>(
+        &mut self,
+        deadline: Duration,
+        mut f: impl FnMut(&mut dyn Session) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(T, u64)> {
         let until = Instant::now() + deadline;
+        let mut refused = 0u64;
         let n = self.sys.nodes();
         let mut last = None;
         while Instant::now() < until {
@@ -452,8 +482,9 @@ impl<'a> Conn<'a> {
             }
             let Some(s) = self.s.as_mut() else { continue };
             match f(s.as_mut()) {
-                Ok(v) => return Ok(v),
+                Ok(v) => return Ok((v, refused)),
                 Err(e) => {
+                    refused += 1;
                     last = Some(e);
                     self.s = None;
                     self.node = (self.node + 1) % n;
@@ -762,91 +793,233 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
 
 /// The operations a write overlapped: it began after `ended` operations had ended and was
 /// acknowledged once `begun` had begun, so it overlapped operations `ended` to `begun` less one.
-pub fn overlapped(ended: usize, begun: usize, ops: usize) -> std::ops::Range<usize> {
-    ended.min(ops)..begun.min(ops).max(ended.min(ops))
+/// One write of the cutover measure: its writer, when it was sent and acknowledged (microseconds
+/// from the measure's start), and how many sends of it were refused first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sent {
+    writer: usize,
+    t0: u64,
+    t1: u64,
+    resends: u64,
+}
+
+/// One range operation: when it began and took effect (microseconds from the measure's start), and
+/// the writers whose new rows its range takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Moved {
+    t0: u64,
+    t1: u64,
+    writers: Vec<usize>,
+}
+
+/// The cutover measure's figures (G13 step 2), all latencies in microseconds.
+struct Figures {
+    /// Every write acknowledged before the first operation began.
+    baseline: Vec<u64>,
+    /// The moved writers' writes that overlapped their operation.
+    moved: Vec<u64>,
+    /// The other writers' writes that overlapped an operation.
+    others: Vec<u64>,
+    /// Each operation's longest gap between two acknowledgements of its moved writers that overlaps it.
+    unavailable: Vec<u64>,
+    /// Each operation's upper bound: the longest acknowledgement of any write it overlapped.
+    pauses: Vec<u64>,
+    moved_resends: u64,
+    other_resends: u64,
+}
+
+/// The writers of the group session `w` is in, by [`session_splits`].
+pub fn group_writers(w: usize, writers: usize, groups: usize) -> Vec<usize> {
+    let g = |x: usize| key_group(i64::try_from(x).unwrap_or(0), writers, groups);
+    (0..writers).filter(|&x| g(x) == g(w)).collect()
+}
+
+fn hist(samples: &[u64]) -> Hist {
+    let mut h = Hist::new();
+    for &v in samples {
+        h.record(v);
+    }
+    h
+}
+
+/// The figures from every write and every operation.
+fn figures(writes: &[Sent], ops: &[Moved]) -> Figures {
+    let mut f = Figures {
+        baseline: Vec::new(),
+        moved: Vec::new(),
+        others: Vec::new(),
+        unavailable: Vec::new(),
+        pauses: Vec::new(),
+        moved_resends: 0,
+        other_resends: 0,
+    };
+    let first = ops.iter().map(|m| m.t0).min().unwrap_or(u64::MAX);
+    let over = |w: &Sent, m: &Moved| w.t0 < m.t1 && w.t1 > m.t0;
+    for w in writes {
+        let lat = w.t1.saturating_sub(w.t0);
+        if w.t1 <= first {
+            f.baseline.push(lat);
+        }
+        let mut overlapping = ops.iter().filter(|m| over(w, m)).peekable();
+        if overlapping.peek().is_none() {
+            continue;
+        }
+        if overlapping.any(|m| m.writers.contains(&w.writer)) {
+            f.moved.push(lat);
+            f.moved_resends += w.resends;
+        } else {
+            f.others.push(lat);
+            f.other_resends += w.resends;
+        }
+    }
+    for m in ops {
+        let pause = writes
+            .iter()
+            .filter(|w| over(w, m))
+            .map(|w| w.t1.saturating_sub(w.t0))
+            .max()
+            .unwrap_or(0);
+        f.pauses.push(pause);
+        let mut acks: Vec<u64> = writes
+            .iter()
+            .filter(|w| m.writers.contains(&w.writer))
+            .map(|w| w.t1)
+            .collect();
+        acks.sort_unstable();
+        let gap = acks
+            .windows(2)
+            .filter_map(|p| match p {
+                [a, b] if *a < m.t1 && *b > m.t0 => Some(b.saturating_sub(*a)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        f.unavailable.push(gap);
+    }
+    f
 }
 
 fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
     let m = &o.measure;
-    let (batch, text, ops, settle) = (
+    let (batch, text, ops, concurrent, settle) = (
         need(o.batch, "--batch", m)?,
         need(o.text_bytes, "--text-bytes", m)?,
         need(o.ops, "--ops", m)?,
+        need(o.concurrent_ops, "--concurrent-ops", m)?,
         need(o.settle, "--settle-s", m)?,
     );
     let nodes = sys.nodes();
     let down: Vec<AtomicBool> = (0..nodes).map(|_| AtomicBool::new(false)).collect();
-    let (stop, begun, ended) = (
-        AtomicBool::new(false),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-    );
+    let (stop, next) = (AtomicBool::new(false), AtomicUsize::new(0));
     let acked: Vec<AtomicU64> = (0..o.writers).map(|_| AtomicU64::new(0)).collect();
-    // Each operation's pause: the longest acknowledgement of a write it overlapped, microseconds.
-    let pause: Vec<AtomicU64> = (0..ops).map(|_| AtomicU64::new(0)).collect();
+    // Each writer's writes and each operation's span: held to the end, one entry a write (the run
+    // is bounded by --ops and --deadline-s, so they are too).
+    let sent: Vec<Mutex<Vec<Sent>>> = (0..o.writers).map(|_| Mutex::new(Vec::new())).collect();
+    let spans: Mutex<Vec<Moved>> = Mutex::new(Vec::new());
     let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let mut took = Hist::new();
+    let fail = |e: anyhow::Error| {
+        if let Ok(mut f) = failed.lock() {
+            f.get_or_insert(e);
+        }
+    };
+    let start = Instant::now();
+    let at = || u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let stale_before = sys.stale_routes()?;
     std::thread::scope(|scope| -> anyhow::Result<()> {
         for w in 0..o.writers {
-            let (down, stop, begun, ended, acked, pause, failed) =
-                (&down, &stop, &begun, &ended, &acked, &pause, &failed);
+            let (down, stop, acked, sent, fail, at) = (&down, &stop, &acked, &sent, &fail, &at);
             scope.spawn(move || {
                 let mut wr = Writer::new(w, w % nodes);
                 let mut conn = Conn::new(sys, down, w % nodes);
+                let mut mine = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
                     let rows = wr.next(batch, text);
-                    let (t, before) = (Instant::now(), ended.load(Ordering::SeqCst));
-                    match conn.run(o.deadline, |s| s.write(false, &rows)) {
-                        Ok(()) => {
-                            let lat = us(t);
-                            for k in overlapped(before, begun.load(Ordering::SeqCst), ops) {
-                                if let Some(p) = pause.get(k) {
-                                    p.fetch_max(lat, Ordering::Relaxed);
-                                }
-                            }
+                    let t0 = at();
+                    match conn.counted(o.deadline, |s| s.write(false, &rows)) {
+                        Ok(((), resends)) => {
+                            mine.push(Sent {
+                                writer: w,
+                                t0,
+                                t1: at(),
+                                resends,
+                            });
                             if let Some(a) = acked.get(w) {
                                 a.store(wr.seq, Ordering::Relaxed);
                             }
                         }
                         Err(e) => {
-                            if let Ok(mut f) = failed.lock() {
-                                f.get_or_insert(e);
-                            }
-                            return;
+                            fail(e);
+                            break;
                         }
                     }
                 }
+                if let Some(Ok(mut s)) = sent.get(w).map(Mutex::lock) {
+                    *s = mine;
+                }
             });
         }
-        let ran = (|| -> anyhow::Result<()> {
-            std::thread::park_timeout(settle);
-            for k in 0..ops {
-                if failed.lock().map_or(true, |f| f.is_some()) {
-                    break;
-                }
-                let t = Instant::now();
-                begun.store(k + 1, Ordering::SeqCst);
-                let done = sys.reshard(k, o);
-                ended.store(k + 1, Ordering::SeqCst);
-                done?;
-                took.record(us(t));
-            }
-            Ok(())
-        })();
+        std::thread::park_timeout(settle);
+        let runners: Vec<_> = (0..concurrent)
+            .map(|_| {
+                let (next, spans, failed, fail, at) = (&next, &spans, &failed, &fail, &at);
+                scope.spawn(move || {
+                    loop {
+                        if failed.lock().map_or(true, |f| f.is_some()) {
+                            return;
+                        }
+                        let k = next.fetch_add(1, Ordering::SeqCst);
+                        if k >= ops {
+                            return;
+                        }
+                        let t0 = at();
+                        if let Err(e) = sys.reshard(k, o) {
+                            fail(e);
+                            return;
+                        }
+                        let writers = group_writers((k / 3) % o.writers, o.writers, o.groups);
+                        if let Ok(mut s) = spans.lock() {
+                            s.push(Moved {
+                                t0,
+                                t1: at(),
+                                writers,
+                            });
+                        }
+                    }
+                })
+            })
+            .collect();
+        for r in runners {
+            r.join()
+                .map_err(|_| anyhow::anyhow!("a range operation panicked"))?;
+        }
         stop.store(true, Ordering::Relaxed);
-        ran
+        Ok(())
     })?;
     if let Some(e) = failed
         .lock()
-        .map_err(|_| anyhow::anyhow!("a writer's failure was poisoned"))?
+        .map_err(|_| anyhow::anyhow!("a failure was poisoned"))?
         .take()
     {
         return Err(e);
     }
-    let mut pauses = Hist::new();
-    for p in &pause {
-        pauses.record(p.load(Ordering::Relaxed));
+    let stale = sys.stale_routes()?.saturating_sub(stale_before);
+    let mut writes = Vec::new();
+    for s in &sent {
+        writes.extend(
+            s.lock()
+                .map_err(|_| anyhow::anyhow!("a writer's writes were poisoned"))?
+                .iter()
+                .copied(),
+        );
     }
+    let spans = spans
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("the operations' spans were poisoned"))?;
+    let mut took = Hist::new();
+    for s in &spans {
+        took.record(s.t1.saturating_sub(s.t0));
+    }
+    let f = figures(&writes, &spans);
     let mut conn = Conn::new(sys, &down, 0);
     let (mut acknowledged, mut lost) = (0u64, 0u64);
     for (w, a) in acked.iter().enumerate() {
@@ -856,8 +1029,11 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
         lost += want.saturating_sub(held);
     }
     Ok(serde_json::json!({
-        "writers": o.writers, "batch": batch, "text_bytes": text, "ops": ops, "settle_s": settle.as_secs_f64(),
-        "cutover_ms": summary(pauses), "op_ms": summary(took), "acknowledged_rows": acknowledged, "lost": lost,
+        "writers": o.writers, "batch": batch, "text_bytes": text, "ops": ops, "concurrent_ops": concurrent, "settle_s": settle.as_secs_f64(),
+        "unavailable_ms": summary(hist(&f.unavailable)), "moved_ms": summary(hist(&f.moved)), "baseline_ms": summary(hist(&f.baseline)),
+        "others_ms": summary(hist(&f.others)),
+        "stale_routes": { "resends": { "moved": f.moved_resends, "others": f.other_resends }, "system": stale },
+        "cutover_ms": summary(hist(&f.pauses)), "op_ms": summary(took), "acknowledged_rows": acknowledged, "lost": lost,
     }))
 }
 
@@ -1389,6 +1565,10 @@ mod inproc {
             Ok(())
         }
 
+        fn stale_routes(&self) -> anyhow::Result<u64> {
+            Err(no_reshard_shell())
+        }
+
         fn reshard(&self, _op: usize, _o: &Opts) -> anyhow::Result<()> {
             Err(no_reshard_shell())
         }
@@ -1565,7 +1745,12 @@ pub mod sql {
             if let Err(e) = self.script(&["down"]) {
                 use std::io::Write;
                 // Drop can't return the failure: it goes to stderr, and the containers stay for `down`.
-                writeln!(std::io::stderr().lock(), "{} down: {e}", self.script.display()).ok();
+                writeln!(
+                    std::io::stderr().lock(),
+                    "{} down: {e}",
+                    self.script.display()
+                )
+                .ok();
             }
         }
     }
@@ -1772,6 +1957,21 @@ pub mod sql {
             self.script(&["start", &node.to_string()]).map(|_| ())
         }
 
+        fn stale_routes(&self) -> anyhow::Result<u64> {
+            let names: &[&str] = match self.kind {
+                Kind::Cockroach => &[
+                    "distsender_errors_notleaseholder",
+                    "distsender_rpc_err_rangekeymismatcherrtype",
+                ],
+                Kind::Tidb => &["tidb_tikvclient_region_err_total"],
+            };
+            let mut total = 0u64;
+            for n in 0..self.nodes() {
+                total += stale_count(&self.script(&["metrics", &n.to_string()])?, names);
+            }
+            Ok(total)
+        }
+
         fn reshard(&self, op: usize, o: &Opts) -> anyhow::Result<()> {
             let session = session_name((op / 3) % o.writers);
             let what = Op::of(op, self.nodes());
@@ -1780,6 +1980,22 @@ pub mod sql {
                 Kind::Tidb => self.reshard_tidb(what, &session, op, o),
             }
         }
+    }
+
+    /// The sum of the samples of metrics `names` in a Prometheus text exposition (every label set).
+    pub fn stale_count(text: &str, names: &[&str]) -> u64 {
+        text.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| {
+                let (key, value) = l.rsplit_once(' ')?;
+                let name = key.split('{').next()?;
+                if !names.contains(&name) {
+                    return None;
+                }
+                value.parse::<f64>().ok()
+            })
+            .map(|v| v.max(0.0) as u64)
+            .sum()
     }
 
     /// The cutover measure's operations, cycled: a split, a leader move, a replica move (a leader
@@ -1818,6 +2034,25 @@ pub mod sql {
                 .map(|&r| if r == from { to } else { r })
                 .collect(),
         ))
+    }
+
+    /// A Region bound decoded by `TIDB_DECODE_KEY` as (session, seq): `None` when it names no row of
+    /// the table (its start or end, or another table).
+    fn bound(decoded: &str) -> Option<(String, i64)> {
+        let v: serde_json::Value = serde_json::from_str(decoded).ok()?;
+        let h = v.get("handle")?;
+        let session = h.get("session")?.as_str()?.to_owned();
+        let seq = match h.get("seq")? {
+            serde_json::Value::String(s) => s.parse().ok()?,
+            n => n.as_i64()?,
+        };
+        Some((session, seq))
+    }
+
+    /// Whether the Region from `lo` to `hi` (decoded) holds (`session`, the largest sequence number).
+    pub fn holds(lo: &str, hi: &str, session: &str) -> bool {
+        let key = (session.to_owned(), i64::MAX);
+        bound(lo).is_none_or(|b| b <= key) && bound(hi).is_none_or(|b| key < b)
     }
 
     /// Whether a Region's peers' stores and its leader's store show an operation taken effect.
@@ -1894,6 +2129,23 @@ pub mod sql {
             Ok(out)
         }
 
+        /// The Region that takes `session`'s new rows: the one whose keys, decoded by TiDB, hold
+        /// (`session`, the largest sequence number).
+        fn tidb_region_of(c: &mut mysql::Conn, session: &str) -> anyhow::Result<u64> {
+            use mysql::prelude::Queryable;
+            let bounds: Vec<(u64, String, String)> = c.query(
+                "SELECT REGION_ID, TIDB_DECODE_KEY(START_KEY), TIDB_DECODE_KEY(END_KEY) FROM information_schema.tikv_region_status \
+                 WHERE DB_NAME = 'test' AND TABLE_NAME = 'events' AND IS_INDEX = 0",
+            )?;
+            bounds
+                .iter()
+                .find(|(_, lo, hi)| holds(lo, hi, session))
+                .map(|(r, _, _)| *r)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no Region of events holds {session}'s new rows: {bounds:?}")
+                })
+        }
+
         fn reshard_tidb(&self, what: Op, session: &str, op: usize, o: &Opts) -> anyhow::Result<()> {
             use mysql::prelude::Queryable;
             let mut c = mysql::Conn::new(mysql::Opts::from_url(self.endpoint(0)?)?)?;
@@ -1904,12 +2156,11 @@ pub mod sql {
                 ))?;
                 return Ok(());
             }
-            let regions = Self::tidb_regions(&mut c)?;
-            anyhow::ensure!(!regions.is_empty(), "the events table has no Regions");
-            let (region, replicas, leader) = regions
-                .get((op / 3) % regions.len())
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("no Region"))?;
+            let region = Self::tidb_region_of(&mut c, session)?;
+            let (region, replicas, leader) = Self::tidb_regions(&mut c)?
+                .into_iter()
+                .find(|(r, _, _)| *r == region)
+                .ok_or_else(|| anyhow::anyhow!("Region {region} has no peers"))?;
             let done: Taken = if what == Op::Leader {
                 let to = *replicas
                     .iter()
@@ -2060,7 +2311,7 @@ mod tests {
     // takes its operations' count.
     #[test]
     fn g13_scale_machines_are_arguments() {
-        let base = "--scale cutover --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --ops 4 --settle-s 1 --poll-us 1000";
+        let base = "--scale cutover --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --ops 4 --concurrent-ops 1 --settle-s 1 --poll-us 1000";
         let e = parse(&args(base)).err().unwrap().to_string();
         assert!(e.contains("--hosts"), "{e}");
         let e = parse(&args(&format!("{base} --hosts local")))
@@ -2085,25 +2336,104 @@ mod tests {
     }
 
     // G13 step 2: a write counts toward every operation it was in flight during, and only those.
+    // G13 step 2: the four figures beside the upper bound, from the writes and operations seen.
     #[test]
-    fn g13_cutover_write_overlaps_the_operations_in_flight() {
-        assert_eq!(overlapped(0, 0, 5), 0..0, "before any operation");
-        assert_eq!(
-            overlapped(0, 1, 5),
-            0..1,
-            "acknowledged while the first ran"
-        );
-        assert_eq!(
-            overlapped(1, 3, 5),
-            1..3,
-            "began after the first ended, outlived the third's start"
-        );
-        assert_eq!(overlapped(5, 5, 5), 5..5, "after the last");
-        assert_eq!(overlapped(7, 9, 5), 5..5, "never past --ops");
+    fn g13_cutover_figures_split_moved_from_others() {
+        let w = |writer, t0, t1, resends| Sent {
+            writer,
+            t0,
+            t1,
+            resends,
+        };
+        // Before the operation: the baseline. Writer 0 moves; writer 1 doesn't.
+        let writes = [
+            w(0, 0, 10, 0),
+            w(1, 0, 12, 0),
+            w(0, 10, 20, 0),
+            // Writer 0's write across the operation (100..200): a stale route sent again twice.
+            w(0, 90, 260, 2),
+            w(1, 150, 170, 1),
+            w(0, 260, 270, 0),
+        ];
+        let ops = [Moved {
+            t0: 100,
+            t1: 200,
+            writers: vec![0],
+        }];
+        let f = figures(&writes, &ops);
+        assert_eq!((f.moved_resends, f.other_resends), (2, 1));
+        // The longest gap between writer 0's acknowledgements overlapping 100..200: 20 to 260.
+        assert_eq!(f.unavailable, vec![240]);
+        // The upper bound: the longest acknowledgement of any overlapping write.
+        assert_eq!(f.pauses, vec![170]);
+        assert_eq!(f.baseline, vec![10, 12, 10]);
+        assert_eq!((f.moved, f.others), (vec![170], vec![20]));
     }
 
-    // G13 steps 1 and 2: operations cycle split, leader move, replica move; a replica move swaps one
-    // follower for a node holding no copy, and falls back to a leader move with no such node.
+    // G13 step 2: a write overlapping a concurrent operation that moved its range counts as moved.
+    #[test]
+    fn g13_cutover_concurrent_operations_attribute_each_write() {
+        let writes = [Sent {
+            writer: 1,
+            t0: 5,
+            t1: 50,
+            resends: 0,
+        }];
+        let ops = [
+            Moved {
+                t0: 0,
+                t1: 40,
+                writers: vec![0],
+            },
+            Moved {
+                t0: 10,
+                t1: 60,
+                writers: vec![1],
+            },
+        ];
+        let f = figures(&writes, &ops);
+        assert_eq!((f.moved.len(), f.others.len()), (1, 0));
+    }
+
+    #[test]
+    fn g13_cutover_moved_writers_are_the_sessions_group() {
+        assert_eq!(group_writers(1, 4, 2), vec![0, 1]);
+        assert_eq!(group_writers(3, 4, 2), vec![2, 3]);
+        assert_eq!(group_writers(2, 4, 4), vec![2]);
+        assert_eq!(group_writers(0, 3, 1), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn g13_cutover_stale_routes_sum_every_label_set() {
+        let text = "# HELP x\ndistsender_errors_notleaseholder 3\ndistsender_rpc_err_rangekeymismatcherrtype{node=\"1\"} 2.0\nother 9\n";
+        let names = [
+            "distsender_errors_notleaseholder",
+            "distsender_rpc_err_rangekeymismatcherrtype",
+        ];
+        assert_eq!(sql::stale_count(text, &names), 5);
+        let tidb = "tidb_tikvclient_region_err_total{type=\"not_leader\"} 4\ntidb_tikvclient_region_err_total{type=\"epoch_not_match\"} 1\n";
+        assert_eq!(
+            sql::stale_count(tidb, &["tidb_tikvclient_region_err_total"]),
+            5
+        );
+    }
+
+    #[test]
+    fn g13_cutover_tidb_region_of_a_session() {
+        let k = |s: &str, q: i64| {
+            format!("{{\"handle\":{{\"session\":\"{s}\",\"seq\":\"{q}\"}},\"table_id\":7}}")
+        };
+        let table = "{\"table_id\":7}";
+        assert!(sql::holds(table, &k("s-000001", 0), "s-000000"));
+        assert!(!sql::holds(table, &k("s-000001", 0), "s-000001"));
+        assert!(sql::holds(&k("s-000001", 4), "", "s-000001"));
+        assert!(!sql::holds(
+            &k("s-000001", 4),
+            &k("s-000001", 9),
+            "s-000001"
+        ));
+    }
+
     #[test]
     fn g13_cutover_operations_cycle() {
         use sql::{Op, moved};

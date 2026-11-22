@@ -1,7 +1,7 @@
 # Sourced by the cluster scripts beside it (bench/src/scale.rs drives them; CP-T1.9 to CP-T1.11). Each
 # sets SYS, IMAGES (every image its nodes run) and PORTS (how many ports a node takes), defines
 # `containers N` (node N's containers, by name), `run_node N` (its `docker run -d`s), `ready_node N`
-# (true once node N answers SQL), `endpoint N` (its client URL), and optionally `after_up` (run once
+# (true once node N answers SQL), `endpoint N` (its client URL), `metrics_url N` (its Prometheus text), and optionally `after_up` (run once
 # every node is up), then calls `main "$@"`.
 #
 # The machines are arguments, never names in code: HOSTS is a comma-separated list of
@@ -10,10 +10,13 @@
 # machine and the bench reach that machine by. Node n runs on machine n mod the machines' count, so
 # five nodes on five machines is one node a machine, and the same five on one machine is a lab.
 #
-# Node n takes ports BASE + n*PORTS .. BASE + n*PORTS + PORTS-1 on its machine (BASE:
-# AMPHORA_BENCH_SCALE_PORT, else the script's own), published as the same numbers inside its
-# containers, so the address it advertises is the address its peers dial: one path whether the
-# nodes share a machine or not. Node n is region r<n>. Every container carries the label
+# Node n takes ports BASE + n*PORTS .. BASE + n*PORTS + PORTS-1 on its machine, published as the
+# same numbers inside its containers, so the address it advertises is the address its peers dial:
+# one path whether the nodes share a machine or not. BASE is found, not fixed: AMPHORA_BENCH_SCALE_PORT
+# (else the script's own) is only where `up` starts looking, and a block any machine's Docker refuses
+# to publish (taken, or reserved: Windows hands ranges to Hyper-V that move from boot to boot, `netsh
+# interface ipv4 show excludedportrange protocol=tcp`) moves the whole cluster to the next block, up
+# to the last port; the block taken is kept in the state file beside the node count. Node n is region r<n>. Every container carries the label
 # amphora-bench-scale=<system>, and is stopped and removed only by the IDs that label finds on each
 # machine; `rmi` removes the images they ran, by ID, on each machine. Data stays inside the containers:
 # `down` (docker rm -f -v) leaves only the pulled images.
@@ -25,7 +28,9 @@
 #
 # Waits are bounded by WAIT_S seconds (the driver passes its --deadline-s), polled every POLL_S.
 #
-# usage: HOSTS=... <system>.sh up N|down|kill N|start N|endpoint N|delay MS|rmi|ids|exec N ARGS...
+# `metrics N`: node N's Prometheus text, from the script's `metrics_url N`.
+#
+# usage: HOSTS=... <system>.sh up N|down|kill N|start N|endpoint N|metrics N|delay MS|rmi|ids|exec N ARGS...
 set -euo pipefail
 # Git for Windows' bash rewrites arguments that look like paths (/data, /etc/...): not the containers'.
 export MSYS_NO_PATHCONV=1
@@ -39,13 +44,15 @@ POLL_S=${POLL_S:-1}
 HOSTS=${HOSTS:?HOSTS: the machines, ENDPOINT=ADDR,... (ENDPOINT local or a docker -H endpoint)}
 BASE=${AMPHORA_BENCH_SCALE_PORT:-$BASE}
 STATE="${XDG_CACHE_HOME:-$HOME/.cache}/amphora-bench-scale-$SYS${RUN:+-$RUN}.nodes"
+# The state file: the node count, then the BASE `up` found.
+if [[ -s $STATE ]]; then read -r _ found <"$STATE" && [[ -n ${found:-} ]] && BASE=$found; fi
 IFS=, read -r -a MACHINES <<<"$HOSTS"
 ((${#MACHINES[@]} > 0)) || { echo "HOSTS names no machine" >&2; exit 2; }
 for spec in "${MACHINES[@]}"; do
   [[ $spec == *=?* && ${spec%%=*} != "" ]] || { echo "HOSTS entry '$spec' isn't ENDPOINT=ADDR" >&2; exit 2; }
 done
 name() { echo "amphora-bench-scale-$SYS${RUN:+-$RUN}-$1"; }
-nodes() { cat "$STATE" 2>/dev/null || echo 0; }
+nodes() { local count; read -r count _ <"$STATE" 2>/dev/null && echo "$count" || echo 0; }
 machine() { echo "${MACHINES[$(($1 % ${#MACHINES[@]}))]}"; }
 # Node n's machine's address.
 addr() { local m; m=$(machine "$1"); echo "${m#*=}"; }
@@ -97,13 +104,32 @@ down() {
   rm -f "$STATE"
 }
 
+# Docker's refusals to publish a port, on Linux and Docker Desktop.
+PORT_REFUSED='ports are not available|port is already allocated|address already in use'
+
 up() {
-  local n count=${1:?up takes the node count}
-  down
-  echo "$count" >"$STATE"
-  for ((n = 0; n < count; n++)); do
-    run_node "$n" >/dev/null
+  local n count=${1:?up takes the node count} err="$STATE.err" placed=0
+  while ((placed == 0)); do
+    down
+    ((BASE + count * PORTS - 1 <= 65535)) || { echo "no block of $((count * PORTS)) ports from the starting port up that every machine publishes" >&2; return 1; }
+    echo "$count $BASE" >"$STATE"
+    placed=1
+    for ((n = 0; n < count; n++)); do
+      # In the background so that set -e still stops run_node at its first failed docker run.
+      run_node "$n" >/dev/null 2>"$err" &
+      if ! wait $!; then
+        if grep -Eq "$PORT_REFUSED" "$err"; then
+          placed=0
+          BASE=$((BASE + count * PORTS))
+          break
+        fi
+        cat "$err" >&2
+        rm -f "$err"
+        return 1
+      fi
+    done
   done
+  rm -f "$err"
   if declare -F after_up >/dev/null; then after_up; fi
   for ((n = 0; n < count; n++)); do
     if ! wait_for ready_node "$n"; then
@@ -153,6 +179,7 @@ main() {
       wait_for ready_node "$2"
       ;;
     endpoint) endpoint "$2" ;;
+    metrics) curl -sf --max-time "$WAIT_S" "$(metrics_url "$2")" ;;
     delay) delay "$2" ;;
     rmi) each_machine rmi_on ;;
     ids) ids ;;
@@ -162,7 +189,7 @@ main() {
       node_exec "$n" "$@"
       ;;
     *)
-      echo "usage: HOSTS=ENDPOINT=ADDR,... $0 up N|down|kill N|start N|endpoint N|delay MS|rmi|ids|exec N ARGS..." >&2
+      echo "usage: HOSTS=ENDPOINT=ADDR,... $0 up N|down|kill N|start N|endpoint N|metrics N|delay MS|rmi|ids|exec N ARGS..." >&2
       return 2
       ;;
   esac
