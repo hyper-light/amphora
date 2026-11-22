@@ -24,6 +24,7 @@ load1() { sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || awk '{print $1}
 until awk -v l="$(load1)" -v max="${MAX_LOAD:-2}" 'BEGIN { exit !(l < max) }'; do sleep 60; done
 {
   echo "host $(hostname) $(sysctl -n hw.model 2>/dev/null) $(sysctl -n machdep.cpu.brand_string 2>/dev/null) cores $(sysctl -n hw.ncpu 2>/dev/null) mem $(sysctl -n hw.memsize 2>/dev/null)"
+  echo "client join-methods (bench/join_methods), Amphora alone, in its process, no container; os $(uname -s) $(uname -r) $(uname -m)"
   echo "commit $(git -C "$here" rev-parse HEAD) diff-sha256 $(git -C "$here" diff HEAD | shasum -a 256 | cut -d' ' -f1)"
   echo "start $(date -u +%Y-%m-%dT%H:%M:%SZ) load $(sysctl -n vm.loadavg 2>/dev/null || cut -d" " -f1-3 /proc/loadavg)"
 } > "$out/host.txt"
