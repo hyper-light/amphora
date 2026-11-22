@@ -97,6 +97,58 @@ pub struct CopyCounts {
     /// Nanoseconds copies were absent, from being let go to being built again: absences ended
     /// ([`Copies::absent_nanos`] adds those still open).
     pub absent_nanos: u64,
+    /// Analytic statements the scan hook handed the copies with the copies on (lane colcopy-9,
+    /// AC-CB.4.6): those a copy could answer, and those [`Skip`] says none could.
+    pub handed: u64,
+    /// Of those, the statements no copy could answer, by [`Skip`]'s reason: they read the rows
+    /// under either rebuy policy, so an A/B leaves them out.
+    pub skipped_rows: u64,
+    pub skipped_body: u64,
+    pub skipped_join: u64,
+    pub skipped_transaction: u64,
+}
+
+impl CopyCounts {
+    /// The statements handed over that no copy could answer, every reason.
+    pub fn skipped(&self) -> u64 {
+        self.skipped_rows
+            .saturating_add(self.skipped_body)
+            .saturating_add(self.skipped_join)
+            .saturating_add(self.skipped_transaction)
+    }
+
+    /// Whether the statements between `before` and `self` were all handed over and none was
+    /// skipped: a copy could answer them (lane colcopy-9, AC-CB.4.6).
+    pub fn reached_since(&self, before: &CopyCounts, statements: u64) -> bool {
+        self.handed.saturating_sub(before.handed) == statements
+            && self.skipped() == before.skipped()
+    }
+}
+
+/// Why an analytic statement the scan hook handed over can't be answered by a copy (lane
+/// colcopy-9, AC-CB.4.6): the rows answer it under either rebuy policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    /// It returns the table's rows, not aggregates.
+    Rows,
+    /// A filter or expression only the statement's loop body states.
+    Body,
+    /// A join.
+    Join,
+    /// Outside autocommit, or in a transaction that changed rows: the copy holds commits alone.
+    Transaction,
+}
+
+impl Skip {
+    /// The reason in the records' and trace events' words.
+    pub fn name(self) -> &'static str {
+        match self {
+            Skip::Rows => "rows",
+            Skip::Body => "body",
+            Skip::Join => "join",
+            Skip::Transaction => "transaction",
+        }
+    }
 }
 
 /// What the copies asked their memory source for (AC-CB.3.1): takes asked, granted and refused,
@@ -347,6 +399,26 @@ impl Copies {
         c.loop_rows = c.loop_rows.saturating_add(rows);
         if absent {
             c.absent = c.absent.saturating_add(1);
+        }
+    }
+
+    /// An analytic statement the scan hook handed over, and why no copy can answer it if none
+    /// can (lane colcopy-9, AC-CB.4.6).
+    fn handed(&self, skip: Option<Skip>) {
+        {
+            let mut c = self.counts.lock();
+            c.handed = c.handed.saturating_add(1);
+            let n = match skip {
+                None => return,
+                Some(Skip::Rows) => &mut c.skipped_rows,
+                Some(Skip::Body) => &mut c.skipped_body,
+                Some(Skip::Join) => &mut c.skipped_join,
+                Some(Skip::Transaction) => &mut c.skipped_transaction,
+            };
+            *n = n.saturating_add(1);
+        }
+        if let Some(skip) = skip {
+            tracing::debug!(target: "amphora::columns", reason = skip.name(), "column copy skipped: no copy can answer the statement");
         }
     }
 
@@ -714,13 +786,22 @@ pub(crate) fn aggregate(
     connection: &crate::Connection,
     statement_memory: usize,
 ) -> Result<Option<Vec<Vec<Value>>>> {
-    // A filter or expression only the loop body states: the serial loop reads the rows.
-    if data.body.as_ref().is_some_and(|body| !body.simple) {
-        return Ok(None);
-    }
     let storage = switch.storage();
     let copies = &storage.copies;
-    if !copies.on() || !data.joins.is_empty() || !connection.get_auto_commit() || switch.wrote() {
+    if !copies.on() {
+        return Ok(None);
+    }
+    // A statement no copy can answer reads the rows, counted with its reason (lane colcopy-9,
+    // AC-CB.4.6) so an A/B can leave it out: it reads the rows under either rebuy policy.
+    let skip = match &data.body {
+        Some(body) if !body.simple && body.rows => Some(Skip::Rows),
+        Some(body) if !body.simple => Some(Skip::Body),
+        _ if !data.joins.is_empty() => Some(Skip::Join),
+        _ if !connection.get_auto_commit() || switch.wrote() => Some(Skip::Transaction),
+        _ => None,
+    };
+    copies.handed(skip);
+    if skip.is_some() {
         return Ok(None);
     }
     let db = storage.db();
@@ -978,6 +1059,60 @@ mod tests {
         assert_eq!(copies(&conn).counts().kept, 0);
         rows(&conn, "SELECT sum(v) FROM t");
         assert_eq!(copies(&conn).counts().kept, 1);
+    }
+
+    /// T-CB.4.4 (lane colcopy-9, AC-CB.4.6): an analytic statement in autocommit, then the same
+    /// statement in a transaction that wrote and in one that only reads, then each of the A/B's
+    /// queries in autocommit. Expect: the first is handed over and reaches the copies; both in a
+    /// transaction are handed over and counted skipped for it, the rows answering alike; every
+    /// statement is handed over once, and each query's reach is printed (the A/B's records name
+    /// those that don't).
+    #[test]
+    fn cb4_statements_no_copy_can_answer_are_counted_with_their_reason() {
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        copies(&on).set_on(true);
+        for c in [&on, &off] {
+            c.execute(SCHEMA).unwrap();
+            fill(c, 1, 500);
+        }
+        let q = "SELECT count(*), sum(v) FROM t WHERE v < 700";
+        let before = copies(&on).counts();
+        assert_eq!(rows(&on, q), rows(&off, q));
+        let after = copies(&on).counts();
+        assert!(after.reached_since(&before, 1), "{after:?}");
+        for c in [&on, &off] {
+            c.execute("BEGIN").unwrap();
+            c.execute("INSERT INTO t VALUES (100000, 1, 1, 'w')")
+                .unwrap();
+        }
+        assert_eq!(rows(&on, q), rows(&off, q));
+        for c in [&on, &off] {
+            c.execute("COMMIT").unwrap();
+            c.execute("BEGIN").unwrap();
+        }
+        assert_eq!(rows(&on, q), rows(&off, q));
+        for c in [&on, &off] {
+            c.execute("COMMIT").unwrap();
+        }
+        let txn = copies(&on).counts();
+        assert_eq!(txn.handed, after.handed + 2, "{txn:?}");
+        assert_eq!(
+            txn.skipped_transaction,
+            after.skipped_transaction + 2,
+            "{txn:?}"
+        );
+        assert!(!txn.reached_since(&after, 2), "{txn:?}");
+        for (i, q) in QUERIES.iter().enumerate() {
+            let before = copies(&on).counts();
+            assert_eq!(rows(&on, q), rows(&off, q), "{q}");
+            let after = copies(&on).counts();
+            assert!(after.handed <= before.handed + 1, "{q}: {after:?}");
+            eprintln!(
+                "query {i} reaches the copies: {} ({q})",
+                after.reached_since(&before, 1)
+            );
+        }
     }
 
     /// Do: a copy whose queue holds no commit (its memory source refuses the queue), read, then a
@@ -1343,7 +1478,13 @@ mod tests {
                 }
             }
             let mut other = 0u64;
+            // Every statement's latency, and those of the statements a copy could answer (lane
+            // colcopy-9, AC-CB.4.6): the A/B's percentiles count only those, as the rest read
+            // the rows under either policy. The queries (`QUERIES`' places) any statement of
+            // skipped are named in the record.
             let mut latencies = Vec::with_capacity(s.statements);
+            let mut reached = Vec::with_capacity(s.statements);
+            let mut skipped_queries = std::collections::BTreeSet::new();
             let (mut held_sum, mut held_peak, mut equal, mut waited_most) =
                 (0u64, 0u64, true, 0u64);
             let (mut writes_refused, mut write_refusal) = (0u64, None::<String>);
@@ -1381,9 +1522,16 @@ mod tests {
                     press(&room, &mut other, f, &on);
                 }
                 let q = s.query(k);
+                let before = copies(&on).counts();
                 let t = Instant::now();
                 let got = rows(&on, &q);
-                latencies.push(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                let took = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                latencies.push(took);
+                if copies(&on).counts().reached_since(&before, 1) {
+                    reached.push(took);
+                } else {
+                    skipped_queries.insert(k % QUERIES.len());
+                }
                 equal &= got == rows(&off, &q);
                 let held = copies(&on).meter().held;
                 held_sum = held_sum.saturating_add(held);
@@ -1404,6 +1552,8 @@ mod tests {
             let elapsed = began.elapsed().as_secs_f64();
             room.give(other);
             latencies.sort_unstable();
+            reached.sort_unstable();
+            let reached_ns = reached.iter().fold(0u64, |n, t| n.saturating_add(*t));
             let c = copies(&on).counts();
             let m = copies(&on).meter();
             let waiting = copies(&on).waiting();
@@ -1428,9 +1578,17 @@ mod tests {
                 "statements": s.statements,
                 "need_bytes": need,
                 "free_bytes": s.free(need),
-                "p50_ns": at(&latencies, 0.5),
-                "p99_ns": at(&latencies, 0.99),
-                "p999_ns": at(&latencies, 0.999),
+                "p50_ns": at(&reached, 0.5),
+                "p99_ns": at(&reached, 0.99),
+                "p999_ns": at(&reached, 0.999),
+                "reached_statements": reached.len(),
+                "reached_statements_per_s": reached.len() as f64 / (reached_ns as f64 / 1e9).max(f64::MIN_POSITIVE),
+                "skipped_queries": skipped_queries,
+                "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+                "handed": c.handed,
+                "all_p50_ns": at(&latencies, 0.5),
+                "all_p99_ns": at(&latencies, 0.99),
+                "all_p999_ns": at(&latencies, 0.999),
                 "statements_per_s": s.statements as f64 / elapsed.max(f64::MIN_POSITIVE),
                 "peak_held": held_peak,
                 "avg_held": held_sum / n,
@@ -1484,6 +1642,18 @@ mod tests {
                         o.insert("traces_compiled".into(), Traces::compiled().into());
                     }
                     assert_eq!(line["equal"], true, "{line}");
+                    // Lane colcopy-9 (T-CB.4.4): the A/B counts only statements a copy could
+                    // answer, so there must be some, and each statement handed over is either
+                    // one of them or counted with its reason.
+                    let skipped = line["skipped"]
+                        .as_object()
+                        .map_or(0, |o| o.values().filter_map(|v| v.as_u64()).sum::<u64>());
+                    assert!(line["reached_statements"].as_u64() > Some(0), "{line}");
+                    assert_eq!(
+                        line["reached_statements"].as_u64().map(|r| r + skipped),
+                        line["handed"].as_u64(),
+                        "{line}"
+                    );
                     let under_one = matches!(s.press, Press::Steady { copies } if copies < 1.0);
                     if under_one && s.statements >= 4 * s.tables {
                         assert!(line["dropped"].as_u64() > Some(0), "{line}");

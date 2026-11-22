@@ -250,7 +250,14 @@ moving rows out of blocks over positional deltas, which complicate reads [c80].
    runs the concurrency ladder (`--ladder`, AC-CB.4.5): 1, 8, 32, 128, 512, 2048 and 4096 clients at
    once on each engine, each its own connection and thread, one record a step with p50, p99 and
    p99.9, and the client's threads, connections, peak resident bytes and own share of the time, to
-   show whether the client bounds the top step.
+   show whether the client bounds the top step. Only statements a copy could answer are weighed
+   (lane colcopy-9, AC-CB.4.6): a statement the scan hook hands over that no copy can answer (its
+   rows, a filter only its loop states, a join, a transaction) reads the rows under either way, so
+   it is counted with its reason and traced, and left out. The A/B test tells statement by
+   statement from the copies' counts; the driver runs each query once on a probe table first, and
+   leaves the same ones out on DuckDB and in the ladder. Each record's percentiles count only the
+   statements that reached the copies, every statement's beside them, and it names the queries
+   left out and why.
 
 ## What the next steps prototype and measure
 

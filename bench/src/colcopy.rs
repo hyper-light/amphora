@@ -32,6 +32,15 @@
 //! bytes in the step (Linux), the cores, and the client's own share of the clients' time. A step
 //! runs `clients` times the scenario's statements.
 //!
+//! Only statements a copy could answer are what the A/B and the comparison weigh (lane colcopy-9,
+//! AC-CB.4.6): a statement no copy can answer (the scan hook's `Skip`: its rows, a filter only its
+//! loop states, a join, a transaction) reads the rows under either policy. Before the scenarios,
+//! each of the A/B's queries is run once on a probe table and Amphora's copy counts say whether
+//! it reaches the copies; every record's percentiles (Amphora's and DuckDB's, one client or a
+//! ladder's step) count only the statements that do, `all_p50_ns` and the rest count every one,
+//! and `skipped_queries` names the queries left out and why. An Amphora record's `probe_agrees`
+//! says whether its own counts left out the same statements.
+//!
 //! usage: amphora-bench --colcopy --dir DIR [--scale K] [--engines rent,room,duckdb]
 //!        [--duckdb-threads N] [--ladder [--clients 1,8,32,...]] [--out FILE]
 //!
@@ -40,7 +49,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use amphora_engine::storage::versioned::columns_ab::{Scenario, Traces, scenarios, schema};
+use amphora_engine::storage::versioned::columns_ab::{
+    QUERIES, Scenario, Traces, scenarios, schema,
+};
 use amphora_engine::storage::versioned::columns_sql::{Dropped, Rebuy};
 use amphora_engine::storage::versioned::memory::{Capped, Source};
 use amphora_engine::storage::versioned::switch::Storage;
@@ -235,6 +246,54 @@ fn need(rows: i64) -> anyhow::Result<u64> {
     Ok(a.copies().1)
 }
 
+/// Whether each of the A/B's queries (`QUERIES`' places) reaches the copies: None if it does, else
+/// why not (Amphora's `Skip` reason, or "not_handed" when the scan hook never hands it over). Each
+/// runs once on a table of `rows` rows, copies on, no cap: a skip is the statement's shape and
+/// its transaction, never the copies' state (lane colcopy-9, AC-CB.4.6).
+fn reach(rows: i64) -> anyhow::Result<Vec<Option<&'static str>>> {
+    let a = Amphora::open(None, Some(Rebuy::Rent))?;
+    a.exec(&schema(0))?;
+    a.exec(&fill(false, 0, 1, rows))?;
+    let mut out = Vec::with_capacity(QUERIES.len());
+    for q in QUERIES {
+        let before = a.storage.copy_counts();
+        a.rows(&q.replace("FROM t", "FROM t0"))?;
+        let after = a.storage.copy_counts();
+        out.push(if after.reached_since(&before, 1) {
+            None
+        } else if after.handed == before.handed {
+            Some("not_handed")
+        } else if after.skipped_rows > before.skipped_rows {
+            Some("rows")
+        } else if after.skipped_body > before.skipped_body {
+            Some("body")
+        } else if after.skipped_join > before.skipped_join {
+            Some("join")
+        } else {
+            Some("transaction")
+        });
+    }
+    Ok(out)
+}
+
+/// Whether scenario statement `k` reaches the copies, by [`reach`].
+fn reaches(reach: &[Option<&'static str>], k: usize) -> bool {
+    reach
+        .get(k % QUERIES.len().max(1))
+        .is_some_and(Option::is_none)
+}
+
+/// The queries `reach` leaves out, by place, with why.
+fn skipped_queries(reach: &[Option<&'static str>]) -> serde_json::Value {
+    serde_json::Value::Object(
+        reach
+            .iter()
+            .enumerate()
+            .filter_map(|(i, why)| why.map(|w| (i.to_string(), serde_json::json!(w))))
+            .collect(),
+    )
+}
+
 fn at(sorted: &[u64], p: f64) -> u64 {
     let n = sorted.len();
     let i = ((p * n as f64).ceil() as usize).clamp(1, n.max(1)) - 1;
@@ -243,7 +302,9 @@ fn at(sorted: &[u64], p: f64) -> u64 {
 
 #[derive(Default)]
 struct Tally {
+    /// The statements a copy could answer ([`reach`]), and every statement.
     latencies: Vec<u64>,
+    all: Vec<u64>,
     engine_peak: u64,
     analytic_peak: u64,
     cap_peak: u64,
@@ -269,6 +330,8 @@ struct Context<'a> {
     threads: usize,
     client: &'a serde_json::Value,
     platform: &'a serde_json::Value,
+    /// Whether each query reaches the copies ([`reach`]).
+    reach: &'a [Option<&'static str>],
 }
 
 fn run(
@@ -375,7 +438,10 @@ fn run(
         let took = u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
         match got {
             Ok(got) => {
-                t.latencies.push(took);
+                t.all.push(took);
+                if reaches(cx.reach, k) {
+                    t.latencies.push(took);
+                }
                 t.equal &= got == reference.rows(&q)?;
             }
             // Refused under the cap (DuckDB's out-of-memory): counted, not timed.
@@ -399,9 +465,15 @@ fn run(
     let elapsed = began.elapsed().as_secs_f64();
     room.give(other);
     t.latencies.sort_unstable();
+    t.all.sort_unstable();
+    let left_out = (0..s.statements).filter(|k| !reaches(cx.reach, *k)).count() as u64;
     // What Amphora's copies did and why (DuckDB has no copies: null).
     let copies = amphora.as_ref().map(|a| {
         let c = a.storage.copy_counts();
+        // The statements its own counts left out: skipped, or never handed over.
+        let own = c
+            .skipped()
+            .saturating_add((s.statements as u64).saturating_sub(c.handed));
         let waiting = a.storage.copy_waiting();
         let last = a.storage.copy_dropped().map(
             |Dropped::Memory {
@@ -424,6 +496,9 @@ fn run(
             "waiting_bytes_end": waiting.iter().fold(0u64, |b, w| b.saturating_add(w.bytes)),
             "longest_wait_end_ns": waiting.iter().map(|w| w.nanos).max().unwrap_or(0),
             "last_dropped": last,
+            "handed": c.handed,
+            "skipped": {"rows": c.skipped_rows, "body": c.skipped_body, "join": c.skipped_join, "transaction": c.skipped_transaction},
+            "probe_agrees": own == left_out,
         })
     });
     let (engine_name, policy, version) = match engine {
@@ -462,6 +537,11 @@ fn run(
         "p50_ns": at(&t.latencies, 0.5),
         "p99_ns": at(&t.latencies, 0.99),
         "p999_ns": at(&t.latencies, 0.999),
+        "reached_statements": t.latencies.len(),
+        "skipped_queries": skipped_queries(cx.reach),
+        "all_p50_ns": at(&t.all, 0.5),
+        "all_p99_ns": at(&t.all, 0.99),
+        "all_p999_ns": at(&t.all, 0.999),
         "statements_per_s": s.statements as f64 / elapsed.max(f64::MIN_POSITIVE),
         "engine_bytes_peak": t.engine_peak,
         "analytic_bytes_peak": t.analytic_peak,
@@ -565,7 +645,9 @@ impl Client {
 /// What a client brings back from a step.
 #[derive(Default)]
 struct Taken {
+    /// The statements a copy could answer ([`reach`]), and every statement.
     latencies: Vec<u64>,
+    all: Vec<u64>,
     refused: u64,
     refusal: Option<String>,
     unequal: u64,
@@ -720,8 +802,8 @@ fn ladder_step(
     let taken = std::thread::scope(|sc| -> anyhow::Result<Vec<Taken>> {
         let mut handles = Vec::with_capacity(clients);
         for (c, opener) in openers.into_iter().enumerate() {
-            let (room, storage, done, gate, answers) =
-                (&room, storage.as_deref(), &done, &gate, &answers);
+            let (room, storage, done, gate, answers, reach) =
+                (&room, storage.as_deref(), &done, &gate, &answers, cx.reach);
             let spawned = std::thread::Builder::new()
                 .name(format!("colcopy-client-{c}"))
                 .spawn_scoped(sc, move || -> anyhow::Result<Taken> {
@@ -739,14 +821,18 @@ fn ladder_step(
                         Client::Amphora(_) => None,
                     };
                     for j in 0..s.statements {
-                        let q = s.query((c + j) % s.statements.max(1));
+                        let k = (c + j) % s.statements.max(1);
+                        let q = s.query(k);
                         let clock = Instant::now();
                         let got = client.rows(&q);
                         let took = u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
                         let own = Instant::now();
                         match got {
                             Ok(got) => {
-                                t.latencies.push(took);
+                                t.all.push(took);
+                                if reaches(reach, k) {
+                                    t.latencies.push(took);
+                                }
                                 t.statement_ns = t.statement_ns.saturating_add(took);
                                 if answers.get(&q) != Some(&got) {
                                     t.unequal += 1;
@@ -787,10 +873,12 @@ fn ladder_step(
     let elapsed = began.map_or(0.0, |b| b.elapsed().as_secs_f64());
     let rss = rss_peak();
     let mut latencies = Vec::with_capacity(clients.saturating_mul(s.statements));
+    let mut all = Vec::with_capacity(clients.saturating_mul(s.statements));
     let (mut refused, mut refusal, mut unequal, mut client_ns, mut statement_ns) =
         (0u64, None::<String>, 0u64, 0u64, 0u64);
     for t in taken {
         latencies.extend(t.latencies);
+        all.extend(t.all);
         refused += t.refused;
         unequal += t.unequal;
         client_ns = client_ns.saturating_add(t.client_ns);
@@ -800,6 +888,7 @@ fn ladder_step(
         }
     }
     latencies.sort_unstable();
+    all.sort_unstable();
     let analytic = match (&amphora, &duck) {
         (Some(a), _) => a.copies().1,
         (_, Some(d)) => d.memory()?,
@@ -833,6 +922,11 @@ fn ladder_step(
         "p50_ns": at(&latencies, 0.5),
         "p99_ns": at(&latencies, 0.99),
         "p999_ns": at(&latencies, 0.999),
+        "reached_statements": latencies.len(),
+        "skipped_queries": skipped_queries(cx.reach),
+        "all_p50_ns": at(&all, 0.5),
+        "all_p99_ns": at(&all, 0.99),
+        "all_p999_ns": at(&all, 0.999),
         "statements_per_s": total as f64 / elapsed.max(f64::MIN_POSITIVE),
         "analytic_bytes_end": analytic,
         "rss_peak_bytes": rss,
@@ -911,14 +1005,19 @@ pub fn main() -> anyhow::Result<()> {
         "timing": "Instant around prepare, run and every row read",
     });
     let platform = serde_json::json!({ "host": host(), "os": std::env::consts::OS, "arch": std::env::consts::ARCH });
+    let all = scenarios(scale);
+    let probe = all.iter().map(|s| s.rows).min().unwrap_or(1);
+    let reach = reach(probe)?;
+    eprintln!("queries no copy can answer: {}", skipped_queries(&reach));
     let cx = Context {
         dir: &dir,
         threads,
         client: &client,
         platform: &platform,
+        reach: &reach,
     };
     let mut lines = Vec::new();
-    for s in scenarios(scale) {
+    for s in all {
         let need = need(s.rows)?;
         for &engine in &engines {
             if ladder {
