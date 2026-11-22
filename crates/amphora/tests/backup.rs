@@ -495,13 +495,23 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
         Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
             .unwrap()
     };
-    let (g0, s0) = open(0);
-    let (g1, s1) = open(1);
     let route: amphora::xgroup::Route = Arc::new(|k: &[u8]| u32::from(k == b"b"));
-    let cluster = Cluster::open(vec![g0, g1], Arc::clone(&route), 7, protocol, 1, until()).unwrap();
-    s0.wait(until(), |s| s.bases >= 1).unwrap();
-    s1.wait(until(), |s| s.bases >= 1).unwrap();
+    // The coordinator over both groups, backed up. A step past its learned timeout stops an
+    // incarnation as a crash would (docs/design/xgroup.md); then the groups close, and open again
+    // with the coordinator's next incarnation, which finishes what the last left.
+    let start = || {
+        let (g0, s0) = open(0);
+        let (g1, s1) = open(1);
+        let cluster =
+            Cluster::open(vec![g0, g1], Arc::clone(&route), 7, protocol, 1, until()).unwrap();
+        (cluster, vec![s0, s1])
+    };
+    let (mut cluster, mut shippings) = start();
+    for shipping in &shippings {
+        shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    }
     let based = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    let mut ended = Vec::new();
     for v in [b"1", b"2"] {
         let txn = Txn {
             reads: vec![],
@@ -510,17 +520,28 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
                 (b"b".to_vec(), Some(v.to_vec())),
             ],
         };
-        // The first transaction's resolution may still hold the coordinator's one place.
+        // The first transaction's resolution may still hold the coordinator's one place. A stopped
+        // coordinator is opened again and the transaction sent again: its writes are the same
+        // values, so a second run changes nothing.
         let answer = loop {
             match cluster.transact(txn.clone(), until()) {
                 Err(amphora_api::Refusal::Full { .. }) => std::thread::yield_now(),
+                Err(amphora_api::Refusal::Unavailable(_)) => {
+                    drop(cluster);
+                    for shipping in &shippings {
+                        shipping.wait(until(), |s| s.ended).unwrap();
+                    }
+                    ended.append(&mut shippings);
+                    (cluster, shippings) = start();
+                }
                 other => break other.unwrap(),
             }
         };
         assert!(matches!(answer, Answer::Committed { .. }), "{answer:?}");
     }
     drop(cluster);
-    for shipping in [&s0, &s1] {
+    ended.append(&mut shippings);
+    for shipping in &ended {
         let status = shipping.wait(until(), |s| s.ended).unwrap();
         assert_eq!(status.failures, 0, "{:?}", status.last_failure);
     }
@@ -576,4 +597,126 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol) {
         seen.iter().any(|v| v.as_deref() == Some(b"1")),
         "non-vacuous: a cut between the two"
     );
+}
+
+/// Writes rows `ids` with `tag`, one commit a second, each one's rows kept in `history`.
+fn put(
+    db: &mut Db,
+    now: &AtomicU64,
+    ids: impl Iterator<Item = i64>,
+    tag: &str,
+    model: &mut Rows,
+    history: &mut Vec<(u64, Rows)>,
+) {
+    for id in ids {
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        let v = format!("{tag}{id}:{}", "z".repeat(500));
+        let written = v.clone();
+        db.transaction(|db| {
+            db.query_owned(
+                "INSERT OR REPLACE INTO t (id, v) VALUES (?1, ?2)",
+                [Value::from_i64(id), Value::from_text(written.clone())],
+                |_| Ok(true),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        model.insert(id, v);
+        history.push((now.load(Ordering::SeqCst), model.clone()));
+    }
+}
+
+/// T-T1.12.I1 (AC-T1.12.3, AC-T1.12.4): an incremental base. Do: write 400 rows, start the log
+/// again and copy a base;
+/// change 5 rows over two generations of the log; copy a second base; write on; restore seconds
+/// across both; then let the first base expire and restore again. Expect: the second base keeps
+/// most of the first's chunks and copies the changed ones; every second restored has every row
+/// equal, from both bases; once the first base expires, the chunks the second keeps of it stay and
+/// the newest second still restores equal.
+#[test]
+fn t_t1_12_i1_incremental_bases_keep_unchanged_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS));
+    let read = Arc::clone(&now);
+    let hooks = Hooks::new(Arc::new(move || read.load(Ordering::SeqCst)), 1 << 16);
+    let mut db = Db::open(&path).unwrap();
+    db.back_up(Arc::clone(&hooks));
+    let blobs = backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")
+        .unwrap();
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = vec![(now.load(Ordering::SeqCst), model.clone())];
+    let mut shipper = Shipper::open("db", Arc::clone(&hooks), &blobs, &db, until()).unwrap();
+    put(&mut db, &now, 0..400, "a", &mut model, &mut history);
+    // The base begins just after the log starts again: a restore replays its generation whole, so
+    // what that generation wrote before the base began counts as changed for the next.
+    shipper.ship(&db, &blobs, until()).unwrap();
+    assert!(db.restart_log().unwrap());
+    put(&mut db, &now, 400..401, "c", &mut model, &mut history);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let copy_all = |shipper: &mut Shipper, db: &Db| {
+        let mut copy = shipper.begin_base(db, &blobs, 32 * 1024).unwrap();
+        while shipper.copy_base(db, &blobs, &mut copy, until()).unwrap() {}
+        let reused = copy.reused();
+        shipper.end_base(db, &blobs, copy, until()).unwrap();
+        reused
+    };
+    assert_eq!(
+        copy_all(&mut shipper, &db),
+        0,
+        "the first base copies everything"
+    );
+    let first_base = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+
+    // Five rows changed in one generation of the log, then the log started again.
+    put(&mut db, &now, 0..5, "b", &mut model, &mut history);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    assert!(db.restart_log().unwrap());
+    put(&mut db, &now, 401..402, "c", &mut model, &mut history);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let chunks = std::fs::metadata(&path).unwrap().len().div_ceil(32 * 1024) as usize;
+    let reused = copy_all(&mut shipper, &db);
+    assert!(
+        reused > 0 && reused < chunks,
+        "the second base keeps {reused} of {chunks} chunks"
+    );
+    let second_base = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    put(&mut db, &now, 402..420, "d", &mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    shipper.ship(&db, &blobs, until()).unwrap();
+
+    let last = history.last().unwrap().0.div_ceil(SECOND_NS);
+    let check = |second: u64, name: &str| {
+        let target = dir.path().join(name);
+        let restored = backup::restore(&blobs, "db", second, &target, until())
+            .unwrap_or_else(|e| panic!("second {second} refused: {e:#}"));
+        let expected = at(&history, second).cloned().unwrap_or_default();
+        assert_eq!(
+            rows(&Db::open(&target).unwrap()),
+            expected,
+            "second {second}"
+        );
+        restored.base
+    };
+    let mut bases = std::collections::BTreeSet::new();
+    let mut second = first_base + 1;
+    while second <= last {
+        bases.insert(check(second, &format!("r{second}.db")));
+        second += 13;
+    }
+    bases.insert(check(last, "last.db"));
+    assert!(bases.len() >= 2, "restores used both bases: {bases:?}");
+
+    // The first base expires; what the second keeps of it stays.
+    let now_ns = now.load(Ordering::SeqCst);
+    let retention = now_ns - (second_base + 1) * SECOND_NS;
+    let gone = backup::expire(&blobs, "db", now_ns, retention, until()).unwrap();
+    assert!(
+        gone > 0,
+        "the first base and the log before the second expire"
+    );
+    check(last, "after-expiry.db");
+    check(second_base + 1, "after-expiry-oldest.db");
 }
