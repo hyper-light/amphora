@@ -12,8 +12,10 @@
 #   finding 4's Linux leg with CPU time (kiln goal d38fd52c step 3; bench/records/2026-11-12-finding4-hot-loop.md):
 #     bench/commits_ab.sh a005407 839cd0e 3 --sql-api --shapes reapi,logsearch,insert,parse --runs 1
 #   bulk statements and the log they leave, against the commit before (goal 60805ec4, store.md decisions 37, 39, 44):
-#     bench/commits_ab.sh <before> <after> 3 --suite --target amphora --only insert_batch_100,delete_range_insert \
-#       --items 200000 --clients 1,32 --seconds 5 --warmup 1
+#     bench/commits_ab.sh 13e385da 3e91d702 3 --suite --target amphora --only insert_batch_100,delete_range_insert \
+#       --items 200000 --clients 1,32 --seconds 5 --warmup 1   (3e91d702: the small commits; 13e385da the base they were measured on)
+#   the same against the replica log's bound (goal 7582f00a: 7cfadaf3, the batch before log-bound, against 6c343067, its last merge)
+# amphora-bench must build at both commits: on main 0ace0e0d it does not (bench/src/columns.rs:174, Feed::new's arguments).
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 before="$1"; after="$2"; rounds="$3"; shift 3

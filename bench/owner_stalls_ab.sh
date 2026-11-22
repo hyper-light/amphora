@@ -14,7 +14,7 @@
 #
 # usage: bench/owner_stalls_ab.sh <before> <after> <seconds> [rounds]
 #   the record (persisted flush off the owner, decision of replication.md "A replica's database log"):
-#     LOAD_COPIES=6 bench/owner_stalls_ab.sh db991a05d1769648d1de0390ac80b04c979d150e <the change's commit> 1800 2
+#     LOAD_COPIES=6 bench/owner_stalls_ab.sh b33094fb 0e8a6106 1800 2   (0e8a6106: the flush off the owner; b33094fb its parent)
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 before="$1"; after="$2"; seconds="$3"; rounds="${4:-1}"
