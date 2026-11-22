@@ -1074,6 +1074,8 @@ criteria = [
   # lane g11s5c
   { id = "AC-CS.5.3", text = "SQL tables on the versioned storage keep a column copy behind AMPHORA_COLUMN_PATH=on, fed from the commit stream through Database::commit's feeds (one a tree), chosen by measured use: rent before buying (Karlin et al. 1988), a table's first analytic statement read by the rows, its second making the copy; a dropped table's copy goes with it (storage/versioned/columns_sql.rs)" },
   { id = "AC-CS.5.4", text = "A SQL aggregate the executor's scan hook takes (translate/parallel.rs) reads its table's copy when the planner chooses it, on as many cores as the morsel executor finds pay (Plan::run_on_cores), else its serial loop reads the rows; never in a transaction that changed rows or outside autocommit (vdbe/execute.rs op_morsel_aggregate)" },
+  # lane g11s5e
+  { id = "AC-CS.5.5", text = "A SQL table's column copy takes the bytes of its queue, its decoded blocks and its blocks from the storage's memory source as they grow and gives them back as they go, no share set aside; a copy whose blocks the source refuses is let go with the refusal kept as its reason (columns_sql::Dropped) and the rows answer; a SUM over a column holding text or blobs is declined to the rows (storage/versioned/columns_sql.rs)" },
 ]
 tests = [
   { id = "T-CS.5.1", text = "cs5_answers_identical_whichever_path_{plain,packed} (crates/engine/storage/versioned/columns_path.rs) — passes when every whole-table and point read, by either path, from a copy with deltas and queued keys, equals the rows at its snapshot" },
@@ -1086,6 +1088,9 @@ tests = [
   { id = "T-CS.5.7", text = "cs5_sql_aggregates_answer_alike_on_copy_and_rows (crates/engine/storage/versioned/columns_sql.rs) — passes when SQL filters, aggregates and GROUP BY answer the same with the copies' switch on and off, with inserts, updates and deletes between rounds, and the counts show one copy kept and statements read from it" },
   { id = "T-CS.5.8", text = "cs5_a_copy_is_kept_only_for_tables_analytic_statements_read — passes when a table only point-read and a table read by one analytic statement keep no copy, and a second analytic statement makes one" },
   { id = "T-CS.5.9", text = "cs5_a_copy_behind_its_snapshot_is_never_read — passes when, after a commit its full queue dropped, the next statement is answered by the rows with the copy unread, the copy is rebuilt, and the statement after reads it, every answer the rows'" },
+  # lane g11s5e
+  { id = "T-CS.5.10", text = "cs5_a_copy_its_memory_refuses_is_let_go_and_the_rows_answer (crates/engine/storage/versioned/columns_sql.rs) — passes when each copy whose blocks the memory source refuses is let go with the source's typed refusal kept and counted, none is read, and every answer is the rows'; cs5_a_feeds_queue_takes_from_its_memory_source (columns.rs) — passes when a queued record's bytes are held by the source and given back when the feed goes, and a record the source refuses is lost, not queued" },
+  { id = "T-CS.5.11", text = "cs5_sum_over_text_in_an_integer_column_answers_as_sqlite (crates/engine/storage/versioned/columns_sql.rs) — passes when a SUM over an INTEGER column holding text and a blob answers the same with the copies' switch on and off, as a real, and no such SUM is read from the copy" },
 ]
 
 # lane many-writers

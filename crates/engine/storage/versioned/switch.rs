@@ -86,7 +86,7 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
     let recovered: Mutex<HashMap<u64, Arc<OnceLock<KeyOrder>>>> = Mutex::new(HashMap::new());
     let db = Arc::new(VDatabase::open_in(
         disk,
-        Room::Shared(source),
+        Room::Shared(source.clone()),
         TREES,
         || KeyOrder::rowid().comparator(),
         |tree, bytes| {
@@ -102,11 +102,11 @@ pub fn open(path: &str, memory: bool, source: Option<Arc<dyn Source>>) -> Result
     Ok(Arc::new(Storage {
         db,
         orders: Mutex::new(recovered.into_inner()),
-        // The copies' queues and decoded blocks are charged to the half of the budget the row
-        // versions and records beside the pool's pages take (above).
+        // The copies' queues, decoded blocks and blocks take from the same source as they grow,
+        // as the pages and row versions do: no share is set aside for them.
         copies: super::columns_sql::Copies::new(
             crate::translate::optimizer::column_path::asked(),
-            usize::try_from(budget / 2).unwrap_or(usize::MAX),
+            source,
         ),
     }))
 }
@@ -116,6 +116,11 @@ impl Storage {
     /// they answered, statements sent to the rows, rebuilds.
     pub fn copy_counts(&self) -> super::columns_sql::CopyCounts {
         self.copies.counts()
+    }
+
+    /// The last SQL table's column copy let go for its memory, and why (G11 step 5).
+    pub fn copy_dropped(&self) -> Option<super::columns_sql::Dropped> {
+        self.copies.last_dropped()
     }
 
     /// The versioned database under it.

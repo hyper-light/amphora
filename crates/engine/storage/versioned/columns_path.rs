@@ -381,7 +381,11 @@ mod tests {
 
     fn open(seed: u64, bound: usize) -> (Database, Arc<Feed>) {
         let db = Database::open(Arc::new(Simulated::new(seed, 1).unwrap()), 4_000, 1, cmp).unwrap();
-        let feed = Arc::new(Feed::new(0, bound, Box::new(|| 0)));
+        let feed = Arc::new(Feed::new(
+            0,
+            crate::storage::versioned::memory::capped(u64::try_from(bound).unwrap_or(u64::MAX)),
+            Box::new(|| 0),
+        ));
         db.keep_columns(feed.clone()).unwrap();
         (db, feed)
     }
@@ -582,7 +586,7 @@ mod tests {
             db: &db,
             snap: &snap,
         };
-        let cache = Cache::new(usize::MAX);
+        let cache = Cache::new(crate::storage::versioned::memory::capped(u64::MAX));
         let tick = clock(1);
         let queued = copy.plan_view(snap.start).queued;
         assert!(queued > 0);
@@ -685,7 +689,7 @@ mod tests {
     #[test]
     fn cs5_scan_hook_runs_only_when_the_copy_is_chosen() {
         use crate::storage::versioned::columns::scan::Records;
-        let cache = Cache::new(usize::MAX);
+        let cache = Cache::new(crate::storage::versioned::memory::capped(u64::MAX));
         let tick = clock(1);
         let hooked = Counted {
             inner: Vectorized { cache: &cache },

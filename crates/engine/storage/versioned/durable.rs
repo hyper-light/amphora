@@ -1720,7 +1720,11 @@ mod tests {
     #[test]
     fn ns2_4_a_column_feed_gets_large_values_whole() {
         let db = Database::open(Arc::new(Simulated::new(24, 1).unwrap()), 2_000, 1, cmp).unwrap();
-        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        let feed = Arc::new(Feed::new(
+            0,
+            crate::storage::versioned::memory::capped(u64::MAX),
+            Box::new(|| 0),
+        ));
         db.keep_columns(feed.clone()).unwrap();
         let mut d = Descender::new();
         let key = b"k".to_vec();

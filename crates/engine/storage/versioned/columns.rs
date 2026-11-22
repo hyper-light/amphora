@@ -27,6 +27,7 @@
 //!
 //! The copy orders keys bytewise: it serves trees whose comparator is bytewise.
 
+use super::memory::Source;
 use super::redo::Op;
 use super::version::Ts;
 use crate::error::LimboError;
@@ -68,9 +69,9 @@ pub struct FeedCounts {
 /// The copy's queue: the commits' records for one tree, handed over under the publish lock.
 pub struct Feed {
     tree: u64,
-    /// The queue's bytes may not pass it: the share of the database's memory budget its caller
-    /// charges the queue to (CLAUDE.md §2).
-    bound: usize,
+    /// Where the queue's bytes are taken from as records join it, and given back to as they leave
+    /// (CLAUDE.md §2): a record it refuses is not queued.
+    room: Arc<dyn Source>,
     /// The caller's clock, read at each offer: what the freshness lag is measured from.
     tick: Box<dyn Fn() -> u64 + Send + Sync>,
     queue: Mutex<Queue>,
@@ -84,19 +85,19 @@ fn change_bytes(c: &Change) -> usize {
 }
 
 impl Feed {
-    /// A feed for tree `tree` whose queue holds at most `bound` bytes of keys and rows; `tick`
-    /// the caller's clock, in the unit [`Columns::catch_up`] is given.
-    pub fn new(tree: u64, bound: usize, tick: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
+    /// A feed for tree `tree` whose queue's keys and rows take what `room` grants; `tick` the
+    /// caller's clock, in the unit [`Columns::catch_up`] is given.
+    pub fn new(tree: u64, room: Arc<dyn Source>, tick: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
         Self {
             tree,
-            bound,
+            room,
             tick,
             queue: Mutex::new(Queue::default()),
             counts: Mutex::new(FeedCounts::default()),
         }
     }
 
-    /// The commit `ts`'s changes (call in timestamp order: under the publish lock). Never refuses the commit: a record that would pass the bound is not queued, and the
+    /// The commit `ts`'s changes (call in timestamp order: under the publish lock). Never refuses the commit: a record its memory source refuses is not queued, and the
     /// copy is behind from it until a rebuild after it (counted in [`Feed::counts`]).
     pub fn offer(&self, ts: Ts, ops: &[Op]) {
         let mut changes = Vec::new();
@@ -121,10 +122,7 @@ impl Feed {
             .fold(0usize, |n, c| n.saturating_add(change_bytes(c)));
         let at = (self.tick)();
         let mut q = self.queue.lock();
-        let fits = q
-            .bytes
-            .checked_add(bytes)
-            .is_some_and(|after| after <= self.bound);
+        let fits = self.room.take(QUEUE, as_u64(bytes)).is_ok();
         let mut counts = self.counts.lock();
         if fits {
             q.bytes = q.bytes.saturating_add(bytes);
@@ -149,6 +147,28 @@ impl Feed {
     pub fn queued_bytes(&self) -> usize {
         self.queue.lock().bytes
     }
+
+    /// `bytes` that left the queue, given back to its memory source.
+    fn released(&self, bytes: usize) {
+        if bytes > 0 {
+            self.room.give(as_u64(bytes));
+        }
+    }
+}
+
+impl Drop for Feed {
+    fn drop(&mut self) {
+        let bytes = self.queue.lock().bytes;
+        self.released(bytes);
+    }
+}
+
+/// What a copy's queue takes its bytes from its memory source as.
+pub const QUEUE: &str = "a column copy's queue";
+
+/// A count of bytes as a memory source counts them.
+pub(crate) fn as_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// Rows in key order: each key and its row.
@@ -691,7 +711,7 @@ impl<B: Block> Columns<B> {
         }
         let mut q = self.feed.queue.lock();
         let records: Vec<Queued> = q.records.drain(..).collect();
-        q.bytes = 0;
+        let freed = std::mem::take(&mut q.bytes);
         if let Some((first, last)) = q.lost.take() {
             st.behind = Some(
                 st.behind
@@ -699,6 +719,7 @@ impl<B: Block> Columns<B> {
             );
         }
         drop(q);
+        self.feed.released(freed);
         let n = records.len();
         let st = &mut *st;
         for r in records {
@@ -756,11 +777,15 @@ impl<B: Block> Columns<B> {
         {
             let mut q = self.feed.queue.lock();
             q.records.retain(|r| r.ts > made);
-            q.bytes = q.records.iter().fold(0usize, |n, r| {
+            let kept = q.records.iter().fold(0usize, |n, r| {
                 r.changes
                     .iter()
                     .fold(n, |n, c| n.saturating_add(change_bytes(c)))
             });
+            let freed = q.bytes.saturating_sub(kept);
+            q.bytes = kept;
+            drop(q);
+            self.feed.released(freed);
         }
         // Commits lost after `made` are missing from the new generation too: it answers no
         // snapshot after `made` until the next rebuild.
@@ -870,11 +895,15 @@ impl<B: Block> Columns<B> {
 
     /// The copy's resident bytes: its generations' blocks and deltas, and the queue.
     pub fn resident(&self) -> usize {
+        self.blocks_resident()
+            .saturating_add(self.feed.queued_bytes())
+    }
+
+    /// Its generations' resident bytes, blocks and deltas: what the copy holds beside its queue.
+    pub fn blocks_resident(&self) -> usize {
         let st = self.state.read();
         let g = |g: &Option<Generation<B>>| g.as_ref().map_or(0, Generation::resident);
-        g(&st.current)
-            .saturating_add(g(&st.previous))
-            .saturating_add(self.feed.queued_bytes())
+        g(&st.current).saturating_add(g(&st.previous))
     }
 
     /// The current generation's rows in blocks, its block size, and its block count.
@@ -1152,6 +1181,33 @@ mod tests {
         old_snapshots: u64,
     }
 
+    /// T-CS.5.10: a feed whose memory source has room for one record, offered two. Expect: the
+    /// first record's bytes held by the source, the second lost, not queued; all given back when
+    /// the feed goes.
+    #[test]
+    fn cs5_a_feeds_queue_takes_from_its_memory_source() {
+        let room = Arc::new(crate::storage::versioned::memory::Capped::new(3));
+        let feed = Feed::new(7, room.clone(), Box::new(|| 0));
+        let put = |k: u8| Op::Put {
+            tree: 7,
+            key: vec![k],
+            value: vec![k, k],
+        };
+        feed.offer(1, &[put(1)]);
+        feed.offer(2, &[put(2)]);
+        assert_eq!(room.held(), 3);
+        assert_eq!(feed.queued_bytes(), 3);
+        assert_eq!(
+            feed.counts(),
+            FeedCounts {
+                offered: 1,
+                lost: 1
+            }
+        );
+        drop(feed);
+        assert_eq!(room.held(), 0);
+    }
+
     /// Writers commit puts and removes on one tree while the copy's worker applies the feed and
     /// rebuilds when it pays, and a reader scans the copy at fresh snapshots and at snapshots held
     /// across rebuilds: every scan equals the rows at its snapshot.
@@ -1161,7 +1217,7 @@ mod tests {
         let t2 = ticks.clone();
         let feed = Arc::new(Feed::new(
             0,
-            bound,
+            crate::storage::versioned::memory::capped(u64::try_from(bound).unwrap_or(u64::MAX)),
             Box::new(move || t2.fetch_add(1, Ordering::Relaxed)),
         ));
         db.keep_columns(feed.clone()).unwrap();
@@ -1301,7 +1357,11 @@ mod tests {
     #[test]
     fn cs2_packed_copy_reused_at_open_only_when_current() {
         let db = Database::open(Arc::new(Simulated::new(9, 1).unwrap()), 2_000, 1, cmp).unwrap();
-        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        let feed = Arc::new(Feed::new(
+            0,
+            crate::storage::versioned::memory::capped(u64::MAX),
+            Box::new(|| 0),
+        ));
         db.keep_columns(feed.clone()).unwrap();
         let copy = Columns::<Packed>::new(feed);
         rebuild(&db, &copy, 0);
@@ -1319,7 +1379,11 @@ mod tests {
         }
         let shelf = MemShelf::default();
         copy.persist(db.newest(), &shelf, 0).unwrap();
-        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        let feed = Arc::new(Feed::new(
+            0,
+            crate::storage::versioned::memory::capped(u64::MAX),
+            Box::new(|| 0),
+        ));
         let again = Columns::<Packed>::reopen(feed.clone(), &shelf, db.newest())
             .unwrap()
             .expect("current");
@@ -1350,7 +1414,11 @@ mod tests {
         }
         let shelf = MemShelf::default();
         shelf.put(b"nope").unwrap();
-        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        let feed = Arc::new(Feed::new(
+            0,
+            crate::storage::versioned::memory::capped(u64::MAX),
+            Box::new(|| 0),
+        ));
         assert!(Columns::<Packed>::reopen(feed, &shelf, 0).is_err());
     }
 

@@ -21,17 +21,24 @@
 //! loop over the rows. A statement in a transaction that changed rows, or outside autocommit,
 //! reads the rows: the copy holds commits alone.
 //!
+//! A copy's queue, decoded blocks and blocks take their bytes from the storage's memory source as
+//! they grow and give them back as they go, as its pages and row versions do (AC-CS.5.5): no share
+//! is set aside. A copy whose blocks the source refuses is let go, the refusal kept as its reason
+//! ([`Dropped`]), and the rows answer; its table's next analytic statement pays the rent again.
+//!
 //! Behind the planner's switch (`AMPHORA_COLUMN_PATH=on`, `column_path::asked`), read once when
 //! the storage opens.
 
 use super::blink::Descender;
 use super::columns::scan::{
-    Agg, Cache, Cell, Counts, Decode, Filter, KeyRange, Op, Plan, Query, Records, Sources,
+    Agg, Cache, Cell, Counts, Data, Decode, Filter, KeyRange, Op, Placed, Plan, Query, Records,
+    Sources,
 };
-use super::columns::{Block, Columns, Feed, Plain, Rows, Rowset};
+use super::columns::{as_u64, Block, Columns, Feed, Plain, Rows, Rowset};
 use super::columns_path::{self, CopyScan, OnCopy, Scanned};
 use super::cursor::key_rowid;
 use super::durable::Database as VDatabase;
+use super::memory::Source;
 use super::switch::{tree_of, Switch};
 use super::version::{Snapshot, Ts};
 use crate::error::LimboError;
@@ -45,7 +52,7 @@ use crate::vdbe::morsel::{
 };
 use crate::Result;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// What the copies have counted: the evidence that SQL reads them.
@@ -62,7 +69,24 @@ pub struct CopyCounts {
     pub granule_rows: u64,
     /// Rebuilds made.
     pub rebuilds: u64,
+    /// Copies let go because the memory source refused their blocks.
+    pub dropped: u64,
 }
+
+/// Why a copy was let go: the storage's memory source refused its blocks, `asked` more bytes with
+/// `held` held of `limit` (the source's own [`LimboError::MemoryBudget`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dropped {
+    Memory {
+        tree: u64,
+        asked: u64,
+        held: u64,
+        limit: u64,
+    },
+}
+
+/// What a copy's blocks take their bytes from the memory source as.
+pub const BLOCKS: &str = "a column copy's blocks";
 
 /// One table's copy: its columns, its decoded blocks kept between scans, and the lock its rebuilds
 /// take, so two statements don't rebuild it at once.
@@ -70,19 +94,50 @@ pub(crate) struct TableCopy {
     columns: Columns<Plain>,
     cache: Cache,
     rebuilding: Mutex<()>,
+    /// Where its blocks' bytes are taken from, and the bytes taken now.
+    room: Arc<dyn Source>,
+    held: Mutex<u64>,
+}
+
+impl TableCopy {
+    /// Charges its generations (blocks and deltas) to its memory source as they stand now: what
+    /// they grew by taken, what they shrank by given back; the source's typed refusal
+    /// ([`LimboError::MemoryBudget`]) when it has no room for the growth.
+    fn charge(&self) -> Result<()> {
+        let mut held = self.held.lock();
+        let now = as_u64(self.columns.blocks_resident());
+        if now > *held {
+            self.room.take(BLOCKS, now.saturating_sub(*held))?;
+        } else if now < *held {
+            self.room.give(held.saturating_sub(now));
+        }
+        *held = now;
+        Ok(())
+    }
+}
+
+impl Drop for TableCopy {
+    fn drop(&mut self) {
+        let held = *self.held.lock();
+        if held > 0 {
+            self.room.give(held);
+        }
+    }
 }
 
 /// A storage's SQL tables' copies.
 pub(crate) struct Copies {
     on: AtomicBool,
-    /// The bytes each copy's queue and its decoded blocks may hold.
-    bound: AtomicUsize,
+    /// The storage's memory source: what each copy's queue, decoded blocks and blocks take.
+    room: Arc<dyn Source>,
     /// The clock the copies' freshness lags and scans are timed by.
     base: Instant,
     tables: Mutex<HashMap<u64, Arc<TableCopy>>>,
     /// Trees an analytic statement has read by the rows, no copy kept yet: the rent paid.
     rented: Mutex<HashSet<u64>>,
     counts: Mutex<CopyCounts>,
+    /// The last copy let go, and why.
+    dropped: Mutex<Option<Dropped>>,
 }
 
 fn nanos(base: Instant) -> u128 {
@@ -94,14 +149,15 @@ fn tick(base: Instant) -> u64 {
 }
 
 impl Copies {
-    pub(crate) fn new(on: bool, bound: usize) -> Self {
+    pub(crate) fn new(on: bool, room: Arc<dyn Source>) -> Self {
         Self {
             on: AtomicBool::new(on),
-            bound: AtomicUsize::new(bound),
+            room,
             base: Instant::now(),
             tables: Mutex::new(HashMap::new()),
             rented: Mutex::new(HashSet::new()),
             counts: Mutex::new(CopyCounts::default()),
+            dropped: Mutex::new(None),
         }
     }
 
@@ -116,13 +172,34 @@ impl Copies {
         self.on.store(on, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_bound(&self, bound: usize) {
-        self.bound.store(bound, Ordering::Relaxed);
-    }
-
     pub(crate) fn counts(&self) -> CopyCounts {
         *self.counts.lock()
+    }
+
+    /// The last copy let go and why (None: none was).
+    pub(crate) fn last_dropped(&self) -> Option<Dropped> {
+        *self.dropped.lock()
+    }
+
+    /// Lets `tree`'s copy go when `refused` is the memory source's refusal, kept as its reason and
+    /// counted; any other error is the caller's. The table's next analytic statement pays the
+    /// rent again, and the one after buys again, asking the source anew.
+    fn let_go(&self, db: &VDatabase, tree: u64, refused: LimboError) -> Result<()> {
+        let LimboError::MemoryBudget {
+            asked, held, limit, ..
+        } = refused
+        else {
+            return Err(refused);
+        };
+        self.forget(db, tree);
+        *self.dropped.lock() = Some(Dropped::Memory {
+            tree,
+            asked,
+            held,
+            limit,
+        });
+        self.counts.lock().dropped += 1;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -140,14 +217,19 @@ impl Copies {
         if self.rented.lock().insert(tree) {
             return Ok(None);
         }
-        let bound = self.bound.load(Ordering::Relaxed);
         let base = self.base;
-        let feed = Arc::new(Feed::new(tree, bound, Box::new(move || tick(base))));
+        let feed = Arc::new(Feed::new(
+            tree,
+            self.room.clone(),
+            Box::new(move || tick(base)),
+        ));
         db.keep_columns(feed.clone())?;
         let copy = Arc::new(TableCopy {
             columns: Columns::new(feed),
-            cache: Cache::new(bound),
+            cache: Cache::new(self.room.clone()),
             rebuilding: Mutex::new(()),
+            room: self.room.clone(),
+            held: Mutex::new(0),
         });
         tables.insert(tree, copy.clone());
         self.rented.lock().remove(&tree);
@@ -229,6 +311,12 @@ impl<B: Block> CopyScan<B> for OnCores<'_> {
         q: &Query,
     ) -> Result<Scanned> {
         let (granules, sources) = copy.granules(s, rows, dec, self.cache, &q.keys)?;
+        // A SUM over text or blobs: SQLite sums text by its numeric prefix and makes the sum a
+        // real, which the copy's scan doesn't; it declines, and the serial loop answers.
+        if let Some(kind) = sums_text(q, &granules) {
+            self.declined.set(true);
+            return Err(morsel(MorselError::Unsupported { kind }));
+        }
         let built = granules
             .iter()
             .fold(0usize, |n, p| n.saturating_add(p.granule.rows));
@@ -255,6 +343,30 @@ impl<B: Block> CopyScan<B> for OnCores<'_> {
             Err(e) => Err(morsel(e)),
         }
     }
+}
+
+/// The kind of the first value that isn't a number in a column `q` sums (None: every one is a
+/// number or null).
+fn sums_text(q: &Query, granules: &[Placed]) -> Option<&'static str> {
+    q.aggs
+        .iter()
+        .filter_map(|a| match a {
+            Agg::Sum(c) => Some(*c),
+            _ => None,
+        })
+        .find_map(|c| {
+            granules
+                .iter()
+                .find_map(|p| match &p.granule.columns.get(c)?.data {
+                    Data::Int(_) | Data::Real(_) => None,
+                    Data::Text { .. } => Some("TEXT"),
+                    Data::Mixed(cells) => cells.iter().find_map(|v| match v {
+                        Cell::Text(_) => Some("TEXT"),
+                        Cell::Blob(_) => Some("BLOB"),
+                        _ => None,
+                    }),
+                })
+        })
 }
 
 fn cell(v: &Value) -> Result<Cell> {
@@ -362,6 +474,12 @@ fn read(
     let clock = move || nanos(base);
     let rows = At { db, snap, tree };
     copy.columns.catch_up(tick(base))?;
+    // The copy's blocks as they stand, charged to the memory source; refused, the copy is let go
+    // and the rows answer.
+    if let Err(refused) = copy.charge() {
+        copies.let_go(db, tree, refused)?;
+        return Ok(None);
+    }
     // Unknown rates price nothing: the rows.
     let rates = RowRates::learned(&connection.db.learned_costs);
     let chosen =
@@ -424,6 +542,9 @@ fn read(
             copies.counts.lock().rebuilds += 1;
         }
     }
+    if let Err(refused) = copy.charge() {
+        copies.let_go(db, tree, refused)?;
+    }
     Ok(answer)
 }
 
@@ -441,12 +562,46 @@ mod tests {
     use crate::{ConnectOpts, Database, SqliteDialect};
 
     fn connect() -> (Arc<Database>, Arc<crate::Connection>) {
+        connect_in(None)
+    }
+
+    /// A connection on a versioned storage whose memory source is `room` (None: the machine's).
+    fn connect_in(room: Option<Arc<dyn Source>>) -> (Arc<Database>, Arc<crate::Connection>) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new().with_versioned_storage())
-            .unwrap();
+        let opts = ConnectOpts::new().with_versioned_storage();
+        let opts = match room {
+            Some(room) => opts.with_memory(room),
+            None => opts,
+        };
+        let conn = db.connect(opts).unwrap();
         (db, conn)
+    }
+
+    /// A memory source that refuses every take for one use, `what`, and grants the rest.
+    struct Refuses {
+        what: &'static str,
+    }
+
+    impl Source for Refuses {
+        fn take(&self, what: &'static str, bytes: u64) -> Result<()> {
+            if what == self.what {
+                return Err(LimboError::MemoryBudget {
+                    what,
+                    asked: bytes,
+                    held: 0,
+                    limit: 0,
+                });
+            }
+            Ok(())
+        }
+
+        fn give(&self, _bytes: u64) {}
+    }
+
+    fn refusing(what: &'static str) -> Option<Arc<dyn Source>> {
+        let r: Arc<Refuses> = Arc::new(Refuses { what });
+        Some(r)
     }
 
     fn copies(conn: &Arc<crate::Connection>) -> &Copies {
@@ -541,15 +696,14 @@ mod tests {
         assert_eq!(copies(&conn).counts().kept, 1);
     }
 
-    /// Do: a copy whose queue holds no commit (its bound zero bytes), read, then a write it can't
-    /// queue, then the statement again. Expect: the copy behind its snapshot is not read (the
+    /// Do: a copy whose queue holds no commit (its memory source refuses the queue), read, then a
+    /// write it can't queue, then the statement again. Expect: the copy behind its snapshot is not read (the
     /// rows answer, with the write), then rebuilt and read again, every answer the rows'.
     #[test]
     fn cs5_a_copy_behind_its_snapshot_is_never_read() {
-        let (_a, on) = connect();
+        let (_a, on) = connect_in(refusing(super::super::columns::QUEUE));
         let (_b, off) = connect();
         copies(&on).set_on(true);
-        copies(&on).set_bound(0);
         copies(&off).set_on(false);
         let q = "SELECT g, count(*), sum(v), max(s) FROM t GROUP BY g";
         for c in [&on, &off] {
@@ -580,6 +734,79 @@ mod tests {
         // Current again: read.
         assert_eq!(rows(&on, q), rows(&off, q));
         assert!(copies(&on).counts().copy > before.copy);
+    }
+
+    /// T-CS.5.10: a storage whose memory source refuses a copy's blocks (and grants the rest), the
+    /// analytic statement run four times. Expect: each copy bought (the second and fourth
+    /// statements) is let go with the source's typed refusal kept and counted, none is read, and
+    /// every answer is the rows'.
+    #[test]
+    fn cs5_a_copy_its_memory_refuses_is_let_go_and_the_rows_answer() {
+        let (_a, on) = connect_in(refusing(BLOCKS));
+        let (_b, off) = connect();
+        copies(&on).set_on(true);
+        copies(&off).set_on(false);
+        let q = "SELECT g, count(*), sum(v) FROM t GROUP BY g";
+        for c in [&on, &off] {
+            c.execute(SCHEMA).unwrap();
+            fill(c, 1, 2000);
+        }
+        for _ in 0..4 {
+            assert_eq!(rows(&on, q), rows(&off, q));
+        }
+        let seen = copies(&on).counts();
+        assert_eq!(seen.copy, 0, "{seen:?}");
+        assert_eq!(seen.kept, 2, "{seen:?}");
+        assert_eq!(seen.dropped, 2, "{seen:?}");
+        let tree = tree_of(root(&on)).unwrap();
+        assert!(copies(&on).kept(tree).is_none());
+        assert!(
+            matches!(copies(&on).last_dropped(), Some(Dropped::Memory { tree: t, asked, .. }) if t == tree && asked > 0),
+            "{:?}",
+            copies(&on).last_dropped()
+        );
+    }
+
+    /// T-CS.5.11: an INTEGER column holding text and a blob beside its integers, summed with the
+    /// copies' switch on and off, a copy kept. Expect: the same answer each time, a real (SQLite
+    /// sums text by its numeric prefix, 'abc' as 0, and the sum is then a real); the copy declines
+    /// the column, so no SUM of it is read from the copy, while a SUM of a column of numbers is.
+    #[test]
+    fn cs5_sum_over_text_in_an_integer_column_answers_as_sqlite() {
+        let (_a, on) = connect();
+        let (_b, off) = connect();
+        copies(&on).set_on(true);
+        copies(&off).set_on(false);
+        for c in [&on, &off] {
+            c.execute(SCHEMA).unwrap();
+            fill(c, 1, 3000);
+            c.execute("INSERT INTO t VALUES (4001, 1, 'abc', 'x'), (4002, 2, x'01', 'y')")
+                .unwrap();
+        }
+        let numbers = "SELECT g, count(*), sum(g) FROM t GROUP BY g";
+        for _ in 0..3 {
+            assert_eq!(rows(&on, numbers), rows(&off, numbers));
+        }
+        let before = copies(&on).counts();
+        assert_eq!(before.kept, 1, "{before:?}");
+        for q in ["SELECT sum(v) FROM t", "SELECT g, sum(v) FROM t GROUP BY g"] {
+            for _ in 0..2 {
+                assert_eq!(rows(&on, q), rows(&off, q), "{q}");
+            }
+        }
+        let total = rows(&on, "SELECT sum(v) FROM t");
+        assert!(
+            matches!(
+                total.first().and_then(|r| r.first()),
+                Some(Value::Numeric(Numeric::Float(_)))
+            ),
+            "{total:?}"
+        );
+        let seen = copies(&on).counts();
+        assert_eq!(
+            seen.copy, before.copy,
+            "a SUM over text was read from the copy: {seen:?}"
+        );
     }
 
     fn root(conn: &Arc<crate::Connection>) -> i64 {
