@@ -11,6 +11,7 @@ use super::{
 };
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::storage::versioned::cursor::VersionedCursor;
 use crate::sync::Arc;
 use crate::util::IOExt;
 use crate::{Connection, IOResult, ValueRef};
@@ -43,6 +44,46 @@ pub enum LeafBuildError {
     Refused(#[from] SkipRefusal),
 }
 
+/// The table cursor a summary is built with: on the pager's B-tree, or on the versioned storage's
+/// tree when the connection's B-trees are there (G7 step 2, `AC-NS.2.1`), whose root page is a
+/// tree's id, not a page of the pager's.
+pub(crate) enum LeafCursor {
+    Pager(Box<BTreeCursor>),
+    Versioned(Box<VersionedCursor>),
+}
+
+impl LeafCursor {
+    fn open(conn: &Arc<Connection>, root: i64, columns: usize) -> Result<Self, LeafBuildError> {
+        Ok(match conn.versioned_for(crate::MAIN_DB_ID) {
+            Some(switch) => {
+                Self::Versioned(Box::new(switch.cursor(root, None, conn.get_pager())?))
+            }
+            None => Self::Pager(Box::new(BTreeCursor::new_table(
+                conn.get_pager(),
+                root,
+                columns,
+            ))),
+        })
+    }
+
+    fn get(&mut self) -> &mut dyn CursorTrait {
+        match self {
+            Self::Pager(cursor) => cursor.as_mut(),
+            Self::Versioned(cursor) => cursor.as_mut(),
+        }
+    }
+
+    /// Whether the cursor stands on its leaf's first row; None when it stands on no leaf's row.
+    /// A versioned cursor walking forward copies each leaf from its first row, so its copy's
+    /// first row is the leaf's.
+    fn first_of_leaf(&self) -> Option<bool> {
+        match self {
+            Self::Pager(cursor) => cursor.table_leaf_under_cursor().map(|leaf| leaf.cell == 0),
+            Self::Versioned(cursor) => cursor.table_leaf_under_cursor().map(|leaf| leaf.cell == 0),
+        }
+    }
+}
+
 /// The zone map of `column` of `table` on `conn`'s main database, one zone per leaf of its B-tree.
 pub fn zone_map_of_table(
     conn: &Arc<Connection>,
@@ -66,31 +107,39 @@ pub fn zone_map_of_table(
         .get_column(column)
         .filter(|(_, c)| !c.is_rowid_alias())
         .ok_or_else(no_column)?;
-    let mut cursor =
-        BTreeCursor::new_table(conn.get_pager(), btree.root_page, btree.columns().len());
-    zone_map_from_leaves(&mut cursor, index)
+    let mut cursor = LeafCursor::open(conn, btree.root_page, btree.columns().len())?;
+    if !matches!(cursor, LeafCursor::Versioned(_)) || !conn.get_auto_commit() {
+        return zone_map_from_leaves(&mut cursor, index);
+    }
+    // The versioned cursor reads in the connection's transaction: one begun for the build alone
+    // is ended after it, so no snapshot outlives the read.
+    drop(cursor);
+    conn.execute("BEGIN")?;
+    let built = LeafCursor::open(conn, btree.root_page, btree.columns().len())
+        .and_then(|mut cursor| zone_map_from_leaves(&mut cursor, index));
+    conn.execute("ROLLBACK")?;
+    built
 }
 
 /// The zone map of column `column` (its index in the table's records) of the table `cursor`
 /// walks, one zone per leaf. A value that isn't an integer, or a record shorter than `column`
 /// (a column added after the row was written), is summarized as not an integer.
 pub(crate) fn zone_map_from_leaves(
-    cursor: &mut BTreeCursor,
+    cursor: &mut LeafCursor,
     column: usize,
 ) -> Result<ZoneMap, LeafBuildError> {
-    let pager = cursor.get_pager();
+    let pager = cursor.get().get_pager();
     let mut builder = ZoneMapBuilder::new();
-    pager.io.block(|| cursor.rewind())?;
-    while let Some(rowid) = pager.io.block(|| cursor.rowid())? {
+    pager.io.block(|| cursor.get().rewind())?;
+    while let Some(rowid) = pager.io.block(|| cursor.get().rowid())? {
         let first_of_leaf = cursor
-            .table_leaf_under_cursor()
-            .map(|leaf| leaf.cell == 0)
+            .first_of_leaf()
             .ok_or(LeafBuildError::LeafUnknown { rowid })?;
         if first_of_leaf {
             builder.end_run();
         }
         let value = loop {
-            match cursor.record().map_err(|e| *e)? {
+            match cursor.get().record().map_err(|e| *e)? {
                 IOResult::Done(record) => {
                     break match record.and_then(|record| record.get_value_opt(column)) {
                         Some(ValueRef::Numeric(Numeric::Integer(value))) => Some(value),
@@ -101,7 +150,7 @@ pub(crate) fn zone_map_from_leaves(
             }
         };
         builder.row(rowid, value)?;
-        pager.io.block(|| cursor.next())?;
+        pager.io.block(|| cursor.get().next())?;
     }
     Ok(builder.finish())
 }
@@ -145,15 +194,15 @@ fn summarized_column(
 
 /// Every row's rowid and its column `column`'s integer value, in rowid order.
 fn rows_of(
-    cursor: &mut BTreeCursor,
+    cursor: &mut LeafCursor,
     column: usize,
 ) -> Result<Vec<(i64, Option<i64>)>, LeafBuildError> {
-    let pager = cursor.get_pager();
+    let pager = cursor.get().get_pager();
     let mut rows = Vec::new();
-    pager.io.block(|| cursor.rewind())?;
-    while let Some(rowid) = pager.io.block(|| cursor.rowid())? {
+    pager.io.block(|| cursor.get().rewind())?;
+    while let Some(rowid) = pager.io.block(|| cursor.get().rowid())? {
         let value = loop {
-            match cursor.record().map_err(|e| *e)? {
+            match cursor.get().record().map_err(|e| *e)? {
                 IOResult::Done(record) => {
                     break match record.and_then(|record| record.get_value_opt(column)) {
                         Some(ValueRef::Numeric(Numeric::Integer(value))) => Some(value),
@@ -164,7 +213,7 @@ fn rows_of(
             }
         };
         rows.push((rowid, value));
-        pager.io.block(|| cursor.next())?;
+        pager.io.block(|| cursor.get().next())?;
     }
     Ok(rows)
 }
@@ -191,8 +240,7 @@ pub fn set_skipping(
         return Ok(());
     };
     conn.execute("BEGIN IMMEDIATE")?;
-    let mut cursor = BTreeCursor::new_table(conn.get_pager(), root, columns);
-    let built = match kind {
+    let built = LeafCursor::open(conn, root, columns).and_then(|mut cursor| match kind {
         SkipKind::ZoneMaps => zone_map_from_leaves(&mut cursor, index).map(Skipping::ZoneMaps),
         SkipKind::Cracking => {
             rows_of(&mut cursor, index).map(|rows| Skipping::Cracking(CrackerColumn::new(rows)))
@@ -202,7 +250,7 @@ pub fn set_skipping(
                 Skipping::Measured(Box::new(Chooser::new(zones, CrackerColumn::new(rows))))
             })
         }),
-    };
+    });
     match built {
         Ok(skipping) => {
             conn.db.skipping.set(root, index, skipping);
