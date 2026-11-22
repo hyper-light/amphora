@@ -3,6 +3,47 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
+thread_local! {
+    /// The join search's time on this thread, for the baselines' JOB search time (goal 63c98840,
+    /// bench/baselines/README.md): its nesting depth and the nanoseconds spent in
+    /// [`compute_best_join_order_with_context`], a search inside another counted once, in the
+    /// outermost.
+    static SEARCH: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The nanoseconds this thread has spent searching for join orders since it started. A statement
+/// is planned on the thread that prepares it, so the difference across one `Connection::prepare`
+/// is that statement's search time, every query block's together.
+pub fn join_search_ns() -> u64 {
+    SEARCH.with(|s| s.get().1)
+}
+
+/// Counts the time from its making to its drop into [`SEARCH`], when it is the outermost.
+struct SearchTimer {
+    began: std::time::Instant,
+}
+
+impl SearchTimer {
+    fn start() -> Self {
+        SEARCH.with(|s| {
+            let (depth, ns) = s.get();
+            s.set((depth.saturating_add(1), ns));
+        });
+        Self { began: std::time::Instant::now() }
+    }
+}
+
+impl Drop for SearchTimer {
+    fn drop(&mut self) {
+        let took = u64::try_from(self.began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        SEARCH.with(|s| {
+            let (depth, ns) = s.get();
+            let depth = depth.saturating_sub(1);
+            s.set((depth, if depth == 0 { ns.saturating_add(took) } else { ns }));
+        });
+    }
+}
+
 use amphora_engine_parser::ast::{Operator, SubqueryType, TableInternalId};
 
 use super::{
@@ -1401,6 +1442,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
+    let _timer = SearchTimer::start();
     // Skip work if we have no tables to consider.
     if joined_tables.is_empty() {
         return Ok(None);

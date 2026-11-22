@@ -724,6 +724,13 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 ## Next
 
+- **Baselines before optimizing, the harnesses** (kiln goal 63c98840, lane baselines-2; `BL`,
+  bench/baselines/README.md): `bench/baselines/run.sh <part>` gives each number from one command into
+  bench/records with the machine, commit and load: JOB planning per query with the 20 ms check
+  (`job-plan`), JOB join search time (`job-search`, from `amphora_engine::join_search_ns`), each join
+  kind (`join-kinds`), single-row reads per class against the leading row store (`point-reads`), and
+  scans and aggregates in ns a row beside ClickHouse and DuckDB (`scan-agg`). Each ran once tiny;
+  the quiet-host session (AC-BL.1, AC-BL.2) is the coordinator's.
 - **Replication measured: the harnesses** (G12 steps 1 and 3, CP-T1.8; lane repl-measure; `bench/src/repl.rs`,
   `bench/servers/repl/`): built and unit-tested, not run at size. `amphora-bench --repl commit|failover|catchup
   --system amphora|rqlite|dqlite|litefs|libsql` gives commit latency p50/p99/p99.9 and throughput, the time from a

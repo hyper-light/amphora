@@ -1238,3 +1238,16 @@ criteria = []
 tests = [
   { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
 ]
+
+# lane baselines-2: baseline numbers before optimizing (kiln goal 63c98840; bench/baselines/README.md).
+[[own]]
+id = "BL"
+title = "Baseline numbers before optimizing: JOB planning and search, join kinds, single-row reads, scans and aggregates, each from one command"
+criteria = [
+  { id = "AC-BL.1", text = "Every JOB query plans within 20 ms on the session's quiet machine: bench/baselines/run.sh job-plan exits 0" },
+  { id = "AC-BL.2", text = "One session's records of every part (job-plan, job-search, join-kinds, point-reads, scan-agg) are in bench/records, each with its machine, commit and load, beside DuckDB, ClickHouse and the leading row store" },
+]
+tests = [
+  { id = "T-BL.1", text = "join_search::t_bl_1_the_join_search_time_is_counted_per_thread — passes when join_search_ns grows across a join's prepare and a prepare on another thread leaves it as it was" },
+  { id = "T-BL.2", text = "bench/baselines/test_check.py — passes when check.py fails a JOB query over 20 ms or without a planning time, gives the search's share of planning, names the leader among the row stores, and gives ns a row for whole-table statements" },
+]

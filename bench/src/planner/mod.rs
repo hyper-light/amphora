@@ -288,7 +288,7 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
 
 fn outcome_json(outcome: &Outcome, load: Option<f64>) -> serde_json::Value {
     match outcome {
-        Outcome::Done(r) => serde_json::json!({ "status": "done", "rows": r.rows, "first": r.first, "prepare_ms": r.prepare_ms, "exec_ms": r.exec_ms, "ms": r.prepare_ms + r.exec_ms, "load": load }),
+        Outcome::Done(r) => serde_json::json!({ "status": "done", "rows": r.rows, "first": r.first, "prepare_ms": r.prepare_ms, "exec_ms": r.exec_ms, "search_ms": r.search_ms, "ms": r.prepare_ms + r.exec_ms, "load": load }),
         Outcome::TimedOut => serde_json::json!({ "status": "timed_out", "load": load }),
         Outcome::Failed(e) => serde_json::json!({ "status": "failed", "error": e, "load": load }),
     }

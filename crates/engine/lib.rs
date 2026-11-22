@@ -195,6 +195,7 @@ pub use translate::optimizer::plan_hints::{
     candidate_plans, plan_features, HintChooser, HintGuard, HintModel, HintSet, PlanFeatures,
     Verdict,
 };
+pub use translate::optimizer::join::join_search_ns;
 pub use translate::plan::TablePlanEstimate;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
