@@ -27,8 +27,8 @@ use hyper_raft::wire::Record;
 // charges a full API request for an opaque FnOnce, whose captures the API cannot inspect. The
 // command queue's bytes are the memory budget's room for queues, its application calls counted to
 // what the owner takes in an election timeout; the outgoing queue holds what its host drains in
-// one (`queue_bounds`; QB.1).
-const COMMANDS: usize = 64;
+// one (`queue_bounds`; QB.1). The queue's inputs are counted too, no more than the owner takes in
+// an election timeout and the room holds of an input's least, its envelope (`Bounds::commands`).
 pub(crate) const MEMBERS: usize = 64;
 /// Format (hyper-raft `wire.rs`): what a message record adds past its entries or image, at the
 /// most: its header, fixed body, classic commit and checksum, and an incarnation and end
@@ -97,7 +97,8 @@ type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 /// A bounded ingress and egress handle. Clones share one product-owned Raft actor.
 #[derive(Clone)]
 pub struct ReplicaHandle {
-    sender: mpsc::SyncSender<Envelope>,
+    // Unbounded as a channel: `Control::commands` holds its inputs to their derived bound (QB.1).
+    sender: mpsc::Sender<Envelope>,
     // Declared after `sender`, so it rings once the sender is gone: the last handle's drop wakes
     // the owner to find its channel closed.
     _ring: Ring,
@@ -322,11 +323,16 @@ pub(super) fn wall_micros() -> Result<u64, Refusal> {
 }
 struct Control {
     admitted: AtomicUsize,
+    /// The inputs in the command queue's channel, not yet taken by the owner: no more than
+    /// `command_bound` (QB.1, lane constants-20), as a channel of that many slots held them.
+    commands: AtomicUsize,
+    /// The most inputs the command queue holds, as the owner last learned it (`Bounds::commands`).
+    command_bound: AtomicUsize,
     /// Application calls in the command queue: no more than `call_bound`, so that a wire record
     /// always finds a slot while calls wait for a leader (QB.1).
     calls: AtomicUsize,
     /// The most application calls the command queue holds, as the owner last learned it: what it
-    /// takes in an election timeout at its learned message rate, no more than the queue's slots
+    /// takes in an election timeout at its learned message rate, no more than the queue's inputs
     /// less one (`queue_bounds`; QB.1).
     call_bound: AtomicUsize,
     /// The bytes application calls hold of the command queue, held to `applications` apart from
@@ -682,14 +688,26 @@ struct Outgoing {
 }
 struct Reservation {
     control: Arc<Control>,
+    /// An input's place in the command queue's channel (`Control::commands`), given back once the
+    /// owner takes it or it is dropped untaken (QB.1, lane constants-20).
+    slot: bool,
     bytes: usize,
     /// An application call's slot in the command queue, given back with its bytes (QB.1).
     call: bool,
     /// An application call's bytes in `called`, given back with it.
     called: usize,
 }
+impl Reservation {
+    /// The owner took its input from the channel: its place there is free, its bytes still held.
+    fn taken(&mut self) {
+        if std::mem::take(&mut self.slot) {
+            self.control.commands.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
 impl Drop for Reservation {
     fn drop(&mut self) {
+        self.taken();
         self.control
             .admitted
             .fetch_sub(self.bytes, Ordering::AcqRel);
@@ -847,7 +865,8 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
     floor_published: Option<u32>,
-    // At most COMMANDS admitted operations wait behind the sole prepared transaction.
+    // At most the command queue's inputs' bound of admitted operations wait behind the sole
+    // prepared transaction (`Control::command_bound`).
     waiting: VecDeque<Envelope>,
     // The leader's write slot (replication.md, "A follower's write under steady leader writes"):
     // the members whose writes it refused, queued, and the forwards and barrier it holds, each
@@ -1126,6 +1145,8 @@ struct Bounds {
     queued: usize,
     /// The bytes application calls may hold of them.
     applications: usize,
+    /// The most inputs the command queue holds.
+    commands: usize,
     /// The most application calls the command queue holds.
     calls: usize,
     /// A wire record's most bytes: an image's, held inside the command queue's bound.
@@ -1142,8 +1163,11 @@ struct Bounds {
 /// calls cannot block the record that finds a leader. A wire record's image is the budget's room
 /// for one (SB.1), held inside the command queue's bound. Calls are counted too: no more than the
 /// owner takes in `timeout`, the learned election timeout, at its learned message rate, and never
-/// more than the queue's slots less one, so that a wire record always finds a slot. Before any
-/// intake is measured, the slots less one. A call is charged its worst case (`REQUEST_MAX`) while
+/// more than the queue's inputs less one, so that a wire record always finds a place. The inputs
+/// are what the owner takes in `timeout` at that rate, at least a call and a wire record, and never
+/// more than the room holds of an input's least, its own envelope: a wire record may carry no
+/// bytes, so its bytes alone would not bound them (lane constants-20). Before any intake is
+/// measured, what the room holds. A call is charged its worst case (`REQUEST_MAX`) while
 /// the intake's byte rate is learned mostly from small wire records, so calls are bounded in count
 /// by the rate and in bytes by the room, never in bytes by the rate. The outgoing queue holds what
 /// its host drains in an election timeout, at least a record to each of its `peers` (one broadcast)
@@ -1172,14 +1196,7 @@ fn queue_bounds(
     // A wire record's room is held back from application calls, so that waiting calls cannot
     // block the record that finds a leader.
     let applications = queued.saturating_sub(wire);
-    let call = super::drain::Bound {
-        bytes: request,
-        messages: 1,
-    };
-    // The calls the owner takes in an election timeout, at least one, the queue's last slot kept
-    // for a wire record.
-    let slots = u64::try_from(COMMANDS.saturating_sub(1)).unwrap_or(u64::MAX);
-    let calls = intake.bound(timeout, call, room).messages.min(slots);
+    let (commands, calls) = command_counts(intake, timeout, room, request);
     // The least the outgoing queue carries and still works: one broadcast, a record to each peer
     // (a leader's heartbeats, its appends), so that a queue held to it sheds no record of one.
     let one = super::drain::Bound {
@@ -1189,11 +1206,44 @@ fn queue_bounds(
     Ok(Bounds {
         queued: usize::try_from(queued).unwrap_or(usize::MAX),
         applications: usize::try_from(applications).unwrap_or(usize::MAX),
+        commands: usize::try_from(commands).unwrap_or(usize::MAX),
         calls: usize::try_from(calls).unwrap_or(usize::MAX),
         wire: usize::try_from(wire).unwrap_or(usize::MAX),
         outgoing: outgoing.bound(timeout, one, room),
         room,
     })
+}
+
+/// The command queue's inputs and its application calls, counted (QB.1, lane constants-20): the
+/// inputs the owner takes in `timeout` at its learned message rate, at least a call and a wire
+/// record, and no more than `room` holds of an input's least, its own envelope (a wire record may
+/// carry no bytes); the calls the same, at least one, the queue's last input kept for a wire
+/// record. Before anything is measured, what the room holds. `request` is a call's charge.
+fn command_counts(
+    intake: &super::drain::Drain,
+    timeout: Duration,
+    room: u64,
+    request: u64,
+) -> (u64, u64) {
+    let envelope = u64::try_from(std::mem::size_of::<Envelope>()).unwrap_or(u64::MAX);
+    let input = super::drain::Bound {
+        bytes: envelope,
+        messages: 2,
+    };
+    let commands = intake
+        .bound(timeout, input, room)
+        .messages
+        .min(room.checked_div(envelope).unwrap_or(0))
+        .max(2);
+    let call = super::drain::Bound {
+        bytes: request,
+        messages: 1,
+    };
+    let calls = intake
+        .bound(timeout, call, room)
+        .messages
+        .min(commands.saturating_sub(1));
+    (commands, calls)
 }
 
 /// The frames the database's log may hold now, read on the flushing thread: its file's room and
@@ -1281,6 +1331,7 @@ impl ReplicaHandle {
         let limit = self.shared.queued.load(Ordering::Acquire);
         let application_limit = self.shared.applications.load(Ordering::Acquire);
         let call_limit = self.shared.call_bound.load(Ordering::Acquire);
+        let command_limit = self.shared.command_bound.load(Ordering::Acquire);
         let call = matches!(
             &command,
             Input::Submit { .. }
@@ -1288,26 +1339,35 @@ impl ReplicaHandle {
                 | Input::Transfer { .. }
                 | Input::CatchUp { .. }
         );
-        // A call takes one of the calls' slots, never the queue's last: that one stays a wire
+        // Built before any refusal below, so that dropping it gives back what it took.
+        let mut reservation = Reservation {
+            control: Arc::clone(&self.shared),
+            slot: false,
+            bytes: 0,
+            call: false,
+            called: 0,
+        };
+        // A call takes one of the calls' places, never the queue's last: that one stays a wire
         // record's. A call refused for its count names the count bound.
-        if call
-            && self
-                .shared
+        if call {
+            self.shared
                 .calls
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                     held.checked_add(1).filter(|next| *next <= call_limit)
                 })
-                .is_err()
-        {
-            return Err(Refusal::Full { limit: call_limit });
+                .map_err(|_| Refusal::Full { limit: call_limit })?;
+            reservation.call = true;
         }
-        // Built before any refusal below, so that dropping it gives the call's slot back.
-        let mut reservation = Reservation {
-            control: Arc::clone(&self.shared),
-            bytes: 0,
-            call,
-            called: 0,
-        };
+        // Every input takes a place in the channel, held to the inputs' bound (lane constants-20).
+        self.shared
+            .commands
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(1).filter(|next| *next <= command_limit)
+            })
+            .map_err(|_| Refusal::Full {
+                limit: command_limit,
+            })?;
+        reservation.slot = true;
         // A call's bytes are held to the calls' bound on their own: the wire records queued beside
         // it are the rest of the queue's, not the calls'.
         if call {
@@ -1322,40 +1382,29 @@ impl ReplicaHandle {
                 })?;
             reservation.called = bytes;
         }
-        let mut charged = self.shared.admitted.load(Ordering::Acquire);
-        let mut reserved = false;
-        for _ in 0..COMMANDS {
-            let next = charged.checked_add(bytes).ok_or(Refusal::Full { limit })?;
-            api::bound("replica command queue bytes", next, limit)?;
-            match self.shared.admitted.compare_exchange_weak(
-                charged,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    reserved = true;
-                    break;
+        self.shared
+            .admitted
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
+                charged.checked_add(bytes).filter(|next| *next <= limit)
+            })
+            .map_err(|charged| {
+                match api::bound(
+                    "replica command queue bytes",
+                    charged.saturating_add(bytes),
+                    limit,
+                ) {
+                    Err(refusal) => refusal,
+                    Ok(()) => Refusal::Full { limit },
                 }
-                Err(now) => charged = now,
-            }
-        }
-        if !reserved {
-            return Err(Refusal::Full { limit: COMMANDS });
-        }
+            })?;
         reservation.bytes = bytes;
         let envelope = Envelope {
             command,
             _reservation: reservation,
         };
         self.sender
-            .try_send(envelope)
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => Refusal::Full { limit: COMMANDS },
-                mpsc::TrySendError::Disconnected(_) => {
-                    fenced("replica owner ended; reopen from durable state")
-                }
-            })?;
+            .send(envelope)
+            .map_err(|_| fenced("replica owner ended; reopen from durable state"))?;
         self.shared.bell.ring();
         Ok(())
     }
@@ -1495,6 +1544,11 @@ impl ReplicaHandle {
     #[cfg(test)]
     fn application_bound(&self) -> usize {
         self.shared.applications.load(Ordering::Acquire)
+    }
+    /// The most inputs the command queue holds in force (QB.1, lane constants-20).
+    #[cfg(test)]
+    fn command_bound(&self) -> usize {
+        self.shared.command_bound.load(Ordering::Acquire)
     }
     /// The most application calls the command queue holds in force (QB.1).
     #[cfg(test)]
@@ -1850,6 +1904,8 @@ fn open_on<F: BlockFile + 'static>(
     )?;
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
+        commands: AtomicUsize::new(0),
+        command_bound: AtomicUsize::new(first.commands),
         calls: AtomicUsize::new(0),
         call_bound: AtomicUsize::new(first.calls),
         called: AtomicUsize::new(0),
@@ -1878,7 +1934,7 @@ fn open_on<F: BlockFile + 'static>(
     });
     let election = replica.core().raft.config().election_tick;
     let slots = super::slot::Slots::new(slot_bounds(election, TICK)?);
-    let (sender, receiver) = mpsc::sync_channel(COMMANDS);
+    let (sender, receiver) = mpsc::channel();
     let at = clock();
     let mut actor = Actor {
         published: replica.applied().index,
@@ -2069,8 +2125,9 @@ fn settings(id: u64, durability: &Durability) -> Result<hyper_durable::Settings,
     // The core's memory is the memory budget's room for queues (MB.1), where its messages and
     // unstable entries wait: `Limits::derive` takes its unstable entries, pending messages and
     // entries a message carries from it and from a message's bytes, no picked counts (QB.1, lane
-    // constants-19). The reads pending are the command queue's slots, which hold every read asked,
-    // and one proposal at a time crosses ReadIndex (the module's head).
+    // constants-19), the reads pending among them: each read asked came through the command queue,
+    // whose inputs are bounded apart (lane constants-20). One proposal at a time crosses ReadIndex
+    // (the module's head).
     let memory = crate::memory::process().room(crate::memory::Use::Queues)?;
     let mut limits = hyper_raft::Limits::derive(hyper_raft::Stated {
         message: MESSAGE_BYTES,
@@ -2079,7 +2136,6 @@ fn settings(id: u64, durability: &Durability) -> Result<hyper_durable::Settings,
         depth: 1,
     })
     .map_err(unavailable)?;
-    limits.pending_reads = COMMANDS;
     limits.proposals = 1;
     // The replicated class: a commit on entries held in memory across fates (hyper-raft R-8), and a
     // leader applying what its own term committed before its own write is durable (R-6).
@@ -2246,7 +2302,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.control.moved.notify_all();
             drop(closed);
         }
-        for _ in 0..COMMANDS {
+        for _ in 0..self.waiting.len() {
             let Some(envelope) = self.waiting.pop_front() else {
                 break;
             };
@@ -2254,8 +2310,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                 answer(response, Err(reason.clone()));
             }
         }
-        // The ingress channel has at most COMMANDS items. Notify callers before closing it.
-        for _ in 0..COMMANDS {
+        // The ingress channel holds the inputs `commands` counts. Notify callers before closing it.
+        for _ in 0..self.control.commands.load(Ordering::Acquire) {
             let Ok(envelope) = receiver.try_recv() else {
                 break;
             };
@@ -2368,6 +2424,12 @@ impl<F: BlockFile + 'static> Actor<F> {
         // makes no raft step; what comes waits in order, its bytes still charged to the command
         // queue, so the queue's admission bound holds the callers back.
         let paused = self.paused()?;
+        let mut input = input;
+        if let Some(envelope) = input.as_mut() {
+            // Taken from the channel: its place there is free, its bytes still held (lane
+            // constants-20).
+            envelope._reservation.taken();
+        }
         let input = if paused {
             if let Some(envelope) = input {
                 self.paused_inputs.push_back(envelope);
@@ -2661,6 +2723,11 @@ impl<F: BlockFile + 'static> Actor<F> {
     fn queued(&self) -> u64 {
         u64::try_from(self.control.admitted.load(Ordering::Acquire)).unwrap_or(u64::MAX)
     }
+    /// The most inputs the command queue holds, as this owner last learned it (QB.1): the waiting
+    /// calls are held to it too.
+    fn command_bound(&self) -> usize {
+        self.control.command_bound.load(Ordering::Acquire)
+    }
     /// The queue bounds from what this owner measured, at each tick of its pace (QB.1): each
     /// queue's drain weighed on the owner's clock, the bounds learned from them and the election
     /// timeout in force, and the queues' bytes charged to the memory budget, so that its other uses'
@@ -2750,6 +2817,9 @@ impl<F: BlockFile + 'static> Actor<F> {
             .applications
             .store(bounds.applications, Ordering::Release);
         self.control
+            .command_bound
+            .store(bounds.commands, Ordering::Release);
+        self.control
             .call_bound
             .store(bounds.calls, Ordering::Release);
         self.control.wire.store(bounds.wire, Ordering::Release);
@@ -2762,7 +2832,7 @@ impl<F: BlockFile + 'static> Actor<F> {
     fn expire(&mut self) {
         // Expired callers relinquish queued operations even while a seed or proposal is held.
         // Rotate the bounded queue once; surviving requests retain their FIFO order.
-        let queued = self.waiting.len().min(COMMANDS);
+        let queued = self.waiting.len();
         for _ in 0..queued {
             let Some(envelope) = self.waiting.pop_front() else {
                 break;
@@ -2845,8 +2915,13 @@ impl<F: BlockFile + 'static> Actor<F> {
         };
         if self.at >= pending.until {
             answer(response, Err(Refusal::Timeout));
-        } else if self.waiting.len() >= COMMANDS {
-            answer(response, Err(Refusal::Full { limit: COMMANDS }));
+        } else if self.waiting.len() >= self.command_bound() {
+            answer(
+                response,
+                Err(Refusal::Full {
+                    limit: self.command_bound(),
+                }),
+            );
         } else {
             self.waiting.push_front(Envelope {
                 command: Input::Submit {
@@ -2999,8 +3074,13 @@ impl<F: BlockFile + 'static> Actor<F> {
                     || self.replica.machine().bootstrap_pending()
                     || self.class_in_flight()
                 {
-                    if self.waiting.len() >= COMMANDS {
-                        answer(response, Err(Refusal::Full { limit: COMMANDS }));
+                    if self.waiting.len() >= self.command_bound() {
+                        answer(
+                            response,
+                            Err(Refusal::Full {
+                                limit: self.command_bound(),
+                            }),
+                        );
                     } else {
                         self.waiting.push_back(Envelope {
                             command: Input::Submit {
@@ -4076,6 +4156,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             phase: Phase::Barrier(None),
             _reservation: Reservation {
                 control: Arc::clone(&self.control),
+                slot: false,
                 bytes: 0,
                 call: false,
                 called: 0,
@@ -4249,6 +4330,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             phase: Phase::Barrier(Some(Operation::Call(Mutex::new(Some(call))))),
             _reservation: Reservation {
                 control: Arc::clone(&self.control),
+                slot: false,
                 bytes: 0,
                 call: false,
                 called: 0,
@@ -4619,6 +4701,37 @@ mod tests {
         }
     }
 
+    /// T-QB.1.6 (QB.1, lane constants-20): the command queue's inputs are counted, not picked. Do:
+    /// count them with nothing measured, then for an intake draining 10 inputs every 10 ms under a
+    /// 100 ms election timeout, then in a room of one envelope. Expect: the room's envelopes before
+    /// anything is measured, about 100 once measured, never fewer than a call and a wire record,
+    /// and the calls always one fewer than the inputs, the last kept for a wire record.
+    #[test]
+    fn t_qb_1_6_command_queue_inputs_counted_by_rate_within_the_room() {
+        let envelope = u64::try_from(std::mem::size_of::<Envelope>()).unwrap();
+        let request = u64::try_from(api::REQUEST_MAX).unwrap();
+        let room = 1000 * envelope;
+        let timeout = Duration::from_millis(100);
+        let idle = super::super::drain::Drain::default();
+        assert_eq!(command_counts(&idle, timeout, room, request), (1000, 999));
+        let mut intake = super::super::drain::Drain::default();
+        intake.sample(0, true);
+        for step in 1..=40u64 {
+            intake.drained(1000, 10);
+            intake.sample(step * 10_000_000, true);
+        }
+        let (commands, calls) = command_counts(&intake, timeout, room, request);
+        assert!((90..=110).contains(&commands), "{commands}");
+        assert_eq!(calls, commands - 1);
+        // A room past the rate's count leaves the rate's; one below it, the room's envelopes.
+        assert_eq!(
+            command_counts(&intake, timeout, 50 * envelope, request),
+            (50, 49)
+        );
+        assert_eq!(command_counts(&intake, timeout, envelope, request), (2, 1));
+        assert_eq!(command_counts(&idle, timeout, 0, request), (2, 1));
+    }
+
     /// CP-T1.8 on driven time: admitted application calls cannot consume replication's reserved
     /// byte capacity. Do: fill a leaderless member's queue with calls until it refuses one, then
     /// admit a member's heartbeat and step the member. Expect: the refusal is the application
@@ -4633,7 +4746,7 @@ mod tests {
         let evaluated = Arc::new(AtomicUsize::new(0));
         let mut replies = Vec::new();
         let mut refusal = None;
-        for _ in 0..COMMANDS {
+        for _ in 0..handle.command_bound() {
             let counted = Arc::clone(&evaluated);
             let operation = Operation::Call(Mutex::new(Some(Box::new(move |_| {
                 counted.fetch_add(1, Ordering::Relaxed);
@@ -4661,6 +4774,7 @@ mod tests {
         // The bounds the calls were admitted under, before the step learns new ones.
         let application = handle.application_bound();
         let calls = handle.call_bound();
+        let commands = handle.command_bound();
         let mut bytes = Vec::new();
         Message {
             msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
@@ -4674,8 +4788,8 @@ mod tests {
         driven.step();
         assert!(matches!(heartbeat.try_result(), Ok(Some(()))));
         assert!(
-            calls < COMMANDS,
-            "the queue's last slot stays a wire record's"
+            calls < commands,
+            "the queue's last place stays a wire record's"
         );
         // Calls stop at their bytes' bound or at their count's, the fewer, and the refusal names
         // the bound that refused (QB.1). The count is checked first.
@@ -4814,10 +4928,11 @@ mod tests {
     type Losing = Box<dyn Fn(u64, &Message) -> bool>;
     /// CP-T1.8: mirror the carrier's bounded admission and observe every processed receipt.
     /// Admission never waits for another owner. All records, including retained proposals,
-    /// share COMMANDS/QUEUED_BYTES bounds; each keeps its first absolute receive deadline.
+    /// share the command queue's bounds, its inputs and bytes; each keeps its first absolute
+    /// receive deadline. The receipts grow to the inputs' bound, which the owners learn.
     struct Pump<'a> {
         clients: &'a [Client],
-        receipts: [Option<PumpReceipt>; COMMANDS],
+        receipts: Vec<Option<PumpReceipt>>,
         phase: PumpPhase,
         next_source: usize,
         records: usize,
@@ -4892,7 +5007,7 @@ mod tests {
             assert!(!clients.is_empty() && clients.len() <= MEMBERS);
             Self {
                 clients,
-                receipts: std::array::from_fn(|_| None),
+                receipts: Vec::new(),
                 phase: PumpPhase::Relay,
                 next_source: 0,
                 records: 0,
@@ -4975,11 +5090,14 @@ mod tests {
                 .handle()
                 .admit_receive(packet.from, packet.message.bytes, packet.until)
                 .unwrap();
-            let slot = self
-                .receipts
-                .iter_mut()
-                .find(|slot| slot.is_none())
-                .unwrap();
+            let free = self.receipts.iter().position(Option::is_none);
+            let slot = match free {
+                Some(index) => self.receipts.get_mut(index).unwrap(),
+                None => {
+                    self.receipts.push(None);
+                    self.receipts.last_mut().unwrap()
+                }
+            };
             *slot = Some(PumpReceipt {
                 receipt,
                 bytes,
@@ -5016,11 +5134,13 @@ mod tests {
                 for offset in 0..self.clients.len() {
                     // Reserve room for any legal wire record before draining ownership from a peer.
                     // The conservative byte check needs no unbounded overflow/backpressure buffer.
-                    let bound = self
-                        .clients
-                        .first()
-                        .map_or(0, |client| client.handle().queue_bound());
-                    if self.records == COMMANDS || self.bytes + MESSAGE_BYTES > bound {
+                    let (bound, commands) = self.clients.first().map_or((0, 0), |client| {
+                        (
+                            client.handle().queue_bound(),
+                            client.handle().command_bound(),
+                        )
+                    });
+                    if self.records >= commands || self.bytes + MESSAGE_BYTES > bound {
                         break;
                     }
                     let index = (first + offset) % self.clients.len();
@@ -15154,8 +15274,12 @@ mod tests {
             let (kept, taken) = mpsc::sync_channel(1);
             let capture = submit(clients.first().unwrap(), until, move |_| {
                 // The owner is inside this capture: nothing admitted now can be processed yet.
+                // The capture was taken from the channel, so the records fill it but for the
+                // legacy record's place (lane constants-20). The owner is inside the capture, so
+                // the bound stands still.
+                let commands = handle.command_bound();
                 let mut receipts = Vec::new();
-                for _ in 0..COMMANDS - 1 {
+                for _ in 0..commands - 1 {
                     receipts.push(handle.admit_receive(2, vec![0xff], until).unwrap());
                 }
                 assert!(
@@ -15170,7 +15294,7 @@ mod tests {
                 });
                 // Wait for the legacy record's actual queue reservation, not thread scheduling.
                 for _ in 0..ROUNDS {
-                    if handle.shared.admitted.load(Ordering::Acquire) == api::REQUEST_MAX + COMMANDS
+                    if handle.shared.admitted.load(Ordering::Acquire) == api::REQUEST_MAX + commands
                     {
                         break;
                     }
@@ -15178,7 +15302,7 @@ mod tests {
                 }
                 assert_eq!(
                     handle.shared.admitted.load(Ordering::Acquire),
-                    api::REQUEST_MAX + COMMANDS
+                    api::REQUEST_MAX + commands
                 );
                 assert!(matches!(
                     finishing.try_recv(),
@@ -15186,7 +15310,7 @@ mod tests {
                 ));
                 assert!(matches!(
                     handle.admit_receive(2, vec![0xff], until),
-                    Err(Refusal::Full { limit: COMMANDS })
+                    Err(Refusal::Full { limit }) if limit == commands
                 ));
                 kept.send((receipts, finishing, processed)).unwrap();
                 Ok(Vec::new())
