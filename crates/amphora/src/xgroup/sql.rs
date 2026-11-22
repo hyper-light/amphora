@@ -163,6 +163,28 @@ fn name_at(bytes: &[u8]) -> Option<(&str, &[u8])> {
     Some((std::str::from_utf8(name).ok()?, rest))
 }
 
+/// Whether a transaction across groups holds any lock, a read's or a write's, on a Records row
+/// here: a single-group commit touching it is refused as a conflict, as the lock step would refuse
+/// it (AC-T1.10.1). Unlike [`locked`], a read lock counts: the commit would change what it read.
+pub(crate) fn lock_held(
+    db: &Db,
+    namespace: &str,
+    family: &str,
+    key: &[u8],
+) -> anyhow::Result<bool> {
+    let key = record_key(namespace, family, key).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut held = false;
+    db.query(
+        "SELECT 1 FROM __amphora_xg_lock WHERE key = ?1 LIMIT 1",
+        [blob(&key)?],
+        |_| {
+            held = true;
+            Ok(false)
+        },
+    )?;
+    Ok(held)
+}
+
 /// The cross-group key of a Records row here a transaction across groups holds a write lock on
 /// (a put or a delete): the row's own, if it is locked (`LockedReads::Wait` and `WaitOnLock` wait
 /// on it). A read lock changes no row, so a read needn't wait on it; `kind <> 0` is [`READ`].

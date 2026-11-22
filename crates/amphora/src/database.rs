@@ -3025,7 +3025,7 @@ fn commit(
         (family, key)
     });
     for (family, key) in conds.chain(writes) {
-        if crate::xgroup::sql::locked(db, ns, family, key)?.is_some() {
+        if crate::xgroup::sql::lock_held(db, ns, family, key)? {
             return Ok(Err(Refusal::Conflict {
                 family: family.clone(),
                 key: key.clone(),
