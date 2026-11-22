@@ -2413,7 +2413,7 @@ mod sessions {
             });
             let unmet = commit_records(&cluster, "ns", &conditional, until());
             assert!(
-                matches!(&unmet, Err(Refusal::Conflict { key, .. }) if key == &[0]),
+                matches!(&unmet, Err(Refusal::Conflict { key, .. }) if key == &[0u8]),
                 "{protocol:?} {unmet:?}"
             );
             for k in 0..2u8 {

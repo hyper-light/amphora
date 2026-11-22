@@ -1477,7 +1477,11 @@ fn t_t1_9_r30_a_recovered_transaction_resolves_at_its_one_stamp() {
         );
         let (mut second, events) = Coordinator::start(config.clone()).unwrap();
         drive(&mut groups, &mut second, events, None, &[], |_| Fate::Land);
-        assert_eq!(stamps(&mut groups), vec![Some(50); 3], "{protocol:?}");
+        assert_eq!(
+            stamps(groups.as_mut_slice()),
+            vec![Some(50); 3],
+            "{protocol:?}"
+        );
         assert!(groups.iter().all(|g| g.held().is_empty()), "{protocol:?}");
     }
 
@@ -1507,6 +1511,6 @@ fn t_t1_9_r30_a_recovered_transaction_resolves_at_its_one_stamp() {
     );
     let (mut second, events) = Coordinator::start(config).unwrap();
     drive(&mut groups, &mut second, events, None, &[], |_| Fate::Land);
-    assert_eq!(stamps(&mut groups), vec![Some(21); 3]);
+    assert_eq!(stamps(groups.as_mut_slice()), vec![Some(21); 3]);
     assert!(groups.iter().all(|g| g.held().is_empty()));
 }
