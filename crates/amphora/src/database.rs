@@ -618,9 +618,12 @@ fn owners_unreserved(
             return Ok((owners, file));
         };
         drop(owners);
+        let mut waiting = 0;
         if let Some(reservation) = ongoing(&mut opening, &reserved) {
             reservation.waiting = reservation.waiting.saturating_add(1);
+            waiting = reservation.waiting;
         }
+        tracing::debug!(target: "amphora.records", event = "records.open_waits_for_open_in_flight", path = %path.display(), reserved = %reserved.display(), waiting, "an open of this file is in flight in this process: this one waits for it to end");
         OPENED.notify_all();
         while ongoing(&mut opening, &reserved).is_some() {
             let left = until.saturating_duration_since(Instant::now());
@@ -652,7 +655,7 @@ struct Reservation {
     file: Option<amphora_engine::io::FileId>,
     /// The identity of its lease's file, which every path to this database shares.
     lease: Option<amphora_engine::io::FileId>,
-    /// The opens waiting for this one to end.
+    /// The opens waiting for this one to end (records.open_waits_for_open_in_flight).
     waiting: usize,
 }
 
