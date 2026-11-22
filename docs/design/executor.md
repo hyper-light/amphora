@@ -434,6 +434,41 @@ expressions beyond a column against a literal (each worker running its own copy 
 workers, the page cache's miss path sharded, loom
 or shuttle on the dispatcher, and the worker and morsel metrics are the step's next pieces.
 
+
+### The build side filled together, and a join's rows (QT.6, lane qs6-4)
+
+**The build.** A hash join's table is no longer built on the statement's thread. `TableBuild`
+(`vdbe/morsel_scan.rs`) hands the build table's leaves out in morsels like the probe's: each worker
+keeps the rows of its leaves that pass the build filter and whose key holds no NULL, and scatters
+each row's entry (its key and its place in the worker's run) into one list per partition. Then
+`Partitioner::fill` (`vdbe/morsel.rs`) gives each partition to one worker, which fills that
+partition's map from every run, runs in leaf order: a key's build rows stay in build order
+whatever worker read them, and no lock is taken on the table (Leis et al. 2014, section 4.2, build
+in the same two phases). The partition count is not picked: it is the machine's measured core
+count when parallel mode is on (one partition per worker that may fill), one when it is off. Both
+phases run through `execute`, so the pilot and `choose_degree` pick their workers.
+
+**Bounded memory, typed refusals.** Every kept row (its values and their text or blob bytes) and
+every scattered entry (its key's parts and bytes, its place) is charged to the statement's one
+`MemoryBudget` as it is made; the fill moves the keys, it does not copy them. A build past the
+budget is refused as `MorselError::MemoryBudget`, never a partial table, and the VDBE hook then
+runs the statement's serial loop, whose hash join spills. T-QT.6.12 checks the refusal at every
+degree.
+
+**A join's rows.** A two-table inner hash join with no aggregates, no GROUP BY, LIMIT or
+DISTINCT, whose result columns and ORDER BY keys are columns of either table (INTEGER or TEXT
+affinity, BINARY collation, no NULLS FIRST or LAST named), runs on morsels too (`TableJoinRows`):
+each worker probes its own leaves and keeps each joined row's projected values (the result
+columns, then any ORDER BY key not among them), charged to the budget. With an ORDER BY each
+worker sorts its morsel's rows and the runs are merged by a stable merge in leaf order, so rows
+tied on the keys keep the probe order; without one the runs are concatenated in leaf order
+(probe-row order, a probe row's matches in build order). T-QT.6.13 checks it against the serial
+hash join at 2, 3, 4 and 8 stated cores.
+
+**Not yet.** Workers still run the pipeline's own loop body, not a copy of the VDBE program's,
+so only the filters `Predicate` holds (a column against a literal of its kind, a NULL test) run in
+parallel; joins of more than two tables, outer joins and joins under LIMIT stay serial.
+
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 
 **Decision.** With `Connection::set_vectorized_scans` on (off by default; QT.7, the query-time
@@ -504,8 +539,20 @@ SQL's semantics stay in one place (CLAUDE.md §13): a comparison is the comparis
 `op_agg_step_slow` for what that doesn't take (a first row, text, SUM's exact integer overflow,
 which ends the statement with the same error). A row the batch left out (its record spills to
 overflow pages) ends the fused run before it and is read row-at-a-time. Any other instruction in
-the body (an expression, a GROUP BY's group lookup, a result row) leaves the loop row-at-a-time,
-reading its columns from the batch as decision 9 does.
+the body (an expression, a result row) leaves the loop row-at-a-time, reading its columns from the
+batch as decision 9 does.
+
+A hash GROUP BY's step (decision 4: `GroupFind`, the aggregate steps, `GroupSave`) is one step of
+the fused body. It takes its selection row by row in order and runs the opcodes' own
+`op_group_find` and `op_group_save` for each, so the group table, its budget and its refusals stay
+in one place. Between consecutive rows of one group, their keys identical value for value (then
+equal under any collation the GROUP BY compares with), the save and the next find are skipped and
+the group's accumulators stay in their registers. When the full table refuses a row's new group,
+the run ends before that row: the cursor stops on the row before it, and the refused row runs
+row-at-a-time on to the sorter's insert, which no batch runs. Filters before the group step have no
+effect, so having judged rows past the end costs nothing; a fused body with a group step may hold
+no other aggregate step, nor a jump into the step or the sorter's insert. A ColumnRange (several
+columns into consecutive registers, as multi-key GROUP BYs read them) is one vector a column.
 
 **Why.** Decision 9 decodes each leaf once, but the interpreter still dispatches every filter and
 aggregate instruction once a row. Run by selection, a body instruction is dispatched once a batch
@@ -516,8 +563,8 @@ positions of the rows that pass, read by the next operator; research finding f29
 PVLDB 11(13), 2018 (f30).
 
 **Falsified by.** Any answer or error that differs with the switch on (`vdbe/leaf_batch/tests.rs`,
-T-QT.7.4 and T-QT.7.5); a fused loop running a row the batch left out; or AC-QT.7.1 not met with
-it.
+T-QT.7.4 to T-QT.7.7, the group table whole and filling mid-batch); a fused loop running a row the
+batch left out or a row the group table refused; or AC-QT.7.1 not met with it.
 
 ## 11. Skipping rows: zone maps over leaf runs against cracking, behind one switch
 
