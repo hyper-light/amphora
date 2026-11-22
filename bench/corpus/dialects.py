@@ -1117,10 +1117,7 @@ def functions_said(expression, context, dialect):
       REAL value into an INTEGER, the result is the integer between the REAL value and zero that is
       closest to the REAL value", where DuckDB's, PostgreSQL's and MySQL's casts round (DuckDB 1.4.2
       gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first.
-    - date(X, modifier...): sqlglot reads the first modifier as a time zone (DuckDB got
-      `AT TIME ZONE '+1 day'`), and SQLite's modifiers' arithmetic ("+1 month" on January 31 is
-      March 2 or 3, lang_datefunc.html#modifiers; 'ceiling', 'start of', 'weekday N') is no
-      engine's date arithmetic: not expressible, with the reason. date(X) alone is sqlglot's.
+    - SQLite's date and time functions: dated()'s.
     - total(X): "The sum() and total() aggregate functions return the sum of all non-NULL values
       in the group ... total() always returns a floating point value ... 0.0 if there are only
       NULL inputs" (lang_aggfunc.html#sumunc); no other engine has it. For an X of INTEGER or REAL
@@ -1211,8 +1208,6 @@ def functions_said(expression, context, dialect):
                 node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
             elif arg == "BLOB" and dialect != "postgres":
                 same(node, exp.Anonymous(this="octet_length" if dialect == "duckdb" else "length", expressions=[node.this.copy()]))
-        elif isinstance(node, exp.Date) and (node.args.get("zone") is not None or node.expressions):
-            raise NotExpressible(f"not expressible in {dialect}: date() with modifiers (lang_datefunc.html#modifiers), which sqlglot reads as a time zone and none of whose arithmetic (months normalized past a month's end, 'ceiling', 'start of', 'weekday N') {dialect}'s dates do alike")
         elif isinstance(node, exp.Anonymous) and node.name.upper() == "TOTAL" and len(node.expressions) == 1 and not isinstance(node.expressions[0], exp.Distinct) and classes.get(id(node.expressions[0]), UNKNOWN) in (None, "INTEGER", "REAL"):
             summed = exp.Sum(this=exp.cast(node.expressions[0].copy(), exp.DataType.build("DOUBLE")))
             w = node.parent
@@ -1248,6 +1243,231 @@ def functions_said(expression, context, dialect):
             if classes.get(id(node.this)) == "REAL":
                 node.set("this", exp.Trunc(this=node.this.copy()))
             node.set("to", exp.DataType.build("BIGINT"))
+    return expression
+
+
+# SQLite's date and time functions (https://www.sqlite.org/lang_datefunc.html): each reads a time
+# value and modifiers into a point in time, kept as whole milliseconds ("iJD", the Julian day number
+# times 86400000: lang_datefunc.html section 7 and sqlite3 3.51's date.c), and writes it out.
+DATE_FUNCTIONS = ("DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH", "STRFTIME")
+# Modifiers that say how a numeric time value is read (lang_datefunc.html#modifiers, "The 'auto',
+# 'julianday' and 'unixepoch' modifiers ... must follow immediately after the time-value"): they
+# are part of reading it.
+_READING_MODIFIERS = ("unixepoch", "julianday", "auto")
+_ADDED = re.compile(r"\s*([+-]?)\s*([0-9]+)\s+(day|hour|minute|second|month|year)s?\s*$", re.I)
+_JD_UNIX_MS = 210866760000000  # 1970-01-01 00:00:00 as iJD: Julian day 2440587.5 times 86400000 (date.c's unixepoch)
+# strftime()'s substitutions (lang_datefunc.html#strftime's table) each dialect writes alike, as
+# the dialect's own format (DuckDB's strftime(), "Date Format Functions"; PostgreSQL's to_char(),
+# manual 9.8 Table 9.26), or an expression of the moment (None: written by _moment_text()).
+_STRFTIME = {
+    "d": ("%d", "DD"), "F": ("%Y-%m-%d", "YYYY-MM-DD"), "H": ("%H", "HH24"), "j": ("%j", "DDD"),
+    "m": ("%m", "MM"), "M": ("%M", "MI"), "R": ("%H:%M", "HH24:MI"), "S": ("%S", "SS"),
+    "T": ("%H:%M:%S", "HH24:MI:SS"), "Y": ("%Y", "YYYY"), "f": ("%S.%g", "SS.MS"), "s": None, "w": None,
+}
+
+
+def _time_value(args, dialect, name):
+    """The moment SQLite reads from time value `args[0]` and the reading modifiers after it, as
+    (text 'YYYY-MM-DD HH:MM:SS.SSS', the modifiers left). Only a literal is read here, by SQLite
+    itself (Python's sqlite3, the SQLite the corpus's refusals are taken with): its many formats
+    (lang_datefunc.html#time_values: ten text forms, a time zone suffix, a Julian day or Unix time
+    number, a day past a month's end carried into the next month) are SQLite's to read, and the
+    moment is given to the engine as a TIMESTAMP literal of its own, so the engine still does each
+    function's arithmetic and writing. The text read must read back to the same millisecond
+    (julianday() of each equal), else not expressible. A value read at run time (a column, an
+    expression) is read in SQLite's formats only by SQLite: not expressible; nor is 'now' (the
+    moment the statement runs, which no two engines share), nor a year before 1 (DuckDB's and
+    PostgreSQL's TIMESTAMP have no year 0)."""
+    import sqlite3
+
+    from sqlglot import exp
+
+    first = args[0] if args else exp.Literal.string("now")
+    value = first.this if isinstance(first, exp.Neg) else first
+    if not isinstance(value, exp.Literal):
+        raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of a time value read as it runs, in SQLite's own time-value formats (https://www.sqlite.org/lang_datefunc.html#time_values), which {dialect} doesn't read alike")
+    literal = first.sql(dialect="sqlite")
+    if value.is_string and value.this.strip().lower() == "now":
+        raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of 'now', the moment the statement runs (https://www.sqlite.org/lang_datefunc.html#time_values), which no two engines share")
+    reading, rest = [], [a for a in args[1:]]
+    if rest and isinstance(rest[0], exp.Literal) and rest[0].is_string and rest[0].this.strip().lower() in _READING_MODIFIERS:
+        reading.append(rest.pop(0).sql(dialect="sqlite"))
+    db = sqlite3.connect(":memory:")
+    try:
+        text, jd = db.execute(f"SELECT strftime('%Y-%m-%d %H:%M:%f', {', '.join([literal] + reading)}), julianday({', '.join([literal] + reading)})").fetchone()
+        back = db.execute("SELECT julianday(?)", (text,)).fetchone()[0] if text is not None else None
+    finally:
+        db.close()
+    if text is None:
+        return None, rest
+    if back != jd:
+        raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of {literal}, a moment SQLite's text of it doesn't give back to the millisecond (https://www.sqlite.org/lang_datefunc.html)")
+    if text.startswith("0000") or text.startswith("-"):
+        raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of a moment in the year {text[:4]}, which {dialect}'s TIMESTAMP doesn't have")
+    return text, rest
+
+
+def _moment(text):
+    from sqlglot import exp
+
+    return exp.cast(exp.Literal.string(text), exp.DataType.build("TIMESTAMP"))
+
+
+def _epoch_ms(ts, dialect):
+    """The moment `ts` as whole milliseconds since 1970 (BIGINT): DuckDB's epoch_ms(), PostgreSQL's
+    extract(epoch) (a numeric, exact) times 1000."""
+    from sqlglot import exp
+
+    if dialect == "duckdb":
+        return exp.Anonymous(this="epoch_ms", expressions=[ts])
+    return exp.cast(exp.Floor(this=exp.Mul(this=exp.Extract(this=exp.var("EPOCH"), expression=ts), expression=exp.Literal.number(1000))), exp.DataType.build("BIGINT"))
+
+
+def _formatted(ts, fmt, dialect):
+    from sqlglot import exp
+
+    return exp.Anonymous(this="strftime" if dialect == "duckdb" else "to_char", expressions=[ts, exp.Literal.string(fmt)])
+
+
+def _unix(ts, dialect, subsec):
+    """unixepoch(): "the number of seconds since 1970", an INTEGER, the whole seconds before the
+    moment (date.c: iJD/1000 less 1970's, iJD being positive), or with 'subsec' a REAL of its
+    milliseconds (iJD less 1970's, over 1000.0)."""
+    from sqlglot import exp
+
+    ms = _epoch_ms(ts, dialect)
+    if subsec:
+        return exp.Div(this=exp.cast(ms, exp.DataType.build("DOUBLE")), expression=exp.Literal.number("1000.0"))
+    return exp.cast(exp.Floor(this=exp.Div(this=ms, expression=exp.Literal.number("1000.0"))), exp.DataType.build("BIGINT"))
+
+
+def _strftime_text(fmt, ts, dialect):
+    """strftime(`fmt`, ...)'s text of moment `ts`: each substitution of _STRFTIME (%w the day of the
+    week, Sunday 0: DuckDB's %w, PostgreSQL's extract(dow); %s unixepoch()'s), the text between
+    them as it is, joined with ||. Another substitution (%e, %G, %I, %J, %k, %l, %p, %u, %U, %V,
+    %W ...) is not expressible."""
+    from sqlglot import exp
+
+    parts, i, text = [], 0, ""
+    while i < len(fmt):
+        ch = fmt[i]
+        if ch != "%":
+            text += ch
+            i += 1
+            continue
+        spec = fmt[i + 1] if i + 1 < len(fmt) else ""
+        i += 2
+        if spec == "%":
+            text += "%"
+            continue
+        if spec not in _STRFTIME:
+            raise NotExpressible(f"not expressible in {dialect}: strftime()'s %{spec} (https://www.sqlite.org/lang_datefunc.html#strftime), which {dialect} has nothing that writes alike")
+        if text:
+            parts.append(exp.Literal.string(text))
+            text = ""
+        if spec == "s":
+            parts.append(exp.cast(_unix(ts.copy(), dialect, False), exp.DataType.build("TEXT")))
+        elif spec == "w":
+            dow = _formatted(ts.copy(), "%w", dialect) if dialect == "duckdb" else exp.cast(exp.cast(exp.Extract(this=exp.var("DOW"), expression=ts.copy()), exp.DataType.build("INT")), exp.DataType.build("TEXT"))
+            parts.append(dow)
+        else:
+            parts.append(_formatted(ts.copy(), _STRFTIME[spec][0 if dialect == "duckdb" else 1], dialect))
+    if text or not parts:
+        parts.append(exp.Literal.string(text))
+    said = parts[0]
+    for p in parts[1:]:
+        said = exp.DPipe(this=said, expression=p)
+    return exp.Paren(this=said) if len(parts) > 1 else said
+
+
+def dated(expression, dialect):
+    """`expression` with SQLite's date and time functions (date(), time(), datetime(), julianday(),
+    unixepoch(), strftime(): lang_datefunc.html) said as `dialect`'s arithmetic and writing of the
+    same moment, where each is exact; else not expressible, with the reason.
+    - The time value is a literal SQLite reads (_time_value()); NULL where SQLite reads none.
+    - Modifiers (lang_datefunc.html#modifiers): 'NNN days', 'NNN hours', 'NNN minutes' and 'NNN
+      seconds' of a whole NNN add that many units' milliseconds ("adds the specified amount of time
+      to the date and time"): the dialect's INTERVAL. 'start of day', 'start of month' and 'start
+      of year' ("shift the date backwards to the beginning of the subject day, month or year"):
+      date_trunc(). 'NNN months' and 'NNN years' carry a day past the new month's end into the
+      next month ("2001-03-31 '+1 month' ... 2001-05-01", section 6), where DuckDB's and
+      PostgreSQL's intervals give the month's last day: alike only while the day is 28 or less,
+      which is known of the read moment and after 'start of month' or 'start of year', so they are
+      said there and not expressible after an addition of days or less. 'subsec' and 'subsecond'
+      write the milliseconds ("the 'subsec' ... causes datetime(), time() and unixepoch() to show
+      fractional seconds"). 'localtime' and 'utc' read the machine's time zone, 'weekday N',
+      'ceiling', 'floor', fractional amounts and the '±YYYY-MM-DD' forms are SQLite's own: not
+      expressible.
+    - date() writes '%Y-%m-%d', time() '%H:%M:%S', datetime() '%Y-%m-%d %H:%M:%S' (with 'subsec'
+      '.SSS' after the seconds), strftime() its format (_strftime_text()), julianday() the moment's
+      milliseconds over 86400000.0 from Julian day 0 (date.c's iJD/86400000.0: one exact BIGINT,
+      one IEEE division, so the same REAL), unixepoch() _unix()'s.
+    MySQL's and ClickHouse's are not written yet: not expressible there, with that reason.
+    timediff() (a span written '+YYYY-MM-DD HH:MM:SS.SSS') has no like on any engine."""
+    from sqlglot import exp
+
+    for node in [n for n in reversed(list(expression.dfs()))]:
+        if isinstance(node, exp.Date):
+            name, args = "DATE", [a for a in [node.this, node.args.get("zone")] if a is not None] + list(node.expressions)
+        elif isinstance(node, exp.TimeToStr) and isinstance(node.this, exp.TsOrDsToTimestamp) and node.args.get("format") is not None:
+            # sqlglot's reading of strftime(F, X) with no modifiers.
+            name, args = "STRFTIME", [node.args["format"], node.this.this]
+        elif isinstance(node, exp.Anonymous) and node.name.upper() in DATE_FUNCTIONS + ("TIMEDIFF",):
+            name, args = node.name.upper(), list(node.expressions)
+        else:
+            continue
+        doc = f"https://www.sqlite.org/lang_datefunc.html#{name.lower() if name != 'STRFTIME' else 'strftime'}"
+        if name == "TIMEDIFF":
+            raise NotExpressible(f"not expressible in {dialect}: timediff() ({doc}), whose '+YYYY-MM-DD HH:MM:SS.SSS' span no {dialect} function writes")
+        if dialect not in ("duckdb", "postgres"):
+            raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() ({doc}): its translation is written for DuckDB and PostgreSQL only so far")
+        fmt = None
+        if name == "STRFTIME":
+            if not args or not (isinstance(args[0], exp.Literal) and args[0].is_string):
+                raise NotExpressible(f"not expressible in {dialect}: strftime() of a format read as it runs ({doc})")
+            fmt, args = args[0].this, args[1:]
+        text, mods = (None, []) if any(isinstance(a, exp.Null) for a in args) else _time_value(args, dialect, name)
+        if text is None:
+            said = exp.Null()
+        else:
+            ts, subsec, day_ok = _moment(text), False, int(text[8:10]) <= 28
+            for m in mods:
+                word = m.this.strip().lower() if isinstance(m, exp.Literal) and m.is_string else None
+                added = _ADDED.match(word) if word is not None else None
+                if word in ("subsec", "subsecond"):
+                    subsec = True
+                elif word in ("start of day", "start of month", "start of year"):
+                    unit = word.split()[-1]
+                    ts = exp.cast(exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string(unit), ts]), exp.DataType.build("TIMESTAMP"))
+                    day_ok = day_ok or unit != "day"
+                elif added is not None and (added.group(3).lower() not in ("month", "year") or day_ok):
+                    unit = added.group(3).upper()
+                    n = ("-" if added.group(1) == "-" else "") + added.group(2)
+                    ts = exp.Add(this=ts, expression=exp.Interval(this=exp.Literal.string(n), unit=exp.var(unit)))
+                    day_ok = day_ok and unit in ("MONTH", "YEAR")
+                elif added is not None:
+                    raise NotExpressible(f"not expressible in {dialect}: {name.lower()}()'s '{word}' after a day past the 28th may be ({doc} and #modifiers: SQLite carries a day past the month's end into the next month, {dialect} gives the month's last day)")
+                else:
+                    shown = m.sql(dialect="sqlite")
+                    raise NotExpressible(f"not expressible in {dialect}: {name.lower()}()'s modifier {shown} (https://www.sqlite.org/lang_datefunc.html#modifiers), which {dialect}'s dates have nothing alike of, or which is read as it runs")
+            sec = "%S.%g" if dialect == "duckdb" else "SS.MS"
+            sec = sec if subsec else ("%S" if dialect == "duckdb" else "SS")
+            if name == "DATE":
+                said = _formatted(ts, "%Y-%m-%d" if dialect == "duckdb" else "YYYY-MM-DD", dialect)
+            elif name == "TIME":
+                said = _formatted(ts, ("%H:%M:" if dialect == "duckdb" else "HH24:MI:") + sec, dialect)
+            elif name == "DATETIME":
+                said = _formatted(ts, ("%Y-%m-%d %H:%M:" if dialect == "duckdb" else "YYYY-MM-DD HH24:MI:") + sec, dialect)
+            elif name == "JULIANDAY":
+                said = exp.Div(this=exp.cast(exp.Add(this=_epoch_ms(ts, dialect), expression=exp.Literal.number(_JD_UNIX_MS)), exp.DataType.build("DOUBLE")), expression=exp.Literal.number("86400000.0"))
+            elif name == "UNIXEPOCH":
+                said = _unix(ts, dialect, subsec)
+            else:
+                said = _strftime_text(fmt, ts, dialect)
+        if node is expression:
+            expression = said
+        else:
+            node.replace(said)
     return expression
 
 
@@ -1498,7 +1718,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(globbed(functions_said(extremes(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
+            e = spoken(globbed(functions_said(extremes(dated(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:

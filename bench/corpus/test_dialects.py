@@ -671,7 +671,7 @@ class FunctionsSaid(unittest.TestCase):
     to negative digits, char() of several code points and of NULL, format(), hex() of integers,
     text, a blob and NULL, zeroblob() of a count, a negative one and NULL, length() of an
     integer, a blob and text, hex() and length() of reals (SQLite's %!.15g text of them), typeof() and quote()
-    of values of a known storage class, IS of values, date() with modifiers, CAST to an integer type of a real and of an integer past 32 bits. Expect: DuckDB (when its Python
+    of values of a known storage class, IS of values, CAST to an integer type of a real and of an integer past 32 bits. Expect: DuckDB (when its Python
     module is here) gives what SQLite gives, values compared as numbers; PostgreSQL's round() digits
     guarded; a likelihood() SQLite refuses left for the engine to refuse; hex() and length() of
     a REAL not expressible on PostgreSQL, MySQL and ClickHouse; typeof() and quote() of a known
@@ -714,10 +714,6 @@ class FunctionsSaid(unittest.TestCase):
                 self.assertIn("CASE WHEN a IS NULL THEN 'null' ELSE 'integer' END", out)
                 self.assertEqual(out.upper().count("COALESCE("), 3)
                 self.assertRegex(out.upper(), r"QUOTE\(A \+ 0\.5\)")
-        for d in ENGINES:
-            with self.subTest(dialect=d):
-                self.assertIn(f"not expressible in {d}: date() with modifiers", dialects.translate("SELECT date('2024-01-31', '+1 month')", d)[1])
-                self.assertIsNone(dialects.translate("SELECT date('2024-01-31')", d)[1])
         self.assertEqual(dialects.translate("SELECT a IS 1, a IS NOT 'x', a IS NULL FROM t", "postgres", dialects.contexts([FileRecord(0, "CREATE TABLE t(a INTEGER)")])[0])[0], "SELECT a IS NOT DISTINCT FROM 1, NOT a IS NOT DISTINCT FROM 'x', a IS NULL FROM t")
         self.assertIn("UPPER(ENCODE(CAST('\\x01' AS BYTEA), 'hex'))", dialects.records_in(records, "postgres")[1][0])
         for d in ("postgres", "mysql", "clickhouse"):
@@ -798,3 +794,65 @@ class IntegerColumns(unittest.TestCase):
         for sql in (self.CREATE, insert):
             con.execute(dialects.translate(sql, "duckdb")[0])
         self.assertEqual(con.execute(select).fetchall(), want)
+
+
+class DateFunctions(unittest.TestCase):
+    """Do: date(), time(), datetime(), julianday(), unixepoch() and strftime() of literal time values
+    in SQLite's forms (text, a time zone suffix, a day past a month's end, a Julian day, a Unix time
+    with 'unixepoch', none SQLite reads, NULL), with whole-unit additions, 'start of', months while
+    the day is 28 or less, and 'subsec' (lang_datefunc.html). Expect: DuckDB (when its Python module
+    is here) gives what SQLite gives; PostgreSQL is given to_char() and extract(epoch) of the same
+    TIMESTAMP; what isn't exact ('now', 'localtime', a month added past the 28th, a fractional
+    amount, %W, timediff(), a value read as it runs) is not expressible with the reason, and MySQL
+    and ClickHouse refuse each, saying theirs isn't written yet."""
+
+    CASES = [
+        "date('2024-01-31')", "date('2024-02-30')", "datetime('2024-02-29 12:30:00', 'subsec')", "datetime('2024-01-01 10:00:00+05:00')",
+        "time('12:30')", "time('2024-03-15 08:05:00.123', 'subsecond')", "datetime(1710460800, 'unixepoch')", "date(2460385.5)", "datetime('garbage')", "datetime(NULL)",
+        "datetime('2024-01-01', NULL)", "date('2024-03-15', '+1 month')", "date('2024-01-31', 'start of month', '+1 month')", "date('2024-12-31', 'start of year', '+13 months')",
+        "datetime('2024-01-01', '-3 days', '+2 hours', 'start of day')", "datetime('2024-03-10', '-70 minutes', '+3600 seconds')", "date('0099-06-01')",
+        "julianday('2024-03-15 08:05:00.123')", "julianday(2460385.5)", "julianday('0001-01-01')", "unixepoch('1969-12-31 23:59:59.5')", "unixepoch('2038-01-19 03:14:07')",
+        "unixepoch('2024-03-15 08:05:00.123', 'subsec')", "strftime('%Y-%m-%d %H:%M:%S %j %w %f %s', '2024-03-15 08:05:00.123')", "strftime('%F %T %R', '1999-12-31T23:00:00', '+1 day')",
+        "strftime('%%x%d', '2024-01-02')", "strftime('%s', '1969-06-01 00:00:00.5')", "strftime('%w', 1710460800, 'unixepoch')",
+    ]
+    REFUSED = [
+        ("datetime('now')", "'now'"), ("date()", "'now'"), ("datetime('2024-01-01', 'localtime')", "'localtime'"), ("date('2024-01-31', '+1 month')", "past the 28th"),
+        ("date('2024-01-01', '+3 days', '+1 month')", "past the 28th"), ("datetime('2024-01-01', '+1.5 days')", "'+1.5 days'"), ("datetime('2024-01-01', 'weekday 0')", "'weekday 0'"),
+        ("strftime('%W', '2024-01-01')", "%W"), ("timediff('2024-01-01', '2023-01-01')", "timediff()"), ("date(x) FROM t", "read as it runs"), ("strftime(x, '2024-01-01') FROM t", "format read as it runs"),
+    ]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                want = db.execute(f"SELECT {case}").fetchone()[0]
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                self.assertEqual(duckdb.sql(out).fetchone()[0], want)
+
+    def test_postgres_and_the_others(self):
+        for case in self.CASES:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "postgres")
+                self.assertIsNone(why)
+                self.assertNotRegex(out.upper(), r"\b(STRFTIME|JULIANDAY|UNIXEPOCH|DATETIME)\(")
+                for d in ("mysql", "clickhouse"):
+                    self.assertIn("written for DuckDB and PostgreSQL only", dialects.translate(f"SELECT {case}", d)[1])
+        self.assertEqual(dialects.translate("SELECT datetime('2024-02-29 12:30:00', 'subsec')", "postgres")[0], "SELECT TO_CHAR(CAST('2024-02-29 12:30:00.000' AS TIMESTAMP), 'YYYY-MM-DD HH24:MI:SS.MS')")
+        self.assertIn("EXTRACT(DOW FROM", dialects.translate("SELECT strftime('%w', '2024-01-01')", "postgres")[0])
+
+    def test_not_exact_is_not_expressible(self):
+        for case, reason in self.REFUSED:
+            for d in ("duckdb", "postgres"):
+                with self.subTest(case=case, dialect=d):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    self.assertIsNone(out)
+                    self.assertIn(f"not expressible in {d}", why)
+                    self.assertIn(reason, why)
+                    self.assertIn("https://www.sqlite.org/lang_datefunc.html", why)
