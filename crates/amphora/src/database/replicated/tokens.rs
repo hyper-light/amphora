@@ -92,6 +92,17 @@ impl Client {
     pub(in crate::database) fn closed_micros(&self) -> Result<u64, Refusal> {
         Ok(locked(&self.handle.shared.closed)?.time.unwrap_or(0))
     }
+    /// This replica's closed point as a token (tests across groups, lane xgroup-sql): at or past
+    /// every write it has answered, as `Database::session_token` gave before ryw-6 made each write's
+    /// answer carry its own.
+    #[cfg(test)]
+    pub(in crate::database) fn closed_token(&self) -> Result<Token, Refusal> {
+        let point = locked(&self.handle.shared.closed)?;
+        Ok(Token {
+            micros: point.time.unwrap_or(0),
+            index: point.answered,
+        })
+    }
     /// `read` on a local reader once this replica has applied `token`; `read` answers `Err` with
     /// the time it found if its own transaction's state is earlier than the token's time, and the
     /// next try waits for a later one. Redirected once the replica stays behind past its

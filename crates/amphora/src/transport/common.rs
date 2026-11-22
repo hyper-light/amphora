@@ -2071,7 +2071,7 @@ mod tests {
                         observed.fetch_add(1, Ordering::AcqRel);
                         Some(db.clone())
                     },
-                    None,
+                    &Serves::default(),
                     &Arc::new(AtomicUsize::new(0)),
                     HANG,
                 )
@@ -2177,7 +2177,7 @@ mod tests {
                         observed.fetch_add(1, Ordering::AcqRel);
                         None
                     },
-                    None,
+                    &Serves::default(),
                     &Arc::new(AtomicUsize::new(0)),
                     HANG,
                 )

@@ -1728,6 +1728,18 @@ impl Database {
         Ok(())
     }
 
+    /// A replicated group's closed point as a token, for the tests across groups (lane
+    /// xgroup-sql): at or past every write this node has answered. None standalone and for an
+    /// attached client.
+    #[cfg(test)]
+    pub(crate) fn closed_token(&self, until: Instant) -> Result<Option<Token>, Refusal> {
+        let database = self.resolve(until)?;
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => client.closed_token().map(Some),
+            Writer::Client(_) | Writer::Local(_) => Ok(None),
+        }
+    }
+
     /// This group's clock on the one cross-group clock (lane split-merge-21, T-T1.9.R28; Ada's
     /// decision of 2026-11-22), microseconds since the Unix epoch: a replicated group's closed
     /// time, a backed-up group's writer clock (`Marks::latest_micros`, which

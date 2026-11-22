@@ -5811,7 +5811,7 @@ mod tests {
         }
         /// Takes every receipt answered or expired.
         fn reap(&mut self) {
-            for at in 0..COMMANDS {
+            for at in 0..self.receipts.len() {
                 let Some(pending) = self.receipts.get_mut(at).unwrap().as_mut() else {
                     continue;
                 };
@@ -6061,7 +6061,7 @@ mod tests {
             assert!(self.durable.is_none(), "durable answers were kept back");
             // No new records or grace deadline: each receipt is waited on until its answer comes
             // or its own until passes.
-            for at in 0..COMMANDS {
+            for at in 0..self.receipts.len() {
                 if let Some(mut pending) = self.receipts.get_mut(at).unwrap().take() {
                     let result = answered(&mut pending.receipt);
                     self.settle(pending, result);
@@ -11049,7 +11049,7 @@ mod tests {
         // or paused waits).
         for _ in 0..ROUNDS {
             let admitted = pump.drive_until(driven.until());
-            let running = |index: usize, owner: &Actor<DeviceFile>| {
+            let running = |index: usize, owner: &Actor| {
                 !fenced.contains(&index) && !owner.paused().unwrap_or(false)
             };
             let driving = driven.owners.iter().enumerate().any(|(index, slot)| {
@@ -11154,7 +11154,7 @@ mod tests {
         // Phases by round: writes until `writes` are answered, every host stalled for two election
         // timeouts, then the leader's host stalled for good.
         let mut stall: Option<(u64, bool)> = None;
-        let mut pending: Option<(mpsc::Receiver<Result<Answer, Refusal>>, u64)> = None;
+        let mut pending: Option<(mpsc::Receiver<Result<Answered, Refusal>>, u64)> = None;
         let most = election
             .saturating_mul(400)
             .saturating_add(u64::try_from(writes).unwrap() * election * 40);

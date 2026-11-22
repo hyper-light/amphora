@@ -2799,7 +2799,7 @@ mod sessions {
             let cluster = across_nodes(&local, &replicas, leader, protocol);
             let token = commit_records(&cluster, "ns", &puts(5), until()).unwrap();
             let after = replicas.dbs[leader]
-                .session_token(until())
+                .closed_token(until())
                 .unwrap()
                 .unwrap();
             assert!(
@@ -2909,7 +2909,7 @@ mod sessions {
             for (cluster, reached) in [(&over, "over the transport"), (&here, "in process")] {
                 for (rows, v) in [(&[0u8, 1][..], 1u8), (&[0, 1][..], 2), (&[1][..], 3)] {
                     let at = stamp(cluster.commit(writes(rows, v), until()).unwrap());
-                    let after = group1.session_token(until()).unwrap().unwrap();
+                    let after = group1.closed_token(until()).unwrap().unwrap();
                     assert!(
                         at.is_some_and(|at| at > 0 && at >= last && at <= after.micros),
                         "{protocol:?} {reached} {rows:?}: {at:?} after {last}, before {after:?}"
@@ -3345,7 +3345,7 @@ mod sessions {
             // The follower applies the locks before the read begins: a read carrying the leader's
             // token waits for them there, on its owner's publication. Past its measured apply lag
             // it is redirected (NotLeader), still behind, and waits again.
-            let token = group1.session_token(until()).unwrap().unwrap();
+            let token = group1.closed_token(until()).unwrap().unwrap();
             while let Err(refusal) = head(&replicas.dbs[follower], Some(token)) {
                 assert!(matches!(refusal, Refusal::NotLeader { .. }), "{refusal:?}");
             }
