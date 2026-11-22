@@ -445,6 +445,17 @@ class LeftOutColumns(unittest.TestCase):
                     self.assertIsNone(out[i][0], i)
                     self.assertIn("reads column e of t, left out of its CREATE (line 0) there: not expressible", out[i][1])
 
+    def test_a_collation_the_dialect_has_none_like(self):
+        records = [FileRecord(0, "CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)"), FileRecord(1, "INSERT INTO t2 VALUES (1, 'x', 10)"),
+                   FileRecord(2, "SELECT a, c FROM t2", "query", None), FileRecord(3, "SELECT b FROM t2", "query", None)]
+        for d in ("postgres", "clickhouse"):
+            with self.subTest(dialect=d):
+                out = dialects.records_in(records, d)
+                self.assertNotIn("b", out[0][0].replace("BIGINT", "").replace("Nullable", ""))
+                self.assertIsNone(out[2][1])
+                self.assertIn("reads column b of t2, left out of its CREATE (line 0) there: not expressible in " + d + ": SQLite's collation NOCASE", out[3][1])
+        self.assertTrue(all(why is None for _, why in dialects.records_in(records, "duckdb")))
+
     def test_same_answers_as_sqlite_on_duckdb(self):
         try:
             import duckdb

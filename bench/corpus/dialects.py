@@ -1584,6 +1584,22 @@ def _untypable(table):
     return out
 
 
+def _unsayable(create, table, dialect):
+    """The columns of `table` (a Table, made by CREATE TABLE `create`) the dialect can't hold as
+    SQLite does: without a type typed() can give (_untypable()), or of a collation it has none like
+    (OTHER_COLLATIONS)."""
+    from sqlglot import exp
+
+    out = _untypable(table)
+    if dialect in OTHER_COLLATIONS:
+        for c in create.this.expressions if isinstance(create.this, exp.Schema) else []:
+            for k in c.find_all(exp.CollateColumnConstraint) if isinstance(c, exp.ColumnDef) else []:
+                name = k.this.name.upper() if isinstance(k.this, (exp.Var, exp.Column, exp.Identifier)) else ""
+                if name in ("BINARY", "NOCASE", "RTRIM") and OTHER_COLLATIONS[dialect].get(name) is None:
+                    out.add(c.name.upper())
+    return out
+
+
 def _left_out(e, table, gone):
     """Statement `e` (sqlglot, SQLite's reading) with columns `gone` of `table` (upper-cased names)
     left out, or None when it reads one of them: a CREATE TABLE of `table` without them (None
@@ -1664,12 +1680,12 @@ def records_in(records, dialect, around=None):
         # them, and each record that doesn't read them runs on it unchanged in meaning: a query
         # that reads none of a table's columns gives what it gives whatever other columns the
         # table has. One that reads them is untranslatable, with the reason.
-        lean = [m for m, e in made if ran and m is not None and why is not None and "has no type" in why and isinstance(e, exp.Create)
-                and e.args.get("kind") == "TABLE" and m in c.created and _untypable(c.created[m]) and _untypable(c.created[m]) != set(c.created[m].columns)]
+        lean = [m for m, e in made if ran and m is not None and why is not None and ("has no type" in why or "SQLite's collation" in why) and isinstance(e, exp.Create)
+                and e.args.get("kind") == "TABLE" and m in c.created and _unsayable(e, c.created[m], dialect) and _unsayable(e, c.created[m], dialect) != set(c.created[m].columns)]
         touched = sorted(n for n in named if n in partial) if why is None else []
         if (lean or touched) and len(statements) == 1:
             t = lean[0] if lean else touched[0]
-            table, gone_cols = (c.created[t], _untypable(c.created[t])) if lean else (partial[t][0], partial[t][1])
+            table, gone_cols = (c.created[t], _unsayable(statements[0], c.created[t], dialect)) if lean else (partial[t][0], partial[t][1])
             e = _left_out(statements[0], table, gone_cols)
             if e is not None:
                 lean_sql, lean_why = record_in(_Said(e.sql(dialect="sqlite"), r), dialect, c)
