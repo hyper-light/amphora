@@ -927,8 +927,9 @@ fn t_pl_13_10_a_build_filtered_by_a_column_statistics_term_plans_again() {
             conn.adaptive_filter_corrections(),
         );
         let off = rows(&conn, sql);
-        // b's even ids hold 7 (8 is b.v of no row now): 250 of each even k, each k five rows of a.
-        assert_eq!(off.len(), 10 * 250 * 5, "{case}: the join's rows");
+        // b's even ids hold 7 (8 is b.v of no row now): 250 of each even k, each k five rows of a;
+        // id 7 keeps its own v = 7, five rows more.
+        assert_eq!(off.len(), 10 * 250 * 5 + 5, "{case}: the join's rows");
         assert_eq!(
             conn.adaptive_filter_checks(),
             checks,
@@ -997,7 +998,8 @@ fn t_pl_13_11_a_sorter_fed_by_an_index_seek_plans_again() {
         conn.set_adaptive_joins(false);
         let checks = conn.adaptive_sort_checks();
         let off = run_rows(&mut conn.prepare(sql).unwrap());
-        assert_eq!(off.len(), 2500, "{case}: the rows");
+        // c's 2,500 even ids hold 7, and id 7 keeps its own v = 7.
+        assert_eq!(off.len(), 2501, "{case}: the rows");
         assert_eq!(conn.adaptive_sort_checks(), checks, "{case}: counted off");
 
         conn.set_adaptive_joins(true);
@@ -1305,8 +1307,9 @@ fn t_pl_13_16_a_build_filtered_by_a_mix_of_terms_plans_again() {
         conn.adaptive_filter_corrections(),
     );
     let off = rows(&conn, sql);
-    // b's even ids under 50 (24 rows) hold 7, each meeting the five rows of a with its k.
-    assert_eq!(off.len(), 24 * 5, "the join's rows");
+    // b's even ids under 50 (24 rows) hold 7, and id 7 keeps its own v = 7: 25 rows, each
+    // meeting the five rows of a with its k.
+    assert_eq!(off.len(), 25 * 5, "the join's rows");
     assert_eq!(conn.adaptive_filter_checks(), checks, "counted off");
 
     conn.set_adaptive_joins(true);
