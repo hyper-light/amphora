@@ -17,8 +17,10 @@ use super::object::{
     self, FORMAT, Identity, MANIFEST_FORMAT, Manifest, Segment, StoredMark, Through,
 };
 use super::plan::{self, BaseKey, Link, Rates, SegmentKey, ThroughKey};
+use super::restore::read_segment;
 use super::{Hooks, Mark, SECOND_NS, second_of};
 use crate::db::{Db, PAGE_BYTES};
+use crate::memory::{Budget as Memory, Stream, Use};
 
 /// SQLite's WAL format (sqlite.org/fileformat2.html): a 32-byte header, then frames of a 24-byte
 /// header and a page.
@@ -32,6 +34,29 @@ pub(super) const LIST_PAGE: usize = 1000;
 /// What a restore of 100 GB may take at most (AC-T1.12.3: 30 minutes), in seconds: the objective a
 /// new base is due by ([`plan::base_due`]).
 pub const RESTORE_OBJECTIVE_S: f64 = 1800.0;
+
+/// The memory a base's chunk of `len` bytes takes while it's copied (T-T1.12.M1): the bytes read
+/// from the file and their sealed copy (its sum, then the bytes again), both held until its put
+/// ends.
+pub(super) fn copy_charge(len: u64) -> u64 {
+    len.saturating_mul(2).saturating_add(SUM)
+}
+
+/// The memory a part of a segment takes while it's shipped (T-T1.12.M3): `bytes`, its frames and
+/// the segment's other fields as sealed, held twice at most ([`Shipper::send`]: the frames read and
+/// their body encoded, then the body and its sealed copy, then the sealed copy and a part compared
+/// where it already exists).
+pub(super) fn ship_charge(bytes: u64) -> u64 {
+    bytes.saturating_mul(2)
+}
+
+/// The bytes a chunk of `chunk_bytes` takes sealed: what a restore fetches of it, in parts
+/// (T-T1.12.M2).
+pub(super) fn fetch_charge(chunk_bytes: u64) -> u64 {
+    chunk_bytes.saturating_add(SUM)
+}
+
+const SUM: u64 = object::SUM_BYTES as u64;
 
 /// What one round shipped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -71,6 +96,30 @@ impl Touched {
         Ok(())
     }
 
+    /// Marks the pages of frames given in parts, in order (T-T1.12.M3): `offset` is the part's
+    /// place in the frames, and `head` keeps a frame's page number where a part ends within it.
+    fn mark_part(&mut self, head: &mut Vec<u8>, offset: u64, part: &[u8]) -> anyhow::Result<()> {
+        let end = offset.saturating_add(u64::try_from(part.len())?);
+        let mut at = offset;
+        while at < end {
+            let within = at.checked_rem(FRAME_BYTES).unwrap_or(0);
+            if within >= 4 {
+                at = at.saturating_sub(within).saturating_add(FRAME_BYTES);
+                continue;
+            }
+            let to = at.saturating_add(4u64.saturating_sub(within)).min(end);
+            let from = usize::try_from(at.saturating_sub(offset))?;
+            let upto = usize::try_from(to.saturating_sub(offset))?;
+            head.extend_from_slice(part.get(from..upto).unwrap_or_default());
+            if let Some(&[a, b, c, d]) = head.get(..4) {
+                self.mark(u32::from_be_bytes([a, b, c, d]))?;
+                head.clear();
+            }
+            at = to;
+        }
+        Ok(())
+    }
+
     fn merge(&mut self, other: &Self) {
         if self.0.len() < other.0.len() {
             self.0.resize(other.0.len(), 0);
@@ -97,6 +146,22 @@ impl Touched {
     }
 }
 
+/// Whether a new base's chunks grow where its room holds more than the latest base's did: lane
+/// backups-8's A/B (T-T1.12.M5), today's behaviour the control.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChunkGrowth {
+    /// The latest base's chunk size while it still fits: every chunk the log didn't change is kept,
+    /// but a backup begun with little room keeps its small chunks, and so a restore's many requests,
+    /// for good.
+    #[default]
+    Keep,
+    /// The latest base's chunk size doubled as often as the room holds: a restore waits on fewer
+    /// requests, but a base whose chunks grow copies the whole file again, as no chunk of another
+    /// size is kept. Doubling, never shrinking while the latest size fits, so a room that wavers
+    /// doesn't make each base whole: a backup's chunks grow at most log2(largest / first) times.
+    Grow,
+}
+
 /// The latest base ended: what the next base may reuse of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LastBase {
@@ -118,7 +183,6 @@ struct Reuse {
 }
 
 /// A base being copied, a chunk at a time ([`Shipper::copy_base`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseCopy {
     id: u64,
     start_gen: u64,
@@ -128,9 +192,31 @@ pub struct BaseCopy {
     reuse: Option<Reuse>,
     /// The base each chunk so far is stored under: this one's id, or the earlier base's it reuses.
     bases: Vec<u64>,
+    /// The budget each chunk is charged to while it's held, and this copy's stream of
+    /// [`Use::Chunks`], open while the copy is (T-T1.12.M1).
+    memory: Arc<Memory>,
+    _stream: Stream,
+}
+
+impl std::fmt::Debug for BaseCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseCopy")
+            .field("id", &self.id)
+            .field("start_gen", &self.start_gen)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("file_bytes", &self.file_bytes)
+            .field("next", &self.next)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BaseCopy {
+    /// The bytes each chunk holds (the last fewer), as the base's manifest records them.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.chunk_bytes
+    }
+
     /// The chunks so far kept from an earlier base rather than copied.
     #[must_use]
     pub fn reused(&self) -> usize {
@@ -170,6 +256,28 @@ pub struct Shipper {
     /// The key of the archive's latest through mark ([`ThroughKey`]), let go once a later one or a
     /// segment says more.
     through_mark: Option<String>,
+    /// Whether a new base's chunks grow with the room ([`ChunkGrowth`]).
+    growth: ChunkGrowth,
+    /// The budget each part of a segment is charged to while it's shipped (T-T1.12.M3).
+    memory: Arc<Memory>,
+    /// A send that didn't end, sent again as it was (T-T1.12.M6).
+    unfinished: Option<Unfinished>,
+}
+
+/// A send the store refused partway (an error, or an answer lost): what it was, so sent again it
+/// makes the same objects, under the same keys, whatever room there is now and whatever was
+/// committed since (T-T1.12.M6). The objects it stored are found the same ([`create`]), and no
+/// segment of the retry overlaps one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unfinished {
+    /// The frame it began after.
+    from: u64,
+    /// The frames in each of its parts.
+    per_object: u64,
+    /// The marks it carried: the first of those pending.
+    marks: usize,
+    /// The through its keys named.
+    through: u64,
 }
 
 pub(super) fn list_all(
@@ -193,12 +301,19 @@ pub(super) fn list_all(
 }
 
 /// Creates `key` with `bytes`; where an object is there already (an earlier create whose answer was
-/// lost), it must be the same.
-fn create(blobs: &dyn Blobs, key: &str, bytes: &[u8], until: Instant) -> anyhow::Result<()> {
+/// lost), it must be the same: compared in ranged parts of `part` bytes at most (T-T1.12.M4), so
+/// the caller holds `bytes` and one part, as its charge counts them, never the object read whole.
+fn create(
+    blobs: &dyn Blobs,
+    key: &str,
+    bytes: &[u8],
+    part: usize,
+    until: Instant,
+) -> anyhow::Result<()> {
     match blobs.create(key, bytes, until) {
         Ok(()) => Ok(()),
         Err(BlobRefusal::Exists(_)) => {
-            if blobs.get(key, until)? == bytes {
+            if same(blobs, key, bytes, part, until)? {
                 Ok(())
             } else {
                 anyhow::bail!("archive object {key} exists and differs")
@@ -206,6 +321,26 @@ fn create(blobs: &dyn Blobs, key: &str, bytes: &[u8], until: Instant) -> anyhow:
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Whether the object at `key` is `bytes`, read in parts of `part` bytes at most: the first holds
+/// its sum, so an object that differs is told from its first part.
+fn same(
+    blobs: &dyn Blobs,
+    key: &str,
+    bytes: &[u8],
+    part: usize,
+    until: Instant,
+) -> anyhow::Result<bool> {
+    let mut at = 0u64;
+    for want in bytes.chunks(part.max(1)) {
+        if blobs.get_range(key, at, want.len(), until)? != want {
+            return Ok(false);
+        }
+        at = at.saturating_add(u64::try_from(want.len())?);
+    }
+    // Nor longer.
+    Ok(blobs.get_range(key, at, 1, until)?.is_empty())
 }
 
 fn identity_of(header: &[u8]) -> anyhow::Result<Identity> {
@@ -245,6 +380,19 @@ impl Shipper {
         db: &Db,
         until: Instant,
     ) -> anyhow::Result<Self> {
+        Self::open_within(prefix, hooks, blobs, db, &crate::memory::process(), until)
+    }
+
+    /// [`Shipper::open`], each part of a segment it ships charged to `memory` (the process's budget,
+    /// or a test's) while it's held (T-T1.12.M3).
+    pub fn open_within(
+        prefix: &str,
+        hooks: Arc<Hooks>,
+        blobs: &dyn Blobs,
+        db: &Db,
+        memory: &Arc<Memory>,
+        until: Instant,
+    ) -> anyhow::Result<Self> {
         let mut shipper = Self {
             prefix: prefix.into(),
             hooks,
@@ -266,11 +414,41 @@ impl Shipper {
             last_base: None,
             lost_marks: 0,
             through_mark: None,
+            growth: ChunkGrowth::default(),
+            memory: Arc::clone(memory),
+            unfinished: None,
         };
         let segments = list_all(blobs, &format!("{prefix}/log/"), until)?;
-        if let Some((key, _)) = segments.last() {
-            let last = SegmentKey::parse(prefix, key)?;
-            let body: Segment = object::decode(key, &blobs.get(key, until)?)?;
+        // Segments read back in ranged parts of half this stream's share, as a restore reads them
+        // (T-T1.12.M3).
+        let _stream = memory.stream(Use::Chunks);
+        let part = usize::try_from(
+            memory
+                .stream_room(Use::Chunks)?
+                .min(u64::try_from(blobs.object_max())?)
+                .checked_div(2)
+                .unwrap_or(0),
+        )?;
+        // Where the archive's log ends: the last of the segments covering it once over (a send
+        // retried by an older shipper may have left a segment beginning later that ends sooner,
+        // [`plan::cover`]).
+        let mut keys = Vec::with_capacity(segments.len());
+        for (key, _) in &segments {
+            keys.push(SegmentKey::parse(prefix, key)?);
+        }
+        let end = plan::cover(&keys)
+            .last()
+            .and_then(|i| segments.get(*i).zip(keys.get(*i)));
+        if let Some(((key, size), last)) = end {
+            let body = read_segment(
+                blobs,
+                key,
+                *size,
+                part,
+                memory,
+                until,
+                &mut |_, _, _| Ok(()),
+            )?;
             shipper.generation = last.generation;
             shipper.archived_through = last.through;
             if let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)?
@@ -321,17 +499,26 @@ impl Shipper {
             // segments (what the log since a base holds is bounded by `base_due`), so the next base
             // is incremental after an open too. A gap since leaves it whole.
             if !shipper.broken {
-                for (key, _) in &segments {
+                for (key, size) in &segments {
                     let s = SegmentKey::parse(prefix, key)?;
                     if s.generation < manifest.start_gen {
                         continue;
                     }
-                    let body: Segment = object::decode(key, &blobs.get(key, until)?)?;
-                    if s.generation == shipper.generation {
-                        shipper.current.mark_frames(&body.frames)?;
+                    let touched = if s.generation == shipper.generation {
+                        &mut shipper.current
                     } else {
-                        shipper.older.mark_frames(&body.frames)?;
-                    }
+                        &mut shipper.older
+                    };
+                    let mut head = Vec::new();
+                    read_segment(
+                        blobs,
+                        key,
+                        *size,
+                        part,
+                        memory,
+                        until,
+                        &mut |_, at, frames| touched.mark_part(&mut head, at, frames),
+                    )?;
                 }
                 shipper.last_base = Some(LastBase {
                     id: manifest.id,
@@ -357,7 +544,9 @@ impl Shipper {
     }
 
     /// Ships what is durable and stamped: one segment, split into parts where it outgrows the
-    /// store's objects. With nothing new to ship, and every commit stamped so far shipped, a
+    /// store's objects or the send's room; more than one where a send carries only some of the
+    /// marks ready ([`Shipper::marks_fitting`], or a send refused partway sent again as it was).
+    /// With nothing new to ship, and every commit stamped so far shipped, a
     /// through mark says the archive is whole through now, once that reaches a later second.
     pub fn ship(&mut self, db: &Db, blobs: &dyn Blobs, until: Instant) -> anyhow::Result<Shipped> {
         let drained = self.hooks.marks.drain()?;
@@ -366,7 +555,18 @@ impl Shipper {
         // What was committed before now is durable once this ends (store.md, decision 2): every
         // mark drained is then of a durable commit.
         (db.flusher())()?;
-        let shipped = self.ship_durable(db, blobs, until)?;
+        // A send that carried fewer of the marks ready than there were (its head's room, or a
+        // send refused partway sent again as it was) leaves the rest ready now: sent at once, not
+        // at the next commit.
+        let mut shipped = Shipped::default();
+        loop {
+            let (sent, more) = self.ship_durable(db, blobs, until)?;
+            shipped.segments = shipped.segments.saturating_add(sent.segments);
+            shipped.bytes = shipped.bytes.saturating_add(sent.bytes);
+            if sent.segments == 0 || !more {
+                break;
+            }
+        }
         if shipped.segments > 0 {
             // The segment says as much as the mark did, and more.
             if let Some(old) = self.through_mark.take() {
@@ -403,7 +603,8 @@ impl Shipper {
             last: mark.last,
             through: mark.through,
         };
-        create(blobs, &key, &object::encode(&body)?, until)?;
+        let bytes = object::encode(&body)?;
+        create(blobs, &key, &bytes, bytes.len(), until)?;
         self.archived_through = self.through;
         if let Some(old) = self.through_mark.replace(key) {
             blobs.delete(&old, until)?;
@@ -411,22 +612,23 @@ impl Shipper {
         Ok(())
     }
 
-    /// Sends what is durable and stamped of the log's generation now.
+    /// Sends what is durable and stamped of the log's generation now: what it sent, and whether
+    /// marks it left are ready still.
     fn ship_durable(
         &mut self,
         db: &Db,
         blobs: &dyn Blobs,
         until: Instant,
-    ) -> anyhow::Result<Shipped> {
+    ) -> anyhow::Result<(Shipped, bool)> {
         let (seq, end) = db.log_end();
         let durable = db.durable_frame().unwrap_or(0).min(end);
         let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)? else {
-            return Ok(Shipped::default());
+            return Ok((Shipped::default(), false));
         };
         let identity = identity_of(&head)?;
         if identity.seq != seq {
             // The log was started again and its header isn't written yet.
-            return Ok(Shipped::default());
+            return Ok((Shipped::default(), false));
         }
         if self.identity != Some(identity) {
             self.begin_generation(identity, head)?;
@@ -446,34 +648,107 @@ impl Shipper {
             .iter()
             .take_while(|m| m.seq == identity.seq && m.frame <= durable)
             .count();
+        // A send refused partway goes again as it was: its marks only, the commits since in the
+        // next send (T-T1.12.M6). Its marks are still the first pending, and still durable.
+        let unfinished = self.unfinished.filter(|u| u.from == self.shipped);
+        let all = ready;
+        let ready = match unfinished {
+            Some(u) => u.marks.min(ready),
+            None => self.marks_fitting(ready, identity, blobs)?,
+        };
         if ready == 0 {
-            return Ok(Shipped::default());
+            return Ok((Shipped::default(), false));
         }
-        let mut marks: Vec<Mark> = self.pending.drain(..ready).collect();
+        // Kept pending until the send ends, so a send refused (the store, or no room for its parts)
+        // ships them at the next round.
+        let mut marks: Vec<Mark> = self.pending.iter().take(ready).copied().collect();
         if let (Some(first), Some(unknown)) = (marks.first_mut(), self.unknown) {
             first.unknown_from = Some(first.unknown_from.map_or(unknown, |u| u.min(unknown)));
         }
         let last = marks.last().map_or(self.shipped, |m| m.frame);
         // Every commit stamped at or before `through` is in this segment or before it: those after
         // it are in the next mark's second, or weren't drained yet.
-        let through = match self.pending.front() {
-            Some(next) => {
+        let through = match (unfinished, self.pending.get(ready)) {
+            (Some(u), _) => u.through,
+            (None, Some(next)) => {
                 let second_before = second_of(next.ns)
                     .saturating_sub(1)
                     .saturating_mul(SECOND_NS);
                 next.unknown_from
                     .map_or(second_before, |u| u.min(second_before))
             }
-            None => self.through,
+            (None, None) => self.through,
         };
         let shipped = self.send(db, blobs, &marks, last, through, until)?;
+        self.pending.drain(..ready);
         self.shipped = last;
         self.hooks.fence.shipped(identity.seq, last)?;
         self.archived_through = through;
         self.unknown = None;
         self.next_link = None;
         self.since_base = self.since_base.saturating_add(shipped.bytes);
-        Ok(shipped)
+        Ok((shipped, ready < all))
+    }
+
+    /// How many of the `ready` marks pending one send carries (T-T1.12.M3): all, unless its head
+    /// (the segment's fields before its frames, the marks among them, as [`Shipper::send`] holds
+    /// it with each part) leaves no room for a frame in half a send's share of the room for chunks
+    /// or in the store's objects; then the most that do, one at least. So a backlog of marks (the
+    /// store refused rounds for long) ships over sends, none refused for its head alone.
+    fn marks_fitting(
+        &self,
+        ready: usize,
+        identity: Identity,
+        blobs: &dyn Blobs,
+    ) -> anyhow::Result<usize> {
+        // The share as the send will see it: its own stream among those open.
+        let stream = self.memory.stream(Use::Chunks);
+        let room = self
+            .memory
+            .stream_room(Use::Chunks)?
+            .checked_div(2)
+            .unwrap_or(0)
+            .min(u64::try_from(blobs.object_max())?);
+        drop(stream);
+        let fits = |count: usize| -> anyhow::Result<bool> {
+            let head = Segment {
+                format: FORMAT,
+                generation: self.generation,
+                identity,
+                first: self.shipped.saturating_add(1),
+                header: self.header.clone(),
+                // As large as the send's: the first mark may take the archive's unknown.
+                marks: self
+                    .pending
+                    .iter()
+                    .take(count)
+                    .map(|m| StoredMark {
+                        frame: m.frame,
+                        ns: m.ns,
+                        unknown_from: m.unknown_from.or(self.unknown),
+                    })
+                    .collect(),
+                frames: Vec::new(),
+            };
+            Ok(
+                u64::try_from(object::segment_overhead(&head)?)?.saturating_add(FRAME_BYTES)
+                    <= room,
+            )
+        };
+        if ready <= 1 || fits(ready)? {
+            return Ok(ready);
+        }
+        // The most that fit, one at least: `low` is one, or fits; `high` doesn't.
+        let (mut low, mut high) = (1usize, ready);
+        while low.saturating_add(1) < high {
+            let mid = low.saturating_add(high.saturating_sub(low).checked_div(2).unwrap_or(0));
+            if fits(mid)? {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        Ok(low)
     }
 
     fn begin_generation(&mut self, identity: Identity, head: Vec<u8>) -> anyhow::Result<()> {
@@ -509,11 +784,16 @@ impl Shipper {
         self.identity = Some(identity);
         self.header = head;
         self.shipped = 0;
+        self.unfinished = None;
         self.next_link = Some(link);
         Ok(())
     }
 
-    /// Sends frames `shipped + 1..=last` with `marks`: in as few objects as the store takes.
+    /// Sends frames `shipped + 1..=last` with `marks`: in as few objects as the store takes and this
+    /// send's room in the memory budget allows (T-T1.12.M3). The send opens a stream of
+    /// [`Use::Chunks`], and a part takes at most that stream's share of the room, its frames read,
+    /// encoded and sealed ([`ship_charge`]), charged while the send is held, before any part is
+    /// put: refused, typed, where the room is gone, and sent again at the next round.
     fn send(
         &mut self,
         db: &Db,
@@ -547,10 +827,36 @@ impl Shipper {
             .object_max()
             .checked_sub(object::segment_overhead(&body)?)
             .ok_or_else(|| anyhow::anyhow!("the store's objects can't hold a segment's marks"))?;
-        let per_object = u64::try_from(room)?.checked_div(FRAME_BYTES).unwrap_or(0);
-        if per_object == 0 {
+        let by_store = u64::try_from(room)?.checked_div(FRAME_BYTES).unwrap_or(0);
+        if by_store == 0 {
             anyhow::bail!("the store's objects can't hold one frame of the log");
         }
+        let overhead = u64::try_from(object::segment_overhead(&body)?)?;
+        let _stream = self.memory.stream(Use::Chunks);
+        let by_memory = self
+            .memory
+            .stream_room(Use::Chunks)?
+            .checked_div(2)
+            .unwrap_or(0)
+            .saturating_sub(overhead)
+            .checked_div(FRAME_BYTES)
+            .unwrap_or(0);
+        // A part of one frame at least: where there's no room for one, the charge is refused.
+        let per_object = match self.unfinished {
+            Some(u) if u.from == self.shipped => u.per_object,
+            _ => by_store.min(by_memory.max(1)),
+        };
+        let part_bytes = per_object
+            .min(last.saturating_sub(self.shipped))
+            .saturating_mul(FRAME_BYTES)
+            .saturating_add(overhead);
+        let _held = self.memory.take(Use::Chunks, ship_charge(part_bytes))?;
+        self.unfinished = Some(Unfinished {
+            from: self.shipped,
+            per_object,
+            marks: marks.len(),
+            through,
+        });
         let mut stored = std::mem::take(&mut body.marks);
         let mut shipped = Shipped::default();
         let mut from = self.shipped;
@@ -590,12 +896,23 @@ impl Shipper {
             if is_last {
                 body.marks = std::mem::take(&mut stored);
             }
-            let bytes = object::encode(&body)?;
-            create(blobs, &key.key(&self.prefix), &bytes, until)?;
+            // Encoded, its frames let go, then sealed: two copies held at most ([`ship_charge`]).
+            let plain = postcard::to_allocvec(&body)?;
+            body.frames = Vec::new();
+            let bytes = object::sealed(&plain)?;
+            drop(plain);
+            create(
+                blobs,
+                &key.key(&self.prefix),
+                &bytes,
+                usize::try_from(part_bytes)?,
+                until,
+            )?;
             shipped.segments = shipped.segments.saturating_add(1);
             shipped.bytes = shipped.bytes.saturating_add(u64::try_from(bytes.len())?);
             from = to;
         }
+        self.unfinished = None;
         Ok(shipped)
     }
 
@@ -618,6 +935,11 @@ impl Shipper {
     pub fn ships_current(&self, db: &Db) -> bool {
         let (seq, _) = db.log_end();
         self.identity.is_some_and(|i| i.seq == seq)
+    }
+
+    /// Whether the bases begun from now grow their chunks with the room (T-T1.12.M5).
+    pub fn set_chunk_growth(&mut self, growth: ChunkGrowth) {
+        self.growth = growth;
     }
 
     /// The latest base's id, if the archive holds one.
@@ -669,28 +991,61 @@ impl Shipper {
         Some(bytes)
     }
 
-    /// Begins a copy of the database's file, in chunks as large as the store's objects and
-    /// `memory` allow: a chunk is a request, and a restore's fetch moves more bytes a second the
-    /// fewer requests it waits on. Refused until the log's generation now has been seen by
-    /// [`Shipper::ship`].
+    /// Begins a copy of the database's file, in chunks as large as the store's objects, `cap` and
+    /// this copy's room in `memory` allow: a chunk is a request, and a restore's fetch moves more
+    /// bytes a second the fewer requests it waits on. Refused until the log's generation now has
+    /// been seen by [`Shipper::ship`].
+    ///
+    /// The room (T-T1.12.M1): the copy opens a stream of [`Use::Chunks`], and a chunk takes at
+    /// most that stream's share of the budget's room for chunks, measured now, read and sealed
+    /// ([`copy_charge`]); each chunk is charged as it's held ([`Shipper::copy_base`]). So a file
+    /// far larger than memory is copied in chunks that fit together with every other stream's,
+    /// and a restore with the room this copy had fetches one ([`super::restore_within`]).
     pub fn begin_base(
         &mut self,
         db: &Db,
         blobs: &dyn Blobs,
-        memory: usize,
+        memory: &Arc<Memory>,
+        cap: usize,
     ) -> anyhow::Result<BaseCopy> {
         let (seq, _) = db.log_end();
         if self.identity.is_none_or(|i| i.seq != seq) {
             anyhow::bail!("ship the log's generation before copying a base in it");
         }
-        let room = blobs.object_max().saturating_sub(32).min(memory);
-        let chunk_bytes = u64::try_from(room)?
+        let stream = memory.stream(Use::Chunks);
+        let share = memory.stream_room(Use::Chunks)?;
+        let by_memory = share.saturating_sub(SUM).checked_div(2).unwrap_or(0);
+        let room = u64::try_from(blobs.object_max())?
+            .saturating_sub(SUM)
+            .min(u64::try_from(cap)?)
+            .min(by_memory);
+        let bound = room
             .checked_div(PAGE_BYTES)
             .unwrap_or(0)
             .saturating_mul(PAGE_BYTES);
-        if chunk_bytes == 0 {
-            anyhow::bail!("a base's chunk can't hold a page");
+        if bound == 0 {
+            anyhow::bail!(
+                "a base's chunk can't hold a page: this copy's memory room is {share} bytes, the store's objects {} bytes",
+                blobs.object_max()
+            );
         }
+        // The latest base's chunks keep their size while it still fits, so an incremental base can
+        // keep the ones the log didn't change: a chunk of another size covers other pages.
+        // Grown ([`ChunkGrowth::Grow`]): doubled while twice it still fits.
+        let chunk_bytes = match &self.last_base {
+            Some(last) if last.chunk_bytes > 0 && last.chunk_bytes <= bound => {
+                let mut size = last.chunk_bytes;
+                if self.growth == ChunkGrowth::Grow {
+                    while let Some(twice) = size.checked_mul(2)
+                        && twice <= bound
+                    {
+                        size = twice;
+                    }
+                }
+                size
+            }
+            _ => bound,
+        };
         let id = {
             let mut state = self.hooks.marks.state()?;
             self.hooks.marks.stamp(&mut state)
@@ -724,6 +1079,8 @@ impl Shipper {
             next: 0,
             reuse,
             bases: Vec::new(),
+            memory: Arc::clone(memory),
+            _stream: stream,
         })
     }
 
@@ -755,11 +1112,17 @@ impl Shipper {
         match kept {
             Some(base) => copy.bases.push(base),
             None => {
+                // Charged while it's held (T-T1.12.M1): refused, typed, where another use took the
+                // room since the copy began; the round is tried again at the next commit.
+                let _held = copy.memory.take(Use::Chunks, copy_charge(len))?;
+                // The file's bytes are let go once sealed: the charge's second copy is a part
+                // compared where the chunk already exists (T-T1.12.M4).
                 let bytes = object::sealed(&db.read_file(from, usize::try_from(len)?)?)?;
                 create(
                     blobs,
                     &plan::chunk_key(&self.prefix, copy.id, copy.next),
                     &bytes,
+                    usize::try_from(len)?,
                     until,
                 )?;
                 copy.bases.push(copy.id);
@@ -808,12 +1171,8 @@ impl Shipper {
             start_gen: manifest.start_gen,
             id: manifest.id,
         };
-        create(
-            blobs,
-            &key.key(&self.prefix),
-            &object::encode(&manifest)?,
-            until,
-        )?;
+        let bytes = object::encode(&manifest)?;
+        create(blobs, &key.key(&self.prefix), &bytes, bytes.len(), until)?;
         self.base_bytes = Some(copy.file_bytes);
         self.since_base = 0;
         self.broken = false;
@@ -825,5 +1184,114 @@ impl Shipper {
             bases: copy.bases,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use amphora_api::blobs::{Listing, SimBlobs};
+
+    use super::*;
+
+    /// A store that says the largest answer a read gave, and the reads of an object whole.
+    struct Reads {
+        inner: SimBlobs,
+        largest: AtomicUsize,
+        wholes: AtomicUsize,
+    }
+
+    impl Blobs for Reads {
+        fn object_max(&self) -> usize {
+            self.inner.object_max()
+        }
+        fn create(&self, key: &str, bytes: &[u8], until: Instant) -> Result<(), BlobRefusal> {
+            self.inner.create(key, bytes, until)
+        }
+        fn get(&self, key: &str, until: Instant) -> Result<Vec<u8>, BlobRefusal> {
+            self.wholes.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key, until)
+        }
+        fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: usize,
+            until: Instant,
+        ) -> Result<Vec<u8>, BlobRefusal> {
+            let got = self.inner.get_range(key, offset, len, until)?;
+            self.largest.fetch_max(got.len(), Ordering::SeqCst);
+            Ok(got)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+            until: Instant,
+        ) -> Result<Listing, BlobRefusal> {
+            self.inner.list(prefix, after, limit, until)
+        }
+        fn delete(&self, key: &str, until: Instant) -> Result<(), BlobRefusal> {
+            self.inner.delete(key, until)
+        }
+    }
+
+    fn until() -> Instant {
+        Instant::now()
+            .checked_add(std::time::Duration::from_secs(60))
+            .unwrap()
+    }
+
+    /// T-T1.12.M3: frames given in parts of any size mark the pages they would whole.
+    #[test]
+    fn t_t1_12_m3_pages_marked_in_parts() {
+        let frame = usize::try_from(FRAME_BYTES).unwrap();
+        let mut frames = vec![0u8; frame * 5];
+        for (i, page) in [3u32, 70, 1, 200, 70].into_iter().enumerate() {
+            frames[i * frame..i * frame + 4].copy_from_slice(&page.to_be_bytes());
+        }
+        let mut whole = Touched::default();
+        whole.mark_frames(&frames).unwrap();
+        for size in [1, 2, 3, 5, frame - 1, frame, frame + 3, frames.len()] {
+            let mut parts = Touched::default();
+            let mut head = Vec::new();
+            let mut at = 0u64;
+            for part in frames.chunks(size) {
+                parts.mark_part(&mut head, at, part).unwrap();
+                at += u64::try_from(part.len()).unwrap();
+            }
+            assert_eq!(parts, whole, "parts of {size}");
+        }
+    }
+
+    /// T-T1.12.M4: a create whose object already exists (its first answer lost) compares it in
+    /// parts. Do: store an object, create it again with the same bytes, with one byte changed,
+    /// shorter and longer. Expect: the same is no error, each other refused, and no read gave more
+    /// than a part or read the object whole.
+    #[test]
+    fn t_t1_12_m4_an_existing_object_compared_in_parts() {
+        let blobs = Reads {
+            inner: SimBlobs::new(1 << 20, 100, 1 << 22),
+            largest: AtomicUsize::new(0),
+            wholes: AtomicUsize::new(0),
+        };
+        let bytes = object::sealed(&[5u8; 10_000]).unwrap();
+        blobs.create("a/b", &bytes, until()).unwrap();
+        let part = 1000;
+        create(&blobs, "a/b", &bytes, part, until()).unwrap();
+        let mut changed = bytes.clone();
+        let last = changed.len() - 1;
+        changed[last] ^= 1;
+        assert!(create(&blobs, "a/b", &changed, part, until()).is_err());
+        assert!(create(&blobs, "a/b", &bytes[..bytes.len() - 1], part, until()).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(create(&blobs, "a/b", &longer, part, until()).is_err());
+        assert!(blobs.largest.load(Ordering::SeqCst) <= part);
+        assert_eq!(blobs.wholes.load(Ordering::SeqCst), 0);
     }
 }

@@ -148,6 +148,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | Decision (lane constants): the compaction's expansion learned where it runs (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-compactions-expansion-learned-where-it-runs-2026-11-21) |
 | replication | – | Decision (lane constants): an envelope is what its encoding adds (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-an-envelope-is-what-its-encoding-adds-2026-11-21) |
 | replication | – | Decision (lane constants): an image is bounded by the memory budget's room for one (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-an-image-is-bounded-by-the-memory-budgets-room-for-one-2026-11-21) |
+| replication | – | Decision (lane ryw-1): read-your-writes by session tokens (2026-11-22, kiln goal 8119f25d) | [replication.md](design/replication.md#decision-lane-ryw-1-read-your-writes-by-session-tokens-2026-11-22-kiln-goal-8119f25d) |
 | regions | – | Decision (lane regions): region-local groups under a global root, placed by declared survival | [regions.md](design/regions.md#decision-lane-regions-region-local-groups-under-a-global-root-placed-by-declared-survival) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
 | reshard | – | Decision (lane split-merge-7): batches learned where they run | [reshard.md](design/reshard.md#decision-lane-split-merge-7-batches-learned-where-they-run) |
@@ -160,6 +161,16 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-11): the routing key is bytes | [reshard.md](design/reshard.md#decision-lane-split-merge-11-the-routing-key-is-bytes) |
 | reshard | – | Decision (lane split-merge-12): load from the store's meter | [reshard.md](design/reshard.md#decision-lane-split-merge-12-load-from-the-stores-meter) |
 | reshard | – | Decision (lane split-merge-12): a retired group's files | [reshard.md](design/reshard.md#decision-lane-split-merge-12-a-retired-groups-files) |
+| reshard | – | Decision (lane split-merge-13): the transport between machines | [reshard.md](design/reshard.md#decision-lane-split-merge-13-the-transport-between-machines) |
+| reshard | – | Decision (lane split-merge-15): the size cut from the B-tree's middle key | [reshard.md](design/reshard.md#decision-lane-split-merge-15-the-size-cut-from-the-b-trees-middle-key) |
+| reshard | – | Decision (lane split-merge-18): reads across groups by commit stamp | [reshard.md](design/reshard.md#decision-lane-split-merge-18-reads-across-groups-by-commit-stamp) |
+| reshard | – | Decision (lane split-merge-19): compaction trims the commit stamps | [reshard.md](design/reshard.md#decision-lane-split-merge-19-compaction-trims-the-commit-stamps) |
+| reshard | – | Decision (lane split-merge-19): the read point, A/B | [reshard.md](design/reshard.md#decision-lane-split-merge-19-the-read-point-ab) |
+| reshard | – | Decision (lane split-merge-19): a moved row carries its commit stamp | [reshard.md](design/reshard.md#decision-lane-split-merge-19-a-moved-row-carries-its-commit-stamp) |
+| reshard | – | Decision (lane split-merge-19): one key and what changed, across groups | [reshard.md](design/reshard.md#decision-lane-split-merge-19-one-key-and-what-changed-across-groups) |
+| reshard | – | Decision (lane split-merge-20): a read as of a stamp places moved rows by their stamps | [reshard.md](design/reshard.md#decision-lane-split-merge-20-a-read-as-of-a-stamp-places-moved-rows-by-their-stamps) |
+| reshard | – | Decision (lane split-merge-20): conditions across groups name commit stamps | [reshard.md](design/reshard.md#decision-lane-split-merge-20-conditions-across-groups-name-commit-stamps) |
+| reshard | – | Decision (lane split-merge-21): one clock, one commit stamp | [reshard.md](design/reshard.md#decision-lane-split-merge-21-one-clock-one-commit-stamp) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
@@ -214,6 +225,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |
 | xgroup | – | On a group's database: each step one atomic commit in its group, resolution timeouts learned as TCP's | [xgroup.md](design/xgroup.md#on-a-groups-database) |
 | xgroup | – | A SQL session's commit: rows in one local group commit there without a coordinator step, a held row aborting it; rows in several groups go through the coordinator | [xgroup.md](design/xgroup.md#a-sql-sessions-commit-lane-xgroup-sql-ac-t1101) |
+| xgroup | – | A refusal before the step: NotLeader or Full sent again after the learned RFC 6298 back-off (Retry) or counted lost as today (Stop, the control), with refusals, retries, holds, stops and p99.9 counted | [xgroup.md](design/xgroup.md#a-refusal-before-the-step-lane-xgroup-sql-4-ac-t1106) |
 | xgroup | – | A group's failure mid-commit stops the incarnation as a crash; the next open finishes every transaction committed or aborted everywhere | [xgroup.md](design/xgroup.md#a-groups-failure) |
 | xgroup | – | Over the transport: a step to another node's group is one Step request through transport::Nodes, its stamp carried both ways | [xgroup.md](design/xgroup.md#over-the-transport) |
 | xgroup | – | Which protocol stays: the faster cross-group p99 on the LAN at zero anomalies over 10,000 seeds (numbers pending the coordinator's run) | [xgroup.md](design/xgroup.md#decision-lane-xgroup-lan-which-protocol-stays-the-faster-at-zero-anomalies) |
@@ -222,12 +234,14 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | without-rowid | – | WITHOUT ROWID tables keep their primary-key index as the table | [without-rowid.md](design/without-rowid.md) |
 | backup | – | Decision (lane pitr): backups and point-in-time recovery to Mantle (CP-T1.12, G14 step 4) | [backup.md](design/backup.md) |
 | backup | – | The folder store: keys as paths, create once by link(2), listing in key order | [backup.md](design/backup.md#the-folder-store) |
+| backup | – | The peer store: an archive in another process's folder, over the owner transport | [backup.md](design/backup.md#the-peer-store) |
 | backup | – | Restore-and-check: the newest whole second restored and checked, on the archive's cadence | [backup.md](design/backup.md#restore-and-check) |
 | backup | – | The source's own rows at a quiet second: the shipping thread checks itself against a snapshot lined up with a second's stamps | [backup.md](design/backup.md#the-sources-own-rows-at-a-quiet-second) |
 | backup | – | A base begins just after a restart, so the next base copies least | [backup.md](design/backup.md#a-base-begins-just-after-a-restart) |
 | backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
 | backup | – | Cuts across machines: each cross-group step carries a hybrid logical clock, so a decision is stamped after the writes it decides | [backup.md](design/backup.md#cuts-across-machines) |
 | backup | – | Incremental bases: a new base keeps the latest's chunks the log left unchanged | [backup.md](design/backup.md#incremental-bases) |
+| backup | – | Continuous restore drills: checks on by default, within a budget measured on the machine, at random seconds | [backup.md](design/backup.md#continuous-restore-drills) |
 
 ## Sections that are not decisions
 

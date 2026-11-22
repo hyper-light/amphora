@@ -39,6 +39,10 @@ pub struct Config {
 pub struct Txn {
     pub reads: Vec<Vec<u8>>,
     pub writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Conditions (lane split-merge-20, T-T1.9.R27): each a key and the commit stamp its newest
+    /// version must be at or before (none: it must have none), checked under the transaction's
+    /// locks in the key's group (`xgroup::holds`); one that fails aborts it, [`Why::Unmet`].
+    pub conds: Vec<(Vec<u8>, Option<u64>)>,
 }
 
 /// What the client hears.
@@ -63,6 +67,9 @@ pub enum Why {
     Lost,
     /// A group had already finished it: another decided it.
     Late,
+    /// A condition on this key failed: it was written after the stamp named, or isn't there, or
+    /// is there when it must not be.
+    Unmet(Vec<u8>),
 }
 
 /// A step's outcome the shell couldn't learn: it may land later, or never.
@@ -208,6 +215,7 @@ pub(super) fn validate(txn: &Txn) -> Result<(), Refusal> {
         .reads
         .len()
         .checked_add(txn.writes.len())
+        .and_then(|n| n.checked_add(txn.conds.len()))
         .ok_or_else(|| broken("too many keys"))?;
     if keys == 0 {
         return Err(broken("it reads and writes nothing"));
@@ -238,6 +246,14 @@ pub(super) fn validate(txn: &Txn) -> Result<(), Refusal> {
         if let Some(value) = value {
             api::bound("value", value.len(), api::VALUE_MAX)?;
             add(value.len())?;
+        }
+    }
+    let mut conditioned = BTreeSet::new();
+    for (key, _) in &txn.conds {
+        api::key(key)?;
+        add(key.len())?;
+        if !conditioned.insert(key.as_slice()) {
+            return Err(broken("it names a key in two conditions"));
         }
     }
     api::bound("cross-group transaction bytes", bytes, api::REQUEST_MAX)
@@ -374,7 +390,11 @@ impl Coordinator {
             });
         }
         validate(&txn)?;
-        type Plan = (Vec<Vec<u8>>, Vec<(Vec<u8>, Option<Vec<u8>>)>);
+        type Plan = (
+            Vec<Vec<u8>>,
+            Vec<(Vec<u8>, Option<Vec<u8>>)>,
+            Vec<(Vec<u8>, Option<u64>)>,
+        );
         let mut plan: BTreeMap<GroupId, Plan> = BTreeMap::new();
         // The anchor: the group of the first key written (CockroachDB's record goes with it), or
         // of the first read when nothing is written.
@@ -382,13 +402,17 @@ impl Coordinator {
             .writes
             .first()
             .map(|(key, _)| key)
-            .or_else(|| txn.reads.first());
+            .or_else(|| txn.reads.first())
+            .or_else(|| txn.conds.first().map(|(key, _)| key));
         let anchor = first.map(|key| route(key)).unwrap_or(self.config.registry);
         for key in txn.reads {
             plan.entry(route(&key)).or_default().0.push(key);
         }
         for (key, value) in txn.writes {
             plan.entry(route(&key)).or_default().1.push((key, value));
+        }
+        for (key, named) in txn.conds {
+            plan.entry(route(&key)).or_default().2.push((key, named));
         }
         if let Some(group) = plan.keys().find(|g| !self.config.groups.contains(g)) {
             return Err(broken(&format!(
@@ -420,14 +444,26 @@ impl Coordinator {
         );
         let mut out = Vec::new();
         let parallel = self.config.protocol == Protocol::Parallel;
-        for (group, (reads, writes)) in plan {
+        for (group, (reads, writes, conds)) in plan {
             let stage = (parallel && group == anchor).then(|| participants.clone());
-            let step = Step::Lock {
-                txn: id,
-                anchor,
-                reads,
-                writes,
-                stage,
+            // A group with no condition gets the step every group knows.
+            let step = if conds.is_empty() {
+                Step::Lock {
+                    txn: id,
+                    anchor,
+                    reads,
+                    writes,
+                    stage,
+                }
+            } else {
+                Step::LockIf {
+                    txn: id,
+                    anchor,
+                    reads,
+                    writes,
+                    stage,
+                    conds,
+                }
             };
             self.send(&mut out, group, Some(id), Kind::Lock, step)?;
         }
@@ -605,6 +641,7 @@ impl Coordinator {
                         None
                     }
                     Ok(Reply::Conflict { key }) => Some(Why::Conflict(key)),
+                    Ok(Reply::Unmet { key, .. }) => Some(Why::Unmet(key)),
                     Ok(Reply::Late) => Some(Why::Late),
                     Err(Lost) => Some(Why::Lost),
                     Ok(other) => return Err(unexpected(sent.kind, &other)),

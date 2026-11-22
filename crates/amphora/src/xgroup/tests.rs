@@ -262,6 +262,139 @@ fn t_t1_10_c_the_group_rules_hold_in_a_groups_database() {
     conformance(&mut SqlTablet::new(&db));
 }
 
+fn lock_if(id: TxnId, writes: &[(&[u8], &[u8])], conds: &[(&[u8], Option<u64>)]) -> Step {
+    Step::LockIf {
+        txn: id,
+        anchor: 0,
+        reads: vec![],
+        writes: writes
+            .iter()
+            .map(|(k, v)| (k.to_vec(), Some(v.to_vec())))
+            .collect(),
+        stage: None,
+        conds: conds.iter().map(|(k, s)| (k.to_vec(), *s)).collect(),
+    }
+}
+
+/// T-T1.9.R27 (CP-T1.9; reshard.md, "Decision (lane split-merge-20): conditions across groups
+/// name commit stamps"), a group's part on the simulator's tablet. Do: k written (its stamp kept),
+/// then written again; lock steps with conditions: k as of its first stamp; k as of its new one
+/// and m absent, writing w; a write lock on m from another transaction; a step writing w on k's
+/// first stamp; and one on k absent. Expect: the first unmet at k's new stamp with nothing locked;
+/// the second locked, k and m read-locked beside w's write; the write lock on m refused, a
+/// conflict; the step on w a conflict before its condition is looked at; the last unmet, k there.
+/// T-T1.9.R28 (lane split-merge-21; reshard.md, "Decision (lane split-merge-21): one clock, one
+/// commit stamp"), on the simulator's group. Do: two groups, the second's clock ahead of the first's; one
+/// transaction locks a key in each and resolves at one commit stamp in both; then each writes a
+/// key of its own. Expect: both keys stamped the one commit stamp; each group's next write stamped
+/// after it; a transaction resolved with `Step::Resolve` (no stamp) stamped by its group's clock.
+#[test]
+fn t_t1_9_r28_one_transaction_has_one_stamp_in_every_group() {
+    let mut groups = [Memory::default(), Memory::default()];
+    // The second group's clock is ahead: 40 writes before.
+    for i in 0..40u8 {
+        groups[1].set_value(&[b'z', i], Some(b"v")).unwrap();
+    }
+    let stamp = 1_000;
+    for (g, t) in groups.iter_mut().enumerate() {
+        let key = [b'k', u8::try_from(g).unwrap()];
+        let locked = apply(
+            0,
+            t,
+            &env(1, None, lock_step(txn(1), &[], &[(&key, b"x")], None)),
+        );
+        assert!(matches!(locked.unwrap(), Reply::Locked { .. }));
+        let resolve = Step::ResolveAt {
+            txn: txn(1),
+            outcome: Outcome::Committed,
+            at: stamp,
+        };
+        assert_eq!(
+            apply(0, t, &env(1, None, resolve)).unwrap(),
+            Reply::Resolved
+        );
+        assert_eq!(t.stamp(&key).unwrap(), Some(stamp), "group {g}");
+        t.set_value(b"after", Some(b"v")).unwrap();
+        assert!(t.stamp(b"after").unwrap() > Some(stamp), "group {g}");
+    }
+    let t = &mut groups[0];
+    apply(
+        0,
+        t,
+        &env(1, None, lock_step(txn(2), &[], &[(b"m", b"x")], None)),
+    )
+    .unwrap();
+    let resolve = Step::Resolve {
+        txn: txn(2),
+        outcome: Outcome::Committed,
+    };
+    assert_eq!(
+        apply(0, t, &env(1, None, resolve)).unwrap(),
+        Reply::Resolved
+    );
+    assert!(t.stamp(b"m").unwrap() > t.stamp(b"k\x00").unwrap());
+}
+
+#[test]
+fn t_t1_9_r27_a_lock_step_holds_to_its_conditions() {
+    let mut t = Memory::default();
+    let at = |t: &mut Memory, step: Step| apply(0, t, &env(1, None, step)).unwrap();
+    assert_eq!(
+        apply(0, &mut t, &env(0, None, Step::Begin)).unwrap(),
+        Reply::Epoch(1)
+    );
+    t.set_value(b"k", Some(b"1")).unwrap();
+    let first = t.stamp(b"k").unwrap();
+    t.set_value(b"k", Some(b"2")).unwrap();
+    let now = t.stamp(b"k").unwrap();
+    assert!(now > first, "{now:?} {first:?}");
+
+    assert_eq!(
+        at(&mut t, lock_if(txn(1), &[(b"w", b"x")], &[(b"k", first)])),
+        Reply::Unmet {
+            key: b"k".to_vec(),
+            at: now
+        }
+    );
+    assert!(t.held().is_empty(), "{:?}", t.held());
+    assert_eq!(
+        at(
+            &mut t,
+            lock_if(txn(2), &[(b"w", b"x")], &[(b"k", now), (b"m", None)])
+        ),
+        Reply::Locked { reads: vec![] }
+    );
+    let held: Vec<(Vec<u8>, Intent)> = t
+        .held()
+        .iter()
+        .filter(|((_, of), _)| *of == txn(2))
+        .map(|((key, _), lock)| (key.clone(), lock.intent.clone()))
+        .collect();
+    assert_eq!(
+        held,
+        vec![
+            (b"k".to_vec(), Intent::Read),
+            (b"m".to_vec(), Intent::Read),
+            (b"w".to_vec(), Intent::Put(b"x".to_vec())),
+        ]
+    );
+    assert_eq!(
+        at(&mut t, lock_step(txn(3), &[], &[(b"m", b"y")], None)),
+        Reply::Conflict { key: b"m".to_vec() }
+    );
+    assert_eq!(
+        at(&mut t, lock_if(txn(4), &[(b"w", b"z")], &[(b"k", first)])),
+        Reply::Conflict { key: b"w".to_vec() }
+    );
+    assert_eq!(
+        at(&mut t, lock_if(txn(5), &[], &[(b"k", None)])),
+        Reply::Unmet {
+            key: b"k".to_vec(),
+            at: now
+        }
+    );
+}
+
 // ---- The simulator: groups in memory, steps carried with seeded latencies, losses and lateness,
 // the coordinator crashed and started again.
 
@@ -599,6 +732,7 @@ fn crash_once(
             (vec![1], Some(b"b".to_vec())),
             (vec![2], Some(b"c".to_vec())),
         ],
+        conds: Vec::new(),
     };
     let id = sim.begin(t).unwrap();
     let mut crashes = [crash, crash_again].into_iter().flatten().peekable();
@@ -685,6 +819,7 @@ fn fail_group_once(protocol: Protocol, group: GroupId, at: u64, land: bool) -> S
             (vec![1], Some(b"b".to_vec())),
             (vec![2], Some(b"c".to_vec())),
         ],
+        conds: Vec::new(),
     };
     let id = sim.begin(t).unwrap();
     let mut failed = false;
@@ -1137,6 +1272,7 @@ fn ac_t1_10_5_a_crash_after_every_resolution_landed_leaves_it_committed() {
                 .iter()
                 .map(|(k, v)| (k.clone(), Some(v.clone())))
                 .collect(),
+            conds: Vec::new(),
         };
         let id = sim.begin(t).unwrap();
         while !sim.answers.contains_key(&id) {

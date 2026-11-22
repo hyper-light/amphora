@@ -14,6 +14,8 @@
 //!   ([`crate::database::Database::open_backed_up`]).
 //! - [`restore()`]: the shell that restores a second.
 //! - [`restore_and_check`]: restores the newest whole second into a scratch file and checks it.
+//! - [`CheckPolicy`]: whether the shipping thread checks its archive: by default continuously, at
+//!   seconds drawn at random ([`Drills`]), within a budget derived from the machine ([`admit`]).
 //! - [`restore_cut`]: several groups restored to one second, cross-group transactions finished.
 //! - [`FolderBlobs`]: the store Amphora owns: a folder, local or a peer's over a mount.
 
@@ -22,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 mod check;
 mod cut;
+mod drill;
 mod folder;
 mod object;
 pub mod plan;
@@ -30,13 +33,17 @@ mod ship;
 mod shipping;
 
 pub use check::{
-    CHECK_METRIC, Check, CheckCounters, CheckFailure, RowDigest, check_due, digest, newest_second,
-    restore_and_check, restore_and_check_at,
+    CHECK_METRIC, Check, CheckCounters, CheckFailure, RowDigest, check_due, digest, digest_paced,
+    newest_second, restore_and_check, restore_and_check_at,
 };
 pub use cut::restore_cut;
+pub use drill::{
+    Budget, COST_METRIC, CheckPolicy, DEFER_METRIC, Deferred, DrillMeter, Drills, Foreground,
+    InFlight, Pace, Pacer, Stopped, Unpaced, Yield, admit, behind, device_ns, next_random,
+};
 pub use folder::FolderBlobs;
-pub use restore::{Restored, expire, restore};
-pub use ship::{BaseCopy, Shipped, Shipper};
+pub use restore::{Restored, expire, restore, restore_paced, restore_within};
+pub use ship::{BaseCopy, ChunkGrowth, Shipped, Shipper};
 pub(crate) use shipping::Prepared;
 pub use shipping::{Archive, Shipping, Status, system_clock};
 
@@ -46,6 +53,16 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// The nanoseconds of a second: what "any second" is counted in (AC-T1.12.1).
 pub const SECOND_NS: u64 = 1_000_000_000;
+
+/// The latest stamp in microseconds `state` has made or seen: its own, or a nanosecond stamp read
+/// up to the microsecond it ends.
+fn latest_micros(state: &MarkState) -> u64 {
+    state.micros.max(state.last.div_ceil(MICRO_NS))
+}
+
+/// The nanoseconds of a microsecond: the cross-group clock's unit, as [`Marks::next_micros`] reads
+/// this one (a unit, not a tuned number).
+pub const MICRO_NS: u64 = 1_000;
 
 /// The second a stamp falls in, counted as restore targets are: a commit stamped in
 /// `(s - 1, s]` seconds is in second `s`, so restoring to `s` keeps it.
@@ -73,6 +90,8 @@ struct MarkState {
     marks: VecDeque<Mark>,
     /// The latest stamp or drain: the next is later (a clock that steps back is held at it).
     last: u64,
+    /// The latest stamp in microseconds made or seen ([`Marks::next_micros`]): the next is later.
+    micros: u64,
     held_back: u64,
     merged: u64,
     /// The newest mark drained: a statement that commits nothing after it makes none.
@@ -195,9 +214,53 @@ impl Marks {
         Ok(())
     }
 
+    /// A stamp later than every one made or seen here, under the lock commits are stamped by: every
+    /// stamp after it is later still. On the writer, a Records revision's place in the order across
+    /// groups as its commit writes it, and the time through which a group has made every revision
+    /// it will (lane split-merge-18, T-T1.9.R20); the commit's own mark, made as it ends, is later.
+    pub fn next(&self) -> anyhow::Result<u64> {
+        let mut state = self.state()?;
+        Ok(self.stamp(&mut state))
+    }
+
     /// The latest stamp made or seen here: every commit stamped so far is at or before it.
     pub fn latest(&self) -> anyhow::Result<u64> {
         Ok(self.state()?.last)
+    }
+
+    /// [`Marks::next`] on the clock reads across groups and their commits are stamped by (lane
+    /// split-merge-21, T-T1.9.R28; Ada's decision of 2026-11-22): the cross-group hybrid logical
+    /// clock, in microseconds since the Unix epoch, the unit of the session tokens' times
+    /// (`Token::micros`) and of replicated groups' closed times. It is this clock read
+    /// a thousandth as finely, each stamp the clock's reading or one past the last microsecond
+    /// stamp made or seen, whichever is later: a hybrid logical clock in microseconds, strictly
+    /// rising here, kept beside the nanoseconds so a stamp spends none of the backup marks' (their
+    /// held-back count stays the clock's own steps back).
+    pub fn next_micros(&self) -> anyhow::Result<u64> {
+        let mut state = self.state()?;
+        let before = latest_micros(&state);
+        let micros = self
+            .stamp(&mut state)
+            .div_ceil(MICRO_NS)
+            .max(before.saturating_add(1));
+        state.micros = micros;
+        Ok(micros)
+    }
+
+    /// The latest stamp in microseconds made or seen here, the backup's nanosecond stamps among
+    /// them (so a step's carried stamp covers its commit, T-T1.12.X2): every one
+    /// [`Marks::next_micros`] makes from now on is later.
+    pub fn latest_micros(&self) -> anyhow::Result<u64> {
+        Ok(latest_micros(&*self.state()?))
+    }
+
+    /// [`Marks::observe`] of a stamp in microseconds: every stamp here from now on, in either
+    /// unit, is past the whole of that microsecond, so [`Marks::next_micros`] answers later.
+    pub fn observe_micros(&self, micros: u64) -> anyhow::Result<()> {
+        let mut state = self.state()?;
+        state.micros = state.micros.max(micros);
+        state.last = state.last.max(micros.saturating_mul(MICRO_NS));
+        Ok(())
     }
 
     /// Lines a reader's snapshot up with the commits' stamps (T-T1.12.C3): under the lock commits
@@ -374,6 +437,26 @@ mod tests {
         let now = Arc::new(AtomicU64::new(10 * SECOND_NS + 1));
         let read = Arc::clone(&now);
         (now, Arc::new(move || read.load(Ordering::SeqCst)))
+    }
+
+    /// T-T1.9.R28 (lane split-merge-21): the cross-group clock in microseconds. Do: a clock that
+    /// stands still; two stamps; a stamp a second ahead taken in; then the clock read in both units.
+    /// Expect: the stamps rise though the clock stood; the next after the one taken in is past it;
+    /// the backup's own nanosecond stamps are past it too.
+    #[test]
+    fn t_t1_9_r28_the_cross_group_clock_rises_in_microseconds() {
+        let (_now, clock) = clock();
+        let hooks = Hooks::new(clock, 100);
+        let first = hooks.marks.next_micros().unwrap();
+        let second = hooks.marks.next_micros().unwrap();
+        assert_eq!(first, 10 * SECOND_NS / MICRO_NS + 1);
+        assert!(second > first, "{second} after {first}");
+        let ahead = first + SECOND_NS / MICRO_NS;
+        hooks.marks.observe_micros(ahead).unwrap();
+        let third = hooks.marks.next_micros().unwrap();
+        assert!(third > ahead, "{third} after {ahead}");
+        assert!(hooks.marks.latest_micros().unwrap() >= third);
+        assert!(hooks.marks.next().unwrap() > ahead * MICRO_NS);
     }
 
     /// T-T1.12.P1: commits within a second keep one mark, its last; a new second a new mark.

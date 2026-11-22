@@ -481,9 +481,9 @@ tests = [
   { id = "T-T1.12.P10", text = "An archive object round-trips; a changed byte is refused" },
   { id = "T-T1.12.P11", text = "A log started again twice with no write between keeps its link whole; a restart forced before its frames were shipped, or one the fence wasn't told of, breaks it" },
   { id = "T-T1.12.P12", text = "A through mark makes the seconds after the last segment's whole through its time; one that doesn't end at a segment says nothing" },
-  { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7) passes on SimBlobs" },
+  { id = "AMPHORA-BLOBS", text = "The Blobs seam's conformance suite (AMPHORA-BLOBS-1 to 7 and 9) passes on SimBlobs" },
   # lane pitr-7
-  { id = "AMPHORA-BLOBS-8", text = "The folder store passes AMPHORA-BLOBS-1 to 7, keeps keys apart under case folding and path names, and answers random operations as SimBlobs does" },
+  { id = "AMPHORA-BLOBS-8", text = "The folder store passes AMPHORA-BLOBS-1 to 7 and 9, keeps keys apart under case folding and path names, and answers random operations as SimBlobs does" },
   { id = "T-T1.12.C1", text = "Restore-and-check on a folder passes at the newest whole second against the source's rows and fails naming the rows against rows that differ" },
   { id = "T-T1.12.C2", text = "A check is due at the first, at each new base, and once the log since the last check outweighs what it replayed" },
   { id = "T-T1.12.I1", text = "A second base keeps the first's unchanged chunks and copies the changed; seconds across both restore equal, and after the first expires too" },
@@ -494,6 +494,26 @@ tests = [
   { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
   { id = "T-T1.12.X2", text = "Cuts across two groups whose clocks differ by 5 seconds, under both protocols: both keys or neither at every cut, the carried clock taken out failing it" },
   { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
+  # lane backups-3: continuous restore drills (kiln goal 15580afd; backup.md "Continuous restore drills")
+  { id = "T-T1.12.C4", text = "With no scratch path given, the shipping thread checks its archive beside the database by default; the checks pass and leave no file behind" },
+  { id = "T-T1.12.C5", text = "A check begins only while the disk holds the restore and the log's growth; under one writer per core, with no checks, unpaced checks and paced checks, no check fails and checks pass once the load ends" },
+  { id = "T-T1.12.C6", text = "The drilled seconds are a uniform sample of every quiet snapshot, as many as the memory holds; an expired second is dropped, never picked again" },
+  # lane backups-4: paced checks and the drill after a load (kiln goal 15580afd; backup.md "Continuous restore drills")
+  { id = "T-T1.12.C7", text = "A paced check's step begins only while the database runs no call, woken by the call that ends last; the database's end stops it" },
+  { id = "T-T1.12.D3", text = "After a load from one writer per core, random seconds restore with every row equal to the rows recorded at them" },
+  # lane backups-6: a minimum share against yielding fully, event-driven; the peer store (kiln goal 15580afd; backup.md "Continuous restore drills", "The peer store")
+  { id = "T-T1.12.C8", text = "Checks wait on events, never timers; under a minimum share (a check's work over the retention period) a check behind it steps with calls in flight; a step costs its bytes at the fastest step of its kind over this check and the last; the replay and the integrity check pause in steps" },
+  { id = "T-T1.12.N1", text = "A peer store in another process on the same host: the seam's conformance suite passes through its client, and a database backed up to it restores every row through the client and from the peer's folder" },
+  # lane backups-7: a chunk's memory, charged to the budget and planned by the restore (kiln goal 15580afd; backup.md "A chunk's memory")
+  { id = "T-T1.12.M1", text = "A file far larger than the memory room is copied in chunks that each fit the copy stream's share of the budget, read and sealed; each chunk is charged while held and given back once put, refused typed while another use holds the room, and the restore is whole" },
+  { id = "AMPHORA-BLOBS-9", text = "A ranged get gives an object's bytes from an offset, a length at most, fewer where it ends sooner and none from its end on; a key with no object is refused NotFound: on SimBlobs, the folder store and the peer store" },
+  { id = "T-T1.12.M2", text = "A backup made under a large room restores whole under a small one, each chunk fetched in ranged parts that fit the restore's room, one held at a time, its sum checked over the parts; with no room a restore is refused, typed, before anything is written; an altered chunk is refused by its sum" },
+  # lane backups-8: a segment's memory, a lost create compared in parts, growing chunks (kiln goal 15580afd; backup.md "A segment's memory", "Growing chunks")
+  { id = "T-T1.12.M3", text = "Shipping bounds and charges each part of a segment by half its stream's share, a send without room refused typed before it writes and its commits shipped by the next round; a send carries the marks ready that leave its head room for a frame, the rest sent at once after, so a backlog of marks ships under a small room; a restore and a shipper opening read each segment in ranged parts of half their share, never whole, and a restore under a far smaller room than the segments is whole" },
+  { id = "T-T1.12.M4", text = "A create whose object already exists compares it in ranged parts its caller's charge covers, never read whole: the same is no error, a changed, shorter or longer object is refused" },
+  { id = "T-T1.12.M5", text = "A/B for a base's chunk size after the room grows: kept, the next base copies only changed chunks and a restore makes a request per chunk; grown (doubled while it fits), the next base copies the whole file and a restore makes fewer requests; both restore whole" },
+  # lane backups-9: a retried send's segments (kiln goal 15580afd; backup.md "A retried send")
+  { id = "T-T1.12.M6", text = "A send the store refused partway is sent again as it was, its same marks, through and parts, so each object it stored is made again the same; a restore covers overlapping segments once, the furthest-reaching at each first frame, and checks the frames where kept segments overlap agree with the log it wrote, refusing ones that differ" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
@@ -820,6 +840,23 @@ tests = [
   { id = "T-T1.9.R15", text = "One group measured by the shell with nothing written, after sixty-four keys are written, and again after — passes when the first has no load cut, the second has load above zero and a cut that counts each key on the side its position falls, the plan on two cores splits the group at that cut, and the third has no load" },
   { id = "T-T1.9.R16", text = "A split and a merge back, then a restart, the groups whose files are found asked of the node before and after — passes when only the retired group is named both times, never the group held nor an id never given out, and once its files are deleted every key still reads back from its group" },
   { id = "T-T1.9.R17", text = "Local databases as groups, one split by the driver, then measured by the shell — passes when each group's size is above zero" },
+  # lane split-merge-13
+  { id = "T-T1.9.R18", text = "Pulls over a network address under mutual TLS, then a client from another authority, a server from another authority and a server whose certificate names another node, then a database request at the network endpoint, and the LAN harness over two databases' network endpoints — passes when the pulls are answered, each stranger is refused with no pull served, the database request is refused, and the harness commits with no unknown outcome" },
+  # lane split-merge-15
+  { id = "T-T1.9.R19", text = "A local database made a group's, with one key, then eight, then more keys than one page of its position index holds — passes when it has no size cut with one key, and after that a cut with weight on each side and keys on each side of it, read from the index's root page alone" },
+  # lane split-merge-18
+  { id = "T-T1.9.R20", text = "Two backed-up groups, the second's clock 500 seconds behind the first's, rows written in turn through their coordinator, then read across groups — passes when the changes come in the order written, in pages of one alike, after a row's stamp the rows after it, the head at or past the last, a scan merged by key with more until its last page, a row written after the head stamped past it, and a group that stamps nothing refused" },
+  # lane split-merge-19
+  { id = "T-T1.9.R21", text = "One backed-up database, 600 commits each overwriting the next of 8 keys, compacted to the head after every 50 — passes when after each compaction every revision with a kept version is still stamped and the stamps number at most the kept revisions plus one" },
+  { id = "T-T1.9.R22", text = "Two backed-up groups, the second's clock 500 seconds behind the first's, a row written in the first, then the changes read at the earliest read point and at the latest — passes when the earliest misses the row with its head behind it, the latest holds it, and after each head the later rows are found and no change at or before it" },
+  { id = "T-T1.9.R23", text = "Two groups with revisions 1 to 3 each, stamped 10, 30, 50 and 20, 40, 60, the first's keys moved into the second, then the second's changes read by stamp, and the same keys moved without stamps into a third — passes when each moved row answers its own stamp, the changes interleave by stamp in pages alike, and the third's changes are refused naming the missing stamp" },
+  { id = "T-T1.9.R24", text = "Two backed-up groups, the second's clock 500 seconds behind the first's, a row written in each, then each key read across them, a key never written, a key as of before and at its stamp, and what changed after nothing, after the head and after a later write — passes when each row answers its stamp, the unwritten key and the key before its stamp none, the key at its stamp its row, and what changed the newest stamp, then none, then the later write's stamp past the head" },
+  { id = "T-T1.9.R25", text = "Two backed-up groups, a row written in the first, a wait across them after the head on its own thread while a row is written in the second, then a wait with a deadline and nothing written — passes when the first wait answers the second row's stamp past the head, as changed does, and the second is refused Timeout" },
+  # lane split-merge-20
+  { id = "T-T1.9.R26", text = "An old group writing a1, a2 and a1 again at stamps 10, 30, 50, a new one b1, b2, b3 at 20, 22, 24, the old group's keys moved into the new one, which then writes b1 at 70 and a2 at 80, then the new one scanned and read key by key as of 5, 15, 25, 35, 55, 75 and past every stamp, and as of 55 two at a time — passes when each read holds exactly the versions stamped at or before it, a moved row placed by its own stamp and never by its old group's revision number, each row answering its stamp, and the pages alike" },
+  { id = "T-T1.9.R27", text = "Under two-phase commit and Parallel Commits, two backed-up groups, rows written and read across them for their stamps, one written again, then commits across both conditioned on a row as of a stamp before its last write, on the stamps reads answered and a key absent, on a key absent that is there and on one present that never was, the same in one group, and a condition on a key-value row — passes when the stale condition aborts on its row with none of the commit's rows written, the held conditions commit, the absent and present ones abort on their keys, one group alike, and the key-value condition is refused" },
+  # lane split-merge-21
+  { id = "T-T1.9.R28", text = "Two backed-up groups, the second's clock 500 seconds behind, a transaction across them locking a row in each and resolved in the first at the latest stamp the groups answered, then each group read as of that stamp and the second as of the head before the locks, a scan across both as of the stamp begun before the second resolves, and a commit in the second after; and on the simulator's group one transaction resolved at one stamp in two groups — passes when the first group answers its row at the commit stamp, the second's read as of it is held by the lock and as of the earlier head isn't, the scan answers both rows at the one stamp and never one alone, the later commit is stamped after it, and in the simulator both keys carry the one stamp" },
 ]
 
 # lane qs5
@@ -1167,6 +1204,23 @@ tests = [
 # power-cut nemesis by seed range in both classes, a record a shard, merged with a coverage check;
 # records under bench/records/power-nemesis/<run>/. bench/repl_lab.sh runs the seeds and the
 # comparison set on three machines named as its arguments. The runs of record are the coordinator's.
+# lane repl-measure-7 (CP-T1.8, AC-T1.8.5): no new IDs. The nemesis's classes part at the raft log
+# (`the_classes_acknowledge_apart_under_a_held_flush`); bench/repl_members.sh runs each member its own
+# process on the machines it is given (`amphora-bench --repl-member`, system `amphora-procs`).
+# lane repl-measure-13 (CP-T1.8, AC-T1.8.2): no new IDs. bench/repl_ladder.sh runs the commit measure at
+# 1, 8, 32, 128, 512, 2048 and 4096 writers on one host, every system natively through one client:
+# Amphora's members as processes, the competitors from bench/servers/repl (release binaries
+# fetched by its setup.sh). Each record names its client, platform, system version and durability
+# (`about`) and the client's own use (`client_use`). The runs of record are the coordinator's.
+# lane repl-measure-14 (CP-T1.8, AC-T1.8.2): no new IDs. Each native competitor runs its strongest commit
+# durability, from its own source (cited in bench/servers/repl/<system>.sh): sqld at
+# durability_mode=strong, checked by `up`; rqlite and dqlite at their defaults (2 of 3 logs, fsynced);
+# libSQL and LiteFS can't wait for a replica, which their records' `durability` says.
+# lane repl-measure-15 (CP-T1.8, AC-T1.8.2): no new IDs. The competitors run one way, as processes from
+# bench/servers/repl (the container scripts are gone). The comparability rule is in the records: each
+# record's `about.column` is "quorum" or "primary only" (bench/src/repl.rs QUORUM; libSQL and LiteFS
+# are primary only), and bench/repl_ladder.sh's report keeps the two columns apart, never side by side
+# as equals (test g12_repl_columns_keep_primary_only_apart). dqlite's `up` refuses unless 3 of 3 vote.
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]
@@ -1249,4 +1303,33 @@ title = "Row skipping usable by real statements: bounds from parameters, a measu
 criteria = []
 tests = [
   { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
+]
+
+# lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,
+# "A refusal before the step")
+[[own]]
+id = "T1.10.R"
+title = "A step refused before it was taken is retried with the learned back-off, behind a switch whose control is today's"
+criteria = [
+  { id = "AC-T1.10.6", text = "Under OnRefused::Retry a step refused NotLeader or Full is sent again after the RFC 6298 timeout, doubled per refusal, within its deadline; under Stop it counts as lost; Cluster::counted gives refusals by kind, retries, held steps and transactions, stops and p50/p99/p99.9" },
+]
+tests = [
+  { id = "T-T1.10.R1", text = "xgroup::sql::sessions::ac_t1_10_6_refusals_before_a_step_retried_commit_and_the_control_aborts — passes when one group refusing three times and all three refusing twice commit with no stop under Retry, and abort under Stop, both protocols" },
+  { id = "T-T1.10.R2", text = "xgroup::sql::sessions::ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing — passes when a group failing at each of a session transaction's steps leaves its rows all written or none after recovery, equal to one group's, both protocols, both ends reached" },
+]
+
+# lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session
+# tokens"). Ada's order 2026-11-22: built behind ReadMode, today's read the control.
+[[own]]
+id = "RYW.1"
+title = "Read-your-writes on any replica by session tokens, behind a read-mode switch (CP-T1.10)"
+criteria = [
+  { id = "AC-T1.10.R1", text = "A write's acknowledgement gives its session a token (the group's time and the commit index, published before the answer); a read that carries it is served by any replica once that has applied it, never without the session's own write, under a lagging follower and across changes of leader" },
+  { id = "AC-T1.10.R2", text = "A token read waits only on the replica it asked, only while that replica is behind, woken by the owner's publication; past the replica's measured apply lag (or at once with none measured) it is redirected to the leader's read; a read without a token never waits for the log" },
+  { id = "AC-T1.10.R3", text = "ReadMode::Latest (today's read, the control) and ReadMode::Session answer alike for a session that carries its tokens; tokens order time first, in the cross-group coordinator's time domain" },
+]
+tests = [
+  { id = "T-T1.10.R1", text = "t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower: records to one follower lost while 2 is written; its token read waits (counted, the follower shown behind) and answers 1 and 2 once it rejoins; a read with no token answers at once" },
+  { id = "T-T1.10.R2", text = "t_t1_10_r2_a_behind_replica_with_no_lag_learned_redirects: a follower that applied nothing stamped redirects at once, counted; once caught up every member serves the token with the write" },
+  { id = "T-T1.10.R3", text = "t_t1_10_r3_a_session_reads_its_writes_across_leader_changes: clocks an hour apart, the lead passed 1, 2, 3, 1; each token orders after the last, every token read sees the session's writes, and once caught up every member equals the leader's state" },
 ]

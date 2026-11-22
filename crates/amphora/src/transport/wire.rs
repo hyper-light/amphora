@@ -20,7 +20,9 @@ pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
 /// LocalSession, a local read. 7: Request gained Pull and Answer Pulled, a node's half of a copy
 /// or catch-up batch for another node's new group (CP-T1.9; reshard.md, "Moves across nodes"). 8: Request gained
 /// Step and Answer Stepped, one step of a transaction across groups (CP-T1.10; xgroup.md, "Over the transport").
-pub(super) const VERSION: u32 = 8;
+/// 9: Request gained Blob and Answer Blob, a request to a peer's object store and its answer
+/// (CP-T1.12; backup.md, "The peer store").
+pub(super) const VERSION: u32 = 9;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Hello {
@@ -67,6 +69,54 @@ pub(super) enum Request {
         carried: u64,
         envelope: crate::xgroup::Envelope,
     },
+    // Appended: one request to a peer's object store (CP-T1.12; backup.md, "The peer store"),
+    // answered by a store's endpoint (`PeerStore`). Its sizes are held by the frame's bound.
+    Blob(BlobOp),
+}
+/// A request to a peer's object store: [`amphora_api::blobs::Blobs`]' calls, and its most.
+#[derive(Serialize, Deserialize)]
+pub(super) enum BlobOp {
+    ObjectMax,
+    Create {
+        key: String,
+        bytes: Vec<u8>,
+    },
+    Get(String),
+    List {
+        prefix: String,
+        after: Option<String>,
+        limit: u64,
+    },
+    Delete(String),
+    /// [`amphora_api::blobs::Blobs::get_range`]: appended after every earlier call (version 9 is
+    /// unreleased; lane backups-7).
+    GetRange {
+        key: String,
+        offset: u64,
+        len: u64,
+    },
+}
+/// A peer's object store's answer.
+#[derive(Serialize, Deserialize)]
+pub(super) enum BlobAnswer {
+    ObjectMax(u64),
+    Done,
+    Bytes(Vec<u8>),
+    Listing {
+        objects: Vec<(String, u64)>,
+        truncated: bool,
+    },
+}
+/// What a peer's object store refused, as [`amphora_api::blobs::BlobRefusal`] says it.
+#[derive(Serialize, Deserialize)]
+pub(super) enum BlobRefused {
+    Exists(String),
+    NotFound(String),
+    TooLarge { what: String, size: u64, limit: u64 },
+    Full { what: String, limit: u64 },
+    Invalid { what: String, why: String },
+    Timeout,
+    Unavailable(String),
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Record {
@@ -148,5 +198,7 @@ pub(super) enum Answer {
         reply: crate::xgroup::Reply,
         latest: Option<u64>,
     },
+    // Appended: a Blob's answer, the store's refusal typed as the seam says it.
+    Blob(Result<BlobAnswer, BlobRefused>),
 }
 pub(super) type Response = Result<Answer, Refusal>;

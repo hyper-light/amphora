@@ -5,6 +5,18 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **Read-your-writes by session tokens** (CP-T1.10, AC-T1.10.R1-R3, lane ryw-1; docs/design/replication.md):
+  `Database::session_token` after a write, and `Database::query_session(ReadMode, token, ..)`. `Latest` is today's read
+  (the control). `Session` serves a token read on any replica that has applied the token, waits only while that replica
+  is behind, and redirects past its measured apply lag. A read without a token never waits. `session_counters` holds the
+  instruments, and `amphora-bench --cluster --shapes ryw` runs the ladder. Waits on the coordinator: the A/B on
+  adacachy2, the power-cut case (after repl-measure-8's fix), and the overlay candidate (spec only).
+- **A refusal before a cross-group step** (CP-T1.10, AC-T1.10.6, lane xgroup-sql-4; docs/design/xgroup.md): `Options::on_refused`
+  retries a step a group refused before taking it (`NotLeader`, `Full`) after the learned RFC 6298 back-off, with today's
+  behaviour as the control; `Cluster::counted` gives the instruments. A group failing mid-commit is tested through a session
+  over real groups. Waits on the coordinator: which setting stays, from live runs; the LAN p99 and 10,000-seed runs.
+  At scale (lane xgroup-sql-5): `xgroup_lan refusals` runs Stop against Retry under many callers and correlated
+  refusals, one JSON line a run; the SQL hookup waits on a Database over Groups and a Tablet over the records tables.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
@@ -473,6 +485,30 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   for the log's next restart, one generation at most (T-T1.12.I4); cuts across machines: each
   cross-group step carries a hybrid logical clock, so a decision is stamped after the writes it
   decides whatever the nodes' clocks read (T-T1.12.X2).
+  Lane backups-3: restore checks are on by default (`backup::CheckPolicy`: off, scratch, continuous),
+  within a budget measured on the machine (idle time, free disk), at seconds drawn uniformly from
+  every quiet snapshot, every row compared, with deferral and cost instruments (T-T1.12.C4 to C6).
+  The restore benchmark against PostgreSQL+pgBackRest and SQLite+Litestream: `bench/backup_restore.sh`
+  (AC-T1.12.3; one tiny instance run, the measurement is the coordinator's).
+  Lane backups-6 (not yet built or run: written while kiln was down): Amphora's bench leg in three
+  processes, backup, restore and count, every leg timed the same way in one image (AC-T1.12.3);
+  checks that wait on events, never timers, counting the database's calls in flight, with a
+  minimum share (`CheckPolicy::Shared`) to A/B against yielding fully, the replay and the integrity
+  check pausing in steps (T-T1.12.C7, C8); the peer store, an archive in another process's folder
+  over the owner transport (`transport::PeerStore`, `PeerBlobs`; T-T1.12.N1).
+  Lane backups-7 (not yet built or run): a base's chunk is charged to the process's memory budget
+  while held and bounded by its stream's share of the room, not the whole room taken once; a
+  restore fetches each chunk in ranged parts that fit its own room (`Blobs::get_range`,
+  AMPHORA-BLOBS-9), so a backup made with more room restores with less (T-T1.12.M1, M2).
+  Lane backups-8 (not yet built or run): log segments charged and read in parts too, shipping's
+  bounded by its stream's share and a refused send's commits kept for the next round; a lost
+  create's object compared in parts (T-T1.12.M3, M4); an A/B of growing a base's chunks with the
+  room against keeping them (`ChunkGrowth`, T-T1.12.M5).
+  Lane backups-9 (not yet built or run): a send the store refused partway is sent again as it
+  was, so it makes the same objects, and a restore reads overlapping segments once and checks
+  where they overlap that they agree (`plan::cover`, T-T1.12.M6); a send carries only the marks
+  its room holds, so a backlog of marks ships (T-T1.12.M3); the rule for a base's end stated in
+  its tests (the latest that ended at or before the cut).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -555,10 +591,21 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (T-T1.9.R13). Load from the store's meter (lane split-merge-12): the shell measures each
   group's load (its writer's commit time) and where its writes fall, its size (a local database's
   pages in use) and the machine's cores, and the planner decides from them (T-T1.9.R14,
-  T-T1.9.R15, T-T1.9.R17). Left: that transport off loopback
-  (between machines), a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
+  T-T1.9.R15, T-T1.9.R17). Between machines (lane split-merge-13): a node's endpoint and a group's database owner listen at
+  a network address under the replicated transport's mutual TLS (T-T1.9.R18). Left: a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
   full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
-  them (T-T1.9.R16).
+  them (T-T1.9.R16). Size cut (lane split-merge-15): a group's size cut is its position index's middle key, read
+  from the index's root page alone (T-T1.9.R19). Reads across groups (lane split-merge-18): a database handed the groups'
+  coordinator scans, reads changes and heads across every group, each revision by its commit stamp (T-T1.9.R20). Compaction trims
+  the stamps with the revisions it drops, so the table stays bounded (lane split-merge-19, T-T1.9.R21). The read
+  point is an A/B behind `ReadPoint` (latest with a clock push, the control; earliest without), its lab written (T-T1.9.R22). A row moved in
+  carries its commit stamp, so scans and changes across groups place it (T-T1.9.R23). `get`, `changed` and `wait`
+  read across groups too, the wait woken by any group's change (T-T1.9.R24, T-T1.9.R25). A read as of an older stamp
+  places moved rows by their own stamps (lane split-merge-20, T-T1.9.R26), and a transaction across groups takes
+  conditions naming commit stamps, checked under its locks (T-T1.9.R27). One clock (lane split-merge-21, T-T1.9.R28):
+  stamps are the cross-group clock's microseconds, a transaction's rows take its one commit stamp in every group
+  (`Step::ResolveAt`), reads place rows by their own stamps and wait out a held lock whose stamp is at or before
+  theirs; `Records::commit` across groups waits on the coordinator sending that stamp (lane xgroup-sql-11).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -745,8 +792,8 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   --system amphora|rqlite|dqlite|litefs|libsql` gives commit latency p50/p99/p99.9 and throughput, the time from a
   leader kill to the first acknowledged write with the acknowledged events lost, and a member's time to catch up,
   every size and duration an input. Amphora's three members run in one process (a kill is a cut from the relay);
-  the competitors run as three-node container clusters through their scripts (dqlite and LiteFS through the bench's
-  Go shim). libSQL has no failover and dqlite no member-local read, so those are refused, typed, as is LiteFS's
+  the competitors run as three-node clusters of processes through their scripts (dqlite and LiteFS through the
+  bench's Go shim; lane repl-measure-15 removed the container scripts they first ran as). libSQL has no failover and dqlite no member-local read, so those are refused, typed, as is LiteFS's
   failover until its script runs a Consul lease (lane repl-measure-2: it does now; `bench/repl.sh RECORDS FLAGS...`
   runs every measure on every system, and all four clusters came up on jupiter). Closes with: the comparison set and Amphora's classes measured on
   adacachy, fedora and jupiter, best of 3, and Amphora's members across machines for the LAN p99.
@@ -757,6 +804,37 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   (bench/records/power-nemesis/2026-11-22-jupiter-tiny). `bench/repl_lab.sh RUN HOST1 HOST2 HOST3` splits the
   10,000 seeds a class across three named machines and runs the comparison set on each. Not yet: Amphora's
   members on three machines (the LAN p99); the harness runs them in one process.
+- **Replication measured: the classes part, members as processes** (CP-T1.8, AC-T1.8.5; lanes repl-measure-5 to 7):
+  the power-cut nemesis now holds each member's raft-log flushes as well as its database's, so the two classes
+  no longer count alike: the replicated class must answer some write while a majority's logs hold it unflushed,
+  the persisted class never (`the_classes_acknowledge_apart_under_a_held_flush`, and bench/power_nemesis.sh's
+  merge checks both counts). `amphora-bench --repl-member` runs one member as its own process, its records to
+  its peers over TCP; `bench/repl_members.sh RECORDS CLASS HOST1:PORT HOST2:PORT HOST3:PORT FLAGS...` starts
+  the three (here, or by ssh) and runs every measure as `amphora-procs-CLASS` (tiny run: three processes on
+  jupiter). The competitors' scripts take AMPHORA_BENCH_REPL_NAME and AMPHORA_BENCH_REPL_PORT, so runs sharing
+  a host keep their own nodes. A member's kill is still the cut, not its process killed.
+- **Replication measured: the fair commit ladder** (CP-T1.8, AC-T1.8.2; lane repl-measure-13): written, not yet
+  compiled or run. The earlier compare ran Amphora natively and its competitors in containers, so it doesn't stand.
+  `bench/repl_ladder.sh RECORDS FLAGS...` runs the commit measure at 1, 8, 32, 128, 512, 2048 and 4096 writers on
+  one host, every system as processes through the same driver: Amphora's members (persisted and replicated),
+  rqlite, dqlite, libSQL and LiteFS from `bench/servers/repl` (`setup.sh` fetches their release binaries
+  into ~/.cache). Each record names its client, platform, versions and durability, and the client's CPU, memory
+  and sockets. The HTTP client now keeps a connection a writer to each node; ureq's default of 3 a host had
+  cost the competitors a new connection on most writes.
+- **Replication measured: each competitor at its strongest commit durability** (CP-T1.8, AC-T1.8.2; lane
+  repl-measure-14): written, not yet run. From each system's own source (cited in its script): rqlite's
+  and dqlite's defaults already acknowledge once 2 of 3 Raft logs hold a commit, fsynced, and offer nothing
+  stronger. sqld's default (durability_mode relaxed, synchronous=NORMAL) doesn't fsync at commit; the cluster
+  now runs it at strong (FULL) and refuses to come up otherwise. libSQL and LiteFS replicate asynchronously
+  with no mode that waits for a replica, so they can't match 2 of 3: their records say one member's disk.
+  Bring-up waits on each process's own ready line, followed as the log grows, with two minutes as the give-up
+  (no 50 ms poll). setup.sh pairs go-dqlite with the libdqlite it builds against (v3 for 1.17+, v1.22.0 below).
+- **Replication measured: libSQL and LiteFS in a column of their own** (CP-T1.8, AC-T1.8.2; lane
+  repl-measure-15): written, not yet run. Every record's `about.column` says whether a commit waited for a
+  quorum or only the primary, and the ladder's report prints the primary-only systems (libSQL, LiteFS) in their
+  own table and column group, never beside the quorum systems as equals. The container scripts are gone: the
+  competitors run only as processes from `bench/servers/repl` (Linux). dqlite's cluster refuses to come up
+  unless all three members vote.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
@@ -1069,3 +1147,29 @@ by measured cost and a SQL switch (executor.md decision 11, "Not yet").
 Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
 11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
 skip (T-SKU.1).
+
+Replicated Amphora's reliability fixes (lane roster-fixes, kiln goal ab3aedaf; the 2026-11-06 roster):
+every fix is on main (election flake, disk stalls, membership and floor, fast-ack with class quorum and
+metrics, the replica log and its bound, local reads with the derived reader bound, the persisted flush
+off the owner, the class stated once, prepared statements validated once, owner guards, the WAL's small
+commits). Their benchmarks against the commit before each have harnesses: `bench/owner_stalls_ab.sh`
+(leader changes and owner stalls around the persisted flush, AC-T1.8.D2) and `bench/commits_ab.sh`
+(amphora-bench at two commits, ABBA: finding 4's `--sql-api` with Linux CPU time, and the bulk
+statements with the bytes of log they leave). The runs of record are the coordinator's. amphora-bench
+does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` runs only at commits where it does.
+
+- **Amphora on its own across three machines (CP-T1.13, lane production-1, 2026-11-22):**
+  `amphora serve CONFIG` runs one member of a replicated database as a server, its peers and
+  clients over TCP, each connection proving the cluster's secret (HMAC-SHA256 over a challenge);
+  it reopens on its own data, so a killed member rejoins. `amphora health` checks every member
+  (one leader, the configured voters, none fenced); `scripts/cluster.sh` installs each member as a
+  systemd user unit or a LaunchAgent named amphora-member-N, nothing of kiln's touched;
+  `scripts/drills.sh` runs the kill, split and stall drills under load and counts acknowledged
+  writes on every member (`amphora drill load|check`, AC-T1.13.5). The replica's host now waits
+  for its next record (`ReplicaHandle::drain_wait`) instead of spinning. docs/runbook.md. Not done:
+  the drills of record across three machines, an encrypted link, and kiln opening these members
+  (its seam's client). Lane production-2: the serve test's open timeout was the test's own (one
+  process's opens take turns under its owner table; members now start one after another);
+  `amphora member CONFIG add|promote|demote|remove N` with a config `voters` key (spares start as
+  learners); the region-lost drill replaces a lost member with a spare. Mutual TLS waits on the
+  split-merge listener's TLS landing on t1/group-replication.

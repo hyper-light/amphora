@@ -5,10 +5,15 @@ mod auth;
 mod bounded;
 mod common;
 mod endpoint;
+pub mod network;
+mod peer;
 mod watch;
 mod wire;
 pub use common::{Client, Namespace, Node, Nodes, Owner};
 pub(crate) use endpoint::try_lease;
+pub use peer::{PeerBlobs, PeerStore};
+#[cfg(test)]
+pub(crate) use endpoint::wait_lease;
 pub use watch::Watch;
 
 /// The transport tests' hang guard, measured: twenty times the slowest whole run of any transport

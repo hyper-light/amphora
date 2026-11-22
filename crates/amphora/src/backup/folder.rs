@@ -16,7 +16,7 @@
 //! fsync() on a file descriptor for the directory is also needed").
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -297,6 +297,39 @@ impl Blobs for FolderBlobs {
         Ok(bytes)
     }
 
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, BlobRefusal> {
+        expired(until)?;
+        let (dirs, file) = Self::names(key)?;
+        let path = self.dir_of(&dirs).join(file);
+        let mut handle = match File::open(&path) {
+            Ok(handle) => handle,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(BlobRefusal::NotFound(key.into()));
+            }
+            Err(e) => return Err(unavailable(&path, &e)),
+        };
+        let size = handle.metadata().map_err(|e| unavailable(&path, &e))?.len();
+        let from = offset.min(size);
+        let take = size
+            .saturating_sub(from)
+            .min(u64::try_from(len).unwrap_or(u64::MAX));
+        handle
+            .seek(SeekFrom::Start(from))
+            .map_err(|e| unavailable(&path, &e))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(take).unwrap_or(0));
+        handle
+            .take(take)
+            .read_to_end(&mut bytes)
+            .map_err(|e| unavailable(&path, &e))?;
+        Ok(bytes)
+    }
+
     fn list(
         &self,
         prefix: &str,
@@ -412,7 +445,7 @@ mod tests {
         Instant::now() + Duration::from_secs(60)
     }
 
-    /// AMPHORA-BLOBS-1 to 7: the folder store passes the seam's conformance suite, and leaves
+    /// AMPHORA-BLOBS-1 to 7 and 9: the folder store passes the seam's conformance suite, and leaves
     /// nothing behind.
     #[test]
     fn amphora_blobs_conformance_on_a_folder() {
