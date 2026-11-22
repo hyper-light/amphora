@@ -1649,18 +1649,14 @@ mod inproc {
 
 /// Amphora as its own server (`amphora serve`, CP-T1.13), one member a node, brought up and down by
 /// bench/servers/scale/amphora.sh as CockroachDB's and TiDB's are by theirs, and reached over TCP by
-/// the server's client protocol: a connection opens with `C`, answers the member's challenge with
-/// HMAC-SHA256(secret, challenge || `C`) (RFC 2104), then sends one request a line (`exec SQL`,
-/// `count SQL`, `status`) and reads one answer a line (`ok ...` or `err ...`). The server serves one
+/// the server's own client (`amphora::serve::Client`, one code path with the server's): one request a
+/// line (`exec SQL`, `count SQL`, `status`), one answer a line (`ok ...` or `err ...`). The server serves one
 /// replicated database: `--groups` takes 1. A write goes to the member that leads (a member's
 /// `status` names it), as a client of a single-leader database sends it; a refused one is sent again
 /// by the bench's closed loop after the leader is asked again.
 mod served {
     use super::*;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
+    use amphora::serve::Client as Link;
 
     const EVENTS: &str = "CREATE TABLE IF NOT EXISTS events(session TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(session, seq))";
 
@@ -1669,54 +1665,6 @@ mod served {
         /// Each node's address and the cluster's secret.
         members: Vec<(String, Vec<u8>)>,
         deadline: Duration,
-    }
-
-    /// One client connection to one member.
-    struct Link {
-        r: BufReader<TcpStream>,
-        w: TcpStream,
-    }
-
-    impl Link {
-        fn open(addr: &str, secret: &[u8], deadline: Duration) -> anyhow::Result<Self> {
-            let to = addr
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("{addr} names no address"))?;
-            let s = TcpStream::connect_timeout(&to, deadline)?;
-            s.set_nodelay(true)?;
-            s.set_read_timeout(Some(deadline))?;
-            s.set_write_timeout(Some(deadline))?;
-            let mut w = s.try_clone()?;
-            let mut r = BufReader::new(s);
-            w.write_all(b"C")?;
-            let mut nonce = [0u8; 32];
-            r.read_exact(&mut nonce)?;
-            let mut tag = <Hmac<Sha256> as Mac>::new_from_slice(secret)
-                .map_err(|e| anyhow::anyhow!("the secret as a key: {e}"))?;
-            tag.update(&nonce);
-            tag.update(b"C");
-            w.write_all(&tag.finalize().into_bytes())?;
-            Ok(Self { r, w })
-        }
-
-        /// One request, its answer's text past `ok`; an `err` answer is the error.
-        fn ask(&mut self, line: &str) -> anyhow::Result<String> {
-            anyhow::ensure!(!line.contains(['\n', '\r']), "a request is one line");
-            self.w.write_all(line.as_bytes())?;
-            self.w.write_all(b"\n")?;
-            let mut answer = String::new();
-            anyhow::ensure!(
-                self.r.read_line(&mut answer)? > 0,
-                "the member closed the connection"
-            );
-            let answer = answer.trim_end_matches(['\r', '\n']);
-            match answer.split_once(' ').unwrap_or((answer, "")) {
-                ("ok", rest) => Ok(rest.to_owned()),
-                ("err", why) => anyhow::bail!("{why}"),
-                _ => anyhow::bail!("an answer neither ok nor err: {answer}"),
-            }
-        }
     }
 
     /// A SQL text literal.
@@ -1771,7 +1719,7 @@ mod served {
                 .members
                 .get(node)
                 .ok_or_else(|| anyhow::anyhow!("no node {node}"))?;
-            Link::open(addr, secret, self.deadline)
+            Link::connect(addr, secret, self.deadline)
         }
 
         /// The node that leads, as node `via` names it.
