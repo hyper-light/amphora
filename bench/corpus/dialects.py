@@ -501,10 +501,28 @@ def _declared_class(kind):
 
 class Context:
     """What translate() needs of the file around a record: the tables defined once it has run, and
-    those it creates (by upper-cased name), their columns typed by what the whole file writes."""
+    those it creates (by upper-cased name), their columns typed by what the whole file writes; and
+    whether PRAGMA case_sensitive_like is on when it runs (liked())."""
 
-    def __init__(self, tables=None, created=None):
-        self.tables, self.created = tables or {}, created or {}
+    def __init__(self, tables=None, created=None, case_sensitive_like=False):
+        self.tables, self.created, self.case_sensitive_like = tables or {}, created or {}, case_sensitive_like
+
+
+def _pragma_set(e, name):
+    """The boolean `PRAGMA [schema.]<name> = value` sets, or None when `e` isn't one. SQLite's
+    "PRAGMA Statements" (https://www.sqlite.org/pragma.html): "A boolean value ... 1 yes true on
+    ... 0 no false off"."""
+    from sqlglot import exp
+
+    if not isinstance(e, exp.Pragma) or not isinstance(e.this, exp.EQ):
+        return None
+    target, value = e.this.this, e.this.expression
+    if (target.expression if isinstance(target, exp.Dot) else target).name.lower() != name:
+        return None
+    if isinstance(value, exp.Boolean):
+        return value.this
+    word = value.name.lower() if isinstance(value, (exp.Literal, exp.Var, exp.Column, exp.Identifier)) else ""
+    return True if word in ("1", "yes", "true", "on") else False if word in ("0", "no", "false", "off") else None
 
 
 def _number_class(text, negative=False):
@@ -632,7 +650,7 @@ def contexts(records):
     import sqlglot
     from sqlglot import exp
 
-    tables, out = {}, []
+    tables, out, case_sensitive_like = {}, [], False
     for r in records:
         created = {}
         try:
@@ -655,7 +673,9 @@ def contexts(records):
                 tables.pop(e.this.name.upper(), None)
             elif isinstance(e, (exp.Insert, exp.Update)):
                 _writes(e, tables)
-        out.append(Context(dict(tables), created))
+            elif _pragma_set(e, "case_sensitive_like") is not None:
+                case_sensitive_like = _pragma_set(e, "case_sensitive_like")
+        out.append(Context(dict(tables), created, case_sensitive_like))
     return out
 
 
@@ -876,6 +896,60 @@ def keyed(expression, dialect):
 MYSQL_COLLATIONS = {"BINARY": "utf8mb4_0900_bin", "NOCASE": "utf8mb4_0900_as_ci", "RTRIM": "utf8mb4_bin"}
 
 
+_ASCII_UPPER, _ASCII_LOWER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+
+
+def liked(expression, context, dialect):
+    """`expression` with each LIKE said as SQLite's. SQLite's "The LIKE, GLOB, REGEXP, MATCH, and
+    extract operators" (https://www.sqlite.org/lang_expr.html#the_like_glob_regexp_match_and_extract_operators):
+    - "Any other character matches itself or its lower/upper case equivalent (i.e. case-insensitive
+      matching). Important Note: SQLite only understands upper/lower case for ASCII characters by
+      default", unless PRAGMA case_sensitive_like is on (pragma.html#pragma_case_sensitive_like),
+      where DuckDB's, PostgreSQL's and ClickHouse's LIKE are case-sensitive always. So there, unless
+      the pragma is on, both sides are given ASCII's case folded and nothing else: translate(x,
+      'A..Z', 'a..z') (PostgreSQL's manual, 9.4 "String Functions": translate "Replaces each
+      character in string that matches a character in the from set with the corresponding
+      character in the to set"; DuckDB's and ClickHouse's translate the same). An ESCAPE that is an
+      ASCII letter would be folded with the pattern, so means otherwise: not expressible. MySQL's
+      LIKE compares by its collation, case-insensitively by default (utf8mb4_0900_ai_ci, which also
+      folds accents and letters beyond ASCII): left as it is, a difference of the engine, as
+      MYSQL_COLLATIONS' NOCASE is.
+    - "the optional ESCAPE clause ... If the ESCAPE clause is used, the escape character ..."; without
+      one there is none, where PostgreSQL's and MySQL's LIKE take a backslash as one by default
+      (PostgreSQL 9.7.1: "The default escape character is the backslash but a different one can be
+      selected by using the ESCAPE clause. It's also possible to select no escape character by
+      writing ESCAPE ''"; MySQL 8.4 14.8.1: "The escape sequence should be one character long to
+      specify the escape character, or empty to specify that no escape character is used"), as
+      ClickHouse's does with no ESCAPE clause at all (its "String Search Functions", like: "use the
+      backslash (\\) for escaping metasymbols"). So PostgreSQL and MySQL are given ESCAPE '', and
+      ClickHouse the pattern with each backslash doubled (replaceAll). DuckDB's LIKE has no default
+      escape character, as SQLite's."""
+    from sqlglot import exp
+
+    def fold(e):
+        return exp.Anonymous(this="translate", expressions=[e, exp.Literal.string(_ASCII_UPPER), exp.Literal.string(_ASCII_LOWER)])
+
+    for like in list(expression.find_all(exp.Like)):
+        escape = like.parent if isinstance(like.parent, exp.Escape) and like.parent.this is like else None
+        if dialect in ("duckdb", "postgres", "clickhouse") and not context.case_sensitive_like:
+            mark = escape.expression if escape is not None else None
+            if mark is not None and not (isinstance(mark, exp.Literal) and mark.is_string and not (len(mark.this) == 1 and mark.this in _ASCII_UPPER + _ASCII_LOWER)):
+                raise NotExpressible(f"not expressible in {dialect}: LIKE with an ESCAPE that is an ASCII letter or not a string literal, which folding the pattern's case (SQLite's LIKE is case-insensitive for ASCII, lang_expr.html) would change")
+            like.set("this", fold(like.this))
+            like.set("expression", fold(like.expression))
+        if escape is not None:
+            continue
+        if dialect in ("postgres", "mysql"):
+            said = exp.Escape(this=like.copy(), expression=exp.Literal.string(""))
+            if like is expression:
+                expression = said
+            else:
+                like.replace(said)
+        elif dialect == "clickhouse":
+            like.set("expression", exp.Anonymous(this="replaceAll", expressions=[like.expression, exp.Literal.string("\\"), exp.Literal.string("\\\\")]))
+    return expression
+
+
 def extremes(expression, dialect):
     """`expression` with each multi-argument max() and min() said as the dialect's GREATEST and LEAST
     with SQLite's NULL. SQLite's "Built-In Scalar SQL Functions" (https://www.sqlite.org/lang_corefunc.html#max_scalar):
@@ -1075,7 +1149,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(extremes(keyed(typed(divided(e, context or Context(), dialect), context, dialect), dialect), dialect), dialect)
+            e = spoken(extremes(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:

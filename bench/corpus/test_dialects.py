@@ -459,5 +459,45 @@ class ScalarExtremes(unittest.TestCase):
         self.assertIn("random()", why)
 
 
+class Like(unittest.TestCase):
+    """Do: SQLite's LIKE and like(): ASCII letters of another case, a backslash without an ESCAPE,
+    an ESCAPE, NULL, and PRAGMA case_sensitive_like on. Expect: DuckDB (when its Python module is
+    here) gives what SQLite gives for each; PostgreSQL and MySQL get ESCAPE '', ClickHouse its
+    pattern's backslashes doubled; an ESCAPE that is a letter not expressible where case is folded."""
+
+    CASES = ["'abc' LIKE 'A%'", "like('A%', 'abc')", "like('ab', 'AB')", "like('a\\%', 'a%')", "'a\\b' LIKE 'a\\b'", "'a%' LIKE 'a!%' ESCAPE '!'", "'ab' LIKE 'a!_' ESCAPE '!'", "NULL LIKE 'a'", "'É' LIKE 'é'", "'x' NOT LIKE 'X'"]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                want = db.execute(f"SELECT {case}").fetchone()[0]
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                got = duckdb.sql(out).fetchone()[0]
+                self.assertEqual(None if got is None else int(got), want)
+
+    def test_escapes_and_case(self):
+        self.assertTrue(dialects.translate("SELECT a LIKE 'x%' FROM t", "postgres")[0].endswith("ESCAPE '' FROM t"))
+        self.assertEqual(dialects.translate("SELECT a LIKE 'x%' FROM t", "mysql"), ("SELECT a LIKE 'x%' ESCAPE '' FROM t", None))
+        self.assertIn("replaceAll(", dialects.translate("SELECT a LIKE 'x%' FROM t", "clickhouse")[0])
+        self.assertNotIn("ESCAPE ''", dialects.translate("SELECT a LIKE 'x!%' ESCAPE '!' FROM t", "postgres")[0])
+        for d in ("duckdb", "postgres", "clickhouse"):
+            with self.subTest(dialect=d):
+                self.assertIn("ASCII letter", dialects.translate("SELECT 'a%' LIKE 'aA%' ESCAPE 'A'", d)[1])
+
+    def test_case_sensitive_like_pragma(self):
+        """Do: LIKE before and after PRAGMA case_sensitive_like = on, then off. Expect: folded,
+        not folded, folded."""
+        out = file_in(["SELECT 'a' LIKE 'A'", "PRAGMA case_sensitive_like = on", "SELECT 'a' LIKE 'A'", "PRAGMA main.case_sensitive_like = 0", "SELECT 'a' LIKE 'A'"], "duckdb")
+        self.assertEqual(["TRANSLATE" in (o[0] or "") for o in (out[0], out[2], out[4])], [True, False, True])
+
+
 if __name__ == "__main__":
     unittest.main()
