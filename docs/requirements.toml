@@ -367,6 +367,13 @@ criteria = [
 tests = [
   { id = "T-PL.8.1", text = "The audit's 03-right-full-barrier — passes when the RIGHT JOIN reads tiny first (total_cost 23,007.0 where it is 328,300,039,000.3)" },
   { id = "T-PL.8.2", text = "Outer, semi and anti joins reordered by the conflict detector, against SQLite's answers — passes when every answer is unchanged" },
+  # lane pl8-15: the IDs lanes pl8-10 to pl8-14 cite in code. T-PL.8.2 also gains
+  # bushy_search_tests' corner test (simulator feature: the bushy plan at every corner of the
+  # weights' range) and passes only when t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest
+  # passes 20 of 20 copies run at once.
+  { id = "T-PL.8.3", text = "tests/join_search_budget.rs t_pl_8_3_every_budget_rule_gives_the_controls_answers — passes when every scenario, under every join search budget rule, answers run by run as the control does" },
+  { id = "T-PL.8.6", text = "learned_costs::tests::t_pl_8_6_* — passes when a learned weight moves only for a batch whose mean sits past the spread between batch means times Student's t at the eight kinds' Bonferroni-corrected two-sided 95% level (a burst within that spread, one batch beside another, or one observation alone moves nothing), Student's t matches its published tables, and its expansion in 1/nu takes over only where it is exact to an f64" },
+  { id = "T-PL.8.7", text = "tests/join_search_budget.rs t_pl_8_7_a_join_of_100_tables_plans_and_answers — passes when a join of 100 tables plans by cost and as nested loops and both give the chain's one row" },
 ]
 
 [[own]]
