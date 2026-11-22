@@ -1269,10 +1269,18 @@ impl ReplicaHandle {
         })
     }
 
-    /// Takes at most `limit` messages. An undrained host eventually fences explicitly at the
-    /// egress bound; the actor never acknowledges a send the host has not taken.
+    /// The most records this member's outgoing queue holds (the owner fences rather than queue
+    /// one more), and so the most one [`Self::drain`] takes: a host that drains at it empties the
+    /// queue each call, with no count of its own to pick (lane ryw-6, kiln goal 8119f25d).
+    pub fn outgoing_bound(&self) -> usize {
+        OUTGOING_MESSAGES
+    }
+
+    /// Takes at most `limit` messages, `limit` no more than [`Self::outgoing_bound`]. An undrained
+    /// host eventually fences explicitly at the egress bound; the actor never acknowledges a send
+    /// the host has not taken.
     pub fn drain(&self, limit: usize) -> Result<Vec<Outbound>, Refusal> {
-        api::bound("replica drain count", limit, OUTGOING_MESSAGES)?;
+        api::bound("replica drain count", limit, self.outgoing_bound())?;
         let mut outgoing = locked(&self.shared.outgoing)?;
         if outgoing.messages.is_empty()
             && let Err(error) = &*locked(&self.shared.status)?
@@ -4307,6 +4315,48 @@ mod tests {
             client.handle().drain(OUTGOING_MESSAGES + 1),
             Err(Refusal::TooLarge { .. })
         ));
+    }
+
+    /// Lane ryw-6 (kiln goal 8119f25d): a host that drains at the handle's bound, as the bench's
+    /// relay does, takes the whole outgoing queue in one call, however full the member can make
+    /// it, and needs no count of its own. Do: a member's queue filled to the most it holds (the
+    /// owner fences rather than queue one more); one drain at `outgoing_bound`; one drain past
+    /// it. Expect: every record taken in order, none left and no bytes charged; past the bound
+    /// refused TooLarge.
+    #[test]
+    fn a_drain_at_the_queues_bound_takes_the_whole_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
+        let handle = client.handle();
+        {
+            let mut outgoing = locked(&handle.shared.outgoing).unwrap();
+            while outgoing.messages.len() < OUTGOING_MESSAGES {
+                let n = u8::try_from(outgoing.messages.len() % 251).unwrap();
+                outgoing.bytes += 1;
+                outgoing.messages.push_back(Outbound {
+                    to: 2,
+                    bytes: vec![n],
+                });
+            }
+        }
+        let drained = handle.drain(handle.outgoing_bound()).unwrap();
+        assert_eq!(drained.len(), OUTGOING_MESSAGES);
+        assert!(
+            drained
+                .iter()
+                .enumerate()
+                .all(|(i, record)| record.bytes == [u8::try_from(i % 251).unwrap()])
+        );
+        let outgoing = locked(&handle.shared.outgoing).unwrap();
+        assert!(outgoing.messages.is_empty());
+        assert_eq!(outgoing.bytes, 0);
+        drop(outgoing);
+        assert!(matches!(
+            handle.drain(handle.outgoing_bound() + 1),
+            Err(Refusal::TooLarge { .. })
+        ));
+        drop(driven);
     }
 
     /// CP-T1.8 on driven time: admitted application calls cannot consume replication's reserved
