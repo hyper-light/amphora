@@ -6,9 +6,11 @@
 //! the log's rate and the store's put time. It ships through a reader on the writer's engine, so
 //! the writer never waits on the store. When the database ends it ships once more and ends.
 //!
-//! Given a scratch path ([`Archive::check`]) it restores and checks its own archive on the
-//! archive's cadence ([`super::check_due`]): against the source's rows at a second, digested from a
+//! It restores and checks its own archive on the archive's cadence ([`super::check_due`]), as
+//! [`Archive::check`] says ([`CheckPolicy`]): against the source's rows at a second, digested from a
 //! reader whose snapshot lines up with that second's last commit ([`super::Marks::quiet_second`]).
+//! By default ([`CheckPolicy::Continuous`]) the second is drawn at random from those it holds the
+//! rows of ([`Drills`]), and a check runs only within the budget [`admit`] derives from the machine.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
@@ -17,9 +19,11 @@ use std::time::{Duration, Instant};
 
 use amphora_api::blobs::Blobs;
 
+use super::ship::FRAME_BYTES;
 use super::{
-    BaseCopy, Check, CheckCounters, Clock, Hooks, RowDigest, Shipped, Shipper, check_due, digest,
-    newest_second, plan, restore_and_check_at,
+    BaseCopy, Budget, Check, CheckCounters, CheckPolicy, Clock, DrillMeter, Drills, Hooks,
+    RowDigest, Shipped, Shipper, admit, check_due, digest, newest_second, next_random, plan,
+    restore_and_check_at,
 };
 use crate::db::Db;
 use crate::store::Watcher;
@@ -39,10 +43,10 @@ pub struct Archive {
     /// at the next commit. The caller states it, as the store's own answer time is the caller's
     /// to know (Needs Ada's word: no measured default yet).
     pub patience: Duration,
-    /// Where the thread restores its archive to check it (T-T1.12.C3): a new file there each
-    /// check, removed once it passes and kept on a failure to look into. None: no checks. The
-    /// caller's, as the restore takes as much disk as the database.
-    pub check: Option<PathBuf>,
+    /// Whether and where the thread restores its archive to check it (T-T1.12.C3, C4): a new file
+    /// each check, removed once it passes and kept on a failure to look into. By default
+    /// ([`CheckPolicy::Continuous`]) beside the database, within the machine's budget.
+    pub check: CheckPolicy,
 }
 
 /// Nanoseconds since the Unix epoch by the system's clock: 0 before the epoch, the most a `u64`
@@ -79,6 +83,7 @@ pub struct Status {
 pub struct Shipping {
     status: Arc<(Mutex<Status>, Condvar)>,
     counters: Arc<CheckCounters>,
+    meter: Arc<DrillMeter>,
 }
 
 impl Shipping {
@@ -93,6 +98,13 @@ impl Shipping {
     #[must_use]
     pub fn checks(&self) -> &CheckCounters {
         &self.counters
+    }
+
+    /// What the drills measured: deferrals by reason ([`super::DEFER_METRIC`]), each check's cost
+    /// ([`super::COST_METRIC`]), the thread's idle time.
+    #[must_use]
+    pub fn drills(&self) -> &DrillMeter {
+        &self.meter
     }
 
     /// What the thread has done so far.
@@ -138,10 +150,44 @@ pub(crate) struct Prepared {
     checker: Option<Db>,
     counters: Arc<CheckCounters>,
     /// The latest check's base and the log it replayed, the log shipped since
-    /// ([`super::check_due`]), and a quiet snapshot's second and rows waiting to be checked.
+    /// ([`super::check_due`]), and a quiet snapshot's second, rows and base waiting to be checked.
     last_check: Option<(u64, u64)>,
     log_since_check: u64,
-    pending_check: Option<(u64, RowDigest)>,
+    pending_check: Option<(u64, RowDigest, u64)>,
+    /// Where checks restore to ([`Archive::check`]), and whether within the budget, at drilled
+    /// seconds ([`CheckPolicy::Continuous`]).
+    scratch: Option<PathBuf>,
+    continuous: bool,
+    /// The database's file, whose size (with its log's) a restore writes.
+    source: PathBuf,
+    meter: Arc<DrillMeter>,
+    drills: Drills,
+    random: u64,
+    /// The thread's idle time since the last check ended, what that check cost, and what the
+    /// pending check's digest cost ([`admit`]).
+    idle_since_check: u64,
+    last_cost: Option<u64>,
+    pending_cost: u64,
+}
+
+fn elapsed_ns(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// `path` with `suffix` after its name.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// A file's length; 0 when it isn't there.
+fn file_len(path: &Path) -> anyhow::Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
 }
 
 impl Prepared {
@@ -150,17 +196,27 @@ impl Prepared {
         Arc::clone(&self.hooks)
     }
 
-    /// Backs `db`, the writer, up to `archive`: its commits stamped from now on, its log started
-    /// again only once shipped ([`Db::back_up`]), and a shipper carrying on from what the archive
-    /// holds, on a reader of the same engine.
-    pub(crate) fn on(db: &mut Db, archive: Archive, until: Instant) -> anyhow::Result<Self> {
+    /// Backs `db`, the writer of the database at `path`, up to `archive`: its commits stamped from
+    /// now on, its log started again only once shipped ([`Db::back_up`]), and a shipper carrying
+    /// on from what the archive holds, on a reader of the same engine.
+    pub(crate) fn on(
+        db: &mut Db,
+        path: &Path,
+        archive: Archive,
+        until: Instant,
+    ) -> anyhow::Result<Self> {
         let hooks = Hooks::new(Arc::clone(&archive.clock), db.log_kept_frames());
         db.back_up(Arc::clone(&hooks));
         let reader = db.reader()?;
         // The shipping reader may be the engine's last connection to close: its close must not
         // empty a log the backup hasn't shipped either.
         reader.hold_log();
-        let checker = match archive.check {
+        let (scratch, continuous) = match &archive.check {
+            CheckPolicy::Off => (None, false),
+            CheckPolicy::Scratch(scratch) => (Some(scratch.clone()), false),
+            CheckPolicy::Continuous => (Some(suffixed(path, ".check")), true),
+        };
+        let checker = match scratch {
             Some(_) => {
                 let checker = db.reader()?;
                 checker.hold_log();
@@ -168,6 +224,9 @@ impl Prepared {
             }
             None => None,
         };
+        // The drills' draws: seeded once from the system's entropy.
+        let mut seed = [0u8; 8];
+        getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("the system's entropy: {e}"))?;
         let shipper = Shipper::open(
             &archive.prefix,
             Arc::clone(&hooks),
@@ -185,6 +244,15 @@ impl Prepared {
             last_check: None,
             log_since_check: 0,
             pending_check: None,
+            scratch,
+            continuous,
+            source: path.to_path_buf(),
+            meter: Arc::default(),
+            drills: Drills::default(),
+            random: u64::from_le_bytes(seed),
+            idle_since_check: 0,
+            last_cost: None,
+            pending_cost: 0,
         })
     }
 
@@ -202,6 +270,7 @@ impl Prepared {
         let shipping = Shipping {
             status: Arc::default(),
             counters: Arc::clone(&self.counters),
+            meter: Arc::clone(&self.meter),
         };
         let told = shipping.clone();
         std::thread::Builder::new()
@@ -253,7 +322,13 @@ impl Prepared {
                     Err(TryRecvError::Disconnected) => Err(()),
                 }
             } else {
-                woken.recv().map_err(|_| ())
+                // Time spent waiting for a commit is the budget checks spend ([`admit`]).
+                let waiting = Instant::now();
+                let woke = woken.recv().map_err(|_| ());
+                let idle = elapsed_ns(waiting);
+                self.idle_since_check = self.idle_since_check.saturating_add(idle);
+                self.meter.idle(idle);
+                woke
             };
             if next.is_err() {
                 break;
@@ -339,10 +414,46 @@ impl Prepared {
         if self.pending_check.is_none()
             && let Some(base) = self.shipper.latest_base()
             && check_due(self.last_check, base, self.log_since_check)
+            && self.admitted()?
         {
-            self.pending_check = self.quiet_digest()?;
+            let began = Instant::now();
+            self.pending_check = self
+                .quiet_digest()?
+                .map(|(second, rows)| (second, rows, base));
+            self.pending_cost = elapsed_ns(began);
         }
         Ok(check)
+    }
+
+    /// Whether a due check runs now: at once given a scratch path, within the budget [`admit`]
+    /// derives from the machine when continuous (T-T1.12.C5); a deferral counted with its reason.
+    fn admitted(&self) -> anyhow::Result<bool> {
+        let Some(scratch) = self.scratch.as_ref() else {
+            return Ok(false);
+        };
+        if !self.continuous {
+            return Ok(true);
+        }
+        let disk = match scratch.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let budget = Budget {
+            idle_ns: self.idle_since_check,
+            last_cost_ns: self.last_cost,
+            free: fs4::available_space(disk)?,
+            restore: file_len(&self.source)?
+                .saturating_add(file_len(&suffixed(&self.source, "-wal"))?),
+            log_headroom: self.reader.log_kept_frames().saturating_mul(FRAME_BYTES),
+        };
+        match admit(&budget) {
+            Ok(()) => Ok(true),
+            Err(why) => {
+                self.meter.defer(why);
+                tracing::debug!(target: "amphora.backup.check", event = "deferred", reason = why.reason(), idle_ns = budget.idle_ns, last_cost_ns = ?budget.last_cost_ns, free = budget.free, restore = budget.restore, log_headroom = budget.log_headroom);
+                Ok(false)
+            }
+        }
     }
 
     /// The source's rows at a second, from a snapshot lined up with that second's last commit
@@ -367,7 +478,7 @@ impl Prepared {
     }
 
     fn check_pending(&mut self) -> anyhow::Result<Option<Check>> {
-        let Some((second, _)) = self.pending_check else {
+        let Some((second, _, _)) = self.pending_check else {
             return Ok(None);
         };
         match self.hooks.marks.settled(second)? {
@@ -378,7 +489,7 @@ impl Prepared {
             }
             Some(true) => {}
         }
-        let Some(scratch) = self.archive.check.clone() else {
+        let Some(scratch) = self.scratch.clone() else {
             self.pending_check = None;
             return Ok(None);
         };
@@ -389,10 +500,30 @@ impl Prepared {
         if newest_second(blobs, &self.archive.prefix, until)?.is_none_or(|newest| newest < second) {
             return Ok(None);
         }
-        let Some((second, rows)) = self.pending_check.take() else {
+        let Some((newest, rows, base)) = self.pending_check.take() else {
             return Ok(None);
         };
+        // Continuous: the snapshot joins the drills, and the check restores one of their seconds
+        // drawn at random, so every second the thread ever held is as likely to be drilled
+        // (T-T1.12.C6). Given a scratch path: the snapshot's own second.
+        let (second, rows) = if self.continuous {
+            let draw = next_random(&mut self.random);
+            self.drills.offer(newest, rows, self.archive.memory, draw);
+            let draw = next_random(&mut self.random);
+            let Some((second, rows)) = self.drills.pick(draw).cloned() else {
+                return Ok(None);
+            };
+            (second, rows)
+        } else {
+            (newest, rows)
+        };
+        if second < newest {
+            self.meter
+                .older
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         remove_scratch(&scratch)?;
+        let began = Instant::now();
         let source = |s: u64| Ok((s == second).then(|| rows.clone()));
         let check = restore_and_check_at(
             blobs,
@@ -403,10 +534,18 @@ impl Prepared {
             &self.counters,
             until,
         )?;
+        let cost = self.pending_cost.saturating_add(elapsed_ns(began));
+        self.meter.cost(cost);
+        self.last_cost = Some(cost);
+        self.idle_since_check = 0;
         self.last_check = Some(match &check {
             Check::Passed { restored, .. } => {
                 remove_scratch(&scratch)?;
-                (restored.base, restored.log_bytes)
+                (base, restored.log_bytes)
+            }
+            Check::Expired { second } => {
+                self.drills.drop_second(*second);
+                (base, self.log_since_check)
             }
             // Not passed: checked again at the next base, or once as much log again has shipped.
             _ => (
@@ -422,9 +561,7 @@ impl Prepared {
 /// Removes a check's scratch database and its log, if there.
 fn remove_scratch(scratch: &Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
-        let mut path = scratch.as_os_str().to_owned();
-        path.push(suffix);
-        match std::fs::remove_file(PathBuf::from(path)) {
+        match std::fs::remove_file(suffixed(scratch, suffix)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }

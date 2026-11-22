@@ -5,6 +5,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **A refusal before a cross-group step** (CP-T1.10, AC-T1.10.6, lane xgroup-sql-4; docs/design/xgroup.md): `Options::on_refused`
+  retries a step a group refused before taking it (`NotLeader`, `Full`) after the learned RFC 6298 back-off, with today's
+  behaviour as the control; `Cluster::counted` gives the instruments. A group failing mid-commit is tested through a session
+  over real groups. Waits on the coordinator: which setting stays, from live runs; the LAN p99 and 10,000-seed runs.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
@@ -473,6 +477,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   for the log's next restart, one generation at most (T-T1.12.I4); cuts across machines: each
   cross-group step carries a hybrid logical clock, so a decision is stamped after the writes it
   decides whatever the nodes' clocks read (T-T1.12.X2).
+  Lane backups-3: restore checks are on by default (`backup::CheckPolicy`: off, scratch, continuous),
+  within a budget measured on the machine (idle time, free disk), at seconds drawn uniformly from
+  every quiet snapshot, every row compared, with deferral and cost instruments (T-T1.12.C4 to C6).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -1078,3 +1085,13 @@ by measured cost and a SQL switch (executor.md decision 11, "Not yet").
 Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
 11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
 skip (T-SKU.1).
+
+Replicated Amphora's reliability fixes (lane roster-fixes, kiln goal ab3aedaf; the 2026-11-06 roster):
+every fix is on main (election flake, disk stalls, membership and floor, fast-ack with class quorum and
+metrics, the replica log and its bound, local reads with the derived reader bound, the persisted flush
+off the owner, the class stated once, prepared statements validated once, owner guards, the WAL's small
+commits). Their benchmarks against the commit before each have harnesses: `bench/owner_stalls_ab.sh`
+(leader changes and owner stalls around the persisted flush, AC-T1.8.D2) and `bench/commits_ab.sh`
+(amphora-bench at two commits, ABBA: finding 4's `--sql-api` with Linux CPU time, and the bulk
+statements with the bytes of log they leave). The runs of record are the coordinator's. amphora-bench
+does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` runs only at commits where it does.
