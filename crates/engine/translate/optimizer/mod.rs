@@ -98,6 +98,7 @@ pub(crate) mod learned_costs;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+pub mod plan_hints;
 mod row_value;
 mod sample_filter;
 pub(crate) mod unnest;
@@ -1166,6 +1167,7 @@ fn find_select_plan_form(
     // Amphora (PL.12): and with the values its estimates may read for the statement's parameters.
     let params = &base
         .with_cache_pages(resolver.cache_pages())
+        .with_page_bytes(resolver.page_bytes())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
@@ -2869,6 +2871,7 @@ fn find_table_access_plan(
     // Amphora (PL.12): and with the values its estimates may read for the statement's parameters.
     let params = &base
         .with_cache_pages(resolver.cache_pages())
+        .with_page_bytes(resolver.page_bytes())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
@@ -3081,7 +3084,8 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        allow_automatic_index: resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
+        allow_automatic_index: resolver.automatic_indexes()
+            && resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
         join_methods: resolver.join_methods(),
         sorted_fetches: resolver.sorted_fetches(),
         row_goal,
@@ -3680,76 +3684,56 @@ pub(crate) mod bushy_search_tests {
             rows
         }
 
-        /// PL.8 piece 2 (T-PL.8.2): a join whose cheapest plan is bushy gets it from the search,
-        /// a few outer rows as loops and a large run built once into a hash join's input, and
-        /// answers as the left-deep plan of nested loops does.
+        /// PL.8 piece 2 (T-PL.8.2): two large fact tables, each cut down by a filtered dimension,
+        /// joined to each other on a key with few values. Every left-deep order joins one fact's
+        /// cut to the other whole fact first and drags the large result through the last
+        /// dimension's filter; the bushy plan builds `d1 ⋈ f1` once into a hash join's input and
+        /// probes it from `f2`, under the one row of `d2`. The search picks it, the emitter runs
+        /// it (`BUSHY_PLANS`), and it answers as the plan of nested loops does.
         #[test]
-        fn t_pl_8_2_the_search_makes_bushy_plans_with_the_same_answers() {
+        fn t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest() {
             let io = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             for sql in [
-                "CREATE TABLE a(id INTEGER PRIMARY KEY, x INT)",
-                "CREATE TABLE b(id INTEGER PRIMARY KEY, x INT, y INT)",
-                "CREATE TABLE c(id INTEGER PRIMARY KEY, y INT, z INT)",
-                "CREATE TABLE p(id INTEGER PRIMARY KEY, z INT, w INT)",
+                "CREATE TABLE d1(id INTEGER PRIMARY KEY, cat INT)",
+                "CREATE TABLE d2(id INTEGER PRIMARY KEY, cat INT)",
+                "CREATE TABLE f1(id INTEGER PRIMARY KEY, d1 INT, k INT)",
+                "CREATE TABLE f2(id INTEGER PRIMARY KEY, d2 INT, k INT)",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 200) \
+                 INSERT INTO d1 SELECT x, x % 20 FROM n",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 200) \
+                 INSERT INTO d2 SELECT x, x % 20 FROM n",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
+                 INSERT INTO f1 SELECT x, x % 200 + 1, x % 4 FROM n",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
+                 INSERT INTO f2 SELECT x, x % 200 + 1, x % 4 FROM n",
+                "ANALYZE",
             ] {
                 conn.execute(sql).unwrap();
             }
-            for id in 1..=4 {
-                conn.execute(format!("INSERT INTO a VALUES ({id}, {id})"))
-                    .unwrap();
-            }
-            for id in 1..=300 {
-                conn.execute(format!(
-                    "INSERT INTO b VALUES ({id}, {}, {})",
-                    id % 7,
-                    id % 50
-                ))
-                .unwrap();
-                conn.execute(format!(
-                    "INSERT INTO c VALUES ({id}, {}, {})",
-                    id % 50,
-                    id % 40
-                ))
-                .unwrap();
-            }
-            for id in 1..=12 {
-                conn.execute(format!(
-                    "INSERT INTO p VALUES ({id}, {}, {})",
-                    id % 40,
-                    id % 6
-                ))
-                .unwrap();
-            }
-            conn.execute("ANALYZE").unwrap();
             let queries = [
-                "SELECT a.id, b.id, c.id, p.id FROM a, b, c, p \
-                 WHERE c.y = b.y AND p.z = c.z AND p.w > a.x",
-                "SELECT count(*), sum(p.w) FROM a, b, c, p \
-                 WHERE c.y = b.y AND p.z = c.z AND p.w > a.x AND b.x <> a.x",
-                "SELECT a.id, b.id, c.id, p.id FROM a JOIN p ON p.w > a.x \
-                 JOIN c ON c.z = p.z JOIN b ON b.y = c.y WHERE a.id < 3",
-                "SELECT a.id, b.id, c.id, p.id, p.w FROM a, b, c, p \
-                 WHERE c.y = b.y AND p.z = c.z AND p.w + a.x = 7 AND b.x < a.x + c.id",
+                "SELECT d1.id, f1.id, f2.id, d2.id FROM d1, f1, f2, d2 \
+                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
+                "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
+                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
+                "SELECT count(*), sum(f1.id - f2.id) FROM d1, f1, f2, d2 \
+                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.cat = 7",
             ];
             let mut bushy = 0;
-            for methods in [JoinMethods::ByCost, JoinMethods::HashJoinsOnly] {
-                for sql in queries {
-                    conn.set_join_methods(JoinMethods::NestedLoopsOnly);
-                    let left_deep = rows(&conn, sql);
-                    conn.set_join_methods(methods);
-                    BUSHY_PLANS.with(|plans| plans.set(0));
-                    let searched = rows(&conn, sql);
-                    let made_bushy = BUSHY_PLANS.with(Cell::get);
-                    let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
-                    eprintln!("{methods:?} bushy={made_bushy}: {sql}: {plan:?}");
-                    bushy += made_bushy.min(1);
-                    assert!(!left_deep.is_empty(), "{sql}");
-                    assert_eq!(searched, left_deep, "{methods:?}: {sql}: {plan:?}");
-                }
+            for sql in queries {
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                BUSHY_PLANS.with(|plans| plans.set(0));
+                let searched = rows(&conn, sql);
+                let made_bushy = BUSHY_PLANS.with(Cell::get);
+                let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                eprintln!("bushy={made_bushy}: {sql}: {plan:?}");
+                bushy += made_bushy.min(1);
+                assert!(!nested_loops.is_empty(), "{sql}");
+                assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
             }
-            // Non-vacuity: the search chose bushy plans.
             assert!(bushy > 0, "no query was planned bushy");
         }
     }

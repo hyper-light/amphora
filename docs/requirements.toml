@@ -345,6 +345,8 @@ criteria = [
 ]
 tests = [
   { id = "T-PL.7.1", text = "The audit's 09-cost-model — passes when its tables of 8 and 1,011 pages no longer both scan at one cost" },
+  # lane pl7c: T-PL.7.1's focused tests are tests/column_stats.rs t_pl_7_1_* (ANALYZE keeps each
+  # tree's real pages; a full read of a table of more pages costs more) and cost::tests::t_pl_7_1_*.
   # lane pl7
   { id = "T-PL.7.2", text = "cost_fit::tests::t_pl_7_2_* — passes when the fit of synthetic samples from known weights with 5% noise lands within four standard errors and 5% of each, and a tenfold stall one sample in ten still leaves each within 5%" },
   { id = "T-PL.7.3", text = "cost_fit::tests::t_pl_7_3_* — passes when terms never sampled have no fitted weight and the planner keeps their learned value, and the fit follows weights that move" },
@@ -487,6 +489,7 @@ tests = [
   { id = "T-T1.12.X1", text = "Two groups restored to every second of two cross-group transactions, under both protocols: both keys or neither at every cut, never moving back" },
   # lane pitr-8
   { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
+  { id = "T-T1.12.X2", text = "Cuts across two groups whose clocks differ by 5 seconds, under both protocols: both keys or neither at every cut, the carried clock taken out failing it" },
   { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
 ]
 
@@ -805,6 +808,8 @@ tests = [
   # lane split-merge-9
   { id = "T-T1.9.R10", text = "Two nodes, the second of two groups on the first moved to the second by the driver while a row is written before every action, each pull of its copy and catch-up and its answer carried as bytes — passes when the move ends flipped, the first node keeps one group and has retired the moved one, the second holds its span, every key's acknowledged rows read back at its group's node, and every key is in exactly one group's file" },
   { id = "T-T1.9.R11", text = "The move of T-T1.9.R10 with every third pull's answer lost on the way back after the old group's node acted on it, each loss asked again by the driver — passes when some answers were lost and the move still ends flipped with every acknowledged write at its group's node and every key in exactly one group's file" },
+  # lane split-merge-10
+  { id = "T-T1.9.R12", text = "The move of T-T1.9.R10 with each pull carried over the owner transport between the two nodes' endpoints, every fourth pull asked while the other node's endpoint is down and every third answer dropped after it arrived, each fault asked again by the driver — passes when both faults were met and the move still ends flipped with every acknowledged write at its group's node and every key in exactly one group's file" },
 ]
 
 # lane qs5
@@ -1071,6 +1076,23 @@ tests = [
   { id = "T-CS.5.6", text = "cs5_scan_hook_runs_only_when_the_copy_is_chosen — passes when a scan given to the CopyScan hook runs once per aggregate the copy is chosen for and answers it, never with the switch off or on a stale copy" },
 ]
 
+# lane many-writers
+# Amphora's own IDs for G7 step 5 and G8 steps 4-5 (kiln plan 01a16b0f4716761cb68dc0c96863b53b, under
+# CP-T1.3 stage 3 and CP-T1.4): the harnesses that verify many writers through SQL. Their full runs
+# (the suite's sizes, 10,000 seeds) and the commit p99 bar (G8 step 5: p99 at most 5 ms, p99.9 at most
+# 15 ms at 32 writers) are the coordinator's.
+[[own]]
+id = "G7.5"
+title = "Many writers through SQL answer as a serial replay, and Elle finds no anomaly through SQL (G7 step 5, G8 steps 4-5)"
+criteria = [
+  { id = "AC-G7.5.1", text = "every committed transaction of every write class, run by N connections at once, answers statement for statement as a serial replay in commit order, on each storage" },
+  { id = "AC-G7.5.2", text = "anomalies over 10,000 Elle seeds recorded through SQL at the claimed isolation (serializable) is exactly 0, on each storage" },
+]
+tests = [
+  { id = "T-G7.5.1", text = "storage::versioned::many_writers::g7_5_many_writers_answer_as_a_serial_replay — passes when every answer and the ending rows and index match the serial replay's, on the pager's storage and the versioned one, ids from writers' own slices and from every row" },
+  { id = "T-G8.4.1", text = "storage::versioned::elle_sql::g8_4_sql_histories_have_no_anomaly_on_* — passes when list-append and register histories recorded from N SQL connections show no G0, G1a, G1b, G1c, G-single or G2 (the versioned storage's is ignored until its SQL cursor keeps reads for validation)" },
+]
+
 # lane repl-measure (G12 steps 1 and 3, CP-T1.8): no new IDs. `amphora-bench --repl` is the harness
 # for AC-T1.8.2 and AC-T1.8.3 (`commit`), AC-T1.8.4 and the lab half of AC-T1.8.5 (`failover`: kill the
 # leader under load, count acknowledged events lost), the catch-up of G12 step 3 (`catchup`), and
@@ -1081,3 +1103,29 @@ tests = [
 # every system with one command; LiteFS fails over on Consul's lease (servers/repl/litefs.sh); dqlite's
 # shim builds and its cluster comes up. libSQL's failover and dqlite's member catch-up stay refused,
 # typed: sqld has no election, and dqlite reads only through its leader.
+
+# lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
+[[own]]
+id = "G5.4"
+title = "Skipping rows: zone maps over leaf runs against cracking (G5 step 4; executor.md decision 11)"
+criteria = [
+  { id = "AC-G5.4.1", text = "both prototypes' scan and write costs recorded on filter_no_index-like classes with writes interleaved (crates/engine/tests/skipping_bench.rs; measured by the coordinator)" },
+  { id = "AC-G5.4.2", text = "filter_no_index at 1 client with the winner rises at least 1000% against step 3 (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G5.4.1", text = "skipping::tests::t_g5_4_1_* — passes when, with writes between scans, each prototype's candidates hold exactly a plain scan's rows, no row missed and none stale; zone maps built from a real table's leaves (one zone a leaf) with SQL writes between scans read exactly the plain scan's rows through the engine" },
+]
+
+# lane g6s3
+
+[[own]]
+id = "G6.3"
+title = "Learned plan hints against the cost model (G6 step 3; planner.md, decision of lane g6s3)"
+criteria = [
+  { id = "AC-G6.3.1", text = "hinted and unhinted plans' times on held-out JOB and corpus queries recorded (bench/plan_hints); no held-out query slower by more than 10% with hints on (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-G6.3.1", text = "crates/engine/tests/plan_hints.rs t_g6_3_1_* — passes when every hint set's answers equal the unhinted plan's and a computed nested loop's, and the planner obeys each mask; bench/plan_hints compares hinted answers with SQLite's" },
+  { id = "T-G6.3.2", text = "translate::optimizer::plan_hints::tests::t_g6_3_2_* — passes when the guard admits a faster hint, drops it once its held-out runs are slower, and never admits one no faster" },
+  { id = "T-G6.3.3", text = "translate::optimizer::plan_hints::tests::t_g6_3_3_memory_stays_bounded — passes when the model's size is constant over 10,000 runs and the guard holds no more classes than it was given" },
+]

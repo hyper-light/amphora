@@ -507,7 +507,11 @@ impl Pool {
         let slot = self.slot(page)?;
         // Each pass that doesn't return saw the page leave its frame, or read it in: one a frame
         // at most before the pool is churning faster than this reader can latch.
-        for _ in 0..=self.frames_made().saturating_add(1) {
+        // Bounded by the frames made, read again at each try: a pool making its frames lazily has
+        // as many tries as frames once they are made.
+        let mut tries = 0usize;
+        while tries <= self.frames_made().saturating_add(1) {
+            tries = tries.saturating_add(1);
             if let Some(i) = slot.frame() {
                 let fr = self.frame(i)?;
                 let guard = fr.page.read();
@@ -528,7 +532,11 @@ impl Pool {
     /// checkpoint's pause.
     pub fn write(&self, page: u64) -> Result<PageWrite<'_>> {
         let slot = self.slot(page)?;
-        for _ in 0..=self.frames_made().saturating_add(1) {
+        // Bounded by the frames made, read again at each try: a pool making its frames lazily has
+        // as many tries as frames once they are made.
+        let mut tries = 0usize;
+        while tries <= self.frames_made().saturating_add(1) {
+            tries = tries.saturating_add(1);
             if let Some(i) = slot.frame() {
                 let frame = self.frame(i)?;
                 let guard = frame.page.write();
@@ -717,7 +725,11 @@ impl Pool {
 
     /// Page `page`'s bytes at the pause that ended `epoch`, if it was written in it.
     fn owed(&self, page: u64, slot: &Slot, epoch: u64) -> Result<Option<Vec<u8>>> {
-        for _ in 0..=self.frames_made().saturating_add(1) {
+        // Bounded by the frames made, read again at each try: a pool making its frames lazily has
+        // as many tries as frames once they are made.
+        let mut tries = 0usize;
+        while tries <= self.frames_made().saturating_add(1) {
+            tries = tries.saturating_add(1);
             let take = |held: &[u8]| -> Result<Option<Vec<u8>>> {
                 if slot.copied.load(Ordering::Acquire) == low(epoch) {
                     return match self.kept.lock().remove(&page) {

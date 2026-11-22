@@ -20,9 +20,8 @@ use crate::translate::optimizer::constraints::{
     TableConstraints,
 };
 use crate::translate::optimizer::cost::{
-    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, file_reads,
-    rows_per_leaf_page_for_index, table_pages_fetched, where_expr_steps, AnalyzeCtx, Cost,
-    IndexInfo, RowCountEstimate,
+    estimate_cost_for_scan_or_seek, estimate_rows_per_seek, file_reads, index_rows_per_page,
+    table_pages_fetched, where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::optimizer::AvailableIndexes;
@@ -299,7 +298,7 @@ fn index_info_for_branch(
     index: Option<&Index>,
     rhs_table: &JoinedTable,
     read_mode: BranchReadMode,
-    rows_per_table_page: f64,
+    params: &CostModelParams,
 ) -> Option<IndexInfo> {
     let rowid_only = matches!(read_mode, BranchReadMode::RowIdOnly);
     match index {
@@ -307,17 +306,13 @@ fn index_info_for_branch(
             unique: index.unique,
             covering: rowid_only || rhs_table.index_is_covering(index),
             column_count: index.columns.len(),
-            rows_per_leaf_page: rows_per_leaf_page_for_index(
-                index.columns.len(),
-                rhs_table,
-                rows_per_table_page,
-            ),
+            rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
         }),
         None => Some(IndexInfo {
             unique: true,
             covering: true,
             column_count: 1,
-            rows_per_leaf_page: rows_per_table_page,
+            rows_per_leaf_page: params.rows_per_table_page,
         }),
     }
 }
@@ -382,7 +377,7 @@ fn choose_multi_index_branch_access(
                 chosen.index.as_deref(),
                 rhs_table,
                 BranchReadMode::RowIdOnly,
-                params.rows_per_table_page,
+                params,
             )
             .expect("multi-index branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
@@ -1030,7 +1025,7 @@ pub fn consider_sorted_fetch(
         Some(index.as_ref()),
         rhs_table,
         BranchReadMode::RowIdOnly,
-        params.rows_per_table_page,
+        params,
     ) else {
         return Ok(None);
     };
@@ -1279,7 +1274,7 @@ pub fn consider_multi_index_intersection(
                 b.index.as_deref(),
                 rhs_table,
                 BranchReadMode::RowIdOnly,
-                params.rows_per_table_page,
+                params,
             )
             .expect("intersection branches always have costable access");
             let analyze_ctx = AnalyzeCtx {

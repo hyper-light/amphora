@@ -36,6 +36,19 @@ pub fn asked() -> bool {
     std::env::var(ENV).is_ok_and(|v| v == "versioned")
 }
 
+/// Whether a test of the pager itself stands aside (G7 step 2, `AC-NS.2.1`): with the switch on,
+/// the run that judges the engine's suites on the versioned storage, a test whose subject is the
+/// pager (its log, its MVCC store, its coordination between processes, cursors over its pages)
+/// says why on stderr and checks nothing; with it off, it runs.
+#[cfg(test)]
+pub fn pager_only(why: &str) -> bool {
+    let on = asked();
+    if on {
+        eprintln!("pager-only: {why}");
+    }
+    on
+}
+
 /// The trees a storage is made with: tree 0, which no root page names (SQLite's page numbers start
 /// at 1), and tree 1, `sqlite_schema` (root page 1). The overflow tree comes after them (2), and
 /// every tree made later takes the next id, which is its root page.
