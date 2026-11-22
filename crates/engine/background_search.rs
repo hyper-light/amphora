@@ -173,7 +173,8 @@ pub(crate) struct SearchRequest {
     /// The schema and its statistics the fast plan was made on, taken at hand-off: the search plans
     /// on these, never on the connection's schema as it moves while the connection runs.
     pub(crate) schema: Arc<crate::schema::Schema>,
-    /// The connection's settings' generation at hand-off (`Connection::prepare_context_generation`).
+    /// The generation of the connection's settings at hand-off
+    /// (`Connection::prepare_context_generation`).
     pub(crate) generation: u64,
     pub(crate) pager: Arc<Pager>,
     pub(crate) sql: String,

@@ -916,7 +916,7 @@ impl Statement {
                 _ => {
                     break self
                         .program
-                        .step(&mut self.state, &self.pager, self.query_mode, waker);
+                        .step(&mut self.state, &self.pager, self.query_mode, waker)
                 }
             }
         };
@@ -2646,7 +2646,8 @@ mod tests {
     /// connections, the time to the first row, the time to the exact plan (the search's slot
     /// filled; at prepare under `Off`, whose plan is exact) and the time of the calls that end the
     /// statement (lane pl8-18: under `Idle` they run one waiting search; set against `Off`, the
-    /// latency `Idle` adds to them), at p50, p99 and the largest, and the searches' outcomes. Run: `cargo test -p amphora-engine --lib -- --ignored --nocapture
+    /// latency `Idle` adds to them), at p50, p99 and the largest, and the searches' outcomes.
+    /// Run: `cargo test -p amphora-engine --lib -- --ignored --nocapture
     /// t_pl_8_10_harness` (AMPHORA_BG_CONNECTIONS=1,32,512 by default).
     fn harness(placement: crate::BackgroundSearch, n: usize) -> String {
         let conn = star_connection();

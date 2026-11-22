@@ -95,11 +95,12 @@ pub fn translate(
             | ast::Stmt::Update { .. }
     );
 
-    // Amphora (PL.8, T-PL.8.11, lane pl8-18): only a SELECT takes the fast plan with an exact search
-    // to follow, because only a SELECT's plan reads nothing of what the connection is doing: a
-    // write's reads whether the connection is inside a nested statement and pushes onto its stack
-    // of triggers compiling (`trigger_exec.rs`), state a search made off the connection's thread
-    // would read and change while the connection runs (docs/design/planner.md, decision pl8-18).
+    // Amphora (PL.8, T-PL.8.11, lane pl8-18): only a SELECT takes the fast plan with an exact
+    // search to follow, because only a SELECT's plan reads nothing of what the connection is
+    // doing: a write's reads whether the connection is inside a nested statement and pushes onto
+    // its stack of triggers compiling (`trigger_exec.rs`), state a search made off the connection's
+    // thread would read and change while the connection runs (docs/design/planner.md, decision
+    // pl8-18).
     let fast_search = prepare_options.fast_search && matches!(stmt, ast::Stmt::Select { .. });
 
     let capture_data_changes_info = if connection.is_mvcc_bootstrap_connection() {
