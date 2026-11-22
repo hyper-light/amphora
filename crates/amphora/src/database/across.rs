@@ -2102,4 +2102,81 @@ mod tests {
             .unwrap();
         assert!(later > at, "{later} after {at}");
     }
+
+    /// T-T1.9.R29 (CP-T1.9; reshard.md, "Decision (lane split-merge-22): Records::commit across
+    /// groups, on the one stamp"). Do: two backed-up groups, the second's clock 500 seconds behind
+    /// the first's, routing a key ending in b to the second; under both protocols, through
+    /// `Records::commit` across them: rows 1a and 1b; then 2a and 2b on the conditions that 1a and
+    /// 1b are as of the stamp the first commit answered and 9b is absent; then 3a and 3b on 1a as of
+    /// the stamp before it. Expect: the first commit answers one stamp and both its rows read back
+    /// across groups at it, the second group's 500 seconds behind or not; the conditional commit
+    /// answers a later stamp, both its rows at it; the stale condition is refused as a conflict on
+    /// 1a and writes neither row.
+    #[test]
+    fn t_t1_9_r29_a_conditional_commit_across_groups_answers_its_one_stamp() {
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            let dir = tempfile::tempdir().unwrap();
+            let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+            let route: crate::xgroup::Route =
+                Arc::new(|key: &[u8]| u32::from(key.last() == Some(&b'b')));
+            let (dbs, _sinks, first) = groups_on(
+                dir.path(),
+                2,
+                |group| {
+                    let read = Arc::clone(&now);
+                    let behind = group * 500 * SECOND_NS;
+                    Arc::new(move || read.fetch_add(1, Ordering::SeqCst) - behind)
+                },
+                Arc::clone(&route),
+            );
+            drop(first);
+            let cluster =
+                Arc::new(Cluster::open(dbs.clone(), route, 6, protocol, 1, until()).unwrap());
+            let across = dbs[0].across(Arc::clone(&cluster)).namespace("n").unwrap();
+            let commit = |keys: &[&str], conds: Vec<api::Cond>| {
+                let writes = keys
+                    .iter()
+                    .map(|k| api::Write::Put {
+                        family: "f".into(),
+                        key: k.as_bytes().to_vec(),
+                        value: vec![1],
+                    })
+                    .collect();
+                across.commit(api::Tx { conds, writes }, until())
+            };
+            let stamps = |keys: &[&str]| -> Vec<Option<Rev>> {
+                keys.iter()
+                    .map(|k| {
+                        across
+                            .get("f", k.as_bytes(), Consistency::Linearizable, until())
+                            .unwrap()
+                            .map(|row| row.rev)
+                    })
+                    .collect()
+            };
+            let at = |k: &str, rev: Rev| api::Cond::At {
+                family: "f".into(),
+                key: k.as_bytes().to_vec(),
+                rev,
+            };
+
+            let one = commit(&["1a", "1b"], vec![]).unwrap();
+            assert_eq!(stamps(&["1a", "1b"]), vec![Some(one); 2], "{protocol:?}");
+
+            let absent = api::Cond::Absent {
+                family: "f".into(),
+                key: b"9b".to_vec(),
+            };
+            let two = commit(&["2a", "2b"], vec![at("1a", one), at("1b", one), absent]).unwrap();
+            assert!(two > one, "{two} after {one} ({protocol:?})");
+            assert_eq!(stamps(&["2a", "2b"]), vec![Some(two); 2], "{protocol:?}");
+
+            let stale = commit(&["3a", "3b"], vec![at("1a", one - 1), at("1b", one)]);
+            assert!(
+                matches!(&stale, Err(Refusal::Conflict { key, .. }) if key == b"1a"),
+                "{stale:?} ({protocol:?})"
+            );
+            assert_eq!(stamps(&["3a", "3b"]), vec![None, None], "{protocol:?}");
+        }
+    }
 }

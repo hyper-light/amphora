@@ -651,10 +651,11 @@ pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
 
 /// A step that came over the transport for this owner's group `here` (`Request::Step`): applied as
 /// a local one is, the coordinator's stamp `carried` taken in first; answers the reply, the group's
-/// newest stamp after it (none: the group makes no stamps), and its closed time after it, a session
-/// token's microseconds (none: the group keeps no closed time; AC-T1.10.1, T-T1.10.W4). Taken
-/// after the step answered, the closed time is at or past the step's own commit, as a token taken
-/// after a write's answer is ([`Database::session_token`]).
+/// newest stamp after it (none: the group makes no stamps), and its clock after it, the one
+/// cross-group clock's microseconds ([`Database::cross_clock`]: a replicated group's closed time, a
+/// backed-up group's writer clock; none: it keeps neither; AC-T1.10.1, T-T1.10.W4). Taken after
+/// the step answered, the clock is at or past the step's own commit, as a token taken after a
+/// write's answer is ([`Database::session_token`]).
 pub(crate) fn serve(
     group: &Database,
     here: GroupId,
@@ -671,13 +672,11 @@ pub(crate) fn serve(
     if resolving {
         group.locks_resolved(until)?;
     }
-    let clocked = group.cross_clock(until)?.is_some();
-    let closed = group.session_token(until)?.map(|token| token.micros);
-    Ok((
-        reply,
-        clocked.then(|| stamp.load(Ordering::Acquire)),
-        closed,
-    ))
+    // The group's clock after the step, the one cross-group clock as it keeps it (lane
+    // split-merge-22, as `step_on` reads a local group's): a backed-up group's writer clock, which
+    // a standalone group's session token never had, so its lock replies carry a stamp too.
+    let clock = group.cross_clock(until)?;
+    Ok((reply, clock.map(|_| stamp.load(Ordering::Acquire)), clock))
 }
 
 /// Whether a step resolves a transaction here, dropping its locks: the reads across groups they
@@ -1218,20 +1217,67 @@ fn conditioned(txn: &Txn) -> Result<(), Refusal> {
 /// commit answered. Under
 /// [`AnswerAt::Resolved`] every group has applied its rows by then, so a read that carries the
 /// token reads them in any group; under the control a group may not have yet.
-/// Conditions aren't carried into the coordinator's prepare yet: a transaction with any is refused.
+/// Its conditions are carried into the lock steps as [`commit_stamp`] carries them.
 pub fn commit_records(
     cluster: &Cluster,
     namespace: &str,
     tx: &amphora_api::Tx,
     until: Instant,
 ) -> Result<Token, Refusal> {
-    use amphora_api::Write;
-    if !tx.conds.is_empty() {
-        return Err(amphora_api::invalid(
-            "cross-group transaction",
-            "conditions across groups aren't carried into the prepare yet",
-        ));
+    let (at, touched) = commit_across(cluster, namespace, tx, until)?;
+    // The token is the commit stamp, or the newest closed time of the groups it touched read once
+    // it answered when that is later: a replicated group's replica may have closed past the stamp
+    // before it applied the resolution. No group it touched keeps a clock: its reads see every
+    // write, at any token. Unread by `until`, the caller has no token past its rows, so it hears
+    // the outcome as unknown, as a commit whose answer was lost (Counted::stamps_unread).
+    match closed_at(&cluster.groups, &cluster.closed, &touched, until) {
+        Ok(closed) => Ok(Token::at(at.max(closed).unwrap_or(0))),
+        Err(_) => {
+            counted(&cluster.instruments, |c| {
+                c.stamps_unread = c.stamps_unread.saturating_add(1);
+            });
+            Err(Refusal::UnknownOutcome)
+        }
     }
+}
+
+/// `Records::commit` of `namespace` across `cluster`'s groups (lane split-merge-22, T-T1.9.R29;
+/// reshard.md, "Decision (lane split-merge-21): one clock, one commit stamp"): answers the
+/// transaction's one commit stamp, `Answer::Committed`'s `at`, the stamp every row it wrote carries
+/// in every group (the coordinator resolves it with `Step::ResolveAt` at that stamp), so the
+/// revision it answers is the one reads across groups answer for its rows. A transaction in one
+/// group commits there with no coordinator step, and answers that group's clock read once it
+/// committed, at or past its rows' stamp. Each condition names a row as a read across groups
+/// answered it: [`amphora_api::Cond::At`]'s `rev` is a commit stamp, and the condition holds while
+/// the row's newest version is stamped at or before it (`xgroup::holds`), checked under the
+/// transaction's locks; [`amphora_api::Cond::Absent`], while the row has none. One that fails is
+/// refused `Conflict` on its row and writes nothing. A commit no group gave a stamp for (none keeps
+/// the clock) is refused `Unavailable`: reads across groups need every group stamped.
+pub(crate) fn commit_stamp(
+    cluster: &Cluster,
+    namespace: &str,
+    tx: &amphora_api::Tx,
+    until: Instant,
+) -> Result<amphora_api::Rev, Refusal> {
+    let (at, _) = commit_across(cluster, namespace, tx, until)?;
+    at.ok_or_else(|| {
+        Refusal::Unavailable(
+            "the transaction across groups committed, but no group it touched keeps the cross-group clock"
+                .into(),
+        )
+    })
+}
+
+/// Commits `tx` of `namespace` through `cluster`: its writes and conditions as [`record_key`]s
+/// (a row written twice keeps its last write). Answers the commit stamp the coordinator answered,
+/// and the groups it touched.
+fn commit_across(
+    cluster: &Cluster,
+    namespace: &str,
+    tx: &amphora_api::Tx,
+    until: Instant,
+) -> Result<(Option<u64>, BTreeSet<GroupId>), Refusal> {
+    use amphora_api::{Cond, Write};
     let mut writes = BTreeMap::new();
     for write in &tx.writes {
         let (key, value) = match write {
@@ -1242,38 +1288,30 @@ pub fn commit_records(
         };
         writes.insert(key, value);
     }
+    let mut conds = Vec::with_capacity(tx.conds.len());
+    for cond in &tx.conds {
+        conds.push(match cond {
+            Cond::Absent { family, key } => (record_key(namespace, family, key)?, None),
+            Cond::At { family, key, rev } => (record_key(namespace, family, key)?, Some(*rev)),
+        });
+    }
     let txn = Txn {
         reads: Vec::new(),
         writes: writes.into_iter().collect(),
-        conds: Vec::new(),
+        conds,
     };
     let touched = cluster.touched(&txn);
+    let row_refused = |key: &[u8]| match record_of(key) {
+        Ok(Some((_, family, row))) => Refusal::Conflict {
+            family: family.into(),
+            key: row.to_vec(),
+            at: None,
+        },
+        _ => Refusal::Unavailable("a cross-group conflict on a key that isn't a row".into()),
+    };
     match cluster.commit(txn, until)? {
-        // The token is the commit stamp, or the newest closed time of the groups it touched read
-        // once it answered when that is later: under AnswerAt::Resolved that covers the rows each
-        // group wrote as it resolved, until rows are written at the commit stamp itself (lane
-        // split-merge-21). No group it touched keeps a closed time: its reads see every write, at
-        // any token. Unread by `until`, the caller has no token past its rows, so it hears the
-        // outcome as unknown, as a commit whose answer was lost (Counted::stamps_unread).
-        Answer::Committed { at, .. } => {
-            match closed_at(&cluster.groups, &cluster.closed, &touched, until) {
-                Ok(closed) => Ok(Token::at(at.max(closed).unwrap_or(0))),
-                Err(_) => {
-                    counted(&cluster.instruments, |c| {
-                        c.stamps_unread = c.stamps_unread.saturating_add(1);
-                    });
-                    Err(Refusal::UnknownOutcome)
-                }
-            }
-        }
-        Answer::Aborted(Why::Conflict(key)) => Err(match record_of(&key) {
-            Ok(Some((_, family, row))) => Refusal::Conflict {
-                family: family.into(),
-                key: row.to_vec(),
-                at: None,
-            },
-            _ => Refusal::Unavailable("a cross-group conflict on a key that isn't a row".into()),
-        }),
+        Answer::Committed { at, .. } => Ok((at, touched)),
+        Answer::Aborted(Why::Conflict(key) | Why::Unmet(key)) => Err(row_refused(&key)),
         Answer::Aborted(why) => Err(Refusal::Unavailable(format!(
             "the cross-group transaction aborted: {why:?}"
         ))),
@@ -1281,11 +1319,13 @@ pub fn commit_records(
     }
 }
 
-/// The commit stamp of a commit in `touched` groups, read after it answered: the newest closed
-/// time any of them published ([`Database::session_token`], microseconds since the Unix epoch, the
-/// groups' one hybrid logical clock), so a replica of any of them serves a read that carries it
-/// once it has applied everything up to that time. A group that keeps no closed time (standalone:
-/// its reads see every write) adds nothing; none of them keeping one, none. A group on a node adds
+/// The commit stamp of a commit in `touched` groups, read after it answered: the newest reading
+/// of the one cross-group clock any of them gave ([`Database::cross_clock`], microseconds since the
+/// Unix epoch: a replicated group's closed time, so a replica of any of them serves a read that
+/// carries it once it has applied everything up to that time; a backed-up group's writer clock,
+/// at or past the stamp of every row it wrote; lane split-merge-22). A group that keeps neither
+/// (standalone and not backed up: its reads see every write) adds nothing; none of them keeping
+/// one, none. A group on a node adds
 /// the newest closed time its steps answered with, kept in `closed` (T-T1.10.W4): under
 /// [`AnswerAt::Resolved`] its last step resolved the commit there before the answer came, so that
 /// time is at or past the commit's rows.
@@ -1301,7 +1341,7 @@ fn closed_at(
         .filter_map(|group| usize::try_from(*group).ok())
     {
         let heard = match groups.get(i) {
-            Some(Member::Local(database)) => database.session_token(until)?.map(|t| t.micros),
+            Some(Member::Local(database)) => database.cross_clock(until)?,
             // 0: nothing heard from it yet.
             Some(Member::Node { .. }) => closed
                 .get(i)
@@ -2290,8 +2330,8 @@ mod sessions {
     /// AC-T1.10.1 (lanes xgroup-sql-6 and xgroup-sql-8): a Records transaction across three groups
     /// through [`commit_records`], both protocols, answered once resolved: its rows read back in
     /// each group straight after the answer, the answer is a cross-group timestamp, a row under
-    /// another transaction's lock is refused as a conflict, and conditions are refused until the
-    /// prepare carries them.
+    /// another transaction's lock is refused as a conflict, and so is a condition that fails, its
+    /// rows unwritten.
     #[test]
     fn ac_t1_10_1_commit_records_writes_rows_in_every_group() {
         use amphora_api::{Cond, Consistency, Records, Tx, Write};
@@ -2340,15 +2380,25 @@ mod sessions {
                 matches!(refused, Err(Refusal::Conflict { .. })),
                 "{protocol:?} {refused:?}"
             );
+            // Clear of the held row 2: the condition is what refuses it (lane split-merge-22).
             let mut conditional = tx(7);
+            conditional.writes.truncate(2);
             conditional.conds.push(Cond::Absent {
                 family: "rows".into(),
                 key: vec![0],
             });
-            assert!(matches!(
-                commit_records(&cluster, "ns", &conditional, until()),
-                Err(Refusal::Invalid { .. })
-            ));
+            let unmet = commit_records(&cluster, "ns", &conditional, until());
+            assert!(
+                matches!(&unmet, Err(Refusal::Conflict { key, .. }) if key == &[0]),
+                "{protocol:?} {unmet:?}"
+            );
+            for k in 0..2u8 {
+                let ns = dbs[usize::from(k)].namespace("ns").unwrap();
+                let got = ns
+                    .get("rows", &[k], Consistency::Linearizable, until())
+                    .unwrap();
+                assert_eq!(got.map(|r| r.value), Some(vec![5]), "{protocol:?} row {k}");
+            }
         }
     }
 

@@ -2215,6 +2215,11 @@ impl Records for Namespace {
     }
     fn commit(&self, tx: Tx, until: Instant) -> Result<Rev, Refusal> {
         api::transaction(&tx)?;
+        // Across groups (lane split-merge-22, T-T1.9.R29): through the coordinator, answered with
+        // the transaction's one commit stamp, the revision reads across groups give its rows.
+        if let Some(cluster) = &self.database.cluster {
+            return crate::xgroup::sql::commit_stamp(cluster, &self.name, &tx, until);
+        }
         match self.database.submit(
             &self.name,
             Operation::Mutation(Mutation::Records {
