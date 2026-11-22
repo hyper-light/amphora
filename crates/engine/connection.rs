@@ -178,6 +178,9 @@ pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
     /// Amphora (PL.12): a run's bound values, for a custom plan; `None` plans the generic one.
     pub(crate) plan_values: Option<Arc<crate::plan_cache::PlanValues>>,
+    /// Amphora (PL.8): the runs the plan is expected to serve, which size its join search under
+    /// `JoinSearchBudget::RunShareByExecutions` (`search_budget`); `None` is one run.
+    pub(crate) expected_runs: Option<u64>,
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
@@ -216,6 +219,21 @@ pub enum JoinMethods {
     NestedLoopsOnly = 1,
     /// A hash join wherever the join can take one.
     HashJoinsOnly = 2,
+}
+
+/// Amphora (PL.8, decision 19): the rule that sizes the join search's budget, the number of
+/// connected subsets the exact search may build before the greedy search orders the join instead.
+/// Behind this switch so the rules can be measured against each other (the coordinator's A/B);
+/// the budget only picks the algorithm, so every rule plans the whole query.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSearchBudget {
+    /// Neumann and Radke's 10,000 subsets (`JOIN_SEARCH_BUDGET`): the control.
+    Fixed = 0,
+    /// Planning may take as long as the query's estimated running time, its bound
+    /// (`search_budget::SearchBudget`), divided by the measured time a candidate takes.
+    RunShare = 1,
+    /// `RunShare` times the runs the plan is expected to serve.
+    RunShareByExecutions = 2,
 }
 
 /// Test-only control over correlated-subquery rewrites.
@@ -515,6 +533,7 @@ pub struct Connection {
     pub(super) subquery_unnesting_mode: AtomicSubqueryUnnestingMode,
     /// Amphora: see [`Connection::set_join_methods`].
     pub(super) join_methods: AtomicJoinMethods,
+    pub(super) join_search_budget: AtomicJoinSearchBudget,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
     /// Amphora: see [`Connection::set_adaptive_joins`].
@@ -525,6 +544,9 @@ pub struct Connection {
     /// Amphora (PL.13): how many adaptive joins' hash tables held rows past their estimate's
     /// error, so their statements are prepared again; see [`Connection::adaptive_replans`].
     pub(super) adaptive_replans: AtomicU64,
+    /// Amphora (PL.13): planner-chosen hash joins' builds counted against their estimates; see
+    /// [`Connection::adaptive_build_checks`].
+    pub(super) adaptive_build_checks: AtomicU64,
     /// Amphora: see [`Connection::set_adaptive_handoff`].
     pub(super) adaptive_handoff: AtomicBool,
     /// Amphora (PL.13): how many runs an adaptive join's build handed to a second prepare; see
@@ -993,6 +1015,16 @@ impl Connection {
         self.join_methods.get()
     }
 
+    /// Amphora (PL.8): chooses the rule that sizes the join search for newly prepared statements.
+    pub fn set_join_search_budget(&self, rule: JoinSearchBudget) {
+        self.join_search_budget.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn join_search_budget(&self) -> JoinSearchBudget {
+        self.join_search_budget.get()
+    }
+
     /// Amphora (G6 step 5, a prototype behind this switch, off by default): lets newly prepared
     /// statements read a non-covering index's rowids into a sorted set and fetch the table's rows
     /// in rowid order (a bitmap-style sorted fetch), chosen by cost against the plain index read.
@@ -1065,6 +1097,17 @@ impl Connection {
 
     pub(crate) fn count_adaptive_replan(&self) {
         self.adaptive_replans.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, a materialization point): how many hash joins the planner chose on this
+    /// connection had their build's rows counted against the estimate (each re-plan past its error
+    /// is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_build_checks(&self) -> u64 {
+        self.adaptive_build_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_build_check(&self) {
+        self.adaptive_build_checks.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): when

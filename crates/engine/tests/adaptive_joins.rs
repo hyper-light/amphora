@@ -438,3 +438,82 @@ fn t_pl_13_4_a_run_past_the_estimate_starts_again_on_the_new_plan() {
         "the hand-off on and off differ"
     );
 }
+
+/// Do: a hash join the planner chose itself (hash joins only), its build side a table whose count
+/// the planner holds far past its rows (inserted, counted, rolled back), run with adaptive joins
+/// off and on; then again. Expect: one answer both ways; off, no build counted; on, the build's
+/// rows counted against the estimate, past its error, the statement planned again once; run again
+/// on the counted rows, the build is counted within the band and no re-plan comes (PL.13, the
+/// materialization point at a planner-chosen hash join's build).
+#[test]
+fn pl_13_a_chosen_hash_joins_build_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("chosen_build.db");
+    // A build row priced past a probe row: with the two equal, building a or b costs the same and
+    // the machine's timed weights (a page's, the fitted ones) pick the side, b about one run in five,
+    // whose count is right and plans nothing again. Priced apart, the plan builds the side it counts
+    // smaller, a, whatever the machine.
+    conn.pin_cost_weights(Some((4.0, 3.0, 1.0)));
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=50 {
+        conn.execute(format!(
+            "INSERT INTO a VALUES ({id}, {})",
+            sql_value(key(&mut state, 20))
+        ))
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO b(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 20 FROM n",
+    )
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute(
+        "INSERT INTO a(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) SELECT i % 20 FROM n",
+    )
+    .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+    let sql = "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k";
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_build_checks();
+    let off = rows(&conn, sql);
+    assert_eq!(
+        conn.adaptive_build_checks(),
+        checks,
+        "counted with adaptive joins off"
+    );
+
+    conn.set_adaptive_joins(true);
+    let replans = conn.adaptive_replans();
+    let on = rows(&conn, sql);
+    assert_eq!(on, off, "adaptive joins on and off differ");
+    assert!(
+        conn.adaptive_build_checks() > checks,
+        "the build was not counted"
+    );
+    assert_eq!(
+        conn.adaptive_replans() - replans,
+        1,
+        "the build's rows planned again"
+    );
+
+    let (checks, replans) = (conn.adaptive_build_checks(), conn.adaptive_replans());
+    let again = rows(&conn, sql);
+    assert_eq!(again, off, "the second plan's answer");
+    assert!(
+        conn.adaptive_build_checks() > checks,
+        "the second build was not counted"
+    );
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "a second re-plan on the counted rows"
+    );
+}

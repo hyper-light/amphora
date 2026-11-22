@@ -63,6 +63,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     /// Amphora: the rows a LIMIT (and OFFSET) leaves a one-table read to produce before it stops
     /// (`docs/design/planner.md` decisions 16 and 17), None when it reads to its end.
     pub row_goal: Option<RowGoal>,
+    /// Amphora (PL.8): what sizes the exact search before the greedy one takes the join.
+    pub search_budget: super::search_budget::SearchBudget,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -76,6 +78,7 @@ impl<'a> JoinPlanningContext<'a> {
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
             row_goal: None,
+            search_budget: super::search_budget::SearchBudget::FIXED,
         }
     }
 }
@@ -1407,37 +1410,9 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         }
     };
 
-    // The subsets the search builds plans for, by size; past the budget, none, and the greedy
-    // search orders the join instead (docs/design/planner.md decision 19).
-    let Some(subsets) = searchable_subsets(
-        num_tables,
-        &where_terms,
-        required_lhs_by_table.as_deref(),
-        left_join_illegal_map.as_ref(),
-        JOIN_SEARCH_BUDGET,
-    )?
-    else {
-        return compute_greedy_join_order(
-            set_rows,
-            joined_tables,
-            initial_input_cardinality,
-            planning_context,
-            constraints,
-            base_table_rows,
-            access_methods_arena,
-            where_clause,
-            &where_terms,
-            subqueries,
-            index_method_candidates,
-            params,
-            analyze_stats,
-            available_indexes,
-            table_references,
-            schema,
-        );
-    };
-
-    // Compute naive left-to-right plan to use as pruning threshold
+    // The left-to-right plan: the search's pruning threshold, and (PL.8, decision 19) the bound on
+    // the best plan's estimated cost that sizes the search's budget (`search_budget`).
+    let search_started = std::time::Instant::now();
     let naive_plan = compute_naive_left_deep_plan(
         set_rows,
         joined_tables,
@@ -1456,6 +1431,56 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         table_references,
         schema,
     )?;
+    let budget = planning_context
+        .search_budget
+        .subsets(naive_plan.as_ref().map(|plan| plan.cost.0), num_tables);
+    tracing::debug!(
+        target: "amphora::join_search",
+        rule = ?planning_context.search_budget.rule,
+        budget,
+        bound = ?naive_plan.as_ref().map(|plan| plan.cost.0),
+        executions = planning_context.search_budget.executions,
+        tables = num_tables,
+        "join search budget"
+    );
+
+    // The subsets the search builds plans for, by size; past the budget, none, and the greedy
+    // search orders the join instead (docs/design/planner.md decision 19).
+    let Some(subsets) = searchable_subsets(
+        num_tables,
+        &where_terms,
+        required_lhs_by_table.as_deref(),
+        left_join_illegal_map.as_ref(),
+        budget,
+    )?
+    else {
+        let greedy = compute_greedy_join_order(
+            set_rows,
+            joined_tables,
+            initial_input_cardinality,
+            planning_context,
+            constraints,
+            base_table_rows,
+            access_methods_arena,
+            where_clause,
+            &where_terms,
+            subqueries,
+            index_method_candidates,
+            params,
+            analyze_stats,
+            available_indexes,
+            table_references,
+            schema,
+        );
+        super::search_budget::note_search(
+            super::search_budget::Algorithm::Greedy,
+            0,
+            search_started.elapsed(),
+        );
+        return greedy;
+    };
+    let subsets_built: usize = subsets.iter().map(Vec::len).sum();
+    let mut pairs_tried = 0usize;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
     // We assign Some Cost (tm) to any required sort operation, so the best ordered plan may end up being
@@ -1774,8 +1799,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         planning_context,
         required_lhs_by_table.as_deref(),
     ) {
-        let mut pairs_left =
-            JOIN_SEARCH_BUDGET.saturating_sub(subsets.iter().map(Vec::len).sum::<usize>());
+        let mut pairs_left = budget.saturating_sub(subsets_built);
         let all: TableMask = (0..num_tables).try_collect()?;
         'pairs: for build_mask in subsets.iter().skip(1).flatten() {
             if build_mask.count().saturating_add(2) > num_tables {
@@ -1818,6 +1842,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         break 'pairs;
                     };
                     pairs_left = budget_left;
+                    pairs_tried = pairs_tried.saturating_add(1);
                     let (Some(probe_table), Some(probe_constraints)) =
                         (joined_tables.get(probe), constraints.get(probe))
                     else {
@@ -1960,6 +1985,11 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         }
     }
 
+    super::search_budget::note_search(
+        super::search_budget::Algorithm::Exact,
+        subsets_built.saturating_add(pairs_tried),
+        search_started.elapsed(),
+    );
     match best_plan {
         Some(best_plan) => Ok(Some(BestJoinOrderResult {
             best_plan,
