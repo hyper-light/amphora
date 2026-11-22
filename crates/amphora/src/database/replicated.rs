@@ -689,6 +689,9 @@ struct Outgoing {
     messages: VecDeque<Outbound>,
     /// Bytes and messages the host drained since the owner last weighed them (QB.1).
     drained: (u64, u64),
+    /// The same, to each member: what its path carried (lane constants-21). At most one a member
+    /// of the configuration, the owner weighing them at each rebound.
+    drained_to: std::collections::BTreeMap<u64, (u64, u64)>,
     /// What the host drains in an election timeout, as the owner last learned it (QB.1).
     bound: super::drain::Bound,
     /// The memory budget's room for queues, as the owner last read it (MB.1).
@@ -942,6 +945,10 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // queues' bytes charged to the memory budget (`rebound`; QB.1).
     intake: super::drain::Drain,
     outgo: super::drain::Drain,
+    /// What the host drained to each member, the path's drain (lane constants-21), and the window
+    /// rule the owner opened with.
+    paths: std::collections::BTreeMap<u64, super::drain::Drain>,
+    window: super::drain::Window,
     queues: Option<crate::memory::Charge>,
     // The ticks since the pace was last derived: it is derived once an election timeout, the
     // span the core draws each timeout over.
@@ -1549,6 +1556,11 @@ impl ReplicaHandle {
                     .saturating_add(u64::try_from(message.bytes.len()).unwrap_or(u64::MAX)),
                 outgoing.drained.1.saturating_add(1),
             );
+            let to = outgoing.drained_to.entry(message.to).or_default();
+            *to = (
+                to.0.saturating_add(u64::try_from(message.bytes.len()).unwrap_or(u64::MAX)),
+                to.1.saturating_add(1),
+            );
             messages.push(message);
         }
         if outgoing.messages.is_empty() {
@@ -1872,6 +1884,25 @@ fn open(
     )
 }
 
+// The window a test's owners open with (`Window`'s A/B, lane constants-21): a test on one thread
+// opens its owners there.
+#[cfg(test)]
+thread_local! {
+    static WINDOW: std::cell::Cell<super::drain::Window> =
+        const { std::cell::Cell::new(super::drain::Window::DEFAULT) };
+}
+/// The window to each member an owner opens with: the default, and in a test what it set.
+fn opened_window() -> super::drain::Window {
+    #[cfg(test)]
+    {
+        WINDOW.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        super::drain::Window::DEFAULT
+    }
+}
+
 /// The most members a configuration of this member's group names, which its core opens with: the
 /// bound its group's log stated last, and before any, the first bound from the configuration it
 /// was opened with (`replication::members::first`), the same at every first member of a group, as
@@ -1915,7 +1946,13 @@ fn open_on<F: BlockFile + 'static>(
 ) -> Result<(Client, Actor<F>, mpsc::Receiver<Envelope>), Refusal> {
     let mut machine = machine;
     machine.state_class(&durability)?;
-    let settings = settings(config.node_id, &durability, member_bound(&machine, &config))?;
+    let window = opened_window();
+    let settings = settings(
+        config.node_id,
+        &durability,
+        member_bound(&machine, &config),
+        window,
+    )?;
     // A class entry is bounded by the members the core is opened for (lane constants-20).
     machine.set_members(settings.core.limits.members);
     let meter = Arc::new(ReplicaMeter::default());
@@ -2054,6 +2091,8 @@ fn open_on<F: BlockFile + 'static>(
         paced: 0,
         intake: super::drain::Drain::default(),
         outgo: super::drain::Drain::default(),
+        paths: std::collections::BTreeMap::new(),
+        window,
         queues: None,
         #[cfg(test)]
         stalls: None,
@@ -2204,6 +2243,7 @@ fn settings(
     id: u64,
     durability: &Durability,
     members: usize,
+    window: super::drain::Window,
 ) -> Result<hyper_durable::Settings, Refusal> {
     // The core's memory is the memory budget's room for queues (MB.1), where its messages and
     // unstable entries wait: `Limits::derive` takes its unstable entries, pending messages and
@@ -2239,6 +2279,16 @@ fn settings(
     // gives alone past the second (lane constants-20; were a picked 64 MiB each).
     let message = u64::try_from(MESSAGE_BYTES).map_err(unavailable)?;
     let held = memory.max(message);
+    // The window to each member (lane constants-21): under `Carried`, no count of its own and,
+    // before its path is measured, twice a record's own bytes (a window that holds nothing sends
+    // one entry, however large: hyper-raft's `Inflights::full`), which `Actor::carry` follows to
+    // twice what the path carries in a round trip; under `Picked`, the control, four messages and
+    // 64 MiB.
+    let record = u64::try_from(RECORD_BYTES).map_err(unavailable)?;
+    let (max_inflight_msgs, max_inflight_bytes) = match window {
+        super::drain::Window::Picked => (4, 64 << 20),
+        super::drain::Window::Carried => (usize::MAX, hyper_timing::inflight_window(record)),
+    };
     Ok(hyper_durable::Settings {
         core: hyper_raft::Config {
             fates,
@@ -2248,8 +2298,8 @@ fn settings(
             max_size_per_msg: message,
             max_uncommitted_size: held,
             max_committed_size_per_ready: held,
-            max_inflight_msgs: 4,
-            max_inflight_bytes: 64 << 20,
+            max_inflight_msgs,
+            max_inflight_bytes,
             seed: id,
             ..hyper_raft::Config::new(id, limits)
         },
@@ -2892,7 +2942,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         let mut outgoing = locked(&self.control.outgoing)?;
         let (bytes, messages) = std::mem::take(&mut outgoing.drained);
         self.outgo.drained(bytes, messages);
-        self.outgo.sample(now, !outgoing.messages.is_empty());
+        let busy = !outgoing.messages.is_empty();
+        self.outgo.sample(now, busy);
+        let drained_to = std::mem::take(&mut outgoing.drained_to);
         let bounds = queue_bounds(
             &self.intake,
             &self.outgo,
@@ -2923,6 +2975,54 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.queues = crate::memory::process()
             .take(crate::memory::Use::Queues, queued.saturating_add(held))
             .ok();
+        self.carry(now, &drained_to, busy)
+    }
+    /// The window to each member under `Window::Carried` (lane constants-21; hyper-raft's rule,
+    /// mantle note 32 R16): twice what its path carries in a round trip
+    /// (`Replica::set_carriage`), the bytes the host drained to it over its round trip as `pace`
+    /// measured it, at least a record's own bytes: a window that holds nothing still sends one
+    /// entry, however large (hyper-raft's `Inflights::full`). A path carries what its window let
+    /// out, so the window doubles each round a path
+    /// keeps up and holds where it doesn't: a slow member is sent what it takes, a fast one what
+    /// it can. A member whose round trip isn't measured keeps what it had. Each path's drain is
+    /// weighed at every rebound, the leader's or not, so a new leader starts from what it saw.
+    fn carry(
+        &mut self,
+        now: u64,
+        drained: &std::collections::BTreeMap<u64, (u64, u64)>,
+        busy: bool,
+    ) -> Result<(), Refusal> {
+        let id = self.replica.id();
+        let configuration = self.replica.configuration();
+        let members: std::collections::BTreeSet<u64> = configuration
+            .voters
+            .iter()
+            .chain(&configuration.learners)
+            .chain(&configuration.voters_outgoing)
+            .chain(&configuration.learners_next)
+            .copied()
+            .filter(|member| *member != id)
+            .collect();
+        self.paths.retain(|member, _| members.contains(member));
+        let carries =
+            matches!(self.window, super::drain::Window::Carried) && self.replica.is_leader();
+        let record = u64::try_from(RECORD_BYTES).unwrap_or(u64::MAX);
+        for member in members {
+            let path = self.paths.entry(member).or_default();
+            let (bytes, messages) = drained.get(&member).copied().unwrap_or_default();
+            path.drained(bytes, messages);
+            path.sample(now, busy);
+            if !carries {
+                continue;
+            }
+            let Some(round_trip) = self.pace.round_trip(member) else {
+                continue;
+            };
+            let carried = path.carried(round_trip).unwrap_or(0).max(record);
+            self.replica
+                .set_carriage(member, carried)
+                .map_err(raft_error)?;
+        }
         Ok(())
     }
     fn expire(&mut self) {
@@ -4885,7 +4985,14 @@ mod tests {
     /// compared: other tests hold memory meanwhile.)
     #[test]
     fn qb_1_held_bytes_are_the_queues_room() {
-        let core = settings(1, &Durability::Persisted, 2).unwrap().core;
+        let core = settings(
+            1,
+            &Durability::Persisted,
+            2,
+            super::super::drain::Window::DEFAULT,
+        )
+        .unwrap()
+        .core;
         assert_eq!(core.max_uncommitted_size, core.max_committed_size_per_ready);
         assert!(core.max_uncommitted_size >= core.max_size_per_msg);
         assert_eq!(core.max_size_per_msg, u64::try_from(MESSAGE_BYTES).unwrap());
@@ -9110,10 +9217,15 @@ mod tests {
             .unwrap();
         let record = numbers(include_str!("../../../../docs/research/owner-stalls.md"));
         let requirements = include_str!("../../../../docs/requirements.toml");
-        let election = settings(1, &Durability::Persisted, 2)
-            .unwrap()
-            .core
-            .election_tick;
+        let election = settings(
+            1,
+            &Durability::Persisted,
+            2,
+            super::super::drain::Window::DEFAULT,
+        )
+        .unwrap()
+        .core
+        .election_tick;
         let tick = TICK.as_millis();
         let own = [
             tick.to_string(),
@@ -9988,6 +10100,117 @@ mod tests {
         let report = default.unwrap();
         assert_eq!(report.fenced, 0, "{report}");
         assert!(report.after > 0, "{report}");
+    }
+    /// T-QB.1.11, the window to each member's A/B (lane constants-21; replication.md, "The window
+    /// to each member"): `Window::Picked` (4 messages, 64 MiB; the control) against `Window::Carried`
+    /// (twice what the path carries in a round trip). It forces each one's failure mode at once:
+    /// a slow member flooded with sends, and a fast member starved of them. Do: five voters; cut
+    /// members 2 and 3 off while the leader commits `WINDOW_WRITES` writes (8 when unset) of
+    /// 16 KiB with 4 and 5, each owner's clock a tick on each round; then reconnect both, member 3
+    /// slow (its answers held for `WINDOW_SLOW` rounds of each `WINDOW_SLOW` + 1, 4 when unset),
+    /// member 2 fast. Expect: under each window both catch up to the leader, and each prints the
+    /// most bytes the leader had in flight to the slow member (its flood), and the rounds the
+    /// fast and the slow member took to catch up (the fast one's starving). The comparison is
+    /// the coordinator's run of record: `WINDOW_WRITES=512 WINDOW_SLOW=16 cargo test -p amphora
+    /// --locked --lib -- --nocapture window_slow_flooded_fast_starved`.
+    #[test]
+    fn window_slow_flooded_fast_starved() {
+        use super::super::drain::Window;
+        let var = |name: &str, unset: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(unset)
+        };
+        let (writes, slow) = (var("WINDOW_WRITES", 8), var("WINDOW_SLOW", 4));
+        for window in [Window::Picked, Window::Carried] {
+            let report = window_scenario(window, writes, slow);
+            let said = format!(
+                "window={window:?} writes={writes} slow={slow} flood_bytes={} flood_messages={} \
+                 fast_rounds={:?} slow_rounds={:?}",
+                report.flood_bytes, report.flood_messages, report.fast_rounds, report.slow_rounds
+            );
+            println!("{said}");
+            assert!(report.fast_rounds.is_some(), "{said}");
+            assert!(report.slow_rounds.is_some(), "{said}");
+        }
+    }
+    /// What [`window_scenario`] measured.
+    #[derive(Default)]
+    struct WindowReport {
+        /// The most bytes and messages the leader had in flight to the slow member.
+        flood_bytes: u64,
+        flood_messages: usize,
+        /// Rounds from the reconnect until the fast and the slow member applied what the leader
+        /// had; `None` if never within the scenario's rounds.
+        fast_rounds: Option<u64>,
+        slow_rounds: Option<u64>,
+    }
+    fn window_scenario(
+        window: super::super::drain::Window,
+        writes: u64,
+        slow: u64,
+    ) -> WindowReport {
+        WINDOW.with(|opened| opened.set(window));
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let voters: Vec<u64> = (1..=5).collect();
+        let clients: Vec<Client> = voters
+            .iter()
+            .map(|n| driven.open(dir.path(), *n, voters.clone(), None))
+            .collect();
+        WINDOW.with(|opened| opened.set(super::super::drain::Window::DEFAULT));
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let tick = |driven: &mut Driven| {
+            for owner in 0..5 {
+                driven.advance(owner, TICK);
+            }
+        };
+        pump.lost = vec![2, 3];
+        for _ in 0..writes {
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE IF NOT EXISTS window_items(body)")?;
+                    db.exec("INSERT INTO window_items VALUES(zeroblob(16384))")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            tick(&mut driven);
+        }
+        pump.lost.clear();
+        let target = driven.owner(leader).replica.applied().index;
+        let mut report = WindowReport::default();
+        let most = writes
+            .saturating_mul(slow.saturating_add(1))
+            .saturating_mul(40)
+            + 4000;
+        for round in 0..most {
+            pump.held = if round % (slow + 1) == slow {
+                Vec::new()
+            } else {
+                vec![2]
+            };
+            tick(&mut driven);
+            driven.round(&mut pump);
+            if let Some(progress) = driven.owner(leader).replica.core().raft.tracker().get(3) {
+                report.flood_bytes = report.flood_bytes.max(progress.inflights.bytes());
+                report.flood_messages = report.flood_messages.max(progress.inflights.count());
+            }
+            if report.fast_rounds.is_none() && driven.owner(1).replica.applied().index >= target {
+                report.fast_rounds = Some(round + 1);
+            }
+            if report.slow_rounds.is_none() && driven.owner(2).replica.applied().index >= target {
+                report.slow_rounds = Some(round + 1);
+            }
+            if report.fast_rounds.is_some() && report.slow_rounds.is_some() {
+                break;
+            }
+        }
+        pump.held.clear();
+        driven.drain(&mut pump);
+        pump.finish();
+        report
     }
     /// What [`qb2_scenario`] measured.
     #[derive(Default)]

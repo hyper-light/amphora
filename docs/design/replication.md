@@ -2578,10 +2578,8 @@ wire records queued beside them (`Control::called`).
 - `MEMBERS` (was 64) is gone (lane constants-21): see "The member bound stated once per group", next.
 
 **Still picked in the replication code (lane constants-20's survey), each with what it should come from.**
-- `max_inflight_msgs` (4) and `max_inflight_bytes` (64 MiB), the window to each member: hyper-raft's own rule (mantle
-  note 32 R16) is no count of its own (`usize::MAX`) and bytes of twice what the path carries in a round trip
-  (`hyper_timing::inflight_window`), set per member with `set_inflight_bytes` from the round trips `pace` measures
-  and the outgoing queue's learned drain. A design choice to A/B: the window moves what a slow member is sent ahead.
+- `max_inflight_msgs` (4) and `max_inflight_bytes` (64 MiB), the window to each member: now the control of an A/B
+  (lane constants-21, "The window to each member", below).
 - hyper-log's settings at open (`segment_bytes` 64 MiB, `max_segments` 16, `group_entries` 65 536, `group_bytes`
   512 MiB, `group_cache` 64 MiB, `queue_submissions` 16): the log's disk room (`log_bound::log_room`) and an image's
   share, the memory budget's room for caches, and the device's measured queue depth.
@@ -2646,6 +2644,32 @@ format bound (about 1.6 million) would take megabytes of every image record. The
   and 2, 4, 8, 16 as a group grows to 9) and `replicated::tests::t_qb_1_9_a_one_voter_group_grows_to_five_then_nine_members`
   (driven: a voter grows its group to 5 members, then 9, beside a running learner that took the raising entries with
   the changes behind them, then reopens with the 16 its log recorded).
+
+## The window to each member (lane constants-21, 2026-11-22, not yet landed)
+
+What a leader keeps in flight to each member, ahead of its answers, was a picked 4 messages and 64 MiB. It is now one
+switch (`drain::Window`) with two candidates, the picked one kept as the control:
+- `Picked`: 4 messages and 64 MiB to every member, as before.
+- `Carried` (the default): hyper-raft's own rule (mantle note 32 R16): no count of its own (`usize::MAX`), and twice
+  what the path carries in a round trip (`hyper_timing::inflight_window`, `Replica::set_carriage`). What the path
+  carries is the bytes the host drained to that member (`Outgoing::drained_to`, a `Drain` per member) over its round
+  trip as `pace` measures it from heartbeats' and votes' answers (`Pace::round_trip`), at least a record's own bytes
+  (`RECORD_BYTES`, a format value). A window that holds nothing still sends one entry, however large (hyper-raft's
+  `Inflights::full`), so a path drained of nothing still carries an append; one whole message (32 MiB) as the floor
+  would be about the picked 64 MiB again. Before a path is measured, the window is twice a record's bytes. A path carries only what its window let out, so the window doubles each rebound while the path
+  keeps up, and holds where it doesn't, as TCP's slow start grows its window by what is acknowledged (RFC 5681 §3.1).
+  `Actor::carry` sets it at each rebound, from events the owner already counts, no timer of its own.
+
+Each candidate's failure mode, forced by one driven scenario (`window_slow_flooded_fast_starved`): five voters, members
+2 and 3 cut off while the leader commits with 4 and 5, then both reconnected, member 3 slow (its answers held for most
+rounds) and member 2 fast. `Picked` floods the slow member: up to 64 MiB in flight to a path that drains a little a
+round. `Carried` may starve the fast member: its window starts at one entry an append and doubles only as the path proves it
+carries more. The scenario prints the most bytes and messages in flight to the slow member and the rounds each member
+took to catch up; its run of record, and the choice of the default, are the coordinator's
+(`WINDOW_WRITES=512 WINDOW_SLOW=16 cargo test -p amphora --locked --lib -- --nocapture window_slow_flooded_fast_starved`).
+Open: a member's round trip is measured only from heartbeats and votes, so a learner's comes from the leader's
+heartbeats to it; the per-member drain is weighed at the owner's rebound, which still follows `TICK` (to remove,
+above).
 
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 

@@ -165,6 +165,14 @@ impl Pace {
     pub(super) fn period(&self) -> Duration {
         self.current.period
     }
+    /// The round trip measured to `member`, smoothed (RFC 9002 §5.3), if any was: from its
+    /// heartbeats', pre-votes' and votes' answers.
+    pub(super) fn round_trip(&self, member: u64) -> Option<Duration> {
+        self.paths
+            .get(&member)
+            .filter(|path| path.rtt.samples() > 0)
+            .map(|path| Duration::from_nanos(path.rtt.smoothed_ns()))
+    }
     /// The interval a leader's heartbeats leave at, in nanoseconds: `heartbeat_tick` periods.
     fn interval(&self, heartbeat_tick: usize) -> u64 {
         let ticks = u32::try_from(heartbeat_tick).unwrap_or(u32::MAX);

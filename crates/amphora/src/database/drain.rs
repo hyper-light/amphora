@@ -100,6 +100,42 @@ impl Drain {
     }
 }
 
+impl Drain {
+    /// The bytes the reader drains in `over` at its measured rate: what its path carries in that
+    /// time. `None` before anything is measured.
+    pub(super) fn carried(&self, over: Duration) -> Option<u64> {
+        if self.nanos == 0 {
+            return None;
+        }
+        Some(
+            u128::from(self.bytes)
+                .saturating_mul(over.as_nanos())
+                .checked_div(u128::from(self.nanos))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX),
+        )
+    }
+}
+
+/// The window a leader keeps in flight to each member (lane constants-21): two candidates behind
+/// one switch, decided by the A/B scenario (`window_slow_flooded_fast_starved`), the picked one
+/// its control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Window {
+    /// The control: four messages and 64 MiB to every member, picked.
+    Picked,
+    /// hyper-raft's own rule (mantle note 32 R16): no count of its own, and twice what the path
+    /// carries in a round trip (`hyper_timing::inflight_window`), the path's drain over its round
+    /// trip as `pace` measures it, at least a record's own bytes; before a path is measured, twice
+    /// those.
+    Carried,
+}
+
+impl Window {
+    /// The window an owner opens with.
+    pub(super) const DEFAULT: Self = Self::Carried;
+}
+
 /// What a replicated owner does when its outgoing queue is past its learned bound (QB.2): three
 /// candidates behind one switch, decided by the A/B scenario
 /// (`qb2_many_slow_one_stalled_for_good_by_egress`), the fence its control.
