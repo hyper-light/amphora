@@ -702,19 +702,15 @@ fn locked<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Refusal> {
     m.lock()
         .map_err(|_| unavailable("a database response lock was poisoned"))
 }
+/// The owner table held, and the identity of the file an open is about.
+type OwnersHeld = (
+    std::sync::MutexGuard<'static, BTreeMap<PathBuf, Owner>>,
+    Option<amphora_engine::io::FileId>,
+);
 /// The owner table, locked once no open of this process in flight has reserved the file at
 /// `path`, and that file's identity: an open in flight there is waited for, woken when it ends, to
 /// the deadline (CP-T1.13).
-fn owners_unreserved(
-    path: &Path,
-    until: Instant,
-) -> Result<
-    (
-        std::sync::MutexGuard<'static, BTreeMap<PathBuf, Owner>>,
-        Option<amphora_engine::io::FileId>,
-    ),
-    Refusal,
-> {
+fn owners_unreserved(path: &Path, until: Instant) -> Result<OwnersHeld, Refusal> {
     loop {
         let owners = locked_until(OWNERS.get_or_init(Mutex::default), until)?;
         let file = file_identity(path)?;

@@ -79,6 +79,9 @@ pub fn restore_paced(
     )
 }
 
+/// What a restore hands each segment's frames to: its head, the frame's offset, and its bytes.
+type Frames<'a> = dyn FnMut(&SegmentHead, u64, &[u8]) -> anyhow::Result<()> + 'a;
+
 /// Reads the sealed segment at `key`, `size` bytes, in ranged gets of `part` bytes at most, each
 /// held and charged to `memory` while it's read (T-T1.12.M3): its head ([`SegmentHead`]) kept, and
 /// charged, as it comes in, then each run of its frames' bytes given to `frames` with its offset
@@ -91,7 +94,7 @@ pub(super) fn read_segment(
     part: usize,
     memory: &Arc<Memory>,
     until: Instant,
-    frames: &mut dyn FnMut(&SegmentHead, u64, &[u8]) -> anyhow::Result<()>,
+    frames: &mut Frames<'_>,
 ) -> anyhow::Result<SegmentHead> {
     if part == 0 {
         return Err(Unrestorable::SegmentPastRoom { key: key.into() }.into());

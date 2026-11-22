@@ -99,7 +99,8 @@ fn t_g2_7_2_a_file_runs_on_amphora_as_sqlite_runs_it() {
 /// left once it drops.
 #[test]
 fn t_t1_4_1_a_file_runs_on_amphora_on_disk_and_leaves_nothing() {
-    let dir = std::env::temp_dir().join(format!("amphora-corpus-disk-{}", std::process::id()));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("amphora-corpus-disk");
     std::fs::create_dir_all(&dir).unwrap();
     let right = amphora_corpus::answer::md5_of(
         &[

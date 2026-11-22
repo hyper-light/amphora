@@ -2288,7 +2288,7 @@ mod served {
                 .members
                 .get(node)
                 .ok_or_else(|| anyhow::anyhow!("no node {node}"))?;
-            Link::connect(addr, secret, self.deadline)
+            Link::connect(addr, &amphora::serve::Keys::plain(secret.clone()), self.deadline)
         }
 
         /// The node that leads, as node `via` names it.

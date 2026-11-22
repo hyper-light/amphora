@@ -122,7 +122,9 @@ impl Drain {
 /// its control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Window {
-    /// The control: four messages and 64 MiB to every member, picked.
+    /// The control: four messages and 64 MiB to every member, picked. Only the A/B's tests open
+    /// owners with it (`opened_window`); production opens with the default.
+    #[cfg_attr(not(test), allow(dead_code))]
     Picked,
     /// hyper-raft's own rule (mantle note 32 R16): no count of its own, and twice what the path
     /// carries in a round trip (`hyper_timing::inflight_window`), the path's drain over its round

@@ -1024,7 +1024,7 @@ impl Target for ClickHouse {
                 let mut lines = out.lines();
                 let first = lines.next().map(|line| first_row(line.split('\t').map(str::to_owned)));
                 let rows = u64::from(first.is_some()) + lines.count() as u64;
-                Outcome::Done(Run { rows, first, prepare_ms: 0.0, exec_ms })
+                Outcome::Done(Run { rows, first, prepare_ms: 0.0, exec_ms, search_ms: None })
             }
             Err(e) if e.to_string().contains("TIMEOUT_EXCEEDED") => Outcome::TimedOut,
             Err(e) => Outcome::Failed(e.to_string()),
