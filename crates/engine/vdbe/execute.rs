@@ -1379,7 +1379,14 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
-    if let Some(switch) = program.connection.versioned.as_ref() {
+    // Only the main database's trees are on the versioned storage: a temp or attached database's
+    // tables stay on its own pager, their root pages its pages (G7 step 2, `AC-NS.2.1`).
+    if let Some(switch) = program
+        .connection
+        .versioned
+        .as_ref()
+        .filter(|_| *db == MAIN_DB_ID)
+    {
         if let Some(cursor) = versioned_cursor(switch, cursor_type, *root_page, &pager)? {
             replace_cursor(&mut state.cursors, *cursor_id, cursor)?;
             state.pc += 1;
@@ -13493,10 +13500,16 @@ fn new_rowid_inner(
                     } else {
                         // Not an MvCursor — must be an ephemeral cursor or an attached
                         // DB cursor without MVCC (e.g., :memory: attached DBs skip MVCC).
-                        // Keep the downcast check as a safety net against unexpected cursor types.
+                        // Or a main database's cursor on the versioned storage, whose rows are
+                        // versioned already (G7 step 2, `AC-NS.2.1`): its last rowid is found as a
+                        // B-tree's is. Keep the downcast check as a safety net against unexpected
+                        // cursor types.
                         assert!(
-                            cursor.downcast_ref::<BTreeCursor>().is_some(),
-                            "Expected MvCursor or BTreeCursor in op_new_rowid"
+                            cursor.downcast_ref::<BTreeCursor>().is_some()
+                                || cursor
+                                    .downcast_ref::<crate::storage::versioned::cursor::VersionedCursor>()
+                                    .is_some(),
+                            "Expected MvCursor, BTreeCursor or VersionedCursor in op_new_rowid"
                         );
                         *state.active_op_state.new_rowid() = OpNewRowidState::SeekingToLast {
                             mvcc_already_initialized: false,
@@ -14015,7 +14028,13 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        if let Some(switch) = program.connection.versioned.as_ref() {
+        // The main database's trees only, as in `op_open_read`.
+        if let Some(switch) = program
+            .connection
+            .versioned
+            .as_ref()
+            .filter(|_| *db == MAIN_DB_ID)
+        {
             if let Some(cursor) = versioned_cursor(switch, cursor_type, root_page, &pager)? {
                 replace_cursor(cursors, *cursor_id, cursor)?;
                 state.pc += 1;
