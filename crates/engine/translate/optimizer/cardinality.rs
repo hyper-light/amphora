@@ -206,8 +206,9 @@ pub(super) struct JoinedSetRows<'a> {
     /// Each set's proven upper bound, which its estimate never passes (PL.11).
     bound: DegreeBound,
     /// PL.13 (lane replan-10): the identity of the whole join's rows, where a sorter fed by the
-    /// join may have counted them (`subquery_rows::join_identity`): an inner join of two tables or
-    /// more, planned for one run (`initial` at most one row); `None` otherwise.
+    /// join may have counted them (`subquery_rows::join_identity`): a join of two tables or more,
+    /// inner or LEFT (lane replan-11), planned for one run (`initial` at most one row); `None`
+    /// otherwise.
     joined: Option<u64>,
     /// PL.13 (lane replan-10): each table's own filter terms, where it has a sample.
     own_filters: Vec<Option<OwnFilter>>,
@@ -668,15 +669,13 @@ impl<'a> JoinedSetRows<'a> {
                 })
             })
             .collect();
+        // PL.13 (lane replan-11): a LEFT JOIN's rows too, its right table's unmatched rows kept.
         let joined = (joined_tables.len() > 1
             && initial <= 1.0
-            && kinds.iter().all(|kind| matches!(kind, Kind::Inner)))
-        .then(|| {
-            crate::subquery_rows::join_identity(
-                joined_tables.iter().map(|joined| joined.table.get_name()),
-                where_clause.iter().map(|term| &term.expr),
-            )
-        })
+            && kinds
+                .iter()
+                .all(|kind| matches!(kind, Kind::Inner | Kind::Left)))
+        .then(|| crate::subquery_rows::join_identity(joined_tables, where_clause))
         .flatten();
         // PL.13 (lane replan-11): a join prefix's rows are keyed as a whole join's, read only
         // where a fill counted them; under the same conditions, and only with the store attached.

@@ -191,13 +191,13 @@ pub(crate) fn emit_sorter_count(
 }
 
 /// Amphora (PL.13, lane replan-10: a sorter fed by a join): an ORDER BY or GROUP BY sorter fed by
-/// an inner join of two tables or more holds the join's rows its WHERE and ON terms keep, one a
-/// row. They are checked against the rows the plan read for the whole join
+/// an inner join of two tables or more, or a LEFT JOIN (lane replan-11: its unmatched rows kept,
+/// null-extended), holds the join's rows its WHERE and ON terms keep, one a row. They are checked against the rows the plan read for the whole join
 /// (`cardinality::JoinedSetRows::rows`), noted under the join's identity
 /// (`subquery_rows::join_identity`), where a count past them is stored for the planner. The band
 /// is the statistics' error of each table joined, independent, in quadrature, as a stored
 /// subquery result's over several tables is. `None` where it is not checked: adaptive joins off,
-/// an outer, semi or anti join, a table without statistics, terms reading a parameter, or no rows
+/// a RIGHT, FULL, semi or anti join, a table without statistics, terms reading a parameter, or no rows
 /// noted for the join. With the check, the name of the first table, for EXPLAIN.
 fn joined_sorter_check(
     t_ctx: &TranslateCtx,
@@ -207,17 +207,17 @@ fn joined_sorter_check(
         return None;
     }
     let tables = plan.joined_tables();
+    // A LEFT JOIN is checked (lane replan-11); a RIGHT or FULL JOIN, whose unmatched right rows
+    // come from a read of their own, and a semi or anti join are not.
     if tables.iter().any(|joined| {
-        joined.join_info.as_ref().is_some_and(|info| {
-            info.is_outer() || info.is_semi_or_anti() || info.keeps_right_rows()
-        })
+        joined
+            .join_info
+            .as_ref()
+            .is_some_and(|info| info.is_semi_or_anti() || info.keeps_right_rows())
     }) {
         return None;
     }
-    let identity = crate::subquery_rows::join_identity(
-        tables.iter().map(|joined| joined.table.get_name()),
-        plan.where_clause.iter().map(|term| &term.expr),
-    )?;
+    let identity = crate::subquery_rows::join_identity(tables, &plan.where_clause)?;
     let planned = t_ctx
         .resolver
         .plan_values()

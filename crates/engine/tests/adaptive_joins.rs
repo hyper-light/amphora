@@ -1462,3 +1462,61 @@ fn t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again() {
         "a new statement planned again"
     );
 }
+
+/// Do: T-PL.13.15's join as a LEFT JOIN: `a` (1,000 rows, keys 1 to 1,000) LEFT JOIN `b` (5,000
+/// rows, keys distinct at ANALYZE: about one match a row of `a`, 1,000 estimated), then every
+/// `b.k` set to its tenth, so `a`'s keys 1 to 9 meet 500 rows of `b` each and the other 991 rows of
+/// `a` none, kept null-extended (5,491), the tables' counts unchanged; ORDER BY columns of both
+/// sides, so a sorter holds the join's rows. Run with adaptive joins off, then on twice in one
+/// prepared statement, and in a statement prepared after. Expect: one answer, in order, every way;
+/// on, the sorter counted against the rows the plan read for the whole LEFT JOIN, past its error
+/// the count stored and the statement planned again once; nothing plans again after (PL.13, lane
+/// replan-11, T-PL.13.19: an outer join feeding a sorter, at its materialization point).
+#[test]
+fn t_pl_13_19_a_sorter_fed_by_a_left_join_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("left_joined_sorter.db");
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO a(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) SELECT i FROM n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i, i % 7 FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE b SET k = k % 10").unwrap();
+    let sql = "SELECT a.id, b.id, b.v FROM a LEFT JOIN b ON b.k = a.k ORDER BY b.v, b.id, a.id";
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_sort_checks();
+    let off = run_rows(&mut conn.prepare(sql).unwrap());
+    assert_eq!(off.len(), 9 * 500 + 991, "the rows");
+    assert_eq!(conn.adaptive_sort_checks(), checks, "counted off");
+
+    conn.set_adaptive_joins(true);
+    let replans = conn.adaptive_replans();
+    let mut held = conn.prepare(sql).unwrap();
+    assert_eq!(run_rows(&mut held), off, "on and off differ");
+    assert!(
+        conn.adaptive_sort_checks() > checks,
+        "the LEFT JOIN's sorter was not counted"
+    );
+    assert_eq!(conn.adaptive_replans() - replans, 1, "planned again once");
+    let replans = conn.adaptive_replans();
+    assert_eq!(run_rows(&mut held), off, "the second run's answer");
+    assert_eq!(conn.adaptive_replans(), replans, "a second re-plan");
+    assert_eq!(
+        run_rows(&mut conn.prepare(sql).unwrap()),
+        off,
+        "a new statement's answer"
+    );
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "a new statement planned again"
+    );
+}

@@ -1818,8 +1818,14 @@ join's tables (`cardinality::JoinedSetRows::rows`, for one run: `initial` at mos
 joins only) reads a count stored there in its place and notes the rows it read, and the sorter,
 once all in, is checked against them (`SorterCounted` with a `CountedCheck`); the band is each
 joined table's statistics' error, independent, in quadrature, and past it the count is stored,
-the plan made again and the run handed off as a stored subquery result's is. An outer, semi or
-anti join, or a table without statistics, is not checked.
+the plan made again and the run handed off as a stored subquery result's is. A LEFT JOIN (lane
+replan-11) is checked the same way: the estimate of its whole set counts the right table's
+unmatched rows, kept null-extended, and its identity adds a part for each LEFT JOIN's table and
+each of its ON terms, which keep rows an inner join or a WHERE term of the same text would drop;
+`t_pl_13_19_a_sorter_fed_by_a_left_join_past_the_estimate_plans_again` (T-PL.13.19): T-PL.13.15's
+join as a LEFT JOIN, 1,000 rows estimated and 5,491 counted, one answer in order with adaptive
+joins off and on, one re-plan, none after. A RIGHT or FULL JOIN (its unmatched right rows read
+apart), a semi or anti join, a DISTINCT sorter, or a table without statistics, is not checked.
 `t_pl_13_15_a_sorter_fed_by_a_join_past_the_estimate_plans_again` (T-PL.13.15): a join estimated
 at 1,000 rows from distinct keys, holding 4,500 after an UPDATE: one answer, in order, with adaptive
 joins off and on, one re-plan, none on the second run or in a new statement.

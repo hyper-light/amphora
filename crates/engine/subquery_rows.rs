@@ -127,20 +127,40 @@ pub(crate) fn in_identity(select: &impl std::fmt::Debug) -> Option<u64> {
     identity(&("IN", select))
 }
 
-/// The identity of an inner join's whole result (PL.13, lane replan-10): its tables' names, in any
-/// order, and the fingerprint of its WHERE and ON terms (`filter_shares::fingerprint`, order-free).
+/// The identity of a join's whole result (PL.13, lane replan-10): its tables' names, in any order,
+/// and the fingerprint of its WHERE and ON terms (`filter_shares::fingerprint`, order-free).
 /// `None` for terms that read a parameter, whose rows change with the value bound, or for no term.
 /// Its count is the rows a sorter fed by the join held; the planner reads it for the set of all
-/// the join's tables (`cardinality::JoinedSetRows::rows`).
-pub(crate) fn join_identity<'a>(
-    tables: impl Iterator<Item = &'a str>,
-    terms: impl Iterator<Item = &'a amphora_engine_parser::ast::Expr>,
+/// the join's tables (`cardinality::JoinedSetRows::rows`). A LEFT JOIN (lane replan-11) keeps its
+/// right table's unmatched rows, which an inner join of the same terms drops, and an ON term of it
+/// keeps rows a WHERE term of the same text would drop: each such table and term adds a part of
+/// its own, so an inner join's identity is the one [prefix_identity] gives the same tables.
+pub(crate) fn join_identity(
+    tables: &[crate::translate::plan::JoinedTable],
+    where_clause: &[crate::translate::plan::WhereTerm],
 ) -> Option<u64> {
     let mut each = Vec::new();
-    for expr in terms {
-        each.push(crate::filter_shares::term_fingerprint(expr)?);
+    for term in where_clause {
+        let fingerprint = crate::filter_shares::term_fingerprint(&term.expr)?;
+        each.push(if term.origin.is_outer_join() {
+            identity(&("ON", fingerprint))?
+        } else {
+            fingerprint
+        });
     }
-    join_identity_of(tables.map(crate::util::normalize_ident).collect(), each)
+    let mut names = Vec::new();
+    for joined in tables {
+        let name = crate::util::normalize_ident(joined.table.get_name());
+        if joined
+            .join_info
+            .as_ref()
+            .is_some_and(|info| info.is_outer())
+        {
+            each.push(identity(&("LEFT", &name))?);
+        }
+        names.push(name);
+    }
+    join_identity_of(names, each)
 }
 
 /// [join_identity] of the tables named `names` (normalized) and the terms whose
