@@ -293,7 +293,7 @@ def file_in(sqls, dialect):
     for i, q in enumerate(sqls):
         sql, expect = q if isinstance(q, tuple) else (q, "ok")
         records.append(FileRecord(i, sql, "statement", expect))
-    return [dialects.record_in(r, dialect, c) for r, c in zip(records, dialects.contexts(records))]
+    return dialects.records_in(records, dialect)
 
 
 class UntypedColumns(unittest.TestCase):
@@ -341,6 +341,36 @@ class UntypedColumns(unittest.TestCase):
     def test_insert_select_takes_the_source_columns_class(self):
         out = file_in(["CREATE TABLE s(x INTEGER)", "CREATE TABLE t(a)", "INSERT INTO t SELECT x * 2 FROM s"], "duckdb")
         self.assertIn("BIGINT", out[1][0])
+
+
+class MissingTables(unittest.TestCase):
+    """Do: a table whose CREATE a dialect can't say (an untyped column of several storage classes),
+    then records that read it, write it, index it, view it, name it in a CTE's place, drop it and
+    make it again. Expect: each record naming it (or a view of it) untranslatable with the CREATE's
+    line and reason, where it would have failed on the engine for want of the table; one naming a
+    CTE of the same name, or another table, translated; after the DROP, a translated CREATE makes
+    it again; a CREATE SQLite refuses, or IF NOT EXISTS of a table already made, leaves it be."""
+
+    def test_records_naming_it_are_untranslatable(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in([
+                    "CREATE TABLE t(a INTEGER, e)", "INSERT INTO t VALUES (1, 1), (2, 'two')", "CREATE TABLE u(x INTEGER)",
+                    "SELECT a FROM t", "SELECT x FROM u", "CREATE INDEX ti ON t(a)", "CREATE VIEW v AS SELECT a FROM t", "SELECT * FROM v",
+                    "WITH t(a) AS (SELECT 1) SELECT a FROM t", "SELECT x FROM u WHERE x IN (SELECT a FROM t)",
+                    "DROP TABLE t", "CREATE TABLE t(a INTEGER)", "SELECT a FROM t",
+                ], d)
+                self.assertIsNone(out[0][0])
+                for i in (1, 3, 5, 6, 9, 10):
+                    self.assertIsNone(out[i][0], i)
+                    self.assertIn("names t, whose CREATE (line 0) is untranslatable there: not expressible", out[i][1])
+                self.assertIn("names v, whose CREATE (line 6)", out[7][1])
+                for i in (2, 4, 8, 11, 12):
+                    self.assertIsNone(out[i][1], (i, out[i][1]))
+
+    def test_refused_create_and_if_not_exists(self):
+        out = file_in(["CREATE TABLE t(a INTEGER)", ("CREATE TABLE t(e)", "error"), "CREATE TABLE IF NOT EXISTS t(e)", "SELECT a FROM t"], "duckdb")
+        self.assertIsNone(out[3][1])
 
 
 class IntegerDivision(unittest.TestCase):

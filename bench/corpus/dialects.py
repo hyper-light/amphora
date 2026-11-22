@@ -1447,6 +1447,65 @@ def record_in(record, dialect, context=None):
     return sql, why
 
 
+def _names(e):
+    """The tables and views statement `e` names (upper-cased), less the CTEs it defines, and the one
+    a CREATE TABLE or CREATE VIEW of it creates (None for another statement)."""
+    from sqlglot import exp
+
+    ctes = {c.alias_or_name.upper() for c in e.find_all(exp.CTE)}
+    made = None
+    if isinstance(e, exp.Create) and e.args.get("kind") in ("TABLE", "VIEW"):
+        target = e.this.this if isinstance(e.this, exp.Schema) else e.this
+        made = target.name.upper() if isinstance(target, exp.Table) else None
+    named = {t.name.upper() for t in e.find_all(exp.Table) if isinstance(t.this, exp.Identifier)} - ctes
+    return named - {made}, made
+
+
+def records_in(records, dialect, around=None):
+    """Each of a file's records in `dialect` (record_in()), in order, where a record that names a
+    table or view whose CREATE the dialect couldn't say (one SQLite ran: not a `statement error`)
+    is itself untranslatable, with that CREATE's line and reason: there the table isn't made, so
+    the record would fail on the engine for the translation's sake, not the engine's (G2 step 4:
+    an engine is never charged with a statement the corpus couldn't give it). A
+    translated CREATE of the same name (after a DROP) makes it again; a DROP of it is
+    untranslatable too, and forgets it. `around` is the file's contexts() (computed when None)."""
+    import sqlglot
+    from sqlglot import exp
+
+    around = around if around is not None else contexts(records)
+    missing, out = {}, []
+    for r, c in zip(records, around):
+        sql, why = record_in(r, dialect, c)
+        try:
+            statements = [e for e in sqlglot.parse(comment_closed(defaults_dropped(r.sql)), read=reader()) if e]
+        except Exception:  # sqlglot can't read it: record_in() has said so
+            statements = []
+        ran = not (r.kind == "statement" and r.expect == "error")
+        named, made = set(), []
+        for e in statements:
+            n, m = _names(e)
+            named |= n
+            made.append((m, e))
+        gone = sorted(n for n in named if n in missing)
+        if why is None and gone:
+            line, reason = missing[gone[0]]
+            why = f"untranslatable in {dialect}: names {gone[0].lower()}, whose CREATE (line {line}) is untranslatable there: {reason}"
+            sql = None
+        for m, e in made:
+            if m is None or not ran:
+                continue
+            if why is None:
+                missing.pop(m, None)
+            elif not (e.args.get("exists") and m in c.tables and m not in missing):
+                missing[m] = (r.line, why)
+        if ran:
+            for e in statements:
+                if isinstance(e, exp.Drop) and e.args.get("kind") in ("TABLE", "VIEW") and isinstance(e.this, exp.Table):
+                    missing.pop(e.this.name.upper(), None)
+        out.append((sql, why))
+    return out
+
+
 def refusals(pool, rel):
     """SQLite's error for each `statement error` record of `<pool>/<rel>` (run as the corpus's
     runner runs it, after its fixture `<pool>/<source>/base.test` when it has one): a JSON-ready
@@ -1487,8 +1546,7 @@ def main():
             out = os.path.join(pool, "translations", d, rel + ".jsonl")
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "w", encoding="utf-8") as f:
-                for r, c in zip(records, around):
-                    sql, why = record_in(r, d, c)
+                for r, (sql, why) in zip(records, records_in(records, d, around)):
                     counts[d][why is not None] += 1
                     f.write(json.dumps({"line": r.line, "sql": sql} if why is None else {"line": r.line, "untranslatable": why}) + "\n")
         # SQLite's error for each record it refuses, for comparing refusals by kind.
