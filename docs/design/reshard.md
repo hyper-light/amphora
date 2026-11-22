@@ -702,11 +702,13 @@ so after either cut, and a cursor at either head never passes a change.
 
 Each cut emits a trace event (`read_point_cut`: the point, the groups, and how far apart their
 clocks read), which is both what the latest point pushes the slow groups by and how far the
-earliest point's reads trail. Neither is kept until the lab's numbers decide. The lab, `database::across::tests::lab_read_point_a_b`,
-forces each failure mode: many groups for the push, and one group whose clock lags the rest for
-the staleness. Each round writes a row in every group, then reads the changes from the last cursor;
-it prints the read's and the cut's latency (p50, p99, p99.9), the rows answered before the read
-that it missed, and how far its head trailed the newest stamp. The run of record (the
+earliest point's reads trail. Neither is kept until the lab's numbers decide.
+
+The lab, `database::across::tests::lab_read_point_a_b`, forces each failure mode: many groups for
+the push, and one group whose clock lags the rest for the staleness. Each round writes a row in
+every group, then reads one page of the changes from the last cursor; it prints the read's and the
+cut's latency (p50, p99, p99.9), the rows answered before the read that the reader has not yet
+seen (a backlog past one page counts too), and how far its head trailed the newest stamp. The run of record (the
 coordinator's, on one machine for both candidates):
 
     AMPHORA_AB_GROUPS=2,16,128 AMPHORA_AB_ROUNDS=2000 AMPHORA_AB_LAG_NS=1000000000 \
