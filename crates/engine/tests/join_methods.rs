@@ -6,7 +6,7 @@
 
 use amphora_engine::{
     ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, Numeric, OpenOptions, PlatformIO,
-    SqliteDialect, Value,
+    SqliteDialect, Statement, Value,
 };
 use std::sync::Arc;
 
@@ -483,4 +483,193 @@ fn qt_5_15_equi_joins_over_empty_null_repeated_and_mixed_keys_give_one_answer() 
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+fn open_conn(dir: &tempfile::TempDir, name: &str) -> (Arc<Database>, Arc<Connection>) {
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.path().join(name).to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    (db, conn)
+}
+
+/// The merge's counters for one run of `stmt`: its rows (sorted), build rows passed by merging,
+/// probe rows found by search, merge tables probed by hash, and the bytes spilled.
+fn merge_counted(stmt: &mut Statement) -> (Vec<String>, [u64; 4]) {
+    stmt.reset_metrics();
+    let mut out: Vec<String> = stmt
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    out.sort();
+    let m = stmt.metrics().hash_join;
+    stmt.reset().unwrap();
+    (
+        out,
+        [
+            m.merge_steps,
+            m.merge_searches,
+            m.merge_tables_hashed,
+            m.spill_bytes_written,
+        ],
+    )
+}
+
+/// `a` with each key of 1..=`keys` twice and `b` with each once, in rowid order as `ordered`
+/// says: ascending, or scattered by a multiplicative permutation (a key's rows apart).
+fn fill_pair(conn: &Arc<Connection>, keys: i64, ordered: bool) {
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, y)")
+        .unwrap();
+    // 2654435761, Knuth's multiplicative hashing constant, is prime, so i * m mod keys is a
+    // permutation of 0..keys for every size here.
+    let key = |i: i64| {
+        if ordered {
+            i + 1
+        } else {
+            1 + (i * 2_654_435_761 % keys).rem_euclid(keys)
+        }
+    };
+    conn.execute("BEGIN").unwrap();
+    for i in 0..2 * keys {
+        conn.execute(format!("INSERT INTO a VALUES ({}, {})", i + 1, key(i / 2)))
+            .unwrap();
+    }
+    for i in 0..keys {
+        conn.execute(format!(
+            "INSERT INTO b VALUES ({}, {}, {})",
+            i + 1,
+            key(i),
+            i % 7
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("ANALYZE").unwrap();
+}
+
+/// QT.5 step 4 (lane qs5-21, T-QT.5.18): a merge join merges. Do: join two tables read in key
+/// order (each key twice on one side, once on the other) under merge joins only and hash joins
+/// only. Expect: one answer; the merge plans a MERGE JOIN, passes build rows forward and never
+/// searches (both sides come in key order), and the hash join counts no merge step.
+#[test]
+fn qt_5_18_a_merge_join_over_ordered_inputs_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_db, conn) = open_conn(&dir, "merge.db");
+    fill_pair(&conn, 200, true);
+    let sql = "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k";
+    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+    let hash_plan = plan(&conn, sql);
+    let (hashed, [hash_steps, ..]) = merge_counted(&mut conn.prepare(sql).unwrap());
+    conn.set_join_methods(JoinMethods::MergeJoinsOnly);
+    let merge_plan = plan(&conn, sql);
+    let (merged, [merge_steps, merge_searches, merge_hashed, _]) =
+        merge_counted(&mut conn.prepare(sql).unwrap());
+    assert_eq!(merged, hashed, "{merge_plan} against {hash_plan}");
+    assert_eq!(merged.len(), 400);
+    assert!(merge_plan.contains("MERGE JOIN"), "{merge_plan}");
+    assert_eq!(hash_steps, 0, "{hash_plan}");
+    assert!(merge_steps > 0, "{merge_plan}");
+    assert_eq!(merge_searches, 0, "both read in key order: {merge_plan}");
+    assert_eq!(merge_hashed, 0, "{merge_plan}");
+}
+
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    let Some(last) = sorted.len().checked_sub(1) else {
+        return 0;
+    };
+    sorted[((last as f64 * p).round() as usize).min(last)]
+}
+
+fn env_list(name: &str, default: &[usize]) -> Vec<usize> {
+    std::env::var(name).map_or_else(
+        |_| default.to_vec(),
+        |text| text.split(',').map(|n| n.trim().parse().unwrap()).collect(),
+    )
+}
+
+/// The coordinator's merge-versus-hash measurement (T-QT.5.18), one line a scenario, method and
+/// rung: inputs in key order, inputs scattered, and both under memory pressure (a 100-page cache,
+/// so the statement's memory is small and a large build spills), at `AMPHORA_QT518_ROWS` keys
+/// (default 10,000 and 1,000,000) over the concurrency ladder (`AMPHORA_QT518_LADDER`, default 1 to
+/// 4096), each client its own connection and thread, all starting together, running the join
+/// `AMPHORA_QT518_RUNS` times (default 5). Both methods run in this one driver on one machine.
+/// Tiny instance: `AMPHORA_QT518_ROWS=2000 AMPHORA_QT518_LADDER=1,8 AMPHORA_QT518_RUNS=2`.
+#[test]
+#[ignore = "the coordinator's harness: run with --ignored --nocapture"]
+fn qt_5_18_merge_versus_hash_harness() {
+    let sizes = env_list("AMPHORA_QT518_ROWS", &[10_000, 1_000_000]);
+    let ladder = env_list("AMPHORA_QT518_LADDER", &[1, 8, 32, 128, 512, 2048, 4096]);
+    let runs = env_list("AMPHORA_QT518_RUNS", &[5])[0];
+    let sql = "SELECT count(*), sum(b.y) FROM a JOIN b ON b.k = a.k";
+    for &keys in &sizes {
+        for (scenario, ordered, pressure) in [
+            ("ordered", true, false),
+            ("scattered", false, false),
+            ("ordered_pressure", true, true),
+            ("scattered_pressure", false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, conn) = open_conn(&dir, "harness.db");
+            fill_pair(&conn, i64::try_from(keys).unwrap(), ordered);
+            for methods in [JoinMethods::HashJoinsOnly, JoinMethods::MergeJoinsOnly] {
+                conn.set_join_methods(methods);
+                let shown = plan(&conn, sql);
+                for &clients in &ladder {
+                    let start = Arc::new(std::sync::Barrier::new(clients));
+                    let handles: Vec<_> = (0..clients)
+                        .map(|_| {
+                            let (db, start) = (db.clone(), start.clone());
+                            std::thread::spawn(move || {
+                                let conn = db.connect(ConnectOpts::new()).unwrap();
+                                conn.set_join_methods(methods);
+                                if pressure {
+                                    conn.execute("PRAGMA cache_size = 100").unwrap();
+                                }
+                                let mut stmt = conn.prepare(sql).unwrap();
+                                start.wait();
+                                let mut nanos = Vec::with_capacity(runs);
+                                let mut counts = [0_u64; 4];
+                                for _ in 0..runs {
+                                    let began = std::time::Instant::now();
+                                    let (_, c) = merge_counted(&mut stmt);
+                                    nanos.push(
+                                        u64::try_from(began.elapsed().as_nanos())
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                    for (sum, one) in counts.iter_mut().zip(c) {
+                                        *sum += one;
+                                    }
+                                }
+                                (nanos, counts)
+                            })
+                        })
+                        .collect();
+                    let mut nanos = Vec::new();
+                    let mut counts = [0_u64; 4];
+                    for handle in handles {
+                        let (n, c) = handle.join().unwrap();
+                        nanos.extend(n);
+                        for (sum, one) in counts.iter_mut().zip(c) {
+                            *sum += one;
+                        }
+                    }
+                    nanos.sort_unstable();
+                    println!(
+                        "qt5-18 scenario={scenario} keys={keys} method={methods:?} clients={clients} runs={runs} plan=\"{shown}\" merge_steps={} merge_searches={} merge_tables_hashed={} spill_bytes={} run_ns_p50={} p99={} p999={}",
+                        counts[0],
+                        counts[1],
+                        counts[2],
+                        counts[3],
+                        percentile(&nanos, 0.5),
+                        percentile(&nanos, 0.99),
+                        percentile(&nanos, 0.999),
+                    );
+                }
+            }
+        }
+    }
 }

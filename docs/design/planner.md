@@ -2405,6 +2405,8 @@ memory: a table whose order would pass its budget, or that spilled, is probed by
 **Evidence.** `hash_table::tests::qt_5_18_merge_table_finds_what_the_hash_table_finds` (the same
 rows, with repeats, NULL, 1 and 1.0, text and a blob, probed in key order and out of it, give the
 hash table's matches and unmatched rows; ordered probes merge, the others search);
+`tests/join_methods.rs`'s `qt_5_18_a_merge_join_over_ordered_inputs_merges` (a planned MERGE JOIN
+over inputs read in key order merges forward with no search and gives the hash join's answer);
 `tests/join_methods.rs` under `MergeJoinsOnly` and `ByCostWithMerge` (T-QT.5.1's random joins, the
 star joins' filters, T-QT.5.17's edge cases). Counters: `HashJoinMetrics::merge_steps`,
 `merge_searches`, `merge_tables_hashed`.
@@ -2414,4 +2416,5 @@ star joins' filters, T-QT.5.17's edge cases). Counters: `HashJoinMetrics::merge_
 binary search a row, where the cost function charges it a sort. A merge that spills is a hash join:
 the sort-merge's own spill (sorted runs merged) is not built. To be measured, against the hash join,
 over the concurrency ladder: probes in key order and not, builds already ordered and not, and builds
-that fit and that pass the statement's memory.
+that fit and that pass the statement's memory: `qt_5_18_merge_versus_hash_harness`, ignored, the
+coordinator's.
