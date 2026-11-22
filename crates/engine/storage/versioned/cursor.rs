@@ -274,6 +274,22 @@ impl Rows {
     }
 
     /// Copies `leaf`'s rows on `after`'s side of the point it was read for, as `snap` sees them.
+    /// Keeps the copied leaf's span of keys, its lower bound to its upper, as read by `txn` for its
+    /// commit's validation (G7 step 2, `AC-NS.2.3`): a superset of the rows and gaps the cursor
+    /// sees in the copy, as PostgreSQL's SSI locks an index page it scanned, so a commit since the
+    /// snapshot that wrote a key in it refuses a transaction that wrote. A reading cursor, or one
+    /// whose transaction has ended, keeps nothing.
+    fn keep_read(&self, db: &Database, txn: Option<&SharedTxn>, tree: u64) -> Result<()> {
+        let Some(txn) = txn else {
+            return Ok(());
+        };
+        let mut txn = txn.lock();
+        let Some(txn) = txn.as_mut() else {
+            return Ok(());
+        };
+        txn.keep_span(&db.v.clock, tree, self.low.as_deref(), self.high.as_deref())
+    }
+
     fn copy(
         &mut self,
         vt: &VTree,
@@ -418,6 +434,7 @@ impl VersionedCursor {
             tree,
             order,
             snap,
+            txn,
             d,
             rows,
             ..
@@ -436,6 +453,7 @@ impl VersionedCursor {
                 rows.copy(&vt, db, snap, l, true)
             })?;
             rows.join_chunks(db, d, snap, *tree)?;
+            rows.keep_read(db, txn.as_ref(), *tree)?;
             if !rows.is_empty() {
                 self.at = At::Row(0);
                 return Ok(true);
@@ -463,6 +481,7 @@ impl VersionedCursor {
             tree,
             order,
             snap,
+            txn,
             d,
             rows,
             ..
@@ -485,6 +504,7 @@ impl VersionedCursor {
                     rows.copy(&vt, db, snap, l, false)
                 })?;
                 rows.join_chunks(db, d, snap, *tree)?;
+                rows.keep_read(db, txn.as_ref(), *tree)?;
             }
             if let Some(last) = rows.len().checked_sub(1) {
                 self.at = At::Row(last);
