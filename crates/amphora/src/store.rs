@@ -1091,8 +1091,9 @@ impl<R: Send + 'static> Readers<R> {
         }
         // Each slot once its read is done: `open` is gone, so none is opened in it again.
         if let Some(slots) = &self.slots {
-            for mut slot in slots.take_all() {
-                *slot = None;
+            let mut all = slots.take_all();
+            for reader in all.readers() {
+                *reader = None;
             }
         }
         if let Some((tx, handle)) = locked(&self.checkpointer).take() {

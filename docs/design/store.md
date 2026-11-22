@@ -2009,7 +2009,8 @@ its own switch:
   its own slot's lock. A thread whose slot is busy tries the others, then waits on a condition
   variable; a read that ends wakes waiters only when its read of the waiters' count says there are
   some. Holding a slot stands for holding the gate: the log's restart and the readers' release take
-  every slot.
+  every slot, and giving them back wakes the reads that came meanwhile (no read ends to wake them
+  while every slot is held).
 - **Shared page lookups** (`crates/engine/storage/optimistic_pages.rs`, `SharedPageReads`;
   `AMPHORA_SHARED_PAGE_READS` = `locked`, the default, or `optimistic`). A lookup took its shard's
   read lock, a write to the lock's word. With `optimistic`, frames sit in front of the shards, each
@@ -2022,8 +2023,10 @@ its own switch:
   2012). A key's bytes never change (a frame's image is committed; a file version is forgotten
   before the file's page is written), so a whole image read here is what the shard would give; a
   forget clears the frame before it returns. An image found under its shard's lock is copied into
-  its frame (direct-mapped by the key's hash) by one writer at a time, a mutex no reader takes; a
-  writer that finds it held leaves the image out. Lookups answered here are counted on a stripe per
+  its frame (direct-mapped by the key's hash) by a writer that takes the frame by turning its
+  sequence odd with a compare-and-swap (LeanStore's exclusive latch, on the word readers check), so
+  writers of different frames share no line and no lock spans the frames; an offer that finds its
+  frame taken leaves the image out, and a forget waits for the frame's writer (one image's stores). Lookups answered here are counted on a stripe per
   thread, so the count writes no shared line.
 - **The frames' budget.** The pool gives the frames one shard's share of its budget (`per_shard`
   frames of a page each) and charges it, so the shards keep that many fewer pages: the memory stays

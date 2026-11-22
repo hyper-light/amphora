@@ -16,16 +16,18 @@
 //! What a frame holds is what the shard holds under the same key, and keys never change their
 //! bytes (a frame's image is committed; a file version is forgotten before the file's page is
 //! written): so a whole image read here is the image the shard would have given. A key forgotten
-//! by the pool is cleared here before the forget returns. Frames are written by one writer at a
-//! time (a mutex no reader takes): an image found under its shard's lock and not here is copied in,
-//! if no other writer is at it, replacing whatever its frame held (direct-mapped by the key's hash).
+//! by the pool is cleared here before the forget returns. A frame's writer takes the frame by
+//! turning its sequence odd with a compare-and-swap (LeanStore's exclusive latch: the same word the
+//! readers check), so writers of different frames never meet on a line and no lock spans the
+//! frames: an image found under its shard's lock and not here is copied in, if no other writer is
+//! at its frame, replacing whatever the frame held (direct-mapped by the key's hash); a forget
+//! waits for the frame's writer, which holds it for one image's stores.
 //!
 //! Lookups found here are counted on a stripe of their thread's own, so the count writes no line
 //! another reader writes.
 
 use crate::storage::shared_pages::{Key, Version};
 use crate::sync::atomic::{fence, AtomicU64, Ordering};
-use crate::sync::Mutex;
 use std::cell::Cell;
 use std::sync::OnceLock;
 
@@ -119,8 +121,6 @@ pub(crate) struct Frames {
     frames: Box<[Frame]>,
     /// Bytes an image takes: a whole number of words.
     page_bytes: usize,
-    /// One writer at a time; no reader takes it.
-    writer: Mutex<()>,
     /// Lookups answered here, a stripe a thread.
     hits: Box<[Stripe]>,
 }
@@ -159,7 +159,6 @@ impl Frames {
                 })
                 .collect(),
             page_bytes,
-            writer: Mutex::new(()),
             hits: (0..stripes.max(1))
                 .map(|_| Stripe(AtomicU64::new(0)))
                 .collect(),
@@ -171,6 +170,7 @@ impl Frames {
     }
 
     /// Frames kept.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.frames.len()
     }
@@ -208,8 +208,13 @@ impl Frames {
         {
             return false;
         }
-        for (bytes, word) in dest.chunks_exact_mut(8).zip(frame.words.iter()) {
-            bytes.copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+        for (bytes, word) in dest
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(frame.words.iter())
+        {
+            *bytes = word.load(Ordering::Relaxed).to_le_bytes();
         }
         fence(Ordering::Acquire);
         if frame.sequence.load(Ordering::Relaxed) != before {
@@ -222,7 +227,7 @@ impl Frames {
         true
     }
 
-    /// Writes `image` as `key`'s into its frame, unless another writer is at the frames (it is
+    /// Writes `image` as `key`'s into its frame, unless another writer is at that frame (it is
     /// then left out: the next lookup finds it under the shard's lock again) or the frame holds it
     /// already. Called while the pool keeps `key`'s image, under its shard's lock.
     pub(crate) fn offer(&self, key: &Key, image: &[u8]) {
@@ -232,25 +237,67 @@ impl Frames {
         let Some(frame) = self.frame(key) else {
             return;
         };
-        let Some(_writing) = self.writer.try_lock() else {
-            return;
-        };
         let wanted = words_of(key);
-        if frame
-            .key
-            .iter()
-            .zip(wanted)
-            .all(|(word, w)| word.load(Ordering::Relaxed) == w)
-        {
+        if Self::holds(frame, wanted) {
             return;
         }
-        Self::write(frame, wanted, image);
+        let Some(begun) = Self::try_latch(frame) else {
+            return;
+        };
+        Self::write(frame, begun, wanted, image);
+    }
+
+    /// Whether `frame`'s key words are `key`'s (read by its writer, or as a hint).
+    fn holds(frame: &Frame, key: [u64; 4]) -> bool {
+        frame
+            .key
+            .iter()
+            .zip(key)
+            .all(|(word, w)| word.load(Ordering::Relaxed) == w)
+    }
+
+    /// Takes `frame` for writing, if no writer has it: its sequence turned odd by a
+    /// compare-and-swap, the odd value returned. Readers that read it odd, or read it changed after
+    /// their words, ask the shard instead.
+    fn try_latch(frame: &Frame) -> Option<u64> {
+        let even = frame.sequence.load(Ordering::Relaxed);
+        if even & 1 == 1 {
+            return None;
+        }
+        let begun = even.wrapping_add(1);
+        frame
+            .sequence
+            .compare_exchange(even, begun, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        // The odd sequence before any word stored (Boehm 2012's writer: the fence after it).
+        fence(Ordering::Release);
+        Some(begun)
+    }
+
+    /// Takes `frame` for writing once its writer, if any, is done: a writer holds a frame for one
+    /// image's stores and nothing else, so the wait is that long at most.
+    fn latch(frame: &Frame) -> u64 {
+        loop {
+            if let Some(begun) = Self::try_latch(frame) {
+                return begun;
+            }
+            crate::thread::spin_loop();
+            crate::thread::yield_now();
+        }
+    }
+
+    /// Gives `frame` back unchanged (its sequence even again; a reader that overlapped asks the
+    /// shard, as after any write).
+    fn unlatch(frame: &Frame, begun: u64) {
+        frame
+            .sequence
+            .store(begun.wrapping_add(1), Ordering::Release);
     }
 
     /// Clears every frame whose key `matches`: done by the pool before a forget returns.
     pub(crate) fn forget_where(&self, matches: impl Fn(&Key) -> bool) {
-        let _writing = self.writer.lock();
         for frame in self.frames.iter() {
+            let begun = Self::latch(frame);
             let words = [0, 1, 2, 3].map(|i| {
                 frame
                     .key
@@ -258,7 +305,9 @@ impl Frames {
                     .map_or(EMPTY, |w| w.load(Ordering::Relaxed))
             });
             if key_of(words).is_some_and(|key| matches(&key)) {
-                Self::write(frame, [0, 0, EMPTY, 0], &[]);
+                Self::write(frame, begun, [0, 0, EMPTY, 0], &[]);
+            } else {
+                Self::unlatch(frame, begun);
             }
         }
     }
@@ -268,35 +317,25 @@ impl Frames {
         let Some(frame) = self.frame(key) else {
             return;
         };
-        let _writing = self.writer.lock();
+        let begun = Self::latch(frame);
         let wanted = words_of(key);
-        if frame
-            .key
-            .iter()
-            .zip(wanted)
-            .all(|(word, w)| word.load(Ordering::Relaxed) == w)
-        {
-            Self::write(frame, [0, 0, EMPTY, 0], &[]);
+        if Self::holds(frame, wanted) {
+            Self::write(frame, begun, [0, 0, EMPTY, 0], &[]);
+        } else {
+            Self::unlatch(frame, begun);
         }
     }
 
-    /// Called by the one writer: the sequence made odd, the key and the words stored, the sequence
-    /// made even again (`log_index::HeaderCopy::store`'s order).
-    fn write(frame: &Frame, key: [u64; 4], image: &[u8]) {
-        let begun = frame.sequence.load(Ordering::Relaxed).wrapping_add(1);
-        frame.sequence.store(begun, Ordering::Relaxed);
-        fence(Ordering::Release);
+    /// Called by the frame's writer, its sequence odd (`begun`, from `try_latch`): the key and
+    /// the words stored, the sequence made even again (`log_index::HeaderCopy::store`'s order).
+    fn write(frame: &Frame, begun: u64, key: [u64; 4], image: &[u8]) {
         for (word, w) in frame.key.iter().zip(key) {
             word.store(w, Ordering::Relaxed);
         }
-        for (word, bytes) in frame.words.iter().zip(image.chunks_exact(8)) {
-            let mut w = [0u8; 8];
-            w.copy_from_slice(bytes);
-            word.store(u64::from_le_bytes(w), Ordering::Relaxed);
+        for (word, bytes) in frame.words.iter().zip(image.as_chunks::<8>().0) {
+            word.store(u64::from_le_bytes(*bytes), Ordering::Relaxed);
         }
-        frame
-            .sequence
-            .store(begun.wrapping_add(1), Ordering::Release);
+        Self::unlatch(frame, begun);
     }
 
     /// Lookups answered here so far.
@@ -452,8 +491,8 @@ mod tests {
                         };
                         if pool.copy_into(&frame_key(page, frame), &mut dest) {
                             found += 1;
-                            for bytes in dest.chunks_exact(8) {
-                                let w = u64::from_le_bytes(bytes.try_into().unwrap());
+                            for bytes in dest.as_chunks::<8>().0 {
+                                let w = u64::from_le_bytes(*bytes);
                                 if w != word(page, frame) {
                                     if w & ((1 << 40) - 1) > snapshot {
                                         unsnapshotted += 1;
@@ -468,8 +507,10 @@ mod tests {
                         if pool.copy_into(&file_key(page), &mut dest) {
                             let first = u64::from_le_bytes(dest[..8].try_into().unwrap());
                             let whole = dest
-                                .chunks_exact(8)
-                                .all(|b| u64::from_le_bytes(b.try_into().unwrap()) == first);
+                                .as_chunks::<8>()
+                                .0
+                                .iter()
+                                .all(|b| u64::from_le_bytes(*b) == first);
                             if !whole || first >> 40 != page || first & FILE_MARK == 0 {
                                 torn += 1;
                             }

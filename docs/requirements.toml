@@ -957,7 +957,7 @@ criteria = [
 tests = [
   { id = "T-G3.6.1", text = "storage::optimistic_pages::tests::g3_s6_32_readers_and_a_writer_see_no_unsnapshotted_version_and_no_torn_page — passes when 32 readers beside a writer and a checkpoint's nemesis get only whole images of the versions their snapshots asked for, some of them without a lock (AMPHORA_G3S6_SECONDS=60 for the 60 s run)" },
   { id = "T-G3.6.2", text = "storage::optimistic_pages::tests::g3_s6_frames_give_back_what_was_offered_until_forgotten and g3_s6_only_the_optimistic_pool_reads_without_its_lock — pass when the frames return what they were offered until it is forgotten, and only the optimistic pool makes them, charged to its budget" },
-  { id = "T-G3.6.3", text = "store::checkout::tests::g3_s6_* — pass when slot readers never serve two reads at once, a reader waiting for a slot is woken when one is given back, and a release lets every slot reader go" },
+  { id = "T-G3.6.3", text = "store::checkout::tests::g3_s6_* — pass when slot readers never serve two reads at once, a reader waiting for a slot is woken when one is given back or when the log's restart gives every slot back, and a release lets every slot reader go" },
 ]
 
 # lane qs7

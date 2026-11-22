@@ -184,9 +184,36 @@ impl<R> Slots<R> {
         }
     }
 
-    /// Every slot, each once no read holds it: no read is under way while they are held.
-    pub(super) fn take_all(&self) -> Vec<MutexGuard<'_, Option<R>>> {
-        self.slots.iter().map(Self::lock).collect()
+    /// Every slot, each once no read holds it: no read is under way while they are held, and the
+    /// reads that came meanwhile are woken when they are given back.
+    pub(super) fn take_all(&self) -> All<'_, R> {
+        All {
+            held: self.slots.iter().map(Self::lock).collect(),
+            slots: self,
+        }
+    }
+}
+
+/// Every slot held (`Slots::take_all`, by the log's restart and the readers' release). A read that
+/// found them all held waits on the condition variable, and no read ends to wake it while they
+/// are: giving them back wakes it.
+pub(super) struct All<'a, R> {
+    held: Vec<MutexGuard<'a, Option<R>>>,
+    slots: &'a Slots<R>,
+}
+
+impl<R> All<'_, R> {
+    /// Each slot's reader (None where none was opened).
+    pub(super) fn readers(&mut self) -> impl Iterator<Item = &mut Option<R>> {
+        self.held.iter_mut().map(|slot| &mut **slot)
+    }
+}
+
+impl<R> Drop for All<'_, R> {
+    fn drop(&mut self) {
+        // Every slot unlocked first, then the waiters woken, so they find them free.
+        self.held.clear();
+        self.slots.wake();
     }
 }
 
@@ -304,6 +331,25 @@ mod tests {
         hold_tx.send(()).unwrap();
         holder.join().unwrap().unwrap().unwrap();
         assert_eq!(waiter.join().unwrap().unwrap().unwrap(), 7);
+    }
+
+    /// T-G3.6.3. Do: hold every slot (as the log's restart does), read from another thread, then
+    /// give the slots back. Expect: the read answered once they are given back (the restart's end
+    /// wakes a waiting read; none is left to its deadline).
+    #[test]
+    fn g3_s6_a_read_held_back_by_a_restart_is_woken_when_it_ends() {
+        let (readers, _, _) = readers(2);
+        let slots = readers.slots.as_ref().unwrap();
+        std::thread::scope(|s| {
+            let all = slots.take_all();
+            let waiter =
+                s.spawn(|| readers.with(Instant::now() + Duration::from_secs(60), |_| Ok(7)));
+            while slots.waiting.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            drop(all);
+            assert_eq!(waiter.join().unwrap().unwrap().unwrap(), 7);
+        });
     }
 
     /// T-G3.6.3. Do: read on 3 slots, then release the readers, then read again. Expect: every reader
