@@ -17,6 +17,10 @@
 //!   then 1, 8, 32, 128, 512, 2048, 4096 writes a filter (the brief's ladder), so the writes that
 //!   land during a dropped kind's build climb from none to many times the table's rows.
 //!
+//! Lane skip-10 (T-SKU.13): each scenario runs under each filter form of `--forms`: `between`
+//! (`a BETWEEN ?1 AND ?2`) and `in` (`a IN (?1, ?2)`, the same two values: a skipping scan reads
+//! the rows between them, the list's hull, where the filter matches two values' rows).
+//!
 //! Lane skip-9 (T-SKU.11): `capped` runs under each build mode for a dropped kind, as
 //! `capped:inline` (skip-7's, on the scan's path: the control), `capped:void` (skip-8's, voided by
 //! a write during it) and `capped:replay` (the writes during it applied before it installs, up to
@@ -40,7 +44,7 @@
 //!
 //! usage: amphora-bench --skipping [--rows N] [--filters F] [--writes 0,1,8,32,128,512,2048,4096]
 //!        [--engines off,zone_maps,cracking,measured,capped:inline,capped:void,capped:replay,duckdb]
-//!        [--duckdb-threads N] [--seed S] [--out FILE]
+//!        [--forms between,in] [--duckdb-threads N] [--seed S] [--out FILE]
 //!
 //! `--duckdb-threads` defaults to 1, the threads one Amphora statement runs on.
 
@@ -54,8 +58,14 @@ fn e(err: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{err}")
 }
 
-/// The filter every engine runs, prepared once and bound before each run.
-const FILTER: &str = "SELECT count(*), sum(b) FROM t WHERE a BETWEEN ?1 AND ?2";
+/// The filters every engine runs, by form, each prepared once and bound before each run.
+const FILTERS: [(&str, &str); 2] = [
+    (
+        "between",
+        "SELECT count(*), sum(b) FROM t WHERE a BETWEEN ?1 AND ?2",
+    ),
+    ("in", "SELECT count(*), sum(b) FROM t WHERE a IN (?1, ?2)"),
+];
 /// The write between filters, prepared once.
 const WRITE: &str = "UPDATE t SET a = ?1 WHERE id = ?2";
 
@@ -103,6 +113,8 @@ impl Shape {
 }
 
 struct Scenario {
+    /// The filter's form and its SQL (`FILTERS`).
+    filter: (&'static str, &'static str),
     shape: Shape,
     wide: bool,
     writes: usize,
@@ -111,7 +123,8 @@ struct Scenario {
 impl Scenario {
     fn name(&self) -> String {
         format!(
-            "{}-{}-w{}",
+            "{}-{}-{}-w{}",
+            self.filter.0,
             self.shape.name(),
             if self.wide { "wide" } else { "narrow" },
             self.writes
@@ -238,6 +251,7 @@ fn plan(
 }
 
 fn run_amphora(
+    filter: &str,
     setting: &str,
     fill: &[String],
     steps: &[(Vec<(i64, i64)>, (i64, i64))],
@@ -256,7 +270,7 @@ fn run_amphora(
             .execute(format!("PRAGMA skipping = 't.a {setting}'"))
             .map_err(e)?;
     }
-    let mut filter = db.conn.prepare(FILTER).map_err(e)?;
+    let mut filter = db.conn.prepare(filter).map_err(e)?;
     let mut write = db.conn.prepare(WRITE).map_err(e)?;
     let mut t = Tally {
         rows_read: Some(0),
@@ -298,6 +312,7 @@ fn duck_int(v: duckdb::types::ValueRef<'_>) -> anyhow::Result<Option<i64>> {
 }
 
 fn run_duck(
+    filter: &str,
     threads: usize,
     fill: &[String],
     steps: &[(Vec<(i64, i64)>, (i64, i64))],
@@ -310,7 +325,7 @@ fn run_duck(
         conn.execute_batch(sql)?;
     }
     conn.execute_batch("COMMIT")?;
-    let mut filter = conn.prepare(FILTER)?;
+    let mut filter = conn.prepare(filter)?;
     let mut write = conn.prepare(WRITE)?;
     let mut t = Tally::default();
     let began = Instant::now();
@@ -373,6 +388,7 @@ pub fn main() -> anyhow::Result<()> {
         .filter(|engine| **engine != "capped")
         .map(|s| s.to_string())
         .collect();
+    let mut forms: Vec<(&str, &str)> = FILTERS.to_vec();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || {
@@ -385,6 +401,18 @@ pub fn main() -> anyhow::Result<()> {
             "--filters" => filters = v()?.parse::<usize>()?.max(1),
             "--writes" => writes = v()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             "--engines" => engines = v()?.split(',').map(str::to_owned).collect(),
+            "--forms" => {
+                forms = v()?
+                    .split(',')
+                    .map(|form| {
+                        FILTERS
+                            .iter()
+                            .find(|(name, _)| *name == form)
+                            .copied()
+                            .ok_or_else(|| anyhow::anyhow!("unknown form {form}: between or in"))
+                    })
+                    .collect::<anyhow::Result<_>>()?
+            }
             "--duckdb-threads" => threads = v()?.parse::<usize>()?.max(1),
             "--seed" => seed = v()?.parse()?,
             "--out" => out = Some(v()?.into()),
@@ -405,71 +433,76 @@ pub fn main() -> anyhow::Result<()> {
     });
     let platform = serde_json::json!({ "host": host(), "os": std::env::consts::OS, "arch": std::env::consts::ARCH });
     let mut lines = Vec::new();
-    for shape in [Shape::Ordered, Shape::Scattered] {
-        for wide in [false, true] {
-            for &w in &writes {
-                let sc = Scenario {
-                    shape,
-                    wide,
-                    writes: w,
+    let scenarios = forms.iter().flat_map(|form| {
+        [Shape::Ordered, Shape::Scattered]
+            .into_iter()
+            .flat_map(move |shape| [false, true].map(move |wide| (*form, shape, wide)))
+    });
+    for (filter, shape, wide) in scenarios {
+        for &w in &writes {
+            let sc = Scenario {
+                filter,
+                shape,
+                wide,
+                writes: w,
+            };
+            let (fill, steps) = plan(&sc, rows, filters, seed);
+            let mut first: Option<Vec<Vec<Option<i64>>>> = None;
+            for engine in &engines {
+                let mut t = match engine.as_str() {
+                    "duckdb" => run_duck(sc.filter.1, threads, &fill, &steps)?,
+                    setting => run_amphora(sc.filter.1, setting, &fill, &steps)?,
                 };
-                let (fill, steps) = plan(&sc, rows, filters, seed);
-                let mut first: Option<Vec<Vec<Option<i64>>>> = None;
-                for engine in &engines {
-                    let mut t = match engine.as_str() {
-                        "duckdb" => run_duck(threads, &fill, &steps)?,
-                        setting => run_amphora(setting, &fill, &steps)?,
-                    };
-                    let equal = match &first {
-                        Some(answers) => *answers == t.answers,
-                        None => {
-                            first = Some(std::mem::take(&mut t.answers));
-                            true
-                        }
-                    };
-                    t.filters.sort_unstable();
-                    t.writes.sort_unstable();
-                    let name = if engine == "duckdb" {
-                        "duckdb"
-                    } else {
-                        "amphora"
-                    };
-                    let rate = if t.seconds > 0.0 {
-                        filters as f64 / t.seconds
-                    } else {
-                        0.0
-                    };
-                    let line = serde_json::json!({
-                        "bench": "skipping",
-                        "scenario": sc.name(),
-                        "engine": name,
-                        "setting": engine,
-                        "rows": rows,
-                        "filters": filters,
-                        "filter_p50_ns": pct(&t.filters, 0.50),
-                        "filter_p99_ns": pct(&t.filters, 0.99),
-                        "filter_p999_ns": pct(&t.filters, 0.999),
-                        "write_p50_ns": pct(&t.writes, 0.50),
-                        "write_p99_ns": pct(&t.writes, 0.99),
-                        "write_p999_ns": pct(&t.writes, 0.999),
-                        "filters_per_s": rate,
-                        "rows_read": t.rows_read,
-                        "builds": t.builds.map(|c| serde_json::json!({
-                            "installed": c.builds_installed,
-                            "voided": c.builds_invalidated,
-                            "replayed_writes": c.replayed_writes,
-                            "replay_overflows": c.replay_overflows,
-                            "replay_peak": c.replay_peak,
-                            "inline_rows_read": c.inline_rows_read,
-                        })),
-                        "equal": equal,
-                        "client": client,
-                        "platform": platform,
-                    })
-                    .to_string();
-                    println!("{line}");
-                    lines.push(line);
-                }
+                let equal = match &first {
+                    Some(answers) => *answers == t.answers,
+                    None => {
+                        first = Some(std::mem::take(&mut t.answers));
+                        true
+                    }
+                };
+                t.filters.sort_unstable();
+                t.writes.sort_unstable();
+                let name = if engine == "duckdb" {
+                    "duckdb"
+                } else {
+                    "amphora"
+                };
+                let rate = if t.seconds > 0.0 {
+                    filters as f64 / t.seconds
+                } else {
+                    0.0
+                };
+                let line = serde_json::json!({
+                    "bench": "skipping",
+                    "scenario": sc.name(),
+                    "form": sc.filter.0,
+                    "engine": name,
+                    "setting": engine,
+                    "rows": rows,
+                    "filters": filters,
+                    "filter_p50_ns": pct(&t.filters, 0.50),
+                    "filter_p99_ns": pct(&t.filters, 0.99),
+                    "filter_p999_ns": pct(&t.filters, 0.999),
+                    "write_p50_ns": pct(&t.writes, 0.50),
+                    "write_p99_ns": pct(&t.writes, 0.99),
+                    "write_p999_ns": pct(&t.writes, 0.999),
+                    "filters_per_s": rate,
+                    "rows_read": t.rows_read,
+                    "builds": t.builds.map(|c| serde_json::json!({
+                        "installed": c.builds_installed,
+                        "voided": c.builds_invalidated,
+                        "replayed_writes": c.replayed_writes,
+                        "replay_overflows": c.replay_overflows,
+                        "replay_peak": c.replay_peak,
+                        "inline_rows_read": c.inline_rows_read,
+                    })),
+                    "equal": equal,
+                    "client": client,
+                    "platform": platform,
+                })
+                .to_string();
+                println!("{line}");
+                lines.push(line);
             }
         }
     }
