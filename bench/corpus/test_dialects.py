@@ -409,6 +409,32 @@ class Collations(unittest.TestCase):
                 self.assertEqual([tuple(x) for x in d.execute(dialects.translate(q, "duckdb")[0]).fetchall()], [tuple(int(v) if isinstance(v, bool) else v for v in x) for x in s.execute(q).fetchall()])
 
 
+class Total(unittest.TestCase):
+    """Do: total() of integers, reals and NULL, as an aggregate, over no rows and over a window, and
+    of text. Expect: on DuckDB (when its Python module is here) what SQLite gives (0.0 over no rows);
+    of text left as it is."""
+
+    def test_total_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        records = [FileRecord(0, "CREATE TABLE t(a INTEGER, c REAL)"), FileRecord(1, "INSERT INTO t VALUES (1, 1.5), (2, NULL), (NULL, 2.25)"),
+                   FileRecord(2, "SELECT total(a), total(c), total(NULL) FROM t", "query", None), FileRecord(3, "SELECT total(a) FROM t WHERE a > 5", "query", None),
+                   FileRecord(4, "SELECT a, total(c) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY a", "query", None)]
+        s, d = sqlite3.connect(":memory:"), duckdb.connect()
+        for r, (sql, why) in zip(records, dialects.records_in(records, "duckdb")):
+            self.assertIsNone(why)
+            want = s.execute(r.sql).fetchall()
+            got = d.execute(sql).fetchall()
+            if r.kind == "query":
+                with self.subTest(sql=r.sql):
+                    self.assertEqual([tuple(x) for x in got], want)
+        self.assertIn("TOTAL(B)", dialects.records_in([FileRecord(0, "CREATE TABLE u(b TEXT)"), FileRecord(1, "SELECT total(b) FROM u", "query", None)], "postgres")[1][0].upper())
+
+
 class LeftOutColumns(unittest.TestCase):
     """Do: a table with typed columns and one without a type that holds values of several storage
     classes (the written files' shared t1), then inserts with and without a column list, an

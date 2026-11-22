@@ -1107,6 +1107,12 @@ def functions_said(expression, context, dialect):
       REAL value into an INTEGER, the result is the integer between the REAL value and zero that is
       closest to the REAL value", where DuckDB's, PostgreSQL's and MySQL's casts round (DuckDB 1.4.2
       gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first.
+    - total(X): "The sum() and total() aggregate functions return the sum of all non-NULL values
+      in the group ... total() always returns a floating point value ... 0.0 if there are only
+      NULL inputs" (lang_aggfunc.html#sumunc); no other engine has it. For an X of INTEGER or REAL
+      class (storage_classes()), or NULL, it is coalesce(sum(CAST(X AS DOUBLE)), 0.0), as an
+      aggregate and over a window alike. Another X (text, which total() reads as a number its own
+      way) is left as it is.
     - X IS Y: "The IS and IS NOT operators work like = and != except when one or both of the
       operands are NULL" (lang_expr.html "Operators"), where the other engines' IS takes NULL,
       TRUE and FALSE only: X IS NOT DISTINCT FROM Y (MySQL's <=>), the SQL standard's name for it.
@@ -1191,6 +1197,15 @@ def functions_said(expression, context, dialect):
                 node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
             elif arg == "BLOB" and dialect != "postgres":
                 same(node, exp.Anonymous(this="octet_length" if dialect == "duckdb" else "length", expressions=[node.this.copy()]))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "TOTAL" and len(node.expressions) == 1 and not isinstance(node.expressions[0], exp.Distinct) and classes.get(id(node.expressions[0]), UNKNOWN) in (None, "INTEGER", "REAL"):
+            summed = exp.Sum(this=exp.cast(node.expressions[0].copy(), exp.DataType.build("DOUBLE")))
+            w = node.parent
+            if isinstance(w, exp.Window) and w.this is node:
+                over = w.copy()
+                over.set("this", summed)
+                same(w, exp.Coalesce(this=over, expressions=[exp.Literal.number("0.0")]))
+            else:
+                same(node, exp.Coalesce(this=summed, expressions=[exp.Literal.number("0.0")]))
         elif isinstance(node, exp.Is) and not isinstance(node.expression, (exp.Null, exp.Boolean)):
             same(node, exp.NullSafeEQ(this=node.this.copy(), expression=node.expression.copy()))
         elif isinstance(node, exp.Typeof) and classes.get(id(node.this), UNKNOWN) != UNKNOWN:
