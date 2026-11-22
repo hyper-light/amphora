@@ -712,11 +712,6 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.quiet
     }
 
-    /// How the owner's entries state its group's member bound ([`hyper_raft::Raft::state_members`]).
-    pub fn state_members(&mut self, stated: hyper_raft::StatedMembers) {
-        self.node.raft.state_members(stated);
-    }
-
     /// Raises the most members a configuration may name ([`hyper_raft::Raft::grow_members`]): an
     /// owner whose image states a bound past the one its core was opened for.
     pub fn grow_members(&mut self, members: usize) -> bool {

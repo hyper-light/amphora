@@ -1891,16 +1891,15 @@ thread_local! {
     static WINDOW: std::cell::Cell<super::drain::Window> =
         const { std::cell::Cell::new(super::drain::Window::DEFAULT) };
 }
-/// The window to each member an owner opens with: the default, and in a test what it set.
+/// The window to each member an owner opens with: in a test, what it set.
+#[cfg(test)]
 fn opened_window() -> super::drain::Window {
-    #[cfg(test)]
-    {
-        WINDOW.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        super::drain::Window::DEFAULT
-    }
+    WINDOW.with(std::cell::Cell::get)
+}
+/// The window to each member an owner opens with: the default.
+#[cfg(not(test))]
+fn opened_window() -> super::drain::Window {
+    super::drain::Window::DEFAULT
 }
 
 /// The most members a configuration of this member's group names, which its core opens with: the
@@ -1992,11 +1991,8 @@ fn open_on<F: BlockFile + 'static>(
     // room for queues, the memory its core's limits are derived from (lane constants-20; was a
     // picked 512 MiB).
     let resident = crate::memory::process().room(crate::memory::Use::Queues)?;
-    let mut replica =
+    let replica =
         Replica::open(&settings, group, machine, Bytes::new(resident)).map_err(unavailable)?;
-    // The core raises its bound as it takes an entry that states one, before the change behind it
-    // takes effect (lane constants-21).
-    replica.state_members(crate::replication::members::stated);
     let local = Local::new(
         reader,
         Arc::clone(&meter),
@@ -2300,6 +2296,11 @@ fn settings(
         max_inflight_msgs,
         max_inflight_bytes,
         seed: id,
+        // The core raises its member bound as it takes an entry that states one, at open as
+        // after, before the change behind it takes effect (lane constants-21).
+        stated_members: Some(hyper_raft::StatedMembers(
+            crate::replication::members::stated,
+        )),
         ..hyper_raft::Config::new(id, limits)
     };
     // The owner's quiet period is its learned election timeout (lane constants-21; was focal

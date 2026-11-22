@@ -2631,8 +2631,9 @@ format bound (about 1.6 million) would take megabytes of every image record. The
 - **Taken as the entry is taken.** The core raises its own bound as it takes an entry that states one, before the
   configuration changes behind it take effect: hyper-raft puts a configuration in force when its entry is appended,
   not applied, so raising on apply would come too late at a follower that takes both entries in one append. This is a
-  vendored change to hyper-raft (`vendor/patches/hyper-raft/0006-…`): `Raft::state_members` takes the owner's reader
-  (`members::stated`), and `Raft::grow_members` raises the tracker's, the fast votes' and the pending reads' bounds
+  vendored change to hyper-raft (`vendor/patches/hyper-raft/0006-…`): `Config::stated_members` is the owner's reader
+  (`members::stated`), read as entries are taken at open as after, so a member reopened with a bound entry and the
+  change behind it taken and neither applied opens in bound; and `Raft::grow_members` raises the tracker's, the fast votes' and the pending reads' bounds
   with it. The fast votes' bytes stay what the core opened with: a vote past them is dropped, and the leader commits
   by the classic track. An image installed brings the bound recorded before it, which the core then takes
   (`Actor::keep_member_bound`).

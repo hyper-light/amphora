@@ -326,6 +326,28 @@ pub struct Config {
     pub seed: u64,
     /// The bounds of what grows.
     pub limits: Limits,
+    /// How an owner's normal entry states its group's member bound, if it does: as the core
+    /// takes entries into its log, at open as after, it raises `limits.members` to the most one
+    /// of them states ([`Raft::grow_members`]), before the configurations they change take
+    /// effect. A configuration follows the bound that admits it in the log, so a member that
+    /// takes both at once, or reopens with both taken and neither applied, is raised first
+    /// (Amphora's QB.1, lane constants-21). `None`: no entry states one.
+    pub stated_members: Option<StatedMembers>,
+}
+/// Reads the member bound an owner's normal entry states, if it states one
+/// ([`Config::stated_members`]).
+#[derive(Clone, Copy)]
+pub struct StatedMembers(pub fn(&[u8]) -> Option<usize>);
+impl PartialEq for StatedMembers {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::fn_addr_eq(self.0, other.0)
+    }
+}
+impl Eq for StatedMembers {}
+impl std::fmt::Debug for StatedMembers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StatedMembers")
+    }
 }
 impl Config {
     /// The member `id` with `raft-rs` 0.7's defaults (its `Config::default`:
@@ -360,6 +382,7 @@ impl Config {
             incarnation: 0,
             seed: id,
             limits,
+            stated_members: None,
         }
     }
     /// Whether the settings describe a member that can run: an identity, an
@@ -799,11 +822,7 @@ pub struct Raft<S> {
     /// member opens, a quarter kilobyte inline in every member a host holds (focal's session,
     /// whose inline size its debug stacks on Windows bound).
     pub(crate) config: Box<Config>,
-    /// How an owner's entry states its group's member bound, if it does ([`Raft::state_members`]).
-    stated_members: Option<StatedMembers>,
 }
-/// Reads the member bound an owner's normal entry states, if it states one.
-pub type StatedMembers = fn(&[u8]) -> Option<usize>;
 
 /// The messages that wait to be taken, and what they hold, by capacity,
 /// kept as they are queued so that asking costs nothing.
@@ -1439,7 +1458,6 @@ impl<S: Storage> Raft<S> {
                 Elections::Suspicion => Some(Box::default()),
             },
             config: Box::new(config.clone()),
-            stated_members: None,
         };
         raft.conf_before = conf_before;
         raft.applied_conf = applied_conf;
@@ -1500,17 +1518,11 @@ impl<S: Storage> Raft<S> {
     }
     /// Raises the most members a configuration may name to `members`, never lowers it: the
     /// bound an owner's group states in its log and raised there before a configuration that
-    /// passes it (Amphora's QB.1, lane constants-21), so a group's members, each opened for the
-    /// bound its log named then, take every configuration the group commits. Each of the core's
+    /// passes it ([`Config::stated_members`]; Amphora's QB.1, lane constants-21), so a group's
+    /// members, each opened for the bound its log named then, take every configuration the group
+    /// commits. Each of the core's
     /// parts bounded by it (the tracker, the fast votes and the pending reads) takes the new
     /// bound with it. Returns whether it rose.
-    /// The owner's entries state the group's member bound, read by `stated`: as the core takes
-    /// entries into its log, before the configurations they change take effect, it raises its
-    /// bound to the most one of them states ([`Raft::grow_members`]). A configuration follows
-    /// the bound that admits it in the log, so a member that takes both at once is raised first.
-    pub fn state_members(&mut self, stated: StatedMembers) {
-        self.stated_members = Some(stated);
-    }
     pub fn grow_members(&mut self, members: usize) -> bool {
         if members <= self.config.limits.members {
             return false;
@@ -4677,9 +4689,9 @@ impl<S: Storage> Raft<S> {
         if low <= last {
             // Read where the entries are, none copied: the walk stops only at an error.
             let start = self.tracker.configuration();
-            let stated = self.stated_members;
+            let stated = self.config.stated_members;
             self.log.any_entry(low, last.saturating_add(1), |entry| {
-                if let Some(stated) = stated
+                if let Some(StatedMembers(stated)) = stated
                     && entry.entry_type == EntryType::EntryNormal
                     && let Some(members) = stated(&entry.data)
                 {

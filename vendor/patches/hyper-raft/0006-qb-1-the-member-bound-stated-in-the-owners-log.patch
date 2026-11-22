@@ -2,18 +2,13 @@ Subject: QB.1 the member bound stated in the owner's log
 Why: hyper-raft stops a member handed a configuration past the members it was opened for, so a group's bound has to grow with it: Amphora states the bound in its log (lane constants-21), and the core raises its own as it takes an entry that states one (Raft::state_members), before the change behind it takes effect, and when an owner's image states a larger one (Replica::grow_members)
 
 diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
-index 42b8b414ca173ec0483d5d5d4e0c9599099e226f..2d986f253a5cb7734d9e5889a3356217a31eae98 100644
+index 42b8b414ca173ec0483d5d5d4e0c9599099e226f..20ba16f1b3a94a42e97f131bad6ee5d1d21278c5 100644
 --- a/crates/hyper-durable/src/replica.rs
 +++ b/crates/hyper-durable/src/replica.rs
-@@ -707,6 +707,17 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+@@ -707,6 +707,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
          self.quiet = quiet;
      }
  
-+    /// How the owner's entries state its group's member bound ([`hyper_raft::Raft::state_members`]).
-+    pub fn state_members(&mut self, stated: hyper_raft::StatedMembers) {
-+        self.node.raft.state_members(stated);
-+    }
-+
 +    /// Raises the most members a configuration may name ([`hyper_raft::Raft::grow_members`]): an
 +    /// owner whose image states a bound past the one its core was opened for.
 +    pub fn grow_members(&mut self, members: usize) -> bool {
@@ -69,46 +64,57 @@ index 27ac5f9d907827bbb7f8d1e3e2b95012f78e6137..67bd072c2aba49c4ffd829a981b40655
      /// join: its fixed bytes and `max_size_per_msg` of entries.
      pub fn set_page(&mut self, max_size_per_msg: u64) {
 diff --git a/crates/hyper-raft/src/raft.rs b/crates/hyper-raft/src/raft.rs
-index 4baa0af2c48605001223dff83915b9254b5ee830..424c457e5e89ce3ce25929b6b9548056b9fad085 100644
+index 4baa0af2c48605001223dff83915b9254b5ee830..f1356493b5d661c0865046ff472d6ddb776e3531 100644
 --- a/crates/hyper-raft/src/raft.rs
 +++ b/crates/hyper-raft/src/raft.rs
-@@ -799,7 +799,11 @@ pub struct Raft<S> {
-     /// member opens, a quarter kilobyte inline in every member a host holds (focal's session,
-     /// whose inline size its debug stacks on Windows bound).
-     pub(crate) config: Box<Config>,
-+    /// How an owner's entry states its group's member bound, if it does ([`Raft::state_members`]).
-+    stated_members: Option<StatedMembers>,
+@@ -326,6 +326,28 @@ pub struct Config {
+     pub seed: u64,
+     /// The bounds of what grows.
+     pub limits: Limits,
++    /// How an owner's normal entry states its group's member bound, if it does: as the core
++    /// takes entries into its log, at open as after, it raises `limits.members` to the most one
++    /// of them states ([`Raft::grow_members`]), before the configurations they change take
++    /// effect. A configuration follows the bound that admits it in the log, so a member that
++    /// takes both at once, or reopens with both taken and neither applied, is raised first
++    /// (Amphora's QB.1, lane constants-21). `None`: no entry states one.
++    pub stated_members: Option<StatedMembers>,
++}
++/// Reads the member bound an owner's normal entry states, if it states one
++/// ([`Config::stated_members`]).
++#[derive(Clone, Copy)]
++pub struct StatedMembers(pub fn(&[u8]) -> Option<usize>);
++impl PartialEq for StatedMembers {
++    fn eq(&self, other: &Self) -> bool {
++        std::ptr::fn_addr_eq(self.0, other.0)
++    }
++}
++impl Eq for StatedMembers {}
++impl std::fmt::Debug for StatedMembers {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("StatedMembers")
++    }
  }
-+/// Reads the member bound an owner's normal entry states, if it states one.
-+pub type StatedMembers = fn(&[u8]) -> Option<usize>;
- 
- /// The messages that wait to be taken, and what they hold, by capacity,
- /// kept as they are queued so that asking costs nothing.
-@@ -1435,6 +1439,7 @@ impl<S: Storage> Raft<S> {
-                 Elections::Suspicion => Some(Box::default()),
-             },
-             config: Box::new(config.clone()),
+ impl Config {
+     /// The member `id` with `raft-rs` 0.7's defaults (its `Config::default`:
+@@ -360,6 +382,7 @@ impl Config {
+             incarnation: 0,
+             seed: id,
+             limits,
 +            stated_members: None,
-         };
-         raft.conf_before = conf_before;
-         raft.applied_conf = applied_conf;
-@@ -1493,6 +1498,29 @@ impl<S: Storage> Raft<S> {
+         }
+     }
+     /// Whether the settings describe a member that can run: an identity, an
+@@ -1493,6 +1516,23 @@ impl<S: Storage> Raft<S> {
      pub fn config(&self) -> &Config {
          &self.config
      }
 +    /// Raises the most members a configuration may name to `members`, never lowers it: the
 +    /// bound an owner's group states in its log and raised there before a configuration that
-+    /// passes it (Amphora's QB.1, lane constants-21), so a group's members, each opened for the
-+    /// bound its log named then, take every configuration the group commits. Each of the core's
++    /// passes it ([`Config::stated_members`]; Amphora's QB.1, lane constants-21), so a group's
++    /// members, each opened for the bound its log named then, take every configuration the group
++    /// commits. Each of the core's
 +    /// parts bounded by it (the tracker, the fast votes and the pending reads) takes the new
 +    /// bound with it. Returns whether it rose.
-+    /// The owner's entries state the group's member bound, read by `stated`: as the core takes
-+    /// entries into its log, before the configurations they change take effect, it raises its
-+    /// bound to the most one of them states ([`Raft::grow_members`]). A configuration follows
-+    /// the bound that admits it in the log, so a member that takes both at once is raised first.
-+    pub fn state_members(&mut self, stated: StatedMembers) {
-+        self.stated_members = Some(stated);
-+    }
 +    pub fn grow_members(&mut self, members: usize) -> bool {
 +        if members <= self.config.limits.members {
 +            return false;
@@ -122,7 +128,7 @@ index 4baa0af2c48605001223dff83915b9254b5ee830..424c457e5e89ce3ce25929b6b9548056
      /// This member's identity.
      pub fn id(&self) -> NodeId {
          self.id
-@@ -4645,10 +4673,18 @@ impl<S: Storage> Raft<S> {
+@@ -4645,10 +4685,18 @@ impl<S: Storage> Raft<S> {
              renewed: Vec::new(),
              error: None,
          };
@@ -130,9 +136,9 @@ index 4baa0af2c48605001223dff83915b9254b5ee830..424c457e5e89ce3ce25929b6b9548056
          if low <= last {
              // Read where the entries are, none copied: the walk stops only at an error.
              let start = self.tracker.configuration();
-+            let stated = self.stated_members;
++            let stated = self.config.stated_members;
              self.log.any_entry(low, last.saturating_add(1), |entry| {
-+                if let Some(stated) = stated
++                if let Some(StatedMembers(stated)) = stated
 +                    && entry.entry_type == EntryType::EntryNormal
 +                    && let Some(members) = stated(&entry.data)
 +                {
@@ -141,7 +147,7 @@ index 4baa0af2c48605001223dff83915b9254b5ee830..424c457e5e89ce3ce25929b6b9548056
                  fold.entry(start, entry).is_err_and(|error| {
                      fold.error = Some(error);
                      true
-@@ -4658,6 +4694,7 @@ impl<S: Storage> Raft<S> {
+@@ -4658,6 +4706,7 @@ impl<S: Storage> Raft<S> {
          if let Some(error) = fold.error {
              return Err(error);
          }

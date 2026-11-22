@@ -5,7 +5,7 @@
 //! (`Tracker::apply`), so the bound is the group's, read from its log, never a member's own
 //! picked number. A group starts with room to grow from its first configuration, and a change
 //! that would pass the bound first commits a larger one: the core raises its bound as it takes
-//! the entry, before the change behind it takes effect (`Raft::state_members`).
+//! the entry, before the change behind it takes effect (`hyper_raft::Config::stated_members`).
 use crate::db::Db;
 use amphora_api::{self as api, Refusal};
 
@@ -54,7 +54,7 @@ pub(super) fn decode(data: &[u8]) -> Result<usize, Refusal> {
 }
 
 /// The bound a stamped log entry states, if it states one: what the core reads as it takes
-/// entries (`hyper_raft::StatedMembers`).
+/// entries (`hyper_raft::Config::stated_members`).
 pub(crate) fn stated(entry: &[u8]) -> Option<usize> {
     let (_, data) = super::closed::open(entry).ok()?;
     is_bound(data).then(|| decode(data).ok()).flatten()
