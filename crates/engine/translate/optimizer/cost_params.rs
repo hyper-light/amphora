@@ -130,6 +130,12 @@ pub struct CostModelParams {
     /// (`plan_cache.rs`). Not a tuning parameter: set as the statement is planned.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) plan_values: Option<crate::sync::Arc<crate::plan_cache::PlanValues>>,
+
+    /// Amphora (QT.5, lane qs5-18): how an `IS` of a value planning doesn't know is estimated
+    /// (`Connection::set_is_value_estimate`). Not a tuning parameter: set as the statement is
+    /// planned.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) is_value_estimate: crate::IsValueEstimate,
 }
 
 impl CostModelParams {
@@ -181,6 +187,7 @@ impl CostModelParams {
             ),
 
             plan_values: None,
+            is_value_estimate: crate::IsValueEstimate::Equality,
         }
     }
 }
@@ -276,6 +283,15 @@ impl CostModelParams {
     ) -> Self {
         Self {
             plan_values: values.cloned(),
+            ..self
+        }
+    }
+
+    /// Amphora (QT.5): these parameters with the connection's rule for an `IS` of a value planning
+    /// doesn't know (lane qs5-18).
+    pub(crate) fn with_is_value_estimate(self, rule: crate::IsValueEstimate) -> Self {
+        Self {
+            is_value_estimate: rule,
             ..self
         }
     }

@@ -1177,7 +1177,8 @@ fn find_select_plan_form(
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
-        .with_plan_values(resolver.plan_values());
+        .with_plan_values(resolver.plan_values())
+        .with_is_value_estimate(resolver.is_value_estimate());
     plan.estimated_output_rows = None;
     plan.estimated_cost = None;
 
@@ -2903,7 +2904,8 @@ fn find_table_access_plan(
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
-        .with_plan_values(resolver.plan_values());
+        .with_plan_values(resolver.plan_values())
+        .with_is_value_estimate(resolver.is_value_estimate());
 
     if table_references.joined_tables().is_empty() {
         return Ok(None);

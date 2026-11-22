@@ -1071,3 +1071,5 @@ Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; ex
 skip (T-SKU.1).
 
 Lane qs5-16 (QT.5, T-QT.5.3): a star join's dimensions filter the fact scan with Bloom filters (`optimizer/lip.rs`, `main_loop/star.rs`), each kept by the planner's costs, sharing the statement's memory, behind `Connection::set_star_filters` (off is the control); `tests/star_filters.rs` holds the answers to the control's over a star, a cyclic graph and outer joins. Left: the order by selectivity is the planner's estimate, not yet re-measured as rows run; sort-merge and prefetched index joins not started.
+
+Lane qs5-18 (QT.5, T-QT.5.9, T-QT.5.10): an `IS` takes the `=` row estimate unless its value is NULL (lane qs5-17's fix, redone), so `a IS ? AND b IS ?` no longer prices its search near a scan; where planning doesn't know the value, `Connection::set_is_value_estimate` chooses `Equality` (SQLite's, the default) or `WorstCase` (the control), measured by `tests/is_value_estimate.rs` (`docs/design/planner.md`, "Decision (lane qs5-18)").

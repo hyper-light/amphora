@@ -852,6 +852,7 @@ tests = [
   { id = "T-QT.5.8", text = "crates/engine/tests/join_methods.rs, nested_loops.rs and hash_semi_join.rs, with the rhs_has_selective_seek gate gone (crates/engine/translate/optimizer/join.rs) — passes when a seek and a hash join are weighed by cost alone and each query answers as with nested loops forced" },
   # lane qs5-18
   { id = "T-QT.5.9", text = "t_qt_5_9_an_is_value_is_null_only_where_planning_knows_it (crates/engine/translate/optimizer/cost_params.rs) and a_one_row_lookup_needs_no_sort_for_its_columns (crates/engine/tests/records_plans.rs), twenty copies at once — passes when an IS is NULL only for the NULL literal and a parameter bound to NULL, not NULL for a non-NULL literal or bound value, unknown otherwise, and every copy plans the (a, b) search with its sort" },
+  { id = "T-QT.5.10", text = "t_qt_5_10_each_is_estimate_answers_alike_and_meets_its_failure_mode (crates/engine/tests/is_value_estimate.rs), Connection::set_is_value_estimate's Equality and WorstCase, the generic plan forced, with and without statistics — passes when every answer is the literal query's and, without statistics, Equality takes more cursor steps than WorstCase with NULL bound on a column NULL in 19 rows of 20, and WorstCase more than Equality with distinct values bound; qt_5_10_is_estimate_harness reports both at scale over the concurrency ladder" },
 ]
 
 # lane records-api: Amphora's own IDs for CP-T1.5's Records API (kiln goal a1f386fe, G9 step 1;

@@ -250,6 +250,22 @@ pub enum StarFilters {
     Always = 2,
 }
 
+/// Amphora (QT.5, lane qs5-18): the row estimate of `col IS v` where planning doesn't know whether
+/// `v` is NULL: a parameter of a generic plan, or another table's column. Behind this switch so the
+/// two can be measured against each other (the coordinator's A/B, `tests/is_value_estimate.rs`).
+/// A NULL value (the literal, or a parameter a custom plan binds to NULL) always takes the
+/// `IS NULL` estimate, and a known non-NULL one the `=` estimate.
+#[derive(Debug, Default, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum IsValueEstimate {
+    /// The `=` estimate, as SQLite's `whereLoopAddBtreeIndex` gives every `IS` but `IS NULL`.
+    #[default]
+    Equality = 0,
+    /// The worst case over the value's possible values: the larger of the `=` and the `IS NULL`
+    /// estimates. The control: before it, every NULL-matching `IS` took the `IS NULL` estimate,
+    /// which this equals wherever that one is the larger.
+    WorstCase = 1,
+}
+
 /// Test-only control over correlated-subquery rewrites.
 #[cfg(feature = "simulator")]
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +566,8 @@ pub struct Connection {
     pub(super) join_search_budget: AtomicJoinSearchBudget,
     /// Amphora: see [`Connection::set_star_filters`].
     pub(super) star_filters: AtomicStarFilters,
+    /// Amphora: see [`Connection::set_is_value_estimate`].
+    pub(super) is_value_estimate: AtomicIsValueEstimate,
     /// Amphora: see [`Connection::set_sorted_fetches`].
     pub(super) sorted_fetches: AtomicBool,
     /// Amphora: see [`Connection::set_adaptive_joins`].
@@ -1048,6 +1066,17 @@ impl Connection {
 
     pub(crate) fn star_filters(&self) -> StarFilters {
         self.star_filters.get()
+    }
+
+    /// Amphora (QT.5, lane qs5-18): chooses how newly prepared statements estimate the rows of an
+    /// `IS` whose value planning doesn't know (`IsValueEstimate`).
+    pub fn set_is_value_estimate(&self, rule: IsValueEstimate) {
+        self.is_value_estimate.set(rule);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn is_value_estimate(&self) -> IsValueEstimate {
+        self.is_value_estimate.get()
     }
 
     /// Amphora (PL.8): chooses the rule that sizes the join search for newly prepared statements.

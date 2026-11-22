@@ -139,8 +139,8 @@ pub use cdc::{
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
-    resolve_ext_path, Connection, JoinMethods, JoinSearchBudget, PrepareOptions, Row, StarFilters,
-    StepResult, SymbolTable,
+    resolve_ext_path, Connection, IsValueEstimate, JoinMethods, JoinSearchBudget, PrepareOptions,
+    Row, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use translate::optimizer::search_budget::JoinSearchStats;

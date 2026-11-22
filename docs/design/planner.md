@@ -2188,6 +2188,28 @@ Lane qs5-17, on the fix this redoes: `a_one_row_lookup_needs_no_sort_for_its_col
 40 (two rounds of 20 copies at once on adacachy, where it failed 1 to 3 times in each 20 before),
 with every `records_plans` test and the 134 `translate::optimizer` library tests.
 
-**What would falsify it.** A generic plan of `a IS ?` whose runs mostly bind NULL on a column of
-many NULLs, planned as a search and running slower than the scan the `IS NULL` estimate picks. The
-switch below measures it.
+**The value planning doesn't know, behind a switch.** Whether the generic plan's `a IS ?` (and `a
+IS other.col`) takes the `=` estimate is open, so it sits behind `Connection::set_is_value_estimate`
+for the coordinator's A/B (T-QT.5.10):
+
+- `Equality`, the default: SQLite's.
+- `WorstCase`, the control: the larger of the `=` and the `IS NULL` estimates, the worst over the
+  value's possible values. It is what every NULL-matching `IS` took before wherever the `IS NULL`
+  estimate is the larger, which is every case without statistics.
+
+`tests/is_value_estimate.rs` forces each one's failure mode and counts cursor steps, not time (asserted
+without statistics, where a million rows are assumed; with them the two may plan alike):
+
+- **Mostly NULL, NULL bound** (`Equality`'s). A run whose parameters are all NULL always takes the
+  generic plan (the plan choice sees nothing bound), so a column NULL in 19 rows of 20 is searched
+  for NULL and nearly every row looked up, where `WorstCase` scans once.
+- **Distinct values bound** (`WorstCase`'s). The generic plan scans for a one-row answer; with
+  custom plans allowed, each custom plan (its value known, so the `=` estimate) costs far less than
+  the generic one, so every run is planned again.
+
+The harness (`qt_5_10_is_estimate_harness`, ignored) reports each scenario, rule, plan mode and
+statistics at 1,000 and 1,000,000 rows over the concurrency ladder: plan, cursor steps a run, custom
+plans, and latency p50, p99 and p99.9. The default stays `Equality` until that data says otherwise.
+
+**What would falsify it.** The harness's mostly-NULL scenario at a million rows, if `Equality`'s
+latency there costs more than `WorstCase`'s costs in the distinct scenario across the ladder.

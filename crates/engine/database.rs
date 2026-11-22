@@ -2855,6 +2855,9 @@ impl Database {
             star_filters: crate::connection::AtomicStarFilters::new(
                 crate::connection::StarFilters::ByCost,
             ),
+            is_value_estimate: crate::connection::AtomicIsValueEstimate::new(
+                crate::connection::IsValueEstimate::Equality,
+            ),
             sorted_fetches: AtomicBool::new(false),
             adaptive_joins: AtomicBool::new(false),
             adaptive_join_switches: AtomicU64::new(0),

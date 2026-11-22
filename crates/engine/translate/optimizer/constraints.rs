@@ -596,18 +596,20 @@ fn estimate_constraint_selectivity(
         return estimate(operator);
     }
     // QT.5 (lane qs5-18): an `IS` takes the `=` estimate unless its value is NULL, as SQLite's
-    // `whereLoopAddBtreeIndex` gives it, `IS NULL` alone keeping its own. However estimated, a
-    // NULL-matching `IS` still never counts as one row ([Constraint::null_matching]).
+    // `whereLoopAddBtreeIndex` gives it, `IS NULL` alone keeping its own. A value planning doesn't
+    // know takes the connection's rule (`IsValueEstimate`). However estimated, a NULL-matching
+    // `IS` still never counts as one row ([Constraint::null_matching]).
+    let equality = || estimate(ConstraintOperator::from(ast::Operator::Equals));
     let known = is_value(null_matching, value, params);
-    let selectivity = match known {
-        IsValue::NotNull | IsValue::Unknown => {
-            estimate(ConstraintOperator::from(ast::Operator::Equals))
-        }
-        IsValue::Null => estimate(operator),
+    let selectivity = match (known, params.is_value_estimate) {
+        (IsValue::NotNull, _) | (IsValue::Unknown, crate::IsValueEstimate::Equality) => equality(),
+        (IsValue::Null, _) => estimate(operator),
+        (IsValue::Unknown, crate::IsValueEstimate::WorstCase) => equality().max(estimate(operator)),
     };
     tracing::trace!(
         table = table_reference.table.get_name(),
         value = ?known,
+        rule = ?params.is_value_estimate,
         selectivity,
         "IS estimate"
     );
