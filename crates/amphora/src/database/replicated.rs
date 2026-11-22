@@ -30,7 +30,13 @@ const QUEUED_BYTES: usize = 512 << 20;
 const OUTGOING_BYTES: usize = 512 << 20;
 const OUTGOING_MESSAGES: usize = 4096;
 pub(crate) const MEMBERS: usize = 64;
-const WIRE_BYTES: usize = crate::replication::SNAPSHOT_BYTES.saturating_add(2 << 20);
+/// The most image bytes one wire record carries into this owner's command queue: the queue's room
+/// held back from application calls for one record (`enqueue`). Picked with `QUEUED_BYTES`, whose
+/// split it is, and replaced with it (lane constants, piece 3: the queue sized from the memory
+/// budget and the measured drain rate). An image's own bound is the memory budget's room for one
+/// (SB.1), no more than this while it travels through this queue (`owner_image_room`).
+const WIRE_IMAGE_BYTES: usize = 256 << 20;
+const WIRE_BYTES: usize = WIRE_IMAGE_BYTES.saturating_add(2 << 20);
 const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 << 20);
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
 // randomized election and heartbeat, in the core's fixed tick counts, use this owner clock, never
@@ -997,6 +1003,12 @@ impl Flushing {
     }
 }
 
+/// The most an image of this owner's machine may take now: the memory budget's room for one (SB.1),
+/// no more than one wire record carries ([`WIRE_IMAGE_BYTES`]).
+fn owner_image_room() -> Result<usize, Refusal> {
+    Ok(crate::replication::image_room()?.min(WIRE_IMAGE_BYTES))
+}
+
 /// The frames the database's log may hold now, read on the flushing thread: its file's room and
 /// an equal share of what its filesystem has free (`log_bound::log_room`). Free bytes that can't
 /// be read give no share, and say why; a file whose length can't be read fails the pass.
@@ -1010,7 +1022,11 @@ fn room(
         .map_err(|e| format!("the database log's length couldn't be read: {e:#}"))?;
     let logs = share.logs().map_err(|e| e.to_string())?;
     Ok(match free() {
-        Ok(available) => (log_bound::log_room(available, logs, kept), None),
+        Ok(available) => {
+            let image = owner_image_room().map_err(|e| e.to_string())?;
+            let image = u64::try_from(image).unwrap_or(u64::MAX);
+            (log_bound::log_room(available, image, logs, kept), None)
+        }
         Err(e) => (
             kept,
             Some(format!("its filesystem's free bytes couldn't be read: {e}")),
@@ -1445,7 +1461,7 @@ fn open(
     validate(&config)?;
     validate_durability(&config, &durability)?;
     let log_owner = exclusive_file_of(log_path, &lease)?;
-    let machine = crate::replication::Machine::open_with_owner(
+    let mut machine = crate::replication::Machine::open_with_owner(
         path,
         ConfState {
             voters: config.voters.clone(),
@@ -1457,6 +1473,7 @@ fn open(
         config.bootstrap.clone(),
         matches!(durability, Durability::Replicated(_)),
     )?;
+    machine.set_snapshot_bytes(WIRE_IMAGE_BYTES);
     let file = DeviceFile::open(
         log_path,
         true,
@@ -2146,7 +2163,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         // The log is due by Ongaro's rule at the expansion this owner learned from its own images
         // and replays (`compacting`; replication.md, "Decision (lane constants): the compaction's
         // expansion learned where it runs"; CT.1), or at once while it stalls admission: a
-        // compaction is what frees its room. An image past its budget is refused (`SNAPSHOT_BYTES`),
+        // compaction is what frees its room. An image past its room is refused (`owner_image_room`),
         // so a due compaction waits for one within it; a stall still compacts, and fences on it.
         let ready = !self.replica.machine().bootstrap_pending();
         let due = ready
@@ -9047,7 +9064,7 @@ mod tests {
             .owner_mut(0)
             .replica
             .machine_mut()
-            .set_snapshot_bytes(crate::replication::SNAPSHOT_BYTES);
+            .set_snapshot_bytes(WIRE_IMAGE_BYTES);
         let added = driven
             .answer(
                 &mut pump,
@@ -13381,7 +13398,7 @@ mod tests {
     /// Free bytes that give each of `logs` replica logs on a filesystem `frames` frames past what
     /// its own file holds (`log_bound::log_room`).
     fn free_for(frames: u64, logs: u64) -> u64 {
-        u64::try_from(crate::replication::SNAPSHOT_BYTES).unwrap()
+        u64::try_from(owner_image_room().unwrap()).unwrap()
             + frames * logs * (log_bound::FRAME_BYTES + crate::db::PAGE_BYTES)
     }
     /// The frames owner `owner`'s database log may hold, as it last learned them.
@@ -14135,7 +14152,8 @@ mod tests {
         }
         assert_eq!(logs(), 1);
         let free = free_for(64, 2);
-        assert!(log_bound::log_room(free, 1, 0) > log_bound::log_room(free, 2, 0));
+        let image = u64::try_from(owner_image_room().unwrap()).unwrap();
+        assert!(log_bound::log_room(free, image, 1, 0) > log_bound::log_room(free, image, 2, 0));
         drop(clients);
     }
 

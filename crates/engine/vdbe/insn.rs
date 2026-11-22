@@ -444,7 +444,23 @@ pub struct MorselAggregateData {
     /// For each result column, its place in the pipeline's row (the GROUP BY values, then the
     /// aggregates).
     pub result_map: Vec<usize>,
+    /// A hash join's build side when the scan is the join's probe: the pipeline's row is the probe
+    /// table's columns, then the build's; `filter` is then over the probe table's alone.
+    pub join: Option<MorselJoinData>,
     pub target_pc_serial: BranchOffset,
+}
+
+/// Amphora: the build side of [MorselAggregateData]'s hash join (QT.6).
+#[derive(Debug, Clone)]
+pub struct MorselJoinData {
+    pub root_page: i64,
+    pub columns: usize,
+    pub rowid_alias: Option<usize>,
+    /// Terms over the build table's columns, tested before a row goes into the hash table.
+    pub filter: Vec<crate::vdbe::morsel::Predicate>,
+    /// The key's columns, pair by pair, in the probe table and in the build table.
+    pub probe_key: Vec<usize>,
+    pub build_key: Vec<usize>,
 }
 
 /// Amphora: data for [Insn::GroupSort].

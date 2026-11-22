@@ -2046,3 +2046,29 @@ tests; `AMPHORA_G3S6_SECONDS=60` runs it for 60 s. The measurements are the coor
 60 s run, `perf c2c` at 32 clients with both switches on, and the suite's `point_pk` at 1 and 32
 clients. Falsified if `point_pk` at 32 clients stays under 12x one client with both on, or c2c
 finds more than one contended line per million lookups on the read path.
+
+## Decision (lane constants): one process memory budget (2026-11-21)
+
+Ada's rule: no picked numbers. The process's memory bounds (an image's 256 MiB, the owners' queues' 512 MiB each)
+were each picked, and nothing knew what the process may hold where it runs: decision 26 read the limit on Linux
+only, and a caller fell back to a number of its own elsewhere.
+
+**The decision (MB.1).** `memory::limit` is the smallest limit the platform states: on Linux the limits of the
+control groups the process runs in (v2, else v1) and `/proc/meminfo`'s `MemTotal`; on macOS `hw.memsize` and on
+Windows `GlobalMemoryStatusEx`'s physical memory (the engine makes those two calls, `io::system_memory`, since
+Amphora's crate denies `unsafe`); and on Unix the process's own soft `RLIMIT_AS`, `RLIMIT_DATA` and `RLIMIT_RSS`.
+`memory::resident` is the bytes the process holds resident (memory-stats: `/proc/self/statm`, `task_info`,
+`GetProcessMemoryInfo`). `memory::Budget` shares the limit out by measured use, no share picked: a use (the owners'
+queues, images, caches) charges what it holds as it takes it and gives it back when the charge drops; its room is the
+limit less what the rest of the process holds, the larger of the resident bytes and every charge counted, its own
+given back. Both readings are taken again at every ask, so a limit moved while the process runs is followed. Where
+the limit can't be read the budget refuses, `Unavailable`, naming the platform: there is no fallback.
+
+**What is left.** A Windows job object's memory limit isn't read (`QueryInformationJobObject`): the machine's memory
+bounds such a process from above. The owners' queues don't charge the budget yet (their piece, next in the goal's
+list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
+
+**Tests.** In `memory::tests`: `mb1_a_uses_room_is_what_the_rest_of_the_process_leaves` (T-MB.1.1),
+`mb1_no_limit_read_is_a_typed_refusal_and_the_limit_is_read_again` (T-MB.1.2),
+`mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
+(T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.
