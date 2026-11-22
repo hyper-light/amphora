@@ -1129,12 +1129,12 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   for the group's leader, woken by the step that names it (`Client::leader`); TLS required for
   real services: `cluster.sh install` issues the authority and each member's certificate when no
   `--tls DIR` is given, plain links only with `--service none`.
-  Lane production-6: two more drills, `disk` (a member's log disk cut: every read, write and flush
-  of it fails, the replica fences and the member ends, then starts again with its disk back) and
-  `roll` (a rolling restart, the leader last, each member caught up before the next); `all` runs
-  kill, split, stall, disk and roll, each counted on every member. A test cuts the leader's disk
-  under load and finds every acknowledged write on the two left. `cluster.sh renew` reissues the
-  certificates that expire within W days from the install's authority and asks each member to
-  `reload`: new links use the new files, no restart; the member wakes on that request (Amphora has
-  no file-change source yet: inotify, kqueue and ReadDirectoryChangesW are the proposal). Untested
-  on Linux yet.
+  Lane production-6: three more drills, `hang` (a member's log disk hung, its network going on),
+  `disk` (its log disk cut: every read, write and flush of it fails, the replica fences and the
+  member ends, then starts again with its disk back) and `roll` (a rolling restart, the leader
+  last, each member caught up before the next); `all` runs kill, split, stall, hang, disk and roll,
+  each counted on every member. Tests cut and hang the leader's disk under load and find every
+  acknowledged write on the members left. `cluster.sh renew` reissues the certificates that expire
+  within W days from the install's authority and asks each member to `reload`: new links use the
+  new files, no restart; the member wakes on that request (Amphora has no file-change source yet:
+  inotify, kqueue and ReadDirectoryChangesW are the proposal). Untested on Linux yet.

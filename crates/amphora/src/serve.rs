@@ -9,9 +9,9 @@
 //! - `amphora health CONFIG`: asks every member for its status; healthy when every member answers,
 //!   all name the same leader, each holds the configured voters and none is fenced.
 //! - `amphora ask CONFIG NODE REQUEST`: one request to one member (`status`, `exec SQL`,
-//!   `count SQL`, `cut on|off` and `disk on|off` where the member's config says `drills = on`,
-//!   `member …`, `reload` (its TLS files read again, for the links made from then on: a
-//!   certificate renewed), and
+//!   `count SQL`, `cut on|off` and `disk cut|hang|back` where the member's config says
+//!   `drills = on`, `member …`, `reload` (its TLS files read again, for the links made from then
+//!   on: a certificate renewed), and
 //!   `leader WAIT_MS`: wait until the member knows its group's leader, at most WAIT_MS, and answer
 //!   `leader=ID addr=HOST:PORT term=T`; woken by the election's step, never by polling).
 //! - `amphora drill load|check`: the fire drills' writers and their loss count ([`load`], [`check`]).
@@ -27,7 +27,7 @@
 //! secret_file = /home/me/.config/amphora/secret
 //! deadline_ms = 5000                         # how long one request, connect or open may take
 //! drills = off                               # on: the member takes `cut` (a split at its transport)
-//!                                            # and `disk` (its log's disk cut)
+//!                                            # and `disk` (its log's disk cut or hung)
 //! cert_file = /home/me/.config/amphora/member-1.pem   # with key_file and roots_file, or none
 //! key_file = /home/me/.config/amphora/member-1.key
 //! roots_file = /home/me/.config/amphora/roots.pem
@@ -66,8 +66,8 @@ use anyhow::{Context, anyhow, bail, ensure};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::database::Database;
 use crate::database::replicated::{OUTGOING_MESSAGES, WIRE_BYTES};
+use crate::database::{Database, LogDisk};
 use crate::transport::network::{self, Credentials};
 
 const RECORDS: u8 = b'R';
@@ -456,7 +456,7 @@ struct Shared {
     deadline: Duration,
     keys: Keys,
     drills: bool,
-    /// This member's raft log, whose disk `disk on` cuts.
+    /// This member's raft log, whose disk `disk` cuts or hangs.
     log: PathBuf,
     /// Each member's address as the config names it, for the `leader` request's answer.
     addrs: BTreeMap<u64, String>,
@@ -747,20 +747,23 @@ impl Shared {
                 self.keys.reload()?;
                 Ok(String::new())
             }
-            // A disk cut (T-T1.13.1): every read, write and flush of this member's log fails as a
-            // disk gone away fails them, and its replica fences on the first, ending the process
-            // with the reason; the member started again finds its disk back.
+            // A disk cut or hung (T-T1.13.1): cut, every read, write and flush of this member's
+            // log fails as a disk gone away fails them, its replica fences on the first and the
+            // process ends with the reason; hung, each waits, its network going on, until the
+            // disk is back or cut. A member started again finds its disk back.
             "disk" => {
                 ensure!(
                     self.drills,
                     "drills are off in this member's config (drills = on takes disk)"
                 );
-                let to = match rest {
-                    "on" => true,
-                    "off" => false,
-                    other => bail!("disk {other}: on or off"),
+                let disk = match rest {
+                    "cut" => LogDisk::Cut,
+                    "hang" => LogDisk::Hung,
+                    "back" => LogDisk::Back,
+                    other => bail!("disk {other}: cut, hang or back"),
                 };
-                Database::cut_log_disk(&self.log, to).map_err(|e| anyhow!("disk {rest}: {e:?}"))?;
+                Database::set_log_disk(&self.log, disk)
+                    .map_err(|e| anyhow!("disk {rest}: {e:?}"))?;
                 Ok(String::new())
             }
             // A membership change, made by the leader (T-T1.13.1): a spare added as a learner,

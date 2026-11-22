@@ -459,7 +459,7 @@ fn t_t1_13_1_a_leaders_disk_cut_under_load_loses_no_acknowledged_write() {
     serve::load(c, "before", 2, Duration::from_millis(200), &before).unwrap();
     Client::connect(&addr, &keys, c.deadline)
         .unwrap()
-        .ask("disk on")
+        .ask("disk cut")
         .unwrap();
     let during = dir.path().join("during");
     let summary = serve::load(c, "during", 2, Duration::from_secs(2), &during).unwrap();
@@ -489,4 +489,46 @@ fn t_t1_13_1_a_leaders_disk_cut_under_load_loses_no_acknowledged_write() {
         .map(|l| l.split_whitespace().nth(2).unwrap().parse::<u64>().unwrap())
         .sum();
     assert!(acked > 0, "the two left took no writes: {summary}");
+}
+
+/// A disk hung under load (T-T1.13.1, AC-T1.13.5): the leader's log disk stops answering while
+/// writers write, its network going on (so it can keep its lease while nothing it takes becomes
+/// durable), then comes back; every acknowledged write is then on every member.
+#[test]
+fn t_t1_13_1_a_leaders_disk_hung_under_load_loses_no_acknowledged_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    for c in configs.clone() {
+        let (up, listening) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let node = c.node;
+            let ended = serve::serve(&c, move |_| {
+                let _ = up.send(());
+            });
+            eprintln!("member {node} ended: {ended:?}");
+        });
+        listening.recv().unwrap();
+    }
+    let c = configs[0].clone();
+    healthy(&c);
+    let keys = c.keys().unwrap();
+    let (_, addr) = Client::connect(&c.members[0].addr, &keys, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+    let mut leader = Client::connect(&addr, &keys, c.deadline).unwrap();
+    let ledger = dir.path().join("hang");
+    let load = {
+        let (c, ledger) = (c.clone(), ledger.clone());
+        std::thread::spawn(move || serve::load(&c, "hang", 2, Duration::from_secs(3), &ledger))
+    };
+    leader.ask("disk hang").unwrap();
+    // The fault's length, not an assertion: the disk stays hung for one second of the load.
+    std::thread::sleep(Duration::from_secs(1));
+    leader.ask("disk back").unwrap();
+    let summary = load.join().unwrap().unwrap();
+    healthy(&c);
+    let (report, ok) = serve::check(&c, &ledger, Duration::from_secs(60)).unwrap();
+    assert!(ok, "{summary}{report}");
+    assert!(report.contains("nothing lost"), "{report}");
 }
