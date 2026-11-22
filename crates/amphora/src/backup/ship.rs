@@ -17,6 +17,7 @@ use super::object::{
     self, FORMAT, Identity, MANIFEST_FORMAT, Manifest, Segment, StoredMark, Through,
 };
 use super::plan::{self, BaseKey, Link, Rates, SegmentKey, ThroughKey};
+use super::restore::read_segment;
 use super::{Hooks, Mark, SECOND_NS, second_of};
 use crate::db::{Db, PAGE_BYTES};
 use crate::memory::{Budget as Memory, Stream, Use};
@@ -91,6 +92,30 @@ impl Touched {
             if let Some(&[a, b, c, d]) = frame.get(..4) {
                 self.mark(u32::from_be_bytes([a, b, c, d]))?;
             }
+        }
+        Ok(())
+    }
+
+    /// Marks the pages of frames given in parts, in order (T-T1.12.M3): `offset` is the part's
+    /// place in the frames, and `head` keeps a frame's page number where a part ends within it.
+    fn mark_part(&mut self, head: &mut Vec<u8>, offset: u64, part: &[u8]) -> anyhow::Result<()> {
+        let end = offset.saturating_add(u64::try_from(part.len())?);
+        let mut at = offset;
+        while at < end {
+            let within = at.checked_rem(FRAME_BYTES).unwrap_or(0);
+            if within >= 4 {
+                at = at.saturating_sub(within).saturating_add(FRAME_BYTES);
+                continue;
+            }
+            let to = at.saturating_add(4u64.saturating_sub(within)).min(end);
+            let from = usize::try_from(at.saturating_sub(offset))?;
+            let upto = usize::try_from(to.saturating_sub(offset))?;
+            head.extend_from_slice(part.get(from..upto).unwrap_or_default());
+            if let Some(&[a, b, c, d]) = head.get(..4) {
+                self.mark(u32::from_be_bytes([a, b, c, d]))?;
+                head.clear();
+            }
+            at = to;
         }
         Ok(())
     }
@@ -360,9 +385,27 @@ impl Shipper {
             unfinished: None,
         };
         let segments = list_all(blobs, &format!("{prefix}/log/"), until)?;
-        if let Some((key, _)) = segments.last() {
+        // Segments read back in ranged parts of half this stream's share, as a restore reads them
+        // (T-T1.12.M3).
+        let _stream = memory.stream(Use::Chunks);
+        let part = usize::try_from(
+            memory
+                .stream_room(Use::Chunks)?
+                .min(u64::try_from(blobs.object_max())?)
+                .checked_div(2)
+                .unwrap_or(0),
+        )?;
+        if let Some((key, size)) = segments.last() {
             let last = SegmentKey::parse(prefix, key)?;
-            let body: Segment = object::decode(key, &blobs.get(key, until)?)?;
+            let body = read_segment(
+                blobs,
+                key,
+                *size,
+                part,
+                memory,
+                until,
+                &mut |_, _, _| Ok(()),
+            )?;
             shipper.generation = last.generation;
             shipper.archived_through = last.through;
             if let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)?
@@ -413,17 +456,26 @@ impl Shipper {
             // segments (what the log since a base holds is bounded by `base_due`), so the next base
             // is incremental after an open too. A gap since leaves it whole.
             if !shipper.broken {
-                for (key, _) in &segments {
+                for (key, size) in &segments {
                     let s = SegmentKey::parse(prefix, key)?;
                     if s.generation < manifest.start_gen {
                         continue;
                     }
-                    let body: Segment = object::decode(key, &blobs.get(key, until)?)?;
-                    if s.generation == shipper.generation {
-                        shipper.current.mark_frames(&body.frames)?;
+                    let touched = if s.generation == shipper.generation {
+                        &mut shipper.current
                     } else {
-                        shipper.older.mark_frames(&body.frames)?;
-                    }
+                        &mut shipper.older
+                    };
+                    let mut head = Vec::new();
+                    read_segment(
+                        blobs,
+                        key,
+                        *size,
+                        part,
+                        memory,
+                        until,
+                        &mut |_, at, frames| touched.mark_part(&mut head, at, frames),
+                    )?;
                 }
                 shipper.last_base = Some(LastBase {
                     id: manifest.id,
@@ -1044,6 +1096,28 @@ mod tests {
         Instant::now()
             .checked_add(std::time::Duration::from_secs(60))
             .unwrap()
+    }
+
+    /// T-T1.12.M3: frames given in parts of any size mark the pages they would whole.
+    #[test]
+    fn t_t1_12_m3_pages_marked_in_parts() {
+        let frame = usize::try_from(FRAME_BYTES).unwrap();
+        let mut frames = vec![0u8; frame * 5];
+        for (i, page) in [3u32, 70, 1, 200, 70].into_iter().enumerate() {
+            frames[i * frame..i * frame + 4].copy_from_slice(&page.to_be_bytes());
+        }
+        let mut whole = Touched::default();
+        whole.mark_frames(&frames).unwrap();
+        for size in [1, 2, 3, 5, frame - 1, frame, frame + 3, frames.len()] {
+            let mut parts = Touched::default();
+            let mut head = Vec::new();
+            let mut at = 0u64;
+            for part in frames.chunks(size) {
+                parts.mark_part(&mut head, at, part).unwrap();
+                at += u64::try_from(part.len()).unwrap();
+            }
+            assert_eq!(parts, whole, "parts of {size}");
+        }
     }
 
     /// T-T1.12.M4: a create whose object already exists (its first answer lost) compares it in
