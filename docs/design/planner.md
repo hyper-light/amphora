@@ -2156,3 +2156,38 @@ cost the same before); `cost::tests::t_pl_7_1_*`. `tests/planner.rs`'
 `a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages` rested on the 50: its
 20,000 items are 198 real pages, under the smallest cache a connection takes (200), so it now
 builds 80,000.
+
+## Decision (lane qs5-18): an IS takes the equality's row estimate unless its value is NULL
+
+**Decision.** QT.5, T-QT.5.9 (carried over from lane qs5-17). Every `col IS v` whose `v` might be
+NULL (a parameter, another table's column) took the `IS NULL` estimate, a tenth of the rows a
+column, so `a IS ? AND b IS ?` on a million-row table without statistics was expected to return
+10,000 rows. Now:
+
+- **NULL.** The NULL literal, and a parameter a custom plan binds to NULL (or leaves unbound, which
+  runs as NULL), keep the `IS NULL` estimate.
+- **Not NULL.** A non-NULL literal, and a parameter a custom plan binds to a value, take the `=`
+  estimate, as `a IS 5` already did.
+- **Not known.** A parameter of the generic plan, and another table's column, take the `=`
+  estimate too (`CostModelParams::value_is_null`, `constraints::is_value`).
+- A NULL-matching `IS` still never counts as one row (`Constraint::null_matching`): an index, even a
+  unique one, can hold many NULL keys, so the plan keeps its sort.
+
+**Why.** At a tenth of the rows a column, the `(a, b)` search was expected to make 10,000 table
+lookups, which priced it near a full scan (1,794 against 1,025 in one run, 2,558 against 9,552 in
+another). The learned weight of a row visit against a page read then chose between them, and it
+moved about 27 times over between runs on a loaded host (0.00033 against 0.0089 pages a row), so
+`tests/records_plans.rs`' `a_one_row_lookup_needs_no_sort_for_its_columns` planned a scan in 1 to
+3 of every 20 runs. The equality's estimate is what SQLite gives the same term.
+
+**Sources.** SQLite's `whereLoopAddBtreeIndex` (`src/where.c`, 3.54.0): an `IS` term takes the
+row estimate of `=` (`WO_EQ|WO_IS`), and only `IS NULL` (`WO_ISNULL`) is estimated on its own.
+
+**Evidence.** `cost_params::tests::t_qt_5_9_an_is_value_is_null_only_where_planning_knows_it`.
+Lane qs5-17, on the fix this redoes: `a_one_row_lookup_needs_no_sort_for_its_columns` passed 40 of
+40 (two rounds of 20 copies at once on adacachy, where it failed 1 to 3 times in each 20 before),
+with every `records_plans` test and the 134 `translate::optimizer` library tests.
+
+**What would falsify it.** A generic plan of `a IS ?` whose runs mostly bind NULL on a column of
+many NULLs, planned as a search and running slower than the scan the `IS NULL` estimate picks. The
+switch below measures it.

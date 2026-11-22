@@ -850,6 +850,8 @@ tests = [
   { id = "T-QT.5.7", text = "t_qt_5_7_hash_entry_bytes_are_the_build_tables_row (crates/engine/translate/optimizer/cost_params.rs) — passes when a hash join's entry bytes are its build table's page over its rows a page plus the entry's fixed bytes, the build's and not the probe's" },
   # lane qs5-15
   { id = "T-QT.5.8", text = "crates/engine/tests/join_methods.rs, nested_loops.rs and hash_semi_join.rs, with the rhs_has_selective_seek gate gone (crates/engine/translate/optimizer/join.rs) — passes when a seek and a hash join are weighed by cost alone and each query answers as with nested loops forced" },
+  # lane qs5-18
+  { id = "T-QT.5.9", text = "t_qt_5_9_an_is_value_is_null_only_where_planning_knows_it (crates/engine/translate/optimizer/cost_params.rs) and a_one_row_lookup_needs_no_sort_for_its_columns (crates/engine/tests/records_plans.rs), twenty copies at once — passes when an IS is NULL only for the NULL literal and a parameter bound to NULL, not NULL for a non-NULL literal or bound value, unknown otherwise, and every copy plans the (a, b) search with its sort" },
 ]
 
 # lane records-api: Amphora's own IDs for CP-T1.5's Records API (kiln goal a1f386fe, G9 step 1;

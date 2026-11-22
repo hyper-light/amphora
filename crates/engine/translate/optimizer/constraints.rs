@@ -538,39 +538,80 @@ fn estimate_selectivity(
     }
 }
 
+/// Amphora (QT.5, lane qs5-18): what an `IS` estimate knows of its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsValue {
+    /// Never NULL (a non-NULL literal, or a parameter a custom plan binds to one): the `IS` filters
+    /// exactly like `=`.
+    NotNull,
+    /// NULL: the literal, or a parameter a custom plan binds to NULL.
+    Null,
+    /// Planning doesn't know: a parameter of a generic plan, or another table's column.
+    Unknown,
+}
+
+/// Amphora (QT.5, lane qs5-18): what is known of the value `value` an `IS` compares its column
+/// with; `null_matching` false means it is a non-NULL literal ([Constraint::null_matching]).
+fn is_value(null_matching: bool, value: Option<&ast::Expr>, params: &CostModelParams) -> IsValue {
+    if !null_matching {
+        return IsValue::NotNull;
+    }
+    match value.and_then(|value| params.value_is_null(value)) {
+        Some(true) => IsValue::Null,
+        Some(false) => IsValue::NotNull,
+        None => IsValue::Unknown,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Estimate selectivity for a single WHERE/ON constraint applied to `table_reference`.
+/// Estimate selectivity for a single WHERE/ON constraint applied to `table_reference`. `value` is
+/// the expression the constrained column is compared with, where there is one.
 fn estimate_constraint_selectivity(
     schema: &Schema,
     table_reference: &JoinedTable,
     column: Option<&Column>,
     operator: ConstraintOperator,
     null_matching: bool,
+    value: Option<&ast::Expr>,
     index: Option<&Index>,
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
-    // `a IS 5` filters exactly like `a = 5` — the key is never NULL — so give
-    // it the `=` estimate. Only a NULL-matching `IS` keeps its own, much less
-    // selective, estimate (see [Constraint::null_matching]).
-    let operator = if operator.as_ast_operator() == Some(ast::Operator::Is) && !null_matching {
-        ConstraintOperator::from(ast::Operator::Equals)
-    } else {
-        operator
+    let estimate = |operator| {
+        estimate_selectivity(
+            schema,
+            table_reference.table.get_name(),
+            column,
+            index,
+            operator,
+            params,
+            is_rowid,
+            table_reference
+                .table
+                .btree()
+                .is_some_and(|table| table.primary_key_columns.len() == 1),
+        )
     };
-    estimate_selectivity(
-        schema,
-        table_reference.table.get_name(),
-        column,
-        index,
-        operator,
-        params,
-        is_rowid,
-        table_reference
-            .table
-            .btree()
-            .is_some_and(|table| table.primary_key_columns.len() == 1),
-    )
+    if operator.as_ast_operator() != Some(ast::Operator::Is) {
+        return estimate(operator);
+    }
+    // QT.5 (lane qs5-18): an `IS` takes the `=` estimate unless its value is NULL, as SQLite's
+    // `whereLoopAddBtreeIndex` gives it, `IS NULL` alone keeping its own. However estimated, a
+    // NULL-matching `IS` still never counts as one row ([Constraint::null_matching]).
+    let known = is_value(null_matching, value, params);
+    let selectivity = match known {
+        IsValue::NotNull | IsValue::Unknown => {
+            estimate(ConstraintOperator::from(ast::Operator::Equals))
+        }
+        IsValue::Null => estimate(operator),
+    };
+    tracing::trace!(
+        table = table_reference.table.get_name(),
+        value = ?known,
+        selectivity,
+        "IS estimate"
+    );
+    selectivity
 }
 
 fn selectivity_index_for_column<'a>(
@@ -941,6 +982,7 @@ pub fn constraints_from_where_clause(
                                     Some(table_column),
                                     operator,
                                     null_matching(rhs),
+                                    Some(rhs),
                                     index_for_column(*column),
                                     params,
                                     false,
@@ -974,6 +1016,7 @@ pub fn constraints_from_where_clause(
                                     col,
                                     operator,
                                     null_matching(rhs),
+                                    Some(rhs),
                                     None,
                                     params,
                                     true,
@@ -1000,6 +1043,7 @@ pub fn constraints_from_where_clause(
                             None,
                             operator,
                             null_matching(rhs),
+                            Some(rhs),
                             None,
                             params,
                             false,
@@ -1047,6 +1091,7 @@ pub fn constraints_from_where_clause(
                                     Some(table_column),
                                     operator,
                                     null_matching(lhs),
+                                    Some(lhs),
                                     index_for_column(*column),
                                     params,
                                     false,
@@ -1080,6 +1125,7 @@ pub fn constraints_from_where_clause(
                                     col,
                                     operator,
                                     null_matching(lhs),
+                                    Some(lhs),
                                     None,
                                     params,
                                     true,
@@ -1106,6 +1152,7 @@ pub fn constraints_from_where_clause(
                             None,
                             operator,
                             null_matching(lhs),
+                            Some(lhs),
                             None,
                             params,
                             false,
@@ -2101,7 +2148,11 @@ fn estimate_bound_expr_selectivity(
         }
     };
     let leaf_selectivity = |lhs: &ast::Expr, rhs: &ast::Expr, op: ConstraintOperator| -> f64 {
-        let resolved = resolve_side(lhs).or_else(|| resolve_side(rhs));
+        // The value is the side opposite the constrained column.
+        let (resolved, value) = match resolve_side(lhs) {
+            Some(side) => (Some(side), rhs),
+            None => (resolve_side(rhs), lhs),
+        };
         let (col, col_pos, is_rowid) = resolved.unwrap_or((None, None, false));
         let index = col_pos.and_then(|pos| {
             selectivity_index_for_column(schema, table_reference, available_indexes, pos)
@@ -2116,6 +2167,7 @@ fn estimate_bound_expr_selectivity(
             col,
             op,
             null_matching,
+            Some(value),
             index,
             params,
             is_rowid,
@@ -2192,6 +2244,7 @@ fn estimate_bound_expr_selectivity(
                     estimated_values: rhs.len() as f64,
                 },
                 false,
+                None,
                 index,
                 params,
                 is_rowid,
@@ -2534,6 +2587,7 @@ pub(crate) fn analyze_binary_term_for_index(
         table_column,
         operator,
         null_matching,
+        Some(constraining_expr),
         best_index.as_deref(),
         params,
         is_rowid,

@@ -116,6 +116,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane qs5-10): calibration from repeated samples, and the filter's lookup and a WHERE step measured | [planner.md](design/planner.md#decision-lane-qs5-10-calibration-from-repeated-samples-and-the-filters-lookup-and-a-where-step-measured) |
 | planner | – | Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model | [planner.md](design/planner.md#decision-lane-g6s3-learned-plan-hints-kept-for-a-query-class-only-where-its-held-out-runs-beat-the-cost-model) |
 | planner | – | Decision (lane pl7c): a table's pages counted by ANALYZE, else derived from its page and records | [planner.md](design/planner.md#decision-lane-pl7c-a-tables-pages-counted-by-analyze-else-derived-from-its-page-and-records) |
+| planner | – | Decision (lane qs5-18): an IS takes the equality's row estimate unless its value is NULL | [planner.md](design/planner.md#decision-lane-qs5-18-an-is-takes-the-equalitys-row-estimate-unless-its-value-is-null) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
