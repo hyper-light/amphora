@@ -1065,7 +1065,14 @@ def functions_said(expression, context, dialect):
       DuckDB's and MySQL's hex() of an integer give its value in base 16, ClickHouse's its bytes,
       and each gives NULL for NULL: on those three an INTEGER X (storage_classes()) is cast to text
       first, and the result is coalesce(hex(X), ''). A REAL X is left as it is: each engine writes
-      a real as text its own way. PostgreSQL has no hex()."""
+      a real as text its own way. PostgreSQL has no hex().
+    - zeroblob(N): "a BLOB consisting of N bytes of 0x00" (lang_corefunc.html#zeroblob), none for
+      a negative N, and SQLite 3.51 gives NULL's as the empty blob. DuckDB and PostgreSQL have no
+      zeroblob(): for an INTEGER or NULL N (storage_classes()) it is DuckDB's repeat() of the one
+      byte (unhex('00'), "repeat(string, count)" takes a BLOB there, none for a count below one)
+      and PostgreSQL's decode(repeat('00', N), 'hex') (9.4 and 9.5: repeat gives '' for a count
+      below one), N coalesced to 0. Another N, which SQLite takes as an integer its own way, is
+      left as it is, for the engine to refuse."""
     from sqlglot import exp
 
     classes = storage_classes(expression, context.tables)
@@ -1113,6 +1120,16 @@ def functions_said(expression, context, dialect):
             else:
                 arg = arg.copy()
             same(node, exp.Coalesce(this=exp.Hex(this=arg), expressions=[exp.Literal.string("")]))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "ZEROBLOB" and len(node.expressions) == 1 and dialect in ("duckdb", "postgres"):
+            n_ = node.expressions[0]
+            if not (isinstance(n_, exp.Null) or classes.get(id(n_)) == "INTEGER"):
+                continue
+            count = exp.Coalesce(this=n_.copy(), expressions=[exp.Literal.number(0)])
+            if dialect == "duckdb":
+                said = exp.Anonymous(this="repeat", expressions=[exp.Unhex(this=exp.Literal.string("00")), count])
+            else:
+                said = exp.Anonymous(this="decode", expressions=[exp.Anonymous(this="repeat", expressions=[exp.Literal.string("00"), count]), exp.Literal.string("hex")])
+            same(node, said)
     return expression
 
 
