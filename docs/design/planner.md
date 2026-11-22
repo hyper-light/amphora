@@ -1623,7 +1623,10 @@ order just past it, and ignores a carried order that isn't each table once.
 `bushy_search_tests::t_pl_8_2_left_joins_follow_a_bushy_plan`: the fact query's core followed by
 LEFT JOINs whose ON terms read the probe's table, a run's table, and another LEFT JOIN's table,
 planned bushy and answering (null-extended rows counted) as nested loops do.
-`learned_costs::ab_tests::t_pl_8_cost_margin_is_the_weights_error` pins the margin's formula. The
+`learned_costs::ab_tests::t_pl_8_cost_margin_is_the_weights_error` pins the margin's formula.
+`statement::tests::t_pl_8_9_ab_carried_orders_flip_no_more_than_fresh_plans` plans a two-table hash
+join again 40 times with the build's weight pinned 10% either side of the probe's and reports the
+order's flips under `Off` and `WithinMargin`. The
 runs of record are the coordinator's: `cargo test -p amphora-engine --lib learned_costs::ab_tests
 -- --nocapture`, with more seeds and batches.
 

@@ -2221,6 +2221,74 @@ mod tests {
         assert_eq!(order(&stmt), Some(first));
     }
 
+    /// The A/B of the carried join order at the plan (T-PL.8.9, lane pl8-16): a join of two
+    /// tables of 1,000 and 1,200 rows on a key neither indexes, whose two hash-join orders differ by
+    /// `200 * (probe - build)` rows' visits, planned again 40 times with the hash build's weight
+    /// pinned 10% either side of the probe's in turn (the noise the weights carry), the database's
+    /// seek weight showing a spread between batches of `ln(110 / 90)`. Returns how often the order
+    /// changed from one plan to the next, and the margin the weights' error gave.
+    #[cfg(feature = "simulator")]
+    fn order_flips(rule: crate::CarriedJoinOrders) -> (usize, f64) {
+        use crate::translate::optimizer::learned_costs::Work;
+        let conn = open_test_connection().unwrap();
+        conn.set_carried_join_orders(rule);
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, k INT)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, k INT)",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 1000) \
+             INSERT INTO a SELECT x, x % 97 FROM n",
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 1200) \
+             INSERT INTO b SELECT x, x % 89 FROM n",
+            "ANALYZE",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        for i in 0..64 {
+            let nanos = if i % 2 == 0 { 90.0 } else { 110.0 };
+            for _ in 0..4096 {
+                conn.db.learned_costs.observe_sampled(Work::Seek, nanos);
+            }
+        }
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM a, b WHERE a.k = b.k")
+            .unwrap();
+        let key: Vec<String> = ["a", "b"].iter().map(|t| t.to_string()).collect();
+        let order = |stmt: &Statement| {
+            stmt.program
+                .join_orders
+                .as_ref()
+                .and_then(|orders| orders.get(&key))
+        };
+        let mut last = order(&stmt);
+        let mut flips = 0;
+        for i in 0..40 {
+            let build = if i % 2 == 0 { 15.0 * 1.1 } else { 15.0 / 1.1 };
+            conn.pin_cost_weights(Some((10.0, build, 15.0)));
+            stmt.reprepare().unwrap();
+            let now = order(&stmt);
+            if now != last {
+                flips += 1;
+            }
+            last = now;
+        }
+        (flips, conn.db.learned_costs.cost_margin())
+    }
+
+    /// Do: the carried order's A/B (`order_flips`) under each rule. Expect: weighing the last
+    /// plan's order within the weights' error flips the plan no more often than searching afresh;
+    /// the counts are the report (T-PL.8.9, lane pl8-16).
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn t_pl_8_9_ab_carried_orders_flip_no_more_than_fresh_plans() {
+        let (fresh, _) = order_flips(crate::CarriedJoinOrders::Off);
+        let (carried, margin) = order_flips(crate::CarriedJoinOrders::WithinMargin);
+        println!(
+            "join order flips over 40 plans made again: afresh {fresh}, carried {carried} \
+             (margin {margin})"
+        );
+        assert!(carried <= fresh, "afresh {fresh}, carried {carried}");
+    }
+
     #[test]
     fn test_expanded_sql() {
         let conn = open_test_connection().unwrap();
