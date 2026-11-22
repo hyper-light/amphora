@@ -2322,5 +2322,30 @@ within the bound, the last passing every key); `t_qt_5_3_star_filters_stay_withi
 for all three orders. The learned-costs calibration's filter (`learned_costs.rs`) is given the
 page's hashes and as many bytes again, so its filter is still built.
 
-**Limits.** While the hash list grows, a reallocation may briefly hold the old and the new list;
-that copy is the allocator's and isn't counted.
+**Limits.** While the hash list grew, a reallocation could briefly hold the old and the new list,
+uncounted; lane qs5-20 bounds and counts it (next decision).
+
+## Decision (lane qs5-20): a sized filter's hashes grow within its bound, old and new together
+
+**Decision.** PL.5, T-QT.5.16. A growth of a sized filter's key hashes may move them, holding the
+old list and the new at once. The new list is now what the bound leaves beside the old one: it
+doubles while three lists' room fits, then takes the rest, and a filter whose next growth would
+pass the bound passes every key instead. `BloomFilter::peak` is the most bytes the filter held at
+once, its growths' two lists and its sealing (the copy a shrink makes included) both, and
+`StarProbes` counts each filter's growth beside every other filter's whole list in
+`star_filter_bytes`: at least what they held then, as the filters built after it held nothing.
+
+**Why.** The two ways to keep the copy within the bound are to reserve the bound up front or to
+grow within it. Reserving holds a filter's whole share from its first key, whatever its build
+gives, and counts it all: a star with several filters, and many statements at once, would hold
+their shares for builds of a few keys. Growing within the bound holds what the keys need and
+costs only the last growth's reach: the hashes stop between half and two thirds of the bound, and
+the filter built beside them still gets the rest.
+
+**Evidence.** `bloom_filter::tests::qt_5_16_the_hashes_grow_within_the_bound_old_and_new_together`
+(bounds of 98,304, 65,536 and 1,000 bytes, keys given one at a time: the most held at once within
+the bound after every key; a growth that would pass it passes every key; a small build's peak is
+its last growth's two lists); the qs5-19 sealing test, whose filled filter now stops growing at
+half its bound and passes every key as before. The learned-costs calibration's filter, given
+twice its page's hashes, still fits its hashes and a filter at its rate (at least a third of its
+bound remains, over 40 bits a key against the `ln(rows)/ln²2` its rate takes).

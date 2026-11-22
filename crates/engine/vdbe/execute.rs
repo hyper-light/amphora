@@ -20620,14 +20620,22 @@ pub fn op_star_probes(
         // The filters are sealed one after another: while one is, it holds its hashes and its
         // finished filter at once (`BloomFilter::seal`), the ones before it their filters and the
         // ones after it their hashes. The most they hold together is counted (lane qs5-19).
+        // Before that, as each filter's hashes grew, a growth held its old list and its new
+        // (`BloomFilter::peak`), beside the lists of the filters built before it: counted here
+        // beside every other filter's whole list, at least what they held then (lane qs5-20).
         let mut held = data
             .probes
             .iter()
             .filter_map(|probe| state.bloom_filters.get(&probe.cursor_id))
             .fold(0usize, |held, filter| held.saturating_add(filter.bytes()));
+        let lists = held;
         let mut most = held;
         for probe in data.probes.iter() {
             if let Some(filter) = state.bloom_filters.get_mut(&probe.cursor_id) {
+                let growing = lists
+                    .saturating_sub(filter.bytes())
+                    .saturating_add(filter.peak());
+                most = most.max(growing);
                 let others = held.saturating_sub(filter.bytes());
                 let sealing = filter.seal();
                 most = most.max(others.saturating_add(sealing));

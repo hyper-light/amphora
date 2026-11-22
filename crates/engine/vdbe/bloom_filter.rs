@@ -49,6 +49,9 @@ pub struct BloomFilter {
     sizing: Option<FilterSizing>,
     /// Number of items inserted into the filter
     count: usize,
+    /// Amphora (QT.5, lane qs5-20): the most bytes this filter held at once: a growth of its key
+    /// hashes, which may hold the old list and the new while it moves them, and its sealing.
+    peak: usize,
 }
 
 impl fmt::Debug for BloomFilter {
@@ -133,6 +136,7 @@ impl BloomFilter {
             ),
             sizing: None,
             count: 0,
+            peak: 0,
         }
     }
 
@@ -143,6 +147,7 @@ impl BloomFilter {
             store: Store::Collecting(Vec::new()),
             sizing: Some(sizing),
             count: 0,
+            peak: 0,
         }
     }
 
@@ -157,17 +162,22 @@ impl BloomFilter {
                     self.store = Store::PassAll;
                     return;
                 };
-                // The hashes grow within the filter's memory bound, never past it.
+                // The hashes grow within the filter's memory bound, never past it. A growth may
+                // move them, holding the old list and the new at once, so the new list is what
+                // the bound leaves beside the old one (QT.5, lane qs5-20): it doubles while three
+                // lists' room fits, then takes the rest, and past half the bound it can't grow.
                 if hashes.len() == hashes.capacity() {
                     let most = sizing.max_bytes / size_of::<u64>();
-                    let more = hashes
-                        .capacity()
-                        .max(1)
-                        .min(most.saturating_sub(hashes.len()));
+                    let old = hashes.capacity();
+                    let more = old.max(1).min(most.saturating_sub(old.saturating_mul(2)));
                     if more == 0 || hashes.try_reserve_exact(more).is_err() {
                         self.store = Store::PassAll;
                         return;
                     }
+                    let moving = old
+                        .saturating_add(hashes.capacity())
+                        .saturating_mul(size_of::<u64>());
+                    self.peak = self.peak.max(moving);
                 }
                 hashes.push(hash);
             }
@@ -192,7 +202,9 @@ impl BloomFilter {
     /// Amphora (PL.5): ends a sized filter's build: sizes it from the distinct keys it was given
     /// and fills it. A filter already sealed, or of fixed size, is left as it is. Returns the most
     /// bytes the filter held while sealed (QT.5, lane qs5-19): its key hashes and the finished
-    /// filter at once, within its bound (`sized_store`); a filter left as it is, its bytes.
+    /// filter at once, within its bound (`sized_store`), or the copy a shrink of the hashes makes
+    /// if that is more (lane qs5-20); a filter left as it is, its bytes. [Self::peak] counts
+    /// its growth's moments too.
     pub fn seal(&mut self) -> usize {
         let (Store::Collecting(hashes), Some(sizing)) = (&mut self.store, self.sizing) else {
             return self.bytes();
@@ -206,12 +218,27 @@ impl BloomFilter {
             .capacity()
             .saturating_add(hashes.len())
             .saturating_mul(size_of::<u64>());
-        if hashes.len() < hashes.capacity() && copying <= sizing.max_bytes {
+        let shrinks = hashes.len() < hashes.capacity() && copying <= sizing.max_bytes;
+        if shrinks {
             hashes.shrink_to_fit();
         }
         let held = hashes.capacity().saturating_mul(size_of::<u64>());
         self.store = sized_store(&hashes, sizing, held);
-        held.saturating_add(self.bytes())
+        let sealing = held.saturating_add(self.bytes());
+        let sealing = if shrinks {
+            sealing.max(copying)
+        } else {
+            sealing
+        };
+        self.peak = self.peak.max(sealing);
+        sealing
+    }
+
+    /// Amphora (QT.5, lane qs5-20): the most bytes this filter held at once so far: its key
+    /// hashes' growths, the old list and the new together, and its sealing ([Self::seal]). A
+    /// filter of fixed size, its bytes.
+    pub fn peak(&self) -> usize {
+        self.peak.max(self.bytes())
     }
 
     /// Amphora (QT.5, lane qs5-19): whether this is a sized filter whose build has not ended
@@ -511,9 +538,10 @@ mod bloomtests {
     /// QT.5 (lane qs5-19): a sized filter is built while its build's hashes are still held. Do:
     /// seal filters under a bound of 98,304 bytes whose hashes take 65,536 of it (7,000 keys), whose
     /// duplicates leave room once removed (3,000 keys, each twice), and, under 65,536, whose hashes
-    /// fill all of it (8,192 keys). Expect: the most bytes each held while sealed, its hashes and
-    /// the finished filter at once, within its bound; the first two filtering, the last passing
-    /// every key, as no filter fits beside its hashes; none rejecting a key it was given.
+    /// would fill all of it (8,192 keys). Expect: the most bytes each held while sealed, its hashes
+    /// and the finished filter at once, within its bound; the first two filtering, the last passing
+    /// every key, as no filter fits beside its hashes (lane qs5-20: they stop growing at half the
+    /// bound, where the next growth's two lists would pass it); none rejecting a key it was given.
     #[test]
     fn qt_5_sealing_holds_the_hashes_and_the_filter_within_the_bound() {
         let bound = 98_304;
@@ -545,5 +573,42 @@ mod bloomtests {
         assert!((0..8_192).all(|i| filled.contains_i64(i)));
         // Sealed again, it holds what it holds.
         assert_eq!(filled.seal(), filled.bytes());
+    }
+
+    /// QT.5 (lane qs5-20, T-QT.5.16): a sized filter's key hashes grow within its bound, the old
+    /// list and the new counted together as a growth moves them. Do: give filters under bounds of
+    /// 98,304 and 65,536 bytes, and one of an odd 1,000, keys one at a time until they pass every
+    /// key or hold 20,000, sealing those that still filter. Expect: the most bytes each held at
+    /// once, its growths' two lists included, within its bound; a growth that would pass it
+    /// passes every key instead; none rejecting a key it was given.
+    #[test]
+    fn qt_5_16_the_hashes_grow_within_the_bound_old_and_new_together() {
+        for bound in [98_304, 65_536, 1_000] {
+            let mut filter = BloomFilter::sized(sizing(1e-12, bound));
+            let mut given = 0_i64;
+            while given < 20_000 && filter.building() {
+                filter.insert_i64(given);
+                given += 1;
+                assert!(
+                    filter.peak() <= bound,
+                    "{} bytes held at once after {given} keys, the bound {bound}",
+                    filter.peak()
+                );
+            }
+            filter.seal();
+            assert!(
+                filter.peak() <= bound,
+                "{} bytes, the bound {bound}",
+                filter.peak()
+            );
+            assert!((0..given).all(|i| filter.contains_i64(i)));
+        }
+        // A growth is counted as it moves the list: four keys under a roomy bound grew 0→1→2→4,
+        // the last growth holding two words and four.
+        let mut small = BloomFilter::sized(sizing(1e-12, 1 << 20));
+        for i in 0..4 {
+            small.insert_i64(i);
+        }
+        assert_eq!(small.peak(), 6 * size_of::<u64>());
     }
 }
