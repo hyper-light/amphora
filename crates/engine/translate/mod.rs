@@ -186,6 +186,15 @@ pub fn translate(
             prepare_options.expected_runs,
         ),
     );
+    // Amphora (PL.8, lane pl8-16): where this plan notes its join orders, the last plan's, and the
+    // share of a plan's cost the weights' error could explain, which a carried order keeps its
+    // place by.
+    let join_orders = Arc::new(crate::translate::optimizer::join::JoinOrders::default());
+    resolver.set_join_orders(
+        join_orders.clone(),
+        prepare_options.carried_join_orders.clone(),
+        connection.db.learned_costs.cost_margin(),
+    );
     resolver.set_sorted_fetches(connection.sorted_fetches());
     resolver.set_adaptive_joins(connection.adaptive_joins());
     resolver.set_automatic_indexes(connection.automatic_indexes());
@@ -253,6 +262,7 @@ pub fn translate(
         .add(crate::translate::optimizer::search_budget::end_statement());
     program.reads_parameter_values = plan_values.asked();
     program.planned_tables = plan_values.take_planned();
+    program.join_orders = Some(join_orders);
     program.planned_filters = plan_values.take_planned_filters();
     program.planned_subqueries = plan_values.take_planned_subqueries();
     program.write_target = write_target;

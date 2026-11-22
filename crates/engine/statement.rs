@@ -1293,8 +1293,11 @@ impl Statement {
         // Amphora (PL.8): a statement that ran r times since it was planned is expected to run r
         // times more: Gott's Copernican estimate, the median of what remains of a run of unknown
         // length seen at a random point in it (Nature 363, 1993).
+        // Amphora (PL.8, lane pl8-16): and it weighs the join orders its last plan chose, so a
+        // plan made again on the same facts keeps them.
         let new_program = self.plan_again(&PrepareOptions {
             expected_runs: Some(self.runs_since_planned.max(1)),
+            carried_join_orders: self.program.join_orders.clone(),
             ..PrepareOptions::default()
         })?;
         self.runs_since_planned = 0;

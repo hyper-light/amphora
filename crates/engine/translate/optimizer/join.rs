@@ -65,6 +65,16 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub row_goal: Option<RowGoal>,
     /// Amphora (PL.8): what sizes the exact search before the greedy one takes the join.
     pub search_budget: super::search_budget::SearchBudget,
+    /// Amphora (PL.8, lane pl8-16): the order this query block's tables were read in when the
+    /// statement was last planned, as positions in `joined_tables` (`JoinOrders`); None for a
+    /// statement planned for the first time, or a block whose last plan was bushy.
+    pub carried_order: Option<&'a [usize]>,
+    /// Amphora (PL.8, lane pl8-16): how much more the carried order may cost than the search's best
+    /// and still be kept, as a share of the best's cost: the weights' own error
+    /// (`LearnedCosts::cost_margin`). A new plan replaces the cached one only when it is cheaper
+    /// past what the weights' noise could explain, so a statement planned again on the same facts
+    /// keeps its plan.
+    pub carried_margin: f64,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -79,7 +89,125 @@ impl<'a> JoinPlanningContext<'a> {
             sorted_fetches: false,
             row_goal: None,
             search_budget: super::search_budget::SearchBudget::FIXED,
+            carried_order: None,
+            carried_margin: 0.0,
         }
+    }
+}
+
+/// Amphora (PL.8, lane pl8-16): the join orders a statement's plan chose, one for each query block
+/// the join search planned, keyed by the block's tables (their identifiers in FROM order). A plan
+/// keeps them (`Program::join_orders`) and the statement hands them to its next plan when it plans
+/// again (`Statement::reprepare`), so the search can weigh the order it ran before
+/// (`JoinPlanningContext::carried_order`). Bounded by the statement's query blocks.
+#[derive(Debug, Default)]
+pub(crate) struct JoinOrders {
+    chosen: parking_lot::Mutex<Vec<(Vec<String>, Vec<usize>)>>,
+}
+
+impl JoinOrders {
+    /// Notes that the block of `tables` chose `order`; a block planned again within the same
+    /// prepare (a cost-limited retry) replaces its earlier order.
+    pub(crate) fn record(&self, tables: Vec<String>, order: Vec<usize>) {
+        let mut chosen = self.chosen.lock();
+        match chosen.iter_mut().find(|(key, _)| *key == tables) {
+            Some(entry) => entry.1 = order,
+            None => chosen.push((tables, order)),
+        }
+    }
+
+    /// The order the block of `tables` chose, None if it wasn't planned or was planned bushy.
+    pub(crate) fn get(&self, tables: &[String]) -> Option<Vec<usize>> {
+        self.chosen
+            .lock()
+            .iter()
+            .find(|(key, _)| key.as_slice() == tables)
+            .map(|(_, order)| order.clone())
+    }
+
+    /// How many blocks noted an order.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.chosen.lock().len()
+    }
+}
+
+/// The key a query block's order is kept under (`JoinOrders`): its tables' identifiers in FROM
+/// order.
+pub(crate) fn join_order_key(joined_tables: &[JoinedTable]) -> Vec<String> {
+    joined_tables.iter().map(|t| t.identifier.clone()).collect()
+}
+
+/// Amphora (PL.8, lane pl8-16): whether `order` reads every one of `num_tables` tables once, each
+/// after the tables the conflict rules keep before it (`can_add_table_to_prefix`): a carried order
+/// is planned only if the query block it is carried into can still run in it.
+fn order_is_legal(
+    order: &[usize],
+    num_tables: usize,
+    required_lhs_by_table: Option<&[TableMask]>,
+    left_join_illegal_map: Option<&HashMap<usize, TableMask>>,
+) -> Result<bool> {
+    if order.len() != num_tables {
+        return Ok(false);
+    }
+    let mut prefix = TableMask::default();
+    for &table in order {
+        if table >= num_tables
+            || prefix.get(table)
+            || !can_add_table_to_prefix(
+                &prefix,
+                table,
+                required_lhs_by_table,
+                left_join_illegal_map,
+            )
+        {
+            return Ok(false);
+        }
+        prefix.set(table)?;
+    }
+    Ok(true)
+}
+
+/// Amphora (PL.8, lane pl8-16): the search's result with the carried plan in the best plan's
+/// place where the best is not cheaper past the margin: `carried.cost <= best.cost * (1 + margin)`.
+/// A best plan that kept the order target stays as the ordered plan, so the caller still weighs a
+/// sort against it.
+fn keep_carried(
+    result: BestJoinOrderResult,
+    carried: Option<JoinN>,
+    margin: f64,
+    has_order_target: bool,
+) -> BestJoinOrderResult {
+    let Some(carried) = carried else {
+        return result;
+    };
+    let margin = if margin.is_finite() && margin > 0.0 {
+        margin
+    } else {
+        0.0
+    };
+    if carried.data == result.best_plan.data && carried.inner_joins == result.best_plan.inner_joins
+    {
+        return result;
+    }
+    if carried.cost.0 > result.best_plan.cost.0 * (1.0 + margin) {
+        return result;
+    }
+    tracing::debug!(
+        target: "amphora::join_search",
+        carried = carried.cost.0,
+        best = result.best_plan.cost.0,
+        margin,
+        "the carried join order stands"
+    );
+    let best_ordered_plan = match (result.best_ordered_plan, has_order_target) {
+        (Some(ordered), _) => Some(ordered),
+        (None, true) => Some(result.best_plan),
+        (None, false) => None,
+    };
+    BestJoinOrderResult {
+        best_plan: carried,
+        best_ordered_plan,
     }
 }
 
@@ -1431,6 +1559,51 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         table_references,
         schema,
     )?;
+    // PL.8 (lane pl8-16): the order the statement's last plan read this block in, priced as the
+    // block now stands, where the block can still run in it (`keep_carried` weighs it last).
+    let carried_plan = match planning_context.carried_order {
+        Some(order)
+            if order_is_legal(
+                order,
+                num_tables,
+                required_lhs_by_table.as_deref(),
+                left_join_illegal_map.as_ref(),
+            )? =>
+        {
+            compute_left_deep_plan_in_order(
+                order,
+                set_rows,
+                joined_tables,
+                initial_input_cardinality,
+                planning_context,
+                base_table_rows,
+                access_methods_arena,
+                constraints,
+                where_clause,
+                &where_terms,
+                subqueries,
+                index_method_candidates,
+                params,
+                analyze_stats,
+                available_indexes,
+                table_references,
+                schema,
+            )?
+        }
+        _ => None,
+    };
+    let carry = |result: Result<Option<BestJoinOrderResult>>, carried: Option<JoinN>| {
+        result.map(|result| {
+            result.map(|result| {
+                keep_carried(
+                    result,
+                    carried,
+                    planning_context.carried_margin,
+                    planning_context.maybe_order_target.is_some(),
+                )
+            })
+        })
+    };
     let budget = planning_context
         .search_budget
         .subsets(naive_plan.as_ref().map(|plan| plan.cost.0), num_tables);
@@ -1477,7 +1650,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             0,
             search_started.elapsed(),
         );
-        return greedy;
+        return carry(greedy, carried_plan);
     };
     let subsets_built: usize = subsets.iter().map(Vec::len).sum();
     let mut pairs_tried = 0usize;
@@ -2059,7 +2232,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         subsets_built.saturating_add(pairs_tried),
         search_started.elapsed(),
     );
-    match best_plan {
+    let result = match best_plan {
         Some(best_plan) => Ok(Some(BestJoinOrderResult {
             best_plan,
             best_ordered_plan: if best_plan_is_also_ordered {
@@ -2069,7 +2242,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             },
         })),
         None => Err(LimboError::PlanningError("no query solution".to_string())),
-    }
+    };
+    carry(result, carried_plan)
 }
 
 /// PL.8: the tables the search may plan bushy, `joined_tables[..core]`, None where it tries no
@@ -2793,26 +2967,74 @@ fn compute_naive_left_deep_plan<'a>(
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
-    let n = joined_tables.len();
+    let order: Vec<usize> = (0..joined_tables.len()).collect();
+    compute_left_deep_plan_in_order(
+        &order,
+        set_rows,
+        joined_tables,
+        initial_input_cardinality,
+        planning_context,
+        base_table_rows,
+        access_methods_arena,
+        constraints,
+        where_clause,
+        where_terms,
+        subqueries,
+        index_method_candidates,
+        params,
+        analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
+    )
+}
+
+/// The left-deep plan that reads `joined_tables` in `order` (positions in it), each table by its
+/// cheapest access method given the tables before it; None if a table can't be read there.
+/// The naive plan is the FROM order; lane pl8-16's carried order is the last plan's (PL.8).
+#[allow(clippy::too_many_arguments)]
+fn compute_left_deep_plan_in_order<'a>(
+    order: &[usize],
+    set_rows: &mut JoinedSetRows<'_>,
+    joined_tables: &[JoinedTable],
+    initial_input_cardinality: f64,
+    planning_context: JoinPlanningContext<'_>,
+    base_table_rows: &[RowCountEstimate],
+    access_methods_arena: &'a mut Vec<AccessMethod>,
+    constraints: &'a [TableConstraints],
+    where_clause: &mut [WhereTerm],
+    where_terms: &[WhereTermInfo],
+    subqueries: &[NonFromClauseSubquery],
+    index_method_candidates: &[IndexMethodCandidate],
+    params: &CostModelParams,
+    analyze_stats: &AnalyzeStats,
+    available_indexes: &AvailableIndexes,
+    table_references: &TableReferences,
+    schema: &Schema,
+) -> Result<Option<JoinN>> {
+    let n = order.len();
     turso_assert_greater_than!(n, 0);
 
-    let join_order = joined_tables
-        .iter()
-        .enumerate()
-        .map(|(i, t)| JoinOrderMember {
+    let mut join_order = Vec::with_capacity(n);
+    for &i in order {
+        let (Some(t), Some(_)) = (joined_tables.get(i), constraints.get(i)) else {
+            return Ok(None);
+        };
+        join_order.push(JoinOrderMember {
             table_id: t.internal_id,
             original_idx: i,
             is_outer: t.join_info.as_ref().is_some_and(|j| j.is_outer()),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
 
     // Start with first table
+    let first = order[0];
     let mut best_plan = join_lhs_and_rhs(
         None,
         set_rows,
         initial_input_cardinality,
-        &joined_tables[0],
-        &constraints[0],
+        &joined_tables[first],
+        &constraints[first],
         constraints,
         base_table_rows,
         &join_order[..1],
@@ -2836,12 +3058,13 @@ fn compute_naive_left_deep_plan<'a>(
 
     // Add remaining tables one at a time from left to right
     for i in 1..n {
+        let table = order[i];
         best_plan = join_lhs_and_rhs(
             best_plan.as_ref(),
             set_rows,
             initial_input_cardinality,
-            &joined_tables[i],
-            &constraints[i],
+            &joined_tables[table],
+            &constraints[table],
             constraints,
             base_table_rows,
             &join_order[..=i],
@@ -4520,6 +4743,114 @@ mod tests {
             assert!(constraint.lhs_mask.get(FACT_TABLE_IDX));
             assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         }
+    }
+
+    /// The five-table chain of [test_compute_best_join_order_linked_list] planned with `carried`
+    /// as the order its last plan ran in, kept at `margin`: the plan's order and its cost.
+    fn linked_list_plan_with_carried(carried: Option<&[usize]>, margin: f64) -> (Vec<usize>, f64) {
+        const NUM_TABLES: usize = 5;
+        let mut tables = Vec::with_capacity(NUM_TABLES);
+        for i in 0..NUM_TABLES {
+            let mut columns = vec![_create_column_rowid_alias("id")];
+            if i < NUM_TABLES - 1 {
+                columns.push(_create_column_of_type("next_id", Type::Integer));
+            }
+            tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
+        }
+        let available_indexes = AvailableIndexes::default();
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables: Vec<_> = tables
+            .iter()
+            .map(|t| _create_table_reference(t.clone(), None, table_id_counter.next()))
+            .collect();
+        let mut where_clause = Vec::new();
+        for i in 0..NUM_TABLES - 1 {
+            where_clause.push(_create_binary_expr(
+                _create_column_expr(joined_tables[i].internal_id, 1, false),
+                ast::Operator::Equals,
+                _create_column_expr(joined_tables[i + 1].internal_id, 0, true),
+            ));
+        }
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let mut access_methods_arena = Vec::new();
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
+        let BestJoinOrderResult { best_plan, .. } = compute_best_join_order_with_context(
+            table_references.joined_tables(),
+            1.0,
+            JoinPlanningContext {
+                carried_order: carried,
+                carried_margin: margin,
+                ..JoinPlanningContext::default_with_order_target(None)
+            },
+            &table_constraints,
+            &base_table_rows,
+            &mut access_methods_arena,
+            &mut where_clause,
+            &[],
+            &[],
+            &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
+        )
+        .unwrap()
+        .unwrap();
+        (best_plan.table_numbers().collect(), best_plan.cost.0)
+    }
+
+    /// Do: plan the five-table chain with no carried order, then carry in its reverse at no margin
+    /// and at margins just under and just past the reverse's extra cost, then an order that is not
+    /// one of the tables each once. Expect: the chain's order wherever the reverse costs more than
+    /// the margin allows, the reverse where it costs no more, and a carried order that isn't a
+    /// permutation ignored (PL.8, lane pl8-16: a statement planned again keeps its plan unless
+    /// the new best is cheaper past the weights' error).
+    #[test]
+    fn t_pl_8_a_carried_join_order_stands_within_its_margin() {
+        let chain: Vec<usize> = (0..5).collect();
+        let reverse: Vec<usize> = (0..5).rev().collect();
+        let (order, best) = linked_list_plan_with_carried(None, 0.0);
+        assert_eq!(order, chain);
+        // The reverse priced alone: carried at a margin past any cost, it is the plan.
+        let (order, reverse_cost) = linked_list_plan_with_carried(Some(&reverse), 1e9);
+        assert_eq!(order, reverse);
+        assert!(reverse_cost > best, "{reverse_cost} vs {best}");
+        let extra = reverse_cost / best - 1.0;
+        let (order, _) = linked_list_plan_with_carried(Some(&reverse), 0.0);
+        assert_eq!(order, chain);
+        let (order, _) = linked_list_plan_with_carried(Some(&reverse), extra * 0.99);
+        assert_eq!(order, chain);
+        let (order, _) = linked_list_plan_with_carried(Some(&reverse), extra * 1.01);
+        assert_eq!(order, reverse);
+        for wrong in [&[0, 1, 2][..], &[0, 0, 1, 2, 3], &[0, 1, 2, 3, 9]] {
+            let (order, _) = linked_list_plan_with_carried(Some(wrong), 1e9);
+            assert_eq!(order, chain, "{wrong:?}");
+        }
+    }
+
+    /// Do: note two blocks' orders, one twice. Expect: each block's latest order, under its own
+    /// tables only (PL.8, lane pl8-16).
+    #[test]
+    fn t_pl_8_join_orders_keep_each_blocks_latest() {
+        let orders = JoinOrders::default();
+        let key = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        orders.record(key(&["a", "b"]), vec![1, 0]);
+        orders.record(key(&["c", "d", "e"]), vec![2, 0, 1]);
+        orders.record(key(&["a", "b"]), vec![0, 1]);
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders.get(&key(&["a", "b"])), Some(vec![0, 1]));
+        assert_eq!(orders.get(&key(&["c", "d", "e"])), Some(vec![2, 0, 1]));
+        assert_eq!(orders.get(&key(&["b", "a"])), None);
     }
 
     #[test]

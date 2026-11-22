@@ -310,6 +310,15 @@ impl Rate {
         }
     }
 
+    /// The spread between this rate's batch means, as a logarithm's (`Batches`): None under
+    /// [WeightRule::Blend], which keeps none, or before a difference was counted.
+    fn spread(&self) -> Option<f64> {
+        let batches = &self.batches;
+        let spread = (batches.squares / batches.differences).sqrt();
+        (self.rule == WeightRule::BatchMeans && batches.differences >= 1.0 && spread.is_finite())
+            .then_some(spread)
+    }
+
     /// Nanoseconds a unit, None before any time was seen: the standing rate, or before there is
     /// one, the batch's so far (there is no standing rate for it to move).
     fn nanos_per_unit(&self) -> Option<f64> {
@@ -340,6 +349,35 @@ struct Rates {
 }
 
 impl Rates {
+    /// PL.8 (lane pl8-16): the share of a plan's cost its weights' error could explain
+    /// (`LearnedCosts::cost_margin`). A plan's cost is a sum of work counts times weights in page
+    /// reads, each weight a kind's rate over the page read's, so a term's error (as a logarithm's)
+    /// is `sqrt(s_kind^2 + s_page^2)` from the spreads between batch means, and a sum of positive
+    /// terms is off by no more than its worst term. Two plans priced on the same weights share
+    /// their errors, so this bounds the gap between them from above. Tested at [MOVE_Z], the
+    /// level the weights themselves move at; 0 where no spread was measured.
+    fn cost_margin(&self) -> f64 {
+        let page = self.page.spread().unwrap_or(0.0);
+        let kind = [
+            &self.row,
+            &self.seek,
+            &self.hash_build,
+            &self.hash_probe,
+            &self.sort,
+            &self.bloom_probe,
+            &self.where_step,
+        ]
+        .into_iter()
+        .filter_map(Rate::spread)
+        .fold(0.0_f64, f64::max);
+        let margin = (MOVE_Z * (kind * kind + page * page).sqrt()).exp_m1();
+        if margin.is_finite() && margin > 0.0 {
+            margin
+        } else {
+            0.0
+        }
+    }
+
     /// Every kind's rate under `rule` (`Rate::switch`).
     fn switch(&mut self, rule: WeightRule) {
         for rate in [
@@ -592,6 +630,13 @@ impl LearnedCosts {
             return;
         }
         rates.page.anchor(reads, nanos);
+    }
+
+    /// PL.8 (lane pl8-16): how much more than the search's best a statement's carried join order
+    /// may cost and keep its place (`join::keep_carried`), as a share of the best's cost: what the
+    /// weights' measured error could explain (`Rates::cost_margin`). 0 under [WeightRule::Blend].
+    pub(crate) fn cost_margin(&self) -> f64 {
+        self.rates.lock().cost_margin()
     }
 
     /// PL.8 (T-PL.8.6, lane pl8-16): moves every weight to `rule` (`WeightRule`), from the rates as
@@ -1468,6 +1513,31 @@ mod ab_tests {
                 assert!(batch.iter().all(|b| *b == Some(1)), "{batch:?}");
             }
         }
+    }
+
+    /// Do: a rate's batches 10% either way of their mean, then the same under the blend. Expect: no
+    /// margin before a spread is measured, then `exp(MOVE_Z * s) - 1` for the batches' spread `s`,
+    /// and none under the blend, which measures no spread (PL.8, lane pl8-16).
+    #[test]
+    fn t_pl_8_cost_margin_is_the_weights_error() {
+        let costs = LearnedCosts::from_rates(&Rates {
+            row: Rate::measured(EPOCH, EPOCH),
+            seek: Rate::measured(EPOCH, EPOCH * TRUE_NANOS),
+            ..Rates::default()
+        });
+        assert_eq!(costs.cost_margin(), 0.0);
+        for i in 0..4 {
+            for _ in 0..100 {
+                costs.observe_sampled(Work::Seek, if i % 2 == 0 { 90.0 } else { 110.0 });
+            }
+        }
+        // The first batch replaced calibration's rate; then three differences of ln(110/90).
+        let s = (110.0_f64 / 90.0).ln();
+        let want = (MOVE_Z * s).exp_m1();
+        let got = costs.cost_margin();
+        assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        costs.set_rule(WeightRule::Blend);
+        assert_eq!(costs.cost_margin(), 0.0);
     }
 
     /// Do: a rate under each rule, switched to the other after a batch. Expect: the weight as it

@@ -213,6 +213,13 @@ pub struct Resolver<'a> {
     star_filters: crate::StarFilters,
     /// Amphora (PL.8): what sizes the join search (`Connection::set_join_search_budget`).
     join_search: crate::translate::optimizer::search_budget::SearchBudget,
+    /// Amphora (PL.8, lane pl8-16): where this plan notes each query block's join order, and the
+    /// orders the statement's last plan noted (`join::JoinOrders`); set at prepare.
+    join_orders: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    carried_join_orders: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+    /// Amphora (PL.8, lane pl8-16): the share of a plan's cost a carried join order may cost past
+    /// the search's best (`LearnedCosts::cost_margin`); set at prepare.
+    join_margin: f64,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
@@ -356,6 +363,9 @@ impl<'a> Resolver<'a> {
             join_methods: crate::JoinMethods::ByCost,
             star_filters: crate::StarFilters::ByCost,
             join_search: crate::translate::optimizer::search_budget::SearchBudget::FIXED,
+            join_orders: None,
+            carried_join_orders: None,
+            join_margin: 0.0,
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
@@ -478,6 +488,34 @@ impl<'a> Resolver<'a> {
         self.join_search = budget;
     }
 
+    /// PL.8 (lane pl8-16): where this plan notes its join orders, and the last plan's.
+    pub(crate) fn set_join_orders(
+        &mut self,
+        record: crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>,
+        carried: Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
+        margin: f64,
+    ) {
+        self.join_orders = Some(record);
+        self.carried_join_orders = carried;
+        self.join_margin = margin;
+    }
+
+    /// The order the statement's last plan read the block of `tables` in (`join::JoinOrders`).
+    pub(crate) fn carried_join_order(&self, tables: &[String]) -> Option<Vec<usize>> {
+        self.carried_join_orders.as_ref()?.get(tables)
+    }
+
+    pub(crate) fn join_margin(&self) -> f64 {
+        self.join_margin
+    }
+
+    /// Notes the order the block of `tables` chose, for the statement's next plan.
+    pub(crate) fn record_join_order(&self, tables: Vec<String>, order: Vec<usize>) {
+        if let Some(orders) = &self.join_orders {
+            orders.record(tables, order);
+        }
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches
     }
@@ -540,6 +578,9 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             star_filters: self.star_filters,
             join_search: self.join_search,
+            join_orders: self.join_orders.clone(),
+            carried_join_orders: self.carried_join_orders.clone(),
+            join_margin: self.join_margin,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
@@ -580,6 +621,9 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             star_filters: self.star_filters,
             join_search: self.join_search,
+            join_orders: self.join_orders.clone(),
+            carried_join_orders: self.carried_join_orders.clone(),
+            join_margin: self.join_margin,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,

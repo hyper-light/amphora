@@ -181,6 +181,10 @@ pub struct PrepareOptions {
     /// Amphora (PL.8): the runs the plan is expected to serve, which size its join search under
     /// `JoinSearchBudget::RunShareByExecutions` (`search_budget`); `None` is one run.
     pub(crate) expected_runs: Option<u64>,
+    /// Amphora (PL.8, lane pl8-16): the join orders the statement's last plan chose, which the new
+    /// one weighs against its search's best (`join::keep_carried`); `None` for a first plan.
+    pub(crate) carried_join_orders:
+        Option<crate::sync::Arc<crate::translate::optimizer::join::JoinOrders>>,
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the

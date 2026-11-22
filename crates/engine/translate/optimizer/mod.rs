@@ -3108,6 +3108,10 @@ fn find_table_access_plan(
         &mut constraints_per_table,
     )?;
 
+    // PL.8 (lane pl8-16): the order this block ran in when the statement was last planned, and
+    // the margin it keeps its place by (`join::keep_carried`).
+    let join_order_key = join::join_order_key(table_references.joined_tables());
+    let carried_order = resolver.carried_join_order(&join_order_key);
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
@@ -3117,6 +3121,8 @@ fn find_table_access_plan(
         search_budget: resolver.join_search(),
         sorted_fetches: resolver.sorted_fetches(),
         row_goal,
+        carried_order: carried_order.as_deref(),
+        carried_margin: resolver.join_margin(),
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
@@ -3159,6 +3165,11 @@ fn find_table_access_plan(
     } else {
         best_plan
     };
+    // PL.8 (lane pl8-16): the order chosen, for the statement's next plan to weigh; a bushy plan
+    // carries none.
+    if best_plan.is_left_deep() {
+        resolver.record_join_order(join_order_key, best_plan.table_numbers().collect());
+    }
 
     // PL.8: a bushy plan's run reads its rows before the loops, so it keeps no order.
     let sort_eliminated = best_plan.is_left_deep()
@@ -3338,6 +3349,8 @@ fn plan_unmatched_right_rows(
                 search_budget: resolver.join_search(),
                 sorted_fetches: false,
                 row_goal: None,
+                carried_order: None,
+                carried_margin: 0.0,
             },
             &where_clause_for_unmatched_rows,
             // The result subroutine evaluates all WHERE terms after matching.
