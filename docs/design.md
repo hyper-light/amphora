@@ -189,6 +189,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | 41 | Skipping the descent: an adaptive hash against a learned leaf locator (prototypes, behind a switch) | [store.md](design/store.md#41-skipping-the-descent-an-adaptive-hash-against-a-learned-leaf-locator-prototypes-behind-a-switch) |
 | store | – | Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time | [store.md](design/store.md#decision-lane-wal-read-a-commits-records-published-at-a-lookups-cost-its-deltas-found-a-word-at-a-time) |
 | store | 42 | The page path SQLite takes: plain pins, the pool's buffer counted once, misses read in line, checksums once (prototype, behind a switch) | [store.md](design/store.md#42-the-page-path-sqlite-takes-plain-pins-the-pools-buffer-counted-once-misses-read-in-line-checksums-once-prototype-behind-a-switch) |
+| store | 43 | Point readers write no line another reader writes: the reader taken from a slot of its own, shared pages read under a version check (prototype, behind a switch) | [store.md](design/store.md#43-point-readers-write-no-line-another-reader-writes-the-reader-taken-from-a-slot-of-its-own-shared-pages-read-under-a-version-check-prototype-behind-a-switch) |
 | without-rowid | – | Native primary-root query access | [without-rowid.md](design/without-rowid.md#native-primary-root-query-access) |
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
 | xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |
@@ -200,6 +201,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | backup | – | The folder store: keys as paths, create once by link(2), listing in key order | [backup.md](design/backup.md#the-folder-store) |
 | backup | – | Restore-and-check: the newest whole second restored and checked, on the archive's cadence | [backup.md](design/backup.md#restore-and-check) |
 | backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
+| backup | – | Incremental bases: a new base keeps the latest's chunks the log left unchanged | [backup.md](design/backup.md#incremental-bases) |
 
 ## Sections that are not decisions
 
