@@ -277,7 +277,10 @@ fn t_bl_1_the_join_search_time_is_counted_per_thread() {
     let before = amphora_engine::join_search_ns();
     drop(conn.prepare(star_query(3)).unwrap());
     let after = amphora_engine::join_search_ns();
-    assert!(after > before, "the join search's time was not counted: {before} then {after}");
+    assert!(
+        after > before,
+        "the join search's time was not counted: {before} then {after}"
+    );
     let other = conn.clone();
     std::thread::spawn(move || drop(other.prepare(star_query(3)).unwrap()))
         .join()

@@ -29,7 +29,9 @@ impl SearchTimer {
             let (depth, ns) = s.get();
             s.set((depth.saturating_add(1), ns));
         });
-        Self { began: std::time::Instant::now() }
+        Self {
+            began: std::time::Instant::now(),
+        }
     }
 }
 
@@ -39,7 +41,14 @@ impl Drop for SearchTimer {
         SEARCH.with(|s| {
             let (depth, ns) = s.get();
             let depth = depth.saturating_sub(1);
-            s.set((depth, if depth == 0 { ns.saturating_add(took) } else { ns }));
+            s.set((
+                depth,
+                if depth == 0 {
+                    ns.saturating_add(took)
+                } else {
+                    ns
+                },
+            ));
         });
     }
 }
