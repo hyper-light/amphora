@@ -75,6 +75,14 @@ impl Drain {
     /// The bound in force: what the reader drains in `timeout` at its measured rate, no less than
     /// `least` (one record), its bytes no more than `room` (the memory budget's room for queues).
     pub(super) fn bound(&self, timeout: Duration, least: Bound, room: u64) -> Bound {
+        // Nothing measured yet: the memory budget's room, the only bound known before the reader
+        // has drained (QB.1). One record would fence a host whose first burst outruns it.
+        if self.nanos == 0 {
+            return Bound {
+                bytes: room,
+                messages: u64::MAX,
+            };
+        }
         let timeout = timeout.as_nanos();
         // sum × timeout / nanos, in u128: no product of a u64 and a u64-sized duration overflows.
         let within = |sum: u64| -> u64 {
@@ -82,7 +90,7 @@ impl Drain {
                 .saturating_mul(timeout)
                 .checked_div(u128::from(self.nanos))
                 .and_then(|over| u64::try_from(over).ok())
-                .unwrap_or(if self.nanos == 0 { 0 } else { u64::MAX })
+                .unwrap_or(u64::MAX)
         };
         Bound {
             bytes: within(self.bytes).max(least.bytes).min(room),
@@ -109,15 +117,19 @@ mod tests {
     /// T-QB.1.1: nothing measured, then an interval with nothing queued and nothing read: passes
     /// when the bound is one record (`least`), the room no matter how large.
     #[test]
-    fn drain_nothing_measured_bounds_one_record() {
+    fn drain_nothing_measured_bounds_the_room() {
         let mut drain = Drain::default();
         let timeout = Duration::from_secs(1);
-        assert_eq!(drain.bound(timeout, LEAST, u64::MAX), LEAST);
+        let room = Bound {
+            bytes: 4000,
+            messages: u64::MAX,
+        };
+        assert_eq!(drain.bound(timeout, LEAST, 4000), room);
         drain.sample(0, false);
         drain.sample(10 * MS, false);
         assert_eq!(
-            drain.bound(timeout, LEAST, u64::MAX),
-            LEAST,
+            drain.bound(timeout, LEAST, 4000),
+            room,
             "an idle start tells nothing"
         );
     }

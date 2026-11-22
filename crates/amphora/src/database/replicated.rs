@@ -1019,7 +1019,9 @@ impl Flushing {
 /// The most an image of this owner's machine may take now: the memory budget's room for one (SB.1).
 /// The owner's machine holds it inside its command queue's bound too (`queue_bounds`).
 fn owner_image_room() -> Result<usize, Refusal> {
-    crate::replication::image_room()
+    let room = crate::memory::process().room(crate::memory::Use::Queues)?;
+    let room = usize::try_from(room).unwrap_or(usize::MAX);
+    Ok(crate::replication::image_room()?.min(room.saturating_sub(FRAMING_BYTES)))
 }
 
 /// The owner's queue bounds now (QB.1).
@@ -1064,8 +1066,13 @@ fn queue_bounds(
         bytes: request,
         messages: 1,
     };
-    let applications = intake.bound(timeout, call, room).bytes.min(queued);
     let wire = record.min(queued);
+    // A wire record's room is held back from application calls, so that waiting calls cannot
+    // block the record that finds a leader.
+    let applications = intake
+        .bound(timeout, call, room)
+        .bytes
+        .min(queued.saturating_sub(wire));
     let one = super::drain::Bound {
         bytes: wire,
         messages: 1,
