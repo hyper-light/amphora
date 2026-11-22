@@ -667,7 +667,7 @@ class FunctionsSaid(unittest.TestCase):
     to negative digits, char() of several code points and of NULL, format(), hex() of integers,
     text, a blob and NULL, zeroblob() of a count, a negative one and NULL, length() of an
     integer, a blob and text, hex() and length() of reals (SQLite's %!.15g text of them), typeof() and quote()
-    of values of a known storage class, IS of values, CAST to an integer type of a real and of an integer past 32 bits. Expect: DuckDB (when its Python
+    of values of a known storage class, IS of values, date() with modifiers, CAST to an integer type of a real and of an integer past 32 bits. Expect: DuckDB (when its Python
     module is here) gives what SQLite gives, values compared as numbers; PostgreSQL's round() digits
     guarded; a likelihood() SQLite refuses left for the engine to refuse; hex() and length() of
     a REAL not expressible on PostgreSQL, MySQL and ClickHouse; typeof() and quote() of a known
@@ -710,6 +710,10 @@ class FunctionsSaid(unittest.TestCase):
                 self.assertIn("CASE WHEN a IS NULL THEN 'null' ELSE 'integer' END", out)
                 self.assertEqual(out.upper().count("COALESCE("), 3)
                 self.assertRegex(out.upper(), r"QUOTE\(A \+ 0\.5\)")
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                self.assertIn(f"not expressible in {d}: date() with modifiers", dialects.translate("SELECT date('2024-01-31', '+1 month')", d)[1])
+                self.assertIsNone(dialects.translate("SELECT date('2024-01-31')", d)[1])
         self.assertEqual(dialects.translate("SELECT a IS 1, a IS NOT 'x', a IS NULL FROM t", "postgres", dialects.contexts([FileRecord(0, "CREATE TABLE t(a INTEGER)")])[0])[0], "SELECT a IS NOT DISTINCT FROM 1, NOT a IS NOT DISTINCT FROM 'x', a IS NULL FROM t")
         self.assertIn("UPPER(ENCODE(CAST('\\x01' AS BYTEA), 'hex'))", dialects.records_in(records, "postgres")[1][0])
         for d in ("postgres", "mysql", "clickhouse"):

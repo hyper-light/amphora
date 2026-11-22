@@ -1107,6 +1107,10 @@ def functions_said(expression, context, dialect):
       REAL value into an INTEGER, the result is the integer between the REAL value and zero that is
       closest to the REAL value", where DuckDB's, PostgreSQL's and MySQL's casts round (DuckDB 1.4.2
       gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first.
+    - date(X, modifier...): sqlglot reads the first modifier as a time zone (DuckDB got
+      `AT TIME ZONE '+1 day'`), and SQLite's modifiers' arithmetic ("+1 month" on January 31 is
+      March 2 or 3, lang_datefunc.html#modifiers; 'ceiling', 'start of', 'weekday N') is no
+      engine's date arithmetic: not expressible, with the reason. date(X) alone is sqlglot's.
     - total(X): "The sum() and total() aggregate functions return the sum of all non-NULL values
       in the group ... total() always returns a floating point value ... 0.0 if there are only
       NULL inputs" (lang_aggfunc.html#sumunc); no other engine has it. For an X of INTEGER or REAL
@@ -1197,6 +1201,8 @@ def functions_said(expression, context, dialect):
                 node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
             elif arg == "BLOB" and dialect != "postgres":
                 same(node, exp.Anonymous(this="octet_length" if dialect == "duckdb" else "length", expressions=[node.this.copy()]))
+        elif isinstance(node, exp.Date) and (node.args.get("zone") is not None or node.expressions):
+            raise NotExpressible(f"not expressible in {dialect}: date() with modifiers (lang_datefunc.html#modifiers), which sqlglot reads as a time zone and none of whose arithmetic (months normalized past a month's end, 'ceiling', 'start of', 'weekday N') {dialect}'s dates do alike")
         elif isinstance(node, exp.Anonymous) and node.name.upper() == "TOTAL" and len(node.expressions) == 1 and not isinstance(node.expressions[0], exp.Distinct) and classes.get(id(node.expressions[0]), UNKNOWN) in (None, "INTEGER", "REAL"):
             summed = exp.Sum(this=exp.cast(node.expressions[0].copy(), exp.DataType.build("DOUBLE")))
             w = node.parent
