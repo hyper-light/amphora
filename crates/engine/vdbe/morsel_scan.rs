@@ -1607,3 +1607,7 @@ fn kept(out: &[Value], budget: &MemoryBudget) -> Result<Vec<Value>, MorselError>
 #[cfg(test)]
 #[path = "morsel_scan_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "morsel_join_ab.rs"]
+mod join_ab;
