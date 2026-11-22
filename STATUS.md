@@ -605,7 +605,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   conditions naming commit stamps, checked under its locks (T-T1.9.R27). One clock (lane split-merge-21, T-T1.9.R28):
   stamps are the cross-group clock's microseconds, a transaction's rows take its one commit stamp in every group
   (`Step::ResolveAt`), reads place rows by their own stamps and wait out a held lock whose stamp is at or before
-  theirs; `Records::commit` across groups waits on the coordinator sending that stamp (lane xgroup-sql-11).
+  theirs. On the one stamp (lane split-merge-22): `Records::commit` across groups answers the transaction's commit
+  stamp, its conditions carried (T-T1.9.R29); a recovery resolves every group at the one stamp, kept with the decision
+  and with each resolution (T-T1.9.R30); a held read wakes only for its own row's resolution (T-T1.9.R31).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

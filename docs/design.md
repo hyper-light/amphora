@@ -171,6 +171,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-20): a read as of a stamp places moved rows by their stamps | [reshard.md](design/reshard.md#decision-lane-split-merge-20-a-read-as-of-a-stamp-places-moved-rows-by-their-stamps) |
 | reshard | – | Decision (lane split-merge-20): conditions across groups name commit stamps | [reshard.md](design/reshard.md#decision-lane-split-merge-20-conditions-across-groups-name-commit-stamps) |
 | reshard | – | Decision (lane split-merge-21): one clock, one commit stamp | [reshard.md](design/reshard.md#decision-lane-split-merge-21-one-clock-one-commit-stamp) |
+| reshard | – | Decision (lane split-merge-22): Records::commit and recovery on the one stamp | [reshard.md](design/reshard.md#decision-lane-split-merge-22-recordscommit-and-recovery-on-the-one-stamp) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
