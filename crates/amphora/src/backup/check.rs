@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use amphora_api::blobs::Blobs;
+use amphora_engine_parser::ast::{Cmd, CreateTableBody, Stmt};
+use amphora_engine_parser::parser::Parser;
 use sha2::{Digest as _, Sha256};
 
 use super::drill::{Pace, Unpaced};
@@ -17,10 +19,12 @@ use super::plan::{self, SegmentKey, ThroughKey};
 use super::restore::{Restored, restore_paced, through_marks};
 use super::ship::list_all;
 use super::{SECOND_NS, second_of};
+
 use crate::db::Db;
 
 /// A database's rows, table by table: each table's name, its row count and a SHA-256 over its rows
-/// in rowid order. Two databases with the same rows have the same digest.
+/// in rowid order, or a WITHOUT ROWID table's in its columns' order ([`row_order`]). Two databases
+/// with the same rows have the same digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowDigest(pub Vec<(String, u64, [u8; 32])>);
 
@@ -33,22 +37,25 @@ pub fn digest(db: &Db) -> anyhow::Result<RowDigest> {
 pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<RowDigest> {
     let mut tables = Vec::new();
     db.query(
-        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
         [],
         |r| {
-            tables.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+            let name = r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let sql = r.get::<String>(1).map_err(|e| anyhow::anyhow!("{e}"))?;
+            tables.push((name, sql));
             Ok(true)
         },
     )?;
     let mut out = Vec::with_capacity(tables.len());
     let mut read = 0u64;
     pace.ready()?;
-    for table in tables {
+    for (table, sql) in tables {
         let quoted = table.replace('"', "\"\"");
+        let order = row_order(&table, &sql)?;
         let mut hash = Sha256::new();
         let mut rows = 0u64;
         db.query_owned(
-            &format!("SELECT * FROM \"{quoted}\" ORDER BY rowid"),
+            &format!("SELECT * FROM \"{quoted}\" ORDER BY {order}"),
             [],
             |r| {
                 let values: Vec<_> = r.get_values().collect();
@@ -68,6 +75,32 @@ pub fn digest_paced(db: &Db, pace: &mut dyn Pace, step: u64) -> anyhow::Result<R
     }
     pace.done(None, read)?;
     Ok(RowDigest(out))
+}
+
+/// The order a digest reads `table`'s rows in, from its `CREATE TABLE` text `sql`: its rowid's; a
+/// WITHOUT ROWID table has none (the tables of transactions across groups are such, made in every
+/// database), so its every column in turn, a whole order since its primary key makes each row
+/// distinct (T-T1.12.C1).
+fn row_order(table: &str, sql: &str) -> anyhow::Result<String> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let Some(Cmd::Stmt(Stmt::CreateTable {
+        body: CreateTableBody::ColumnsAndConstraints {
+            columns, options, ..
+        },
+        ..
+    })) = parser
+        .next_cmd()
+        .map_err(|e| anyhow::anyhow!("table {table}: {e}"))?
+    else {
+        return Err(anyhow::anyhow!("table {table} is not a table of columns"));
+    };
+    if !options.contains_without_rowid() {
+        return Ok("rowid".to_owned());
+    }
+    Ok((1..=columns.len())
+        .map(|column| column.to_string())
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 /// The bytes of rows a paced digest reads a step: as many as one object of the store holds, the
