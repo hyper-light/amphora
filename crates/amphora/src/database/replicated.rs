@@ -51,6 +51,11 @@ const TICK: Duration = Duration::from_millis(10);
 // no input, as before.
 const CHANGE_BYTES: usize = std::mem::size_of::<Input>();
 
+// Session tokens: read-your-writes on any replica (replication.md, "Decision (lane ryw-1):
+// read-your-writes by session tokens").
+mod tokens;
+pub use tokens::{ReadMode, Served, SessionCounters, Token};
+
 /// One of the floor's own sessions: the work it does on the database at its base.
 type FloorSession = Box<dyn FnOnce(&mut Db) -> anyhow::Result<()> + Send>;
 type Durable<F = DeviceFile> = Replica<GroupStore<F>, crate::replication::Machine, Bytes>;
@@ -304,12 +309,19 @@ struct Control {
     // reads at a closed time").
     closed: Mutex<Closed>,
     moved: std::sync::Condvar,
+    // This replica's token reads, counted (`tokens`).
+    sessions: tokens::SessionMeter,
 }
-/// What a replica's owner published of its closed time.
-#[derive(Debug, Clone, Copy, Default)]
+/// What a replica's owner published of its closed time, and of its applied and answered points
+/// (the session tokens', `tokens`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Closed {
     time: Option<u64>,
     lag: Option<u64>,
+    /// The index this replica applied.
+    applied: u64,
+    /// The highest index whose write this owner answered: a token taken after the answer names it.
+    answered: u64,
 }
 /// The readers of a replica's local reads (replication.md, "A local read on a replica"):
 /// connections of their own on the machine's database, each on what the machine committed when
@@ -1595,8 +1607,11 @@ fn open_on<F: BlockFile + 'static>(
         closed: Mutex::new(Closed {
             time: replica.machine().closed(),
             lag: None,
+            applied: replica.applied().index,
+            answered: 0,
         }),
         moved: std::sync::Condvar::new(),
+        sessions: tokens::SessionMeter::default(),
     });
     let election = replica.core().raft.config().election_tick;
     let slots = super::slot::Slots::new(slot_bounds(election, TICK)?);
@@ -3363,6 +3378,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self.replica.applied().index != self.published {
             self.refresh()?;
         }
+        // And the point its answers are at, which a session's token takes (`tokens`).
+        if !output.answers.is_empty() {
+            self.publish_point(self.replica.applied().index)?;
+        }
         for applied in output.answers {
             let matches = self
                 .pending
@@ -3518,6 +3537,11 @@ impl<F: BlockFile + 'static> Actor<F> {
             // A malformed entry fences at its apply, which answers.
             Err(_) => return,
         };
+        // The point a session's token takes, published before the answer (`tokens`). Unpublished
+        // (a poisoned lock), no token can be read either, so none is stale.
+        if self.publish_point(index).is_err() {
+            return;
+        }
         let Some(mut pending) = self.pending.take() else {
             return;
         };
@@ -3805,18 +3829,29 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// Publishes this replica's closed time if it moved since the last step, with the lag it
     /// measured, and tells the reads waiting for it.
     fn publish_closed(&mut self) -> Result<(), Refusal> {
+        self.publish_point(0)
+    }
+    /// Publishes this replica's closed time, its applied index and, past what it published, the
+    /// index `answered` it is about to answer a write at, if any moved; and tells the reads
+    /// waiting for them (`tokens`): an event of the owner's step, never a timer's.
+    fn publish_point(&mut self, answered: u64) -> Result<(), Refusal> {
         let time = self.replica.machine().closed();
+        let applied = self.replica.applied().index;
         let mut closed = locked(&self.control.closed)?;
-        if closed.time == time {
-            return Ok(());
-        }
-        if let Some(time) = time {
+        let moved = closed.time != time;
+        if moved && let Some(time) = time {
             self.lag.moved(self.wall_now()?, time);
         }
-        *closed = Closed {
+        let next = Closed {
             time,
-            lag: self.lag.p99(),
+            lag: if moved { self.lag.p99() } else { closed.lag },
+            applied,
+            answered: closed.answered.max(answered),
         };
+        if *closed == next {
+            return Ok(());
+        }
+        *closed = next;
         drop(closed);
         self.control.moved.notify_all();
         Ok(())
@@ -4056,6 +4091,8 @@ mod tests {
     // Follower reads at a closed time, under leader changes (replication.md, "Follower reads at a
     // closed time"): in a file of its own, on this module's driven shell.
     mod closed_reads;
+    // Session tokens: read-your-writes on any replica (`tokens`), on the same driven shell.
+    mod session_reads;
 
     thread_local! {
         /// The account the owners a test opens on its thread charge their readers to, in place of

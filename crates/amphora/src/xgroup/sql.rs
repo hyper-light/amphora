@@ -893,6 +893,9 @@ where
     Ok(reply)
 }
 
+/// A step held to be sent again: its group, transaction, envelope and the refusals of it so far.
+type Held = (GroupId, Option<TxnId>, Envelope, u32);
+
 /// Where a caller waits for its transaction's answer.
 type Waiter = SyncSender<Result<Answer, Refusal>>;
 
@@ -932,7 +935,7 @@ struct Driver {
     /// Steps a group refused before taking, each to be sent again at its instant
     /// ([`OnRefused::Retry`]): its group, transaction, envelope and refusals so far. At most the
     /// steps the coordinator has out.
-    held: BTreeMap<(Instant, u64), (GroupId, Option<TxnId>, Envelope, u32)>,
+    held: BTreeMap<(Instant, u64), Held>,
     instruments: Instruments,
 }
 
@@ -987,9 +990,13 @@ impl Driver {
                     };
                     if let Err(refusal) = &reply {
                         counted(&self.instruments, |c| match refusal {
-                            Refusal::NotLeader { .. } => c.refused_not_leader += 1,
-                            Refusal::Full { .. } => c.refused_full += 1,
-                            _ => c.refused_other += 1,
+                            Refusal::NotLeader { .. } => {
+                                c.refused_not_leader = c.refused_not_leader.saturating_add(1);
+                            }
+                            Refusal::Full { .. } => {
+                                c.refused_full = c.refused_full.saturating_add(1)
+                            }
+                            _ => c.refused_other = c.refused_other.saturating_add(1),
                         });
                     }
                     if let (Err(refusal), Some((group, envelope, refusals))) = (&reply, again)
@@ -1205,7 +1212,7 @@ impl Driver {
             .collect();
         let txns = u64::try_from(txns.len()).unwrap_or(u64::MAX);
         counted(&self.instruments, |c| {
-            c.retries += u64::from(retry);
+            c.retries = c.retries.saturating_add(u64::from(retry));
             c.held_steps = steps;
             c.held_txns = txns;
             c.held_txns_most = c.held_txns_most.max(txns);
@@ -1252,7 +1259,7 @@ impl Driver {
     }
 
     fn stop(&mut self, refusal: &Refusal) {
-        counted(&self.instruments, |c| c.stops += 1);
+        counted(&self.instruments, |c| c.stops = c.stops.saturating_add(1));
         for (_, waiter) in std::mem::take(&mut self.waiters) {
             let _ = waiter.send(Err(refusal.clone()));
         }
@@ -1430,10 +1437,15 @@ mod sessions {
     fn refusing(groups: &[GroupId], times: u64, refusal: fn() -> Refusal) -> Fault {
         let calls: Arc<Vec<AtomicU64>> = Arc::new((0..3).map(|_| AtomicU64::new(0)).collect());
         let groups = groups.to_vec();
-        // Only a transaction's steps: an open's recovery scans aren't the scenario's.
+        // Only the steps of transactions this incarnation began: an open's recovery scans, and its
+        // finishing of what the last incarnation left (whose resolution may still have been under
+        // way when it stopped), aren't the scenario's and would spend its refusals.
         Arc::new(move |here, envelope: &Envelope| {
             let calls = calls.get(usize::try_from(here).ok()?)?;
-            (envelope.step.txn().is_some()
+            (envelope
+                .step
+                .txn()
+                .is_some_and(|txn| txn.epoch == envelope.epoch)
                 && groups.contains(&here)
                 && calls.fetch_add(1, Ordering::AcqRel) < times)
                 .then(refusal)
