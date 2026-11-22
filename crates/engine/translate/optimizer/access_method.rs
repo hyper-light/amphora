@@ -15,7 +15,9 @@ use crate::translate::optimizer::constraints::{
     partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
     ConstraintRef, RangeConstraintRef,
 };
-use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
+use crate::translate::optimizer::cost::{
+    index_rows_per_page, rows_per_leaf_page_for_index, RowCountEstimate,
+};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
     plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, JoinInfo, JoinOrigin,
@@ -414,11 +416,7 @@ pub(super) fn choose_best_btree_candidate(
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
+                rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             // The table's own B-tree holds every column: read in rowid order, a page is read
             // once, never once as an index page and again as a table page.
@@ -754,11 +752,7 @@ pub(super) fn choose_best_in_seek_candidate(
                 unique: index.unique,
                 covering: rowid_only || rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
+                rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,
@@ -996,7 +990,8 @@ pub fn find_best_access_method_for_join_order(
             analyze_stats,
             input_cardinality,
             base_row_count,
-            params,
+            // Amphora (PL.7, T-PL.7.1): a table's reads cost its own pages.
+            &params.for_table(rhs_table, analyze_stats),
             whole_reads,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
@@ -1101,11 +1096,7 @@ fn find_best_access_method_for_btree(
                 unique: index.unique,
                 covering: rhs_table.index_is_covering(index),
                 column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    rhs_table,
-                    params.rows_per_table_page,
-                ),
+                rows_per_leaf_page: index_rows_per_page(index, rhs_table, params),
             },
             None => IndexInfo {
                 unique: true,

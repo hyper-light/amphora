@@ -1811,3 +1811,42 @@ with time, counted rows in place of estimates, no higher with the switch on than
 (T-PL.7.1, the audit's 09-cost-model; `cost.rs`, lane qs5-7's), and the P-error harness
 (AC-PL.7.2), the coordinator's. External sorts and hash spills give no term yet: their work is
 folded into the others'.
+
+## Decision (lane pl7c): a table's pages counted by ANALYZE, else derived from its page and records
+
+**Decision.** PL.7, T-PL.7.1. The planner took every table's pages as its rows over 50, a picked
+number, so a table of 8 pages and one of 1,011 with the same rows scanned at one cost. Now:
+
+- **Counted.** ANALYZE walks each table's and index's B-tree once more, as `Count` does
+  (`Insn::TreePages`, `BTreeCursor::counted_pages`): every interior and leaf page entered once, no
+  record decoded. It keeps the count beside its other statistics, `(tbl, index or NULL, 'pages',
+  n)` in `__turso_internal_column_stats`. The planner reads a table's rows a page as its rows over
+  its pages, an index's the same, for every read of that table (`CostModelParams::for_table`,
+  called where each B-tree table is costed: its access methods, its seeks' scores, a hash join's
+  probe).
+- **Before ANALYZE counts them.** From the connection's usable page bytes and the table's average
+  record as ANALYZE's sample measured it, laid out as the file format lays a table leaf's cells
+  (an 8-byte header; each cell a 2-byte pointer, the payload's size and the rowid as varints, and
+  the record). With no ANALYZE at all, the record is the fewest bytes the format lets a record of
+  the table's columns take (one header byte and one serial type byte a column), a lower bound: the
+  rows a page are an upper bound, never a picked number. An index without counted pages keeps its
+  width against its table's rows a page, as before.
+- **Not counted.** Overflow pages: a scan reads a row's overflow only for the columns past it.
+  ANALYZE of one index keeps that index's old count, as it keeps its degrees (PL.11).
+
+**Why.** A read's file pages are the cost model's unit (decision 5); the tree has them exactly, so
+an estimate of them is the wrong thing to keep. The walk reads each page once, against ANALYZE's
+scans that decode every record.
+
+**Sources.** SQLite file format (https://www.sqlite.org/fileformat2.html), sections 1.3.2 (the
+default page size, 4096), 1.6 (page header, cell pointers, cells, varints) and 2.1 (record format);
+SQLite's `sqlite3BtreeCount`, the walk `Count` follows.
+
+**Evidence.** `tests/column_stats.rs`: `t_pl_7_1_analyze_keeps_each_trees_real_pages` (the pages
+kept equal those the table and its index added to the file, none free) and
+`t_pl_7_1_plans_read_the_pages_analyze_counted` (two tables of the same rows, one's records a
+thousand bytes: the wide one's full read costs more than ten times the narrow one's, where both
+cost the same before); `cost::tests::t_pl_7_1_*`. `tests/planner.rs`'
+`a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages` rested on the 50: its
+20,000 items are 198 real pages, under the smallest cache a connection takes (200), so it now
+builds 80,000.

@@ -770,7 +770,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   sort work, file page reads) by non-negative least squares with Huber weights, in bounded memory;
   weights no sample determines, or none tells from nothing at 95%, keep the learned calibration's
   (docs/design/planner.md, "Decision (lane pl7)"; lane pl7b, T-PL.7.6, after a loaded run's noisy
-  weights flipped a plan in `tests/planner.rs`). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
+  weights flipped a plan in `tests/planner.rs`). Lane pl7c (T-PL.7.1): ANALYZE counts each table's and index's
+  B-tree pages and the planner reads rows a page from them, else from the page size and the
+  sample's measured records, else from the format's smallest record; the picked 50 rows a page is
+  gone (docs/design/planner.md, "Decision (lane pl7c)"). Open: the audit's 09-cost-model run, the P-error harness (AC-PL.7.2), and
   AC-PL.7.1's JOB rank correlation with the switch on and off.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
