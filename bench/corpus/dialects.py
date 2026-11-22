@@ -1107,6 +1107,10 @@ def functions_said(expression, context, dialect):
       REAL value into an INTEGER, the result is the integer between the REAL value and zero that is
       closest to the REAL value", where DuckDB's, PostgreSQL's and MySQL's casts round (DuckDB 1.4.2
       gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first.
+    - X IS Y: "The IS and IS NOT operators work like = and != except when one or both of the
+      operands are NULL" (lang_expr.html "Operators"), where the other engines' IS takes NULL,
+      TRUE and FALSE only: X IS NOT DISTINCT FROM Y (MySQL's <=>), the SQL standard's name for it.
+      IS NULL, IS TRUE and IS FALSE stay.
     - typeof(X): "a string that indicates the datatype of the expression X: "null", "integer",
       "real", "text", or "blob"" (lang_corefunc.html#typeof), where DuckDB's and PostgreSQL's
       typeof name the engine's type ('INTEGER', 'DECIMAL(2,1)', 'VARCHAR') and ClickHouse's
@@ -1187,6 +1191,8 @@ def functions_said(expression, context, dialect):
                 node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
             elif arg == "BLOB" and dialect != "postgres":
                 same(node, exp.Anonymous(this="octet_length" if dialect == "duckdb" else "length", expressions=[node.this.copy()]))
+        elif isinstance(node, exp.Is) and not isinstance(node.expression, (exp.Null, exp.Boolean)):
+            same(node, exp.NullSafeEQ(this=node.this.copy(), expression=node.expression.copy()))
         elif isinstance(node, exp.Typeof) and classes.get(id(node.this), UNKNOWN) != UNKNOWN:
             c, x = classes[id(node.this)], node.this
             if c is None or isinstance(x, exp.Literal) or (isinstance(x, exp.Neg) and isinstance(x.this, exp.Literal)):

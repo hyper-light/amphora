@@ -589,13 +589,13 @@ class FunctionsSaid(unittest.TestCase):
     to negative digits, char() of several code points and of NULL, format(), hex() of integers,
     text, a blob and NULL, zeroblob() of a count, a negative one and NULL, length() of an
     integer, a blob and text, hex() and length() of reals (SQLite's %!.15g text of them), typeof() and quote()
-    of values of a known storage class, CAST to an integer type of a real and of an integer past 32 bits. Expect: DuckDB (when its Python
+    of values of a known storage class, IS of values, CAST to an integer type of a real and of an integer past 32 bits. Expect: DuckDB (when its Python
     module is here) gives what SQLite gives, values compared as numbers; PostgreSQL's round() digits
     guarded; a likelihood() SQLite refuses left for the engine to refuse; hex() and length() of
     a REAL not expressible on PostgreSQL, MySQL and ClickHouse; typeof() and quote() of a known
     class said on every engine, of a REAL (quote) or an unknown class left as they are."""
 
-    CASES = ["likely(1 > 0)", "unlikely(3) + 1", "likelihood(2, 0.5)", "upper('héllo')", "lower('ÉaB')", "round(2.5, -1)", "round(25, -2)", "char(72, 105)", "char(NULL)", "char(97)", "format('%d-%s', 7, 'x')", "format('%05.1f', 3.14159)", "hex(1)", "hex(-7)", "hex(NULL)", "hex('ab')", "hex(x'00ff')", "hex(1 + 2)", "zeroblob(3)", "zeroblob(-1)", "zeroblob(NULL)", "length(-7)", "length(x'00ff')", "length(1 + 22)", "length('é')", "hex(2.5)", "hex(100.0)", "hex(1e20)", "hex(-0.0)", "hex(9e999)", "length(1.0 / 3)", "length(1e-5)", "length(CAST(3 AS REAL))", "length(-9e999)", "length(123456789012345678.0)", "typeof(NULL)", "typeof(-7)", "typeof(2.5)", "typeof('abc')", "typeof(x'00')", "typeof(1 / 2.0)", "typeof(CAST(1 AS TEXT))", "quote(NULL)", "quote(-7)", "quote('it''s')", "quote(x'00ff')", "quote('')", "quote(x'')", "quote(1 + 2)", "CAST(3.9 AS INTEGER)", "CAST(-2.5 AS INT)", "CAST(3000000000 AS INTEGER)", "CAST(2.5 AS TINYINT) + 1"]
+    CASES = ["likely(1 > 0)", "unlikely(3) + 1", "likelihood(2, 0.5)", "upper('héllo')", "lower('ÉaB')", "round(2.5, -1)", "round(25, -2)", "char(72, 105)", "char(NULL)", "char(97)", "format('%d-%s', 7, 'x')", "format('%05.1f', 3.14159)", "hex(1)", "hex(-7)", "hex(NULL)", "hex('ab')", "hex(x'00ff')", "hex(1 + 2)", "zeroblob(3)", "zeroblob(-1)", "zeroblob(NULL)", "length(-7)", "length(x'00ff')", "length(1 + 22)", "length('é')", "hex(2.5)", "hex(100.0)", "hex(1e20)", "hex(-0.0)", "hex(9e999)", "length(1.0 / 3)", "length(1e-5)", "length(CAST(3 AS REAL))", "length(-9e999)", "length(123456789012345678.0)", "typeof(NULL)", "typeof(-7)", "typeof(2.5)", "typeof('abc')", "typeof(x'00')", "typeof(1 / 2.0)", "typeof(CAST(1 AS TEXT))", "quote(NULL)", "quote(-7)", "quote('it''s')", "quote(x'00ff')", "quote('')", "quote(x'')", "quote(1 + 2)", "2 IS 1", "NULL IS 1", "NULL IS NULL", "2 IS NOT 2", "'a' IS 'a'", "1 IS NOT NULL", "CAST(3.9 AS INTEGER)", "CAST(-2.5 AS INT)", "CAST(3000000000 AS INTEGER)", "CAST(2.5 AS TINYINT) + 1"]
 
     def test_same_answers_as_sqlite_on_duckdb(self):
         try:
@@ -632,6 +632,7 @@ class FunctionsSaid(unittest.TestCase):
                 self.assertIn("CASE WHEN a IS NULL THEN 'null' ELSE 'integer' END", out)
                 self.assertEqual(out.upper().count("COALESCE("), 3)
                 self.assertRegex(out.upper(), r"QUOTE\(A \+ 0\.5\)")
+        self.assertEqual(dialects.translate("SELECT a IS 1, a IS NOT 'x', a IS NULL FROM t", "postgres", dialects.contexts([FileRecord(0, "CREATE TABLE t(a INTEGER)")])[0])[0], "SELECT a IS NOT DISTINCT FROM 1, NOT a IS NOT DISTINCT FROM 'x', a IS NULL FROM t")
         self.assertIn("UPPER(ENCODE(CAST('\\x01' AS BYTEA), 'hex'))", dialects.records_in(records, "postgres")[1][0])
         for d in ("postgres", "mysql", "clickhouse"):
             for f in ("hex", "length") if d != "postgres" else ("length",):  # PostgreSQL has no hex()
