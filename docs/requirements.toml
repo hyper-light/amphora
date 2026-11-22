@@ -811,6 +811,11 @@ tests = [
   { id = "T-T1.9.R11", text = "The move of T-T1.9.R10 with every third pull's answer lost on the way back after the old group's node acted on it, each loss asked again by the driver — passes when some answers were lost and the move still ends flipped with every acknowledged write at its group's node and every key in exactly one group's file" },
   # lane split-merge-10
   { id = "T-T1.9.R12", text = "The move of T-T1.9.R10 with each pull carried over the owner transport between the two nodes' endpoints, every fourth pull asked while the other node's endpoint is down and every third answer dropped after it arrived, each fault asked again by the driver — passes when both faults were met and the move still ends flipped with every acknowledged write at its group's node and every key in exactly one group's file" },
+  # lane split-merge-11
+  { id = "T-T1.9.R13", text = "Local databases as groups, one split and then merged back by the driver through the shell while a Records transaction is written before every action — passes when each operation is done, every acknowledged write reads back through its group after each, and while split a transaction within one group commits and one whose writes or condition name keys in both groups is refused whole" },
+  # lane split-merge-12
+  { id = "T-T1.9.R14", text = "A thousand weights added at positions, kept to eight entries — passes when no more than eight are ever kept, their total is exact, the cut leaves weight on each side, and four single weights cut exactly at the middle" },
+  { id = "T-T1.9.R15", text = "One group measured by the shell with nothing written, after sixty-four keys are written, and again after — passes when the first has no load cut, the second has load above zero and a cut that counts each key on the side its position falls, the plan on two cores splits the group at that cut, and the third has no load" },
 ]
 
 # lane qs5
@@ -1151,4 +1156,21 @@ tests = [
   { id = "T-QT.2.3", text = "qs2_a_page_read_ahead_that_fails_its_checksum_is_not_served — passes when the damaged page is refused as corrupt and the pages around it read as written" },
   { id = "T-QT.2.4", text = "qs2_runs_over_files_read_each_page_as_written and qs2_a_run_is_the_measured_fixed_cost_over_the_cost_of_a_page — passes when preadv's runs read as written and the run follows the fit" },
   { id = "T-QT.2.5", text = "versioned_crash with AMPHORA_READ_AHEAD=runs and without — passes when both pass" },
+  { id = "T-QT.2.6", text = "qs2_read_ahead_takes_only_the_frames_a_shared_source_grants and qs2_a_run_past_iov_max_reads_every_page (pool.rs) — passes when a run under a shared source makes no frame past those granted and is never refused, and a run of 2,000 pages over a file (past IOV_MAX) reads every page as written" },
+]
+
+# lane xgroup-lan: G13 step 3's measurement (kiln goal c2e7f9ebe5678ec5a6edc38baec7f3f8; xgroup.md,
+# "Over the transport" and "Decision (lane xgroup-lan)"). AC-T1.10.2 and AC-T1.10.5 are the measures.
+[[own]]
+id = "T1.10.X"
+title = "Transactions across groups over the transport, and the harness that chooses the protocol (G13 step 3)"
+criteria = [
+  { id = "AC-T1.10.X1", text = "A cross-group step to a group on another node is one Request::Step over transport::Nodes (wire version 8), applied by the group's owner as a local step is, the coordinator's commit stamp carried in and the group's carried back" },
+  { id = "AC-T1.10.X3", text = "A group that fails mid-commit leaves every transaction committed in every group or aborted in every group once it answers again; a begin that finds the coordinator full waits for a transaction to finish, at most in_flight of them waiting (lane xgroup-lan-2)" },
+  { id = "AC-T1.10.X2", text = "examples/xgroup_lan.rs bench records p50, p99, p99.9 commit latency and commits a second per protocol to bench/records; elle checks seeded histories over the transport; sizes, durations, seeds and endpoints are inputs (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-T1.10.X1", text = "xgroup::lan::tests::ac_t1_10_2_the_lan_harness_measures_both_protocols_over_two_endpoints — passes when both protocols commit across two groups reached only over the transport, none unknown, percentiles in order" },
+  { id = "T-T1.10.X3", text = "xgroup::tests::t_t1_10_x3_a_group_failure_at_every_step_ends_committed_or_aborted_everywhere — passes when each of three groups failing at every coordinator input, its in-flight step landed or not, ends committed or aborted in every group, as answered, under both protocols, both ends reached" },
+  { id = "T-T1.10.X2", text = "xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly — passes when three seeds of each protocol over the transport commit across groups with no anomaly and no unknown outcome; ac_t1_10_5_the_lan_check_finds_a_lost_update_and_an_aborted_read holds the check to finding them" },
 ]

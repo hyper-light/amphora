@@ -222,6 +222,10 @@ deterministic simulator:
    Built (lane split-merge-10): a pull over the owner transport, its appended request and answer,
    between a node's endpoint and its peers (decision "Pulls over the owner transport", T-T1.9.R12).
 
+   Built (lane split-merge-11): the routing key is bytes, and a Records transaction routes by
+   every key it names, so it stays within one group (decision "The routing key is bytes",
+   T-T1.9.R13); local databases as groups split and merge under Records writes.
+
    Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
    which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
    one group), with a split and merge of it under writes through `carry`; the transport off
@@ -229,6 +233,13 @@ deterministic simulator:
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.
+
+   Built (lane split-merge-12): load from the store's meter (decision "Load from the store's
+   meter", T-T1.9.R14, T-T1.9.R15). `Groups::measure` gives each group's load (its writer's commit
+   time over the window) and its load cut (where the keys written to it fall), and `groups::room`
+   this machine's cores; the operations' lab plans from them. Still left of this item: a group's
+   size and its size cut from the B-tree's middle key (`Groups::measure` gives no bytes yet, so a
+   group splits and merges by its load alone).
 3. **`bench reshard`.** The cutover pause on a 10 GB partition under load (AC-T1.9.2), and the
    three-machine lab's 1,000 operations (AC-T1.9.3).
 4. **Metrics.** Operations by kind and outcome, and the fence lag. Their names still need
@@ -424,3 +435,76 @@ replicated transport's, hyper-transport); `Nodes` is the seam it plugs into.
 
 **Falsified by.** A pull answered through a partition; a move over the transport that loses an
 acknowledged write or leaves a key in two groups; a pull's answer larger than a frame.
+
+## Decision (lane split-merge-11): the routing key is bytes
+
+A store in groups routed a row by one key, a string (`Engine::key`), the same key a read waits on
+for its writes. A Records row's routing key is bytes (`reshard::row_key`: namespace, family, key),
+and a Records transaction names many keys, each of which may fall in a different group. Now an
+engine also says the keys a row routes by, as bytes (`Engine::routes`, one call a key); a store in
+groups routes a batch by every one of them, and refuses the batch whole if they are not all in one
+group (`store::Refused::Groups`), as it refused a batch of rows across groups before. Its key, unless
+the engine says otherwise, so every engine whose key is its route is unchanged.
+
+`Engine::key` stays what a read waits on: Amphora's own engine (`database::Local`) keeps one key
+for every command (`"database"`), so a read still waits for every write handed to its group before
+it, while it routes:
+- a Records transaction by the row key of every key its conditions and writes name, so a
+  condition on a key in another group refuses the transaction as a write there would;
+- a get by its key's row key;
+- any other command (SQL, a scan, changes, a namespace's head) by none: it goes to the group
+  holding position 0. SQL tables have no row key and don't move (decision "A row routes by its
+  namespace, family and key"); a scan, changes and a head over a namespace whose keys are in more
+  than one group need CP-T1.10's order across groups.
+
+`Groups::read_routed` reads in the group of a key in bytes, waiting on the key the engine's reads
+wait on, and `Groups::group_of` names the group of a key in bytes.
+
+**Evidence.** `database::group_holding`, T-T1.9.R13: local databases as groups (`Groups<Local>`),
+one group split by the driver through the shell while a Records transaction is written before every
+action, then merged back. Each operation is done; after each, every acknowledged write reads back
+through its group; while split, a transaction of two keys in one group commits, and one whose
+writes, or whose condition, name a key of the other group is refused whole.
+
+**Left.** A `Database` (the public type) over `Groups<Local>`: its writer is one store today, and
+its scans, changes, heads and SQL need the answers above across groups before it can be.
+
+**Falsified by.** A Records transaction committed with keys in two groups; a write acknowledged
+through `Groups<Local>` that doesn't read back after a split or merge.
+
+## Decision (lane split-merge-12): load from the store's meter
+
+The planner (`plan::plan`) compares each group's share of the load with one core's share, but the
+shell didn't measure the load: the lab counted its own writes. Now the shell does
+(`Groups::measure`, one call a planner run):
+- a group's **load** is the time its writer spent committing since the last call (the store's
+  meter, `Counters::apply_us`). Time adds up across groups and weighs a costly write more than a
+  cheap one, which a count of writes doesn't;
+- its **load cut** is where the keys handed to it since the last call fall half each side
+  (`plan::Weights`, one weight a key at its position, cut by `plan::cut`);
+- this machine's **cores** are what the operating system lets the process run on
+  (`groups::room`, `std::thread::available_parallelism`).
+
+Each call starts the next window, so the window is the time between planner runs; the plan
+compares shares, which don't depend on its length. None of this is a picked number: the split,
+merge and move rules stay those of "When: from what is measured", now fed what the store measured.
+
+The positions are kept bounded. A group's weights hold at most as many entries as the process's
+memory for batches holds (decision "A batch bounded by the process's memory"), shared among this
+node's groups. Past that, each pair of neighbouring entries folds into one at the first's position,
+so the total stays exact and a cut still falls at a position written, at the resolution the bound
+leaves. A fold halves the entries, so it runs no more than once every half-bound adds.
+
+**Evidence.** `plan::tests`, T-T1.9.R14: a thousand weights kept to eight entries stay within eight,
+their total exact, and cut with weight on each side; four single weights cut exactly in the middle.
+`tests/groups.rs`, T-T1.9.R15: a group measured with nothing written has no load cut; after
+sixty-four keys are written its load is above zero, its cut counts every key on the side its
+position falls, and the plan on two cores splits it there; the next window starts empty. The
+operations' lab (T-T1.9.L1) plans from `Groups::measure` and `groups::room`.
+
+**Left.** A group's size and size cut (from the B-tree's middle key, without reading every row on
+the writer). A write takes the group's window lock once a batch; if that shows in a profile, the
+weights can be kept per writer thread and gathered at `measure`.
+
+**Falsified by.** A plan from `Groups::measure` that splits a group with no load or misses one with
+more than a core's share; a group's weights growing past their bound.
