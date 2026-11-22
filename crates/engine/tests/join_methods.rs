@@ -190,3 +190,103 @@ fn t_qt_5_1_every_join_run_both_ways_gives_one_answer() {
         plan(&conn, inner)
     );
 }
+
+/// PL.5 (T-PL.5.1): a star join planned with hash joins only and with nested loops only, its
+/// dimension filters keeping some fact rows and keeping none, and the fact joined to one filtered
+/// dimension. Expect: one answer, the model's; where the fact table is probed, against a filtered
+/// dimension's keys, the hash-join plan probes a Bloom filter (most probe rows miss, so the costs
+/// choose one); the nested-loop plans probe none.
+#[test]
+fn pl_5_star_join_filters_fire_and_answers_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
+    let db = Database::open(io, dir.path().join("star.db").to_str().unwrap(), options).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE f (id INTEGER PRIMARY KEY, a, b, v)")
+        .unwrap();
+    conn.execute("CREATE TABLE d1 (id INTEGER PRIMARY KEY, cat)")
+        .unwrap();
+    conn.execute("CREATE TABLE d2 (id INTEGER PRIMARY KEY, cat)")
+        .unwrap();
+    for id in 0..100_i64 {
+        conn.execute(format!("INSERT INTO d1 VALUES ({id}, {})", id % 10))
+            .unwrap();
+        conn.execute(format!("INSERT INTO d2 VALUES ({id}, {})", (id * 7) % 20))
+            .unwrap();
+    }
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut facts = Vec::new();
+    conn.execute("BEGIN").unwrap();
+    for id in 0..4_000_i64 {
+        let a = key(&mut state).map_or(0, |k| k * 5 + id % 5);
+        let b = key(&mut state).map_or(1, |k| k * 5 + id % 3);
+        facts.push((a, b, id % 13));
+        conn.execute(format!(
+            "INSERT INTO f VALUES ({id}, {a}, {b}, {})",
+            id % 13
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("ANALYZE").unwrap();
+
+    // (d1's category, d2's categories below, whether d2 is joined)
+    for (d1_cat, d2_below, star) in [
+        (3_i64, 5_i64, true),
+        (999, 5, true),
+        (3, 20, false),
+        (999, 20, false),
+    ] {
+        let sql = if star {
+            format!(
+                "SELECT count(*), sum(f.v) FROM f JOIN d1 ON f.a = d1.id JOIN d2 ON f.b = d2.id \
+                 WHERE d1.cat = {d1_cat} AND d2.cat < {d2_below}"
+            )
+        } else {
+            format!(
+                "SELECT count(*), sum(f.v) FROM d1 JOIN f ON f.a = d1.id WHERE d1.cat = {d1_cat}"
+            )
+        };
+        let kept: Vec<i64> = facts
+            .iter()
+            .filter(|(a, b, _)| a % 10 == d1_cat && (b * 7) % 20 < d2_below)
+            .map(|(_, _, v)| *v)
+            .collect();
+        let int = |v: i64| Value::Numeric(Numeric::Integer(v));
+        let want = vec![format!(
+            "{:?}",
+            vec![
+                int(kept.len() as i64),
+                if kept.is_empty() {
+                    Value::Null
+                } else {
+                    int(kept.iter().sum())
+                },
+            ]
+        )];
+        for methods in [
+            JoinMethods::HashJoinsOnly,
+            JoinMethods::NestedLoopsOnly,
+            JoinMethods::ByCost,
+        ] {
+            conn.set_join_methods(methods);
+            assert_eq!(rows(&conn, &sql), want, "{methods:?}: {sql}");
+            let mut stmt = conn.prepare(format!("EXPLAIN {sql}")).unwrap();
+            let filters = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row[1].to_string() == "Filter")
+                .count();
+            match methods {
+                JoinMethods::HashJoinsOnly if !star && d1_cat == 3 => {
+                    assert!(filters > 0, "no filter: {}", plan(&conn, &sql))
+                }
+                JoinMethods::HashJoinsOnly => {}
+                JoinMethods::NestedLoopsOnly => assert_eq!(filters, 0, "{}", plan(&conn, &sql)),
+                JoinMethods::ByCost => {}
+            }
+        }
+    }
+}

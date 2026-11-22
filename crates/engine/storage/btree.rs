@@ -823,6 +823,12 @@ pub trait CursorTrait: Any + Send + Sync {
     ///
     /// Only supposed to be used in the context of a simple Count Select Statement
     fn count(&mut self) -> IOResultOr<usize>;
+    /// Amphora (PL.7, T-PL.7.1): the pages of the tree the last whole [Self::count] walked, its
+    /// interior and leaf pages, each once; `None` before a count finished, or for a cursor over
+    /// no B-tree of its own.
+    fn counted_pages(&self) -> Option<usize> {
+        None
+    }
     fn is_empty(&self) -> bool;
     fn root_page(&self) -> i64;
     fn set_root_page(&mut self, _root_page: i64) {}
@@ -927,6 +933,8 @@ pub struct BTreeCursor {
     pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
     count: usize,
+    /// Amphora (PL.7): the pages the walk `count` makes has entered, each once.
+    pages: usize,
     /// Stores the cursor context before rebalancing so that a seek can be done later
     context: Option<CursorContext>,
     /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
@@ -1272,6 +1280,7 @@ impl BTreeCursor {
             row_header: RowHeader::new(num_columns),
             index_info,
             count: 0,
+            pages: 0,
             context: None,
             valid_state,
             seek_state: CursorSeekState::Start,
@@ -1665,6 +1674,7 @@ impl BTreeCursor {
     fn invalidate_count_cache(&mut self) {
         self.count_state = CountState::Start;
         self.count = 0;
+        self.pages = 0;
     }
 
     /// Check if the table is empty.
@@ -7801,6 +7811,9 @@ impl CursorTrait for BTreeCursor {
                     if !matches!(contents.page_type()?, PageType::TableInterior) {
                         self.count += contents.cell_count();
                     }
+                    // Each pass of this arm stands on a page just entered: the root, then each
+                    // child the descents below push (PL.7).
+                    self.pages += 1;
 
                     let cell_idx = self.stack.current_cell_index() as usize;
 
@@ -7916,6 +7929,10 @@ impl CursorTrait for BTreeCursor {
                 }
             }
         }
+    }
+
+    fn counted_pages(&self) -> Option<usize> {
+        matches!(self.count_state, CountState::Finish).then_some(self.pages)
     }
 
     #[inline]

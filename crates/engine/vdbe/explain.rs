@@ -2218,7 +2218,7 @@ pub fn insn_to_row(
                 *num_keys as i64,
                 format!("if !bloom_filter(r[{}..{}]) goto {}", key_reg, key_reg + num_keys, target_pc.as_debug_int()),
             ),
-            Insn::FilterAdd{cursor_id, key_reg, num_keys} => (
+            Insn::FilterAdd{cursor_id, key_reg, num_keys, ..} => (
                 "FilterAdd",
                 *cursor_id as i64,
                 *key_reg as i64,
@@ -2706,12 +2706,25 @@ pub fn insn_to_row(
             Value::build_text(""),
             0,
             format!(
-                "root={} filter={} group_by={:?} aggregates={:?}",
+                "root={} join={:?} filter={} group_by={:?} aggregates={:?}",
                 data.root_page,
+                data.join.as_ref().map(|j| j.root_page),
                 data.filter.len(),
                 data.group_by,
                 data.aggregates
             ),
+        ),
+        Insn::TreePages {
+            cursor_id,
+            target_reg,
+        } => (
+            "TreePages",
+            i64::try_from(*cursor_id).unwrap_or(i64::MAX),
+            i64::try_from(*target_reg).unwrap_or(i64::MAX),
+            0,
+            Value::build_text(""),
+            0,
+            format!("r[{target_reg}]=pages(cursor {cursor_id})"),
         ),
         Insn::MorselNext {
             dest_start,

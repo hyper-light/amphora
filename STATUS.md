@@ -434,6 +434,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   the source's digest taken by the shipping thread itself; cuts across nodes' clocks. Incremental
   bases (T-T1.12.I1 to I3): a new base keeps the latest's chunks the log left unchanged, due once the
   log outweighs what it would copy, after a reopen too.
+  Lane pitr-8: the shipping thread checks itself (`Archive::check`): the source's own rows from a
+  reader snapshot lined up with a second's stamps, checked once that second settles and the archive
+  holds it, the result in `Status::last_check` and the check counters (T-T1.12.C3); a due base waits
+  for the log's next restart, one generation at most (T-T1.12.I4).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -501,8 +505,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Moved across nodes (lane split-merge-9): a copy or catch-up batch reads its old group through a
   pull (`groups::Pull`, answered by `Groups::serve` where the group is, through `groups::Peers` from
   another node), and a group moved to a second node under writes keeps every acknowledged write
-  (T-T1.9.R10). Left: `Peers` over a socket between machines, a `Database` over `Groups<Local>`,
-  load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
+  (T-T1.9.R10). Over the transport (lane split-merge-10): a pull and its answer are appended variants of
+  the owner transport (version 7), a node's endpoint answers them (`transport::Node`) and its peers
+  ask through it (`transport::Nodes`); a move through loss and partition keeps every acknowledged
+  write (T-T1.9.R12). Left: that transport off loopback (between machines), a `Database` over
+  `Groups<Local>`, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -648,6 +655,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 ## Next
 
+- **Replication measured: the harnesses** (G12 steps 1 and 3, CP-T1.8; lane repl-measure; `bench/src/repl.rs`,
+  `bench/servers/repl/`): built and unit-tested, not run at size. `amphora-bench --repl commit|failover|catchup
+  --system amphora|rqlite|dqlite|litefs|libsql` gives commit latency p50/p99/p99.9 and throughput, the time from a
+  leader kill to the first acknowledged write with the acknowledged events lost, and a member's time to catch up,
+  every size and duration an input. Amphora's three members run in one process (a kill is a cut from the relay);
+  the competitors run as three-node container clusters through their scripts (dqlite and LiteFS through the bench's
+  Go shim). libSQL has no failover and dqlite no member-local read, so those are refused, typed, as is LiteFS's
+  failover until its script runs a Consul lease (lane repl-measure-2: it does now; `bench/repl.sh RECORDS FLAGS...`
+  runs every measure on every system, and all four clusters came up on jupiter). Closes with: the comparison set and Amphora's classes measured on
+  adacachy, fedora and jupiter, best of 3, and Amphora's members across machines for the LAN p99.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
@@ -656,7 +673,7 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   partitions at once and merges newest first. Closes with: AC-T1.10.3 and AC-T1.10.4 measured (`amphora-bench
   --cluster`), an idle group's time closed on demand, and the attached client's request on the wire.
 - **Query speed step 6 (QT.6), started** (lane qs6; docs/design/executor.md section 8): built and unit-tested, not
-  measured, not yet in the VDBE's loops. `vdbe/morsel.rs` runs a scan with its filter and aggregates, and a hash join's
+  measured. `vdbe/morsel.rs` runs a scan with its filter and aggregates, and a hash join's
   probe side, in morsels on several threads behind `ParallelMode` (off by default); the worker count and morsel size
   come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5).
   `vdbe/morsel_scan.rs` (lane qs6-2) reads a table b-tree in morsels of leaf pages: the leaves come from its interior
@@ -665,9 +682,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   pages. Answers equal the VDBE's serial SQL answers at every worker count (T-QT.6.7 to T-QT.6.9). The VDBE's hook:
   `Connection::set_parallel_mode` (off by default) lets a single-table scan with its filter and aggregates run as
   `Insn::MorselAggregate` ahead of its serial loop, which answers when the run declines a value (`translate/parallel.rs`;
-  T-QT.6.10). Closes with: the hash join's probe loop handed over the same way, expressions beyond column-against-
-  literal terms (a program's own loop body per worker), a shared hash build, loom or shuttle on the dispatcher, worker
+  T-QT.6.10). Lane qs6-3: a two-table inner hash join with aggregates goes through the same hook, the build side read
+  and hashed once, each worker probing over its own leaves of the probe table with its own cursor and folding the
+  joined rows into its partial aggregates (T-QT.6.11). Closes with: a join's own rows and joins of more than two
+  tables through the hook, expressions beyond column-against-literal terms (a program's own loop body per worker), a shared hash build, loom or shuttle on the dispatcher, worker
   and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
+- **PL.5's Bloom filters sized and chosen by cost** (lane qs5-9): a hash join's filter is sized when its build ends
+  from the distinct keys it measured, at a false-positive rate derived from the learned build and probe weights, and
+  chosen only where it costs less than the probes it saves; its hashes and bits stay within the join's memory budget
+  (`docs/design/planner.md`, "Decision (lane qs5-9)"). LIP and predicate transfer, a measured filter-lookup weight,
+  removing `rhs_has_selective_seek` and deriving `cpu_cost_per_where_step` are left.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
@@ -717,6 +741,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   by default. Index-only reads were already planned (covering indexes, expression indexes included). Left: the 2x
   measurements on order_by_sort, exists_subquery and left_join_anti, and the sorted fetch's measurement against the
   plain read (the coordinator's).
+- **G6 step 3, learned plan hints, built as a prototype** (lane g6s3; planner.md, decision of lane g6s3): Bao's
+  hint sets over the planner (`optimizer/plan_hints.rs`), ten on/off masks of hash joins, nested loops, automatic
+  indexes (`Connection::set_automatic_indexes`, new) and sorted fetches, applied with `HintSet::apply`. A Bayesian
+  linear model over sixteen plan features, its precisions learned from the runs, chooses a training run's mask by
+  Thompson sampling; a guard keeps a query class on the cost model's plan until a mask's held-out runs beat it, and
+  drops it when they show it slower. Memory is fixed for the model and bounded by the caller's class count for the
+  guard. `tests/plan_hints.rs` runs every mask's answers against the unhinted plan's; `bench/plan_hints` trains and
+  checks held-out queries, answers against SQLite's. Left: held-out JOB and corpus times (AC-G6.3.1, the
+  coordinator's), and hints in the engine's own prepare path (today the caller applies them).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -795,7 +828,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   sort work, file page reads) by non-negative least squares with Huber weights, in bounded memory;
   weights no sample determines, or none tells from nothing at 95%, keep the learned calibration's
   (docs/design/planner.md, "Decision (lane pl7)"; lane pl7b, T-PL.7.6, after a loaded run's noisy
-  weights flipped a plan in `tests/planner.rs`). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
+  weights flipped a plan in `tests/planner.rs`). Lane pl7c (T-PL.7.1): ANALYZE counts each table's and index's
+  B-tree pages and the planner reads rows a page from them, else from the page size and the
+  sample's measured records, else from the format's smallest record; the picked 50 rows a page is
+  gone (docs/design/planner.md, "Decision (lane pl7c)"). Open: the audit's 09-cost-model run, the P-error harness (AC-PL.7.2), and
   AC-PL.7.1's JOB rank correlation with the switch on and off.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
@@ -822,8 +858,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lane pl8-3 (docs/design/planner.md "Decision (lane pl8-3)"): a LEFT JOIN's right table follows only
   the tables its ON terms read (CD-C's left-asscom rule), answers held against SQLite (T-PL.8.2), and
   `JoinN` carries a bushy shape (`inner_joins`) that left-deep plans leave empty.
-  Not built: bushy plans over connected complement pairs with a composite hash-join build, and semi
-  and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
+  Lane pl8-4 (docs/design/planner.md "Decision (lane pl8-4)"): a hash join's build side can be a
+  run of tables joined among themselves while the loops before the probe stay loops; the emitter
+  runs such bushy plans and refuses other shapes with a typed error.
+  Not built: the search over connected complement pairs (DPccp) that would choose bushy plans, and
+  semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted
@@ -870,6 +909,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
   SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
   coordinator's.
+- **G5 step 4, skipping rows** (docs/design/executor.md decision 11; AC-G5.4.1, T-G5.4.1; lanes
+  g5s4, g5s4b): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf
+  runs and database cracking behind one switch, each kept from the write path through one hook;
+  zone maps are built from the table's own leaves (`zone_map_of_table`), one zone a leaf. With
+  writes between scans each names exactly what a plain scan finds, in the model and on a real table
+  through SQL (T-G5.4.1). Open: the scan and write costs (`crates/engine/tests/skipping_bench.rs`,
+  through the engine), the choice they make, and the VDBE's scan and write opcodes calling the
+  switch.
 
 ## Open
 

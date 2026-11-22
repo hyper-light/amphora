@@ -135,6 +135,12 @@ pub fn translate(
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
     // Amphora: what a table lookup costs depends on what the connection caches (decision 5).
     resolver.set_cache_pages(connection.get_pager().cached_page_capacity());
+    // Amphora (PL.7): a table's rows a page, before ANALYZE counts them, come from its pages' size.
+    let page_pager = connection.get_pager();
+    resolver.set_page_bytes(page_pager.get_page_size().map(|size| {
+        let reserved = page_pager.get_reserved_space().unwrap_or(0);
+        (size.get() as usize).saturating_sub(usize::from(reserved))
+    }));
     // Amphora (PL.12): the values the estimates may read (none for the generic plan), and where
     // they note that one asked, which says whether a custom plan could differ.
     let plan_values = prepare_options
@@ -165,6 +171,7 @@ pub fn translate(
     resolver.set_statement_memory(connection.get_pager().statement_memory_budget());
     resolver.set_join_methods(connection.join_methods());
     resolver.set_sorted_fetches(connection.sorted_fetches());
+    resolver.set_automatic_indexes(connection.automatic_indexes());
     // Amphora (QT.6): leaf-page morsels read the pager's b-trees, which MVCC and the versioned
     // storage don't keep a table's rows in.
     resolver.set_parallel(

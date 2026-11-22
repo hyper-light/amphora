@@ -113,26 +113,51 @@ fn two_writers_both_commit(db: MvccTestDbNoConn, group_commit: bool) {
 
 #[test]
 fn two_writers_both_commit_with_group_commit_truncate() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     two_writers_both_commit(MvccTestDbNoConn::new_with_random_db(), true);
 }
 
 #[test]
 fn two_writers_both_commit_with_group_commit_passive() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     two_writers_both_commit(MvccTestDbNoConn::new_with_random_db_passive(), true);
 }
 
 #[test]
 fn two_writers_both_commit_with_group_commit_off_truncate() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     two_writers_both_commit(MvccTestDbNoConn::new_with_random_db(), false);
 }
 
 #[test]
 fn two_writers_both_commit_with_group_commit_off_passive() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     two_writers_both_commit(MvccTestDbNoConn::new_with_random_db_passive(), false);
 }
 
 #[test]
 fn commits_batch_into_one_group() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -204,6 +229,11 @@ fn commits_batch_into_one_group() {
 
 #[test]
 fn batched_records_survive_a_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     const WRITERS: usize = 4;
     let rounds = 25usize;
@@ -376,11 +406,21 @@ fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
 
 #[test]
 fn dropped_commit_after_log_record_is_written_still_commits() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     dropped_after_log_record_written_still_commits(true);
 }
 
 #[test]
 fn dropped_commit_after_log_record_is_written_still_commits_without_group() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     dropped_after_log_record_written_still_commits(false);
 }
 
@@ -429,6 +469,11 @@ fn step_until_done(stmt: &mut crate::Statement) {
 
 #[test]
 fn commit_parks_once_while_another_transaction_holds_the_commit_lock() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
@@ -468,6 +513,11 @@ fn commit_parks_once_while_another_transaction_holds_the_commit_lock() {
 
 #[test]
 fn parked_waiter_wakes_when_the_leader_makes_it_durable() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -514,6 +564,11 @@ fn parked_waiter_wakes_when_the_leader_makes_it_durable() {
 
 #[test]
 fn begin_immediate_still_commits_with_group_commit_on() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
@@ -530,6 +585,11 @@ fn begin_immediate_still_commits_with_group_commit_on() {
 
 #[test]
 fn dropped_waiter_after_log_tx_still_commits() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's group commit of its log; the versioned storage writes its own redo log",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
