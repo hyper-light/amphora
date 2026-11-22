@@ -360,9 +360,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   N connections run the suite's write classes at once and every committed transaction answers as a
   serial replay in commit order does (`T-G7.5.1`), passing on the pager's storage and the versioned
   one; Elle's list-append and register histories are recorded through SQL and checked (`T-G8.4.1`),
-  clean on the pager's storage. On the versioned storage they show G2: its SQL cursor keeps no reads
-  for the commit's validation, so SQL there is snapshot isolation (that test is ignored until it
-  holds). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the coordinator's.
+  clean on both storages. The versioned storage's SQL cursor keeps the span of keys each move reads
+  for its commit's validation (`Versioned::keep_read`; before, SQL there was snapshot isolation and
+  Elle found G2), refusing write skew and phantoms (`T-G8.4.2`), and reads the budget refused refuse
+  the commit (`T-G8.4.3`). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the
+  coordinator's; the power-cut harness (`T-T1.4.1`).
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
