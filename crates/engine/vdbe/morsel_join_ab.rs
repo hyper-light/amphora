@@ -313,3 +313,137 @@ fn t_qt_6_26_outer_join_orientation_extremes() {
         }
     }
 }
+
+/// `name(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, v INTEGER)` of `rows` rows, ids 1 to
+/// `rows`; `k` cycles over `1..=keys`, a foreign key into another such table of `keys` rows
+/// (T-QT.6.28).
+fn fill_keyed(conn: &Arc<Connection>, name: &str, rows: usize, keys: usize) {
+    conn.execute(format!(
+        "CREATE TABLE {name}(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, v INTEGER)"
+    ))
+    .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let batch = 500usize;
+    let mut at = 0usize;
+    while at < rows {
+        let end = (at + batch).min(rows);
+        let values: Vec<String> = (at..end)
+            .map(|i| format!("({}, {}, {}, {i})", i + 1, i % keys.max(1) + 1, i % 13))
+            .collect();
+        conn.execute(format!(
+            "INSERT INTO {name}(id, k, g, v) VALUES {}",
+            values.join(", ")
+        ))
+        .unwrap();
+        at = end;
+    }
+    conn.execute("COMMIT").unwrap();
+}
+
+/// T-QT.6.28 (lane qs6-16): the extremes that tell the candidates of
+/// [`crate::SearchedLinks`] apart, a join planned by cost onto a primary key (the planner reads
+/// the joined table by a rowid seek per probe row). `Off`, the control, is the serial loop; `Hash`
+/// reads the joined table whole into a hash link, so a tiny probe against a huge table
+/// (`tiny_probe`) is its failure mode; `Seek` seeks per probe row, so a huge probe against a tiny
+/// table (`huge_probe`, every seek into the same few pages, against a hash table that fits in
+/// cache) is its; `equal` sits between. The probe `f` has `AMPHORA_AB_BIG_ROWS` rows or
+/// `AMPHORA_AB_SMALL_ROWS`, the joined table `d` the other.
+///
+/// A harness, as T-QT.6.20: `#[ignore]`d, its sizes the run's (`AMPHORA_AB_BIG_ROWS`,
+/// `AMPHORA_AB_SMALL_ROWS`, `AMPHORA_AB_RUNS`, `AMPHORA_AB_CORES`, `AMPHORA_AB_LABEL`), the defaults
+/// a tiny instance. Each line is a TSV record per scenario, query, setting and stated cores: p50,
+/// p99 and p99.9 in microseconds, and per statement the links built from searched tables and the
+/// ones read by seeks (0 at `Hash` or `Seek`: the planner chose another loop than a seek, or the
+/// serial loop answered). Each rung's first answer is checked against the serial loop's.
+#[test]
+#[ignore = "a harness: run by name with --ignored --nocapture"]
+fn t_qt_6_28_searched_link_extremes() {
+    let big = env_usize("AMPHORA_AB_BIG_ROWS", 4000).max(1);
+    let small = env_usize("AMPHORA_AB_SMALL_ROWS", 40).max(1);
+    let runs = env_usize("AMPHORA_AB_RUNS", 20).max(1);
+    let label = std::env::var("AMPHORA_AB_LABEL").unwrap_or_else(|_| "unlabelled".into());
+    let cores: Vec<usize> = std::env::var("AMPHORA_AB_CORES")
+        .unwrap_or_else(|_| "1,2,4,8,32".into())
+        .split(',')
+        .filter_map(|c| c.trim().parse().ok())
+        .filter(|c| *c > 0)
+        .collect();
+    // (scenario, probe rows, joined rows)
+    let scenarios = [
+        ("tiny_probe", small, big),
+        ("huge_probe", big, small),
+        ("equal", big, big),
+    ];
+    let queries = [
+        (
+            "count",
+            "SELECT count(*), sum(d.v) FROM f JOIN d ON f.k = d.id",
+        ),
+        (
+            "group_sum",
+            "SELECT d.g, count(*), sum(f.v) FROM f JOIN d ON f.k = d.id GROUP BY d.g",
+        ),
+        ("rows", "SELECT f.v, d.v FROM f JOIN d ON f.k = d.id"),
+    ];
+    let measured = MachineCosts::measure().unwrap();
+    let worker_start = measured.worker_start().mean().unwrap_or(0.0);
+    let dispatch = measured.dispatch().mean().unwrap_or(0.0);
+    println!(
+        "label\tscenario\tprobe_rows\tjoined_rows\tquery\tlinks\tcores\truns\tp50_us\tp99_us\tp999_us\t\
+         searched_per_stmt\tseeks_per_stmt"
+    );
+    for (scenario, probe_rows, joined_rows) in scenarios {
+        let conn = open(&format!(":memory:qt-6-28-{scenario}"));
+        fill_keyed(&conn, "d", joined_rows, joined_rows);
+        fill_keyed(&conn, "f", probe_rows, joined_rows);
+        for (name, sql) in queries {
+            conn.set_parallel_mode(ParallelMode::Off);
+            let mut serial = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+            serial.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+            conn.set_parallel_mode(ParallelMode::On);
+            for (links, &c) in [
+                crate::SearchedLinks::Off,
+                crate::SearchedLinks::Hash,
+                crate::SearchedLinks::Seek,
+            ]
+            .into_iter()
+            .flat_map(|l| cores.iter().map(move |c| (l, c)))
+            {
+                conn.set_parallel_searched_links(links);
+                *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                    NonZeroUsize::new(c).unwrap(),
+                    worker_start,
+                    dispatch,
+                ));
+                let counts = || {
+                    [&conn.morsel_searched_links, &conn.morsel_seek_links]
+                        .map(|n| n.load(Ordering::Relaxed))
+                };
+                let before = counts();
+                let mut samples = Vec::with_capacity(runs);
+                for run in 0..runs {
+                    let began = Instant::now();
+                    let mut rows = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+                    samples.push(began.elapsed().as_secs_f64() * 1e6);
+                    if run == 0 {
+                        rows.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+                        assert_eq!(rows, serial, "{scenario}: {sql} at {links:?} on {c} cores");
+                    }
+                }
+                let after = counts();
+                let per = |at: usize| after[at].saturating_sub(before[at]) as f64 / runs as f64;
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "{label}\t{scenario}\t{probe_rows}\t{joined_rows}\t{name}\t{links:?}\t{c}\t{runs}\t\
+                     {:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}",
+                    quantile(&samples, 0.5),
+                    quantile(&samples, 0.99),
+                    quantile(&samples, 0.999),
+                    per(0),
+                    per(1),
+                );
+            }
+        }
+        conn.set_parallel_searched_links(crate::SearchedLinks::Off);
+    }
+}

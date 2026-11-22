@@ -658,7 +658,11 @@ joined row, each worker with a cursor of its own (`SeekLink`, `TableSource::seek
 key pairs compared as the hash table compares keys, its own terms tested on the row found), no
 table built and nothing charged, as the serial loop reads it; any other searched link is a hash
 link there too. `MorselJoinData::searched` marks such a link; `morsel_searched_links` and
-`morsel_seek_links` count them (T-QT.6.27).
+`morsel_seek_links` count them (T-QT.6.27). T-QT.6.28, a harness beside T-QT.6.26, forces each
+candidate's failure mode on a join onto a primary key: a tiny probe against a huge table (`Hash`
+reads it all), a huge probe against a tiny one (`Seek` seeks per row where a small hash table
+would do), and equal sizes, with p50, p99 and p99.9 and the links per statement at each setting
+and stated cores.
 
 **What still runs on the serial loop** (lane qs6-16's audit; each an open part of QT.6):
 - *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
