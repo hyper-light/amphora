@@ -24,62 +24,20 @@ use hyper_raft::proto::{
 use hyper_raft::wire::Record;
 
 // Admission limits, not throughput tuning: overflow refuses before taking ownership. The queue
-// charges a full API request for an opaque FnOnce, whose captures the API cannot inspect. The
-// command queue's bytes are the memory budget's room for queues, its application calls counted to
-// what the owner takes in an election timeout; the outgoing queue holds what its host drains in
-// one (`queue_bounds`; QB.1). The queue's inputs are counted too, no more than the owner takes in
-// an election timeout and the room holds of an input's least, its envelope (`Bounds::commands`).
-// The most members a configuration names is the group's, stated in its log (`replication::
-// members`; lane constants-21), no constant.
-/// Format (hyper-raft `wire.rs`): what a message record adds past its entries or image, at the
-/// most: its header, fixed body, classic commit and checksum, and an incarnation and end
-/// (`MESSAGE_TOLD_BYTES`), which a leader's records don't carry but are counted for any record.
-const RECORD_BYTES: usize = hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES
-    .saturating_add(hyper_raft::wire::MESSAGE_TOLD_BYTES);
-/// Format: an entry's context, the request identity `Actor::context` writes: four `u64`s.
-const CONTEXT_BYTES: usize = std::mem::size_of::<u64>().saturating_mul(4);
-/// Format: the framing a wire record adds past the command its one entry carries (QB.1, lane
-/// constants-19): the record's, the entry's fixed bytes (hyper-raft `ENTRY_FIXED_BYTES`), its
-/// context, and what a prepared transaction's encoding adds to its pages
-/// (`replication::COMMAND_ENVELOPE`). Derived, no longer the picked 2 MiB.
-const FRAMING_BYTES: usize = RECORD_BYTES
-    .saturating_add(hyper_raft::wire::ENTRY_FIXED_BYTES)
-    .saturating_add(CONTEXT_BYTES)
-    .saturating_add(crate::replication::COMMAND_ENVELOPE);
-/// A message record that carries one command whole.
-const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(FRAMING_BYTES);
-/// Format (hyper-raft `wire.rs`, `Snapshot` and `ConfState`): what a wire record adds past an
-/// image's data, at the most: the record's; the snapshot's presence, data length, index and term;
-/// and its configuration's auto-leave flag, four set lengths and at most `members` ids of eight
-/// bytes in each of its four sets, `members` the group's bound (lane constants-21).
-const fn image_framing(members: usize) -> usize {
-    RECORD_BYTES
-        // The snapshot's presence byte, its data's length, and its index and term.
-        .saturating_add(1)
-        .saturating_add(4)
-        .saturating_add(16)
-        // Its configuration's auto-leave byte, four set lengths, and four sets of eight-byte ids.
-        .saturating_add(1)
-        .saturating_add(16)
-        .saturating_add(members.saturating_mul(32))
-}
-/// The wire record of an image of `image` bytes of pages, at the most: its data, the pages'
-/// encoding (`replication::image_envelope`) and the record's framing, in a group of at most
-/// `members`.
-fn image_record(image: u64, members: usize) -> u64 {
-    let pages = usize::try_from(image).unwrap_or(usize::MAX);
-    let framed = pages
-        .saturating_add(crate::replication::image_envelope(pages))
-        .saturating_add(image_framing(members));
-    u64::try_from(framed).unwrap_or(u64::MAX)
-}
-/// The most bytes of pages an image may take whose wire record fits `wire`: the record's room less
-/// its framing, less the pages' encoding of that room (an encoding grows with its pages, so that
-/// of the larger room is at least that of the image's).
-fn image_within(wire: usize, members: usize) -> usize {
-    let room = wire.saturating_sub(image_framing(members));
-    room.saturating_sub(crate::replication::image_envelope(room))
-}
+// charges a full API request for an opaque FnOnce, whose captures the API cannot inspect.
+const COMMANDS: usize = 64;
+const QUEUED_BYTES: usize = 512 << 20;
+const OUTGOING_BYTES: usize = 512 << 20;
+pub(crate) const OUTGOING_MESSAGES: usize = 4096;
+pub(crate) const MEMBERS: usize = 64;
+/// The most image bytes one wire record carries into this owner's command queue: the queue's room
+/// held back from application calls for one record (`enqueue`). Picked with `QUEUED_BYTES`, whose
+/// split it is, and replaced with it (lane constants, piece 3: the queue sized from the memory
+/// budget and the measured drain rate). An image's own bound is the memory budget's room for one
+/// (SB.1), no more than this while it travels through this queue (`owner_image_room`).
+const WIRE_IMAGE_BYTES: usize = 256 << 20;
+pub(crate) const WIRE_BYTES: usize = WIRE_IMAGE_BYTES.saturating_add(2 << 20);
+const MESSAGE_BYTES: usize = crate::replication::COMMAND_BYTES.saturating_add(2 << 20);
 // Ticks are the pinned core's documented tick election mode (raft.rs, Elections::Ticks). Its
 // randomized election and heartbeat, in the core's fixed tick counts, use this owner clock, never
 // host votes. The period between ticks is learned where the owner runs (`pace`): this is only
@@ -87,12 +45,11 @@ fn image_within(wire: usize, members: usize) -> usize {
 // vendor/hyper-raft/crates/hyper-timing/src/lib.rs), the owner's period before it has measured a
 // quorum's round trips, its timer and its leader's link. Once measured, it bounds nothing.
 const TICK: Duration = Duration::from_millis(10);
-// Every queued input is charged its envelope, the bytes it takes in the channel itself, beside
-// what it carries (`enqueue`; lane constants-21): memory is counted once, in the queue's bytes, and
-// bounded once, by them. A change of members, a hand-off of the lead and a catch-up carry nothing
-// past their envelope; an attestation carries its name. The response channel's own allocation is
-// charged for no input, as before.
-const ENVELOPE_BYTES: usize = std::mem::size_of::<Envelope>();
+// The admission charge of a change of members, a hand-off of the lead, a catch-up or an
+// attestation: the bytes the queued input itself takes, its place in the queue's byte budget (an
+// attestation's name is charged beside it). The response channel's own allocation is charged for
+// no input, as before.
+const CHANGE_BYTES: usize = std::mem::size_of::<Input>();
 
 // Session tokens: read-your-writes on any replica (replication.md, "Decision (lane ryw-1):
 // read-your-writes by session tokens").
@@ -107,8 +64,7 @@ type Response<T> = mpsc::SyncSender<Result<T, Refusal>>;
 /// A bounded ingress and egress handle. Clones share one product-owned Raft actor.
 #[derive(Clone)]
 pub struct ReplicaHandle {
-    // Unbounded as a channel: `Control::commands` holds its inputs to their derived bound (QB.1).
-    sender: mpsc::Sender<Envelope>,
+    sender: mpsc::SyncSender<Envelope>,
     // Declared after `sender`, so it rings once the sender is gone: the last handle's drop wakes
     // the owner to find its channel closed.
     _ring: Ring,
@@ -352,26 +308,6 @@ pub(super) fn wall_micros() -> Result<u64, Refusal> {
 }
 struct Control {
     admitted: AtomicUsize,
-    /// The inputs in the command queue's channel, not yet taken by the owner: no more than
-    /// `command_bound` (QB.1, lane constants-20), as a channel of that many slots held them.
-    commands: AtomicUsize,
-    /// The most inputs the command queue holds, as the owner last learned it (`Bounds::commands`).
-    command_bound: AtomicUsize,
-    /// Application calls in the command queue: no more than `call_bound`, so that a wire record
-    /// always finds a slot while calls wait for a leader (QB.1).
-    calls: AtomicUsize,
-    /// The most application calls the command queue holds, as the owner last learned it: what it
-    /// takes in an election timeout at its learned message rate, no more than the queue's inputs
-    /// less one (`queue_bounds`; QB.1).
-    call_bound: AtomicUsize,
-    /// The bytes application calls hold of the command queue, held to `applications` apart from
-    /// the wire records beside them (QB.1).
-    called: AtomicUsize,
-    // The command queue's bound in bytes and a wire record's most, as the owner last learned them
-    // (`queue_bounds`; QB.1).
-    queued: AtomicUsize,
-    applications: AtomicUsize,
-    wire: AtomicUsize,
     // The application this member's handles last bound, so that binding it again asks nothing.
     attesting: Mutex<Option<crate::database::Application>>,
     // The floor in force at the applied index last published, so a bind below it is refused
@@ -381,8 +317,6 @@ struct Control {
     floor_status: Mutex<amphora_api::replication::FloorStatus>,
     floor_meter: FloorMeter,
     outgoing: Mutex<Outgoing>,
-    /// What the owner does past the outgoing queue's bound: QB.2's switch, `Egress`'s code.
-    egress: std::sync::atomic::AtomicU8,
     /// Rung when a record joins `outgoing` ([`ReplicaHandle::drain_wait`]).
     sent: std::sync::Condvar,
     /// The host's one listener ([`ReplicaHandle::listen`]): woken when records join `outgoing`,
@@ -740,56 +674,16 @@ impl Local {
 struct Outgoing {
     bytes: usize,
     messages: VecDeque<Outbound>,
-    /// Bytes and messages the host drained since the owner last weighed them (QB.1).
-    drained: (u64, u64),
-    /// The same, to each member: what its path carried (lane constants-21). At most one a member
-    /// of the configuration, the owner weighing them at each rebound.
-    drained_to: std::collections::BTreeMap<u64, (u64, u64)>,
-    /// What the host drains in an election timeout, as the owner last learned it (QB.1).
-    bound: super::drain::Bound,
-    /// The memory budget's room for queues, as the owner last read it (MB.1).
-    room: u64,
-    /// The owner's clock reading since which the queue has held more than its bound.
-    over: Option<u64>,
-    /// Records shed past the bound (`Egress::Shed`), pauses begun and whether one holds
-    /// (`Egress::Pause`; QB.2).
-    shed: u64,
-    pauses: u64,
-    paused: bool,
-    /// A record was shed since the leader last beat for one (`Egress::Shed`): the host's next
-    /// drain rings the owner, which beats once the queue has room for a record to each peer, so
-    /// each member's answer brings what it lacks (QB.2). Woken by the drain, never by a tick.
-    owed: bool,
 }
 struct Reservation {
     control: Arc<Control>,
-    /// An input's place in the command queue's channel (`Control::commands`), given back once the
-    /// owner takes it or it is dropped untaken (QB.1, lane constants-20).
-    slot: bool,
     bytes: usize,
-    /// An application call's slot in the command queue, given back with its bytes (QB.1).
-    call: bool,
-    /// An application call's bytes in `called`, given back with it.
-    called: usize,
-}
-impl Reservation {
-    /// The owner took its input from the channel: its place there is free, its bytes still held.
-    fn taken(&mut self) {
-        if std::mem::take(&mut self.slot) {
-            self.control.commands.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.taken();
         self.control
             .admitted
             .fetch_sub(self.bytes, Ordering::AcqRel);
-        if self.call {
-            self.control.calls.fetch_sub(1, Ordering::AcqRel);
-            self.control.called.fetch_sub(self.called, Ordering::AcqRel);
-        }
     }
 }
 struct Envelope {
@@ -862,10 +756,6 @@ struct Changing {
 enum Stage {
     /// Waiting for the ReadIndex that shows this leader current and its configuration applied.
     Barrier,
-    /// Past its barrier, its configuration past the group's member bound, waiting for the write
-    /// under way to end before the entry that raises the bound moves the point under it (lane
-    /// constants-21).
-    Raising,
     /// Proposed at `index`, in this leader's term.
     Proposed { index: u64 },
     /// Applied: the group is in the joint configuration, or has left it.
@@ -951,8 +841,7 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
     floor_published: Option<u32>,
-    // At most the command queue's inputs' bound of admitted operations wait behind the sole
-    // prepared transaction (`Control::command_bound`).
+    // At most COMMANDS admitted operations wait behind the sole prepared transaction.
     waiting: VecDeque<Envelope>,
     // The leader's write slot (replication.md, "A follower's write under steady leader writes"):
     // the members whose writes it refused, queued, and the forwards and barrier it holds, each
@@ -973,8 +862,6 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // Whether this step's drive left more to drive without waiting for the log
     // (`Driven::more`): the next step comes at once, without waiting for an input.
     driving: bool,
-    /// Inputs taken while QB.2's pause held the owner, in order.
-    paused_inputs: VecDeque<Envelope>,
     // The log's writes and compactions wake the owner through this, its bell's waker.
     waker: std::task::Waker,
     // The instant this owner last read from its clock: at its step's start, and again after a
@@ -1001,15 +888,6 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // The tick pace this owner measured where it runs (replication.md, "Decision (lane
     // constants): the owner's tick pace").
     pace: super::pace::Pace,
-    // What the command queue's intake and the host's drain of the outgoing queue took, and the
-    // queues' bytes charged to the memory budget (`rebound`; QB.1).
-    intake: super::drain::Drain,
-    outgo: super::drain::Drain,
-    /// What the host drained to each member, the path's drain (lane constants-21), and the window
-    /// rule the owner opened with.
-    paths: std::collections::BTreeMap<u64, super::drain::Drain>,
-    window: super::drain::Window,
-    queues: Option<crate::memory::Charge>,
     // The ticks since the pace was last derived: it is derived once an election timeout, the
     // span the core draws each timeout over.
     paced: usize,
@@ -1019,7 +897,7 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // The replicated class's gate on held answers (replication.md, "The class stated once per
     // group"): the members the host's detector suspects, and those this owner holds suspected
     // only until its group's recorded class is its own. A member is counted held when neither
-    // suspects it. Each is at most the members a configuration names (the group's member bound).
+    // suspects it. Each is at most the members a configuration names (`MEMBERS`).
     detected: std::collections::BTreeSet<u64>,
     gated: std::collections::BTreeSet<u64>,
     // The term this owner proposed its class entry in, once taken: one a term.
@@ -1092,9 +970,6 @@ struct Pass {
     /// The frames the log may hold, from the filesystem's free bytes as read after the pass
     /// (`log_bound::log_room`).
     room: u64,
-    /// The bytes one image may take on the log's filesystem, read with `room`
-    /// (`log_bound::image_disk_room`; QB.1); with the free bytes unread, no bound from the disk.
-    image: u64,
     /// Why the free bytes couldn't be read, if they couldn't: the log is then held to its file's
     /// room, and a submit refused past it says why.
     unread: Option<String>,
@@ -1127,9 +1002,8 @@ impl Flushing {
         let mut copier = machine.reader()().map_err(|error| refused(&error))?;
         let mut free = machine.free_space();
         let share = LogShare::join(account, machine.filesystem().map_err(unavailable)?)?;
-        let members = machine.members_shared();
         // The room before any pass, read as each pass reads it.
-        let first = room(&copier, &mut free, &share, &members).map_err(fenced)?;
+        let first = room(&copier, &mut free, &share).map_err(fenced)?;
         let (ask, asked) = mpsc::sync_channel::<Ask>(1);
         let (finished, done) = mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -1164,7 +1038,7 @@ impl Flushing {
                             Err(e) => Err(format!("a checkpoint failed: {e:#}")),
                         };
                         match said.and_then(|copied| {
-                            let (room, image, unread) = room(&copier, &mut free, &share, &members)?;
+                            let (room, unread) = room(&copier, &mut free, &share)?;
                             let through = copier.durable_frame();
                             let caught_up = copied.is_some_and(|c| {
                                 c.left == 0
@@ -1174,7 +1048,6 @@ impl Flushing {
                                 caught_up,
                                 busy: copied.is_none(),
                                 room,
-                                image,
                                 unread,
                             })
                         }) {
@@ -1189,7 +1062,7 @@ impl Flushing {
                 }
             })
             .map_err(unavailable)?;
-        let (room, image, unread) = first;
+        let (room, unread) = first;
         Ok(Self::Thread {
             ask,
             done,
@@ -1198,178 +1071,38 @@ impl Flushing {
                 caught_up: false,
                 busy: false,
                 room,
-                image,
                 unread,
             },
         })
     }
 }
 
-impl Flushing {
-    /// The bytes one image may take on the log's filesystem, as the last checkpoint pass read
-    /// them (QB.1); a test's held flushing reads none.
-    fn image_disk(&self) -> u64 {
-        match self {
-            Self::Thread { pass, .. } => pass.image,
-            #[cfg(test)]
-            Self::Held => u64::MAX,
-        }
-    }
-}
-
-/// The most an image of this owner's machine may take now in memory: the memory budget's room for
-/// one (SB.1), held inside its command queue's bound too (`queue_bounds`). On disk it takes no more
-/// than its share beside the replica logs there (`log_bound::image_disk_room`; QB.1), read on the
-/// flushing thread and set on the machine (`Machine::set_image_disk`).
-fn owner_image_room(members: usize) -> Result<usize, Refusal> {
-    let room = crate::memory::process().room(crate::memory::Use::Queues)?;
-    let room = usize::try_from(room).unwrap_or(usize::MAX);
-    // The command queue holds the image's wire record beside one application call (`queue_bounds`).
-    let wire = room.saturating_sub(api::REQUEST_MAX);
-    Ok(crate::replication::image_room()?.min(image_within(wire, members)))
-}
-
-/// The owner's queue bounds now (QB.1).
-#[derive(Clone, Copy, Debug)]
-struct Bounds {
-    /// The command queue's bytes.
-    queued: usize,
-    /// The bytes application calls may hold of them.
-    applications: usize,
-    /// The most inputs the command queue holds.
-    commands: usize,
-    /// The most application calls the command queue holds.
-    calls: usize,
-    /// A wire record's most bytes: an image's, held inside the command queue's bound.
-    wire: usize,
-    /// The outgoing queue's bytes and messages.
-    outgoing: super::drain::Bound,
-    /// The memory budget's room for queues.
-    room: u64,
-}
-
-/// The owner's queue bounds from what it measured (replication.md, "Decision (lane constants): the
-/// queue bounds by drain rate"; QB.1). The command queue's bytes are the memory budget's room for
-/// queues (MB.1), and application calls hold that less one wire record's room, so that waiting
-/// calls cannot block the record that finds a leader. A wire record's image is the budget's room
-/// for one (SB.1), held inside the command queue's bound. Calls are counted too: no more than the
-/// owner takes in `timeout`, the learned election timeout, at its learned message rate, and never
-/// more than the queue's inputs less one, so that a wire record always finds a place. The inputs
-/// are what the owner takes in `timeout` at that rate, at least a call and a wire record, and never
-/// more than the room holds of an input's least, its own envelope: a wire record may carry no
-/// bytes, so its bytes alone would not bound them (lane constants-20). Before any intake is
-/// measured, what the room holds. A call is charged its worst case (`REQUEST_MAX`) while
-/// the intake's byte rate is learned mostly from small wire records, so calls are bounded in count
-/// by the rate and in bytes by the room, never in bytes by the rate. The outgoing queue holds what
-/// its host drains in an election timeout, at least a record to each of its `peers` (one broadcast)
-/// and no more than the room: the room before any drain is measured.
-fn queue_bounds(
-    intake: &super::drain::Drain,
-    outgoing: &super::drain::Drain,
-    timeout: Duration,
-    peers: u64,
-    members: usize,
-) -> Result<Bounds, Refusal> {
-    let room = crate::memory::process().room(crate::memory::Use::Queues)?;
-    let image = u64::try_from(crate::replication::image_room()?).unwrap_or(u64::MAX);
-    let request = u64::try_from(api::REQUEST_MAX).unwrap_or(u64::MAX);
-    // A wire record's room: an image's and its framing, no more than an equal share of the queue's
-    // room between the wire record and the application calls beside it, nor than the room less one
-    // call. Images and queues draw on one memory budget, so an image's room is about the queue's
-    // whole room: held back whole, it would leave the calls one call's room. The equal share among
-    // a queue's holders is the rule the logs and the image share the disk by
-    // (`log_bound::image_disk_room`; QB.1).
-    let record = image_record(image, members)
-        .min(room.checked_div(2).unwrap_or(0))
-        .min(room.saturating_sub(request));
-    // The command queue's bytes: the room, which holds one wire record beside one call.
-    let queued = room;
-    let wire = record.min(queued);
-    // A wire record's room is held back from application calls, so that waiting calls cannot
-    // block the record that finds a leader: its bytes and its envelope (lane constants-21).
-    let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
-    let applications = queued.saturating_sub(wire).saturating_sub(envelope);
-    let (commands, calls) = command_counts(intake, timeout, room, request);
-    // The least the outgoing queue carries and still works: one broadcast, a record to each peer
-    // (a leader's heartbeats, its appends), so that a queue held to it sheds no record of one.
-    let one = super::drain::Bound {
-        bytes: wire,
-        messages: peers.max(1),
-    };
-    Ok(Bounds {
-        queued: usize::try_from(queued).unwrap_or(usize::MAX),
-        applications: usize::try_from(applications).unwrap_or(usize::MAX),
-        commands: usize::try_from(commands).unwrap_or(usize::MAX),
-        calls: usize::try_from(calls).unwrap_or(usize::MAX),
-        wire: usize::try_from(wire).unwrap_or(usize::MAX),
-        outgoing: outgoing.bound(timeout, one, room),
-        room,
-    })
-}
-
-/// The command queue's inputs and its application calls, counted (QB.1, lane constants-20): the
-/// inputs the owner takes in `timeout` at its learned message rate, at least a call and a wire
-/// record, and no more than `room` holds of an input's least, its own envelope (a wire record may
-/// carry no bytes); the calls the same, at least one, the queue's last input kept for a wire
-/// record. Before anything is measured, what the room holds. `request` is a call's charge.
-fn command_counts(
-    intake: &super::drain::Drain,
-    timeout: Duration,
-    room: u64,
-    request: u64,
-) -> (u64, u64) {
-    let envelope = u64::try_from(ENVELOPE_BYTES).unwrap_or(u64::MAX);
-    let input = super::drain::Bound {
-        bytes: envelope,
-        messages: 2,
-    };
-    let commands = intake
-        .bound(timeout, input, room)
-        .messages
-        .min(room.checked_div(envelope).unwrap_or(0))
-        .max(2);
-    let call = super::drain::Bound {
-        bytes: request,
-        messages: 1,
-    };
-    let calls = intake
-        .bound(timeout, call, room)
-        .messages
-        .min(commands.saturating_sub(1));
-    (commands, calls)
+/// The most an image of this owner's machine may take now: the memory budget's room for one (SB.1),
+/// no more than one wire record carries ([`WIRE_IMAGE_BYTES`]).
+fn owner_image_room() -> Result<usize, Refusal> {
+    Ok(crate::replication::image_room()?.min(WIRE_IMAGE_BYTES))
 }
 
 /// The frames the database's log may hold now, read on the flushing thread: its file's room and
-/// an equal share of what its filesystem has free past one image (`log_bound::log_room`), with the
-/// bytes that image may take on the disk (`log_bound::image_disk_room`; QB.1). An image takes the
-/// smaller of its memory room and its disk share, so the log keeps room beside one image. Free
-/// bytes that can't be read give no share and no disk bound, and say why; a file whose length
-/// can't be read fails the pass.
+/// an equal share of what its filesystem has free (`log_bound::log_room`). Free bytes that can't
+/// be read give no share, and say why; a file whose length can't be read fails the pass.
 fn room(
     copier: &Db,
     free: &mut crate::replication::FreeSpace,
     share: &LogShare,
-    members: &AtomicUsize,
-) -> Result<(u64, u64, Option<String>), String> {
+) -> Result<(u64, Option<String>), String> {
     let kept = copier
         .log_frames()
         .map_err(|e| format!("the database log's length couldn't be read: {e:#}"))?;
     let logs = share.logs().map_err(|e| e.to_string())?;
     Ok(match free() {
         Ok(available) => {
-            let disk = log_bound::image_disk_room(available, logs);
-            let image =
-                owner_image_room(members.load(Ordering::Acquire)).map_err(|e| e.to_string())?;
-            let image = u64::try_from(image).unwrap_or(u64::MAX).min(disk);
-            (
-                log_bound::log_room(available, image, logs, kept),
-                disk,
-                None,
-            )
+            let image = owner_image_room().map_err(|e| e.to_string())?;
+            let image = u64::try_from(image).unwrap_or(u64::MAX);
+            (log_bound::log_room(available, image, logs, kept), None)
         }
         Err(e) => (
             kept,
-            u64::MAX,
             Some(format!("its filesystem's free bytes couldn't be read: {e}")),
         ),
     })
@@ -1426,86 +1159,62 @@ fn answer<T>(response: Response<T>, result: Result<T, Refusal>) {
 }
 
 impl ReplicaHandle {
-    /// Queues `command`, charged `bytes` for what it carries and its envelope beside them
-    /// (`ENVELOPE_BYTES`).
     fn enqueue(&self, command: Input, bytes: usize) -> Result<(), Refusal> {
-        let bytes = bytes.saturating_add(ENVELOPE_BYTES);
-        // Untouched application calls can wait for leadership. They hold no more than the owner
-        // takes in an election timeout and the queue's room less a wire record's (QB.1), so that
-        // waiting calls leave the rest of the queue to the wire records that discover it.
-        let limit = self.shared.queued.load(Ordering::Acquire);
-        let application_limit = self.shared.applications.load(Ordering::Acquire);
-        let call_limit = self.shared.call_bound.load(Ordering::Acquire);
-        let command_limit = self.shared.command_bound.load(Ordering::Acquire);
-        let call = matches!(
-            &command,
-            Input::Submit { .. }
-                | Input::Change { .. }
-                | Input::Transfer { .. }
-                | Input::CatchUp { .. }
-        );
-        // Built before any refusal below, so that dropping it gives back what it took.
-        let mut reservation = Reservation {
-            control: Arc::clone(&self.shared),
-            slot: false,
-            bytes: 0,
-            call: false,
-            called: 0,
-        };
-        // A call takes one of the calls' places, never the queue's last: that one stays a wire
-        // record's. A call refused for its count names the count bound.
-        if call {
-            self.shared
-                .calls
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    held.checked_add(1).filter(|next| *next <= call_limit)
-                })
-                .map_err(|_| Refusal::Full { limit: call_limit })?;
-            reservation.call = true;
-        }
-        // Every input takes a place in the channel, held to the inputs' bound (lane constants-20).
-        self.shared
-            .commands
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(1).filter(|next| *next <= command_limit)
-            })
-            .map_err(|_| Refusal::Full {
-                limit: command_limit,
+        // Untouched application calls can wait for leadership. Keep room for one maximum wire
+        // record against application pressure so that waiting calls cannot block that discovery.
+        let application_limit = QUEUED_BYTES
+            .checked_sub(WIRE_BYTES)
+            .ok_or_else(|| fenced("replica wire reservation exceeds command queue budget"))?;
+        let mut charged = self.shared.admitted.load(Ordering::Acquire);
+        let mut reserved = false;
+        for _ in 0..COMMANDS {
+            let next = charged.checked_add(bytes).ok_or(Refusal::Full {
+                limit: QUEUED_BYTES,
             })?;
-        reservation.slot = true;
-        // A call's bytes are held to the calls' bound on their own: the wire records queued beside
-        // it are the rest of the queue's, not the calls'.
-        if call {
-            self.shared
-                .called
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    held.checked_add(bytes)
-                        .filter(|next| *next <= application_limit)
-                })
-                .map_err(|_| Refusal::Full {
+            if matches!(
+                &command,
+                Input::Submit { .. }
+                    | Input::Change { .. }
+                    | Input::Transfer { .. }
+                    | Input::CatchUp { .. }
+            ) && next > application_limit
+            {
+                return Err(Refusal::Full {
                     limit: application_limit,
-                })?;
-            reservation.called = bytes;
+                });
+            }
+            api::bound("replica command queue bytes", next, QUEUED_BYTES)?;
+            match self.shared.admitted.compare_exchange_weak(
+                charged,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    reserved = true;
+                    break;
+                }
+                Err(now) => charged = now,
+            }
         }
-        self.shared
-            .admitted
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |charged| {
-                charged.checked_add(bytes).filter(|next| *next <= limit)
-            })
-            .map_err(|charged| match charged.checked_add(bytes) {
-                Some(next) => api::bound("replica command queue bytes", next, limit)
-                    .err()
-                    .unwrap_or(Refusal::Full { limit }),
-                None => Refusal::Full { limit },
-            })?;
-        reservation.bytes = bytes;
+        if !reserved {
+            return Err(Refusal::Full { limit: COMMANDS });
+        }
         let envelope = Envelope {
             command,
-            _reservation: reservation,
+            _reservation: Reservation {
+                control: Arc::clone(&self.shared),
+                bytes,
+            },
         };
         self.sender
-            .send(envelope)
-            .map_err(|_| fenced("replica owner ended; reopen from durable state"))?;
+            .try_send(envelope)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Refusal::Full { limit: COMMANDS },
+                mpsc::TrySendError::Disconnected(_) => {
+                    fenced("replica owner ended; reopen from durable state")
+                }
+            })?;
         self.shared.bell.ring();
         Ok(())
     }
@@ -1548,11 +1257,7 @@ impl ReplicaHandle {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
-        api::bound(
-            "replica wire record",
-            bytes.len(),
-            self.shared.wire.load(Ordering::Acquire),
-        )?;
+        api::bound("replica wire record", bytes.len(), WIRE_BYTES)?;
         let charge = bytes.len();
         let (response, receiver) = mpsc::sync_channel(1);
         self.enqueue(
@@ -1597,18 +1302,18 @@ impl ReplicaHandle {
         })
     }
 
-    /// The most records one [`Self::drain`] takes to keep up with this member's outgoing queue:
-    /// what its host drains in an election timeout, learned from the host's own drain (QB.1), so
-    /// a host that drains at it needs no count of its own to pick (lane ryw-6, kiln goal 8119f25d).
-    pub fn outgoing_bound(&self) -> Result<usize, Refusal> {
-        let messages = locked(&self.shared.outgoing)?.bound.messages;
-        Ok(usize::try_from(messages).unwrap_or(usize::MAX).max(1))
+    /// The most records this member's outgoing queue holds (the owner fences rather than queue
+    /// one more), and so the most one [`Self::drain`] takes: a host that drains at it empties the
+    /// queue each call, with no count of its own to pick (lane ryw-6, kiln goal 8119f25d).
+    pub fn outgoing_bound(&self) -> usize {
+        OUTGOING_MESSAGES
     }
 
-    /// Takes at most `limit` messages. A host that stays behind the egress bound, what it drains
-    /// in an election timeout, for a whole election timeout fences the owner explicitly (QB.1);
-    /// the actor never acknowledges a send the host has not taken.
+    /// Takes at most `limit` messages, `limit` no more than [`Self::outgoing_bound`]. An undrained
+    /// host eventually fences explicitly at the egress bound; the actor never acknowledges a send
+    /// the host has not taken.
     pub fn drain(&self, limit: usize) -> Result<Vec<Outbound>, Refusal> {
+        api::bound("replica drain count", limit, self.outgoing_bound())?;
         let mut outgoing = locked(&self.shared.outgoing)?;
         if outgoing.messages.is_empty()
             && let Err(error) = &*locked(&self.shared.status)?
@@ -1624,69 +1329,11 @@ impl ReplicaHandle {
                 .bytes
                 .checked_sub(message.bytes.len())
                 .ok_or_else(|| fenced("outgoing accounting underflow"))?;
-            outgoing.drained = (
-                outgoing
-                    .drained
-                    .0
-                    .saturating_add(u64::try_from(message.bytes.len()).unwrap_or(u64::MAX)),
-                outgoing.drained.1.saturating_add(1),
-            );
-            let to = outgoing.drained_to.entry(message.to).or_default();
-            *to = (
-                to.0.saturating_add(u64::try_from(message.bytes.len()).unwrap_or(u64::MAX)),
-                to.1.saturating_add(1),
-            );
             messages.push(message);
-        }
-        if outgoing.messages.is_empty() {
-            outgoing.over = None;
-        }
-        // A paused owner, and a leader owing the members it shed for a beat, wait for the host's
-        // drain (QB.2).
-        if (outgoing.paused || outgoing.owed) && !messages.is_empty() {
-            self.shared.bell.ring();
         }
         Ok(messages)
     }
 
-    /// The command queue's bound in bytes in force (QB.1).
-    #[cfg(test)]
-    fn queue_bound(&self) -> usize {
-        self.shared.queued.load(Ordering::Acquire)
-    }
-    /// The bytes application calls may hold of the command queue in force (QB.1).
-    #[cfg(test)]
-    fn application_bound(&self) -> usize {
-        self.shared.applications.load(Ordering::Acquire)
-    }
-    /// The most inputs the command queue holds in force (QB.1, lane constants-20).
-    #[cfg(test)]
-    fn command_bound(&self) -> usize {
-        self.shared.command_bound.load(Ordering::Acquire)
-    }
-    /// The most application calls the command queue holds in force (QB.1).
-    #[cfg(test)]
-    fn call_bound(&self) -> usize {
-        self.shared.call_bound.load(Ordering::Acquire)
-    }
-    /// A wire record's most bytes in force (QB.1): a host's transport refuses a longer record
-    /// before it reads it (`crate::serve`).
-    pub fn wire_bytes(&self) -> usize {
-        self.shared.wire.load(Ordering::Acquire)
-    }
-    /// QB.2's switch: what this replica's owner does past its outgoing bound.
-    #[cfg(test)]
-    fn set_egress(&self, egress: super::drain::Egress) {
-        self.shared.egress.store(egress.code(), Ordering::Release);
-    }
-    /// QB.2's instruments: records shed, pauses begun, the outgoing queue's depth in messages and
-    /// its bound.
-    #[cfg(test)]
-    fn egress(&self) -> Result<(u64, u64, u64, super::drain::Bound), Refusal> {
-        let outgoing = locked(&self.shared.outgoing)?;
-        let depth = u64::try_from(outgoing.messages.len()).unwrap_or(u64::MAX);
-        Ok((outgoing.shed, outgoing.pauses, depth, outgoing.bound))
-    }
     /// As [`Self::drain`], waiting until `until` for a record when none waits: a host's sender
     /// waits here rather than spinning (`crate::serve`, CP-T1.13). With none waiting, refused
     /// Fenced at once while the replica is fenced, and with the owner's reason once it ended: the
@@ -1802,7 +1449,7 @@ impl ReplicaHandle {
                 until,
                 response,
             },
-            0,
+            CHANGE_BYTES,
         )?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
@@ -1836,7 +1483,7 @@ impl ReplicaHandle {
         if attesting.as_ref() == Some(&application) {
             return Ok(());
         }
-        let charge = application.name.len();
+        let charge = CHANGE_BYTES.saturating_add(application.name.len());
         self.enqueue(
             Input::Attest {
                 application: application.clone(),
@@ -1866,7 +1513,7 @@ impl ReplicaHandle {
                 until,
                 response,
             },
-            0,
+            CHANGE_BYTES,
         )?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
@@ -1936,7 +1583,7 @@ impl ReplicaHandle {
             return Err(Refusal::Timeout);
         }
         let (response, receiver) = mpsc::sync_channel(1);
-        self.enqueue(Input::CatchUp { until, response }, 0)?;
+        self.enqueue(Input::CatchUp { until, response }, CHANGE_BYTES)?;
         receiver
             .recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|error| match error {
@@ -2003,17 +1650,7 @@ fn open(
         config.bootstrap.clone(),
         matches!(durability, Durability::Replicated(_)),
     )?;
-    // Nothing drained yet: the room (QB.1), which bounds no peers' least; an image held inside the
-    // command queue's bound.
-    let bound = member_bound(&machine, &config);
-    let first = queue_bounds(
-        &super::drain::Drain::default(),
-        &super::drain::Drain::default(),
-        Duration::ZERO,
-        0,
-        bound,
-    )?;
-    machine.set_snapshot_bytes(image_within(first.wire, bound));
+    machine.set_snapshot_bytes(WIRE_IMAGE_BYTES);
     let file = DeviceFile::open(
         log_path,
         true,
@@ -2226,37 +1863,6 @@ impl BlockFile for LogDevice {
     }
 }
 
-// The window a test's owners open with (`Window`'s A/B, lane constants-21): a test on one thread
-// opens its owners there.
-#[cfg(test)]
-thread_local! {
-    static WINDOW: std::cell::Cell<super::drain::Window> =
-        const { std::cell::Cell::new(super::drain::Window::DEFAULT) };
-}
-/// The window to each member an owner opens with: in a test, what it set.
-#[cfg(test)]
-fn opened_window() -> super::drain::Window {
-    WINDOW.with(std::cell::Cell::get)
-}
-/// The window to each member an owner opens with: the default.
-#[cfg(not(test))]
-fn opened_window() -> super::drain::Window {
-    super::drain::Window::DEFAULT
-}
-
-/// The most members a configuration of this member's group names, which its core opens with: the
-/// bound its group's log stated last, and before any, the first bound from the configuration it
-/// was opened with (`replication::members::first`), the same at every first member of a group, as
-/// they open with one configuration (lane constants-21). A member opened with more than the log
-/// recorded (a joiner told the group's members now) takes the larger: a bound only rises.
-fn member_bound(machine: &crate::replication::Machine, config: &ReplicaConfig) -> usize {
-    let configured = config.voters.len().saturating_add(config.learners.len());
-    let first = crate::replication::members::first(configured);
-    machine
-        .member_bound()
-        .map_or(first, |bound| bound.max(first))
-}
-
 /// The write slot's bounds, stated from the core's, so the slot adds no number of its own: a
 /// member's first slot is the core's election timeout in this owner's ticks of `period`, its pace
 /// in force; a learned gap is believed for one to two of its member's own recurrences (`slot`). A
@@ -2287,19 +1893,10 @@ fn open_on<F: BlockFile + 'static>(
 ) -> Result<(Client, Actor<F>, mpsc::Receiver<Envelope>), Refusal> {
     let mut machine = machine;
     machine.state_class(&durability)?;
-    let window = opened_window();
-    let settings = settings(
-        config.node_id,
-        &durability,
-        member_bound(&machine, &config),
-        window,
-    )?;
-    // A class entry is bounded by the members the core is opened for (lane constants-20).
-    machine.set_members(settings.core.limits.members);
+    let settings = settings(config.node_id, &durability)?;
     let meter = Arc::new(ReplicaMeter::default());
     let bell = Bell::new();
     let flushing = Flushing::start(&machine, Arc::clone(&meter), account(), Arc::clone(&bell))?;
-    machine.set_image_disk(flushing.image_disk());
     let reader = machine.reader();
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
@@ -2329,46 +1926,21 @@ fn open_on<F: BlockFile + 'static>(
         log
     };
     let group = GroupStore::claim(&log, 1).map_err(unavailable)?;
-    // The replica's resident bytes (its core's and its shell's) are held to the memory budget's
-    // room for queues, the memory its core's limits are derived from (lane constants-20; was a
-    // picked 512 MiB).
-    let resident = crate::memory::process().room(crate::memory::Use::Queues)?;
     let replica =
-        Replica::open(&settings, group, machine, Bytes::new(resident)).map_err(unavailable)?;
+        Replica::open(&settings, group, machine, Bytes::new(512 << 20)).map_err(unavailable)?;
     let local = Local::new(
         reader,
         Arc::clone(&meter),
         account(),
         crate::descriptors::process()?,
     );
-    // Nothing drained yet: the room (QB.1), which bounds no peers' least.
-    let first = queue_bounds(
-        &super::drain::Drain::default(),
-        &super::drain::Drain::default(),
-        Duration::ZERO,
-        0,
-        replica.core().raft.config().limits.members,
-    )?;
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
-        commands: AtomicUsize::new(0),
-        command_bound: AtomicUsize::new(first.commands),
-        calls: AtomicUsize::new(0),
-        call_bound: AtomicUsize::new(first.calls),
-        called: AtomicUsize::new(0),
-        queued: AtomicUsize::new(first.queued),
-        applications: AtomicUsize::new(first.applications),
-        wire: AtomicUsize::new(first.wire),
         attesting: Mutex::new(None),
         floor: Mutex::new(None),
         floor_status: Mutex::default(),
         floor_meter: FloorMeter::default(),
-        outgoing: Mutex::new(Outgoing {
-            bound: first.outgoing,
-            room: first.room,
-            ..Outgoing::default()
-        }),
-        egress: std::sync::atomic::AtomicU8::new(super::drain::Egress::DEFAULT.code()),
+        outgoing: Mutex::default(),
         sent: std::sync::Condvar::new(),
         listener: Mutex::new(None),
         status: Mutex::new(Ok(status(&replica))),
@@ -2386,10 +1958,8 @@ fn open_on<F: BlockFile + 'static>(
         observed: AtomicU64::new(0),
     });
     let election = replica.core().raft.config().election_tick;
-    // The members its core was opened for: the voters a leader measures (lane constants-20).
-    let members = replica.core().raft.config().limits.members;
     let slots = super::slot::Slots::new(slot_bounds(election, TICK)?);
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(COMMANDS);
     let at = clock();
     let mut actor = Actor {
         published: replica.applied().index,
@@ -2426,14 +1996,9 @@ fn open_on<F: BlockFile + 'static>(
         compacting: super::compacting::Costs::default(),
         log_full: None,
         step_queued: 0,
-        answers: patience::Answers::new(election, members),
+        answers: patience::Answers::new(election),
         pace: super::pace::Pace::new(TICK, 0),
         paced: 0,
-        intake: super::drain::Drain::default(),
-        outgo: super::drain::Drain::default(),
-        paths: std::collections::BTreeMap::new(),
-        window,
-        queues: None,
         #[cfg(test)]
         stalls: None,
         #[cfg(test)]
@@ -2461,7 +2026,6 @@ fn open_on<F: BlockFile + 'static>(
         lag: crate::replication::closed::Lag::default(),
         ticked: at,
         driving: false,
-        paused_inputs: VecDeque::new(),
         waker: std::task::Waker::from(Arc::clone(&bell)),
         at,
     };
@@ -2481,13 +2045,12 @@ fn open_on<F: BlockFile + 'static>(
 }
 
 pub(super) fn validate(config: &ReplicaConfig) -> Result<(), Refusal> {
-    // The members are bounded by the group's bound, from its log or its first configuration
-    // (`member_bound`), which the core's settings are derived within the memory room for.
-    config
+    let count = config
         .voters
         .len()
         .checked_add(config.learners.len())
         .ok_or_else(|| api::invalid("replica configuration", "member count overflow"))?;
+    api::bound("replica members", count, MEMBERS)?;
     if config.node_id == 0 || config.voters.is_empty() {
         return Err(api::invalid(
             "replica configuration",
@@ -2579,26 +2142,18 @@ pub(super) fn validate_durability(
     }
     Ok(())
 }
-fn settings(
-    id: u64,
-    durability: &Durability,
-    members: usize,
-    window: super::drain::Window,
-) -> Result<hyper_durable::Settings, Refusal> {
-    // The core's memory is the memory budget's room for queues (MB.1), where its messages and
-    // unstable entries wait: `Limits::derive` takes its unstable entries, pending messages and
-    // entries a message carries from it and from a message's bytes, no picked counts (QB.1, lane
-    // constants-19), the reads pending among them: each read asked came through the command queue,
-    // whose inputs are bounded apart (lane constants-20). One proposal at a time crosses ReadIndex
-    // (the module's head).
-    let memory = crate::memory::process().room(crate::memory::Use::Queues)?;
+fn settings(id: u64, durability: &Durability) -> Result<hyper_durable::Settings, Refusal> {
     let mut limits = hyper_raft::Limits::derive(hyper_raft::Stated {
         message: MESSAGE_BYTES,
-        members,
-        memory: usize::try_from(memory).unwrap_or(usize::MAX),
+        members: MEMBERS,
+        memory: 64 << 20,
         depth: 1,
     })
     .map_err(unavailable)?;
+    limits.pending_messages = OUTGOING_MESSAGES;
+    limits.pending_reads = COMMANDS;
+    limits.unstable_entries = 1024;
+    limits.entries_per_message = 1024;
     limits.proposals = 1;
     // The replicated class: a commit on entries held in memory across fates (hyper-raft R-8), and a
     // leader applying what its own term committed before its own write is durable (R-6).
@@ -2614,55 +2169,25 @@ fn settings(
         }
     };
     let apply_unpersisted = fates.is_some();
-    // What a leader holds uncommitted and a ready gives committed are held in memory beside the
-    // queues: the same room, and one message at least, which hyper-raft asks of the first and
-    // gives alone past the second (lane constants-20; were a picked 64 MiB each).
-    let message = u64::try_from(MESSAGE_BYTES).map_err(unavailable)?;
-    let held = memory.max(message);
-    // The window to each member (lane constants-21): under `Carried`, no count of its own and,
-    // before its path is measured, the memory room, the only bound known before a path has
-    // drained, as the queues' bounds start (QB.1); `Actor::carry` then follows twice what the path
-    // carries in a round trip. Under `Picked`, the control, four messages and 64 MiB.
-    let (max_inflight_msgs, max_inflight_bytes) = match window {
-        super::drain::Window::Picked => (4, 64 << 20),
-        super::drain::Window::Carried => (usize::MAX, held),
-    };
-    let core = hyper_raft::Config {
-        fates,
-        apply_unpersisted,
-        check_quorum: true,
-        pre_vote: true,
-        max_size_per_msg: message,
-        max_uncommitted_size: held,
-        max_committed_size_per_ready: held,
-        max_inflight_msgs,
-        max_inflight_bytes,
-        seed: id,
-        // The core raises its member bound as it takes an entry that states one, at open as
-        // after, before the change behind it takes effect (lane constants-21).
-        stated_members: Some(hyper_raft::StatedMembers(
-            crate::replication::members::stated,
-        )),
-        ..hyper_raft::Config::new(id, limits)
-    };
-    // The owner's quiet period is its learned election timeout (lane constants-21; was focal
-    // F17's picked 50 ms): at open the start pace's, then the pace's as it is learned (`repace`).
-    let quiet = quiet_period(core.election_tick, TICK);
     Ok(hyper_durable::Settings {
-        core,
+        core: hyper_raft::Config {
+            fates,
+            apply_unpersisted,
+            check_quorum: true,
+            pre_vote: true,
+            max_size_per_msg: u64::try_from(MESSAGE_BYTES).map_err(unavailable)?,
+            max_uncommitted_size: 64 << 20,
+            max_committed_size_per_ready: 64 << 20,
+            max_inflight_msgs: 4,
+            max_inflight_bytes: 64 << 20,
+            seed: id,
+            ..hyper_raft::Config::new(id, limits)
+        },
         // CP-T2.2: preserve flush-proved group durability during API reconciliation.
         disk: hyper_durable::Disk::Flushed,
         elections: hyper_raft::Elections::Ticks,
-        quiet,
+        quiet: Duration::from_millis(50),
     })
-}
-/// The owner's quiet period (hyper-durable's `Settings::quiet`): a commit no write stated while
-/// the applied index ran past the durable commit is written once the owner has been quiet this
-/// long, so a member that stops reopens with what it applied. The learned election timeout, the
-/// core's `election_tick` periods of the pace (lane constants-21): a member a group takes for
-/// lost after an election timeout has stated what it applied by then.
-fn quiet_period(election_tick: usize, period: Duration) -> Duration {
-    super::drain::election_timeout(election_tick, period)
 }
 fn status<F: BlockFile + 'static>(replica: &Durable<F>) -> ReplicaStatus {
     ReplicaStatus {
@@ -2788,7 +2313,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         if let Some(changing) = self.changing.take() {
             let result = match changing.stage {
-                Stage::Barrier | Stage::Raising => Err(reason.clone()),
+                Stage::Barrier => Err(reason.clone()),
                 Stage::Proposed { .. } | Stage::Applied => Err(unknown()),
             };
             answer(changing.response, result);
@@ -2812,7 +2337,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.control.moved.notify_all();
             drop(closed);
         }
-        for _ in 0..self.waiting.len() {
+        for _ in 0..COMMANDS {
             let Some(envelope) = self.waiting.pop_front() else {
                 break;
             };
@@ -2820,8 +2345,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                 answer(response, Err(reason.clone()));
             }
         }
-        // The ingress channel holds the inputs `commands` counts. Notify callers before closing it.
-        for _ in 0..self.control.commands.load(Ordering::Acquire) {
+        // The ingress channel has at most COMMANDS items. Notify callers before closing it.
+        for _ in 0..COMMANDS {
             let Ok(envelope) = receiver.try_recv() else {
                 break;
             };
@@ -2890,7 +2415,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             .pace
             .derive(&voters, id, election, heartbeat, votes, now);
         self.slots.bound(slot_bounds(election, pace.period)?);
-        self.replica.set_quiet(quiet_period(election, pace.period));
         Ok(())
     }
     /// The owner's next deadline: its next tick, or sooner a deadline of what it holds (a queued
@@ -2931,36 +2455,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let queued = self.queued();
         self.step_queued = queued;
         let applied = self.replica.applied().index;
-        // QB.2's pause: while the outgoing queue is at its bound the owner takes no input and
-        // makes no raft step; what comes waits in order, its bytes still charged to the command
-        // queue, so the queue's admission bound holds the callers back.
-        let paused = self.paused()?;
-        let mut input = input;
-        if let Some(envelope) = input.as_mut() {
-            // Taken from the channel: its place there is free, its bytes still held (lane
-            // constants-20).
-            envelope._reservation.taken();
-        }
-        let input = if paused {
-            if let Some(envelope) = input {
-                self.paused_inputs.push_back(envelope);
-            }
-            None
-        } else {
-            match self.paused_inputs.pop_front() {
-                Some(first) => {
-                    if let Some(envelope) = input {
-                        self.paused_inputs.push_back(envelope);
-                    }
-                    Some(first)
-                }
-                None => input,
-            }
-        };
         if let Some(envelope) = input {
-            // The command queue's reader is this intake (QB.1).
-            let bytes = u64::try_from(envelope._reservation.bytes).unwrap_or(u64::MAX);
-            self.intake.drained(bytes, 1);
             self.receive(envelope)?;
         }
         #[cfg(test)]
@@ -2971,7 +2466,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             // A delayed owner does not invent missed heartbeats or run an unbounded catchup.
             self.ticked = at;
             self.repace()?;
-            self.rebound()?;
             // The quorum patience in force for this tick's check, from the answers measured.
             let leading = self.replica.is_leader().then(|| self.replica.term());
             // The voters the core's quorum check counts: the newest configuration its log states,
@@ -2996,9 +2490,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .and_then(|ticks| self.pace.period().checked_mul(ticks))
                 .ok_or_else(|| fenced("the quorum patience overflowed its gauge"))?;
             self.control.meter.patience(shown);
-            if !paused {
-                self.replica.tick().map_err(raft_error)?;
-            }
+            self.replica.tick().map_err(raft_error)?;
             #[cfg(test)]
             if let Some(stalls) = &self.stalls {
                 locked(stalls)?.ticked(at);
@@ -3010,14 +2502,6 @@ impl<F: BlockFile + 'static> Actor<F> {
         // Round Robin", SIGCOMM 1995, Theorem 4.5: fair within one unit when every quantum is at
         // least the largest unit, here one `Ready`), so no count of drives is picked. A drive that
         // leaves more steps again at once (`run_loop`).
-        if paused {
-            self.driving = false;
-            self.expire();
-            self.expire_change();
-            *locked(&self.control.status)? = Ok(status(&self.replica));
-            return Ok(());
-        }
-        self.resend()?;
         let mut output = Output::default();
         let nanos = self.now()?;
         let (began, applying) = ((self.clock)(), self.replica.machine().applied_bytes());
@@ -3041,8 +2525,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
         }
         self.release(output)?;
-        // Inputs a pause kept are taken at once, one a step.
-        self.driving = driven.more || !self.paused_inputs.is_empty();
+        self.driving = driven.more;
         #[cfg(test)]
         if driven.more {
             self.drove_more = self.drove_more.saturating_add(1);
@@ -3058,8 +2541,6 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.settle_transfer();
         self.bootstrap()?;
         self.propose_class()?;
-        self.raise_waiting();
-        self.keep_member_bound();
         self.keep_class_gate()?;
         self.keep_slots()?;
         if self.tail.is_some() || self.slot_deferred {
@@ -3163,7 +2644,6 @@ impl<F: BlockFile + 'static> Actor<F> {
                         self.replica.machine_mut().flushed_through(flushed.at);
                         *out = false;
                         if let Some(said) = flushed.pass {
-                            self.replica.machine_mut().set_image_disk(said.image);
                             *pass = said;
                         }
                     }
@@ -3255,172 +2735,10 @@ impl<F: BlockFile + 'static> Actor<F> {
     fn queued(&self) -> u64 {
         u64::try_from(self.control.admitted.load(Ordering::Acquire)).unwrap_or(u64::MAX)
     }
-    /// The most inputs the command queue holds, as this owner last learned it (QB.1): the waiting
-    /// calls are held to it too.
-    fn command_bound(&self) -> usize {
-        self.control.command_bound.load(Ordering::Acquire)
-    }
-    /// The queue bounds from what this owner measured, at each tick of its pace (QB.1): each
-    /// queue's drain weighed on the owner's clock, the bounds learned from them and the election
-    /// timeout in force, and the queues' bytes charged to the memory budget, so that its other uses'
-    /// room leaves them out (MB.1). A charge past the room is refused, and the bounds then refuse
-    /// more; the resident bytes count them still.
-    /// The members this owner's core sends to: those it tracks, less itself.
-    fn peers(&self) -> u64 {
-        let tracked = self.replica.core().raft.tracker().len();
-        u64::try_from(tracked.saturating_sub(1)).unwrap_or(u64::MAX)
-    }
-    /// QB.2's shed, made good by events: once records were shed (`Outgoing::owed`) and the host's
-    /// drain has left the queue room for a record to each peer, the leader beats, and each
-    /// member's answer brings what it lacks (raft's heartbeat answer resumes a paused probe and
-    /// sends the entries a member is behind by). A report of unreachable gives up the member's
-    /// window, but a probe already out waits for an answer: without this beat only the next
-    /// heartbeat tick would send again. Any other role's beat sends nothing; what a follower shed
-    /// is a lost answer, which its leader's heartbeat timeout makes good. A refusal short of a
-    /// fence keeps the beat owed.
-    fn resend(&mut self) -> Result<(), Refusal> {
-        let peers = self.peers();
-        let mut outgoing = locked(&self.control.outgoing)?;
-        if !outgoing.owed {
-            return Ok(());
-        }
-        let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
-        let count = u64::try_from(outgoing.messages.len()).unwrap_or(u64::MAX);
-        // Not yet room for the beat: the host's next drain rings the owner again.
-        if super::drain::past(outgoing.bound, held, count.saturating_add(peers)) {
-            return Ok(());
-        }
-        outgoing.owed = false;
-        drop(outgoing);
-        match self.replica.beat().map_err(raft_error) {
-            Err(error @ Refusal::Fenced(_)) => Err(error),
-            Err(_) => {
-                locked(&self.control.outgoing)?.owed = true;
-                Ok(())
-            }
-            Ok(()) => Ok(()),
-        }
-    }
-    /// QB.2's pause: whether the outgoing queue is at its bound (one more record would pass it)
-    /// under `Egress::Pause`, each pause begun counted.
-    fn paused(&self) -> Result<bool, Refusal> {
-        let egress = super::drain::Egress::from_code(self.control.egress.load(Ordering::Acquire));
-        if !matches!(egress, super::drain::Egress::Pause) {
-            return Ok(false);
-        }
-        let mut outgoing = locked(&self.control.outgoing)?;
-        let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
-        let count = u64::try_from(outgoing.messages.len()).unwrap_or(u64::MAX);
-        let paused = count > 0
-            && super::drain::past(
-                outgoing.bound,
-                held.saturating_add(1),
-                count.saturating_add(1),
-            );
-        if paused && !outgoing.paused {
-            outgoing.pauses = outgoing.pauses.saturating_add(1);
-        }
-        outgoing.paused = paused;
-        Ok(paused)
-    }
-    fn rebound(&mut self) -> Result<(), Refusal> {
-        let now = self.now()?;
-        let timeout = super::drain::election_timeout(
-            self.replica.core().raft.config().election_tick,
-            self.pace.period(),
-        );
-        let queued = self.queued();
-        self.intake.sample(now, queued > 0);
-        let mut outgoing = locked(&self.control.outgoing)?;
-        let (bytes, messages) = std::mem::take(&mut outgoing.drained);
-        self.outgo.drained(bytes, messages);
-        let busy = !outgoing.messages.is_empty();
-        self.outgo.sample(now, busy);
-        let drained_to = std::mem::take(&mut outgoing.drained_to);
-        let bounds = queue_bounds(
-            &self.intake,
-            &self.outgo,
-            timeout,
-            self.peers(),
-            self.replica.core().raft.config().limits.members,
-        )?;
-        outgoing.bound = bounds.outgoing;
-        outgoing.room = bounds.room;
-        let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
-        let count = u64::try_from(outgoing.messages.len()).unwrap_or(u64::MAX);
-        if held <= bounds.outgoing.bytes && count <= bounds.outgoing.messages {
-            outgoing.over = None;
-        }
-        drop(outgoing);
-        self.control.queued.store(bounds.queued, Ordering::Release);
-        self.control
-            .applications
-            .store(bounds.applications, Ordering::Release);
-        self.control
-            .command_bound
-            .store(bounds.commands, Ordering::Release);
-        self.control
-            .call_bound
-            .store(bounds.calls, Ordering::Release);
-        self.control.wire.store(bounds.wire, Ordering::Release);
-        self.queues = None;
-        self.queues = crate::memory::process()
-            .take(crate::memory::Use::Queues, queued.saturating_add(held))
-            .ok();
-        self.carry(now, &drained_to, busy)
-    }
-    /// The window to each member under `Window::Carried` (lane constants-21; hyper-raft's rule,
-    /// mantle note 32 R16): twice what its path carries in a round trip
-    /// (`Replica::set_carriage`), the bytes the host drained to it over its round trip as `pace`
-    /// measured it, at least a record's own bytes: a window that holds nothing still sends one
-    /// entry, however large (hyper-raft's `Inflights::full`). A path carries what its window let
-    /// out, so the window doubles each round a path
-    /// keeps up and holds where it doesn't: a slow member is sent what it takes, a fast one what
-    /// it can. A member whose round trip isn't measured keeps what it had. Each path's drain is
-    /// weighed at every rebound, the leader's or not, so a new leader starts from what it saw.
-    fn carry(
-        &mut self,
-        now: u64,
-        drained: &std::collections::BTreeMap<u64, (u64, u64)>,
-        busy: bool,
-    ) -> Result<(), Refusal> {
-        let id = self.replica.id();
-        let configuration = self.replica.configuration();
-        let members: std::collections::BTreeSet<u64> = configuration
-            .voters
-            .iter()
-            .chain(&configuration.learners)
-            .chain(&configuration.voters_outgoing)
-            .chain(&configuration.learners_next)
-            .copied()
-            .filter(|member| *member != id)
-            .collect();
-        self.paths.retain(|member, _| members.contains(member));
-        let carries =
-            matches!(self.window, super::drain::Window::Carried) && self.replica.is_leader();
-        let record = u64::try_from(RECORD_BYTES).unwrap_or(u64::MAX);
-        for member in members {
-            let path = self.paths.entry(member).or_default();
-            let (bytes, messages) = drained.get(&member).copied().unwrap_or_default();
-            path.drained(bytes, messages);
-            path.sample(now, busy);
-            if !carries {
-                continue;
-            }
-            let Some(round_trip) = self.pace.round_trip(member) else {
-                continue;
-            };
-            let carried = path.carried(round_trip).unwrap_or(0).max(record);
-            self.replica
-                .set_carriage(member, carried)
-                .map_err(raft_error)?;
-        }
-        Ok(())
-    }
     fn expire(&mut self) {
         // Expired callers relinquish queued operations even while a seed or proposal is held.
         // Rotate the bounded queue once; surviving requests retain their FIFO order.
-        let queued = self.waiting.len();
+        let queued = self.waiting.len().min(COMMANDS);
         for _ in 0..queued {
             let Some(envelope) = self.waiting.pop_front() else {
                 break;
@@ -3503,13 +2821,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         };
         if self.at >= pending.until {
             answer(response, Err(Refusal::Timeout));
-        } else if self.waiting.len() >= self.command_bound() {
-            answer(
-                response,
-                Err(Refusal::Full {
-                    limit: self.command_bound(),
-                }),
-            );
+        } else if self.waiting.len() >= COMMANDS {
+            answer(response, Err(Refusal::Full { limit: COMMANDS }));
         } else {
             self.waiting.push_front(Envelope {
                 command: Input::Submit {
@@ -3529,7 +2842,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some(mut changing) = self.changing.take() else {
             return;
         };
-        if !matches!(changing.stage, Stage::Barrier | Stage::Raising) {
+        if !matches!(changing.stage, Stage::Barrier) {
             self.changing = Some(changing);
             return;
         }
@@ -3540,23 +2853,9 @@ impl<F: BlockFile + 'static> Actor<F> {
         } else {
             match self.member_change(changing.change) {
                 Ok(None) => Ok(status(&self.replica)),
-                Ok(Some((_, members)))
-                    if members > self.replica.core().raft.config().limits.members
-                        && (self.pending.is_some() || self.slots.holds()) =>
-                {
-                    // The write ends, an event that wakes this owner, and the change goes on
-                    // from here then (`raise_waiting`).
-                    changing.stage = Stage::Raising;
-                    self.changing = Some(changing);
-                    return;
-                }
-                Ok(Some((proposal, members))) => {
+                Ok(Some(proposal)) => {
                     let before = self.replica.core().raft.pending_conf_index();
-                    match self.raise_members(members).and_then(|()| {
-                        self.replica
-                            .change(changing.context.clone(), &proposal)
-                            .map_err(raft_error)
-                    }) {
+                    match self.replica.change(changing.context.clone(), &proposal) {
                         // The core marks the entry it took as its pending change. One it can't
                         // take it keeps in place stating nothing, and leaves that mark.
                         Ok(()) if self.replica.core().raft.pending_conf_index() > before => {
@@ -3568,57 +2867,13 @@ impl<F: BlockFile + 'static> Actor<F> {
                         Ok(()) => Err(unavailable(
                             "the leader did not take the change of members; try again",
                         )),
-                        Err(refusal) => Err(refusal),
+                        Err(error) => Err(raft_error(error)),
                     }
                 }
                 Err(refusal) => Err(refusal),
             }
         };
         answer(changing.response, result);
-    }
-    /// The core's member bound at least what its machine recorded: an image installed brings the
-    /// bound its group's log stated before it, which the core took no entry of. The voters the
-    /// leader's quorum patience measures follow the core's bound (lane constants-21).
-    fn keep_member_bound(&mut self) {
-        if let Some(bound) = self.replica.machine().member_bound()
-            && self.replica.grow_members(bound)
-        {
-            tracing::info!(target: "amphora.replication", event = "member_bound_taken", bound);
-        }
-        self.answers
-            .grow(self.replica.core().raft.config().limits.members);
-    }
-    /// A change waiting to raise the member bound, once no write is under way (lane constants-21).
-    fn raise_waiting(&mut self) {
-        if self.pending.is_none()
-            && !self.slots.holds()
-            && self
-                .changing
-                .as_ref()
-                .is_some_and(|changing| matches!(changing.stage, Stage::Raising))
-        {
-            self.propose_change();
-        }
-    }
-    /// A configuration of `members` past the group's bound: the bound raised first, by an entry
-    /// stating twice it, or `members` if more (`replication::members::grown`), in the log ahead of
-    /// the change. The core raises its own as it takes the entry, so the change behind it is in
-    /// bound at every member that takes both, in log order (lane constants-21).
-    fn raise_members(&mut self, members: usize) -> Result<(), Refusal> {
-        let bound = self.replica.core().raft.config().limits.members;
-        if members <= bound {
-            return Ok(());
-        }
-        let raised = crate::replication::members::grown(bound, members);
-        let context = self.context()?;
-        self.propose(&context, crate::replication::members::entry(raised))?;
-        tracing::info!(target: "amphora.replication", event = "member_bound_raised", from = bound, to = raised, members);
-        if self.replica.core().raft.config().limits.members < members {
-            return Err(unavailable(
-                "the leader did not take the raised member bound; try again",
-            ));
-        }
-        Ok(())
     }
     /// The change under way, once applied, and once the group has left the joint configuration it
     /// made: answered with the status. It runs after `expire_change`, so a change still proposed
@@ -3651,8 +2906,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             || changing.leader != self.replica.leader()
             || self.replica.leader() == 0;
         let result = match changing.stage {
-            Stage::Barrier | Stage::Raising if expired => Err(Refusal::Timeout),
-            Stage::Barrier | Stage::Raising if moved => Err(not_leader(self.replica.leader())),
+            Stage::Barrier if expired => Err(Refusal::Timeout),
+            Stage::Barrier if moved => Err(not_leader(self.replica.leader())),
             Stage::Proposed { .. } if expired || moved => Err(unknown()),
             // Committed. The leader leaves the joint configuration by itself, this one or the
             // next, so a new lead waits for that; a deadline answers what is applied.
@@ -3720,13 +2975,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                     || self.replica.machine().bootstrap_pending()
                     || self.class_in_flight()
                 {
-                    if self.waiting.len() >= self.command_bound() {
-                        answer(
-                            response,
-                            Err(Refusal::Full {
-                                limit: self.command_bound(),
-                            }),
-                        );
+                    if self.waiting.len() >= COMMANDS {
+                        answer(response, Err(Refusal::Full { limit: COMMANDS }));
                     } else {
                         self.waiting.push_back(Envelope {
                             command: Input::Submit {
@@ -3939,12 +3189,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         Ok(())
     }
     /// What `change` asks of the group as this leader leads it now: the joint change that makes
-    /// it, with the members it leaves the group with, none when the group is so already, or why
-    /// the group can't take it.
-    fn member_change(
-        &mut self,
-        change: MemberChange,
-    ) -> Result<Option<(ConfChangeV2, usize)>, Refusal> {
+    /// it, none when the group is so already, or why the group can't take it.
+    fn member_change(&mut self, change: MemberChange) -> Result<Option<ConfChangeV2>, Refusal> {
         let raft = &self.replica.core().raft;
         let configuration = raft.configuration();
         if configuration.is_joint() || raft.has_pending_conf() {
@@ -3952,7 +3198,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 "a change of members is under way; try again once it is applied",
             ));
         }
-        let invalid = |why: &str| -> Result<Option<(ConfChangeV2, usize)>, Refusal> {
+        let invalid = |why: &str| -> Result<Option<ConfChangeV2>, Refusal> {
             Err(api::invalid("member change", why))
         };
         let (MemberChange::AddLearner(member)
@@ -3998,9 +3244,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         let changed = Plan::of(&proposal)
             .and_then(|plan| plan.apply(configuration))
             .map_err(|error| api::invalid("member change", &error.to_string()))?;
-        // The members it leaves the group with: past the group's bound, the bound is raised first
-        // (`propose_change`; lane constants-21).
-        let members = changed.configuration.members().count();
+        api::bound(
+            "replica members",
+            changed.configuration.members().count(),
+            raft.config().limits.members.min(MEMBERS),
+        )?;
         // A joiner catches up by the leader's image once the log no longer reaches back: past
         // the image's ceiling it never could, so it is refused here, not added to fall behind.
         match change {
@@ -4008,7 +3256,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             MemberChange::Promote(member) => self.admits_voter(member)?,
             MemberChange::Demote(_) | MemberChange::Remove(_) => (),
         }
-        Ok(Some((proposal, members)))
+        Ok(Some(proposal))
     }
     /// A learner becomes a voter only on its attestation of the floor in force, under its current
     /// join, at or above it (replication.md, "How it composes with membership changes"). It is read
@@ -4490,8 +3738,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some(class) = self.replica.machine().class_proposal() else {
             return Ok(());
         };
-        let members = self.replica.machine().members();
-        let bytes = crate::replication::class::entry(&class, members)?;
+        let bytes = crate::replication::class::entry(&class)?;
         let context = self.context()?;
         match self.propose(&context, bytes) {
             Ok(()) => {
@@ -4611,74 +3858,21 @@ impl<F: BlockFile + 'static> Actor<F> {
             .and_then(|beats| u32::try_from(beats).ok())
             .unwrap_or(u32::MAX);
         let now = self.now()?;
-        let timeout = u64::try_from(
-            super::drain::election_timeout(config.election_tick, self.pace.period()).as_nanos(),
-        )
-        .unwrap_or(u64::MAX);
-        let wire = self.control.wire.load(Ordering::Acquire);
-        let egress = super::drain::Egress::from_code(self.control.egress.load(Ordering::Acquire));
-        // The members a shed record was for: told to the core as unreachable, as etcd's
-        // transport reports a peer whose stream dropped a message (QB.2).
-        let mut unreachable: Vec<u64> = Vec::new();
         let mut outgoing = locked(&self.control.outgoing)?;
         let any = !output.messages.is_empty();
         for message in output.messages {
             self.pace.sent(&message, now, lost);
             let mut bytes = Vec::new();
             message.encode(&mut bytes);
-            api::bound("replica outgoing record", bytes.len(), wire)?;
-            // QB.2's shed: the oldest records go until the new one fits the bound, each counted;
-            // raft sends again what a member still lacks, as over a lossy link.
-            if matches!(egress, super::drain::Egress::Shed) {
-                loop {
-                    let held = u64::try_from(outgoing.bytes.saturating_add(bytes.len()))
-                        .unwrap_or(u64::MAX);
-                    let count = u64::try_from(outgoing.messages.len())
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(1);
-                    if !super::drain::past(outgoing.bound, held, count) {
-                        break;
-                    }
-                    let Some(oldest) = outgoing.messages.pop_front() else {
-                        break;
-                    };
-                    outgoing.bytes = outgoing
-                        .bytes
-                        .checked_sub(oldest.bytes.len())
-                        .ok_or_else(|| fenced("outgoing accounting underflow"))?;
-                    outgoing.shed = outgoing.shed.saturating_add(1);
-                    outgoing.owed = true;
-                    if !unreachable.contains(&oldest.to) {
-                        unreachable.push(oldest.to);
-                    }
-                }
-            }
+            api::bound("replica outgoing record", bytes.len(), WIRE_BYTES)?;
             let total = outgoing
                 .bytes
                 .checked_add(bytes.len())
                 .ok_or_else(|| fenced("outgoing size overflow"))?;
-            let total_bytes = u64::try_from(total).unwrap_or(u64::MAX);
-            // Past the memory budget's room for queues: fenced at once (MB.1).
-            if total_bytes > outgoing.room {
+            if total > OUTGOING_BYTES || outgoing.messages.len() >= OUTGOING_MESSAGES {
                 return Err(fenced(
-                    "replica outgoing queue is past the memory budget's room for queues; drain and reopen from durable state",
+                    "replica outgoing queue is full; drain and reopen from durable state",
                 ));
-            }
-            // Past what the host drains in an election timeout (QB.1): a bound that starts at one
-            // message grows as the host's drain is measured, so only a host that stays behind it
-            // for a whole election timeout fences the owner.
-            let count = u64::try_from(outgoing.messages.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
-            if matches!(egress, super::drain::Egress::Fence)
-                && super::drain::past(outgoing.bound, total_bytes, count)
-            {
-                let since = *outgoing.over.get_or_insert(now);
-                if now.saturating_sub(since) > timeout {
-                    return Err(fenced(
-                        "replica outgoing queue stayed past what its host drains in an election timeout for one; drain and reopen from durable state",
-                    ));
-                }
             }
             outgoing.bytes = total;
             outgoing.messages.push_back(Outbound {
@@ -4688,16 +3882,6 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         self.control.sent.notify_all();
         drop(outgoing);
-        for member in unreachable {
-            // A report the core refuses short of a fence changes nothing: the beat the host's
-            // drain prompts (`Outgoing::owed`) finds what the member lacks all the same.
-            if let Err(error) = self.replica.report_unreachable(member) {
-                let error = raft_error(error);
-                if matches!(error, Refusal::Fenced(_)) {
-                    return Err(error);
-                }
-            }
-        }
         if any {
             self.control.listened();
         }
@@ -4838,10 +4022,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             phase: Phase::Barrier(None),
             _reservation: Reservation {
                 control: Arc::clone(&self.control),
-                slot: false,
                 bytes: 0,
-                call: false,
-                called: 0,
             },
         });
         Ok(())
@@ -5012,10 +4193,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             phase: Phase::Barrier(Some(Operation::Call(Mutex::new(Some(call))))),
             _reservation: Reservation {
                 control: Arc::clone(&self.control),
-                slot: false,
                 bytes: 0,
-                call: false,
-                called: 0,
             },
         });
         self.floor_inflight = true;
@@ -5395,102 +4573,27 @@ mod tests {
         for receipt in &mut receipts {
             assert!(matches!(receipt.try_result(), Err(Refusal::Invalid { .. })));
         }
+        assert!(matches!(
+            client.handle().drain(OUTGOING_MESSAGES + 1),
+            Err(Refusal::TooLarge { .. })
+        ));
     }
 
-    /// QB.1 (lane constants-20): a leader's uncommitted bytes and a ready's committed bytes are
-    /// the memory budget's room for queues, at least one message, not a picked 64 MiB. Do: state a
-    /// persisted member's settings. Expect: both one value, a message at least, which the core's
-    /// settings take. (The room moves with the process's resident bytes, so its value is not
-    /// compared: other tests hold memory meanwhile.)
-    #[test]
-    fn qb_1_held_bytes_are_the_queues_room() {
-        let core = settings(
-            1,
-            &Durability::Persisted,
-            2,
-            super::super::drain::Window::DEFAULT,
-        )
-        .unwrap()
-        .core;
-        assert_eq!(core.max_uncommitted_size, core.max_committed_size_per_ready);
-        assert!(core.max_uncommitted_size >= core.max_size_per_msg);
-        assert_eq!(core.max_size_per_msg, u64::try_from(MESSAGE_BYTES).unwrap());
-        core.validate().unwrap();
-    }
-
-    /// T-QB.1.6 (QB.1, lane constants-20): the command queue's inputs are counted, not picked. Do:
-    /// count them with nothing measured, then for an intake draining 10 inputs every 10 ms under a
-    /// 100 ms election timeout, then in a room of one envelope. Expect: the room's envelopes before
-    /// anything is measured, about 100 once measured, never fewer than a call and a wire record,
-    /// and the calls always one fewer than the inputs, the last kept for a wire record.
-    #[test]
-    fn t_qb_1_6_command_queue_inputs_counted_by_rate_within_the_room() {
-        let envelope = u64::try_from(std::mem::size_of::<Envelope>()).unwrap();
-        let request = u64::try_from(api::REQUEST_MAX).unwrap();
-        let room = 1000 * envelope;
-        let timeout = Duration::from_millis(100);
-        let idle = super::super::drain::Drain::default();
-        assert_eq!(command_counts(&idle, timeout, room, request), (1000, 999));
-        let mut intake = super::super::drain::Drain::default();
-        intake.sample(0, true);
-        for step in 1..=40u64 {
-            intake.drained(1000, 10);
-            intake.sample(step * 10_000_000, true);
-        }
-        let (commands, calls) = command_counts(&intake, timeout, room, request);
-        assert!((90..=110).contains(&commands), "{commands}");
-        assert_eq!(calls, commands - 1);
-        // A room past the rate's count leaves the rate's; one below it, the room's envelopes.
-        assert_eq!(
-            command_counts(&intake, timeout, 50 * envelope, request),
-            (50, 49)
-        );
-        assert_eq!(command_counts(&intake, timeout, envelope, request), (2, 1));
-        assert_eq!(command_counts(&idle, timeout, 0, request), (2, 1));
-    }
-
-    /// T-QB.1.10 (QB.1, lane constants-21): every queued input is charged its envelope against
-    /// the queue's bytes, so memory is counted once and bounded once. Do: on a member whose owner
-    /// is not stepped, queue a wire record of one byte and a catch-up that carries nothing.
-    /// Expect: the queue's bytes are the one byte and two envelopes.
-    #[test]
-    fn t_qb_1_10_each_queued_input_is_charged_its_envelope() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut driven = Driven::new();
-        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
-        let handle = client.handle();
-        let until = driven.until();
-        let before = handle.shared.admitted.load(Ordering::Acquire);
-        let _record = handle.admit_receive(2, vec![0xff], until).unwrap();
-        let (response, _answer) = mpsc::sync_channel(1);
-        handle
-            .enqueue(Input::CatchUp { until, response }, 0)
-            .unwrap();
-        assert_eq!(
-            handle.shared.admitted.load(Ordering::Acquire) - before,
-            1 + 2 * ENVELOPE_BYTES
-        );
-    }
-
-    /// Lane ryw-6 (kiln goal 8119f25d) on QB.1's learned bound: a host that drains at the
-    /// handle's bound, as the bench's relay does, takes the whole queue in one call and needs no
-    /// count of its own. Before anything is drained the bound is the memory room (QB.1), far past
-    /// what a test fills, so the queue holds a burst of records the bound covers. Do: a member's
-    /// queue holding 1,004 records (four times 251, the byte pattern's period); one drain at
-    /// `outgoing_bound`. Expect: the bound covers them, every record taken in order, none left and
-    /// no bytes charged.
+    /// Lane ryw-6 (kiln goal 8119f25d): a host that drains at the handle's bound, as the bench's
+    /// relay does, takes the whole outgoing queue in one call, however full the member can make
+    /// it, and needs no count of its own. Do: a member's queue filled to the most it holds (the
+    /// owner fences rather than queue one more); one drain at `outgoing_bound`; one drain past
+    /// it. Expect: every record taken in order, none left and no bytes charged; past the bound
+    /// refused TooLarge.
     #[test]
     fn a_drain_at_the_queues_bound_takes_the_whole_queue() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle();
-        let burst = 4 * 251;
-        let bound = handle.outgoing_bound().unwrap();
-        assert!(bound >= burst, "the bound {bound} covers the burst {burst}");
         {
             let mut outgoing = locked(&handle.shared.outgoing).unwrap();
-            while outgoing.messages.len() < burst {
+            while outgoing.messages.len() < OUTGOING_MESSAGES {
                 let n = u8::try_from(outgoing.messages.len() % 251).unwrap();
                 outgoing.bytes += 1;
                 outgoing.messages.push_back(Outbound {
@@ -5499,8 +4602,8 @@ mod tests {
                 });
             }
         }
-        let drained = handle.drain(bound).unwrap();
-        assert_eq!(drained.len(), burst);
+        let drained = handle.drain(handle.outgoing_bound()).unwrap();
+        assert_eq!(drained.len(), OUTGOING_MESSAGES);
         assert!(
             drained
                 .iter()
@@ -5511,6 +4614,10 @@ mod tests {
         assert!(outgoing.messages.is_empty());
         assert_eq!(outgoing.bytes, 0);
         drop(outgoing);
+        assert!(matches!(
+            handle.drain(handle.outgoing_bound() + 1),
+            Err(Refusal::TooLarge { .. })
+        ));
         drop(driven);
     }
 
@@ -5528,7 +4635,7 @@ mod tests {
         let evaluated = Arc::new(AtomicUsize::new(0));
         let mut replies = Vec::new();
         let mut refusal = None;
-        for _ in 0..handle.command_bound() {
+        for _ in 0..COMMANDS {
             let counted = Arc::clone(&evaluated);
             let operation = Operation::Call(Mutex::new(Some(Box::new(move |_| {
                 counted.fetch_add(1, Ordering::Relaxed);
@@ -5553,10 +4660,6 @@ mod tests {
             }
         }
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
-        // The bounds the calls were admitted under, before the step learns new ones.
-        let application = handle.application_bound();
-        let calls = handle.call_bound();
-        let commands = handle.command_bound();
         let mut bytes = Vec::new();
         Message {
             msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
@@ -5569,20 +4672,14 @@ mod tests {
         let mut heartbeat = handle.admit_receive(2, bytes, until).unwrap();
         driven.step();
         assert!(matches!(heartbeat.try_result(), Ok(Some(()))));
-        assert!(
-            calls < commands,
-            "the queue's last place stays a wire record's"
-        );
-        // Calls stop at their bytes' bound or at their count's, the fewer, and the refusal names
-        // the bound that refused (QB.1). The count is checked first. Each call is charged its
-        // worst case and its envelope (lane constants-21).
-        let by_bytes = application / (api::REQUEST_MAX + ENVELOPE_BYTES);
-        let refused_by = if by_bytes < calls { application } else { calls };
         assert!(matches!(
             refusal,
-            Some(Refusal::Full { limit }) if limit == refused_by
+            Some(Refusal::Full { limit }) if limit == QUEUED_BYTES - WIRE_BYTES
         ));
-        assert_eq!(replies.len(), by_bytes.min(calls));
+        assert_eq!(
+            replies.len(),
+            (QUEUED_BYTES - WIRE_BYTES) / api::REQUEST_MAX
+        );
         assert!(!replies.is_empty());
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }
@@ -5642,8 +4739,8 @@ mod tests {
         assert_eq!(progress.completed, 2);
         assert_eq!(progress.feed, 1);
         let applied = client.handle().status().unwrap().applied;
-        // Past the owner's quiet period, so it states its durable commit before it stops.
-        driven.advance(0, past_quiet(&driven, 0));
+        // Past hyper-durable's quiet period, so the owner states its durable commit before it stops.
+        driven.advance(0, Duration::from_millis(60));
         for _ in 0..8 {
             driven.round(&mut pump);
         }
@@ -5711,11 +4808,10 @@ mod tests {
     type Losing = Box<dyn Fn(u64, &Message) -> bool>;
     /// CP-T1.8: mirror the carrier's bounded admission and observe every processed receipt.
     /// Admission never waits for another owner. All records, including retained proposals,
-    /// share the command queue's bounds, its inputs and bytes; each keeps its first absolute
-    /// receive deadline. The receipts grow to the inputs' bound, which the owners learn.
+    /// share COMMANDS/QUEUED_BYTES bounds; each keeps its first absolute receive deadline.
     struct Pump<'a> {
         clients: &'a [Client],
-        receipts: Vec<Option<PumpReceipt>>,
+        receipts: [Option<PumpReceipt>; COMMANDS],
         phase: PumpPhase,
         next_source: usize,
         records: usize,
@@ -5787,10 +4883,10 @@ mod tests {
     }
     impl<'a> Pump<'a> {
         fn new(clients: &'a [Client]) -> Self {
-            assert!(!clients.is_empty());
+            assert!(!clients.is_empty() && clients.len() <= MEMBERS);
             Self {
                 clients,
-                receipts: Vec::new(),
+                receipts: std::array::from_fn(|_| None),
                 phase: PumpPhase::Relay,
                 next_source: 0,
                 records: 0,
@@ -5878,14 +4974,11 @@ mod tests {
                 .handle()
                 .admit_receive(packet.from, packet.message.bytes, packet.until)
                 .unwrap();
-            let free = self.receipts.iter().position(Option::is_none);
-            let slot = match free {
-                Some(index) => self.receipts.get_mut(index).unwrap(),
-                None => {
-                    self.receipts.push(None);
-                    self.receipts.last_mut().unwrap()
-                }
-            };
+            let slot = self
+                .receipts
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .unwrap();
             *slot = Some(PumpReceipt {
                 receipt,
                 bytes,
@@ -5922,13 +5015,7 @@ mod tests {
                 for offset in 0..self.clients.len() {
                     // Reserve room for any legal wire record before draining ownership from a peer.
                     // The conservative byte check needs no unbounded overflow/backpressure buffer.
-                    let (bound, commands) = self.clients.first().map_or((0, 0), |client| {
-                        (
-                            client.handle().queue_bound(),
-                            client.handle().command_bound(),
-                        )
-                    });
-                    if self.records >= commands || self.bytes + MESSAGE_BYTES > bound {
+                    if self.records == COMMANDS || self.bytes + WIRE_BYTES > QUEUED_BYTES {
                         break;
                     }
                     let index = (first + offset) % self.clients.len();
@@ -5954,11 +5041,7 @@ mod tests {
                         {
                             continue;
                         }
-                        let wire = self
-                            .clients
-                            .first()
-                            .map_or(0, |client| client.handle().wire_bytes());
-                        api::bound("fixture wire record", message.bytes.len(), wire).unwrap();
+                        api::bound("fixture wire record", message.bytes.len(), WIRE_BYTES).unwrap();
                         let packet = PumpPacket {
                             from,
                             message,
@@ -9957,15 +9040,10 @@ mod tests {
             .unwrap();
         let record = numbers(include_str!("../../../../docs/research/owner-stalls.md"));
         let requirements = include_str!("../../../../docs/requirements.toml");
-        let election = settings(
-            1,
-            &Durability::Persisted,
-            2,
-            super::super::drain::Window::DEFAULT,
-        )
-        .unwrap()
-        .core
-        .election_tick;
+        let election = settings(1, &Durability::Persisted)
+            .unwrap()
+            .core
+            .election_tick;
         let tick = TICK.as_millis();
         let own = [
             tick.to_string(),
@@ -10048,7 +9126,7 @@ mod tests {
                     until,
                     response,
                 },
-                0,
+                CHANGE_BYTES,
             )
             .unwrap();
         receiver
@@ -10069,7 +9147,7 @@ mod tests {
                     until,
                     response,
                 },
-                0,
+                CHANGE_BYTES,
             )
             .unwrap();
         receiver
@@ -10083,55 +9161,6 @@ mod tests {
                 Ok(Vec::new())
             })
             .unwrap();
-    }
-    /// A tick past owner `owner`'s quiet period, its learned election timeout (lane constants-21):
-    /// what a test advances its clock by so that it states its durable commit before it stops.
-    fn past_quiet(driven: &Driven, owner: usize) -> Duration {
-        driven.owner(owner).replica.quiet() + driven.owner(owner).pace.period()
-    }
-    /// T-QB.1.12 (QB.1, lane constants-21): the owner's quiet period is its learned election
-    /// timeout, not focal F17's picked 50 ms. Do: open three voters, elect, then three election
-    /// timeouts of ticks, a tick on every clock each round. Expect: at open, each owner's quiet
-    /// period is its core's election ticks of the start pace; after, its election ticks of the
-    /// pace it learned, whatever that is.
-    #[test]
-    fn t_qb_1_12_the_quiet_period_is_the_learned_election_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut driven = Driven::new();
-        let voters = vec![1, 2, 3];
-        let clients: Vec<Client> = voters
-            .iter()
-            .map(|n| driven.open(dir.path(), *n, voters.clone(), None))
-            .collect();
-        let quiet = |driven: &Driven, owner: usize| {
-            let actor = driven.owner(owner);
-            let election = actor.replica.core().raft.config().election_tick;
-            (
-                actor.replica.quiet(),
-                quiet_period(election, actor.pace.period()),
-            )
-        };
-        for owner in 0..3 {
-            let (held, learned) = quiet(&driven, owner);
-            assert_eq!(held, learned);
-            assert_ne!(held, Duration::from_millis(50));
-        }
-        let mut pump = Pump::new(&clients);
-        driven.elect(&mut pump, &clients, 0, 1);
-        let election = driven.owner(0).replica.core().raft.config().election_tick;
-        for _ in 0..3 * election {
-            for owner in 0..3 {
-                let period = driven.owner(owner).pace.period();
-                driven.advance(owner, period);
-            }
-            driven.round(&mut pump);
-        }
-        for owner in 0..3 {
-            let (held, learned) = quiet(&driven, owner);
-            assert_eq!(held, learned, "owner {owner}");
-        }
-        driven.drain(&mut pump);
-        pump.finish();
     }
     /// The values of member_items that owner `owner` has applied, read on its own state.
     fn held(driven: &mut Driven, owner: usize) -> Vec<u8> {
@@ -10198,47 +9227,13 @@ mod tests {
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
-            .enqueue(Input::CatchUp { until, response }, 0)
+            .enqueue(Input::CatchUp { until, response }, CHANGE_BYTES)
             .unwrap();
         receiver
     }
     /// The ticks owner 0's core waits, at least, before it campaigns: an election timeout.
     fn leader_core_election_tick(driven: &Driven) -> usize {
         driven.owner(0).replica.core().raft.config().election_tick
-    }
-
-    /// T-QB.1.4 (QB.1) on driven time: a bound starts at the budget's room for queues, so a burst
-    /// before any drain is measured never fences, and is learned from the host's drain after.
-    /// Do: a lone member of three campaigns, sending its vote requests in one step (a burst past
-    /// one message), its host draining after each tick, for ten election timeouts. Expect: the
-    /// outgoing bound starts at the room, with no count of messages; never fenced; then held to
-    /// a count the host's measured drain gives, no less than a record to each peer.
-    #[test]
-    fn queue_bound_a_burst_at_start_is_held_by_the_room() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut driven = Driven::new();
-        let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
-        let election = leader_core_election_tick(&driven);
-        let outgoing = locked(&driven.owner(0).control.outgoing).unwrap();
-        let (start, room) = (outgoing.bound, outgoing.room);
-        drop(outgoing);
-        assert_eq!(start.bytes, room, "{start:?}");
-        assert_eq!(start.messages, u64::MAX, "{start:?}");
-        let mut drained = 0;
-        let mut burst = 0;
-        for _ in 0..10 * election {
-            driven.advance_tick(0);
-            driven.step();
-            assert!(client.handle().status().is_ok(), "fenced");
-            let taken = client.handle().drain(usize::MAX).unwrap().len();
-            burst = burst.max(taken);
-            drained += taken;
-        }
-        assert!(burst > 1, "no burst past one message: {burst}");
-        assert!(drained > burst, "{drained}");
-        let learned = locked(&driven.owner(0).control.outgoing).unwrap().bound;
-        // Its least is one broadcast: a record to each of its two peers (QB.2).
-        assert!((2..u64::MAX).contains(&learned.messages), "{learned:?}");
     }
 
     /// AC-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan 01a1a283e14c,
@@ -10339,7 +9334,7 @@ mod tests {
                 match answer.try_recv() {
                     Ok(result) => return result,
                     Err(mpsc::TryRecvError::Empty) => {
-                        drop(client.handle().drain(usize::MAX).unwrap());
+                        drop(client.handle().drain(OUTGOING_MESSAGES).unwrap());
                         std::thread::park_timeout(POLL);
                         driven.step();
                     }
@@ -10361,7 +9356,7 @@ mod tests {
         let election = |driven: &mut Driven| {
             for _ in 0..=leader_core_election_tick(driven) {
                 driven.advance_tick(0);
-                drop(leader.handle().drain(usize::MAX).unwrap());
+                drop(leader.handle().drain(OUTGOING_MESSAGES).unwrap());
                 driven.step();
             }
         };
@@ -10534,10 +9529,11 @@ mod tests {
     /// AC-T1.8.M1, T-T1.8.M2 (CP-T1.8) on driven time (replication.md, "Membership"): only the
     /// leader changes members, one change at a time, and only as the configuration can take it. Do,
     /// in a group of three voters: ask a follower; ask the leader for two changes at once; promote
-    /// a non-member, add a voter as a learner, demote and remove the leader. Expect: NotLeader
-    /// naming the leader; the first of the two answered and the second Unavailable; Invalid for
-    /// each the configuration can't take, each proposing nothing; a change the configuration
-    /// already shows answered with it.
+    /// a non-member, add a voter as a learner, demote and remove the leader; add a learner to a
+    /// group of the most members. Expect: NotLeader naming the leader; the first of the two
+    /// answered and the second Unavailable; Invalid for each the configuration can't take and
+    /// TooLarge past the members, each proposing nothing; a change the configuration already shows
+    /// answered with it.
     #[test]
     fn member_changes_are_refused_off_the_leader_at_once_or_when_impossible() {
         let dir = tempfile::tempdir().unwrap();
@@ -10586,71 +9582,39 @@ mod tests {
         assert_eq!(led.handle().status().unwrap().applied, before.applied);
         driven.drain(&mut pump);
         pump.finish();
-    }
-    /// T-QB.1.9 (QB.1, lane constants-21; replication.md, "The member bound stated once per group"):
-    /// a group's member bound is its log's, so growth always works. Do: open one voter, and a
-    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running), and catch
-    /// member 2 up; restart the voter from the configuration it first opened with. Expect: the
-    /// voter opened for 2 (twice its first configuration); each change past the bound raised it
-    /// first, to 4, then 8 by the fifth member, then 16 by the ninth, every change answered;
-    /// member 2, which took the raising entries with the changes behind them, applied the nine
-    /// members and its core rose to 16; the voter reopened for the 16 its log recorded.
-    #[test]
-    fn t_qb_1_9_a_one_voter_group_grows_to_five_then_nine_members() {
+
+        // A group of the most members: one voter and 63 learners, none of them running, so no
+        // relay; time stands still.
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
-        let clients = vec![
-            driven.open(dir.path(), 1, vec![1], None),
-            driven.open_member(dir.path(), 2, vec![1], vec![2], None),
-        ];
-        let bound = |driven: &Driven, owner: usize| {
-            driven
-                .owner(owner)
-                .replica
-                .core()
-                .raft
-                .config()
-                .limits
-                .members
-        };
-        assert_eq!(bound(&driven, 0), 2);
-        let mut pump = Pump::new(&clients);
-        driven.elect(&mut pump, &clients[..1], 0, 1);
-        for member in 2..=9 {
-            let until = driven.until();
-            let status = driven
-                .answer(
-                    &mut pump,
-                    &change(&clients[0], until, MemberChange::AddLearner(member)),
-                )
-                .unwrap();
-            assert_eq!(status.learners.len(), usize::try_from(member - 1).unwrap());
-            if member == 2 {
-                write(&mut driven, &mut pump, &clients[0], 1);
-                catch_up(&mut driven, &mut pump, &clients, 0, 1);
-            }
-            if member == 5 {
-                assert_eq!(bound(&driven, 0), 8);
-            }
-        }
-        assert_eq!(bound(&driven, 0), 16);
-        assert_eq!(driven.owner(0).replica.machine().member_bound(), Some(16));
-        write(&mut driven, &mut pump, &clients[0], 2);
-        catch_up(&mut driven, &mut pump, &clients, 0, 1);
-        let follower = applied_configuration(&driven, 1);
-        assert_eq!(follower.voters.len() + follower.learners.len(), 9);
-        assert_eq!(bound(&driven, 1), 16);
-        driven.drain(&mut pump);
-        pump.finish();
-        drop(clients);
-        drop(driven);
-
-        let mut driven = Driven::new();
-        let _reopened = driven.open(dir.path(), 1, vec![1], None);
+        let full = driven.open_member(dir.path(), 1, vec![1], (2..=64).collect(), None);
+        driven.owner_mut(0).replica.campaign().unwrap();
+        // Its lead and the change's barrier each wait on its disk: each step yields to it, and
+        // the change is asked only once the voter leads.
+        let led = (0..ROUNDS).any(|_| {
+            driven.step();
+            std::thread::park_timeout(POLL);
+            full.handle().status().unwrap().leader == 1
+        });
+        assert!(led, "the voter did not lead in {ROUNDS} driven steps");
+        let asked = change(&full, driven.until(), MemberChange::AddLearner(65));
+        let refused = (0..ROUNDS)
+            .find_map(|_| {
+                driven.step();
+                std::thread::park_timeout(POLL);
+                asked.try_recv().ok()
+            })
+            .unwrap();
         assert_eq!(
-            driven.owner(0).replica.core().raft.config().limits.members,
-            16
+            refused,
+            Err(Refusal::TooLarge {
+                what: "replica members".into(),
+                size: 65,
+                limit: MEMBERS,
+            })
         );
+        let status = full.handle().status().unwrap();
+        assert_eq!((status.voters.len(), status.learners.len()), (1, 63));
     }
     /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): the members a
     /// group changed to are what it reopens with, whatever its config first named. Do: add member 2
@@ -10676,7 +9640,7 @@ mod tests {
         write(&mut driven, &mut pump, &clients[0], 1);
         catch_up(&mut driven, &mut pump, &clients, 0, 1);
         for owner in 0..2 {
-            driven.advance(owner, past_quiet(&driven, owner));
+            driven.advance(owner, Duration::from_millis(60));
         }
         for _ in 0..8 {
             driven.round(&mut pump);
@@ -10854,422 +9818,6 @@ mod tests {
         pump.finish();
     }
 
-    /// QB.2's scenario, the A/B of what an owner does past its outgoing bound (`Egress`): the
-    /// fence (the control), shedding the oldest records, or pausing the owner. Do, for each: a
-    /// group of `QB2_MEMBERS` voters (5 when unset) on driven time, every clock a tick on each
-    /// round; `QB2_WRITES` writes (8) at its leader; then every member's host stops draining at
-    /// once for two election timeouts while a write is asked of the leader; then every host drains
-    /// again but the leader's, which stays stalled for good, and writes go on at whichever member
-    /// the others name leader. Prints, by candidate: members fenced, records shed, pauses begun,
-    /// the deepest queue against its bound, writes answered before and after the stall, refusals by
-    /// kind, and the writes' latency in driven ticks at p50, p99 and p99.9 (nearest rank). Expect,
-    /// under the default candidate: no member fenced, and the group writes again after its
-    /// leader's host stalls.
-    #[test]
-    #[ignore = "QB.2's A/B, the coordinator's run of record: cargo test -p amphora --locked --lib -- --ignored --nocapture qb2_many_slow_one_stalled_for_good_by_egress"]
-    fn qb2_many_slow_one_stalled_for_good_by_egress() {
-        use super::super::drain::Egress;
-        let members: u64 = std::env::var("QB2_MEMBERS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(5);
-        let writes: usize = std::env::var("QB2_WRITES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(8);
-        // Every candidate runs and prints its numbers before the default's verdict.
-        let mut default = None;
-        for egress in [Egress::Fence, Egress::Shed, Egress::Pause] {
-            let report = qb2_scenario(egress, members, writes);
-            println!("QB.2 egress={egress:?} members={members} writes={writes} {report}");
-            if egress == Egress::DEFAULT {
-                default = Some(report);
-            }
-        }
-        let report = default.unwrap();
-        assert_eq!(report.fenced, 0, "{report}");
-        assert!(report.after > 0, "{report}");
-    }
-    /// T-QB.1.11, the window to each member's A/B (lane constants-21; replication.md, "The window
-    /// to each member"): `Window::Picked` (4 messages, 64 MiB; the control) against `Window::Carried`
-    /// (twice what the path carries in a round trip). It forces each one's failure mode at once:
-    /// a slow member flooded with sends, and a fast member starved of them. Do: five voters; cut
-    /// members 2 and 3 off while the leader commits `WINDOW_WRITES` writes (8 when unset) of
-    /// 16 KiB with 4 and 5, each owner's clock a tick on each round; then reconnect both, member 3
-    /// slow (its answers held for `WINDOW_SLOW` rounds of each `WINDOW_SLOW` + 1, 4 when unset),
-    /// member 2 fast. Expect: under each window both catch up to the leader, and each prints the
-    /// most bytes the leader had in flight to the slow member (its flood), and the rounds the
-    /// fast and the slow member took to catch up (the fast one's starving). The comparison is
-    /// the coordinator's run of record: `WINDOW_WRITES=512 WINDOW_SLOW=16 cargo test -p amphora
-    /// --locked --lib -- --nocapture window_slow_flooded_fast_starved`.
-    #[test]
-    fn window_slow_flooded_fast_starved() {
-        use super::super::drain::Window;
-        let var = |name: &str, unset: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(unset)
-        };
-        let (writes, slow) = (var("WINDOW_WRITES", 8), var("WINDOW_SLOW", 4));
-        for window in [Window::Picked, Window::Carried] {
-            let report = window_scenario(window, writes, slow);
-            let said = format!(
-                "window={window:?} writes={writes} slow={slow} flood_bytes={} flood_messages={} \
-                 fast_rounds={:?} slow_rounds={:?}",
-                report.flood_bytes, report.flood_messages, report.fast_rounds, report.slow_rounds
-            );
-            println!("{said}");
-            assert!(report.fast_rounds.is_some(), "{said}");
-            assert!(report.slow_rounds.is_some(), "{said}");
-        }
-    }
-    /// What [`window_scenario`] measured.
-    #[derive(Default)]
-    struct WindowReport {
-        /// The most bytes and messages the leader had in flight to the slow member.
-        flood_bytes: u64,
-        flood_messages: usize,
-        /// Rounds from the reconnect until the fast and the slow member applied what the leader
-        /// had; `None` if never within the scenario's rounds.
-        fast_rounds: Option<u64>,
-        slow_rounds: Option<u64>,
-    }
-    fn window_scenario(
-        window: super::super::drain::Window,
-        writes: u64,
-        slow: u64,
-    ) -> WindowReport {
-        WINDOW.with(|opened| opened.set(window));
-        let dir = tempfile::tempdir().unwrap();
-        let mut driven = Driven::new();
-        let voters: Vec<u64> = (1..=5).collect();
-        let clients: Vec<Client> = voters
-            .iter()
-            .map(|n| driven.open(dir.path(), *n, voters.clone(), None))
-            .collect();
-        WINDOW.with(|opened| opened.set(super::super::drain::Window::DEFAULT));
-        let mut pump = Pump::new(&clients);
-        let leader = driven.elect(&mut pump, &clients, 0, 1);
-        let tick = |driven: &mut Driven| {
-            for owner in 0..5 {
-                let period = driven.owner(owner).pace.period();
-                driven.advance(owner, period);
-            }
-        };
-        pump.lost = vec![2, 3];
-        for _ in 0..writes {
-            driven
-                .call(&mut pump, &clients[leader], |db| {
-                    db.exec("CREATE TABLE IF NOT EXISTS window_items(body)")?;
-                    db.exec("INSERT INTO window_items VALUES(zeroblob(16384))")?;
-                    Ok(Vec::new())
-                })
-                .unwrap();
-            tick(&mut driven);
-        }
-        pump.lost.clear();
-        let target = driven.owner(leader).replica.applied().index;
-        let mut report = WindowReport::default();
-        let most = writes
-            .saturating_mul(slow.saturating_add(1))
-            .saturating_mul(40)
-            + 4000;
-        for round in 0..most {
-            pump.held = if round % (slow + 1) == slow {
-                Vec::new()
-            } else {
-                vec![2]
-            };
-            tick(&mut driven);
-            driven.round(&mut pump);
-            if let Some(progress) = driven.owner(leader).replica.core().raft.tracker().get(3) {
-                report.flood_bytes = report.flood_bytes.max(progress.inflights.bytes());
-                report.flood_messages = report.flood_messages.max(progress.inflights.count());
-            }
-            if report.fast_rounds.is_none() && driven.owner(1).replica.applied().index >= target {
-                report.fast_rounds = Some(round + 1);
-            }
-            if report.slow_rounds.is_none() && driven.owner(2).replica.applied().index >= target {
-                report.slow_rounds = Some(round + 1);
-            }
-            if report.fast_rounds.is_some() && report.slow_rounds.is_some() {
-                break;
-            }
-        }
-        pump.held.clear();
-        driven.drain(&mut pump);
-        pump.finish();
-        report
-    }
-    /// What [`qb2_scenario`] measured.
-    #[derive(Default)]
-    struct Qb2Report {
-        fenced: usize,
-        shed: u64,
-        pauses: u64,
-        deepest: u64,
-        bound: u64,
-        before: usize,
-        after: usize,
-        refused: BTreeMap<String, usize>,
-        unanswered: usize,
-        latencies: Vec<u64>,
-    }
-    impl std::fmt::Display for Qb2Report {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let mut sorted = self.latencies.clone();
-            sorted.sort_unstable();
-            // Nearest rank: the ceil(q·n)-th smallest, q in thousandths.
-            let rank = |per_mille: usize| {
-                let n = sorted.len();
-                (n > 0).then(|| sorted[(per_mille * n).div_ceil(1000).max(1) - 1])
-            };
-            write!(
-                f,
-                "fenced={} shed={} pauses={} deepest={}/{} ok_before={} ok_after={} unanswered={} refused={:?} ticks_p50={:?} p99={:?} p99.9={:?}",
-                self.fenced,
-                self.shed,
-                self.pauses,
-                self.deepest,
-                self.bound,
-                self.before,
-                self.after,
-                self.unanswered,
-                self.refused,
-                rank(500),
-                rank(990),
-                rank(999),
-            )
-        }
-    }
-    /// One driven tick of [`qb2_scenario`]: every clock a tick on, then relay rounds and steps until
-    /// the group is quiet but for what its hosts hold. Driven by events, not by a poll: with nothing
-    /// to relay and no owner with more to drive, the round waits for a write out on an owner's disk
-    /// to end, whose end rings that owner's bell (its log's waker; its flushing thread's too).
-    fn qb2_round(
-        driven: &mut Driven,
-        pump: &mut Pump<'_>,
-        clients: &[Client],
-        fenced: &mut std::collections::BTreeSet<usize>,
-        report: &mut Qb2Report,
-    ) {
-        for owner in 0..clients.len() {
-            driven.advance_tick(owner);
-        }
-        // Rounds at this tick until the group is quiet but for what its hosts hold: nothing to
-        // relay, no owner that runs with more to drive, and no write out on its disk (one fenced
-        // or paused waits).
-        for _ in 0..ROUNDS {
-            let admitted = pump.drive_until(driven.until());
-            let running = |index: usize, owner: &Actor| {
-                !fenced.contains(&index) && !owner.paused().unwrap_or(false)
-            };
-            let driving = driven.owners.iter().enumerate().any(|(index, slot)| {
-                slot.as_ref()
-                    .is_some_and(|(owner, _)| running(index, owner) && owner.driving)
-            });
-            let writing = driven
-                .owners
-                .iter()
-                .enumerate()
-                .find_map(|(index, slot)| {
-                    slot.as_ref().filter(|(owner, _)| {
-                        running(index, owner)
-                            && (owner.replica.in_flight() != 0
-                                || matches!(owner.flushing, Flushing::Thread { out: true, .. }))
-                    })
-                })
-                .map(|(owner, _)| Arc::clone(&owner.control.bell));
-            if admitted == 0 && !driving {
-                let Some(bell) = writing else {
-                    break;
-                };
-                // The write's end rings the bell, and a ring before the wait is kept: no wake is
-                // lost, and the wait has no bound of its own, since a write out always ends.
-                bell.wait(Duration::MAX).unwrap();
-            }
-            qb2_steps(driven, pump, fenced);
-        }
-        for index in fenced.iter() {
-            if !pump.held.contains(index) {
-                pump.held.push(*index);
-            }
-        }
-        report.fenced = fenced.len();
-        let (mut shed, mut pauses) = (0, 0);
-        for client in clients {
-            let (s, p, depth, bound) = client.handle().egress().unwrap();
-            shed += s;
-            pauses += p;
-            if depth > report.deepest {
-                report.deepest = depth;
-                report.bound = bound.messages;
-            }
-        }
-        report.shed = shed;
-        report.pauses = pauses;
-    }
-    /// Every owner not fenced steps through its inputs; an owner that fences is counted, and its
-    /// records are lost from then on.
-    fn qb2_steps(
-        driven: &mut Driven,
-        pump: &mut Pump<'_>,
-        fenced: &mut std::collections::BTreeSet<usize>,
-    ) {
-        for (index, slot) in driven.owners.iter_mut().enumerate() {
-            if fenced.contains(&index) {
-                continue;
-            }
-            let Some((owner, inputs)) = slot.as_mut() else {
-                continue;
-            };
-            let mut result = Ok(());
-            while result.is_ok()
-                && let Ok(input) = inputs.try_recv()
-            {
-                result = owner.run_step(Some(input));
-            }
-            if let Err(error) = result.and_then(|()| owner.run_step(None)) {
-                assert!(matches!(error, Refusal::Fenced(_)), "{error:?}");
-                fenced.insert(index);
-                pump.lost.push(u64::try_from(index + 1).unwrap());
-                pump.held.push(index);
-            }
-        }
-    }
-    fn qb2_scenario(egress: super::super::drain::Egress, members: u64, writes: usize) -> Qb2Report {
-        let dir = tempfile::tempdir().unwrap();
-        let mut driven = Driven::new();
-        let voters: Vec<u64> = (1..=members).collect();
-        let clients: Vec<Client> = voters
-            .iter()
-            .map(|n| driven.open(dir.path(), *n, voters.clone(), None))
-            .collect();
-        for client in &clients {
-            client.handle().set_egress(egress);
-        }
-        let mut pump = Pump::new(&clients);
-        let leader = driven.elect(&mut pump, &clients, 0, 1);
-        driven.drain(&mut pump);
-        let election = u64::try_from(
-            driven
-                .owner(leader)
-                .replica
-                .core()
-                .raft
-                .config()
-                .election_tick,
-        )
-        .unwrap();
-        let mut report = Qb2Report::default();
-        let mut fenced = std::collections::BTreeSet::new();
-        // Phases by round: writes until `writes` are answered, every host stalled for two election
-        // timeouts, then the leader's host stalled for good.
-        let mut stall: Option<(u64, bool)> = None;
-        let mut pending: Option<(mpsc::Receiver<Result<Answered, Refusal>>, u64)> = None;
-        let most = election
-            .saturating_mul(400)
-            .saturating_add(u64::try_from(writes).unwrap() * election * 40);
-        for round in 0..most {
-            let after = stall.is_some_and(|(_, released)| released);
-            if after && report.after >= writes {
-                break;
-            }
-            if stall.is_none() && report.before >= writes {
-                pump.held = (0..clients.len()).collect();
-                stall = Some((round, false));
-            }
-            if let Some((at, false)) = stall
-                && round >= at + 2 * election
-            {
-                pump.held = vec![leader];
-                stall = Some((at, true));
-            }
-            if pending.is_none() {
-                // The member the others name leader; the stalled one names itself while it leads.
-                let named = clients
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| !after || *index != leader)
-                    .filter_map(|(_, client)| client.handle().status().ok())
-                    .map(|status| status.leader)
-                    .find(|named| *named != 0)
-                    .and_then(|named| usize::try_from(named).ok())
-                    .and_then(|named| named.checked_sub(1))
-                    .filter(|named| !fenced.contains(named));
-                if let Some(target) = named {
-                    let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-                        db.exec("CREATE TABLE IF NOT EXISTS qb2(value)")?;
-                        db.exec("INSERT INTO qb2 VALUES(1)")?;
-                        Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
-                    }))));
-                    let (response, receiver) = mpsc::sync_channel(1);
-                    let asked = clients[target].handle.enqueue(
-                        Input::Submit {
-                            namespace: String::new(),
-                            operation,
-                            application: None,
-                            until: driven.until(),
-                            response,
-                        },
-                        api::REQUEST_MAX,
-                    );
-                    match asked {
-                        Ok(()) => pending = Some((receiver, round)),
-                        Err(refusal) => {
-                            let kind = format!("{refusal:?}");
-                            let kind = kind.split(['(', ' ', '{']).next().unwrap_or("").to_string();
-                            *report.refused.entry(kind).or_default() += 1;
-                        }
-                    }
-                }
-            }
-            qb2_round(&mut driven, &mut pump, &clients, &mut fenced, &mut report);
-            if std::env::var("QB2_TRACE").is_ok() && round < 60 {
-                let seen: Vec<(u64, u64)> = clients
-                    .iter()
-                    .filter_map(|client| client.handle().status().ok())
-                    .map(|status| (status.leader, status.term))
-                    .collect();
-                eprintln!(
-                    "QB.2 trace round={round} pending={} (leader, term)={seen:?} refused={:?}",
-                    pending.is_some(),
-                    report.refused
-                );
-            }
-            if let Some((receiver, asked)) = pending.take() {
-                match receiver.try_recv() {
-                    Ok(Ok(_)) => {
-                        report.latencies.push(round - asked + 1);
-                        if after {
-                            report.after += 1;
-                        } else {
-                            report.before += 1;
-                        }
-                    }
-                    Ok(Err(refusal)) => {
-                        let kind = format!("{refusal:?}");
-                        let kind = kind.split(['(', ' ', '{']).next().unwrap_or("").to_string();
-                        *report.refused.entry(kind).or_default() += 1;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        *report.refused.entry("ended".to_string()).or_default() += 1;
-                    }
-                    // A write unanswered for ten election timeouts is given up on, counted.
-                    Err(mpsc::TryRecvError::Empty) if round - asked > 10 * election => {
-                        report.unanswered += 1;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => pending = Some((receiver, asked)),
-                }
-            }
-        }
-        // Records held for fenced or stalled members are never settled: the pump goes without its
-        // settling checks.
-        pump.abandon();
-        report
-    }
-
     /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): a change at
     /// its barrier when its lead is lost is refused, with nothing proposed. Do: in a group of three
     /// voters, the relay held, ask the leader for a change, then move its clock until its quorum
@@ -11333,7 +9881,7 @@ mod tests {
             pending_change(driven, leader) > proposed
         });
         // What goes on is what the proposal's round hadn't sent: its entry is lost with this.
-        clients[leader].handle().drain(usize::MAX).unwrap();
+        clients[leader].handle().drain(OUTGOING_MESSAGES).unwrap();
         let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
         let answered = (0..ROUNDS)
             .find_map(|_| {
@@ -11567,7 +10115,7 @@ mod tests {
             .owner_mut(0)
             .replica
             .machine_mut()
-            .set_snapshot_bytes(usize::MAX);
+            .set_snapshot_bytes(WIRE_IMAGE_BYTES);
         let added = driven
             .answer(
                 &mut pump,
@@ -11628,7 +10176,7 @@ mod tests {
         reach(&mut driven, &mut pump, "the removal appended", |driven| {
             pending_change(driven, leader) > proposed
         });
-        clients[leader].handle().drain(usize::MAX).unwrap();
+        clients[leader].handle().drain(OUTGOING_MESSAGES).unwrap();
         let counts = |driven: &Driven| {
             driven
                 .owner(leader)
@@ -11660,7 +10208,7 @@ mod tests {
             Err(Refusal::Invalid { why, .. }) if why == "sender is not a current member"
         ));
         // Lost too: whatever that step had the old leader send.
-        clients[leader].handle().drain(usize::MAX).unwrap();
+        clients[leader].handle().drain(OUTGOING_MESSAGES).unwrap();
 
         let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
         let answered = (0..ROUNDS)
@@ -13809,7 +12357,7 @@ mod tests {
             )
         });
         // What goes on is what the proposal's round hadn't sent: its entry is lost with this.
-        clients[leader].handle().drain(usize::MAX).unwrap();
+        clients[leader].handle().drain(OUTGOING_MESSAGES).unwrap();
         let others: Vec<usize> = (0..3).filter(|owner| *owner != leader).collect();
         let answered = (0..ROUNDS)
             .find_map(|_| {
@@ -15173,7 +13721,7 @@ mod tests {
         );
         // Past hyper-durable's quiet period, so each owner states its durable commit before it stops.
         for owner in 0..3 {
-            driven.advance(owner, past_quiet(&driven, owner));
+            driven.advance(owner, Duration::from_millis(60));
         }
         for _ in 0..8 {
             driven.round(&mut pump);
@@ -15298,7 +13846,7 @@ mod tests {
             assert_eq!(driven.call(&mut pump, client, unchanged).unwrap(), original);
         }
         for owner in 0..3 {
-            driven.advance(owner, past_quiet(&driven, owner));
+            driven.advance(owner, Duration::from_millis(60));
         }
         for _ in 0..8 {
             driven.round(&mut pump);
@@ -16113,20 +14661,9 @@ mod tests {
     }
     /// Free bytes that give each of `logs` replica logs on a filesystem `frames` frames past what
     /// its own file holds (`log_bound::log_room`).
-    /// The image takes the smaller of its memory room and its disk share (QB.1): past the memory
-    /// room's own frames, the free bytes are the logs' frames and that room; below it, the image
-    /// takes one log's share.
     fn free_for(frames: u64, logs: u64) -> u64 {
-        // A voter and a learner (`voter_and_learner`): the bound of their first configuration.
-        let members = crate::replication::members::first(2);
-        let memory = u64::try_from(owner_image_room(members).unwrap()).unwrap();
-        let each = log_bound::FRAME_BYTES + crate::db::PAGE_BYTES;
-        let past = memory + frames * logs * each;
-        if memory <= log_bound::image_disk_room(past, logs) {
-            past
-        } else {
-            frames * (logs + 1) * each
-        }
+        u64::try_from(owner_image_room().unwrap()).unwrap()
+            + frames * logs * (log_bound::FRAME_BYTES + crate::db::PAGE_BYTES)
     }
     /// The frames owner `owner`'s database log may hold, as it last learned them.
     fn room(clients: &[Client], owner: usize) -> u64 {
@@ -16572,7 +15109,6 @@ mod tests {
             caught_up,
             busy,
             room: 64,
-            image: u64::MAX,
             unread: None,
         };
         assert!(hold_due(&pass(false, false), true, true));
@@ -16684,7 +15220,7 @@ mod tests {
                         until: Instant::now() + HANG_READ,
                         response,
                     },
-                    0,
+                    CHANGE_BYTES,
                 )
                 .unwrap();
             answers.push(answer);
@@ -16880,13 +15416,8 @@ mod tests {
         }
         assert_eq!(logs(), 1);
         let free = free_for(64, 2);
-        // A voter and a learner (`voter_and_learner`): the bound of their first configuration.
-        let members = crate::replication::members::first(2);
-        let memory = u64::try_from(owner_image_room(members).unwrap()).unwrap();
-        let image = |logs| memory.min(log_bound::image_disk_room(free, logs));
-        assert!(
-            log_bound::log_room(free, image(1), 1, 0) > log_bound::log_room(free, image(2), 2, 0)
-        );
+        let image = u64::try_from(owner_image_room().unwrap()).unwrap();
+        assert!(log_bound::log_room(free, image, 1, 0) > log_bound::log_room(free, image, 2, 0));
         drop(clients);
     }
 
@@ -16949,17 +15480,8 @@ mod tests {
             let (kept, taken) = mpsc::sync_channel(1);
             let capture = submit(clients.first().unwrap(), until, move |_| {
                 // The owner is inside this capture: nothing admitted now can be processed yet.
-                // The capture was taken from the channel, so the records fill it but for the
-                // legacy record's place (lane constants-20). The owner is inside the capture, so
-                // no rebound moves the bound; before any intake is measured it is the room's
-                // envelopes, millions, so the test holds it to the 64 inputs it fills.
-                let commands = handle.command_bound().min(64);
-                handle
-                    .shared
-                    .command_bound
-                    .store(commands, Ordering::Release);
                 let mut receipts = Vec::new();
-                for _ in 0..commands - 1 {
+                for _ in 0..COMMANDS - 1 {
                     receipts.push(handle.admit_receive(2, vec![0xff], until).unwrap());
                 }
                 assert!(
@@ -16973,23 +15495,24 @@ mod tests {
                     finished.send(legacy.receive(2, vec![0xff], until)).unwrap();
                 });
                 // Wait for the legacy record's actual queue reservation, not thread scheduling.
-                // Held: the capture's worst case and a byte for each of the records, and an
-                // envelope for each of them all, the capture's too (lane constants-21).
-                let held = api::REQUEST_MAX + commands + (commands + 1) * ENVELOPE_BYTES;
                 for _ in 0..ROUNDS {
-                    if handle.shared.admitted.load(Ordering::Acquire) == held {
+                    if handle.shared.admitted.load(Ordering::Acquire) == api::REQUEST_MAX + COMMANDS
+                    {
                         break;
                     }
                     std::thread::park_timeout(POLL);
                 }
-                assert_eq!(handle.shared.admitted.load(Ordering::Acquire), held);
+                assert_eq!(
+                    handle.shared.admitted.load(Ordering::Acquire),
+                    api::REQUEST_MAX + COMMANDS
+                );
                 assert!(matches!(
                     finishing.try_recv(),
                     Err(mpsc::TryRecvError::Empty)
                 ));
                 assert!(matches!(
                     handle.admit_receive(2, vec![0xff], until),
-                    Err(Refusal::Full { limit }) if limit == commands
+                    Err(Refusal::Full { limit: COMMANDS })
                 ));
                 kept.send((receipts, finishing, processed)).unwrap();
                 Ok(Vec::new())
@@ -17250,7 +15773,7 @@ mod tests {
                 while !stop.load(Ordering::Relaxed) {
                     let mut moved = 0;
                     for (from, handle) in (1u64..).zip(&handles) {
-                        for record in handle.drain(usize::MAX).unwrap_or_default() {
+                        for record in handle.drain(OUTGOING_MESSAGES).unwrap_or_default() {
                             let to = usize::try_from(record.to - 1).unwrap();
                             let deadline = Instant::now() + Duration::from_secs(5);
                             let _ = handles

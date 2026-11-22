@@ -29,11 +29,11 @@ use crate::{
     translate::collate::CollationSeq,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
-    BusyHandlerCallback, BusyWake, CaptureDataChangesInfo, CheckpointMode, CheckpointResult,
-    CipherMode, Cmd, Completion, ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog,
-    DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError,
-    MvStore, OpenFlags, PageSize, Pager, Program, QueryMode, QueryRunner, Result, Schema,
-    Statement, SyncMode, TransactionMode, Trigger, Value, VirtualTable, WalAutoActions,
+    BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
+    Completion, ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
+    EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
+    Pager, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
+    Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -809,9 +809,6 @@ pub struct Connection {
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
     pub(super) busy_handler: RwLock<BusyHandler>,
-    /// Amphora (lane constants-22): true when a busy statement waits on SQLite's schedule (the
-    /// control, [`BusyWake::Schedule`]) instead of a lock's release.
-    pub(super) busy_schedule: AtomicBool,
     /// Step-based progress callback for SQLite-compatible cancellation hooks.
     pub(super) progress_handler: ProgressHandler,
     /// Maximum execution time for a single statement on this connection.
@@ -5945,22 +5942,6 @@ impl Connection {
             BusyHandler::Timeout(duration)
         };
         self.bump_prepare_context_generation();
-    }
-
-    /// Amphora (lane constants-22): how a statement that finds the database busy waits under the
-    /// busy timeout: on a lock's release (the default) or on SQLite's schedule (the control).
-    pub fn set_busy_wake(&self, wake: BusyWake) {
-        self.busy_schedule
-            .store(wake == BusyWake::Schedule, Ordering::Relaxed);
-    }
-
-    /// [`Self::set_busy_wake`]'s choice.
-    pub fn busy_wake(&self) -> BusyWake {
-        if self.busy_schedule.load(Ordering::Relaxed) {
-            BusyWake::Schedule
-        } else {
-            BusyWake::Release
-        }
     }
 
     /// Get the busy timeout duration.

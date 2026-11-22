@@ -276,12 +276,6 @@ impl Votes {
             members,
         }
     }
-    /// Raises the most members that vote an index ([`crate::Raft::grow_members`]). The votes'
-    /// bytes stay what the core was opened with: a vote past them is dropped, and the leader
-    /// decides by fewer votes and commits by the classic track.
-    pub fn grow_members(&mut self, members: usize) {
-        self.members = self.members.max(members);
-    }
     /// Whether no vote is held.
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()

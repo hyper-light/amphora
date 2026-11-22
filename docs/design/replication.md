@@ -212,8 +212,8 @@ joint configuration leaves, empty outside one). `ReplicaHandle::transfer` hands 
   below: a deadline once the joint configuration is applied. A change the configuration already
   shows proposes nothing and answers at once. A change the core would refuse when applied (one that
   leaves no voter) is refused before it is proposed, by applying hyper-raft's own `Plan` to the
-  configuration, so it is never committed as a change that changes nothing. A change past the
-  group's member bound raises the bound first ("The member bound stated once per group", below).
+  configuration, so it is never committed as a change that changes nothing. The same check refuses
+  one past the members a group may have (`TooLarge`, `MEMBERS` and the core's `Limits::members`).
   The leader neither demotes nor removes itself (`Invalid`): it hands its lead to another voter with
   `transfer` (hyper-durable's `Replica::transfer`, Raft's leadership transfer, Ongaro's
   dissertation, section 3.10), and that voter, once leading, changes it. `transfer` is taken only by
@@ -1437,7 +1437,7 @@ held quorum can then sit within one real fate.
   encoding of the class as `api::replication::Durability`, its fates in canonical order (`database::canonical`,
   sorted by member). It holds at most what the largest class encodes to (`ENTRY_BYTES`, 2026-11-11, in place of a
   picked 64 KiB): postcard's varints (postcard.jamesmunns.com, "Wire Format": a tag or u32 at most 5 bytes, a length
-  or u64 at most 10) for the tag, the fates' length, two u64s for each of the most members (the group's member bound, below)
+  or u64 at most 10) for the tag, the fates' length, two u64s for each of the most members (`replicated::MEMBERS`)
   and the span: 1,317 bytes with the 17-byte prefix; a class past the members is refused
   (`a_class_entry_holds_the_most_members_and_no_more`). A leader proposes it in its term whenever its machine records no class: at bootstrap that is
   the group's first leader; for a group from before this change, the first leader that runs it. Two leaders may
@@ -2060,7 +2060,7 @@ learned length closes (b), and the queue at append with the held barrier closes 
 (b) apart in a run: a slot lost to time ends `expired`.
 
 **Bounds.** The queue, the waiting barriers, the learned gaps and the held forwards are each at most one per member
-of the configuration (at most the group's member bound): the owner keeps them to its members each step (`Slots::keep`). A second
+of the configuration (at most `MEMBERS`): the owner keeps them to its members each step (`Slots::keep`). A second
 barrier from a member whose first still waits steps the first, and a second forward from a held member ends the slot
 or the turn. The held messages number at most (members − 1)
 forwards plus one ReadIndex per member. Each keeps its admission reservation, so its
@@ -2470,251 +2470,12 @@ free on its filesystem (`log_bound::log_room` takes it as an argument). A machin
 (`Machine::set_snapshot_bytes`): the replicated owner's command queue holds back room for one wire record's image
 (`WIRE_IMAGE_BYTES`), so that owner's image is the smaller of the two.
 
-**What was left.** `WIRE_IMAGE_BYTES` (256 MiB), the owner's queue's split, went with `QUEUED_BYTES` ("Decision
-(lane constants): the queue bounds by drain rate"; QB.1).
+**What is left.** `WIRE_IMAGE_BYTES` (256 MiB) is the owner's queue's split, picked with `QUEUED_BYTES`, and goes
+with it when the queue is sized from the budget and its measured drain.
 
 **Tests.** `image_room_tests::sb1_an_image_is_bounded_by_the_memory_budgets_room_for_one` (T-SB.1.1);
 `log_bound::tests::a_log_takes_its_file_and_an_equal_share_of_what_is_free_past_one_image`, the image's room passed in
 (T-SB.1.2).
-
-## Decision (lane constants): the queue bounds by drain rate (2026-11-22)
-
-The replicated owner's queues were bounded by picked numbers: the command queue at 512 MiB (`QUEUED_BYTES`, with a
-second copy for the local writer's queue in `database.rs`), the outgoing queue at 512 MiB and 4096 messages
-(`OUTGOING_BYTES`, `OUTGOING_MESSAGES`), and the image one wire record carries at 256 MiB (`WIRE_IMAGE_BYTES`).
-
-**The decision (QB.1).** A queue holds what its reader takes in an election timeout: what waits longer is older than
-the time in which the group elects another leader, so holding more serves no one. Each queue's drain rate is measured
-in bytes and messages a second, the outgoing queue's in `ReplicaHandle::drain` (its reader the host) and the command
-queue's at the owner's intake, each a decaying ratio of sums with RFC 6298's gain of 1/8, as the compaction's costs are
-(CT.1; `database/drain.rs`). An interval counts when the queue held work at its start or its reader took some in it.
-The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). The bounds are read
-again at each tick of the pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`).
-- The outgoing queue holds the lesser of its host's rate times that timeout and the memory budget's room for queues
-  (MB.1), at least a record to each peer (one broadcast: a leader's heartbeats or appends), and the room before any
-  drain is measured. A bound below one broadcast would shed a record of every broadcast.
-- The command queue's bytes are the budget's room for queues. Application calls hold that room less one wire record's,
-  so that calls waiting for a leader cannot block the wire record that finds one. A wire record's image is the
-  budget's room for one (SB.1), held inside the command queue's bound.
-- Application calls are also counted (`Control::call_bound`): no more than the inputs the owner takes in an election
-  timeout at its learned message rate (`Drain::bound(..).messages`), at least one, and never more than the queue's
-  slots less one, so that a wire record always finds a slot. Before the intake is measured, the slots less one.
-- A call is charged its worst case (`REQUEST_MAX`, 32 MiB), while the intake's byte rate is learned mostly from small
-  wire records. A byte bound learned from that rate fell to one call and refused a change of members queued beside it
-  (`every_falsifier_of_the_floor_holds_under_a_nemesis`). So calls are bounded in count by the rate and in bytes by the
-  room, never in bytes by the rate. A call refused for its count is `Full` at the count bound, one refused for its
-  bytes `Full` at the calls' byte bound.
-
-The local writer's queue has no election: each request it admits is charged to the budget's room for queues, refused
-`Full` at that room.
-
-**A bound that starts small grows before it fences.** A full outgoing queue fenced the owner. Now a queue past the
-budget's room fences at once, since memory can't be lent; one past what its host drains in an election timeout fences
-only once it has stayed past it for a whole election timeout, so that a burst at start, before any drain is measured,
-waits for the host's drain to be measured and the bound to grow.
-
-**What is left.** `MEMBERS` is the group's, stated in its log (lane constants-21, below); `COMMANDS` is derived
-(lane constants-20). The
-framing a wire record adds (`FRAMING_BYTES`) is derived (below). The image cap set on
-the owner's machine is the wire record's room at open; the room read later bounds images through `image_room`.
-
-**Amendment (QB.2, lane constants-17, 2026-11-22, not yet landed): past the outgoing bound, shed; don't fence.**
-What the owner does once its outgoing queue is past its learned bound is one switch (`drain::Egress`) with three
-candidates: `Fence` (the rule above, the control), `Shed` (drop the oldest records until the new one fits, count each,
-and report its member unreachable, so raft sends again what the member lacks; etcd's rafthttp drops a message whose
-peer's buffer is full and reports the peer unreachable) and `Pause` (no input and no raft step while the queue is at
-its bound; the host's drain rings the owner). The default is `Shed`. In two driven tests whose relay is held while the
-leader's clock moves, both fence under `Fence`, and under `Pause` the leader never steps down, because a paused leader
-doesn't tick (`a_change_at_its_barrier_is_refused_once_the_lead_is_lost`). Both pass under `Shed`. A shed record is a
-lost packet, which raft already tolerates; a fence ends the member, and a pause keeps a stalled leader in office.
-A shed is made good by events (lane constants-19): a report of unreachable gives up the member's window, but a probe
-already out waits for an answer, so raft would send again only on its next heartbeat tick, and never while a driven
-test keeps time still (the likely cause of `a_change_past_its_deadline_answers_what_its_stage_knows` never
-settling; not yet confirmed by a run). Now a shed marks a
-resend owed (`Outgoing::owed`); the host's next drain rings the owner, and once the queue has room for a record to
-each peer the leader beats (`Actor::resend`). Each member's heartbeat answer resumes its probe and brings the entries
-it lacks. A follower's shed record is a lost answer, which its leader's heartbeat timeout makes good, as on a lossy
-link. The
-A/B scenario (`qb2_many_slow_one_stalled_for_good_by_egress`: every host slows at once, then the leader's host stalls
-for good) is driven by events (lane constants-19: a round waits on a writing owner's bell, not a poll, and counts an owner
-with more to drive as busy), and prints each candidate's numbers; its run of record is the coordinator's. Application calls are held to their own bound apart from the
-wire records queued beside them (`Control::called`).
-
-**Derivations for the numbers still picked.**
-- `FRAMING_BYTES` is derived (lane constants-19), a format value: what a wire record adds past the command its one
-  entry carries. That is the record's fixed bytes with its classic commit and checksum (`MESSAGE_RECORD_FIXED_BYTES`)
-  and an incarnation and end (`MESSAGE_TOLD_BYTES`), counted for any record; the entry's fixed bytes
-  (`ENTRY_FIXED_BYTES`, hyper-raft `wire.rs`); its context (the request identity `Actor::context` writes: four u64s);
-  and what a prepared transaction's encoding adds to its pages (`replication::COMMAND_ENVELOPE`, EN.1). It was a
-  picked 2 MiB. An image's record is framed apart (`image_framing(members)`): the record's bytes, the snapshot's
-  presence, data length, index and term, and a `ConfState` of four sets of at most the group's member bound of eight-byte ids, beside
-  the pages' encoding of its budget (`replication::image_envelope`). An image's cap is the most whose record fits a
-  wire record's room (`image_within`).
-- `unstable_entries` and `entries_per_message` are no longer overridden (lane constants-19). `hyper_raft::Limits::derive`
-  derives them, the first from the memory stated over `size_of::<Entry>()` and the second from a message's payload
-  over `ENTRY_FIXED_BYTES`. The memory stated is the budget's room for queues (MB.1), read at open, in place of the
-  picked `64 << 20`. `pending_reads` is no longer overridden either (lane constants-20): `Limits::derive` takes it
-  from the memory stated over `size_of::<PendingRead>()`, and every read asked comes through the command queue, whose
-  inputs are bounded apart. `proposals` stays one, since one command at a time crosses ReadIndex.
-- A leader's uncommitted bytes and a ready's committed bytes (`max_uncommitted_size`, `max_committed_size_per_ready`)
-  are the budget's room for queues, at least one message (lane constants-20; were a picked 64 MiB each): both are held
-  in memory beside the queues.
-- A seed chunk's framing (`bootstrap::FRAMING`) is derived from its postcard encoding (lane constants-20; was a picked
-  1024): the prefix, the declaration's node varint and 32-byte identity, and the offset, total and image length
-  varints.
-- `COMMANDS` is derived (lane constants-20). The command queue is an unbounded channel whose inputs `Control` counts
-  (`Control::commands`), each held at enqueue to `Bounds::commands`: what the owner takes in the learned election
-  timeout at its learned message rate (`Drain::bound(..).messages`), at least a call and a wire record, and no more
-  than the budget's room for queues holds of an input's least in memory, its own envelope (`size_of::<Envelope>()`):
-  a wire record may carry no bytes, so bytes alone would not bound the count. Before anything is measured, the room's
-  envelopes. Calls are counted one fewer, so a wire record always finds a place. An input's place is given back when
-  the owner takes it from the channel (`Reservation::taken`), as a bounded channel's slot was; waiting calls are held
-  to the same bound. The pump's receipts in the tests grow to the bound (`Pump::receipts`). T-QB.1.6 tests the counts.
-- Each queued input is charged its envelope (`ENVELOPE_BYTES`, `size_of::<Envelope>()`) against the queue's bytes,
-  beside what it carries (lane constants-21): memory is counted once, in the bytes, and bounded once, by them, where
-  before a count of envelopes and a byte bound that left them out together allowed up to twice the room. A change of
-  members, a hand-off and a catch-up carry nothing past their envelope (were charged `size_of::<Input>()`), an
-  attestation its name. The room held back for a wire record holds its envelope too. T-QB.1.10 tests the charge.
-- `MEMBERS` (was 64) is gone (lane constants-21): see "The member bound stated once per group", next.
-
-**Still picked in the replication code (lane constants-20's survey), each with what it should come from.**
-- `max_inflight_msgs` (4) and `max_inflight_bytes` (64 MiB), the window to each member: now the control of an A/B
-  (lane constants-21, "The window to each member", below).
-- hyper-log's settings at open (`segment_bytes` 64 MiB, `max_segments` 16, `group_entries` 65 536, `group_bytes`
-  512 MiB, `group_cache` 64 MiB, `queue_submissions` 16): the log's disk room (`log_bound::log_room`) and an image's
-  share, the memory budget's room for caches, and the device's measured queue depth.
-- `quiet` is now the learned election timeout (lane constants-21; was focal F17's picked 50 ms): the core's election
-  ticks of the start pace at open, and of the learned pace at each repace (`quiet_period`, `Replica::set_quiet`), so a
-  member a group takes for lost after an election timeout has stated what it applied by then. Tests that let an owner
-  state its durable commit before it stops advance its clock a tick past it (`past_quiet`). T-QB.1.12 tests it.
-- `TICK` (10 ms): to remove (below).
-- `CHECKPOINT_EVERY` (25 ms, measured once on fedora): learned from this host's checkpoint costs, as `compacting`
-  learns compaction's.
-- The log device's alignment (4096): the device's logical block size, read at open.
-- `serve::OUTGOING_MESSAGES` (4096, CP-T1.13's peer senders): the outgoing queue's learned bound in messages.
-- `compaction::ENVELOPE` (81): stated as a format value; it could be worked out from the encoding as
-  `COMMAND_ENVELOPE` is.
-Format and requirement values, not picked: `PAGE_BYTES`, `FRAME_BYTES`, `U64_MOST`, `U32_MOST`, `LAG_SAMPLES` (the
-p99 quantile's), `COMMIT_TAIL` (AC-T1.3.4's bound).
-
-**To remove: event-driven (Ada, 2026-11-22).** `TICK`, `POLL` and `DRIVE_QUANTUM`, and any driver that wakes on a timer,
-are to be removed, with that work driven from events, not given better intervals. The election and heartbeat
-timeouts stay learned, since they are truly about time. Lane repl-measure-8 owns the commit path's timer waits
-(`run_loop`, `deadline`, `Bell`).
-
-**Tests.** `drain::tests::drain_nothing_measured_bounds_one_record` (T-QB.1.1),
-`drain_bound_is_rate_times_election_timeout_within_room` (T-QB.1.2), `drain_bound_follows_the_reader_and_ignores_no_time`
-(T-QB.1.3), `replicated::tests::queue_bound_a_burst_at_start_grows_before_it_fences` (T-QB.1.4),
-`replicated::tests::t_qb_1_6_command_queue_inputs_counted_by_rate_within_the_room` (T-QB.1.6) and
-`patience::tests::t_qb_1_7_a_leader_measures_the_members_its_core_was_opened_for` (T-QB.1.7).
-
-## The member bound stated once per group (lane constants-21, 2026-11-22, not yet landed)
-
-hyper-raft stops a member handed a configuration of more members than it was opened for (`Progress::apply`, "a
-configuration of more members than the member was opened for"), so the bound is the group's, not a member's own. Lane
-constants-20 weighed three ways to derive it and found each fails: the memory room differs between hosts, the members a
-member is configured with differ between a founder and a joiner (a one-voter group could never add member 2), and a
-format bound (about 1.6 million) would take megabytes of every image record. The rule now (`replication::members`):
-- **Stated in the log, as the class is.** A bound entry is its own kind of log entry: the prefix
-  `amphora.members.v1\0` and the bound as a little-endian u64 (27 bytes). The machine records the highest bound
-  applied (`__amphora_member_bound`, part of the image), and a lower or equal one changes nothing, the same at every
-  member because it depends on the log alone.
-- **Opened with the log's bound.** A member opens its core with the bound its log recorded, and before any, with
-  twice the members of the configuration it opens with, two at least (`members::first`): every founder opens with the
-  one first configuration, so all hold the same bound, with room to grow. A member opened with more than its log
-  recorded (a joiner told today's members) keeps the larger: a bound only rises.
-- **Raised ahead of the change that needs it.** A change whose configuration would pass the leader's bound first
-  proposes a bound entry of twice the bound, or the new member count if that is more (`members::grown`; doubling's
-  amortized constant cost per member added, Cormen et al., "Introduction to Algorithms", 3rd ed., section 17.4), then
-  the change behind it (`Actor::raise_members`). While a write is under way, the change waits (`Stage::Raising`) until
-  it ends, as the class entry does, because the bound entry moves the point the write was prepared at.
-- **Taken as the entry is taken.** The core raises its own bound as it takes an entry that states one, before the
-  configuration changes behind it take effect: hyper-raft puts a configuration in force when its entry is appended,
-  not applied, so raising on apply would come too late at a follower that takes both entries in one append. This is a
-  vendored change to hyper-raft (`vendor/patches/hyper-raft/0006-…`): `Config::stated_members` is the owner's reader
-  (`members::stated`), read as entries are taken at open as after, so a member reopened with a bound entry and the
-  change behind it taken and neither applied opens in bound; and `Raft::grow_members` raises the tracker's, the fast votes' and the pending reads' bounds
-  with it. The fast votes' bytes stay what the core opened with: a vote past them is dropped, and the leader commits
-  by the classic track. An image installed brings the bound recorded before it, which the core then takes
-  (`Actor::keep_member_bound`), and the voters the leader's quorum patience measures follow the core's bound
-  (`patience::Answers::grow`), so a voter added past the old bound is measured.
-- **What is still open.** A joiner that installs an image whose configuration names more members than its own opening
-  bound fails in hyper-raft before the machine sees the image's bound. A joiner opened with the group's members today
-  is in bound. Carrying the bound in the snapshot itself would close this; it needs a hyper-raft wire change,
-  written up below ("The joiner's image and the member bound"), not built.
-  A member whose core took an uncommitted bound entry that a new leader replaced keeps the higher bound; that only
-  costs room. `IMAGE_FRAMING_BYTES` is now `image_framing(members)`, sized by the bound, read on the flushing thread
-  as it rises (`Machine::members_shared`).
-- **Tests.** `members::tests::t_qb_1_8_a_bound_entry_states_the_bound_and_growth_always_fits` (the entry, the first bound,
-  and 2, 4, 8, 16 as a group grows to 9) and `replicated::tests::t_qb_1_9_a_one_voter_group_grows_to_five_then_nine_members`
-  (driven: a voter grows its group to 5 members, then 9, beside a running learner that took the raising entries with
-  the changes behind them, then reopens with the 16 its log recorded).
-
-### The joiner's image and the member bound: the wire change it needs (lane constants-22, not built)
-
-- **The failure.** `Raft::restore` (vendored `crates/hyper-raft/src/raft.rs`) rebuilds the tracker from the image's
-  `SnapshotMetadata::conf_state` with `config.limits.members`, the bound the joiner opened with. An image whose
-  configuration names more members than that fails there (`Tracker::new`, then `Progress::apply`: "a configuration of
-  more members than the member was opened for"), before Amphora's machine restores the image and reads the
-  `__amphora_member_bound` it records. `Config::stated_members` doesn't help: it reads entries as they are taken, and an
-  image carries no entries.
-- **The change.** The bound travels with the image's metadata, in hyper-raft's own record, so the core can raise its
-  bound before it builds the tracker:
-  - `SnapshotMetadata` gains `members: Option<u64>`: the bound in force at `index`, as the core held it when the image
-    was made (its tracker's bound; the owner's `stated_members` reader has already folded every bound entry through
-    `index` into it).
-  - The wire (`wire.rs`, `impl Record for Snapshot`, kind 5, docs/raft.md section 3.1): a third presence bit,
-    `HAS_MEMBERS = 1 << 2`, valid only with `HAS_METADATA`, and the bound as a little-endian u64 after the
-    configuration. `body_len` adds 8 when present. A record without the bit decodes as `members: None`, so an image
-    from an older member still reads. An older decoder refuses the new bit (`take_body` rejects unknown presence
-    bits), so a group mixes versions only if the leader leaves the bit off until every member decodes it: hyper-raft
-    has no capability exchange for that, so the bit is set only when the owner says so (`Config::image_members`,
-    off by default), and Amphora turns it on once every member runs the patched core, in the same release as the
-    member bound itself (which isn't landed either, so no Amphora group has mixed versions to cover).
-  - `Raft::restore`: before `Tracker::new`, `self.grow_members(members)` when the image states more than the core
-    holds (the patch-0006 path: tracker, fast votes and pending reads raised together; a bound only rises), then the
-    tracker is built with the raised bound. The image's own `members` is checked against the configuration it
-    carries (a bound below its own configuration's count is a corrupt image: `Error::Violation`).
-  - Wherever the core fills an image's metadata for a send (`Storage::snapshot`'s caller in `raft.rs`): `members:
-    Some(self.config.limits.members)` when `image_members` is on.
-  - `hyper-durable`'s replica passes nothing new: the metadata is the core's.
-- **Amphora's side.** None in the protocol: `Actor::keep_member_bound` already takes the image's recorded bound
-  after restore, and with the core raised first it finds the core in bound. The joiner's opening bound no longer
-  has to cover the group's current size; it only has to cover the configuration it opens with.
-- **Cost.** Eight bytes per image record; one comparison at restore.
-- **Tests it would need.** A wire round trip with and without the bit (and an old record decoding as `None`); a
-  restore of an image naming more members than the core's bound raising it and building the tracker; a driven
-  test where a joiner opened with one member installs the image of a nine-member group and serves.
-- **Where it lives.** It is a change to hyper-raft's wire, so it belongs upstream or in the one shared series
-  (`vendor/hyper-raft/UPSTREAM.md`, "The two QB.1 changes reach kiln's and Quiver's copies too"): Ada's call.
-
-## The window to each member (lane constants-21, 2026-11-22, not yet landed)
-
-What a leader keeps in flight to each member, ahead of its answers, was a picked 4 messages and 64 MiB. It is now one
-switch (`drain::Window`) with two candidates, the picked one kept as the control:
-- `Picked`: 4 messages and 64 MiB to every member, as before.
-- `Carried` (the default): hyper-raft's own rule (mantle note 32 R16): no count of its own (`usize::MAX`), and twice
-  what the path carries in a round trip (`hyper_timing::inflight_window`, `Replica::set_carriage`). What the path
-  carries is the bytes the host drained to that member (`Outgoing::drained_to`, a `Drain` per member) over its round
-  trip as `pace` measures it from heartbeats' and votes' answers (`Pace::round_trip`), at least a record's own bytes
-  (`RECORD_BYTES`, a format value). A window that holds nothing still sends one entry, however large (hyper-raft's
-  `Inflights::full`), so a path drained of nothing still carries an append; one whole message (32 MiB) as the floor
-  would be about the picked 64 MiB again. Before a path is measured, the window is the memory room for queues (at
-  least one message), the only bound known before a path has drained, as the queues' bounds start (QB.1): a test whose
-  time stands still, and so never measures a path, sends as before. A path carries only what its window let out, so the window doubles each rebound while the path
-  keeps up, and holds where it doesn't, as TCP's slow start grows its window by what is acknowledged (RFC 5681 §3.1).
-  `Actor::carry` sets it at each rebound, from events the owner already counts, no timer of its own.
-
-Each candidate's failure mode, forced by one driven scenario (`window_slow_flooded_fast_starved`): five voters, members
-2 and 3 cut off while the leader commits with 4 and 5, then both reconnected, member 3 slow (its answers held for most
-rounds) and member 2 fast. `Picked` floods the slow member: up to 64 MiB in flight to a path that drains a little a
-round. `Carried` may starve the fast member: once measured, its window is what it carried, and doubles only as the path proves it
-carries more. The scenario prints the most bytes and messages in flight to the slow member and the rounds each member
-took to catch up; its run of record, and the choice of the default, are the coordinator's
-(`WINDOW_WRITES=512 WINDOW_SLOW=16 cargo test -p amphora --locked --lib -- --nocapture window_slow_flooded_fast_starved`).
-Open: a member's round trip is measured only from heartbeats and votes, so a learner's comes from the leader's
-heartbeats to it; the per-member drain is weighed at the owner's rebound, which still follows `TICK` (to remove,
-above).
 
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 

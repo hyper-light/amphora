@@ -1,82 +1,5 @@
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::sync::Mutex;
 use crate::MonotonicInstant;
-use std::task::Waker;
 use std::time::Duration;
-
-/// Amphora (lane constants-22, goal "no picked constants"): how a statement that finds the database
-/// busy waits under a timeout handler ([`BusyHandler::Timeout`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BusyWake {
-    /// Until a lock it could be waiting on is released ([`LockRelease`]), with the busy timeout as
-    /// its deadline only. A statement stepped without a waker, or on a log whose holders may be in
-    /// another process (which no event here sees), waits on SQLite's schedule instead.
-    #[default]
-    Release,
-    /// SQLite's schedule (`sqliteDefaultBusyCallback`: 1, 2, 5 ... 100 ms): the control.
-    Schedule,
-}
-
-/// Amphora (lane constants-22): the event a busy statement waits on: a lock of the log's shared
-/// state (the write lock, a read mark, the checkpoint lock, the vacuum lock) released, or a commit
-/// published. Each release counts once (`generation`); a statement reads the count before it tries
-/// its locks, so a release between its failed try and its wait is never missed: [`Self::wait`]
-/// sees the count moved and the statement tries again at once. The wakers held are those of the
-/// statements busy on this log now, at most one each (a waker already held isn't held twice).
-#[derive(Debug)]
-pub struct LockRelease {
-    generation: AtomicU64,
-    /// Whether any waker is held, so a release with nobody waiting takes no lock.
-    armed: AtomicBool,
-    wakers: Mutex<Vec<Waker>>,
-}
-
-impl Default for LockRelease {
-    fn default() -> Self {
-        Self {
-            generation: AtomicU64::new(0),
-            armed: AtomicBool::new(false),
-            wakers: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl LockRelease {
-    /// The releases so far.
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
-    }
-
-    /// Holds `waker` for the next release after `seen`: true. False when one came already: try
-    /// again now.
-    pub fn wait(&self, seen: u64, waker: &Waker) -> bool {
-        let mut wakers = self.wakers.lock();
-        self.armed.store(true, Ordering::SeqCst);
-        if self.generation.load(Ordering::SeqCst) != seen {
-            return false;
-        }
-        if !wakers.iter().any(|held| held.will_wake(waker)) {
-            wakers.push(waker.clone());
-        }
-        true
-    }
-
-    /// A lock was released: wakes every statement waiting.
-    pub fn notify(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        if !self.armed.load(Ordering::SeqCst) {
-            return;
-        }
-        let woken = {
-            let mut wakers = self.wakers.lock();
-            self.armed.store(false, Ordering::SeqCst);
-            std::mem::take(&mut *wakers)
-        };
-        for waker in woken {
-            waker.wake();
-        }
-    }
-}
 
 /// Type alias for busy handler callback function.
 ///
@@ -132,9 +55,6 @@ pub struct BusyHandlerState {
     timeout: MonotonicInstant,
     /// For timeout-based handlers: the current iteration index into DELAYS
     iteration: usize,
-    /// Amphora (lane constants-22): under [`BusyWake::Release`], when the first busy round came:
-    /// the busy timeout counts from it.
-    first: Option<MonotonicInstant>,
 }
 
 impl BusyHandlerState {
@@ -176,7 +96,6 @@ impl BusyHandlerState {
             invocation_count: 0,
             timeout: now,
             iteration: 0,
-            first: None,
         }
     }
 
@@ -185,23 +104,6 @@ impl BusyHandlerState {
         self.invocation_count = 0;
         self.timeout = now;
         self.iteration = 0;
-        self.first = None;
-    }
-
-    /// Amphora (lane constants-22): under [`BusyWake::Release`], how long the statement may still
-    /// wait for a release (about `Duration::MAX`: no deadline), or None when `max_duration`, counted from
-    /// the first busy round, has passed. The statement steps again when woken, never held back by a
-    /// delay of the schedule.
-    pub fn until_released(
-        &mut self,
-        max_duration: Duration,
-        now: MonotonicInstant,
-    ) -> Option<Duration> {
-        let first = *self.first.get_or_insert(now);
-        self.invocation_count = self.invocation_count.saturating_add(1);
-        self.timeout = now;
-        let left = max_duration.saturating_sub(now.duration_since(first));
-        (!left.is_zero()).then_some(left)
     }
 
     /// Get the current timeout instant
@@ -280,62 +182,6 @@ impl BusyHandlerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Counts the times it is woken.
-    struct Count(std::sync::atomic::AtomicUsize);
-    impl std::task::Wake for Count {
-        fn wake(self: std::sync::Arc<Self>) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    /// T-QB.1.13 (lane constants-22): a release after the count was read is never missed (the
-    /// wait says try again), a waiting waker is woken once by the next release and then let go,
-    /// and one waker waiting twice is held once.
-    #[test]
-    fn constants_22_lock_release_wakes_its_waiters_once_and_misses_none() {
-        let release = LockRelease::default();
-        let count = std::sync::Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
-        let waker = Waker::from(std::sync::Arc::clone(&count));
-        let seen = release.generation();
-        release.notify();
-        assert!(
-            !release.wait(seen, &waker),
-            "a release since `seen`: try again now"
-        );
-        let seen = release.generation();
-        assert!(release.wait(seen, &waker));
-        assert!(release.wait(seen, &waker));
-        assert_eq!(release.wakers.lock().len(), 1, "one waker held once");
-        release.notify();
-        assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
-        release.notify();
-        assert_eq!(
-            count.0.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "woken wakers are let go"
-        );
-    }
-
-    /// Lane constants-22: under the release wake the busy timeout is a deadline only, counted from
-    /// the first busy round: no delay of the schedule, and None once it has passed.
-    #[test]
-    fn constants_22_until_released_is_the_deadline_left() {
-        let now = test_instant();
-        let mut state = BusyHandlerState::new(now);
-        let max = Duration::from_millis(100);
-        assert_eq!(state.until_released(max, now), Some(max));
-        assert_eq!(state.timeout(), now, "no delay before the next try");
-        let later = now + Duration::from_millis(40);
-        assert_eq!(
-            state.until_released(max, later),
-            Some(Duration::from_millis(60))
-        );
-        assert_eq!(state.until_released(max, now + max), None);
-        assert!(state
-            .until_released(Duration::MAX, now)
-            .is_some_and(|left| left > max));
-    }
 
     fn test_instant() -> MonotonicInstant {
         MonotonicInstant::now()

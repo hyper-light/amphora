@@ -80,7 +80,7 @@ struct Gap {
 
 /// One leader's slots, in the term it leads. The queue, the barriers waiting, the gaps and the
 /// forwards held are each at most one a member of the configuration (the owner keeps them to its
-/// members, `keep`), so at most the group's member bound; `ready` holds what an end released until the owner's
+/// members, `keep`), so at most `MEMBERS`; `ready` holds what an end released until the owner's
 /// same step drains it.
 pub(super) struct Slots<T> {
     bounds: Bounds,

@@ -49,6 +49,9 @@ impl Recurrence {
     }
 }
 
+/// Voters a leader measures at most: the replicated owner's member bound.
+const PEERS: usize = super::replicated::MEMBERS;
+
 /// An answer the window does not learn, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(super) enum Unmeasured {
@@ -87,32 +90,21 @@ pub(super) struct Answers {
     /// The term this owner leads, and the tick it began to.
     leading: Option<u64>,
     led_from: u64,
-    /// The voters a leader measures at most: the members its core was opened for
-    /// (`Limits::members`), read once at open, not a constant of this module's (lane constants-20).
-    members: usize,
     peers: Vec<Peer>,
     tails: Vec<u64>,
 }
 
 impl Answers {
-    /// An owner's measure, its core's election timeout `election` ticks, of at most `members`
-    /// voters: the members its core was opened for.
-    pub(super) fn new(election: usize, members: usize) -> Self {
+    /// An owner's measure, its core's election timeout `election` ticks.
+    pub(super) fn new(election: usize) -> Self {
         Self {
             ticks: 0,
             election: u64::try_from(election).unwrap_or(u64::MAX),
             leading: None,
             led_from: 0,
-            members,
             peers: Vec::new(),
             tails: Vec::new(),
         }
-    }
-
-    /// The voters it measures at most rise to `members`, never fall: the group's member bound as
-    /// its log raised it (lane constants-21).
-    pub(super) fn grow(&mut self, members: usize) {
-        self.members = self.members.max(members);
     }
 
     /// One tick of the owner, leading the term `leading` if it leads, among `voters` and, in a
@@ -157,10 +149,10 @@ impl Answers {
     fn peer(&mut self, voter: u64) -> Result<usize, Unmeasured> {
         Ok(match self.peers.iter().position(|peer| peer.id == voter) {
             Some(index) => index,
-            None if self.peers.len() >= self.members => {
+            None if self.peers.len() >= PEERS => {
                 return Err(Unmeasured::Full {
                     voter,
-                    limit: self.members,
+                    limit: PEERS,
                 });
             }
             None => {
@@ -240,11 +232,7 @@ impl Answers {
             return 0;
         };
         self.tails.clear();
-        for member in set
-            .iter()
-            .filter(|member| **member != local)
-            .take(self.members)
-        {
+        for member in set.iter().filter(|member| **member != local).take(PEERS) {
             let tail = self
                 .peers
                 .iter()
@@ -263,8 +251,6 @@ mod tests {
 
     const ELECTION: usize = 20;
     const VOTERS: [u64; 3] = [1, 2, 3];
-    /// The members the tests' cores are opened for: as many as the voters.
-    const MEMBERS: usize = VOTERS.len();
 
     fn leading(answers: &mut Answers, ticks: usize) {
         for _ in 0..ticks {
@@ -276,7 +262,7 @@ mod tests {
     /// patience of the smaller, 30 less the election timeout.
     #[test]
     fn the_patience_is_the_quorums_tail_less_the_election_timeout() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         leading(&mut answers, 1);
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -291,7 +277,7 @@ mod tests {
     /// election timeout as at fixed ticks.
     #[test]
     fn answers_within_the_election_timeout_give_no_patience() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         for _ in 0..100 {
             leading(&mut answers, 1);
             answers.heard(2, 7).unwrap();
@@ -305,7 +291,7 @@ mod tests {
     /// gap, unsuspected, learned.
     #[test]
     fn a_suspected_voters_gap_is_refused_and_not_learned() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         leading(&mut answers, 1);
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -328,7 +314,7 @@ mod tests {
     /// generation and forgotten within two.
     #[test]
     fn a_gap_is_believed_for_one_to_two_of_its_voters_own_recurrences() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         leading(&mut answers, 1);
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -374,7 +360,7 @@ mod tests {
     /// a new lead's first gap counted from the tick it began.
     #[test]
     fn only_the_term_it_leads_is_measured() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         for _ in 0..60 {
             answers.tick(None, &VOTERS, &[]).unwrap();
         }
@@ -393,7 +379,7 @@ mod tests {
     /// Do a voter answer late, then leave the configuration; expect it forgotten.
     #[test]
     fn a_voter_that_left_is_forgotten() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         leading(&mut answers, 1);
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -412,7 +398,7 @@ mod tests {
     fn a_joint_configuration_takes_the_larger_of_its_two_sets() {
         let incoming = [1, 4, 5];
         let joint = |answers: &mut Answers| answers.tick(Some(7), &incoming, &VOTERS).unwrap();
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         joint(&mut answers);
         for voter in [2, 3, 4, 5] {
             answers.heard(voter, 7).unwrap();
@@ -435,7 +421,7 @@ mod tests {
     #[test]
     fn a_leader_outside_a_set_needs_a_majority_of_its_members() {
         let incoming = [2, 3];
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         answers.tick(Some(7), &incoming, &VOTERS).unwrap();
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -453,25 +439,7 @@ mod tests {
     /// A single voter needs no one: no patience.
     #[test]
     fn a_lone_voter_has_no_patience() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION);
         assert_eq!(answers.patience(&[1], &[], 1, ELECTION), 0);
-    }
-
-    /// T-QB.1.7 (QB.1, lane constants-20): the voters a leader measures are the members its core
-    /// was opened for, not a module's constant. Do: open a measure for two members and hear from
-    /// two voters and a third while leading. Expect: the two measured, the third refused `Full`
-    /// naming the two, and it marked suspected nowhere.
-    #[test]
-    fn t_qb_1_7_a_leader_measures_the_members_its_core_was_opened_for() {
-        let mut answers = Answers::new(ELECTION, 2);
-        leading(&mut answers, 1);
-        answers.heard(2, 7).unwrap();
-        answers.heard(3, 7).unwrap();
-        assert_eq!(
-            answers.heard(4, 7),
-            Err(Unmeasured::Full { voter: 4, limit: 2 })
-        );
-        answers.suspected(4);
-        assert_eq!(answers.peers.len(), 2);
     }
 }

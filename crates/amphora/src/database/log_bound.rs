@@ -206,22 +206,10 @@ impl Spacing {
     }
 }
 
-/// The bytes one snapshot's image may take on a filesystem with `available` bytes free, shared by
-/// `logs` replica logs: an equal share among those logs and the one image (replication.md,
-/// "Decision (lane constants): the queue bounds by drain rate"; QB.1), the rule the logs already
-/// share the disk by, the image counted as one more holder. An image is no larger than this and
-/// its memory room (SB.1), so the logs always keep their share past it.
-pub(super) fn image_disk_room(available: u64, logs: u64) -> u64 {
-    available
-        .checked_div(logs.max(1).saturating_add(1))
-        .unwrap_or(0)
-}
-
 /// The frames a replica's database log may hold: the bytes its file already takes (`kept` frames,
 /// reused, store.md decision 13) and an equal share among the `logs` replica logs on its
 /// filesystem of the `available` bytes there, less one image's `image` bytes (the most an image
-/// may take now: the smaller of its memory budget's room for one, SB.1, and its share of the disk,
-/// `image_disk_room`, QB.1; so an install has room), each frame taking its own
+/// may take now, its memory budget's room for one: SB.1; so an install has room), each frame taking its own
 /// bytes and the page its copy may add to the database's file. Counted in bytes, a frame the log
 /// grows by moves bytes from `available` to its file, so the room holds still for one log and
 /// grows by less than half a frame a frame for more, the others' growth seen at the next pass. The
@@ -427,21 +415,5 @@ mod tests {
             log_room(image + 100 * each, image, 1, 40)
         );
         assert_eq!(log_room(u64::MAX, image, 0, u64::MAX), u64::MAX / each);
-    }
-
-    /// T-QB.1.5 (QB.1): an image's share of the disk beside the replica logs there. Do: the rule
-    /// at one log, at three, at none counted, and with nothing free; then the log's room past that
-    /// image. Expect: a half, a quarter, a half and nothing; the log keeps the share the image
-    /// takes, so its room is never nothing while bytes are free.
-    #[test]
-    fn an_image_takes_an_equal_share_of_the_disk_beside_the_logs() {
-        let each = FRAME_BYTES + crate::db::PAGE_BYTES;
-        assert_eq!(image_disk_room(1000, 1), 500);
-        assert_eq!(image_disk_room(1000, 3), 250);
-        assert_eq!(image_disk_room(1000, 0), 500);
-        assert_eq!(image_disk_room(0, 1), 0);
-        let free = 200 * each;
-        assert_eq!(log_room(free, image_disk_room(free, 1), 1, 0), 100);
-        assert_eq!(log_room(free, image_disk_room(free, 3), 3, 0), 50);
     }
 }

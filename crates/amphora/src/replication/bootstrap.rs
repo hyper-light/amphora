@@ -18,17 +18,7 @@ fn image_bytes() -> Result<usize, Refusal> {
     let room = super::image_room()?;
     Ok(room.saturating_add(super::image_envelope(room)))
 }
-/// Format (postcard's wire format): what a seed's chunk entry adds past its image bytes, at the
-/// most: the prefix; the declaration's source node, a `u64` varint, and its 32-byte identity, a
-/// fixed array written whole; the offset and total, `u64` varints; and the image's length, a
-/// `usize` varint (lane constants-20; was a picked 1024).
-const FRAMING: usize = PREFIX
-    .len()
-    .saturating_add(super::U64_MOST)
-    .saturating_add(32)
-    .saturating_add(super::U64_MOST)
-    .saturating_add(super::U64_MOST)
-    .saturating_add(super::U64_MOST);
+const FRAMING: usize = 1024;
 
 /// Inspect ownership before a startup importer opens the local writer. A pending baseline also
 /// counts: a crash can occur after retaining the source but before the replica table is created.
@@ -465,26 +455,6 @@ impl Baseline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// QB.1 (lane constants-20): a chunk's framing is its encoding's most, derived. Do: encode a
-    /// chunk of every field at its type's largest around 1000 image bytes. Expect: it takes the
-    /// framing and its image exactly, so the room less the framing always holds the chunk.
-    #[test]
-    fn a_seed_chunks_framing_is_its_encodings_most() {
-        let chunk = Chunk {
-            declaration: Bootstrap {
-                source_node: u64::MAX,
-                source_id: [0xff; 32],
-            },
-            offset: u64::MAX,
-            total: u64::MAX,
-            image: vec![0xab; 1000],
-        };
-        let mut bytes = PREFIX.to_vec();
-        bytes.extend(postcard::to_allocvec(&chunk).unwrap());
-        // The image's length, 1000, takes two of a varint's ten bytes.
-        assert_eq!(bytes.len(), FRAMING - (super::super::U64_MOST - 2) + 1000);
-        assert!(bytes.len() <= FRAMING + 1000);
-    }
     fn source(db: &mut Db) -> Bootstrap {
         db.exec("CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES('unchanged base')")
             .unwrap();

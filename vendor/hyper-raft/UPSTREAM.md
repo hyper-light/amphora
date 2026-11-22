@@ -30,10 +30,6 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 
 | `crates/hyper-durable/src/replica.rs` | `Replica::suspect_held` and `Replica::trust_held`: the owner's node-level detector's verdicts for the held count alone (core step R-8, `RawNode::suspect_held`, `trust_held`), additive | Amphora elects on ticks, where `Replica::suspect`, `trust` and `restarted` are refused once they've taken the held part; its replicated class needs a suspected member left out of held quorums without its elections taking a detector's word (Amphora's docs/design/replication.md, "The suspicion feed") | `0005-cp-t1-8-the-held-count-fed-on-ticks.patch` |
 
-| `crates/hyper-raft/src/{raft,progress,fast,read,lib}.rs`, `crates/hyper-durable/src/replica.rs` | `Raft::grow_members` raises the most members a configuration may name (the tracker's, the fast votes' and the pending reads' bound with it), never lowers it; `Config::stated_members` (`StatedMembers`, `None` by default) is the owner's reader of a bound its entries state, which the core folds in as it takes entries, at open as after, before the configurations they change take effect; `Replica::grow_members` passes the raise through, additive | hyper-raft stops a member handed a configuration past the members it was opened for, so a group that grows needs its bound to grow at every member: Amphora states the bound once in its log and raises it ahead of a change that passes it (Amphora's docs/design/replication.md, "The member bound stated once per group"; QB.1, lane constants-21) | `0006-qb-1-the-member-bound-stated-in-the-owners-log.patch` |
-
-| `crates/hyper-durable/src/replica.rs` | `Replica::quiet`: the owner's quiet period in force, read back, additive | Amphora sets its quiet period from its learned election timeout as its pace moves (`Replica::set_quiet`; Amphora's docs/design/replication.md, QB.1, lane constants-21), and its test reads it back | `0007-qb-1-the-owners-quiet-period-read-back.patch` |
-
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft
 would reach slates. Focal's agent agrees (2026-10-22), and notes that Focal names `RamStore` only in a
@@ -42,36 +38,6 @@ as a dev-dependency, as kiln's sync tests do.
 
 The former IOCP patch `0002` is superseded by upstream at `53a28a0`, with its regressions, and is dropped.
 The Darwin FIFO patch `0003` remains: upstream kqueue code is unchanged at this pin.
-
-## The two QB.1 changes reach kiln's and Quiver's copies too
-
-Changes `0006` (the member bound) and `0007` (the quiet period read back) are new in Amphora's
-series and in no other product's yet. Ada wants one hyper-raft, so both must reach kiln's copy
-(`vendor/hyper-raft` in hyper-light/kiln) and, through it, Quiver's: kiln vendors Quiver without its
-`vendor/hyper-raft` (kiln's MANIFEST `exclude`), and Quiver's pin moves with kiln's (kiln's
-`vendor/patches/quiver/0002`). Which series they live in, and whether they go upstream instead, is
-Ada's call. The series differ (lane constants-22, read from kiln's refs on 2026-11-22):
-
-| Amphora (pin `d5d5f8f6`) | kiln `main` (pin `e0613f52`) | kiln `land/unify`, `route/landed` (pin `fb74b595`, 2026-11-13) |
-|---|---|---|
-| `0001` RamStore for tests alone | `0001`, the same | `0001`, the same |
-| (dropped: upstream `53a28a0` has it) | `0002` hyper-rt from kiln's own runtime (`kiln-rt`) | `0002`, the same |
-| - | `0003` driver polls a turn's received events before its sends | `0003`, the same |
-| - | `0004` hyper-tls: a connection's largest record set as it goes | `0004`, the same |
-| - | `0005` hyper-transport says which suite and group a connection used | `0005`, the same |
-| `0003` CP-M1 Darwin FIFO EOF | not on `main` | `0006` |
-| `0005` CP-T1.8 the held count fed on ticks | not on `main` | `0007` |
-| `0004` CP-T2.2 frame provenance and exact TLS exporter | not on `main` | `0008` |
-| `0006` QB.1 the member bound | none: would be `0009` | none: would be `0009` |
-| `0007` QB.1 the quiet period read back | none: would be `0010` | none: would be `0010` |
-
-Both QB.1 changes touch `crates/hyper-durable/src/replica.rs` beside CP-T1.8's `suspect_held` and
-`trust_held`, so in kiln they go after CP-T1.8 (its `0007` on the landing branches; on `main`, after
-CP-T1.8 lands there). `0006` also changes `crates/hyper-raft/src/{raft,progress,fast,read,lib}.rs`,
-which none of kiln's `0002`-`0005` touch. Both are additive (new methods; `Config::stated_members`
-is `None` by default), so kiln's and Quiver's behaviour is unchanged until they use them. The pins
-differ (`d5d5f8f6`, `e0613f52`, `fb74b595`): `scripts/vendor.py hyper-raft <commit>` re-applies each
-series by three-way merge, and kiln's `scripts/vendor.py check` then holds the copy to its record.
 
 ## Taking a newer upstream
 

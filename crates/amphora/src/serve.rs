@@ -66,13 +66,9 @@ use anyhow::{Context, anyhow, bail, ensure};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+use crate::database::replicated::{OUTGOING_MESSAGES, WIRE_BYTES};
 use crate::database::{Database, LogDisk};
 use crate::transport::network::{self, Credentials};
-
-/// The records a peer's sender holds and one drain takes: the 4096 that
-/// `replicated::OUTGOING_MESSAGES` was until QB.1 (lanes constants) bounded the outgoing queue by
-/// its learned drain. Still picked: CP-T1.13's to derive from that bound (lane constants-20).
-const OUTGOING_MESSAGES: usize = 4096;
 
 const RECORDS: u8 = b'R';
 const CLIENT: u8 = b'C';
@@ -618,14 +614,12 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
             }
             let handle = shared.db.replica().ok_or_else(|| anyhow!("no replica"))?;
             loop {
-                // The replica's wire record bound in force (QB.1), read at each record.
-                let wire = handle.wire_bytes();
                 let mut len = [0u8; 4];
                 r.read_exact(&mut len)?;
                 let len = usize::try_from(u32::from_le_bytes(len))?;
                 ensure!(
-                    len <= wire,
-                    "a record of {len} bytes, past the replica's {wire}"
+                    len <= WIRE_BYTES,
+                    "a record of {len} bytes, past the replica's {WIRE_BYTES}"
                 );
                 let mut bytes = vec![0u8; len];
                 r.read_exact(&mut bytes)?;
