@@ -1932,6 +1932,10 @@ impl Engine for Local {
         group::head(&self.db)
     }
 
+    fn bytes(&mut self) -> anyhow::Result<Option<u64>> {
+        group::used_bytes(&self.db).map(Some)
+    }
+
     fn export(&mut self, span: reshard::Span, positions: usize) -> anyhow::Result<store::Exported> {
         group::export(&self.db, span, positions)
     }
@@ -2725,7 +2729,7 @@ mod group_holding {
     /// one group committed there and one whose keys (written or only a condition's) span both
     /// groups refused whole.
     #[test]
-    fn t_t1_9_r13_records_through_groups_of_local_databases_split_and_merge_under_writes() {
+    fn t_t1_9_r13_r17_records_through_groups_of_local_databases_split_and_merge_under_writes() {
         use crate::reshard::directory::Proposal;
         use crate::reshard::driver::Driver;
         let dir = tempfile::tempdir().unwrap();
@@ -2774,6 +2778,12 @@ mod group_holding {
         );
         assert_eq!(ended, 1);
         assert_eq!(groups.len(), 2);
+        // T-T1.9.R17: each local database's size, as the shell measures it, is its pages in use.
+        let measured = groups
+            .measure(Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(measured.len(), 2);
+        assert!(measured.iter().all(|m| m.bytes > 0));
         let (old, new): (Vec<&String>, Vec<&String>) = keys
             .iter()
             .partition(|k| groups.group_of(&routing(k)) == Some(GroupId(0)));
