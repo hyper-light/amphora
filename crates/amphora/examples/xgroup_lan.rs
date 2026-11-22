@@ -528,8 +528,11 @@ struct RywTally {
 
 /// `ryw` (AC-T1.10.1, lane xgroup-sql-8): the switch `Options::answer_at` at scale, `Decided`
 /// (the control) against `Resolved`, and (lane xgroup-sql-10) `Decided` with each group's reads
-/// waiting on a held lock (`LockedReads::Wait`, setting `locked-wait`), under both protocols,
-/// forcing each one's failure mode.
+/// waiting on a held lock (`LockedReads::Wait`, setting `locked-wait`), and (lane xgroup-sql-11,
+/// T-T1.10.W9) the same waiting on the lock's own resolution (`LockedReads::WaitOnLock`, setting
+/// `lock-wake`), under both protocols, forcing each one's failure mode: under `locked-wait` every
+/// change in a group wakes every read waiting there, so its wakes per waiting read grow with
+/// the callers; under `lock-wake` a read is woken by its own row's resolution.
 /// `--clients` callers each commit `--txns` Records transactions through `commit_records`, each
 /// writing one row in every one of `--groups` local groups under `--dir`, drawn from the caller's
 /// own `--keys` rows. No other caller writes them, so every conflict a caller meets is a lock of
@@ -537,8 +540,8 @@ struct RywTally {
 /// conflict, until `--secs`. Straight after each answer it reads every row it wrote, in its group:
 /// one that doesn't hold the write is a read-your-writes miss. One JSON line a run: the misses, the
 /// conflicts met, the commit's time (its tries again included) at p50, p99 and p99.9, the reads'
-/// at p50, p99 and p99.9, the reads that waited on a lock, the answers held at most, and committed
-/// per second.
+/// at p50, p99 and p99.9, the reads that waited on a lock, their wakes (all, per waiting read and
+/// per read), the answers held at most, and committed per second.
 fn ryw(args: &Args) -> anyhow::Result<()> {
     use std::sync::{Mutex, PoisonError};
 
@@ -562,6 +565,7 @@ fn ryw(args: &Args) -> anyhow::Result<()> {
             ("decided", AnswerAt::Decided, LockedReads::Committed),
             ("resolved", AnswerAt::Resolved, LockedReads::Committed),
             ("locked-wait", AnswerAt::Decided, LockedReads::Wait),
+            ("lock-wake", AnswerAt::Decided, LockedReads::WaitOnLock),
         ] {
             let id = id.wrapping_add(run);
             run = run.wrapping_add(1);
@@ -687,9 +691,15 @@ fn ryw(args: &Args) -> anyhow::Result<()> {
             let [p50, p99, p999] = [500, 990, 999].map(|m| tally.latencies.quantile(m).as_micros());
             let [r50, r99, r999] = [500, 990, 999].map(|m| tally.reads.quantile(m).as_micros());
             let locked_waits: u64 = databases.iter().map(Database::locked_waits).sum();
+            let locked_wakes: u64 = databases.iter().map(Database::locked_wakes).sum();
+            let reads_done = tally.reads.count();
+            let per = |n: u64, of: u64| {
+                f64::from(u32::try_from(n).unwrap_or(u32::MAX))
+                    / f64::from(u32::try_from(of).unwrap_or(u32::MAX).max(1))
+            };
             let total = u64::try_from(clients)?.saturating_mul(txns);
             out!(
-                "{{\"bench\":\"xgroup_ryw\",\"protocol\":\"{}\",\"answer_at\":\"{setting}\",\"groups\":{groups},\"clients\":{clients},\"txns\":{total},\"keys\":{keys},\"committed\":{},\"failed\":{},\"misses\":{},\"conflicts\":{},\"answers_held_most\":{},\"stops\":{},\"p50_us\":{p50},\"p99_us\":{p99},\"p999_us\":{p999},\"read_p50_us\":{r50},\"read_p99_us\":{r99},\"read_p999_us\":{r999},\"locked_waits\":{locked_waits},\"secs\":{secs:.3},\"committed_per_s\":{:.1}}}",
+                "{{\"bench\":\"xgroup_ryw\",\"protocol\":\"{}\",\"answer_at\":\"{setting}\",\"groups\":{groups},\"clients\":{clients},\"txns\":{total},\"keys\":{keys},\"committed\":{},\"failed\":{},\"misses\":{},\"conflicts\":{},\"answers_held_most\":{},\"stops\":{},\"p50_us\":{p50},\"p99_us\":{p99},\"p999_us\":{p999},\"read_p50_us\":{r50},\"read_p99_us\":{r99},\"read_p999_us\":{r999},\"locked_waits\":{locked_waits},\"locked_wakes\":{locked_wakes},\"wakes_per_wait\":{:.3},\"wakes_per_read\":{:.3},\"secs\":{secs:.3},\"committed_per_s\":{:.1}}}",
                 lan::protocol_name(protocol),
                 tally.committed,
                 tally.failed,
@@ -697,6 +707,8 @@ fn ryw(args: &Args) -> anyhow::Result<()> {
                 tally.conflicts,
                 counted.answers_held_most,
                 counted.stops,
+                per(locked_wakes, locked_waits),
+                per(locked_wakes, reads_done),
                 f64::from(u32::try_from(tally.committed).unwrap_or(u32::MAX))
                     / secs.max(f64::MIN_POSITIVE),
             );

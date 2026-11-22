@@ -7,7 +7,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::sync::{OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -145,11 +145,29 @@ pub(crate) struct Changed {
     event: Condvar,
     published: Mutex<BTreeMap<String, Published>>,
     watchers: Mutex<watch::Watchers>,
-    /// [`LockedReads::Wait`] when set: a Records get of a row a cross-group transaction holds a
-    /// lock on waits on `event` until it resolves ([`Database::set_locked_reads`]).
-    locked_reads: AtomicBool,
+    /// What a Records get of a row under a cross-group lock does ([`LockedReads`] as
+    /// [`LockedReads::code`]; [`Database::set_locked_reads`]).
+    locked_reads: AtomicU8,
     /// Records gets that met a cross-group lock and waited for it, once each.
     locked_waits: AtomicU64,
+    /// The times a waiting get tried its row again, each wake counted: under
+    /// [`LockedReads::Wait`] every change in the group wakes every waiting get, under
+    /// [`LockedReads::WaitOnLock`] only its own row's resolution does (T-T1.10.W9).
+    locked_wakes: AtomicU64,
+    /// [`LockedReads::WaitOnLock`]'s waiter lists: each row a get waits on, by its cross-group key
+    /// (`xgroup::sql::record_key`), with its own bell, rung when a resolution here drops that
+    /// row's locks ([`Database::ring_locks`]). A row's entry lives while a get waits on it, so it
+    /// holds at most one entry per waiting get.
+    lock_waiters: Mutex<BTreeMap<Vec<u8>, LockBell>>,
+}
+
+/// One row's waiter list under [`LockedReads::WaitOnLock`]: how many gets wait on it, how many
+/// times a resolution rang it, and the bell they wait on (with [`Changed::lock_waiters`]'s lock).
+#[derive(Default)]
+struct LockBell {
+    waiters: usize,
+    rung: u64,
+    bell: Arc<Condvar>,
 }
 
 /// What a Records get here does with a row a transaction across groups holds a lock on, between
@@ -168,6 +186,31 @@ pub enum LockedReads {
     /// the read's deadline. Each read of a latest row looks the lock up first, single-group
     /// reads included. Reads at an older revision never wait: no lock is on what was committed.
     Wait,
+    /// As [`LockedReads::Wait`], but a waiting get waits on its own row's waiter list, rung when
+    /// a resolution here drops that row's locks, not on every change in the group (T-T1.10.W9,
+    /// lane xgroup-sql-11: Wait's thundering herd at scale). The ring comes from the step that
+    /// resolves, in the process that runs it ([`Database::ring_locks`]); a replicated group's
+    /// replica may not be that process, so a replicated database's gets wait as under
+    /// [`LockedReads::Wait`].
+    WaitOnLock,
+}
+
+impl LockedReads {
+    /// The setting as [`Changed::locked_reads`] keeps it.
+    const fn code(self) -> u8 {
+        match self {
+            Self::Committed => 0,
+            Self::Wait => 1,
+            Self::WaitOnLock => 2,
+        }
+    }
+    const fn of(code: u8) -> Self {
+        match code {
+            1 => Self::Wait,
+            2 => Self::WaitOnLock,
+            _ => Self::Committed,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1383,7 +1426,30 @@ impl Database {
         self.shared
             .changed
             .locked_reads
-            .store(reads == LockedReads::Wait, Ordering::Release);
+            .store(reads.code(), Ordering::Release);
+    }
+
+    /// The times a get waiting on a cross-group lock here tried its row again, each wake counted
+    /// ([`LockedReads::Wait`] against [`LockedReads::WaitOnLock`], T-T1.10.W9).
+    pub fn locked_wakes(&self) -> u64 {
+        self.shared.changed.locked_wakes.load(Ordering::Acquire)
+    }
+
+    /// Rings the waiter list of each row a resolution here just dropped the locks of, by its
+    /// cross-group key ([`LockedReads::WaitOnLock`]): called once the resolving step answered, so
+    /// a get it wakes reads the resolution. A row no get waits on rings no one.
+    pub(crate) fn ring_locks(&self, keys: &[Vec<u8>]) -> Result<(), Refusal> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut lists = locked(&self.shared.changed.lock_waiters)?;
+        for key in keys {
+            if let Some(list) = lists.get_mut(key) {
+                list.rung = list.rung.wrapping_add(1);
+                list.bell.notify_all();
+            }
+        }
+        Ok(())
     }
 
     /// Records gets here that met a cross-group lock and waited for it ([`LockedReads::Wait`]),
@@ -1410,6 +1476,111 @@ impl Database {
             return Err(Refusal::Timeout);
         }
         Ok(())
+    }
+
+    /// A read under [`LockedReads::Wait`] (lane xgroup-sql-10): `try_read` answers None while
+    /// its rows are under a cross-group lock, and it tries again on each change in the group. The
+    /// change counter is read before each try, so a resolution landing between a try and the
+    /// wait moves it and the read tries again; a wait can't miss it. Refused `Timeout` at `until`.
+    fn wait_on_group<T>(
+        &self,
+        until: Instant,
+        mut try_read: impl FnMut() -> Result<Option<T>, Refusal>,
+    ) -> Result<T, Refusal> {
+        let changed = &self.shared.changed;
+        let mut waited = false;
+        loop {
+            let before = *locked(&changed.generation)?;
+            if let Some(v) = try_read()? {
+                return Ok(v);
+            }
+            let guard = locked(&changed.generation)?;
+            if !waited {
+                // Counted under the counter's lock, and told on its event, so whoever waits for
+                // a read to be waiting can't miss it; a get waiting here re-checks its change.
+                waited = true;
+                changed.locked_waits.fetch_add(1, Ordering::AcqRel);
+                changed.event.notify_all();
+            }
+            if *guard != before {
+                changed.locked_wakes.fetch_add(1, Ordering::AcqRel);
+                continue;
+            }
+            let (_guard, timeout) = changed
+                .event
+                .wait_timeout_while(
+                    guard,
+                    until.saturating_duration_since(Instant::now()),
+                    |v| *v == before,
+                )
+                .map_err(unavailable)?;
+            if timeout.timed_out() {
+                return Err(Refusal::Timeout);
+            }
+            changed.locked_wakes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A read under [`LockedReads::WaitOnLock`] (T-T1.10.W9, lane xgroup-sql-11): as
+    /// [`Database::wait_on_group`], but it waits on the waiter list of `row` (a cross-group key),
+    /// rung only by a resolution that drops that row's locks ([`Database::ring_locks`]). It joins
+    /// the list after its first locked try and tries once more before it first waits, so a
+    /// resolution between that try and joining isn't missed; from then on the list's ring count,
+    /// read before each try, says whether one landed since. It leaves the list however it ends.
+    fn wait_on_lock<T>(
+        &self,
+        row: &[u8],
+        until: Instant,
+        mut try_read: impl FnMut() -> Result<Option<T>, Refusal>,
+    ) -> Result<T, Refusal> {
+        let changed = &self.shared.changed;
+        if let Some(v) = try_read()? {
+            return Ok(v);
+        }
+        let bell = {
+            let mut lists = locked(&changed.lock_waiters)?;
+            let list = lists.entry(row.to_vec()).or_default();
+            list.waiters = list.waiters.saturating_add(1);
+            Arc::clone(&list.bell)
+        };
+        {
+            let _generation = locked(&changed.generation)?;
+            changed.locked_waits.fetch_add(1, Ordering::AcqRel);
+            changed.event.notify_all();
+        }
+        let rung = |lists: &BTreeMap<Vec<u8>, LockBell>| lists.get(row).map_or(0, |l| l.rung);
+        let waited = (|| -> Result<T, Refusal> {
+            loop {
+                let before = rung(&*locked(&changed.lock_waiters)?);
+                if let Some(v) = try_read()? {
+                    return Ok(v);
+                }
+                let lists = locked(&changed.lock_waiters)?;
+                if rung(&lists) != before {
+                    changed.locked_wakes.fetch_add(1, Ordering::AcqRel);
+                    continue;
+                }
+                let (_lists, timeout) = bell
+                    .wait_timeout_while(
+                        lists,
+                        until.saturating_duration_since(Instant::now()),
+                        |lists| rung(lists) == before,
+                    )
+                    .map_err(unavailable)?;
+                if timeout.timed_out() {
+                    return Err(Refusal::Timeout);
+                }
+                changed.locked_wakes.fetch_add(1, Ordering::AcqRel);
+            }
+        })();
+        let mut lists = locked(&changed.lock_waiters)?;
+        if let Some(list) = lists.get_mut(row) {
+            list.waiters = list.waiters.saturating_sub(1);
+            if list.waiters == 0 {
+                lists.remove(row);
+            }
+        }
+        waited
     }
 
     /// This replica's token reads, counted, with its measured apply lag. None standalone and for
@@ -1760,13 +1931,14 @@ impl Records for Namespace {
     ) -> Result<Option<Row>, Refusal> {
         api::family(family)?;
         api::key(key)?;
-        if !self
-            .database
-            .shared
-            .changed
-            .locked_reads
-            .load(Ordering::Acquire)
-        {
+        let reads = LockedReads::of(
+            self.database
+                .shared
+                .changed
+                .locked_reads
+                .load(Ordering::Acquire),
+        );
+        if reads == LockedReads::Committed {
             return match self.database.submit(
                 &self.name,
                 Operation::Get(family.into(), key.into(), at, LockedReads::Committed),
@@ -1776,47 +1948,26 @@ impl Records for Namespace {
                 _ => Err(unavailable("wrong record answer")),
             };
         }
-        // LockedReads::Wait (lane xgroup-sql-10): the change counter is read before each try, so
-        // a resolution landing between a try and the wait moves it and the read tries again; a
-        // wait can't miss it.
         let namespace = self.resolved(until)?;
-        let changed = &namespace.database.shared.changed;
-        let mut waited = false;
-        loop {
-            let before = *locked(&changed.generation)?;
+        let try_get = || -> Result<Option<Option<Row>>, Refusal> {
             match namespace.database.submit(
                 &namespace.name,
-                Operation::Get(family.into(), key.into(), at, LockedReads::Wait),
+                Operation::Get(family.into(), key.into(), at, reads),
                 until,
             )? {
-                Answer::Row(v) => return Ok(v),
-                Answer::Locked => {}
-                _ => return Err(unavailable("wrong record answer")),
+                Answer::Row(v) => Ok(Some(v)),
+                Answer::Locked => Ok(None),
+                _ => Err(unavailable("wrong record answer")),
             }
-            let guard = locked(&changed.generation)?;
-            if *guard != before {
-                continue;
-            }
-            if !waited {
-                // Counted under the counter's lock, and told on its event, so whoever waits for
-                // a read to be waiting can't miss it; a get waiting here re-checks its change.
-                waited = true;
-                changed.locked_waits.fetch_add(1, Ordering::AcqRel);
-                changed.event.notify_all();
-            }
-            let (_guard, timeout) = changed
-                .event
-                .wait_timeout_while(
-                    guard,
-                    until.saturating_duration_since(Instant::now()),
-                    |v| *v == before,
-                )
-                .map_err(unavailable)?;
-            if timeout.timed_out() {
-                return Err(Refusal::Timeout);
-            }
+        };
+        let replicated = matches!(namespace.database.shared.writer, Writer::Replicated { .. });
+        if reads == LockedReads::WaitOnLock && !replicated {
+            let row = crate::xgroup::sql::record_key(&namespace.name, family, key)?;
+            return namespace.database.wait_on_lock(&row, until, try_get);
         }
+        namespace.database.wait_on_group(until, try_get)
     }
+
     fn scan(&self, family: &str, mut scan: Scan, until: Instant) -> Result<Page, Refusal> {
         api::family(family)?;
         scan.limit = api::limit(scan.limit)?;
@@ -2354,7 +2505,7 @@ fn apply(
                 Ok(at) => at,
                 Err(e) => return Ok(Err(e)),
             };
-            if *locks == LockedReads::Wait
+            if *locks != LockedReads::Committed
                 && at == head
                 && crate::xgroup::sql::locked(db, namespace, f, k)?
             {

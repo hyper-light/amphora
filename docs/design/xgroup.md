@@ -160,6 +160,28 @@ a read on an aborted transaction's lock and finds the row as it was before; `xgr
 `locked-wait` beside `decided` and `resolved`, with the reads' p50, p99 and p99.9 and the reads that
 waited.
 
+That failure mode is the thundering herd: with many callers, each commit and each step in a group
+wakes every read waiting there, to read and find its own row still locked. Lane xgroup-sql-11 builds
+the candidate that removes it as a third setting, `LockedReads::WaitOnLock`, `Wait` its control:
+- A waiting get joins its row's waiter list on the group's database (by the row's cross-group key),
+  then reads once more, so a resolution between its first try and joining isn't missed; it waits on
+  that list's own bell, and the list's ring count, read before each try, says whether a resolution
+  landed since.
+- A resolution step that drops a transaction's locks notes their Records rows; once the step has
+  answered, the process that ran it rings those rows' lists (`Database::ring_locks`), so a woken get
+  reads the resolution. A row nobody waits on rings no one, and a list lives only while a get waits.
+- Each wake is counted (`Database::locked_wakes`), under both settings.
+- What it costs: one more read for each get that meets a lock (the read after joining), and a list
+  entry per row waited on.
+- Where it can't apply: the ring comes from the process that runs the resolving step (a local group,
+  or the owner serving a step over the transport). A replicated group's replica need not be that
+  process, so a replicated database's gets wait as under `Wait`.
+
+`t_t1_10_w9_*` holds a read waiting on group 1's held resolution while eight commits of another row
+land there: under `WaitOnLock` it wakes once, at its own resolution. `xgroup_lan ryw` runs it as
+`lock-wake` beside `locked-wait`, reporting each one's wakes, wakes per waiting read and per read;
+the A/B of record is the ladder at 1, 128 and 4096 callers.
+
 ## A refusal before the step (lane xgroup-sql-4, AC-T1.10.6)
 
 A group that refuses a step before taking it (`NotLeader`: its leader moved; `Full`: its writer

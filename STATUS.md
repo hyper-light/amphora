@@ -21,7 +21,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `Answer::Committed` carries `at: Option<u64>`, the commit's hybrid-logical-clock microseconds, stamped by the
   coordinator's shell on both paths, for conditional commits across groups (lane split-merge-20). And reads that
   wait on a held lock (`LockedReads::Wait`, a switch on each group's database, today's read the control), event-driven,
-  forced against `AnswerAt::Resolved` in `t_t1_10_w7_*` and run at scale as `xgroup_lan ryw`'s `locked-wait`.
+  forced against `AnswerAt::Resolved` in `t_t1_10_w7_*` and run at scale as `xgroup_lan ryw`'s `locked-wait`. Lane
+  xgroup-sql-11: `LockedReads::WaitOnLock`, a waiting read woken by its own row's resolution (a waiter list per
+  row, rung by the resolving step) rather than every change in its group, A/B'd against `Wait` as `ryw`'s
+  `lock-wake` with wakes per read (`t_t1_10_w9_*`).
 - **Cross-group tokens over nodes and followers behind** (CP-T1.10, AC-T1.10.1, lane xgroup-sql-9;
   docs/design/xgroup.md): a step's answer over the transport carries its group's closed time (wire version 9), so a
   group on another node adds to `commit_records`' token; tests cover a replicated group on a second node and a

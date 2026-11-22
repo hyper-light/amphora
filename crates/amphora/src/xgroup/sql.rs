@@ -175,6 +175,9 @@ pub(crate) struct SqlTablet<'a> {
     db: &'a Db,
     /// Each namespace's revision this step writes its Records rows at, and the next row's place.
     revs: BTreeMap<String, (amphora_api::Rev, u64)>,
+    /// The Records rows whose locks this step dropped, by key: once it answered, their waiter
+    /// lists are rung (`Database::ring_locks`, `LockedReads::WaitOnLock`; T-T1.10.W9).
+    dropped: Vec<Vec<u8>>,
 }
 
 impl<'a> SqlTablet<'a> {
@@ -182,8 +185,20 @@ impl<'a> SqlTablet<'a> {
         Self {
             db,
             revs: BTreeMap::new(),
+            dropped: Vec::new(),
         }
     }
+}
+
+/// Applies one step on a group's database, and answers the Records rows whose locks it dropped.
+fn apply_step(
+    db: &Db,
+    here: GroupId,
+    envelope: &Envelope,
+) -> anyhow::Result<(Reply, Vec<Vec<u8>>)> {
+    let mut tablet = SqlTablet::new(db);
+    let reply = apply(here, &mut tablet, envelope)?;
+    Ok((reply, tablet.dropped))
 }
 
 impl Tablet for SqlTablet<'_> {
@@ -295,6 +310,17 @@ impl Tablet for SqlTablet<'_> {
     }
 
     fn drop_locks_of(&mut self, txn: TxnId) -> anyhow::Result<()> {
+        let dropped = &mut self.dropped;
+        self.db.query(
+            "SELECT key FROM __amphora_xg_lock WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3",
+            txn_params(txn)?,
+            |row| {
+                if let Some(key) = bytes_at(row, 0).filter(|key| key.starts_with(RECORD)) {
+                    dropped.push(key);
+                }
+                Ok(true)
+            },
+        )?;
         self.db.query(
             "DELETE FROM __amphora_xg_lock WHERE coordinator = ?1 AND epoch = ?2 AND seq = ?3",
             txn_params(txn)?,
@@ -508,9 +534,10 @@ pub(crate) fn serve(
     until: Instant,
 ) -> Result<(Reply, Option<u64>, Option<u64>), Refusal> {
     let stamp = AtomicU64::new(carried);
-    let reply = step(group, &stamp, until, move |db| {
-        apply(here, &mut SqlTablet::new(db), &envelope)
+    let (reply, dropped) = step(group, &stamp, until, move |db| {
+        apply_step(db, here, &envelope)
     })?;
+    group.ring_locks(&dropped)?;
     let closed = group.session_token(until)?.map(|token| token.micros);
     Ok((
         reply,
@@ -531,9 +558,13 @@ fn step_on(
     envelope: Envelope,
 ) -> Result<Reply, Refusal> {
     match member {
-        Member::Local(group) => step(group, carried, until, move |db| {
-            apply(here, &mut SqlTablet::new(db), &envelope)
-        }),
+        Member::Local(group) => {
+            let (reply, dropped) = step(group, carried, until, move |db| {
+                apply_step(db, here, &envelope)
+            })?;
+            group.ring_locks(&dropped)?;
+            Ok(reply)
+        }
         Member::Node { nodes, node } => {
             let (reply, latest, micros) = nodes
                 .step(
@@ -2602,6 +2633,7 @@ mod sessions {
             (AnswerAt::Decided, LockedReads::Committed),
             (AnswerAt::Resolved, LockedReads::Committed),
             (AnswerAt::Decided, LockedReads::Wait),
+            (AnswerAt::Decided, LockedReads::WaitOnLock),
         ];
         for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
             for (answer_at, reads) in modes {
@@ -2640,7 +2672,7 @@ mod sessions {
                             let began = Instant::now();
                             (read(reader), began.elapsed())
                         }
-                        LockedReads::Wait => {
+                        LockedReads::Wait | LockedReads::WaitOnLock => {
                             let waiting = scope.spawn(move || {
                                 let began = Instant::now();
                                 (read(reader), began.elapsed())
@@ -2657,7 +2689,7 @@ mod sessions {
                         assert_eq!(seen, Some(vec![4]), "{mode}");
                     }
                     let waits = reader.locked_waits();
-                    assert_eq!(waits, u64::from(reads == LockedReads::Wait), "{mode}");
+                    assert_eq!(waits, u64::from(reads != LockedReads::Committed), "{mode}");
                     eprintln!("{mode}: committed in {committed_in:?}, read in {read_in:?}");
                 });
             }
@@ -2677,35 +2709,108 @@ mod sessions {
     fn t_t1_10_w8_a_read_waiting_on_an_aborted_lock_answers_the_row_before() {
         use crate::database::LockedReads;
         use amphora_api::{Consistency, Records};
-        let dir = tempfile::tempdir().unwrap();
-        let dbs = databases(dir.path(), 3);
-        for db in &dbs {
-            db.set_locked_reads(LockedReads::Wait);
-        }
-        let gate = gate(&dbs, 0, true);
-        let cluster = open_gated(&dbs, Protocol::TwoPhase, &gate, AnswerAt::Decided, 1);
-        std::thread::scope(|scope| {
-            let answer = {
-                let cluster = &cluster;
-                scope.spawn(move || cluster.commit(across(5), until()))
-            };
-            gate.reached.recv().unwrap();
-            let answer = answer.join().unwrap();
-            assert!(matches!(answer, Ok(Answer::Aborted(_))), "{answer:?}");
-            let reader = &dbs[0];
-            let read = scope.spawn(move || {
-                reader.namespace("ns").unwrap().get(
-                    "rows",
-                    &[0],
-                    Consistency::Linearizable,
-                    until(),
-                )
+        for reads in [LockedReads::Wait, LockedReads::WaitOnLock] {
+            let dir = tempfile::tempdir().unwrap();
+            let dbs = databases(dir.path(), 3);
+            for db in &dbs {
+                db.set_locked_reads(reads);
+            }
+            let gate = gate(&dbs, 0, true);
+            let cluster = open_gated(&dbs, Protocol::TwoPhase, &gate, AnswerAt::Decided, 1);
+            std::thread::scope(|scope| {
+                let answer = {
+                    let cluster = &cluster;
+                    scope.spawn(move || cluster.commit(across(5), until()))
+                };
+                gate.reached.recv().unwrap();
+                let answer = answer.join().unwrap();
+                assert!(
+                    matches!(answer, Ok(Answer::Aborted(_))),
+                    "{reads:?}: {answer:?}"
+                );
+                let reader = &dbs[0];
+                let read = scope.spawn(move || {
+                    reader.namespace("ns").unwrap().get(
+                        "rows",
+                        &[0],
+                        Consistency::Linearizable,
+                        until(),
+                    )
+                });
+                reader.locked_waits_reach(1, until()).unwrap();
+                gate.open.send(()).unwrap();
+                let seen = read.join().unwrap();
+                assert!(matches!(seen, Ok(None)), "{reads:?}: {seen:?}");
+                assert_eq!(reader.locked_waits(), 1, "{reads:?}");
             });
-            reader.locked_waits_reach(1, until()).unwrap();
-            gate.open.send(()).unwrap();
-            let seen = read.join().unwrap();
-            assert!(matches!(seen, Ok(None)), "{seen:?}");
-            assert_eq!(reader.locked_waits(), 1);
-        });
+        }
+    }
+
+    /// T-T1.10.W9 (AC-T1.10.1, lane xgroup-sql-11): a read waiting on a held lock under
+    /// [`LockedReads::WaitOnLock`] is woken by its own row's resolution only, where under
+    /// [`LockedReads::Wait`] each change in the group wakes it to read again (the thundering herd
+    /// at scale). Do: three standalone groups, the answer at the decision, group 1's resolution
+    /// held back; a read of row 1 in group 1, waiting; then commits of another row in group 1;
+    /// then group 1 let go. Expect: under WaitOnLock one wake, its row's resolution; under Wait
+    /// at least that one; both find the row. Each setting's wakes are printed.
+    ///
+    /// [`LockedReads::WaitOnLock`]: crate::database::LockedReads::WaitOnLock
+    /// [`LockedReads::Wait`]: crate::database::LockedReads::Wait
+    #[test]
+    fn t_t1_10_w9_a_read_waiting_on_its_lock_is_woken_by_its_own_resolution_only() {
+        use crate::database::LockedReads;
+        use amphora_api::{Consistency, Records, Tx, Write};
+        const OTHERS: u8 = 8;
+        for reads in [LockedReads::Wait, LockedReads::WaitOnLock] {
+            let dir = tempfile::tempdir().unwrap();
+            let dbs = databases(dir.path(), 3);
+            for db in &dbs {
+                db.set_locked_reads(reads);
+            }
+            let gate = gate(&dbs, 1, false);
+            let cluster = open_gated(&dbs, Protocol::TwoPhase, &gate, AnswerAt::Decided, 1);
+            std::thread::scope(|scope| {
+                let answer = {
+                    let cluster = &cluster;
+                    scope.spawn(move || cluster.commit(across(6), until()))
+                };
+                gate.reached.recv().unwrap();
+                let answer = answer.join().unwrap();
+                assert!(
+                    matches!(answer, Ok(Answer::Committed { .. })),
+                    "{reads:?}: {answer:?}"
+                );
+                let reader = &dbs[1];
+                let read = scope.spawn(move || {
+                    reader
+                        .namespace("ns")
+                        .unwrap()
+                        .get("rows", &[1], Consistency::Linearizable, until())
+                        .unwrap()
+                        .map(|r| r.value)
+                });
+                reader.locked_waits_reach(1, until()).unwrap();
+                let others = reader.namespace("ns").unwrap();
+                for v in 0..OTHERS {
+                    let tx = Tx {
+                        conds: Vec::new(),
+                        writes: vec![Write::Put {
+                            family: "rows".into(),
+                            key: vec![4],
+                            value: vec![v],
+                        }],
+                    };
+                    others.commit(tx, until()).unwrap();
+                }
+                gate.open.send(()).unwrap();
+                assert_eq!(read.join().unwrap(), Some(vec![6]), "{reads:?}");
+                let wakes = reader.locked_wakes();
+                match reads {
+                    LockedReads::WaitOnLock => assert_eq!(wakes, 1, "{reads:?}"),
+                    _ => assert!(wakes >= 1, "{reads:?}: {wakes}"),
+                }
+                eprintln!("{reads:?}: {wakes} wakes, {OTHERS} other commits in the group");
+            });
+        }
     }
 }
