@@ -447,7 +447,19 @@ pub struct MorselAggregateData {
     /// A hash join's build side when the scan is the join's probe: the pipeline's row is the probe
     /// table's columns, then the build's; `filter` is then over the probe table's alone.
     pub join: Option<MorselJoinData>,
+    /// A join's rows rather than groups: `result_map` then names the joined row's columns each
+    /// output row takes (the result columns, then the ORDER BY keys), and there are no aggregates.
+    pub joined_rows: Option<MorselRows>,
     pub target_pc_serial: BranchOffset,
+}
+
+/// Amphora: how [MorselAggregateData]'s joined rows come out (QT.6).
+#[derive(Debug, Clone)]
+pub struct MorselRows {
+    /// The ORDER BY keys: each one's place in the output row, and whether it descends.
+    pub order: Vec<(usize, bool)>,
+    /// How many of the output row's values are result columns (the rest are sort keys).
+    pub width: usize,
 }
 
 /// Amphora: the build side of [MorselAggregateData]'s hash join (QT.6).
@@ -2339,6 +2351,14 @@ pub enum Insn {
     JoinSwitchBuilt {
         data: Box<JoinSwitchBuiltData>,
     },
+
+    /// Amphora (PL.7, T-PL.7.1): writes into `target_reg` the pages of the B-tree open at
+    /// `cursor_id`, its interior and leaf pages, as the walk [Insn::Count] makes counts them; NULL
+    /// for a cursor over no B-tree of its own. ANALYZE keeps it beside its other statistics.
+    TreePages {
+        cursor_id: CursorID,
+        target_reg: usize,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2591,6 +2611,7 @@ impl InsnVariants {
             InsnVariants::JoinSwitchStep => execute::op_join_switch_step,
             InsnVariants::JoinSwitchHash => execute::op_join_switch_hash,
             InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
+            InsnVariants::TreePages => execute::op_tree_pages,
         }
     }
 }

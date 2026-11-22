@@ -25,6 +25,11 @@ fn tables(dir: &Path) -> Arc<Connection> {
 
 /// The suite's tables, indexes and statistics, with `owners` owners and a fiftieth of its items.
 fn suite_tables(dir: &Path, owners: i64) -> Arc<Connection> {
+    suite_tables_of(dir, owners, ITEMS)
+}
+
+/// The suite's tables, indexes and statistics, with `owners` owners and `items` items.
+fn suite_tables_of(dir: &Path, owners: i64, items: i64) -> Arc<Connection> {
     let io = Arc::new(PlatformIO::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
     let db = Database::open(io, dir.join("suite.db").to_str().unwrap(), options).unwrap();
@@ -44,7 +49,7 @@ fn suite_tables(dir: &Path, owners: i64) -> Arc<Connection> {
         .collect();
     conn.execute(format!("INSERT INTO owners VALUES {}", rows.join(", ")))
         .unwrap();
-    for first in (1..=ITEMS).step_by(500) {
+    for first in (1..=items).step_by(500) {
         let rows: Vec<String> = (first..first + 500)
             .map(|id| {
                 format!(
@@ -140,7 +145,8 @@ fn a_page_by_key_reads_in_key_order_without_sorting() {
 }
 
 /// Do: GROUP BY the first column of an index that lacks the aggregated columns, over the whole
-/// table, with the connection's cache a fraction of the table and then holding all of it: with
+/// table of 80,000 items, with the connection's cache a fraction of the table's pages as ANALYZE
+/// counted them and then holding all of it: with
 /// aggregates a hash table keeps, and with a COUNT(DISTINCT), which a sort groups. Expect: the
 /// hashed GROUP BY scans the table and hashes its 100 groups whatever the cache holds (a probe a
 /// row costs less than the index order's seek a row, cached or not; docs/design/planner.md,
@@ -149,7 +155,8 @@ fn a_page_by_key_reads_in_key_order_without_sorting() {
 #[test]
 fn a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages() {
     let dir = tempfile::tempdir().unwrap();
-    let conn = tables(dir.path());
+    // Four times the suite's fiftieth, so the table's real pages pass the smallest cache (PL.7).
+    let conn = suite_tables_of(dir.path(), OWNERS, 4 * ITEMS);
     let hashed = "SELECT grp, COUNT(*), AVG(price) FROM items GROUP BY grp";
     let sorted = "SELECT grp, COUNT(DISTINCT owner) FROM items GROUP BY grp";
     let scan_and_hash = vec![
@@ -163,9 +170,20 @@ fn a_whole_table_group_by_scans_and_sorts_where_lookups_would_read_pages() {
         let sorter = steps.iter().any(|s| s == "USE SORTER FOR GROUP BY");
         (steps.first().cloned().unwrap_or_default(), sorter)
     };
+    // The table's pages as ANALYZE counted them (PL.7, T-PL.7.1), several times the smallest
+    // cache the connection takes, 200 pages.
+    let mut stmt = conn
+        .prepare("SELECT data FROM __turso_internal_column_stats WHERE kind = 'pages' AND tbl = 'items' AND col IS NULL")
+        .unwrap();
+    let pages = stmt.run_collect_rows().unwrap()[0][0].as_int().unwrap();
+    assert!(pages > 3 * 200, "{pages} pages");
     conn.execute("PRAGMA cache_size = 200").unwrap();
     assert_eq!(plan(&conn, hashed), scan_and_hash);
-    assert_eq!(sorted_plan(&conn), ("SCAN items".to_owned(), true));
+    assert_eq!(
+        sorted_plan(&conn),
+        ("SCAN items".to_owned(), true),
+        "{pages} pages"
+    );
     conn.execute("PRAGMA cache_size = 100000").unwrap();
     assert_eq!(plan(&conn, hashed), scan_and_hash);
     assert_eq!(

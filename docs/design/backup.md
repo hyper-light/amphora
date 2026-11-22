@@ -198,11 +198,9 @@ every step. This is the consistent cut Chandy and Lamport define ("Distributed S
 3(1), 1985): no group holds the effect of a decision another group's cut has not yet reached once the
 records finish it.
 
-- **The groups' clocks.** A cut is one second in every group, so every group's commits must be
-  stamped by one clock. Groups on one node share it. Across nodes, a participant's intent stamped
-  later than its anchor's decision by clock skew would be cut away while the decision stays: open,
-  not built (the stamps would need a bound on skew, as Spanner's commit wait gives, or a hybrid
-  logical clock carried in each step).
+- **The groups' clocks.** A cut is one second in every group, so a commit made after another must
+  be stamped after it in whichever group each is. Groups on one node share a clock; across nodes
+  the next section carries one in each cross-group step.
 
 **Evidence.** T-T1.12.X1: two groups backed up to one folder under a clock that moves a second at
 every reading, so every commit in either group has its own second; two transactions across both
@@ -213,6 +211,38 @@ cut between the two (non-vacuous).
 
 **Falsified by.** A cut at which one group holds a transaction's write and another doesn't after
 `restore_cut`; a cut whose restore is refused while each group's archive holds the second whole.
+
+## Cuts across machines
+
+**Decision.** Groups on different nodes stamp commits by different clocks, and a participant whose
+clock runs ahead stamps its prepared write later than the anchor's decision that followed it: a cut
+between the two would keep the decision and lose the write. Each cross-group step therefore carries
+a hybrid logical clock (Kulkarni, Demirbas et al., "Logical Physical Clocks", OPODIS 2014): a group
+takes in the latest stamp the coordinator heard of before the step (`Marks::observe`), so its
+commit is stamped later than that, and answers with its own latest (`Marks::latest`), which the
+coordinator keeps as the most it has heard of. A stamp stays the clock's reading, or one nanosecond
+past the latest stamp made or seen when that is later, as `Marks` already held a clock stepping
+back. Every decision is sent after the replies it rests on, so it is stamped after every write it
+decides on, whatever the clocks read, and a cut keeping it keeps them.
+
+- **Why not a bound on skew.** Spanner's commit wait sleeps out a measured uncertainty (TrueTime),
+  which needs clocks with a bound measured and kept (GPS and atomic references); Amphora's nodes are
+  any machines, with no such bound to measure. The carried clock needs no bound, and costs no wait.
+- **What a stamp then means.** Stamps stay close to real time: a stamp runs ahead of a group's
+  clock only by as much as another group's clock ran ahead of it, the HLC's bound. A restore target
+  is a second in the stamps, so a second asked for on a group whose clock lags is that much later in
+  its own clock; each group's archive still restores exactly the commits stamped at or before it.
+- **Where it is carried.** In the coordinator's process (`xgroup::sql`'s step), for groups backed
+  up there; a step over the wire would carry the same number in its envelope (not built: groups are
+  in-process `Database`s today).
+
+**Evidence.** T-T1.12.X2: as T-T1.12.X1, the participant's clock 5 seconds ahead of the anchor's,
+under both protocols: at every cut both keys or neither, never moving back. With the carried clock
+taken out (the step observing 0), it fails: "second 1037: one group without the other". The unit
+case: an observed stamp orders every later commit after it.
+
+**Falsified by.** A cut that keeps a decision and loses a write it decided on, with any clocks; a
+stamp further ahead of its group's clock than the furthest-ahead clock of a group it heard from.
 
 ## Incremental bases
 

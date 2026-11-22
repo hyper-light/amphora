@@ -1167,6 +1167,7 @@ fn find_select_plan_form(
     // Amphora (PL.12): and with the values its estimates may read for the statement's parameters.
     let params = &base
         .with_cache_pages(resolver.cache_pages())
+        .with_page_bytes(resolver.page_bytes())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
@@ -2870,6 +2871,7 @@ fn find_table_access_plan(
     // Amphora (PL.12): and with the values its estimates may read for the statement's parameters.
     let params = &base
         .with_cache_pages(resolver.cache_pages())
+        .with_page_bytes(resolver.page_bytes())
         .with_statement_memory(resolver.statement_memory())
         .with_learned(resolver.learned_weights())
         .with_fitted(resolver.fitted_weights())
