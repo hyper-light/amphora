@@ -499,5 +499,40 @@ class Like(unittest.TestCase):
         self.assertEqual(["TRANSLATE" in (o[0] or "") for o in (out[0], out[2], out[4])], [True, False, True])
 
 
+class FunctionsSaid(unittest.TestCase):
+    """Do: likely(), unlikely(), likelihood(), upper() and lower() of letters beyond ASCII, round()
+    to negative digits, char() of several code points and of NULL. Expect: DuckDB (when its Python
+    module is here) gives what SQLite gives, values compared as numbers; PostgreSQL's round() digits
+    guarded; a likelihood() SQLite refuses left for the engine to refuse."""
+
+    CASES = ["likely(1 > 0)", "unlikely(3) + 1", "likelihood(2, 0.5)", "upper('héllo')", "lower('ÉaB')", "round(2.5, -1)", "round(25, -2)", "char(72, 105)", "char(NULL)", "char(97)"]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                want = db.execute(f"SELECT {case}").fetchone()[0]
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                got = duckdb.sql(out).fetchone()[0]
+                self.assertEqual(got if isinstance(want, str) else float(got), want)
+
+    def test_other_dialects(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out, why = dialects.translate("SELECT likely(a), likelihood(a, 0.25), round(a, -1) FROM t", d)
+                self.assertIsNone(why)
+                self.assertNotRegex(out.upper(), r"LIKEL|-1")
+        self.assertIn("CASE WHEN b < 0 THEN 0 ELSE b END", dialects.translate("SELECT round(a, b) FROM t", "postgres")[0])
+        self.assertIn("LIKELIHOOD(a, 1)", dialects.translate("SELECT likelihood(a, 1) FROM t", "postgres")[0])
+        self.assertEqual(dialects.translate("SELECT upper(b) FROM t", "clickhouse"), ("SELECT UPPER(b) FROM t", None))
+
+
 if __name__ == "__main__":
     unittest.main()

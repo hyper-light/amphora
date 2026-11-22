@@ -950,6 +950,67 @@ def liked(expression, context, dialect):
     return expression
 
 
+def functions_said(expression, dialect):
+    """`expression` with SQLite's built-in functions that sqlglot writes as functions of the same
+    name that mean otherwise, said as SQLite's (lang_corefunc.html, "Built-In Scalar SQL Functions"):
+    - likely(X) and unlikely(X): "returns the argument X unchanged", a hint to the query planner;
+      likelihood(X,Y): "returns argument X unchanged. The value Y in likelihood(X,Y) must be a
+      floating point constant between 0.0 and 1.0, inclusive" (SQLite refuses an integer Y: "second
+      argument to likelihood() must be a constant between 0.0 and 1.0"). Each is X, in parentheses;
+      a likelihood() SQLite refuses is left as it is, for the engine to refuse. No other engine has
+      them.
+    - upper(X) and lower(X): "a copy of input string X in which all lower-case ASCII characters are
+      converted to their upper-case equivalent" (lower the other way), ASCII's letters only, where
+      DuckDB's and PostgreSQL's convert every letter: translate(X, 'a..z', 'A..Z') there (liked()'s
+      translate). ClickHouse's upper and lower are ASCII's already ("String Functions": upperUTF8
+      is its Unicode one); MySQL's convert by the character set's case mapping: left as it is, a
+      difference of the engine.
+    - round(X,Y): "If the Y argument is omitted or negative, it is taken to be 0", where every other
+      engine rounds to tens, hundreds, ...: Y is given as CASE WHEN Y < 0 THEN 0 ELSE Y END (a
+      literal Y as its value), so a Y of random() is not expressible.
+    - char(X1,...,XN): "a string composed of characters having the unicode code point values of
+      integers X1 through XN", a NULL being 0 (SQLite gives char(NULL) as one character U+0000),
+      where sqlglot writes DuckDB's chr() of X1 alone: there, chr(coalesce(Xi, 0)) of each,
+      joined with ||."""
+    from sqlglot import exp
+
+    def same(node, said):
+        nonlocal expression
+        if node is expression:
+            expression = said
+        else:
+            node.replace(said)
+
+    for node in [n for n in reversed(list(expression.dfs()))]:
+        if isinstance(node, exp.Anonymous) and node.name.upper() in ("LIKELY", "UNLIKELY", "LIKELIHOOD"):
+            args = node.expressions
+            if node.name.upper() == "LIKELIHOOD":
+                y = args[1] if len(args) == 2 else None
+                if not (isinstance(y, exp.Literal) and not y.is_string and not y.this.isdigit() and 0.0 <= float(y.this) <= 1.0):
+                    continue
+            elif len(args) != 1:
+                continue
+            same(node, exp.Paren(this=args[0].copy()))
+        elif isinstance(node, (exp.Upper, exp.Lower)) and dialect in ("duckdb", "postgres"):
+            frm, to = (_ASCII_LOWER, _ASCII_UPPER) if isinstance(node, exp.Upper) else (_ASCII_UPPER, _ASCII_LOWER)
+            same(node, exp.Anonymous(this="translate", expressions=[node.this.copy(), exp.Literal.string(frm), exp.Literal.string(to)]))
+        elif isinstance(node, exp.Round) and node.args.get("decimals") is not None:
+            y = node.args["decimals"]
+            if isinstance(y, exp.Neg) and isinstance(y.this, exp.Literal) and not y.this.is_string:
+                node.set("decimals", exp.Literal.number(0))
+            elif not (isinstance(y, exp.Literal) and not y.is_string):
+                if any(isinstance(n, exp.Rand) for n in y.walk()):
+                    raise NotExpressible(f"not expressible in {dialect}: round() to random() digits, which SQLite's negative-digits rule (lang_corefunc.html#round) would have to evaluate twice")
+                node.set("decimals", exp.Case(ifs=[exp.If(this=exp.LT(this=y.copy(), expression=exp.Literal.number(0)), true=exp.Literal.number(0))], default=y.copy()))
+        elif isinstance(node, exp.Chr) and dialect == "duckdb" and node.expressions:
+            parts = [exp.Chr(expressions=[exp.Coalesce(this=a.copy(), expressions=[exp.Literal.number(0)])]) for a in node.expressions]
+            said = parts[0]
+            for more in parts[1:]:
+                said = exp.DPipe(this=said, expression=more)
+            same(node, exp.Paren(this=said) if len(parts) > 1 else said)
+    return expression
+
+
 def extremes(expression, dialect):
     """`expression` with each multi-argument max() and min() said as the dialect's GREATEST and LEAST
     with SQLite's NULL. SQLite's "Built-In Scalar SQL Functions" (https://www.sqlite.org/lang_corefunc.html#max_scalar):
@@ -1149,7 +1210,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(extremes(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), dialect)
+            e = spoken(functions_said(extremes(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:
