@@ -623,6 +623,32 @@ impl Db {
             .map_err(fail)
     }
 
+    /// Folds the log into the file through `frame` (inclusive), leaving the rest in the log and the
+    /// log as it is: a replay in parts, each a step a paced check can pause after (T-T1.12.C8). The
+    /// engine's passive checkpoint, bounded (`CheckpointMode::Passive`'s `upper_bound_inclusive`).
+    pub(crate) fn fold_log_through(&mut self, frame: u64) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        self.conn
+            .checkpoint(CheckpointMode::Passive {
+                upper_bound_inclusive: Some(frame),
+            })
+            .map(|_| ())
+            .map_err(fail)
+    }
+
+    /// [`Db::query`] uncached, `between` called each time the statement waits on the device: a long
+    /// statement (`PRAGMA integrity_check`) a paced check can pause inside (T-T1.12.C8).
+    pub(crate) fn query_between(
+        &self,
+        sql: &str,
+        each: impl FnMut(&Row) -> anyhow::Result<bool>,
+        between: &mut dyn FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.ensure_unfenced()?;
+        let mut stmt = self.conn.prepare(sql).map_err(fail)?;
+        step_between(self.io.as_ref(), &mut stmt, [], each, between)
+    }
+
     /// The frames the log holds now, as this connection last saw it: for a writer, all of them.
     pub(crate) fn log_frames_in_use(&self) -> anyhow::Result<u64> {
         Ok(self.conn.wal_state().map_err(fail)?.max_frame)
@@ -1317,7 +1343,19 @@ pub fn step(
     io: &dyn IO,
     stmt: &mut Statement,
     params: impl IntoIterator<Item = Value>,
+    each: impl FnMut(&Row) -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    step_between(io, stmt, params, each, &mut || Ok(()))
+}
+
+/// [`step`], `between` called each time the statement waits on the device, before it does: a long
+/// statement's points to pause at (T-T1.12.C8).
+fn step_between(
+    io: &dyn IO,
+    stmt: &mut Statement,
+    params: impl IntoIterator<Item = Value>,
     mut each: impl FnMut(&Row) -> anyhow::Result<bool>,
+    between: &mut dyn FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     stmt.reset().map_err(fail)?;
     for (i, p) in params.into_iter().enumerate() {
@@ -1335,7 +1373,10 @@ pub fn step(
                 }
             }
             StepResult::Done => return Ok(()),
-            StepResult::IO | StepResult::Yield => io.step().map_err(fail)?,
+            StepResult::IO | StepResult::Yield => {
+                between()?;
+                io.step().map_err(fail)?;
+            }
             StepResult::Sleep { duration } => {
                 pause(duration);
                 io.step().map_err(fail)?;

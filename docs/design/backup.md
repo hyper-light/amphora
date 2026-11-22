@@ -347,3 +347,39 @@ to 94 ms paced, a spread wider than any difference; and under one writer committ
 (T-T1.12.C4) paced checks found no quiet stretch and only the first passed. The coordinator's
 run of record: `AMPHORA_DRILL_LOAD_RUNS=20 AMPHORA_DRILL_LOAD_COMMITS=500 cargo test -p amphora
 --release --test backup t_t1_12_c5 -- --nocapture --test-threads=1` on an otherwise idle machine.
+
+Starvation, event-driven (lane backups-6, T-T1.12.C7, C8). Under one writer per core the
+foreground always has a call in flight, so a check that yields to it fully never runs: the
+failure mode at scale. `CheckPolicy` gains a fourth setting for the A/B, the control
+(`Scratch`, unpaced) unchanged beside it:
+
+- `Continuous` yields fully (`backup::Yield::Fully`): a step begins only while the database runs
+  no call. The database counts each call from its submission to its answer
+  (`backup::Foreground::call`, reads on the local writer too), not only finished commits, and
+  the call that ends last wakes the check. No timer: the quiet wait and the rest after each step
+  are gone, as every wait now ends on an event (a call's end, a commit, the database's end).
+- `Shared(retention)` gives each check a minimum share (`backup::Yield::Share`): its work over the
+  retention period its owner expires the archive by, so a check finishes within the time its
+  second is kept. A check behind its share (`backup::behind`: its work so far under the last whole
+  check's work times the share of the period gone; before any whole check, once the whole period
+  is gone) takes its step with calls in flight, counted as `forced`; it looks again at each commit
+  (the store's one thread tells it) and at the last call's end, so callers never meet on the
+  check's lock while the foreground stays busy.
+- A check's work is counted in the device's time (`backup::device_ns`): a step's bytes at the
+  fastest a step of its kind went per byte, never more than it took, so a step the foreground
+  slowed counts what it would take alone. That reference decays: it is the fastest of the check
+  under way and the last whole check (LEDBAT's base delay, kept as minima over recent intervals,
+  RFC 6817's BASE_HISTORY; the interval here a check), so a device that slowed for good is read as it is after one
+  check.
+- The replay and the integrity check are steps that can pause. The replay folds the log in parts
+  of an object's worth of frames (the engine's passive checkpoint, bounded), each made durable as
+  it ends, the last fold emptying the log; unpaced, it folds in one step as before. The integrity
+  check ends a step at each of its waits on the device, inside its one statement.
+
+Evidence: unit tests of the share, the device cost, the decay and both yields, and a restore whose
+paced replay and integrity check end steps inside them (T-T1.12.C8). The A/B of record is the
+coordinator's: `AMPHORA_DRILL_LOAD_RUNS=20 AMPHORA_DRILL_LOAD_COMMITS=500
+AMPHORA_DRILL_RETENTION_MS=<the retention under test> cargo test -p amphora --release --test backup
+t_t1_12_c5 -- --nocapture --test-threads=1`, reading `under_load`, `forced` and commit p99 per
+policy. A single call running long with no other event holds a waiting check until it ends: one
+call's length, not a starvation.

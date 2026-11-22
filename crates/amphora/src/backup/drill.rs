@@ -1,13 +1,13 @@
 //! Continuous restore drills (docs/design/backup.md, "Continuous restore drills"; T-T1.12.C4 to
 //! C7): whether the shipping thread checks its archive ([`CheckPolicy`]), whether the disk holds a
-//! check ([`admit`]), how a check yields to the foreground step by step ([`Pacer`]), the seconds it
-//! drills ([`Drills`]) and what it measured ([`DrillMeter`]).
+//! check ([`admit`]), how a check yields to the foreground step by step ([`Pacer`], [`Yield`]), the
+//! seconds it drills ([`Drills`]) and what it measured ([`DrillMeter`]).
 //!
-//! The pure parts take what they decide from as arguments (the free bytes, the quiet time, a step's
-//! cost, a random number), so each is tested without a disk, a clock or a seed.
+//! The pure parts take what they decide from as arguments (the free bytes, a step's cost, the time
+//! a check has run, a random number), so each is tested without a disk, a clock or a seed.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,8 +25,39 @@ pub enum CheckPolicy {
     Scratch(Option<PathBuf>),
     /// Checks into a file beside the database, each at a second drawn at random from those the
     /// thread holds the source's rows for, paced step by step so they yield to the foreground
-    /// ([`Pacer`], T-T1.12.C7).
+    /// fully ([`Yield::Fully`], T-T1.12.C7).
     Continuous,
+    /// [`CheckPolicy::Continuous`], each check given a minimum share of the machine so the
+    /// foreground can't starve it ([`Yield::Share`], T-T1.12.C8): the archive's retention period,
+    /// the one its owner expires it by ([`super::expire`]), a check's second lost past it.
+    Shared(Duration),
+}
+
+impl CheckPolicy {
+    /// How a check under this policy yields to the foreground: none when unpaced or off.
+    #[must_use]
+    pub fn pace(&self) -> Option<Yield> {
+        match self {
+            Self::Off | Self::Scratch(_) => None,
+            Self::Continuous => Some(Yield::Fully),
+            Self::Shared(retention) => Some(Yield::Share {
+                retention_ns: u64::try_from(retention.as_nanos()).unwrap_or(u64::MAX),
+            }),
+        }
+    }
+}
+
+/// How a paced check shares the machine with the foreground (T-T1.12.C8): the two candidates the
+/// A/B runs, behind [`CheckPolicy`], the control ([`CheckPolicy::Scratch`]) unpaced beside them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Yield {
+    /// A step begins only while the database runs no call: the call that ends last wakes it. A
+    /// foreground that always has a call in flight starves the check.
+    Fully,
+    /// As [`Yield::Fully`], but a step also begins with calls in flight while the check is behind
+    /// its minimum share ([`behind`]): its work over the retention period, so a check finishes
+    /// within the period its second is kept for, whatever the load.
+    Share { retention_ns: u64 },
 }
 
 impl Default for CheckPolicy {
@@ -74,24 +105,29 @@ pub fn admit(budget: &Budget) -> Result<(), Deferred> {
     if fits { Ok(()) } else { Err(Deferred::Disk) }
 }
 
-/// What the foreground does, as a check's [`Pacer`] reads it (T-T1.12.C7): when the store's last
-/// commit was, and whether the database ended. The store's commit watcher writes it.
-#[derive(Debug)]
+/// What the foreground does, as a check's [`Pacer`] reads it (T-T1.12.C7, C8): the calls the
+/// database runs now, each counted from its submission to its answer ([`Foreground::call`]), and
+/// whether the database ended. The last call's end, each commit and the database's end wake a
+/// waiting check: it waits on events, never on a timer.
+#[derive(Debug, Default)]
 pub struct Foreground {
-    base: Instant,
-    /// Nanoseconds from `base` to the last commit.
-    last_ns: AtomicU64,
+    in_flight: AtomicU64,
+    /// The check thread waits for an event: whoever makes one tells it.
+    waiting: AtomicBool,
     ended: Mutex<bool>,
     woken: Condvar,
 }
 
-impl Default for Foreground {
-    fn default() -> Self {
-        Self {
-            base: Instant::now(),
-            last_ns: AtomicU64::new(0),
-            ended: Mutex::new(false),
-            woken: Condvar::new(),
+/// A call in flight, counted until it drops ([`Foreground::call`]).
+#[derive(Debug)]
+pub struct InFlight(Arc<Foreground>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // Only the last call's end wakes a check: the callers never meet on the check's lock while
+        // the foreground stays busy; the store's commits, from its one thread, wake it meanwhile.
+        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.wake();
         }
     }
 }
@@ -109,19 +145,27 @@ impl std::fmt::Display for Stopped {
 impl std::error::Error for Stopped {}
 
 impl Foreground {
-    fn now_ns(&self) -> u64 {
-        u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    /// A call begins: counted in flight until what this returns drops.
+    #[must_use]
+    pub fn call(self: &Arc<Self>) -> InFlight {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        InFlight(Arc::clone(self))
     }
 
-    /// The store made a commit.
+    /// The store made a commit: a waiting check looks again.
     pub fn committed(&self) {
-        self.last_ns.store(self.now_ns(), Ordering::Relaxed);
+        self.wake();
     }
 
-    /// Nanoseconds since the last commit (since this began, before the first).
-    fn quiet_ns(&self) -> u64 {
-        self.now_ns()
-            .saturating_sub(self.last_ns.load(Ordering::Relaxed))
+    /// Tells a waiting check of an event. The event's change is made before `waiting` is read and
+    /// the waiter sets `waiting` before it reads the change, both sequentially consistent, so
+    /// either the waiter sees the change or this sees the waiter; the lock taken to notify is the
+    /// one it waits under, so the notice can't fall between its look and its wait.
+    fn wake(&self) {
+        if self.waiting.load(Ordering::SeqCst) {
+            let _held = self.ended.lock();
+            self.woken.notify_all();
+        }
     }
 
     /// The database ended: a check under way stops at its next step.
@@ -132,42 +176,28 @@ impl Foreground {
         self.woken.notify_all();
     }
 
-    fn has_ended(&self) -> bool {
-        self.ended.lock().map_or(true, |e| *e)
-    }
-
-    /// Waits `ns`, less if the database ends first: whether it ended.
-    fn sleep(&self, ns: u64) -> bool {
-        let Ok(mut ended) = self.ended.lock() else {
-            return true;
-        };
-        let deadline = Instant::now().checked_add(Duration::from_nanos(ns));
-        loop {
+    /// Waits, event by event, while `blocked(busy)` holds, `busy` being whether a call is in
+    /// flight: whether it waited at all. Refused [`Stopped`] once the database ended.
+    fn wait_while(&self, mut blocked: impl FnMut(bool) -> bool) -> Result<bool, Stopped> {
+        let mut ended = self.ended.lock().map_err(|_| Stopped)?;
+        let mut waited = false;
+        let out = loop {
             if *ended {
-                return true;
+                break Err(Stopped);
             }
-            let left = match deadline {
-                Some(d) => d.saturating_duration_since(Instant::now()),
-                None => Duration::MAX,
-            };
-            if left.is_zero() {
-                return false;
+            self.waiting.store(true, Ordering::SeqCst);
+            if !blocked(self.in_flight.load(Ordering::SeqCst) > 0) {
+                break Ok(waited);
             }
-            match self.woken.wait_timeout(ended, left) {
-                Ok((guard, _)) => ended = guard,
-                Err(_) => return true,
+            waited = true;
+            match self.woken.wait(ended) {
+                Ok(guard) => ended = guard,
+                Err(_) => break Err(Stopped),
             }
-        }
+        };
+        self.waiting.store(false, Ordering::SeqCst);
+        out
     }
-}
-
-/// How long a check's next step waits for the foreground to go quiet (T-T1.12.C7): until no commit
-/// was made for as long as the check's last step took, so a step begins only in a quiet stretch at
-/// least its own length, and a commit arriving pauses the steps after it. None before a step was
-/// measured.
-#[must_use]
-pub fn quiet_wait(quiet_ns: u64, last_step_ns: Option<u64>) -> u64 {
-    last_step_ns.map_or(0, |step| step.saturating_sub(quiet_ns))
 }
 
 /// Whether a step of `took_ns` over `bytes` went faster per byte than `best` (its nanoseconds and
@@ -177,26 +207,74 @@ fn faster(took_ns: u64, bytes: u64, best: (u64, u64)) -> bool {
         < u128::from(best.0).saturating_mul(u128::from(bytes))
 }
 
-/// How long a check rests after a step so its share of the device is no more than the room the
-/// device has (T-T1.12.C7). The step measures the room itself, as LEDBAT (RFC 6817, "Low Extra
-/// Delay Background Transport") and TCP Vegas measure a path's queue by their own delay against the
-/// least they saw: the fastest a step of its kind went per byte on this machine, over how fast this
-/// one went, is the share of the device the check had (1 with the device to itself); resting
-/// `took × (1 − room) / room` holds the check to that share, leaving the rest to the foreground.
+/// What a step cost the device (T-T1.12.C8): the time its bytes take at the fastest a step of its
+/// kind went per byte (`reference`, its nanoseconds and bytes), never more than it took; what it
+/// took when it moved no bytes or nothing is measured. A step slowed by the foreground counts what
+/// it would take alone, as LEDBAT (RFC 6817, "Low Extra Delay Background Transport") and TCP Vegas
+/// take the least delay they saw as the path's own.
 #[must_use]
-pub fn rest_ns(took_ns: u64, bytes: u64, best: (u64, u64)) -> u64 {
-    let (best_ns, best_bytes) = best;
-    let observed = u128::from(took_ns).saturating_mul(u128::from(best_bytes));
-    let fastest = u128::from(bytes).saturating_mul(u128::from(best_ns));
-    let excess = observed.saturating_sub(fastest);
-    u128::from(took_ns)
-        .saturating_mul(excess)
-        .checked_div(fastest)
-        .map_or(0, |ns| u64::try_from(ns).unwrap_or(u64::MAX))
+pub fn device_ns(took_ns: u64, bytes: u64, reference: Option<(u64, u64)>) -> u64 {
+    match reference {
+        Some((ns, of)) if bytes > 0 && of > 0 => u128::from(bytes)
+            .saturating_mul(u128::from(ns))
+            .checked_div(u128::from(of))
+            .map_or(took_ns, |alone| {
+                u64::try_from(alone).unwrap_or(u64::MAX).min(took_ns)
+            }),
+        _ => took_ns,
+    }
+}
+
+/// Whether a check is behind its minimum share (T-T1.12.C8): after `elapsed_ns` of its `retention_ns`,
+/// it owes `whole_ns × elapsed / retention` of work, `whole_ns` being the last whole check's work,
+/// and has done `work_ns`. Before a whole check was measured there is no work to divide, and a check
+/// is behind once it has run the whole period, its second about to be lost.
+#[must_use]
+pub fn behind(elapsed_ns: u64, retention_ns: u64, work_ns: u64, whole_ns: Option<u64>) -> bool {
+    match whole_ns {
+        Some(whole) => {
+            u128::from(work_ns).saturating_mul(u128::from(retention_ns))
+                < u128::from(whole).saturating_mul(u128::from(elapsed_ns))
+        }
+        None => elapsed_ns >= retention_ns,
+    }
+}
+
+/// The fastest step per byte of one kind (writing or reading): the device's own speed, when a
+/// check has it to itself. It decays: it holds the check under way's fastest and the last whole
+/// check's, so a device that slowed for good (worn, throttled, moved) is read as it is now after
+/// one check, as LEDBAT keeps its base delay as minima over recent intervals (RFC 6817's
+/// BASE_HISTORY), the interval here a check: the event a reference changes on, not a clock's.
+#[derive(Debug, Clone, Copy, Default)]
+struct Fastest {
+    now: Option<(u64, u64)>,
+    before: Option<(u64, u64)>,
+}
+
+impl Fastest {
+    fn reference(&self) -> Option<(u64, u64)> {
+        match (self.now, self.before) {
+            (Some(a), Some(b)) => Some(if faster(a.0, a.1, b) { a } else { b }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn observe(&mut self, took_ns: u64, bytes: u64) {
+        if bytes > 0 && self.now.is_none_or(|best| faster(took_ns, bytes, best)) {
+            self.now = Some((took_ns, bytes));
+        }
+    }
+
+    /// A check ended: its fastest becomes the one before, if it measured any.
+    fn age(&mut self) {
+        if self.now.is_some() {
+            self.before = self.now.take();
+        }
+    }
 }
 
 /// What a restore or a digest does between its steps (T-T1.12.C7): a base's chunk, a log segment, a
-/// replay, a chunk's worth of rows read.
+/// replay's part, a chunk's worth of rows read, each wait of the integrity check on the device.
 pub trait Pace {
     /// Before a step: waits while the foreground keeps the machine busy. Refused ([`Stopped`]) once
     /// the database ended: the check stops there.
@@ -204,6 +282,10 @@ pub trait Pace {
     /// After a step that moved `bytes`, written to `file` if it wrote. Paced, the file is made
     /// durable here, so the step's cost is the device's and its writes never pile up past a step.
     fn done(&mut self, file: Option<&std::fs::File>, bytes: u64) -> anyhow::Result<()>;
+    /// Whether steps are paced: an unpaced restore replays its log in one step, as before.
+    fn paced(&self) -> bool {
+        true
+    }
 }
 
 /// No pacing: a restore the caller asked for, as fast as it goes, and the control's checks.
@@ -218,58 +300,94 @@ impl Pace for Unpaced {
     fn done(&mut self, _: Option<&std::fs::File>, _: u64) -> anyhow::Result<()> {
         Ok(())
     }
+
+    fn paced(&self) -> bool {
+        false
+    }
 }
 
-/// A continuous check's pace (T-T1.12.C7): each step begins only once the foreground has been quiet
-/// as long as the last step took ([`quiet_wait`]), and rests after it by the device's measured room
-/// ([`rest_ns`]), so a check takes only what the foreground leaves and pauses when it comes back.
+/// A continuous check's pace (T-T1.12.C7, C8): each step begins only while the database runs no
+/// call, woken by the call that ends last; under [`Yield::Share`] also while the check is behind
+/// its minimum share, woken by each commit to look again. No timer: every wait ends on an event.
 #[derive(Debug)]
 pub struct Pacer {
     foreground: Arc<Foreground>,
     meter: Arc<DrillMeter>,
-    began: Option<Instant>,
-    last_step_ns: Option<u64>,
-    /// The fastest step per byte seen, writing and reading: the device's room when the check has it
-    /// to itself.
-    best_write: Option<(u64, u64)>,
-    best_read: Option<(u64, u64)>,
+    policy: Yield,
+    /// When the check under way took its first step; none between checks.
+    check_began: Option<Instant>,
+    step_began: Option<Instant>,
+    /// The check under way's work so far and the last whole check's, in the device's nanoseconds
+    /// ([`device_ns`]).
+    work_ns: u64,
+    whole_ns: Option<u64>,
+    write: Fastest,
+    read: Fastest,
 }
 
 impl Pacer {
     #[must_use]
-    pub fn new(foreground: Arc<Foreground>, meter: Arc<DrillMeter>) -> Self {
+    pub fn new(foreground: Arc<Foreground>, meter: Arc<DrillMeter>, policy: Yield) -> Self {
         Self {
             foreground,
             meter,
-            began: None,
-            last_step_ns: None,
-            best_write: None,
-            best_read: None,
+            policy,
+            check_began: None,
+            step_began: None,
+            work_ns: 0,
+            whole_ns: None,
+            write: Fastest::default(),
+            read: Fastest::default(),
         }
     }
+
+    /// A check ended: whole, its work is the next check's measure and the fastest steps age
+    /// ([`Fastest::age`]); stopped short, it's measured again by the next.
+    pub fn end_check(&mut self, whole: bool) {
+        if whole {
+            self.whole_ns = Some(self.work_ns);
+            self.write.age();
+            self.read.age();
+        }
+        self.work_ns = 0;
+        self.check_began = None;
+        self.step_began = None;
+    }
+}
+
+fn since_ns(at: Instant) -> u64 {
+    u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Pace for Pacer {
     fn ready(&mut self) -> anyhow::Result<()> {
-        let mut paused = false;
-        loop {
-            if self.foreground.has_ended() {
-                return Err(Stopped.into());
+        let began = *self.check_began.get_or_insert_with(Instant::now);
+        let (policy, work, whole) = (self.policy, self.work_ns, self.whole_ns);
+        let mut forced = false;
+        let asked = Instant::now();
+        let waited = self.foreground.wait_while(|busy| {
+            forced = false;
+            if !busy {
+                return false;
             }
-            let wait = quiet_wait(self.foreground.quiet_ns(), self.last_step_ns);
-            if wait == 0 {
-                break;
+            match policy {
+                Yield::Fully => true,
+                Yield::Share { retention_ns } => {
+                    forced = behind(since_ns(began), retention_ns, work, whole);
+                    !forced
+                }
             }
-            if !paused {
-                paused = true;
-                self.meter.paused.fetch_add(1, Ordering::Relaxed);
-            }
-            self.meter.waited_ns.fetch_add(wait, Ordering::Relaxed);
-            if self.foreground.sleep(wait) {
-                return Err(Stopped.into());
-            }
+        })?;
+        if waited {
+            self.meter.paused.fetch_add(1, Ordering::Relaxed);
+            self.meter
+                .waited_ns
+                .fetch_add(since_ns(asked), Ordering::Relaxed);
         }
-        self.began = Some(Instant::now());
+        if forced {
+            self.meter.forced.fetch_add(1, Ordering::Relaxed);
+        }
+        self.step_began = Some(Instant::now());
         Ok(())
     }
 
@@ -277,32 +395,16 @@ impl Pace for Pacer {
         if let Some(file) = file {
             file.sync_data()?;
         }
-        let took = self.began.take().map_or(0, |b| {
-            u64::try_from(b.elapsed().as_nanos()).unwrap_or(u64::MAX)
-        });
-        self.last_step_ns = Some(took);
-        if bytes == 0 {
-            return Ok(());
-        }
-        let best = if file.is_some() {
-            &mut self.best_write
+        let took = self.step_began.take().map_or(0, since_ns);
+        let fastest = if file.is_some() {
+            &mut self.write
         } else {
-            &mut self.best_read
+            &mut self.read
         };
-        let fastest = match *best {
-            Some(b) if !faster(took, bytes, b) => b,
-            _ => {
-                *best = Some((took, bytes));
-                (took, bytes)
-            }
-        };
-        let rest = rest_ns(took, bytes, fastest);
-        if rest > 0 {
-            self.meter.rested_ns.fetch_add(rest, Ordering::Relaxed);
-            if self.foreground.sleep(rest) {
-                return Err(Stopped.into());
-            }
-        }
+        fastest.observe(took, bytes);
+        self.work_ns = self
+            .work_ns
+            .saturating_add(device_ns(took, bytes, fastest.reference()));
         Ok(())
     }
 }
@@ -388,17 +490,18 @@ pub fn next_random(state: &mut u64) -> u64 {
 }
 
 /// What the drills measured: deferrals by reason, drills of a second older than the newest
-/// snapshot, the pace's pauses and waits for a quiet foreground and its rests for the device's
-/// room, the checks' cost, each check's cost in power-of-two buckets for its quantiles.
+/// snapshot, the pace's pauses and waits for the foreground and the steps its minimum share began
+/// with calls in flight, the checks' cost, each check's cost in power-of-two buckets for its
+/// quantiles.
 #[derive(Debug)]
 pub struct DrillMeter {
     pub deferred_disk: AtomicU64,
     pub older: AtomicU64,
-    /// Steps that waited for the foreground to go quiet, and the nanoseconds waited.
+    /// Steps that waited for the foreground, and the nanoseconds waited.
     pub paused: AtomicU64,
     pub waited_ns: AtomicU64,
-    /// Nanoseconds rested after steps to keep within the device's room.
-    pub rested_ns: AtomicU64,
+    /// Steps begun with calls in flight, the check behind its minimum share ([`Yield::Share`]).
+    pub forced: AtomicU64,
     pub cost_ns: AtomicU64,
     /// Checks whose cost in nanoseconds had `i` significant bits, at `i` (0 to 64).
     buckets: [AtomicU64; 65],
@@ -412,7 +515,7 @@ pub const DEFER_METRIC: (&str, &str, &str) = (
 );
 
 /// `amphora_backup_check_seconds`: what each check took, its digest and its restore-and-check,
-/// its pauses and rests included.
+/// its pauses included.
 pub const COST_METRIC: (&str, &str, &str) = (
     "amphora_backup_check_seconds",
     "histogram",
@@ -426,7 +529,7 @@ impl Default for DrillMeter {
             older: AtomicU64::new(0),
             paused: AtomicU64::new(0),
             waited_ns: AtomicU64::new(0),
-            rested_ns: AtomicU64::new(0),
+            forced: AtomicU64::new(0),
             cost_ns: AtomicU64::new(0),
             buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -517,59 +620,128 @@ mod tests {
         assert_eq!(admit(&overflow), Err(Deferred::Disk));
     }
 
-    /// T-T1.12.C7: a step begins only once the foreground was quiet as long as the last step took;
-    /// the first at once.
+    /// T-T1.12.C8: a step costs the device what its bytes take at the fastest a step of its kind
+    /// went, never more than it took; what it took with no bytes or nothing measured.
     #[test]
-    fn t_t1_12_c7_a_step_waits_for_a_quiet_stretch_its_own_length() {
-        assert_eq!(quiet_wait(0, None), 0);
-        assert_eq!(quiet_wait(10, Some(50)), 40);
-        assert_eq!(quiet_wait(50, Some(50)), 0);
-        assert_eq!(quiet_wait(u64::MAX, Some(50)), 0);
-    }
-
-    /// T-T1.12.C7: a step as fast per byte as the fastest rests none; one twice as slow (half the
-    /// device's room) rests as long as it took, holding the check to half; ten times as slow, nine
-    /// times as long. Nothing measured rests none.
-    #[test]
-    fn t_t1_12_c7_rests_hold_a_check_to_the_devices_room() {
-        assert_eq!(rest_ns(100, 1_000, (100, 1_000)), 0);
-        assert_eq!(rest_ns(50, 1_000, (100, 1_000)), 0);
-        assert_eq!(rest_ns(200, 1_000, (100, 1_000)), 200);
-        assert_eq!(rest_ns(100, 500, (100, 1_000)), 100);
-        assert_eq!(rest_ns(1_000, 1_000, (100, 1_000)), 9_000);
-        assert_eq!(rest_ns(100, 0, (100, 1_000)), 0);
-        assert_eq!(rest_ns(100, 1_000, (0, 0)), 0);
-        assert_eq!(rest_ns(u64::MAX, 1, (1, u64::MAX)), u64::MAX);
+    fn t_t1_12_c8_a_step_costs_what_it_would_alone() {
+        assert_eq!(device_ns(100, 1_000, Some((100, 1_000))), 100);
+        assert_eq!(device_ns(200, 1_000, Some((100, 1_000))), 100);
+        assert_eq!(device_ns(1_000, 500, Some((100, 1_000))), 50);
+        assert_eq!(device_ns(50, 1_000, Some((100, 1_000))), 50);
+        assert_eq!(device_ns(100, 0, Some((100, 1_000))), 100);
+        assert_eq!(device_ns(100, 1_000, None), 100);
+        assert_eq!(device_ns(100, 1_000, Some((0, 0))), 100);
+        assert_eq!(device_ns(u64::MAX, u64::MAX, Some((u64::MAX, 1))), u64::MAX);
         assert!(faster(1, 10, (2, 10)));
         assert!(!faster(2, 10, (2, 10)));
     }
 
-    /// T-T1.12.C7: a commit just made pauses the next step (counted); once the database ends, a
-    /// step is refused with [`Stopped`], not failed.
+    /// T-T1.12.C8: a check is behind its minimum share once its work falls under the last whole
+    /// check's work times the share of the retention period gone; before any whole check, once
+    /// the period is gone.
     #[test]
-    fn t_t1_12_c7_the_pacer_pauses_for_a_commit_and_stops_at_the_end() {
+    fn t_t1_12_c8_the_minimum_share_is_a_checks_work_over_the_retention() {
+        // A whole check of 100 over a period of 1,000: half the period gone owes 50.
+        assert!(behind(500, 1_000, 49, Some(100)));
+        assert!(!behind(500, 1_000, 50, Some(100)));
+        assert!(!behind(0, 1_000, 0, Some(100)));
+        assert!(behind(2_000, 1_000, 199, Some(100)));
+        assert!(!behind(500, 1_000, 0, Some(0)));
+        assert!(!behind(999, 1_000, 0, None));
+        assert!(behind(1_000, 1_000, 0, None));
+        assert!(!behind(u64::MAX, u64::MAX, u64::MAX, Some(u64::MAX)));
+    }
+
+    /// T-T1.12.C8: the fastest-step reference decays: a check's fastest holds through the next
+    /// check, then gives way to that check's own, slower or not; a check that measured nothing
+    /// keeps the one before.
+    #[test]
+    fn t_t1_12_c8_the_fastest_step_reference_decays() {
+        let mut fastest = Fastest::default();
+        assert_eq!(fastest.reference(), None);
+        fastest.observe(100, 1_000);
+        fastest.observe(150, 1_000);
+        assert_eq!(fastest.reference(), Some((100, 1_000)));
+        fastest.age();
+        fastest.observe(300, 1_000);
+        assert_eq!(
+            fastest.reference(),
+            Some((100, 1_000)),
+            "held through the next check"
+        );
+        fastest.age();
+        assert_eq!(
+            fastest.reference(),
+            Some((300, 1_000)),
+            "then the slower device's own"
+        );
+        fastest.age();
+        assert_eq!(
+            fastest.reference(),
+            Some((300, 1_000)),
+            "kept by a check that measured none"
+        );
+        fastest.observe(1, 0);
+        assert_eq!(fastest.now, None, "a step of no bytes measures nothing");
+    }
+
+    /// T-T1.12.C8: yielding fully, a step never begins while a call is in flight: it begins once the
+    /// last call ends, woken by that end, the wait counted; with nothing in flight it begins at once.
+    #[test]
+    fn t_t1_12_c8_yielding_fully_waits_for_the_last_call_to_end() {
         let foreground = Arc::new(Foreground::default());
         let meter = Arc::new(DrillMeter::default());
-        let mut pacer = Pacer::new(Arc::clone(&foreground), Arc::clone(&meter));
+        let mut pacer = Pacer::new(Arc::clone(&foreground), Arc::clone(&meter), Yield::Fully);
         pacer.ready().unwrap();
-        pacer.done(None, 0).unwrap();
-        assert_eq!(
-            meter.paused.load(Ordering::Relaxed),
-            0,
-            "the first step waits for nothing"
-        );
-        // The last step's cost: a millisecond.
-        pacer.last_step_ns = Some(1_000_000);
-        foreground.committed();
-        pacer.ready().unwrap();
-        assert_eq!(meter.paused.load(Ordering::Relaxed), 1);
-        assert!(meter.waited_ns.load(Ordering::Relaxed) > 0);
         pacer.done(None, 4096).unwrap();
-        assert_eq!(pacer.best_read.map(|b| b.1), Some(4096));
+        assert_eq!(meter.paused.load(Ordering::Relaxed), 0);
+        let first = foreground.call();
+        let second = foreground.call();
+        let ended = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&ended);
+        let step = std::thread::spawn(move || {
+            pacer.ready().unwrap();
+            assert!(
+                seen.load(Ordering::SeqCst),
+                "a step began with a call in flight"
+            );
+            pacer
+        });
+        drop(first);
+        foreground.committed();
+        ended.store(true, Ordering::SeqCst);
+        drop(second);
+        let pacer = step.join().unwrap();
+        assert_eq!(meter.forced.load(Ordering::Relaxed), 0);
+        assert!(pacer.step_began.is_some());
+    }
+
+    /// T-T1.12.C8: under a minimum share, a check behind it takes its step with calls in flight,
+    /// counted; once the database ends a waiting step is refused [`Stopped`], not failed.
+    #[test]
+    fn t_t1_12_c8_a_share_steps_through_load_and_the_end_stops_it() {
+        let foreground = Arc::new(Foreground::default());
+        let meter = Arc::new(DrillMeter::default());
+        // A period of none: any check is behind.
+        let mut shared = Pacer::new(
+            Arc::clone(&foreground),
+            Arc::clone(&meter),
+            Yield::Share { retention_ns: 0 },
+        );
+        let held = foreground.call();
+        shared.ready().unwrap();
+        shared.done(None, 0).unwrap();
+        assert_eq!(meter.forced.load(Ordering::Relaxed), 1);
+        shared.end_check(true);
+        assert!(shared.whole_ns.is_some(), "a whole check measures the next");
+        let mut fully = Pacer::new(Arc::clone(&foreground), Arc::clone(&meter), Yield::Fully);
+        let waiting = std::thread::spawn(move || fully.ready().unwrap_err());
         foreground.end();
-        let refused = pacer.ready().unwrap_err();
+        let refused = waiting.join().unwrap();
         assert_eq!(refused.downcast_ref::<Stopped>(), Some(&Stopped));
+        drop(held);
         assert!(Unpaced.ready().is_ok());
+        assert!(!Unpaced.paced());
     }
 
     fn rows(n: u64) -> RowDigest {

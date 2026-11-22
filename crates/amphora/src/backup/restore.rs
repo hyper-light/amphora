@@ -180,12 +180,7 @@ pub fn restore_paced(
         }
         log.sync_all()?;
         drop(log);
-        // The replay is one step: the engine folds the log as one.
-        pace.ready()?;
-        let mut db = Db::open(path)?;
-        db.fold_log()?;
-        drop(db);
-        pace.done(None, 0)?;
+        replay(path, written, super::check::step_bytes(blobs), pace)?;
         if generation == plan.cut.0 {
             if written != plan.cut.1 {
                 anyhow::bail!(
@@ -202,6 +197,33 @@ pub fn restore_paced(
         bytes,
         log_bytes,
     })
+}
+
+/// Folds the restored log's `frames` into the file. Unpaced, in one step, as the engine folds a log.
+/// Paced, in parts of as many frames as one of the store's objects holds (`step` bytes, the size a
+/// restore's other steps move), each part a step made durable as it ends, so a paced check pauses
+/// inside the replay (T-T1.12.C8); the last fold empties the log.
+fn replay(path: &Path, frames: u64, step: u64, pace: &mut dyn Pace) -> anyhow::Result<()> {
+    let mut db = Db::open(path)?;
+    if pace.paced() {
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        let per_step = step.checked_div(FRAME_BYTES).unwrap_or(0).max(1);
+        let mut through = 0u64;
+        while through < frames {
+            pace.ready()?;
+            let to = through.saturating_add(per_step).min(frames);
+            db.fold_log_through(to)?;
+            pace.done(
+                Some(&file),
+                to.saturating_sub(through).saturating_mul(FRAME_BYTES),
+            )?;
+            through = to;
+        }
+        pace.ready()?;
+    }
+    db.fold_log()?;
+    drop(db);
+    pace.done(None, 0)
 }
 
 /// Deletes what a retention of `retention_ns` lets go at `now_ns` ([`plan::expired`]): how many

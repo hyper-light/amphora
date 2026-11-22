@@ -499,8 +499,10 @@ tests = [
   { id = "T-T1.12.C5", text = "A check begins only while the disk holds the restore and the log's growth; under one writer per core, with no checks, unpaced checks and paced checks, no check fails and checks pass once the load ends" },
   { id = "T-T1.12.C6", text = "The drilled seconds are a uniform sample of every quiet snapshot, as many as the memory holds; an expired second is dropped, never picked again" },
   # lane backups-4: paced checks and the drill after a load (kiln goal 15580afd; backup.md "Continuous restore drills")
-  { id = "T-T1.12.C7", text = "A paced check's step waits for the foreground to be quiet as long as the last step took and rests by the device's measured room; a commit pauses it, the database's end stops it" },
+  { id = "T-T1.12.C7", text = "A paced check's step begins only while the database runs no call, woken by the call that ends last; the database's end stops it" },
   { id = "T-T1.12.D3", text = "After a load from one writer per core, random seconds restore with every row equal to the rows recorded at them" },
+  # lane backups-6: a minimum share against yielding fully, event-driven (kiln goal 15580afd; backup.md "Continuous restore drills")
+  { id = "T-T1.12.C8", text = "Checks wait on events, never timers; under a minimum share (a check's work over the retention period) a check behind it steps with calls in flight; a step costs its bytes at the fastest step of its kind over this check and the last; the replay and the integrity check pause in steps" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.

@@ -102,6 +102,9 @@ struct Shared {
     admitted: Arc<AtomicUsize>,
     /// A backed-up writer's stamps ([`Database::open_backed_up`]): what cross-group steps carry.
     stamps: OnceLock<Arc<crate::backup::Hooks>>,
+    /// A backed-up writer's foreground, the calls it runs counted for its checks' pace
+    /// (T-T1.12.C8).
+    foreground: OnceLock<Arc<crate::backup::Foreground>>,
     // The engine, readers and flusher retain the same lease until asynchronous drain ends.
     _owner: Option<Owned>,
 }
@@ -926,6 +929,7 @@ impl Database {
         };
         // A second set can't happen: the database was made just now, once.
         let _ = database.shared.stamps.set(prepared.hooks());
+        let _ = database.shared.foreground.set(prepared.foreground());
         let shipping = prepared
             .start(|watcher| store.on_commit(watcher))
             .map_err(|e| refused(&e))?;
@@ -1051,6 +1055,7 @@ impl Database {
                         restoring: AtomicBool::new(false),
                         admitted: Arc::new(AtomicUsize::new(0)),
                         stamps: OnceLock::new(),
+                        foreground: OnceLock::new(),
                         _owner: Some(owner),
                     }),
                 })
@@ -1123,6 +1128,7 @@ impl Database {
                 restoring: AtomicBool::new(restoring),
                 admitted: Arc::new(AtomicUsize::new(0)),
                 stamps: OnceLock::new(),
+                foreground: OnceLock::new(),
                 _owner: owner,
             }),
         };
@@ -1205,6 +1211,11 @@ impl Database {
         let Writer::Local(store) = &database.shared.writer else {
             return database.call(until, f);
         };
+        let _in_flight = database
+            .shared
+            .foreground
+            .get()
+            .map(crate::backup::Foreground::call);
         // The store runs the session on a reader, or on the writer while it has none to lend.
         let session = Arc::new(Mutex::new(Some(f)));
         let on_writer = Arc::clone(&session);
@@ -1465,6 +1476,12 @@ impl Database {
             }
         };
         let admission = Admission::reserve(&self.shared.admitted)?;
+        // In flight from here to its answer, as a backed-up writer's checks yield to it.
+        let _in_flight = self
+            .shared
+            .foreground
+            .get()
+            .map(crate::backup::Foreground::call);
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
             || matches!(
                 &operation,

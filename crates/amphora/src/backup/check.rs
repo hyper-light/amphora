@@ -268,12 +268,20 @@ fn check_second(
     };
     let db = Db::open(scratch)?;
     let mut integrity = Vec::new();
-    // One step: the engine's check runs as one statement.
+    // The engine's check runs as one statement; each of its waits on the device is a step's end,
+    // so it pauses inside the statement as the pace says (T-T1.12.C8).
     pace.ready()?;
-    db.query("PRAGMA integrity_check", [], |r| {
-        integrity.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
-        Ok(integrity.len() < 8)
-    })?;
+    db.query_between(
+        "PRAGMA integrity_check",
+        |r| {
+            integrity.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+            Ok(integrity.len() < 8)
+        },
+        &mut || {
+            pace.done(None, 0)?;
+            pace.ready()
+        },
+    )?;
     pace.done(None, 0)?;
     if integrity.as_slice() != ["ok"] {
         return Ok(Check::Failed {

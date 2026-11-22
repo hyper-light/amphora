@@ -955,17 +955,19 @@ fn t_t1_12_d3_restore_drill_after_a_load() {
     }
 }
 
-/// T-T1.12.C5, C7 (AC-T1.12.4): checks competing with foreground load, the failure mode the pace
-/// is for. Do: back a database up to a folder, then commit back to back from one writer per core
-/// (`AMPHORA_DRILL_LOAD_COMMITS` each, a tiny run by default), each commit a second later, under no
-/// checks (`off`, the floor), the control (`scratch`: unpaced checks whenever due) and continuous
-/// (paced checks), `AMPHORA_DRILL_LOAD_RUNS` runs of each interleaved (one by default; the spread
-/// across runs is what a policy's p99 is judged against); then, with checks, a row a second until
-/// a check passes. Expect: no check failed, and checks pass once the load ends. A write the
-/// database refuses `Full` under the load (its typed back-pressure) is counted, not failed. It
-/// prints each run's instruments: commit latency p50/p99/p99.9, writes refused, checks run,
-/// deferrals, drills of older seconds, the pace's pauses, waits and rests, check cost
-/// p50/p99/p99.9 and total.
+/// T-T1.12.C5, C7, C8 (AC-T1.12.4): checks competing with foreground load, the failure mode the
+/// pace is for. Do: back a database up to a folder, then commit back to back from one writer per
+/// core (`AMPHORA_DRILL_LOAD_COMMITS` each, a tiny run by default), each commit a second later,
+/// under no checks (`off`, the floor), the control (`scratch`: unpaced checks whenever due),
+/// `continuous` (paced, yielding fully to calls in flight, which one writer per core starves) and
+/// `shared` (paced, with a minimum share over a retention period of `AMPHORA_DRILL_RETENTION_MS`,
+/// the scenario's setting, 1,000 by default), `AMPHORA_DRILL_LOAD_RUNS` runs of each interleaved
+/// (one by default; the spread across runs is what a policy's p99 is judged against); then, with
+/// checks, a row a second until a check passes. Expect: no check failed, and checks pass once the
+/// load ends. A write the database refuses `Full` under the load (its typed back-pressure) is
+/// counted, not failed. It prints each run's instruments: commit latency p50/p99/p99.9, writes
+/// refused, checks run and run under the load, deferrals, drills of older seconds, the pace's
+/// pauses, waits and steps the share forced, check cost p50/p99/p99.9 and total.
 #[test]
 fn t_t1_12_c5_checks_competing_with_foreground_load() {
     let var = |name: &str, default: u64| -> u64 {
@@ -976,9 +978,10 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
     };
     let commits = var("AMPHORA_DRILL_LOAD_COMMITS", 50);
     let runs = var("AMPHORA_DRILL_LOAD_RUNS", 1);
+    let retention = Duration::from_millis(var("AMPHORA_DRILL_RETENTION_MS", 1_000));
     let writers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     for (run, policy) in
-        (0..runs).flat_map(|run| ["off", "scratch", "continuous"].map(|p| (run, p)))
+        (0..runs).flat_map(|run| ["off", "scratch", "continuous", "shared"].map(|p| (run, p)))
     {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.db");
@@ -995,7 +998,8 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
             check: match policy {
                 "off" => backup::CheckPolicy::Off,
                 "scratch" => backup::CheckPolicy::Scratch(Some(dir.path().join("scratch.db"))),
-                _ => backup::CheckPolicy::Continuous,
+                "continuous" => backup::CheckPolicy::Continuous,
+                _ => backup::CheckPolicy::Shared(retention),
             },
         };
         let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
@@ -1073,7 +1077,7 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
             latencies.get(i).copied().unwrap_or(0)
         };
         println!(
-            "drill-load run={run} policy={policy} writers={writers} commits={} refused={} commit_ns p50={} p99={} p99.9={} checks={} under_load={under_load} passed={} deferred disk={} older={} paused={} waited_ns={} rested_ns={} cost_ns p50={:?} p99={:?} p99.9={:?} cost_total_ns={cost}",
+            "drill-load run={run} policy={policy} writers={writers} commits={} refused={} commit_ns p50={} p99={} p99.9={} checks={} under_load={under_load} passed={} deferred disk={} older={} paused={} waited_ns={} forced={} cost_ns p50={:?} p99={:?} p99.9={:?} cost_total_ns={cost}",
             latencies.len(),
             refused.load(Ordering::Relaxed),
             q(0.5),
@@ -1085,12 +1089,115 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
             meter.older.load(Ordering::Relaxed),
             meter.paused.load(Ordering::Relaxed),
             meter.waited_ns.load(Ordering::Relaxed),
-            meter.rested_ns.load(Ordering::Relaxed),
+            meter.forced.load(Ordering::Relaxed),
             meter.cost_quantile(0.5),
             meter.cost_quantile(0.99),
             meter.cost_quantile(0.999),
         );
     }
+}
+
+/// What a restore's pace saw: each step's end, whether it wrote and the bytes it moved.
+struct Recording {
+    paced: bool,
+    steps: Vec<(bool, u64)>,
+}
+
+impl backup::Pace for Recording {
+    fn ready(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn done(&mut self, file: Option<&std::fs::File>, bytes: u64) -> anyhow::Result<()> {
+        self.steps.push((file.is_some(), bytes));
+        Ok(())
+    }
+
+    fn paced(&self) -> bool {
+        self.paced
+    }
+}
+
+/// T-T1.12.C8 (AC-T1.12.4): a paced check pauses inside its replay and its integrity check. Do:
+/// back a database up to a folder whose objects hold 64 KiB, write a row a second, close it;
+/// restore its last second unpaced and paced, then restore-and-check it paced. Expect: both
+/// restores hold the model's rows; the paced one writes in more steps, its replay folded in parts
+/// of an object's worth of frames; the check passes, its integrity check ending steps inside the
+/// statement (a step with no bytes for each wait on the device, beyond the restore's and the
+/// integrity check's own last).
+#[test]
+fn t_t1_12_c8_replay_and_integrity_check_pause_in_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let blobs =
+        Arc::new(backup::FolderBlobs::open(&dir.path().join("archive"), 64 * 1024).unwrap());
+    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+    let mut model = Rows::new();
+    let mut history: Vec<(u64, Rows)> = Vec::new();
+    let (database, shipping) = open_backed_up(&path, &blobs, &now);
+    database
+        .call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+            Ok(())
+        })
+        .unwrap();
+    shipping.wait(until(), |s| s.bases >= 1).unwrap();
+    write_seconds(&database, &now, 1..120, &mut model, &mut history);
+    now.fetch_add(SECOND_NS, Ordering::SeqCst);
+    drop(database);
+    let status = shipping.wait(until(), |s| s.ended).unwrap();
+    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+    let second = history.last().unwrap().0.div_ceil(SECOND_NS);
+
+    let mut unpaced = Recording {
+        paced: false,
+        steps: Vec::new(),
+    };
+    let mut paced = Recording {
+        paced: true,
+        steps: Vec::new(),
+    };
+    for (name, pace) in [("unpaced.db", &mut unpaced), ("paced.db", &mut paced)] {
+        let target = dir.path().join(name);
+        backup::restore_paced(blobs.as_ref(), "db", second, &target, pace, until()).unwrap();
+        assert_eq!(rows(&Db::open(&target).unwrap()), model, "{name}");
+    }
+    let writes = |r: &Recording| r.steps.iter().filter(|(wrote, _)| *wrote).count();
+    assert!(
+        writes(&paced) > writes(&unpaced),
+        "the paced replay folds in parts: {} writing steps paced, {} unpaced",
+        writes(&paced),
+        writes(&unpaced)
+    );
+
+    let mut checked = Recording {
+        paced: true,
+        steps: Vec::new(),
+    };
+    let oracle_dir = tempfile::tempdir().unwrap();
+    let want = oracle_digest(oracle_dir.path(), "o.db", &model);
+    let source = |_: u64| -> anyhow::Result<Option<backup::RowDigest>> { Ok(Some(want.clone())) };
+    let check = backup::restore_and_check_at(
+        blobs.as_ref(),
+        "db",
+        second,
+        &dir.path().join("check.db"),
+        &source,
+        &backup::CheckCounters::default(),
+        &mut checked,
+        until(),
+    )
+    .unwrap();
+    assert!(matches!(check, backup::Check::Passed { .. }), "{check:?}");
+    // The restore's steps with no bytes are its replays' last folds; the check adds its integrity
+    // check's last, and one for each wait on the device inside the statement.
+    let empty = |r: &Recording| r.steps.iter().filter(|s| **s == (false, 0)).count();
+    assert!(
+        empty(&checked) > empty(&paced) + 1,
+        "the integrity check ended no step inside its statement: {} empty steps, the restore's {}",
+        empty(&checked),
+        empty(&paced)
+    );
 }
 
 /// The restore benchmark's Amphora leg (AC-T1.12.3; bench/backup_restore.sh runs it beside

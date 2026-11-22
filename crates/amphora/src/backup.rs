@@ -38,8 +38,8 @@ pub use check::{
 };
 pub use cut::restore_cut;
 pub use drill::{
-    Budget, COST_METRIC, CheckPolicy, DEFER_METRIC, Deferred, DrillMeter, Drills, Foreground, Pace,
-    Pacer, Stopped, Unpaced, admit, next_random, quiet_wait, rest_ns,
+    Budget, COST_METRIC, CheckPolicy, DEFER_METRIC, Deferred, DrillMeter, Drills, Foreground,
+    InFlight, Pace, Pacer, Stopped, Unpaced, Yield, admit, behind, device_ns, next_random,
 };
 pub use folder::FolderBlobs;
 pub use restore::{Restored, expire, restore, restore_paced};

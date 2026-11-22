@@ -10,9 +10,9 @@
 //! ([`super::check_due`]), as [`Archive::check`] says ([`CheckPolicy`]): against the source's rows
 //! at a second, digested from a reader whose snapshot lines up with that second's last commit
 //! ([`super::Marks::quiet_second`]). The shipping thread tells it of each round and never waits on
-//! it. Continuous ([`CheckPolicy::Continuous`]), the second is drawn at random from those it holds
-//! the rows of ([`Drills`]), and each step of a check yields to the foreground ([`Pacer`],
-//! T-T1.12.C7).
+//! it. Continuous ([`CheckPolicy::Continuous`], [`CheckPolicy::Shared`]), the second is drawn at
+//! random from those it holds the rows of ([`Drills`]), and each step of a check yields to the
+//! foreground's calls in flight ([`Pacer`], T-T1.12.C7, C8).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
@@ -105,7 +105,7 @@ impl Shipping {
     }
 
     /// What the drills measured: deferrals by reason ([`super::DEFER_METRIC`]), each check's cost
-    /// ([`super::COST_METRIC`]), the pace's pauses, waits and rests.
+    /// ([`super::COST_METRIC`]), the pace's pauses, waits and forced steps.
     #[must_use]
     pub fn drills(&self) -> &DrillMeter {
         &self.meter
@@ -218,16 +218,16 @@ struct Checker {
     last_check: Option<(u64, u64)>,
     log_since_check: u64,
     pending_check: Option<(u64, RowDigest, u64)>,
-    /// Where checks restore to ([`Archive::check`]), and whether paced, at drilled seconds
-    /// ([`CheckPolicy::Continuous`]).
+    /// Where checks restore to ([`Archive::check`]).
     scratch: PathBuf,
-    continuous: bool,
     /// The database's file, whose size (with its log's) a restore writes.
     source: PathBuf,
     meter: Arc<DrillMeter>,
     drills: Drills,
     random: u64,
-    pacer: Pacer,
+    /// The checks' pace, at drilled seconds ([`CheckPolicy::Continuous`], [`CheckPolicy::Shared`]);
+    /// none unpaced, at the newest second ([`CheckPolicy::Scratch`]).
+    pacer: Option<Pacer>,
     /// What the pending check's digest cost.
     pending_cost: u64,
 }
@@ -258,6 +258,12 @@ impl Prepared {
         Arc::clone(&self.hooks)
     }
 
+    /// What the checks' pace reads of the foreground: the database counts its calls in it
+    /// ([`Foreground::call`], T-T1.12.C8).
+    pub(crate) fn foreground(&self) -> Arc<Foreground> {
+        Arc::clone(&self.foreground)
+    }
+
     /// Backs `db`, the writer of the database at `path`, up to `archive`: its commits stamped from
     /// now on, its log started again only once shipped ([`Db::back_up`]), and a shipper carrying
     /// on from what the archive holds, on a reader of the same engine.
@@ -273,13 +279,12 @@ impl Prepared {
         // The shipping reader may be the engine's last connection to close: its close must not
         // empty a log the backup hasn't shipped either.
         reader.hold_log();
-        let (scratch, continuous) = match &archive.check {
-            CheckPolicy::Off => (None, false),
-            CheckPolicy::Scratch(scratch) => (
-                Some(scratch.clone().unwrap_or_else(|| suffixed(path, ".check"))),
-                false,
-            ),
-            CheckPolicy::Continuous => (Some(suffixed(path, ".check")), true),
+        let scratch = match &archive.check {
+            CheckPolicy::Off => None,
+            CheckPolicy::Scratch(scratch) => {
+                Some(scratch.clone().unwrap_or_else(|| suffixed(path, ".check")))
+            }
+            CheckPolicy::Continuous | CheckPolicy::Shared(_) => Some(suffixed(path, ".check")),
         };
         let foreground = Arc::new(Foreground::default());
         let counters: Arc<CheckCounters> = Arc::default();
@@ -304,12 +309,13 @@ impl Prepared {
                     log_since_check: 0,
                     pending_check: None,
                     scratch,
-                    continuous,
                     source: path.to_path_buf(),
                     meter: Arc::clone(&meter),
                     drills: Drills::default(),
                     random: u64::from_le_bytes(seed),
-                    pacer: Pacer::new(Arc::clone(&foreground), Arc::clone(&meter)),
+                    pacer: archive.check.pace().map(|policy| {
+                        Pacer::new(Arc::clone(&foreground), Arc::clone(&meter), policy)
+                    }),
                     pending_cost: 0,
                 })
             }
@@ -548,7 +554,7 @@ impl Checker {
     /// Whether a due check begins now: at once given a scratch path; continuous, once the disk
     /// holds it ([`admit`], T-T1.12.C5), a deferral counted with its reason.
     fn admitted(&self) -> anyhow::Result<bool> {
-        if !self.continuous {
+        if self.pacer.is_none() {
             return Ok(true);
         }
         let disk = match self.scratch.parent() {
@@ -577,10 +583,9 @@ impl Checker {
         let step = step_bytes(self.blobs.as_ref());
         let marks = &self.hooks.marks;
         let mut unpaced = Unpaced;
-        let pace: &mut dyn Pace = if self.continuous {
-            &mut self.pacer
-        } else {
-            &mut unpaced
+        let pace: &mut dyn Pace = match self.pacer.as_mut() {
+            Some(pacer) => pacer,
+            None => &mut unpaced,
         };
         self.reader.query_transaction(|r| {
             let second = marks.quiet_second(|| {
@@ -604,6 +609,9 @@ impl Checker {
             None => return Ok(None),
             Some(false) => {
                 self.pending_check = None;
+                if let Some(pacer) = self.pacer.as_mut() {
+                    pacer.end_check(false);
+                }
                 return Ok(None);
             }
             Some(true) => {}
@@ -622,7 +630,7 @@ impl Checker {
         // Continuous: the snapshot joins the drills, and the check restores one of their seconds
         // drawn at random, so every second the thread ever held is as likely to be drilled
         // (T-T1.12.C6). Given a scratch path: the snapshot's own second.
-        let (second, rows) = if self.continuous {
+        let (second, rows) = if self.pacer.is_some() {
             let draw = next_random(&mut self.random);
             self.drills.offer(newest, rows, self.memory, draw);
             let draw = next_random(&mut self.random);
@@ -642,10 +650,9 @@ impl Checker {
         let began = Instant::now();
         let source = |s: u64| Ok((s == second).then(|| rows.clone()));
         let mut unpaced = Unpaced;
-        let pace: &mut dyn Pace = if self.continuous {
-            &mut self.pacer
-        } else {
-            &mut unpaced
+        let pace: &mut dyn Pace = match self.pacer.as_mut() {
+            Some(pacer) => pacer,
+            None => &mut unpaced,
         };
         let check = restore_and_check_at(
             blobs,
@@ -656,7 +663,12 @@ impl Checker {
             &self.counters,
             pace,
             until,
-        )?;
+        );
+        // A check run to its end measures the next one's minimum share (T-T1.12.C8).
+        if let Some(pacer) = self.pacer.as_mut() {
+            pacer.end_check(check.is_ok());
+        }
+        let check = check?;
         let cost = self.pending_cost.saturating_add(elapsed_ns(began));
         self.meter.cost(cost);
         self.last_check = Some(match &check {
