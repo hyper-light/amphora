@@ -53,7 +53,7 @@ mod watch;
 pub use guards::Guards;
 pub(crate) use guards::Owned;
 pub use online::SchemaChange;
-pub use replicated::{ReadMode, SessionCounters, Token};
+pub use replicated::{LogDisk, ReadMode, SessionCounters, Token};
 pub use restore::Restore;
 pub use watch::Watch;
 
@@ -1195,14 +1195,15 @@ impl Database {
         )
     }
 
-    /// Cuts the disk under the replicated log open at `log_path`, or gives it back (CP-T1.13,
-    /// T-T1.13.1: the fire drills' cut disk, `amphora serve`'s `disk on|off`). While cut, every read,
-    /// write and flush of that log fails with an I/O error and its replica fences on the first, as
-    /// it does when a real disk goes away; a member opened again finds its disk back. The member's
-    /// database files are its own and aren't cut: every write is made durable in the log first.
-    /// Refused when no replicated log of this process is open at `log_path`.
-    pub fn cut_log_disk(log_path: &Path, on: bool) -> Result<(), Refusal> {
-        replicated::cut_disk(&resolved_path(log_path)?, on)
+    /// Sets the disk under the replicated log open at `log_path` as a fire drill says (CP-T1.13,
+    /// T-T1.13.1; `amphora serve`'s `disk cut|hang|back`): cut, every read, write and flush of that
+    /// log fails with an I/O error and its replica fences on the first, as when a real disk goes
+    /// away; hung, each waits until the disk is back or cut, as when a disk stops answering; a
+    /// member opened again finds its disk back. The member's database files aren't touched: every
+    /// write is made durable in the log first. Refused when no replicated log of this process is
+    /// open at `log_path`.
+    pub fn set_log_disk(log_path: &Path, disk: LogDisk) -> Result<(), Refusal> {
+        replicated::set_disk(&resolved_path(log_path)?, disk)
     }
 
     pub fn replica(&self) -> Option<crate::replication::ReplicaHandle> {

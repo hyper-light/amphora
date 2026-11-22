@@ -76,7 +76,11 @@ Lost must be 0; the script exits 1 otherwise.
 - `stall`: the victim's process stopped (SIGSTOP) for F seconds: its disk, network and clock stop
   together, the worst a stalled disk does to a member. A stall of the disk alone (Linux
   `dmsetup suspend`) needs root and a device-mapper volume.
-- `disk`: the victim's log disk cut (`disk on`; needs `--drills on`): every read, write and flush
+- `hang`: the victim's log disk hung for F seconds (`disk hang`, then `disk back`; needs
+  `--drills on`): every read, write and flush of its raft log waits while its network and clock go
+  on, as a disk that stops answering holds them. Unlike `stall`, the member still answers its peers'
+  heartbeats: the drill for a leader that keeps its lease while it can't make anything durable.
+- `disk`: the victim's log disk cut (`disk cut`; needs `--drills on`): every read, write and flush
   of its raft log fails with an I/O error, as a disk gone away fails them. Its replica fences on the
   first and the member ends; with `--local` it is kept down F seconds and started again, its disk
   back, and catches up from its own durable log; as services, the service manager starts it again
@@ -86,7 +90,7 @@ Lost must be 0; the script exits 1 otherwise.
   as its service manager stops it (SIGTERM), kept down F seconds, started again, caught up and the
   cluster healthy before the next. `--victim` is ignored; the load must last the whole roll (three
   times F plus each member's catch-up).
-- `all` runs kill, split, stall, disk and roll, each with its own load and its own count.
+- `all` runs kill, split, stall, hang, disk and roll, each with its own load and its own count.
 - `--local`: the members are processes the script starts from the config's folder (three on one
   machine, no services); `stall` is refused on Windows (no SIGSTOP).
 

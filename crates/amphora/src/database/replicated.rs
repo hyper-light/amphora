@@ -1553,7 +1553,7 @@ fn open(
     .map_err(unavailable)?;
     let file = LogDevice {
         file,
-        cut: disk_switch(log_path)?,
+        disk: disk_switch(log_path)?,
     };
     open_on(
         machine, log_owner, file, config, durability, changed, lease, until, clock,
@@ -1561,50 +1561,119 @@ fn open(
 }
 
 /// Each open replicated log's disk switch, by its path as the open resolved it (CP-T1.13,
-/// T-T1.13.1: the fire drills' cut disk). An open puts a fresh switch, off, in place of its path's
-/// last: a member started again finds its disk back. Bounded by the logs open now: a switch no
-/// log holds any more is dropped when the next is put in.
-static DISKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AtomicBool>>>> = OnceLock::new();
+/// T-T1.13.1: the fire drills' cut and hung disks). An open puts a fresh switch, the disk there, in
+/// place of its path's last: a member started again finds its disk back. Bounded by the logs open
+/// now: a switch no log holds any more is dropped when the next is put in.
+static DISKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<DiskSwitch>>>> = OnceLock::new();
 
-fn disk_switch(log_path: &Path) -> Result<Arc<AtomicBool>, Refusal> {
+/// What a fire drill does to a member's log disk ([`Database::set_log_disk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDisk {
+    /// The disk there: every operation the file's own.
+    Back,
+    /// The disk hung: every operation waits, its thread with it, until the disk is back or cut,
+    /// as a disk that stops answering holds them; the member's network and clock go on.
+    Hung,
+    /// The disk gone: every operation fails with an I/O error, and the replica fences on the
+    /// first, as it does when a real disk goes away.
+    Cut,
+}
+
+/// One log's disk as a drill set it: read with one relaxed load per operation, waited on only
+/// while hung, woken when it is set again.
+struct DiskSwitch {
+    now: std::sync::atomic::AtomicU8,
+    set: Mutex<()>,
+    moved: Condvar,
+}
+
+impl DiskSwitch {
+    const BACK: u8 = 0;
+    const HUNG: u8 = 1;
+    const CUT: u8 = 2;
+
+    fn set(&self, disk: LogDisk) -> Result<(), Refusal> {
+        let held = locked(&self.set)?;
+        self.now.store(
+            match disk {
+                LogDisk::Back => Self::BACK,
+                LogDisk::Hung => Self::HUNG,
+                LogDisk::Cut => Self::CUT,
+            },
+            Ordering::Release,
+        );
+        // Under the lock, so no operation that saw the disk hung misses its change.
+        self.moved.notify_all();
+        drop(held);
+        Ok(())
+    }
+
+    /// Whether `op` may go to the disk now: at once while it is there, an error once it is cut,
+    /// and while it hangs, a wait for the next setting.
+    fn pass(&self, op: &'static str) -> Result<(), hyper_block::DiskError> {
+        let cut = || hyper_block::DiskError::Io {
+            op,
+            path: PathBuf::new(),
+            source: std::io::Error::other("the disk is cut (a fire drill)"),
+        };
+        let poisoned = || hyper_block::DiskError::Io {
+            op,
+            path: PathBuf::new(),
+            source: std::io::Error::other("a disk switch's lock was poisoned"),
+        };
+        match self.now.load(Ordering::Acquire) {
+            Self::BACK => return Ok(()),
+            Self::CUT => return Err(cut()),
+            _ => {}
+        }
+        let mut held = self.set.lock().map_err(|_| poisoned())?;
+        while self.now.load(Ordering::Acquire) == Self::HUNG {
+            held = self.moved.wait(held).map_err(|_| poisoned())?;
+        }
+        drop(held);
+        match self.now.load(Ordering::Acquire) {
+            Self::CUT => Err(cut()),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn disk_switch(log_path: &Path) -> Result<Arc<DiskSwitch>, Refusal> {
     let mut disks = locked(DISKS.get_or_init(Mutex::default))?;
-    disks.retain(|_, cut| Arc::strong_count(&*cut) > 1);
-    let cut = Arc::new(AtomicBool::new(false));
-    disks.insert(log_path.to_path_buf(), Arc::clone(&cut));
-    Ok(cut)
+    disks.retain(|_, disk| Arc::strong_count(&*disk) > 1);
+    let disk = Arc::new(DiskSwitch {
+        now: std::sync::atomic::AtomicU8::new(DiskSwitch::BACK),
+        set: Mutex::new(()),
+        moved: Condvar::new(),
+    });
+    disks.insert(log_path.to_path_buf(), Arc::clone(&disk));
+    Ok(disk)
 }
 
-/// Cuts the disk under the replicated log open at `log_path` (resolved as its open resolved it),
-/// or gives it back: while cut, every read, write and flush of the log fails as a disk that has gone
-/// away fails them (an I/O error), and the replica fences on the first, as it does on a real one.
+/// Sets the disk under the replicated log open at `log_path` (resolved as its open resolved it).
 /// Refused when no log is open there.
-pub(super) fn cut_disk(log_path: &Path, on: bool) -> Result<(), Refusal> {
-    let disks = locked(DISKS.get_or_init(Mutex::default))?;
-    let cut = disks
-        .get(log_path)
-        .filter(|cut| Arc::strong_count(*cut) > 1)
-        .ok_or_else(|| api::invalid("log path", "no replicated log is open there"))?;
-    cut.store(on, Ordering::Relaxed);
-    Ok(())
+pub(super) fn set_disk(log_path: &Path, disk: LogDisk) -> Result<(), Refusal> {
+    let switch = {
+        let disks = locked(DISKS.get_or_init(Mutex::default))?;
+        disks
+            .get(log_path)
+            .filter(|switch| Arc::strong_count(*switch) > 1)
+            .cloned()
+            .ok_or_else(|| api::invalid("log path", "no replicated log is open there"))?
+    };
+    switch.set(disk)
 }
 
-/// The system's device file under a member's log, and its disk switch ([`cut_disk`]): every
-/// operation the file's own while the switch is off, one relaxed load past it.
+/// The system's device file under a member's log, and its disk switch ([`set_disk`]): every
+/// operation the file's own while the disk is there, one relaxed load past it.
 pub(super) struct LogDevice {
     file: DeviceFile,
-    cut: Arc<AtomicBool>,
+    disk: Arc<DiskSwitch>,
 }
 
 impl LogDevice {
     fn up(&self, op: &'static str) -> Result<(), hyper_block::DiskError> {
-        if self.cut.load(Ordering::Relaxed) {
-            return Err(hyper_block::DiskError::Io {
-                op,
-                path: PathBuf::new(),
-                source: std::io::Error::other("the disk is cut (a fire drill)"),
-            });
-        }
-        Ok(())
+        self.disk.pass(op)
     }
 }
 
@@ -1682,7 +1751,7 @@ impl BlockFile for LogDevice {
     fn try_clone(&self) -> Result<Self, hyper_block::DiskError> {
         Ok(Self {
             file: BlockFile::try_clone(&self.file)?,
-            cut: Arc::clone(&self.cut),
+            disk: Arc::clone(&self.disk),
         })
     }
 }

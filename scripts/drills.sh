@@ -9,10 +9,12 @@
 #               every record in and out dropped at its transport for F s: `cut`, the members' config
 #               must say drills = on), stall (the victim's process stopped for F s, SIGSTOP/SIGCONT:
 #               its disk, its network and its clock stop together, the worst a stalled disk does),
-#               disk (the victim's log disk cut: every read, write and flush of it fails, `disk on`,
+#               disk (the victim's log disk cut: every read, write and flush of it fails, `disk cut`,
 #               drills = on; its replica fences and the member ends; kept down F s and started
 #               again, its disk back, it catches up from its own durable log; as services, the
-#               service manager starts it again as soon as it ends), roll (a rolling restart: each
+#               service manager starts it again as soon as it ends), hang (the victim's log disk
+#               hung for F s, `disk hang` then `disk back`: every operation of it waits while its
+#               network and clock go on, a disk that stops answering; drills = on), roll (a rolling restart: each
 #               member in turn, the leader last, stopped as its service manager stops it (SIGTERM),
 #               kept down F s, started again, and caught up and the cluster healthy before the
 #               next; --victim is ignored),
@@ -20,7 +22,7 @@
 #               spare, a fourth HOST:PORT named in every member's `members` and started as a learner
 #               by `voters = 1,2,3`, added, caught up, promoted, the victim removed; the count then
 #               runs on the new voters, from CONF's copy region-after.conf), or all (kill, split,
-#               stall, disk, roll).
+#               stall, hang, disk, roll).
 #   --config    any member's config, on this machine: the members, the secret and the deadline.
 #   --victim    the member to fault (default: the leader when the fault starts).
 #   --local     the members are processes this script starts here from CONF's folder's
@@ -86,8 +88,9 @@ EOF
       [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]] || { echo "refused: stall: SIGSTOP doesn't reach a native Windows process" >&2; return 3; }
       kill -STOP "${PID[$2]}"; sleep "$fault"; kill -CONT "${PID[$2]}" ;;
     stall:0) local p; p=$(service_pid "$2"); on "$host" <<<"kill -STOP $p; sleep $fault; kill -CONT $p" ;;
-    disk:1) "$BIN" ask "$conf" "$2" disk on >/dev/null || return 1; ended "$2" || return 1; sleep "$fault"; start_local "$2" ;;
-    disk:0) "$BIN" ask "$conf" "$2" disk on >/dev/null || return 1; sleep "$fault" ;;
+    hang:*) "$BIN" ask "$conf" "$2" disk hang >/dev/null || return 1; sleep "$fault"; "$BIN" ask "$conf" "$2" disk back >/dev/null ;;
+    disk:1) "$BIN" ask "$conf" "$2" disk cut >/dev/null || return 1; ended "$2" || return 1; sleep "$fault"; start_local "$2" ;;
+    disk:0) "$BIN" ask "$conf" "$2" disk cut >/dev/null || return 1; sleep "$fault" ;;
     roll:*) roll ;;
   esac
 }
@@ -176,8 +179,8 @@ one() { # one DRILL: load, the fault inside it, heal, count
 
 failed=0
 case "$drill" in
-  kill | split | stall | disk | roll | region) one "$drill" || failed=1 ;;
-  all) for d in kill split stall disk roll; do one "$d" || failed=1; done ;;
-  *) sed -n '2,31p' "$0" >&2; exit 2 ;;
+  kill | split | stall | hang | disk | roll | region) one "$drill" || failed=1 ;;
+  all) for d in kill split stall hang disk roll; do one "$d" || failed=1; done ;;
+  *) sed -n '2,33p' "$0" >&2; exit 2 ;;
 esac
 exit $failed
