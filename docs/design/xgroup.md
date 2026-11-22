@@ -46,7 +46,7 @@ coordinator runs at once.
 `xgroup::sql`: each step is one `Database` call (`call_internal`, the owner's own session, able to
 name `__amphora_xg_*`): one atomic commit in its group, committed by its quorum on a replicated
 group before it answers. The data the prototype's transactions act on is `__amphora_xg_data`, a
-key-value space over the groups; SQL sessions across groups are not built (AC-T1.10.1 is open).
+key-value space over the groups; a SQL session commits its rows through `Cluster::commit` (below).
 `Cluster` runs one coordinator on a driver thread; the route from key to group is the caller's, so
 the routing lanes keep it. Values introduced: none tuned. Bounds are the API's own (`TX_MAX`,
 `KEY_MAX`, `VALUE_MAX`, `REQUEST_MAX`, `SCAN_MAX` for a scan page); the transactions in flight are
@@ -64,6 +64,70 @@ A caller's next transaction often arrives while its last one still resolves, aft
 heard; refusing it `Full` would make every caller spin. At most `in_flight` begins wait, the
 callers the shell was opened for; one more is refused `Full`, and one whose caller's deadline
 passed while it waited is answered `Timeout` and never begun. Values introduced: none.
+
+## A SQL session's commit (lane xgroup-sql, AC-T1.10.1)
+
+`Cluster::commit` takes a session's transaction, the rows it read and wrote by key. Rows all in one
+group this process holds commit in that group's one database transaction, without a coordinator step:
+the fast path, one group commit and no record. A row another transaction holds a lock on (a prepare
+or a staging write not yet resolved) aborts it `Conflict`, as a lock step would, so a cross-group
+transaction's held rows are never written under it. Rows in several groups, or a group reached over
+the transport, commit through the coordinator (`Cluster::transact`), under either protocol. Answers
+are the same as the same statements on one group, reads compared as a set (the coordinator answers
+them as their groups reply): `xgroup::sql::sessions`, seeded, both protocols. Values introduced: none.
+
+What is left: the grouped database (Database over Groups, lane split-merge-13) refuses a batch with
+rows in more than one group (`Refused::Groups`); that refusal is where its SQL session hands the
+batch to `Cluster::commit`, once its row keys are the coordinator's keys. Found by lane
+xgroup-sql-5 (2026-11-22): no `Database` runs over `Groups` yet (its writer is one `Store<Local>`,
+which never refuses `Groups`; only the tests' `Groups<Local>` does), and handing the rows over today
+would be wrong in two ways. The coordinator writes `__amphora_xg_data`, not the records tables a
+group's `get`, `scan` and change feed read, so a committed row would not be read back; and a
+single-group Records batch commits without looking at `__amphora_xg_lock`, so it could write under a
+cross-group transaction's lock. A Records batch's conditions (`Absent`, `At`) also have no place in
+the coordinator's transaction, which reads and writes but decides nothing on what it read. The
+hookup needs the Tablet over the records tables (revisions and feed rows written as a Records commit
+writes them) and the records commit checking the locks. A group failing mid-commit
+is tested on the coordinator (T-T1.10.X3), not yet through a SQL session over real groups. The fast
+path refuses a row another transaction only reads; the coordinator's lock rules decide that case the
+same way today (any lock conflicts).
+
+## A refusal before the step (lane xgroup-sql-4, AC-T1.10.6)
+
+A group that refuses a step before taking it (`NotLeader`: its leader moved; `Full`: its writer
+admitted nothing) ran nothing of it. What the driver does then is a switch, `Options::on_refused`,
+until the coordinator's live runs decide:
+- `Stop`, today's and the control: the step counts as lost, as one whose answer never came. A lost
+  lock step aborts its transaction; any other is sent again at once, and a step past its deadline
+  stops the coordinator.
+- `Retry`: the same step is held and sent again after the steps' learned timeout (RFC 6298 §2, the
+  same estimator the resolution uses; the refusal itself, answered at a first send, is a sample),
+  doubled for each refusal of that step (§5.5), while that comes before the step's deadline; past
+  it, as `Stop`. The transaction keeps its locks while its step is held.
+
+`Cluster::counted` gives the instruments: refusals by kind, retries, steps and transactions held
+now and at most, coordinator stops, and each answered transaction's time (p50, p99, p99.9 from the
+LAN harness's log-linear buckets). `Options::fault` is the seam the scenarios use: a group refusing
+a transaction's steps as a sick or restarting group would. `xgroup::sql::sessions` runs one group
+that keeps refusing and all groups refusing at once, both protocols, under both settings: retried,
+the transaction commits with no stop; under the control, it aborts. Values introduced: none.
+
+A group failing mid-commit is also tested through a session over three real groups:
+`ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing` fails each group at
+each of its steps in turn, reopens the coordinator, and checks the rows are all written or none and
+read as on one group that ran the transaction or didn't, under both protocols.
+
+### At scale (lane xgroup-sql-5)
+
+`xgroup_lan refusals` (the LAN harness's example) runs the switch under many callers and correlated
+refusals: `--clients` callers each run `--txns` transactions (one read, two writes, mostly across
+groups) while every group refuses together, as a fleet restarting at once: of each `--every` steps
+sent, the first `--burst` are refused (`--refusal not-leader` or `full`) before they are taken. The
+groups are `--node`s over the transport or `--groups` local databases under `--dir`. Each run is one
+JSON line per protocol and setting: outcomes (committed, aborted by why, unknown, failed), the
+coordinator's instruments summed over its incarnations (a coordinator that stops is opened again, as
+its process would be, and counted), and the committed transactions' p50, p99 and p99.9. The scenario's
+sizes are its inputs, not tuned values. Which setting stays is the coordinator's live runs' to decide.
 
 ## A group's failure
 

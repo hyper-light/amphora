@@ -239,9 +239,9 @@ deterministic simulator:
    meter", T-T1.9.R14, T-T1.9.R15). `Groups::measure` gives each group's load (its writer's commit
    time over the window) and its load cut (where the keys written to it fall), and `groups::room`
    this machine's cores; the operations' lab plans from them. A group's size is what its engine says
-   its rows hold (`Engine::bytes`; a local database's pages in use, T-T1.9.R17). Still left of this
-   item: the size cut from the B-tree's middle key (a group splits by its load alone; its size
-   counts toward when to split and merge).
+   its rows hold (`Engine::bytes`; a local database's pages in use, T-T1.9.R17). Built (lane
+   split-merge-15): the size cut from the B-tree's middle key (decision "The size cut from the
+   B-tree's middle key", T-T1.9.R19).
 3. **`bench reshard`.** The cutover pause on a 10 GB partition under load (AC-T1.9.2), and the
    three-machine lab's 1,000 operations (AC-T1.9.3).
 4. **Metrics.** Operations by kind and outcome, and the fence lag. Their names still need
@@ -510,8 +510,7 @@ operations' lab (T-T1.9.L1) plans from `Groups::measure` and `groups::room`.
 `database::group_holding`, T-T1.9.R17: after a split of local databases, each group's measured size
 is above zero.
 
-**Left.** A group's size cut (from the B-tree's middle key, without reading every row on the
-writer): without it a group too big for its share isn't split by size. A write takes the group's window lock once a batch; if that shows in a profile, the
+**Left.** A write takes the group's window lock once a batch; if that shows in a profile, the
 weights can be kept per writer thread and gathered at `measure`.
 
 **Falsified by.** A plan from `Groups::measure` that splits a group with no load or misses one with
@@ -578,3 +577,31 @@ other than the one the dialer named; a network endpoint serving a database sessi
 **Left.** One connection a request, each a full handshake: if the LAN runs show the handshake
 dominating a step's or a pull's time, connections are kept and reused. The coordinator's numbers
 decide it.
+
+## Decision (lane split-merge-15): the size cut from the B-tree's middle key
+
+The planner splits a group whose size is more than one core's share of the whole at its size cut
+(`GroupLoad::by_size`), but the shell gave none, so a group too big for its share and with no load
+was never split. Now `Groups::measure` asks each group's engine for one (`Engine::size_cut`, on its
+writer, with its size). A local database reads it from its position index (`__amphora_positions`)
+alone: the root page of that index's B-tree, read through the engine's pager in a transaction of its own, and its middle cell's key.
+- A B-tree keeps every leaf at one depth and splits a full page into two halves, so the root's
+  children hold about as many keys each. The middle cell's position cuts the keys about in half,
+  and the weight on each side is the root's children before and from it (a root that is a leaf:
+  its cells). The planner needs weight on both sides; the numbers are counts, not bytes.
+- It reads one page whatever the rows, on the group's writer, so a measure holds the writer about as
+  long as a point read does, never as long as a scan.
+- The page's layout is SQLite's file format (§1.6, "B-tree Pages"; §2.1, "Record Format"), which the
+  engine keeps: format values, none picked. A page it doesn't know, or a root with too few keys to
+  cut, gives no cut, and the group splits by its load alone as before.
+
+**Evidence.** `database::group_holding`, T-T1.9.R19: a local database made a group's has no size cut
+with one key; with eight keys, and again with more keys than one page of the index holds, its cut
+has weight on each side and keys on each side.
+
+**Left.** The cut counts keys, not their bytes: a group whose large rows sit on one side is cut by
+count. If a lab shows cuts far from the middle of the bytes, the root's children can be read too
+(one level, at most the root's fan-out of pages), weighing each by its cells.
+
+**Falsified by.** A size cut with no key on one side; a measure that reads more than the root page
+of the position index for it.

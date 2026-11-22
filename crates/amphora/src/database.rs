@@ -53,6 +53,7 @@ mod watch;
 pub use guards::Guards;
 pub(crate) use guards::Owned;
 pub use online::SchemaChange;
+pub use replicated::{ReadMode, SessionCounters, Token};
 pub use restore::Restore;
 pub use watch::Watch;
 
@@ -624,6 +625,9 @@ pub(crate) fn bootstrap_db(db: &Db) -> Result<(), Refusal> {
     db.exec(restore::SCHEMA).map_err(unavailable)?;
     db.exec(import::SCHEMA).map_err(unavailable)?;
     db.exec(group::SCHEMA).map_err(unavailable)?;
+    // Every group keeps the tables of transactions across groups, so a single-group commit can
+    // respect their locks (AC-T1.10.1, lane xgroup-sql-6).
+    db.exec(crate::xgroup::sql::SCHEMA).map_err(unavailable)?;
     Ok(())
 }
 
@@ -909,8 +913,9 @@ impl Database {
     ) -> Result<(Self, crate::backup::Shipping), Refusal> {
         let mut prepared = None;
         let database = Self::open_owned(path, until, false, None, |db| {
-            prepared =
-                Some(crate::backup::Prepared::on(db, archive, until).map_err(|e| refused(&e))?);
+            prepared = Some(
+                crate::backup::Prepared::on(db, path, archive, until).map_err(|e| refused(&e))?,
+            );
             Ok(())
         })?;
         let (Some(prepared), Writer::Local(store)) = (prepared, &database.shared.writer) else {
@@ -1281,6 +1286,78 @@ impl Database {
                     .query(until, f)
                     .map(|value| ClosedRead { value, micros })
             }
+        }
+    }
+
+    /// The token of this node's last acknowledged write (replication.md, "Decision (lane ryw-1):
+    /// read-your-writes by session tokens"): taken after a write's answer, it is at or past that
+    /// write, so a read that carries it sees the write on any replica. A session keeps the latest
+    /// of its tokens (`Token::after`). None standalone and for an attached client, whose reads
+    /// all see every write.
+    pub fn session_token(&self, until: Instant) -> Result<Option<Token>, Refusal> {
+        let database = self.resolve(until)?;
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => client.token().map(Some),
+            Writer::Client(_) | Writer::Local(_) => Ok(None),
+        }
+    }
+
+    /// One read-only SQL session in the read mode asked (kiln goal 8119f25d, the switch):
+    /// - [`ReadMode::Latest`], the control and today's read: [`Database::query`], which waits for
+    ///   the leader's latest commit whatever `token` says;
+    /// - [`ReadMode::Session`]: with no token, [`Database::query_local`], which never waits for
+    ///   the log; with one, on this replica once it has applied the token, waiting only while it
+    ///   is behind and redirected to [`Database::query`] past its measured apply lag.
+    ///
+    /// Answers alike in both modes for every session that carries its tokens.
+    pub fn query_session<R, F>(
+        &self,
+        mode: ReadMode,
+        token: Option<Token>,
+        until: Instant,
+        f: F,
+    ) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let (ReadMode::Session, Some(token)) = (mode, token) else {
+            return match mode {
+                ReadMode::Latest => self.query(until, f),
+                ReadMode::Session => self.query_local(until, f),
+            };
+        };
+        let database = self.resolve(until)?;
+        let Writer::Replicated { client, .. } = &database.shared.writer else {
+            return self.query(until, f);
+        };
+        let session = Mutex::new(Some(f));
+        let claim = database.application.as_ref();
+        let served = client.read_session(token, until, |reader| {
+            if token.micros == 0 {
+                return run_query(reader, until, claim, &session).map(Ok);
+            }
+            run_closed(reader, token.micros, until, claim, &session)
+                .map(|read| read.map(|read| read.value))
+        })?;
+        match served {
+            replicated::Served::Here(value) => Ok(value),
+            replicated::Served::Redirect => {
+                let f = locked(&session)?
+                    .take()
+                    .ok_or_else(|| api::invalid("SQL query", "was already executed"))?;
+                self.query(until, f)
+            }
+        }
+    }
+
+    /// This replica's token reads, counted, with its measured apply lag. None standalone and for
+    /// an attached client.
+    pub fn session_counters(&self, until: Instant) -> Result<Option<SessionCounters>, Refusal> {
+        let database = self.resolve(until)?;
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => client.session_counters().map(Some),
+            Writer::Client(_) | Writer::Local(_) => Ok(None),
         }
     }
 
@@ -1936,6 +2013,11 @@ impl Engine for Local {
         group::used_bytes(&self.db).map(Some)
     }
 
+    fn size_cut(&mut self) -> anyhow::Result<Option<reshard::plan::Cut>> {
+        // In a transaction of its own, so the root page read is the one its schema read named.
+        self.db.transaction(|db| group::size_cut(db))
+    }
+
     fn export(&mut self, span: reshard::Span, positions: usize) -> anyhow::Result<store::Exported> {
         group::export(&self.db, span, positions)
     }
@@ -2277,6 +2359,82 @@ fn get(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<O
     db.query("SELECT rev, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev <= ?4 ORDER BY rev DESC LIMIT 1", [text(ns), text(family), blob(key)?, integer(at)?], |r| { out = bytes(r, 1)?.map(|value| Ok::<_, anyhow::Error>(Row { key: key.into(), value, rev: rev(r, 0)? })).transpose()?; Ok(false) })?;
     Ok(out)
 }
+
+/// A Records row's newest value, as a transaction across groups reads it under its lock
+/// (AC-T1.10.1, lane xgroup-sql-6).
+pub(crate) fn newest(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut head = 0;
+    db.query(
+        "SELECT head FROM __amphora_namespaces WHERE name = ?1",
+        [text(ns)],
+        |r| {
+            head = rev(r, 0)?;
+            Ok(false)
+        },
+    )?;
+    Ok(get(db, ns, family, key, head)?.map(|row| row.value))
+}
+
+/// Writes one row a transaction across groups committed into this group's Records, inside the
+/// step that resolves it (AC-T1.10.1, lane xgroup-sql-6): a revision and a feed row as a
+/// single-group commit writes them. The step's rows in a namespace share one revision, `at` (none:
+/// the first of them takes the namespace's next), each at its own `seq`; answers the revision.
+pub(crate) fn write_across(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+    value: Option<&[u8]>,
+    at: Option<Rev>,
+    seq: u64,
+) -> anyhow::Result<Rev> {
+    db.query("INSERT OR IGNORE INTO __amphora_namespaces(name, head, horizon, feed, live) VALUES (?1, 0, 0, 0, 0)", [text(ns)], |_| Ok(true))?;
+    let (mut head, mut live) = (0, 0);
+    db.query(
+        "SELECT head, live FROM __amphora_namespaces WHERE name = ?1",
+        [text(ns)],
+        |r| {
+            head = rev(r, 0)?;
+            live = rev(r, 1)?;
+            Ok(false)
+        },
+    )?;
+    let at = match at {
+        Some(at) => at,
+        None => head
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("revision overflow"))?,
+    };
+    let before = get(db, ns, family, key, head)?.is_some();
+    live = match (before, value.is_some()) {
+        (false, true) => live
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("live rows overflow"))?,
+        (true, false) => live
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("live rows underflow"))?,
+        _ => live,
+    };
+    let stored = match value {
+        Some(value) => blob(value)?,
+        None => EValue::Null,
+    };
+    db.query("INSERT INTO __amphora_versions(namespace, family, key, rev, seq, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", [text(ns), text(family), blob(key)?, integer(at)?, integer(seq)?, stored], |_| Ok(true))?;
+    group::wrote(db, ns, family, key)?;
+    db.query("INSERT INTO __amphora_families(namespace, family, newest) VALUES (?1, ?2, ?3) ON CONFLICT(namespace, family) DO UPDATE SET newest = excluded.newest", [text(ns), text(family), integer(at)?], |_| Ok(true))?;
+    db.query(
+        "UPDATE __amphora_namespaces SET head = ?2, live = ?3 WHERE name = ?1",
+        [text(ns), integer(at)?, integer(live)?],
+        |_| Ok(true),
+    )?;
+    Ok(at)
+}
+
 fn commit(
     db: &Db,
     ns: &str,
@@ -2284,6 +2442,26 @@ fn commit(
     head: Rev,
     live: u64,
 ) -> anyhow::Result<Result<Answer, Refusal>> {
+    // A row a transaction across groups holds a lock on is refused as a conflict until that
+    // transaction resolves, as its own lock step would refuse this one (AC-T1.10.1, lane
+    // xgroup-sql-6): the caller retries, as after any conflict.
+    let conds = tx.conds.iter().map(|c| {
+        let (Cond::Absent { family, key } | Cond::At { family, key, .. }) = c;
+        (family, key)
+    });
+    let writes = tx.writes.iter().map(|w| {
+        let (Write::Put { family, key, .. } | Write::Delete { family, key }) = w;
+        (family, key)
+    });
+    for (family, key) in conds.chain(writes) {
+        if crate::xgroup::sql::locked(db, ns, family, key)? {
+            return Ok(Err(Refusal::Conflict {
+                family: family.clone(),
+                key: key.clone(),
+                at: get(db, ns, family, key, head)?.map(|r| r.rev),
+            }));
+        }
+    }
     for c in &tx.conds {
         let (Cond::Absent { family, key } | Cond::At { family, key, .. }) = c;
         let now = get(db, ns, family, key, head)?.map(|r| r.rev);
@@ -2520,6 +2698,49 @@ mod group_holding {
             )
             .unwrap();
         (rows, live, head)
+    }
+
+    /// T-T1.9.R19 (CP-T1.9; docs/design/reshard.md, decision "The size cut from the B-tree's middle
+    /// key"): a local database made a group's, then its Records keys written. Expect: with one key,
+    /// no size cut; with eight, and again with more than one page of its position index holds (a
+    /// page over 16 bytes a key, each key's cell being longer), a cut with weight on each side, and
+    /// keys on each side of it.
+    #[test]
+    fn t_t1_9_r19_a_local_databases_size_cut_is_its_position_index_middle_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = local(&dir.path().join("g.db")).unwrap();
+        db.keep_holding(&postcard::to_allocvec(&Holding::owning(Some(Span::ALL))).unwrap())
+            .unwrap();
+        write(&mut db, "k0", Some(b"v"));
+        assert_eq!(db.size_cut().unwrap(), None);
+        let mut page = 0;
+        db.db
+            .query("PRAGMA page_size", [], |r| {
+                page = rev(r, 0)?;
+                Ok(false)
+            })
+            .unwrap();
+        let past_a_page = usize::try_from(page / 16 + 1).unwrap();
+        let mut written = 1;
+        for target in [8, past_a_page] {
+            while written < target {
+                write(&mut db, &format!("k{written}"), Some(b"v"));
+                written += 1;
+            }
+            let cut = db.size_cut().unwrap().unwrap();
+            assert!(cut.left > 0 && cut.right > 0, "{cut:?}");
+            let below = (0..target)
+                .filter(|i| {
+                    let id =
+                        crate::reshard::row_key("ns", "f", format!("k{i}").as_bytes()).unwrap();
+                    crate::reshard::position_of(&id) < cut.at
+                })
+                .count();
+            assert!(
+                below > 0 && below < target,
+                "{below} of {target} below {cut:?}"
+            );
+        }
     }
 
     /// T-T1.9.R9 (CP-T1.9; docs/design/reshard.md, "A row routes by its namespace, family and

@@ -494,6 +494,13 @@ tests = [
   { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
   { id = "T-T1.12.X2", text = "Cuts across two groups whose clocks differ by 5 seconds, under both protocols: both keys or neither at every cut, the carried clock taken out failing it" },
   { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
+  # lane backups-3: continuous restore drills (kiln goal 15580afd; backup.md "Continuous restore drills")
+  { id = "T-T1.12.C4", text = "With no scratch path given, the shipping thread checks its archive beside the database by default; the checks pass and leave no file behind" },
+  { id = "T-T1.12.C5", text = "A check begins only while the disk holds the restore and the log's growth; under one writer per core, with no checks, unpaced checks and paced checks, no check fails and checks pass once the load ends" },
+  { id = "T-T1.12.C6", text = "The drilled seconds are a uniform sample of every quiet snapshot, as many as the memory holds; an expired second is dropped, never picked again" },
+  # lane backups-4: paced checks and the drill after a load (kiln goal 15580afd; backup.md "Continuous restore drills")
+  { id = "T-T1.12.C7", text = "A paced check's step waits for the foreground to be quiet as long as the last step took and rests by the device's measured room; a commit pauses it, the database's end stops it" },
+  { id = "T-T1.12.D3", text = "After a load from one writer per core, random seconds restore with every row equal to the rows recorded at them" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.
@@ -822,6 +829,8 @@ tests = [
   { id = "T-T1.9.R17", text = "Local databases as groups, one split by the driver, then measured by the shell — passes when each group's size is above zero" },
   # lane split-merge-13
   { id = "T-T1.9.R18", text = "Pulls over a network address under mutual TLS, then a client from another authority, a server from another authority and a server whose certificate names another node, then a database request at the network endpoint, and the LAN harness over two databases' network endpoints — passes when the pulls are answered, each stranger is refused with no pull served, the database request is refused, and the harness commits with no unknown outcome" },
+  # lane split-merge-15
+  { id = "T-T1.9.R19", text = "A local database made a group's, with one key, then eight, then more keys than one page of its position index holds — passes when it has no size cut with one key, and after that a cut with weight on each side and keys on each side of it, read from the index's root page alone" },
 ]
 
 # lane qs5
@@ -1169,6 +1178,9 @@ tests = [
 # power-cut nemesis by seed range in both classes, a record a shard, merged with a coverage check;
 # records under bench/records/power-nemesis/<run>/. bench/repl_lab.sh runs the seeds and the
 # comparison set on three machines named as its arguments. The runs of record are the coordinator's.
+# lane repl-measure-7 (CP-T1.8, AC-T1.8.5): no new IDs. The nemesis's classes part at the raft log
+# (`the_classes_acknowledge_apart_under_a_held_flush`); bench/repl_members.sh runs each member its own
+# process on the machines it is given (`amphora-bench --repl-member`, system `amphora-procs`).
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]
@@ -1230,6 +1242,18 @@ tests = [
   { id = "T-T1.10.X2", text = "xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly — passes when three seeds of each protocol over the transport commit across groups with no anomaly and no unknown outcome; ac_t1_10_5_the_lan_check_finds_a_lost_update_and_an_aborted_read holds the check to finding them" },
 ]
 
+# lane xgroup-sql: G13 step 3's SQL part (kiln goal 3d2c567d4a24841eb73cc0fb95b76f27; xgroup.md,
+# "A SQL session's commit")
+[[own]]
+id = "T1.10.S"
+title = "A SQL session's transaction across groups commits through the coordinator; one group's keeps its fast path (G13 step 3)"
+criteria = [
+  { id = "AC-T1.10.S1", text = "Cluster::commit commits rows all in one local group in that group's one database transaction, aborting Conflict on a row another transaction holds a lock on, and rows in several groups through the coordinator, under either protocol" },
+]
+tests = [
+  { id = "T-T1.10.S1", text = "xgroup::sql::sessions::ac_t1_10_1_a_sessions_answers_across_groups_equal_the_same_on_one_group — passes when 40 seeded transactions over three groups answer as the same over one group, some spanning groups, under both protocols, and every key reads the same after" },
+]
+
 # lane pl8-9: no new IDs. T-PL.8.2 gains the search test of docs/design/planner.md "Decision (lane pl8-9)".
 
 # lane skip-usable: row skipping usable by real statements (kiln goal 99e6cc88; executor.md decision 11).
@@ -1239,4 +1263,33 @@ title = "Row skipping usable by real statements: bounds from parameters, a measu
 criteria = []
 tests = [
   { id = "T-SKU.1", text = "skipping::tests::scans::t_sku_1_* — passes when, for each kind, prepared statements bounding the summarized column by parameters (BETWEEN ? AND ?, ?1 and ?2, :lo and :hi), bound again before each run with random SQL writes between, answer exactly as on a database without the summary; every run consulted the summary and rows_read summed lower; a parameter bound to a real gives no bound and the answer stays right" },
+]
+
+# lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,
+# "A refusal before the step")
+[[own]]
+id = "T1.10.R"
+title = "A step refused before it was taken is retried with the learned back-off, behind a switch whose control is today's"
+criteria = [
+  { id = "AC-T1.10.6", text = "Under OnRefused::Retry a step refused NotLeader or Full is sent again after the RFC 6298 timeout, doubled per refusal, within its deadline; under Stop it counts as lost; Cluster::counted gives refusals by kind, retries, held steps and transactions, stops and p50/p99/p99.9" },
+]
+tests = [
+  { id = "T-T1.10.R1", text = "xgroup::sql::sessions::ac_t1_10_6_refusals_before_a_step_retried_commit_and_the_control_aborts — passes when one group refusing three times and all three refusing twice commit with no stop under Retry, and abort under Stop, both protocols" },
+  { id = "T-T1.10.R2", text = "xgroup::sql::sessions::ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing — passes when a group failing at each of a session transaction's steps leaves its rows all written or none after recovery, equal to one group's, both protocols, both ends reached" },
+]
+
+# lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session
+# tokens"). Ada's order 2026-11-22: built behind ReadMode, today's read the control.
+[[own]]
+id = "RYW.1"
+title = "Read-your-writes on any replica by session tokens, behind a read-mode switch (CP-T1.10)"
+criteria = [
+  { id = "AC-T1.10.R1", text = "A write's acknowledgement gives its session a token (the group's time and the commit index, published before the answer); a read that carries it is served by any replica once that has applied it, never without the session's own write, under a lagging follower and across changes of leader" },
+  { id = "AC-T1.10.R2", text = "A token read waits only on the replica it asked, only while that replica is behind, woken by the owner's publication; past the replica's measured apply lag (or at once with none measured) it is redirected to the leader's read; a read without a token never waits for the log" },
+  { id = "AC-T1.10.R3", text = "ReadMode::Latest (today's read, the control) and ReadMode::Session answer alike for a session that carries its tokens; tokens order time first, in the cross-group coordinator's time domain" },
+]
+tests = [
+  { id = "T-T1.10.R1", text = "t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower: records to one follower lost while 2 is written; its token read waits (counted, the follower shown behind) and answers 1 and 2 once it rejoins; a read with no token answers at once" },
+  { id = "T-T1.10.R2", text = "t_t1_10_r2_a_behind_replica_with_no_lag_learned_redirects: a follower that applied nothing stamped redirects at once, counted; once caught up every member serves the token with the write" },
+  { id = "T-T1.10.R3", text = "t_t1_10_r3_a_session_reads_its_writes_across_leader_changes: clocks an hour apart, the lead passed 1, 2, 3, 1; each token orders after the last, every token read sees the session's writes, and once caught up every member equals the leader's state" },
 ]
