@@ -491,7 +491,7 @@ pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
     versioned: bool,
-    memory_budget: Option<u64>,
+    memory: Option<Arc<dyn crate::storage::versioned::memory::Source>>,
 }
 
 #[expect(
@@ -506,7 +506,7 @@ impl ConnectOpts {
             encryption_key: None,
             page_codec: None,
             versioned: false,
-            memory_budget: None,
+            memory: None,
         }
     }
 
@@ -533,12 +533,16 @@ impl ConnectOpts {
         self
     }
 
-    /// Amphora (G7 step 2, `AC-NS.2.1`): the bytes the versioned storage may hold, its pages and
-    /// row versions together: the shell's share of the memory its process may use
-    /// (`amphora::memory`). Without it the engine takes a share of the machine's memory
-    /// (`storage::versioned::memory`). Read by the connection that makes the storage.
-    pub fn with_memory_budget(mut self, bytes: u64) -> Self {
-        self.memory_budget = Some(bytes);
+    /// Amphora (G7 step 2, `AC-NS.2.1`): where the versioned storage takes its memory from, its
+    /// pages and row versions alike: the shell's process memory budget (`amphora::memory`, MB.1),
+    /// which every database of the process shares. Without it the storages of the process share
+    /// the machine's memory (`storage::versioned::memory::machine`). Read by the connection that
+    /// makes the storage.
+    pub fn with_memory(
+        mut self,
+        source: Arc<dyn crate::storage::versioned::memory::Source>,
+    ) -> Self {
+        self.memory = Some(source);
         self
     }
 }
@@ -2574,7 +2578,7 @@ impl Database {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
         let made = opts.versioned && self.versioned.lock().is_none();
-        self.versioned_storage(opts.versioned, opts.memory_budget)?;
+        self.versioned_storage(opts.versioned, opts.memory.clone())?;
         let conn = self._connect(
             false,
             None,
@@ -2815,6 +2819,7 @@ impl Database {
                 crate::connection::JoinMethods::ByCost,
             ),
             sorted_fetches: AtomicBool::new(false),
+            automatic_indexes: AtomicBool::new(true),
             parallel_mode: AtomicBool::new(false),
             morsel_costs: crate::sync::Mutex::new(None),
             vectorized_scans: AtomicBool::new(false),
@@ -2848,14 +2853,14 @@ impl Database {
     pub(crate) fn versioned_storage(
         &self,
         ask: bool,
-        budget: Option<u64>,
+        memory: Option<Arc<dyn crate::storage::versioned::memory::Source>>,
     ) -> Result<Option<Arc<crate::storage::versioned::switch::Storage>>> {
         let mut slot = self.versioned.lock();
         if slot.is_none() && ask {
             *slot = Some(crate::storage::versioned::switch::open(
                 &self.path,
                 self.io.is_memory(),
-                budget,
+                memory,
             )?);
         }
         Ok(slot.clone())

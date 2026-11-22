@@ -8618,6 +8618,11 @@ pub mod test {
 
     #[test]
     fn in_process_checkpoint_with_no_frames_to_backfill_compares_no_frames() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir.path().join("late-reader.db");
         let db = Database::open_file(
@@ -11498,6 +11503,11 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     fn test_restart_checkpoint_clears_backfill_proof_and_later_replaces_it() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, path) = get_database();
         let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
@@ -11586,6 +11596,11 @@ pub mod test {
     #[cfg(host_shared_wal)]
     #[test]
     fn test_truncate_checkpoint_clears_backfill_proof_and_later_replaces_it() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, path) = get_database();
         let wal_path = path.path().join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
@@ -12606,6 +12621,11 @@ pub mod test {
 
     #[test]
     fn restart_checkpoint_reset_wal_state_handling() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, path) = get_database();
 
         let walpath = path.path().join("test.db-wal");
@@ -12700,6 +12720,11 @@ pub mod test {
 
     #[test]
     fn test_wal_passive_partial_then_complete() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, _tmp) = get_database();
         let conn1 = db.connect(ConnectOpts::new()).unwrap();
         let conn2 = db.connect(ConnectOpts::new()).unwrap();
@@ -12887,6 +12912,11 @@ pub mod test {
 
     #[test]
     fn test_wal_concurrent_readers_during_checkpoint() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, _path) = get_database();
         let conn_writer = db.connect(ConnectOpts::new()).unwrap();
 
@@ -13052,6 +13082,11 @@ pub mod test {
 
     #[test]
     fn test_wal_multiple_readers_at_different_frames() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, _path) = get_database();
         let conn_writer = db.connect(ConnectOpts::new()).unwrap();
 
@@ -13267,6 +13302,11 @@ pub mod test {
 
     #[test]
     fn test_wal_stale_snapshot_in_write_transaction() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, _path) = get_database();
         let conn1 = db.connect(ConnectOpts::new()).unwrap();
         let conn2 = db.connect(ConnectOpts::new()).unwrap();
@@ -13315,6 +13355,11 @@ pub mod test {
     /// count), and a write made after it still to refuse it.
     #[test]
     fn test_wal_backfill_alone_leaves_a_read_snapshot_writable() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, _path) = get_database();
         let conn1 = db.connect(ConnectOpts::new()).unwrap();
         let conn2 = db.connect(ConnectOpts::new()).unwrap();
@@ -13464,6 +13509,11 @@ pub mod test {
 
     #[test]
     fn test_wal_full_waits_for_old_reader_then_succeeds() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's write-ahead log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         let (db, _tmp) = get_database();
         let writer = db.connect(ConnectOpts::new()).unwrap();
         let reader = db.connect(ConnectOpts::new()).unwrap();

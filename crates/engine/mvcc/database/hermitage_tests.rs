@@ -102,6 +102,11 @@ fn verify_final_state(db: &MvccTestDbNoConn, expected: &[(i64, i64)]) {
 /// FoundationDB: T2 writes locally, T2's commit is rejected.
 #[test]
 fn test_hermitage_g0_write_cycles_prevented() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     let db = setup_hermitage_test();
 
     // T1 and T2 try to update the same row - second should fail
@@ -148,6 +153,11 @@ fn test_hermitage_g0_write_cycles_prevented() {
 /// FoundationDB: T2 never sees T1's uncommitted write.
 #[test]
 fn test_hermitage_g1a_aborted_reads() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     let db = setup_hermitage_test();
 
     let conn1 = db.connect();
@@ -198,6 +208,11 @@ fn test_hermitage_g1a_aborted_reads() {
 /// FoundationDB: T2 sees its snapshot value (10).
 #[test]
 fn test_hermitage_g1b_intermediate_reads() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     let db = setup_hermitage_test();
 
     let conn1 = db.connect();
@@ -244,6 +259,11 @@ fn test_hermitage_g1b_intermediate_reads() {
 /// uncommitted write
 #[test]
 fn test_hermitage_g1c_circular_information_flow() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     let db = setup_hermitage_test();
 
     let conn1 = db.connect();
@@ -293,6 +313,11 @@ fn test_hermitage_g1c_circular_information_flow() {
 /// FoundationDB: T2 writes locally, snapshot at first read, T2's commit is rejected.
 #[test]
 fn test_hermitage_otv_observed_transaction_vanishes() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // T3 should not see T1's changes "vanish"
     let db = setup_hermitage_test();
 
@@ -374,6 +399,11 @@ fn test_hermitage_otv_observed_transaction_vanishes() {
 /// FoundationDB: T1 does not see T2's inserted row.
 #[test]
 fn test_hermitage_pmp_predicate_many_preceders_read() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // T1 should not see T2's inserted row that matches T1's predicate
     let db = setup_hermitage_test();
 
@@ -419,6 +449,11 @@ fn test_hermitage_pmp_predicate_many_preceders_read() {
 /// FoundationDB: T2's delete succeeds locally, T2's commit is rejected.
 #[test]
 fn test_hermitage_pmp_predicate_many_preceders_write() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // T2's delete based on predicate conflicts with T1's update
     let db = setup_hermitage_test();
 
@@ -460,6 +495,11 @@ fn test_hermitage_pmp_predicate_many_preceders_write() {
 /// FoundationDB: T2's update succeeds locally, T2's commit is rejected.
 #[test]
 fn test_hermitage_p4_lost_update() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // T2's update should not be lost when T1 also updates
     let db = setup_hermitage_test();
 
@@ -501,6 +541,11 @@ fn test_hermitage_p4_lost_update() {
 /// Turso / Postgres (repeatable read) / FoundationDB: T1 sees original values throughout (snapshot isolation).
 #[test]
 fn test_hermitage_g_single_read_skew() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // T1 should see a consistent snapshot
     let db = setup_hermitage_test();
 
@@ -550,6 +595,11 @@ fn test_hermitage_g_single_read_skew() {
 /// Turso / Postgres (repeatable read) / FoundationDB: T1 sees original values from its snapshot (snapshot isolation).
 #[test]
 fn test_hermitage_g_single_read_skew_predicate_dependencies() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // T1's snapshot should not see T2's predicate-changing update
     let db = setup_hermitage_test();
 
@@ -602,6 +652,11 @@ fn test_hermitage_g_single_read_skew_predicate_dependencies() {
 /// FoundationDB: T1's delete succeeds locally, T1's commit is rejected.
 #[test]
 fn test_hermitage_g_single_read_skew_write_predicate() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // T1's delete based on predicate should conflict
     let db = setup_hermitage_test();
 
@@ -656,6 +711,11 @@ fn test_hermitage_g_single_read_skew_write_predicate() {
 ///        Final state: T2's values (12, 18) — conflicts are checked at commit time.
 #[test]
 fn test_hermitage_g_single_read_skew_write_interleaved() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // Interleaved operations with rollback
     let db = setup_hermitage_test();
 
@@ -704,6 +764,11 @@ fn test_hermitage_g_single_read_skew_write_interleaved() {
 /// FoundationDB: T2's commit is REJECTED — serializable prevents write skew via read-conflict tracking.
 #[test]
 fn test_hermitage_g2_item_write_skew() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // This test explicitly verifies that write skew DOES occur with snapshot isolation
     // This is the expected behavior unless serializable isolation is implemented
     let db = setup_hermitage_test();
@@ -750,6 +815,11 @@ fn test_hermitage_g2_item_write_skew() {
 /// FoundationDB: T1's commit is REJECTED (serializable, detects read-write conflict on row 2).
 #[test]
 fn test_hermitage_g2_two_edges_fekete() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // G2-two-edges: Fekete et al's example with two anti-dependency edges
     let db = setup_hermitage_test();
 
@@ -817,6 +887,11 @@ fn test_hermitage_g2_two_edges_fekete() {
 /// FoundationDB: T2's commit is REJECTED (serializable, detects predicate read-write conflict).
 #[test]
 fn test_hermitage_g2_anti_dependency_cycles() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     // This test verifies that G2 anomalies DO occur with snapshot isolation
     let db = setup_hermitage_test();
 
@@ -860,6 +935,11 @@ fn test_hermitage_g2_anti_dependency_cycles() {
 /// here T2 reads after T1 has already rolled back.
 #[test]
 fn test_hermitage_aborted_transaction_not_visible() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
@@ -889,6 +969,11 @@ fn test_hermitage_aborted_transaction_not_visible() {
 /// write-write conflict, even if the first transaction has not committed yet.
 #[test]
 fn test_hermitage_write_write_conflict() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store's isolation; the versioned storage's is checked in storage::versioned::elle and txn_model",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")

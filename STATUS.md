@@ -655,6 +655,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 ## Next
 
+- **Replication measured: the harnesses** (G12 steps 1 and 3, CP-T1.8; lane repl-measure; `bench/src/repl.rs`,
+  `bench/servers/repl/`): built and unit-tested, not run at size. `amphora-bench --repl commit|failover|catchup
+  --system amphora|rqlite|dqlite|litefs|libsql` gives commit latency p50/p99/p99.9 and throughput, the time from a
+  leader kill to the first acknowledged write with the acknowledged events lost, and a member's time to catch up,
+  every size and duration an input. Amphora's three members run in one process (a kill is a cut from the relay);
+  the competitors run as three-node container clusters through their scripts (dqlite and LiteFS through the bench's
+  Go shim). libSQL has no failover and dqlite no member-local read, so those are refused, typed, as is LiteFS's
+  failover until its script runs a Consul lease (lane repl-measure-2: it does now; `bench/repl.sh RECORDS FLAGS...`
+  runs every measure on every system, and all four clusters came up on jupiter). Closes with: the comparison set and Amphora's classes measured on
+  adacachy, fedora and jupiter, best of 3, and Amphora's members across machines for the LAN p99.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
@@ -729,6 +739,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   by default. Index-only reads were already planned (covering indexes, expression indexes included). Left: the 2x
   measurements on order_by_sort, exists_subquery and left_join_anti, and the sorted fetch's measurement against the
   plain read (the coordinator's).
+- **G6 step 3, learned plan hints, built as a prototype** (lane g6s3; planner.md, decision of lane g6s3): Bao's
+  hint sets over the planner (`optimizer/plan_hints.rs`), ten on/off masks of hash joins, nested loops, automatic
+  indexes (`Connection::set_automatic_indexes`, new) and sorted fetches, applied with `HintSet::apply`. A Bayesian
+  linear model over sixteen plan features, its precisions learned from the runs, chooses a training run's mask by
+  Thompson sampling; a guard keeps a query class on the cost model's plan until a mask's held-out runs beat it, and
+  drops it when they show it slower. Memory is fixed for the model and bounded by the caller's class count for the
+  guard. `tests/plan_hints.rs` runs every mask's answers against the unhinted plan's; `bench/plan_hints` trains and
+  checks held-out queries, answers against SQLite's. Left: held-out JOB and corpus times (AC-G6.3.1, the
+  coordinator's), and hints in the engine's own prepare path (today the caller applies them).
 - **The replicated class** (docs/design/replication.md, "Fast acknowledgement"; Ada's word 2026-11-01): built on
   t1/replicated-line, not on main (fast-ack, class-metrics, class-quorum and disk-stalls, merged in that order). A
   replicated database opened with `Durability::Replicated(Fates)` answers a write once members spanning the fates
@@ -807,7 +826,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   sort work, file page reads) by non-negative least squares with Huber weights, in bounded memory;
   weights no sample determines, or none tells from nothing at 95%, keep the learned calibration's
   (docs/design/planner.md, "Decision (lane pl7)"; lane pl7b, T-PL.7.6, after a loaded run's noisy
-  weights flipped a plan in `tests/planner.rs`). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
+  weights flipped a plan in `tests/planner.rs`). Lane pl7c (T-PL.7.1): ANALYZE counts each table's and index's
+  B-tree pages and the planner reads rows a page from them, else from the page size and the
+  sample's measured records, else from the format's smallest record; the picked 50 rows a page is
+  gone (docs/design/planner.md, "Decision (lane pl7c)"). Open: the audit's 09-cost-model run, the P-error harness (AC-PL.7.2), and
   AC-PL.7.1's JOB rank correlation with the switch on and off.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
@@ -834,8 +856,11 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   Lane pl8-3 (docs/design/planner.md "Decision (lane pl8-3)"): a LEFT JOIN's right table follows only
   the tables its ON terms read (CD-C's left-asscom rule), answers held against SQLite (T-PL.8.2), and
   `JoinN` carries a bushy shape (`inner_joins`) that left-deep plans leave empty.
-  Not built: bushy plans over connected complement pairs with a composite hash-join build, and semi
-  and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
+  Lane pl8-4 (docs/design/planner.md "Decision (lane pl8-4)"): a hash join's build side can be a
+  run of tables joined among themselves while the loops before the probe stay loops; the emitter
+  runs such bushy plans and refuses other shapes with a typed error.
+  Not built: the search over connected complement pairs (DPccp) that would choose bushy plans, and
+  semi and anti joins placed before other loops (the emitter's no-match path); JOB's AC-PL.8.1 is open.
   PL.9 is built (lane pl9, docs/design/planner.md "row counts kept as rows change"): each table's
   rows inserted less deleted since ANALYZE are kept as writes finish (one atomic add a statement),
   the planner's row count follows them, and a prepared statement plans again once a table it counted
@@ -882,6 +907,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
   SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
   coordinator's.
+- **G5 step 4, skipping rows** (docs/design/executor.md decision 11; AC-G5.4.1, T-G5.4.1; lanes
+  g5s4, g5s4b): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf
+  runs and database cracking behind one switch, each kept from the write path through one hook;
+  zone maps are built from the table's own leaves (`zone_map_of_table`), one zone a leaf. With
+  writes between scans each names exactly what a plain scan finds, in the model and on a real table
+  through SQL (T-G5.4.1). Open: the scan and write costs (`crates/engine/tests/skipping_bench.rs`,
+  through the engine), the choice they make, and the VDBE's scan and write opcodes calling the
+  switch.
 
 ## Open
 
