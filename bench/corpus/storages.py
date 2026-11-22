@@ -7,8 +7,11 @@ disk under test (`--disk`: WAL, `synchronous = FULL`, the commit bench's durabil
 the four runs and prints:
 
   differ memory|disk <file>:<line> ...  a line for each record whose answer isn't the same on both
-  answers: SAME|DIFFER ...   the answers' verdict over every record both in-memory runs reached
-  answers on disk: SAME|DIFFER ...  the same over the two runs on the disk
+  answers: SAME|DIFFER|PARTIAL ...  the answers' verdict over the in-memory runs: SAME only when
+                             every record of the pool's files was reached by both runs and answered
+                             the same; PARTIAL when none differs but a record is in one run only or
+                             unreached (a file stopped short, a budget): not the whole corpus
+  answers on disk: SAME|DIFFER|PARTIAL ...  the same over the two runs on the disk
   reads: MEETS|MISSES ...    query records on the disk: versioned's time over the pager's (the bar:
                              no slower)
   writes: MEETS|MISSES|UNSETTLED ...  INSERT, UPDATE, DELETE and REPLACE statements on the disk:
@@ -28,8 +31,8 @@ when it lies wholly at or above 3, miss when wholly below, and are unsettled bet
 Each pair (in memory, on the disk) must name one client and one platform, the same for both of its
 runs, and the two pairs one platform (each --times line names them): runs from another client or
 machine aren't a comparison but experiment error, refused with exit 2 before anything is compared.
-Each pair's client and platform head the verdicts. Exits 0 when both pairs' answers are the same,
-1 when either pair's differ.
+Each pair's client and platform head the verdicts. Exits 0 when both pairs' answers are the same
+over every record, 1 when either pair's differ or are partial.
 
 usage: storages.py <pool dir> <memory pager run> <memory versioned run> <disk pager run> <disk versioned run>
   each run dir holds out.txt (the run's stdout) and times.jsonl (its --times)
@@ -123,7 +126,8 @@ def pair(label, pager_dir, versioned_dir):
 
 
 def answers(label, pager, versioned, pager_dir, versioned_dir):
-    """Prints each record whose answer differs between a pair's runs: (differ, reached, in one run)."""
+    """Prints each record whose answer differs between a pair's runs: (differ, reached by both, in
+    one run only, unreached by either)."""
     pager_shown, versioned_shown = shown(pager_dir), shown(versioned_dir)
     both = sorted(set(pager) & set(versioned))
     differ = 0
@@ -136,8 +140,8 @@ def answers(label, pager, versioned, pager_dir, versioned_dir):
             for side, text in (("pager", ps), ("versioned", vs)):
                 if text:
                     print(f"  {side}:\n{text}")
-    reached = sum(1 for k in both if pager[k][0] != "unreached")
-    return differ, reached, len(set(pager) ^ set(versioned))
+    reached = sum(1 for k in both if pager[k][0] != "unreached" and versioned[k][0] != "unreached")
+    return differ, reached, len(set(pager) ^ set(versioned)), len(both) - reached
 
 
 def main():
@@ -154,9 +158,14 @@ def main():
         print(f"{label}: client {client}, platform {platform}, both runs")
     mem = answers("memory", memory[0], memory[1], mem_pager, mem_versioned)
     on_disk = answers("disk", disk[0], disk[1], disk_pager, disk_versioned)
-    for head, (differ, reached, one_side) in (("answers", mem), ("answers on disk", on_disk)):
-        print(f"{head}: {'SAME' if differ == 0 else 'DIFFER'}: {differ} of {reached} records reached by both differ"
-              f" ({one_side} records in one run only)")
+    # The whole corpus answers the same only when every record was reached by both runs (T-T1.4.1):
+    # a record in one run only, or unreached, is one whose answers weren't compared.
+    whole = []
+    for head, (differ, reached, one_side, unreached) in (("answers", mem), ("answers on disk", on_disk)):
+        verdict = "DIFFER" if differ else "PARTIAL" if one_side or unreached else "SAME"
+        whole.append(verdict == "SAME")
+        print(f"{head}: {verdict}: {differ} of {reached} records reached by both differ"
+              f" ({one_side} records in one run only, {unreached} unreached)")
     # The times are the disk's.
     pager, versioned = disk[0], disk[1]
     both = sorted(set(pager) & set(versioned))
@@ -177,7 +186,7 @@ def main():
         verdict = "MEETS" if lo >= 3 else "MISSES" if hi < 3 else "UNSETTLED"
         print(f"writes: {verdict}: on the disk, versioned is {g:.3f}x as fast as the pager"
               f" (95% {lo:.3f} to {hi:.3f}; totals {total:.3f}x; {n} statements; bar: 3x)")
-    return 0 if mem[0] == 0 and on_disk[0] == 0 else 1
+    return 0 if all(whole) else 1
 
 
 if __name__ == "__main__":
