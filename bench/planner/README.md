@@ -109,7 +109,9 @@ Fair comparisons: the same driver, machine, OS, disk and filesystem for all thre
 DuckDB run in this process; ClickHouse is a server, reached only over HTTP on this machine, so for
 the run of record it runs as its own binary beside the driver (`clickhouse server`), not in
 `servers/clickhouse.sh`'s container, whose 8 GiB cap the others don't have. Its HTTP round trip
-and TSV rows are in its times; the record says so (`about`). Not yet run: the coordinator runs the
+and TSV rows are in its times; the record says so (`about`). Its tables load through the same
+record reader as Amphora's and SQLite's, sent as ClickHouse's TabSeparated, since its CSV reader
+takes no `\` escapes and JOB's files use them. Not yet run: the coordinator runs the
 ladder of record, on a machine of at least 32 cores.
 
 ## Prepared statements (PL.12)

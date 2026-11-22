@@ -968,13 +968,16 @@ impl Target for ClickHouse {
     }
 
     fn load(&mut self, table: &str, path: &Path, format: Format) -> anyhow::Result<u64> {
-        let mut file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        // dbgen's rows end with a `|`, an empty column past the table's: let go.
-        let settings: Vec<(&str, String)> = match format {
-            Format::Csv => vec![("format_csv_allow_single_quotes", "0".into())],
-            Format::Pipe => vec![("format_csv_delimiter", "|".into()), ("input_format_csv_allow_variable_number_of_columns", "1".into())],
-        };
-        self.post(Some(&format!("INSERT INTO {table} FORMAT CSV")), true, &settings, ureq::SendBody::from_reader(&mut file))?;
+        // ClickHouse's CSV reader takes no `\` escapes, and JOB's files escape with them (lane
+        // qs6-13): each record is read by the reader Amphora's and SQLite's loads use, and sent
+        // as ClickHouse's TabSeparated, whose escapes are exact.
+        let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let mut rows = TabSeparated::new(Records::new(BufReader::with_capacity(1 << 20, file), format));
+        let sent = self.post(Some(&format!("INSERT INTO {table} FORMAT TabSeparated")), true, &[], ureq::SendBody::from_reader(&mut rows));
+        if let Some(e) = rows.failed.take() {
+            return Err(e.context(format!("{}", path.display())));
+        }
+        sent?;
         let count = self.post_text(&[], &format!("SELECT count() FROM {table} FORMAT TSV"))?;
         Ok(count.trim().parse()?)
     }
@@ -1012,9 +1015,101 @@ impl Target for ClickHouse {
     }
 }
 
+/// A table's records as ClickHouse's TabSeparated rows, streamed: a tab between fields, a newline
+/// after each record, NULL as `\N`, and in a value `\`, tab, newline, carriage return and NUL
+/// escaped with a backslash (ClickHouse's documented TabSeparated escapes, "Formats for Input
+/// and Output Data", TabSeparated). A read error stops the stream at a record's end and is kept
+/// in `failed`, since `Read` can't carry its words.
+struct TabSeparated<R> {
+    records: Records<R>,
+    row: Vec<u8>,
+    at: usize,
+    failed: Option<anyhow::Error>,
+}
+
+impl<R: BufRead> TabSeparated<R> {
+    fn new(records: Records<R>) -> Self {
+        Self { records, row: Vec::new(), at: 0, failed: None }
+    }
+
+    /// The next record into `row`; false at the end of the file or on an error.
+    fn fill(&mut self) -> bool {
+        self.row.clear();
+        self.at = 0;
+        match self.records.next() {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                self.failed = Some(e);
+                return false;
+            }
+        }
+        for (i, field) in self.records.fields.iter().enumerate() {
+            if i > 0 {
+                self.row.push(b'\t');
+            }
+            match field {
+                None => self.row.extend_from_slice(b"\\N"),
+                Some(text) => {
+                    for &byte in text.as_bytes() {
+                        match byte {
+                            b'\\' => self.row.extend_from_slice(b"\\\\"),
+                            b'\t' => self.row.extend_from_slice(b"\\t"),
+                            b'\n' => self.row.extend_from_slice(b"\\n"),
+                            b'\r' => self.row.extend_from_slice(b"\\r"),
+                            0 => self.row.extend_from_slice(b"\\0"),
+                            other => self.row.push(other),
+                        }
+                    }
+                }
+            }
+        }
+        self.row.push(b'\n');
+        true
+    }
+}
+
+impl<R: BufRead> std::io::Read for TabSeparated<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.at >= self.row.len() && !self.fill() {
+            return Ok(0);
+        }
+        let rest = self.row.get(self.at..).unwrap_or_default();
+        let n = rest.len().min(buf.len());
+        buf.get_mut(..n).unwrap_or_default().copy_from_slice(rest.get(..n).unwrap_or_default());
+        self.at += n;
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod clickhouse_tests {
-    use super::clickhouse_table;
+    use super::super::data::{Format, Records};
+    use super::{clickhouse_table, TabSeparated};
+    use std::io::Read;
+
+    /// Do: send JOB rows as COPY wrote them (a NULL, an empty quoted string, a quote and a
+    /// backslash escaped with `\`, a tab and a newline inside quotes, a value ending in a
+    /// backslash) as ClickHouse's TabSeparated. Expect: each value exact, NULL as `\N`, the
+    /// backslash, tab and newline escaped, one line per record.
+    #[test]
+    fn job_csv_with_backslashes_goes_to_clickhouse_as_tab_separated() {
+        let csv = "1,,\"\",\"a \\\"b\\\" \\\\ c\"\n2,\"tab\there\nnext\",\"ends \\\\\",x\n";
+        let mut out = String::new();
+        TabSeparated::new(Records::new(csv.as_bytes(), Format::Csv)).read_to_string(&mut out).unwrap();
+        assert_eq!(out, "1\t\\N\t\ta \"b\" \\\\ c\n2\ttab\\there\\nnext\tends \\\\\tx\n");
+    }
+
+    /// Do: a record the reader refuses (the file ends inside quotes). Expect: the stream ends
+    /// and keeps the reader's error.
+    #[test]
+    fn a_refused_record_stops_the_tab_separated_stream_with_its_error() {
+        let mut rows = TabSeparated::new(Records::new("1,\"open\n".as_bytes(), Format::Csv));
+        let mut out = String::new();
+        rows.read_to_string(&mut out).unwrap();
+        assert!(out.is_empty());
+        assert!(rows.failed.is_some());
+    }
 
     /// Do: translate TPC-H's partsupp (its decimal written for the full dialect, a two-column
     /// key) and JOB's aka_name. Expect: each column's nearest ClickHouse type, Nullable unless NOT
