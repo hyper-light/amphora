@@ -2856,6 +2856,7 @@ impl Database {
             adaptive_build_checks: AtomicU64::new(0),
             adaptive_filter_checks: AtomicU64::new(0),
             adaptive_filter_corrections: AtomicU64::new(0),
+            adaptive_sort_checks: AtomicU64::new(0),
             adaptive_handoff: AtomicBool::new(true),
             adaptive_handoffs: AtomicU64::new(0),
             pinned_cost_weights: crate::sync::RwLock::new(None),

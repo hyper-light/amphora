@@ -2741,6 +2741,21 @@ pub fn insn_to_row(
                 ),
             },
         ),
+        Insn::SorterCounted { data } => (
+            "SorterCounted",
+            i64::try_from(data.cursor_id).unwrap_or(i64::MAX),
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            match &data.filter {
+                None => format!("count sorter[{}] against {}", data.cursor_id, data.table),
+                Some(filter) => format!(
+                    "count sorter[{}] against {} filtered to share {}",
+                    data.cursor_id, data.table, filter.planned_share
+                ),
+            },
+        ),
         Insn::MorselNext {
             dest_start,
             count,

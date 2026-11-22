@@ -600,3 +600,74 @@ fn pl_13_a_filtered_builds_share_past_its_estimate_plans_again() {
         "a second share stored"
     );
 }
+
+/// Do: an ORDER BY over one table's full scan, with no WHERE term on a table counted far past its
+/// rows (inserted, counted, rolled back) and with a range one row in a hundred passed as ANALYZE
+/// sampled it and every row after an UPDATE; each run with adaptive joins off, then on twice in one
+/// prepared statement. Expect: one answer, in order, every way; off, no sorter counted; on, the
+/// sorter's input counted against the estimate past its error and the statement planned again
+/// once; the second run plans on the counted rows and nothing plans again (PL.13, lane replan-5:
+/// the sorter's materialization point).
+#[test]
+fn pl_13_a_sorters_input_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("sorter.db");
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 20, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE b SET v = v % 50").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50000) SELECT i % 20, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    for (case, sql, rows_expected) in [
+        ("unfiltered", "SELECT id, k FROM b ORDER BY k, id", 5000),
+        (
+            "filtered",
+            "SELECT id, k FROM b WHERE v < 50 ORDER BY k, id",
+            5000,
+        ),
+    ] {
+        let ordered = |stmt: &mut amphora_engine::Statement| -> Vec<String> {
+            let out = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| format!("{row:?}"))
+                .collect();
+            stmt.reset().unwrap();
+            out
+        };
+        conn.set_adaptive_joins(false);
+        let checks = conn.adaptive_sort_checks();
+        let off = ordered(&mut conn.prepare(sql).unwrap());
+        assert_eq!(off.len(), rows_expected, "{case}: the rows");
+        assert_eq!(conn.adaptive_sort_checks(), checks, "{case}: counted off");
+
+        conn.set_adaptive_joins(true);
+        let replans = conn.adaptive_replans();
+        let mut held = conn.prepare(sql).unwrap();
+        assert_eq!(ordered(&mut held), off, "{case}: on and off differ");
+        assert!(
+            conn.adaptive_sort_checks() > checks,
+            "{case}: the sorter was not counted"
+        );
+        assert_eq!(
+            conn.adaptive_replans() - replans,
+            1,
+            "{case}: planned again once"
+        );
+        let (checks, replans) = (conn.adaptive_sort_checks(), conn.adaptive_replans());
+        assert_eq!(ordered(&mut held), off, "{case}: the second run's answer");
+        assert!(
+            conn.adaptive_sort_checks() > checks,
+            "{case}: the second sorter was not counted"
+        );
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+    }
+}

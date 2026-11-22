@@ -551,6 +551,8 @@ pub struct Connection {
     pub(super) adaptive_filter_checks: AtomicU64,
     /// Amphora (PL.13, lane replan-5): see [`Connection::adaptive_filter_corrections`].
     pub(super) adaptive_filter_corrections: AtomicU64,
+    /// Amphora (PL.13, lane replan-5): see [`Connection::adaptive_sort_checks`].
+    pub(super) adaptive_sort_checks: AtomicU64,
     /// Amphora: see [`Connection::set_adaptive_handoff`].
     pub(super) adaptive_handoff: AtomicBool,
     /// Amphora (PL.13): how many runs an adaptive join's build handed to a second prepare; see
@@ -1134,6 +1136,17 @@ impl Connection {
     pub(crate) fn count_adaptive_filter_correction(&self) {
         self.adaptive_filter_corrections
             .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Amphora (PL.13, lane replan-5): how many ORDER BY sorters fed by one table's scan on this
+    /// connection had their input rows counted against the plan's estimate of that scan (each
+    /// re-plan past its error is in [`Connection::adaptive_replans`] too).
+    pub fn adaptive_sort_checks(&self) -> u64 {
+        self.adaptive_sort_checks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_adaptive_sort_check(&self) {
+        self.adaptive_sort_checks.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): when

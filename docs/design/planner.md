@@ -1750,6 +1750,17 @@ materialized input is not checked. Evidence: `pl_13_a_filtered_builds_share_past
 ANALYZE and every row after an UPDATE: one answer with adaptive joins off and on, one share stored,
 one re-plan, none on the second run or in a statement prepared on the stored share.
 
+**Sorters (lane replan-5).** An ORDER BY sorter fed by a full scan of one table, with nothing
+grouped, aggregated, windowed or made distinct in between, holds the rows of that table its WHERE
+terms keep. Once the scan has put them all in, ahead of the sort, `SorterCounted` checks their count
+as a build's is: against the table's rows by its counter with no WHERE term, against the share the
+plan read for exactly its WHERE terms with them, re-planning, storing and handing off by the same
+rules. The sorter counts every row put in, kept by a LIMIT or not, in memory or spilled
+(`Sorter::inserted`). Counted by `Connection::adaptive_sort_checks`. Evidence:
+`pl_13_a_sorters_input_past_the_estimate_plans_again` (T-PL.13.6): a table counted far past its rows
+and a range whose share an UPDATE moved, each one answer in order with adaptive joins off and on,
+one re-plan, none on the second run.
+
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).
 - A filtered build's stored share planned on by a statement whose build then counts past it again,

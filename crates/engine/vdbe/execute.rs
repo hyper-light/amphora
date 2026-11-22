@@ -19335,7 +19335,14 @@ pub fn op_build_counted(
             }
             Some(filter) => {
                 program.connection.count_adaptive_filter_check();
-                correct_filter_share(program, data, filter, rows, bytes)
+                correct_filter_share(
+                    program,
+                    &data.table,
+                    data.analyzed_rows,
+                    filter,
+                    rows,
+                    bytes,
+                )
             }
         };
         if hand_off_now(program, state, replanned) {
@@ -19352,15 +19359,16 @@ pub fn op_build_counted(
 /// the planner, and every plan that read the old one is planned again: true when this one is.
 fn correct_filter_share(
     program: &Program,
-    data: &crate::vdbe::insn::BuildCountedData,
+    table: &str,
+    analyzed_rows: f64,
     filter: &crate::vdbe::insn::FilteredBuild,
     rows: usize,
     bytes: usize,
 ) -> bool {
     use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
-    let counter = program.connection.db.row_changes.counter(&data.table);
+    let counter = program.connection.db.row_changes.counter(table);
     let table_rows = crate::row_changes::live_rows(
-        data.analyzed_rows,
+        analyzed_rows,
         counter.load(crate::sync::atomic::Ordering::Acquire),
     );
     let estimate = table_rows * filter.planned_share;
@@ -19375,7 +19383,7 @@ fn correct_filter_share(
                 program.connection.count_adaptive_filter_correction();
                 program.connection.count_adaptive_replan();
                 tracing::debug!(
-                    table = %data.table,
+                    table = %table,
                     planned = filter.planned_share,
                     share,
                     "a filtered build counted past its share's estimate: planned again"
@@ -19386,10 +19394,45 @@ fn correct_filter_share(
         }
         Ok(Replan::Keep) => false,
         Err(refused) => {
-            tracing::debug!(table = %data.table, %refused, "a filtered build's rows not checked");
+            tracing::debug!(table = %table, %refused, "a filtered build's rows not checked");
             false
         }
     }
+}
+
+/// Amphora (PL.13, lane replan-5): [Insn::SorterCounted]. An ORDER BY sorter's input, all in,
+/// counted against the table's rows ([`replan_on_built_rows`]) or its WHERE terms' share of them
+/// ([`correct_filter_share`]), and the run handed off as a build's is ([`hand_off_now`]).
+pub fn op_sorter_counted(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SorterCounted { data }, insn);
+    let rows = {
+        let cursor = state.get_cursor(data.cursor_id);
+        usize::try_from(cursor.as_sorter_mut().inserted()).unwrap_or(usize::MAX)
+    };
+    program.connection.count_adaptive_sort_check();
+    let replanned = match &data.filter {
+        None => replan_on_built_rows(
+            program,
+            &data.table,
+            data.analyzed_rows,
+            data.estimate_error,
+            rows,
+            0,
+        ),
+        Some(filter) => {
+            correct_filter_share(program, &data.table, data.analyzed_rows, filter, rows, 0)
+        }
+    };
+    if hand_off_now(program, state, replanned) {
+        return Ok(InsnFunctionStepResult::Done);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_hash_clear(

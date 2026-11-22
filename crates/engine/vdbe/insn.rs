@@ -332,6 +332,21 @@ pub struct FilteredBuild {
     pub error: f64,
 }
 
+/// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter fed by
+/// one table's full scan, its rows counted against the table's (or its filter's share of them).
+#[derive(Debug, Clone)]
+pub struct SorterCountedData {
+    pub cursor_id: CursorID,
+    /// The scanned table, as its row counter (PL.9, `row_changes`) names it.
+    pub table: String,
+    /// ANALYZE's count of the table's rows.
+    pub analyzed_rows: f64,
+    /// The relative standard error of the statistics that count came from.
+    pub estimate_error: f64,
+    /// The WHERE terms' share check; `None` for a scan with no WHERE term.
+    pub filter: Option<FilteredBuild>,
+}
+
 /// Key columns of a seek that use `IS` instead of `=`, so NULL may match in
 /// them. Most seeks have no such columns, so the empty mask is a null pointer
 /// and only IS-seeks allocate (boxed to keep Insn small).
@@ -2395,6 +2410,13 @@ pub enum Insn {
     BuildCounted {
         data: Box<BuildCountedData>,
     },
+
+    /// Amphora (PL.13, lane replan-5: the sorter's materialization point): an ORDER BY sorter's
+    /// input, all in, counted against the plan's estimate of the scan that fed it, as
+    /// `BuildCounted` counts a build.
+    SorterCounted {
+        data: Box<SorterCountedData>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2649,6 +2671,7 @@ impl InsnVariants {
             InsnVariants::JoinSwitchBuilt => execute::op_join_switch_built,
             InsnVariants::TreePages => execute::op_tree_pages,
             InsnVariants::BuildCounted => execute::op_build_counted,
+            InsnVariants::SorterCounted => execute::op_sorter_counted,
         }
     }
 }
