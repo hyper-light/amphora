@@ -16,14 +16,22 @@
 //!   newest first (`amphora::search`), `--searches` times, words as K0's search phase takes them:
 //!   AC-T1.10.4's search latency.
 //!
-//! usage: amphora-bench --cluster --dir <dir> [--shapes read,search] [--partitions N]
+//! - `ryw` (kiln goal 8119f25d, replication.md "Decision (lane ryw-1): read-your-writes by session
+//!   tokens"): at each count of `--ladder`, that many sessions at once each write one event through
+//!   member 1 and read it straight back on a follower (members 2 and 3 in turn) in `--read-mode`
+//!   (`latest`, the control, or `session`), `--reads` pairs in all: read and write latency, reads
+//!   that missed their own write (must be 0), throughput, each follower's waits, redirects and apply
+//!   lag, and the process's CPU seconds and peak memory.
+//!
+//! usage: amphora-bench --cluster --dir <dir> [--shapes read,search,ryw] [--partitions N]
 //!        [--events 1000000] [--sessions 1000] [--batch 1000] [--reads 10000] [--searches 300]
+//!        [--read-mode latest|session] [--ladder 1,8,32,128]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use amphora::database::Database;
+use amphora::database::{Database, ReadMode};
 use amphora_api::replication::ReplicaConfig;
 
 use crate::{Hist, Rng, NONE, RARE, schema, summary};
@@ -43,6 +51,8 @@ struct Opts {
     reads: usize,
     searches: usize,
     text_bytes: usize,
+    read_mode: ReadMode,
+    ladder: Vec<usize>,
 }
 
 fn opts() -> anyhow::Result<Opts> {
@@ -57,6 +67,8 @@ fn opts() -> anyhow::Result<Opts> {
         reads: 10_000,
         searches: 300,
         text_bytes: 600,
+        read_mode: ReadMode::Latest,
+        ladder: vec![1, 8, 32, 128],
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -72,6 +84,14 @@ fn opts() -> anyhow::Result<Opts> {
             "--reads" => o.reads = v()?.parse()?,
             "--searches" => o.searches = v()?.parse()?,
             "--text-bytes" => o.text_bytes = v()?.parse()?,
+            "--read-mode" => {
+                o.read_mode = match v()?.as_str() {
+                    "latest" => ReadMode::Latest,
+                    "session" => ReadMode::Session,
+                    other => anyhow::bail!("--read-mode is latest or session, not {other}"),
+                }
+            }
+            "--ladder" => o.ladder = v()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -222,6 +242,95 @@ fn search_one(partition: &Partition, word: &str, limit: usize) -> anyhow::Result
     Ok(read.value)
 }
 
+/// This process's CPU seconds (user and system) and peak resident kilobytes, from /proc on Linux;
+/// none elsewhere.
+fn process_use() -> (Option<f64>, Option<u64>) {
+    let cpu = std::fs::read_to_string("/proc/self/stat").ok().and_then(|stat| {
+        // Fields after the command's closing parenthesis: utime and stime are the 12th and 13th.
+        let rest = stat.rsplit_once(')')?.1.to_owned();
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let ticks = f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?;
+        // Linux's USER_HZ, a format value: 100 on every architecture it ships (times(2)).
+        Some(ticks as f64 / 100.0)
+    });
+    let hwm = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:"))?.split_whitespace().nth(1)?.parse().ok());
+    (cpu, hwm)
+}
+
+/// The `ryw` shape at one count of sessions: each session writes one event through member 1, takes
+/// its token, and reads the event back on a follower in `o.read_mode`.
+fn ryw(partition: &Partition, o: &Opts, sessions: usize, base: u64) -> anyhow::Result<serde_json::Value> {
+    let rounds = o.reads.div_ceil(sessions).max(1);
+    let (cpu0, _) = process_use();
+    let began = Instant::now();
+    let (writes, reads, missed) = std::thread::scope(|scope| -> anyhow::Result<(Hist, Hist, u64)> {
+        let mut running = Vec::new();
+        for s in 0..sessions {
+            running.push(scope.spawn(move || -> anyhow::Result<(Hist, Hist, u64)> {
+                let (mut w, mut r, mut missed) = (Hist::new(), Hist::new(), 0u64);
+                let mut rng = Rng(0x7279_7731 ^ (u64::try_from(s)? + 1));
+                let writer = partition.member(1)?;
+                let reader = partition.member(2 + u64::try_from(s % 2)?)?;
+                let mut token: Option<amphora::database::Token> = None;
+                for i in 0..rounds {
+                    let seq = base + u64::try_from(s * rounds + i)?;
+                    let event = crate::event(&mut rng, 1_000_000 + s, seq, o.text_bytes);
+                    let id = event.id.clone();
+                    let t = Instant::now();
+                    write(partition, vec![event])?;
+                    w.record(us(t));
+                    let mine = writer.session_token(Instant::now() + WAIT).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    token = match (token, mine) {
+                        (Some(held), Some(mine)) => Some(held.after(mine)),
+                        (held, mine) => mine.or(held),
+                    };
+                    let t = Instant::now();
+                    let found = reader
+                        .query_session(o.read_mode, token, Instant::now() + WAIT, move |c| {
+                            let mut q = c.prepare_cached("SELECT id FROM events WHERE id = ?1")?;
+                            let rows = q.query_map(vec![amphora_api::Value::Text(id)], |row| row.get::<_, String>(0usize))?;
+                            Ok(rows.count())
+                        })
+                        .map_err(|e| anyhow::anyhow!("a read was refused: {e:?}"))?;
+                    r.record(us(t));
+                    if found == 0 {
+                        missed += 1;
+                    }
+                }
+                Ok((w, r, missed))
+            }));
+        }
+        let (mut w, mut r, mut missed) = (Hist::new(), Hist::new(), 0u64);
+        for run in running {
+            let (wi, ri, mi) = run.join().map_err(|_| anyhow::anyhow!("a session panicked"))??;
+            w.merge(&wi);
+            r.merge(&ri);
+            missed += mi;
+        }
+        Ok((w, r, missed))
+    })?;
+    let took = began.elapsed().as_secs_f64();
+    let (cpu1, hwm) = process_use();
+    let mut followers = Vec::new();
+    for node in [2u64, 3] {
+        let c = partition.member(node)?.session_counters(Instant::now() + WAIT).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        followers.push(c.map(|c| serde_json::json!({
+            "node": node, "at_once": c.at_once, "waited": c.waited, "wait_ms": c.wait_nanos as f64 / 1e6,
+            "redirects": c.redirects, "apply_lag_us": c.apply_lag_micros,
+        })));
+    }
+    let pairs = sessions * rounds;
+    Ok(serde_json::json!({
+        "bench": "amphora_ryw", "client": "amphora-bench --cluster, in process", "platform": std::env::consts::OS,
+        "read_mode": format!("{:?}", o.read_mode), "sessions": sessions, "pairs": pairs, "missed_own_write": missed,
+        "pairs_per_s": pairs as f64 / took, "write_ms": summary(writes), "read_after_write_ms": summary(reads),
+        "followers": followers, "cpu_s": cpu0.zip(cpu1).map(|(a, b)| b - a), "wall_s": took, "peak_rss_kb": hwm,
+        "threads": sessions,
+    }))
+}
+
 fn us(t: Instant) -> u64 {
     u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
@@ -280,6 +389,14 @@ pub fn main() -> anyhow::Result<()> {
                     Ok(h)
                 })?;
                 report("read", written);
+            }
+            if o.shapes.iter().any(|s| s == "ryw") {
+                let first = partitions.first().ok_or_else(|| anyhow::anyhow!("no partition"))?;
+                let mut base = u64::try_from(o.events)? + 1_000_000_000;
+                for &sessions in &o.ladder {
+                    println!("{}", ryw(first, &o, sessions, base)?);
+                    base += u64::try_from(o.reads.saturating_mul(2).max(sessions * 2))?;
+                }
             }
             if o.shapes.iter().any(|s| s == "search") {
                 let mut h = Hist::new();
