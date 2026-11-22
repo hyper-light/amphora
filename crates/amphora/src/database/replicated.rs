@@ -633,6 +633,10 @@ struct Outgoing {
     shed: u64,
     pauses: u64,
     paused: bool,
+    /// A record was shed since the leader last beat for one (`Egress::Shed`): the host's next
+    /// drain rings the owner, which beats once the queue has room for a record to each peer, so
+    /// each member's answer brings what it lacks (QB.2). Woken by the drain, never by a tick.
+    owed: bool,
 }
 struct Reservation {
     control: Arc<Control>,
@@ -1100,12 +1104,13 @@ struct Bounds {
 /// intake is measured, the slots less one. A call is charged its worst case (`REQUEST_MAX`) while
 /// the intake's byte rate is learned mostly from small wire records, so calls are bounded in count
 /// by the rate and in bytes by the room, never in bytes by the rate. The outgoing queue holds what
-/// its host drains in an election timeout, at least one record and no more than the room: the room
-/// before any drain is measured.
+/// its host drains in an election timeout, at least a record to each of its `peers` (one broadcast)
+/// and no more than the room: the room before any drain is measured.
 fn queue_bounds(
     intake: &super::drain::Drain,
     outgoing: &super::drain::Drain,
     timeout: Duration,
+    peers: u64,
 ) -> Result<Bounds, Refusal> {
     let room = crate::memory::process().room(crate::memory::Use::Queues)?;
     let image = u64::try_from(crate::replication::image_room()?).unwrap_or(u64::MAX);
@@ -1135,9 +1140,11 @@ fn queue_bounds(
     // for a wire record.
     let slots = u64::try_from(COMMANDS.saturating_sub(1)).unwrap_or(u64::MAX);
     let calls = intake.bound(timeout, call, room).messages.min(slots);
+    // The least the outgoing queue carries and still works: one broadcast, a record to each peer
+    // (a leader's heartbeats, its appends), so that a queue held to it sheds no record of one.
     let one = super::drain::Bound {
         bytes: wire,
-        messages: 1,
+        messages: peers.max(1),
     };
     Ok(Bounds {
         queued: usize::try_from(queued).unwrap_or(usize::MAX),
@@ -1431,8 +1438,9 @@ impl ReplicaHandle {
         if outgoing.messages.is_empty() {
             outgoing.over = None;
         }
-        // A paused owner waits for the host's drain (QB.2).
-        if outgoing.paused && !messages.is_empty() {
+        // A paused owner, and a leader owing the members it shed for a beat, wait for the host's
+        // drain (QB.2).
+        if (outgoing.paused || outgoing.owed) && !messages.is_empty() {
             self.shared.bell.ring();
         }
         Ok(messages)
@@ -1700,11 +1708,13 @@ fn open(
         config.bootstrap.clone(),
         matches!(durability, Durability::Replicated(_)),
     )?;
-    // Nothing drained yet: one record each (QB.1); an image held inside the command queue's bound.
+    // Nothing drained yet: the room (QB.1), which bounds no peers' least; an image held inside the
+    // command queue's bound.
     let first = queue_bounds(
         &super::drain::Drain::default(),
         &super::drain::Drain::default(),
         Duration::ZERO,
+        0,
     )?;
     machine.set_snapshot_bytes(first.wire.saturating_sub(FRAMING_BYTES));
     let file = DeviceFile::open(
@@ -1791,11 +1801,12 @@ fn open_on<F: BlockFile + 'static>(
         account(),
         crate::descriptors::process()?,
     );
-    // Nothing drained yet: one record each (QB.1).
+    // Nothing drained yet: the room (QB.1), which bounds no peers' least.
     let first = queue_bounds(
         &super::drain::Drain::default(),
         &super::drain::Drain::default(),
         Duration::ZERO,
+        0,
     )?;
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
@@ -2389,6 +2400,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             *locked(&self.control.status)? = Ok(status(&self.replica));
             return Ok(());
         }
+        self.resend()?;
         let mut output = Output::default();
         let nanos = self.now()?;
         let (began, applying) = ((self.clock)(), self.replica.machine().applied_bytes());
@@ -2610,6 +2622,42 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// timeout in force, and the queues' bytes charged to the memory budget, so that its other uses'
     /// room leaves them out (MB.1). A charge past the room is refused, and the bounds then refuse
     /// more; the resident bytes count them still.
+    /// The members this owner's core sends to: those it tracks, less itself.
+    fn peers(&self) -> u64 {
+        let tracked = self.replica.core().raft.tracker().len();
+        u64::try_from(tracked.saturating_sub(1)).unwrap_or(u64::MAX)
+    }
+    /// QB.2's shed, made good by events: once records were shed (`Outgoing::owed`) and the host's
+    /// drain has left the queue room for a record to each peer, the leader beats, and each
+    /// member's answer brings what it lacks (raft's heartbeat answer resumes a paused probe and
+    /// sends the entries a member is behind by). A report of unreachable gives up the member's
+    /// window, but a probe already out waits for an answer: without this beat only the next
+    /// heartbeat tick would send again. Any other role's beat sends nothing; what a follower shed
+    /// is a lost answer, which its leader's heartbeat timeout makes good. A refusal short of a
+    /// fence keeps the beat owed.
+    fn resend(&mut self) -> Result<(), Refusal> {
+        let peers = self.peers();
+        let mut outgoing = locked(&self.control.outgoing)?;
+        if !outgoing.owed {
+            return Ok(());
+        }
+        let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
+        let count = u64::try_from(outgoing.messages.len()).unwrap_or(u64::MAX);
+        // Not yet room for the beat: the host's next drain rings the owner again.
+        if super::drain::past(outgoing.bound, held, count.saturating_add(peers)) {
+            return Ok(());
+        }
+        outgoing.owed = false;
+        drop(outgoing);
+        match self.replica.beat().map_err(raft_error) {
+            Err(error @ Refusal::Fenced(_)) => Err(error),
+            Err(_) => {
+                locked(&self.control.outgoing)?.owed = true;
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
     /// QB.2's pause: whether the outgoing queue is at its bound (one more record would pass it)
     /// under `Egress::Pause`, each pause begun counted.
     fn paused(&self) -> Result<bool, Refusal> {
@@ -2644,7 +2692,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let (bytes, messages) = std::mem::take(&mut outgoing.drained);
         self.outgo.drained(bytes, messages);
         self.outgo.sample(now, !outgoing.messages.is_empty());
-        let bounds = queue_bounds(&self.intake, &self.outgo, timeout)?;
+        let bounds = queue_bounds(&self.intake, &self.outgo, timeout, self.peers())?;
         outgoing.bound = bounds.outgoing;
         outgoing.room = bounds.room;
         let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
@@ -3813,6 +3861,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                         .checked_sub(oldest.bytes.len())
                         .ok_or_else(|| fenced("outgoing accounting underflow"))?;
                     outgoing.shed = outgoing.shed.saturating_add(1);
+                    outgoing.owed = true;
                     if !unreachable.contains(&oldest.to) {
                         unreachable.push(oldest.to);
                     }
@@ -3853,8 +3902,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         drop(outgoing);
         for member in unreachable {
-            // A report the core refuses short of a fence changes nothing: raft's next heartbeat
-            // finds what the member lacks all the same.
+            // A report the core refuses short of a fence changes nothing: the beat the host's
+            // drain prompts (`Outgoing::owed`) finds what the member lacks all the same.
             if let Err(error) = self.replica.report_unreachable(member) {
                 let error = raft_error(error);
                 if matches!(error, Refusal::Fenced(_)) {

@@ -2491,7 +2491,8 @@ queue's at the owner's intake, each a decaying ratio of sums with RFC 6298's gai
 The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). The bounds are read
 again at each tick of the pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`).
 - The outgoing queue holds the lesser of its host's rate times that timeout and the memory budget's room for queues
-  (MB.1), at least one message: the room before any drain is measured.
+  (MB.1), at least a record to each peer (one broadcast: a leader's heartbeats or appends), and the room before any
+  drain is measured. A bound below one broadcast would shed a record of every broadcast.
 - The command queue's bytes are the budget's room for queues. Application calls hold that room less one wire record's,
   so that calls waiting for a leader cannot block the wire record that finds one. A wire record's image is the
   budget's room for one (SB.1), held inside the command queue's bound.
@@ -2524,7 +2525,14 @@ peer's buffer is full and reports the peer unreachable) and `Pause` (no input an
 its bound; the host's drain rings the owner). The default is `Shed`. In two driven tests whose relay is held while the
 leader's clock moves, both fence under `Fence`, and under `Pause` the leader never steps down, because a paused leader
 doesn't tick (`a_change_at_its_barrier_is_refused_once_the_lead_is_lost`). Both pass under `Shed`. A shed record is a
-lost packet, which raft already tolerates; a fence ends the member, and a pause keeps a stalled leader in office. The
+lost packet, which raft already tolerates; a fence ends the member, and a pause keeps a stalled leader in office.
+A shed is made good by events (lane constants-19): a report of unreachable gives up the member's window, but a probe
+already out waits for an answer, so raft would send again only on its next heartbeat tick, and never while a driven
+test keeps time still (`a_change_past_its_deadline_answers_what_its_stage_knows` hung on it). Now a shed marks a
+resend owed (`Outgoing::owed`); the host's next drain rings the owner, and once the queue has room for a record to
+each peer the leader beats (`Actor::resend`). Each member's heartbeat answer resumes its probe and brings the entries
+it lacks. A follower's shed record is a lost answer, which its leader's heartbeat timeout makes good, as on a lossy
+link. The
 A/B scenario (`qb2_many_slow_one_stalled_for_good_by_egress`: every host slows at once, then the leader's host stalls
 for good) is written but its driver is unfinished. Application calls are held to their own bound apart from the
 wire records queued beside them (`Control::called`).

@@ -11,8 +11,9 @@
 //! interval counts when the queue held work at its start or its reader took some in it: one with
 //! nothing to read and nothing read tells nothing of how fast it reads. The election timeout is
 //! learned too: `election_tick` periods of the owner's measured pace (TP.1). Each bound is the lesser of the rate times that
-//! timeout and the memory budget's room for queues (MB.1); before anything is measured it is one
-//! record, the least a queue can carry and still work.
+//! timeout and the memory budget's room for queues (MB.1), no less than the least a queue can
+//! carry and still work (the outgoing queue's: a record to each peer, one broadcast); before
+//! anything is measured, the room.
 //!
 //! A pure core: the owner tells it what was drained and reads its own clock; nothing here reads a
 //! clock, the disk or the memory.
@@ -107,9 +108,11 @@ pub(super) enum Egress {
     /// QB.1's rule: the owner fences once the queue has stayed past its bound an election timeout.
     Fence,
     /// The oldest records past the bound are dropped, counted, and their members reported
-    /// unreachable, so raft sends again what each still lacks: etcd's transport drops a message
-    /// whose peer's buffer is full and reports the peer unreachable (etcd server/etcdserver/api/
-    /// rafthttp/peer.go, `send`; raft's `ReportUnreachable`).
+    /// unreachable: etcd's transport drops a message whose peer's buffer is full and reports the
+    /// peer unreachable (etcd server/etcdserver/api/rafthttp/peer.go, `send`; raft's
+    /// `ReportUnreachable`). Once the host's drain leaves room for a record to each peer, a
+    /// leader beats, and each member's answer brings what it lacks: the drain prompts the resend,
+    /// not the next heartbeat tick (`Actor::resend`).
     Shed,
     /// The owner takes no input and makes no raft step while the queue is at its bound.
     Pause,
