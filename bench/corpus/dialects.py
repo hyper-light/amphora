@@ -950,7 +950,7 @@ def liked(expression, context, dialect):
     return expression
 
 
-def functions_said(expression, dialect):
+def functions_said(expression, context, dialect):
     """`expression` with SQLite's built-in functions that sqlglot writes as functions of the same
     name that mean otherwise, said as SQLite's (lang_corefunc.html, "Built-In Scalar SQL Functions"):
     - likely(X) and unlikely(X): "returns the argument X unchanged", a hint to the query planner;
@@ -971,8 +971,22 @@ def functions_said(expression, dialect):
     - char(X1,...,XN): "a string composed of characters having the unicode code point values of
       integers X1 through XN", a NULL being 0 (SQLite gives char(NULL) as one character U+0000),
       where sqlglot writes DuckDB's chr() of X1 alone: there, chr(coalesce(Xi, 0)) of each,
-      joined with ||."""
+      joined with ||.
+    - format(FORMAT, ...): "an alias for printf()" (lang_corefunc.html#format), where sqlglot keeps
+      the name, which is another function in each engine (PostgreSQL's takes %s, %I and %L only;
+      MySQL's FORMAT(X,D) formats a number; DuckDB's and ClickHouse's take {} fields): said as
+      printf(), which DuckDB and ClickHouse have ("printf-style", their references) and PostgreSQL
+      and MySQL refuse.
+    - hex(X): "interprets its argument as a BLOB and returns a string which is the upper-case
+      hexadecimal rendering of the content of that blob" (lang_corefunc.html#hex), so an integer is
+      its text's bytes (hex(1) is '31') and NULL the empty blob's '' (SQLite 3.51 gives ''), where
+      DuckDB's and MySQL's hex() of an integer give its value in base 16, ClickHouse's its bytes,
+      and each gives NULL for NULL: on those three an INTEGER X (storage_classes()) is cast to text
+      first, and the result is coalesce(hex(X), ''). A REAL X is left as it is: each engine writes
+      a real as text its own way. PostgreSQL has no hex()."""
     from sqlglot import exp
+
+    classes = storage_classes(expression, context.tables)
 
     def same(node, said):
         nonlocal expression
@@ -1008,6 +1022,15 @@ def functions_said(expression, dialect):
             for more in parts[1:]:
                 said = exp.DPipe(this=said, expression=more)
             same(node, exp.Paren(this=said) if len(parts) > 1 else said)
+        elif isinstance(node, exp.Format):
+            same(node, exp.Anonymous(this="printf", expressions=[a.copy() for a in [node.this] + list(node.expressions)]))
+        elif isinstance(node, exp.Hex) and dialect in ("duckdb", "mysql", "clickhouse"):
+            arg = node.this
+            if classes.get(id(arg)) == "INTEGER":
+                arg = exp.cast(arg.copy(), exp.DataType.build("TEXT"))
+            else:
+                arg = arg.copy()
+            same(node, exp.Coalesce(this=exp.Hex(this=arg), expressions=[exp.Literal.string("")]))
     return expression
 
 
@@ -1210,7 +1233,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(functions_said(extremes(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), dialect), dialect)
+            e = spoken(functions_said(extremes(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), dialect), context or Context(), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:
