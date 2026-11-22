@@ -1032,6 +1032,26 @@ def globbed(expression, dialect):
     return expression
 
 
+def _real_text(x, dialect, what):
+    """REAL `x` as the text SQLite writes it, for hex() and length() of it: SQLite's real-to-text
+    conversion is printf's "%!.15g" (sqlite3 3.51's vdbemem.c sqlite3VdbeMemStringify(); its "!"
+    flag keeps a decimal point: 100.0 is '100.0', 1e20 '1.0e+20'), infinities 'Inf' and '-Inf',
+    and -0.0 '0.0' (Python's sqlite3 3.51.0 gives each). DuckDB's printf() takes %.15g, without
+    the point: given back as regexp_replace() of a mantissa without one, and its 'inf' as 'Inf';
+    x is read once. One difference stays: a real whose decimal expansion ties at the fifteenth
+    digit (100000000000000.5) SQLite's own printf rounds away from zero and DuckDB's to even
+    ('100000000000001.0' against '100000000000000.0'). PostgreSQL's and MySQL's float text is the shortest that reads back (100.0 is
+    '100', 0.1 + 0.2 '0.30000000000000004'), ClickHouse's too, and none has a %g: not
+    expressible there."""
+    from sqlglot import exp
+
+    if dialect != "duckdb":
+        raise NotExpressible(f"not expressible in {dialect}: {what}() of a REAL, which reads SQLite's text of the real (printf's %!.15g, lang_corefunc.html#{what}); {dialect} writes a real as the shortest text that reads back and has no %g")
+    g = exp.Anonymous(this="printf", expressions=[exp.Literal.string("%.15g"), x.copy()])
+    pointed = exp.RegexpReplace(this=g, expression=exp.Literal.string("^(-?[0-9]+)(e|$)"), replacement=exp.Literal.string("\\1.0\\2"))
+    return exp.Anonymous(this="replace", expressions=[pointed, exp.Literal.string("inf"), exp.Literal.string("Inf")])
+
+
 def functions_said(expression, context, dialect):
     """`expression` with SQLite's built-in functions that sqlglot writes as functions of the same
     name that mean otherwise, said as SQLite's (lang_corefunc.html, "Built-In Scalar SQL Functions"):
@@ -1064,8 +1084,8 @@ def functions_said(expression, context, dialect):
       its text's bytes (hex(1) is '31') and NULL the empty blob's '' (SQLite 3.51 gives ''), where
       DuckDB's and MySQL's hex() of an integer give its value in base 16, ClickHouse's its bytes,
       and each gives NULL for NULL: on those three an INTEGER X (storage_classes()) is cast to text
-      first, and the result is coalesce(hex(X), ''). A REAL X is left as it is: each engine writes
-      a real as text its own way. PostgreSQL has no hex().
+      first, and the result is coalesce(hex(X), ''). A REAL X is SQLite's text of it (_real_text():
+      DuckDB's printf(), not expressible on the others). PostgreSQL has no hex().
     - zeroblob(N): "a BLOB consisting of N bytes of 0x00" (lang_corefunc.html#zeroblob), none for
       a negative N, and SQLite 3.51 gives NULL's as the empty blob. DuckDB and PostgreSQL have no
       zeroblob(): for an INTEGER or NULL N (storage_classes()) it is DuckDB's repeat() of the one
@@ -1077,8 +1097,8 @@ def functions_said(expression, context, dialect):
       ... If X is a blob, then length(X) returns the number of bytes in the blob ... If X is numeric
       then length(X) returns the length of a string representation of X" (lang_corefunc.html#length).
       DuckDB's, PostgreSQL's and ClickHouse's take no integer: an INTEGER X (storage_classes()),
-      whose text is the same on every engine, is cast to text first (a REAL's isn't: each writes a
-      real its own way). A BLOB X is DuckDB's octet_length() (its length() takes no BLOB) and
+      whose text is the same on every engine, is cast to text first; a REAL X is SQLite's text of
+      it (_real_text(): DuckDB's printf(), not expressible on the others). A BLOB X is DuckDB's octet_length() (its length() takes no BLOB) and
       ClickHouse's length(), its bytes, where sqlglot writes CHAR_LENGTH, its UTF-8 characters.
       PostgreSQL's length() of a bytea and MySQL's CHAR_LENGTH() of a binary string count bytes.
     - CAST(X AS <a type of INTEGER affinity>) (lang_expr.html#castexpr): SQLite's INTEGER is 64 bits
@@ -1131,6 +1151,8 @@ def functions_said(expression, context, dialect):
             arg = node.this
             if classes.get(id(arg)) == "INTEGER":
                 arg = exp.cast(arg.copy(), exp.DataType.build("TEXT"))
+            elif classes.get(id(arg)) == "REAL":
+                arg = _real_text(arg, dialect, "hex")
             else:
                 arg = arg.copy()
             same(node, exp.Coalesce(this=exp.Hex(this=arg), expressions=[exp.Literal.string("")]))
@@ -1144,6 +1166,8 @@ def functions_said(expression, context, dialect):
             else:
                 said = exp.Anonymous(this="decode", expressions=[exp.Anonymous(this="repeat", expressions=[exp.Literal.string("00"), count]), exp.Literal.string("hex")])
             same(node, said)
+        elif isinstance(node, exp.Length) and classes.get(id(node.this)) == "REAL":
+            node.set("this", _real_text(node.this, dialect, "length"))
         elif isinstance(node, exp.Length) and dialect in ("duckdb", "postgres", "clickhouse"):
             arg = classes.get(id(node.this))
             if arg == "INTEGER":
