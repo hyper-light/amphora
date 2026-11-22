@@ -9,6 +9,7 @@ use std::time::Instant;
 use amphora_api::blobs::Blobs;
 
 use super::Mark;
+use super::drill::{Pace, Unpaced};
 use super::object::{self, Segment};
 use super::plan::{self, BaseKey, SegmentKey, ThroughKey};
 use super::ship::{FRAME_BYTES, list_all};
@@ -51,6 +52,18 @@ pub fn restore(
     prefix: &str,
     second: u64,
     path: &Path,
+    until: Instant,
+) -> anyhow::Result<Restored> {
+    restore_paced(blobs, prefix, second, path, &mut Unpaced, until)
+}
+
+/// [`restore`], each base chunk, log segment and replay a step of `pace`'s (T-T1.12.C7).
+pub fn restore_paced(
+    blobs: &dyn Blobs,
+    prefix: &str,
+    second: u64,
+    path: &Path,
+    pace: &mut dyn Pace,
     until: Instant,
 ) -> anyhow::Result<Restored> {
     if path.try_exists()? || wal_path(path).try_exists()? {
@@ -100,9 +113,11 @@ pub fn restore(
         // pages (docs/design/backup.md, "Incremental bases").
         for (chunk, base) in (0u64..).zip(manifest.chunk_bases()?) {
             let key = plan::chunk_key(prefix, base, chunk);
+            pace.ready()?;
             let sealed = blobs.get(&key, until)?;
             let pages = object::opened(&key, &sealed)?;
             file.write_all(pages)?;
+            pace.done(Some(&file), u64::try_from(pages.len())?)?;
             bytes = bytes.saturating_add(u64::try_from(sealed.len())?);
         }
         file.sync_all()?;
@@ -129,6 +144,7 @@ pub fn restore(
                 break;
             }
             index = index.saturating_add(1);
+            pace.ready()?;
             let body: Segment = if *i == at {
                 log_bytes = log_bytes.saturating_add(u64::try_from(located.frames.len())?);
                 located.clone()
@@ -156,6 +172,7 @@ pub fn restore(
                 .get(..usize::try_from(take)?)
                 .ok_or_else(|| anyhow::anyhow!("segment {name} holds fewer frames than it says"))?;
             log.write_all(frames)?;
+            pace.done(Some(&log), u64::try_from(frames.len())?)?;
             written = end;
             if generation == plan.cut.0 && written >= plan.cut.1 {
                 break;
@@ -163,9 +180,12 @@ pub fn restore(
         }
         log.sync_all()?;
         drop(log);
+        // The replay is one step: the engine folds the log as one.
+        pace.ready()?;
         let mut db = Db::open(path)?;
         db.fold_log()?;
         drop(db);
+        pace.done(None, 0)?;
         if generation == plan.cut.0 {
             if written != plan.cut.1 {
                 anyhow::bail!(
