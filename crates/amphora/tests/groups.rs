@@ -748,7 +748,7 @@ fn t_t1_9_r4_a_split_copies_the_moving_ranges_rows_and_a_merge_brings_them_back(
 /// driver); expect the retired group neither started nor made again, empty, but the Create refused
 /// as of an operation that ended, and every acknowledged row still in the one group left.
 #[test]
-fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
+fn t_t1_9_r6_r16_a_retired_group_stays_retired_across_a_restart_and_its_files_go() {
     let dir = tempfile::tempdir().unwrap();
     let directory = Directory::new(NodeId(0));
     let groups = on(dir.path(), &directory);
@@ -800,6 +800,10 @@ fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
     );
     assert_eq!(ended, 2);
     assert!(groups.holding_of(GroupId(1)).is_none());
+    // T-T1.9.R16: of the groups whose files are found, the retired one is named, not the one
+    // held nor one never given out.
+    let found = [GroupId(0), GroupId(1), GroupId(2)];
+    assert_eq!(groups.retired_of(found), vec![GroupId(1)]);
     groups.sync(soon()).unwrap();
     drop(groups);
 
@@ -817,8 +821,21 @@ fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
         )))
     );
     assert_eq!(again.len(), 1);
+    // T-T1.9.R16: still named after the restart; its files deleted, the node goes on without them.
+    assert_eq!(again.retired_of(found), vec![GroupId(1)]);
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.starts_with("events-1.db") {
+            std::fs::remove_file(&path).unwrap();
+            deleted += 1;
+        }
+    }
+    assert!(deleted > 0);
     again.route(driver.directory()).unwrap();
     every_key_in_its_group(&again, &keys, &acked);
+    assert!(!dir.path().join("events-1.db").exists());
 }
 
 /// T-T1.9.R5 (CP-T1.9 step 3; the driver's contract, docs/design/reshard.md): the split and merge

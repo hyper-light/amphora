@@ -1725,7 +1725,13 @@ pub fn emit_from_clause_subqueries(
         .map(|member| member.original_idx)
         .collect();
     let mut visit_set: TableMask = visit_order.iter().copied().try_collect()?;
-    for table in tables.joined_tables().iter() {
+    // A hash join runs where its probe table stands in the join order: one whose probe a
+    // materialized build input took into its prefix ran in that input's subplan, so its build
+    // table is neither read nor listed here (PL.6, PL.5).
+    for member in join_order.iter() {
+        let Some(table) = tables.joined_tables().get(member.original_idx) else {
+            continue;
+        };
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_idx = hash_join_op.build_table_idx;
             if visit_set.get(build_idx)

@@ -59,6 +59,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | engine | 12 | Large rows as chunk rows of an overflow tree; trees made and dropped as records of their own | [engine.md](design/engine.md#12-large-rows-as-chunk-rows-of-an-overflow-tree-trees-made-and-dropped-as-records-of-their-own) |
 | engine | 13 | The switch: a connection's B-trees on the versioned storage, the pager beside it | [engine.md](design/engine.md#13-the-switch-a-connections-b-trees-on-the-versioned-storage-the-pager-beside-it) |
 | engine | 14 | Eviction: CLOCK to a spill file, slots by page number, reads verified once, a typed bound | [engine.md](design/engine.md#14-eviction-clock-to-a-spill-file-slots-by-page-number-reads-verified-once-a-typed-bound) |
+| engine | 15 | Read-ahead runs: one read for a sequential walk's next pages, sized by the measured cost | [engine.md](design/engine.md#15-read-ahead-runs-one-read-for-a-sequential-walks-next-pages-sized-by-the-measured-cost) |
 | executor | 1 | A statement keeps its small ephemeral tables from one run to the next | [executor.md](design/executor.md#1-a-statement-keeps-its-small-ephemeral-tables-from-one-run-to-the-next) |
 | executor | 2 | `IN (SELECT ...)` answers a row with one search of its list | [executor.md](design/executor.md#2-in-select--answers-a-row-with-one-search-of-its-list) |
 | executor | 3 | LIKE jumps to where the literal after a `%` can match | [executor.md](design/executor.md#3-like-jumps-to-where-the-literal-after-a--can-match) |
@@ -111,6 +112,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane pl11): degree-sequence upper bounds guard each joined set's estimate | [planner.md](design/planner.md#decision-lane-pl11-degree-sequence-upper-bounds-guard-each-joined-sets-estimate) |
 | planner | – | Decision (lane pl7): cost weights fitted to measured statement times, behind a switch | [planner.md](design/planner.md#decision-lane-pl7-cost-weights-fitted-to-measured-statement-times-behind-a-switch) |
 | planner | – | Decision (lane qs5-9): a hash join's Bloom filter sized from its build's measured keys, chosen by the learned weights | [planner.md](design/planner.md#decision-lane-qs5-9-a-hash-joins-bloom-filter-sized-from-its-builds-measured-keys-chosen-by-the-learned-weights) |
+| planner | – | Decision (lane qs5-10): calibration from repeated samples, and the filter's lookup and a WHERE step measured | [planner.md](design/planner.md#decision-lane-qs5-10-calibration-from-repeated-samples-and-the-filters-lookup-and-a-where-step-measured) |
 | planner | – | Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model | [planner.md](design/planner.md#decision-lane-g6s3-learned-plan-hints-kept-for-a-query-class-only-where-its-held-out-runs-beat-the-cost-model) |
 | planner | – | Decision (lane pl7c): a table's pages counted by ANALYZE, else derived from its page and records | [planner.md](design/planner.md#decision-lane-pl7c-a-tables-pages-counted-by-analyze-else-derived-from-its-page-and-records) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
@@ -156,6 +158,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | reshard | – | Decision (lane split-merge-10): pulls over the owner transport | [reshard.md](design/reshard.md#decision-lane-split-merge-10-pulls-over-the-owner-transport) |
 | reshard | – | Decision (lane split-merge-11): the routing key is bytes | [reshard.md](design/reshard.md#decision-lane-split-merge-11-the-routing-key-is-bytes) |
 | reshard | – | Decision (lane split-merge-12): load from the store's meter | [reshard.md](design/reshard.md#decision-lane-split-merge-12-load-from-the-stores-meter) |
+| reshard | – | Decision (lane split-merge-12): a retired group's files | [reshard.md](design/reshard.md#decision-lane-split-merge-12-a-retired-groups-files) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |

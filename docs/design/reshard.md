@@ -229,7 +229,8 @@ deterministic simulator:
    Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
    which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
    one group), with a split and merge of it under writes through `carry`; the transport off
-   loopback, between machines; a retired group's files, which the shell's caller deletes.
+   loopback, between machines. Built (lane split-merge-12): a retired group's files, named to
+   the shell's caller, who deletes them (decision "A retired group's files", T-T1.9.R16).
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.
@@ -508,3 +509,23 @@ weights can be kept per writer thread and gathered at `measure`.
 
 **Falsified by.** A plan from `Groups::measure` that splits a group with no load or misses one with
 more than a core's share; a group's weights growing past their bound.
+
+## Decision (lane split-merge-12): a retired group's files
+
+A merge or a move retires a group, and its files stayed on disk for good. `Groups` doesn't know
+where a group's files are (its caller opens each group's engine), so it names them and the caller
+deletes them: `Groups::retired_of(found)` takes the groups whose files the caller found and gives
+back those retired here or shown retired by the directory routed by, and not held here. Such a
+group is never opened again by this node: a restart doesn't start it and a create asked of it again
+is refused (decision "Retired groups kept"). A group held here, one being made, and an id never
+given out are never named, so no live file is named. The list is as long as what the caller found,
+so it stays bounded. A file a store still has open (a read in flight as the group retired) may
+refuse deletion on Windows; the caller asks again at its next pass, or at start, when nothing of the
+group is open.
+
+**Evidence.** `tests/groups.rs`, T-T1.9.R16 (with T-T1.9.R6): after a split and a merge back, of
+groups 0, 1 and 2 only the retired group 1 is named, before and after a restart; its files deleted,
+every key still reads back from its group.
+
+**Falsified by.** A group named whose files are still read or written by this node; a retired
+group's files left after the caller has deleted those named.
