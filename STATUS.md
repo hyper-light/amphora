@@ -388,7 +388,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   for its commit's validation (`Versioned::keep_read`; before, SQL there was snapshot isolation and
   Elle found G2), refusing write skew and phantoms (`T-G8.4.2`), and reads the budget refused refuse
   the commit (`T-G8.4.3`). Not yet: the suite's sizes, the 10,000 seeds and the commit p99, the
-  coordinator's; the power-cut harness (`T-T1.4.1`).
+  coordinator's; the power-cut harness (`T-T1.4.1`) runs below.
+- **Power cuts on a real device** (CP-T1.4, AC-T1.4.4, `T-T1.4.1`; `bench/powercut/`, `bench/src/powercut.rs`):
+  32 writers commit single-row transactions with `synchronous = FULL`, each acknowledgement printed once
+  its commit returned; Linux cuts the device's writes (dm-flakey), macOS powers a VM off; a check
+  after recovery counts acknowledged ids missing, and `bench/power_nemesis.sh tally` gives both
+  harnesses' one verdict. A cut lands after 1 to `--powercut span` acknowledgements: two of the WAL's
+  checkpoint cycles by the engine's own `wal_autocheckpoint`, so cuts fall before, across and after a
+  checkpoint. dm-flakey's down interval is 1 s, the least it takes (up 0 s is down at every moment).
+  The 1,000 cuts on each storage and the macOS VM: the coordinator's.
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
@@ -740,6 +748,13 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 ## Next
 
+- **Baselines before optimizing, the harnesses** (kiln goal 63c98840, lane baselines-2; `BL`,
+  bench/baselines/README.md): `bench/baselines/run.sh <part>` gives each number from one command into
+  bench/records with the machine, commit and load: JOB planning per query with the 20 ms check
+  (`job-plan`), JOB join search time (`job-search`, from `amphora_engine::join_search_ns`), each join
+  kind (`join-kinds`), single-row reads per class against the leading row store (`point-reads`), and
+  scans and aggregates in ns a row beside ClickHouse and DuckDB (`scan-agg`). Each ran once tiny;
+  the quiet-host session (AC-BL.1, AC-BL.2) is the coordinator's.
 - **Replication measured: the harnesses** (G12 steps 1 and 3, CP-T1.8; lane repl-measure; `bench/src/repl.rs`,
   `bench/servers/repl/`): built and unit-tested, not run at size. `amphora-bench --repl commit|failover|catchup
   --system amphora|rqlite|dqlite|litefs|libsql` gives commit latency p50/p99/p99.9 and throughput, the time from a

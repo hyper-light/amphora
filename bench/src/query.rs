@@ -57,7 +57,7 @@ pub fn main() -> anyhow::Result<()> {
         "amphora" => {
             // The suite's readers read on connections of their own beside the writer's: so does this.
             let writer = amphora::db::Db::open_sharing(&path, &crate::suite_db::amphora_sharing()?)?;
-            let mut db = writer.reader()?;
+            let db = writer.reader()?;
             if let Some(pages) = std::env::var("AMPHORA_READER_PAGES").ok().and_then(|v| v.parse().ok()) {
                 db.keep_pages(pages)?;
             }
