@@ -29,7 +29,8 @@ use crate::schema::{BTreeTable, Table};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    translate_condition_expr, translate_expr, walk_expr, ConditionMetadata, WalkControl,
+    translate_condition_expr, translate_expr, walk_expr, walk_expr_mut, ConditionMetadata,
+    WalkControl,
 };
 use crate::translate::plan::{
     Distinctness, HashJoinType, JoinType, JoinedTable, Operation, QueryDestination, Scan, Search,
@@ -139,8 +140,34 @@ pub(crate) fn emit_morsel_hook(
     let serial = program.allocate_label();
     let end = program.allocate_label();
     let next = program.allocate_label();
-    let count = plan.result_columns.len();
+    let shown = plan.result_columns.len();
+    // A HAVING (lane qs6-17): every aggregate's value is loaded after the result columns, for the
+    // row loop to test its terms on.
+    let having = plan.group_by.as_ref().is_some_and(|g| g.having.is_some());
+    let mut data = data;
+    let count = if having {
+        let keys = data.group_by.len();
+        for at in 0..plan.aggregates.len() {
+            data.result_map.push(keys.checked_add(at).ok_or_else(|| {
+                crate::LimboError::InternalError("a HAVING's place overflows".into())
+            })?);
+        }
+        shown.saturating_add(plan.aggregates.len())
+    } else {
+        shown
+    };
     let dest_start = program.alloc_registers(count);
+    let having_terms = if having {
+        let first = dest_start.checked_add(shown).ok_or_else(|| {
+            crate::LimboError::InternalError("a HAVING's register overflows".into())
+        })?;
+        // `body_outputs` took the HAVING only where its terms qualify.
+        having_terms(plan, first).ok_or_else(|| {
+            crate::LimboError::InternalError("a HAVING the hook took doesn't qualify".into())
+        })?
+    } else {
+        Vec::new()
+    };
     // A LIMIT and an OFFSET count the hook's rows down as the serial loop's do (QT.6, lane qs6-6).
     let offset = (window.offset > 0).then(|| {
         let reg = program.alloc_register();
@@ -175,9 +202,26 @@ pub(crate) fn emit_morsel_hook(
             decrement_by: 1,
         });
     }
+    // A group that fails a HAVING term is skipped, as the serial loop skips it.
+    for term in &having_terms {
+        let passed = program.allocate_label();
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            term,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: passed,
+                jump_target_when_false: next,
+                jump_target_when_null: next,
+            },
+            resolver,
+        )?;
+        program.preassign_label_to_next_insn(passed);
+    }
     program.emit_insn(Insn::ResultRow {
         start_reg: dest_start,
-        count,
+        count: shown,
     });
     if let Some(reg) = limit {
         program.emit_insn(Insn::DecrJumpZero {
@@ -286,7 +330,8 @@ fn body_outputs(plan: &SelectPlan, rows: bool) -> Option<BodyOutputs<'_>> {
     let mut outs: Vec<&Expr> = Vec::new();
     let mut group_by = Vec::new();
     if let Some(group) = &plan.group_by {
-        if group.having.is_some() {
+        // A HAVING over the aggregates alone is the row loop's (`having_terms`, lane qs6-17).
+        if group.having.is_some() && having_terms(plan, 0).is_none() {
             return None;
         }
         for expr in &group.exprs {
@@ -486,6 +531,52 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         agg_filters,
         rows,
     })
+}
+
+/// A GROUP BY's HAVING terms as the hook's row loop tests them (lane qs6-17): each aggregate in
+/// them rewritten to the register its value is loaded into, `first + i` for the plan's aggregate
+/// `i`. Only terms over the aggregates and
+/// constants qualify: a group key or a bare column read through a register would lose the
+/// column's affinity in a comparison, which the serial loop applies. None: the statement is the
+/// serial loop's; an empty list: no HAVING.
+fn having_terms(plan: &SelectPlan, first: usize) -> Option<Vec<Expr>> {
+    let Some(having) = plan.group_by.as_ref().and_then(|g| g.having.as_ref()) else {
+        return Some(Vec::new());
+    };
+    let mut terms = Vec::new();
+    for term in having {
+        let mut term = term.clone();
+        let mut fine = true;
+        walk_expr_mut(
+            &mut term,
+            &mut |e: &mut Expr| -> crate::Result<WalkControl> {
+                if let Some(at) = plan.aggregates.iter().position(|a| a.original_expr == *e) {
+                    match first.checked_add(at) {
+                        Some(reg) => *e = Expr::Register(reg),
+                        None => fine = false,
+                    }
+                    return Ok(WalkControl::SkipChildren);
+                }
+                match e {
+                    Expr::Column { .. }
+                    | Expr::RowId { .. }
+                    | Expr::Collate(..)
+                    | Expr::Exists(..)
+                    | Expr::InSelect { .. }
+                    | Expr::Subquery(..)
+                    | Expr::Register(..) => fine = false,
+                    _ => {}
+                }
+                Ok(WalkControl::Continue)
+            },
+        )
+        .ok()?;
+        if !fine {
+            return None;
+        }
+        terms.push(term);
+    }
+    Some(terms)
 }
 
 /// The FILTER expressions of `agg_filters`, for [`body_reads`] (lane qs6-17).

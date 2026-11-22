@@ -699,6 +699,18 @@ TOTAL 0.0), as the serial loop does. A body that is nothing but reads has no FIL
 FILTER keeps the statement off the direct path. T-QT.6.31 checks them in scans and joins against
 the serial loop at 1, 2, 3, 4 and 8 stated cores.
 
+**A HAVING over the aggregates on morsels** (lane qs6-17). The planner moves a HAVING's terms over
+the group keys alone into the WHERE; what is left is the row loop's to test once the groups are
+made. With a HAVING, the hook loads every aggregate's value after the result columns
+(`MorselAggregateData::result_map` grows by one place per aggregate, `MorselNext` fills them, and
+`ResultRow` returns only the result columns), rewrites each aggregate in the HAVING's terms to the
+register its value is loaded into (`having_terms`), and tests them with `translate_condition_expr`
+as the serial loop does, a group that fails going on to the next. Only terms over the aggregates
+and constants qualify: a group key or a bare column read through a register would lose its
+column's affinity in a comparison, which the serial loop applies, so those stay serial. A HAVING
+with no GROUP BY is a GROUP BY of no keys, its one group tested the same way. T-QT.6.32 checks
+them in scans and joins against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
 **What still runs on the serial loop** (lane qs6-16's audit, updated by lane qs6-17; each an open
 part of QT.6):
 - *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
@@ -724,7 +736,7 @@ part of QT.6):
   default, on the versioned storage's column copy, which decodes records as written; a scan through an index or a
   rowid range (`Operation::Search` on the probe: a rowid range is a run of leaves); a one-table
   scan's rows under ORDER BY; AVG and TOTAL over REALs or past 2^53, group_concat and DISTINCT
-  aggregates, HAVING, and
+  aggregates, a HAVING over a group key or a bare column, and
   an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and
   other statements that don't return rows; joins with no equality of one affinity (a cross
   product, a range join).

@@ -2989,3 +2989,95 @@ fn t_qt_6_31_filtered_aggregates_run_on_morsels_as_the_serial_loop() {
     }
     conn.set_parallel_mode(ParallelMode::Off);
 }
+
+/// T-QT.6.32 (lane qs6-17): a GROUP BY with a HAVING over its aggregates runs on morsels: every
+/// aggregate's value is loaded after the result columns and the hook's row loop tests the
+/// HAVING's terms on them, skipping a group that fails, as the serial loop does. HAVINGs over
+/// aggregates in the result columns and aggregates only the HAVING names, ANDed and ORed, with
+/// NULL aggregates, none passing, and a HAVING with no GROUP BY, in scans and joins, answer as the
+/// serial loop at 1, 2, 3, 4 and 8 stated cores, and the hook ran each. A HAVING over a group key
+/// or a bare column, which would lose the column's affinity read through a register, stays the
+/// serial loop's.
+#[test]
+fn t_qt_6_32_having_over_aggregates_runs_on_morsels_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-32");
+    let mut rng = ChaCha8Rng::seed_from_u64(632);
+    let pad = "x".repeat(64);
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, k INTEGER, g INTEGER, p TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..2500 {
+        let a = rng.random_range(-30i64..30);
+        let b = match rng.random_range(0..5) {
+            0 => "NULL".to_string(),
+            _ => rng.random_range(-1000i64..1000).to_string(),
+        };
+        let c = ["NULL", "'x'", "'y'", "'z'"][rng.random_range(0..4)];
+        conn.execute(format!(
+            "INSERT INTO t(a, b, c, p) VALUES ({a}, {b}, {c}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    for _ in 0..300 {
+        let k = rng.random_range(-30i64..30);
+        let g = rng.random_range(-7i64..7);
+        conn.execute(format!("INSERT INTO u(k, g, p) VALUES ({k}, {g}, '{pad}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let ran = |conn: &Arc<Connection>| {
+        [&conn.morsel_body_rows, &conn.morsel_join_links]
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    // (statement, whether the hook answers it).
+    let queries: [(&str, bool); 10] = [
+        ("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 40", true),
+        ("SELECT a % 7, sum(b) FROM t GROUP BY a % 7 HAVING sum(b) > 0 AND max(b) > 990", true),
+        ("SELECT c, count(*) FROM t GROUP BY c HAVING min(b) < -995 OR count(b) < 450", true),
+        ("SELECT a, avg(b) FROM t GROUP BY a HAVING sum(b) FILTER (WHERE c = 'x') IS NULL OR avg(b) > 30", true),
+        ("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 100000", true),
+        ("SELECT count(*), sum(b) FROM t HAVING count(*) > 10", true),
+        ("SELECT t.c, count(*), sum(u.g) FROM t JOIN u ON t.a = u.k GROUP BY t.c HAVING sum(u.g) <> 0 AND count(*) > 10", true),
+        ("SELECT u.g, count(t.id) FROM u LEFT JOIN t ON t.a = u.k GROUP BY u.g HAVING count(t.id) > 50", true),
+        // The serial loop's: a group key, a bare column.
+        ("SELECT c, count(*) FROM t GROUP BY c HAVING c <> 'y' AND count(*) > 1", false),
+        ("SELECT a % 3, count(*) FROM t GROUP BY a % 3 HAVING max(b) > b", false),
+    ];
+    for (sql, hooked) in queries {
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = ran(&conn);
+            let parallel = sql_rows(&conn, sql);
+            let after = ran(&conn);
+            assert_eq!(
+                format!("{parallel:?}"),
+                format!("{serial:?}"),
+                "{sql} on {cores} cores"
+            );
+            if hooked {
+                assert!(
+                    after[0] > before[0] || after[1] > before[1],
+                    "{sql} on {cores} cores: the hook didn't run"
+                );
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    // Non-vacuity: a HAVING kept some groups and dropped others.
+    let all = sql_rows(&conn, "SELECT a, count(*) FROM t GROUP BY a").len();
+    let kept = sql_rows(
+        &conn,
+        "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 40",
+    )
+    .len();
+    assert!(kept > 0 && kept < all, "{kept} of {all} groups kept");
+}
