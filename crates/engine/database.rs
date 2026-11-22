@@ -5138,6 +5138,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn pragma_checkpoint_codec_error_releases_checkpoint_lock() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-pragma-checkpoint-retry.db");
         let path = path.to_str().unwrap();
@@ -5204,6 +5209,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_transaction_recovers_after_wal_encode_failure() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-commit-retry.db");
         let path = path.to_str().unwrap();
@@ -5247,6 +5257,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_pager_read_recovers_after_decode_failure() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-read-retry.db");
         let path = path.to_str().unwrap();
@@ -5294,6 +5309,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_checkpoint_recovers_after_backfill_transform_failures() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-backfill-retry.db");
         let path = path.to_str().unwrap();
@@ -5346,6 +5366,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_round_trips_wal_and_checkpointed_database_with_bootstrap_header() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-roundtrip.db");
         let path = path.to_str().unwrap();
@@ -5580,6 +5605,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_reopen_rejects_invalid_header_layout() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-invalid-header-layout.db");
         let path = path.to_str().unwrap();
@@ -5805,6 +5835,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_connections_preserve_old_reader_snapshot_during_checkpoint() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-connections.db");
         let path = path.to_str().unwrap();
@@ -5901,6 +5936,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_reserved_tail_detects_persistent_page_corruption() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         use std::fs::OpenOptions as StdOpenOptions;
         use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -6010,6 +6050,11 @@ mod database_tests {
     #[cfg(feature = "fs")]
     #[test]
     fn page_codec_rejects_database_already_in_mvcc_mode() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's own pages: its page codec, its log and checkpoint; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let temp_dir = tempfile::TempDir::new().unwrap();
         let path = temp_dir.path().join("codec-existing-mvcc.db");
         let path_str = path.to_str().unwrap();

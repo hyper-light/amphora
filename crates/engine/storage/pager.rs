@@ -7465,6 +7465,11 @@ mod tests {
     /// each time it reads the rows as committed.
     #[test]
     fn a_reader_forgets_only_the_pages_written_since_its_last_read() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's page cache and its log; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
             crate::Database::open_file(io, "forget.db", Arc::new(crate::SqliteDialect)).unwrap();
@@ -8231,6 +8236,11 @@ mod checkpoint_phase_tests {
 
     #[test]
     fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the pager's page cache and its log; the versioned storage keeps neither",
+        ) {
+            return;
+        }
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.path().join("test.db");
         let conn = db.connect(ConnectOpts::new()).unwrap();
