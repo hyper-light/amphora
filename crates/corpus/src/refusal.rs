@@ -199,8 +199,12 @@ fn duckdb(error: &str) -> ErrorKind {
     let m = message.to_ascii_lowercase();
     match kind.trim() {
         "Constraint" => ErrorKind::Constraint,
+        "Parser" if m.contains("does not exist") => ErrorKind::Missing,
         "Parser" | "Syntax" => ErrorKind::Syntax,
         "Conversion" | "Mismatch Type" | "Out of Range" => ErrorKind::Type,
+        // Its parser names a window that doesn't exist ("Parser Error: window \"nope\" does not
+        // exist"), its binder a column ("Table \"t\" does not have a column with name \"c\"").
+        "Binder" if m.contains("does not have a column") => ErrorKind::Missing,
         "Catalog" if m.contains("does not exist") => ErrorKind::Missing,
         "Catalog" if m.contains("already exists") => ErrorKind::Exists,
         "Binder" if m.contains("not found") || m.contains("does not exist") => ErrorKind::Missing,
@@ -455,6 +459,30 @@ mod tests {
         for (engine, error, want) in cases {
             assert_eq!(of(engine, error), want, "{engine}: {error}");
         }
+    }
+
+    /// Do: DuckDB's parser and binder naming an object that doesn't exist. Expect: a missing
+    /// object, as SQLite's "no such window" and "no such column" are.
+    #[test]
+    fn duckdbs_missing_objects_by_message() {
+        assert_eq!(
+            of("duckdb", "Parser Error: window \"nope\" does not exist"),
+            ErrorKind::Missing
+        );
+        assert_eq!(
+            of(
+                "duckdb",
+                "Binder Error: Table \"krn2\" does not have a column with name \"nope\""
+            ),
+            ErrorKind::Missing
+        );
+        assert_eq!(
+            of(
+                "duckdb",
+                "Parser Error: syntax error at or near \"REINDEX\""
+            ),
+            ErrorKind::Syntax
+        );
     }
 
     /// Do: SQLite's codes as the corpus keeps them: an extended constraint code, STRICT's datatype

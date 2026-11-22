@@ -25,6 +25,7 @@ use amphora_corpus::amphora::AmphoraRender;
 use amphora_corpus::dialect::{Translated, Translation};
 use amphora_corpus::refusal::{self, Compared, Refusals};
 use amphora_corpus::run::{Counts, Limits, Outcome, run_file};
+use amphora_corpus::slt::Kind;
 
 struct Args {
     pool: PathBuf,
@@ -225,6 +226,11 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
         let counts = run_file(engine.as_mut(), &mut render, &text, fix.as_deref(), translated, limits, &mut |ran| {
             let outcome = match &ran.outcome {
                 Outcome::Agree => match ran.refused.as_deref() {
+                    // A statement SQLite refuses, refused after one the engine couldn't run.
+                    None if ran.record.kind == Kind::Statement { ok: false } => {
+                        unknown = unknown.saturating_add(1);
+                        "agree".to_owned()
+                    }
                     None => "agree".to_owned(),
                     Some(e) => match refusal::compare(refusals.get(ran.record.line), refusal::of(name, e)) {
                         Compared::Same => {
@@ -318,7 +324,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
     .map_err(|e| e.to_string())?;
     writeln!(
         out,
-        "{}: {} refusals of what SQLite refuses (any error matches: the control), {same} of SQLite's kind of error, {differs} of another kind{}, {unknown} not compared (SQLite's kind not kept, or none named)",
+        "{}: {} refusals of what SQLite refuses (any error matches: the control), {same} of SQLite's kind of error, {differs} of another kind{}, {unknown} not compared (SQLite's kind not kept or none named, or after a statement the engine couldn't run)",
         a.engine,
         same.saturating_add(differs).saturating_add(unknown),
         if a.by_kind { " (disagreements: --refusals kind)" } else { "" }

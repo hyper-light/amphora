@@ -145,6 +145,13 @@ impl AmphoraRender {
     }
 
     fn one(io: &dyn IO, stmt: &mut Statement, r: f64) -> Result<String, String> {
+        // NaN is no SQLite value (sqlite3_bind_double and every result store it as NULL, SQLite's
+        // "Floating Point Numbers", https://www.sqlite.org/floatingpoint.html), so no SQLite answer
+        // holds it; a competitor's REAL can (DuckDB's power(-1, 0.5)). It renders as its own text,
+        // which no answer of SQLite's is: the answer disagrees and the run goes on.
+        if r.is_nan() {
+            return Ok("NaN".to_owned());
+        }
         stmt.reset().map_err(|e| e.to_string())?;
         let first = NonZero::new(1usize).ok_or("parameter 0")?;
         stmt.bind_at(first, amphora_engine::Value::from_f64(r))
