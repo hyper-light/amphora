@@ -293,7 +293,6 @@ impl Copies {
         *self.rebuy.lock()
     }
 
-    #[cfg(test)]
     pub(crate) fn set_rebuy(&self, rebuy: Rebuy) {
         *self.rebuy.lock() = rebuy;
     }
@@ -387,7 +386,6 @@ impl Copies {
         self.on.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     pub(crate) fn set_on(&self, on: bool) {
         self.on.store(on, Ordering::Relaxed);
     }
@@ -1502,7 +1500,7 @@ mod tests {
             let m = copies(&on).meter();
             let n = s.statements.max(1) as u64;
             format!(
-                "{{\"lane\":\"colcopy-bound\",\"policy\":\"{}\",\"scenario\":\"{}\",\"tables\":{},\"rows\":{},\"statements\":{},\"need_bytes\":{},\"free_bytes\":{},\"p50_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"statements_per_s\":{:.1},\"peak_held\":{},\"avg_held\":{},\"build_rows\":{},\"rebuy_rows\":{},\"build_bytes\":{},\"rebuy_bytes\":{},\"resident_peak\":{},\"granted_peak\":{},\"rebuys\":{},\"kept\":{},\"dropped\":{},\"resumed\":{},\"absent_ns\":{},\"longest_wait_ns\":{},\"copy_statements\":{},\"absent_statements\":{},\"copy_rows\":{},\"loop_rows\":{},\"asked\":{},\"granted\":{},\"refused\":{},\"refused_bytes\":{},\"equal\":{}}}",
+                "{{\"harness\":\"colcopy-ab\",\"policy\":\"{}\",\"scenario\":\"{}\",\"tables\":{},\"rows\":{},\"statements\":{},\"need_bytes\":{},\"free_bytes\":{},\"p50_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"statements_per_s\":{:.1},\"peak_held\":{},\"avg_held\":{},\"build_rows\":{},\"rebuy_rows\":{},\"build_bytes\":{},\"rebuy_bytes\":{},\"resident_peak\":{},\"granted_peak\":{},\"rebuys\":{},\"kept\":{},\"dropped\":{},\"resumed\":{},\"absent_ns\":{},\"longest_wait_ns\":{},\"copy_statements\":{},\"absent_statements\":{},\"copy_rows\":{},\"loop_rows\":{},\"asked\":{},\"granted\":{},\"refused\":{},\"refused_bytes\":{},\"equal\":{}}}",
                 match rebuy { Rebuy::Rent => "A_rent", Rebuy::Room => "B_room" },
                 s.name, s.tables, s.rows, s.statements, need,
                 free.map_or("null".to_string(), |f| f.to_string()),

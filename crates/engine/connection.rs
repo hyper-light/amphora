@@ -1053,6 +1053,12 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// Amphora (lane colcopy-5, AC-CB.4.2): the versioned storage the connection's B-trees are on
+    /// (None: the pager's), for its column copies' switch, rebuy policy and instruments.
+    pub fn versioned_storage(&self) -> Option<Arc<crate::storage::versioned::switch::Storage>> {
+        self.versioned.as_ref().map(|s| s.storage().clone())
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches.load(Ordering::Acquire)
     }

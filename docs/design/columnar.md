@@ -232,7 +232,11 @@ moving rows out of blocks over positional deltas, which complicate reads [c80].
    each way's failure mode: a laptop's cap with one big table, many tables under a small cap, steady
    pressure, bursty pressure that frees memory in small pieces, a table that grows while its copy
    waits, and a huge cap with many tables. It writes one JSONL record per way and scenario. The
-   choice waits for the coordinator's run of record; until then A stays the default.
+   choice waits for the coordinator's run of record; until then A stays the default. Against DuckDB,
+   one driver (`amphora-bench --colcopy`, AC-CB.4.2) runs the same scenarios on Amphora under both
+   ways and on DuckDB, both in process and in memory, each statement timed the same way. DuckDB's
+   cap is `SET memory_limit` to the bytes it holds before the statement plus the scenario's free
+   bytes: its table is its columns, so it gets the same room for the analytic work as Amphora's copies.
 
 ## What the next steps prototype and measure
 

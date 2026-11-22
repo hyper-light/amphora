@@ -554,7 +554,13 @@ fn run_batch(
         Some(Some(crate::types::Cursor::BTree(cursor, ..))) => cursor,
         _ => return Ok(0),
     };
-    let Some(cell) = super::window(batches, plan, fused.cursor_id, cursor)? else {
+    let Some(cell) = super::window(
+        batches,
+        plan,
+        fused.cursor_id,
+        super::ScanCursor::Pager(cursor),
+    )?
+    else {
         return Ok(0);
     };
     let batch = batches
