@@ -764,6 +764,12 @@ tests = [
   # lane split-merge-7
   { id = "T-T1.9.R6", text = "A split and a merge back through the shell, the node started again by the directory from before both and the split's Create asked again — passes when the retired group is neither started nor made again but the Create is refused as of an ended operation, and every acknowledged row is in the one group left" },
   { id = "T-T1.9.R7", text = "A local database as a group's engine, its holding fenced through the shell, then the group started again on the same file — passes when the fenced holding is answered after the restart, kept in the file as the Holding command left it" },
+  # lane split-merge-8
+  { id = "T-T1.9.R8", text = "Copy-path batches on a node with no commit measured, and batches learned from time with large units — passes when no batch holds more units than the process's memory budget takes at the most bytes a unit has held, and at least one" },
+  { id = "T-T1.9.R9", text = "A local database holding Records rows made a group's, its keys copied by position in batches into another local database, changed and caught up from its log, then swept — passes when the second answers every key as the first, with the same live count and a head no older than every revision moved, a catch-up from before the log was held is refused, and the sweep leaves the first with no key" },
+  # lane split-merge-9
+  { id = "T-T1.9.R10", text = "Two nodes, the second of two groups on the first moved to the second by the driver while a row is written before every action, each pull of its copy and catch-up and its answer carried as bytes — passes when the move ends flipped, the first node keeps one group and has retired the moved one, the second holds its span, every key's acknowledged rows read back at its group's node, and every key is in exactly one group's file" },
+  { id = "T-T1.9.R11", text = "The move of T-T1.9.R10 with every third pull's answer lost on the way back after the old group's node acted on it, each loss asked again by the driver — passes when some answers were lost and the move still ends flipped with every acknowledged write at its group's node and every key in exactly one group's file" },
 ]
 
 # lane qs5

@@ -573,7 +573,11 @@ copy-on-update, checksum), in buckets that double so it grows without moving: G7
 evicted frame reached each time a page is read in, so no copy from an earlier stay matches. Every
 frame latched, or a page that left its frame on as many tries as there are frames, is refused with
 `MemoryBudget`; a pool without a disk keeps every page resident and refuses past its frames with
-`DatabaseFull`, as before.
+`DatabaseFull`, as before. A checkpoint writes its journal a page at a time as `Pool::copy_owed`
+hands the pages over, its seal last over the body's hash, and recovery checks the journal and
+writes its pages home a page at a time: neither holds more than one page of it in memory, however
+many pages were written since the last checkpoint (the journal's body: its stamp, its list's length
+and list, then its pages to the end).
 
 **Why.** In-place write-back between checkpoints would break decision 8: recovery starts from the
 last checkpoint's pages and replays logical row changes, and a page written home early (a split's
@@ -592,12 +596,12 @@ a checkpoint, read back and reopened; a crash at every disk operation of a workl
 checkpoints recovers a prefix of its commits at least as long as the last acknowledged durable; the
 pool's model test with eviction, 32 threads on 8 frames over 64 pages, every read whole and every
 owner reading its last write. `pool.rs`: a spilled page damaged on disk refused as corrupt; every
-frame latched refused typed.
+frame latched refused typed. `durable.rs`: every crash test, through journals written and read a
+page at a time.
 
 **Falsified by.** The coordinator's 10M-row corpus run in a pool a tenth of the data with resident
 memory more than 10% over the budget, or slower than the reach design chosen by the numbers. What
-isn't bounded by the pool yet, and would show there: a checkpoint builds its journal of the pages
-written since the last in memory (decision 7's copy, `Pool::copy_owed`), and a page first written
+isn't bounded by the pool yet, and would show there: a page first written
 during a checkpoint's copy keeps its old bytes in memory until the copy takes them; the slots are 16
 bytes a page of the database (0.4% of it, 3.9% of a pool a tenth of it, up to twice that in a bucket
 just made).

@@ -22,8 +22,9 @@
 //!
 //! Journal and header: `magic` (`u64`), the body's length (`u64`) and XXH3 (`u64`), then the body:
 //! the checkpoint's sequence number (`u64`), T (`u64`), the pages handed out (`u64`), the tree count
-//! (`u64`) and each tree's root (`u64`); a journal's body then holds its page count (`u64`), each
-//! page's number (`u64`) and bytes, and its list as one redo record at T. Journals take turns by
+//! (`u64`) and each tree's root (`u64`); a journal's body then holds its list's length (`u64`), its
+//! list as one redo record at T, and each page's number (`u64`) and bytes to the end, written and
+//! read a page at a time (G7 step 4). Journals take turns by
 //! sequence number's parity, so a checkpoint never writes over the journal recovery may need.
 
 use super::blink::{Comparator, Descender};
@@ -127,15 +128,6 @@ fn unseal(magic: u64, bytes: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// Reads a whole file.
-fn read_all(disk: &dyn Disk, file: File) -> Result<Vec<u8>> {
-    let len = usize::try_from(disk.len(file)?).map_err(|_| LimboError::IntegerOverflow)?;
-    let mut bytes = vec![0u8; len];
-    let n = disk.read_at(file, 0, &mut bytes)?;
-    bytes.truncate(n);
-    Ok(bytes)
-}
-
 fn journal_file(seq: u64) -> File {
     if seq.is_multiple_of(2) {
         File::Journal
@@ -167,51 +159,214 @@ fn partition(op: &Op, parts: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// A journal's contents: its stamp, its pages and its list.
+/// A seal's own bytes ahead of its body: magic, length and hash (`seal`'s format).
+const SEAL_BYTES: u64 = 24;
+
+/// A journal page: its number (`u64`) and its bytes (the journal's format).
+const ENTRY_BYTES: usize = 8 + PAGE_SIZE;
+
+/// Where a journal's pages lie: `count` of them, `ENTRY_BYTES` each, from `at` in `file`.
+struct JournalPages {
+    file: File,
+    at: u64,
+    count: u64,
+}
+
+/// A journal's stamp and list, and where its pages lie. Its body is the stamp, the list's length
+/// (`u64`) and the list (one redo record), then its pages to the end, sealed like a header. It is
+/// written and read a page at a time, so a checkpoint and recovery hold one page of it in memory
+/// however many it copies (G7 step 4, `NS.4`: the pool's budget bounds what a checkpoint holds).
 struct Journal {
     stamp: Stamp,
-    pages: Vec<(u64, Vec<u8>)>,
     list: Vec<Op>,
+    pages: JournalPages,
+}
+
+/// `len` bytes of `file` at `offset`; None if the file ends first.
+fn read_exact(disk: &dyn Disk, file: File, offset: u64, len: usize) -> Result<Option<Vec<u8>>> {
+    let mut buf = vec![0u8; len];
+    let n = disk.read_at(file, offset, &mut buf)?;
+    Ok(if n == len { Some(buf) } else { None })
+}
+
+fn to_u64(n: usize) -> Result<u64> {
+    u64::try_from(n).map_err(|_| LimboError::IntegerOverflow)
 }
 
 impl Journal {
-    fn encode(&self) -> Result<Vec<u8>> {
-        let mut body = Vec::new();
-        self.stamp.encode(&mut body)?;
-        body.extend_from_slice(
-            &u64::try_from(self.pages.len())
-                .map_err(|_| LimboError::IntegerOverflow)?
-                .to_le_bytes(),
-        );
-        for (no, bytes) in &self.pages {
-            body.extend_from_slice(&no.to_le_bytes());
-            body.extend_from_slice(bytes);
+    /// Writes a journal over `stamp`'s file, flushed: the stamp, `list`, and each page `copy`
+    /// hands its callback, written as it comes; the seal last, over the body's hash, so a journal
+    /// cut short never checks out.
+    fn write(
+        disk: &dyn Disk,
+        stamp: &Stamp,
+        list: &[Op],
+        copy: impl FnOnce(&mut dyn FnMut(u64, &[u8]) -> Result<()>) -> Result<()>,
+    ) -> Result<JournalPages> {
+        use std::hash::Hasher;
+        let file = journal_file(stamp.seq);
+        disk.truncate(file, 0)?;
+        let mut head = Vec::new();
+        stamp.encode(&mut head)?;
+        let list = redo::encode(stamp.ts, list)?;
+        head.extend_from_slice(&to_u64(list.len())?.to_le_bytes());
+        head.extend_from_slice(&list);
+        let mut hash = twox_hash::XxHash3_64::with_seed(0);
+        hash.write(&head);
+        disk.write_at(file, SEAL_BYTES, &head)?;
+        let at = SEAL_BYTES
+            .checked_add(to_u64(head.len())?)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let entry_len = to_u64(ENTRY_BYTES)?;
+        let (mut end, mut count) = (at, 0u64);
+        let mut entry = Vec::with_capacity(ENTRY_BYTES);
+        copy(&mut |no, bytes| {
+            if bytes.len() != PAGE_SIZE {
+                return Err(LimboError::InternalError(
+                    "versioned storage: a checkpoint's page of the wrong size".into(),
+                ));
+            }
+            entry.clear();
+            entry.extend_from_slice(&no.to_le_bytes());
+            entry.extend_from_slice(bytes);
+            hash.write(&entry);
+            disk.write_at(file, end, &entry)?;
+            end = end
+                .checked_add(entry_len)
+                .ok_or(LimboError::IntegerOverflow)?;
+            count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            Ok(())
+        })?;
+        let len = end
+            .checked_sub(SEAL_BYTES)
+            .ok_or(LimboError::IntegerOverflow)?;
+        let mut seal = Vec::with_capacity(24);
+        for word in [JOURNAL_MAGIC, len, hash.finish()] {
+            seal.extend_from_slice(&word.to_le_bytes());
         }
-        body.extend_from_slice(&redo::encode(self.stamp.ts, &self.list)?);
-        seal(JOURNAL_MAGIC, &body)
+        disk.write_at(file, 0, &seal)?;
+        disk.sync(file)?;
+        Ok(JournalPages { file, at, count })
     }
 
-    fn decode(bytes: &[u8]) -> Option<Self> {
-        let body = unseal(JOURNAL_MAGIC, bytes)?;
+    /// The journal in `file` if it is whole: its body hashed a page at a time, then its stamp and
+    /// list read; its pages left in the file.
+    fn read(disk: &dyn Disk, file: File) -> Result<Option<Self>> {
+        use std::hash::Hasher;
+        let size = disk.len(file)?;
+        let Some(seal) = read_exact(disk, file, 0, 24)? else {
+            return Ok(None);
+        };
         let mut at = 0;
-        let stamp = Stamp::decode(body, &mut at)?;
-        let n = usize::try_from(take_u64(body, &mut at)?).ok()?;
-        if n > body.len() / PAGE_SIZE {
-            return None;
+        let magic = take_u64(&seal, &mut at);
+        let len = take_u64(&seal, &mut at);
+        let sum = take_u64(&seal, &mut at);
+        let (Some(JOURNAL_MAGIC), Some(len), Some(sum)) = (magic, len, sum) else {
+            return Ok(None);
+        };
+        if SEAL_BYTES.checked_add(len).is_none_or(|end| end > size) {
+            return Ok(None);
         }
-        let mut pages = Vec::with_capacity(n);
-        for _ in 0..n {
-            let no = take_u64(body, &mut at)?;
-            let end = at.checked_add(PAGE_SIZE)?;
-            pages.push((no, body.get(at..end)?.to_vec()));
-            at = end;
+        let mut hash = twox_hash::XxHash3_64::with_seed(0);
+        let mut buf = vec![0u8; ENTRY_BYTES];
+        let mut done = 0u64;
+        while done < len {
+            let n = usize::try_from(len.saturating_sub(done))
+                .unwrap_or(usize::MAX)
+                .min(ENTRY_BYTES);
+            let Some(chunk) = buf.get_mut(..n) else {
+                return Ok(None);
+            };
+            if disk.read_at(file, SEAL_BYTES.saturating_add(done), chunk)? != n {
+                return Ok(None);
+            }
+            hash.write(chunk);
+            done = done.saturating_add(to_u64(n)?);
         }
-        let (records, valid) = redo::decode_all(body.get(at..)?);
-        if valid != body.len().saturating_sub(at) || records.len() != 1 {
-            return None;
+        if hash.finish() != sum {
+            return Ok(None);
         }
-        let list = records.into_iter().next()?.ops;
-        Some(Self { stamp, pages, list })
+        // The stamp's four words, the last its roots' count; then the roots and the list's length.
+        let Some(words) = read_exact(disk, file, SEAL_BYTES, 32)? else {
+            return Ok(None);
+        };
+        let mut at = 24;
+        let Some(head_len) = take_u64(&words, &mut at)
+            .and_then(|roots| roots.checked_mul(8))
+            .and_then(|r| r.checked_add(40))
+            .filter(|&h| h <= len)
+        else {
+            return Ok(None);
+        };
+        let head_len = usize::try_from(head_len).map_err(|_| LimboError::IntegerOverflow)?;
+        let Some(head) = read_exact(disk, file, SEAL_BYTES, head_len)? else {
+            return Ok(None);
+        };
+        let mut at = 0;
+        let (Some(stamp), Some(list_len)) =
+            (Stamp::decode(&head, &mut at), take_u64(&head, &mut at))
+        else {
+            return Ok(None);
+        };
+        let list_at = SEAL_BYTES.saturating_add(to_u64(at)?);
+        let Some(pages_at) = list_at
+            .checked_add(list_len)
+            .filter(|&p| p <= SEAL_BYTES.saturating_add(len))
+        else {
+            return Ok(None);
+        };
+        let list_len = usize::try_from(list_len).map_err(|_| LimboError::IntegerOverflow)?;
+        let Some(list) = read_exact(disk, file, list_at, list_len)? else {
+            return Ok(None);
+        };
+        let (records, valid) = redo::decode_all(&list);
+        if valid != list.len() || records.len() != 1 {
+            return Ok(None);
+        }
+        let Some(list) = records.into_iter().next().map(|r| r.ops) else {
+            return Ok(None);
+        };
+        let rest = SEAL_BYTES.saturating_add(len).saturating_sub(pages_at);
+        let entry_len = to_u64(ENTRY_BYTES)?;
+        if !rest.is_multiple_of(entry_len) {
+            return Ok(None);
+        }
+        let count = rest.checked_div(entry_len).unwrap_or(0);
+        Ok(Some(Self {
+            stamp,
+            list,
+            pages: JournalPages {
+                file,
+                at: pages_at,
+                count,
+            },
+        }))
+    }
+
+    /// Writes a journal's pages, then `stamp` as the header, over the data file a page at a time,
+    /// flushed: a checkpoint's second half, and recovery's finishing of it.
+    fn apply(disk: &dyn Disk, stamp: &Stamp, pages: &JournalPages) -> Result<()> {
+        let entry_len = to_u64(ENTRY_BYTES)?;
+        let mut buf = vec![0u8; ENTRY_BYTES];
+        for i in 0..pages.count {
+            let at = i
+                .checked_mul(entry_len)
+                .and_then(|o| o.checked_add(pages.at))
+                .ok_or(LimboError::IntegerOverflow)?;
+            if disk.read_at(pages.file, at, &mut buf)? != ENTRY_BYTES {
+                return Err(corrupt("a checkpoint journal's page past its file's end"));
+            }
+            let mut head = 0;
+            let no = take_u64(&buf, &mut head)
+                .filter(|no| (1..=stamp.allocated).contains(no))
+                .ok_or_else(|| corrupt("a checkpoint journal's page past the pages handed out"))?;
+            let page = buf
+                .get(head..)
+                .ok_or_else(|| corrupt("a checkpoint journal's page cut short"))?;
+            disk.write_at(File::Data, page_offset(no)?, page)?;
+        }
+        Database::write_header(disk, stamp)?;
+        disk.sync(File::Data)
     }
 }
 
@@ -279,7 +434,7 @@ impl Database {
         // went; with the header damaged, the newer of the two.
         let mut newest: Option<Journal> = None;
         for file in [File::Journal, File::JournalNext] {
-            let Some(j) = Journal::decode(&read_all(&*disk, file)?) else {
+            let Some(j) = Journal::read(&*disk, file)? else {
                 continue;
             };
             let current = header.as_ref().is_none_or(|h| j.stamp.seq >= h.seq);
@@ -298,7 +453,7 @@ impl Database {
                 "no complete checkpoint journal at or after the data file's header",
             ));
         };
-        Self::write_journal_pages(&*disk, &journal)?;
+        Journal::apply(&*disk, &journal.stamp, &journal.pages)?;
         let Journal { stamp, list, .. } = journal;
         // A checkpoint that switched turns and never finished leaves commits after T in both.
         let replay = redo::merge(redo::read(&*disk)?, disk.lanes(), stamp.ts)?;
@@ -452,21 +607,19 @@ impl Database {
         })?;
         let allocated = v.pool.allocated();
         let epoch = v.pool.begin_copy()?;
-        let journal = Journal {
-            stamp: Stamp {
-                seq: 0,
-                ts: 0,
-                allocated,
-                roots: v.roots(),
-            },
-            pages: v.pool.copy_owed(epoch, allocated)?,
-            list: Vec::new(),
+        let stamp = Stamp {
+            seq: 0,
+            ts: 0,
+            allocated,
+            roots: v.roots(),
         };
         // What the redo files hold is no record (the caller found none) of this database.
         let ends = vec![[0, 0]; disk.lanes()];
         redo::trim(&*disk, &ends)?;
-        Self::write_journal(&*disk, &journal)?;
-        Self::write_journal_pages(&*disk, &journal)?;
+        let pages = Journal::write(&*disk, &stamp, &[], |each| {
+            v.pool.copy_owed(epoch, allocated, each)
+        })?;
+        Journal::apply(&*disk, &stamp, &pages)?;
         Ok(Self {
             disk,
             v,
@@ -555,24 +708,6 @@ impl Database {
         }
         page.resize(PAGE_SIZE, 0);
         disk.write_at(File::Data, 0, &page)
-    }
-
-    /// Writes `j` over its journal file, flushed.
-    fn write_journal(disk: &dyn Disk, j: &Journal) -> Result<()> {
-        let file = journal_file(j.stamp.seq);
-        let bytes = j.encode()?;
-        disk.truncate(file, 0)?;
-        disk.write_at(file, 0, &bytes)?;
-        disk.sync(file)
-    }
-
-    /// Writes `j`'s pages and header over the data file, flushed.
-    fn write_journal_pages(disk: &dyn Disk, j: &Journal) -> Result<()> {
-        for (no, bytes) in &j.pages {
-            disk.write_at(File::Data, page_offset(*no)?, bytes)?;
-        }
-        Self::write_header(disk, &j.stamp)?;
-        disk.sync(File::Data)
     }
 
     pub fn begin(&self) -> Result<Txn> {
@@ -904,16 +1039,14 @@ impl Database {
         };
         // Off the commit path: writers go on, each keeping a page's bytes at the pause before its
         // first change of it.
-        let journal = Journal {
-            pages: self.v.pool.copy_owed(epoch, stamp.allocated)?,
-            stamp,
-            list,
-        };
-        Self::write_journal(&*self.disk, &journal)?;
-        Self::write_journal_pages(&*self.disk, &journal)?;
+        // Copied a page at a time into the journal: what it holds is a page, not the pages written.
+        let pages = Journal::write(&*self.disk, &stamp, &list, |each| {
+            self.v.pool.copy_owed(epoch, stamp.allocated, each)
+        })?;
+        Journal::apply(&*self.disk, &stamp, &pages)?;
         // Commits up to T are in the file now; the redo file switched from holds no others.
-        self.redo.cut(&*self.disk, from, journal.stamp.ts)?;
-        Ok(journal.stamp.ts)
+        self.redo.cut(&*self.disk, from, stamp.ts)?;
+        Ok(stamp.ts)
     }
 }
 
@@ -1088,7 +1221,7 @@ mod tests {
         db.commit(t, &mut d, db.lane(), true).unwrap();
         let mut t = db.begin().unwrap();
         db.put(&mut d, &mut t, 0, b"b", b"1").unwrap();
-        // The journal's cut, write and flush, then the first page's write: the next fails.
+        // The journal's cut, its head and its first pages: the next write fails.
         disk.crash_after(4);
         assert!(db.checkpoint().is_err());
         assert!(db.commit(t, &mut d, db.lane(), false).is_err());

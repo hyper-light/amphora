@@ -626,22 +626,28 @@ impl Pool {
         Ok(ending)
     }
 
-    /// The pages written in `epoch` (as [`Pool::begin_copy`] ended it) among the first `pages`
-    /// handed out, each with its bytes as they were when it ended, while writers go on: a page
-    /// none wrote since, copied now under its shared latch or from the spill file; one written
-    /// since, as its first writer kept it. The copying ends with it.
-    pub fn copy_owed(&self, epoch: u64, pages: u64) -> Result<Vec<(u64, Vec<u8>)>> {
-        let mut out = Vec::new();
+    /// Hands `each` the pages written in `epoch` (as [`Pool::begin_copy`] ended it) among the
+    /// first `pages` handed out, one at a time, each with its bytes as they were when it ended,
+    /// while writers go on: a page none wrote since, copied now under its shared latch or from the
+    /// spill file; one written since, as its first writer kept it. The caller holds one page at a
+    /// time, not the pages written (a checkpoint's journal, written as they come). The copying
+    /// ends with it.
+    pub fn copy_owed(
+        &self,
+        epoch: u64,
+        pages: u64,
+        each: &mut dyn FnMut(u64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
         for page in 1..=pages {
             let Some(slot) = self.slots.get(page) else {
                 continue;
             };
             if let Some(bytes) = self.owed(page, slot, epoch)? {
-                out.push((page, bytes));
+                each(page, &bytes)?;
             }
         }
         self.copying.store(0, Ordering::Release);
-        Ok(out)
+        Ok(())
     }
 
     /// Page `page`'s bytes at the pause that ended `epoch`, if it was written in it.
@@ -842,7 +848,12 @@ mod tests {
         for &p in pages.iter().step_by(3) {
             fill(p, 2)(&mut pool.write(p).unwrap());
         }
-        let owed = pool.copy_owed(epoch, pool.allocated()).unwrap();
+        let mut owed = Vec::new();
+        pool.copy_owed(epoch, pool.allocated(), &mut |p, bytes| {
+            owed.push((p, bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(owed.len(), 12);
         for (p, bytes) in &owed {
             assert!(holds(bytes, *p, 1), "page {p}");
