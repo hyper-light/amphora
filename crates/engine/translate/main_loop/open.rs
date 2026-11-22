@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::main_loop::adaptive::AdaptiveSeek;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 use crate::translate::{
     main_loop::close::AutoIndexBuild,
@@ -136,6 +137,52 @@ impl OpenLoop {
 
             let (table_cursor_id, index_cursor_id) =
                 table.resolve_cursors(program, mode.clone())?;
+            // Amphora (G5 step 4, T-G5.4.3): a SELECT's plain forward scan of a rowid table carries
+            // its WHERE terms' integer bounds, so a skipping summary can leave rows out at run
+            // time. Outer joins are left alone: their NULL rows aren't the filter's to drop.
+            if let (
+                true,
+                None,
+                None,
+                Some(cursor_id),
+                Operation::Scan(Scan::BTreeTable {
+                    iter_dir: IterationDirection::Forwards,
+                    index: None,
+                }),
+                Table::BTree(btree),
+            ) = (
+                matches!(mode, OperationMode::SELECT),
+                temp_cursor_id,
+                index_cursor_id,
+                table_cursor_id,
+                &table.op,
+                &table.table,
+            ) {
+                let outer = table_references
+                    .joined_tables()
+                    .iter()
+                    .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_outer()));
+                if btree.has_rowid && !outer {
+                    let bounds = crate::skipping::integer_bounds(
+                        predicates
+                            .iter()
+                            .filter(|t| {
+                                !t.consumed
+                                    && matches!(
+                                        t.origin,
+                                        crate::translate::plan::WhereTermOrigin::Where
+                                    )
+                            })
+                            .map(|t| &t.expr),
+                        table.internal_id,
+                    );
+                    if !bounds.is_empty() {
+                        program
+                            .skip_hints
+                            .push(crate::skipping::SkipHint { cursor_id, bounds });
+                    }
+                }
+            }
 
             match &table.op {
                 Operation::HashJoin(hash_join_op) => {
@@ -172,6 +219,8 @@ impl OpenLoop {
                         loop_end,
                         next,
                     },
+                    // Amphora (PL.13): a join's inner side, in a query.
+                    join_index > 0 && matches!(mode, OperationMode::SELECT),
                 )?,
             }
 
@@ -387,6 +436,7 @@ pub(super) fn emit_table_read_start(
     joined_table_index: usize,
     cursors: TableReadCursors,
     labels: LoopLabels,
+    adaptive: bool,
 ) -> Result<()> {
     let TableReadCursors {
         table_cursor_id,
@@ -601,6 +651,27 @@ pub(super) fn emit_table_read_start(
                         }
                     }
 
+                    // Amphora (PL.13): an inner equality seek that may switch to a hash join.
+                    let adaptive_body = match adaptive
+                        .then(|| AdaptiveSeek::eligible(t_ctx, table, search, index_cursor_id))
+                        .flatten()
+                    {
+                        Some(switch)
+                            if materialized_subquery_storage.is_none()
+                                && temp_cursor_id.is_none() =>
+                        {
+                            Some(switch.emit_prelude(
+                                program,
+                                t_ctx,
+                                table_references,
+                                table,
+                                joined_table_index,
+                                loop_end,
+                            )?)
+                        }
+                        _ => None,
+                    };
+
                     let seek_cursor_id = if materialized_subquery_storage.is_some() {
                         index_cursor_id.expect("materialized subquery must have index cursor")
                     } else {
@@ -653,6 +724,10 @@ pub(super) fn emit_table_read_start(
                             MaterializedFromClauseSubqueryStorage::DirectIndex => {}
                         }
                     } else {
+                        // Amphora (PL.13): a hash probe's match enters here, the index positioned.
+                        if let Some(body) = adaptive_body {
+                            program.preassign_label_to_next_insn(body);
+                        }
                         // Only emit DeferredSeek for non-subquery tables
                         if let Some(index_cursor_id) = index_cursor_id {
                             if let Some(table_cursor_id) = table_cursor_id {

@@ -9,7 +9,10 @@
 //! port asks [`Records::changed`]; where kiln's awaits a wait while it commits, the port waits on
 //! a thread of its own. Why a port and not kiln-seams itself: docs/design/records.md, "One suite".
 //!
-//! The cases after them are Amphora's own: the feed's atomic pages, index families and counters.
+//! The cases after them are Amphora's own: the feed's atomic pages, index families and counters;
+//! then the tables (`table.rs`), one case per input the contract names an edge for.
+
+mod table;
 
 use std::time::{Duration, Instant};
 
@@ -853,4 +856,7 @@ pub fn cases() -> Vec<Case> {
             check: counter_1,
         },
     ]
+    .into_iter()
+    .chain(table::cases())
+    .collect()
 }

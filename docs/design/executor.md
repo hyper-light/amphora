@@ -465,9 +465,20 @@ tied on the keys keep the probe order; without one the runs are concatenated in 
 (probe-row order, a probe row's matches in build order). T-QT.6.13 checks it against the serial
 hash join at 2, 3, 4 and 8 stated cores.
 
+**A join's rows under LIMIT** (lane qs6-6). A LIMIT or OFFSET cuts the rows in order, so the hook
+takes one only when its rows come out in the serial loop's order to the row: the ORDER BY keys hold
+both tables' INTEGER PRIMARY KEYs (as columns or as `rowid`), which tell every joined row apart, so
+no tie can be cut differently. Both must be integer literals, read as SQLite reads them (a negative
+LIMIT is none, a negative OFFSET is none); LIMIT 0 and any other expression stay serial. The hook's
+row loop counts them down as the serial loop does (`IfPos` skips the OFFSET's rows, `DecrJumpZero`
+ends at the LIMIT); the workers still produce every joined row, so the LIMIT saves output, not
+probing. A LIMIT over an order with ties stays serial. T-QT.6.14 checks it row for row against the
+serial loop at 2, 3, 4 and 8 stated cores.
+
 **Not yet.** Workers still run the pipeline's own loop body, not a copy of the VDBE program's,
 so only the filters `Predicate` holds (a column against a literal of its kind, a NULL test) run in
-parallel; joins of more than two tables, outer joins and joins under LIMIT stay serial.
+parallel; joins of more than two tables and outer joins stay serial, and a LIMIT doesn't yet stop
+the workers early.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 
@@ -610,10 +621,37 @@ scan through the engine, the hook's time per write, the summary's build time and
 harness's (`crates/engine/tests/skipping_bench.rs`: an Amphora file, writes through SQL, zones from
 its leaves), run by the coordinator; until recorded the prototypes are unmeasured and neither is chosen.
 
-**Not yet.** The switch is a pure core: the VDBE's table scan doesn't yet ask it for candidates,
-and the Insert and Delete opcodes don't yet call the hook (the scan operators are lane qs7's while
-it builds column batches). Readers at older snapshots: a zone map is safe (a write only widens), the
-cracker is kept at the write and would need its writes held to commit for an older reader.
+**Wired (lane g5s4c, T-G5.4.2).** A database keeps its summaries in one registry its connections
+share (`skipping::SkipRegistry`, on `Database`), one per table, set by `skipping::set_skipping`
+(built holding the write lock, so it holds exactly the newest commit). The Insert and Delete
+opcodes call the hook for a watched main-database table, capturing the old row first (as they do
+for materialized views), so an update is one `RowWrite::Update`. A summary changes at the write,
+before commit, and a delete or update lowers counts (a zone left empty is skipped) or moves a row
+in the cracker, so neither kind is safe for an older reader. The rule, for both: a reader may
+consult a summary only when it is the open writer, or no writer is open and its WAL snapshot is the
+newest commit (`connection_wal_pos` against the shared position); any other reader gets
+`SkipRefusal::OlderSnapshot` and scans every row. A rolled-back transaction or statement makes the
+summaries that took its writes `Stale` until built again; MVCC is refused (`SkipRefusal::Mvcc`).
+`skipping::skipping_candidates` is the scan's question and `skipping_counts` what each summary did.
+
+**The scan (lane g5s4d, T-G5.4.3).** At translation a SELECT's plain forward scan of a rowid
+table (no index, no outer join in the query) carries a `SkipHint`: each column's integer bounds
+that its WHERE terms put on every result row (`a BETWEEN 10 AND 20`, `a >= 10 AND a < 20`,
+`5 < a`, `a = 7`; a real, text or parameter constant, a COLLATE, an IN list or NOT BETWEEN gives no
+bound: loose, never wrong). At run time the Rewind asks the registry for the hinted column's
+candidates only when a summary is kept for it and the reader may consult it (the rule above); a
+refusal is counted (`SkipCounts`) and the scan reads every row. With candidates, a `SkipWalk` on
+the cursor seeks past each run of rows they leave out (a zone map's rowid ranges, or the cracker's
+rowids folded into runs), keeping its place across an I/O wait; the filter is still evaluated on
+each row read, so the answer is the plain scan's. A walking scan runs its body row by row (no
+fused batch). The statement's `rows_read` counts only the rows read, and each seek counts as a
+table seek. No size is picked: a zone is a table leaf (the page size and the record format set
+how many rows it holds), the tail zone grows to the leaves' measured fill, and the cracker's pieces
+are cut where filters asked.
+
+**Not yet.** Neither kind is chosen by measured cost (the harness's numbers aren't recorded), a
+summary is turned on by `skipping::set_skipping` (no SQL), and bounds from parameters
+(`a BETWEEN ? AND ?`) aren't read.
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's

@@ -28,10 +28,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use amphora_api as api;
 
 pub mod coordinator;
+pub mod lan;
 pub mod sql;
 
 pub use coordinator::{Answer, Config, Coordinator, Counts, Event, Lost, Protocol, Send, Txn, Why};
-pub use sql::{Cluster, Route};
+pub use sql::{Cluster, Member, Route};
 
 /// A group's number among the fixed groups a cluster has.
 pub type GroupId = u32;
@@ -41,14 +42,18 @@ pub type GroupId = u32;
 pub type OpenPage = (Vec<(TxnId, Option<GroupId>)>, bool);
 
 /// A place in one coordinator's order of transactions: its incarnation, then its count there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Mark {
     pub epoch: u64,
     pub seq: u64,
 }
 
 /// A transaction: its coordinator, the incarnation that began it, and its count there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct TxnId {
     pub coordinator: u64,
     pub epoch: u64,
@@ -67,7 +72,7 @@ impl TxnId {
 }
 
 /// What became of a transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Outcome {
     Committed,
     Aborted,
@@ -107,7 +112,7 @@ pub struct Guard {
 }
 
 /// One step of a transaction, applied atomically in one group.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Step {
     /// In the registry group: the coordinator's next incarnation.
     Begin,
@@ -150,7 +155,7 @@ impl Step {
 }
 
 /// A step as a coordinator's incarnation sends it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Envelope {
     pub coordinator: u64,
     /// The sending incarnation (0 before [`Step::Begin`] answers).
@@ -161,7 +166,7 @@ pub struct Envelope {
 }
 
 /// A group's answer to a step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reply {
     Epoch(u64),
     Open {

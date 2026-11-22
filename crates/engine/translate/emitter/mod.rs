@@ -211,6 +211,9 @@ pub struct Resolver<'a> {
     join_methods: crate::JoinMethods,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
+    /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
+    /// (`Connection::set_adaptive_joins`).
+    adaptive_joins: bool,
     /// Amphora: whether the planner may build an automatic index
     /// (`Connection::set_automatic_indexes`).
     automatic_indexes: bool,
@@ -348,6 +351,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: None,
             join_methods: crate::JoinMethods::ByCost,
             sorted_fetches: false,
+            adaptive_joins: false,
             automatic_indexes: true,
             parallel: false,
             has_temp_schema,
@@ -457,6 +461,14 @@ impl<'a> Resolver<'a> {
         self.sorted_fetches = on;
     }
 
+    pub(crate) fn adaptive_joins(&self) -> bool {
+        self.adaptive_joins
+    }
+
+    pub(crate) fn set_adaptive_joins(&mut self, on: bool) {
+        self.adaptive_joins = on;
+    }
+
     pub(crate) fn automatic_indexes(&self) -> bool {
         self.automatic_indexes
     }
@@ -502,6 +514,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
+            adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
             parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
@@ -539,6 +552,7 @@ impl<'a> Resolver<'a> {
             fitted_weights: self.fitted_weights,
             join_methods: self.join_methods,
             sorted_fetches: self.sorted_fetches,
+            adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
             parallel: self.parallel,
             has_temp_schema: self.has_temp_schema,
@@ -1296,10 +1310,22 @@ pub struct TranslateCtx<'a> {
     pub meta_window: Option<WindowMetadata<'a>>,
     /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
     pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
+    /// Amphora (PL.13): each adaptive join's labels and registers, by table index, set in
+    /// `open_loop` and read in `close_loop`.
+    pub adaptive_joins: HashMap<usize, AdaptiveJoinCtx>,
     pub unsafe_testing: bool,
     /// Amphora: the number of the query whose loops are open, when rows are counted
     /// (`vdbe/row_counts.rs`).
     pub row_count_plan: Option<usize>,
+}
+
+/// Amphora (PL.13): what an adaptive join's close needs: the switch, and the hash table's
+/// next match, read in place of the index's next entry once the join has switched.
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveJoinCtx {
+    pub switch_id: usize,
+    /// Reads the hash table's next match for the outer row and enters the body with it.
+    pub hash_next: BranchOffset,
 }
 
 /// Metadata for the two-level loop emitted by `Search::InSeek`.
@@ -1339,6 +1365,7 @@ impl<'a> TranslateCtx<'a> {
             cdc_cursor_id: None,
             meta_window: None,
             meta_in_seeks: (0..table_count).map(|_| None).collect(),
+            adaptive_joins: HashMap::default(),
             unsafe_testing,
             row_count_plan: None,
         }
