@@ -26,6 +26,7 @@ use crate::storage::sqlite3_ondisk::PageType;
 use crate::sync::Arc;
 use crate::types::{IOResult, SeekKey, SeekOp, SeekResult, Value};
 use crate::util::IOExt;
+use crate::vdbe::insn::MorselOuter;
 
 fn storage(error: crate::LimboError) -> MorselError {
     MorselError::Storage(Box::new(error))
@@ -375,10 +376,47 @@ impl TableBodyAggregate<'_> {
 
     /// Runs the body over one row; true when the row passed, its values then in `worker.out`.
     fn row(&self, worker: &mut BodyWorker, rowid: i64, row: &[Value]) -> Result<bool, MorselError> {
-        use crate::vdbe::execute::InsnFunctionStepResult;
+        self.load(worker, Some(rowid), row)?;
+        self.passes(worker, self.body.start, self.body.keep)
+    }
+
+    /// An outer join's joined row (lane qs6-12): whether it passed the ON terms (it matched), and
+    /// whether it then passed the rest of the body, its values then in `worker.out`.
+    fn on_row(
+        &self,
+        worker: &mut BodyWorker,
+        rowid: Option<i64>,
+        row: &[Value],
+    ) -> Result<(bool, bool), MorselError> {
+        self.load(worker, rowid, row)?;
+        let on = self.body.on.unwrap_or(self.body.start);
+        if !self.run_to(worker, on, self.body.start)? {
+            return Ok((false, false));
+        }
+        Ok((true, self.passes(worker, self.body.start, self.body.keep)?))
+    }
+
+    /// A row an outer join pads with NULLs (lane qs6-12): its ON terms are not tested, only the
+    /// WHERE terms and the outputs; `rowid` is none when the probe's side is the NULLs.
+    fn padded_row(
+        &self,
+        worker: &mut BodyWorker,
+        rowid: Option<i64>,
+        row: &[Value],
+    ) -> Result<bool, MorselError> {
+        self.load(worker, rowid, row)?;
+        self.passes(worker, self.body.start, self.body.keep)
+    }
+
+    /// Writes a row's columns and its rowid (NULL when there is none) into the body's registers.
+    fn load(
+        &self,
+        worker: &mut BodyWorker,
+        rowid: Option<i64>,
+        row: &[Value],
+    ) -> Result<(), MorselError> {
         use crate::vdbe::Register;
         let state = &mut worker.state;
-        let bad = MorselError::Corrupt("the loop body's register is past the program's");
         for (at, value) in row.iter().enumerate() {
             let reg = self
                 .body
@@ -392,16 +430,47 @@ impl TableBodyAggregate<'_> {
             ))?;
             *register = Register::Value(value.clone());
         }
-        *state.registers.get_mut(self.body.rowid).ok_or(bad)? =
-            Register::Value(Value::from_i64(rowid));
-        let keep = self.body.keep.as_offset_int();
+        *state
+            .registers
+            .get_mut(self.body.rowid)
+            .ok_or(MorselError::Corrupt(
+                "the loop body's register is past the program's",
+            ))? = Register::Value(rowid.map_or(Value::Null, Value::from_i64));
+        Ok(())
+    }
+
+    /// Runs the body's code from `from` until it reaches `pass` (true) or `skip` (false), then,
+    /// when it passed, reads its outputs into `worker.out`.
+    fn passes(
+        &self,
+        worker: &mut BodyWorker,
+        from: crate::vdbe::BranchOffset,
+        pass: crate::vdbe::BranchOffset,
+    ) -> Result<bool, MorselError> {
+        if !self.run_to(worker, from, pass)? {
+            return Ok(false);
+        }
+        self.outputs(worker)?;
+        Ok(true)
+    }
+
+    /// Runs the body's code from `from` until it reaches `pass` (true) or `skip` (false).
+    fn run_to(
+        &self,
+        worker: &mut BodyWorker,
+        from: crate::vdbe::BranchOffset,
+        pass: crate::vdbe::BranchOffset,
+    ) -> Result<bool, MorselError> {
+        use crate::vdbe::execute::InsnFunctionStepResult;
+        let state = &mut worker.state;
+        let pass = pass.as_offset_int();
         let skip = self.body.skip.as_offset_int();
-        state.pc = self.body.start.as_offset_int();
+        state.pc = from.as_offset_int();
         // The body's code jumps forward only (a filter's branches, CASE, a constant call's
-        // `Once`), so it reaches `keep` or `skip` within its own length.
+        // `Once`), so it reaches `pass` or `skip` within its own length.
         loop {
-            if state.pc == keep {
-                break;
+            if state.pc == pass {
+                return Ok(true);
             }
             if state.pc == skip {
                 return Ok(false);
@@ -426,6 +495,12 @@ impl TableBodyAggregate<'_> {
                 Err(error) => return Err(MorselError::Body(error)),
             }
         }
+    }
+
+    /// Reads the body's outputs into `worker.out`; a REAL where `no_real` names sends the
+    /// statement to the serial loop.
+    fn outputs(&self, worker: &mut BodyWorker) -> Result<(), MorselError> {
+        use crate::vdbe::Register;
         worker.out.clear();
         let end =
             self.body
@@ -434,12 +509,14 @@ impl TableBodyAggregate<'_> {
                 .ok_or(MorselError::Overflow {
                     what: "the output registers",
                 })?;
-        let values = state
-            .registers
-            .get(self.body.out_start..end)
-            .ok_or(MorselError::Corrupt(
-                "the loop body's output is past the program's registers",
-            ))?;
+        let values =
+            worker
+                .state
+                .registers
+                .get(self.body.out_start..end)
+                .ok_or(MorselError::Corrupt(
+                    "the loop body's output is past the program's registers",
+                ))?;
         for register in values {
             let Register::Value(value) = register else {
                 return Err(MorselError::Corrupt(
@@ -453,7 +530,7 @@ impl TableBodyAggregate<'_> {
                 return Err(MorselError::Unsupported { kind: "REAL" });
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     /// The answer as the switch and the measured costs pick the degree.
@@ -740,6 +817,9 @@ pub struct TableBuild<'a> {
     pub filter: &'a [Predicate],
     pub key: &'a [usize],
     pub partitioner: &'a Partitioner,
+    /// Keep a row whose key holds a NULL, unscattered (lane qs6-12): an outer join's build row
+    /// matches nothing then, and still appears.
+    pub keep_unkeyed: bool,
 }
 
 /// A worker's run of build rows: its first leaf, the rows it kept, their scattered entries.
@@ -778,6 +858,7 @@ impl Pipeline for TableBuild<'_> {
             if !self
                 .partitioner
                 .scatter(row, self.key, rows.len(), &mut scattered, budget)?
+                && !self.keep_unkeyed
             {
                 return Ok(());
             }
@@ -1066,17 +1147,7 @@ pub struct JoinRowsPartial {
 
 impl TableJoinRows<'_> {
     fn compare(&self, a: &[Value], b: &[Value]) -> std::cmp::Ordering {
-        for (at, descending) in self.order {
-            let order = match (a.get(*at), b.get(*at)) {
-                (Some(x), Some(y)) => x.cmp(y),
-                _ => std::cmp::Ordering::Equal,
-            };
-            let order = if *descending { order.reverse() } else { order };
-            if order.is_ne() {
-                return order;
-            }
-        }
-        std::cmp::Ordering::Equal
+        compare_rows(self.order, a, b)
     }
 
     /// The rows in leaf order, sorted when the query asks: `sort_by` is a stable merge sort that
@@ -1178,6 +1249,339 @@ impl Pipeline for TableJoinRows<'_> {
         into.runs.extend(from.runs);
         Ok(())
     }
+}
+
+/// An outer join of two tables on morsels (lane qs6-12): the probe is the table the join pads with
+/// NULLs, its one link the table whose every row appears. Each worker probes its own leaves; a
+/// joined row that passes the ON terms (the body from `MorselBody::on`) matched, and its build row
+/// is marked in the worker's own bitmap; it then runs the rest of the body (the WHERE terms, the
+/// outputs). A FULL join's probe row that matched nothing comes out padded with NULLs for the
+/// build's side. Once every probe morsel ran, the bitmaps are merged (`merge`, an OR), and the
+/// build rows no worker marked run the body padded with NULLs for the probe's side
+/// ([`TableOuterRest`], in morsels of build rows).
+pub struct TableOuterJoin<'a> {
+    pub table: &'a TableSource,
+    /// Terms over the probe row alone, tested before it is probed (a LEFT join's ON terms on it).
+    pub probe_filter: &'a [Predicate],
+    /// The link: the build table's hash table and rows, every row kept, a NULL key's too.
+    pub stage: &'a JoinStage<'a>,
+    /// The probe's and the build's widths, the NULLs a padded row takes for each.
+    pub probe_columns: usize,
+    pub build_columns: usize,
+    pub kind: MorselOuter,
+    /// The loop body over a joined row, and the grouping and aggregates over its outputs.
+    pub body: &'a TableBodyAggregate<'a>,
+    /// A join's rows: the sort keys, each one's place in the output row and whether it descends.
+    pub order: &'a [(usize, bool)],
+}
+
+/// The partial of [`TableOuterJoin`] and [`TableOuterRest`]: the aggregates, or the output rows
+/// tagged with their morsel's first leaf or build row; the build rows matched, a bit per row; and
+/// the worker that runs the body.
+#[derive(Default)]
+pub struct OuterPartial {
+    aggregate: super::morsel::AggregatePartial,
+    runs: Vec<(usize, Vec<Vec<Value>>)>,
+    matched: Vec<u64>,
+    worker: Option<Box<BodyWorker>>,
+}
+
+/// A build row's word and bit in a matched-row bitmap.
+fn matched_bit(row: usize) -> Result<(usize, u64), MorselError> {
+    let word = row.checked_div(64).ok_or(MorselError::Overflow {
+        what: "a matched row's word",
+    })?;
+    let shift = row
+        .checked_rem(64)
+        .and_then(|bit| u32::try_from(bit).ok())
+        .and_then(|bit| 1u64.checked_shl(bit))
+        .ok_or(MorselError::Overflow {
+            what: "a matched row's bit",
+        })?;
+    Ok((word, shift))
+}
+
+impl TableOuterJoin<'_> {
+    /// Keeps the body's outputs: folded into the aggregates, or as an output row.
+    fn keep(
+        &self,
+        out: &[Value],
+        position: usize,
+        aggregate: &mut super::morsel::AggregatePartial,
+        found: &mut Vec<Vec<Value>>,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        if self.body.body.rows {
+            found.try_reserve(1)?;
+            found.push(kept(out, budget)?);
+            Ok(())
+        } else {
+            self.body.shape.fold(out, position, aggregate, budget)
+        }
+    }
+
+    /// Merges what the padded build rows gave into what the probe gave.
+    fn merge_into(
+        &self,
+        into: &mut OuterPartial,
+        from: OuterPartial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        self.body
+            .shape
+            .merge(&mut into.aggregate, from.aggregate, budget)?;
+        into.runs.try_reserve(from.runs.len())?;
+        into.runs.extend(from.runs);
+        Ok(())
+    }
+
+    /// The answer: the probe's morsels, then the build rows no probe row matched, as the switch
+    /// and the measured costs pick the degree of each.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let (mut probed, stats) = execute(self, mode, costs, budget)?;
+        let matched = std::mem::take(&mut probed.matched);
+        let rest = TableOuterRest {
+            join: self,
+            matched: &matched,
+        };
+        let (padded, _) = execute(&rest, mode, costs, budget)?;
+        if !self.body.body.rows {
+            self.body
+                .shape
+                .merge(&mut probed.aggregate, padded.aggregate, budget)?;
+            return Ok((self.body.shape.finish(probed.aggregate)?, stats));
+        }
+        // The probe's rows in leaf order, then the padded build rows in build order.
+        probed.runs.sort_by_key(|(first, _)| *first);
+        let mut tail = padded.runs;
+        tail.sort_by_key(|(first, _)| *first);
+        let total = probed
+            .runs
+            .iter()
+            .chain(tail.iter())
+            .map(|(_, run)| run.len())
+            .fold(0usize, usize::saturating_add);
+        let mut out = Vec::new();
+        out.try_reserve_exact(total)?;
+        for (_, run) in probed.runs.into_iter().chain(tail) {
+            out.extend(run);
+        }
+        if !self.order.is_empty() {
+            out.sort_by(|a, b| compare_rows(self.order, a, b));
+        }
+        Ok((out, stats))
+    }
+}
+
+impl Pipeline for TableOuterJoin<'_> {
+    type Partial = OuterPartial;
+
+    fn rows(&self) -> usize {
+        self.table.leaves()
+    }
+
+    fn empty(&self) -> Self::Partial {
+        OuterPartial::default()
+    }
+
+    fn run(
+        &self,
+        leaves: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let OuterPartial {
+            aggregate,
+            runs,
+            matched,
+            worker,
+        } = partial;
+        let worker = match worker {
+            Some(worker) => worker,
+            None => worker.insert(Box::new(self.body.worker()?)),
+        };
+        // The worker's bitmap, a bit per build row, charged to the statement's budget.
+        let words = self.stage.rows.len().div_ceil(64);
+        if matched.len() < words {
+            budget.charge(words.saturating_mul(std::mem::size_of::<u64>()))?;
+            matched.try_reserve_exact(words)?;
+            matched.resize(words, 0);
+        }
+        let full = self.kind == MorselOuter::Full;
+        let first = leaves.start;
+        let mut found: Vec<Vec<Value>> = Vec::new();
+        let mut joined: Vec<Value> = Vec::new();
+        let mut ran = 0u64;
+        let scanned = self.table.scan(leaves, |rowid, row| {
+            for term in self.probe_filter {
+                if !term.holds(row)? {
+                    return Ok(());
+                }
+            }
+            let mut any = false;
+            for build in self.stage.probe.matches(row)? {
+                let build_row = self.stage.rows.get(*build).ok_or(MorselError::Overflow {
+                    what: "a match's build row",
+                })?;
+                joined.clear();
+                joined.try_reserve(row.len().saturating_add(build_row.len()))?;
+                joined.extend_from_slice(row);
+                joined.extend_from_slice(build_row);
+                ran = ran.saturating_add(1);
+                let (hit, passed) = self.body.on_row(worker, Some(rowid), &joined)?;
+                if hit {
+                    any = true;
+                    let (word, bit) = matched_bit(*build)?;
+                    let at = matched.get_mut(word).ok_or(MorselError::Overflow {
+                        what: "a matched row's word",
+                    })?;
+                    *at |= bit;
+                }
+                if passed {
+                    self.keep(&worker.out, position(rowid)?, aggregate, &mut found, budget)?;
+                }
+            }
+            // A FULL join's probe row that matched nothing, padded with the build's NULLs.
+            if full && !any {
+                joined.clear();
+                joined.try_reserve(row.len().saturating_add(self.build_columns))?;
+                joined.extend_from_slice(row);
+                joined.resize(row.len().saturating_add(self.build_columns), Value::Null);
+                ran = ran.saturating_add(1);
+                if self.body.padded_row(worker, Some(rowid), &joined)? {
+                    self.keep(&worker.out, position(rowid)?, aggregate, &mut found, budget)?;
+                }
+            }
+            Ok(())
+        });
+        if scanned.is_ok() {
+            self.body
+                .ran
+                .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+        }
+        scanned?;
+        if !self.order.is_empty() {
+            found.sort_by(|a, b| compare_rows(self.order, a, b));
+        }
+        runs.try_reserve(1)?;
+        runs.push((first, found));
+        Ok(())
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        // The matched-row bitmaps merge by OR: a build row matched when any worker matched it.
+        if into.matched.len() < from.matched.len() {
+            into.matched.try_reserve_exact(from.matched.len())?;
+            into.matched.resize(from.matched.len(), 0);
+        }
+        for (word, other) in into.matched.iter_mut().zip(&from.matched) {
+            *word |= *other;
+        }
+        self.merge_into(into, from, budget)
+    }
+}
+
+/// The build rows of an outer join that no probe row matched (lane qs6-12), in morsels of build
+/// rows: each runs the body padded with NULLs for the probe's side, its rowid NULL.
+pub struct TableOuterRest<'a> {
+    pub join: &'a TableOuterJoin<'a>,
+    /// The merged bitmap of the build rows matched.
+    pub matched: &'a [u64],
+}
+
+impl Pipeline for TableOuterRest<'_> {
+    type Partial = OuterPartial;
+
+    fn rows(&self) -> usize {
+        self.join.stage.rows.len()
+    }
+
+    fn empty(&self) -> Self::Partial {
+        OuterPartial::default()
+    }
+
+    fn run(
+        &self,
+        rows: Range<usize>,
+        partial: &mut Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let OuterPartial {
+            aggregate,
+            runs,
+            worker,
+            ..
+        } = partial;
+        let body = self.join.body;
+        let worker = match worker {
+            Some(worker) => worker,
+            None => worker.insert(Box::new(body.worker()?)),
+        };
+        let first = rows.start;
+        let mut found: Vec<Vec<Value>> = Vec::new();
+        let mut joined: Vec<Value> = Vec::new();
+        let mut ran = 0u64;
+        for at in rows {
+            let (word, bit) = matched_bit(at)?;
+            if self.matched.get(word).is_some_and(|w| w & bit != 0) {
+                continue;
+            }
+            let build_row = self.join.stage.rows.get(at).ok_or(MorselError::Overflow {
+                what: "an unmatched build row",
+            })?;
+            joined.clear();
+            joined.try_reserve(self.join.probe_columns.saturating_add(build_row.len()))?;
+            joined.resize(self.join.probe_columns, Value::Null);
+            joined.extend_from_slice(build_row);
+            ran = ran.saturating_add(1);
+            if body.padded_row(worker, None, &joined)? {
+                self.join
+                    .keep(&worker.out, at, aggregate, &mut found, budget)?;
+            }
+        }
+        body.ran
+            .fetch_add(ran, std::sync::atomic::Ordering::Relaxed);
+        if !self.join.order.is_empty() {
+            found.sort_by(|a, b| compare_rows(self.join.order, a, b));
+        }
+        runs.try_reserve(1)?;
+        runs.push((first, found));
+        Ok(())
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        self.join.merge_into(into, from, budget)
+    }
+}
+
+/// Orders two output rows by the sort keys: each one's place in the row, and whether it descends.
+fn compare_rows(order: &[(usize, bool)], a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (at, descending) in order {
+        let order = match (a.get(*at), b.get(*at)) {
+            (Some(x), Some(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        };
+        let order = if *descending { order.reverse() } else { order };
+        if order.is_ne() {
+            return order;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// A copy of an output row the body kept, its values and their text and blob bytes charged to

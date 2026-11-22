@@ -1072,7 +1072,10 @@ probe row walks the chain (T-QT.6.17). Still open: the copy of the loop body for
 
 Lane qs6-12: a join's workers run the copy of the serial loop's body over each joined row, so any
 filter or output the serial loop runs runs in a join's workers too; a REAL where it could tie with
-an INTEGER sends the statement to the serial loop (T-QT.6.18).
+an INTEGER sends the statement to the serial loop (T-QT.6.18). LEFT, RIGHT and FULL joins of two
+tables run on morsels: ON terms decide matches and WHERE terms test the padded rows; each worker
+marks the build rows it matched in its own bitmap, the bitmaps merge by OR, and the unmatched build
+rows run padded with NULLs in morsels of their own (T-QT.6.19).
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.

@@ -37,7 +37,9 @@ use crate::translate::plan::{
 use crate::types::Value;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::{Insn, MorselAggregateData, MorselBody, MorselJoinData, MorselRows};
+use crate::vdbe::insn::{
+    Insn, MorselAggregateData, MorselBody, MorselJoinData, MorselOuter, MorselRows,
+};
 use crate::vdbe::morsel::{Aggregate, CmpOp, Predicate};
 use amphora_engine_parser::ast::{
     Expr, Literal, Operator, SortOrder, TableInternalId, UnaryOperator,
@@ -76,6 +78,7 @@ pub(crate) fn emit_morsel_hook(
                 joins: Vec::new(),
                 joined_rows: None,
                 body: None,
+                outer: None,
                 target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
             };
             (data, Some(looped))
@@ -86,6 +89,7 @@ pub(crate) fn emit_morsel_hook(
         },
     };
     let body = looped.as_ref().map(|looped| MorselBody {
+        on: (!looped.on.is_empty()).then(|| program.allocate_label()),
         start: program.allocate_label(),
         keep: program.allocate_label(),
         skip: program.allocate_label(),
@@ -177,6 +181,9 @@ struct BodyPlan<'p> {
     places: Vec<BodyTable<'p>>,
     /// The row's width: every table's columns.
     width: usize,
+    /// An outer join's ON terms the hash keys and the probe's own `Predicate`s don't hold (lane
+    /// qs6-12): a joined row that fails them did not match.
+    on: Vec<&'p Expr>,
     filter: Vec<&'p Expr>,
     outs: Vec<&'p Expr>,
     group_by: Vec<usize>,
@@ -380,6 +387,7 @@ fn body_plan(plan: &SelectPlan) -> Option<BodyPlan<'_>> {
         table,
         places,
         width: table.columns().len(),
+        on: Vec::new(),
         filter,
         outs,
         group_by,
@@ -405,7 +413,12 @@ fn emit_body(
     let mut reads = Vec::new();
     let overflow = || crate::LimboError::InternalError("register overflow".into());
     let place = |id: TableInternalId| looped.places.iter().find(|p| p.id == id);
-    for expr in looped.filter.iter().chain(looped.outs.iter()) {
+    for expr in looped
+        .on
+        .iter()
+        .chain(looped.filter.iter())
+        .chain(looped.outs.iter())
+    {
         walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
             match e {
                 Expr::Column { table, column, .. } => {
@@ -448,6 +461,26 @@ fn emit_body(
             false,
             &plan.table_references,
         )?;
+    }
+    // An outer join's ON terms come first: a row that reaches `start` matched (lane qs6-12).
+    if let Some(on) = body.on {
+        program.preassign_label_to_next_insn(on);
+    }
+    for term in &looped.on {
+        let passed = program.allocate_label();
+        translate_condition_expr(
+            program,
+            &plan.table_references,
+            term,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: passed,
+                jump_target_when_false: body.skip,
+                jump_target_when_null: body.skip,
+            },
+            &resolver,
+        )?;
+        program.preassign_label_to_next_insn(passed);
     }
     program.preassign_label_to_next_insn(body.start);
     for term in &looped.filter {
@@ -574,6 +607,7 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         joins: Vec::new(),
         joined_rows: None,
         body: None,
+        outer: None,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
     })
 }
@@ -818,13 +852,20 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
     }
     let mut built = Vec::new();
     let mut tables: Vec<&BTreeTable> = Vec::new();
-    for table in joined {
-        if table
-            .join_info
-            .as_ref()
-            .is_some_and(|j| j.join_type != JoinType::Inner)
-        {
-            return None;
+    // An outer join (lane qs6-12): its table and which rows it keeps that match nothing.
+    let mut outer: Option<(usize, MorselOuter)> = None;
+    for (at, table) in joined.iter().enumerate() {
+        let kind = match table.join_info.as_ref().map(|j| &j.join_type) {
+            None | Some(JoinType::Inner) => None,
+            Some(JoinType::LeftOuter) => Some(MorselOuter::Left),
+            Some(JoinType::FullOuter) => Some(MorselOuter::Full),
+            Some(_) => return None,
+        };
+        if let Some(kind) = kind {
+            if outer.is_some() {
+                return None;
+            }
+            outer = Some((at, kind));
         }
         match &table.op {
             Operation::Scan(Scan::BTreeTable { index: None, .. }) => {}
@@ -832,9 +873,16 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
             Operation::Search(Search::Seek {
                 index: Some(index), ..
             }) if index.ephemeral => {}
+            // An outer join's hash join keeps the build rows that match nothing (LEFT), and the
+            // probe rows too (FULL); the probe is the table the join pads with NULLs.
             Operation::HashJoin(op)
-                if op.join_type == HashJoinType::Inner
-                    && op.probe_table_idx != op.build_table_idx =>
+                if op.probe_table_idx != op.build_table_idx
+                    && matches!(
+                        (&op.join_type, kind),
+                        (HashJoinType::Inner, None)
+                            | (HashJoinType::LeftOuter, Some(MorselOuter::Left))
+                            | (HashJoinType::FullOuter, Some(MorselOuter::Full))
+                    ) =>
             {
                 built.push(op.build_table_idx)
             }
@@ -842,10 +890,27 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
         }
         tables.push(stored(table)?);
     }
-    if built.is_empty() {
-        return None;
-    }
-    let probe_at = (0..tables.len()).find(|at| !built.contains(at))?;
+    // An outer join of two tables (lane qs6-12): the probe is the table the join pads, the
+    // other the build, whatever loop the planner chose (it makes no FULL hash join); the hook keys
+    // its hash table by the ON equalities. A LIMIT or OFFSET stays serial.
+    let (probe_at, outer) = match outer {
+        None => {
+            if built.is_empty() {
+                return None;
+            }
+            ((0..tables.len()).find(|at| !built.contains(at))?, None)
+        }
+        Some((at, kind)) => {
+            if tables.len() != 2
+                || built.contains(&at)
+                || plan.limit.is_some()
+                || plan.offset.is_some()
+            {
+                return None;
+            }
+            (at, Some(kind))
+        }
+    };
     // A column the hook reads: its table's place in the join order, and its own place.
     let side = |expr: &Expr| -> Option<(usize, usize)> {
         let (id, column) = match expr {
@@ -879,15 +944,19 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
     let mut edges: Vec<((usize, usize), (usize, usize))> = Vec::new();
     let mut filters: Vec<Vec<Predicate>> = tables.iter().map(|_| Vec::new()).collect();
     let mut residual: Vec<&Expr> = Vec::new();
+    let mut on_terms: Vec<&Expr> = Vec::new();
     for term in &plan.where_clause {
         if matches!(term.origin, WhereTermOrigin::TableFunction(_)) {
             return None;
         }
+        // An outer join's ON terms decide which rows match; its WHERE terms test the joined row,
+        // matched or padded (lane qs6-12). Only an ON equality keys an outer join.
+        let on_term = outer.is_some() && term.origin.is_outer_join();
         if let Expr::Binary(left, Operator::Equals, right) = &term.expr {
             if let (Some(l), Some(r)) = (side(left), side(right)) {
                 // Keys of one affinity compare with no conversion, as a hash table does; an
                 // equality of two kinds is the body's to test.
-                if l.0 != r.0 && affinity(l)? == affinity(r)? {
+                if l.0 != r.0 && affinity(l)? == affinity(r)? && (outer.is_none() || on_term) {
                     edges.push((l, r));
                     continue;
                 }
@@ -898,8 +967,21 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
             let table: &BTreeTable = tables.get(at)?;
             predicate(&term.expr, &on, table).map(|p| (at, p))
         });
-        match found {
+        // A table's own term is tested on its rows when that drops no row the join keeps: in a
+        // LEFT join, an ON term on the probe (a probe row failing it matches nothing, and the
+        // probe's unmatched rows don't appear) and a WHERE term on the build (a build row failing
+        // it fails it padded too); in a FULL join, none.
+        let pushed = match (outer, found) {
+            (_, None) => None,
+            (None, found) => found,
+            (Some(MorselOuter::Left), Some((at, p))) if on_term == (at == probe_at) => {
+                Some((at, p))
+            }
+            (Some(_), Some(_)) => None,
+        };
+        match pushed {
             Some((at, found)) => filters.get_mut(at)?.push(found),
+            None if on_term => on_terms.push(&term.expr),
             None => residual.push(&term.expr),
         }
     }
@@ -1016,6 +1098,7 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
     } else {
         None
     };
+    body_reads(&on_terms, &places)?;
     body_reads(&residual, &places)?;
     body_reads(&outs, &places)?;
     let data = MorselAggregateData {
@@ -1029,12 +1112,14 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
         joins,
         joined_rows,
         body: None,
+        outer,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
     };
     let looped = BodyPlan {
         table: probe_table,
         places,
         width,
+        on: on_terms,
         filter: residual,
         outs,
         group_by,

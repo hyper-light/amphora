@@ -21067,7 +21067,7 @@ pub fn op_morsel_aggregate(
     };
     use crate::vdbe::morsel_scan::{
         JoinStage, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
-        TableJoinAggregate, TableJoinRows, TableSource,
+        TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -21208,6 +21208,8 @@ pub fn op_morsel_aggregate(
                 filter: &join.filter,
                 key: &join.build_key,
                 partitioner: &partitioner,
+                // An outer join's build rows with a NULL key match nothing, and still appear.
+                keep_unkeyed: data.outer.is_some(),
             }
             .run_mode(mode, &mut costs, &budget)?;
             stages.push(JoinStage {
@@ -21238,6 +21240,39 @@ pub fn op_morsel_aggregate(
             shape: &shape,
             ran: &connection.morsel_body_rows,
         };
+        // An outer join of two tables: the probe's morsels mark the build rows they match, the
+        // bitmaps merge, then the unmatched build rows run padded (lane qs6-12).
+        if let Some(kind) = data.outer {
+            let (Some(stage), Some(link)) = (stages.first(), data.joins.first()) else {
+                return Err(MorselError::Corrupt(
+                    "an outer join's hook without its link",
+                ));
+            };
+            let pipeline = TableOuterJoin {
+                table: &table,
+                probe_filter: &data.filter,
+                stage,
+                probe_columns: data.columns,
+                build_columns: link.columns,
+                kind,
+                body: &looped,
+                order: data
+                    .joined_rows
+                    .as_ref()
+                    .map(|rows| rows.order.as_slice())
+                    .unwrap_or_default(),
+            };
+            let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
+            return match &data.joined_rows {
+                Some(rows) => {
+                    for row in &mut out {
+                        row.truncate(rows.width);
+                    }
+                    Ok((out, true))
+                }
+                None => Ok((out, false)),
+            };
+        }
         // A join's rows, no aggregates: each worker keeps its own leaves' output rows, merged
         // in order; they are the answer's rows as they stand.
         if let Some(rows) = &data.joined_rows {

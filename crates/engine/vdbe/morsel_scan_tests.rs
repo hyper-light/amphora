@@ -607,6 +607,7 @@ fn t_qt_6_12_partitioned_parallel_build_matches_the_serial_join() {
                     filter: &filter,
                     key: &build_key,
                     partitioner: &partitioner,
+                    keep_unkeyed: false,
                 };
                 let (rows, table, stats) = build.run_at(degree, &budget).unwrap();
                 if stats.scan.workers > 1 {
@@ -647,6 +648,7 @@ fn t_qt_6_12_partitioned_parallel_build_matches_the_serial_join() {
                 filter: &filter,
                 key: &build_key,
                 partitioner: &partitioner,
+                keep_unkeyed: false,
             };
             assert!(
                 matches!(
@@ -1678,4 +1680,167 @@ fn t_qt_6_18_join_workers_run_a_copy_of_the_loop_body_as_the_serial_loop() {
         queries * 5
     );
     assert!(bodied_rows > 0, "no row-returning join ran the body");
+}
+
+/// A random outer join of `t` and `u` (lane qs6-12), `kind` LEFT, RIGHT or FULL: ON `a`, or `a`
+/// and `c`, with more ON terms on either table or both (so rows on either side match nothing),
+/// WHERE terms that read the padded side's NULLs, and aggregates or rows, with an ORDER BY of
+/// plain columns or none. Says whether it returns rows.
+fn random_outer(rng: &mut ChaCha8Rng, kind: &str) -> (String, bool) {
+    let mut on = vec!["t.a = u.a".to_string()];
+    if rng.random_bool(0.4) {
+        on.push("t.c = u.c".to_string());
+    }
+    for _ in 0..rng.random_range(0..3) {
+        let n = rng.random_range(-20i64..20);
+        let k = rng.random_range(0i64..3);
+        on.push(match rng.random_range(0..6) {
+            0 => format!("u.a > {n}"),
+            1 => format!("t.a < {n}"),
+            2 => format!("u.c LIKE 't{k}%'"),
+            3 => format!("abs(t.b) % 3 = {k}"),
+            4 => format!("t.a + u.a > {n}"),
+            _ => "u.b IS NOT NULL".to_string(),
+        });
+    }
+    let mut filter = Vec::new();
+    for _ in 0..rng.random_range(0..2) {
+        let n = rng.random_range(-20i64..20);
+        let k = rng.random_range(0i64..3);
+        filter.push(match rng.random_range(0..5) {
+            0 => "u.a IS NULL".to_string(),
+            1 => "t.a IS NULL".to_string(),
+            2 => format!("t.c LIKE 't{k}%'"),
+            3 => format!("coalesce(u.a, 0) >= {n}"),
+            _ => format!("t.a > {n}"),
+        });
+    }
+    let rows = rng.random_bool(0.4);
+    let mut select: Vec<String> = Vec::new();
+    let mut group_by: Vec<String> = Vec::new();
+    let mut keys = 0usize;
+    let ordered = rows && rng.random_bool(0.5);
+    if rows {
+        if ordered {
+            keys = rng.random_range(1..=2usize);
+            for _ in 0..keys {
+                select.push(["t.a", "u.a", "t.c", "u.c"][rng.random_range(0..4)].to_string());
+            }
+        }
+        for _ in 0..rng.random_range(1..4) {
+            select.push(
+                [
+                    "t.a",
+                    "u.c",
+                    "coalesce(u.a, -1) + t.a",
+                    "u.b IS NULL",
+                    "t.c || coalesce(u.c, '?')",
+                ][rng.random_range(0..5)]
+                .to_string(),
+            );
+        }
+    } else {
+        for _ in 0..rng.random_range(0..3) {
+            group_by.push(
+                ["u.a IS NULL", "t.a % 3", "coalesce(u.c, 'none')", "t.c"][rng.random_range(0..4)]
+                    .to_string(),
+            );
+        }
+        select = group_by.clone();
+        for _ in 0..rng.random_range(1..4) {
+            select.push(
+                [
+                    "count(*)",
+                    "count(u.a)",
+                    "sum(t.a)",
+                    "sum(coalesce(u.a, 0))",
+                    "min(u.c)",
+                    "max(t.c)",
+                    "max(u.a * 1.5)",
+                ][rng.random_range(0..7)]
+                .to_string(),
+            );
+        }
+    }
+    let mut sql = format!(
+        "SELECT {} FROM t {kind} JOIN u ON {}",
+        select.join(", "),
+        on.join(" AND ")
+    );
+    if !filter.is_empty() {
+        sql.push_str(&format!(" WHERE {}", filter.join(" AND ")));
+    }
+    if !group_by.is_empty() {
+        sql.push_str(&format!(" GROUP BY {}", group_by.join(", ")));
+    }
+    if ordered {
+        let order: Vec<String> = select[..keys]
+            .iter()
+            .map(|key| {
+                let dir = if rng.random_bool(0.5) { " DESC" } else { "" };
+                format!("{key}{dir}")
+            })
+            .collect();
+        sql.push_str(&format!(" ORDER BY {} -- keys {keys}", order.join(", ")));
+    }
+    (sql, rows)
+}
+
+/// T-QT.6.19 (lane qs6-12): outer joins run on morsels. Random LEFT, RIGHT and FULL joins of two
+/// tables, ON terms on either table or both beside the keys, WHERE terms that read the padded
+/// side's NULLs, with aggregates or returning rows, answer the same with `ParallelMode` off (the
+/// serial loop) and on, the machine stated as 1, 2, 3, 4 and 8 cores: the matched rows, the
+/// unmatched rows padded with NULLs (the build side's from the workers' merged bitmaps, a FULL
+/// join's probe side's by the worker that read them), ON terms deciding matches and WHERE terms
+/// testing the padded rows. Each kind took the hook in some runs, one link built and the body run.
+#[test]
+fn t_qt_6_19_outer_joins_pad_unmatched_rows_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-19");
+    let mut rng = ChaCha8Rng::seed_from_u64(619);
+    fill(&conn, &mut rng, "t", 500);
+    fill(&conn, &mut rng, "u", 150);
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let kinds = ["LEFT", "RIGHT", "FULL"];
+    let mut hooked = [0usize; 3];
+    let queries = 36usize;
+    for query in 0..queries {
+        let at = query % kinds.len();
+        let (sql, rows) = random_outer(&mut rng, kinds[at]);
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let links_before = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let body_before = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, &sql);
+            let links = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - links_before;
+            let body = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - body_before;
+            same_answer(&sql, rows, &parallel, &serial, &format!("on {cores} cores"));
+            assert!(links <= 1, "{sql} on {cores} cores built {links} links");
+            if links == 1 && body > 0 {
+                hooked[at] += 1;
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: every kind ran on morsels.
+    for (kind, runs) in kinds.iter().zip(hooked) {
+        assert!(runs > 0, "no {kind} JOIN took the hook");
+    }
 }

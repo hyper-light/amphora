@@ -549,7 +549,27 @@ the workers' sort is the serial sorter's. T-QT.6.18 checks random joins of two, 
 tables whose filters and outputs only the body states against the serial loop at 1, 2, 3, 4 and
 8 stated cores.
 
-**Not yet.** Outer joins stay serial.
+**Outer joins** (lane qs6-12). A LEFT, RIGHT (which the planner turns into a LEFT with the tables
+swapped) or FULL join of two rowid tables runs on morsels too, whatever loop the planner chose for
+it (it makes no FULL hash join): the probe is the table the join may pad with NULLs, the build the
+other, keyed by the ON equalities of columns of one affinity (`MorselOuter`, `TableOuterJoin`).
+ON terms decide which rows match and WHERE terms test the joined row, matched or padded, so they
+are kept apart: only an ON equality is a key; the body's ON terms (`MorselBody::on`) run first, and
+a row that passes them matched; the WHERE terms and the outputs follow. A table's own term is
+tested on its rows only where that drops no row the join keeps: in a LEFT join an ON term on the
+probe and a WHERE term on the build; in a FULL join, none. The build keeps its rows with a NULL key
+(they match nothing, and still appear). Each worker marks the build rows its probe rows matched in
+a bitmap of its own, a bit per row charged to the statement's budget; the bitmaps merge by OR as
+the partials do, and the build rows no worker marked then run the body in morsels of build rows
+(`TableOuterRest`), padded with NULLs for the probe's side, its rowid NULL. A FULL join's probe row
+that matched nothing runs padded with NULLs for the build's side, by the worker that read it. Rows
+come out as the probe's morsels in leaf order, then the padded build rows in build order, sorted
+by a stable merge under an ORDER BY. A LIMIT or OFFSET, a join of more tables with an outer one, a
+RIGHT join the planner keeps as one, and semi and anti joins stay serial. T-QT.6.19 checks random
+LEFT, RIGHT and FULL joins, ON terms on either table or both beside the keys and WHERE terms that
+read the padded side's NULLs, against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**Not yet.** Outer joins of more than two tables, and an outer join under a LIMIT.
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

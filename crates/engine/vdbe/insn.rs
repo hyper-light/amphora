@@ -458,7 +458,23 @@ pub struct MorselAggregateData {
     /// and `result_map` name places in its output row. A join's `filter` and each link's are then
     /// the terms a table's own `Predicate` holds, tested before the body runs.
     pub body: Option<Box<MorselBody>>,
+    /// An outer join of two tables (lane qs6-12): the probe is the table the join may pad with
+    /// NULLs, its one link the table whose every row appears.
+    pub outer: Option<MorselOuter>,
     pub target_pc_serial: BranchOffset,
+}
+
+/// Amphora (QT.6, lane qs6-12): which rows an outer join keeps that match nothing. Each worker
+/// marks the build rows a probe row matched (the ON terms held) in a bitmap of its own; the
+/// bitmaps are merged, and the build rows no worker marked come out padded with NULLs for the
+/// probe's side. A FULL join's probe rows that matched nothing come out padded with NULLs for the
+/// build's side, by the worker that read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MorselOuter {
+    /// LEFT JOIN: every build row (the left table's) appears.
+    Left,
+    /// FULL JOIN: every row of both tables appears.
+    Full,
 }
 
 /// Amphora (QT.6, lane qs6-7): a one-table scan's loop body, emitted as its own range of the
@@ -470,6 +486,9 @@ pub struct MorselAggregateData {
 /// is the probe row's.
 #[derive(Debug, Clone)]
 pub struct MorselBody {
+    /// An outer join's ON terms the hash keys don't hold (lane qs6-12): their code runs from here
+    /// and falls through to `start` when they hold (the row matched), else jumps to `skip`.
+    pub on: Option<BranchOffset>,
     pub start: BranchOffset,
     pub keep: BranchOffset,
     pub skip: BranchOffset,
