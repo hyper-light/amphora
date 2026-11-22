@@ -329,3 +329,21 @@ load's, not the checks'. The live test of record is the coordinator's
 **Falsified by.** A continuous check that runs while the thread has been idle less than the last
 check took; a restore admitted that leaves the source's log no room; a second held by the sample
 more or less often than uniform; a drill that passes on rows that differ.
+
+Paced checks (lane backups-4, T-T1.12.C7). A tiny C5 run showed continuous checks raising commit p99
+from 184 ms to 351 ms, as they ran on the shipping thread with one fsync at the end of a whole
+restore. Checks now run on a thread of their own (`amphora-backup-check`), told of each round,
+so shipping never waits on them. Continuous, every step (a base chunk, a log segment, a replay,
+an object's worth of rows digested) is paced (`backup::Pacer`): it begins only once the store
+has made no commit for as long as the last step took, so a commit pauses the steps after it; a
+writing step is made durable as it ends, so its cost is the device's; and after each step it
+rests `took x (1 - room) / room`, the room being the fastest a step of its kind went per byte
+over how fast this one went (the way LEDBAT, RFC 6817, and TCP Vegas read a queue from their own
+delay). The default is back to unpaced checks into a scratch file (`CheckPolicy::Scratch(None)`,
+beside the database), Ada's earlier word, because the data doesn't yet show paced checks within
+the control's spread: in three interleaved tiny runs on adacachy (32 writers, run beside other
+tests and production), commit p99 was 24 to 32 ms with no checks, 4.8 to 100 ms unpaced and 4.7
+to 94 ms paced, a spread wider than any difference; and under one writer committing back to back
+(T-T1.12.C4) paced checks found no quiet stretch and only the first passed. The coordinator's
+run of record: `AMPHORA_DRILL_LOAD_RUNS=20 AMPHORA_DRILL_LOAD_COMMITS=500 cargo test -p amphora
+--release --test backup t_t1_12_c5 -- --nocapture --test-threads=1` on an otherwise idle machine.
