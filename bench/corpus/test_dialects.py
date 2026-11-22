@@ -155,5 +155,79 @@ class FrameExclusions(unittest.TestCase):
                 self.assertIn(f"not expressible in {d}: a window frame's EXCLUDE", why)
 
 
+class ParseGaps(unittest.TestCase):
+    """Do: what sqlglot's SQLite reader refused in the gate's pool (lane corpus-dialects-5): VALUES
+    after WITH, a table PRIMARY KEY with ASC, COLLATE or AUTOINCREMENT, table constraints without a
+    comma, several upsert clauses, and MySQL's NATURAL FULL JOIN. Expect: each said as SQLite's
+    documentation says it means, else not expressible with the reason."""
+
+    def test_values_after_with_is_its_selects(self):
+        sql = "WITH x(a) AS (SELECT 1) VALUES (1, 'a'), (2, 'b')"
+        for d in ENGINES:
+            out, why = dialects.translate(sql, d)
+            self.assertIsNone(why, d)
+            self.assertIn("UNION ALL", out)
+            self.assertIn("column1", out)
+
+    def test_table_constraints_without_a_comma(self):
+        for d in ENGINES:
+            out, why = dialects.translate("CREATE TABLE ck(a INTEGER, CHECK (a > 0) CHECK (a < 9))", d)
+            self.assertIsNone(why, d)
+            self.assertEqual(out.upper().count("CHECK"), 2, (d, out))
+
+    def test_a_primary_keys_order_is_left_out_and_autoincrement_moves_to_its_column(self):
+        out, why = dialects.translate("CREATE TABLE pk(x INTEGER, y, PRIMARY KEY (x DESC))", "postgres")
+        self.assertIsNone(why)
+        self.assertNotIn("DESC", out)
+        out, why = dialects.translate("CREATE TABLE tc6(a INTEGER, b, PRIMARY KEY (a AUTOINCREMENT))", "mysql")
+        self.assertIsNone(why)
+        self.assertIn("PRIMARY KEY AUTO_INCREMENT", out)
+        out, why = dialects.translate("CREATE TABLE tc6(a INTEGER, b, PRIMARY KEY (a AUTOINCREMENT))", "duckdb")
+        self.assertIsNone(out)
+        self.assertIn("not expressible in duckdb: AUTOINCREMENT", why)
+
+    def test_a_primary_key_collation_other_than_the_columns_is_not_expressible(self):
+        for d in ENGINES:
+            out, why = dialects.translate("CREATE TABLE ixt(k TEXT, v, PRIMARY KEY (k COLLATE NOCASE DESC))", d)
+            self.assertIsNone(out)
+            self.assertIn(f"not expressible in {d}: a PRIMARY KEY column's own collation", why)
+            self.assertIsNone(dialects.translate("CREATE TABLE ixb(k TEXT, v, PRIMARY KEY (k COLLATE BINARY))", d)[1], d)
+
+    def test_several_upsert_clauses_are_not_expressible(self):
+        sql = "INSERT INTO kv(k, v, u) VALUES ('b', 7, 'ub') ON CONFLICT (k) DO UPDATE SET v = -1 ON CONFLICT (u) DO NOTHING"
+        for d in ENGINES:
+            out, why = dialects.translate(sql, d)
+            self.assertIsNone(out)
+            self.assertIn("several upsert clauses", why)
+        self.assertEqual(dialects.upserts("SELECT 'ON CONFLICT DO'; INSERT INTO kv VALUES (1) ON CONFLICT DO NOTHING"), 1)
+
+    def test_natural_full_join_on_mysql(self):
+        out, why = dialects.translate("SELECT a FROM t1 NATURAL FULL JOIN t2", "mysql")
+        self.assertIsNone(out)
+        self.assertIn("not expressible in mysql: a NATURAL FULL JOIN", why)
+        self.assertIsNone(dialects.translate("SELECT a FROM t1 NATURAL FULL JOIN t2", "postgres")[1])
+
+
+class ExclusionAround(unittest.TestCase):
+    """Do: min, max, first_value and last_value with EXCLUDE CURRENT ROW on a ROWS frame holding the
+    row, for MySQL and ClickHouse. Expect: the two parts of the frame around the row, no EXCLUDE
+    (checked against DuckDB's EXCLUDE on random rows by the lane's run); sum and nth_value stay not
+    expressible."""
+
+    def test_around_the_current_row(self):
+        for f in ("min(b)", "max(b)", "first_value(b)", "last_value(b)"):
+            sql = f"SELECT {f} OVER (ORDER BY a ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM t1"
+            for d in ("mysql", "clickhouse"):
+                out, why = dialects.translate(sql, d)
+                self.assertIsNone(why, (f, d))
+                self.assertNotIn("EXCLUDE", out)
+                self.assertIn("ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING", out)
+                self.assertIn("ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING", out)
+        out, _ = dialects.translate("SELECT max(b) OVER (ORDER BY a ROWS BETWEEN CURRENT ROW AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t1", "mysql")
+        self.assertEqual(out, "SELECT NULL FROM t1")
+        for f in ("sum(b)", "nth_value(b, 2)"):
+            self.assertIsNone(dialects.translate(f"SELECT {f} OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM t1", "mysql")[0], f)
+
+
 if __name__ == "__main__":
     unittest.main()
