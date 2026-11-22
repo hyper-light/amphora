@@ -2035,4 +2035,112 @@ mod versioned {
             assert_eq!((counts.built_stale, counts.consulted), (0, 1), "{kind:?}");
         }
     }
+
+    /// The A/B of stale against wait (G7 step 2, `AC-NS.2.1`; lane g7s2-16), the harness of the
+    /// coordinator's run of record: `AMPHORA_SKIP_AB_WRITERS` connections (the ladder 1, 8, 32,
+    /// 128, 512, 2048, 4096; 2 unless set) each commit `AMPHORA_SKIP_AB_TXNS` single-row inserts
+    /// (16 unless set) into one table, while one connection builds its zone-map summary
+    /// `AMPHORA_SKIP_AB_BUILDS` times (4 unless set) and after each build runs a filter. Each arm
+    /// reports its builds' latency (p50, p99, p99.9, max), the builds kept stale, the waits and
+    /// rebuilds, and the rows the filters read (a stale summary's filter reads every row).
+    /// Expect, on each arm: every filter answers as a scan without the summary would (its rows
+    /// counted from the table), and every build ends once the writers do.
+    #[test]
+    fn t_ns_2_1_stale_against_wait_under_writers() {
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let (writers, txns, builds) = (
+            env("AMPHORA_SKIP_AB_WRITERS", 2),
+            env("AMPHORA_SKIP_AB_TXNS", 16),
+            env("AMPHORA_SKIP_AB_BUILDS", 4),
+        );
+        let sql = "SELECT count(*) FROM t WHERE a BETWEEN 100 AND 120";
+        for policy in [BuildPolicy::Stale, BuildPolicy::Wait] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            db.skipping.set_policy(policy);
+            let builder = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            builder
+                .execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+                .unwrap();
+            builder.execute("BEGIN").unwrap();
+            for i in 0..3000 {
+                builder
+                    .execute(format!(
+                        "INSERT INTO t VALUES ({}, '{}')",
+                        i % 1000,
+                        "x".repeat(40)
+                    ))
+                    .unwrap();
+            }
+            builder.execute("COMMIT").unwrap();
+            let next = Arc::new(std::sync::atomic::AtomicU64::new(3001));
+            let threads: Vec<_> = (0..writers)
+                .map(|w| {
+                    let (db, next) = (db.clone(), next.clone());
+                    std::thread::spawn(move || {
+                        let conn = db
+                            .connect(ConnectOpts::new().with_versioned_storage())
+                            .unwrap();
+                        for t in 0..txns {
+                            let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let a = (w * 31 + t * 7) % 1000;
+                            conn.execute(format!(
+                                "INSERT INTO t (rowid, a, pad) VALUES ({id}, {a}, 'w')"
+                            ))
+                            .unwrap();
+                        }
+                    })
+                })
+                .collect();
+            let (mut latencies, mut read, mut stale) = (Vec::new(), 0u64, 0u64);
+            for _ in 0..builds {
+                let started = std::time::Instant::now();
+                set_skipping(&builder, "t", "a", Some(SkipKind::ZoneMaps)).unwrap();
+                latencies.push(started.elapsed().as_nanos());
+                stale += skipping_counts(&builder, "t").map_or(0, |c| c.built_stale);
+                // The filter and the plain scan at one snapshot: writers commit meanwhile.
+                builder.execute("BEGIN").unwrap();
+                let mut stmt = builder.prepare(sql).unwrap();
+                let got = stmt.run_collect_rows().unwrap();
+                read += stmt.metrics().rows_read;
+                let mut plain = builder.prepare("SELECT a FROM t").unwrap();
+                let want = plain
+                    .run_collect_rows()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| matches!(row.first(), Some(Value::Numeric(crate::Numeric::Integer(a))) if (100..=120).contains(a)))
+                    .count();
+                builder.execute("COMMIT").unwrap();
+                assert_eq!(
+                    got,
+                    vec![vec![Value::from_i64(i64::try_from(want).unwrap())]],
+                    "{policy:?}"
+                );
+            }
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            latencies.sort_unstable();
+            // The latency at `per_mille` of the builds (nearest rank).
+            let at = |per_mille: usize| {
+                let i = latencies.len().saturating_sub(1) * per_mille / 1000;
+                latencies.get(i).copied().unwrap_or(0)
+            };
+            let (waits, rebuilds) = db.skipping.wait_counts();
+            eprintln!(
+                "skip_ab policy={policy:?} writers={writers} txns={txns} builds={builds} build_ns_p50={} p99={} p999={} max={} built_stale={stale} waits={waits} rebuilds={rebuilds} filter_rows_read={read}",
+                at(500),
+                at(990),
+                at(999),
+                latencies.last().copied().unwrap_or(0)
+            );
+        }
+    }
 }
