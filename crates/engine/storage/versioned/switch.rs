@@ -783,7 +783,10 @@ mod tests {
         let stopped = cursor.count();
         conn.interrupt_requested.store(false, Ordering::SeqCst);
         assert!(
-            matches!(stopped.as_ref().map_err(|e| &**e), Err(LimboError::Interrupt)),
+            matches!(
+                stopped.as_ref().map_err(|e| &**e),
+                Err(LimboError::Interrupt)
+            ),
             "{stopped:?}"
         );
         switch.finish(true).unwrap();

@@ -1243,9 +1243,15 @@ mod tests {
         }
         let after = copies(&reader).counts();
         assert!(after.reached_since(&before, 3), "{after:?}");
+        // The copy's view and the rows' learned rates, which the planner chose by.
+        let tree = tree_of(root(&reader)).unwrap();
+        let view = copies(&reader)
+            .kept(tree)
+            .map(|c| c.columns.plan_view(Ts::MAX));
+        let rates = RowRates::learned(&reader.db.learned_costs);
         assert!(
             after.copy >= before.copy + 3,
-            "the copy didn't answer: {after:?}"
+            "the copy didn't answer: {after:?}, its view {view:?}, the rows' rates {rates:?}"
         );
         assert_eq!(after.unserved, first.unserved, "{after:?}");
         let now = rows(&writer, SNAPSHOT_Q);
@@ -1658,6 +1664,7 @@ mod tests {
                 (0u64, 0u64, true, 0u64);
             let (mut writes_refused, mut write_refusal) = (0u64, None::<String>);
             let mut next = vec![s.rows + 1; s.tables];
+            let mut rounds = Vec::new();
             let (mut resident_peak, mut granted_peak) = (0u64, 0u64);
             let began = Instant::now();
             for k in 0..s.statements {
@@ -1717,6 +1724,16 @@ mod tests {
                     .waiting()
                     .iter()
                     .fold(waited_most, |m, w| m.max(w.nanos));
+                // Each round's end (one statement on each table): what the copies did in it, so a
+                // record shows in which round the room met them.
+                if (k + 1) % s.tables.max(1) == 0 {
+                    let (c, m) = (copies(&on).counts(), copies(&on).meter());
+                    rounds.push(serde_json::json!({
+                        "kept": c.kept, "dropped": c.dropped, "rebuilds": c.rebuilds,
+                        "copy": c.copy, "rows": c.rows, "unserved": c.unserved,
+                        "asked": m.asked, "refused": m.refused, "held": m.held,
+                    }));
+                }
             }
             let elapsed = began.elapsed().as_secs_f64();
             room.give(other);
@@ -1788,6 +1805,7 @@ mod tests {
                 "writes_refused": writes_refused,
                 "write_refusal": write_refusal,
                 "equal": equal,
+                "rounds": rounds,
             })
         }
 
