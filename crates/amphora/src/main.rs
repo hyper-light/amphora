@@ -8,7 +8,14 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|a| a.into_string().ok())
         .collect();
-    let reply = amphora::reply(&args);
+    // serve, health, ask and drill (CP-T1.13); anything else is `reply`'s.
+    let plain: Option<Vec<String>> = args.iter().cloned().collect();
+    let served = plain.and_then(|plain| {
+        amphora::serve::command(&plain, |addr| {
+            let _ = writeln!(std::io::stderr().lock(), "amphora: serving on {addr}");
+        })
+    });
+    let reply = served.unwrap_or_else(|| amphora::reply(&args));
     let wrote = if reply.to_stderr {
         std::io::stderr().lock().write_all(reply.text.as_bytes())
     } else {
