@@ -494,6 +494,10 @@ tests = [
   { id = "T-T1.12.C3", text = "The shipping thread checks its own archive against the source's rows from a snapshot lined up with a second's stamps, and passes" },
   { id = "T-T1.12.X2", text = "Cuts across two groups whose clocks differ by 5 seconds, under both protocols: both keys or neither at every cut, the carried clock taken out failing it" },
   { id = "T-T1.12.I4", text = "A due base waits for the log to start again, unless no base restores the log or its generation holds what a restart keeps" },
+  # lane backups-3: continuous restore drills (kiln goal 15580afd; backup.md "Continuous restore drills")
+  { id = "T-T1.12.C4", text = "With no scratch path given, the shipping thread checks its archive beside the database by default; the checks pass and leave no file behind" },
+  { id = "T-T1.12.C5", text = "A check runs only once the thread was idle as long as the last check took and the disk holds the restore and the log's growth; under one writer per core no check fails and checks take no more time than the thread was idle" },
+  { id = "T-T1.12.C6", text = "The drilled seconds are a uniform sample of every quiet snapshot, as many as the memory holds; an expired second is dropped, never picked again" },
 ]
 
 # lane keyheads: G3 step 4 (kiln plan 01a16b0f464172dc80c7a3b9a14acbce), searching a page by key heads.

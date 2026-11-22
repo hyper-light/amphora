@@ -287,3 +287,45 @@ reuses it.
 **After an open.** The shipper reads the archived segments since the latest base began back
 and marks their pages, so the next base is incremental after a restart of the process too (the log
 since a base is bounded by `base_due`); a gap since leaves it whole.
+
+## Continuous restore drills
+
+**Decision (lane backups-3).** The shipping thread checks its own archive by default, not only
+when given a scratch path. `Archive::check` is a `backup::CheckPolicy`, a switch with three
+settings: `Off`; `Scratch(path)`, lane pitr-8's behaviour kept as the control (a check whenever
+one is due, at the newest quiet second, no budget); and `Continuous`, the default. Continuous
+checks restore into `<database>.check` beside the database (the same disk), and:
+
+- **Within a budget derived from the machine** (`backup::admit`, T-T1.12.C5). A due check runs only
+  once the thread has waited for commits, since the last check ended, at least as long as that
+  check took, so checks spend only time the foreground leaves idle and none while it keeps the
+  thread busy; the first runs at once, nothing being measured yet. It runs only if the disk's free
+  bytes hold the restore (the source's file and log as they stand) and still leave the source's
+  log room to grow to the most it keeps. No number is picked: each side is measured where the
+  database runs.
+- **At random seconds** (`backup::Drills`, T-T1.12.C6). Each quiet snapshot's second and rows join
+  a uniform sample of every snapshot taken (Vitter's Algorithm R, "Random sampling with a
+  reservoir", ACM TOMS 11(1), 1985), as many as `Archive::memory` holds; each check restores one
+  drawn uniformly and compares every row (`backup::restore_and_check_at`). Draws come from
+  SplitMix64 (Steele, Lea and Flood, OOPSLA 2014) seeded once from the system's entropy. A drilled
+  second the archive's owner has since expired is `Check::Expired`, dropped from the sample, never
+  a failure.
+- **Instruments.** `amphora_backup_checks_deferred_total{reason="busy"|"disk"}`,
+  `amphora_backup_check_seconds` (each check's cost, digest included, in power-of-two buckets for
+  p50/p99/p99.9), drills of a second older than the newest, the thread's idle time
+  (`Shipping::drills`), each deferral a trace event with its reason and inputs
+  (`amphora.backup.check`, `event="deferred"`).
+
+**Evidence.** T-T1.12.C4: on by default with no path given, three checks pass beside the database
+and leave no file behind. T-T1.12.C5: one writer per core committing back to back, under the
+control and under the default; no check fails under either, checks pass once the load ends, and
+under the budget the checks took no more time than the thread was idle (the last check aside).
+One tiny run (adacachy, 32 writers, 50 commits each; one run, not a measurement): control commit
+p50 17.7 ms, p99 184 ms; continuous p50 11.8 ms, p99 351 ms, 181 checks deferred busy; 848 writes
+refused `Full` by the database's own bound under both, the same count, so the refusals are the
+load's, not the checks'. The live test of record is the coordinator's
+(`AMPHORA_DRILL_LOAD_COMMITS=<n> cargo test -p amphora --release --test backup t_t1_12_c5 -- --nocapture`).
+
+**Falsified by.** A continuous check that runs while the thread has been idle less than the last
+check took; a restore admitted that leaves the source's log no room; a second held by the sample
+more or less often than uniform; a drill that passes on rows that differ.
