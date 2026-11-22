@@ -53,6 +53,7 @@ mod watch;
 pub use guards::Guards;
 pub(crate) use guards::Owned;
 pub use online::SchemaChange;
+pub use replicated::{ReadMode, SessionCounters, Token};
 pub use restore::Restore;
 pub use watch::Watch;
 
@@ -1282,6 +1283,78 @@ impl Database {
                     .query(until, f)
                     .map(|value| ClosedRead { value, micros })
             }
+        }
+    }
+
+    /// The token of this node's last acknowledged write (replication.md, "Decision (lane ryw-1):
+    /// read-your-writes by session tokens"): taken after a write's answer, it is at or past that
+    /// write, so a read that carries it sees the write on any replica. A session keeps the latest
+    /// of its tokens (`Token::after`). None standalone and for an attached client, whose reads
+    /// all see every write.
+    pub fn session_token(&self, until: Instant) -> Result<Option<Token>, Refusal> {
+        let database = self.resolve(until)?;
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => client.token().map(Some),
+            Writer::Client(_) | Writer::Local(_) => Ok(None),
+        }
+    }
+
+    /// One read-only SQL session in the read mode asked (kiln goal 8119f25d, the switch):
+    /// - [`ReadMode::Latest`], the control and today's read: [`Database::query`], which waits for
+    ///   the leader's latest commit whatever `token` says;
+    /// - [`ReadMode::Session`]: with no token, [`Database::query_local`], which never waits for
+    ///   the log; with one, on this replica once it has applied the token, waiting only while it
+    ///   is behind and redirected to [`Database::query`] past its measured apply lag.
+    ///
+    /// Answers alike in both modes for every session that carries its tokens.
+    pub fn query_session<R, F>(
+        &self,
+        mode: ReadMode,
+        token: Option<Token>,
+        until: Instant,
+        f: F,
+    ) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let (ReadMode::Session, Some(token)) = (mode, token) else {
+            return match mode {
+                ReadMode::Latest => self.query(until, f),
+                ReadMode::Session => self.query_local(until, f),
+            };
+        };
+        let database = self.resolve(until)?;
+        let Writer::Replicated { client, .. } = &database.shared.writer else {
+            return self.query(until, f);
+        };
+        let session = Mutex::new(Some(f));
+        let claim = database.application.as_ref();
+        let served = client.read_session(token, until, |reader| {
+            if token.micros == 0 {
+                return run_query(reader, until, claim, &session).map(Ok);
+            }
+            run_closed(reader, token.micros, until, claim, &session)
+                .map(|read| read.map(|read| read.value))
+        })?;
+        match served {
+            replicated::Served::Here(value) => Ok(value),
+            replicated::Served::Redirect => {
+                let f = locked(&session)?
+                    .take()
+                    .ok_or_else(|| api::invalid("SQL query", "was already executed"))?;
+                self.query(until, f)
+            }
+        }
+    }
+
+    /// This replica's token reads, counted, with its measured apply lag. None standalone and for
+    /// an attached client.
+    pub fn session_counters(&self, until: Instant) -> Result<Option<SessionCounters>, Refusal> {
+        let database = self.resolve(until)?;
+        match &database.shared.writer {
+            Writer::Replicated { client, .. } => client.session_counters().map(Some),
+            Writer::Client(_) | Writer::Local(_) => Ok(None),
         }
     }
 
