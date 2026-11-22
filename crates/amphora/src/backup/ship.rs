@@ -544,7 +544,9 @@ impl Shipper {
     }
 
     /// Ships what is durable and stamped: one segment, split into parts where it outgrows the
-    /// store's objects. With nothing new to ship, and every commit stamped so far shipped, a
+    /// store's objects or the send's room; more than one where a send carries only some of the
+    /// marks ready ([`Shipper::marks_fitting`], or a send refused partway sent again as it was).
+    /// With nothing new to ship, and every commit stamped so far shipped, a
     /// through mark says the archive is whole through now, once that reaches a later second.
     pub fn ship(&mut self, db: &Db, blobs: &dyn Blobs, until: Instant) -> anyhow::Result<Shipped> {
         let drained = self.hooks.marks.drain()?;
@@ -553,7 +555,18 @@ impl Shipper {
         // What was committed before now is durable once this ends (store.md, decision 2): every
         // mark drained is then of a durable commit.
         (db.flusher())()?;
-        let shipped = self.ship_durable(db, blobs, until)?;
+        // A send that carried fewer of the marks ready than there were (its head's room, or a
+        // send refused partway sent again as it was) leaves the rest ready now: sent at once, not
+        // at the next commit.
+        let mut shipped = Shipped::default();
+        loop {
+            let (sent, more) = self.ship_durable(db, blobs, until)?;
+            shipped.segments = shipped.segments.saturating_add(sent.segments);
+            shipped.bytes = shipped.bytes.saturating_add(sent.bytes);
+            if sent.segments == 0 || !more {
+                break;
+            }
+        }
         if shipped.segments > 0 {
             // The segment says as much as the mark did, and more.
             if let Some(old) = self.through_mark.take() {
@@ -599,22 +612,23 @@ impl Shipper {
         Ok(())
     }
 
-    /// Sends what is durable and stamped of the log's generation now.
+    /// Sends what is durable and stamped of the log's generation now: what it sent, and whether
+    /// marks it left are ready still.
     fn ship_durable(
         &mut self,
         db: &Db,
         blobs: &dyn Blobs,
         until: Instant,
-    ) -> anyhow::Result<Shipped> {
+    ) -> anyhow::Result<(Shipped, bool)> {
         let (seq, end) = db.log_end();
         let durable = db.durable_frame().unwrap_or(0).min(end);
         let Some(head) = db.read_log(0, usize::try_from(LOG_HEADER_BYTES)?)? else {
-            return Ok(Shipped::default());
+            return Ok((Shipped::default(), false));
         };
         let identity = identity_of(&head)?;
         if identity.seq != seq {
             // The log was started again and its header isn't written yet.
-            return Ok(Shipped::default());
+            return Ok((Shipped::default(), false));
         }
         if self.identity != Some(identity) {
             self.begin_generation(identity, head)?;
@@ -637,9 +651,13 @@ impl Shipper {
         // A send refused partway goes again as it was: its marks only, the commits since in the
         // next send (T-T1.12.M6). Its marks are still the first pending, and still durable.
         let unfinished = self.unfinished.filter(|u| u.from == self.shipped);
-        let ready = unfinished.map_or(ready, |u| u.marks.min(ready));
+        let all = ready;
+        let ready = match unfinished {
+            Some(u) => u.marks.min(ready),
+            None => self.marks_fitting(ready, identity, blobs)?,
+        };
         if ready == 0 {
-            return Ok(Shipped::default());
+            return Ok((Shipped::default(), false));
         }
         // Kept pending until the send ends, so a send refused (the store, or no room for its parts)
         // ships them at the next round.
@@ -669,7 +687,68 @@ impl Shipper {
         self.unknown = None;
         self.next_link = None;
         self.since_base = self.since_base.saturating_add(shipped.bytes);
-        Ok(shipped)
+        Ok((shipped, ready < all))
+    }
+
+    /// How many of the `ready` marks pending one send carries (T-T1.12.M3): all, unless its head
+    /// (the segment's fields before its frames, the marks among them, as [`Shipper::send`] holds
+    /// it with each part) leaves no room for a frame in half a send's share of the room for chunks
+    /// or in the store's objects; then the most that do, one at least. So a backlog of marks (the
+    /// store refused rounds for long) ships over sends, none refused for its head alone.
+    fn marks_fitting(
+        &self,
+        ready: usize,
+        identity: Identity,
+        blobs: &dyn Blobs,
+    ) -> anyhow::Result<usize> {
+        // The share as the send will see it: its own stream among those open.
+        let stream = self.memory.stream(Use::Chunks);
+        let room = self
+            .memory
+            .stream_room(Use::Chunks)?
+            .checked_div(2)
+            .unwrap_or(0)
+            .min(u64::try_from(blobs.object_max())?);
+        drop(stream);
+        let fits = |count: usize| -> anyhow::Result<bool> {
+            let head = Segment {
+                format: FORMAT,
+                generation: self.generation,
+                identity,
+                first: self.shipped.saturating_add(1),
+                header: self.header.clone(),
+                // As large as the send's: the first mark may take the archive's unknown.
+                marks: self
+                    .pending
+                    .iter()
+                    .take(count)
+                    .map(|m| StoredMark {
+                        frame: m.frame,
+                        ns: m.ns,
+                        unknown_from: m.unknown_from.or(self.unknown),
+                    })
+                    .collect(),
+                frames: Vec::new(),
+            };
+            Ok(
+                u64::try_from(object::segment_overhead(&head)?)?.saturating_add(FRAME_BYTES)
+                    <= room,
+            )
+        };
+        if ready <= 1 || fits(ready)? {
+            return Ok(ready);
+        }
+        // The most that fit, one at least: `low` is one, or fits; `high` doesn't.
+        let (mut low, mut high) = (1usize, ready);
+        while low.saturating_add(1) < high {
+            let mid = low.saturating_add(high.saturating_sub(low).checked_div(2).unwrap_or(0));
+            if fits(mid)? {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        Ok(low)
     }
 
     fn begin_generation(&mut self, identity: Identity, head: Vec<u8>) -> anyhow::Result<()> {

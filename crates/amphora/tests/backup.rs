@@ -2219,16 +2219,17 @@ fn sealed_segment(body: &SegmentBody) -> Vec<u8> {
 }
 
 /// T-T1.12.M6: segments that overlap, as a send made again in other parts leaves them. Do: ship
-/// about 400 KB in parts of 64 KiB; put the last part again beginning two frames earlier, inside
-/// the part before it, and remove it as it was; restore; then alter a byte of those two frames,
-/// sealed again, and restore. Expect: the restore whole, the overlap found to agree with the log it
-/// wrote; the altered one refused for differing there, though its sum holds.
+/// about 400 KB under a 64 KiB room, so in parts; put the last part again beginning two frames
+/// earlier, inside the part before it, and remove it as it was; restore; then alter a byte of those
+/// two frames, sealed again, and restore. Expect: the restore whole, the overlap found to agree
+/// with the log it wrote; the altered one refused for differing there, though its sum holds.
 #[test]
 fn t_t1_12_m6_overlapping_segments_checked_to_agree() {
     let dir = tempfile::tempdir().unwrap();
-    let blobs = SimBlobs::new(64 * 1024, 1 << 20, 1 << 30);
+    // Parts bounded by the shipper's room, so the store takes a part made larger.
+    let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
     let (mut db, mut shipper, mut model, now, _) =
-        written_within(dir.path(), 10, &blobs, &room(1 << 30));
+        written_within(dir.path(), 10, &blobs, &room(64 * 1024));
     copy_whole(&mut shipper, &db, &blobs, &room(1 << 30));
     one_commit(&mut db, &now, 100, 100, &mut model);
     shipper.ship(&db, &blobs, until()).unwrap();
@@ -2291,4 +2292,57 @@ fn t_t1_12_m6_overlapping_segments_checked_to_agree() {
         format!("{refused:#}").contains("differs from it"),
         "{refused:#}"
     );
+}
+
+/// T-T1.12.M3: a backlog of marks under a small room. Do: ship under a 10 KiB budget; make 150
+/// commits, a second apart, while the store refuses every round; then let it take them and ship.
+/// Expect: the round after ships every commit, in more than one send, each send's marks no more
+/// than leave its head room for a frame (none refused for its head alone), and the restore of the
+/// last second whole.
+#[test]
+fn t_t1_12_m3_a_backlog_of_marks_ships_over_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
+    let store = FailsMidSend {
+        inner: &blobs,
+        lose: false,
+        left: std::sync::Mutex::new(None),
+        refused: AtomicU64::new(0),
+    };
+    let memory = room(10 * 1024);
+    let (mut db, mut shipper, mut model, now, _) = written_within(dir.path(), 10, &store, &memory);
+    copy_whole(&mut shipper, &db, &store, &room(1 << 30));
+    for i in 0..150 {
+        one_commit(&mut db, &now, 100 + i, 1, &mut model);
+        *store.left.lock().unwrap() = Some(0);
+        assert!(shipper.ship(&db, &store, until()).is_err(), "round {i}");
+    }
+    assert_eq!(store.refused.load(Ordering::SeqCst), 150);
+    *store.left.lock().unwrap() = None;
+    let before = segment_keys(&blobs)
+        .iter()
+        .filter(|(s, _)| s.marks.is_some())
+        .count();
+    shipper.ship(&db, &store, until()).unwrap();
+    let sends = segment_keys(&blobs)
+        .iter()
+        .filter(|(s, _)| s.marks.is_some())
+        .count()
+        - before;
+    assert!(sends > 1, "{sends} sends");
+    assert_eq!(memory.held(Use::Chunks), 0);
+    let second = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    archive_through(&mut shipper, &db, &store, &now);
+    let target = dir.path().join("restored.db");
+    backup::restore_within(
+        &blobs,
+        "db",
+        second,
+        &target,
+        &mut backup::Unpaced,
+        &room(1 << 30),
+        until(),
+    )
+    .unwrap();
+    assert_eq!(rows(&Db::open(&target).unwrap()), model);
 }

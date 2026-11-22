@@ -325,25 +325,25 @@ pub fn restore_within(
             }
             // Its frames' bytes that are in the log already, from the segment before, which this
             // one begins within (a send retried, [`plan::cover`]), and those up to the cut.
-            let first = key.first;
+            let begins = key.first;
             let overlap = written
                 .saturating_add(1)
-                .saturating_sub(first)
+                .saturating_sub(begins)
                 .saturating_mul(FRAME_BYTES);
             let upto = end
                 .saturating_add(1)
-                .saturating_sub(first)
+                .saturating_sub(begins)
                 .saturating_mul(FRAME_BYTES);
             let take = upto.saturating_sub(overlap);
-            let at_log = frame_offset(first.saturating_sub(1))?;
+            let at_log = frame_offset(begins.saturating_sub(1))?;
             // Its frames up to the cut written as their parts come (T-T1.12.M3), after the log's
             // header where this is the generation's first segment; those the log holds already
             // compared with it, a frame at a time, and refused where they differ (T-T1.12.M6).
             let mut put = |head: &SegmentHead, offset: u64, part: &[u8]| -> anyhow::Result<()> {
                 if offset == 0 {
-                    if head.first != first {
+                    if head.first != begins {
                         anyhow::bail!(
-                            "segment {name} begins at frame {}, its key says {first}",
+                            "segment {name} begins at frame {}, its key says {begins}",
                             head.first
                         );
                     }
@@ -383,7 +383,7 @@ pub fn restore_within(
             let head = read_segment(blobs, name, *size, log_part, memory, until, &mut put)?;
             bytes = bytes.saturating_add(*size);
             log_bytes = log_bytes.saturating_add(if *i == at { head.frames } else { *size });
-            if head.first != first {
+            if head.first != begins {
                 anyhow::bail!("segment {name} doesn't follow frame {written}");
             }
             if head.frames < upto {

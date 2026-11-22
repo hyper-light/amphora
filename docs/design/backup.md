@@ -60,8 +60,10 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
 - **A segment's memory** (T-T1.12.M3, M4). Shipping opens a stream of chunks for each send and
   bounds a segment's part by half its share (its frames read, then encoded, then sealed: two copies
   at most), charged before any part is put, so a send with no room is refused, typed, before it
-  writes, and its commits stay pending for the next round. A send that didn't end keeps its parts'
-  size when sent again, so it makes the same objects. A restore, and a shipper opening, read each
+  writes, and its commits stay pending for the next round. A send carries only as many of the
+  marks ready as leave its head (the marks among it) room for a frame in that half, one at least,
+  and the round sends again at once for the rest, so a backlog of marks after the store refused
+  rounds for long ships over sends instead of never. A restore, and a shipper opening, read each
   segment in ranged parts of half their stream's share: the segment's head (its fields before the
   frames, as postcard lays them out) kept and charged until it decodes, then the frames written as
   their parts come, the sum checked over the parts (no room: `Unrestorable::SegmentPastRoom`). A
