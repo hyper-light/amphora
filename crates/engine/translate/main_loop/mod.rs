@@ -48,6 +48,7 @@ use crate::{
 use amphora_engine_macros::turso_assert_some;
 use std::{borrow::Cow, collections::HashSet, ops::Range, sync::Arc};
 
+mod adaptive;
 mod body;
 mod close;
 mod conditions;

@@ -19,11 +19,10 @@
 //! passes (the statement's hash-table share, `vdbe::hash_table::table_share`): past it they refuse
 //! with an [`AdaptiveError`] and the plan goes on as it was, which is always a correct answer.
 //!
-//! The executor's shell that drives them (a join emitted with both inner loops and the switch
-//! between them; a materialization point that hands its rows to a second prepare) is PL.13's next
-//! piece; until it lands only the tests reach these cores, so the dead-code allowance below stands
-//! for PL.13 (T-PL.13.1) and goes when the shell lands.
-#![cfg_attr(not(test), allow(dead_code))]
+//! The executor drives the join switch: `translate/main_loop/adaptive.rs` emits an index join with
+//! its hash join beside it, and `JoinSwitchStep` (`vdbe/execute.rs`) steps the switch per outer row.
+//! Its hash table, once built, is a materialization point: `JoinSwitchBuilt` sets the rows it holds
+//! against the plan's estimate and, past the estimate's error, has the statement prepared again.
 
 use std::fmt;
 
@@ -94,6 +93,19 @@ pub(crate) fn switch_point(
         Ok(Some(point))
     } else {
         Ok(None)
+    }
+}
+
+/// The weights a switch reads (the seek's, the hash table's build and probe), as an instruction
+/// carries them from prepare; the rest are not read here.
+pub(crate) fn weights(seek: f64, hash_build: f64, hash_probe: f64) -> LearnedWeights {
+    LearnedWeights {
+        row_in_pages: None,
+        seek,
+        hash_build,
+        hash_probe,
+        sort: 0.0,
+        page_miss: None,
     }
 }
 
@@ -174,12 +186,19 @@ impl JoinSwitch {
         }
     }
 
+    /// Takes back a switch the executor could not carry out (its hash table spilled past its
+    /// share of memory): nested loops from here to the end.
+    pub(crate) fn refuse(&mut self) {
+        self.mode = Mode::Refused;
+    }
+
     /// Whether the join switched to a hash join.
     pub(crate) fn switched(&self) -> bool {
         self.mode == Mode::Hash
     }
 
     /// The outer rows counted so far.
+    #[cfg(test)]
     pub(crate) fn rows_seen(&self) -> u64 {
         self.seen
     }
@@ -221,11 +240,11 @@ impl MaterializePoint {
         })
     }
 
-    /// Counts one row of `bytes` held; past the budget it refuses.
-    pub(crate) fn row(&mut self, bytes: u64) -> Result<(), AdaptiveError> {
+    /// Counts `rows` more rows, `bytes` more held; past the budget it refuses.
+    pub(crate) fn rows(&mut self, rows: u64, bytes: u64) -> Result<(), AdaptiveError> {
         self.rows = self
             .rows
-            .checked_add(1)
+            .checked_add(rows)
             .ok_or(AdaptiveError::CountOverflow {
                 what: "materialized rows",
             })?;
@@ -504,7 +523,7 @@ mod tests {
         ] {
             let mut point = MaterializePoint::new(1_000.0, error, u64::MAX).unwrap();
             for _ in 0..rows {
-                point.row(8).unwrap();
+                point.rows(1, 8).unwrap();
             }
             assert_eq!(point.verdict(), expect, "{rows} rows");
         }
@@ -516,10 +535,10 @@ mod tests {
     fn t_pl_13_3_materialization_is_bounded() {
         let mut point = MaterializePoint::new(10.0, 0.1, 100).unwrap();
         for _ in 0..12 {
-            point.row(8).unwrap();
+            point.rows(1, 8).unwrap();
         }
         assert_eq!(
-            point.row(8),
+            point.rows(1, 8),
             Err(AdaptiveError::MaterializeOverBudget {
                 needed: 104,
                 budget: 100
