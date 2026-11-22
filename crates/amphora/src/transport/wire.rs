@@ -18,8 +18,9 @@ pub(super) const CAP_BOUNDED_COMPACTION: u64 = 1;
 /// changes it (local-owner-transport.md, "Versions"). 3: ReplicaStatus gained voters_outgoing; 4: the owner's Identity gained durability.
 /// 5: Request gained Application, the client's claim before its ordinary request. 6: Request gained
 /// LocalSession, a local read. 7: Request gained Pull and Answer Pulled, a node's half of a copy
-/// or catch-up batch for another node's new group (CP-T1.9; reshard.md, "Moves across nodes").
-pub(super) const VERSION: u32 = 7;
+/// or catch-up batch for another node's new group (CP-T1.9; reshard.md, "Moves across nodes"). 8: Request gained
+/// Step and Answer Stepped, one step of a transaction across groups (CP-T1.10; xgroup.md, "Over the transport").
+pub(super) const VERSION: u32 = 8;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Hello {
@@ -58,6 +59,14 @@ pub(super) enum Request {
     // Appended: a node's pull from one of its groups, for a move's new group on another node
     // (CP-T1.9; reshard.md, "Moves across nodes"), answered by a node endpoint (`Node`).
     Pull(crate::groups::Pull),
+    // Appended: one step of a transaction across groups on this owner's group `here`, with the
+    // newest commit stamp the coordinator heard of (CP-T1.10, T-T1.12.X2; xgroup.md, "Over the
+    // transport"). Its sizes are held by the frame's bound, as every request's are.
+    Step {
+        here: crate::xgroup::GroupId,
+        carried: u64,
+        envelope: crate::xgroup::Envelope,
+    },
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Record {
@@ -133,5 +142,11 @@ pub(super) enum Answer {
     Compaction(amphora_api::CompactionProgress),
     // Appended: a Pull's answer.
     Pulled(crate::groups::Pulled),
+    // Appended: a Step's answer, with the group's newest commit stamp after it (none: the group
+    // makes no stamps).
+    Stepped {
+        reply: crate::xgroup::Reply,
+        latest: Option<u64>,
+    },
 }
 pub(super) type Response = Result<Answer, Refusal>;
