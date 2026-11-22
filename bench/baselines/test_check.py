@@ -21,8 +21,14 @@ def query(name, *prepare_search, target="amphora", bench="job"):
     return {"record": "query", "bench": bench, "query": name, "target": target, "runs": runs}
 
 
-def suite(target, items, *results):
-    return {"host": "h", "cpu": "c", "cores": 4, "commit": "abc", "load_before": 0.5, "load_after": 0.6,
+IN_PROCESS = {"host": "h", "os": "linux", "arch": "x86_64", "kernel": "6.1", "engine_runs": "in the driver's process", "container": None,
+              "data_dir": "/d", "fs": "ext4", "disk": "nvme", "file_attrs": ""}
+SERVER = dict(IN_PROCESS, engine_runs="a local server over 127.0.0.1", container="postgres:17")
+CLIENT = {"program": "amphora-bench", "mode": "--suite", "commit": "abc"}
+
+
+def suite(target, items, *results, platform=IN_PROCESS, client=CLIENT):
+    return {"host": "h", "cpu": "c", "cores": 4, "commit": "abc", "load_before": 0.5, "load_after": 0.6, "client": client, "platform": platform,
             "report": {"target": target, "items": items, "results": [{"op": op, "clients": 1, "kind": "Read", "errors": 0, "ms": {"p50": p50, "p99": p50 * 2}} for op, p50 in results]}}
 
 
@@ -84,6 +90,32 @@ class Leader(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("leader sqlite; Amphora's p50 over the leader's: 2.000", out)
         self.assertIn("commit abc", out)
+        self.assertIn("client amphora-bench --suite at abc", out)
+
+    def test_a_row_store_on_another_platform_is_not_the_leader(self):
+        """Do: Amphora 0.004 and SQLite 0.008 ms in the driver's process, PostgreSQL 0.001 ms as a
+        server in a container. Expect: SQLite the leader at 0.500, PostgreSQL named as set apart."""
+        recs = [suite("amphora", 100, ("point_pk", 0.004)), suite("sqlite", 100, ("point_pk", 0.008)),
+                suite("postgres", 100, ("point_pk", 0.001), platform=SERVER)]
+        code, out = run("leader", recs)
+        self.assertEqual(code, 0, out)
+        self.assertIn("leader sqlite; Amphora's p50 over the leader's: 0.500", out)
+        self.assertIn("not set beside Amphora (another run, client or platform): postgres", out)
+
+    def test_another_client_is_not_the_leader(self):
+        """Do: SQLite timed by another program. Expect: no leader."""
+        recs = [suite("amphora", 100, ("point_pk", 0.004)), suite("sqlite", 100, ("point_pk", 0.002), client=dict(CLIENT, program="other"))]
+        code, out = run("leader", recs)
+        self.assertEqual(code, 0, out)
+        self.assertIn("no other row store ran in Amphora's run on its client and platform: no leader", out)
+
+    def test_a_record_without_its_platform_is_set_beside_nothing(self):
+        """Do: records as written before they named their client and platform. Expect: no ratio."""
+        recs = [suite("amphora", 100, ("point_pk", 0.004), platform=None, client=None), suite("sqlite", 100, ("point_pk", 0.002), platform=None, client=None)]
+        code, out = run("leader", recs)
+        self.assertEqual(code, 0, out)
+        self.assertIn("Amphora's record names no client or platform: set beside nothing", out)
+        self.assertNotIn("leader sqlite", out)
 
 
 class Scan(unittest.TestCase):

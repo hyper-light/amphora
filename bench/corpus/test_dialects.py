@@ -23,13 +23,13 @@ class DefaultClauses(unittest.TestCase):
     def test_each_translates_everywhere(self):
         for sql, gone in [
             ("CREATE TABLE kab(k INTEGER PRIMARY KEY, v TEXT UNIQUE ON CONFLICT ABORT)", "ABORT"),
-            ("CREATE TABLE kac(a NOT NULL ON CONFLICT ABORT)", "ABORT"),
+            ("CREATE TABLE kac(a INTEGER NOT NULL ON CONFLICT ABORT)", "ABORT"),
             ("UPDATE OR ABORT kab SET v = 'a' WHERE k = 3", "ABORT"),
             ("INSERT OR ABORT INTO kab VALUES (1, 'a')", "ABORT"),
             ("CREATE TABLE cd3(r INTEGER REFERENCES pd(k) NOT DEFERRABLE)", "DEFERRABLE"),
             ("CREATE TABLE cd5(r INTEGER, FOREIGN KEY (r) REFERENCES pd(k) NOT DEFERRABLE INITIALLY DEFERRED)", "DEFERRED"),
-            ("CREATE TABLE fc5(a, b, FOREIGN KEY (a, b) REFERENCES fp(k, u) MATCH SIMPLE NOT DEFERRABLE INITIALLY IMMEDIATE)", "MATCH"),
-            ("CREATE TABLE fc6(a REFERENCES fp(k) ON DELETE CASCADE MATCH FULL)", "MATCH"),
+            ("CREATE TABLE fc5(a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES fp(k, u) MATCH SIMPLE NOT DEFERRABLE INITIALLY IMMEDIATE)", "MATCH"),
+            ("CREATE TABLE fc6(a INTEGER REFERENCES fp(k) ON DELETE CASCADE MATCH FULL)", "MATCH"),
             ("SELECT a, count(*) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING EXCLUDE NO OTHERS) FROM t1", "EXCLUDE"),
         ]:
             for d in ENGINES:
@@ -102,12 +102,14 @@ class SQLiteReading(unittest.TestCase):
         self.assertIsNone(why)
         self.assertEqual(out, "CREATE TABLE r1 (x INT, y INT NOT NULL, z TEXT DEFAULT 'a', a DECIMAL)")
 
-    def test_strict_table_is_typed_and_its_any_is_blob(self):
+    def test_strict_table_is_typed_and_its_any_by_its_values(self):
+        """An ANY column keeps values as written, as a column without a type does (UntypedColumns)."""
+        file = ["CREATE TABLE st(i INTEGER, a ANY) STRICT", "INSERT INTO st VALUES (1, 'a')"]
         for d in ENGINES:
-            out, why = dialects.translate("CREATE TABLE st(i INTEGER, a ANY) STRICT", d)
+            out, why = file_in(file, d)[0]
             self.assertIsNone(why)
             self.assertNotIn("STRICT", out.upper())
-        self.assertEqual(dialects.translate("CREATE TABLE st(i INTEGER, a ANY) STRICT", "postgres")[0], "CREATE TABLE st (i INT, a BYTEA)")
+        self.assertEqual(file_in(file, "postgres")[0][0], "CREATE TABLE st (i INT, a TEXT)")
 
     def test_conflict_resolutions_are_not_expressible_with_the_reason(self):
         for sql, clause in [("UPDATE OR IGNORE cf SET u = 'a' WHERE k = 2", "UPDATE OR IGNORE"), ("UPDATE OR REPLACE cf SET u = 'zz'", "UPDATE OR REPLACE"), ("CREATE TABLE cf2(a TEXT UNIQUE ON CONFLICT REPLACE)", "ON CONFLICT REPLACE")]:
@@ -176,22 +178,22 @@ class ParseGaps(unittest.TestCase):
             self.assertEqual(out.upper().count("CHECK"), 2, (d, out))
 
     def test_a_primary_keys_order_is_left_out_and_autoincrement_moves_to_its_column(self):
-        out, why = dialects.translate("CREATE TABLE pk(x INTEGER, y, PRIMARY KEY (x DESC))", "postgres")
+        out, why = dialects.translate("CREATE TABLE pk(x INTEGER, y TEXT, PRIMARY KEY (x DESC))", "postgres")
         self.assertIsNone(why)
         self.assertNotIn("DESC", out)
-        out, why = dialects.translate("CREATE TABLE tc6(a INTEGER, b, PRIMARY KEY (a AUTOINCREMENT))", "mysql")
+        out, why = dialects.translate("CREATE TABLE tc6(a INTEGER, b TEXT, PRIMARY KEY (a AUTOINCREMENT))", "mysql")
         self.assertIsNone(why)
         self.assertIn("PRIMARY KEY AUTO_INCREMENT", out)
-        out, why = dialects.translate("CREATE TABLE tc6(a INTEGER, b, PRIMARY KEY (a AUTOINCREMENT))", "duckdb")
+        out, why = dialects.translate("CREATE TABLE tc6(a INTEGER, b TEXT, PRIMARY KEY (a AUTOINCREMENT))", "duckdb")
         self.assertIsNone(out)
         self.assertIn("not expressible in duckdb: AUTOINCREMENT", why)
 
     def test_a_primary_key_collation_other_than_the_columns_is_not_expressible(self):
         for d in ENGINES:
-            out, why = dialects.translate("CREATE TABLE ixt(k TEXT, v, PRIMARY KEY (k COLLATE NOCASE DESC))", d)
+            out, why = dialects.translate("CREATE TABLE ixt(k TEXT, v TEXT, PRIMARY KEY (k COLLATE NOCASE DESC))", d)
             self.assertIsNone(out)
             self.assertIn(f"not expressible in {d}: a PRIMARY KEY column's own collation", why)
-            self.assertIsNone(dialects.translate("CREATE TABLE ixb(k TEXT, v, PRIMARY KEY (k COLLATE BINARY))", d)[1], d)
+            self.assertIsNone(dialects.translate("CREATE TABLE ixb(k TEXT, v TEXT, PRIMARY KEY (k COLLATE BINARY))", d)[1], d)
 
     def test_several_upsert_clauses_are_not_expressible(self):
         sql = "INSERT INTO kv(k, v, u) VALUES ('b', 7, 'ub') ON CONFLICT (k) DO UPDATE SET v = -1 ON CONFLICT (u) DO NOTHING"
@@ -276,6 +278,112 @@ class Refusals(unittest.TestCase):
         if sys.version_info >= (3, 11):
             self.assertEqual(kept[0]["code"], 2067)  # SQLITE_CONSTRAINT_UNIQUE (rescode.html)
             self.assertEqual(kept[1]["code"], 1)
+
+
+class FileRecord(Record):
+    def __init__(self, line, sql, kind="statement", expect="ok"):
+        super().__init__(sql, kind, expect)
+        self.line = line
+
+
+def file_in(sqls, dialect):
+    """Each of `sqls` (a file's records: SQL, or (SQL, "error") for one SQLite refuses) in `dialect`,
+    each with its file's context, as dialects.main() writes them."""
+    records = []
+    for i, q in enumerate(sqls):
+        sql, expect = q if isinstance(q, tuple) else (q, "ok")
+        records.append(FileRecord(i, sql, "statement", expect))
+    return [dialects.record_in(r, dialect, c) for r, c in zip(records, dialects.contexts(records))]
+
+
+class UntypedColumns(unittest.TestCase):
+    """Do: tables with columns without a type (no affinity: SQLite keeps each value as written),
+    the file writing values of one storage class, of several, and none. Expect: the column declared
+    the one class's type in every dialect; not expressible, with the reason, otherwise; never BLOB."""
+
+    def test_one_class_gives_its_type(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in(["CREATE TABLE t(a, b TEXT, c)", "INSERT INTO t VALUES (1, 'x', 'p'), (-2, 'y', NULL)", "INSERT INTO t(a, c) VALUES (3, 'q')", "UPDATE t SET c = 'r' || c WHERE a = 1"], d)
+                sql, why = out[0]
+                self.assertIsNone(why)
+                self.assertNotIn("BLOB", sql.upper())
+                self.assertNotIn("BYTEA", sql.upper())
+                self.assertRegex(sql.upper(), r"\bA (BIGINT|INT64|NULLABLE\(INT64\))")
+                self.assertRegex(sql.upper(), r"\bC (TEXT|VARCHAR\(255\)|STRING|NULLABLE\(STRING\))")
+
+    def test_reals_strict_any_and_defaults(self):
+        out = file_in(["CREATE TABLE t(a ANY, b DEFAULT 2.5) STRICT", "INSERT INTO t(a) VALUES (1.5)"], "postgres")
+        self.assertEqual(out[0], ("CREATE TABLE t (a DOUBLE PRECISION, b DOUBLE PRECISION DEFAULT 2.5)", None))
+
+    def test_mixed_classes_not_expressible(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                sql, why = file_in(["CREATE TABLE t(a)", "INSERT INTO t VALUES (1)", "INSERT INTO t VALUES ('one')"], d)[0]
+                self.assertIsNone(sql)
+                self.assertIn(f"not expressible in {d}", why)
+                self.assertIn("several storage classes (INTEGER, TEXT)", why)
+        sql, why = file_in(["CREATE TABLE t(a)", "INSERT INTO t VALUES (1), (2.5)"], "duckdb")[0]
+        self.assertIn("(INTEGER, REAL)", why)
+
+    def test_no_value_or_unknown_value_not_expressible(self):
+        self.assertIn("no value but NULL", file_in(["CREATE TABLE t(a)", "INSERT INTO t VALUES (NULL)"], "duckdb")[0][1])
+        self.assertIn("only running it shows", file_in(["CREATE TABLE t(a)", "INSERT INTO t VALUES (random_thing())"], "duckdb")[0][1])
+        self.assertIn("weren't read", dialects.translate("CREATE TABLE t(a)", "duckdb")[1])
+
+    def test_refused_writes_and_dropped_tables_dont_count(self):
+        """Do: a write SQLite refuses, and a table dropped and made again. Expect: only what SQLite
+        kept counts, each table by its own writes."""
+        out = file_in(["CREATE TABLE t(a)", "INSERT INTO t VALUES (1)", ("INSERT INTO t VALUES ('no')", "error"), "DROP TABLE t", "CREATE TABLE t(a)", "INSERT INTO t VALUES ('text')"], "duckdb")
+        self.assertIn("BIGINT", out[0][0])
+        self.assertIn("TEXT", out[4][0])
+
+    def test_insert_select_takes_the_source_columns_class(self):
+        out = file_in(["CREATE TABLE s(x INTEGER)", "CREATE TABLE t(a)", "INSERT INTO t SELECT x * 2 FROM s"], "duckdb")
+        self.assertIn("BIGINT", out[1][0])
+
+
+class IntegerDivision(unittest.TestCase):
+    """Do: `/` of two INTEGER operands (integer columns, typed by declaration or by their values,
+    integer literals, count()), and of a REAL one. Expect: DuckDB's `//`, PostgreSQL's DIV with
+    NULLIF on the divisor, MySQL's DIV for the first; `/` kept for the second and on ClickHouse."""
+
+    FILE = ["CREATE TABLE t(a INTEGER, b, r REAL)", "INSERT INTO t VALUES (7, 2, 1.5)"]
+
+    def last(self, sql, d):
+        return file_in(self.FILE + [sql], d)[-1]
+
+    def test_integers_divide_as_integers(self):
+        sql = "SELECT a / b, 7 / 2, count(*) / 2, (a + 1) / -2 FROM t"
+        self.assertEqual(self.last(sql, "duckdb"), ("SELECT a // b, 7 // 2, COUNT(*) // 2, (a + 1) // -2 FROM t", None))
+        self.assertEqual(self.last(sql, "postgres"), ("SELECT DIV(a, NULLIF(b, 0)), DIV(7, NULLIF(2, 0)), DIV(COUNT(*), NULLIF(2, 0)), DIV((a + 1), NULLIF(-2, 0)) FROM t", None))
+        self.assertEqual(self.last(sql, "mysql"), ("SELECT a DIV b, 7 DIV 2, COUNT(*) DIV 2, (a + 1) DIV -2 FROM t", None))
+        self.assertNotIn("intDiv", self.last(sql, "clickhouse")[0])
+
+    def test_reals_and_unknowns_keep_their_division(self):
+        for sql in ["SELECT a / r FROM t", "SELECT 7.0 / 2 FROM t", "SELECT a / (SELECT 2) FROM t"]:
+            with self.subTest(sql=sql):
+                out, why = self.last(sql, "duckdb")
+                self.assertIsNone(why)
+                self.assertNotIn("//", out)
+
+    def test_qualified_and_correlated_columns(self):
+        sql = "SELECT x.a / y.b FROM t AS x JOIN t AS y ON 1 WHERE EXISTS (SELECT 1 FROM t AS z WHERE z.r = x.a / 2)"
+        out, why = self.last(sql, "duckdb")
+        self.assertIsNone(why)
+        self.assertEqual(out.count("//"), 2)
+
+
+class ClickHouseAutoincrement(unittest.TestCase):
+    """Do: an AUTOINCREMENT key for ClickHouse, on its column and as the table's key. Expect: not
+    expressible, with the reason (ClickHouse has no AUTO_INCREMENT)."""
+
+    def test_not_expressible(self):
+        for sql in ["CREATE TABLE t(x INTEGER PRIMARY KEY AUTOINCREMENT, y TEXT)", "CREATE TABLE t(x INTEGER, y TEXT, PRIMARY KEY(x AUTOINCREMENT))"]:
+            with self.subTest(sql=sql):
+                out, why = dialects.translate(sql, "clickhouse")
+                self.assertIsNone(out)
+                self.assertIn("not expressible in clickhouse: AUTOINCREMENT", why)
 
 
 if __name__ == "__main__":

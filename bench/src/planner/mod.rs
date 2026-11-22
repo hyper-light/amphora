@@ -359,10 +359,18 @@ pub fn main() -> anyhow::Result<()> {
     for t in &mut targets {
         engines.push(t.about()?);
     }
+    let h = host(&o.dir);
     write(serde_json::json!({
         "record": "run",
         "date": utc_now(),
-        "host": host(&o.dir),
+        // Who drove the engines and where they ran (Ada's fair comparisons, 2026-11-21; goal
+        // 63c98840): this one program for every engine, each in its process, no container.
+        "client": { "program": "amphora-bench --planner", "commit": commit, "timing": "amphora-bench's own, one code path for every engine" },
+        "platform": {
+            "host": h["host"], "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "kernel": h["kernel"], "cpu": h["cpu"],
+            "engine_runs": "in the driver's process", "container": null, "data_dir": o.dir.display().to_string(), "fs": h["fs"], "disk": h["disk"],
+        },
+        "host": h,
         "cores": std::thread::available_parallelism().map(usize::from).unwrap_or(0),
         "commit": commit,
         "dirty_files": git(&["status", "--porcelain"]).lines().count(),

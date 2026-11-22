@@ -30,6 +30,7 @@ use amphora_engine::storage::versioned::columns::{
     Block, Columns, Feed, Packed, Plain, Rows, ScanCounts,
 };
 use amphora_engine::storage::versioned::disk::Files;
+use amphora_engine::storage::versioned::memory::Capped;
 use amphora_engine::storage::versioned::durable::Database;
 use amphora_engine::storage::versioned::version::Snapshot;
 
@@ -171,7 +172,8 @@ fn run<B: Block + 'static>(o: &Opts, name: &str, clients: usize, keep: bool) -> 
     let copy = if keep {
         let feed = Arc::new(Feed::new(
             0,
-            amphora_engine::storage::versioned::memory::capped(o.queue_bytes as u64),
+            // The queue's bytes capped at --queue-bytes, as before the feed took a memory source (CS.5).
+            Arc::new(Capped::new(o.queue_bytes as u64)),
             Box::new(move || epoch.elapsed().as_nanos() as u64),
         ));
         db.keep_columns(feed.clone()).map_err(e)?;

@@ -160,3 +160,15 @@ fn t_g2_7_4_a_record_that_cant_finish_is_stopped_and_classified() {
         (3, 0, 1)
     );
 }
+
+/// Do: render NaN, which no SQLite value is but a competitor's REAL can be, as R and as T. Expect:
+/// "NaN" for both, a text no SQLite answer holds, rather than the run failing.
+#[test]
+fn nan_renders_as_its_own_text() -> Result<(), String> {
+    use amphora_corpus::answer::Render;
+    let mut r = amphora_corpus::amphora::AmphoraRender::new()?;
+    assert_eq!(r.real3(f64::NAN)?, "NaN");
+    assert_eq!(r.real_text(f64::NAN)?, "NaN");
+    assert_eq!(r.real3(1.5)?, "1.500");
+    Ok(())
+}

@@ -13,8 +13,10 @@
 //! and 3 when the engine can't run on this machine (its program missing, its server not reached).
 //! A `statement error` record the engine refuses too is compared with SQLite's error by kind
 //! (crate::refusal, from `<pool>/refusals/`): both counts are written, "any error matches" (the
-//! control, sqllogictest's own rule) and "the same kind"; `--refusals kind` makes a refusal of
-//! another kind a disagreement, `any` (the default) keeps it an agreement.
+//! control, sqllogictest's own rule) and "the same kind"; `--refusals kind` (the default) makes a
+//! refusal of another kind a disagreement, since "any error matches" hides an engine refusing good
+//! SQL for the wrong reason; `any` (the control) keeps it an agreement. Every record the run writes
+//! (its summary and each `--times` line) names its client and platform (engines::client, engines::platform).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,7 @@ use amphora_corpus::amphora::AmphoraRender;
 use amphora_corpus::dialect::{Translated, Translation};
 use amphora_corpus::refusal::{self, Compared, Refusals};
 use amphora_corpus::run::{Counts, Limits, Outcome, run_file};
+use amphora_corpus::slt::Kind;
 
 struct Args {
     pool: PathBuf,
@@ -49,8 +52,7 @@ fn args() -> Result<Args, String> {
         }
     }
     let pool = PathBuf::from(it.next().transpose()?.ok_or("run takes a pool directory")?);
-    let (mut budget, mut times, mut engine, mut by_kind) =
-        (None, None, "amphora".to_owned(), false);
+    let (mut budget, mut times, mut engine, mut by_kind) = (None, None, "amphora".to_owned(), true);
     while let Some(a) = it.next().transpose()? {
         let v = it
             .next()
@@ -159,6 +161,10 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
     let a = args()?;
     let began = Instant::now();
     let deadline = a.budget.and_then(|b| began.checked_add(b));
+    let (client, platform) = (
+        amphora_corpus::engines::client(&a.engine),
+        amphora_corpus::engines::platform(),
+    );
     let mut times = match &a.times {
         Some(p) => Some(std::io::BufWriter::new(
             std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?,
@@ -225,6 +231,11 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
         let counts = run_file(engine.as_mut(), &mut render, &text, fix.as_deref(), translated, limits, &mut |ran| {
             let outcome = match &ran.outcome {
                 Outcome::Agree => match ran.refused.as_deref() {
+                    // A statement SQLite refuses, refused after one the engine couldn't run.
+                    None if ran.record.kind == Kind::Statement { ok: false } => {
+                        unknown = unknown.saturating_add(1);
+                        "agree".to_owned()
+                    }
                     None => "agree".to_owned(),
                     Some(e) => match refusal::compare(refusals.get(ran.record.line), refusal::of(name, e)) {
                         Compared::Same => {
@@ -266,7 +277,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
                 }
             };
             if let Some(t) = times.as_mut() {
-                let line = serde_json::json!({ "file": rel, "line": ran.record.line, "outcome": outcome, "ns": ran.nanos });
+                let line = serde_json::json!({ "file": rel, "line": ran.record.line, "outcome": outcome, "ns": ran.nanos, "client": client, "platform": platform });
                 if let Err(e) = writeln!(t, "{line}") {
                     write_error = Some(e.to_string());
                 }
@@ -277,7 +288,7 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
             // The file whole, its fresh database and fixture included: what it costs a run's budget;
             // and its failed settles, which fail a run as a disagreement does.
             let ns = u64::try_from(file_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let line = serde_json::json!({ "file": rel, "file_ns": ns, "required": required, "unsettled": counts.unsettled, "past_budget": counts.past_budget });
+            let line = serde_json::json!({ "file": rel, "file_ns": ns, "required": required, "unsettled": counts.unsettled, "past_budget": counts.past_budget, "client": client, "platform": platform });
             writeln!(t, "{line}").map_err(|e| e.to_string())?;
         }
         files = files.saturating_add(1);
@@ -318,11 +329,13 @@ fn go(out: &mut dyn Write) -> Result<bool, String> {
     .map_err(|e| e.to_string())?;
     writeln!(
         out,
-        "{}: {} refusals of what SQLite refuses (any error matches: the control), {same} of SQLite's kind of error, {differs} of another kind{}, {unknown} not compared (SQLite's kind not kept, or none named)",
+        "{}: {} refusals of what SQLite refuses (any error matches: the control), {same} of SQLite's kind of error, {differs} of another kind{}, {unknown} not compared (SQLite's kind not kept or none named, or after a statement the engine couldn't run)",
         a.engine,
         same.saturating_add(differs).saturating_add(unknown),
         if a.by_kind { " (disagreements: --refusals kind)" } else { "" }
     )
     .map_err(|e| e.to_string())?;
+    writeln!(out, "{}: client {client}, platform {platform}", a.engine)
+        .map_err(|e| e.to_string())?;
     Ok(total.disagree == 0 && total.unsettled == 0 && required_past == 0)
 }

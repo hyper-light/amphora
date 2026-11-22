@@ -103,7 +103,8 @@ pub struct Ran<'a> {
     pub record: &'a Record,
     pub outcome: Outcome,
     /// The engine's error for a statement SQLite refuses too (an agreement by "any error
-    /// matches"), which crate::refusal compares with SQLite's by kind.
+    /// matches"), which crate::refusal compares with SQLite's by kind; None for one after a
+    /// statement with no translation or that the engine refused, which may be why.
     pub refused: Option<String>,
     /// Time spent running and comparing it, in nanoseconds.
     pub nanos: u64,
@@ -333,7 +334,9 @@ pub fn run_file(
         each(Ran {
             record: &record,
             outcome,
-            refused,
+            // A refusal after a statement with no translation, or one the engine refused, may be
+            // that statement's: not compared by kind.
+            refused: refused.filter(|_| untranslated.is_none()),
             nanos,
         });
     }
