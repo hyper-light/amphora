@@ -721,6 +721,8 @@ pub struct Database<
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
+    /// Amphora (G5 step 4): the skipping summaries its connections share (executor.md decision 11).
+    pub(crate) skipping: crate::skipping::SkipRegistry,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
@@ -905,6 +907,7 @@ impl Database {
 
         let db = Database {
             mv_store,
+            skipping: crate::skipping::SkipRegistry::default(),
             allocators,
             path,
             wal_path,
@@ -2577,8 +2580,9 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
-        let made = opts.versioned && self.versioned.lock().is_none();
-        self.versioned_storage(opts.versioned, opts.memory.clone())?;
+        let ask = opts.versioned || crate::storage::versioned::switch::asked();
+        let made = ask && self.versioned.lock().is_none();
+        self.versioned_storage(ask, opts.memory.clone())?;
         let conn = self._connect(
             false,
             None,
@@ -2600,14 +2604,21 @@ impl Database {
         self: &Arc<Database>,
         context: Arc<C>,
     ) -> Result<Arc<Connection>> {
-        self._connect(
+        let ask = crate::storage::versioned::switch::asked();
+        let made = ask && self.versioned.lock().is_none();
+        self.versioned_storage(ask, None)?;
+        let conn = self._connect(
             false,
             None,
             None,
             None,
             Some(context),
             StatsRefresh::Blocking,
-        )
+        )?;
+        if made {
+            conn.load_versioned_schema()?;
+        }
+        Ok(conn)
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2640,6 +2651,9 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
+                let ask = opts.versioned || crate::storage::versioned::switch::asked();
+                let made = ask && self.versioned.lock().is_none();
+                self.versioned_storage(ask, opts.memory.clone())?;
                 let conn = self._connect(
                     false,
                     None,
@@ -2648,6 +2662,9 @@ impl Database {
                     None,
                     StatsRefresh::Deferred,
                 )?;
+                if made {
+                    conn.load_versioned_schema()?;
+                }
                 state.conn = Some(conn.clone());
                 conn
             }
@@ -2745,7 +2762,15 @@ impl Database {
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let versioned = self
-            .versioned_storage(crate::storage::versioned::switch::asked(), None)?
+            // The switch in the environment opens a storage the database already has (one to
+            // recover) as soon as the database opens; a fresh one is made by the first
+            // connection asked for through `connect`, which carries its memory source
+            // (`ConnectOpts::with_memory`; G7 step 2, `AC-NS.2.1`). Once made, every
+            // connection is on it.
+            .versioned_storage(
+                crate::storage::versioned::switch::asked() && self.versioned_found(),
+                None,
+            )?
             .map(crate::storage::versioned::switch::Switch::new);
         let conn = Arc::new(Connection {
             versioned,
@@ -2853,6 +2878,15 @@ impl Database {
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
         Ok(conn)
+    }
+
+    /// Whether the database already has a versioned storage to recover: one its in-memory IO
+    /// keeps beside the file, or the directory `<path>-versioned` of a file database.
+    fn versioned_found(&self) -> bool {
+        if self.io.is_memory() || is_memory_like(&self.path) {
+            return self.io.versioned_kept(&self.path);
+        }
+        std::path::Path::new(&format!("{}-versioned", self.path)).is_dir()
     }
 
     /// The versioned storage the connections' B-trees are on: made now if `ask` and not yet made.

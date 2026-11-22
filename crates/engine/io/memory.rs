@@ -94,6 +94,10 @@ impl IO for MemoryIO {
         true
     }
 
+    fn versioned_kept(&self, path: &str) -> bool {
+        self.versioned.lock().contains_key(path)
+    }
+
     fn versioned_beside(
         &self,
         path: &str,

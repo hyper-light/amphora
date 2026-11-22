@@ -1,0 +1,314 @@
+//! Amphora (G5 step 4, T-G5.4.3; executor.md decision 11): a SQL filter's table scan skipping the
+//! rows its summary rules out.
+//!
+//! Two halves. At translation, [`bound_terms`] reads a SELECT's WHERE terms that bound a column by
+//! an integer constant or a parameter (`a BETWEEN 10 AND 20`, `a >= ?`, `5 < a`, `a = :v`), and
+//! the scan's cursor is given a [`SkipHint`] with them; this costs a scan nothing when no summary
+//! is kept. At run time the Rewind reads the parameters' bound values ([`SkipHint::bounds`]: a
+//! prepared statement skips by whatever it is bound to on each run) and asks the database's summary for the hinted column (if one is kept and the reader
+//! sees exactly what it holds), and a [`SkipWalk`] then moves the cursor past each run of rows the
+//! candidates leave out with one seek, instead of reading them. The filter is still evaluated on
+//! every row read, as in a plain scan: the candidates only leave out rows it can't match.
+//!
+//! Only rows whose value is an integer are left out: a NULL, real, text or blob value makes its
+//! row a candidate (the summaries' rule, `skipping/mod.rs`), so SQLite's affinity and mixed-type
+//! comparisons never reach the summaries. A term that isn't a plain integer comparison (a real or
+//! text constant, a parameter bound to anything but an integer, a COLLATE, an IN list, NOT BETWEEN)
+//! gives no bound: loose, never wrong.
+
+use super::{Candidates, RowidRange};
+use amphora_engine_parser::ast::{Expr, Literal, Operator, TableInternalId, UnaryOperator};
+use std::num::NonZeroUsize;
+
+/// One column's integer bounds, resolved when the scan starts: a row its filter can match has
+/// `lo <= value <= hi` (or a value that isn't an integer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnBounds {
+    pub column: usize,
+    pub lo: i64,
+    pub hi: i64,
+}
+
+/// What a term compares its column with: an integer constant, or a statement parameter whose
+/// bound value is read when the scan starts (lane skip-usable, T-SKU.1: prepared statements skip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundValue {
+    Integer(i64),
+    Parameter(NonZeroUsize),
+}
+
+/// How a term bounds its column: `column op value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundOp {
+    Equals,
+    Greater,
+    GreaterEquals,
+    Less,
+    LessEquals,
+}
+
+/// One AND-ed WHERE term's bound on a column, as translation reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundTerm {
+    pub column: usize,
+    pub op: BoundOp,
+    pub value: BoundValue,
+}
+
+/// What a scan's cursor may skip by, set at translation: its filter's bounding terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipHint {
+    pub cursor_id: usize,
+    pub terms: Vec<BoundTerm>,
+}
+
+impl SkipHint {
+    /// `column`'s bounds from the hint's terms, intersected, each parameter's value read by
+    /// `parameter` (`None`: the value isn't an integer, so its term gives no bound: loose, never
+    /// wrong); `None` when no term bounds the column.
+    pub fn bounds(
+        &self,
+        column: usize,
+        parameter: impl Fn(NonZeroUsize) -> Option<i64>,
+    ) -> Option<ColumnBounds> {
+        let mut out: Option<ColumnBounds> = None;
+        for term in self.terms.iter().filter(|t| t.column == column) {
+            let value = match term.value {
+                BoundValue::Integer(value) => Some(value),
+                BoundValue::Parameter(index) => parameter(index),
+            };
+            let Some(b) = value.and_then(|value| bound(column, term.op, value)) else {
+                continue;
+            };
+            out = Some(match out {
+                Some(o) => ColumnBounds {
+                    column,
+                    lo: o.lo.max(b.lo),
+                    hi: o.hi.min(b.hi),
+                },
+                None => b,
+            });
+        }
+        out
+    }
+}
+
+/// An integer constant: a numeric literal that is an `i64`, with an optional sign.
+fn integer_of(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Numeric(text)) => text.parse::<i64>().ok(),
+        Expr::Unary(UnaryOperator::Negative, inner) => match inner.as_ref() {
+            Expr::Literal(Literal::Numeric(text)) => format!("-{text}").parse::<i64>().ok(),
+            _ => None,
+        },
+        Expr::Unary(UnaryOperator::Positive, inner) => integer_of(inner),
+        _ => None,
+    }
+}
+
+/// What a term's other side compares with: an integer constant or a parameter.
+fn value_of(expr: &Expr) -> Option<BoundValue> {
+    match expr {
+        Expr::Variable(variable) => usize::try_from(variable.index.get())
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .map(BoundValue::Parameter),
+        _ => integer_of(expr).map(BoundValue::Integer),
+    }
+}
+
+/// The column of `table` an expression names, when it is a plain column (not the rowid).
+fn column_of(expr: &Expr, table: TableInternalId) -> Option<usize> {
+    match expr {
+        Expr::Column {
+            table: t,
+            column,
+            is_rowid_alias: false,
+            ..
+        } if *t == table => Some(*column),
+        _ => None,
+    }
+}
+
+/// `column op value` as bounds; `None` when it gives none (the bound passes `i64`).
+fn bound(column: usize, op: BoundOp, value: i64) -> Option<ColumnBounds> {
+    let (lo, hi) = match op {
+        BoundOp::Equals => (value, value),
+        BoundOp::Greater => (value.checked_add(1)?, i64::MAX),
+        BoundOp::GreaterEquals => (value, i64::MAX),
+        BoundOp::Less => (i64::MIN, value.checked_sub(1)?),
+        BoundOp::LessEquals => (i64::MIN, value),
+    };
+    Some(ColumnBounds { column, lo, hi })
+}
+
+/// The bounding operator `op` is, if any.
+fn op_of(op: Operator) -> Option<BoundOp> {
+    match op {
+        Operator::Equals => Some(BoundOp::Equals),
+        Operator::Greater => Some(BoundOp::Greater),
+        Operator::GreaterEquals => Some(BoundOp::GreaterEquals),
+        Operator::Less => Some(BoundOp::Less),
+        Operator::LessEquals => Some(BoundOp::LessEquals),
+        _ => None,
+    }
+}
+
+/// `value op column` read as `column op' value`.
+fn flipped(op: BoundOp) -> BoundOp {
+    match op {
+        BoundOp::Greater => BoundOp::Less,
+        BoundOp::GreaterEquals => BoundOp::LessEquals,
+        BoundOp::Less => BoundOp::Greater,
+        BoundOp::LessEquals => BoundOp::GreaterEquals,
+        BoundOp::Equals => BoundOp::Equals,
+    }
+}
+
+fn push_terms(expr: &Expr, table: TableInternalId, out: &mut Vec<BoundTerm>) {
+    match expr {
+        Expr::Binary(lhs, op, rhs) => {
+            let Some(op) = op_of(*op) else {
+                return;
+            };
+            let term = match (column_of(lhs, table), value_of(rhs)) {
+                (Some(column), Some(value)) => Some(BoundTerm { column, op, value }),
+                _ => column_of(rhs, table)
+                    .zip(value_of(lhs))
+                    .map(|(column, value)| BoundTerm {
+                        column,
+                        op: flipped(op),
+                        value,
+                    }),
+            };
+            out.extend(term);
+        }
+        Expr::Between {
+            lhs,
+            not: false,
+            start,
+            end,
+        } => {
+            let Some(column) = column_of(lhs, table) else {
+                return;
+            };
+            for (op, side) in [(BoundOp::GreaterEquals, start), (BoundOp::LessEquals, end)] {
+                out.extend(value_of(side).map(|value| BoundTerm { column, op, value }));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The bounding terms AND-ed `terms` put on `table`'s rows, a parameter's value left to be read
+/// when the scan starts. The caller passes only terms every result row must satisfy.
+pub fn bound_terms<'a>(
+    terms: impl IntoIterator<Item = &'a Expr>,
+    table: TableInternalId,
+) -> Vec<BoundTerm> {
+    let mut out = Vec::new();
+    for term in terms {
+        push_terms(term, table, &mut out);
+    }
+    out
+}
+
+/// Where a walk sends its cursor from the row it is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkTarget {
+    /// The row is a candidate: read it.
+    Here,
+    /// No candidate is left: the scan ends.
+    Past,
+    /// Seek to this rowid (the next candidate run's first row).
+    Seek(i64),
+}
+
+/// Where a walk is in moving its cursor, kept across an I/O wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkPhase {
+    /// On a candidate row, or not yet moved.
+    Idle,
+    /// The cursor moved: check its row.
+    Settle,
+    /// Seeking to a rowid.
+    Seeking(i64),
+    /// The seek landed before its leaf's end: step to the next row.
+    Advancing,
+}
+
+/// One scan cursor's walk over its candidates' rowid runs (ascending, disjoint).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipWalk {
+    pub cursor_id: usize,
+    ranges: Vec<RowidRange>,
+    at: usize,
+    pub phase: WalkPhase,
+}
+
+impl SkipWalk {
+    /// A walk over `candidates`; `None` for every row (nothing to skip).
+    pub fn new(cursor_id: usize, candidates: Candidates) -> Option<Self> {
+        let ranges = match candidates {
+            Candidates::All => return None,
+            Candidates::Ranges(ranges) => ranges,
+            Candidates::Rowids(rowids) => {
+                let mut ranges: Vec<RowidRange> = Vec::with_capacity(rowids.len());
+                for rowid in rowids {
+                    match ranges.last_mut() {
+                        Some(last) if last.last.checked_add(1) == Some(rowid) => last.last = rowid,
+                        _ => ranges.push(RowidRange {
+                            first: rowid,
+                            last: rowid,
+                        }),
+                    }
+                }
+                ranges
+            }
+        };
+        Some(Self {
+            cursor_id,
+            ranges,
+            at: 0,
+            phase: WalkPhase::Settle,
+        })
+    }
+
+    /// Where to go from the row at `rowid`; rowids only ascend, so runs passed are dropped.
+    pub fn target(&mut self, rowid: i64) -> WalkTarget {
+        while self.ranges.get(self.at).is_some_and(|r| r.last < rowid) {
+            self.at += 1;
+        }
+        match self.ranges.get(self.at) {
+            None => WalkTarget::Past,
+            Some(r) if rowid < r.first => WalkTarget::Seek(r.first),
+            Some(_) => WalkTarget::Here,
+        }
+    }
+}
+
+/// A program run's walks, one a scan cursor that skips; empty unless a summary is consulted.
+#[derive(Debug, Default)]
+pub struct SkipWalks {
+    walks: Vec<SkipWalk>,
+}
+
+impl SkipWalks {
+    pub fn is_empty(&self) -> bool {
+        self.walks.is_empty()
+    }
+
+    /// Takes cursor `cursor_id`'s walk out (give it back with [`SkipWalks::put`]).
+    pub fn take(&mut self, cursor_id: usize) -> Option<SkipWalk> {
+        let at = self.walks.iter().position(|w| w.cursor_id == cursor_id)?;
+        Some(self.walks.swap_remove(at))
+    }
+
+    pub fn put(&mut self, walk: SkipWalk) {
+        self.walks.push(walk);
+    }
+
+    pub fn clear(&mut self) {
+        self.walks.clear();
+    }
+}

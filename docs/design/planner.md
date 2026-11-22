@@ -1481,6 +1481,48 @@ read by a key.
 **Falsified by.** An answer of a plan the hook splits that differs from its left-deep plan's; a CERT
 finding where an outer join's ON terms read only an earlier table.
 
+## Decision (lane pl8-9): the search makes bushy plans where they cost less
+
+**Decision.** PL.8, the search's half of bushy plans (lanes pl8-7 to pl8-9). After the left-deep
+search, `compute_best_join_order_with_context` (`optimizer/join.rs`) pairs each connected subset it
+planned (the run) with a table joined to it (the probe) and the connected rest of the tables (the
+loops): DPccp's connected complement pairs (Moerkotte and Neumann, VLDB 2006), in the one shape the
+emitter runs (decision pl8-5). The loops are the rest's best plan; the run is its plan ending at the
+table the probe joins; the probe is an inner hash join built once from the run's rows, materialized,
+and read once for each row of the loops. Its cost is the loops' plus the run's plus the hash join's
+(`estimate_hash_join_cost`, the probe table's scan at its own pages, PL.7) plus a row's visit for
+each row of the run materialized, the terms a left-deep plan's materialized build input pays. The
+bushy plan replaces the left-deep one only when it costs less. The pairs are walked on loops over
+the subsets found, not recursion (CLAUDE.md section 11), and each pair counts against what the
+subsets left of `JOIN_SEARCH_BUDGET` (decision 19): past it the left-deep plan stands. No bushy plan
+is tried for a join with an outer, semi or anti join, a RIGHT or FULL JOIN, or a table that must
+follow another (`bushy_plans_allowed`), and a bushy plan keeps no order, so it removes no sort.
+
+**Why.** A left-deep order joins one table at a time, so two selective joins whose small results
+meet only through each other force it to join one side's small result to the other side's whole
+table first and carry that large result to the last filter. A bushy plan joins each side on its own
+and meets their small results. The data where this holds is the test's below: two fact tables, each
+cut down by a filtered dimension, joined on a key of two values.
+
+**Evidence.** `optimizer::bushy_search_tests::tests::t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest`
+(T-PL.8.2): three queries over that data (rows, and two aggregates, with one or several rows of the
+second dimension). Each is planned bushy by the search alone (the planner counts each plan with a
+build group it hands the emitter, `BUSHY_PLANS`), and each answers as the plan of nested loops does.
+The learned hash probe weight rises about tenfold once the test's first statements have run (a debug
+build's hash join timed against a row's visit), so the data makes the left-deep orders' intermediate
+result large enough that the bushy plan wins at either weight. The hand-built test of decision pl8-5
+(`bushy_test_hook`) stays: it covers shapes the search's data does not (a range join before the run,
+a WHERE term between the run and the loop before it, a probe term reading the loop before the run).
+
+**Not yet built.** `JOIN_SEARCH_BUDGET` is still decision 19's 10,000 subsets from Neumann and Radke;
+deriving it from a plan-time target (the measured time a candidate takes against the planning time a
+query may take) needs that target defined first. Semi and anti joins placed before other loops. The
+probe is read whole; a probe that keeps its own access method would let the run's result join a loop
+read by a key.
+
+**Falsified by.** A bushy plan's answer that differs from the nested loops'; a JOB query whose plan
+turns bushy and runs slower than on its parent (AC-PL.8.1).
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
