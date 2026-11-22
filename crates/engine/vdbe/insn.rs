@@ -2401,12 +2401,14 @@ pub enum Insn {
     /// Amphora (lane skip-5, T-SKU.6): `PRAGMA skipping`'s setting, acted on when the statement
     /// runs: keeps a skipping summary of `column` of `table` built from the rows there now
     /// (`kind` `None`: drops it), as `skipping::set_skipping` does; lane skip-9 (T-SKU.11): a
-    /// measured summary's dropped method built again by `build`.
+    /// measured summary's dropped method built again by `build`; lane skip-11 (T-SKU.14): an IN
+    /// list asked for as `lists` says.
     SetSkipping {
         table: String,
         column: String,
         kind: Option<crate::skipping::SkipKind>,
         build: crate::skipping::BuildMode,
+        lists: crate::skipping::ListProbe,
     },
 }
 

@@ -1988,22 +1988,25 @@ fn skip_walk_for(
     let column = registry.column_of(root)?;
     // Lane skip-usable (T-SKU.1): a parameter's bound value is read as the scan starts.
     let parameters = &state.parameters;
-    let bounds = hint.bounds(column, |index| match parameters.get(index.get() - 1) {
+    let parameter = |index: std::num::NonZeroUsize| match parameters.get(index.get() - 1) {
         Some(Value::Numeric(Numeric::Integer(value))) => Some(*value),
         _ => None,
-    })?;
+    };
+    let bounds = hint.bounds(column, parameter)?;
+    // Lane skip-11 (T-SKU.14): an IN list asked value by value, behind the summary's switch
+    // (the span, skip-10's, is the control).
+    let values = match registry.list_probe(root) {
+        Some(crate::skipping::ListProbe::PerValue) => hint.spans(column, parameter),
+        _ => None,
+    };
+    let span = [(bounds.lo, bounds.hi)];
+    let spans: &[(i64, i64)] = values.as_deref().unwrap_or(&span);
     let (reader_pos, committed) = conn.skipping_positions()?;
-    // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
+    // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end (lane
+    // skip-11: every probe of an IN list's values included).
     let mut started = std::time::Instant::now();
     let (candidates, method) = registry
-        .candidates_by(
-            root,
-            conn.skipping_id(),
-            reader_pos,
-            committed,
-            bounds.lo,
-            bounds.hi,
-        )
+        .candidates_spans(root, conn.skipping_id(), reader_pos, committed, spans)
         .ok()?;
     // Lane skip-8 (T-SKU.10): a method dropped for its upkeep whose trial is due is built again
     // off this scan's path, one build per summary at a time; this scan goes on with the leader.
@@ -17338,11 +17341,15 @@ pub fn op_set_skipping(
             column,
             kind,
             build,
+            lists,
         },
         insn
     );
     crate::skipping::set_skipping_with(&program.connection, table, column, *kind, *build)
         .map_err(|e| LimboError::InvalidArgument(e.to_string()))?;
+    // Lane skip-11 (T-SKU.14): the summary just set asks for IN lists as `lists` says (none is
+    // kept when `kind` dropped it).
+    let _kept = crate::skipping::set_list_probe(&program.connection, table, *lists);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

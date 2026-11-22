@@ -18,6 +18,11 @@
 //! value (lane skip-10, T-SKU.13): a row it matches equals one of them, so lies between the two;
 //! one value that isn't an integer (as bound on this run) leaves the whole list unbounded, as a
 //! row could match that value.
+//!
+//! Lane skip-11 (T-SKU.14): under [`ListProbe::PerValue`](super::ListProbe) the scan asks the
+//! summary once per value of the column's shortest IN list instead ([`SkipHint::spans`]), each
+//! value kept only when the column's other terms (and other lists' spans) allow it, and unions
+//! what each probe names: a list whose values are far apart reads only the rows near them.
 
 use super::{Candidates, RowidRange, SkipMethod};
 use amphora_engine_parser::ast::{Expr, Literal, Operator, TableInternalId, UnaryOperator};
@@ -140,6 +145,37 @@ impl SkipHint {
             lo: a.lo.max(b.lo),
             hi: a.hi.min(b.hi),
         })
+    }
+
+    /// Lane skip-11 (T-SKU.14): the spans to ask the summary for, one per value of `column`'s
+    /// shortest IN list whose values are all integers as bound on this run (`parameter` reads a
+    /// parameter as [`SkipHint::bounds`] does), each `(v, v)`, ascending and distinct, keeping
+    /// only the values within `column`'s [`SkipHint::bounds`]. `None` when no such list bounds
+    /// the column, or none of its values lies within the bounds (a contradiction, so its bounds
+    /// alone say more): ask for the bounds' one span instead.
+    pub fn spans(
+        &self,
+        column: usize,
+        parameter: impl Fn(NonZeroUsize) -> Option<i64>,
+    ) -> Option<Vec<(i64, i64)>> {
+        let read = |value: &BoundValue| match value {
+            BoundValue::Integer(value) => Some(*value),
+            BoundValue::Parameter(index) => parameter(*index),
+        };
+        let shortest = self
+            .lists
+            .iter()
+            .filter(|list| list.column == column)
+            .filter_map(|list| list.values.iter().map(&read).collect::<Option<Vec<i64>>>())
+            .min_by_key(Vec::len)?;
+        let bounds = self.bounds(column, &parameter)?;
+        let mut values: Vec<i64> = shortest
+            .into_iter()
+            .filter(|value| (bounds.lo..=bounds.hi).contains(value))
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        (!values.is_empty()).then(|| values.into_iter().map(|value| (value, value)).collect())
     }
 }
 

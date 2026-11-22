@@ -2719,6 +2719,7 @@ pub fn insn_to_row(
             column,
             kind,
             build,
+            lists,
         } => (
             "SetSkipping",
             0,
@@ -2726,7 +2727,7 @@ pub fn insn_to_row(
             0,
             Value::build_text(format!("{table}.{column}")),
             0,
-            format!("skipping({table}.{column}) = {kind:?}, build {build:?}"),
+            format!("skipping({table}.{column}) = {kind:?}, build {build:?}, lists {lists:?}"),
         ),
         Insn::TreePages {
             cursor_id,

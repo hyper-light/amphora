@@ -21,6 +21,14 @@
 //! (`a BETWEEN ?1 AND ?2`) and `in` (`a IN (?1, ?2)`, the same two values: a skipping scan reads
 //! the rows between them, the list's hull, where the filter matches two values' rows).
 //!
+//! Lane skip-11 (T-SKU.14): two more forms force each way of asking for an IN list into its
+//! failure mode: `gap` (`a IN (?1, ?2)` bound to two values half the table apart, narrow, or
+//! three quarters, wide: the span reads the whole gap) and `cluster` (`a IN (?1, ..., ?64)`, 64
+//! values a width's 64th apart: neighbours, narrow, where asking value by value pays 64 probes
+//! for the rows one span names). A setting ending `:values` asks value by value (`PRAGMA skipping
+//! = 't.a zone_maps values'`); without it, the span (the control). Each line reports the
+//! summary's probes.
+//!
 //! Lane skip-9 (T-SKU.11): `capped` runs under each build mode for a dropped kind, as
 //! `capped:inline` (skip-7's, on the scan's path: the control), `capped:void` (skip-8's, voided by
 //! a write during it) and `capped:replay` (the writes during it applied before it installs, up to
@@ -44,7 +52,9 @@
 //!
 //! usage: amphora-bench --skipping [--rows N] [--filters F] [--writes 0,1,8,32,128,512,2048,4096]
 //!        [--engines off,zone_maps,cracking,measured,capped:inline,capped:void,capped:replay,duckdb]
-//!        [--forms between,in] [--duckdb-threads N] [--seed S] [--out FILE]
+//!        [--forms between,in,gap,cluster] [--duckdb-threads N] [--seed S] [--out FILE]
+//!
+//! Each kind also runs as `<kind>:values` (`capped:replay:values` for capped).
 //!
 //! `--duckdb-threads` defaults to 1, the threads one Amphora statement runs on.
 
@@ -58,14 +68,38 @@ fn e(err: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{err}")
 }
 
+/// Lane skip-11 (T-SKU.14): the `cluster` form's list length: the scenario's definition (a long
+/// list), not an engine setting.
+const CLUSTER: i64 = 64;
+
 /// The filters every engine runs, by form, each prepared once and bound before each run.
-const FILTERS: [(&str, &str); 2] = [
-    (
-        "between",
-        "SELECT count(*), sum(b) FROM t WHERE a BETWEEN ?1 AND ?2",
-    ),
-    ("in", "SELECT count(*), sum(b) FROM t WHERE a IN (?1, ?2)"),
-];
+fn filter_forms() -> Vec<(&'static str, String)> {
+    let cluster = (1..=CLUSTER)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![
+        (
+            "between",
+            "SELECT count(*), sum(b) FROM t WHERE a BETWEEN ?1 AND ?2".to_string(),
+        ),
+        (
+            "in",
+            "SELECT count(*), sum(b) FROM t WHERE a IN (?1, ?2)".to_string(),
+        ),
+        (
+            "gap",
+            "SELECT count(*), sum(b) FROM t WHERE a IN (?1, ?2)".to_string(),
+        ),
+        (
+            "cluster",
+            format!("SELECT count(*), sum(b) FROM t WHERE a IN ({cluster})"),
+        ),
+    ]
+}
+
+/// One filter's writes before it (each `(a, id)`) and the values it is bound to.
+type Step = (Vec<(i64, i64)>, Vec<i64>);
 /// The write between filters, prepared once.
 const WRITE: &str = "UPDATE t SET a = ?1 WHERE id = ?2";
 
@@ -113,8 +147,8 @@ impl Shape {
 }
 
 struct Scenario {
-    /// The filter's form and its SQL (`FILTERS`).
-    filter: (&'static str, &'static str),
+    /// The filter's form and its SQL (`filter_forms`).
+    filter: (&'static str, String),
     shape: Shape,
     wide: bool,
     writes: usize,
@@ -136,6 +170,21 @@ impl Scenario {
             rows / 4
         } else {
             (rows / 1000).max(1)
+        }
+    }
+
+    /// The values a filter starting at `lo` is bound to, by its form.
+    fn values(&self, lo: i64, rows: i64) -> Vec<i64> {
+        let width = self.width(rows);
+        match self.filter.0 {
+            "gap" => vec![lo, lo.saturating_add(rows / 2).saturating_add(width)],
+            "cluster" => {
+                let step = (width / CLUSTER).max(1);
+                (0..CLUSTER)
+                    .map(|i| lo.saturating_add(i.saturating_mul(step)))
+                    .collect()
+            }
+            _ => vec![lo, lo.saturating_add(width)],
         }
     }
 }
@@ -226,15 +275,9 @@ fn fill_sql(shape: Shape, rows: i64, s: &mut Stream) -> Vec<String> {
 const SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, pad TEXT)";
 
 /// The scenario's stream of (writes, bounds) for each filter.
-fn plan(
-    sc: &Scenario,
-    rows: i64,
-    filters: usize,
-    seed: u64,
-) -> (Vec<String>, Vec<(Vec<(i64, i64)>, (i64, i64))>) {
+fn plan(sc: &Scenario, rows: i64, filters: usize, seed: u64) -> (Vec<String>, Vec<Step>) {
     let mut s = Stream(seed);
     let fill = fill_sql(sc.shape, rows, &mut s);
-    let width = sc.width(rows);
     let steps = (0..filters)
         .map(|_| {
             let writes = (0..sc.writes)
@@ -244,7 +287,7 @@ fn plan(
                 })
                 .collect();
             let lo = s.below(rows);
-            (writes, (lo, lo.saturating_add(width)))
+            (writes, sc.values(lo, rows))
         })
         .collect();
     (fill, steps)
@@ -254,7 +297,7 @@ fn run_amphora(
     filter: &str,
     setting: &str,
     fill: &[String],
-    steps: &[(Vec<(i64, i64)>, (i64, i64))],
+    steps: &[Step],
 ) -> anyhow::Result<Tally> {
     let db = Amphora::open()?;
     db.conn.execute(SCHEMA).map_err(e)?;
@@ -277,7 +320,7 @@ fn run_amphora(
         ..Tally::default()
     };
     let began = Instant::now();
-    for (writes, (lo, hi)) in steps {
+    for (writes, values) in steps {
         for (a, id) in writes {
             let clock = Instant::now();
             db.run(&mut write, &[*a, *id])?;
@@ -285,7 +328,7 @@ fn run_amphora(
                 .push(u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
         let clock = Instant::now();
-        let (answer, read) = db.run(&mut filter, &[*lo, *hi])?;
+        let (answer, read) = db.run(&mut filter, values)?;
         t.filters
             .push(u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX));
         t.rows_read = t.rows_read.map(|r| r.saturating_add(read));
@@ -315,7 +358,7 @@ fn run_duck(
     filter: &str,
     threads: usize,
     fill: &[String],
-    steps: &[(Vec<(i64, i64)>, (i64, i64))],
+    steps: &[Step],
 ) -> anyhow::Result<Tally> {
     let conn = duckdb::Connection::open_in_memory()?;
     conn.execute_batch(&format!("SET threads = {threads}"))?;
@@ -329,7 +372,7 @@ fn run_duck(
     let mut write = conn.prepare(WRITE)?;
     let mut t = Tally::default();
     let began = Instant::now();
-    for (writes, (lo, hi)) in steps {
+    for (writes, values) in steps {
         for (a, id) in writes {
             let clock = Instant::now();
             write.execute(duckdb::params![*a, *id])?;
@@ -338,7 +381,7 @@ fn run_duck(
         }
         let clock = Instant::now();
         let mut answer = Vec::new();
-        let mut found = filter.query(duckdb::params![*lo, *hi])?;
+        let mut found = filter.query(duckdb::params_from_iter(values.iter()))?;
         while let Some(r) = found.next()? {
             for i in 0..r.as_ref().column_count() {
                 answer.push(duck_int(r.get_ref(i)?)?);
@@ -381,6 +424,11 @@ pub fn main() -> anyhow::Result<()> {
         "capped:inline",
         "capped:void",
         "capped:replay",
+        // Lane skip-11 (T-SKU.14): an IN list asked value by value.
+        "zone_maps:values",
+        "cracking:values",
+        "measured:values",
+        "capped:replay:values",
         "duckdb",
     ];
     let mut engines: Vec<String> = known
@@ -388,7 +436,8 @@ pub fn main() -> anyhow::Result<()> {
         .filter(|engine| **engine != "capped")
         .map(|s| s.to_string())
         .collect();
-    let mut forms: Vec<(&str, &str)> = FILTERS.to_vec();
+    let all_forms = filter_forms();
+    let mut forms: Vec<(&'static str, String)> = all_forms.clone();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut v = || {
@@ -405,11 +454,13 @@ pub fn main() -> anyhow::Result<()> {
                 forms = v()?
                     .split(',')
                     .map(|form| {
-                        FILTERS
+                        all_forms
                             .iter()
                             .find(|(name, _)| *name == form)
-                            .copied()
-                            .ok_or_else(|| anyhow::anyhow!("unknown form {form}: between or in"))
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("unknown form {form}: between, in, gap or cluster")
+                            })
                     })
                     .collect::<anyhow::Result<_>>()?
             }
@@ -436,12 +487,12 @@ pub fn main() -> anyhow::Result<()> {
     let scenarios = forms.iter().flat_map(|form| {
         [Shape::Ordered, Shape::Scattered]
             .into_iter()
-            .flat_map(move |shape| [false, true].map(move |wide| (*form, shape, wide)))
+            .flat_map(move |shape| [false, true].map(move |wide| (form.clone(), shape, wide)))
     });
     for (filter, shape, wide) in scenarios {
         for &w in &writes {
             let sc = Scenario {
-                filter,
+                filter: filter.clone(),
                 shape,
                 wide,
                 writes: w,
@@ -450,8 +501,8 @@ pub fn main() -> anyhow::Result<()> {
             let mut first: Option<Vec<Vec<Option<i64>>>> = None;
             for engine in &engines {
                 let mut t = match engine.as_str() {
-                    "duckdb" => run_duck(sc.filter.1, threads, &fill, &steps)?,
-                    setting => run_amphora(sc.filter.1, setting, &fill, &steps)?,
+                    "duckdb" => run_duck(&sc.filter.1, threads, &fill, &steps)?,
+                    setting => run_amphora(&sc.filter.1, setting, &fill, &steps)?,
                 };
                 let equal = match &first {
                     Some(answers) => *answers == t.answers,
@@ -495,6 +546,7 @@ pub fn main() -> anyhow::Result<()> {
                         "replay_overflows": c.replay_overflows,
                         "replay_peak": c.replay_peak,
                         "inline_rows_read": c.inline_rows_read,
+                        "probes": c.probes,
                     })),
                     "equal": equal,
                     "client": client,

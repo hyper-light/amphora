@@ -1246,6 +1246,275 @@ mod scans {
         every_bound_shape_reads_its_parameters(SkipKind::Measured);
     }
 
+    /// Lane skip-11 (T-SKU.14). Do: a hint with a `>= 20` term and two IN lists on one column
+    /// (three values, and a constant and two parameters), read under several bindings. Expect:
+    /// the shortest list whose values are all integers on this run is asked value by value, only
+    /// the values within the column's bounds (the term and every list's span) kept, ascending and
+    /// distinct; a list holding a value that isn't an integer is passed over; no list, or no value
+    /// within the bounds, asks for the bounds' one span instead (`None`).
+    #[test]
+    fn t_sku_14_spans_ask_each_value_within_the_bounds() {
+        use super::super::{BoundOp, BoundTerm, BoundValue, ListTerm, SkipHint};
+        let p = |index: usize| BoundValue::Parameter(std::num::NonZeroUsize::new(index).unwrap());
+        let int = BoundValue::Integer;
+        let hint = |lists: Vec<Vec<BoundValue>>| SkipHint {
+            cursor_id: 0,
+            terms: vec![BoundTerm {
+                column: 1,
+                op: BoundOp::GreaterEquals,
+                value: int(20),
+            }],
+            lists: lists
+                .into_iter()
+                .map(|values| ListTerm { column: 1, values })
+                .collect(),
+        };
+        let bound_to = |values: [Option<i64>; 2]| {
+            move |index: std::num::NonZeroUsize| values.get(index.get() - 1).copied().flatten()
+        };
+        let one = hint(vec![vec![int(50), p(1), p(2)]]);
+        // 10 is below the term's 20; the parameters' 90 repeats.
+        assert_eq!(
+            one.spans(1, bound_to([Some(10), Some(90)])),
+            Some(vec![(50, 50), (90, 90)])
+        );
+        assert_eq!(
+            one.spans(1, bound_to([Some(90), Some(90)])),
+            Some(vec![(50, 50), (90, 90)])
+        );
+        assert_eq!(one.spans(1, bound_to([Some(70), None])), None);
+        assert_eq!(one.spans(0, bound_to([Some(70), Some(80)])), None);
+        // Every value below the term: the bounds alone (a contradiction) say more.
+        let below = hint(vec![vec![int(1), int(2)]]);
+        assert_eq!(below.spans(1, |_| None), None);
+        // Two lists: the shorter is asked for, bounded by the longer's span (40 to 300).
+        let two = hint(vec![vec![int(40), int(300), int(100)], vec![p(1), p(2)]]);
+        assert_eq!(
+            two.spans(1, bound_to([Some(500), Some(60)])),
+            Some(vec![(60, 60)])
+        );
+        // The shorter holds a value that isn't an integer: the longer is asked for.
+        assert_eq!(
+            two.spans(1, bound_to([Some(500), None])),
+            Some(vec![(40, 40), (100, 100), (300, 300)])
+        );
+        // No list: no spans.
+        assert_eq!(hint(Vec::new()).spans(1, |_| Some(1)), None);
+    }
+
+    /// Lane skip-11 (T-SKU.14, kiln goal 623adc1c): each way of asking for an IN list, forced
+    /// into its failure mode. Do: three databases with the same rows and the same writes between
+    /// rounds (deletes, and inserts whose values lie past every filter's), one asking for an IN
+    /// list's span (the control), one asking value by value (`PRAGMA skipping = 't.a <kind>
+    /// values'`), one keeping no summary; two prepared statements, each re-bound every round:
+    /// `a IN (?1, ?2)` bound to two values far apart (the span's failure mode: it reads the
+    /// whole gap), and `a IN (?1, ..., ?64)` bound to 64 neighbouring values (asking by value's:
+    /// 64 probes for the rows one span names). Expect: every answer as without a summary; on the
+    /// gap, asking by value read under a tenth of the rows the span read; on the clustered list,
+    /// a single kind (zone maps or cracking) read the same rows both ways; the span probed once a
+    /// run, by value twice a gap run and 64 times a clustered run.
+    fn in_lists_by_span_and_by_value(kind: &str) {
+        use super::super::{ListProbe, SkipCounts};
+        use crate::Value;
+        const CLUSTER: i64 = 64;
+        let rows = 4000i64;
+        let (_span_db, span) = open();
+        let (_values_db, values) = open();
+        let (_off_db, off) = open();
+        fill([&span, &values], rows);
+        {
+            // `fill` takes two: `off` is filled alike here.
+            off.execute("CREATE TABLE t (a INTEGER, b INTEGER, pad TEXT)")
+                .unwrap();
+            off.execute("BEGIN").unwrap();
+            for i in 0..rows {
+                off.execute(format!(
+                    "INSERT INTO t VALUES ({i}, {}, '{}')",
+                    i % 7,
+                    "x".repeat(40)
+                ))
+                .unwrap();
+            }
+            off.execute("COMMIT").unwrap();
+        }
+        span.execute(format!("PRAGMA skipping = 't.a {kind} span'"))
+            .unwrap();
+        values
+            .execute(format!("PRAGMA skipping = 't.a {kind} values'"))
+            .unwrap();
+        let root = root_of(&values);
+        assert_eq!(
+            values.db.skipping.list_probe(root),
+            Some(ListProbe::PerValue),
+            "'{kind} values'"
+        );
+        assert_eq!(
+            span.db.skipping.list_probe(root_of(&span)),
+            Some(ListProbe::Span),
+            "'{kind} span'"
+        );
+        let cluster_sql = format!(
+            "SELECT rowid, a, b FROM t WHERE a IN ({}) ORDER BY rowid",
+            (1..=CLUSTER)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let sqls = [
+            "SELECT rowid, a, b FROM t WHERE a IN (?1, ?2) ORDER BY rowid".to_string(),
+            cluster_sql,
+        ];
+        let mut stmts: Vec<_> = sqls
+            .iter()
+            .map(|sql| {
+                [
+                    span.prepare(sql).unwrap(),
+                    values.prepare(sql).unwrap(),
+                    off.prepare(sql).unwrap(),
+                ]
+            })
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(14);
+        // Rows read (span, by value), per statement; runs per statement.
+        let mut read = [[0u64; 2]; 2];
+        let mut runs = [0u64; 2];
+        let mut appended = rows;
+        for round in 0..30u64 {
+            for _ in 0..rng.random_range(0..6) {
+                let sql = if rng.random_bool(0.5) {
+                    format!("DELETE FROM t WHERE rowid = {}", rng.random_range(1..rows))
+                } else {
+                    // Past every value a filter asks for: the zones stay as tight as they were.
+                    appended += 1;
+                    format!("INSERT INTO t VALUES ({appended}, 1, 'new')")
+                };
+                for conn in [&span, &values, &off] {
+                    conn.execute(&sql).unwrap();
+                }
+            }
+            for bind in 0..2u64 {
+                let at = usize::try_from((round + bind) % 2).unwrap();
+                let bound: Vec<Value> = if at == 0 {
+                    let lo = rng.random_range(0..rows / 10);
+                    let hi = rows - 1 - rng.random_range(0..rows / 10);
+                    vec![Value::from_i64(lo), Value::from_i64(hi)]
+                } else {
+                    let base = rng.random_range(0..rows - CLUSTER);
+                    (0..CLUSTER).map(|i| Value::from_i64(base + i)).collect()
+                };
+                let [stmt_span, stmt_values, stmt_off] = &mut stmts[at];
+                let (answer_span, r_span) = run_bound(stmt_span, &bound);
+                let (answer_values, r_values) = run_bound(stmt_values, &bound);
+                let (answer_off, _) = run_bound(stmt_off, &bound);
+                assert_eq!(
+                    answer_span, answer_off,
+                    "'{kind} span' round {round}: {}",
+                    sqls[at]
+                );
+                assert_eq!(
+                    answer_values, answer_off,
+                    "'{kind} values' round {round}: {}",
+                    sqls[at]
+                );
+                if at == 1 && kind != "measured" && kind != "capped" {
+                    assert_eq!(
+                        r_values, r_span,
+                        "'{kind}' round {round}: the clustered list's values read other rows than its span"
+                    );
+                }
+                read[at][0] += r_span;
+                read[at][1] += r_values;
+                runs[at] += 1;
+            }
+        }
+        let [gap, _] = read;
+        assert!(
+            gap[1].saturating_mul(10) < gap[0],
+            "'{kind}': on the gap, by value read {} rows, the span {}",
+            gap[1],
+            gap[0]
+        );
+        let counts = |conn: &Arc<Connection>| -> SkipCounts { skipping_counts(conn, "t").unwrap() };
+        let (by_span, by_value) = (counts(&span), counts(&values));
+        let all = runs[0] + runs[1];
+        assert_eq!(by_span.consulted, all, "'{kind} span': {by_span:?}");
+        assert_eq!(by_span.probes, all, "'{kind} span': {by_span:?}");
+        assert_eq!(by_value.consulted, all, "'{kind} values': {by_value:?}");
+        assert_eq!(
+            by_value.probes,
+            2 * runs[0] + u64::try_from(CLUSTER).unwrap() * runs[1],
+            "'{kind} values': {by_value:?}"
+        );
+    }
+
+    #[test]
+    fn t_sku_14_zone_maps_in_lists_by_span_and_by_value() {
+        in_lists_by_span_and_by_value("zone_maps");
+    }
+
+    #[test]
+    fn t_sku_14_cracking_in_lists_by_span_and_by_value() {
+        in_lists_by_span_and_by_value("cracking");
+    }
+
+    #[test]
+    fn t_sku_14_measured_in_lists_by_span_and_by_value() {
+        in_lists_by_span_and_by_value("measured");
+    }
+
+    #[test]
+    fn t_sku_14_capped_in_lists_by_span_and_by_value() {
+        in_lists_by_span_and_by_value("capped");
+    }
+
+    /// Lane skip-11 (T-SKU.14): `PRAGMA skipping` takes how an IN list is asked for after the
+    /// kind (and a measured kind's build mode), the span by default, and refuses it with `off`.
+    #[test]
+    fn t_sku_14_pragma_sets_how_in_lists_are_asked_for() {
+        use super::super::{BuildMode, ListProbe};
+        let (db, on) = open();
+        let (_other_db, other) = open();
+        fill([&on, &other], 10);
+        let root = root_of(&on);
+        for (setting, probe, build) in [
+            ("t.a", ListProbe::Span, BuildMode::Replay),
+            (
+                "t.a zone_maps values",
+                ListProbe::PerValue,
+                BuildMode::Replay,
+            ),
+            ("t.a cracking SPAN", ListProbe::Span, BuildMode::Replay),
+            (
+                "t.a capped inline values",
+                ListProbe::PerValue,
+                BuildMode::Inline,
+            ),
+            (
+                "t.a measured values",
+                ListProbe::PerValue,
+                BuildMode::Replay,
+            ),
+            ("t.a capped void", ListProbe::Span, BuildMode::VoidOnWrite),
+        ] {
+            on.execute(format!("PRAGMA skipping = '{setting}'"))
+                .unwrap();
+            assert_eq!(db.skipping.list_probe(root), Some(probe), "'{setting}'");
+            assert_eq!(db.skipping.build_mode(root), Some(build), "'{setting}'");
+        }
+        for bad in [
+            "t.a off values",
+            "t.a values capped",
+            "t.a capped values inline",
+            "t.a zone_maps values again",
+            "t.a capped each",
+        ] {
+            assert!(
+                on.execute(format!("PRAGMA skipping = '{bad}'")).is_err(),
+                "'{bad}' was taken"
+            );
+        }
+    }
+
     /// Lane skip-5 (T-SKU.4): a skipping scan runs its body over column batches (QT.7's fused
     /// loops) up to each candidate run's end. Four databases, batches on and off by skipping on and
     /// off, take the same random writes and answer every filtered aggregate and row query alike;

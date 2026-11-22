@@ -1106,4 +1106,8 @@ database with the scan's key (T-SKU.12). The bench runs each mode up a write-rat
 Lane skip-10: an IN list bounds a skipping scan by its smallest and largest value, read from its
 parameters on each run (T-SKU.13); each bound shape (BETWEEN ? AND ?, >= ?, <= ?, IN (?, ?), = ?)
 is tested prepared once and re-bound.
+Lane skip-11: an IN list can be asked for value by value, the candidates unioned, behind a
+per-summary switch with the span as the control (T-SKU.14); the chooser counts either as one
+filter with one cost. Tests and bench forms force each one's failure mode (a huge gap, a long
+clustered list).
 Open: the benchmark against DuckDB and ClickHouse; which build mode leads at which write rate.

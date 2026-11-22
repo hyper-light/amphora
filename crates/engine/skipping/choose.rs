@@ -501,6 +501,18 @@ impl Chooser {
     /// The rows a filter `lo <= value <= hi` may need, and the method that named them: hand its
     /// cost back with [`Chooser::record`].
     pub fn candidates(&mut self, lo: i64, hi: i64) -> Result<(Candidates, SkipMethod), SkipError> {
+        self.candidates_spans(&[(lo, hi)])
+    }
+
+    /// Lane skip-11 (T-SKU.14): [`Chooser::candidates`] for a filter whose rows lie in any of
+    /// `spans` (each `(lo, hi)`, inclusive: an IN list asked value by value). It is one filter
+    /// however many spans it has: one method answers every span, one trial or choice is counted,
+    /// and the one cost handed back ([`Chooser::record`]) covers every probe and every row the
+    /// scan read, so a span and a list of values are measured alike.
+    pub fn candidates_spans(
+        &mut self,
+        spans: &[(i64, i64)],
+    ) -> Result<(Candidates, SkipMethod), SkipError> {
         self.close_stretch();
         let (method, trial) = match self.next_method() {
             // A dropped method waits for its build (`rebuild_due`): the leader answers.
@@ -523,10 +535,10 @@ impl Chooser {
         }
         let candidates = match (method, self.zones.as_mut(), self.cracker.as_mut()) {
             (SkipMethod::ZoneMaps, Some(zones), _) => {
-                Candidates::Ranges(zones.candidate_ranges(lo, hi))
+                Candidates::Ranges(zones.candidate_ranges_each(spans))
             }
             (SkipMethod::Cracking, _, Some(cracker)) => {
-                Candidates::Rowids(cracker.candidate_rowids(lo, hi)?)
+                Candidates::Rowids(cracker.candidate_rowids_each(spans)?)
             }
             // Neither kept can't happen (only the method not leading is dropped): every row.
             _ => Candidates::All,

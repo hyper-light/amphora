@@ -31,6 +31,14 @@
 //! the rows the summary holds at the pin: past that, replaying costs more than reading the table
 //! again and the record outweighs the copy it feeds, so the build drops its record and falls back
 //! to void ([`SkipCounts::replay_overflows`]).
+//!
+//! Lane skip-11 (T-SKU.14): how a scan asks a summary for an IN list's rows, behind one switch
+//! ([`ListProbe`]), per summary. [`ListProbe::Span`] is skip-10's: one probe over the list's span,
+//! smallest value to largest (the control); a list whose values are far apart reads every row
+//! between them. [`ListProbe::PerValue`] asks once per value and unions what each names; a long
+//! list of clustered values pays a probe per value for rows one span would name. Either way the
+//! scan is one filter to a measured summary's chooser: one method chosen, one cost handed back,
+//! covering every probe it made and every row it read ([`SkipRegistry::candidates_spans`]).
 
 use super::{Candidates, CrackerColumn, RowWrite, SkipError, SkipMethod, Skipping};
 use crate::sync::Mutex;
@@ -81,6 +89,20 @@ pub struct SkipCounts {
     /// Lane skip-9: rows inline builds read on a scan's own path (the inline control's cost to
     /// the scan that finds the trial due).
     pub inline_rows_read: u64,
+    /// Lane skip-11 (T-SKU.14): probes of the summary scans made (one per span asked for: one per
+    /// filter under [`ListProbe::Span`], one per IN value under [`ListProbe::PerValue`]).
+    pub probes: u64,
+}
+
+/// Lane skip-11 (T-SKU.14): how a scan asks the summary for an IN list's rows (see the module's
+/// comment).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ListProbe {
+    /// One probe over the list's span, smallest value to largest (lane skip-10's; the control).
+    #[default]
+    Span,
+    /// One probe per value, the candidates each names unioned.
+    PerValue,
 }
 
 /// Lane skip-9 (T-SKU.11): how a summary's dropped method is built again (see the module's
@@ -147,6 +169,8 @@ struct Entry {
     building: Option<Building>,
     /// Lane skip-9 (T-SKU.11): how the summary's dropped method is built again.
     build_mode: BuildMode,
+    /// Lane skip-11 (T-SKU.14): how a scan asks it for an IN list's rows.
+    list_probe: ListProbe,
 }
 
 /// Lane skip-8 (T-SKU.10): the claim to build a summary's dropped `method` again, held by one
@@ -219,8 +243,33 @@ impl SkipRegistry {
                 counts: SkipCounts::default(),
                 building: None,
                 build_mode: build,
+                list_probe: ListProbe::default(),
             });
         }
+    }
+
+    /// Lane skip-11 (T-SKU.14): how scans of the table at `root_page` ask its summary for an IN
+    /// list's rows; `false` when no summary is kept.
+    pub fn set_list_probe(&self, root_page: i64, probe: ListProbe) -> bool {
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.root_page == root_page);
+        let kept = entry.is_some();
+        if let Some(entry) = entry {
+            entry.list_probe = probe;
+        }
+        kept
+    }
+
+    /// Lane skip-11 (T-SKU.14): how scans of the table at `root_page` ask its summary for an IN
+    /// list's rows, if a summary is kept.
+    pub fn list_probe(&self, root_page: i64) -> Option<ListProbe> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|entry| entry.root_page == root_page)
+            .map(|entry| entry.list_probe)
     }
 
     /// Marks the table at `root_page`'s summary stale: a write reached it that it couldn't take.
@@ -324,6 +373,20 @@ impl SkipRegistry {
         lo: i64,
         hi: i64,
     ) -> Result<(Candidates, Option<SkipMethod>), SkipRefusal> {
+        self.candidates_spans(root_page, reader, reader_pos, committed, &[(lo, hi)])
+    }
+
+    /// Lane skip-11 (T-SKU.14): [`SkipRegistry::candidates_by`] for a filter whose rows lie in
+    /// any of `spans` (each `(lo, hi)`, inclusive): every span probed, the candidates unioned, and
+    /// the whole scan one filter to a measured summary's chooser (one method, one cost back).
+    pub fn candidates_spans(
+        &self,
+        root_page: i64,
+        reader: usize,
+        reader_pos: WalPos,
+        committed: WalPos,
+        spans: &[(i64, i64)],
+    ) -> Result<(Candidates, Option<SkipMethod>), SkipRefusal> {
         let mut entries = self.entries.lock();
         let entry = entries
             .iter_mut()
@@ -350,9 +413,11 @@ impl SkipRegistry {
             entry.counts.refused_older = entry.counts.refused_older.saturating_add(1);
             return Err(SkipRefusal::OlderSnapshot);
         }
-        match entry.skipping.candidates_by(lo, hi) {
+        match entry.skipping.candidates_spans(spans) {
             Ok(candidates) => {
                 entry.counts.consulted = entry.counts.consulted.saturating_add(1);
+                let probes = u64::try_from(spans.len()).unwrap_or(u64::MAX);
+                entry.counts.probes = entry.counts.probes.saturating_add(probes);
                 Ok(candidates)
             }
             Err(SkipError::Overflow)

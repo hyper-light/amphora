@@ -186,6 +186,27 @@ impl CrackerColumn {
         Ok((from, to))
     }
 
+    /// Lane skip-11 (T-SKU.14): the rowids a filter whose rows lie in any of `spans` (each
+    /// `(lo, hi)`, inclusive) may need, ascending: each span's piece (cracking at its bounds, one
+    /// query each), and every row whose value isn't an integer, once.
+    pub fn candidate_rowids_each(&mut self, spans: &[(i64, i64)]) -> Result<Vec<i64>, SkipError> {
+        if let [(lo, hi)] = spans {
+            return self.candidate_rowids(*lo, *hi);
+        }
+        count(&mut self.stats.queries, spans.len());
+        let mut rowids: Vec<i64> = self.others.iter().copied().collect();
+        for (lo, hi) in spans {
+            let (from, to) = self.cracked(*lo, *hi)?;
+            let piece = self.entries.get(from..to).ok_or(SkipError::Inconsistent)?;
+            count(&mut self.stats.entries_returned, piece.len());
+            rowids.extend(piece.iter().map(|(_, rowid)| *rowid));
+        }
+        rowids.sort_unstable();
+        // Overlapping spans name a row twice.
+        rowids.dedup();
+        Ok(rowids)
+    }
+
     /// The (value, rowid) entries a filter `lo <= value <= hi` matches among the integers, as the
     /// cracker holds them (T-G5.4.1 checks each against the table: none stale).
     pub fn matching_entries(&mut self, lo: i64, hi: i64) -> Result<Vec<(i64, i64)>, SkipError> {

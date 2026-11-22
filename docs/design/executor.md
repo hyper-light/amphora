@@ -723,6 +723,20 @@ no bound. The hull is loose for values far apart (it reads the rows between them
 summary once per value and joining the candidates is tighter, at one summary call per value and
 one measured cost per filter split across them; the hull keeps one call and one cost.
 
+Lane skip-11 (T-SKU.14): both, behind a per-summary switch (`ListProbe`, `PRAGMA skipping = 't.a
+<kind> [span|values]'`); the span is the control and the default until the bench decides. Under
+`values` the scan asks the summary once for each value of the column's shortest list whose values
+are all integers on this run, keeping only the values within the column's bounds (its terms and
+every list's span), and unions the candidates: a zone map checks each zone against every value
+in one pass, a cracker cracks at each value and returns each piece, the rows whose value isn't an
+integer once. No list, or no value within the bounds, asks for the bounds' one span. The chooser
+counts a filter alike under both: it is one filter however many values it asks for (one method
+answers every probe, one trial or choice is counted), and its one measured cost runs from before
+the first probe to the scan's end, so it covers every probe and every row read. `SkipCounts`
+counts the probes. Each failure mode has a test and a bench form: `gap` (two values half the
+table apart: the span reads the whole gap) and `cluster` (64 neighbouring values: 64 probes for the
+rows one span names).
+
 ### Choosing a kind by measured cost (lanes skip-3 and skip-4, T-SKU.2)
 
 `SkipKind::Measured` keeps both a zone map and a cracked copy of the column, each fed every write

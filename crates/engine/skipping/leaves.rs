@@ -289,6 +289,15 @@ pub fn skipping_candidates(
         .candidates(root, conn.skipping_id(), reader_pos, committed, lo, hi)
 }
 
+/// Lane skip-11 (T-SKU.14): how scans of `table` ask its summary for an IN list's rows (span or
+/// value by value); `false` when no summary is kept.
+pub fn set_list_probe(conn: &Arc<Connection>, table: &str, probe: super::ListProbe) -> bool {
+    conn.with_schema_mut(|schema| schema.get_btree_table(table))
+        .ok()
+        .flatten()
+        .is_some_and(|btree| conn.db.skipping.set_list_probe(btree.root_page, probe))
+}
+
 /// Amphora (G5 step 4): what `table`'s summary has done, if one is kept.
 pub fn skipping_counts(conn: &Arc<Connection>, table: &str) -> Option<SkipCounts> {
     let root = conn
