@@ -58,6 +58,7 @@ mod init;
 mod multi_index;
 mod open;
 mod seek;
+mod star;
 
 use body::emit_unmatched_row_conditions_and_loop;
 pub(crate) use body::LoopBodyEmitter;

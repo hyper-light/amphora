@@ -731,6 +731,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 target_pc: self.next,
                 key_reg: probe_key_start_reg,
                 num_keys,
+                star: false,
             });
         }
 
