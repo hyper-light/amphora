@@ -100,11 +100,11 @@ impl CrackerColumn {
             if from >= to {
                 continue;
             }
-            let middle = from + (to - from) / 2;
+            let middle = from.midpoint(to);
             let bound = *sorted.get(middle).ok_or(SkipError::Inconsistent)?;
             self.crack(bound)?;
             stretches.push((from, middle));
-            stretches.push((middle + 1, to));
+            stretches.push((middle.checked_add(1).ok_or(SkipError::Overflow)?, to));
         }
         Ok(())
     }
