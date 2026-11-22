@@ -468,6 +468,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   for the log's next restart, one generation at most (T-T1.12.I4); cuts across machines: each
   cross-group step carries a hybrid logical clock, so a decision is stamped after the writes it
   decides whatever the nodes' clocks read (T-T1.12.X2).
+  Lane backups-3: restore checks are on by default (`backup::CheckPolicy`: off, scratch, continuous),
+  within a budget measured on the machine (idle time, free disk), at seconds drawn uniformly from
+  every quiet snapshot, every row compared, with deferral and cost instruments (T-T1.12.C4 to C6).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and

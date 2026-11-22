@@ -909,8 +909,9 @@ impl Database {
     ) -> Result<(Self, crate::backup::Shipping), Refusal> {
         let mut prepared = None;
         let database = Self::open_owned(path, until, false, None, |db| {
-            prepared =
-                Some(crate::backup::Prepared::on(db, archive, until).map_err(|e| refused(&e))?);
+            prepared = Some(
+                crate::backup::Prepared::on(db, path, archive, until).map_err(|e| refused(&e))?,
+            );
             Ok(())
         })?;
         let (Some(prepared), Writer::Local(store)) = (prepared, &database.shared.writer) else {

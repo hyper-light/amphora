@@ -86,6 +86,12 @@ pub enum Check {
     },
     /// The archive holds no second whole yet.
     Empty,
+    /// The second is before the archive's first commit now: its owner expired it ([`super::expire`]).
+    /// Only a second older than the archive's oldest segment is this; one the archive should
+    /// still restore and doesn't is `Failed`.
+    Expired {
+        second: u64,
+    },
 }
 
 /// Checks run, by result: what `amphora_backup_checks_total{result}` reports.
@@ -94,13 +100,14 @@ pub struct CheckCounters {
     pub passed: AtomicU64,
     pub failed: AtomicU64,
     pub source_moved: AtomicU64,
+    pub expired: AtomicU64,
 }
 
 /// `amphora_backup_checks_total`: its type and help line, as `CheckCounters` counts it.
 pub const CHECK_METRIC: (&str, &str, &str) = (
     "amphora_backup_checks_total",
     "counter",
-    "Restore-and-checks of the backup archive, by result (passed, failed, source_moved).",
+    "Restore-and-checks of the backup archive, by result (passed, failed, source_moved, expired).",
 );
 
 impl CheckCounters {
@@ -109,6 +116,7 @@ impl CheckCounters {
             Check::Passed { .. } => &self.passed,
             Check::Failed { .. } => &self.failed,
             Check::SourceMoved { .. } => &self.source_moved,
+            Check::Expired { .. } => &self.expired,
             Check::Empty => return,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -212,6 +220,9 @@ fn check_second(
 ) -> anyhow::Result<Check> {
     let restored = match restore(blobs, prefix, second, scratch, until) {
         Ok(restored) => restored,
+        Err(e) if matches!(e.downcast_ref(), Some(plan::Unrestorable::BeforeArchive(_))) => {
+            return Ok(Check::Expired { second });
+        }
         Err(e) => {
             return Ok(Check::Failed {
                 second,

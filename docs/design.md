@@ -227,6 +227,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | backup | – | One cut across groups: each group restored to the second, half-done transactions finished by their records | [backup.md](design/backup.md#one-cut-across-groups) |
 | backup | – | Cuts across machines: each cross-group step carries a hybrid logical clock, so a decision is stamped after the writes it decides | [backup.md](design/backup.md#cuts-across-machines) |
 | backup | – | Incremental bases: a new base keeps the latest's chunks the log left unchanged | [backup.md](design/backup.md#incremental-bases) |
+| backup | – | Continuous restore drills: checks on by default, within a budget measured on the machine, at random seconds | [backup.md](design/backup.md#continuous-restore-drills) |
 
 ## Sections that are not decisions
 
