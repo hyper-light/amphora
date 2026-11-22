@@ -100,7 +100,7 @@ class SQLiteReading(unittest.TestCase):
         self.assertEqual(dialects.affinity("ANY"), "NUMERIC")
         out, why = dialects.translate("CREATE TABLE r1(x FLOATING POINT, y UNSIGNED BIG INT NOT NULL, z VARYING CHARACTER(255) DEFAULT 'a', a ANY)", "postgres")
         self.assertIsNone(why)
-        self.assertEqual(out, "CREATE TABLE r1 (x INT, y INT NOT NULL, z TEXT DEFAULT 'a', a DECIMAL)")
+        self.assertEqual(out, "CREATE TABLE r1 (x BIGINT, y BIGINT NOT NULL, z TEXT DEFAULT 'a', a DECIMAL)")
 
     def test_strict_table_is_typed_and_its_any_by_its_values(self):
         """An ANY column keeps values as written, as a column without a type does (UntypedColumns)."""
@@ -109,7 +109,7 @@ class SQLiteReading(unittest.TestCase):
             out, why = file_in(file, d)[0]
             self.assertIsNone(why)
             self.assertNotIn("STRICT", out.upper())
-        self.assertEqual(file_in(file, "postgres")[0][0], "CREATE TABLE st (i INT, a TEXT)")
+        self.assertEqual(file_in(file, "postgres")[0][0], "CREATE TABLE st (i BIGINT, a TEXT)")
 
     def test_conflict_resolutions_are_not_expressible_with_the_reason(self):
         for sql, clause in [("UPDATE OR IGNORE cf SET u = 'a' WHERE k = 2", "UPDATE OR IGNORE"), ("UPDATE OR REPLACE cf SET u = 'zz'", "UPDATE OR REPLACE"), ("CREATE TABLE cf2(a TEXT UNIQUE ON CONFLICT REPLACE)", "ON CONFLICT REPLACE")]:
@@ -293,7 +293,7 @@ def file_in(sqls, dialect):
     for i, q in enumerate(sqls):
         sql, expect = q if isinstance(q, tuple) else (q, "ok")
         records.append(FileRecord(i, sql, "statement", expect))
-    return [dialects.record_in(r, dialect, c) for r, c in zip(records, dialects.contexts(records))]
+    return dialects.records_in(records, dialect)
 
 
 class UntypedColumns(unittest.TestCase):
@@ -343,6 +343,173 @@ class UntypedColumns(unittest.TestCase):
         self.assertIn("BIGINT", out[1][0])
 
 
+class MissingTables(unittest.TestCase):
+    """Do: a table whose CREATE a dialect can't say (its one column without a type holds values of
+    several storage classes), then records that read it, write it, index it, view it, name it in a
+    CTE's place, drop it and make it again. Expect: each record naming it (or a view of it)
+    untranslatable with the CREATE's line and reason, where it would have failed on the engine for
+    want of the table; one naming a CTE of the same name, or another table, translated; after the
+    DROP, a translated CREATE makes it again; a CREATE SQLite refuses, or IF NOT EXISTS of a table
+    already made, leaves it be."""
+
+    def test_records_naming_it_are_untranslatable(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in([
+                    "CREATE TABLE t(e)", "INSERT INTO t VALUES (1), ('two')", "CREATE TABLE u(x INTEGER)",
+                    "SELECT e FROM t", "SELECT x FROM u", "CREATE INDEX ti ON t(e)", "CREATE VIEW v AS SELECT e FROM t", "SELECT * FROM v",
+                    "WITH t(a) AS (SELECT 1) SELECT a FROM t", "SELECT x FROM u WHERE x IN (SELECT e FROM t)",
+                    "DROP TABLE t", "CREATE TABLE t(a INTEGER)", "SELECT a FROM t",
+                ], d)
+                self.assertIsNone(out[0][0])
+                for i in (1, 3, 5, 6, 9, 10):
+                    self.assertIsNone(out[i][0], i)
+                    self.assertIn("names t, whose CREATE (line 0) is untranslatable there: not expressible", out[i][1])
+                self.assertIn("names v, whose CREATE (line 6)", out[7][1])
+                for i in (2, 4, 8, 11, 12):
+                    self.assertIsNone(out[i][1], (i, out[i][1]))
+
+    def test_refused_create_and_if_not_exists(self):
+        out = file_in(["CREATE TABLE t(a INTEGER)", ("CREATE TABLE t(e)", "error"), "CREATE TABLE IF NOT EXISTS t(e)", "SELECT a FROM t"], "duckdb")
+        self.assertIsNone(out[3][1])
+
+
+class Collations(unittest.TestCase):
+    """Do: SQLite's BINARY, NOCASE and RTRIM on a column and on an expression. Expect: DuckDB's
+    "binary" and "nocase", PostgreSQL's "C", ClickHouse's bytes (the clause left out), MySQL's
+    as before; RTRIM everywhere but MySQL, and NOCASE on PostgreSQL and ClickHouse, not
+    expressible; on DuckDB, a comparison's operands both of the explicit collation SQLite picks (the
+    left's first), and (when its Python module is here) BINARY orders and compares as SQLite does."""
+
+    def test_each_dialect(self):
+        sql = "CREATE TABLE r(b TEXT COLLATE BINARY, n TEXT COLLATE NOCASE)"
+        self.assertEqual(dialects.translate(sql, "duckdb")[0], 'CREATE TABLE r (b TEXT COLLATE "binary", n TEXT COLLATE "nocase")')
+        self.assertEqual(dialects.translate("SELECT b FROM r ORDER BY b COLLATE BINARY", "postgres")[0], 'SELECT b FROM r ORDER BY b COLLATE "C" NULLS FIRST')
+        self.assertEqual(dialects.translate("CREATE TABLE r(b TEXT COLLATE BINARY)", "clickhouse")[0], "CREATE TABLE r (b Nullable(String))")
+        self.assertIn("COLLATE utf8mb4_0900_as_ci", dialects.translate(sql, "mysql")[0])
+        for d, word in (("duckdb", "RTRIM"), ("postgres", "RTRIM"), ("clickhouse", "RTRIM"), ("postgres", "NOCASE"), ("clickhouse", "NOCASE")):
+            with self.subTest(dialect=d, collation=word):
+                self.assertIn(f"not expressible in {d}: SQLite's collation {word}", dialects.translate(f"SELECT 'a' COLLATE {word} = 'a '", d)[1])
+        self.assertIsNone(dialects.translate("SELECT 'a' COLLATE RTRIM = 'a '", "mysql")[1])
+        self.assertEqual(dialects.translate("SELECT b COLLATE NOCASE = n COLLATE BINARY, b = 'a' COLLATE BINARY FROM r", "duckdb")[0], 'SELECT b COLLATE "nocase" = n COLLATE "nocase", b COLLATE "binary" = \'a\' COLLATE "binary" FROM r')
+
+    def test_binary_orders_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        s, d = sqlite3.connect(":memory:"), duckdb.connect()
+        for q in ["CREATE TABLE r(b TEXT COLLATE NOCASE)", "INSERT INTO r VALUES ('a'), ('B'), ('A')"]:
+            s.execute(q)
+            d.execute(dialects.translate(q, "duckdb")[0])
+        for q in ["SELECT b FROM r ORDER BY b COLLATE BINARY", "SELECT b = 'a' COLLATE BINARY FROM r ORDER BY b COLLATE BINARY"]:
+            with self.subTest(sql=q):
+                self.assertEqual([tuple(x) for x in d.execute(dialects.translate(q, "duckdb")[0]).fetchall()], [tuple(int(v) if isinstance(v, bool) else v for v in x) for x in s.execute(q).fetchall()])
+
+
+class Total(unittest.TestCase):
+    """Do: total() of integers, reals and NULL, as an aggregate, over no rows and over a window, and
+    of text. Expect: on DuckDB (when its Python module is here) what SQLite gives (0.0 over no rows);
+    of text left as it is."""
+
+    def test_total_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        records = [FileRecord(0, "CREATE TABLE t(a INTEGER, c REAL)"), FileRecord(1, "INSERT INTO t VALUES (1, 1.5), (2, NULL), (NULL, 2.25)"),
+                   FileRecord(2, "SELECT total(a), total(c), total(NULL) FROM t", "query", None), FileRecord(3, "SELECT total(a) FROM t WHERE a > 5", "query", None),
+                   FileRecord(4, "SELECT a, total(c) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY a", "query", None)]
+        s, d = sqlite3.connect(":memory:"), duckdb.connect()
+        for r, (sql, why) in zip(records, dialects.records_in(records, "duckdb")):
+            self.assertIsNone(why)
+            want = s.execute(r.sql).fetchall()
+            got = d.execute(sql).fetchall()
+            if r.kind == "query":
+                with self.subTest(sql=r.sql):
+                    self.assertEqual([tuple(x) for x in got], want)
+        self.assertIn("TOTAL(B)", dialects.records_in([FileRecord(0, "CREATE TABLE u(b TEXT)"), FileRecord(1, "SELECT total(b) FROM u", "query", None)], "postgres")[1][0].upper())
+
+
+class LeftOutColumns(unittest.TestCase):
+    """Do: a table with typed columns and one without a type that holds values of several storage
+    classes (the written files' shared t1), then inserts with and without a column list, an
+    INSERT ... SELECT, queries that read the typed columns only, and ones that read the untyped
+    one, `*`, NATURAL and USING joins, an UPDATE of it. Expect: the table made without that
+    column; inserts without its values; the queries that don't read it translated; the rest
+    untranslatable, naming the column and the CREATE's reason; on DuckDB (when its Python module
+    is here) the translated queries give what SQLite gives."""
+
+    FILE = ["CREATE TABLE t(a INTEGER, b TEXT, e)", "INSERT INTO t VALUES (1, 'one', 1), (2, 'two', 'x')", "INSERT INTO t(e, a) VALUES (x'07', 3)",
+            "CREATE TABLE s(a INTEGER, e INTEGER)", "INSERT INTO s VALUES (4, 5)", "INSERT INTO t SELECT a, 'four', e FROM s",
+            ("SELECT a, b FROM t ORDER BY a", "query"), ("SELECT count(*), sum(a) FROM t WHERE b IS NOT NULL", "query"),
+            ("SELECT e FROM t", "query"), ("SELECT * FROM t", "query"), ("SELECT a FROM t NATURAL JOIN s", "query"), ("SELECT a FROM t JOIN s USING (a)", "query"),
+            "UPDATE t SET e = 2 WHERE a = 1", "UPDATE t SET b = 'uno' WHERE a = 1", ("SELECT b FROM t WHERE a = 1", "query"),
+            "CREATE TABLE w(x INTEGER, y TEXT, z INTEGER)", "INSERT INTO w SELECT a, b, a FROM t", ("SELECT x, y, z FROM w ORDER BY x", "query"),
+            "CREATE TABLE v2(a INTEGER, f TEXT COLLATE RTRIM, g INTEGER)", ("SELECT t.a FROM t JOIN v2 ON t.a = v2.a", "query"), ("SELECT t.a FROM t JOIN v2 ON t.a = v2.a WHERE f = 'x'", "query"),
+            ("SELECT count(*) FROM pragma_table_info('t')", "query"), ("PRAGMA table_info(t)", "query"), ("SELECT count(*) FROM pragma_table_info('w')", "query")]
+
+    def records(self):
+        out = []
+        for i, q in enumerate(self.FILE):
+            sql, kind = q if isinstance(q, tuple) else (q, "statement")
+            out.append(FileRecord(i, sql, kind, "ok" if kind == "statement" else None))
+        return out
+
+    def test_left_out_where_not_read(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = dialects.records_in(self.records(), d)
+                self.assertNotRegex(out[0][0], r"\be\b")
+                self.assertIn("'one'", out[1][0])
+                self.assertNotIn("7", out[2][0].replace("'\\x07'", "").replace("x'07'", ""))
+                self.assertRegex(out[5][0], r"SELECT a, 'four' FROM s$")
+                for i in (6, 7, 13, 14, 16, 17):
+                    self.assertIsNone(out[i][1], (i, out[i][1]))
+                self.assertRegex(out[16][0], r"SELECT a, b, a FROM t$")
+                for i in (21, 22):
+                    self.assertIn("https://www.sqlite.org/pragma.html#", out[i][1])
+                self.assertIn("https://www.sqlite.org/pragma.html#", out[23][1])
+                if d != "mysql":  # MySQL has RTRIM's like
+                    self.assertIsNone(out[19][1], out[19][1])
+                    self.assertIn("reads column f of v2", out[20][1])
+                for i in (8, 9, 10, 11, 12):
+                    self.assertIsNone(out[i][0], i)
+                    self.assertIn("reads column e of t, left out of its CREATE (line 0) there: not expressible", out[i][1])
+
+    def test_a_collation_the_dialect_has_none_like(self):
+        records = [FileRecord(0, "CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT COLLATE NOCASE, c INTEGER)"), FileRecord(1, "INSERT INTO t2 VALUES (1, 'x', 10)"),
+                   FileRecord(2, "SELECT a, c FROM t2", "query", None), FileRecord(3, "SELECT b FROM t2", "query", None)]
+        for d in ("postgres", "clickhouse"):
+            with self.subTest(dialect=d):
+                out = dialects.records_in(records, d)
+                self.assertNotIn("b", out[0][0].replace("BIGINT", "").replace("Nullable", ""))
+                self.assertIsNone(out[2][1])
+                self.assertIn("reads column b of t2, left out of its CREATE (line 0) there: not expressible in " + d + ": SQLite's collation NOCASE", out[3][1])
+        self.assertTrue(all(why is None for _, why in dialects.records_in(records, "duckdb")))
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        s, d = sqlite3.connect(":memory:"), duckdb.connect()
+        for r, (sql, why) in zip(self.records(), dialects.records_in(self.records(), "duckdb")):
+            want = s.execute(r.sql).fetchall()
+            if why is None and r.kind != "query":
+                d.execute(sql)
+            elif why is None:
+                with self.subTest(sql=r.sql):
+                    got = d.execute(sql).fetchall()
+                    self.assertEqual([tuple(x) for x in got], want)
+
+
 class IntegerDivision(unittest.TestCase):
     """Do: `/` of two INTEGER operands (integer columns, typed by declaration or by their values,
     integer literals, count()), and of a REAL one. Expect: DuckDB's `//`, PostgreSQL's DIV with
@@ -386,5 +553,619 @@ class ClickHouseAutoincrement(unittest.TestCase):
                 self.assertIn("not expressible in clickhouse: AUTOINCREMENT", why)
 
 
+class HexIntegers(unittest.TestCase):
+    """Do: SQLite's hexadecimal integer literals (0x10, 0X1f; lang_expr.html "Literal Values": "0x1234
+    means the same as 4660"), beside a blob literal X'10'. Expect: each hex literal written as the
+    decimal integer SQLite gives it (64-bit two's complement), the same value and an integer when
+    SQLite itself runs the written text; the blob still a blob; one SQLite refuses ("hex literal too
+    big") untranslatable."""
+
+    CASES = ["0x10", "0X1f", "0x7FFFFFFFFFFFFFFF", "0x8000000000000000", "0xFFFFFFFFFFFFFFFF", "-0x10", "-0xFFFFFFFFFFFFFFFF", "0x00000000000000000001", "0x10 / 3", "(0xff)"]
+
+    def test_written_as_the_integer_sqlite_gives(self):
+        import sqlite3
+
+        import sqlglot
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            want = db.execute(f"SELECT {case}, typeof({case})").fetchone()
+            # The reading every dialect is written from, written back in SQLite's spelling for SQLite to run.
+            said = sqlglot.parse_one(f"SELECT {case}", read=dialects.reader()).expressions[0].sql(dialect="sqlite")
+            with self.subTest(case=case):
+                self.assertEqual(db.execute(f"SELECT {said}, typeof({said})").fetchone(), want)
+            for d in ENGINES:
+                with self.subTest(case=case, dialect=d):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    self.assertIsNone(why)
+                    self.assertNotRegex(out.upper(), r"0X|UNHEX|BYTEA|X'")
+        self.assertEqual(dialects.translate("SELECT 0x10, X'10'", "postgres"), ("SELECT 16, CAST('\\x10' AS BYTEA)", None))
+
+    def test_too_big_is_untranslatable(self):
+        for case in ["0x1FFFFFFFFFFFFFFFF", "-0x8000000000000000", "-(0x8000000000000000)"]:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "postgres")
+                self.assertIsNone(out)
+                self.assertIn("hex literal too big", why)
+
+    def test_untyped_column_takes_integer(self):
+        """Do: a hex literal written to a column without a type. Expect: the column an integer one."""
+        self.assertIn("BIGINT", file_in(["CREATE TABLE t(a)", "INSERT INTO t VALUES (0x10), (2)"], "duckdb")[0][0])
+
+
+class ScalarExtremes(unittest.TestCase):
+    """Do: SQLite's max() and min() of several arguments, with and without a NULL, nested, and
+    beside the aggregate max(). Expect: each said with SQLite's NULL (NULL if any argument is,
+    lang_corefunc.html#max_scalar), which SQLite gives the same answers to when it runs the CASE
+    (written in its spelling); the aggregate untouched; one of random() not expressible."""
+
+    CASES = ["max(1, NULL, 3)", "min(2, 7)", "max(min(5, 9), 2)", "min(NULL, 1)", "max(1, 3) / 2", "min(-0.25, -7)"]
+
+    def test_null_if_any_argument_is(self):
+        import sqlite3
+
+        import sqlglot
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            for d in ENGINES:
+                with self.subTest(case=case, dialect=d):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    self.assertIsNone(why)
+                    self.assertIn("IS NULL THEN NULL", out)
+                    self.assertNotRegex(out.upper(), r"\b(MAX|MIN)\(")
+            # What every dialect is written from, said in SQLite's spelling for SQLite to run.
+            said = dialects.extremes(sqlglot.parse_one(f"SELECT {case}", read=dialects.reader()), "duckdb")
+            with self.subTest(case=case):
+                self.assertEqual(db.execute(said.sql(dialect="sqlite")).fetchone(), db.execute(f"SELECT {case}").fetchone())
+
+    def test_aggregate_and_random(self):
+        self.assertEqual(dialects.translate("SELECT max(a), min(a) OVER () FROM t", "postgres"), ("SELECT MAX(a), MIN(a) OVER () FROM t", None))
+        out, why = dialects.translate("SELECT max(random(), 1)", "postgres")
+        self.assertIsNone(out)
+        self.assertIn("random()", why)
+
+
+class Like(unittest.TestCase):
+    """Do: SQLite's LIKE and like(): ASCII letters of another case, a backslash without an ESCAPE,
+    an ESCAPE, NULL, and PRAGMA case_sensitive_like on. Expect: DuckDB (when its Python module is
+    here) gives what SQLite gives for each; PostgreSQL and MySQL get ESCAPE '', ClickHouse its
+    pattern's backslashes doubled; an ESCAPE that is a letter not expressible where case is folded."""
+
+    CASES = ["'abc' LIKE 'A%'", "like('A%', 'abc')", "like('ab', 'AB')", "like('a\\%', 'a%')", "'a\\b' LIKE 'a\\b'", "'a%' LIKE 'a!%' ESCAPE '!'", "'ab' LIKE 'a!_' ESCAPE '!'", "NULL LIKE 'a'", "'É' LIKE 'é'", "'x' NOT LIKE 'X'"]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                want = db.execute(f"SELECT {case}").fetchone()[0]
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                got = duckdb.sql(out).fetchone()[0]
+                self.assertEqual(None if got is None else int(got), want)
+
+    def test_escapes_and_case(self):
+        self.assertTrue(dialects.translate("SELECT a LIKE 'x%' FROM t", "postgres")[0].endswith("ESCAPE '' FROM t"))
+        self.assertEqual(dialects.translate("SELECT a LIKE 'x%' FROM t", "mysql"), ("SELECT a LIKE 'x%' ESCAPE '' FROM t", None))
+        self.assertIn("replaceAll(", dialects.translate("SELECT a LIKE 'x%' FROM t", "clickhouse")[0])
+        self.assertNotIn("ESCAPE ''", dialects.translate("SELECT a LIKE 'x!%' ESCAPE '!' FROM t", "postgres")[0])
+        for d in ("duckdb", "postgres", "clickhouse"):
+            with self.subTest(dialect=d):
+                self.assertIn("ASCII letter", dialects.translate("SELECT 'a%' LIKE 'aA%' ESCAPE 'A'", d)[1])
+
+    def test_case_sensitive_like_pragma(self):
+        """Do: LIKE before and after PRAGMA case_sensitive_like = on, then off. Expect: folded,
+        not folded, folded."""
+        out = file_in(["SELECT 'a' LIKE 'A'", "PRAGMA case_sensitive_like = on", "SELECT 'a' LIKE 'A'", "PRAGMA main.case_sensitive_like = 0", "SELECT 'a' LIKE 'A'"], "duckdb")
+        self.assertEqual(["TRANSLATE" in (o[0] or "") for o in (out[0], out[2], out[4])], [True, False, True])
+
+
+class FunctionsSaid(unittest.TestCase):
+    """Do: likely(), unlikely(), likelihood(), upper() and lower() of letters beyond ASCII, round()
+    to negative digits, char() of several code points and of NULL, format(), hex() of integers,
+    text, a blob and NULL, zeroblob() of a count, a negative one and NULL, length() of an
+    integer, a blob and text, hex() and length() of reals (SQLite's %!.15g text of them), typeof() and quote()
+    of values of a known storage class, IS of values, CAST to an integer type of a real and of an integer past 32 bits. Expect: DuckDB (when its Python
+    module is here) gives what SQLite gives, values compared as numbers; PostgreSQL's round() digits
+    guarded; a likelihood() SQLite refuses left for the engine to refuse; hex() and length() of
+    a REAL not expressible on PostgreSQL, MySQL and ClickHouse; typeof() and quote() of a known
+    class said on every engine, of a REAL (quote) or an unknown class not expressible with the reason."""
+
+    CASES = ["likely(1 > 0)", "unlikely(3) + 1", "likelihood(2, 0.5)", "upper('héllo')", "lower('ÉaB')", "round(2.5, -1)", "round(25, -2)", "char(72, 105)", "char(NULL)", "char(97)", "format('%d-%s', 7, 'x')", "format('%05.1f', 3.14159)", "hex(1)", "hex(-7)", "hex(NULL)", "hex('ab')", "hex(x'00ff')", "hex(1 + 2)", "zeroblob(3)", "zeroblob(-1)", "zeroblob(NULL)", "length(-7)", "length(x'00ff')", "length(1 + 22)", "length('é')", "hex(2.5)", "hex(100.0)", "hex(1e20)", "hex(-0.0)", "hex(9e999)", "length(1.0 / 3)", "length(1e-5)", "length(CAST(3 AS REAL))", "length(-9e999)", "length(123456789012345678.0)", "typeof(NULL)", "typeof(-7)", "typeof(2.5)", "typeof('abc')", "typeof(x'00')", "typeof(1 / 2.0)", "typeof(CAST(1 AS TEXT))", "quote(NULL)", "quote(-7)", "quote('it''s')", "quote(x'00ff')", "quote('')", "quote(x'')", "quote(1 + 2)", "2 IS 1", "NULL IS 1", "NULL IS NULL", "2 IS NOT 2", "'a' IS 'a'", "1 IS NOT NULL", "CAST(3.9 AS INTEGER)", "CAST(-2.5 AS INT)", "CAST(3000000000 AS INTEGER)", "CAST(2.5 AS TINYINT) + 1"]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                want = db.execute(f"SELECT {case}").fetchone()[0]
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                got = duckdb.sql(out).fetchone()[0]
+                self.assertEqual(got if isinstance(want, (str, bytes)) else float(got), want)
+
+    def test_other_dialects(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out, why = dialects.translate("SELECT likely(a), likelihood(a, 0.25), round(a, -1) FROM t", d)
+                self.assertIsNone(why)
+                self.assertNotRegex(out.upper(), r"LIKEL|-1")
+        self.assertIn("CASE WHEN b < 0 THEN 0 ELSE b END", dialects.translate("SELECT round(a, b) FROM t", "postgres")[0])
+        self.assertIn("LIKELIHOOD(a, 1)", dialects.translate("SELECT likelihood(a, 1) FROM t", "postgres")[0])
+        self.assertEqual(dialects.translate("SELECT upper(b) FROM t", "clickhouse"), ("SELECT UPPER(b) FROM t", None))
+        self.assertEqual(dialects.translate("SELECT CAST(3.9 AS INTEGER), CAST(a AS INT) FROM t", "mysql"), ("SELECT CAST(TRUNCATE(3.9, 0) AS SIGNED), CAST(a AS SIGNED) FROM t", None))
+        self.assertEqual(dialects.translate("SELECT zeroblob(2), zeroblob(2.9)", "postgres"), ("SELECT DECODE(REPEAT('00', COALESCE(2, 0)), 'hex'), ZEROBLOB(2.9)", None))
+        self.assertEqual(dialects.translate("SELECT format('%d', 2), hex(1), hex(a)", "mysql"), ("SELECT PRINTF('%d', 2), COALESCE(HEX(CAST(1 AS CHAR)), ''), COALESCE(HEX(a), '')", None))
+        records = [FileRecord(0, "CREATE TABLE t(a INTEGER, b TEXT, c BLOB)"), FileRecord(1, "SELECT typeof(a), quote(a), quote(b), quote(x'01') FROM t", "query", None)]
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = dialects.records_in(records, d)[1][0]
+                self.assertIn("CASE WHEN a IS NULL THEN 'null' ELSE 'integer' END", out)
+                self.assertEqual(out.upper().count("COALESCE("), 3)
+        for sql, why in [("SELECT quote(a + 0.5) FROM t", "quote() of a REAL"), ("SELECT typeof(abs(NULL)) FROM t", "typeof() of a value whose storage class only running it shows"), ("SELECT typeof(c) FROM t", "typeof() of a value whose storage class only running it shows"), ("SELECT quote(c || 1) FROM t", None)]:
+            for d in ENGINES:
+                with self.subTest(sql=sql, dialect=d):
+                    out = dialects.records_in(records[:1] + [FileRecord(1, sql, "query", None)], d)[1]
+                    if why is None:
+                        self.assertIsNone(out[1])
+                    else:
+                        self.assertIsNone(out[0])
+                        self.assertIn(f"not expressible in {d}: {why}", out[1])
+                        self.assertIn("https://www.sqlite.org/lang_corefunc.html#", out[1])
+        self.assertEqual(dialects.translate("SELECT a IS 1, a IS NOT 'x', a IS NULL FROM t", "postgres", dialects.contexts([FileRecord(0, "CREATE TABLE t(a INTEGER)")])[0])[0], "SELECT a IS NOT DISTINCT FROM 1, NOT a IS NOT DISTINCT FROM 'x', a IS NULL FROM t")
+        self.assertIn("UPPER(ENCODE(CAST('\\x01' AS BYTEA), 'hex'))", dialects.records_in(records, "postgres")[1][0])
+        for d in ("postgres", "mysql", "clickhouse"):
+            for f in ("hex", "length") if d != "postgres" else ("length",):  # PostgreSQL has no hex()
+                with self.subTest(dialect=d, function=f):
+                    self.assertIn(f"not expressible in {d}: {f}() of a REAL", dialects.translate(f"SELECT {f}(2.5)", d)[1])
+
+
+class Glob(unittest.TestCase):
+    """Do: SQLite's GLOB and glob(): wildcards, sets with ranges and negation, a backslash (no escape
+    in GLOB), regular expressions' own characters, a newline, a NULL pattern. Expect: DuckDB (when
+    its Python module is here) gives what SQLite gives; each dialect a case-sensitive regular
+    expression match; a pattern not a literal, an unclosed set or a backwards range not expressible."""
+
+    CASES = ["'abc' GLOB 'a*'", "'abc' GLOB 'a?c'", "'bx' GLOB '[a-c]x'", "'' GLOB '*'", "'abc' GLOB 'A*'", "'a' GLOB NULL", "'bc' GLOB '[^a]*'", "'f.txt' GLOB '*.txt'", "'ab' GLOB '?'", "'a*' GLOB 'a[*]'", "glob('a\\*', 'a\\b')", "'a]' GLOB 'a[]]'", "'-' GLOB '[a-c-x]'", "'x' GLOB '[a-c-x]'", "'x' || char(10) || 'y' GLOB 'x?y'", "'axb' GLOB 'a.b'", "'abc' NOT GLOB 'a*'", "'é' GLOB '?'", "'(a|b)' GLOB '(*|?)'", "'a b' GLOB 'a b'"]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                want = db.execute(f"SELECT {case}").fetchone()[0]
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                got = duckdb.sql(out).fetchone()[0]
+                self.assertEqual(None if got is None else int(got), want)
+
+    def test_each_dialect(self):
+        sql = "SELECT a GLOB '[^a]*.t?t' FROM t"
+        self.assertEqual(dialects.translate(sql, "postgres"), ("SELECT a ~ '^[^a].*\\.t.t$' FROM t", None))
+        self.assertEqual(dialects.translate(sql, "mysql"), ("SELECT REGEXP_LIKE(a, '(?s)^[^a].*\\\\.t.t\\\\z', 'c') FROM t", None))
+        self.assertEqual(dialects.translate(sql, "clickhouse"), ("SELECT match(a, '(?s)^[^a].*\\\\.t.t$') FROM t", None))
+        for sql, why in [("SELECT a GLOB b FROM t", "isn't a string literal"), ("SELECT 'a' GLOB 'a[b'", "not closed"), ("SELECT 'a' GLOB '[z-a]'", "before its start")]:
+            for d in ENGINES:
+                with self.subTest(sql=sql, dialect=d):
+                    self.assertIn(why, dialects.translate(sql, d)[1])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class IntegerColumns(unittest.TestCase):
+    """Do: tables whose columns are declared INT, INTEGER, SMALLINT, TINYINT, INT2, INT8 and
+    UNSIGNED BIG INT (each INTEGER affinity: SQLite's 64-bit INTEGER, datatype3.html), and ALTER
+    TABLE ADD COLUMN of one. Expect: each is the engine's 64-bit integer (BIGINT, ClickHouse's
+    Int64), and DuckDB (when its Python module is here) holds 2^62 in each as SQLite does."""
+
+    CREATE = "CREATE TABLE w(a INT, b INTEGER, c SMALLINT, d TINYINT, e INT2, f INT8, g UNSIGNED BIG INT)"
+
+    def test_every_dialect_is_64_bits(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out, why = dialects.translate(self.CREATE, d)
+                self.assertIsNone(why)
+                wide = "Int64" if d == "clickhouse" else "BIGINT"
+                self.assertEqual(out.count(wide), 7, out)
+                self.assertIn(wide, dialects.translate("ALTER TABLE w ADD COLUMN h INT", d)[0])
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        insert, select = f"INSERT INTO w VALUES ({', '.join([str(2**62)] * 7)})", "SELECT a, b, c, d, e, f, g FROM w"
+        db = sqlite3.connect(":memory:")
+        db.execute(self.CREATE)
+        db.execute(insert)
+        want = db.execute(select).fetchall()
+        con = duckdb.connect()
+        for sql in (self.CREATE, insert):
+            con.execute(dialects.translate(sql, "duckdb")[0])
+        self.assertEqual(con.execute(select).fetchall(), want)
+
+
+class DateFunctions(unittest.TestCase):
+    """Do: date(), time(), datetime(), julianday(), unixepoch() and strftime() of literal time values
+    in SQLite's forms (text, a time zone suffix, a day past a month's end, a Julian day, a Unix time
+    with 'unixepoch', none SQLite reads, NULL), with whole-unit additions, 'start of', months while
+    the day is 28 or less, and 'subsec' (lang_datefunc.html). Expect: DuckDB (when its Python module
+    is here) gives what SQLite gives; PostgreSQL is given to_char() and extract(epoch) of the same
+    TIMESTAMP; what isn't exact ('now', 'localtime', a month added past the 28th, a fractional
+    amount, %W, timediff(), a value read as it runs) is not expressible with the reason on every
+    engine; MySQL is given DATE_FORMAT() and TIMESTAMPDIFF() of a DATETIME(3), ClickHouse
+    formatDateTime() and toUnixTimestamp64Milli() of a DateTime64(3) in UTC, each output reading
+    back in its dialect, and a moment outside the years each holds is not expressible there
+    (unverified on the engines until the jupiter run)."""
+
+    CASES = [
+        "date('2024-01-31')", "date('2024-02-30')", "datetime('2024-02-29 12:30:00', 'subsec')", "datetime('2024-01-01 10:00:00+05:00')",
+        "time('12:30')", "time('2024-03-15 08:05:00.123', 'subsecond')", "datetime(1710460800, 'unixepoch')", "date(2460385.5)", "datetime('garbage')", "datetime(NULL)",
+        "datetime('2024-01-01', NULL)", "date('2024-03-15', '+1 month')", "date('2024-01-31', 'start of month', '+1 month')", "date('2024-12-31', 'start of year', '+13 months')",
+        "datetime('2024-01-01', '-3 days', '+2 hours', 'start of day')", "datetime('2024-03-10', '-70 minutes', '+3600 seconds')", "date('0099-06-01')",
+        "julianday('2024-03-15 08:05:00.123')", "julianday(2460385.5)", "julianday('0001-01-01')", "unixepoch('1969-12-31 23:59:59.5')", "unixepoch('2038-01-19 03:14:07')",
+        "unixepoch('2024-03-15 08:05:00.123', 'subsec')", "strftime('%Y-%m-%d %H:%M:%S %j %w %f %s', '2024-03-15 08:05:00.123')", "strftime('%F %T %R', '1999-12-31T23:00:00', '+1 day')",
+        "strftime('%%x%d', '2024-01-02')", "strftime('%s', '1969-06-01 00:00:00.5')", "strftime('%w', 1710460800, 'unixepoch')",
+    ]
+    REFUSED = [
+        ("datetime('now')", "'now'"), ("date()", "'now'"), ("datetime('2024-01-01', 'localtime')", "'localtime'"), ("date('2024-01-31', '+1 month')", "past the 28th"),
+        ("date('2024-01-01', '+3 days', '+1 month')", "past the 28th"), ("datetime('2024-01-01', '+1.5 days')", "'+1.5 days'"), ("datetime('2024-01-01', 'weekday 0')", "'weekday 0'"),
+        ("strftime('%W', '2024-01-01')", "%W"), ("timediff('2024-01-01', '2023-01-01')", "timediff()"), ("date(x) FROM t", "read as it runs"), ("strftime(x, '2024-01-01') FROM t", "format read as it runs"),
+    ]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                want = db.execute(f"SELECT {case}").fetchone()[0]
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                self.assertEqual(duckdb.sql(out).fetchone()[0], want)
+
+    def test_postgres_and_the_others(self):
+        for case in self.CASES:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "postgres")
+                self.assertIsNone(why)
+                self.assertNotRegex(out.upper(), r"\b(STRFTIME|JULIANDAY|UNIXEPOCH|DATETIME)\(")
+                for d in ("mysql", "clickhouse"):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    if case in ("date('0099-06-01')", "julianday('0001-01-01')"):
+                        self.assertIn("outside the years", why)
+                        continue
+                    self.assertIsNone(why, f"{d}: {case}")
+                    self.assertNotRegex(out.upper(), r"\b(STRFTIME|JULIANDAY|UNIXEPOCH|TO_CHAR|EPOCH_MS)\(|\bDATETIME\((?!3\))")
+                    import sqlglot
+
+                    sqlglot.parse_one(out, read=d)
+        self.assertEqual(dialects.translate("SELECT datetime('2024-02-29 12:30:00', 'subsec')", "postgres")[0], "SELECT TO_CHAR(CAST('2024-02-29 12:30:00.000' AS TIMESTAMP), 'YYYY-MM-DD HH24:MI:SS.MS')")
+        self.assertIn("EXTRACT(DOW FROM", dialects.translate("SELECT strftime('%w', '2024-01-01')", "postgres")[0])
+        self.assertEqual(dialects.translate("SELECT datetime('2024-02-29 12:30:00', '+1 day')", "mysql")[0], "SELECT DATE_FORMAT(CAST('2024-02-29 12:30:00.000' AS DATETIME(3)) + INTERVAL 1 DAY, '%Y-%m-%d %H:%i:%s')")
+        self.assertEqual(dialects.translate("SELECT date('2024-02-29', 'start of month', '-2 days')", "clickhouse")[0],
+                         "SELECT formatDateTime(addDays(toDateTime64(toStartOfMonth(toDateTime64('2024-02-29 00:00:00.000', 3, 'UTC')), 3, 'UTC'), -2), '%Y-%m-%d', 'UTC')")
+        self.assertIn("outside the years 1900 to 2299", dialects.translate("SELECT date('2299-12-31', '+1 day')", "clickhouse")[1])
+        for d in ("mysql", "clickhouse"):
+            self.assertIsNone(dialects.translate("SELECT datetime(0, 'unixepoch', '+1 day')", d)[1])
+
+    def test_not_exact_is_not_expressible(self):
+        for case, reason in self.REFUSED:
+            for d in ENGINES:
+                with self.subTest(case=case, dialect=d):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    self.assertIsNone(out)
+                    self.assertIn(f"not expressible in {d}", why)
+                    self.assertIn(reason, why)
+                    self.assertIn("https://www.sqlite.org/lang_datefunc.html", why)
+
+
+class SQLiteOwn(unittest.TestCase):
+    """Do: SQLite's JSON functions and operators (json(), json_extract(), -> and ->>, json_set(),
+    jsonb(), json_group_array(), json_each() ...), PRAGMAs that read and set (with a schema, with a
+    table) and pragma_ table functions. Expect: each not expressible in every dialect with its
+    reason and SQLite's doc reference (json1.html, pragma.html); a word 'json' or 'pragma' in a string or a
+    name stays; a PRAGMA record SQLite refuses is given as written, for the engine to refuse."""
+
+    JSON = ["SELECT json(' { \"a\" : 1 } ')", "SELECT json_extract('{\"a\":1}', '$.a')", "SELECT '{\"a\":1}' -> '$.a'", "SELECT '{\"a\":1}' ->> '$.a'",
+            "SELECT json_set('{}', '$.a', 1)", "SELECT jsonb('[1]')", "SELECT json_group_array(x) FROM t", "SELECT value FROM json_each('[1,2]')", "SELECT json_valid('{}')", "SELECT json_type('[1]')", "SELECT json_array(1.5)"]
+    PRAGMAS = ["PRAGMA foreign_keys = ON", "PRAGMA main.user_version", "PRAGMA table_info(t)", "PRAGMA integrity_check", "PRAGMA case_sensitive_like = 1", "SELECT name FROM pragma_table_info('t')", "SELECT strict FROM pragma_table_list WHERE name = 'st'"]
+
+    def test_not_expressible_everywhere(self):
+        for sql in self.JSON + self.PRAGMAS:
+            ref = "https://www.sqlite.org/json1.html" if sql in self.JSON else "https://www.sqlite.org/pragma.html#"
+            for d in ENGINES:
+                with self.subTest(sql=sql, dialect=d):
+                    out, why = dialects.translate(sql, d)
+                    self.assertIsNone(out)
+                    self.assertIn(f"not expressible in {d}", why)
+                    self.assertIn(ref, why)
+        self.assertIn("pragma.html#pragma_user_version", dialects.translate("PRAGMA main.user_version", "duckdb")[1])
+
+    EXACT = ["json_object('k', 1, 'b', NULL)", "json_array(1, NULL, -3)", "json_array()", "json_object()", "json_array(1) || 'x'", "length(json_array(1, 2))",
+             "json_array_length('[1,[2],3]')", "json_array_length('{\"a\":1}')"]
+
+    def test_exact_on_duckdb(self):
+        """json_array() and json_object() of integers and NULLs (plain keys), json_array_length() of RFC
+        8259 JSON: DuckDB's, giving SQLite's text (when its Python module is here); else not expressible."""
+        for case in self.EXACT:
+            for d in ("postgres", "mysql", "clickhouse"):
+                self.assertIn("https://www.sqlite.org/json1.html", dialects.translate(f"SELECT {case}", d)[1])
+        for case in ["json_array(1.5)", "json_array(json_array(1))", "json_object('a\"', 1)", "json_array_length('[1,]')", "json_array_length('[NaN]')", "json_array(x) FROM t"]:
+            self.assertIn("https://www.sqlite.org/json1.html", dialects.translate(f"SELECT {case}", "duckdb")[1])
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.EXACT:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                self.assertEqual(duckdb.sql(out).fetchone()[0], db.execute(f"SELECT {case}").fetchone()[0])
+
+    def test_words_in_strings_and_names_stay(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                self.assertIsNone(dialects.translate("SELECT 'json(1)', 'PRAGMA x' AS pragma_x", d)[1])
+        self.assertEqual(dialects.record_in(Record("PRAGMA no_such_thing = 1", "statement", "error"), "duckdb"), ("PRAGMA no_such_thing = 1", None))
+
+
+class BlobCasts(unittest.TestCase):
+    """Do: CAST(X AS BLOB) of an integer, a text past ASCII, a text with a backslash, and NULL, and
+    typeof(), hex(), length() and quote() of it (lang_expr.html#castexpr: "first converted to TEXT").
+    Expect: DuckDB (when its Python module is here) gives what SQLite gives; typeof() is 'blob' or
+    'null' on every engine."""
+
+    CASES = ["typeof(CAST(7 AS BLOB))", "typeof(CAST(NULL AS BLOB))", "typeof(CAST('12' AS BLOB))", "hex(CAST(-7 AS BLOB))", "CAST(1 + 2 AS BLOB)",
+             "length(CAST('é' AS BLOB))", "CAST('\\xAA' AS BLOB)", "hex(CAST('12' AS BLOB))", "quote(CAST('é' AS BLOB))"]
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for case in self.CASES:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertIsNone(why)
+                self.assertEqual(duckdb.sql(out).fetchone()[0], db.execute(f"SELECT {case}").fetchone()[0])
+
+    def test_typeof_on_every_engine(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out, why = dialects.translate("SELECT typeof(CAST(a AS BLOB)) FROM t", d, dialects.contexts([FileRecord(0, "CREATE TABLE t(a TEXT)")])[0])
+                self.assertIsNone(why)
+                self.assertIn("ELSE 'blob' END", out)
+
+
+class DeclaredColumnClasses(unittest.TestCase):
+    """Do: typeof() and `/` of columns declared INTEGER, REAL and TEXT, written values their
+    affinity takes whole, and an INTEGER column written a REAL and a text (datatype3.html, section 3:
+    those are kept as written). Expect: the first said as their class's (typeof() a CASE, `/` integer
+    division of the INTEGER column), the second not expressible: its values' classes only running
+    it shows; DuckDB (when its Python module is here) gives what SQLite gives for the first."""
+
+    FILE = ["CREATE TABLE r0(x INTEGER)", "INSERT INTO r0 VALUES (12), (1.5), ('abc')", ("SELECT typeof(x) FROM r0", "query"),
+            "CREATE TABLE r1(x INTEGER, y REAL, z TEXT)", "INSERT INTO r1 VALUES (7, 2, 3)", ("SELECT typeof(x), typeof(y), typeof(z), x / 2 FROM r1", "query")]
+
+    def records(self):
+        return [FileRecord(i, q[0], q[1], None) if isinstance(q, tuple) else FileRecord(i, q) for i, q in enumerate(self.FILE)]
+
+    def test_each_dialect(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = dialects.records_in(self.records(), d)
+                self.assertIsNone(out[2][0])
+                self.assertIn("typeof() of a value whose storage class only running it shows", out[2][1])
+                self.assertIsNone(out[5][1])
+                self.assertIn("ELSE 'integer' END", out[5][0])
+
+    def test_same_answers_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db, con = sqlite3.connect(":memory:"), duckdb.connect()
+        for r, (sql, why) in list(zip(self.records(), dialects.records_in(self.records(), "duckdb")))[3:]:
+            want = db.execute(r.sql).fetchall()
+            got = con.execute(sql).fetchall()
+            if r.kind == "query":
+                self.assertEqual([tuple(float(v) if isinstance(v, (int, float)) else v for v in row) for row in got], [tuple(float(v) if isinstance(v, (int, float)) else v for v in row) for row in want])
+
+
+class TextIntegerCasts(unittest.TestCase):
+    """Do: CAST of text to an integer, of literals and of a TEXT column holding every form SQLite
+    reads (lang_expr.html#castexpr: the leading integer, 0 if none, clamped at 64 bits). Expect: a
+    plain integer literal is cast to BIGINT on every engine, another said by its reading on DuckDB
+    and PostgreSQL and refused on MySQL and ClickHouse, with the reason; DuckDB (when its Python
+    module is here) gives what SQLite gives for the literals and the column."""
+
+    TEXTS = ["1.5", " 12abc", "abc", "1e3", "-7.9", "+5", "  -0x10", "9223372036854775807", "9223372036854775808", "99999999999999999999",
+             "-9223372036854775808", "-99999999999999999999", "\t\n\x0b\x0c\r 3", "", ".5", "- 5", "+-5", "00000000000000000000000009223372036854775807",
+             "-0009223372036854775808", "１２", "  +0012x", "0"]
+
+    def test_literals_everywhere(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out, why = dialects.translate("SELECT CAST('12' AS INTEGER), CAST('-7' AS INT)", d)
+                self.assertIsNone(why)
+                self.assertNotIn("SUBSTRING", out.upper())
+                out, why = dialects.translate("SELECT CAST('1.5' AS INTEGER)", d)
+                if d in ("mysql", "clickhouse"):
+                    self.assertIn("castexpr", why)
+                else:
+                    self.assertIsNone(why)
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for t in self.TEXTS:
+            q = "SELECT CAST('" + t.replace("'", "''") + "' AS INTEGER)"
+            with self.subTest(text=t):
+                out, why = dialects.translate(q, "duckdb")
+                self.assertIsNone(why)
+                self.assertEqual(duckdb.sql(out).fetchone()[0], db.execute(q).fetchone()[0])
+
+    def test_column_same_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db, dd = sqlite3.connect(":memory:"), duckdb.connect()
+        rows = [(i, t) for i, t in enumerate(self.TEXTS)] + [(len(self.TEXTS), None)]
+        db.execute("CREATE TABLE t(k INTEGER, a TEXT)")
+        db.executemany("INSERT INTO t VALUES (?, ?)", rows)
+        dd.execute("CREATE TABLE t(k BIGINT, a TEXT)")
+        dd.executemany("INSERT INTO t VALUES (?, ?)", rows)
+        context = dialects.contexts([FileRecord(0, "CREATE TABLE t(k INTEGER, a TEXT)")])[0]
+        q = "SELECT k, CAST(a AS INTEGER), CAST(a || '' AS INT) FROM t ORDER BY k"
+        out, why = dialects.translate(q, "duckdb", context)
+        self.assertIsNone(why)
+        self.assertEqual(dd.execute(out).fetchall(), db.execute(q).fetchall())
+
+    def test_column_refused_where_unwritten(self):
+        context = dialects.contexts([FileRecord(0, "CREATE TABLE t(a TEXT)")])[0]
+        for d in ("mysql", "clickhouse"):
+            with self.subTest(dialect=d):
+                out, why = dialects.translate("SELECT CAST(a AS INTEGER) FROM t", d, context)
+                self.assertIsNone(out)
+                self.assertIn("castexpr", why)
+        out, why = dialects.translate("SELECT CAST(a AS INTEGER) FROM t", "postgres", context)
+        self.assertIsNone(why)
+        self.assertIn("SUBSTRING(", out.upper())
+
+
+class ConnectionFunctions(unittest.TestCase):
+    """Do: changes(), total_changes() and last_insert_rowid() (lang_corefunc.html), and unistr()
+    and unistr_quote() of literals and of a column. Expect: the first three and the column's are
+    not expressible anywhere, with the reason; the literals' are SQLite's values, and DuckDB (when
+    its Python module is here) gives what SQLite gives."""
+
+    def test_connection_functions_refused(self):
+        for f in ("changes", "total_changes", "last_insert_rowid"):
+            for d in ENGINES:
+                with self.subTest(f=f, dialect=d):
+                    out, why = dialects.translate(f"SELECT {f}()", d)
+                    self.assertIsNone(out)
+                    self.assertIn(f"lang_corefunc.html#{f}", why)
+
+    def test_unistr_of_a_column_refused(self):
+        context = dialects.contexts([FileRecord(0, "CREATE TABLE t(a TEXT)")])[0]
+        for f in ("unistr", "unistr_quote"):
+            for d in ENGINES:
+                with self.subTest(f=f, dialect=d):
+                    out, why = dialects.translate(f"SELECT {f}(a) FROM t", d, context)
+                    self.assertIsNone(out)
+                    self.assertIn(f"#{f}", why)
+
+    def test_unistr_literals_same_as_sqlite(self):
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        cases = ["unistr('\\u0041\\+01F600\\\\x')", "unistr_quote('a' || 'b''')", "unistr_quote(1)", "unistr(NULL)", "unistr_quote('it''s')"]
+        for case in cases:
+            for d in ENGINES:
+                with self.subTest(case=case, dialect=d):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    self.assertIsNone(why)
+                    self.assertNotIn("UNISTR", out.upper().replace("'UNISTR", ""))
+        out, why = dialects.translate("SELECT unistr('\\0000')", "duckdb")
+        self.assertIsNone(out)
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        for case in cases:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertEqual(duckdb.sql(out).fetchone()[0], db.execute(f"SELECT {case}").fetchone()[0])
+
+
+class ConstraintSwitches(unittest.TestCase):
+    """Do: files with foreign keys and CHECK constraints, PRAGMA foreign_keys and
+    ignore_check_constraints off and on (foreignkeys.html, pragma.html), one inside a transaction.
+    Expect: with foreign keys never on, REFERENCES and FOREIGN KEY are left out and every write
+    translates; with them on somewhere, MySQL is given a column's REFERENCES as a FOREIGN KEY (it
+    ignores the column's own), and a write to a linked table while off is not expressible
+    (and on ClickHouse while on), with the reason; a write to a CHECKed table while checks are
+    ignored is not expressible; a PRAGMA foreign_keys inside BEGIN ... END does nothing."""
+
+    SCHEMA = ["CREATE TABLE p(k INTEGER PRIMARY KEY)", "CREATE TABLE c(k INTEGER, r INTEGER REFERENCES p(k) ON DELETE CASCADE, FOREIGN KEY (k) REFERENCES p(k))"]
+
+    def test_never_on_leaves_references_out(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in(self.SCHEMA + ["INSERT INTO c VALUES (1, 2)", "DELETE FROM p", "PRAGMA foreign_keys = OFF"], d)
+                self.assertNotIn("REFERENCES", out[1][0].upper())
+                self.assertIsNone(out[2][1])
+                self.assertIsNone(out[3][1])
+
+    def test_off_while_on_elsewhere(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in(self.SCHEMA + ["INSERT INTO c VALUES (1, 2)", "PRAGMA foreign_keys = ON", "INSERT INTO p VALUES (1)", "PRAGMA main.foreign_keys = 0", "DELETE FROM p", "SELECT 1"], d)
+                self.assertIn("REFERENCES", out[1][0].upper())
+                if d == "mysql":
+                    self.assertIn("FOREIGN KEY (r) REFERENCES p (k) ON DELETE CASCADE", out[1][0])
+                    self.assertNotIn("INTEGER REFERENCES", out[1][0].upper())
+                self.assertIn("foreign_keys is off", out[2][1])
+                self.assertIn("foreign_keys is off", out[6][1])
+                self.assertIsNone(out[7][1])
+                if d == "clickhouse":
+                    self.assertIn("no foreign keys", out[4][1])
+                else:
+                    self.assertIsNone(out[4][1])
+
+    def test_pragma_in_a_transaction_does_nothing(self):
+        out = file_in(self.SCHEMA + ["PRAGMA foreign_keys = ON", "BEGIN", "PRAGMA foreign_keys = OFF", "END", "INSERT INTO p VALUES (1)", "BEGIN", "PRAGMA foreign_keys = OFF", "COMMIT", "INSERT INTO p VALUES (2)",
+                                     "PRAGMA foreign_keys = OFF", "INSERT INTO p VALUES (3)"], "duckdb")
+        self.assertIsNone(out[6][1])
+        self.assertIsNone(out[10][1])
+        self.assertIn("foreign_keys is off", out[12][1])
+
+    def test_ignored_checks(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in(["CREATE TABLE k(a INTEGER CHECK (a > 0))", "CREATE TABLE n(a INTEGER)", "PRAGMA ignore_check_constraints = ON", "INSERT INTO k VALUES (-1)",
+                               "UPDATE k SET a = -2", "INSERT INTO n VALUES (-1)", "SELECT a FROM k", "PRAGMA ignore_check_constraints = FALSE", "INSERT INTO k VALUES (3)"], d)
+                self.assertIn("ignore_check_constraints is on", out[3][1])
+                self.assertIn("ignore_check_constraints is on", out[4][1])
+                for i in (5, 6, 8):
+                    self.assertNotIn("ignore_check_constraints", out[i][1] or "")

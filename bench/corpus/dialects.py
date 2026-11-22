@@ -79,6 +79,41 @@ def _reader():
 
     class Parser(SQLite.Parser):
         FUNCTIONS = {**SQLite.Parser.FUNCTIONS, "IIF": _iif, "IF": _iif}
+        PRIMARY_PARSERS = {**SQLite.Parser.PRIMARY_PARSERS, TokenType.HEX_STRING: lambda self, token: self._parse_hex(token)}
+        UNARY_PARSERS = {**SQLite.Parser.UNARY_PARSERS, TokenType.DASH: lambda self: self._parse_negated()}
+
+        def _parse_hex(self, token):
+            # 0x10 is an integer, X'10' a blob: sqlglot's SQLite tokenizer makes both one HEX_STRING
+            # token of the digits alone, so the text it was read from tells them apart. SQLite's
+            # "Literal Values" (https://www.sqlite.org/lang_expr.html#literal_values_constants_):
+            # "Hexadecimal integer literals follow the C-language notation of "0x" or "0X" followed
+            # by hexadecimal digits. For example, 0x1234 means the same as 4660 and
+            # 0x8000000000000000 means the same as -9223372036854775808. Hexadecimal literals are
+            # interpreted as 64-bit two's-complement integers and are thus limited to sixteen
+            # significant digits of precision." So it is written as the decimal integer it means;
+            # one of more than sixteen significant digits SQLite refuses ("hex literal too big").
+            if self.sql[token.start : token.start + 2].upper() != "0X":
+                return SQLite.Parser.PRIMARY_PARSERS[TokenType.HEX_STRING](self, token)
+            value = int(token.text, 16)
+            if value >= 2**64:
+                self.raise_error(f"hex literal too big: 0x{token.text} (SQLite takes at most sixteen significant hexadecimal digits, lang_expr.html)", token)
+            value = value - 2**64 if value >= 2**63 else value
+            said = exp.Literal.number(value)
+            said.meta["sqlite_hex"] = value
+            return said
+
+        def _parse_negated(self):
+            # A minus before a hex literal (through parentheses, which SQLite's parser drops: "expr
+            # ::= LP expr RP", src/parse.y) negates its 64-bit value, and SQLite refuses the one
+            # value whose negation has none, -0x8000000000000000 ("hex literal too big", src/expr.c
+            # codeInteger), rather than make it a floating point value as it does a decimal one.
+            negated = self.expression(exp.Neg(this=self._parse_unary()))
+            inner = negated.this
+            while isinstance(inner, exp.Paren):
+                inner = inner.this
+            if inner is not None and inner.meta.get("sqlite_hex") == -(2**63):
+                self.raise_error("hex literal too big: -0x8000000000000000 (its negation is no 64-bit integer, and SQLite refuses it)")
+            return negated
         # char(X1,...,XN): "a string composed of characters having the unicode code point values of
         # integers X1 through XN" (lang_corefunc.html#char): of none, the empty string.
         FUNCTION_PARSERS = {**SQLite.Parser.FUNCTION_PARSERS, "CHAR": lambda self: exp.Literal.string("") if self._curr and self._curr.token_type == TokenType.R_PAREN else self._parse_char()}
@@ -428,14 +463,19 @@ class Table:
     """A table as a file defines it: its columns in order (upper-cased: SQLite's names are
     case-insensitive), each one's declared type (a sqlglot DataType; None for a column without a
     type, or an ANY column of a STRICT table: no affinity, values kept as written) and default, and,
-    for each column without a type, the storage classes of the values the file writes to it."""
+    for each column without a type, the storage classes of the values the file writes to it (for
+    each column with one, in `held`)."""
 
     def __init__(self, name):
-        self.name, self.columns, self.kinds, self.defaults, self.written = name, [], {}, {}, {}
+        self.name, self.columns, self.kinds, self.defaults, self.written, self.held = name, [], {}, {}, {}, {}
+        # The tables its foreign keys reference (upper-cased), and whether it has a CHECK constraint.
+        self.parents, self.checked = set(), False
 
     def write(self, column, cls):
         if column in self.written and cls is not None:
             self.written[column].add(cls)
+        elif column in self.kinds and cls is not None:
+            self.held.setdefault(column, set()).add(cls)
 
     def storage(self, column):
         """The storage class every value of `column` has, as far as the file has written it, else UNKNOWN."""
@@ -445,7 +485,15 @@ class Table:
         if kind is None:
             classes = self.written.get(column, set())
             return next(iter(classes)) if len(classes) == 1 else UNKNOWN
-        return _declared_class(kind)
+        # A column's affinity converts a value to its class only when it can: "a column with
+        # INTEGER affinity ... a REAL value ... that cannot be represented exactly as an integer
+        # is kept as REAL", text that isn't a well-formed number stays TEXT, and a BLOB is kept as
+        # it is in every column (datatype3.html, section 3, "Type Affinity"). So the declared class
+        # is every value's only when every value the file writes is one the affinity takes whole:
+        # INTEGERs into INTEGER, INTEGERs and REALs into REAL, anything but a BLOB into TEXT.
+        c = _declared_class(kind)
+        takes = {"INTEGER": {"INTEGER"}, "REAL": {"INTEGER", "REAL"}, "TEXT": {"INTEGER", "REAL", "TEXT"}}.get(c, set())
+        return c if self.held.get(column, set()) <= takes else UNKNOWN
 
 
 def _declared_class(kind):
@@ -466,10 +514,33 @@ def _declared_class(kind):
 
 class Context:
     """What translate() needs of the file around a record: the tables defined once it has run, and
-    those it creates (by upper-cased name), their columns typed by what the whole file writes."""
+    those it creates (by upper-cased name), their columns typed by what the whole file writes;
+    whether PRAGMA case_sensitive_like is on when it runs (liked()); and for enforced(): whether
+    PRAGMA foreign_keys is on when it runs and whether the file ever turns it on, whether PRAGMA
+    ignore_check_constraints is on, and the tables a foreign key links (children and parents) and
+    those with a CHECK constraint, as they stand before it runs."""
 
-    def __init__(self, tables=None, created=None):
-        self.tables, self.created = tables or {}, created or {}
+    def __init__(self, tables=None, created=None, case_sensitive_like=False, foreign_keys=False, ignore_check_constraints=False, linked=(), checked=()):
+        self.tables, self.created, self.case_sensitive_like = tables or {}, created or {}, case_sensitive_like
+        self.foreign_keys, self.ignore_check_constraints, self.linked, self.checked = foreign_keys, ignore_check_constraints, set(linked), set(checked)
+        self.foreign_keys_ever = foreign_keys
+
+
+def _pragma_set(e, name):
+    """The boolean `PRAGMA [schema.]<name> = value` sets, or None when `e` isn't one. SQLite's
+    "PRAGMA Statements" (https://www.sqlite.org/pragma.html): "A boolean value ... 1 yes true on
+    ... 0 no false off"."""
+    from sqlglot import exp
+
+    if not isinstance(e, exp.Pragma) or not isinstance(e.this, exp.EQ):
+        return None
+    target, value = e.this.this, e.this.expression
+    if (target.expression if isinstance(target, exp.Dot) else target).name.lower() != name:
+        return None
+    if isinstance(value, exp.Boolean):
+        return value.this
+    word = value.name.lower() if isinstance(value, (exp.Literal, exp.Var, exp.Column, exp.Identifier)) else ""
+    return True if word in ("1", "yes", "true", "on") else False if word in ("0", "no", "false", "off") else None
 
 
 def _number_class(text, negative=False):
@@ -537,9 +608,9 @@ def storage_classes(expression, tables):
     0); columns by their table (_column_class); `||` is TEXT; +, -, *, / and % of two INTEGERs are
     INTEGER and with a REAL REAL (lang_expr.html, "Operators": "integer arithmetic if both operands
     are integers and no overflow would result, or floating point arithmetic ... if either operand is
-    a real value"); count() and length() INTEGER; sum(), min(), max() and abs() their argument's;
+    a real value"); count() and length() INTEGER; sum(), min(), max() and abs() their argument's (max() and min() of several arguments theirs when they share one, NULL with a NULL);
     avg() and total() REAL (lang_aggfunc.html); CAST by the type's affinity (lang_expr.html "CAST
-    expressions"); anything else UNKNOWN."""
+    expressions"), to BLOB a BLOB; anything else UNKNOWN."""
     from sqlglot import exp
 
     classes = {}
@@ -577,10 +648,17 @@ def storage_classes(expression, tables):
         elif isinstance(node, (exp.Sum, exp.Min, exp.Max, exp.Abs)) and not node.expressions:
             arg = classes.get(id(node.this), UNKNOWN)
             c = arg if arg in ("INTEGER", "REAL") else UNKNOWN
+        elif isinstance(node, (exp.Min, exp.Max)):
+            # max(X, Y, ...) and min(): one of its arguments, NULL if any is (lang_corefunc.html#max_scalar).
+            args = {classes.get(id(a), UNKNOWN) for a in [node.this] + list(node.expressions)}
+            c = None if None in args else next(iter(args)) if len(args) == 1 and args <= {"INTEGER", "REAL"} else UNKNOWN
         elif isinstance(node, exp.Avg):
             c = "REAL"
         elif isinstance(node, exp.Cast) and isinstance(node.to, exp.DataType):
-            c = _declared_class(node.to)
+            # "When casting to a BLOB, the value is first converted to TEXT ... and the resulting
+            # byte sequence is reinterpreted as a BLOB" (lang_expr.html#castexpr): a BLOB, NULL a NULL.
+            blob = affinity(node.to.sql(dialect="sqlite")) == "BLOB" and node.to.sql(dialect="sqlite").strip() != ""
+            c = (None if classes.get(id(node.this)) is None else "BLOB") if blob else _declared_class(node.to)
         classes[id(node)] = c
     return classes
 
@@ -589,13 +667,22 @@ def contexts(records):
     """Each record's Context, the file's records read in order as SQLite runs them: a CREATE TABLE
     defines its table (one of IF NOT EXISTS whose table is there leaves it), DROP TABLE removes it,
     and each INSERT (its VALUES or SELECT, its columns' defaults, its upsert's SET), UPDATE ... SET
-    writes values to its columns. A `statement error` record SQLite refuses writes nothing."""
+    writes values to its columns. A `statement error` record SQLite refuses writes nothing.
+    PRAGMA case_sensitive_like, foreign_keys and ignore_check_constraints are carried into the
+    records after them, as SQLite keeps them for the connection (https://www.sqlite.org/pragma.html);
+    foreign_keys "is a no-op within a transaction" (pragma.html#pragma_foreign_keys), so one between
+    BEGIN and COMMIT, END or ROLLBACK leaves it as it was. SQLite's foreign keys are off and its
+    CHECK constraints enforced until a PRAGMA says otherwise ("Foreign key constraints are disabled
+    by default", foreignkeys.html section 2)."""
     import sqlglot
     from sqlglot import exp
 
-    tables, out = {}, []
+    tables, out, case_sensitive_like = {}, [], False
+    foreign_keys, ignore_check, in_transaction = False, False, False
     for r in records:
         created = {}
+        linked = {n for n, t in tables.items() if t.parents} | {p for t in tables.values() for p in t.parents}
+        checked = {n for n, t in tables.items() if t.checked}
         try:
             statements = sqlglot.parse(comment_closed(defaults_dropped(r.sql)), read=reader())
         except Exception:  # sqlglot can't read it: translate() says why
@@ -616,8 +703,30 @@ def contexts(records):
                 tables.pop(e.this.name.upper(), None)
             elif isinstance(e, (exp.Insert, exp.Update)):
                 _writes(e, tables)
-        out.append(Context(dict(tables), created))
+            elif _pragma_set(e, "case_sensitive_like") is not None:
+                case_sensitive_like = _pragma_set(e, "case_sensitive_like")
+            elif _pragma_set(e, "foreign_keys") is not None and not in_transaction:
+                foreign_keys = _pragma_set(e, "foreign_keys")
+            elif _pragma_set(e, "ignore_check_constraints") is not None:
+                ignore_check = _pragma_set(e, "ignore_check_constraints")
+            elif isinstance(e, exp.Transaction):
+                in_transaction = True
+            elif isinstance(e, exp.Commit) or (isinstance(e, exp.Rollback) and not e.args.get("savepoint")) or _end(e):
+                in_transaction = False
+        out.append(Context(dict(tables), created, case_sensitive_like, foreign_keys, ignore_check, linked, checked))
+    ever = any(c.foreign_keys for c in out)
+    for c in out:
+        c.foreign_keys_ever = ever
     return out
+
+
+def _end(e):
+    """Whether `e` is SQLite's END [TRANSACTION] (COMMIT's other name), which sqlglot reads as a column."""
+    from sqlglot import exp
+
+    if isinstance(e, exp.Alias) and e.alias.upper() == "TRANSACTION":
+        e = e.this
+    return isinstance(e, exp.Column) and not e.table and e.name.upper() == "END"
 
 
 def _table(create):
@@ -639,6 +748,8 @@ def _table(create):
         t.kinds[name], t.defaults[name] = kind, default
         if kind is None:
             t.written[name] = set()
+    t.parents = {r.this.this.name.upper() if isinstance(r.this, exp.Schema) else r.this.name.upper() for r in create.find_all(exp.Reference) if isinstance(r.this, (exp.Schema, exp.Table))}
+    t.checked = any(True for _ in create.find_all(exp.CheckColumnConstraint))
     return t
 
 
@@ -748,6 +859,16 @@ def typed(expression, context=None, dialect="the dialect"):
         if len(classes) > 1:
             raise NotExpressible(f"not expressible in {dialect}: {where}; the file writes it values of several storage classes ({', '.join(sorted(classes))}), which no one {dialect} column type holds unchanged")
         column.set("kind", exp.DataType.build(STORAGE_TYPES[next(iter(classes))]))
+    # A column of INTEGER affinity holds SQLite's INTEGER, "a signed integer, stored in 0, 1, 2, 3,
+    # 4, 6, or 8 bytes" whatever its type's name (INT, SMALLINT, TINYINT, INT2 ...: datatype3.html,
+    # sections 2 and 3.1), where sqlglot writes those names as each engine's 8, 16 or 32-bit types
+    # (INT is 32 bits on DuckDB, PostgreSQL and MySQL, Int32 on ClickHouse), which refuse or wrap
+    # what SQLite keeps: each such column is given the engine's 64-bit integer, BIGINT (Int64 on
+    # ClickHouse), as CAST's INTEGER is (functions_said()).
+    for column in expression.find_all(exp.ColumnDef):
+        kind = column.args.get("kind")
+        if isinstance(kind, exp.DataType) and not kind.is_type(exp.DataType.Type.BIGINT) and affinity(kind.sql(dialect="sqlite")) == "INTEGER":
+            column.set("kind", exp.DataType.build("BIGINT"))
     return expression
 
 
@@ -837,6 +958,1022 @@ def keyed(expression, dialect):
 MYSQL_COLLATIONS = {"BINARY": "utf8mb4_0900_bin", "NOCASE": "utf8mb4_0900_as_ci", "RTRIM": "utf8mb4_bin"}
 
 
+_ASCII_UPPER, _ASCII_LOWER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+
+
+def liked(expression, context, dialect):
+    """`expression` with each LIKE said as SQLite's. SQLite's "The LIKE, GLOB, REGEXP, MATCH, and
+    extract operators" (https://www.sqlite.org/lang_expr.html#the_like_glob_regexp_match_and_extract_operators):
+    - "Any other character matches itself or its lower/upper case equivalent (i.e. case-insensitive
+      matching). Important Note: SQLite only understands upper/lower case for ASCII characters by
+      default", unless PRAGMA case_sensitive_like is on (pragma.html#pragma_case_sensitive_like),
+      where DuckDB's, PostgreSQL's and ClickHouse's LIKE are case-sensitive always. So there, unless
+      the pragma is on, both sides are given ASCII's case folded and nothing else: translate(x,
+      'A..Z', 'a..z') (PostgreSQL's manual, 9.4 "String Functions": translate "Replaces each
+      character in string that matches a character in the from set with the corresponding
+      character in the to set"; DuckDB's and ClickHouse's translate the same). An ESCAPE that is an
+      ASCII letter would be folded with the pattern, so means otherwise: not expressible. MySQL's
+      LIKE compares by its collation, case-insensitively by default (utf8mb4_0900_ai_ci, which also
+      folds accents and letters beyond ASCII): left as it is, a difference of the engine, as
+      MYSQL_COLLATIONS' NOCASE is.
+    - "the optional ESCAPE clause ... If the ESCAPE clause is used, the escape character ..."; without
+      one there is none, where PostgreSQL's and MySQL's LIKE take a backslash as one by default
+      (PostgreSQL 9.7.1: "The default escape character is the backslash but a different one can be
+      selected by using the ESCAPE clause. It's also possible to select no escape character by
+      writing ESCAPE ''"; MySQL 8.4 14.8.1: "The escape sequence should be one character long to
+      specify the escape character, or empty to specify that no escape character is used"), as
+      ClickHouse's does with no ESCAPE clause at all (its "String Search Functions", like: "use the
+      backslash (\\) for escaping metasymbols"). So PostgreSQL and MySQL are given ESCAPE '', and
+      ClickHouse the pattern with each backslash doubled (replaceAll). DuckDB's LIKE has no default
+      escape character, as SQLite's."""
+    from sqlglot import exp
+
+    def fold(e):
+        return exp.Anonymous(this="translate", expressions=[e, exp.Literal.string(_ASCII_UPPER), exp.Literal.string(_ASCII_LOWER)])
+
+    for like in list(expression.find_all(exp.Like)):
+        escape = like.parent if isinstance(like.parent, exp.Escape) and like.parent.this is like else None
+        if dialect in ("duckdb", "postgres", "clickhouse") and not context.case_sensitive_like:
+            mark = escape.expression if escape is not None else None
+            if mark is not None and not (isinstance(mark, exp.Literal) and mark.is_string and not (len(mark.this) == 1 and mark.this in _ASCII_UPPER + _ASCII_LOWER)):
+                raise NotExpressible(f"not expressible in {dialect}: LIKE with an ESCAPE that is an ASCII letter or not a string literal, which folding the pattern's case (SQLite's LIKE is case-insensitive for ASCII, lang_expr.html) would change")
+            like.set("this", fold(like.this))
+            like.set("expression", fold(like.expression))
+        if escape is not None:
+            continue
+        if dialect in ("postgres", "mysql"):
+            said = exp.Escape(this=like.copy(), expression=exp.Literal.string(""))
+            if like is expression:
+                expression = said
+            else:
+                like.replace(said)
+        elif dialect == "clickhouse":
+            like.set("expression", exp.Anonymous(this="replaceAll", expressions=[like.expression, exp.Literal.string("\\"), exp.Literal.string("\\\\")]))
+    return expression
+
+
+def glob_regex(pattern, dialect):
+    """SQLite's GLOB pattern `pattern` as a regular expression matching the whole string the same,
+    or NotExpressible. SQLite's GLOB (lang_expr.html#the_like_glob_regexp_match_and_extract_operators:
+    "The GLOB operator is similar to LIKE but uses the Unix file globbing syntax for its wildcards.
+    Also, GLOB is case sensitive, unlike LIKE"), as its matcher reads it (src/func.c,
+    patternCompare(), https://sqlite.org/src/file?name=src/func.c): `*` any characters, `?` one,
+    `[...]` one of a set (`^` first negates it, `]` first is itself, `a-z` a range of code points,
+    `-` first or last itself), every other character itself, a backslash too (GLOB has no escape
+    character). The expression's `.` takes a newline as any other character ((?s) for RE2 and ICU;
+    PostgreSQL's does unasked, its manual 9.7.3.5), and it is anchored at both ends (MySQL's ICU `$`
+    also matches before a final newline, so `\z` there). Only the characters a regular expression
+    reads otherwise are given a backslash (RE2 refuses one before some others)."""
+    out, i, n = [], 0, len(pattern)
+
+    def lit(c):
+        return "\\" + c if c in "\\.^$|?*+()[]{}-" else c
+
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            out.append(".*")
+        elif c == "?":
+            out.append(".")
+        elif c == "[":
+            # prior: the set's last single character, which a `-` makes a range's start; none
+            # after a range (patternCompare()'s prior_c, set to 0 there).
+            j, negate, members, prior = i + 1, False, [], None
+            if j < n and pattern[j] == "^":
+                negate, j = True, j + 1
+            if j < n and pattern[j] == "]":
+                members.append(lit("]"))
+                prior, j = "]", j + 1
+            while j < n and pattern[j] != "]":
+                if pattern[j] == "-" and prior is not None and j + 1 < n and pattern[j + 1] != "]":
+                    hi = pattern[j + 1]
+                    if ord(hi) < ord(prior):
+                        raise NotExpressible(f"not expressible in {dialect}: a GLOB range [{prior}-{hi}] whose end comes before its start, which matches nothing in SQLite and which regular expressions refuse")
+                    members[-1] = f"{lit(prior)}-{lit(hi)}"
+                    prior, j = None, j + 2
+                    continue
+                members.append(lit(pattern[j]))
+                prior, j = pattern[j], j + 1
+            if j >= n:
+                raise NotExpressible(f"not expressible in {dialect}: a GLOB pattern with a '[' not closed, which SQLite's matcher stops at")
+            out.append("[" + ("^" if negate else "") + "".join(members) + "]")
+            i = j
+        else:
+            out.append(lit(c))
+        i += 1
+    body = "".join(out)
+    if dialect == "postgres":
+        return "^" + body + "$"
+    return "(?s)^" + body + ("\\z" if dialect == "mysql" else "$")
+
+
+def globbed(expression, dialect):
+    """`expression` with each GLOB said as a regular expression match (glob_regex()), where sqlglot
+    writes GLOB, which PostgreSQL, MySQL and ClickHouse don't have and DuckDB's reads otherwise
+    (its GLOB negates a set with `!` and takes a backslash as an escape: DuckDB 1.4.2 gives
+    'bc' GLOB '[^a]*' false, SQLite true). Each engine's match: PostgreSQL's `~` (case-sensitive,
+    its manual 9.7.3), DuckDB's regexp_matches(), MySQL's REGEXP_LIKE() with match type 'c'
+    (case-sensitive: "c: Case-sensitive matching", MySQL 8.4 14.8.2, where its collation would
+    otherwise fold case), ClickHouse's match(). A NULL pattern gives NULL as SQLite's does; a pattern
+    that isn't a string literal is not expressible (its expression is made from its text)."""
+    from sqlglot import exp
+
+    for g in [n for n in reversed(list(expression.dfs())) if isinstance(n, exp.Glob)]:
+        pattern = g.expression
+        if isinstance(pattern, exp.Null):
+            regex = exp.Null()
+        elif isinstance(pattern, exp.Literal) and pattern.is_string:
+            regex = exp.Literal.string(glob_regex(pattern.this, dialect))
+        else:
+            raise NotExpressible(f"not expressible in {dialect}: GLOB with a pattern that isn't a string literal (lang_expr.html), whose regular expression is made from its text")
+        said = exp.RegexpLike(this=g.this.copy(), expression=regex, flag=exp.Literal.string("c") if dialect == "mysql" else None)
+        if g is expression:
+            expression = said
+        else:
+            g.replace(said)
+    return expression
+
+
+def _real_text(x, dialect, what):
+    """REAL `x` as the text SQLite writes it, for hex() and length() of it: SQLite's real-to-text
+    conversion is printf's "%!.15g" (sqlite3 3.51's vdbemem.c sqlite3VdbeMemStringify(); its "!"
+    flag keeps a decimal point: 100.0 is '100.0', 1e20 '1.0e+20'), infinities 'Inf' and '-Inf',
+    and -0.0 '0.0' (Python's sqlite3 3.51.0 gives each). DuckDB's printf() takes %.15g, without
+    the point: given back as regexp_replace() of a mantissa without one, and its 'inf' as 'Inf';
+    x is read once. One difference stays: a real whose decimal expansion ties at the fifteenth
+    digit (100000000000000.5) SQLite's own printf rounds away from zero and DuckDB's to even
+    ('100000000000001.0' against '100000000000000.0'). PostgreSQL's and MySQL's float text is the shortest that reads back (100.0 is
+    '100', 0.1 + 0.2 '0.30000000000000004'), ClickHouse's too, and none has a %g: not
+    expressible there."""
+    from sqlglot import exp
+
+    if dialect != "duckdb":
+        raise NotExpressible(f"not expressible in {dialect}: {what}() of a REAL, which reads SQLite's text of the real (printf's %!.15g, lang_corefunc.html#{what}); {dialect} writes a real as the shortest text that reads back and has no %g")
+    g = exp.Anonymous(this="printf", expressions=[exp.Literal.string("%.15g"), x.copy()])
+    pointed = exp.RegexpReplace(this=g, expression=exp.Literal.string("^(-?[0-9]+)(e|$)"), replacement=exp.Literal.string("\\1.0\\2"))
+    return exp.Anonymous(this="replace", expressions=[pointed, exp.Literal.string("inf"), exp.Literal.string("Inf")])
+
+
+def _sqlite_value(node, dialect, what):
+    """`node`, an expression of literals alone, as the literal SQLite gives for it (Python's sqlite3,
+    the SQLite the corpus's refusals are taken with): an INTEGER as a BIGINT, a TEXT as a string,
+    NULL as NULL. A value of another class, or text holding U+0000 (which no engine's string
+    literal carries alike), is not expressible."""
+    import sqlite3
+
+    from sqlglot import exp
+
+    db = sqlite3.connect(":memory:")
+    try:
+        value = db.execute(f"SELECT {node.sql(dialect='sqlite')}").fetchone()[0]
+    except sqlite3.Error as e:
+        raise NotExpressible(f"not expressible in {dialect}: {what}, which SQLite refuses ({e})")
+    finally:
+        db.close()
+    if value is None:
+        return exp.Null()
+    if isinstance(value, bool) or not isinstance(value, (int, str)) or (isinstance(value, str) and "\x00" in value):
+        raise NotExpressible(f"not expressible in {dialect}: {what}, whose value SQLite gives as {type(value).__name__}, which {dialect} has no literal alike of")
+    if isinstance(value, int):
+        return exp.cast(exp.Literal.number(value), exp.DataType.build("BIGINT"))
+    return exp.Literal.string(value)
+
+
+def _literals_only(node):
+    """Whether `node` is made of literals, NULLs, parentheses, signs and || alone: SQLite's value of
+    it is the same whenever it runs."""
+    from sqlglot import exp
+
+    return all(isinstance(n, (exp.Literal, exp.Null, exp.Paren, exp.Neg, exp.DPipe, exp.HexString)) for n in node.walk())
+
+
+# Text every engine's cast to an integer reads as SQLite does: an optional minus and at most 18
+# digits, inside BIGINT's range whatever they are.
+_PLAIN_INTEGER = re.compile(r"-?[0-9]{1,18}\Z")
+# The whitespace SQLite skips before a number in text: sqlite3Isspace(), its ctype map's 0x01 class
+# (sqlite3 3.51's global.c: '\t', '\n', '\v', '\f', '\r' and ' '); Python's sqlite3 3.51.0 skips each.
+_TEXT_INTEGER = "^[\\t\\n\\v\\f\\r ]*"
+
+
+def _text_integer(x, dialect):
+    """CAST(X AS INTEGER) of a TEXT X, as SQLite reads it (lang_expr.html#castexpr): "the longest
+    possible prefix of the value that can be interpreted as an integer number is extracted from the
+    TEXT value and the remainder ignored. Any leading spaces in the TEXT value when converting from
+    TEXT to INTEGER are ignored. If there is no prefix that can be interpreted as an integer number,
+    the result of the conversion is 0. If the prefix integer is greater than +9223372036854775807
+    then the result of the cast is exactly +9223372036854775807. Similarly, if the prefix integer is
+    less than -9223372036854775808 then the result of the cast is exactly -9223372036854775808"
+    ('1.5' is 1, '1e3' 1, 'abc' 0, ' -0x10' 0: Python's sqlite3 3.51.0). DuckDB and PostgreSQL cast
+    the whole text, rounding '1.5' to 2 and refusing 'abc': there the sign and the digits after the
+    leading zeros are taken with a regular expression (DuckDB's regexp_extract(X, P, group), RE2;
+    PostgreSQL's substring(X FROM P), its first group, manual 9.7.3), a run of more than 19 digits,
+    or 19 above 9223372036854775807, is the bound of its sign, and the rest is cast. X is read
+    several times, so one holding random() is not expressible. MySQL's CAST(... AS SIGNED) and
+    ClickHouse's toInt64 read text otherwise, and no translation for them has been run yet: not
+    expressible there."""
+    from sqlglot import exp
+
+    if dialect not in ("duckdb", "postgres"):
+        raise NotExpressible(f"not expressible in {dialect}: CAST of text to an integer, which SQLite reads as the text's leading integer, 0 if none (https://www.sqlite.org/lang_expr.html#castexpr), where {dialect}'s cast reads the whole text; no translation for {dialect} has been run yet")
+    if any(isinstance(n, exp.Rand) or (isinstance(n, exp.Anonymous) and n.name.lower() in ("random", "randomblob")) for n in x.walk()):
+        raise NotExpressible(f"not expressible in {dialect}: CAST of text to an integer of random(), which the translation of SQLite's reading (https://www.sqlite.org/lang_expr.html#castexpr) reads several times")
+
+    def group(pattern):
+        if dialect == "duckdb":
+            return exp.Anonymous(this="regexp_extract", expressions=[x.copy(), exp.Literal.string(pattern), exp.Literal.number(1)])
+        return exp.Substring(this=x.copy(), start=exp.Literal.string(pattern))
+
+    def sign():
+        return group(_TEXT_INTEGER + "([+-]?)")
+
+    def digits():
+        return group(_TEXT_INTEGER + "[+-]?0*([0-9]*)")
+
+    big = exp.or_(exp.GT(this=exp.Length(this=digits()), expression=exp.Literal.number(19)),
+                  exp.and_(exp.EQ(this=exp.Length(this=digits()), expression=exp.Literal.number(19)), exp.GT(this=digits(), expression=exp.Literal.string("9223372036854775807"))))
+    minus = exp.EQ(this=sign(), expression=exp.Literal.string("-"))
+    bound = exp.Case(ifs=[exp.If(this=minus.copy(), true=exp.Literal.number("-9223372036854775808"))], default=exp.Literal.number("9223372036854775807"))
+    value = exp.cast(exp.Case(ifs=[exp.If(this=exp.EQ(this=digits(), expression=exp.Literal.string("")), true=exp.Literal.string("0"))], default=digits()), exp.DataType.build("BIGINT"))
+    said = exp.Case(ifs=[exp.If(this=big, true=bound), exp.If(this=minus, true=exp.Neg(this=value.copy()))], default=value)
+    return exp.cast(said, exp.DataType.build("BIGINT"))
+
+
+# SQLite's functions of the connection (lang_corefunc.html): each reads what earlier statements of
+# the same connection did, which no other engine counts alike.
+_CONNECTION_FUNCTIONS = {
+    "CHANGES": "the rows the latest INSERT, UPDATE or DELETE changed, kept across the statements after it (https://www.sqlite.org/lang_corefunc.html#changes); MySQL's ROW_COUNT() is -1 after a SELECT and counts an UPDATE's rows otherwise, the others have none",
+    "TOTAL_CHANGES": "the rows every INSERT, UPDATE and DELETE since the connection opened changed (https://www.sqlite.org/lang_corefunc.html#total_changes), which no other engine counts",
+    "LAST_INSERT_ROWID": "the rowid of the latest successful INSERT into a rowid table (https://www.sqlite.org/lang_corefunc.html#last_insert_rowid), where MySQL's LAST_INSERT_ID() is an AUTO_INCREMENT column's first value of its latest INSERT and the others have no rowid",
+}
+
+
+def functions_said(expression, context, dialect):
+    """`expression` with SQLite's built-in functions that sqlglot writes as functions of the same
+    name that mean otherwise, said as SQLite's (lang_corefunc.html, "Built-In Scalar SQL Functions"):
+    - likely(X) and unlikely(X): "returns the argument X unchanged", a hint to the query planner;
+      likelihood(X,Y): "returns argument X unchanged. The value Y in likelihood(X,Y) must be a
+      floating point constant between 0.0 and 1.0, inclusive" (SQLite refuses an integer Y: "second
+      argument to likelihood() must be a constant between 0.0 and 1.0"). Each is X, in parentheses;
+      a likelihood() SQLite refuses is left as it is, for the engine to refuse. No other engine has
+      them.
+    - upper(X) and lower(X): "a copy of input string X in which all lower-case ASCII characters are
+      converted to their upper-case equivalent" (lower the other way), ASCII's letters only, where
+      DuckDB's and PostgreSQL's convert every letter: translate(X, 'a..z', 'A..Z') there (liked()'s
+      translate). ClickHouse's upper and lower are ASCII's already ("String Functions": upperUTF8
+      is its Unicode one); MySQL's convert by the character set's case mapping: left as it is, a
+      difference of the engine.
+    - round(X,Y): "If the Y argument is omitted or negative, it is taken to be 0", where every other
+      engine rounds to tens, hundreds, ...: Y is given as CASE WHEN Y < 0 THEN 0 ELSE Y END (a
+      literal Y as its value), so a Y of random() is not expressible.
+    - char(X1,...,XN): "a string composed of characters having the unicode code point values of
+      integers X1 through XN", a NULL being 0 (SQLite gives char(NULL) as one character U+0000),
+      where sqlglot writes DuckDB's chr() of X1 alone: there, chr(coalesce(Xi, 0)) of each,
+      joined with ||.
+    - format(FORMAT, ...): "an alias for printf()" (lang_corefunc.html#format), where sqlglot keeps
+      the name, which is another function in each engine (PostgreSQL's takes %s, %I and %L only;
+      MySQL's FORMAT(X,D) formats a number; DuckDB's and ClickHouse's take {} fields): said as
+      printf(), which DuckDB and ClickHouse have ("printf-style", their references) and PostgreSQL
+      and MySQL refuse.
+    - hex(X): "interprets its argument as a BLOB and returns a string which is the upper-case
+      hexadecimal rendering of the content of that blob" (lang_corefunc.html#hex), so an integer is
+      its text's bytes (hex(1) is '31') and NULL the empty blob's '' (SQLite 3.51 gives ''), where
+      DuckDB's and MySQL's hex() of an integer give its value in base 16, ClickHouse's its bytes,
+      and each gives NULL for NULL: on those three an INTEGER X (storage_classes()) is cast to text
+      first, and the result is coalesce(hex(X), ''). A REAL X is SQLite's text of it (_real_text():
+      DuckDB's printf(), not expressible on the others). PostgreSQL has no hex().
+    - zeroblob(N): "a BLOB consisting of N bytes of 0x00" (lang_corefunc.html#zeroblob), none for
+      a negative N, and SQLite 3.51 gives NULL's as the empty blob. DuckDB and PostgreSQL have no
+      zeroblob(): for an INTEGER or NULL N (storage_classes()) it is DuckDB's repeat() of the one
+      byte (unhex('00'), "repeat(string, count)" takes a BLOB there, none for a count below one)
+      and PostgreSQL's decode(repeat('00', N), 'hex') (9.4 and 9.5: repeat gives '' for a count
+      below one), N coalesced to 0. Another N, which SQLite takes as an integer its own way, is
+      left as it is, for the engine to refuse.
+    - length(X): "For a string value X, the length(X) function returns the number of characters
+      ... If X is a blob, then length(X) returns the number of bytes in the blob ... If X is numeric
+      then length(X) returns the length of a string representation of X" (lang_corefunc.html#length).
+      DuckDB's, PostgreSQL's and ClickHouse's take no integer: an INTEGER X (storage_classes()),
+      whose text is the same on every engine, is cast to text first; a REAL X is SQLite's text of
+      it (_real_text(): DuckDB's printf(), not expressible on the others). A BLOB X is DuckDB's octet_length() (its length() takes no BLOB) and
+      ClickHouse's length(), its bytes, where sqlglot writes CHAR_LENGTH, its UTF-8 characters.
+      PostgreSQL's length() of a bytea and MySQL's CHAR_LENGTH() of a binary string count bytes.
+    - CAST(X AS BLOB) of an INTEGER X: "When casting to a BLOB, the value is first converted to
+      TEXT" (lang_expr.html#castexpr), an integer's text the same on every engine, where DuckDB
+      casts no integer to a BLOB: CAST(CAST(X AS TEXT) AS BLOB). Of a TEXT X on DuckDB, encode(X)
+      ("Converts the string to BLOB", its UTF-8 bytes), where DuckDB's CAST refuses a character
+      past ASCII and reads '\\xAA' as one byte.
+    - CAST(X AS <a type of INTEGER affinity>) (lang_expr.html#castexpr): SQLite's INTEGER is 64 bits
+      whatever the type's name ("INTEGER ... stored in 0, 1, 2, 3, 4, 6, or 8 bytes", datatype3.html),
+      where sqlglot writes INT, 32 bits on each engine: the type is given as BIGINT. "When casting a
+      REAL value into an INTEGER, the result is the integer between the REAL value and zero that is
+      closest to the REAL value", where DuckDB's, PostgreSQL's and MySQL's casts round (DuckDB 1.4.2
+      gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first.
+    - CAST(X AS <a type of INTEGER affinity>) of a TEXT X: a literal of an optional '-' and at
+      most 18 digits (_PLAIN_INTEGER), which every engine's cast reads as SQLite does, is cast to
+      BIGINT; another X is _text_integer()'s, so the engine still does the reading.
+    - changes(), total_changes() and last_insert_rowid(): not expressible (_CONNECTION_FUNCTIONS).
+    - unistr(X) and unistr_quote(X) (lang_corefunc.html#unistr, #unistr_quote, SQLite 3.50): of a
+      literal X, SQLite's value of it (_sqlite_value()); PostgreSQL's unistr() reads escapes
+      alike but no translation of it has been run, and the others have none: another X is not
+      expressible.
+    - SQLite's date and time functions: dated()'s.
+    - total(X): "The sum() and total() aggregate functions return the sum of all non-NULL values
+      in the group ... total() always returns a floating point value ... 0.0 if there are only
+      NULL inputs" (lang_aggfunc.html#sumunc); no other engine has it. For an X of INTEGER or REAL
+      class (storage_classes()), or NULL, it is coalesce(sum(CAST(X AS DOUBLE)), 0.0), as an
+      aggregate and over a window alike. Another X (text, which total() reads as a number its own
+      way) is left as it is.
+    - X IS Y: "The IS and IS NOT operators work like = and != except when one or both of the
+      operands are NULL" (lang_expr.html "Operators"), where the other engines' IS takes NULL,
+      TRUE and FALSE only: X IS NOT DISTINCT FROM Y (MySQL's <=>), the SQL standard's name for it.
+      IS NULL, IS TRUE and IS FALSE stay.
+    - typeof(X): "a string that indicates the datatype of the expression X: "null", "integer",
+      "real", "text", or "blob"" (lang_corefunc.html#typeof), where DuckDB's and PostgreSQL's
+      typeof name the engine's type ('INTEGER', 'DECIMAL(2,1)', 'VARCHAR') and ClickHouse's
+      toTypeName its own: for an X whose storage class storage_classes() knows, the class's name,
+      'null' where X is NULL (a literal's name alone). Another X is not expressible.
+    - quote(X): "the text of an SQL literal which is the value of its argument suitable for
+      inclusion into an SQL statement. Strings are surrounded by single-quotes with escapes on
+      interior quotes as needed. BLOBs are encoded as hexadecimal literals" (lang_corefunc.html#quote),
+      NULL as NULL; no other engine has it. For an X of a class storage_classes() knows: an
+      INTEGER's text, a TEXT's with each ' doubled between quotes, a BLOB's X'..' of its upper-case
+      hex (PostgreSQL's upper(encode(X, 'hex'))), each 'NULL' where X is NULL. A REAL's text is
+      SQLite's own (%!.15g, more digits where that doesn't read back: quote(1.0/3) is
+      '3.333333333333333148e-01'), and another X: not expressible."""
+    from sqlglot import exp
+
+    classes = storage_classes(expression, context.tables)
+
+    def same(node, said):
+        nonlocal expression
+        classes[id(said)] = classes.get(id(node), UNKNOWN)  # the same value, for the functions of it said after
+        if node is expression:
+            expression = said
+        else:
+            node.replace(said)
+
+    for node in [n for n in reversed(list(expression.dfs()))]:
+        if isinstance(node, exp.Anonymous) and node.name.upper() in ("LIKELY", "UNLIKELY", "LIKELIHOOD"):
+            args = node.expressions
+            if node.name.upper() == "LIKELIHOOD":
+                y = args[1] if len(args) == 2 else None
+                if not (isinstance(y, exp.Literal) and not y.is_string and not y.this.isdigit() and 0.0 <= float(y.this) <= 1.0):
+                    continue
+            elif len(args) != 1:
+                continue
+            same(node, exp.Paren(this=args[0].copy()))
+        elif isinstance(node, (exp.Upper, exp.Lower)) and dialect in ("duckdb", "postgres"):
+            frm, to = (_ASCII_LOWER, _ASCII_UPPER) if isinstance(node, exp.Upper) else (_ASCII_UPPER, _ASCII_LOWER)
+            same(node, exp.Anonymous(this="translate", expressions=[node.this.copy(), exp.Literal.string(frm), exp.Literal.string(to)]))
+        elif isinstance(node, exp.Round) and node.args.get("decimals") is not None:
+            y = node.args["decimals"]
+            if isinstance(y, exp.Neg) and isinstance(y.this, exp.Literal) and not y.this.is_string:
+                node.set("decimals", exp.Literal.number(0))
+            elif not (isinstance(y, exp.Literal) and not y.is_string):
+                if any(isinstance(n, exp.Rand) for n in y.walk()):
+                    raise NotExpressible(f"not expressible in {dialect}: round() to random() digits, which SQLite's negative-digits rule (lang_corefunc.html#round) would have to evaluate twice")
+                node.set("decimals", exp.Case(ifs=[exp.If(this=exp.LT(this=y.copy(), expression=exp.Literal.number(0)), true=exp.Literal.number(0))], default=y.copy()))
+        elif isinstance(node, exp.Chr) and dialect == "duckdb" and node.expressions:
+            parts = [exp.Chr(expressions=[exp.Coalesce(this=a.copy(), expressions=[exp.Literal.number(0)])]) for a in node.expressions]
+            said = parts[0]
+            for more in parts[1:]:
+                said = exp.DPipe(this=said, expression=more)
+            same(node, exp.Paren(this=said) if len(parts) > 1 else said)
+        elif isinstance(node, exp.Format):
+            same(node, exp.Anonymous(this="printf", expressions=[a.copy() for a in [node.this] + list(node.expressions)]))
+        elif isinstance(node, exp.Hex) and dialect in ("duckdb", "mysql", "clickhouse"):
+            arg = node.this
+            if classes.get(id(arg)) == "INTEGER":
+                arg = exp.cast(arg.copy(), exp.DataType.build("TEXT"))
+            elif classes.get(id(arg)) == "REAL":
+                arg = _real_text(arg, dialect, "hex")
+            else:
+                arg = arg.copy()
+            same(node, exp.Coalesce(this=exp.Hex(this=arg), expressions=[exp.Literal.string("")]))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "ZEROBLOB" and len(node.expressions) == 1 and dialect in ("duckdb", "postgres"):
+            n_ = node.expressions[0]
+            if not (isinstance(n_, exp.Null) or classes.get(id(n_)) == "INTEGER"):
+                continue
+            count = exp.Coalesce(this=n_.copy(), expressions=[exp.Literal.number(0)])
+            if dialect == "duckdb":
+                said = exp.Anonymous(this="repeat", expressions=[exp.Unhex(this=exp.Literal.string("00")), count])
+            else:
+                said = exp.Anonymous(this="decode", expressions=[exp.Anonymous(this="repeat", expressions=[exp.Literal.string("00"), count]), exp.Literal.string("hex")])
+            same(node, said)
+        elif isinstance(node, exp.Length) and classes.get(id(node.this)) == "REAL":
+            node.set("this", _real_text(node.this, dialect, "length"))
+        elif isinstance(node, exp.Length) and dialect in ("duckdb", "postgres", "clickhouse"):
+            arg = classes.get(id(node.this))
+            if arg == "INTEGER":
+                node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
+            elif arg == "BLOB" and dialect != "postgres":
+                same(node, exp.Anonymous(this="octet_length" if dialect == "duckdb" else "length", expressions=[node.this.copy()]))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "TOTAL" and len(node.expressions) == 1 and not isinstance(node.expressions[0], exp.Distinct) and classes.get(id(node.expressions[0]), UNKNOWN) in (None, "INTEGER", "REAL"):
+            summed = exp.Sum(this=exp.cast(node.expressions[0].copy(), exp.DataType.build("DOUBLE")))
+            w = node.parent
+            if isinstance(w, exp.Window) and w.this is node:
+                over = w.copy()
+                over.set("this", summed)
+                same(w, exp.Coalesce(this=over, expressions=[exp.Literal.number("0.0")]))
+            else:
+                same(node, exp.Coalesce(this=summed, expressions=[exp.Literal.number("0.0")]))
+        elif isinstance(node, exp.Is) and not isinstance(node.expression, (exp.Null, exp.Boolean)):
+            same(node, exp.NullSafeEQ(this=node.this.copy(), expression=node.expression.copy()))
+        elif isinstance(node, exp.Typeof) and classes.get(id(node.this), UNKNOWN) == UNKNOWN:
+            raise NotExpressible(f"not expressible in {dialect}: typeof() of a value whose storage class only running it shows (https://www.sqlite.org/lang_corefunc.html#typeof), where {dialect}'s values are of their column's or expression's type, not SQLite's classes")
+        elif isinstance(node, exp.Typeof):
+            c, x = classes[id(node.this)], node.this
+            if c is None or isinstance(x, exp.Literal) or (isinstance(x, exp.Neg) and isinstance(x.this, exp.Literal)):
+                same(node, exp.Literal.string((c or "null").lower()))
+            else:
+                same(node, exp.Case(ifs=[exp.If(this=exp.Is(this=x.copy(), expression=exp.Null()), true=exp.Literal.string("null"))], default=exp.Literal.string(c.lower())))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "QUOTE" and len(node.expressions) == 1 and classes.get(id(node.expressions[0]), UNKNOWN) in (None, "INTEGER", "TEXT", "BLOB"):
+            x = node.expressions[0]
+            c = classes[id(x)]
+            if c is None:
+                said = exp.Literal.string("NULL")
+            elif c == "INTEGER":
+                said = exp.cast(x.copy(), exp.DataType.build("TEXT"))
+            elif c == "TEXT":
+                q = exp.Literal.string("'")
+                said = exp.DPipe(this=exp.DPipe(this=q, expression=exp.Anonymous(this="replace", expressions=[x.copy(), q.copy(), exp.Literal.string("''")])), expression=q.copy())
+            else:
+                hexed = exp.Upper(this=exp.Anonymous(this="encode", expressions=[x.copy(), exp.Literal.string("hex")])) if dialect == "postgres" else exp.Hex(this=x.copy())
+                said = exp.DPipe(this=exp.DPipe(this=exp.Literal.string("X'"), expression=hexed), expression=exp.Literal.string("'"))
+            same(node, said if c is None else exp.Coalesce(this=said, expressions=[exp.Literal.string("NULL")]))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "QUOTE" and len(node.expressions) == 1:
+            what = "a REAL, whose text is SQLite's own (%!.15g, more digits where that doesn't read back)" if classes.get(id(node.expressions[0])) == "REAL" else "a value whose storage class only running it shows"
+            raise NotExpressible(f"not expressible in {dialect}: quote() of {what} (https://www.sqlite.org/lang_corefunc.html#quote), which no {dialect} function writes alike")
+        elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and node.to.sql(dialect="sqlite").strip() and affinity(node.to.sql(dialect="sqlite")) == "BLOB" and classes.get(id(node.this)) == "INTEGER":
+            node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
+        elif type(node) is exp.Cast and dialect == "duckdb" and isinstance(node.to, exp.DataType) and node.to.sql(dialect="sqlite").strip() and affinity(node.to.sql(dialect="sqlite")) == "BLOB" and classes.get(id(node.this)) == "TEXT":
+            same(node, exp.Anonymous(this="encode", expressions=[node.this.copy()]))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() in _CONNECTION_FUNCTIONS:
+            raise NotExpressible(f"not expressible in {dialect}: {node.name.lower()}(), {_CONNECTION_FUNCTIONS[node.name.upper()]}")
+        elif isinstance(node, exp.Anonymous) and node.name.upper() in ("UNISTR", "UNISTR_QUOTE"):
+            if not all(_literals_only(a) for a in node.expressions):
+                raise NotExpressible(f"not expressible in {dialect}: {node.name.lower()}() of a value read as it runs (https://www.sqlite.org/lang_corefunc.html#{node.name.lower()}), whose escapes no {dialect} function reads alike, or none has been run")
+            same(node, _sqlite_value(node, dialect, f"{node.name.lower()}()"))
+        elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and affinity(node.to.sql(dialect="sqlite")) == "INTEGER" and classes.get(id(node.this)) == "TEXT":
+            x = node.this
+            if isinstance(x, exp.Literal) and _PLAIN_INTEGER.match(x.this):
+                node.set("to", exp.DataType.build("BIGINT"))
+            else:
+                same(node, _text_integer(x, dialect))
+        elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and affinity(node.to.sql(dialect="sqlite")) == "INTEGER":
+            if classes.get(id(node.this)) == "REAL":
+                node.set("this", exp.Trunc(this=node.this.copy()))
+            node.set("to", exp.DataType.build("BIGINT"))
+    return expression
+
+
+# SQLite's date and time functions (https://www.sqlite.org/lang_datefunc.html): each reads a time
+# value and modifiers into a point in time, kept as whole milliseconds ("iJD", the Julian day number
+# times 86400000: lang_datefunc.html section 7 and sqlite3 3.51's date.c), and writes it out.
+DATE_FUNCTIONS = ("DATE", "TIME", "DATETIME", "JULIANDAY", "UNIXEPOCH", "STRFTIME")
+# Modifiers that say how a numeric time value is read (lang_datefunc.html#modifiers, "The 'auto',
+# 'julianday' and 'unixepoch' modifiers ... must follow immediately after the time-value"): they
+# are part of reading it.
+_READING_MODIFIERS = ("unixepoch", "julianday", "auto")
+_ADDED = re.compile(r"\s*([+-]?)\s*([0-9]+)\s+(day|hour|minute|second|month|year)s?\s*$", re.I)
+_JD_UNIX_MS = 210866760000000  # 1970-01-01 00:00:00 as iJD: Julian day 2440587.5 times 86400000 (date.c's unixepoch)
+# strftime()'s substitutions (lang_datefunc.html#strftime's table) each dialect writes alike, as
+# the dialect's own format (DuckDB's strftime(), "Date Format Functions"; PostgreSQL's to_char(),
+# manual 9.8 Table 9.26), or an expression of the moment (None: written by _strftime_text()).
+_STRFTIME = {
+    "d": ("%d", "DD"), "F": ("%Y-%m-%d", "YYYY-MM-DD"), "H": ("%H", "HH24"), "j": ("%j", "DDD"),
+    "m": ("%m", "MM"), "M": ("%M", "MI"), "R": ("%H:%M", "HH24:MI"), "S": ("%S", "SS"),
+    "T": ("%H:%M:%S", "HH24:MI:SS"), "Y": ("%Y", "YYYY"), "f": ("%S.%g", "SS.MS"), "s": None, "w": None,
+}
+
+
+def _time_value(args, dialect, name):
+    """The moment SQLite reads from time value `args[0]` and the reading modifiers after it, as
+    (text 'YYYY-MM-DD HH:MM:SS.SSS', the modifiers left). Only a literal is read here, by SQLite
+    itself (Python's sqlite3, the SQLite the corpus's refusals are taken with): its many formats
+    (lang_datefunc.html#time_values: ten text forms, a time zone suffix, a Julian day or Unix time
+    number, a day past a month's end carried into the next month) are SQLite's to read, and the
+    moment is given to the engine as a TIMESTAMP literal of its own, so the engine still does each
+    function's arithmetic and writing. The text read must read back to the same millisecond
+    (julianday() of each equal), else not expressible. A value read at run time (a column, an
+    expression) is read in SQLite's formats only by SQLite: not expressible; nor is 'now' (the
+    moment the statement runs, which no two engines share), nor a year before 1 (DuckDB's and
+    PostgreSQL's TIMESTAMP have no year 0)."""
+    import sqlite3
+
+    from sqlglot import exp
+
+    first = args[0] if args else exp.Literal.string("now")
+    value = first.this if isinstance(first, exp.Neg) else first
+    if not isinstance(value, exp.Literal):
+        raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of a time value read as it runs, in SQLite's own time-value formats (https://www.sqlite.org/lang_datefunc.html#time_values), which {dialect} doesn't read alike")
+    literal = first.sql(dialect="sqlite")
+    if value.is_string and value.this.strip().lower() == "now":
+        raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of 'now', the moment the statement runs (https://www.sqlite.org/lang_datefunc.html#time_values), which no two engines share")
+    reading, rest = [], [a for a in args[1:]]
+    if rest and isinstance(rest[0], exp.Literal) and rest[0].is_string and rest[0].this.strip().lower() in _READING_MODIFIERS:
+        reading.append(rest.pop(0).sql(dialect="sqlite"))
+    db = sqlite3.connect(":memory:")
+    try:
+        text, jd = db.execute(f"SELECT strftime('%Y-%m-%d %H:%M:%f', {', '.join([literal] + reading)}), julianday({', '.join([literal] + reading)})").fetchone()
+        back = db.execute("SELECT julianday(?)", (text,)).fetchone()[0] if text is not None else None
+    finally:
+        db.close()
+    if text is None:
+        return None, rest
+    if back != jd:
+        raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of {literal}, a moment SQLite's text of it doesn't give back to the millisecond (https://www.sqlite.org/lang_datefunc.html)")
+    if text.startswith("0000") or text.startswith("-"):
+        raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of a moment in the year {text[:4]}, which {dialect}'s TIMESTAMP doesn't have")
+    return text, rest
+
+
+# MySQL's and ClickHouse's dates (unverified here: no MySQL or ClickHouse on this machine; the
+# jupiter run checks them). Sources: MySQL 8.4 Reference Manual, "Date and Time Functions"
+# (https://dev.mysql.com/doc/refman/8.4/en/date-and-time-functions.html: DATE_FORMAT()'s
+# specifiers, DATE_ADD()'s "date + INTERVAL expr unit", TIMESTAMPDIFF()) and "The DATE, DATETIME,
+# and TIMESTAMP Types" (https://dev.mysql.com/doc/refman/8.4/en/datetime.html: DATETIME(3) keeps
+# milliseconds, "The supported range is '1000-01-01 00:00:00.000000' to '9999-12-31
+# 23:59:59.499999'", no time zone); ClickHouse's "Dates and Times" functions
+# (https://clickhouse.com/docs/sql-reference/functions/date-time-functions: formatDateTime()'s
+# specifiers and time zone argument, toStartOfDay(), toStartOfMonth(), toStartOfYear(), addDays()
+# and the rest), "DateTime64" (https://clickhouse.com/docs/sql-reference/data-types/datetime64:
+# "Supported range of values: [1900-01-01 00:00:00, 2299-12-31 23:59:59.99999999]"), and
+# toUnixTimestamp64Milli() (https://clickhouse.com/docs/sql-reference/functions/type-conversion-functions).
+# Each moment is UTC on ClickHouse (given with every function) and zoneless on MySQL, as SQLite's are.
+# Years each holds: (first, last).
+_YEARS = {"mysql": (1000, 9999), "clickhouse": (1900, 2299)}
+# strftime()'s substitutions as DATE_FORMAT() and formatDateTime() write them ('%f' and '%s' are
+# _other_text()'s): MySQL's minutes are %i and seconds %s, ClickHouse's %i and %S; %j is the day
+# of the year 001-366 and %w the day of the week, Sunday 0, on both.
+_OTHER_STRFTIME = {
+    "mysql": {"d": "%d", "F": "%Y-%m-%d", "H": "%H", "j": "%j", "m": "%m", "M": "%i", "R": "%H:%i", "S": "%s", "T": "%H:%i:%s", "Y": "%Y", "w": "%w"},
+    "clickhouse": {"d": "%d", "F": "%Y-%m-%d", "H": "%H", "j": "%j", "m": "%m", "M": "%i", "R": "%H:%i", "S": "%S", "T": "%H:%i:%S", "Y": "%Y", "w": "%w"},
+}
+
+
+def _moment(text, dialect="duckdb"):
+    """Moment `text` ('YYYY-MM-DD HH:MM:SS.SSS') as the dialect's: a TIMESTAMP; MySQL's
+    DATETIME(3); ClickHouse's toDateTime64(text, 3, 'UTC')."""
+    from sqlglot import exp
+
+    lit = exp.Literal.string(text)
+    if dialect == "mysql":
+        return exp.cast(lit, exp.DataType.build("DATETIME(3)", dialect="mysql"))
+    if dialect == "clickhouse":
+        return _utc(exp.Anonymous(this="toDateTime64", expressions=[lit, exp.Literal.number(3)]))
+    return exp.cast(lit, exp.DataType.build("TIMESTAMP"))
+
+
+def _utc(call):
+    """ClickHouse's `call` with its time zone argument 'UTC' last."""
+    from sqlglot import exp
+
+    call.append("expressions", exp.Literal.string("UTC"))
+    return call
+
+
+def _started(ts, unit, dialect):
+    """'start of day', 'start of month', 'start of year' of `ts`: date_trunc(); MySQL's DATETIME of
+    DATE_FORMAT()'s day, month or year; ClickHouse's toStartOfDay(), toStartOfMonth(),
+    toStartOfYear() (a Date for a month or a year) made a DateTime64(3) in UTC again."""
+    from sqlglot import exp
+
+    if dialect == "mysql":
+        fmt = {"day": "%Y-%m-%d 00:00:00", "month": "%Y-%m-01 00:00:00", "year": "%Y-01-01 00:00:00"}[unit]
+        return exp.cast(exp.Anonymous(this="DATE_FORMAT", expressions=[ts, exp.Literal.string(fmt)]), exp.DataType.build("DATETIME(3)", dialect="mysql"))
+    if dialect == "clickhouse":
+        return _utc(exp.Anonymous(this="toDateTime64", expressions=[exp.Anonymous(this=f"toStartOf{unit.capitalize()}", expressions=[ts]), exp.Literal.number(3)]))
+    return exp.cast(exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string(unit), ts]), exp.DataType.build("TIMESTAMP"))
+
+
+def _added(ts, unit, n, dialect):
+    """`ts` with `n` (text of a whole number, maybe negative) of `unit` (DAY ... YEAR) added: the
+    INTERVAL; ClickHouse's addDays(), addHours(), ... addYears(). Months and years end on the new
+    month's last day on every engine (MySQL: "the day is adjusted to the maximum days in the new
+    month"); dated() says them only where that can't happen."""
+    from sqlglot import exp
+
+    if dialect == "clickhouse":
+        return exp.Anonymous(this=f"add{unit.capitalize()}s", expressions=[ts, exp.Literal.number(n)])
+    if dialect == "mysql":
+        return exp.Add(this=ts, expression=exp.Interval(this=exp.Literal.number(n), unit=exp.var(unit)))
+    return exp.Add(this=ts, expression=exp.Interval(this=exp.Literal.string(n), unit=exp.var(unit)))
+
+
+def _other_text(fmt, ts, dialect):
+    """strftime(`fmt`)'s text of `ts` on MySQL (DATE_FORMAT()) and ClickHouse (formatDateTime(...,
+    'UTC')): each run of _OTHER_STRFTIME's substitutions and the text between them ('%' as '%%')
+    one format; '%f' (SS.SSS) MySQL's first six characters of '%s.%f' (microseconds, of a moment
+    of whole milliseconds), ClickHouse's '%S', '.' and the milliseconds of toUnixTimestamp64Milli()
+    padded to three; '%s' unixepoch()'s. Another substitution is not expressible."""
+    from sqlglot import exp
+
+    table = _OTHER_STRFTIME[dialect]
+
+    def call(f, at=None):
+        at = at if at is not None else ts.copy()
+        if dialect == "mysql":
+            return exp.Anonymous(this="DATE_FORMAT", expressions=[at, exp.Literal.string(f)])
+        return _utc(exp.Anonymous(this="formatDateTime", expressions=[at, exp.Literal.string(f)]))
+
+    def written(run):
+        # A run without a substitution is its text, '%%' a '%'.
+        return call(run) if "%" in run.replace("%%", "") else exp.Literal.string(run.replace("%%", "%"))
+
+    parts, run, i = [], "", 0
+    while i < len(fmt):
+        ch = fmt[i]
+        if ch != "%":
+            run += ch
+            i += 1
+            continue
+        spec = fmt[i + 1] if i + 1 < len(fmt) else ""
+        i += 2
+        if spec == "%":
+            run += "%%"
+        elif spec in table:
+            run += table[spec]
+        elif spec in ("f", "s"):
+            if run:
+                parts.append(written(run))
+                run = ""
+            if spec == "s":
+                parts.append(exp.cast(_unix(ts.copy(), dialect, False), exp.DataType.build("TEXT")))
+            elif dialect == "mysql":
+                parts.append(exp.Substring(this=call("%s.%f"), start=exp.Literal.number(1), length=exp.Literal.number(6)))
+            else:
+                ms = exp.Mod(this=exp.Paren(this=exp.Add(this=exp.Mod(this=_epoch_ms(ts.copy(), dialect), expression=exp.Literal.number(1000)), expression=exp.Literal.number(1000))), expression=exp.Literal.number(1000))
+                padded = exp.Anonymous(this="leftPad", expressions=[exp.Anonymous(this="toString", expressions=[ms]), exp.Literal.number(3), exp.Literal.string("0")])
+                parts.append(exp.DPipe(this=exp.DPipe(this=call("%S"), expression=exp.Literal.string(".")), expression=padded))
+        else:
+            raise NotExpressible(f"not expressible in {dialect}: strftime()'s %{spec} (https://www.sqlite.org/lang_datefunc.html#strftime), which {dialect} has nothing that writes alike")
+    if run or not parts:
+        parts.append(written(run))
+    said = parts[0]
+    for p in parts[1:]:
+        said = exp.DPipe(this=said, expression=p)
+    return exp.Paren(this=said) if len(parts) > 1 else said
+
+
+def _in_years(args, dialect, name):
+    """Not expressible where SQLite's moment of time value and modifiers `args` (literals, read
+    by Python's sqlite3), as read or once modified, is outside the years the dialect holds (_YEARS)."""
+    import sqlite3
+
+    if dialect not in _YEARS:
+        return
+    first, last = _YEARS[dialect]
+    from sqlglot import exp
+
+    shown = [a.sql(dialect="sqlite") for a in args]
+    # The moment as read: the time value with its reading modifier (_READING_MODIFIERS), if any.
+    read = 2 if len(args) > 1 and isinstance(args[1], exp.Literal) and args[1].is_string and args[1].this.strip().lower() in _READING_MODIFIERS else 1
+    db = sqlite3.connect(":memory:")
+    try:
+        years = [db.execute(f"SELECT strftime('%Y', {', '.join(shown[:k])})").fetchone()[0] for k in (read, len(shown))]
+    finally:
+        db.close()
+    for y in years:
+        if y is not None and not first <= int(y) <= last:
+            raise NotExpressible(f"not expressible in {dialect}: {name.lower()}() of a moment in the year {y}, outside the years {first} to {last} {dialect}'s dates hold")
+
+
+def _epoch_ms(ts, dialect):
+    """The moment `ts` as whole milliseconds since 1970 (BIGINT): DuckDB's epoch_ms(), PostgreSQL's
+    extract(epoch) (a numeric, exact) times 1000, MySQL's TIMESTAMPDIFF() in microseconds from
+    1970 DIV 1000 (exact: whole milliseconds), ClickHouse's toUnixTimestamp64Milli()."""
+    from sqlglot import exp
+
+    if dialect == "mysql":
+        epoch = exp.cast(exp.Literal.string("1970-01-01 00:00:00"), exp.DataType.build("DATETIME(3)", dialect="mysql"))
+        return exp.IntDiv(this=exp.Anonymous(this="TIMESTAMPDIFF", expressions=[exp.var("MICROSECOND"), epoch, ts]), expression=exp.Literal.number(1000))
+    if dialect == "clickhouse":
+        return exp.Anonymous(this="toUnixTimestamp64Milli", expressions=[ts])
+    if dialect == "duckdb":
+        return exp.Anonymous(this="epoch_ms", expressions=[ts])
+    return exp.cast(exp.Floor(this=exp.Mul(this=exp.Extract(this=exp.var("EPOCH"), expression=ts), expression=exp.Literal.number(1000))), exp.DataType.build("BIGINT"))
+
+
+def _formatted(ts, fmt, dialect):
+    from sqlglot import exp
+
+    return exp.Anonymous(this="strftime" if dialect == "duckdb" else "to_char", expressions=[ts, exp.Literal.string(fmt)])
+
+
+def _unix(ts, dialect, subsec):
+    """unixepoch(): "the number of seconds since 1970", an INTEGER, the whole seconds before the
+    moment (date.c: iJD/1000 less 1970's, iJD being positive), or with 'subsec' a REAL of its
+    milliseconds (iJD less 1970's, over 1000.0)."""
+    from sqlglot import exp
+
+    ms = _epoch_ms(ts, dialect)
+    if subsec:
+        return exp.Div(this=exp.cast(ms, exp.DataType.build("DOUBLE")), expression=exp.Literal.number("1000.0"))
+    return exp.cast(exp.Floor(this=exp.Div(this=ms, expression=exp.Literal.number("1000.0"))), exp.DataType.build("BIGINT"))
+
+
+def _strftime_text(fmt, ts, dialect):
+    """strftime(`fmt`, ...)'s text of moment `ts`: each substitution of _STRFTIME (%w the day of the
+    week, Sunday 0: DuckDB's %w, PostgreSQL's extract(dow); %s unixepoch()'s), the text between
+    them as it is, joined with ||. Another substitution (%e, %G, %I, %J, %k, %l, %p, %u, %U, %V,
+    %W ...) is not expressible."""
+    from sqlglot import exp
+
+    parts, i, text = [], 0, ""
+    while i < len(fmt):
+        ch = fmt[i]
+        if ch != "%":
+            text += ch
+            i += 1
+            continue
+        spec = fmt[i + 1] if i + 1 < len(fmt) else ""
+        i += 2
+        if spec == "%":
+            text += "%"
+            continue
+        if spec not in _STRFTIME:
+            raise NotExpressible(f"not expressible in {dialect}: strftime()'s %{spec} (https://www.sqlite.org/lang_datefunc.html#strftime), which {dialect} has nothing that writes alike")
+        if text:
+            parts.append(exp.Literal.string(text))
+            text = ""
+        if spec == "s":
+            parts.append(exp.cast(_unix(ts.copy(), dialect, False), exp.DataType.build("TEXT")))
+        elif spec == "w":
+            dow = _formatted(ts.copy(), "%w", dialect) if dialect == "duckdb" else exp.cast(exp.cast(exp.Extract(this=exp.var("DOW"), expression=ts.copy()), exp.DataType.build("INT")), exp.DataType.build("TEXT"))
+            parts.append(dow)
+        else:
+            parts.append(_formatted(ts.copy(), _STRFTIME[spec][0 if dialect == "duckdb" else 1], dialect))
+    if text or not parts:
+        parts.append(exp.Literal.string(text))
+    said = parts[0]
+    for p in parts[1:]:
+        said = exp.DPipe(this=said, expression=p)
+    return exp.Paren(this=said) if len(parts) > 1 else said
+
+
+def dated(expression, dialect):
+    """`expression` with SQLite's date and time functions (date(), time(), datetime(), julianday(),
+    unixepoch(), strftime(): lang_datefunc.html) said as `dialect`'s arithmetic and writing of the
+    same moment, where each is exact; else not expressible, with the reason.
+    - The time value is a literal SQLite reads (_time_value()); NULL where SQLite reads none.
+    - Modifiers (lang_datefunc.html#modifiers): 'NNN days', 'NNN hours', 'NNN minutes' and 'NNN
+      seconds' of a whole NNN add that many units' milliseconds ("adds the specified amount of time
+      to the date and time"): the dialect's INTERVAL. 'start of day', 'start of month' and 'start
+      of year' ("shift the date backwards to the beginning of the subject day, month or year"):
+      date_trunc(). 'NNN months' and 'NNN years' carry a day past the new month's end into the
+      next month ("2001-03-31 '+1 month' ... 2001-05-01", section 6), where DuckDB's and
+      PostgreSQL's intervals give the month's last day: alike only while the day is 28 or less,
+      which is known of the read moment and after 'start of month' or 'start of year', so they are
+      said there and not expressible after an addition of days or less. 'subsec' and 'subsecond'
+      write the milliseconds ("the 'subsec' ... causes datetime(), time() and unixepoch() to show
+      fractional seconds"). 'localtime' and 'utc' read the machine's time zone, 'weekday N',
+      'ceiling', 'floor', fractional amounts and the '±YYYY-MM-DD' forms are SQLite's own: not
+      expressible.
+    - date() writes '%Y-%m-%d', time() '%H:%M:%S', datetime() '%Y-%m-%d %H:%M:%S' (with 'subsec'
+      '.SSS' after the seconds), strftime() its format (_strftime_text()), julianday() the moment's
+      milliseconds over 86400000.0 from Julian day 0 (date.c's iJD/86400000.0: one exact BIGINT,
+      one IEEE division, so the same REAL), unixepoch() _unix()'s.
+    MySQL and ClickHouse: the same, with _moment(), _started(), _added(), _epoch_ms() and
+    _other_text() of theirs, where SQLite's moment read and modified is in the years they hold
+    (_in_years()); unverified until the jupiter run.
+    timediff() (a span written '+YYYY-MM-DD HH:MM:SS.SSS') has no like on any engine."""
+    from sqlglot import exp
+
+    for node in [n for n in reversed(list(expression.dfs()))]:
+        if isinstance(node, exp.Date):
+            name, args = "DATE", [a for a in [node.this, node.args.get("zone")] if a is not None] + list(node.expressions)
+        elif isinstance(node, exp.TimeToStr) and isinstance(node.this, exp.TsOrDsToTimestamp) and node.args.get("format") is not None:
+            # sqlglot's reading of strftime(F, X) with no modifiers.
+            name, args = "STRFTIME", [node.args["format"], node.this.this]
+        elif isinstance(node, exp.Anonymous) and node.name.upper() in DATE_FUNCTIONS + ("TIMEDIFF",):
+            name, args = node.name.upper(), list(node.expressions)
+        else:
+            continue
+        doc = f"https://www.sqlite.org/lang_datefunc.html#{name.lower() if name != 'STRFTIME' else 'strftime'}"
+        if name == "TIMEDIFF":
+            raise NotExpressible(f"not expressible in {dialect}: timediff() ({doc}), whose '+YYYY-MM-DD HH:MM:SS.SSS' span no {dialect} function writes")
+        fmt = None
+        if name == "STRFTIME":
+            if not args or not (isinstance(args[0], exp.Literal) and args[0].is_string):
+                raise NotExpressible(f"not expressible in {dialect}: strftime() of a format read as it runs ({doc})")
+            fmt, args = args[0].this, args[1:]
+        text, mods = (None, []) if any(isinstance(a, exp.Null) for a in args) else _time_value(args, dialect, name)
+        if text is None:
+            said = exp.Null()
+        else:
+            ts, subsec, day_ok = _moment(text, dialect), False, int(text[8:10]) <= 28
+            for m in mods:
+                word = m.this.strip().lower() if isinstance(m, exp.Literal) and m.is_string else None
+                added = _ADDED.match(word) if word is not None else None
+                if word in ("subsec", "subsecond"):
+                    subsec = True
+                elif word in ("start of day", "start of month", "start of year"):
+                    unit = word.split()[-1]
+                    ts = _started(ts, unit, dialect)
+                    day_ok = day_ok or unit != "day"
+                elif added is not None and (added.group(3).lower() not in ("month", "year") or day_ok):
+                    unit = added.group(3).upper()
+                    n = ("-" if added.group(1) == "-" else "") + added.group(2)
+                    ts = _added(ts, unit, n, dialect)
+                    day_ok = day_ok and unit in ("MONTH", "YEAR")
+                elif added is not None:
+                    raise NotExpressible(f"not expressible in {dialect}: {name.lower()}()'s '{word}' after a day past the 28th may be ({doc} and #modifiers: SQLite carries a day past the month's end into the next month, {dialect} gives the month's last day)")
+                else:
+                    shown = m.sql(dialect="sqlite")
+                    raise NotExpressible(f"not expressible in {dialect}: {name.lower()}()'s modifier {shown} (https://www.sqlite.org/lang_datefunc.html#modifiers), which {dialect}'s dates have nothing alike of, or which is read as it runs")
+            _in_years(args, dialect, name)
+            sec = "%S.%g" if dialect == "duckdb" else "SS.MS"
+            sec = sec if subsec else ("%S" if dialect == "duckdb" else "SS")
+            other = {"DATE": "%Y-%m-%d", "TIME": "%H:%M:" + ("%f" if subsec else "%S"), "DATETIME": "%Y-%m-%d %H:%M:" + ("%f" if subsec else "%S"), "STRFTIME": fmt}
+            if dialect in _YEARS and name in other:
+                said = _other_text(other[name], ts, dialect)
+            elif name == "DATE":
+                said = _formatted(ts, "%Y-%m-%d" if dialect == "duckdb" else "YYYY-MM-DD", dialect)
+            elif name == "TIME":
+                said = _formatted(ts, ("%H:%M:" if dialect == "duckdb" else "HH24:MI:") + sec, dialect)
+            elif name == "DATETIME":
+                said = _formatted(ts, ("%Y-%m-%d %H:%M:" if dialect == "duckdb" else "YYYY-MM-DD HH24:MI:") + sec, dialect)
+            elif name == "JULIANDAY":
+                said = exp.Div(this=exp.cast(exp.Add(this=_epoch_ms(ts, dialect), expression=exp.Literal.number(_JD_UNIX_MS)), exp.DataType.build("DOUBLE")), expression=exp.Literal.number("86400000.0"))
+            elif name == "UNIXEPOCH":
+                said = _unix(ts, dialect, subsec)
+            else:
+                said = _strftime_text(fmt, ts, dialect)
+        if node is expression:
+            expression = said
+        else:
+            node.replace(said)
+    return expression
+
+
+def _canonical_json(text):
+    """Whether `text` is RFC 8259 JSON (Python's json reads it, with no NaN or Infinity), which every
+    reader reads alike: SQLite's json functions "accept JSON text that conforms to RFC-8259"
+    (json1.html section 3.1) and the JSON5 extensions beyond it are where readers differ."""
+    import json
+
+    def refuse(_):
+        raise ValueError("not RFC 8259")
+
+    try:
+        json.loads(text, parse_constant=refuse)
+    except ValueError:
+        return False
+    return True
+
+
+_PLAIN_KEY = re.compile(r"[A-Za-z0-9_ ]*$")
+
+
+def sqlite_own(expression, context, dialect):
+    """`expression` as it is, or not expressible where it uses what is SQLite's own:
+    - SQLite's JSON functions and operators (json(), json_extract(), -> and ->>, json_set(), the
+      jsonb_ functions, json_each() ...: https://www.sqlite.org/json1.html) read JSON5 ("JSON5
+      extensions", json1.html section 3.4), write SQLite's own minified text, give an SQL value of
+      each JSON type (json_extract('{"a":1}', '$.a') is the INTEGER 1, of a string its text
+      unquoted: json1.html, "The json_extract() function") and keep JSONB, SQLite's own binary
+      format: each engine's JSON functions read, write and type JSON otherwise (DuckDB's
+      json_extract() gives a JSON value, '"x"' quoted; PostgreSQL's ->> takes a key, not a path).
+    - a PRAGMA, and a pragma_ table-valued function (https://www.sqlite.org/pragma.html): it reads
+      or sets SQLite's own settings and catalog, which no engine has a statement like (DuckDB's
+      PRAGMA table_info gives other columns); case_sensitive_like's effect is carried into each
+      later LIKE's translation (liked()), the PRAGMA itself is not expressible.
+    Exact on DuckDB, where its JSON text is SQLite's ("Minified" both, no spaces), each written as
+    DuckDB's function of the same name cast to TEXT: json_array() of INTEGERs and NULLs
+    (storage_classes(): an integer's text is the same, NULL null; json1.html#jarray), json_object()
+    of the same with literal keys of letters, digits, '_' and spaces (no escapes to differ in;
+    json1.html#jobj), and json_array_length() of a literal of RFC 8259 JSON (_canonical_json();
+    json1.html#jarraylen). PostgreSQL's, MySQL's and ClickHouse's JSON text puts spaces between
+    elements ('[1, 2]'): not expressible there."""
+    from sqlglot import exp
+
+    classes = storage_classes(expression, context.tables)
+
+    def exact(node):
+        if dialect != "duckdb":
+            return False
+        if isinstance(node, exp.Anonymous) and node.name.lower() == "json_array":
+            return all(classes.get(id(a)) in (None, "INTEGER") for a in node.expressions)
+        if isinstance(node, exp.JSONObject):
+            pairs = node.expressions
+            return all(isinstance(kv, exp.JSONKeyValue) and isinstance(kv.this, exp.Literal) and kv.this.is_string and _PLAIN_KEY.match(kv.this.this)
+                       and classes.get(id(kv.expression)) in (None, "INTEGER") for kv in pairs) and not any(node.args.get(k) for k in ("null_handling", "unique_keys", "return_type", "encoding"))
+        if isinstance(node, exp.Anonymous) and node.name.lower() == "json_array_length" and len(node.expressions) == 1:
+            x = node.expressions[0]
+            return isinstance(x, exp.Literal) and x.is_string and _canonical_json(x.this)
+        return False
+
+    approved = set()
+    for node in [n for n in reversed(list(expression.walk())) if isinstance(n, exp.Func)]:
+        if exact(node):
+            kept = node.copy()
+            approved.add(id(kept))
+            said = exp.Cast(this=kept, to=exp.DataType.build("TEXT")) if isinstance(kept, exp.JSONObject) or kept.name.lower() == "json_array" else kept
+            if node is expression:
+                expression = said
+            else:
+                node.replace(said)
+
+    if isinstance(expression, exp.Pragma):
+        target = expression.this.this if isinstance(expression.this, exp.EQ) else expression.this
+        target = target.expression if isinstance(target, exp.Dot) else target
+        name = (target.name if isinstance(target, (exp.Column, exp.Identifier, exp.Var, exp.Anonymous)) else target.sql(dialect="sqlite").split("(")[0]).lower() if target is not None else ""
+        raise NotExpressible(f"not expressible in {dialect}: PRAGMA {name} (https://www.sqlite.org/pragma.html#pragma_{name}) reads or sets SQLite's own settings and catalog, which {dialect} has no statement like")
+    for node in expression.walk():
+        if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier) and node.name.lower().startswith("pragma_"):
+            # A pragma_ table function without arguments, which sqlglot reads as a table.
+            raise NotExpressible(f"not expressible in {dialect}: the table-valued {node.name.lower()} (https://www.sqlite.org/pragma.html#pragfunc), which reads SQLite's own catalog, which {dialect} has nothing like")
+        if not isinstance(node, exp.Func) or id(node) in approved:
+            continue
+        name = node.name.lower() if isinstance(node, exp.Anonymous) else type(node).__name__.lower()
+        if name.startswith("pragma_"):
+            raise NotExpressible(f"not expressible in {dialect}: the table-valued {name}() (https://www.sqlite.org/pragma.html#pragfunc), which reads SQLite's own catalog, which {dialect} has nothing like")
+        if name.startswith("json"):
+            shown = node.name.lower() if isinstance(node, exp.Anonymous) else node.sql(dialect="sqlite").split("(")[0].lower()
+            shown = f"{shown}()" if shown.startswith("json") else f"JSON operator in {node.sql(dialect='sqlite')[:40]}"
+            raise NotExpressible(f"not expressible in {dialect}: SQLite's {shown} (https://www.sqlite.org/json1.html), which reads JSON5, writes SQLite's own minified text and gives an SQL value of each JSON type, where {dialect}'s JSON functions read, write and type JSON otherwise")
+    return expression
+
+
+def _written_table(e):
+    """The table (upper-cased) INSERT, UPDATE, DELETE or DROP TABLE `e` writes or drops, else None."""
+    from sqlglot import exp
+
+    if isinstance(e, (exp.Insert, exp.Update, exp.Delete)) or (isinstance(e, exp.Drop) and e.args.get("kind") == "TABLE"):
+        t = e.this.this if isinstance(e.this, exp.Schema) else e.this
+        return t.name.upper() if isinstance(t, exp.Table) else None
+    return None
+
+
+def enforced(expression, context, dialect):
+    """`expression` with SQLite's switches for its constraints as the file has them (contexts()):
+    - PRAGMA foreign_keys (https://www.sqlite.org/foreignkeys.html): "Foreign key constraints are
+      disabled by default", and while off SQLite neither checks a foreign key nor runs its ON
+      DELETE and ON UPDATE actions (section 2); PostgreSQL, DuckDB and MySQL always do. In a file
+      that never turns them on, each REFERENCES and FOREIGN KEY is left out of the statement, which
+      then means the same. In one that does, an INSERT, UPDATE, DELETE or DROP TABLE of a table a
+      foreign key links (child or parent) while they are off is not expressible; and while they are
+      on, on ClickHouse, which has no foreign keys. There, on MySQL, a column's own REFERENCES is
+      given as a table's FOREIGN KEY of that column: MySQL 8.0 "parses but ignores 'inline
+      REFERENCES specifications' ... MySQL accepts REFERENCES clauses only when specified as part
+      of a separate FOREIGN KEY specification" (https://dev.mysql.com/doc/refman/8.0/en/ansi-diff-foreign-keys.html).
+    - PRAGMA ignore_check_constraints (pragma.html#pragma_ignore_check_constraints): while on,
+      SQLite checks no CHECK constraint, where every engine checks them: an INSERT or UPDATE of a
+      table with one is not expressible then."""
+    from sqlglot import exp
+
+    if not context.foreign_keys_ever:
+        for node in [n for n in expression.walk() if isinstance(n, exp.ForeignKey) or (isinstance(n, exp.ColumnConstraint) and isinstance(n.args.get("kind"), exp.Reference))]:
+            node.pop()
+    elif dialect == "mysql" and isinstance(expression, exp.Create) and isinstance(expression.this, exp.Schema):
+        for column in [c for c in expression.this.expressions if isinstance(c, exp.ColumnDef)]:
+            for k in [k for k in column.args.get("constraints") or [] if isinstance(k.args.get("kind"), exp.Reference)]:
+                reference = k.args["kind"]
+                k.pop()
+                expression.this.append("expressions", exp.ForeignKey(expressions=[column.this.copy()], reference=reference))
+    target = _written_table(expression)
+    if target is None:
+        return expression
+    if target in context.linked and context.foreign_keys_ever and not context.foreign_keys:
+        raise NotExpressible(f"not expressible in {dialect}: a write to {target.lower()}, which a foreign key links, while PRAGMA foreign_keys is off (https://www.sqlite.org/foreignkeys.html#fk_enable): SQLite neither checks it nor runs its actions then, where {dialect} always does")
+    if target in context.linked and context.foreign_keys and dialect == "clickhouse":
+        raise NotExpressible(f"not expressible in {dialect}: a write to {target.lower()}, which a foreign key links, while PRAGMA foreign_keys is on (https://www.sqlite.org/foreignkeys.html): ClickHouse has no foreign keys to check")
+    if target in context.checked and context.ignore_check_constraints and isinstance(expression, (exp.Insert, exp.Update)):
+        raise NotExpressible(f"not expressible in {dialect}: a write to {target.lower()}, which has a CHECK constraint, while PRAGMA ignore_check_constraints is on (https://www.sqlite.org/pragma.html#pragma_ignore_check_constraints): SQLite checks none then, where {dialect} always does")
+    return expression
+
+
+def extremes(expression, dialect):
+    """`expression` with each multi-argument max() and min() said as the dialect's GREATEST and LEAST
+    with SQLite's NULL. SQLite's "Built-In Scalar SQL Functions" (https://www.sqlite.org/lang_corefunc.html#max_scalar):
+    "The multi-argument max() function returns the argument with the maximum value, or return NULL
+    if any argument is NULL" (min() the same, lang_corefunc.html#min_scalar). PostgreSQL's GREATEST
+    and LEAST ignore NULLs ("NULL values in the argument list are ignored. The result will be NULL
+    only if all the expressions evaluate to NULL", its manual, 9.18.4), as DuckDB's and ClickHouse's
+    (24.12 on) do; MySQL's return NULL "if any argument is NULL" (MySQL 8.4 manual, 14.4.2). So each
+    is said as CASE WHEN an argument IS NULL THEN NULL ELSE GREATEST(...) END, exact on every engine
+    whichever way its GREATEST takes NULLs. That names each argument twice, which is the same only
+    when an argument gives the same value each time: one that calls random() or randomblob()
+    (lang_corefunc.html: "a pseudo-random integer", "random bytes") is not expressible. sqlglot
+    otherwise writes PostgreSQL's GREATEST unguarded, and DuckDB's and ClickHouse's max() of
+    several arguments, which is their aggregate's top-N or an error."""
+    from sqlglot import exp
+
+    # Innermost first, so one inside another's argument is said before that argument is copied.
+    for node in [n for n in reversed(list(expression.dfs())) if isinstance(n, (exp.Max, exp.Min)) and n.expressions]:
+        args = [node.this] + list(node.expressions)
+        if any(isinstance(n, exp.Rand) or (isinstance(n, exp.Anonymous) and n.name.upper() == "RANDOMBLOB") for a in args for n in a.walk()):
+            raise NotExpressible(f"not expressible in {dialect}: a multi-argument {node.key}() of a random() or randomblob() argument (lang_corefunc.html), which SQLite's NULL rule would have to evaluate twice")
+        pick = (exp.Greatest if isinstance(node, exp.Max) else exp.Least)(this=args[0].copy(), expressions=[a.copy() for a in args[1:]], ignore_nulls=True)
+        nulls = [exp.Is(this=a.copy(), expression=exp.Null()) for a in args]
+        said = exp.Case(ifs=[exp.If(this=exp.or_(*nulls), true=exp.Null())], default=pick)
+        if node is expression:
+            expression = said
+        else:
+            node.replace(said)
+    return expression
+
+
 def spoken(expression, dialect):
     """`expression` with what sqlglot writes in SQLite's spelling, which `dialect` reads otherwise,
     given that dialect's spelling of it:
@@ -853,7 +1990,7 @@ def spoken(expression, dialect):
       and converts it to the byte represented by the number") gives the bytes as a String, the type a
       BLOB column is there.
     - a collation SQLite names (NOCASE, RTRIM, BINARY) is MySQL's that compares the same
-      (MYSQL_COLLATIONS).
+      (MYSQL_COLLATIONS), and the other engines' that does (OTHER_COLLATIONS), or not expressible.
     - a window frame's EXCLUDE NO OTHERS, its default, is left out; its other exclusions, which
       MySQL and ClickHouse don't have, are said as excluded() says them, or the record is not
       expressible there (NotExpressible)."""
@@ -910,7 +2047,55 @@ def spoken(expression, dialect):
             mysql = MYSQL_COLLATIONS.get(name.name.upper()) if isinstance(name, (exp.Var, exp.Column, exp.Identifier)) else None
             if mysql:
                 node.set(arg, exp.Var(this=mysql))
+    else:
+        for node, arg in [(c, "expression") for c in expression.find_all(exp.Collate)] + [(c, "this") for c in expression.find_all(exp.CollateColumnConstraint)]:
+            name = node.args.get(arg)
+            said = name.name.upper() if isinstance(name, (exp.Var, exp.Column, exp.Identifier)) else None
+            if said not in ("BINARY", "NOCASE", "RTRIM"):
+                continue
+            to = OTHER_COLLATIONS[dialect].get(said)
+            if to is None:
+                raise NotExpressible(f"not expressible in {dialect}: SQLite's collation {said} (https://www.sqlite.org/datatype3.html#collating_sequences), which {dialect} has none like")
+            if to == "":
+                (node.pop() if isinstance(node, exp.CollateColumnConstraint) else node.replace(node.this.copy()))
+            else:
+                node.set(arg, exp.Identifier(this=to, quoted=True))
+        if dialect == "duckdb":
+            # SQLite: "If either operand has an explicit collating function assignment using the
+            # postfix COLLATE operator, then the explicit collating function is used for comparison,
+            # with precedence to the collating function of the left operand" (datatype3.html 7.1).
+            # DuckDB refuses operands of different collations ("Cannot combine types with different
+            # collation"): the other operand is given the same explicit collation.
+            def explicit(e):
+                while isinstance(e, exp.Paren):
+                    e = e.this
+                return e.expression if isinstance(e, exp.Collate) else None
+
+            for node in list(expression.find_all(exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ)):
+                left, right = explicit(node.this), explicit(node.expression)
+                pick = left or right
+                if pick is None:
+                    continue
+                for arg, own in (("this", left), ("expression", right)):
+                    if own is None or own.sql() != pick.sql():
+                        side = node.args[arg]
+                        inner = side
+                        while isinstance(inner, exp.Paren):
+                            inner = inner.this
+                        node.set(arg, exp.Collate(this=(inner.this if isinstance(inner, exp.Collate) else side).copy(), expression=pick.copy()))
     return expression
+
+
+# SQLite's built-in collations (datatype3.html#collating_sequences) on the other engines, where one
+# compares the same: DuckDB's "binary" (its collation list, PRAGMA collations) and "nocase" (its
+# "Collations" page: "NOCASE ... case-insensitive"); PostgreSQL's "C" ("Collation Support",
+# 23.2.2.1: "C ... sorts by byte values"); ClickHouse's String compares bytes and takes no
+# collation on a column ("" leaves it out). RTRIM ("the same as binary, except that trailing space
+# characters are ignored") has no like on any of them, nor NOCASE on PostgreSQL (its case-insensitive
+# collations are ICU's, which fold every letter, and LIKE refuses them) or ClickHouse: not expressible.
+# DuckDB's nocase folds letters beyond ASCII too, where SQLite's folds ASCII's only: as it was
+# before this map, a difference for text beyond ASCII, which the written files' cases don't hold.
+OTHER_COLLATIONS = {"duckdb": {"BINARY": "binary", "NOCASE": "nocase"}, "postgres": {"BINARY": "C"}, "clickhouse": {"BINARY": ""}}
 
 
 # Clauses SQLite reads that state what every engine the corpus compares does unasked, so the record
@@ -1005,7 +2190,8 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
-            e = spoken(keyed(typed(divided(e, context or Context(), dialect), context, dialect), dialect), dialect)
+            e = enforced(e, context or Context(), dialect)
+            e = spoken(globbed(functions_said(extremes(dated(sqlite_own(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), context or Context(), dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
     except NotExpressible as e:
@@ -1096,6 +2282,179 @@ def record_in(record, dialect, context=None):
     return sql, why
 
 
+def _names(e):
+    """The tables and views statement `e` names (upper-cased), less the CTEs it defines, and the one
+    a CREATE TABLE or CREATE VIEW of it creates (None for another statement)."""
+    from sqlglot import exp
+
+    ctes = {c.alias_or_name.upper() for c in e.find_all(exp.CTE)}
+    made = None
+    if isinstance(e, exp.Create) and e.args.get("kind") in ("TABLE", "VIEW"):
+        target = e.this.this if isinstance(e.this, exp.Schema) else e.this
+        made = target.name.upper() if isinstance(target, exp.Table) else None
+    named = {t.name.upper() for t in e.find_all(exp.Table) if isinstance(t.this, exp.Identifier)} - ctes
+    return named - {made}, made
+
+
+def _untypable(table):
+    """The columns of `table` (a Table) without a type that typed() can't give one: those the file
+    writes values of several storage classes, of one only running it shows, or none but NULL."""
+    out = set()
+    for name in table.columns:
+        if table.kinds.get(name) is None and name in table.written:
+            classes = table.written[name] - {None}
+            if UNKNOWN in classes or len(classes) != 1:
+                out.add(name)
+    return out
+
+
+def _unsayable(create, table, dialect):
+    """The columns of `table` (a Table, made by CREATE TABLE `create`) the dialect can't hold as
+    SQLite does: without a type typed() can give (_untypable()), or of a collation it has none like
+    (OTHER_COLLATIONS)."""
+    from sqlglot import exp
+
+    out = _untypable(table)
+    if dialect in OTHER_COLLATIONS:
+        for c in create.this.expressions if isinstance(create.this, exp.Schema) else []:
+            for k in c.find_all(exp.CollateColumnConstraint) if isinstance(c, exp.ColumnDef) else []:
+                name = k.this.name.upper() if isinstance(k.this, (exp.Var, exp.Column, exp.Identifier)) else ""
+                if name in ("BINARY", "NOCASE", "RTRIM") and OTHER_COLLATIONS[dialect].get(name) is None:
+                    out.add(c.name.upper())
+    return out
+
+
+def _left_out(e, table, gone):
+    """Statement `e` (sqlglot, SQLite's reading) with columns `gone` of `table` (upper-cased names)
+    left out, or None when it reads one of them: a CREATE TABLE of `table` without them (None
+    when a table constraint names one); an INSERT into it without their values (VALUES rows and
+    a SELECT's columns at their places; None for SELECT *); any statement with a column of one of
+    their names anywhere, a `*` (count(*)'s aside), a NATURAL join or USING reads them: None."""
+    from sqlglot import exp
+
+    e = e.copy()
+    if isinstance(e, exp.Create):
+        schema = e.this
+        for c in list(schema.expressions):
+            if isinstance(c, (exp.Identifier, exp.ColumnDef)):
+                if c.name.upper() in gone:
+                    c.pop()
+            elif any(i.name.upper() in gone for i in c.find_all(exp.Identifier, exp.Column)):
+                return None
+        return e
+    if isinstance(e, exp.Insert) and (e.this.this if isinstance(e.this, exp.Schema) else e.this).name.upper() == table.name:
+        target = e.this
+        names = [i.name.upper() for i in target.expressions] if isinstance(target, exp.Schema) else list(table.columns)
+        drop = [k for k, n in enumerate(names) if n in gone]
+        if drop:
+            source = e.expression
+            if isinstance(source, exp.Values):
+                rows = [row.expressions if isinstance(row, exp.Tuple) else None for row in source.expressions]
+            elif isinstance(source, exp.Select) and not any(isinstance(p, exp.Star) for p in source.selects):
+                rows = [source.expressions]
+            else:
+                return None
+            if any(r is None or len(r) != len(names) for r in rows):
+                return None
+            for r in rows:
+                for k in reversed(drop):
+                    r[k].pop()
+            kept = [exp.to_identifier(n.lower()) for k, n in enumerate(names) if k not in drop]
+            e.set("this", exp.Schema(this=target.this.copy() if isinstance(target, exp.Schema) else target.copy(), expressions=kept))
+    if any(c.name.upper() in gone for c in e.find_all(exp.Column)) or any(not isinstance(st.parent, exp.Count) for st in e.find_all(exp.Star)):
+        return None
+    if any(j.args.get("method") == "NATURAL" or j.args.get("using") for j in e.find_all(exp.Join)):
+        return None
+    return e
+
+
+class _Said:
+    """A record's kind and expectation with other SQL: what records_in() translates in its place."""
+
+    def __init__(self, sql, record):
+        self.sql, self.kind, self.expect, self.line = sql, record.kind, record.expect, record.line
+
+
+def records_in(records, dialect, around=None):
+    """Each of a file's records in `dialect` (record_in()), in order, where a record that names a
+    table or view whose CREATE the dialect couldn't say (one SQLite ran: not a `statement error`)
+    is itself untranslatable, with that CREATE's line and reason: there the table isn't made, so
+    the record would fail on the engine for the translation's sake, not the engine's (G2 step 4:
+    an engine is never charged with a statement the corpus couldn't give it). A
+    translated CREATE of the same name (after a DROP) makes it again; a DROP of it is
+    untranslatable too, and forgets it. `around` is the file's contexts() (computed when None)."""
+    import sqlglot
+    from sqlglot import exp
+
+    around = around if around is not None else contexts(records)
+    missing, partial, out = {}, {}, []
+    for r, c in zip(records, around):
+        sql, why = record_in(r, dialect, c)
+        try:
+            statements = [e for e in sqlglot.parse(comment_closed(defaults_dropped(r.sql)), read=reader()) if e]
+        except Exception:  # sqlglot can't read it: record_in() has said so
+            statements = []
+        ran = not (r.kind == "statement" and r.expect == "error")
+        named, made = set(), []
+        for e in statements:
+            n, m = _names(e)
+            named |= n
+            made.append((m, e))
+        # A table some of whose columns no type of the dialect holds (typed()) is made without
+        # them, and each record that doesn't read them runs on it unchanged in meaning: a query
+        # that reads none of a table's columns gives what it gives whatever other columns the
+        # table has. One that reads them is untranslatable, with the reason.
+        lean = [m for m, e in made if ran and m is not None and why is not None and ("has no type" in why or "SQLite's collation" in why) and isinstance(e, exp.Create)
+                and e.args.get("kind") == "TABLE" and m in c.created and _unsayable(e, c.created[m], dialect) and _unsayable(e, c.created[m], dialect) != set(c.created[m].columns)]
+        touched = sorted(n for n in named if n in partial) if why is None else []
+        if lean and len(statements) == 1:
+            t = lean[0]
+            table, gone_cols = c.created[t], _unsayable(statements[0], c.created[t], dialect)
+            e = _left_out(statements[0], table, gone_cols)
+            lean_sql, lean_why = record_in(_Said(e.sql(dialect="sqlite"), r), dialect, c) if e is not None else (None, why)
+            if lean_why is None:
+                partial[t] = (table, gone_cols, r.line, why)
+                missing.pop(t, None)
+                out.append((lean_sql, None))
+                continue
+        elif touched:
+            # Each table of the record's with columns left out, in turn; a record of several
+            # statements is read as one would be only by the engine: not expressible.
+            e, culprit = statements[0] if len(statements) == 1 else None, touched[0]
+            for t in touched:
+                if e is None:
+                    break
+                culprit = t
+                e = _left_out(e, partial[t][0], partial[t][1])
+            if e is None:
+                table, gone_cols, line, reason = partial[culprit]
+                why, sql = f"untranslatable in {dialect}: reads column {', '.join(sorted(g.lower() for g in gone_cols))} of {culprit.lower()}, left out of its CREATE (line {line}) there: {reason}", None
+            else:
+                sql, why = record_in(_Said(e.sql(dialect="sqlite"), r), dialect, c)
+        gone = sorted(n for n in named if n in missing)
+        if why is None and gone:
+            line, reason = missing[gone[0]]
+            why = f"untranslatable in {dialect}: names {gone[0].lower()}, whose CREATE (line {line}) is untranslatable there: {reason}"
+            sql = None
+        for m, e in made:
+            if m is None or not ran:
+                continue
+            if why is None:
+                missing.pop(m, None)
+            elif not (e.args.get("exists") and m in c.tables and m not in missing):
+                missing[m] = (r.line, why)
+        for m, e in made:
+            if m is not None and ran and why is None:
+                partial.pop(m, None)
+        if ran:
+            for e in statements:
+                if isinstance(e, exp.Drop) and e.args.get("kind") in ("TABLE", "VIEW") and isinstance(e.this, exp.Table):
+                    missing.pop(e.this.name.upper(), None)
+                    partial.pop(e.this.name.upper(), None)
+        out.append((sql, why))
+    return out
+
+
 def refusals(pool, rel):
     """SQLite's error for each `statement error` record of `<pool>/<rel>` (run as the corpus's
     runner runs it, after its fixture `<pool>/<source>/base.test` when it has one): a JSON-ready
@@ -1136,8 +2495,7 @@ def main():
             out = os.path.join(pool, "translations", d, rel + ".jsonl")
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "w", encoding="utf-8") as f:
-                for r, c in zip(records, around):
-                    sql, why = record_in(r, d, c)
+                for r, (sql, why) in zip(records, records_in(records, d, around)):
                     counts[d][why is not None] += 1
                     f.write(json.dumps({"line": r.line, "sql": sql} if why is None else {"line": r.line, "untranslatable": why}) + "\n")
         # SQLite's error for each record it refuses, for comparing refusals by kind.

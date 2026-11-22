@@ -829,6 +829,85 @@ measure and each record's `waits` says so (lane scaleout-harness-11, AC-SH.11).
   pool (26,980 records) the untranslatable records go from 10, 10, 116 and 113 (DuckDB, PostgreSQL,
   MySQL, ClickHouse) to 8, 7, 109 and 106, every one "not expressible" with its reason: none fails to
   parse. Left: refusals compared by kind, DuckDB's disagreements classified, the tiny run on every engine.
+  Lane corpus-dialects-9 (`bench/corpus/dialects.py`, `test_dialects.py`): records sqlglot wrote without
+  complaint but that meant something else on the other engines, each now written as SQLite's documentation
+  says it means: a hex integer (`0x10`) as the integer, not a blob, with "hex literal too big" refused as
+  SQLite refuses it (lang_expr.html); max() and min() of several arguments NULL when any argument is
+  (PostgreSQL's, DuckDB's and ClickHouse's GREATEST ignore NULLs); LIKE matching ASCII letters of either
+  case unless `PRAGMA case_sensitive_like` is on, and with no escape character unless ESCAPE gives one
+  (PostgreSQL, MySQL and ClickHouse take a backslash); likely(), unlikely() and likelihood() as their
+  argument; upper() and lower() of ASCII letters only; round() to negative digits as to 0; char() of
+  several code points (DuckDB got only the first); format() as printf(); hex() of an integer as its text's
+  bytes; length() of an integer and of a blob; CAST to an integer type as 64 bits, a real truncated toward
+  zero (DuckDB, PostgreSQL and MySQL round); zeroblob() on DuckDB and PostgreSQL; GLOB as a case-sensitive
+  regular expression match of the whole string (no other engine has SQLite's GLOB: DuckDB's negates sets
+  with `!` and escapes with a backslash), a pattern that isn't a literal not expressible. The
+  untranslatable counts on the gate's pool don't move (381, 381, 483, 480 for DuckDB, PostgreSQL, MySQL,
+  ClickHouse): these records were translated before, wrongly. A local check, not a record (this Mac,
+  Python's SQLite 3.51 against DuckDB 1.4.2's Python module, one script for both, answers compared
+  loosely, the pool's function, expression, affinity, operator, collation, rule and storage-class files):
+  of 2,448 queries, 1,270 answered differently with the old translator and 1,174 now, 118 fixed and none
+  newly wrong; what's left is mostly SQLite's types against DuckDB's, functions DuckDB lacks, and tables a
+  translation couldn't make. Left: the DuckDB counts through the harness and the tiny run on every engine
+  on jupiter (kiln was down), and hex() and length() of a REAL.
+  Lane corpus-dialects-10 (`bench/corpus/dialects.py`, `test_dialects.py`): a record that names a table
+  whose CREATE a dialect can't say is untranslatable there, with that CREATE's line and reason, where it
+  had been sent to the engine to fail for want of the table; and a table is made without the columns the
+  dialect can't hold as SQLite does (an untyped column of several storage classes, as the written files'
+  shared t1.e; a collation it has none like, as t2.b's NOCASE on PostgreSQL and ClickHouse), each record
+  that doesn't read them run on it unchanged in meaning, inserts without their values. Also said as SQLite
+  means them: hex() and length() of a REAL (SQLite's %!.15g text of it on DuckDB, not expressible on the
+  others), typeof() and quote() of a value of known storage class, `X IS Y` of values (IS NOT DISTINCT
+  FROM), BINARY and NOCASE collations (DuckDB's "binary" and "nocase", PostgreSQL's "C"; RTRIM not
+  expressible but on MySQL), and total() of numbers; date() with modifiers, which sqlglot wrote as a time
+  zone, is not expressible; so is a PRAGMA inspecting a table with columns left out. Untranslatable on the
+  gate's pool: 267, 406, 338, 507
+  (DuckDB, PostgreSQL, MySQL, ClickHouse), from 381, 381, 483, 480. The local check (as lane 9's, every
+  written file now, DuckDB's Python replacement scans off, each statement given up after 10 s): of 3,544
+  queries 2,129 answered differently before and 1,239 now, none newly; 187 are untranslatable with their
+  reasons (186 more than before), so at least 704 now give SQLite's answer. The record that hung lane 9's check is written/syntax/recursive-cte's
+  `WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT max(n) + 1 FROM c WHERE n < 3) SELECT * FROM c`, a
+  `statement error` SQLite refuses (an aggregate in a recursive select) that DuckDB runs forever: the
+  harness's own per-record bound covers it. Left: datetime() and the other date functions, JSON, PRAGMAs.
+  Lane corpus-dialects-11 (`bench/corpus/dialects.py`, `test_dialects.py`): integer columns are each
+  engine's 64-bit integer (BIGINT, ClickHouse's Int64), as SQLite's INTEGER is whatever the type's name;
+  sqlglot wrote INT, SMALLINT and TINYINT as 32, 16 and 8 bits. SQLite's date and time functions (date(),
+  time(), datetime(), julianday(), unixepoch(), strftime()) of a literal time value are DuckDB's
+  strftime() and epoch_ms() and PostgreSQL's to_char() and extract(epoch) of a TIMESTAMP literal of the
+  moment SQLite reads (Python's SQLite reads the literal, in all its forms), with whole-unit additions,
+  'start of', 'subsec', and months while the day is 28 or less; 'now', 'localtime', 'utc', 'weekday N',
+  a month past the 28th, fractional amounts, the strftime() substitutions no engine writes alike,
+  timediff() and a value read as it runs are not expressible, each with SQLite's doc reference, and
+  MySQL's and ClickHouse's are not written yet (not expressible there, saying so). SQLite's JSON
+  functions and operators, PRAGMAs and pragma_ table functions are not expressible (json1.html,
+  pragma.html), but json_array() and json_object() of integers and json_array_length() of RFC 8259 JSON
+  on DuckDB; so are typeof() and quote() of a value whose storage class only running it shows, which
+  now includes a declared column written a value its affinity doesn't convert (an INTEGER column keeps
+  1.5 a REAL). CAST to BLOB is a BLOB, an integer's through its text, a text's encode() on DuckDB.
+  Untranslatable on the gate's pool: 1,043, 1,184, 1,306, 1,456 (DuckDB, PostgreSQL, MySQL,
+  ClickHouse), from 267, 406, 338, 507; most of the rise is JSON (about 300 each), PRAGMAs (about 150),
+  typeof() and quote() (about 85), and on MySQL and ClickHouse the date functions (262). The local
+  check (as lane 10's): of 3,545 queries 1,239 answered differently before and 488 now, none newly; 855
+  are untranslatable with their reasons (668 more), so 83 more give SQLite's answer. Left: date
+  functions on MySQL and ClickHouse, the rest of JSON, SQLite's CAST of text to an integer (its leading
+  digits, where DuckDB rounds '1.5' and refuses 'abc'), INDEXED BY and NOT INDEXED.
+  Lane corpus-dialects-12 (`bench/corpus/dialects.py`, `test_dialects.py`): CAST of text to an integer
+  is read as SQLite reads it (the leading integer after whitespace, 0 if none, clamped at 64 bits:
+  '1.5' is 1, 'abc' 0) on DuckDB and PostgreSQL, a plain integer literal staying a cast; MySQL and
+  ClickHouse: not expressible, saying so. changes(), total_changes() and last_insert_rowid() are not
+  expressible, each with its reason; unistr() and unistr_quote() of literals are SQLite's value. PRAGMA
+  foreign_keys and ignore_check_constraints carry into later records (foreign_keys does nothing inside
+  a transaction): a file that never turns foreign keys on has its REFERENCES left out; in one that
+  does, a write to a linked table while they're off is not expressible (on ClickHouse while on too),
+  and so is a write to a CHECKed table while checks are ignored; there MySQL is given a column's own
+  REFERENCES as a table's FOREIGN KEY, since it ignores the column's own. The date functions are said in MySQL
+  (DATETIME(3), INTERVAL, DATE_FORMAT(), TIMESTAMPDIFF()) and ClickHouse (DateTime64(3) in UTC,
+  addDays() and the rest, formatDateTime(), toUnixTimestamp64Milli()) from their manuals, inside the
+  years each holds; unverified on those engines until the jupiter run. Untranslatable on the gate's
+  pool: 1,073, 1,214, 1,163, 1,335 (DuckDB, PostgreSQL, MySQL, ClickHouse), from 1,043, 1,184, 1,306,
+  1,456. The local check: of 3,545 queries 488 answered differently before and 435 now, none newly; 880
+  are untranslatable with their reasons (25 more). Left: MySQL's and ClickHouse's CAST of text to an
+  integer, the rest of JSON, INDEXED BY and NOT INDEXED.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691
