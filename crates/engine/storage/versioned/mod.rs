@@ -16,7 +16,7 @@
 pub mod blink;
 pub mod columns;
 pub(crate) mod columns_path;
-pub(crate) mod columns_sql;
+pub mod columns_sql;
 #[cfg(test)]
 mod conformance;
 pub mod cursor;

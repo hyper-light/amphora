@@ -102,6 +102,12 @@ pub fn open(path: &str, memory: bool, budget: Option<u64>) -> Result<Arc<Storage
 }
 
 impl Storage {
+    /// What the SQL tables' column copies have counted (G11 step 5): copies kept, statements
+    /// they answered, statements sent to the rows, rebuilds.
+    pub fn copy_counts(&self) -> super::columns_sql::CopyCounts {
+        self.copies.counts()
+    }
+
     /// The versioned database under it.
     pub(crate) fn db(&self) -> &Arc<VDatabase> {
         &self.db
