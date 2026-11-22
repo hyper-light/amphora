@@ -1129,3 +1129,6 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   last, each member caught up before the next); `all` runs kill, split, stall, hang, disk and roll,
   each counted on every member. A test cuts the leader's disk
   under load and finds every acknowledged write on the two left. Untested on Linux yet.
+  Lane production-7: a log write the disk refuses ends the member at once: the replica fences,
+  and the fence now wakes the member's sender (`drain_wait`), which used to sleep out its
+  deadline. A member with `drills = off` refuses `disk` and `cut`. Untested on Linux yet.
