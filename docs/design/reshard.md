@@ -222,6 +222,10 @@ deterministic simulator:
    Built (lane split-merge-10): a pull over the owner transport, its appended request and answer,
    between a node's endpoint and its peers (decision "Pulls over the owner transport", T-T1.9.R12).
 
+   Built (lane split-merge-11): the routing key is bytes, and a Records transaction routes by
+   every key it names, so it stays within one group (decision "The routing key is bytes",
+   T-T1.9.R13); local databases as groups split and merge under Records writes.
+
    Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
    which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
    one group), with a split and merge of it under writes through `carry`; the transport off
@@ -424,3 +428,39 @@ replicated transport's, hyper-transport); `Nodes` is the seam it plugs into.
 
 **Falsified by.** A pull answered through a partition; a move over the transport that loses an
 acknowledged write or leaves a key in two groups; a pull's answer larger than a frame.
+
+## Decision (lane split-merge-11): the routing key is bytes
+
+A store in groups routed a row by one key, a string (`Engine::key`), the same key a read waits on
+for its writes. A Records row's routing key is bytes (`reshard::row_key`: namespace, family, key),
+and a Records transaction names many keys, each of which may fall in a different group. Now an
+engine also says the keys a row routes by, as bytes (`Engine::routes`, one call a key); a store in
+groups routes a batch by every one of them, and refuses the batch whole if they are not all in one
+group (`store::Refused::Groups`), as it refused a batch of rows across groups before. Its key, unless
+the engine says otherwise, so every engine whose key is its route is unchanged.
+
+`Engine::key` stays what a read waits on: Amphora's own engine (`database::Local`) keeps one key
+for every command (`"database"`), so a read still waits for every write handed to its group before
+it, while it routes:
+- a Records transaction by the row key of every key its conditions and writes name, so a
+  condition on a key in another group refuses the transaction as a write there would;
+- a get by its key's row key;
+- any other command (SQL, a scan, changes, a namespace's head) by none: it goes to the group
+  holding position 0. SQL tables have no row key and don't move (decision "A row routes by its
+  namespace, family and key"); a scan, changes and a head over a namespace whose keys are in more
+  than one group need CP-T1.10's order across groups.
+
+`Groups::read_routed` reads in the group of a key in bytes, waiting on the key the engine's reads
+wait on, and `Groups::group_of` names the group of a key in bytes.
+
+**Evidence.** `database::group_holding`, T-T1.9.R13: local databases as groups (`Groups<Local>`),
+one group split by the driver through the shell while a Records transaction is written before every
+action, then merged back. Each operation is done; after each, every acknowledged write reads back
+through its group; while split, a transaction of two keys in one group commits, and one whose
+writes, or whose condition, name a key of the other group is refused whole.
+
+**Left.** A `Database` (the public type) over `Groups<Local>`: its writer is one store today, and
+its scans, changes, heads and SQL need the answers above across groups before it can be.
+
+**Falsified by.** A Records transaction committed with keys in two groups; a write acknowledged
+through `Groups<Local>` that doesn't read back after a split or merge.

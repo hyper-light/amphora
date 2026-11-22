@@ -810,6 +810,8 @@ tests = [
   { id = "T-T1.9.R11", text = "The move of T-T1.9.R10 with every third pull's answer lost on the way back after the old group's node acted on it, each loss asked again by the driver — passes when some answers were lost and the move still ends flipped with every acknowledged write at its group's node and every key in exactly one group's file" },
   # lane split-merge-10
   { id = "T-T1.9.R12", text = "The move of T-T1.9.R10 with each pull carried over the owner transport between the two nodes' endpoints, every fourth pull asked while the other node's endpoint is down and every third answer dropped after it arrived, each fault asked again by the driver — passes when both faults were met and the move still ends flipped with every acknowledged write at its group's node and every key in exactly one group's file" },
+  # lane split-merge-11
+  { id = "T-T1.9.R13", text = "Local databases as groups, one split and then merged back by the driver through the shell while a Records transaction is written before every action — passes when each operation is done, every acknowledged write reads back through its group after each, and while split a transaction within one group commits and one whose writes or condition name keys in both groups is refused whole" },
 ]
 
 # lane qs5

@@ -299,6 +299,15 @@ impl GroupTicket {
     }
 }
 
+/// The positions of the keys `rows` route by ([`Engine::routes`]), in bytes.
+fn routes<E: Engine>(rows: &[E::Row]) -> Vec<Pos> {
+    let mut positions = Vec::with_capacity(rows.len());
+    for row in rows {
+        E::routes(row, &mut |key| positions.push(reshard::position_of(key)));
+    }
+    positions
+}
+
 /// FNV-1a: a key's position stays put from build to build and machine to machine.
 pub(crate) fn fnv_bytes(key: &[u8]) -> u64 {
     key.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
@@ -950,8 +959,14 @@ impl<E: Engine> Groups<E> {
     /// memory, which [`Groups::route`] never takes).
     #[must_use]
     pub fn group(&self, key: &str) -> Option<GroupId> {
+        self.group_of(key.as_bytes())
+    }
+
+    /// [`Groups::group`] of a key in bytes, as [`Engine::routes`] gives them.
+    #[must_use]
+    pub fn group_of(&self, key: &[u8]) -> Option<GroupId> {
         let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
-        route.directory.owner(position(key))
+        route.directory.owner(reshard::position_of(key))
     }
 
     /// The store of the group `positions` all route to, once its holding answers every one of
@@ -987,7 +1002,7 @@ impl<E: Engine> Groups<E> {
 
     /// [`Store::put`] to the rows' group.
     pub fn put(&self, rows: Vec<E::Row>) -> Result<GroupTicket, Refused> {
-        let positions: Vec<Pos> = rows.iter().map(|r| position(E::key(r))).collect();
+        let positions = routes::<E>(&rows);
         self.routed(positions.into_iter(), |group, store| {
             let ticket = store.put(rows)?;
             Ok(GroupTicket { group, ticket })
@@ -997,7 +1012,7 @@ impl<E: Engine> Groups<E> {
     /// [`Store::put_wait`] to the rows' group. It waits for room under the route's read lock, so a
     /// fence waits for it too, no longer than `until`.
     pub fn put_wait(&self, rows: Vec<E::Row>, until: Instant) -> Result<GroupTicket, Refused> {
-        let positions: Vec<Pos> = rows.iter().map(|r| position(E::key(r))).collect();
+        let positions = routes::<E>(&rows);
         self.routed(positions.into_iter(), |group, store| {
             let ticket = store.put_wait(rows, until)?;
             Ok(GroupTicket { group, ticket })
@@ -1011,7 +1026,7 @@ impl<E: Engine> Groups<E> {
         until: Instant,
         then: impl FnOnce(Result<(), Refused>) + Send + 'static,
     ) -> Result<GroupTicket, Refused> {
-        let positions: Vec<Pos> = rows.iter().map(|r| position(E::key(r))).collect();
+        let positions = routes::<E>(&rows);
         self.routed(positions.into_iter(), |group, store| {
             let ticket = store.put_then(rows, until, then)?;
             Ok(GroupTicket { group, ticket })
@@ -1039,8 +1054,22 @@ impl<E: Engine> Groups<E> {
         f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
         on_writer: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
-        self.routed(std::iter::once(position(key)), |_, store| {
-            Ok(store.read(Some(key), until, f, on_writer))
+        self.read_routed(key.as_bytes(), Some(key), until, f, on_writer)
+    }
+
+    /// [`Store::read`] in the group of `route` (a key in bytes, as [`Engine::routes`] gives
+    /// them), once the writes of `key` handed to it before are committed (none: every write
+    /// handed to it before), under the route's read lock as [`Groups::read`] is.
+    pub fn read_routed<T: Send + 'static>(
+        &self,
+        route: &[u8],
+        key: Option<&str>,
+        until: Instant,
+        f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
+        on_writer: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        self.routed(std::iter::once(reshard::position_of(route)), |_, store| {
+            Ok(store.read(key, until, f, on_writer))
         })?
     }
 
