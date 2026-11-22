@@ -98,6 +98,7 @@ pub(crate) mod learned_costs;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+pub mod plan_hints;
 mod row_value;
 mod sample_filter;
 pub(crate) mod unnest;
@@ -3083,7 +3084,8 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        allow_automatic_index: resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
+        allow_automatic_index: resolver.automatic_indexes()
+            && resolver.join_methods() != crate::JoinMethods::NestedLoopsOnly,
         join_methods: resolver.join_methods(),
         sorted_fetches: resolver.sorted_fetches(),
         row_goal,
