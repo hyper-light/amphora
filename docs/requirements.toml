@@ -968,6 +968,8 @@ tests = [
   { id = "T-QT.6.10", text = "Random filters, groupings and aggregates in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook ran for most of them" },
   # lane qs6-3
   { id = "T-QT.6.11", text = "Random inner equi-joins of two tables of many leaf pages on one or two columns, with filters on either table and groupings and aggregates over both, in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores and the planner held to hash joins (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook probed for most of them" },
+  { id = "T-QT.6.12", text = "t_qt_6_12_partitioned_parallel_build_matches_the_serial_join (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when a hash join's table built by 1, 2, 3, 4 and 8 workers into 1, 2, 3, 4 and 8 partitions gives the serial join's matches in order, most runs parallel and partitioned, and a budget too small is refused by type at every degree" },
+  { id = "T-QT.6.13", text = "t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when random two-table hash joins returning rows, with or without ORDER BY, answer as the serial loop at 2, 3, 4 and 8 stated cores (in ORDER BY order, ties as sets) and the hook ran for most" },
 ]
 
 # lane g3s2
@@ -1057,6 +1059,9 @@ tests = [
   # lane qs7-3
   { id = "T-QT.7.4", text = "Filters (comparisons, ranges, IN, IS NULL, AND, OR) and aggregates (COUNT, SUM with its overflow error, TOTAL, AVG, MIN, MAX, with and without GROUP BY) over random tables of every storage class, NULLs, a collation, overflow rows and added columns, switch on against off — passes when answers and errors are identical and the fused loops ran rows" },
   { id = "T-QT.7.5", text = "A fused loop over rows with overflow records amid the batch and the scan's end — passes when its answer is exact and matches row-at-a-time, and the fused loop ran" },
+  # lane qs7-4
+  { id = "T-QT.7.6", text = "Hash GROUP BYs (one key and two, filtered and not) over random tables of every storage class, NULLs, a collation, overflow rows and added columns, the group table whole and bounded so it fills mid-scan, switch on against off — passes when answers are identical, batch group steps ran rows, and with the bound a full table ended a batch run early" },
+  { id = "T-QT.7.7", text = "A GROUP BY over runs of rows of one group, with the group table whole and then filling mid-batch — passes when answers match row-at-a-time, rows of the group just stepped skipped the find, and a full table ended a run before the row it refused" },
 ]
 
 # lane g11s5

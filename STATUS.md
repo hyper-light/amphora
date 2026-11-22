@@ -733,8 +733,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   --planner` runs it as the target `amphora-vectorized`. Lane qs7-3: a scan loop whose body only filters and
   steps COUNT, SUM, TOTAL, AVG, MIN or MAX runs over the whole batch by selection vectors
   (`vdbe/leaf_batch/fused.rs`, executor.md decision 10), through the opcodes' own comparison and aggregate code
-  (T-QT.7.4, .5). Left: AC-QT.7.1 to .3 measured (the coordinator's); GROUP BY bodies still run row-at-a-time
-  from the batch (a batch group lookup is the next piece); compiled pipelines if G5 measures them better;
+  (T-QT.7.4, .5). Lane qs7-4: a hash GROUP BY's step runs in the fused loop too, row by row through the
+  opcodes' own GroupFind and GroupSave, skipping both between rows of one group; a row the full group table
+  refuses ends the run before it and goes row-at-a-time to the sorter (T-QT.7.6, .7). Left: AC-QT.7.1 to .3
+  measured (the coordinator's); compiled pipelines if G5 measures them better;
   Windows's cache size, which needs an OS call this crate makes only with unsafe code.
 - **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
@@ -929,3 +931,10 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 
 Everything else the track's plan names (kiln plan `01a157fdefba746a94a5fcd920a80d5a`): each goal, its criteria and how each is
 measured are in `docs/requirements.toml`.
+
+QT.6 (lane qs6-4): a hash join's table is now built by the workers together, partitioned (each
+worker scans its own build leaves and scatters entries by partition, each partition filled by one
+worker), charged to the statement's memory budget with a typed refusal that falls back to the
+serial loop; two-table hash joins that return rows (no aggregates) run on morsels, with an
+order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
+the VDBE loop body (any expression in parallel), joins of three or more tables.
