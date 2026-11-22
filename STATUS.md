@@ -308,6 +308,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   near the largest size gathered on one side). Trees made and dropped while running (`AC-NS.2.5`): a
   redo record each, a dropped tree's root listed as 0 in the checkpoint, both replayed; dropped
   trees' pages stay unreferenced (the pool has no free list yet).
+- **Eviction on the versioned storage** (G7 step 4, `NS.4`, docs/design/engine.md decision 14,
+  `crates/engine/storage/versioned/{pool,evict}.rs`): a database's pool holds the frames its byte
+  budget pays for and evicts by CLOCK; dirty pages go to a spill file recovery never reads (the data
+  file still changes only by checkpoints), pages read in are checked once against a checksum, and a
+  pool whose every frame is latched refuses typed (`MemoryBudget`). Tests: a database over ten times
+  its pool across a checkpoint and a reopen, a crash at every disk operation of a spilling,
+  checkpointing workload losing no acknowledged commit, and the pool's model test with eviction
+  under 32 threads. Not yet: the 10M-row corpus run and its resident memory (the coordinator's);
+  checkpoints still build their journal in memory; the shell passes the budget once the switch
+  takes it from `amphora::memory::limit`.
 - **The switch: SQL on the versioned storage** (G7 step 2, `AC-NS.2.1`, docs/design/engine.md
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
@@ -408,8 +418,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   integrity-checked and its rows compared with the source's, typed and counted, due on the archive's
   cadence (T-T1.12.C1, C2). One cut across groups (`backup::restore_cut`): every group restored to
   one second, half-done cross-group transactions finished by their records (T-T1.12.X1). Not yet:
-  the source's digest taken by the shipping thread itself; incremental bases; cuts across nodes'
-  clocks.
+  the source's digest taken by the shipping thread itself; cuts across nodes' clocks. Incremental
+  bases (T-T1.12.I1 to I3): a new base keeps the latest's chunks the log left unchanged, due once the
+  log outweighs what it would copy; after a reopen the first base is still whole.
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and

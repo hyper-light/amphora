@@ -491,10 +491,12 @@ pub struct Rates {
     pub replay: f64,
 }
 
-/// Whether a new base is due, with `log` bytes shipped since the latest base of `base` bytes:
+/// Whether a new base is due, with `log` bytes shipped since the latest base of `base` bytes, a new
+/// one copying `copy` bytes (an incremental base: the chunks whose pages the log changed since the
+/// latest began; none when it would copy the whole file):
 /// - there is none, or the log broke since (`broken`);
-/// - the log since it outweighs it: a new base then costs a restore less to fetch than the log it
-///   replaces;
+/// - the log since it outweighs what a new base copies: the new base then costs less to make than
+///   the log it spares every later restore;
 /// - with rates measured, a restore of the newest second would take longer than `objective_s`
 ///   (AC-T1.12.3: 100 GB in at most 30 minutes) at them.
 #[must_use]
@@ -502,11 +504,12 @@ pub fn base_due(
     base: Option<u64>,
     broken: bool,
     log: u64,
+    copy: Option<u64>,
     rates: Option<Rates>,
     objective_s: f64,
 ) -> bool {
     let Some(base) = base else { return true };
-    if broken || log >= base {
+    if broken || log >= copy.unwrap_or(base) {
         return true;
     }
     let Some(rates) = rates else { return false };
@@ -762,15 +765,24 @@ mod tests {
     /// restore at the measured rates would pass the objective.
     #[test]
     fn t_t1_12_p9_base_due() {
-        assert!(base_due(None, false, 0, None, 1800.0));
-        assert!(base_due(Some(100), true, 0, None, 1800.0));
-        assert!(base_due(Some(100), false, 100, None, 1800.0));
-        assert!(!base_due(Some(100), false, 99, None, 1800.0));
+        assert!(base_due(None, false, 0, None, None, 1800.0));
+        assert!(base_due(Some(100), true, 0, None, None, 1800.0));
+        assert!(base_due(Some(100), false, 100, None, None, 1800.0));
+        assert!(!base_due(Some(100), false, 99, None, None, 1800.0));
         let rates = Rates {
             fetch: 1.0,
             replay: 1.0,
         };
-        assert!(base_due(Some(1000), false, 900, Some(rates), 1800.0));
-        assert!(!base_due(Some(1000), false, 10, Some(rates), 1800.0));
+        assert!(base_due(Some(1000), false, 900, None, Some(rates), 1800.0));
+        assert!(!base_due(Some(1000), false, 10, None, Some(rates), 1800.0));
+    }
+
+    /// T-T1.12.I3: an incremental base is due once the log since the latest base outweighs what it
+    /// would copy, well before the log outweighs the whole file.
+    #[test]
+    fn t_t1_12_i3_incremental_base_due() {
+        assert!(base_due(Some(1000), false, 100, Some(100), None, 1800.0));
+        assert!(!base_due(Some(1000), false, 99, Some(100), None, 1800.0));
+        assert!(base_due(Some(1000), true, 0, Some(100), None, 1800.0));
     }
 }
