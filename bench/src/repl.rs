@@ -22,8 +22,14 @@
 //! comes from it, nothing reaches it). `amphora-procs` runs each member as its own process, on the
 //! machines bench/repl_members.sh is given, over TCP (`procs`), a kill the same cut. The competitors run as containers through their scripts,
 //! `bench/servers/repl/<system>.sh up|down|kill N|start N|leader|endpoint N` (a kill is
-//! `docker kill`, SIGKILL). A system without a measure's concept, or one whose cluster can't be
-//! brought up here, is refused, typed, and the refusal is recorded beside the measures.
+//! `docker kill`, SIGKILL); `--scripts bench/servers/repl/native` runs the same systems as processes
+//! on this host instead (a kill is kill -9 of the recorded PID), from the release binaries
+//! `native/setup.sh` fetched: every system on one platform, as Ada's fair-comparison rule asks
+//! (bench/repl_ladder.sh runs the commit ladder that way). Every record carries `about` (the system's
+//! version, its platform, what its acknowledgement means, and the client: driver, transport, pool)
+//! and `client_use` (the client's CPU, memory and sockets). A system without a measure's concept, or
+//! one whose cluster can't be brought up here, is refused, typed, and the refusal is recorded beside
+//! the measures.
 //!
 //! usage: amphora-bench --repl <commit|failover|catchup> --system <amphora|rqlite|dqlite|litefs|libsql>
 //!        --batch N --text-bytes N --deadline-s N [--record FILE]
@@ -33,7 +39,7 @@
 //!        amphora:  --dir DIR --class persisted|replicated [--spanning N] --relay-records N (records the relay
 //!                  moves from a member at a time)
 //!        amphora-procs: --members A1,A2,A3 (each member's address; [--class C] names the record)
-//!        others:   [--scripts DIR (bench/servers/repl)] [--shell PROGRAM (bash)]
+//!        others:   [--scripts DIR (bench/servers/repl; bench/servers/repl/native for processes)] [--shell PROGRAM (bash)]
 //!        a member: amphora-bench --repl-member ... (`procs`)
 
 use std::path::PathBuf;
@@ -110,6 +116,34 @@ pub trait Cluster: Sync {
     fn no_catch_up(&self) -> Option<String> {
         None
     }
+    /// What the record says of the system and of the client that drove it (Ada's fair-comparison
+    /// rule: each record names its client, its platform, the system's version and its durability).
+    fn about(&self) -> serde_json::Value;
+}
+
+/// The client's own use of this host over the run, to show it wasn't the bottleneck (the
+/// concurrency ladder's check): CPU seconds (user and system, every thread), peak resident memory and
+/// the sockets it holds open at the end (its pooled connections). Linux's /proc; elsewhere null.
+fn client_use() -> serde_json::Value {
+    let status = std::fs::read_to_string("/proc/self/status").ok();
+    let field = |name: &str| status.as_deref().and_then(|s| s.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<u64>().ok()));
+    // utime and stime are the 14th and 15th fields, counted after the parenthesised name (which
+    // can hold spaces), in clock ticks of the system's rate (getconf CLK_TCK).
+    let ticks = std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| {
+        let rest = s.rsplit_once(')')?.1;
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
+    });
+    let hz = std::process::Command::new("getconf").arg("CLK_TCK").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.trim().parse::<u64>().ok()).filter(|&h| h > 0);
+    let cpu_s = ticks.zip(hz).map(|(t, h)| t as f64 / h as f64);
+    let sockets = std::fs::read_dir("/proc/self/fd").ok().map(|d| d.filter_map(Result::ok).filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l.to_string_lossy().starts_with("socket:"))).count());
+    serde_json::json!({ "cpu_s": cpu_s, "peak_rss_kib": field("VmHWM:"), "sockets": sockets })
+}
+
+/// The host the client ran on: its kernel, and the platform the driver itself ran on.
+fn platform() -> serde_json::Value {
+    let uname = std::process::Command::new("uname").arg("-srm").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_owned());
+    serde_json::json!({ "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "kernel": uname })
 }
 
 pub const NODES: usize = 3;
@@ -300,21 +334,27 @@ fn send(c: &dyn Cluster, down: &[AtomicBool; NODES], via: usize, s: &[(String, V
 }
 
 /// The record's common fields: what ran, where, when, at which commit.
-fn record_head(o: &Opts, c: &str) -> serde_json::Value {
-    let host = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_default();
-    let commit = std::process::Command::new("git")
+/// The commit this bench was built from (Amphora's version in a record).
+fn record_commit() -> String {
+    std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_owned())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn record_head(o: &Opts, c: &str) -> serde_json::Value {
+    let host = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_default();
+    let commit = record_commit();
     let load = std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| s.split_whitespace().next().map(str::to_owned));
     let date = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     serde_json::json!({
         "bench": format!("repl_{}", o.measure), "system": c, "nodes": NODES, "batch": o.batch, "text_bytes": o.text_bytes,
         "host": host, "cpus": std::thread::available_parallelism().map_or(0, usize::from), "commit": commit, "unix_s": date, "load1": load,
+        "platform": platform(),
     })
 }
 
@@ -506,7 +546,7 @@ fn open(o: &Opts) -> anyhow::Result<Box<dyn Cluster>> {
     Ok(match o.system.as_str() {
         "amphora" => Box::new(inproc::Amphora::open(o)?),
         "amphora-procs" => Box::new(procs::Procs::open(o)?),
-        "rqlite" | "dqlite" | "litefs" | "libsql" => Box::new(http::Http::up(&o.system, &o.scripts, &o.shell, o.deadline)?),
+        "rqlite" | "dqlite" | "litefs" | "libsql" => Box::new(http::Http::up(&o.system, &o.scripts, &o.shell, o.deadline, o.writers.unwrap_or(1))?),
         other => anyhow::bail!("unknown system {other} (amphora, amphora-procs, rqlite, dqlite, litefs, libsql)"),
     })
 }
@@ -524,11 +564,16 @@ pub fn main() -> anyhow::Result<()> {
     let ran = open(&o).and_then(|c| {
         let until = Instant::now() + o.deadline;
         schema(c.as_ref(), until)?;
-        match o.measure.as_str() {
+        let mut body = match o.measure.as_str() {
             "commit" => commit(c.as_ref(), &o),
             "failover" => failover(c.as_ref(), &o),
             _ => catchup(c.as_ref(), &o),
+        }?;
+        if let Some(b) = body.as_object_mut() {
+            b.insert("about".into(), c.about());
+            b.insert("client_use".into(), client_use());
         }
+        Ok(body)
     });
     let head = record_head(&o, &label);
     match ran {
@@ -642,6 +687,14 @@ mod inproc {
     }
 
     impl Cluster for Amphora {
+        fn about(&self) -> serde_json::Value {
+            serde_json::json!({
+                "system": "amphora", "version": record_commit(), "platform": "in-process",
+                "durability": "the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed)",
+                "client": { "driver": "amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each", "transport": "in process: calls on the member, no network" },
+            })
+        }
+
         fn exec(&self, via: usize, stmts: &[(String, Vec<Arg>)], until: Instant) -> anyhow::Result<()> {
             anyhow::ensure!(!self.cut.get(via).is_some_and(|c| c.load(Ordering::Relaxed)), "node {via} is down");
             let stmts = stmts.to_vec();
@@ -714,6 +767,7 @@ mod http {
 
     pub struct Http {
         system: String,
+        writers: usize,
         dialect: Dialect,
         script: PathBuf,
         shell: String,
@@ -782,14 +836,24 @@ mod http {
     }
 
     impl Http {
-        pub fn up(system: &str, scripts: &std::path::Path, shell: &str, deadline: Duration) -> anyhow::Result<Self> {
+        /// `writers` sizes the client's pool: a kept connection to each node for every writer, as
+        /// `procs`'s pool keeps one, so no write pays a new connection (ureq's default keeps 3 a host,
+        /// which made every write past the third writer's open one).
+        pub fn up(system: &str, scripts: &std::path::Path, shell: &str, deadline: Duration, writers: usize) -> anyhow::Result<Self> {
             let dialect = match system {
                 "rqlite" => Dialect::Rqlite,
                 "libsql" => Dialect::Hrana,
                 _ => Dialect::Shim,
             };
-            let agent: ureq::Agent = ureq::Agent::config_builder().no_delay(true).http_status_as_error(false).timeout_global(Some(deadline)).build().into();
-            let mut h = Self { system: system.to_owned(), dialect, script: PathBuf::from(format!("{}/{system}.sh", scripts.display())), shell: shell.to_owned(), endpoints: Vec::new(), agent };
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .no_delay(true)
+                .http_status_as_error(false)
+                .timeout_global(Some(deadline))
+                .max_idle_connections(writers.saturating_mul(NODES))
+                .max_idle_connections_per_host(writers)
+                .build()
+                .into();
+            let mut h = Self { system: system.to_owned(), writers, dialect, script: PathBuf::from(format!("{}/{system}.sh", scripts.display())), shell: shell.to_owned(), endpoints: Vec::new(), agent };
             h.script(&["up"]).map_err(|e| Refusal::Unavailable(format!("{system}'s cluster didn't come up through {}: {e}", h.script.display())))?;
             for n in 0..NODES {
                 h.endpoints.push(h.script(&["endpoint", &n.to_string()])?.trim().to_owned());
@@ -827,6 +891,23 @@ mod http {
     }
 
     impl Cluster for Http {
+        fn about(&self) -> serde_json::Value {
+            // The cluster script's own account (its binary's version line, native or docker, the
+            // data folder's filesystem and what an acknowledgement means), and the client's.
+            let mut a = self.script(&["about"]).ok().and_then(|out| serde_json::from_str::<serde_json::Value>(out.trim()).ok()).unwrap_or_else(|| serde_json::json!({ "system": self.system }));
+            if let Some(o) = a.as_object_mut() {
+                o.insert(
+                    "client".into(),
+                    serde_json::json!({
+                        "driver": "amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each",
+                        "transport": "HTTP/1.1 keep-alive over TCP (ureq 3), TCP_NODELAY, one request a write",
+                        "pool_per_node": self.writers, "dialect": format!("{:?}", self.dialect),
+                    }),
+                );
+            }
+            a
+        }
+
         fn exec(&self, via: usize, stmts: &[(String, Vec<Arg>)], _until: Instant) -> anyhow::Result<()> {
             let ep = self.endpoint(via)?;
             let (url, body) = match self.dialect {
@@ -1246,6 +1327,18 @@ mod procs {
     }
 
     impl Cluster for Procs {
+        fn about(&self) -> serde_json::Value {
+            serde_json::json!({
+                "system": "amphora", "version": record_commit(), "platform": "native",
+                "members": self.members,
+                "durability": "the --class named in the record (persisted: once a quorum's disks hold it and the proposer's log is flushed; replicated: once members spanning --spanning fates hold it)",
+                "client": {
+                    "driver": "amphora-bench --repl: an OS thread a writer, closed loop, one write outstanding each",
+                    "transport": "one JSON line a request over TCP, TCP_NODELAY, one request a write; a kept connection to each member for every writer in flight",
+                },
+            })
+        }
+
         fn exec(&self, via: usize, stmts: &[(String, Vec<Arg>)], _until: Instant) -> anyhow::Result<()> {
             anyhow::ensure!(!self.is_cut(via), "node {via} is down");
             self.ask(via, &serde_json::json!({ "op": "exec", "stmts": http::rqlite_body(stmts) })).map(|_| ())

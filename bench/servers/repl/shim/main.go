@@ -68,6 +68,9 @@ func main() {
 	join := flag.String("join", "", "dqlite: comma-separated addresses to join")
 	path := flag.String("path", "/litefs/bench.db", "sqlite: the database file")
 	listen := flag.String("listen", ":8080", "HTTP address")
+	// The name /leader gives for this node on LiteFS (its lease hostname): the host's by default, as
+	// in a container; native nodes sharing one host each name themselves (native/litefs.sh).
+	name := flag.String("name", "", "sqlite: this node's lease hostname (default the host's name)")
 	flag.Parse()
 	ctx := context.Background()
 
@@ -130,10 +133,12 @@ func main() {
 		if dq == nil {
 			if tx, err := db.BeginTx(r.Context(), nil); err == nil {
 				_ = tx.Rollback()
-				host, err := os.Hostname()
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusServiceUnavailable)
-					return
+				host := *name
+				if host == "" {
+					if host, err = os.Hostname(); err != nil {
+						http.Error(w, err.Error(), http.StatusServiceUnavailable)
+						return
+					}
 				}
 				_, _ = w.Write([]byte(host))
 				return
@@ -170,6 +175,22 @@ func main() {
 		req, err := decode(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// One statement is its own transaction, as rqlite's and sqld's one-statement requests are:
+		// one exchange with the database, not BEGIN, the statement and COMMIT (three of dqlite's
+		// round trips to its leader).
+		if len(req.Stmts) == 1 {
+			q, a, ok := args(req.Stmts[0])
+			if !ok {
+				http.Error(w, "a statement is [sql, arg...]", http.StatusBadRequest)
+				return
+			}
+			if _, err := db.ExecContext(r.Context(), q, a...); err != nil {
+				reply(w, map[string]any{"error": err.Error()})
+				return
+			}
+			reply(w, map[string]any{})
 			return
 		}
 		tx, err := db.BeginTx(r.Context(), nil)

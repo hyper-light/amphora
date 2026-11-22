@@ -13,7 +13,7 @@
 # sharing a Docker host give each their own, with their own AMPHORA_BENCH_REPL_PORT, and never touch
 # each other's containers.
 #
-# usage: <system>.sh up|down|kill N|start N|leader|endpoint N|images
+# usage: <system>.sh up|down|kill N|start N|leader|endpoint N|images|about
 set -euo pipefail
 # Git for Windows' bash rewrites arguments that look like paths (/data, /etc/...): not the containers'.
 export MSYS_NO_PATHCONV=1
@@ -78,6 +78,12 @@ main() {
     leader) leader ;;
     endpoint) echo "http://127.0.0.1:$(port "$2")" ;;
     images) docker image inspect -f '{{.Id}}' "$IMAGE" ${EXTRA_IMAGE:-} ;;
+    # What the record says of this cluster (bench/src/repl.rs's `about`): the image it ran and that
+    # it ran in containers; native/ has the same systems as processes on the host.
+    about)
+      python3 -I -c 'import json,sys; print(json.dumps({"system": sys.argv[1], "version": sys.argv[2], "platform": "docker", "docker": sys.argv[3]}))' \
+        "$SYS" "$IMAGE $(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || true)" "$(docker version -f '{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}' 2>/dev/null || true)"
+      ;;
     *)
       echo "usage: $0 up|down|kill N|start N|leader|endpoint N|images" >&2
       return 2
