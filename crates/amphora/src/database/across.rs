@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use amphora_api::{self as api, Change, Changes, Consistency, Page, Refusal, Rev, Scan};
 
-use super::{Answer, Operation, blob, bytes, integer, rev, text, unavailable};
+use super::{blob, bytes, integer, rev, text, unavailable};
 use crate::backup::Hooks;
 use crate::database::Database;
 use crate::db::Db;
@@ -324,6 +324,156 @@ pub(super) fn moved_in(
     )
 }
 
+/// Whether a version `w` of `v`'s key is in a read as of stamp `?5`, `?4` the newest revision here
+/// stamped at or before it (lane split-merge-20, T-T1.9.R26): one made here by its revision, one
+/// moved in by the stamp it carried, never by its revision, which counts its old group's commits.
+/// A key's versions rise in stamp as in revision (a group's own commits follow every version it
+/// took in, its clock past their stamps), so the newest of them in the read is its row there.
+macro_rules! newest_in_the_read {
+    () => {
+        "(SELECT MAX(w.rev) FROM __amphora_versions w LEFT JOIN __amphora_moved_stamps m ON m.namespace = w.namespace AND m.family = w.family AND m.key = w.key AND m.rev = w.rev WHERE w.namespace = v.namespace AND w.family = v.family AND w.key = v.key AND ((m.rev IS NULL AND w.rev <= ?4) OR m.stamp <= ?5))"
+    };
+}
+
+/// The refusals a read as of stamp `at` gets here before it reads: compaction took the versions
+/// it would answer (`r`, the newest revision stamped at or before it, below the horizon), or a
+/// version of `family` moved in without its stamp, which the read can't place.
+fn refused_at(db: &Db, ns: &str, family: &str, at: u64, r: Rev) -> anyhow::Result<Option<Refusal>> {
+    let mut floor = 0;
+    db.query(
+        "SELECT horizon FROM __amphora_namespaces WHERE name = ?1",
+        [text(ns)],
+        |row| {
+            floor = rev(row, 0)?;
+            Ok(false)
+        },
+    )?;
+    if r < floor {
+        let mut horizon = 0;
+        db.query(
+            "SELECT COALESCE(MAX(stamp), 0) FROM __amphora_rev_stamps WHERE namespace = ?1 AND rev <= ?2",
+            [text(ns), integer(floor)?],
+            |row| {
+                horizon = rev(row, 0)?;
+                Ok(false)
+            },
+        )?;
+        return Ok(Some(Refusal::Compacted { asked: at, horizon }));
+    }
+    unstamped(db, ns, family)
+}
+
+/// One group's page of `family` as of stamp `at` (lane split-merge-20, T-T1.9.R26): each key's
+/// newest version in the read (`newest_in_the_read`), its revision answered as its stamp. A row
+/// moved in after `at` from a group that wrote it before is in the page, as it was then.
+fn page_at(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    scan: &Scan,
+    at: u64,
+) -> anyhow::Result<Result<Page, Refusal>> {
+    let r = through(db, ns, at)?;
+    if let Some(refusal) = refused_at(db, ns, family, at, r)? {
+        return Ok(Err(refusal));
+    }
+    let upper = super::successor(&scan.prefix);
+    // The same four shapes as a group's own scan, the cursor and the upper bound outside the
+    // read's OR; a cursor below the prefix is the prefix's own first seek.
+    let (lower, continued) = match scan.after.as_ref() {
+        Some(after) if after >= &scan.prefix => (after.as_slice(), true),
+        _ => (scan.prefix.as_slice(), false),
+    };
+    let query = match (continued, upper.is_some()) {
+        (false, false) => concat!(
+            "SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key >= ?3 AND v.rev = ",
+            newest_in_the_read!(),
+            " AND v.value IS NOT NULL ORDER BY v.key LIMIT ?6"
+        ),
+        (false, true) => concat!(
+            "SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key >= ?3 AND v.key < ?7 AND v.rev = ",
+            newest_in_the_read!(),
+            " AND v.value IS NOT NULL ORDER BY v.key LIMIT ?6"
+        ),
+        (true, false) => concat!(
+            "SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key > ?3 AND v.rev = ",
+            newest_in_the_read!(),
+            " AND v.value IS NOT NULL ORDER BY v.key LIMIT ?6"
+        ),
+        (true, true) => concat!(
+            "SELECT v.key, v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key > ?3 AND v.key < ?7 AND v.rev = ",
+            newest_in_the_read!(),
+            " AND v.value IS NOT NULL ORDER BY v.key LIMIT ?6"
+        ),
+    };
+    let mut params = vec![
+        text(ns),
+        text(family),
+        blob(lower)?,
+        integer(r)?,
+        integer(at)?,
+        integer(
+            u64::try_from(scan.limit)?
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("limit overflow"))?,
+        )?,
+    ];
+    if let Some(upper) = upper {
+        params.push(blob(&upper)?);
+    }
+    let mut rows = Vec::new();
+    db.query(query, params, |row| {
+        rows.push(api::Row {
+            key: bytes(row, 0)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
+            rev: rev(row, 1)?,
+            value: bytes(row, 2)?.ok_or_else(|| anyhow::anyhow!("null value"))?,
+        });
+        Ok(true)
+    })?;
+    let more = rows.len() > scan.limit;
+    rows.truncate(scan.limit);
+    for row in &mut rows {
+        row.rev = stamp_of_version(db, ns, family, &row.key, row.rev)?.unwrap_or(0);
+    }
+    Ok(Ok(Page { rows, more }))
+}
+
+/// One key's row here as of stamp `at` (lane split-merge-20, T-T1.9.R26): its newest version in
+/// the read (`newest_in_the_read`), as [`page_at`] reads each key; none while that is a delete.
+fn row_at(
+    db: &Db,
+    ns: &str,
+    family: &str,
+    key: &[u8],
+    at: u64,
+) -> anyhow::Result<Result<Option<api::Row>, Refusal>> {
+    let r = through(db, ns, at)?;
+    if let Some(refusal) = refused_at(db, ns, family, at, r)? {
+        return Ok(Err(refusal));
+    }
+    let mut found = None;
+    db.query(
+        concat!(
+            "SELECT v.rev, v.value FROM __amphora_versions v WHERE v.namespace = ?1 AND v.family = ?2 AND v.key = ?3 AND v.rev = ",
+            newest_in_the_read!()
+        ),
+        [text(ns), text(family), blob(key)?, integer(r)?, integer(at)?],
+        |row| {
+            found = Some((rev(row, 0)?, bytes(row, 1)?));
+            Ok(false)
+        },
+    )?;
+    let Some((version, Some(value))) = found else {
+        return Ok(Ok(None));
+    };
+    let stamp = stamp_of_version(db, ns, family, key, version)?.unwrap_or(0);
+    Ok(Ok(Some(api::Row {
+        key: key.to_vec(),
+        rev: stamp,
+        value,
+    })))
+}
+
 /// The namespace's head across groups: the cut, a stamp every group has made all its revisions
 /// at or before by the time this answers.
 pub(super) fn head(
@@ -365,25 +515,7 @@ pub(super) fn scan(
     let mut more = false;
     for (group, _) in &groups {
         let (ns, family, scan) = (ns.to_owned(), family.to_owned(), scan.clone());
-        let page = group.call_internal(until, move |db| {
-            let r = through(db, &ns, at)?;
-            let operation = Operation::Scan(
-                family.clone(),
-                Scan {
-                    at: Consistency::Snapshot(r),
-                    ..scan
-                },
-            );
-            let mut page = match super::apply(db, &ns, &operation)? {
-                Ok(Answer::Page(page)) => page,
-                Ok(_) => return Ok(Err(unavailable("wrong scan answer"))),
-                Err(refusal) => return Ok(Err(refusal)),
-            };
-            for row in &mut page.rows {
-                row.rev = stamp_of_version(db, &ns, &family, &row.key, row.rev)?.unwrap_or(0);
-            }
-            Ok(Ok(page))
-        })??;
+        let page = group.call_internal(until, move |db| page_at(db, &ns, &family, &scan, at))??;
         more |= page.more;
         rows.extend(page.rows);
     }
@@ -769,19 +901,7 @@ pub(super) fn get(
         }
     };
     let (ns, family, key) = (ns.to_owned(), family.to_owned(), key.to_vec());
-    database.call_internal(until, move |db| {
-        let r = through(db, &ns, at)?;
-        let operation = Operation::Get(family.clone(), key, Consistency::Snapshot(r));
-        match super::apply(db, &ns, &operation)? {
-            Ok(Answer::Row(Some(mut row))) => {
-                row.rev = stamp_of_version(db, &ns, &family, &row.key, row.rev)?.unwrap_or(0);
-                Ok(Ok(Some(row)))
-            }
-            Ok(Answer::Row(None)) => Ok(Ok(None)),
-            Ok(_) => Ok(Err(unavailable("wrong record answer"))),
-            Err(refusal) => Ok(Err(refusal)),
-        }
-    })?
+    database.call_internal(until, move |db| row_at(db, &ns, &family, &key, at))?
 }
 
 /// `changes` cut to `limit`, never through a stamp: a cursor is a stamp, so advancing to the last
@@ -1251,6 +1371,136 @@ mod tests {
             matches!(&refused, Err(Refusal::Unavailable(why)) if why.contains("without its commit stamp")),
             "{refused:?}"
         );
+    }
+
+    /// T-T1.9.R26 (CP-T1.9; reshard.md, "Decision (lane split-merge-20): a read as of a stamp
+    /// places moved rows by their stamps"). Do: two databases made groups' (unbacked, so the test
+    /// writes the stamps): the old one writes a1 at 10, a2 at 30 and a1 again at 50 (its
+    /// revisions 1 to 3); the new one b1, b2, b3 at 20, 22, 24 (its own revisions 1 to 3); the
+    /// old one's keys moved into the new one after all of them; then the new one writes b1 again
+    /// at 70 and the moved a2 again at 80. Then the new one is scanned, and each key read, as of
+    /// stamps before the move: 5, 15, 25, 35, 55, 75 and one past every stamp, and as of 55 two
+    /// at a time. Expect: each read holds exactly the versions stamped at or before it, a moved
+    /// row by the stamp it carried, never by its old group's revision number: at 15 a1 alone
+    /// (the new group had no revision yet), at 25 a1's first value and the b-keys but not a2 nor
+    /// a1's second (whose old revisions 2 and 3 are at or below the new group's), at 55 a1's
+    /// second; each row answering its stamp; the pages of two alike.
+    #[test]
+    fn t_t1_9_r26_a_read_as_of_an_older_stamp_places_moved_rows_by_their_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            let db = Db::open(&dir.path().join(name)).unwrap();
+            crate::database::bootstrap_db(&db).unwrap();
+            db
+        };
+        let commit = |db: &Db, key: &[u8], value: &[u8], stamp: u64| {
+            let at =
+                crate::database::write_across(db, "n", "f", key, Some(value), None, 0).unwrap();
+            db.query(
+                "INSERT INTO __amphora_rev_stamps(namespace, rev, stamp) VALUES ('n', ?1, ?2)",
+                [integer(at).unwrap(), integer(stamp).unwrap()],
+                |_| Ok(true),
+            )
+            .unwrap();
+        };
+        let (old, mut new) = (open("old.db"), open("new.db"));
+        commit(&old, b"a1", b"1", 10);
+        commit(&old, b"a2", b"1", 30);
+        commit(&old, b"a1", b"2", 50);
+        commit(&new, b"b1", b"1", 20);
+        commit(&new, b"b2", b"1", 22);
+        commit(&new, b"b3", b"1", 24);
+        crate::database::group::begin(&old).unwrap();
+        crate::database::group::begin(&new).unwrap();
+        let batch = crate::database::group::export(&old, crate::reshard::Span::ALL, 100).unwrap();
+        assert_eq!(batch.keys.len(), 2, "{batch:?}");
+        new.transaction(|db| crate::database::group::import(db, &batch.keys))
+            .unwrap();
+        commit(&new, b"b1", b"2", 70);
+        commit(&new, b"a2", b"3", 80);
+
+        type Seen = Vec<(String, String, Rev)>;
+        let seen = |rows: &[api::Row]| -> Seen {
+            rows.iter()
+                .map(|r| {
+                    (
+                        String::from_utf8(r.key.clone()).unwrap(),
+                        String::from_utf8(r.value.clone()).unwrap(),
+                        r.rev,
+                    )
+                })
+                .collect()
+        };
+        let want = |rows: &[(&str, &str, Rev)]| -> Seen {
+            rows.iter()
+                .map(|(k, v, r)| ((*k).to_owned(), (*v).to_owned(), *r))
+                .collect()
+        };
+        let scan = |at: u64, after: Option<&[u8]>, limit: usize| {
+            let scan = Scan {
+                prefix: vec![],
+                after: after.map(<[u8]>::to_vec),
+                limit,
+                at: Consistency::Linearizable,
+            };
+            page_at(&new, "n", "f", &scan, at).unwrap().unwrap()
+        };
+        let b = [("b1", "1", 20), ("b2", "1", 22), ("b3", "1", 24)];
+        let cases: [(u64, Vec<(&str, &str, Rev)>); 7] = [
+            (5, vec![]),
+            (15, vec![("a1", "1", 10)]),
+            (25, [vec![("a1", "1", 10)], b.to_vec()].concat()),
+            (
+                35,
+                [vec![("a1", "1", 10), ("a2", "1", 30)], b.to_vec()].concat(),
+            ),
+            (
+                55,
+                [vec![("a1", "2", 50), ("a2", "1", 30)], b.to_vec()].concat(),
+            ),
+            (
+                75,
+                vec![
+                    ("a1", "2", 50),
+                    ("a2", "1", 30),
+                    ("b1", "2", 70),
+                    ("b2", "1", 22),
+                    ("b3", "1", 24),
+                ],
+            ),
+            (
+                1_000,
+                vec![
+                    ("a1", "2", 50),
+                    ("a2", "3", 80),
+                    ("b1", "2", 70),
+                    ("b2", "1", 22),
+                    ("b3", "1", 24),
+                ],
+            ),
+        ];
+        for (at, rows) in &cases {
+            let page = scan(*at, None, 100);
+            assert_eq!(seen(&page.rows), want(rows), "as of {at}");
+            assert!(!page.more, "as of {at}");
+            for key in ["a1", "a2", "b1", "b2", "b3"] {
+                let row = row_at(&new, "n", "f", key.as_bytes(), *at)
+                    .unwrap()
+                    .unwrap();
+                let expected: Seen = want(rows)
+                    .into_iter()
+                    .filter(|(k, _, _)| k == key)
+                    .collect();
+                assert_eq!(seen(row.as_slice()), expected, "{key} as of {at}");
+            }
+        }
+        let first = scan(55, None, 2);
+        assert_eq!(
+            (seen(&first.rows), first.more),
+            (want(&[("a1", "2", 50), ("a2", "1", 30)]), true)
+        );
+        let next = scan(55, Some(b"a2".as_slice()), 2);
+        assert_eq!((seen(&next.rows), next.more), (want(&b[..2]), true));
     }
 
     /// T-T1.9.R24 (CP-T1.9; reshard.md, "Decision (lane split-merge-19): one key and what changed,

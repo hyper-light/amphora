@@ -751,7 +751,9 @@ interleave by stamp, after a stamp the rows after it, two at a time the first tw
 same rows moved without stamps into a third group make its changes refused.
 
 **Left.** A scan as of an older stamp still picks each group's versions by its own revision, so a
-moved row's version is chosen by its old group's number there; the scan at the cut is exact.
+moved row's version is chosen by its old group's number there; the scan at the cut is exact. Done
+by lane split-merge-20: "Decision (lane split-merge-20): a read as of a stamp places moved rows by
+their stamps".
 
 **Falsified by.** A moved row answered with the stamp of this group's own revision of the same
 number; a moved row missing from the changes, or answered twice; changes answered without a moved
@@ -794,3 +796,40 @@ waiter the wakes of reads.
 **Falsified by.** A get across groups missing a write of the key answered before it began; a get
 as of a stamp whose answer changes later; `changed` answering none while `changes` after the same
 cursor answers a change.
+
+## Decision (lane split-merge-20): a read as of a stamp places moved rows by their stamps
+
+A scan or a get across groups as of a stamp asked to each group for its newest revision stamped
+at or before it, then read that group as of that revision. A version moved in keeps its old
+group's revision number, which counts the old group's commits, not this one's: as of an older
+stamp it was taken when its number was at or below the revision (though stamped after the read),
+and left out when its number was above it (though stamped before). A row moved after the read's
+stamp, from a group that wrote it before, was missing or answered at the wrong version.
+- Each group now picks each key's version by stamp: a version made here by its revision (at or
+  below the newest revision stamped at or before the read's stamp, which is the same as its own
+  stamp being at or before it), a version moved in by the stamp it carried. One query a page, the
+  same four shapes as a group's own scan, the cursor and the upper bound outside the choice.
+- A key's versions rise in stamp as they rise in revision: a key moved in is dropped and taken
+  whole, and the group's head is raised past its revisions and its clock past their stamps, so
+  every version the group then writes of it is later in both. So the newest version in the read
+  is the key's row as of that stamp.
+- The scan at the cut and the get at a fresh stamp read the same way, so a row moved in after
+  the cut was taken but before the group's read ran (stamped after the cut by its old group) is
+  left out of the read, as a write made there then would be.
+- A version moved in without a stamp has no place in the order, so a scan or get as of any stamp
+  is refused while one is here, as the changes are. A read whose revision compaction took is
+  refused `Compacted`, the horizon a stamp.
+
+**Evidence.** T-T1.9.R26: an old group writes a1 at 10, a2 at 30 and a1 again at 50 (its revisions
+1 to 3), a new one b1, b2, b3 at 20, 22, 24 (its own revisions 1 to 3); the old group's keys move
+into the new one, which then writes b1 at 70 and the moved a2 at 80. Scanned and read key by key
+as of 5, 15, 25, 35, 55, 75 and past every stamp, each read holds exactly the versions stamped at
+or before it: at 15 a1 alone, though the new group had no revision yet; at 25 a1's first value and
+the b-keys, not a2 nor a1's second, whose old numbers are at or below the new group's revision;
+at 55 a1's second. Pages of two answer the same.
+
+**Left.** Compaction still takes a moved version by its old revision number, against this
+group's own revisions; a read as of a stamp that compaction passed that way can miss it.
+
+**Falsified by.** A read as of a stamp holding a version stamped after it, or missing one stamped
+at or before it that is still kept; a key answered twice in a page.
