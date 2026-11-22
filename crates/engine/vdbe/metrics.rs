@@ -25,6 +25,13 @@ pub struct HashJoinMetrics {
     pub grace_probe_rows_streamed: u64,
     pub grace_probe_rows_buffered: u64,
     pub grace_matches: u64,
+
+    /// Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's build rows passed by merging
+    /// forward, probe rows out of key order found by binary search instead, and merge tables that
+    /// spilled and so probed by hash (`HashTable::set_merge`).
+    pub merge_steps: u64,
+    pub merge_searches: u64,
+    pub merge_tables_hashed: u64,
 }
 
 impl HashJoinMetrics {
@@ -58,6 +65,11 @@ impl HashJoinMetrics {
             .grace_probe_rows_buffered
             .wrapping_add(other.grace_probe_rows_buffered);
         self.grace_matches = self.grace_matches.wrapping_add(other.grace_matches);
+        self.merge_steps = self.merge_steps.wrapping_add(other.merge_steps);
+        self.merge_searches = self.merge_searches.wrapping_add(other.merge_searches);
+        self.merge_tables_hashed = self
+            .merge_tables_hashed
+            .wrapping_add(other.merge_tables_hashed);
     }
 
     pub fn reset(&mut self) {

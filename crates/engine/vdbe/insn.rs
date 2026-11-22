@@ -268,6 +268,9 @@ pub struct HashBuildData {
     pub num_payload: usize,
     /// Whether to track which entries are matched (for FULL OUTER JOIN).
     pub track_matched: bool,
+    /// Amphora (QT.5 step 4, lane qs5-21): the join is a sort-merge (`HashJoinMethod::Merge`):
+    /// the table sorts its rows by key once built and is probed by merging (`HashTable::set_merge`).
+    pub merge: bool,
 }
 
 /// Amphora (PL.13): one adaptive join's switch (boxed to keep Insn small). The three weights are

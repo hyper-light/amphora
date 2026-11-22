@@ -18480,7 +18480,10 @@ fn hash_build_run(
             track_matched: data.track_matched,
             partition_count: None,
         };
-        e.insert(HashTable::new(config, pager.io.clone())?);
+        let mut table = HashTable::new(config, pager.io.clone())?;
+        // Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's table.
+        table.set_merge(data.merge);
+        e.insert(table);
     }
 
     // Read pre-computed key values directly from registers

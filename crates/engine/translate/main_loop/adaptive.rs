@@ -389,6 +389,8 @@ impl<'a> AdaptiveSeek<'a> {
                 payload_start_reg: (num_payload > 0).then_some(build_keys + num_keys),
                 num_payload,
                 track_matched: false,
+                // An adaptive join's switch weighs a hash table, not a merge.
+                merge: false,
             }),
         });
         program.emit_insn(Insn::Next {
