@@ -1053,6 +1053,96 @@ mod scans {
         );
     }
 
+    /// Lane skip-5 (T-SKU.4): a skipping scan runs its body over column batches (QT.7's fused
+    /// loops) up to each candidate run's end. Four databases, batches on and off by skipping on and
+    /// off, take the same random writes and answer every filtered aggregate and row query alike;
+    /// with batches on, the skipping scan's fused loops ran rows and it read fewer rows than the
+    /// unskipped one, as it does row by row.
+    fn batched_skipping_answers_as_every_switch(kind: SkipKind) {
+        let rows = 4000;
+        let queries = 32;
+        for seed in 0..3u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            // (batches, skipping) for each database.
+            let switches = [(true, true), (true, false), (false, true), (false, false)];
+            let dbs: Vec<_> = switches.iter().map(|_| open()).collect();
+            for ((_, conn), (batches, _)) in dbs.iter().zip(switches) {
+                conn.set_vectorized_scans(batches);
+            }
+            fill([&dbs[0].1, &dbs[1].1], rows);
+            fill([&dbs[2].1, &dbs[3].1], rows);
+            for ((_, conn), (_, skipping)) in dbs.iter().zip(switches) {
+                if skipping {
+                    set_skipping(conn, "t", "a", Some(kind)).unwrap();
+                }
+            }
+            let mut read = [0u64; 4];
+            let mut fused_skipping = 0usize;
+            for round in 0..queries {
+                for _ in 0..rng.random_range(0..15) {
+                    let sql = random_write(&mut rng, rows);
+                    dbs.iter().for_each(|(_, conn)| conn.execute(&sql).unwrap());
+                }
+                let lo = rng.random_range(-10..rows);
+                let hi = lo.saturating_add(rng.random_range(0..rows / 10));
+                let sql = match round % 4 {
+                    0 => format!("SELECT count(*), sum(b), min(a), max(a) FROM t WHERE a BETWEEN {lo} AND {hi}"),
+                    1 => format!("SELECT count(*), total(a) FROM t WHERE a >= {lo} AND a <= {hi} AND b <> 3"),
+                    2 => format!("SELECT b, count(*), max(a) FROM t WHERE {lo} <= a AND a < {hi} GROUP BY b ORDER BY b"),
+                    _ => format!("SELECT rowid, a, b FROM t WHERE a BETWEEN {lo} AND {hi} ORDER BY rowid"),
+                };
+                let mut answers = Vec::new();
+                for (at, (_, conn)) in dbs.iter().enumerate() {
+                    let before = crate::vdbe::leaf_batch::tests::fused();
+                    let (answer, r) = query(conn, &sql);
+                    if at == 0 {
+                        fused_skipping += crate::vdbe::leaf_batch::tests::fused() - before;
+                    }
+                    read[at] += r;
+                    answers.push(answer);
+                }
+                for (at, answer) in answers.iter().enumerate().skip(1) {
+                    assert_eq!(
+                        answer, &answers[0],
+                        "seed {seed} {kind:?} (batches, skipping) {:?} vs {:?}: {sql}",
+                        switches[at], switches[0]
+                    );
+                }
+            }
+            assert!(
+                fused_skipping > 0,
+                "seed {seed} {kind:?}: no skipping row ran in a batch"
+            );
+            assert!(
+                read[0] < read[1],
+                "seed {seed} {kind:?}: batched read {} skipping, {} without",
+                read[0],
+                read[1]
+            );
+            assert!(
+                read[2] < read[3],
+                "seed {seed} {kind:?}: row by row read {} skipping, {} without",
+                read[2],
+                read[3]
+            );
+        }
+    }
+
+    #[test]
+    fn t_sku_4_zone_maps_batched_skipping_answers_as_every_switch() {
+        batched_skipping_answers_as_every_switch(SkipKind::ZoneMaps);
+    }
+
+    #[test]
+    fn t_sku_4_cracking_batched_skipping_answers_as_every_switch() {
+        batched_skipping_answers_as_every_switch(SkipKind::Cracking);
+    }
+
+    #[test]
+    fn t_sku_4_measured_batched_skipping_answers_as_every_switch() {
+        batched_skipping_answers_as_every_switch(SkipKind::Measured);
+    }
+
     #[test]
     fn t_sku_1_zone_maps_prepared_parameters_skip_and_answer_as_unswitched() {
         prepared_parameters_skip(SkipKind::ZoneMaps);

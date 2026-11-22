@@ -85,6 +85,9 @@ pub struct CopyCounts {
     /// Rows the copies' builds read from their tables, and of those the rows rebuys read.
     pub build_rows: u64,
     pub rebuy_rows: u64,
+    /// The keys' and rows' bytes those builds read, and of those the bytes rebuys read.
+    pub build_bytes: u64,
+    pub rebuy_bytes: u64,
     /// Analytic statements the rows answered with no copy kept (the rent paid, or the copy let go
     /// or waiting).
     pub absent: u64,
@@ -349,12 +352,14 @@ impl Copies {
     }
 
     /// A build of `tree`'s copy read `rows` rows of its table: a rebuy's when its copy was let go.
-    fn read_for_build(&self, tree: u64, rows: u64) {
+    fn read_for_build(&self, tree: u64, rows: u64, bytes: u64) {
         let rebuy = self.absent.lock().contains_key(&tree);
         let mut c = self.counts.lock();
         c.build_rows = c.build_rows.saturating_add(rows);
+        c.build_bytes = c.build_bytes.saturating_add(bytes);
         if rebuy {
             c.rebuy_rows = c.rebuy_rows.saturating_add(rows);
+            c.rebuy_bytes = c.rebuy_bytes.saturating_add(bytes);
         }
     }
 
@@ -815,7 +820,11 @@ fn read(
             let start = clock();
             let all = rows.all()?;
             let n = as_u64(all.len());
-            copies.read_for_build(tree, n);
+            let read = all.iter().fold(0u64, |b, (k, v)| {
+                b.saturating_add(as_u64(k.len()))
+                    .saturating_add(as_u64(v.len()))
+            });
+            copies.read_for_build(tree, n, read);
             // Each block's bytes granted before it is built (AC-CB.1.1); refused, the copy is let
             // go, expecting the generation these rows make.
             if let Err(refused) = copy.columns.rebuild(snap.start, &all, tick(base)) {
@@ -1145,7 +1154,7 @@ mod tests {
         (db, off)
     }
 
-    /// T-CB.1.1: a copy with room for it, then one with half the room it needs, through writes,
+    /// T-CB.1.3: a copy with room for it, then one with half the room it needs, through writes,
     /// rebuilds and refusals, under both policies. Expect: after every statement and write the
     /// copies' generations hold no more bytes than were granted them, the copies never hold more
     /// than the room left them, and every answer equals the rows'.
@@ -1435,6 +1444,7 @@ mod tests {
             let (mut held_sum, mut held_peak, mut equal, mut waited_most) =
                 (0u64, 0u64, true, 0u64);
             let mut next = vec![s.rows + 1; s.tables];
+            let (mut resident_peak, mut granted_peak) = (0u64, 0u64);
             let began = Instant::now();
             for k in 0..s.statements {
                 let i = k % s.tables;
@@ -1472,6 +1482,14 @@ mod tests {
                 let held = copies(&on).meter().held;
                 held_sum = held_sum.saturating_add(held);
                 held_peak = held_peak.max(held);
+                let (resident, granted) = copies(&on).held();
+                assert!(
+                    resident <= granted,
+                    "{}: {resident} resident, {granted} granted",
+                    s.name
+                );
+                resident_peak = resident_peak.max(resident);
+                granted_peak = granted_peak.max(granted);
                 waited_most = copies(&on)
                     .waiting()
                     .iter()
@@ -1484,13 +1502,13 @@ mod tests {
             let m = copies(&on).meter();
             let n = s.statements.max(1) as u64;
             format!(
-                "{{\"lane\":\"colcopy-bound\",\"policy\":\"{}\",\"scenario\":\"{}\",\"tables\":{},\"rows\":{},\"statements\":{},\"need_bytes\":{},\"free_bytes\":{},\"p50_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"statements_per_s\":{:.1},\"peak_held\":{},\"avg_held\":{},\"build_rows\":{},\"rebuy_rows\":{},\"rebuys\":{},\"kept\":{},\"dropped\":{},\"resumed\":{},\"absent_ns\":{},\"longest_wait_ns\":{},\"copy_statements\":{},\"absent_statements\":{},\"copy_rows\":{},\"loop_rows\":{},\"asked\":{},\"granted\":{},\"refused\":{},\"refused_bytes\":{},\"equal\":{}}}",
+                "{{\"lane\":\"colcopy-bound\",\"policy\":\"{}\",\"scenario\":\"{}\",\"tables\":{},\"rows\":{},\"statements\":{},\"need_bytes\":{},\"free_bytes\":{},\"p50_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"statements_per_s\":{:.1},\"peak_held\":{},\"avg_held\":{},\"build_rows\":{},\"rebuy_rows\":{},\"build_bytes\":{},\"rebuy_bytes\":{},\"resident_peak\":{},\"granted_peak\":{},\"rebuys\":{},\"kept\":{},\"dropped\":{},\"resumed\":{},\"absent_ns\":{},\"longest_wait_ns\":{},\"copy_statements\":{},\"absent_statements\":{},\"copy_rows\":{},\"loop_rows\":{},\"asked\":{},\"granted\":{},\"refused\":{},\"refused_bytes\":{},\"equal\":{}}}",
                 match rebuy { Rebuy::Rent => "A_rent", Rebuy::Room => "B_room" },
                 s.name, s.tables, s.rows, s.statements, need,
                 free.map_or("null".to_string(), |f| f.to_string()),
                 at(&latencies, 0.5), at(&latencies, 0.99), at(&latencies, 0.999),
                 s.statements as f64 / elapsed.max(f64::MIN_POSITIVE),
-                held_peak, held_sum / n, c.build_rows, c.rebuy_rows, c.rebuys, c.kept, c.dropped, c.resumed,
+                held_peak, held_sum / n, c.build_rows, c.rebuy_rows, c.build_bytes, c.rebuy_bytes, resident_peak, granted_peak, c.rebuys, c.kept, c.dropped, c.resumed,
                 copies(&on).absent_nanos(), waited_most, c.copy, c.absent, c.granule_rows, c.loop_rows,
                 m.asked, m.granted, m.refused, m.refused_bytes, equal
             )

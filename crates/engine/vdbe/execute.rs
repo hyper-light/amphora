@@ -2119,6 +2119,24 @@ fn skip_settle(
     }
 }
 
+/// A fused run's rows past the one its Next stepped onto, counted as that many Next steps.
+fn record_fused_rows(state: &mut ProgramState, rows: usize, fullscan: bool, is_index: bool) {
+    if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
+        let skipped = skipped as u64;
+        state.record_rows_read(skipped);
+        state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
+        state.metrics.search_count = state.metrics.search_count.wrapping_add(skipped as i64);
+        state.metrics.fullscan_steps = state
+            .metrics
+            .fullscan_steps
+            .wrapping_add(fullscan as u64 * skipped);
+        state.metrics.index_steps = state
+            .metrics
+            .index_steps
+            .wrapping_add(is_index as u64 * skipped);
+    }
+}
+
 pub fn op_last(
     program: &Program,
     state: &mut ProgramState,
@@ -3811,7 +3829,9 @@ pub fn op_next(
         insn
     );
     // Amphora (G5 step 4, T-G5.4.3): a scan skipping by a summary steps, then seeks past the rows
-    // its candidates leave out (its body runs row by row: no fused batch).
+    // its candidates leave out. Lane skip-5 (T-SKU.4): on a candidate row, a fused loop's body
+    // runs over the batch up to the candidate run's end, as an unskipped scan's does to the
+    // batch's end.
     if !state.skip_walks.is_empty() {
         if let Some(mut walk) = state.skip_walks.take(*cursor_id) {
             if walk.phase == crate::skipping::WalkPhase::Idle {
@@ -3834,8 +3854,24 @@ pub fn op_next(
                     }
                 }
             }
-            let on_end = state.pc + 1;
-            return skip_walk_step(program, state, walk, on_end, pc_if_next.as_offset_int());
+            let next_pc = state.pc;
+            let on_end = next_pc + 1;
+            let stepped = skip_walk_step(program, state, walk, on_end, pc_if_next.as_offset_int())?;
+            if state.pc == pc_if_next.as_offset_int() {
+                let fused = program
+                    .leaf_batch_plan
+                    .as_deref()
+                    .and_then(|plan| plan.fused_loop(next_pc as usize));
+                if let Some((fused, until)) = fused.zip(state.skip_walks.run_end(*cursor_id)) {
+                    let rows =
+                        super::leaf_batch::fused::run(program, state, fused, pager, Some(until))?;
+                    record_fused_rows(state, rows, *fullscan, *is_index);
+                    if rows > 0 {
+                        state.pc = next_pc;
+                    }
+                }
+            }
+            return Ok(stepped);
         }
     }
     let is_empty = {
@@ -3871,22 +3907,8 @@ pub fn op_next(
             .as_deref()
             .and_then(|plan| plan.fused_loop(next_pc as usize))
         {
-            let rows = super::leaf_batch::fused::run(program, state, fused, pager)?;
-            if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
-                let skipped = skipped as u64;
-                state.record_rows_read(skipped);
-                state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
-                state.metrics.search_count =
-                    state.metrics.search_count.wrapping_add(skipped as i64);
-                state.metrics.fullscan_steps = state
-                    .metrics
-                    .fullscan_steps
-                    .wrapping_add(*fullscan as u64 * skipped);
-                state.metrics.index_steps = state
-                    .metrics
-                    .index_steps
-                    .wrapping_add(*is_index as u64 * skipped);
-            }
+            let rows = super::leaf_batch::fused::run(program, state, fused, pager, None)?;
+            record_fused_rows(state, rows, *fullscan, *is_index);
             if rows > 0 {
                 state.pc = next_pc;
             }
