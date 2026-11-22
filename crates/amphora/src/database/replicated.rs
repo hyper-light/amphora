@@ -5473,19 +5473,24 @@ mod tests {
     }
 
     /// Lane ryw-6 (kiln goal 8119f25d) on QB.1's learned bound: a host that drains at the
-    /// handle's bound, as the bench's relay does, takes a queue filled to that bound in one call
-    /// and needs no count of its own. Do: a member's queue filled to `outgoing_bound`; one drain
-    /// at it. Expect: every record taken in order, none left and no bytes charged.
+    /// handle's bound, as the bench's relay does, takes the whole queue in one call and needs no
+    /// count of its own. Before anything is drained the bound is the memory room (QB.1), far past
+    /// what a test fills, so the queue holds a burst of records the bound covers. Do: a member's
+    /// queue holding 1,004 records (four times 251, the byte pattern's period); one drain at
+    /// `outgoing_bound`. Expect: the bound covers them, every record taken in order, none left and
+    /// no bytes charged.
     #[test]
     fn a_drain_at_the_queues_bound_takes_the_whole_queue() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let handle = client.handle();
+        let burst = 4 * 251;
         let bound = handle.outgoing_bound().unwrap();
+        assert!(bound >= burst, "the bound {bound} covers the burst {burst}");
         {
             let mut outgoing = locked(&handle.shared.outgoing).unwrap();
-            while outgoing.messages.len() < bound {
+            while outgoing.messages.len() < burst {
                 let n = u8::try_from(outgoing.messages.len() % 251).unwrap();
                 outgoing.bytes += 1;
                 outgoing.messages.push_back(Outbound {
@@ -5495,7 +5500,7 @@ mod tests {
             }
         }
         let drained = handle.drain(bound).unwrap();
-        assert_eq!(drained.len(), bound);
+        assert_eq!(drained.len(), burst);
         assert!(
             drained
                 .iter()
