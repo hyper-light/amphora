@@ -1179,7 +1179,17 @@ impl Versioned {
         trees: usize,
         cmp: impl Fn(usize) -> super::blink::Comparator,
     ) -> Result<Self> {
-        let pool = Pool::new(frames);
+        Self::new_in(Pool::new(frames), trees, cmp)
+    }
+
+    /// `trees` empty trees in `pool` (one over a disk evicts, G7 step 4), tree `i` ordered by
+    /// `cmp(i)`.
+    pub fn new_in(
+        pool: Pool,
+        trees: usize,
+        cmp: impl Fn(usize) -> super::blink::Comparator,
+    ) -> Result<Self> {
+        let frames = pool.capacity();
         let mut made = Vec::with_capacity(trees);
         for i in 0..trees {
             let id = u64::try_from(i).map_err(|_| LimboError::IntegerOverflow)?;

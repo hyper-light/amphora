@@ -10,18 +10,21 @@
 //! Each granule carries its summaries: per column the least and greatest value and the null count
 //! (min/max), and its first and last key and the position of its first row in the scan
 //! (positional). A filter whose literal falls outside a granule's range skips the granule without
-//! reading it. Filters and aggregates run over whole column vectors; a column whose values mix
-//! types in a granule falls back to comparing value by value, with the same answers.
+//! reading it. Filters and aggregates run over whole column vectors; grouped, one pass over the
+//! group columns gives each row its group's slot in the granule, and each aggregate folds its
+//! vector by slot. A column whose values mix types in a granule falls back to comparing value by
+//! value, with the same answers.
 //!
 //! A granule whose block no change touches at the scan's snapshot is decoded once per generation
 //! and kept ([`Cache`]); one with deltas, or with keys the queue holds, is decoded from its rows at
 //! the snapshot each scan. So every scan reads exactly the rows at its snapshot, as
 //! [`super::Columns::scan`] does.
 //!
-//! Morsel-parallel execution: [`Plan`] has the shape of the morsel executor's pipeline (lane qs6's
-//! `vdbe/morsel.rs`, `Pipeline`: `rows`, `empty`, `run` over a range, `merge`), with granules as the
-//! unit a worker takes, and every answer the same however the granules are split and merged, so
-//! that executor drives it once it is on main.
+//! Morsel-parallel execution: [`Plan`] is a pipeline of the morsel executor (`vdbe/morsel.rs`,
+//! lane qs6), with granules as the unit a worker takes and new groups charged to the statement's
+//! shared memory budget. Every answer is the same however the granules are split among workers and
+//! merged: counts and integer sums are exact, real sums exact until one rounding, and of values or
+//! group keys equal under [`order`] (an integer and an equal real) the earliest row's is kept.
 //!
 //! Values compare as SQLite orders them under the BINARY collation: NULL first, then integers and
 //! reals by value, then text bytewise, then blobs bytewise.
@@ -32,6 +35,9 @@ use crate::numeric::Numeric;
 use crate::storage::versioned::version::Ts;
 use crate::sync::{Arc, Mutex};
 use crate::types::{ImmutableRecordRef, ValueRef};
+use crate::vdbe::morsel::{
+    self, MachineCosts, MemoryBudget, MorselError, ParallelMode, Pipeline, RunStats,
+};
 use crate::Result;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -743,8 +749,10 @@ enum Acc {
         any_real: bool,
         numbers: u64,
     },
-    Min(Option<Cell>),
-    Max(Option<Cell>),
+    /// The least value and its row's position: ties go to the earliest row, whatever order the
+    /// partials merge in.
+    Min(Option<(Cell, u64)>),
+    Max(Option<(Cell, u64)>),
 }
 
 fn overflow() -> LimboError {
@@ -766,8 +774,8 @@ impl Acc {
         }
     }
 
-    /// Folds one value (for COUNT(*), any non-null cell).
-    fn fold(&mut self, c: &Cell) -> Result<()> {
+    /// Folds one value, of the row at position `pos` (for COUNT(*), any non-null cell).
+    fn fold(&mut self, c: &Cell, pos: u64) -> Result<()> {
         if *c == Cell::Null {
             return Ok(());
         }
@@ -790,22 +798,25 @@ impl Acc {
                 }
                 _ => {}
             },
-            // Ties keep the earlier value: the same in every split, as merges go in row order.
             Acc::Min(m) => {
-                if m.as_ref().is_none_or(|m| order(c, m) == Ordering::Less) {
-                    *m = Some(c.clone());
+                if m.as_ref()
+                    .is_none_or(|(m, at)| order(c, m).then(pos.cmp(at)) == Ordering::Less)
+                {
+                    *m = Some((c.clone(), pos));
                 }
             }
             Acc::Max(m) => {
-                if m.as_ref().is_none_or(|m| order(c, m) == Ordering::Greater) {
-                    *m = Some(c.clone());
+                if m.as_ref()
+                    .is_none_or(|(m, at)| order(c, m).then(at.cmp(&pos)) == Ordering::Greater)
+                {
+                    *m = Some((c.clone(), pos));
                 }
             }
         }
         Ok(())
     }
 
-    /// Folds the state of rows after this one's.
+    /// Folds another partial's state for the same aggregate.
     fn merge(&mut self, later: &Acc) -> Result<()> {
         let later_kind = matches!(later, Acc::Min(_));
         match (self, later) {
@@ -835,8 +846,8 @@ impl Acc {
                     (Acc::Min(_), true) | (Acc::Max(_), false)
                 ) =>
             {
-                if let Some(c) = later {
-                    me.fold(c)?;
+                if let Some((c, pos)) = later {
+                    me.fold(c, *pos)?;
                 }
             }
             _ => {
@@ -877,7 +888,7 @@ impl Acc {
                     Cell::Int(i64::try_from(*ints).map_err(|_| overflow())?)
                 }
             }
-            Acc::Min(m) | Acc::Max(m) => m.clone().unwrap_or(Cell::Null),
+            Acc::Min(m) | Acc::Max(m) => m.as_ref().map_or(Cell::Null, |(c, _)| c.clone()),
         })
     }
 }
@@ -948,7 +959,9 @@ impl Counts {
 /// A worker's state: its groups, their bytes, and its counts.
 #[derive(Clone, Debug, Default)]
 pub struct Partial {
-    groups: BTreeMap<Key, Vec<Acc>>,
+    /// Each group's accumulators and the position of the row its key came from: of keys equal
+    /// under [`order`] (an integer and an equal real), the earliest row's is kept.
+    groups: BTreeMap<Key, (u64, Vec<Acc>)>,
     bytes: usize,
     pub counts: Counts,
 }
@@ -969,51 +982,84 @@ fn key_bytes(k: &Key, aggs: usize) -> usize {
 /// the vectors are checked against.
 pub fn evaluate_rows(q: &Query, rows: &[(Vec<u8>, Vec<Cell>)]) -> Result<Vec<Vec<Cell>>> {
     let mut p = Partial::default();
-    for (k, r) in rows {
+    let mut charge = within(q);
+    for (i, (k, r)) in rows.iter().enumerate() {
         if !q.keys.contains(k) || !q.filters.iter().all(|f| f.matches(r)) {
             continue;
         }
+        let pos = u64::try_from(i).unwrap_or(u64::MAX);
         let key = Key(q
             .group
             .iter()
             .map(|c| r.get(*c).cloned().unwrap_or(Cell::Null))
             .collect());
-        let accs = group(q, &mut p, key)?;
+        let accs = group(q, &mut p, key, pos, &mut charge)?;
         for (acc, a) in accs.iter_mut().zip(&q.aggs) {
             let c = match a.col() {
                 None => Cell::Int(1),
                 Some(c) => r.get(c).cloned().unwrap_or(Cell::Null),
             };
-            acc.fold(&c)?;
+            acc.fold(&c, pos)?;
         }
     }
     finish(q, p)
 }
 
-/// The group `key`'s accumulators, made (and charged to the budget) when it is new.
-fn group<'p>(q: &Query, p: &'p mut Partial, key: Key) -> Result<&'p mut Vec<Acc>> {
-    if !p.groups.contains_key(&key) {
-        let bytes = p
-            .bytes
-            .checked_add(key_bytes(&key, q.aggs.len()))
-            .filter(|b| *b <= q.budget)
-            .ok_or(LimboError::OutOfMemory)?;
-        p.bytes = bytes;
+/// What a new group's bytes are charged to: called with its bytes and the partial's total after
+/// it; an error refuses the group.
+type Charge<'c> = dyn FnMut(usize, usize) -> Result<()> + 'c;
+
+/// Charges against the statement's own budget, [`Query::budget`].
+fn within(q: &Query) -> impl FnMut(usize, usize) -> Result<()> + '_ {
+    move |_, total| {
+        if total <= q.budget {
+            Ok(())
+        } else {
+            Err(LimboError::OutOfMemory)
+        }
     }
-    Ok(p.groups
-        .entry(key)
-        .or_insert_with(|| q.aggs.iter().map(|a| Acc::new(*a)).collect()))
+}
+
+/// The group `key`'s accumulators (its key from the row at `pos`), made and charged when new.
+fn group<'p>(
+    q: &Query,
+    p: &'p mut Partial,
+    key: Key,
+    pos: u64,
+    charge: &mut Charge<'_>,
+) -> Result<&'p mut Vec<Acc>> {
+    match p.groups.get(&key).map(|(at, _)| *at) {
+        Some(at) if pos >= at => {}
+        Some(_) => {
+            // An earlier row's equal key: it becomes the group's key.
+            if let Some((_, (_, accs))) = p.groups.remove_entry(&key) {
+                p.groups.insert(key.clone(), (pos, accs));
+            }
+        }
+        None => {
+            let bytes = key_bytes(&key, q.aggs.len());
+            let total = p.bytes.checked_add(bytes).ok_or(LimboError::OutOfMemory)?;
+            charge(bytes, total)?;
+            p.bytes = total;
+            let accs = q.aggs.iter().map(|a| Acc::new(*a)).collect();
+            p.groups.insert(key.clone(), (pos, accs));
+        }
+    }
+    p.groups
+        .get_mut(&key)
+        .map(|(_, accs)| accs)
+        .ok_or_else(|| LimboError::InternalError("column scan: a group just made is gone".into()))
 }
 
 fn finish(q: &Query, mut p: Partial) -> Result<Vec<Vec<Cell>>> {
     if q.group.is_empty() && p.groups.is_empty() {
         p.groups.insert(
             Key(Vec::new()),
-            q.aggs.iter().map(|a| Acc::new(*a)).collect(),
+            (0, q.aggs.iter().map(|a| Acc::new(*a)).collect()),
         );
     }
     let mut out = Vec::with_capacity(p.groups.len());
-    for (k, accs) in p.groups {
+    for (k, (_, accs)) in p.groups {
         let mut row = k.0;
         for a in &accs {
             row.push(a.finish()?);
@@ -1040,8 +1086,12 @@ impl Plan<'_> {
         Partial::default()
     }
 
-    /// Folds granules `range` into `p`.
+    /// Folds granules `range` into `p`, its groups charged to [`Query::budget`].
     pub fn run(&self, range: Range<usize>, p: &mut Partial) -> Result<()> {
+        self.fold(range, p, &mut within(self.query))
+    }
+
+    fn fold(&self, range: Range<usize>, p: &mut Partial, charge: &mut Charge<'_>) -> Result<()> {
         let q = self.query;
         let Some(granules) = self.granules.get(range) else {
             return Err(LimboError::InternalError(
@@ -1075,33 +1125,34 @@ impl Plan<'_> {
                 .counts
                 .selected
                 .saturating_add(u64::try_from(selected).unwrap_or(u64::MAX));
+            let at = u64::try_from(placed.at).unwrap_or(u64::MAX);
             if q.group.is_empty() {
-                let accs = group(q, p, Key(Vec::new()))?;
+                let accs = group(q, p, Key(Vec::new()), at, charge)?;
                 for (acc, a) in accs.iter_mut().zip(&q.aggs) {
-                    fold_vector(acc, *a, g, &sel, selected)?;
+                    fold_vector(acc, *a, g, &sel, selected, at)?;
                 }
             } else {
-                for (i, _) in sel.iter().enumerate().filter(|(_, s)| **s) {
-                    let key = Key(q.group.iter().map(|c| g.cell(*c, i)).collect());
-                    let accs = group(q, p, key)?;
-                    for (acc, a) in accs.iter_mut().zip(&q.aggs) {
-                        let c = match a.col() {
-                            None => Cell::Int(1),
-                            Some(c) => g.cell(c, i),
-                        };
-                        acc.fold(&c)?;
-                    }
-                }
+                fold_groups(q, g, &sel, at, p, charge)?;
             }
         }
         Ok(())
     }
 
-    /// Folds `later`, the state of granules after `into`'s, into `into`.
+    /// Folds `later`, another partial's state, into `into`, new groups charged to
+    /// [`Query::budget`]. Answers don't depend on which granules each partial ran.
     pub fn merge(&self, into: &mut Partial, later: Partial) -> Result<()> {
+        self.merge_with(into, later, &mut within(self.query))
+    }
+
+    fn merge_with(
+        &self,
+        into: &mut Partial,
+        later: Partial,
+        charge: &mut Charge<'_>,
+    ) -> Result<()> {
         into.counts.merge(&later.counts);
-        for (k, accs) in later.groups {
-            let mine = group(self.query, into, k)?;
+        for (k, (pos, accs)) in later.groups {
+            let mine = group(self.query, into, k, pos, charge)?;
             for (a, b) in mine.iter_mut().zip(&accs) {
                 a.merge(b)?;
             }
@@ -1114,6 +1165,20 @@ impl Plan<'_> {
         finish(self.query, p)
     }
 
+    /// Runs the statement on as many cores as the morsel executor finds pay, from its pilot's cost
+    /// per granule and the machine's measured costs (`mode` off: the caller's thread alone).
+    pub fn run_on_cores(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> std::result::Result<(Vec<Vec<Cell>>, Counts, RunStats), MorselError> {
+        let (p, stats) = morsel::execute(self, mode, costs, budget)?;
+        let counts = p.counts;
+        let rows = self.finish(p).map_err(morsel_error)?;
+        Ok((rows, counts, stats))
+    }
+
     /// Runs every granule on the caller's thread: the serial degree.
     pub fn run_all(&self) -> Result<(Vec<Vec<Cell>>, Counts)> {
         let mut p = self.empty();
@@ -1123,8 +1188,253 @@ impl Plan<'_> {
     }
 }
 
+/// The morsel executor's pipeline (`vdbe/morsel.rs`): granules are the unit its workers take,
+/// and the statement's memory budget it shares among them is what new groups are charged to.
+impl Pipeline for Plan<'_> {
+    type Partial = Partial;
+
+    fn rows(&self) -> usize {
+        self.granules.len()
+    }
+
+    fn empty(&self) -> Partial {
+        Partial::default()
+    }
+
+    fn run(
+        &self,
+        rows: Range<usize>,
+        partial: &mut Partial,
+        budget: &MemoryBudget,
+    ) -> std::result::Result<(), MorselError> {
+        let mut refused = None;
+        let done = self.fold(rows, partial, &mut |bytes, _| {
+            budget.charge(bytes).map_err(|e| {
+                refused = Some(e);
+                LimboError::OutOfMemory
+            })
+        });
+        morsel_result(done, refused)
+    }
+
+    fn merge(
+        &self,
+        into: &mut Partial,
+        from: Partial,
+        _budget: &MemoryBudget,
+    ) -> std::result::Result<(), MorselError> {
+        // A group's bytes were charged by the worker that made it.
+        morsel_result(self.merge_with(into, from, &mut |_, _| Ok(())), None)
+    }
+}
+
+/// A scan's error as the executor's: the budget's own refusal when it refused, an integer past
+/// its type as such, and a granule range past the scan (the only other) as an overflow of it.
+fn morsel_result(
+    done: Result<()>,
+    refused: Option<MorselError>,
+) -> std::result::Result<(), MorselError> {
+    match (done, refused) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(e)) => Err(e),
+        (Err(e), None) => Err(morsel_error(e)),
+    }
+}
+
+fn morsel_error(e: LimboError) -> MorselError {
+    match e {
+        LimboError::IntegerOverflow => MorselError::IntegerOverflow,
+        _ => MorselError::Overflow {
+            what: "a column scan's granule range",
+        },
+    }
+}
+
+/// Folds a granule's selected rows into their groups (T-CS.4.1). One pass over the group columns
+/// gives each selected row its group's slot in the granule (keys equal under [`order`] share one,
+/// the earliest row's key kept); each aggregate then folds its whole column vector by slot, and
+/// each group is looked up in the partial once a granule, from its earliest row. The slots are
+/// bounded by the granule's rows. `at` is the position of the granule's first row.
+fn fold_groups(
+    q: &Query,
+    g: &Granule,
+    sel: &[bool],
+    at: u64,
+    p: &mut Partial,
+    charge: &mut Charge<'_>,
+) -> Result<()> {
+    let pos = |i: usize| at.saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
+    let mut local: BTreeMap<Key, usize> = BTreeMap::new();
+    // Each slot's earliest row.
+    let mut first: Vec<usize> = Vec::new();
+    let mut slots: Vec<Option<usize>> = vec![None; sel.len()];
+    for ((i, s), slot) in sel.iter().enumerate().zip(slots.iter_mut()) {
+        if !*s {
+            continue;
+        }
+        let next = first.len();
+        let at_slot = *local
+            .entry(Key(q.group.iter().map(|c| g.cell(*c, i)).collect()))
+            .or_insert(next);
+        if at_slot == next {
+            first.push(i);
+        }
+        *slot = Some(at_slot);
+    }
+    let mut accs: Vec<Vec<Acc>> = first
+        .iter()
+        .map(|_| q.aggs.iter().map(|a| Acc::new(*a)).collect())
+        .collect();
+    for (j, a) in q.aggs.iter().enumerate() {
+        fold_slots(&mut accs, j, *a, g, &slots, at)?;
+    }
+    let mut keys: Vec<Option<Key>> = vec![None; first.len()];
+    for (k, s) in local {
+        if let Some(x) = keys.get_mut(s) {
+            *x = Some(k);
+        }
+    }
+    for ((key, row), mine) in keys.into_iter().zip(&first).zip(&accs) {
+        let Some(key) = key else {
+            return Err(LimboError::InternalError(
+                "column scan: a granule's group without its key".into(),
+            ));
+        };
+        let theirs = group(q, p, key, pos(*row), charge)?;
+        for (a, b) in theirs.iter_mut().zip(mine) {
+            a.merge(b)?;
+        }
+    }
+    Ok(())
+}
+
+/// Slot `s`'s accumulator for aggregate `j`.
+fn slot(accs: &mut [Vec<Acc>], s: usize, j: usize) -> Option<&mut Acc> {
+    accs.get_mut(s).and_then(|x| x.get_mut(j))
+}
+
+/// Aggregate `j` of each slot's accumulators, folded over its column's whole vector: `slots` holds
+/// each row's slot (None: not selected). `at` is the position of the granule's first row.
+fn fold_slots(
+    accs: &mut [Vec<Acc>],
+    j: usize,
+    a: Agg,
+    g: &Granule,
+    slots: &[Option<usize>],
+    at: u64,
+) -> Result<()> {
+    let pos = |i: usize| at.saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
+    let count = |n: &mut u64| -> Result<()> {
+        *n = n.checked_add(1).ok_or_else(overflow)?;
+        Ok(())
+    };
+    let Some(c) = a.col() else {
+        // COUNT(*): every selected row.
+        for s in slots.iter().flatten() {
+            if let Some(Acc::Count(n)) = slot(accs, *s, j) {
+                count(n)?;
+            }
+        }
+        return Ok(());
+    };
+    let Some(v) = g.columns.get(c) else {
+        // Every value NULL: nothing to fold.
+        return Ok(());
+    };
+    let valid = |i: usize| {
+        v.valid
+            .as_ref()
+            .is_none_or(|x| x.get(i).copied().unwrap_or(false))
+    };
+    // The selected rows with a value, and their slots.
+    let rows = || {
+        slots
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, s)| (*s).filter(|_| valid(i)).map(|s| (i, s)))
+    };
+    match (a, &v.data) {
+        (Agg::CountOf(_), _) => {
+            for (_, s) in rows() {
+                if let Some(Acc::Count(n)) = slot(accs, s, j) {
+                    count(n)?;
+                }
+            }
+        }
+        (Agg::Sum(_), Data::Int(xs)) => {
+            for (i, s) in rows() {
+                if let (Some(Acc::Sum { ints, numbers, .. }), Some(x)) =
+                    (slot(accs, s, j), xs.get(i))
+                {
+                    *ints = ints.checked_add(i128::from(*x)).ok_or_else(overflow)?;
+                    count(numbers)?;
+                }
+            }
+        }
+        (Agg::Sum(_), Data::Real(xs)) => {
+            for (i, s) in rows() {
+                if let (
+                    Some(Acc::Sum {
+                        reals,
+                        any_real,
+                        numbers,
+                        ..
+                    }),
+                    Some(x),
+                ) = (slot(accs, s, j), xs.get(i))
+                {
+                    reals.add(*x);
+                    *any_real = true;
+                    count(numbers)?;
+                }
+            }
+        }
+        (Agg::Sum(_), Data::Text { .. }) => {}
+        (Agg::Min(_) | Agg::Max(_), Data::Int(xs)) => {
+            let want_min = matches!(a, Agg::Min(_));
+            // Each slot's first row holding its least (or greatest) value.
+            let mut best: Vec<Option<(i64, usize)>> = Vec::new();
+            for (i, s) in rows() {
+                let Some(x) = xs.get(i).copied() else {
+                    continue;
+                };
+                if best.len() <= s {
+                    best.resize(s.saturating_add(1), None);
+                }
+                if let Some(b) = best.get_mut(s) {
+                    if (*b).is_none_or(|(y, _)| if want_min { x < y } else { x > y }) {
+                        *b = Some((x, i));
+                    }
+                }
+            }
+            for (s, b) in best.into_iter().enumerate() {
+                if let (Some((x, i)), Some(m)) = (b, slot(accs, s, j)) {
+                    m.fold(&Cell::Int(x), pos(i))?;
+                }
+            }
+        }
+        _ => {
+            for (i, s) in rows() {
+                if let Some(m) = slot(accs, s, j) {
+                    m.fold(&v.cell(i), pos(i))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Folds a granule's selected rows of one column into an aggregate, over its whole vector.
-fn fold_vector(acc: &mut Acc, a: Agg, g: &Granule, sel: &[bool], selected: usize) -> Result<()> {
+/// `at` is the position of the granule's first row.
+fn fold_vector(
+    acc: &mut Acc,
+    a: Agg,
+    g: &Granule,
+    sel: &[bool],
+    selected: usize,
+    at: u64,
+) -> Result<()> {
+    let pos = |i: usize| at.saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
     let Some(c) = a.col() else {
         if let Acc::Count(n) = acc {
             *n = n
@@ -1186,24 +1496,24 @@ fn fold_vector(acc: &mut Acc, a: Agg, g: &Granule, sel: &[bool], selected: usize
         (Acc::Sum { .. }, Data::Text { .. }) => {}
         (acc @ (Acc::Min(_) | Acc::Max(_)), Data::Int(xs)) => {
             let want_min = matches!(acc, Acc::Min(_));
-            let mut best: Option<i64> = None;
+            // The first row holding the least (or greatest) value.
+            let mut best: Option<(i64, usize)> = None;
             for (i, (x, s)) in xs.iter().zip(sel).enumerate() {
-                if *s && valid(i) {
-                    best = Some(match best {
-                        None => *x,
-                        Some(b) if want_min => b.min(*x),
-                        Some(b) => b.max(*x),
-                    });
+                if *s
+                    && valid(i)
+                    && best.is_none_or(|(b, _)| if want_min { *x < b } else { *x > b })
+                {
+                    best = Some((*x, i));
                 }
             }
-            if let Some(b) = best {
-                acc.fold(&Cell::Int(b))?;
+            if let Some((b, i)) = best {
+                acc.fold(&Cell::Int(b), pos(i))?;
             }
         }
         (acc, _) => {
             for (i, s) in sel.iter().enumerate() {
                 if *s {
-                    acc.fold(&v.cell(i))?;
+                    acc.fold(&v.cell(i), pos(i))?;
                 }
             }
         }
@@ -1212,14 +1522,24 @@ fn fold_vector(acc: &mut Acc, a: Agg, g: &Granule, sel: &[bool], selected: usize
 }
 
 /// The decoded granules of the blocks no change touches, for the copy's current and previous
-/// generations (bound: their blocks, one granule each), keyed by each generation's id. A copy is
-/// scanned with one [`Decode`] for its life: the cache holds what it decoded.
-#[derive(Default)]
+/// generations, keyed by each generation's id. Bound: at most one granule a block of those two,
+/// and at most `bound` resident bytes, the share of the database's memory budget its caller
+/// charges it to (CLAUDE.md §2); a granule that would pass it isn't kept, and is decoded again by
+/// each scan that reads it (counted in [`Sources::uncached`]). A copy is scanned with one
+/// [`Decode`] for its life: the cache holds what it decoded.
 pub struct Cache {
+    bound: usize,
     slots: Mutex<Vec<Slot>>,
 }
 
 impl Cache {
+    pub fn new(bound: usize) -> Self {
+        Cache {
+            bound,
+            slots: Mutex::new(Vec::new()),
+        }
+    }
+
     fn get(&self, made: u64, j: usize) -> Option<Arc<Granule>> {
         self.slots
             .lock()
@@ -1228,9 +1548,17 @@ impl Cache {
             .and_then(|(_, gs)| gs.get(j).cloned().flatten())
     }
 
-    fn put(&self, made: u64, live: &[u64], blocks: usize, j: usize, g: Arc<Granule>) {
+    /// Keeps `g` as generation `made`'s block `j` (of `blocks`), dropping generations no longer
+    /// `live` first; false when it would pass the bound, and isn't kept.
+    fn put(&self, made: u64, live: &[u64], blocks: usize, j: usize, g: Arc<Granule>) -> bool {
         let mut slots = self.slots.lock();
         slots.retain(|(m, _)| live.contains(m));
+        let fits = resident(&slots)
+            .checked_add(g.resident())
+            .is_some_and(|total| total <= self.bound);
+        if !fits {
+            return false;
+        }
         if !slots.iter().any(|(m, _)| *m == made) {
             slots.push((made, vec![None; blocks]));
         }
@@ -1241,16 +1569,21 @@ impl Cache {
         {
             *slot = Some(g);
         }
+        true
     }
 
     /// The bytes its granules keep resident.
     pub fn resident(&self) -> usize {
-        self.slots.lock().iter().fold(0usize, |n, (_, gs)| {
-            gs.iter()
-                .flatten()
-                .fold(n, |n, g| n.saturating_add(g.resident()))
-        })
+        resident(&self.slots.lock())
     }
+}
+
+fn resident(slots: &[Slot]) -> usize {
+    slots.iter().fold(0usize, |n, (_, gs)| {
+        gs.iter()
+            .flatten()
+            .fold(n, |n, g| n.saturating_add(g.resident()))
+    })
 }
 
 /// One generation's decoded granules, by block, keyed by its id.
@@ -1265,6 +1598,8 @@ pub struct Sources {
     pub decoded: u64,
     /// Granules of blocks with changes at the snapshot, decoded from their rows at it.
     pub changed: u64,
+    /// Granules decoded now that the cache's bound left out.
+    pub uncached: u64,
     /// Scans answered from the rows: no generation answered them exactly.
     pub fallbacks: u64,
     /// Blocks outside the statement's key range, skipped undecoded.
@@ -1343,7 +1678,9 @@ impl<B: Block> Columns<B> {
                         let mut block_rows = Vec::new();
                         g.scan_block(j, s, &skip, &mut block_rows)?;
                         let made = Arc::new(Granule::build(&block_rows, dec)?);
-                        cache.put(g.id, &live, g.blocks.len(), j, made.clone());
+                        if !cache.put(g.id, &live, g.blocks.len(), j, made.clone()) {
+                            src.uncached = src.uncached.saturating_add(1);
+                        }
                         src.decoded = src.decoded.saturating_add(1);
                         made
                     }
@@ -1388,6 +1725,8 @@ mod tests {
     use crate::storage::versioned::durable::Database;
     use crate::storage::versioned::version::Snapshot;
     use crate::types::{ImmutableRecord, Value};
+    use crate::vdbe::morsel::{self, Degree};
+    use std::num::NonZeroUsize;
     use std::time::Instant;
 
     fn cmp() -> Comparator {
@@ -1658,6 +1997,21 @@ mod tests {
                 plan.merge(&mut total, p).unwrap();
             }
             assert_eq!(plan.finish(total).unwrap(), want, "split {cuts:?}, {q:?}");
+            // The morsel executor, on four workers taking granules one at a time.
+            let degree = Degree::Parallel {
+                workers: NonZeroUsize::new(4).unwrap(),
+                morsel_rows: NonZeroUsize::new(1).unwrap(),
+            };
+            let (p, stats) =
+                morsel::execute_at(&plan, 0, degree, None, &MemoryBudget::new(usize::MAX)).unwrap();
+            assert_eq!(plan.finish(p).unwrap(), want, "{stats:?}, {q:?}");
+            // And as the executor chooses, on a stated four-core machine.
+            let mut costs = MachineCosts::stated(NonZeroUsize::new(4).unwrap(), 1.0, 1.0);
+            let (got, counts, stats) = plan
+                .run_on_cores(ParallelMode::On, &mut costs, &MemoryBudget::new(usize::MAX))
+                .unwrap();
+            assert_eq!(got, want, "{stats:?}, {q:?}");
+            assert_eq!(counts, c);
         }
     }
 
@@ -1761,7 +2115,7 @@ mod tests {
         let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
         db.keep_columns(feed.clone()).unwrap();
         let copy = Columns::<B>::new(feed);
-        let cache = Cache::default();
+        let cache = Cache::new(usize::MAX);
         let mut x = seed | 1;
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();
@@ -1920,6 +2274,53 @@ mod tests {
         assert_eq!((c.skipped, c.granules, c.rows, c.selected), (8, 2, 20, 14));
     }
 
+    /// Do: scan a copy of several blocks through a cache whose bound holds none of them, twice.
+    /// Expect: nothing kept, every untouched granule decoded again and counted, answers still equal
+    /// the rows' (CLAUDE.md §2).
+    #[test]
+    fn cs4_granule_cache_keeps_to_its_bound() {
+        let db = Database::open(Arc::new(Simulated::new(29, 1).unwrap()), 2_000, 1, cmp).unwrap();
+        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        db.keep_columns(feed.clone()).unwrap();
+        let copy = Columns::<Plain>::new(feed);
+        let mut x = 9u64;
+        let mut d = Descender::new();
+        let mut t = db.begin().unwrap();
+        for k in 0..200u32 {
+            db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &record(k, &mut x))
+                .unwrap();
+        }
+        db.commit(t, &mut d, db.lane(), false).unwrap();
+        rebuild(&db, &copy);
+        let cache = Cache::new(0);
+        for _ in 0..2 {
+            let snap = db.snapshot().unwrap();
+            let rows = At {
+                db: &db,
+                snap: &snap,
+            };
+            let (placed, src) = copy
+                .granules(snap.start, &rows, &Records, &cache, &KeyRange::default())
+                .unwrap();
+            assert_eq!((src.cached, src.uncached), (0, src.decoded));
+            assert!(src.decoded > 0);
+            let qs = queries();
+            let q = &qs[1];
+            let (got, _) = Plan {
+                granules: placed,
+                query: q,
+            }
+            .run_all()
+            .unwrap();
+            assert_eq!(
+                got,
+                evaluate_rows(q, &decoded(&rows.all().unwrap())).unwrap()
+            );
+            db.close_snapshot(snap);
+        }
+        assert_eq!(cache.resident(), 0);
+    }
+
     /// Do: group 50 distinct keys under a budget that holds fewer. Expect: a typed refusal, no
     /// group past the budget (CLAUDE.md §2).
     #[test]
@@ -1963,6 +2364,127 @@ mod tests {
             s.add(v);
         }
         assert_eq!(s.value(), 1.25);
+    }
+
+    /// Do: group rows whose keys mix integers with equal reals, nulls and text, under every
+    /// aggregate, over granules of each size from one row to all of them, run whole and merged one
+    /// granule at a time from the last. Expect: each answer equals the statement row by row,
+    /// including which of a group's equal keys it shows (the earliest row's) (T-CS.4.5).
+    #[test]
+    fn cs4_grouped_aggregates_fold_whole_vectors() {
+        struct Table(Vec<Vec<Cell>>);
+        impl Decode for Table {
+            fn decode(&self, _key: &[u8], row: &[u8], out: &mut Vec<Cell>) -> Result<()> {
+                let i = row
+                    .get(..2)
+                    .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                    .map(u16::from_be_bytes)
+                    .ok_or_else(|| LimboError::InternalError("short row".into()))?;
+                out.extend(
+                    self.0
+                        .get(usize::from(i))
+                        .ok_or_else(|| LimboError::InternalError("no such row".into()))?
+                        .iter()
+                        .cloned(),
+                );
+                Ok(())
+            }
+        }
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut cells = Vec::new();
+        for i in 0..240u16 {
+            let r = next();
+            let k = i64::try_from(r % 4).unwrap();
+            let key = match r % 5 {
+                0 => Cell::Int(k),
+                1 => Cell::Real(k as f64),
+                2 => Cell::Null,
+                3 => Cell::Text(vec![b'a', u8::try_from(r % 3).unwrap()]),
+                _ => Cell::Int(-k),
+            };
+            let v = match (r >> 8) % 4 {
+                0 => Cell::Int(i64::from(i) - 100),
+                1 => Cell::Real(f64::from(i) * 0.5),
+                2 => Cell::Null,
+                _ => Cell::Int(i64::try_from((r >> 16) % 7).unwrap()),
+            };
+            let int = Cell::Int(i64::try_from((r >> 24) % 9).unwrap() - 4);
+            let text = Cell::Text(vec![b'x', u8::try_from((r >> 32) % 5).unwrap()]);
+            cells.push(vec![key, v, int, text]);
+        }
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..240u16)
+            .map(|i| {
+                (
+                    u32::from(i).to_be_bytes().to_vec(),
+                    i.to_be_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let decoded: Vec<(Vec<u8>, Vec<Cell>)> = rows
+            .iter()
+            .zip(&cells)
+            .map(|((k, _), c)| (k.clone(), c.clone()))
+            .collect();
+        let table = Table(cells);
+        let aggs = vec![
+            Agg::Count,
+            Agg::CountOf(1),
+            Agg::Sum(1),
+            Agg::Min(1),
+            Agg::Max(1),
+            Agg::Sum(2),
+            Agg::Min(2),
+            Agg::Max(2),
+            Agg::CountOf(3),
+            Agg::Min(3),
+            Agg::Max(3),
+            Agg::Sum(3),
+        ];
+        for group in [vec![0], vec![0, 3], vec![2]] {
+            for filters in [vec![], vec![Filter::NotNull(1)]] {
+                let q = Query {
+                    filters,
+                    group: group.clone(),
+                    aggs: aggs.clone(),
+                    budget: usize::MAX,
+                    keys: KeyRange::default(),
+                };
+                let want = evaluate_rows(&q, &decoded).unwrap();
+                for size in [1, 7, 64, 240] {
+                    let mut granules = Vec::new();
+                    for (n, chunk) in rows.chunks(size).enumerate() {
+                        granules.push(Placed {
+                            at: n * size,
+                            block: None,
+                            granule: Arc::new(Granule::build(chunk, &table).unwrap()),
+                        });
+                    }
+                    let plan = Plan {
+                        granules,
+                        query: &q,
+                    };
+                    assert_eq!(plan.run_all().unwrap().0, want, "{group:?} at {size}");
+                    let mut later = plan.empty();
+                    for i in (0..plan.rows()).rev() {
+                        let mut p = plan.empty();
+                        plan.run(i..i + 1, &mut p).unwrap();
+                        plan.merge(&mut p, later).unwrap();
+                        later = p;
+                    }
+                    assert_eq!(
+                        plan.finish(later).unwrap(),
+                        want,
+                        "{group:?} at {size}, merged"
+                    );
+                }
+            }
+        }
     }
 
     /// Do: decode every truncation of a record. Expect: a value or a typed error, never a panic

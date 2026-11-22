@@ -1430,6 +1430,22 @@ placed before other loops (the emitter's no-match path first).
 `answers.py`) for a query with a LEFT JOIN; or such a plan slower than its parent's on the bench
 suite beyond the passes' spread.
 
+## Decision (lane pl8-4): an outer join's ON terms on an earlier table count given its filters
+
+**Decision.** PL.8's estimate (decision 21, CERT). An outer join's ON terms that read only an
+earlier table (lane pl8's `on_elsewhere`) were run over that table's sample apart from its filters,
+so a pair correlated on the sample counted as independent. Their share is now the earlier table's
+sample run with its filters and them together, over its filters alone (`cardinality.rs`,
+`JoinedSetRows::new`): the share of the rows its filters keep that the ON terms match, as the inner
+join reads the same terms together on the same sample.
+
+**Evidence.** `crates/engine/tests/sample_filters.rs`'s
+`an_outer_join_with_sampled_terms_is_estimated_at_least_its_inner_join`: `t0 AS a0 RIGHT JOIN t0 AS
+a1 ON NOT (a1.c0 GLOB 'a%') WHERE a1.c1 >= 3` was estimated at 0.684 against its inner join's 1 on
+main; it passes with the change.
+
+**Falsified by.** A CERT finding where an outer join's ON terms read only an earlier table.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
@@ -1721,3 +1737,77 @@ ANALYZE's norms equal a GROUP BY's counts on random data; a partial index keeps 
 or inserts that deletes cancel, aren't in it, so between ANALYZE runs the bound is proven for the
 net change only. Making it hold through every write takes a count of rows written, PL.9's call. A
 WITHOUT ROWID table's primary key keeps its norms but the bound doesn't yet read them.
+
+## Decision (lane pl7): cost weights fitted to measured statement times, behind a switch
+
+**Decision.** PL.7 (docs/research/planner.md section 9, rank 7). With the database's switch on
+(`Connection::set_fitted_costs`, or `AMPHORA_FITTED_COSTS=1` at open; off by default), the database
+times a share of its statements and fits the planner's weights to those times
+(`crates/engine/translate/optimizer/cost_fit.rs`). The planner reads them through one hook,
+`CostModelParams::with_fitted`, after the learned calibration's (`with_learned`, QT.5): each weight
+the fit determines replaces the learned one, in page reads; a weight no sample determines keeps the
+learned value. Nothing is picked.
+
+- **Terms.** A timed statement gives the work it counted as it ran: rows its cursors stepped
+  through, b-tree seeks, rows added to hash tables, hash lookups, in-memory sort work in rows times
+  log2 rows, and pages read from the file. Counted, not estimated: the fit is of the cost model,
+  and estimates would fold cardinality errors into the weights.
+- **Time.** A statement's time is its steps' time and its waits on IO between them; the caller's
+  time between a row and the next step, and a busy handler's sleep, are not its work. Each step's
+  timing window holds about one clock read, subtracted.
+- **Fit.** Time is regressed on the counts, relative to each statement's time (statement times
+  span orders of magnitude): non-negative least squares by Lawson and Hanson's active-set method
+  on the normal equations, each sample weighted by Huber's function of its residual against the fit
+  as it stood (constant 1.345 scales; scale from the residuals' mean absolute value). Terms whose
+  columns the others explain to within the arithmetic's precision, and terms the fit holds at zero
+  (the constraint, not a measurement), are not determined, and keep the learned value. Nor does a
+  weight the samples can't tell from nothing: the planner reads a fitted weight only when it
+  stands above zero by more than its standard error times the same 95% Bonferroni quantile the
+  epochs are compared by (T-PL.7.6). Without this, a few samples timed on a loaded host moved
+  plans at the margin: `tests/planner.rs` failed one run in seven with the switch on.
+- **Memory.** The fit keeps two epochs' normal equations, never samples: fixed-size arrays. An
+  epoch closes once it alone determines what the previous one did and holds its length; the length
+  doubles while consecutive epochs' fits agree within their standard errors (a 95% test,
+  Bonferroni-corrected over the weights compared) and halves when they don't. An epoch that no
+  longer sees a term closes once it holds as many samples as the previous one: the term goes back
+  to its learned weight.
+- **Sampling.** A statement is timed as often as what timing it adds (two clock reads a step,
+  measured where the engine runs, and the fit's update, timed) stays within the measurement's own
+  spread: `rate = min(1, spread × statement time / timing's time)`, every statement until the fit
+  has a spread. Deterministic: a running credit, no random draw.
+
+**Why.** Step 3's JOB costs ranked measured times at a Spearman correlation of 0.20. QT.5's
+calibration times each kind of work alone, on a page of keys; a statement's work runs beside the
+rest of the engine (cursor bookkeeping, record decoding, the page cache), which no isolated
+calibration sees. Fitting to the statements' own times weighs the terms as they cost there, on the
+hardware and data in use, and follows them as conditions move.
+
+**Sources.**
+- Leis, Gubichev, Mirchev, Boncz, Kemper, Neumann, "How Good Are Query Optimizers, Really?",
+  PVLDB 9(3), 2015: on JOB, cost-model errors are dwarfed by cardinality errors; the cost model is
+  tuned and judged on true cardinalities (f12).
+- Lawson and Hanson, "Solving Least Squares Problems", Prentice-Hall 1974, chapter 23 (NNLS); Bro
+  and De Jong, "A fast non-negativity-constrained least squares algorithm", J. Chemometrics 11(5),
+  1997 (the normal-equation form). The outer loop's bound, three passes a term, is MATLAB
+  `lsqnonneg`'s documented default.
+- Huber, "Robust Estimation of a Location Parameter", Ann. Math. Statist. 35(1), 1964; Holland and
+  Welsch, "Robust regression using iteratively reweighted least-squares", Comm. Statist. A6(9),
+  1977 (1.345: 95% efficiency at the normal).
+- Bifet and Gavaldà, "Learning from Time-Changing Data with Adaptive Windowing", SDM 2007 (a
+  window that grows while the data hold and shrinks when they move); Dunn, "Multiple Comparisons
+  Among Means", JASA 56(293), 1961 (the correction).
+
+**Evidence.** `cost_fit`'s unit tests (T-PL.7.2 to T-PL.7.5): on synthetic samples from known
+weights with 5% noise the fit lands within four standard errors and 5% of each; one sample in ten a
+tenfold stall still leaves every weight within 5%; terms never sampled have no fitted weight and the
+planner's value stands; two hundred thousand samples leave the fit's size unchanged; doubled weights
+are followed. The planner suites (`tests/planner.rs`, `records_plans.rs`, `join_methods.rs`) pass
+with the switch on and off.
+
+**Falsified by.** The coordinator's JOB run (AC-PL.7.1): the rank correlation of estimated cost
+with time, counted rows in place of estimates, no higher with the switch on than off.
+
+**Open.** The other parts of PL.7's row: a table's pages from its file rather than its rows over 50
+(T-PL.7.1, the audit's 09-cost-model; `cost.rs`, lane qs5-7's), and the P-error harness
+(AC-PL.7.2), the coordinator's. External sorts and hash spills give no term yet: their work is
+folded into the others'.

@@ -15,6 +15,9 @@ pub struct HashJoinMetrics {
     // Probe metrics
     pub probe_calls: u64,
 
+    /// Amphora (PL.7): rows added to hash tables, a term of the fitted cost model.
+    pub build_rows: u64,
+
     // Grace hash join metrics
     pub probe_spill_bytes_written: u64,
     pub probe_spill_chunks: u64,
@@ -38,6 +41,7 @@ impl HashJoinMetrics {
             .max(other.spill_max_partition_bytes);
         self.load_bytes_read = self.load_bytes_read.wrapping_add(other.load_bytes_read);
         self.probe_calls = self.probe_calls.wrapping_add(other.probe_calls);
+        self.build_rows = self.build_rows.wrapping_add(other.build_rows);
         self.probe_spill_bytes_written = self
             .probe_spill_bytes_written
             .wrapping_add(other.probe_spill_bytes_written);
@@ -101,6 +105,10 @@ pub struct StatementMetrics {
 
     // Hash join spill/probe metrics
     pub hash_join: HashJoinMetrics,
+
+    /// Amphora (PL.7): in-memory sorts' work in rows times log2 rows, as the planner counts a sort
+    /// (`cost::estimate_sort_cpu_cost`): a term of the fitted cost model.
+    pub sort_units: f64,
 }
 
 impl StatementMetrics {
@@ -135,6 +143,7 @@ impl StatementMetrics {
         self.btree_prev = self.btree_prev.wrapping_add(other.btree_prev);
         self.search_count = self.search_count.wrapping_add(other.search_count);
         self.hash_join.merge(&other.hash_join);
+        self.sort_units += other.sort_units;
     }
 
     /// Reset all counters to zero
