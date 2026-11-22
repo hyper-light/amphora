@@ -3956,10 +3956,16 @@ pub(crate) mod bushy_search_tests {
 
         /// Two dimensions of 50 rows and two facts of 12,000, analyzed
         /// (`t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest` says why that size).
+        /// The bushy tests' facts run under `AMPHORA_WEIGHT_RULE=blend`'s control rule for the
+        /// weight rules' A/B at the plan (T-PL.8.8, lane pl8-16: 20 copies at once under each
+        /// rule, `pl8-16-test.sh`); batch means otherwise.
         fn facts() -> (Arc<Database>, Arc<crate::Connection>) {
             let io = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
+            if std::env::var("AMPHORA_WEIGHT_RULE").as_deref() == Ok("blend") {
+                conn.set_weight_rule(crate::WeightRule::Blend);
+            }
             for sql in [
                 "CREATE TABLE d1(id INTEGER PRIMARY KEY, cat INT)",
                 "CREATE TABLE d2(id INTEGER PRIMARY KEY, cat INT)",
