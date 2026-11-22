@@ -1697,6 +1697,14 @@ def records_in(records, dialect, around=None):
             n, m = _names(e)
             named |= n
             made.append((m, e))
+        # A PRAGMA or pragma_ table function (table_info, index_list, ...) names its table in a
+        # string or a bare word: it inspects the table's columns, which on the dialect are other.
+        if re.search(r"\bpragma", r.sql, re.I):
+            named |= {t for t in list(missing) + list(partial) if re.search(r"(?<![\w$])" + re.escape(t) + r"(?![\w$])", r.sql, re.I)}
+            inspects = sorted(t for t in named if t in partial)
+            if why is None and inspects:
+                table, gone_cols, line, reason = partial[inspects[0]]
+                why, sql = f"untranslatable in {dialect}: inspects the columns of {inspects[0].lower()}, of which {', '.join(sorted(g.lower() for g in gone_cols))} is left out of its CREATE (line {line}) there: {reason}", None
         # A table some of whose columns no type of the dialect holds (typed()) is made without
         # them, and each record that doesn't read them runs on it unchanged in meaning: a query
         # that reads none of a table's columns gives what it gives whatever other columns the

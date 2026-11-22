@@ -450,7 +450,8 @@ class LeftOutColumns(unittest.TestCase):
             ("SELECT e FROM t", "query"), ("SELECT * FROM t", "query"), ("SELECT a FROM t NATURAL JOIN s", "query"), ("SELECT a FROM t JOIN s USING (a)", "query"),
             "UPDATE t SET e = 2 WHERE a = 1", "UPDATE t SET b = 'uno' WHERE a = 1", ("SELECT b FROM t WHERE a = 1", "query"),
             "CREATE TABLE w(x INTEGER, y TEXT, z INTEGER)", "INSERT INTO w SELECT a, b, a FROM t", ("SELECT x, y, z FROM w ORDER BY x", "query"),
-            "CREATE TABLE v2(a INTEGER, f TEXT COLLATE RTRIM, g INTEGER)", ("SELECT t.a FROM t JOIN v2 ON t.a = v2.a", "query"), ("SELECT t.a FROM t JOIN v2 ON t.a = v2.a WHERE f = 'x'", "query")]
+            "CREATE TABLE v2(a INTEGER, f TEXT COLLATE RTRIM, g INTEGER)", ("SELECT t.a FROM t JOIN v2 ON t.a = v2.a", "query"), ("SELECT t.a FROM t JOIN v2 ON t.a = v2.a WHERE f = 'x'", "query"),
+            ("SELECT count(*) FROM pragma_table_info('t')", "query"), ("PRAGMA table_info(t)", "query"), ("SELECT count(*) FROM pragma_table_info('w')", "query")]
 
     def records(self):
         out = []
@@ -470,6 +471,9 @@ class LeftOutColumns(unittest.TestCase):
                 for i in (6, 7, 13, 14, 16, 17):
                     self.assertIsNone(out[i][1], (i, out[i][1]))
                 self.assertRegex(out[16][0], r"SELECT a, b, a FROM t$")
+                for i in (21, 22):
+                    self.assertIn("inspects the columns of t, of which e is left out of its CREATE (line 0) there", out[i][1])
+                self.assertIsNone(out[23][1])
                 if d != "mysql":  # MySQL has RTRIM's like
                     self.assertIsNone(out[19][1], out[19][1])
                     self.assertIn("reads column f of v2", out[20][1])
