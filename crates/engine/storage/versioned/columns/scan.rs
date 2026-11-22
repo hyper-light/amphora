@@ -29,9 +29,10 @@
 //! Values compare as SQLite orders them under the BINARY collation: NULL first, then integers and
 //! reals by value, then text bytewise, then blobs bytewise.
 
-use super::{Block, Columns, Rows, Rowset};
+use super::{as_u64, Block, Columns, Rows, Rowset};
 use crate::error::LimboError;
 use crate::numeric::Numeric;
+use crate::storage::versioned::memory::Source;
 use crate::storage::versioned::version::Ts;
 use crate::sync::{Arc, Mutex};
 use crate::types::{ImmutableRecordRef, ValueRef};
@@ -1584,19 +1585,22 @@ fn fold_vector(
 
 /// The decoded granules of the blocks no change touches, for the copy's current and previous
 /// generations, keyed by each generation's id. Bound: at most one granule a block of those two,
-/// and at most `bound` resident bytes, the share of the database's memory budget its caller
-/// charges it to (CLAUDE.md §2); a granule that would pass it isn't kept, and is decoded again by
+/// and what its memory source grants, taken as granules are kept and given back as they go
+/// (CLAUDE.md §2); a granule the source refuses isn't kept, and is decoded again by
 /// each scan that reads it (counted in [`Sources::uncached`]). A copy is scanned with one
 /// [`Decode`] for its life: the cache holds what it decoded.
 pub struct Cache {
-    bound: usize,
+    room: Arc<dyn Source>,
     slots: Mutex<Vec<Slot>>,
 }
 
+/// What a copy's decoded blocks take their bytes from its memory source as.
+pub const CACHE: &str = "a column copy's decoded blocks";
+
 impl Cache {
-    pub fn new(bound: usize) -> Self {
+    pub fn new(room: Arc<dyn Source>) -> Self {
         Cache {
-            bound,
+            room,
             slots: Mutex::new(Vec::new()),
         }
     }
@@ -1610,25 +1614,34 @@ impl Cache {
     }
 
     /// Keeps `g` as generation `made`'s block `j` (of `blocks`), dropping generations no longer
-    /// `live` first; false when it would pass the bound, and isn't kept.
+    /// `live` first (their bytes given back); false when its memory source refuses its bytes, and
+    /// it isn't kept.
     fn put(&self, made: u64, live: &[u64], blocks: usize, j: usize, g: Arc<Granule>) -> bool {
         let mut slots = self.slots.lock();
+        let before = resident(&slots);
         slots.retain(|(m, _)| live.contains(m));
-        let fits = resident(&slots)
-            .checked_add(g.resident())
-            .is_some_and(|total| total <= self.bound);
-        if !fits {
+        let freed = before.saturating_sub(resident(&slots));
+        if freed > 0 {
+            self.room.give(as_u64(freed));
+        }
+        let bytes = g.resident();
+        if self.room.take(CACHE, as_u64(bytes)).is_err() {
             return false;
         }
         if !slots.iter().any(|(m, _)| *m == made) {
             slots.push((made, vec![None; blocks]));
         }
-        if let Some(slot) = slots
+        let given = match slots
             .iter_mut()
             .find(|(m, _)| *m == made)
             .and_then(|(_, gs)| gs.get_mut(j))
         {
-            *slot = Some(g);
+            Some(slot) => slot.replace(g).map_or(0, |old| old.resident()),
+            // No such block: nothing kept.
+            None => bytes,
+        };
+        if given > 0 {
+            self.room.give(as_u64(given));
         }
         true
     }
@@ -1636,6 +1649,15 @@ impl Cache {
     /// The bytes its granules keep resident.
     pub fn resident(&self) -> usize {
         resident(&self.slots.lock())
+    }
+}
+
+impl Drop for Cache {
+    fn drop(&mut self) {
+        let bytes = resident(&self.slots.lock());
+        if bytes > 0 {
+            self.room.give(as_u64(bytes));
+        }
     }
 }
 
@@ -1659,7 +1681,7 @@ pub struct Sources {
     pub decoded: u64,
     /// Granules of blocks with changes at the snapshot, decoded from their rows at it.
     pub changed: u64,
-    /// Granules decoded now that the cache's bound left out.
+    /// Granules decoded now that the cache's memory source refused.
     pub uncached: u64,
     /// Scans answered from the rows: no generation answered them exactly.
     pub fallbacks: u64,
@@ -2173,10 +2195,14 @@ mod tests {
     /// over the copy's granules equals the same statement row by row over the row B-tree.
     fn vectors_equal_rows<B: Block>(seed: u64) -> Seen {
         let db = Database::open(Arc::new(Simulated::new(seed, 1).unwrap()), 4_000, 1, cmp).unwrap();
-        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        let feed = Arc::new(Feed::new(
+            0,
+            crate::storage::versioned::memory::capped(u64::MAX),
+            Box::new(|| 0),
+        ));
         db.keep_columns(feed.clone()).unwrap();
         let copy = Columns::<B>::new(feed);
-        let cache = Cache::new(usize::MAX);
+        let cache = Cache::new(crate::storage::versioned::memory::capped(u64::MAX));
         let mut x = seed | 1;
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();
@@ -2341,7 +2367,11 @@ mod tests {
     #[test]
     fn cs4_granule_cache_keeps_to_its_bound() {
         let db = Database::open(Arc::new(Simulated::new(29, 1).unwrap()), 2_000, 1, cmp).unwrap();
-        let feed = Arc::new(Feed::new(0, usize::MAX, Box::new(|| 0)));
+        let feed = Arc::new(Feed::new(
+            0,
+            crate::storage::versioned::memory::capped(u64::MAX),
+            Box::new(|| 0),
+        ));
         db.keep_columns(feed.clone()).unwrap();
         let copy = Columns::<Plain>::new(feed);
         let mut x = 9u64;
@@ -2353,7 +2383,7 @@ mod tests {
         }
         db.commit(t, &mut d, db.lane(), false).unwrap();
         rebuild(&db, &copy);
-        let cache = Cache::new(0);
+        let cache = Cache::new(crate::storage::versioned::memory::capped(0));
         for _ in 0..2 {
             let snap = db.snapshot().unwrap();
             let rows = At {

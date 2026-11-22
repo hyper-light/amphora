@@ -127,7 +127,13 @@ impl InitLoop {
             .iter()
             .map(|member| member.original_idx)
             .try_collect()?;
-        for table in tables.joined_tables().iter() {
+        // A hash join runs where its probe table stands in the join order. One whose probe a
+        // materialized build input took into its prefix ran in that input's subplan, and the
+        // main plan reads neither its probe nor its build table (PL.6, PL.5).
+        for member in join_order.iter() {
+            let Some(table) = tables.joined_tables().get(member.original_idx) else {
+                continue;
+            };
             let Operation::HashJoin(hash_join_op) = &table.op else {
                 continue;
             };

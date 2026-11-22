@@ -416,6 +416,12 @@ struct Committed {
 }
 
 impl Txn {
+    /// Whether it has changed a row: a read of a column copy, fed by commits alone, would miss it
+    /// (G11 step 5, CS.5).
+    pub fn wrote(&self) -> bool {
+        !self.changed.is_empty()
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             start: self.start,
