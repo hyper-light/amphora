@@ -401,7 +401,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   runs on both storages and `storages.py` gives one verdict each for answers, reads and writes, refusing two
   runs from another client or platform; `amphora-bench --powercut bench` drives Amphora on both storages,
   SQLite (WAL, `synchronous = FULL`, no busy wait) and PostgreSQL through one commit loop up the writers'
-  ladder, each record with its client's resources and platform. Not yet compiled or run: the coordinator's.
+  ladder, each record with its client's resources and platform. The reads and writes verdicts come from
+  runs on a file on the disk under test (`amphora-corpus run --disk`, the commit bench's WAL and
+  `synchronous = FULL`); the answers are compared in memory and on the disk. Each writer count's memory,
+  open files and threads are extrapolated from the counts already run and checked against the host first
+  (`bench/commits_fit.py`): one that doesn't fit is refused, saying why, and PostgreSQL's `shared_buffers`
+  and `work_mem` are sized to fit beside its backends and recorded. Not yet compiled or run: the coordinator's.
 - **Versions collected, memory bounded** (G8 step 2, docs/design/engine.md decision 10,
   `crates/engine/storage/versioned/version.rs`): collection keeps of each row only the versions some
   open snapshot sees, so a long reader holds one version a row; versions, transactions' records and
