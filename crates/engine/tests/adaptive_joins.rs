@@ -1269,3 +1269,72 @@ fn t_pl_13_15_a_sorter_fed_by_a_join_past_the_estimate_plans_again() {
         "a new statement planned again"
     );
 }
+
+/// Do: a hash join the planner chose itself (hash joins only), its build side a table filtered by
+/// `b.v = 7 AND b.w < 50`: the `=` priced by the column statistics (every value distinct as ANALYZE
+/// counted them), the range by the sample (one row in a hundred), a mix the sample does not run
+/// together; then half the rows set to `v = 7` (the count unchanged); run with adaptive joins off,
+/// then on twice in one prepared statement, and in a statement prepared after. Expect: one answer
+/// every way; on, the filtered build counted against the share the plan read for both terms
+/// together (their product), past its error the counted share stored and the statement planned
+/// again once; nothing plans again after (PL.13, lane replan-10, T-PL.13.16: a mix of filter terms
+/// at a build's materialization point).
+#[test]
+fn t_pl_13_16_a_build_filtered_by_a_mix_of_terms_plans_again() {
+    let (_dir, conn) = open("mixed_filter_build.db");
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v, w)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO a(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100) SELECT i % 20 FROM n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v, w) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 20, i, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE b SET v = 7 WHERE id % 2 = 0").unwrap();
+    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+    let sql = "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE b.v = 7 AND b.w < 50";
+
+    conn.set_adaptive_joins(false);
+    let (checks, corrections) = (
+        conn.adaptive_filter_checks(),
+        conn.adaptive_filter_corrections(),
+    );
+    let off = rows(&conn, sql);
+    // b's even ids under 50 (24 rows) hold 7, each meeting the five rows of a with its k.
+    assert_eq!(off.len(), 24 * 5, "the join's rows");
+    assert_eq!(conn.adaptive_filter_checks(), checks, "counted off");
+
+    conn.set_adaptive_joins(true);
+    let replans = conn.adaptive_replans();
+    let mut held = conn.prepare(sql).unwrap();
+    assert_eq!(collect(&mut held), off, "on and off differ");
+    assert!(
+        conn.adaptive_filter_checks() > checks,
+        "the filtered build was not counted"
+    );
+    assert_eq!(
+        conn.adaptive_filter_corrections() - corrections,
+        1,
+        "the counted share stored"
+    );
+    assert_eq!(conn.adaptive_replans() - replans, 1, "planned again once");
+
+    let replans = conn.adaptive_replans();
+    assert_eq!(collect(&mut held), off, "the second run's answer");
+    assert_eq!(
+        rows(&conn, sql),
+        off,
+        "a statement planned on the stored share"
+    );
+    assert_eq!(conn.adaptive_replans(), replans, "a second re-plan");
+    assert_eq!(
+        conn.adaptive_filter_corrections() - corrections,
+        1,
+        "a second share stored"
+    );
+}

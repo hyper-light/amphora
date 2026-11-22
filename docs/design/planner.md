@@ -1750,7 +1750,15 @@ a rare value's what the sample's counts leave. Only with adaptive joins on; coun
 `adaptive_replans`). The store holds its entries weakly, so it is bound by the plans that read them:
 a share outlives the last statement planned on it only until its entry is swept. A build whose
 terms the sample did not run together and that are not one column statistics term (an `=` beside
-a range, say), or fed by a materialized input, is not checked. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
+a range, say) is checked the same way (lane replan-10, `cardinality::OwnFilter`): the estimate of
+a table's own filters together, however it combined them (the sample's share, the column
+statistics', independent terms multiplied), is noted under the fingerprint of every term the sample
+ran and every constraint counted as a filter that reads no other table, and a share a build or
+sorter stored for them is read in its place; the error is the sample's binomial one at that share.
+`t_pl_13_16_a_build_filtered_by_a_mix_of_terms_plans_again` (T-PL.13.16): `b.v = 7 AND b.w < 50`,
+the `=` priced by the column statistics and the range by the sample, half the rows set to 7 after:
+one answer with adaptive joins off and on, one share stored, one re-plan, none after. A build fed
+by a materialized input is not checked. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
 (`crates/engine/tests/adaptive_joins.rs`; T-PL.13.5), a range one row in a hundred passed at
 ANALYZE and every row after an UPDATE: one answer with adaptive joins off and on, one share stored,
 one re-plan, none on the second run or in a statement prepared on the stored share.
@@ -1856,14 +1864,15 @@ re-plan, none on the second run or in a new statement.
 values read by a scan of the outer table, 4,000 rows of five values by its index, where the square
 root's cap took both for 70 values.
 
-**Not checked yet (lane replan-9's audit of the points this decision names).** A hash join's build
-fed by a materialized input, or filtered by terms that are neither one column statistics term nor
-a set the sample ran together; a sorter fed by an outer, semi or anti join, a GROUP BY's hash table of groups (a store of group
-counts), a DISTINCT, or a sorter fed by a seek whose terms the plan read no one share
-for (an `=` its column statistics price beside a range the sample runs, say); a stored subquery result over another subquery or
-a table without statistics. Each needs a store for its own
-correction (a join's or a group's rows, keyed as a filter share is), or the new plan would be the
-old one (the last falsifier below).
+**Not checked yet (lane replan-9's audit of the points this decision names, as lane replan-10
+left it).** A hash join's build fed by a materialized input (it needs a store of a join prefix's
+rows, keyed as the whole join's is and read for that prefix's set of tables); a filter term that
+neither the sample runs nor a constraint counts; a sorter fed by an outer, semi or anti join; a
+GROUP BY's hash table of groups (a store of group counts); a DISTINCT; a stored subquery result
+over another subquery or a table without statistics (its band has no statistics' error to take).
+Each needs a store for its own correction, or the new plan would be the old one (the last
+falsifier below). A sorter fed by a seek beside other terms is checked against the share of all
+its terms together (T-PL.13.16's `OwnFilter`).
 
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).

@@ -209,6 +209,21 @@ pub(super) struct JoinedSetRows<'a> {
     /// join may have counted them (`subquery_rows::join_identity`): an inner join of two tables or
     /// more, planned for one run (`initial` at most one row); `None` otherwise.
     joined: Option<u64>,
+    /// PL.13 (lane replan-10): each table's own filter terms, where it has a sample.
+    own_filters: Vec<Option<OwnFilter>>,
+}
+
+/// A table's own filter terms together (PL.13, lane replan-10): every term its sample ran and every
+/// one of its constraints counted as a filter that reads no other table. Their share, however the
+/// estimate combined it (the sample's, the column statistics', independent terms multiplied), is
+/// noted as the share the plan read for those terms (`PlanValues::filter_selectivity`), and a share
+/// a build or sorter counted for them is read in its place: a mix the sample did not run together
+/// is checked and corrected as one set is. The error is the sample's binomial one at the share,
+/// as for a set the sample ran.
+struct OwnFilter {
+    table: String,
+    fingerprint: u64,
+    sample_rows: usize,
 }
 
 impl<'a> JoinedSetRows<'a> {
@@ -583,6 +598,47 @@ impl<'a> JoinedSetRows<'a> {
         let none_pass = where_clause
             .iter()
             .any(|term| term.origin.join_origin().is_none() && never_true(&term.expr));
+        // PL.13 (lane replan-10): each table's own filter terms together, the sampled ones and
+        // those its constraints count, whose share a filtered build or sorter checks.
+        let own_filters: Vec<Option<OwnFilter>> = tables
+            .iter()
+            .enumerate()
+            .map(|(table_idx, t)| {
+                let btree = joined_tables.get(table_idx)?.btree()?;
+                let sample_rows = schema
+                    .analyze_stats
+                    .table_stats(&btree.name)?
+                    .sample
+                    .as_deref()?
+                    .rows
+                    .len();
+                let table_constraints = constraints.get(table_idx)?;
+                let mut terms: SmallVec<[usize; 8]> = t
+                    .sampled
+                    .iter()
+                    .flat_map(|sampled| sampled.terms.iter().copied())
+                    .collect();
+                for counted in t.counted.iter().filter(|c| c.class == Class::Filter) {
+                    if let Some(c) = table_constraints.constraints.get(counted.constraint) {
+                        if c.lhs_mask.is_empty() && !c.implied {
+                            terms.push(c.where_clause_pos.0);
+                        }
+                    }
+                }
+                terms.sort_unstable();
+                terms.dedup();
+                let fingerprint = crate::filter_shares::fingerprint(
+                    terms
+                        .iter()
+                        .filter_map(|pos| where_clause.get(*pos).map(|term| &term.expr)),
+                )?;
+                (sample_rows > 0).then(|| OwnFilter {
+                    table: btree.name.clone(),
+                    fingerprint,
+                    sample_rows,
+                })
+            })
+            .collect();
         let joined = (joined_tables.len() > 1
             && initial <= 1.0
             && kinds.iter().all(|kind| matches!(kind, Kind::Inner)))
@@ -604,6 +660,7 @@ impl<'a> JoinedSetRows<'a> {
             memo: HashMap::default(),
             bound,
             joined,
+            own_filters,
         }
     }
 
@@ -793,15 +850,29 @@ impl<'a> JoinedSetRows<'a> {
                 .any(|s| s.terms.contains(&c.where_clause_pos.0))
         };
         let shares: SmallVec<[f64; 2]> = sampled.iter().map(|s| s.selectivity).collect();
-        alone
-            * constraints_selectivity(
-                counted
-                    .filter(|c| !reads_a_table(c))
-                    .map(|(constraint, _)| constraint)
-                    .filter(|constraint| !in_sampled(constraint)),
-                &shares,
-                self.params,
-            )
+        let own = constraints_selectivity(
+            counted
+                .filter(|c| !reads_a_table(c))
+                .map(|(constraint, _)| constraint)
+                .filter(|constraint| !in_sampled(constraint)),
+            &shares,
+            self.params,
+        );
+        // PL.13 (lane replan-10): the table's own filters together, as a build checks them.
+        let own = match (
+            classes,
+            self.own_filters.get(table).and_then(Option::as_ref),
+            self.params.plan_values.as_deref(),
+        ) {
+            ([Class::Filter], Some(filter), Some(values)) => values.filter_selectivity(
+                &filter.table,
+                filter.fingerprint,
+                own,
+                filter.sample_rows,
+            ),
+            _ => own,
+        };
+        alone * own
     }
 
     /// The share of the pairs of an outer join's left rows and `table`'s rows its ON terms keep:
