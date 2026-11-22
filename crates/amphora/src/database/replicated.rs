@@ -4703,7 +4703,7 @@ mod tests {
             before: 2,
         });
         let answer = enqueue(client, driven.until(), "gc", step);
-        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap() else {
+        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap().answer else {
             panic!("wrong compaction answer")
         };
         assert_eq!(progress.completed, 2);
@@ -4732,7 +4732,7 @@ mod tests {
             "gc",
             Operation::Changes("items".into(), 1, 10),
         );
-        let Answer::Changes(changes) = driven.answer(&mut pump, &changes).unwrap() else {
+        let Answer::Changes(changes) = driven.answer(&mut pump, &changes).unwrap().answer else {
             panic!("wrong changes answer")
         };
         assert_eq!(changes.changes.len(), 1);
@@ -4742,7 +4742,7 @@ mod tests {
             before: 2,
         });
         let answer = enqueue(client, driven.until(), "gc", step);
-        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap() else {
+        let Answer::Compacted(progress) = driven.answer(&mut pump, &answer).unwrap().answer else {
             panic!("wrong recovered compaction answer")
         };
         assert_eq!(progress.completed, 2);
