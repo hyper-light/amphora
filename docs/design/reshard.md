@@ -637,10 +637,11 @@ them come in the order written, in pages of one alike, a scan merges them by key
 after the head is stamped past it.
 
 **Left.**
-- One candidate is built. Its rival is a cut from each group's own stamp alone, the earliest of
-  them, with no observe: one call fewer a group, but a quiet group holds the head back. They want a
-  switch and the lab's numbers (head latency p50/p99/p99.9 and how far the head trails, at 1 to
-  4096 groups) before either is kept.
+- One candidate is built. Its rival is the earliest of the groups' stamps, with no observe: no
+  group's clock is pushed forward, but the head trails by the widest skew between the groups'
+  clocks, and a write a group with a clock ahead just answered is missing from a read begun after
+  it. They want a switch and the lab's numbers (head latency p50/p99/p99.9, how far the head
+  trails, writes missing from a read begun after them, at 1 to 4096 groups) before either is kept.
 - A revision made before its group stamped, or moved in from another group, has no stamp: a scan
   answers it at 0, and the changes refuse it. The copy path doesn't move the stamps with the rows
   yet.
