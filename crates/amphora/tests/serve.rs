@@ -628,8 +628,8 @@ fn t_t1_13_1_a_member_without_drills_refuses_the_disk_request() {
         });
     }
     listening.recv().unwrap();
-    let secret = c.secret().unwrap();
-    let mut member = Client::connect(&c.members[0].addr, &secret, c.deadline).unwrap();
+    let keys = c.keys().unwrap();
+    let mut member = Client::connect(&c.members[0].addr, &keys, c.deadline).unwrap();
     member.leader(Duration::from_secs(60)).unwrap();
     for request in ["disk hang", "disk cut", "disk back", "cut on"] {
         let refused = member
