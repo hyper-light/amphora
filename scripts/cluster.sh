@@ -20,6 +20,8 @@
 #               or members run by hand: `amphora serve CONFIG`). Only then may links be plain: with
 #               a service (auto), every link runs inside mutual TLS, and without --tls DIR the
 #               script issues the certificates (--tls issue).
+#   --drills    on: the members take `cut` and `disk` (drills.sh). Refused with --tls issue, so a
+#               production install can't turn them on: a drill's hung disk waits with no time limit.
 #   --spare     a fourth member, 4, set up beside the three as a learner: every config names it in
 #               `members` and says `voters = 1,2,3`, so it holds no vote until `amphora member
 #               CONFIG add 4` and `promote 4` (docs/runbook.md, "A region lost"; drills.sh region).
@@ -115,6 +117,12 @@ install() {
   trap 'rm -rf "$work"' EXIT
   # Production runs inside mutual TLS: plain links only for members run by hand (--service none).
   [[ -z $tls && $service == auto ]] && tls=issue
+  [[ $drills == on || $drills == off ]] || die "--drills $drills: on or off"
+  # A drill's hung disk waits with no time limit (drills.sh hang), so a production install can't
+  # take the drills: none on the certificates this script issues (CP-T1.13, T-T1.13.1).
+  if [[ $drills == on && $tls == issue ]]; then
+    die "--drills on is refused with --tls issue (a production install's default with a service): drill clusters run with --tls DIR or --service none"
+  fi
   if [[ $tls == issue ]]; then
     [[ -n $days ]] || die "issuing certificates needs --cert-days DAYS (or give --tls DIR)"
     issue "$days" "$work/tls" "$adays" "${addrs[@]}"

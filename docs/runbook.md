@@ -23,7 +23,7 @@ Nothing here touches kiln: the binary goes to `~/.local/lib/amphora/amphora`, co
 
 ```sh
 scripts/cluster.sh install --bin target/release/amphora --class persisted --deadline-ms MS \
-  --cert-days DAYS --authority-days ADAYS [--drills on] [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
+  --cert-days DAYS --authority-days ADAYS [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
 ```
 
 - `--class persisted`: a write is answered once a majority of members hold it on disk.
@@ -32,7 +32,11 @@ scripts/cluster.sh install --bin target/release/amphora --class persisted --dead
   machine.
 - `--deadline-ms`: how long one request, connect or open may take. Pick it from the slowest
   machine's disk and the link's round trip; nothing here picks it.
-- `--drills on`: the members take `cut` (the split drill). Leave it off in production.
+- `--drills on`: the members take `cut` and `disk` (the split, hang and disk drills). A hung disk
+  waits with no time limit, so install refuses `--drills on` with the certificates it issues
+  (`--tls issue`, the default with a service): a production install can't turn the drills on. A
+  drill cluster runs with `--tls DIR` (its own certificates) or `--service none`. A member whose
+  config says `drills = off` refuses `cut` and `disk`.
 - The script makes one secret (48 random bytes) and copies it to each machine's
   `~/.config/amphora/secret`, readable by its owner only. Every connection proves it holds the
   secret (HMAC-SHA256 over a random challenge); the secret never crosses the link.
