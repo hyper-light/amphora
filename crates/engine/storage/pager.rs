@@ -3905,6 +3905,8 @@ impl Pager {
             // Parent statement will handle the transaction rollback.
             return;
         }
+        // Amphora (G5 step 4): a skipping summary that took the undone writes is stale.
+        connection.db.skipping.rolled_back(connection.skipping_id());
         // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction rolls back with
         // the pager's, on every path that ends one. This returns no error, so a failed rollback
         // is logged and kept: the connection's next transaction is refused with it.

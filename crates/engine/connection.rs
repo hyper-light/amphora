@@ -3546,6 +3546,24 @@ impl Connection {
         self.db.mvcc_enabled()
     }
 
+    /// Amphora (G5 step 4): this connection's identity in the skipping registry.
+    pub(crate) fn skipping_id(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
+    /// Amphora (G5 step 4): this connection's snapshot and the newest commit, as WAL positions;
+    /// `None` without a WAL.
+    pub(crate) fn skipping_positions(
+        &self,
+    ) -> Option<(crate::skipping::WalPos, crate::skipping::WalPos)> {
+        let pager = self.get_pager();
+        let wal = pager.wal.as_ref()?;
+        Some((
+            wal.connection_wal_pos(),
+            (wal.get_checkpoint_seq(), wal.get_max_frame_in_wal()),
+        ))
+    }
+
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
         struct TransparentWrapper<T>(T);
 
@@ -5685,6 +5703,8 @@ impl Connection {
     }
 
     pub(crate) fn rollback_named_savepoint_frame(&self, name: &str) -> Option<RollbackFrameInfo> {
+        // Amphora (G5 step 4): a summary that took the undone writes is stale.
+        self.db.skipping.rolled_back(self.skipping_id());
         let mut savepoints = self.named_savepoints.write();
         let target_idx = savepoints
             .iter()
