@@ -86,8 +86,8 @@ EOF
       [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]] || { echo "refused: stall: SIGSTOP doesn't reach a native Windows process" >&2; return 3; }
       kill -STOP "${PID[$2]}"; sleep "$fault"; kill -CONT "${PID[$2]}" ;;
     stall:0) local p; p=$(service_pid "$2"); on "$host" <<<"kill -STOP $p; sleep $fault; kill -CONT $p" ;;
-    disk:1) "$BIN" ask "$conf" "$2" disk on >/dev/null; ended "$2" || return 1; sleep "$fault"; start_local "$2" ;;
-    disk:0) "$BIN" ask "$conf" "$2" disk on >/dev/null; sleep "$fault" ;;
+    disk:1) "$BIN" ask "$conf" "$2" disk on >/dev/null || return 1; ended "$2" || return 1; sleep "$fault"; start_local "$2" ;;
+    disk:0) "$BIN" ask "$conf" "$2" disk on >/dev/null || return 1; sleep "$fault" ;;
     roll:*) roll ;;
   esac
 }
@@ -103,7 +103,7 @@ ended() {
 restart() { # restart N: member N stopped as its service manager stops it, kept down F s, started
   local host=${addrs[$(($1 - 1))]%:*}
   if [[ $local == 1 ]]; then
-    kill -TERM "${PID[$1]}"; wait "${PID[$1]}" 2>/dev/null || true; sleep "$fault"; start_local "$1"
+    kill -TERM "${PID[$1]}" 2>/dev/null || true; wait "${PID[$1]}" 2>/dev/null || true; sleep "$fault"; start_local "$1"
   else on "$host" <<EOF
 case "\$(uname -s)" in
   Linux) systemctl --user stop amphora-member-$1.service; sleep $fault; systemctl --user start amphora-member-$1.service ;;
@@ -116,7 +116,7 @@ roll() { # every member restarted in turn, the leader last, each caught up befor
   local l n; l=$(leader)
   for n in $(printf '%s\n' 1 2 3 | grep -vx "${l:-0}") $l; do
     echo "== roll: member $n" >&2
-    restart "$n"
+    restart "$n" || return 1
     caught_up "$n" "$catchup" || { echo "member $n never caught up after its restart" >&2; return 1; }
     healthy "$catchup" || return 1
   done
