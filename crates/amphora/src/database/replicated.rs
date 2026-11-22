@@ -279,6 +279,9 @@ pub(super) fn wall_micros() -> Result<u64, Refusal> {
 }
 struct Control {
     admitted: AtomicUsize,
+    /// Application calls in the command queue: no more than its slots less one, so that a wire
+    /// record always finds a slot while calls wait for a leader (QB.1).
+    calls: AtomicUsize,
     // The command queue's bound in bytes and a wire record's most, as the owner last learned them
     // (`queue_bounds`; QB.1).
     queued: AtomicUsize,
@@ -619,12 +622,17 @@ struct Outgoing {
 struct Reservation {
     control: Arc<Control>,
     bytes: usize,
+    /// An application call's slot in the command queue, given back with its bytes (QB.1).
+    call: bool,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.control
             .admitted
             .fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.call {
+            self.control.calls.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 struct Envelope {
@@ -1137,7 +1145,11 @@ fn room(
             let disk = log_bound::image_disk_room(available, logs);
             let image = owner_image_room().map_err(|e| e.to_string())?;
             let image = u64::try_from(image).unwrap_or(u64::MAX).min(disk);
-            (log_bound::log_room(available, image, logs, kept), disk, None)
+            (
+                log_bound::log_room(available, image, logs, kept),
+                disk,
+                None,
+            )
         }
         Err(e) => (
             kept,
@@ -1197,18 +1209,38 @@ impl ReplicaHandle {
         // the wire records that discover it.
         let limit = self.shared.queued.load(Ordering::Acquire);
         let application_limit = self.shared.applications.load(Ordering::Acquire);
+        let call = matches!(
+            &command,
+            Input::Submit { .. }
+                | Input::Change { .. }
+                | Input::Transfer { .. }
+                | Input::CatchUp { .. }
+        );
+        // A call takes a slot of the queue's own, all but its last: that one stays a wire record's.
+        if call
+            && self
+                .shared
+                .calls
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                    held.checked_add(1).filter(|next| *next < COMMANDS)
+                })
+                .is_err()
+        {
+            return Err(Refusal::Full {
+                limit: application_limit,
+            });
+        }
+        // Built before any refusal below, so that dropping it gives the call's slot back.
+        let mut reservation = Reservation {
+            control: Arc::clone(&self.shared),
+            bytes: 0,
+            call,
+        };
         let mut charged = self.shared.admitted.load(Ordering::Acquire);
         let mut reserved = false;
         for _ in 0..COMMANDS {
             let next = charged.checked_add(bytes).ok_or(Refusal::Full { limit })?;
-            if matches!(
-                &command,
-                Input::Submit { .. }
-                    | Input::Change { .. }
-                    | Input::Transfer { .. }
-                    | Input::CatchUp { .. }
-            ) && next > application_limit
-            {
+            if call && next > application_limit {
                 return Err(Refusal::Full {
                     limit: application_limit,
                 });
@@ -1230,12 +1262,10 @@ impl ReplicaHandle {
         if !reserved {
             return Err(Refusal::Full { limit: COMMANDS });
         }
+        reservation.bytes = bytes;
         let envelope = Envelope {
             command,
-            _reservation: Reservation {
-                control: Arc::clone(&self.shared),
-                bytes,
-            },
+            _reservation: reservation,
         };
         self.sender
             .try_send(envelope)
@@ -1713,6 +1743,7 @@ fn open_on<F: BlockFile + 'static>(
     )?;
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
+        calls: AtomicUsize::new(0),
         queued: AtomicUsize::new(first.queued),
         applications: AtomicUsize::new(first.applications),
         wire: AtomicUsize::new(first.wire),
@@ -3796,6 +3827,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             _reservation: Reservation {
                 control: Arc::clone(&self.control),
                 bytes: 0,
+                call: false,
             },
         });
         Ok(())
@@ -3967,6 +3999,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             _reservation: Reservation {
                 control: Arc::clone(&self.control),
                 bytes: 0,
+                call: false,
             },
         });
         self.floor_inflight = true;
@@ -4390,7 +4423,12 @@ mod tests {
             refusal,
             Some(Refusal::Full { limit }) if limit == application
         ));
-        assert_eq!(replies.len(), application / api::REQUEST_MAX);
+        // Calls stop at their bytes' bound or at the queue's slots less the wire record's, the
+        // fewer (QB.1).
+        assert_eq!(
+            replies.len(),
+            (application / api::REQUEST_MAX).min(COMMANDS - 1)
+        );
         assert!(!replies.is_empty());
         assert_eq!(evaluated.load(Ordering::Relaxed), 0);
     }
@@ -8507,10 +8545,7 @@ mod tests {
         assert!(burst > 1, "no burst past one message: {burst}");
         assert!(drained > burst, "{drained}");
         let learned = locked(&driven.owner(0).control.outgoing).unwrap().bound;
-        assert!(
-            (1..u64::MAX).contains(&learned.messages),
-            "{learned:?}"
-        );
+        assert!((1..u64::MAX).contains(&learned.messages), "{learned:?}");
     }
 
     /// AC-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan 01a1a283e14c,
