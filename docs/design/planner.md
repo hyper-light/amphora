@@ -1806,8 +1806,14 @@ an ephemeral table (a CTE read more than once, or one declared `MATERIALIZED`, o
 RIGHT or FULL JOIN reads again) holds the rows the planner estimated for it. Once its fill
 finishes, inside the block that runs it once, `SubqueryCounted` checks their count against the rows
 the plan read for the subquery: its own estimate, `estimated_output_rows`, or a count a fill stored.
-The band is the statistics' relative error of each table the subquery reads, in quadrature; a
-subquery over anything else (another subquery, a table without statistics) is not checked. The
+The band is the statistics' relative error of each table the subquery reads, in quadrature. A
+subquery over another FROM-clause subquery (lane replan-10, `main_loop::adaptive::tables_error`)
+takes that subquery's own error in its place: its group count's where ANALYZE's group count set its
+rows, else the errors of the tables it reads, from a worklist bounded by the plan's size. A subquery
+over a table without statistics, or a table-valued function, is not checked.
+`t_pl_13_17_a_stored_subquery_over_a_subquery_plans_again` (T-PL.13.17): a materialized CTE filtered
+by a range on another's column, which no statistics estimate, 4,750 rows: one answer with adaptive
+joins off and on, one re-plan, none on the second run or in a new statement. The
 count is the last row's rowid (the fill numbers its rows 1, 2, ...), read without a scan. Past the
 band the count goes to the database's `SubqueryRows`, keyed by the subquery's identity: a
 fingerprint of its syntax taken when it is planned, since optimizing and emitting the plan rewrite
@@ -1869,7 +1875,7 @@ left it).** A hash join's build fed by a materialized input (it needs a store of
 rows, keyed as the whole join's is and read for that prefix's set of tables); a filter term that
 neither the sample runs nor a constraint counts; a sorter fed by an outer, semi or anti join; a
 GROUP BY's hash table of groups (a store of group counts); a DISTINCT; a stored subquery result
-over another subquery or a table without statistics (its band has no statistics' error to take).
+over a table without statistics (its band has no statistics' error to take).
 Each needs a store for its own correction, or the new plan would be the old one (the last
 falsifier below). A sorter fed by a seek beside other terms is checked against the share of all
 its terms together (T-PL.13.16's `OwnFilter`).

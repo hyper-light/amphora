@@ -1338,3 +1338,52 @@ fn t_pl_13_16_a_build_filtered_by_a_mix_of_terms_plans_again() {
         "a second share stored"
     );
 }
+
+/// Do: a materialized CTE `o` over another materialized CTE `i` (all of b), `o` filtered by a range
+/// on `i`'s column, which no statistics estimate (19 of b's 20 keys pass); run with adaptive joins
+/// off, then on twice in one prepared statement, and in a statement prepared after. Expect: one
+/// answer, in order, every way; on, `o`'s stored result counted against the rows the plan read for
+/// it, with the band of the statistics of b that `i` reads, past it stored and the statement planned
+/// again once; nothing plans again after (PL.13, lane replan-10, T-PL.13.17: a stored subquery
+/// result over another subquery at its materialization point).
+#[test]
+fn t_pl_13_17_a_stored_subquery_over_a_subquery_plans_again() {
+    let (_dir, conn) = open("subquery_over_subquery.db");
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 20, i FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    let sql = "WITH i AS MATERIALIZED (SELECT id, k FROM b), o AS MATERIALIZED (SELECT id, k FROM i WHERE k < 19) SELECT id, k FROM o ORDER BY id";
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_subquery_checks();
+    let off = run_rows(&mut conn.prepare(sql).unwrap());
+    assert_eq!(off.len(), 4750, "the rows");
+    assert_eq!(conn.adaptive_subquery_checks(), checks, "counted off");
+
+    conn.set_adaptive_joins(true);
+    let replans = conn.adaptive_replans();
+    let mut held = conn.prepare(sql).unwrap();
+    assert_eq!(run_rows(&mut held), off, "on and off differ");
+    assert!(
+        conn.adaptive_subquery_checks() > checks,
+        "the stored results were not counted"
+    );
+    assert_eq!(conn.adaptive_replans() - replans, 1, "planned again once");
+    let replans = conn.adaptive_replans();
+    assert_eq!(run_rows(&mut held), off, "the second run's answer");
+    assert_eq!(conn.adaptive_replans(), replans, "a second re-plan");
+    assert_eq!(
+        run_rows(&mut conn.prepare(sql).unwrap()),
+        off,
+        "a new statement's answer"
+    );
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "a new statement planned again"
+    );
+}

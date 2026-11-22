@@ -299,26 +299,48 @@ pub(crate) fn subquery_count_check(
     let estimate_error =
         match crate::translate::optimizer::group_count_error(plan, resolver.schema()) {
             Some(error) => error,
-            None => {
-                let tables = plan.joined_tables();
-                if tables.is_empty() {
-                    return None;
-                }
-                let mut squared_error = 0.0;
-                for joined in tables {
-                    let Table::BTree(btree) = &joined.table else {
-                        return None;
-                    };
-                    let (_, error) = analyzed_table(resolver, &btree.name)?;
-                    squared_error += error * error;
-                }
-                f64::sqrt(squared_error)
-            }
+            None => tables_error(resolver, plan)?,
         };
     Some(SubqueryCheck {
         planned,
         estimate_error,
     })
+}
+
+/// The relative error of the rows a query reads, its tables' statistics' errors, independent, in
+/// quadrature; `None` where one has none (a table without statistics, a table-valued function), or
+/// for a query reading no table. A FROM-clause subquery it reads (lane replan-10) adds its own:
+/// its GROUP BY's group count error where ANALYZE's group count set its rows, else the errors of
+/// the tables it reads, taken from a worklist of the plans still to read, bounded by the plan's own
+/// size (no recursion at run time).
+fn tables_error(resolver: &Resolver, plan: &crate::translate::plan::SelectPlan) -> Option<f64> {
+    let mut squared_error = 0.0;
+    let mut pending = vec![plan];
+    while let Some(select) = pending.pop() {
+        let tables = select.joined_tables();
+        if tables.is_empty() {
+            return None;
+        }
+        for joined in tables {
+            match &joined.table {
+                Table::BTree(btree) => {
+                    let (_, error) = analyzed_table(resolver, &btree.name)?;
+                    squared_error += error * error;
+                }
+                Table::FromClauseSubquery(subquery) => {
+                    let crate::translate::plan::Plan::Select(inner) = subquery.plan.as_ref() else {
+                        return None;
+                    };
+                    match crate::translate::optimizer::group_count_error(inner, resolver.schema()) {
+                        Some(error) => squared_error += error * error,
+                        None => pending.push(inner),
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(f64::sqrt(squared_error))
 }
 
 /// Counts a stored subquery result's rows where `storage` keeps them and checks them
