@@ -27,8 +27,8 @@
 //!   with the same settings: a comparison between them is fair only so.
 //!
 //! The relay (lane ryw-4, replication.md, "The bench's relay wakes on records") waits, when no
-//! member had records, on one bell every member's records ring (`ReplicaHandle::on_sent`), and
-//! `stop` rings it too: no timer between a record and its delivery. `--relay park` is the 100µs
+//! member had records, on one bell every member's records and end ring (`ReplicaHandle::listen`),
+//! and `stop` rings it too: no timer between a record and its delivery. `--relay park` is the 100µs
 //! timer it replaced, kept only as the control of the A/B run and removed once that run decides.
 //! Each `ryw` record says which relay ran and what it did (passes, records moved, waits, and
 //! wakes that found nothing to move).
@@ -157,8 +157,8 @@ enum RelayWait {
     Park,
 }
 
-/// What wakes the relay: a member's records joining its outgoing queue (the waker each member's
-/// handle is given, `ReplicaHandle::on_sent`), or `stop`. A ring given while the relay is moving
+/// What wakes the relay: a member's records joining its outgoing queue, or its owner going (the
+/// listener each member's handle is given, `ReplicaHandle::listen`), or `stop`. A ring given while the relay is moving
 /// records is kept, so the relay's next wait finds it: no record waits for a later ring.
 #[derive(Default)]
 struct Bell {
@@ -228,7 +228,7 @@ fn relay(partitions: &[Partition], stop: &AtomicBool, bell: &Arc<Bell>, wait: Re
         for handle in handles.iter().flatten() {
             // Refused only for a member already fenced: its calls are refused, and the bench
             // reports those.
-            let _ = handle.on_sent(std::task::Waker::from(Arc::clone(bell)));
+            let _ = handle.listen(std::task::Waker::from(Arc::clone(bell)));
         }
     }
     let mut woke = false;

@@ -300,9 +300,9 @@ struct Control {
     outgoing: Mutex<Outgoing>,
     /// Rung when a record joins `outgoing` ([`ReplicaHandle::drain_wait`]).
     sent: std::sync::Condvar,
-    /// Woken, as `sent` is rung, for a host that relays many members from one thread
-    /// ([`ReplicaHandle::on_sent`]). One: a member's records have one host to take them.
-    sent_waker: Mutex<Option<std::task::Waker>>,
+    /// The host's one listener ([`ReplicaHandle::listen`]): woken when records join `outgoing`,
+    /// as `sent` is rung, and when the owner ends or is dropped.
+    listener: Mutex<Option<std::task::Waker>>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     /// Told, under `status`, when the published status names another leader or term, and when the
     /// owner ends ([`ReplicaHandle::wait_leader`]).
@@ -317,6 +317,21 @@ struct Control {
     moved: std::sync::Condvar,
     // This replica's token reads, counted (`tokens`).
     sessions: tokens::SessionMeter,
+}
+impl Control {
+    /// Wakes the host's listener, if one is set ([`ReplicaHandle::listen`]). Taken out first, so
+    /// the host's waker runs with no lock of this member's held. A slot poisoned (only a panic
+    /// while it was held does that) wakes no one, and the host's next `listen` is refused.
+    fn listened(&self) {
+        let waker = self
+            .listener
+            .lock()
+            .ok()
+            .and_then(|listener| listener.clone());
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
 }
 /// What a replica's owner published of its closed time, and of its applied and answered points
 /// (the session tokens', `tokens`).
@@ -1291,14 +1306,16 @@ impl ReplicaHandle {
         self.drain(limit)
     }
 
-    /// Wakes `waker` each time records join this member's outgoing queue, as
-    /// [`Self::drain_wait`]'s wait is woken (lane ryw-4, kiln goal 8119f25d; replication.md, "The
-    /// bench's relay wakes on records"): a host that relays many members from one thread waits on
-    /// one bell of its own for all of them, then drains each, with no timer between a record and
-    /// its delivery. A member's records have one host to take them, so a waker given again
-    /// replaces the one before.
-    pub fn on_sent(&self, waker: std::task::Waker) -> Result<(), Refusal> {
-        *locked(&self.shared.sent_waker)? = Some(waker);
+    /// Sets the one listener this member wakes each time records join its outgoing queue, as
+    /// [`Self::drain_wait`]'s wait is woken, and when its owner ends or is dropped (lanes ryw-4,
+    /// ryw-5 and scaleout-harness-9; kiln goal 8119f25d, G13; replication.md, "The bench's relay
+    /// wakes on records"). A host that relays many members' records from one thread waits on one
+    /// wake of its own across all of them, then drains each: no timer between a record and its
+    /// delivery, and a member whose owner went is heard at once (its drain then answers why). A
+    /// member's records have one host to take them, so a listener set again replaces the one
+    /// before.
+    pub fn listen(&self, waker: std::task::Waker) -> Result<(), Refusal> {
+        *locked(&self.shared.listener)? = Some(waker);
         Ok(())
     }
 
@@ -1660,7 +1677,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_meter: FloorMeter::default(),
         outgoing: Mutex::default(),
         sent: std::sync::Condvar::new(),
-        sent_waker: Mutex::new(None),
+        listener: Mutex::new(None),
         status: Mutex::new(Ok(status(&replica))),
         led: std::sync::Condvar::new(),
         meter,
@@ -1936,6 +1953,8 @@ impl<F: BlockFile + 'static> Drop for Actor<F> {
             self.control.led.notify_all();
             drop(status);
         }
+        // And the host's listener, so a relay hears this member went.
+        self.control.listened();
     }
 }
 impl<F: BlockFile + 'static> Actor<F> {
@@ -2038,6 +2057,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             // Hosts waiting for a leader hear it ended.
             self.control.led.notify_all();
         }
+        // A host waiting on its listener hears the owner ended: its drain now answers the reason.
+        self.control.listened();
         // Local reads end with the owner: none opens again, and the idle readers let its lease go.
         self.control.local.release();
         // Reads waiting for a closed time hear it ended (under the lock, so none misses it).
@@ -3580,14 +3601,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         self.control.sent.notify_all();
         drop(outgoing);
-        // Taken out first, so the host's waker runs with no lock of this member's held.
-        let waker = if any {
-            locked(&self.control.sent_waker)?.clone()
-        } else {
-            None
-        };
-        if let Some(waker) = waker {
-            waker.wake();
+        if any {
+            self.control.listened();
         }
         Ok(())
     }
@@ -10359,14 +10374,16 @@ mod tests {
         ringer.join().unwrap();
     }
 
-    /// Lane ryw-4 (kiln goal 8119f25d; replication.md, "The bench's relay wakes on records"): a
-    /// member's records wake the waker its host gave it, so a host relaying many members from one
-    /// thread needs no timer. Do: three voters, a counting waker given to each member's handle;
-    /// elect a leader; give the leader a second waker; write through it. Expect: every member's
-    /// waker was woken by the election's records (votes and their answers, appends and theirs);
-    /// the write's records wake the second waker and not the first, which it replaced.
+    /// Lanes ryw-4, ryw-5 and scaleout-harness-9 (kiln goal 8119f25d, G13; replication.md, "The
+    /// bench's relay wakes on records"): a member wakes the listener its host set when records
+    /// join its outgoing queue and when its owner goes, so a host relaying many members from one
+    /// thread needs no timer. Do: three voters, a counting listener set on each member's handle;
+    /// elect a leader; set a second listener on the leader; write through it; then drop every
+    /// owner. Expect: every member's listener woken by the election's records (votes and their
+    /// answers, appends and theirs); the write's records wake the second listener and not the
+    /// first, which it replaced; and each listener in place woken again as its owner goes.
     #[test]
-    fn a_members_records_wake_the_waker_its_host_gave() {
+    fn a_members_listener_wakes_for_its_records_and_its_owners_end() {
         struct Count(AtomicUsize);
         impl std::task::Wake for Count {
             fn wake(self: Arc<Self>) {
@@ -10379,13 +10396,13 @@ mod tests {
         let clients: Vec<Client> = (1..=3)
             .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
             .collect();
-        let counts: Vec<Arc<Count>> = clients
+        let mut counts: Vec<Arc<Count>> = clients
             .iter()
             .map(|client| {
                 let count = Arc::new(Count(AtomicUsize::new(0)));
                 client
                     .handle()
-                    .on_sent(std::task::Waker::from(Arc::clone(&count)))
+                    .listen(std::task::Waker::from(Arc::clone(&count)))
                     .unwrap();
                 count
             })
@@ -10398,18 +10415,26 @@ mod tests {
         let again = Arc::new(Count(AtomicUsize::new(0)));
         clients[leader]
             .handle()
-            .on_sent(std::task::Waker::from(Arc::clone(&again)))
+            .listen(std::task::Waker::from(Arc::clone(&again)))
             .unwrap();
-        let before = counted(&counts[leader]);
+        let replaced = std::mem::replace(&mut counts[leader], again);
+        let before = counted(&replaced);
         write(&mut driven, &mut pump, &clients[leader], 1);
-        assert!(counted(&again) > 0, "the write's records woke no one");
-        assert_eq!(
-            counted(&counts[leader]),
-            before,
-            "a replaced waker was woken"
+        assert!(
+            counted(&counts[leader]) > 0,
+            "the write's records woke no one"
         );
+        assert_eq!(counted(&replaced), before, "a replaced listener was woken");
         driven.drain(&mut pump);
         pump.finish();
+        let woken: Vec<usize> = counts.iter().map(counted).collect();
+        drop(driven);
+        for (member, (count, before)) in counts.iter().zip(woken).enumerate() {
+            assert!(
+                counted(count) > before,
+                "member {member}'s owner went and woke no one"
+            );
+        }
     }
 
     /// Lane ryw-5 (kiln goal 8119f25d; replication.md, "A host waits for a leader on the owner's

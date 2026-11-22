@@ -2662,18 +2662,21 @@ The bench's members run in one process, and one relay thread moves every member'
 name (the host's part: Amphora carries no network of its own). It used to wait, after a pass that moved nothing, on a
 100µs `park_timeout`: a record queued just after a pass waited for the timer, and an idle relay woke 10,000 times a
 second for nothing (Ada's rule, 2026-11-21: wake on events, never on timers). Lane ryw-4 (2026-11-22) makes it wait on
-one bell instead. `ReplicaHandle::on_sent` gives a member's handle a waker, which the owner wakes each time records join
-its outgoing queue, as it already rings `drain_wait`'s condition; the bench gives every member the same bell, and
-`stop` rings it too. The bell keeps a ring given while the relay is moving records, so no record waits for a later ring.
-A member's records have one host to take them, so a waker given again replaces the one before.
+one bell instead. `ReplicaHandle::listen` gives a member's handle a waker. The owner wakes it each time records join
+its outgoing queue, as it already rings `drain_wait`'s condition, and when it ends or is dropped, so a relay hears a
+member that went. The bench gives every member the same bell, and `stop` rings it too. Lane scaleout-harness-9 wrote
+the same hook for `scale.rs`'s relay; lane ryw-5 made the two one (`listen`, which `on_sent` had been). The bell
+keeps a ring given while the relay is moving records, so no record waits for a later ring. A member's records have
+one host to take them, so a waker given again replaces the one before.
 `amphora_ryw`'s records now carry `relay`: its kind (`Bell` or `Park`), its passes, records moved, waits and the
 wakes that found nothing to move.
 
 `--relay park` keeps the timer only as the control of the A/B run, at 1, 128 and 4096 sessions: p50, p99 and p99.9
 of read-after-write and write latency, pairs a second, and the relay's counts, per relay on one host, through this one
 client. Once that run decides, the loser is removed. Tested by
-`a_members_records_wake_the_waker_its_host_gave` (crates/amphora/src/database/replicated.rs): every member's
-election records wake its waker, and a write's records wake the waker that replaced it and not the one before.
+`a_members_listener_wakes_for_its_records_and_its_owners_end` (crates/amphora/src/database/replicated.rs): every
+member's election records wake its listener, a write's records wake the listener that replaced it and not the one
+before, and each listener in place is woken again as its owner goes.
 
 ### A host waits for a leader on the owner's word
 
