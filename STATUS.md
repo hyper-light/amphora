@@ -108,9 +108,12 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   run, perf c2c and the 32-client suite are the coordinator's).
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
-  commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
-  statements now match the page-a-frame log (`AMPHORA_PAGE_LOG=1` in the bench) waits on the
-  interleaved bench.
+  commit's pages, and deltas are found a word at a time. Merged. Then (decision 44, lane
+  wal-read-2) a commit lays its chains' pages out in the buffer pool's frames, as page-a-frame
+  does, and finds its deltas in one buffer it reuses: no buffer of the commit's images, no page
+  allocated a delta. `bench/log_ab.sh` runs the mixed log against page-a-frame in one binary,
+  interleaved; a tiny check has the bulk statements within its noise (0.93-0.98). The run of record
+  is the coordinator's. Left: a page's log base and each record's payload still allocate.
 - **The planner where the suite found it choosing far more work** (docs/design/planner.md,
   `crates/engine/tests/planner.rs`): a closed range with unknown bounds is 0.5% of its table whether
   it drives a seek or filters one, so a join from a key range looks each row's partner up by key; a
