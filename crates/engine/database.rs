@@ -2863,11 +2863,16 @@ impl Database {
     ) -> Result<Option<Arc<crate::storage::versioned::switch::Storage>>> {
         let mut slot = self.versioned.lock();
         if slot.is_none() && ask {
-            *slot = Some(crate::storage::versioned::switch::open(
-                &self.path,
-                self.io.is_memory(),
-                memory,
-            )?);
+            // An IO whose files live in memory keeps the storage beside the file, so a database
+            // reopened on it finds its trees (G7 step 2, `AC-NS.2.1`).
+            let memory_io = self.io.is_memory();
+            let mut make =
+                || crate::storage::versioned::switch::open(&self.path, memory_io, memory.clone());
+            let kept = self.io.versioned_beside(&self.path, &mut make)?;
+            *slot = Some(match kept {
+                Some(storage) => storage,
+                None => make()?,
+            });
         }
         Ok(slot.clone())
     }
