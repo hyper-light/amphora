@@ -15,10 +15,11 @@ use super::GroupId;
 use super::coordinator::{Answer, Protocol, Txn};
 use super::sql::{Cluster, Member, Route};
 
-/// A harness key: an 8-byte prefix (a run's or a seed's, so runs on the same groups never share a
-/// key), then a number whose remainder by the group count is the key's group ([`route`]).
-fn key(prefix: u64, n: u64) -> Vec<u8> {
-    let mut k = prefix.to_be_bytes().to_vec();
+/// A harness key: a prefix of 8-byte numbers (a run's coordinator, and a seed's number, so runs on
+/// the same groups never share a key: a seed's values are unique only within its run), then a
+/// number whose remainder by the group count is the key's group ([`route`]).
+fn key(prefix: &[u64], n: u64) -> Vec<u8> {
+    let mut k: Vec<u8> = prefix.iter().flat_map(|p| p.to_be_bytes()).collect();
     k.extend_from_slice(&n.to_be_bytes());
     k
 }
@@ -133,11 +134,7 @@ impl Latencies {
     /// The `per_mille`th quantile by nearest rank (500: p50; 990: p99; 999: p99.9); none recorded: 0.
     #[must_use]
     pub fn quantile(&self, per_mille: u64) -> Duration {
-        let rank = self
-            .total
-            .saturating_mul(per_mille)
-            .div_ceil(1000)
-            .max(1);
+        let rank = self.total.saturating_mul(per_mille).div_ceil(1000).max(1);
         let mut seen = 0u64;
         for (index, count) in self.counts.iter().enumerate() {
             seen = seen.saturating_add(*count);
@@ -257,8 +254,11 @@ pub fn measure(
                         let mut txn = Txn::default();
                         for i in 0..u64::try_from(load.span).unwrap_or(0) {
                             let group = first.saturating_add(i).checked_rem(width).unwrap_or(0);
-                            let n = rng.below(load.keys).saturating_mul(width).saturating_add(group);
-                            let k = key(id, n);
+                            let n = rng
+                                .below(load.keys)
+                                .saturating_mul(width)
+                                .saturating_add(group);
+                            let k = key(&[id], n);
                             written = written.wrapping_add(1);
                             txn.reads.push(k.clone());
                             txn.writes.push((k, Some(written.to_be_bytes().to_vec())));
@@ -267,7 +267,8 @@ pub fn measure(
                         match cluster.transact(txn, until) {
                             Ok(Answer::Committed { .. }) => latencies.record(began.elapsed()),
                             Ok(Answer::Aborted(_)) => aborted = aborted.saturating_add(1),
-                            Ok(Answer::Unknown) | Err(Refusal::UnknownOutcome | Refusal::Timeout) => {
+                            Ok(Answer::Unknown)
+                            | Err(Refusal::UnknownOutcome | Refusal::Timeout) => {
                                 unknown = unknown.saturating_add(1)
                             }
                             Err(refusal) => return Err(refusal),
@@ -281,7 +282,9 @@ pub fn measure(
             .into_iter()
             .map(|h| {
                 h.join().unwrap_or_else(|_| {
-                    Err(Refusal::Unavailable("a harness client's thread panicked".into()))
+                    Err(Refusal::Unavailable(
+                        "a harness client's thread panicked".into(),
+                    ))
                 })
             })
             .collect()
@@ -374,11 +377,15 @@ pub fn elle(
     let clients = usize::try_from(rng.below(u64::try_from(shape.clients).unwrap_or(1)))
         .unwrap_or(0)
         .saturating_add(1);
-    let keys = rng.below(shape.keys).saturating_add(1).saturating_mul(width);
-    // The seed's keys: its own prefix, so seeds on the same groups never share one.
-    let prefix = seed;
+    let keys = rng
+        .below(shape.keys)
+        .saturating_add(1)
+        .saturating_mul(width);
+    // The seed's keys: its coordinator's and its own prefix, so runs on the same groups never share one.
+    let prefix = [id, seed];
     let route_of = route(groups);
-    let cluster = Cluster::open_members(members, Arc::clone(&route_of), id, protocol, clients, until)?;
+    let cluster =
+        Cluster::open_members(members, Arc::clone(&route_of), id, protocol, clients, until)?;
     let next = AtomicUsize::new(0);
     let unique = AtomicU64::new(0);
     let results: Vec<Result<Vec<Op>, Refusal>> = std::thread::scope(|scope| {
@@ -386,7 +393,11 @@ pub fn elle(
             .map(|client| {
                 let (cluster, next, unique) = (&cluster, &next, &unique);
                 scope.spawn(move || {
-                    let mut rng = Rng(seed ^ u64::try_from(client).unwrap_or(0).wrapping_add(1).rotate_left(40));
+                    let mut rng = Rng(seed
+                        ^ u64::try_from(client)
+                            .unwrap_or(0)
+                            .wrapping_add(1)
+                            .rotate_left(40));
                     let mut ops = Vec::new();
                     while next.fetch_add(1, Ordering::AcqRel) < shape.ops {
                         let size = rng.below(width.saturating_add(1)).saturating_add(1);
@@ -394,26 +405,36 @@ pub fn elle(
                         let mut txn = Txn::default();
                         let mut writes = BTreeMap::new();
                         for n in picked {
-                            let k = key(prefix, n);
+                            let k = key(&prefix, n);
                             txn.reads.push(k.clone());
                             // Two in three of its keys written, as the simulator's runs write them.
                             if rng.below(3) != 0 {
-                                let value = unique.fetch_add(1, Ordering::AcqRel).to_be_bytes().to_vec();
+                                let value =
+                                    unique.fetch_add(1, Ordering::AcqRel).to_be_bytes().to_vec();
                                 txn.writes.push((k.clone(), Some(value.clone())));
                                 writes.insert(k, value);
                             }
                         }
                         let invoke = Instant::now();
                         let (heard, reads) = match cluster.transact(txn, until) {
-                            Ok(Answer::Committed { reads }) => (Heard::Committed, reads.into_iter().collect()),
+                            Ok(Answer::Committed { reads }) => {
+                                (Heard::Committed, reads.into_iter().collect())
+                            }
                             Ok(Answer::Aborted(_)) => (Heard::Aborted, BTreeMap::new()),
-                            Ok(Answer::Unknown) | Err(Refusal::UnknownOutcome | Refusal::Timeout) => {
+                            Ok(Answer::Unknown)
+                            | Err(Refusal::UnknownOutcome | Refusal::Timeout) => {
                                 (Heard::Unknown, BTreeMap::new())
                             }
                             Err(refusal) => return Err(refusal),
                         };
                         let done = (heard != Heard::Unknown).then(Instant::now);
-                        ops.push(Op { invoke, done, heard, writes, reads });
+                        ops.push(Op {
+                            invoke,
+                            done,
+                            heard,
+                            writes,
+                            reads,
+                        });
                     }
                     Ok(ops)
                 })
@@ -423,7 +444,9 @@ pub fn elle(
             .into_iter()
             .map(|h| {
                 h.join().unwrap_or_else(|_| {
-                    Err(Refusal::Unavailable("a harness client's thread panicked".into()))
+                    Err(Refusal::Unavailable(
+                        "a harness client's thread panicked".into(),
+                    ))
                 })
             })
             .collect()
@@ -434,7 +457,7 @@ pub fn elle(
     }
     // The final values: one read of every key, again until it commits (a lock a resolution still
     // holds aborts it) or the run's time is up.
-    let all: Vec<Vec<u8>> = (0..keys).map(|n| key(prefix, n)).collect();
+    let all: Vec<Vec<u8>> = (0..keys).map(|n| key(&prefix, n)).collect();
     let finals = loop {
         let txn = Txn {
             reads: all.clone(),
@@ -442,7 +465,9 @@ pub fn elle(
         };
         match cluster.transact(txn, until)? {
             Answer::Committed { reads } => break reads.into_iter().collect::<BTreeMap<_, _>>(),
-            Answer::Aborted(_) | Answer::Unknown if Instant::now() < until => std::thread::yield_now(),
+            Answer::Aborted(_) | Answer::Unknown if Instant::now() < until => {
+                std::thread::yield_now()
+            }
             Answer::Aborted(_) | Answer::Unknown => return Err(Refusal::Timeout),
         }
     };
@@ -477,7 +502,9 @@ fn check(ops: &[Op], finals: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<String>
         }
     }
     let heard = |i: usize| ops.get(i).map_or(Heard::Aborted, |op| op.heard);
-    let committed: Vec<usize> = (0..ops.len()).filter(|i| heard(*i) == Heard::Committed).collect();
+    let committed: Vec<usize> = (0..ops.len())
+        .filter(|i| heard(*i) == Heard::Committed)
+        .collect();
     let observed = committed
         .iter()
         .filter_map(|i| ops.get(*i))
@@ -487,8 +514,12 @@ fn check(ops: &[Op], finals: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<String>
     for value in observed {
         match writer.get(value.as_slice()).map(|w| (*w, heard(*w))) {
             None => anomalies.push(format!("a read of {value:?}, which nobody wrote")),
-            Some((w, Heard::Aborted)) => anomalies.push(format!("G1a: a read of {value:?}, written by aborted #{w}")),
-            Some((w, Heard::Unknown)) => anomalies.push(format!("a read of {value:?}, written by #{w}, whose outcome is unknown")),
+            Some((w, Heard::Aborted)) => {
+                anomalies.push(format!("G1a: a read of {value:?}, written by aborted #{w}"))
+            }
+            Some((w, Heard::Unknown)) => anomalies.push(format!(
+                "a read of {value:?}, written by #{w}, whose outcome is unknown"
+            )),
             Some((_, Heard::Committed)) => {}
         }
     }
@@ -502,12 +533,17 @@ fn check(ops: &[Op], finals: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<String>
                 continue;
             };
             if let Some(other) = next.insert((key.as_slice(), prev.as_deref()), *i) {
-                anomalies.push(format!("lost update: #{other} and #{i} both wrote {key:?} after {prev:?}"));
+                anomalies.push(format!(
+                    "lost update: #{other} and #{i} both wrote {key:?} after {prev:?}"
+                ));
             }
         }
     }
     let mut edges: BTreeSet<(usize, usize)> = BTreeSet::new();
-    let keys: BTreeSet<&[u8]> = ops.iter().flat_map(|op| op.writes.keys().map(Vec::as_slice)).collect();
+    let keys: BTreeSet<&[u8]> = ops
+        .iter()
+        .flat_map(|op| op.writes.keys().map(Vec::as_slice))
+        .collect();
     for key in keys {
         let mut version: Option<&[u8]> = None;
         let mut chain: Vec<usize> = Vec::new();
@@ -522,7 +558,10 @@ fn check(ops: &[Op], finals: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<String>
                 edges.insert((*prev, w)); // ww
             }
             chain.push(w);
-            version = ops.get(w).and_then(|op| op.writes.get(key)).map(Vec::as_slice);
+            version = ops
+                .get(w)
+                .and_then(|op| op.writes.get(key))
+                .map(Vec::as_slice);
             if chain.len() > ops.len() {
                 anomalies.push(format!("{key:?}'s versions loop"));
                 break;
@@ -533,7 +572,10 @@ fn check(ops: &[Op], finals: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<String>
             .filter(|i| ops.get(**i).is_some_and(|op| op.writes.contains_key(key)))
             .count();
         if chain.len() != writes {
-            anomalies.push(format!("{key:?}: {writes} committed writes, {} in its chain", chain.len()));
+            anomalies.push(format!(
+                "{key:?}: {writes} committed writes, {} in its chain",
+                chain.len()
+            ));
         }
         let last = finals.get(key).and_then(Option::as_deref);
         if last != version {
@@ -550,7 +592,9 @@ fn check(ops: &[Op], finals: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<String>
     }
     // Real time: a transaction answered before another began precedes it.
     for a in &committed {
-        let Some(done) = ops.get(*a).and_then(|op| op.done) else { continue };
+        let Some(done) = ops.get(*a).and_then(|op| op.done) else {
+            continue;
+        };
         for b in &committed {
             if ops.get(*b).is_some_and(|op| done < op.invoke) {
                 edges.insert((*a, *b));
@@ -564,7 +608,11 @@ fn check(ops: &[Op], finals: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Vec<String>
             *d = d.saturating_add(1);
         }
     }
-    let mut free: Vec<usize> = indegree.iter().filter(|(_, d)| **d == 0).map(|(i, _)| *i).collect();
+    let mut free: Vec<usize> = indegree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(i, _)| *i)
+        .collect();
     let mut left = indegree.len();
     while let Some(i) = free.pop() {
         left = left.saturating_sub(1);
@@ -594,11 +642,19 @@ mod tests {
     /// reaches both only over the transport.
     fn two_endpoints(dir: &std::path::Path, until: Instant) -> (Vec<Database>, Vec<Member>) {
         let paths: Vec<_> = (0..2).map(|g| dir.join(format!("group{g}.db"))).collect();
-        let databases: Vec<Database> = paths.iter().map(|p| Database::open(p, until).unwrap()).collect();
+        let databases: Vec<Database> = paths
+            .iter()
+            .map(|p| Database::open(p, until).unwrap())
+            .collect();
         for database in &databases {
             super::super::sql::prepare(database, until).unwrap();
         }
-        let nodes = Arc::new(Nodes::new(paths.iter().enumerate().map(|(g, p)| (NodeId(u64::try_from(g).unwrap()), p.clone()))));
+        let nodes = Arc::new(Nodes::new(
+            paths
+                .iter()
+                .enumerate()
+                .map(|(g, p)| (NodeId(u64::try_from(g).unwrap()), p.clone())),
+        ));
         let members = (0..2)
             .map(|g| Member::Node {
                 nodes: Arc::clone(&nodes),
@@ -645,7 +701,11 @@ mod tests {
             let mut crossed = 0;
             for seed in 0..3 {
                 let checked = elle(members.clone(), id, protocol, seed, shape, until()).unwrap();
-                assert_eq!(checked.anomalies, Vec::<String>::new(), "{protocol:?} seed {seed}");
+                assert_eq!(
+                    checked.anomalies,
+                    Vec::<String>::new(),
+                    "{protocol:?} seed {seed}"
+                );
                 assert_eq!(checked.unknown, 0, "{protocol:?} seed {seed}");
                 crossed += checked.crossed;
             }
@@ -660,15 +720,25 @@ mod tests {
             invoke: now,
             done: Some(now),
             heard,
-            writes: writes.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect(),
-            reads: reads.iter().map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect(),
+            writes: writes
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .collect(),
+            reads: reads
+                .iter()
+                .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
+                .collect(),
         };
         let lost = [
             op(Heard::Committed, &[(b"k", b"a")], &[(b"k", None)]),
             op(Heard::Committed, &[(b"k", b"b")], &[(b"k", None)]),
         ];
         let finals = [(b"k".to_vec(), Some(b"b".to_vec()))].into();
-        assert!(check(&lost, &finals).iter().any(|a| a.starts_with("lost update")));
+        assert!(
+            check(&lost, &finals)
+                .iter()
+                .any(|a| a.starts_with("lost update"))
+        );
         let dirty = [
             op(Heard::Aborted, &[(b"k", b"a")], &[]),
             op(Heard::Committed, &[], &[(b"k", Some(b"a"))]),
@@ -679,7 +749,17 @@ mod tests {
 
     #[test]
     fn ac_t1_10_2_latency_buckets_hold_a_value_within_a_128th() {
-        for nanos in [0u64, 1, 127, 128, 129, 1_000, 999_999, 10_000_000, u64::MAX / 3] {
+        for nanos in [
+            0u64,
+            1,
+            127,
+            128,
+            129,
+            1_000,
+            999_999,
+            10_000_000,
+            u64::MAX / 3,
+        ] {
             let b = bucket(nanos);
             assert!(b < BUCKETS, "{nanos}");
             let top = upper(b);

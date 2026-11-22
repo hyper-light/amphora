@@ -42,14 +42,18 @@ pub type GroupId = u32;
 pub type OpenPage = (Vec<(TxnId, Option<GroupId>)>, bool);
 
 /// A place in one coordinator's order of transactions: its incarnation, then its count there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Mark {
     pub epoch: u64,
     pub seq: u64,
 }
 
 /// A transaction: its coordinator, the incarnation that began it, and its count there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct TxnId {
     pub coordinator: u64,
     pub epoch: u64,

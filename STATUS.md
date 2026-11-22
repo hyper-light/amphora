@@ -456,7 +456,10 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `Request::Step` through `transport::Nodes`, and `examples/xgroup_lan.rs` measures both protocols (bench) and checks
   seeded histories (elle); the decision record's rule is written, its numbers blank. Left: the coordinator's LAN p99
   (AC-T1.10.2) and 10,000-seed run, which decide between the two, once split-merge-11's network listener lets
-  nodes sit on separate machines; SQL sessions across groups (AC-T1.10.1).
+  nodes sit on separate machines; SQL sessions across groups (AC-T1.10.1). Lane xgroup-lan-2: a group failing
+  mid-commit is tested at every step (T-T1.10.X3); a begin that finds the coordinator full waits for a finished
+  transaction instead of being refused, so the harness's clients run back to back; both protocols stay until the
+  coordinator's LAN numbers decide (xgroup.md, "Decision (lane xgroup-lan)").
 - **Picked constants replaced by derived ones** (lane constants, kiln goal dfabffcc; Ada, 2026-11-11: "learned and
   stat derived values only"): a page's chain of deltas ends where its bytes reach a page (store.md decision 17); the
   store's log is copied past its bound (decision 35); a term runs on the whole sample (planner.md decision 21); a

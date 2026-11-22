@@ -58,6 +58,24 @@ doubled for each resolution step lost (RFC 6298 §5.5). It follows the groups wh
 their load moves; nothing in it is tuned. A step past its deadline stops the incarnation, as a crash
 would, and the next open finishes it.
 
+A begin that finds the coordinator full (its `in_flight` transactions running, recovered ones
+among them) waits, parked, and begins in arrival order as transactions finish (lane xgroup-lan-2).
+A caller's next transaction often arrives while its last one still resolves, after the caller
+heard; refusing it `Full` would make every caller spin. At most `in_flight` begins wait, the
+callers the shell was opened for; one more is refused `Full`, and one whose caller's deadline
+passed while it waited is answered `Timeout` and never begun. Values introduced: none.
+
+## A group's failure
+
+A group that fails mid-commit (its quorum lost, or its owner's node gone) refuses the step's call,
+a refusal the protocol can't retry (`Unavailable`; a step whose answer was lost after it went out
+is `UnknownOutcome` and is retried). The driver stops that incarnation as a crash would: its waiting
+callers hear `Unavailable`, and nothing it decided is lost, since every decision lives in a group.
+The next open, once the group answers again, scans every group and finishes each transaction left:
+committed everywhere or aborted everywhere, never in part. `t_t1_10_x3_*` fails each group (the
+registry and anchor, and each participant) at every one of the coordinator's inputs, with the step
+in flight landing first or not, under both protocols (T-T1.10.X3).
+
 ## Over the transport
 
 A group on another node is reached as `Member::Node` (`xgroup::sql`): each step is one request over
@@ -104,6 +122,12 @@ The coordinator's measurement (blanks to fill):
 Decision: ___ stays; ___ is removed (commit ___). Expected from the simulator: Parallel Commits,
 one group commit before the client hears against two; falsified if its p99 is not below two-phase
 commit's on the LAN, or if it shows an anomaly two-phase commit doesn't.
+
+Until the coordinator's numbers are in (lane xgroup-lan-2, 2026-11-22): both protocols stay behind
+`Protocol`, the reversible option. Removing one before the LAN run would decide on the simulator's
+round counts alone; keeping both costs one switch, and both pass every crash, group-failure and
+seeded test. The evidence so far favours Parallel Commits (one group commit before the client hears
+against two, `ac_t1_10_2_parallel_commits_answers_after_one_group_commit_two_phase_after_two`).
 
 ## Evidence so far
 

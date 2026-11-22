@@ -294,7 +294,11 @@ impl Nodes {
         };
         match client.request(request, until)? {
             Answer::Stepped { reply, latest } => Ok((reply, latest)),
-            _ => Err(unavailable(format_args!("node {}'s answer to a step is not a step's", node.0)).into()),
+            _ => Err(unavailable(format_args!(
+                "node {}'s answer to a step is not a step's",
+                node.0
+            ))
+            .into()),
         }
     }
 }

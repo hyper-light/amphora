@@ -30,12 +30,25 @@ struct Args {
 
 impl Args {
     fn parse() -> anyhow::Result<Self> {
-        let mut args = std::env::args().skip(1);
-        let command = args.next().ok_or_else(|| anyhow::anyhow!("a command: node, bench or elle"))?;
+        let mut args = std::env::args_os()
+            .skip(1)
+            .map(|a| {
+                a.into_string()
+                    .map_err(|a| anyhow::anyhow!("{} isn't Unicode", a.to_string_lossy()))
+            })
+            .collect::<anyhow::Result<Vec<String>>>()?
+            .into_iter();
+        let command = args
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("a command: node, bench or elle"))?;
         let mut flags: BTreeMap<String, Vec<String>> = BTreeMap::new();
         while let Some(flag) = args.next() {
-            let name = flag.strip_prefix("--").ok_or_else(|| anyhow::anyhow!("{flag} isn't a flag"))?;
-            let value = args.next().ok_or_else(|| anyhow::anyhow!("--{name} needs a value"))?;
+            let name = flag
+                .strip_prefix("--")
+                .ok_or_else(|| anyhow::anyhow!("{flag} isn't a flag"))?;
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--{name} needs a value"))?;
             flags.entry(name.to_owned()).or_default().push(value);
         }
         Ok(Self { command, flags })
@@ -53,14 +66,20 @@ impl Args {
     where
         T::Err: std::fmt::Display,
     {
-        self.one(name)?.parse().map_err(|e| anyhow::anyhow!("--{name}: {e}"))
+        self.one(name)?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--{name}: {e}"))
     }
 
     fn or<T: std::str::FromStr>(&self, name: &str, default: T) -> anyhow::Result<T>
     where
         T::Err: std::fmt::Display,
     {
-        if self.flags.contains_key(name) { self.number(name) } else { Ok(default) }
+        if self.flags.contains_key(name) {
+            self.number(name)
+        } else {
+            Ok(default)
+        }
     }
 
     fn secs(&self) -> anyhow::Result<Duration> {
@@ -71,14 +90,18 @@ impl Args {
     fn members(&self) -> anyhow::Result<Vec<Member>> {
         let mut endpoints = BTreeMap::new();
         for node in self.flags.get("node").into_iter().flatten() {
-            let (group, path) = node.split_once('=').ok_or_else(|| anyhow::anyhow!("--node {node}: GROUP=ENDPOINT"))?;
+            let (group, path) = node
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--node {node}: GROUP=ENDPOINT"))?;
             endpoints.insert(group.parse::<u64>()?, PathBuf::from(path));
         }
         let count = u64::try_from(endpoints.len())?;
         if endpoints.keys().copied().ne(0..count) {
             anyhow::bail!("--node: the groups are numbered 0 to one less than how many there are");
         }
-        let nodes = Arc::new(Nodes::new(endpoints.into_iter().map(|(g, p)| (NodeId(g), p))));
+        let nodes = Arc::new(Nodes::new(
+            endpoints.into_iter().map(|(g, p)| (NodeId(g), p)),
+        ));
         Ok((0..count)
             .map(|g| Member::Node {
                 nodes: Arc::clone(&nodes),
@@ -88,7 +111,12 @@ impl Args {
     }
 
     fn protocols(&self) -> anyhow::Result<Vec<Protocol>> {
-        match self.flags.get("protocol").and_then(|v| v.last()).map_or("both", String::as_str) {
+        match self
+            .flags
+            .get("protocol")
+            .and_then(|v| v.last())
+            .map_or("both", String::as_str)
+        {
             "two-phase" => Ok(vec![Protocol::TwoPhase]),
             "parallel" => Ok(vec![Protocol::Parallel]),
             "both" => Ok(vec![Protocol::TwoPhase, Protocol::Parallel]),
@@ -102,6 +130,14 @@ fn later(by: Duration) -> Instant {
     now.checked_add(by).unwrap_or(now)
 }
 
+/// A line of the command's output on stdout: its records and what it serves.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        writeln!(std::io::stdout().lock(), $($arg)*)?;
+    }};
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     match args.command.as_str() {
@@ -111,7 +147,7 @@ fn main() -> anyhow::Result<()> {
             let served = later(secs);
             let database = amphora::database::Database::open(&path, served)?;
             amphora::xgroup::sql::prepare(&database, served)?;
-            println!("serving {} for {secs:?}", path.display());
+            out!("serving {} for {secs:?}", path.display());
             while Instant::now() < served {
                 std::thread::park_timeout(served.saturating_duration_since(Instant::now()));
             }
@@ -131,14 +167,23 @@ fn main() -> anyhow::Result<()> {
             for (i, protocol) in args.protocols()?.into_iter().enumerate() {
                 // The run's own time, and as long again for its coordinator to open and finish.
                 let until = later(load.duration.saturating_mul(2));
-                let measured = lan::measure(members.clone(), id.wrapping_add(u64::try_from(i)?), protocol, load, until)?;
+                let measured = lan::measure(
+                    members.clone(),
+                    id.wrapping_add(u64::try_from(i)?),
+                    protocol,
+                    load,
+                    until,
+                )?;
                 let line = measured.record(&host);
-                println!("{line}");
+                out!("{line}");
                 lines.push(line);
             }
             if let Ok(out) = args.one("out") {
                 use std::io::Write;
-                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(out)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(out)?;
                 for line in lines {
                     writeln!(file, "{line}")?;
                 }
@@ -154,13 +199,15 @@ fn main() -> anyhow::Result<()> {
                 keys: args.number("keys")?,
             };
             let id: u64 = args.or("id", 1)?;
-            let budget = Duration::try_from_secs_f64(args.or("secs", 60.0)?)?;
+            let budget = Duration::try_from_secs_f64(args.number::<f64>("secs")?)?;
             let mut failed = 0u64;
             for (i, protocol) in args.protocols()?.into_iter().enumerate() {
                 let id = id.wrapping_add(u64::try_from(i)?);
-                let (mut committed, mut crossed, mut aborted, mut unknown, mut anomalies) = (0usize, 0usize, 0usize, 0usize, 0usize);
+                let (mut committed, mut crossed, mut aborted, mut unknown, mut anomalies) =
+                    (0usize, 0usize, 0usize, 0usize, 0usize);
                 for seed in 0..seeds {
-                    let checked = lan::elle(members.clone(), id, protocol, seed, shape, later(budget))?;
+                    let checked =
+                        lan::elle(members.clone(), id, protocol, seed, shape, later(budget))?;
                     committed = committed.saturating_add(checked.committed);
                     crossed = crossed.saturating_add(checked.crossed);
                     aborted = aborted.saturating_add(checked.aborted);
@@ -168,10 +215,15 @@ fn main() -> anyhow::Result<()> {
                     anomalies = anomalies.saturating_add(checked.anomalies.len());
                     if !checked.anomalies.is_empty() || checked.unknown > 0 {
                         failed = failed.saturating_add(1);
-                        println!("seed {seed} {}: {} unknown, {:#?}", lan::protocol_name(protocol), checked.unknown, checked.anomalies);
+                        out!(
+                            "seed {seed} {}: {} unknown, {:#?}",
+                            lan::protocol_name(protocol),
+                            checked.unknown,
+                            checked.anomalies
+                        );
                     }
                 }
-                println!(
+                out!(
                     "{{\"bench\":\"xgroup_elle\",\"protocol\":\"{}\",\"seeds\":{seeds},\"committed\":{committed},\"crossed\":{crossed},\"aborted\":{aborted},\"unknown\":{unknown},\"anomalies\":{anomalies}}}",
                     lan::protocol_name(protocol)
                 );
