@@ -6,8 +6,8 @@
 //! This is the one place the skipping module reads storage; the summaries themselves stay pure.
 
 use super::{
-    Candidates, Chooser, CrackerColumn, SkipCounts, SkipError, SkipRefusal, Skipping, ZoneMap,
-    ZoneMapBuilder,
+    Candidates, Chooser, CrackerColumn, SkipCounts, SkipError, SkipRefusal, Skipping, Upkeep,
+    ZoneMap, ZoneMapBuilder,
 };
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
@@ -114,6 +114,9 @@ pub enum SkipKind {
     /// Both, each filter answered by whichever measures cheaper on this column (lane skip-3,
     /// T-SKU.2).
     Measured,
+    /// [`SkipKind::Measured`], the method not leading dropped once its write upkeep passes its
+    /// cost to build again (lane skip-5, T-SKU.5: [`super::Upkeep::Capped`]).
+    MeasuredCapped,
 }
 
 /// The table's root page and the record index of its summarized column, refusing what can't be
@@ -144,6 +147,22 @@ fn summarized_column(
 }
 
 /// Every row's rowid and its column `column`'s integer value, in rowid order.
+pub(crate) fn nanos_since(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Lane skip-5 (T-SKU.5): a dropped cracker built again from the table's B-tree (rooted at
+/// `root`, `columns` wide) for its trial, at the caller's snapshot.
+pub(crate) fn cracker_of_table(
+    pager: Arc<crate::storage::pager::Pager>,
+    root: i64,
+    column: usize,
+    columns: usize,
+) -> Result<CrackerColumn, LeafBuildError> {
+    let mut cursor = BTreeCursor::new_table(pager, root, columns);
+    rows_of(&mut cursor, column).map(CrackerColumn::new)
+}
+
 fn rows_of(
     cursor: &mut BTreeCursor,
     column: usize,
@@ -197,11 +216,24 @@ pub fn set_skipping(
         SkipKind::Cracking => {
             rows_of(&mut cursor, index).map(|rows| Skipping::Cracking(CrackerColumn::new(rows)))
         }
-        SkipKind::Measured => zone_map_from_leaves(&mut cursor, index).and_then(|zones| {
-            rows_of(&mut cursor, index).map(|rows| {
-                Skipping::Measured(Box::new(Chooser::new(zones, CrackerColumn::new(rows))))
+        SkipKind::Measured | SkipKind::MeasuredCapped => {
+            // Lane skip-5 (T-SKU.5): each build timed, the cost to build it again if dropped.
+            let started = std::time::Instant::now();
+            zone_map_from_leaves(&mut cursor, index).and_then(|zones| {
+                let zones_cost = nanos_since(started);
+                let started = std::time::Instant::now();
+                rows_of(&mut cursor, index).map(|rows| {
+                    let cracker = CrackerColumn::new(rows);
+                    let upkeep = if kind == SkipKind::MeasuredCapped {
+                        Upkeep::Capped
+                    } else {
+                        Upkeep::KeepBoth
+                    };
+                    let cost = [Some(zones_cost), Some(nanos_since(started))];
+                    Skipping::Measured(Box::new(Chooser::with_upkeep(zones, cracker, upkeep, cost)))
+                })
             })
-        }),
+        }
     };
     match built {
         Ok(skipping) => {

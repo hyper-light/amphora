@@ -2714,6 +2714,19 @@ pub fn insn_to_row(
                 data.aggregates
             ),
         ),
+        Insn::SetSkipping {
+            table,
+            column,
+            kind,
+        } => (
+            "SetSkipping",
+            0,
+            0,
+            0,
+            Value::build_text(format!("{table}.{column}")),
+            0,
+            format!("skipping({table}.{column}) = {kind:?}"),
+        ),
         Insn::TreePages {
             cursor_id,
             target_reg,

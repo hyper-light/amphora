@@ -6996,6 +6996,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    /// Whether the store holds the database header yet: its bootstrap publishes it (from page 1,
+    /// or the log's replay). Until then page 1 is the header's only copy, as recovery's fallback
+    /// cookie reads it (G7 step 2, `AC-NS.2.1`: an open on the versioned storage reads its schema
+    /// before the store's bootstrap).
+    pub fn header_published(&self) -> bool {
+        self.global_header.read().is_some()
+    }
+
     pub fn with_header<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
     where
         F: Fn(&DatabaseHeader) -> T,

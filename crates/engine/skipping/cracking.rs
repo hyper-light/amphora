@@ -67,6 +67,16 @@ impl CrackerColumn {
         self.stats
     }
 
+    /// Every row the copy holds, (rowid, value), in no order (lane skip-5: zone maps are built
+    /// again from it).
+    pub fn rows(&self) -> Vec<(i64, Option<i64>)> {
+        self.entries
+            .iter()
+            .map(|(value, rowid)| (*rowid, Some(*value)))
+            .chain(self.others.iter().map(|rowid| (*rowid, None)))
+            .collect()
+    }
+
     pub fn crack_count(&self) -> usize {
         self.cracks.len()
     }

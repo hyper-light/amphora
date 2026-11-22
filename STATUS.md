@@ -1085,4 +1085,10 @@ skip (T-SKU.1).
 Lanes skip-3 and skip-4 (kiln goal 623adc1c): `PRAGMA skipping = 'table.column'` turns skipping
 on (T-SKU.3), and by default it keeps both kinds and answers each filter with whichever measured
 cheaper on that column's own scans, measuring the other again on a doubling schedule (T-SKU.2).
-Open: skipping scans in the fused column batches; the benchmark against DuckDB and ClickHouse.
+Lane skip-5: a skipping scan runs its body over the fused column batches up to each candidate
+run's end (T-SKU.4). `PRAGMA skipping = 't.a capped'` keeps the measured choice but drops the
+method not leading once its write upkeep passes its measured build cost (ski rental's break-even),
+building it again when its doubling-schedule trial comes due; `measured` (keep both) is the
+control (T-SKU.5). The setting now acts when its statement runs, by its own instruction, so a
+statement prepared before the data loads still skips it (T-SKU.6).
+Open: the benchmark against DuckDB and ClickHouse.

@@ -115,7 +115,14 @@ impl SkipRegistry {
     /// The write hook: `writer` (the connection's identity, its snapshot the newest commit
     /// `committed`, as it holds the write lock) wrote one row of the table at `root_page`. A write
     /// the summary refuses makes it stale.
-    pub fn on_write(&self, root_page: i64, writer: usize, committed: WalPos, write: RowWrite) {
+    pub fn on_write(
+        &self,
+        root_page: i64,
+        writer: usize,
+        committed: WalPos,
+        write: RowWrite,
+        now: &mut dyn FnMut() -> u64,
+    ) {
         let mut entries = self.entries.lock();
         let Some(entry) = entries
             .iter_mut()
@@ -131,7 +138,7 @@ impl SkipRegistry {
         if entry.stale {
             return;
         }
-        if entry.skipping.on_write(write).is_err() {
+        if entry.skipping.on_write_timed(write, now).is_err() {
             entry.stale = true;
         }
     }
@@ -231,6 +238,59 @@ impl SkipRegistry {
     }
 
     /// What the table at `root_page`'s summary has done, if one is kept.
+    /// Lane skip-5 (T-SKU.5): the dropped method a measured summary's trial waits on, if any.
+    pub fn rebuild_due(&self, root_page: i64) -> Option<SkipMethod> {
+        let entries = self.entries.lock();
+        match entries.iter().find(|entry| entry.root_page == root_page) {
+            Some(Entry {
+                skipping: Skipping::Measured(chooser),
+                stale: false,
+                ..
+            }) => chooser.rebuild_due(),
+            _ => None,
+        }
+    }
+
+    /// Builds a dropped zone map again from the cracker (in memory, under the lock).
+    pub fn rebuild_zones(&self, root_page: i64, now: &mut dyn FnMut() -> u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.root_page == root_page)
+        {
+            if let Skipping::Measured(chooser) = &mut entry.skipping {
+                if chooser.rebuild_zones(now).is_err() {
+                    entry.stale = true;
+                }
+            }
+        }
+    }
+
+    /// Installs a cracker the caller built again from the table, read when `writes` writes had
+    /// come in: refused (`false`) when another came in since, as the copy would miss it.
+    pub fn install_cracker(
+        &self,
+        root_page: i64,
+        writes: u64,
+        cracker: super::CrackerColumn,
+        cost: u64,
+    ) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.root_page == root_page)
+        else {
+            return false;
+        };
+        match &mut entry.skipping {
+            Skipping::Measured(chooser) if entry.counts.writes == writes && !entry.stale => {
+                chooser.install_cracker(cracker, cost);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn counts(&self, root_page: i64) -> Option<SkipCounts> {
         let entries = self.entries.lock();
         entries
