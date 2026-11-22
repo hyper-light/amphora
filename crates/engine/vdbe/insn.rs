@@ -348,6 +348,9 @@ pub struct SorterCountedData {
     /// Amphora (PL.13, lane replan-10): for a sorter fed by an inner join, the check of its rows
     /// against the rows the plan read for the whole join, in place of `table`'s and `filter`'s.
     pub joined: Option<CountedCheck>,
+    /// Amphora (PL.13, lane replan-12): whether `joined` is a SELECT DISTINCT's rows, the sorter
+    /// after it holding them, rather than a join's.
+    pub distinct: bool,
 }
 
 /// A stored result's rows checked against the rows the plan read for it (PL.13, lane replan-10):

@@ -141,6 +141,42 @@ pub(crate) fn join_identity(
     tables: &[crate::translate::plan::JoinedTable],
     where_clause: &[crate::translate::plan::WhereTerm],
 ) -> Option<u64> {
+    let (names, each) = read_parts(tables, where_clause)?;
+    join_identity_of(names, each)
+}
+
+/// The identity of a SELECT DISTINCT's rows (PL.13, lane replan-12: a DISTINCT sorter's own
+/// count): the rows it reads, keyed as a whole join's are ([join_identity]: the tables, each outer,
+/// semi or anti join's mark and the WHERE and ON terms), and the result columns made distinct, as
+/// a GROUP BY's groups are its rows and its keys. Column order and a column repeated change no
+/// count, so the columns are a set; one table without a term has an identity too. `None` for a
+/// term or a column that reads a parameter. Its count is the distinct rows an ORDER BY sorter
+/// after the DISTINCT held; the planner reads it for the DISTINCT's output rows
+/// (`optimizer::distinct_rows`), apart from the rows read, which the sorter does not see.
+pub(crate) fn distinct_identity(
+    tables: &[crate::translate::plan::JoinedTable],
+    where_clause: &[crate::translate::plan::WhereTerm],
+    result_columns: &[crate::translate::plan::ResultSetColumn],
+) -> Option<u64> {
+    let (mut names, mut each) = read_parts(tables, where_clause)?;
+    let mut columns = Vec::new();
+    for column in result_columns {
+        columns.push(crate::filter_shares::term_fingerprint(&column.expr)?);
+    }
+    names.sort_unstable();
+    each.sort_unstable();
+    each.dedup();
+    columns.sort_unstable();
+    columns.dedup();
+    Some(part(("DISTINCT", names, each, columns)))
+}
+
+/// The parts of [join_identity]: each table's [table_part], and each term's fingerprint with each
+/// outer, semi or anti join's mark; `None` for a term that reads a parameter.
+fn read_parts(
+    tables: &[crate::translate::plan::JoinedTable],
+    where_clause: &[crate::translate::plan::WhereTerm],
+) -> Option<(Vec<u64>, Vec<u64>)> {
     let mut each = Vec::new();
     for term in where_clause {
         let fingerprint = crate::filter_shares::term_fingerprint(&term.expr)?;
@@ -161,7 +197,7 @@ pub(crate) fn join_identity(
         }
         names.push(table_part(&name));
     }
-    join_identity_of(names, each)
+    Some((names, each))
 }
 
 /// A part of a join's identity: the hash of `value`.

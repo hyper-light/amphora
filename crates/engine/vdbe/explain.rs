@@ -2749,6 +2749,10 @@ pub fn insn_to_row(
             Value::build_text(""),
             0,
             match (&data.joined, &data.filter) {
+                (Some(joined), _) if data.distinct => format!(
+                    "count sorter[{}] against the distinct rows from {} at {} rows",
+                    data.cursor_id, data.table, joined.planned_rows
+                ),
                 (Some(joined), _) => format!(
                     "count sorter[{}] against the join from {} at {} rows",
                     data.cursor_id, data.table, joined.planned_rows

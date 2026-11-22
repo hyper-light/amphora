@@ -1663,3 +1663,84 @@ fn t_pl_13_20_a_sorter_fed_by_a_semi_or_anti_join_past_the_estimate_plans_again(
         );
     }
 }
+
+/// Do: a SELECT DISTINCT of `b.k` ORDER BY it descending (no index on it: a sorter after the
+/// DISTINCT holds its rows), over 5,000 rows holding 20 values of `k`, unfiltered and filtered by a
+/// range; the plan estimates the DISTINCT's rows as the rows read, which its EXPLAIN states and
+/// the test checks first (at least twice the 20 distinct rows, past any band of statistics' error
+/// under one). Run each with adaptive joins off, then on twice in one prepared statement, and in a
+/// statement prepared after. Expect: one answer, in order, every way; off, no sorter counted; on,
+/// the sorter's distinct rows counted against the DISTINCT's own estimate, past its error the
+/// count stored under the DISTINCT's identity and the statement planned again once; nothing plans
+/// again after, the new plans reading the stored count (PL.13, lane replan-12, T-PL.13.21: a
+/// DISTINCT sorter's own count, at its materialization point).
+#[test]
+fn t_pl_13_21_a_distinct_sorters_rows_past_the_estimate_plan_again() {
+    let (_dir, conn) = open("distinct_sorter.db");
+    for sql in [
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)",
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i % 20, i FROM n",
+        "ANALYZE",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for (case, sql) in [
+        ("unfiltered", "SELECT DISTINCT k FROM b ORDER BY k DESC"),
+        (
+            "filtered",
+            "SELECT DISTINCT k FROM b WHERE v > 0 ORDER BY k DESC",
+        ),
+    ] {
+        conn.set_adaptive_joins(true);
+        let planned = planned_rows(&conn, sql, "SorterCounted", " at ");
+        let [estimate] = planned[..] else {
+            panic!("{case}: one sorter counted against the DISTINCT: {planned:?}");
+        };
+        assert!(
+            estimate >= 2.0 * 20.0,
+            "{case}: the DISTINCT estimated at {estimate} rows, near its 20"
+        );
+
+        conn.set_adaptive_joins(false);
+        let checks = conn.adaptive_sort_checks();
+        let off = run_rows(&mut conn.prepare(sql).unwrap());
+        assert_eq!(off.len(), 20, "{case}: the distinct rows");
+        assert_eq!(conn.adaptive_sort_checks(), checks, "{case}: counted off");
+
+        conn.set_adaptive_joins(true);
+        let replans = conn.adaptive_replans();
+        let mut held = conn.prepare(sql).unwrap();
+        assert_eq!(run_rows(&mut held), off, "{case}: on and off differ");
+        assert!(
+            conn.adaptive_sort_checks() > checks,
+            "{case}: the DISTINCT's sorter was not counted"
+        );
+        assert_eq!(
+            conn.adaptive_replans() - replans,
+            1,
+            "{case}: planned again once"
+        );
+        let (checks, replans) = (conn.adaptive_sort_checks(), conn.adaptive_replans());
+        assert_eq!(run_rows(&mut held), off, "{case}: the second run's answer");
+        assert!(
+            conn.adaptive_sort_checks() > checks,
+            "{case}: the second sorter was not counted"
+        );
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+        assert_eq!(
+            run_rows(&mut conn.prepare(sql).unwrap()),
+            off,
+            "{case}: a new statement's answer"
+        );
+        assert_eq!(
+            conn.adaptive_replans(),
+            replans,
+            "{case}: a new statement planned again"
+        );
+        assert_eq!(
+            planned_rows(&conn, sql, "SorterCounted", " at "),
+            vec![20.0],
+            "{case}: a new plan reads the stored count"
+        );
+    }
+}

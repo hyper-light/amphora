@@ -1777,9 +1777,12 @@ run, a left-deep plan (a bushy run is joined among itself), a prefix of two tabl
 every table the input reads. A single table's filtered materialized input is not checked.
 `t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again` (T-PL.13.18): `r JOIN s JOIN t` by
 hash joins only, `s` the first join's probe and the second's build, so the second's input is
-materialized from `r` and `s`; every `s.k` set to `r`'s common value after ANALYZE (20 rows
-estimated for the pair, 2,000 counted): one answer with adaptive joins off and on, the prefix
-counted, one re-plan, none after. A superset of a corrected prefix keeps its own estimate (the
+materialized from a two-table prefix: the prefix the first plan holds is read from its EXPLAIN
+(lane replan-12) before the data changes, and only then is that prefix thrown off its estimate
+(`{r, s}`: every `s.k` set to `r`'s common value, 20 rows estimated, 2,000 counted; `{s, t}`: 2,000
+estimated, 200 counted) and the other left on its own, so the test forces its premise whichever
+prefix the planner picks: one answer with adaptive joins off and on, the prefix counted, one
+re-plan, none after. A superset of a corrected prefix keeps its own estimate (the
 whole join's store corrects the whole join only); carrying a prefix's correction into the sets
 that hold it is not built. Evidence: `pl_13_a_filtered_builds_share_past_its_estimate_plans_again`
 (`crates/engine/tests/adaptive_joins.rs`; T-PL.13.5), a range one row in a hundred passed at
@@ -1828,11 +1831,26 @@ joins off and on, one re-plan, none after. So is a semi or anti join (an EXISTS 
 unnested), whose whole set's estimate is the rows it keeps, its table adding a part of its own to
 the identity, one for a semi and another for an anti join:
 `t_pl_13_20_a_sorter_fed_by_a_semi_or_anti_join_past_the_estimate_plans_again` (T-PL.13.20), by
-hash joins only, `b`'s keys ten values none of `a`'s at ANALYZE (10 rows kept by the EXISTS and 990
-by the NOT EXISTS, estimated) and covering all of `a`'s after (1,000 and none): one answer in order
-each way, one re-plan each, none after. A RIGHT or FULL JOIN (its unmatched right rows read apart),
-a DISTINCT sorter (it holds the distinct rows, not the join's), or a table without statistics, is
-not checked.
+hash joins only, `b`'s keys ten values none of `a`'s at ANALYZE; the rows each plan checks its
+sorter against are read from its EXPLAIN first (lane replan-12), and `b`'s keys then set to cover
+all of `a`'s or none, whichever keeps the farther of none and all 1,000 rows from that estimate:
+one answer in order each way, one re-plan each, none after. A RIGHT or FULL JOIN (its unmatched
+right rows read apart), or a table without statistics, is not checked.
+
+A sorter after a SELECT DISTINCT (lane replan-12) takes a row only once the DISTINCT has dropped
+its duplicates, so it holds the distinct rows, which neither a table's counter nor a join's count
+corrects. Its correction is a store of its own in `SubqueryRows`, under the DISTINCT's identity
+(`subquery_rows::distinct_identity`): the rows it reads keyed as a whole join's are, and the
+result columns made distinct as a set, as a GROUP BY's groups are its rows and its keys. The
+planner's estimate of the DISTINCT's output rows (the rows read) reads a count stored there in
+its place and notes the rows it read (`optimizer::distinct_rows`, for one run, with no GROUP BY,
+aggregate or window), and the sorter, once all in, is checked against them
+(`main_loop::distinct_sorter_check`, `SorterCounted` marked `distinct`), the band each table's
+statistics' error in quadrature, as the estimate is the rows read; past it the count is stored and
+the plan made again. `t_pl_13_21_a_distinct_sorters_rows_past_the_estimate_plan_again`
+(T-PL.13.21): `SELECT DISTINCT k ... ORDER BY k DESC` over 5,000 rows holding 20 values, unfiltered
+and filtered: one answer in order with adaptive joins off and on, one re-plan, none after, and a
+new plan reads the 20 rows stored.
 `t_pl_13_15_a_sorter_fed_by_a_join_past_the_estimate_plans_again` (T-PL.13.15): a join estimated
 at 1,000 rows from distinct keys, holding 4,500 after an UPDATE: one answer, in order, with adaptive
 joins off and on, one re-plan, none on the second run or in a new statement.

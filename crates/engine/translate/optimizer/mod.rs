@@ -1295,6 +1295,7 @@ fn find_select_plan_form(
     if let Some(table_plan) = table_plan.as_ref() {
         let rows_before_limit =
             estimate_select_output_rows(plan, table_plan.join.output_cardinality, schema);
+        let rows_before_limit = distinct_rows(plan, rows_before_limit, params);
         let mut rows = rows_before_limit;
         if let Some(limit_rows) = plan.limit.as_deref().and_then(literal_limit_rows) {
             rows = rows.min(limit_rows);
@@ -2480,6 +2481,39 @@ fn group_count_from_index_stats<'a>(
             },
         )
         .map(|(groups, rows_per_group)| (groups, rows_per_group, table_stats))
+}
+
+/// Amphora (PL.13, lane replan-12; `docs/design/planner.md`, "Stored subquery results"): a SELECT
+/// DISTINCT's output rows, where an ORDER BY sorter after the DISTINCT counted them past their
+/// estimate (`main_loop::distinct_sorter_check`), stand in for the estimate, and the rows planned
+/// on are noted under the DISTINCT's identity (`subquery_rows::distinct_identity`) for the sorter
+/// to check. The estimate itself is `rows`, the rows read, as before. Only where the plan reads
+/// such counts (adaptive joins on), for one run (`input_cardinality_hint` at most one), with no
+/// GROUP BY, aggregate or window between the read and the DISTINCT.
+fn distinct_rows(plan: &SelectPlan, rows: f64, params: &cost_params::CostModelParams) -> f64 {
+    let Some(values) = params
+        .plan_values
+        .as_deref()
+        .filter(|values| values.reads_subquery_rows())
+    else {
+        return rows;
+    };
+    if !plan.distinctness.is_distinct()
+        || plan.group_by.is_some()
+        || !plan.aggregates.is_empty()
+        || plan.window.is_some()
+        || plan.input_cardinality_hint.unwrap_or(1.0) > 1.0
+    {
+        return rows;
+    }
+    match crate::subquery_rows::distinct_identity(
+        plan.joined_tables(),
+        &plan.where_clause,
+        &plan.result_columns,
+    ) {
+        Some(identity) => values.subquery_rows(identity, rows),
+        None => rows,
+    }
 }
 
 /// Amphora (PL.13, lane replan-11; `docs/design/planner.md`, "Filtered builds"): once the join

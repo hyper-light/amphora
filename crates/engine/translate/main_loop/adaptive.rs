@@ -118,6 +118,9 @@ fn counted_check(
 /// made from them again. Only a sorter that takes every row: one beside a hash table of groups
 /// (`GroupByRowSource::Sorter`'s `hash`) takes only the rows of groups past its budget, and is
 /// not checked; nor is a GROUP BY under a window.
+///
+/// After a SELECT DISTINCT (lane replan-12), the sorter holds the distinct rows, not the rows
+/// read: they are checked against the DISTINCT's own count ([distinct_sorter_check]).
 pub(crate) fn emit_sorter_count(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
@@ -131,8 +134,28 @@ pub(crate) fn emit_sorter_count(
         || (grouped && plan.group_by.is_none())
         || plan.window.is_some()
         || plan.contains_constant_false_condition
-        || !matches!(plan.distinctness, Distinctness::NonDistinct)
     {
+        return;
+    }
+    // PL.13 (lane replan-12): after a DISTINCT, the sorter holds its distinct rows, checked against
+    // the DISTINCT's own count.
+    if !matches!(plan.distinctness, Distinctness::NonDistinct) {
+        if grouped {
+            return;
+        }
+        if let Some((table, check)) = distinct_sorter_check(t_ctx, plan) {
+            program.emit_insn(Insn::SorterCounted {
+                data: Box::new(crate::vdbe::insn::SorterCountedData {
+                    cursor_id,
+                    table,
+                    analyzed_rows: 0.0,
+                    estimate_error: check.estimate_error,
+                    filter: None,
+                    joined: Some(check),
+                    distinct: true,
+                }),
+            });
+        }
         return;
     }
     let joined = match plan.joined_tables() {
@@ -147,6 +170,7 @@ pub(crate) fn emit_sorter_count(
                         estimate_error: check.estimate_error,
                         filter: None,
                         joined: Some(check),
+                        distinct: false,
                     }),
                 });
             }
@@ -186,6 +210,7 @@ pub(crate) fn emit_sorter_count(
             estimate_error,
             filter,
             joined: None,
+            distinct: false,
         }),
     });
 }
@@ -239,6 +264,44 @@ fn joined_sorter_check(
             rows: planned.rows,
             planned_rows: planned.planned_rows,
             estimate_error: f64::sqrt(squared_error),
+        },
+    ))
+}
+
+/// Amphora (PL.13, lane replan-12: a DISTINCT sorter's own count): an ORDER BY sorter after a
+/// SELECT DISTINCT takes a row only once the DISTINCT has dropped its duplicates
+/// (`EmitOrderBy::sorter_insert`), so it holds the DISTINCT's rows, not the rows read: they
+/// are checked against the rows the plan read for the DISTINCT (`optimizer::distinct_rows`), noted
+/// under its identity (`subquery_rows::distinct_identity`), where a count past them is stored for
+/// the planner. The estimate is the rows read, so the band is the statistics' error of each table
+/// read, independent, in quadrature, as a stored subquery result's ([tables_error]). `None` where
+/// it is not checked: adaptive joins off, a table without statistics, a term or column reading a
+/// parameter, or no rows noted for the DISTINCT. With the check, the name of the first table, for
+/// EXPLAIN.
+fn distinct_sorter_check(
+    t_ctx: &TranslateCtx,
+    plan: &crate::translate::plan::SelectPlan,
+) -> Option<(String, crate::vdbe::insn::CountedCheck)> {
+    if !t_ctx.resolver.adaptive_joins() {
+        return None;
+    }
+    let identity = crate::subquery_rows::distinct_identity(
+        plan.joined_tables(),
+        &plan.where_clause,
+        &plan.result_columns,
+    )?;
+    let planned = t_ctx
+        .resolver
+        .plan_values()
+        .and_then(|values| values.planned_subquery(identity))?;
+    let estimate_error = tables_error(&t_ctx.resolver, plan)?;
+    let first = plan.joined_tables().first()?.table.get_name().to_string();
+    Some((
+        first,
+        crate::vdbe::insn::CountedCheck {
+            rows: planned.rows,
+            planned_rows: planned.planned_rows,
+            estimate_error,
         },
     ))
 }
