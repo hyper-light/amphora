@@ -20,16 +20,19 @@
 //! skip only rows whose integer value the filter's integer bounds exclude.
 //!
 //! Sizes: a zone's rows are a leaf's rows, as the builder is told where each leaf ends (no picked
-//! run size); rows appended past the last zone start a new zone once the tail holds as many rows as
-//! the built runs held on average (the leaves' measured fill). The cracker's pieces are cut where
-//! the filters asked, no smaller or larger by any picked rule.
+//! run size; [`zone_map_of_table`] walks the table's own leaves); rows appended past the last
+//! zone start a new zone once the tail holds as many rows as the built runs held on average (the
+//! leaves' measured fill). The cracker's pieces are cut where the filters asked, no smaller or
+//! larger by any picked rule.
 //!
 //! The switch is per table and per column: a connection that turns neither on pays nothing.
 
 mod cracking;
+mod leaves;
 mod zone_map;
 
 pub use cracking::{CrackerColumn, CrackerStats};
+pub use leaves::{zone_map_of_table, LeafBuildError};
 pub use zone_map::{RowidRange, ZoneMap, ZoneMapBuilder, ZoneStats};
 
 /// One finished write to the summarized table, as the write path hands it to the hook: the row's

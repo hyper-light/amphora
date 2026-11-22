@@ -984,5 +984,5 @@ criteria = [
   { id = "AC-G5.4.2", text = "filter_no_index at 1 client with the winner rises at least 1000% against step 3 (measured by the coordinator)" },
 ]
 tests = [
-  { id = "T-G5.4.1", text = "skipping::tests::t_g5_4_1_* — passes when, with writes between scans, each prototype's candidates hold exactly a plain scan's rows, no row missed and none stale" },
+  { id = "T-G5.4.1", text = "skipping::tests::t_g5_4_1_* — passes when, with writes between scans, each prototype's candidates hold exactly a plain scan's rows, no row missed and none stale; zone maps built from a real table's leaves (one zone a leaf) with SQL writes between scans read exactly the plain scan's rows through the engine" },
 ]

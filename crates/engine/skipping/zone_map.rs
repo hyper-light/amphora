@@ -162,6 +162,13 @@ impl ZoneMap {
         self.zones.len()
     }
 
+    /// The rows the zones hold, all told.
+    pub fn rows(&self) -> Result<u64, SkipError> {
+        self.zones.iter().try_fold(0u64, |sum, zone| {
+            sum.checked_add(zone.rows()?).ok_or(SkipError::Overflow)
+        })
+    }
+
     /// The zone covering `rowid`, made or widened to cover it when no zone does yet.
     fn zone_for_insert(&mut self, rowid: i64) -> Result<&mut Zone, SkipError> {
         let after = self.zones.partition_point(|zone| zone.start <= rowid);

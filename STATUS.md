@@ -807,12 +807,14 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Open: SQL tables don't keep a copy yet, so
   no SQL statement reaches it; step 4's vectorized scan replaces `Columns::scan` there; the
   classes against CedarDB and ClickHouse (AC-CS.5.2) are the coordinator's.
-- **G5 step 4, skipping rows** (docs/design/executor.md decision 10; AC-G5.4.1, T-G5.4.1; lane
-  g5s4): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf runs and
-  database cracking behind one switch, each kept from the write path through one hook; with writes
-  between scans each names exactly what a plain scan finds (T-G5.4.1). Open: the scan and write
-  costs (`crates/engine/tests/skipping_bench.rs`), the choice they make, and the VDBE's scan and
-  write opcodes calling the switch.
+- **G5 step 4, skipping rows** (docs/design/executor.md decision 10; AC-G5.4.1, T-G5.4.1; lanes
+  g5s4, g5s4b): built, not measured, not wired. `crates/engine/skipping` holds zone maps over leaf
+  runs and database cracking behind one switch, each kept from the write path through one hook;
+  zone maps are built from the table's own leaves (`zone_map_of_table`), one zone a leaf. With
+  writes between scans each names exactly what a plain scan finds, in the model and on a real table
+  through SQL (T-G5.4.1). Open: the scan and write costs (`crates/engine/tests/skipping_bench.rs`,
+  through the engine), the choice they make, and the VDBE's scan and write opcodes calling the
+  switch.
 
 ## Open
 

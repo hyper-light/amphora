@@ -296,3 +296,181 @@ fn t_g5_4_1_disagreements_are_refused() {
         })
     );
 }
+
+/// A real table's leaves (G5 step 4: run sizes from measured data): an in-memory database whose
+/// rows span many leaves.
+mod leaves {
+    use super::super::{zone_map_of_table, LeafBuildError, RowWrite, ZoneMap};
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+    use crate::{Connection, Database, SqliteDialect, Value};
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+
+    fn open() -> Arc<Connection> {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        db.connect(crate::ConnectOpts::new()).unwrap()
+    }
+
+    fn query(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+        let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        stmt.run_collect_rows()
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    fn rowids(conn: &Arc<Connection>, sql: &str) -> Vec<i64> {
+        query(conn, sql)
+            .into_iter()
+            .map(|row| match row.first() {
+                Some(Value::Numeric(crate::Numeric::Integer(rowid))) => *rowid,
+                other => panic!("{sql}: rowid {other:?}"),
+            })
+            .collect()
+    }
+
+    fn build(conn: &Arc<Connection>, table: &str) -> ZoneMap {
+        zone_map_of_table(conn, table, "a").unwrap()
+    }
+
+    /// A row's column `a` as the hook takes it (`None`: not an integer).
+    fn value_of(conn: &Arc<Connection>, rowid: i64) -> Option<i64> {
+        match query(conn, &format!("SELECT a FROM t WHERE rowid = {rowid}"))
+            .first()
+            .and_then(|row| row.first())
+        {
+            Some(Value::Numeric(crate::Numeric::Integer(a))) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// Do: build zone maps over two tables whose rows differ only in size. Expect: one zone per
+    /// leaf, so the table with larger rows has fewer rows a zone; every row is in some zone.
+    #[test]
+    fn t_g5_4_1_zones_follow_the_tables_leaves() {
+        let conn = open();
+        for (table, pad) in [("small", 40), ("large", 400)] {
+            conn.execute(format!("CREATE TABLE {table}(a INTEGER, pad BLOB)"))
+                .unwrap();
+            conn.execute(format!(
+                "INSERT INTO {table} SELECT value, randomblob({pad}) FROM generate_series(1, 4000)"
+            ))
+            .unwrap();
+        }
+        let small = build(&conn, "small");
+        let large = build(&conn, "large");
+        assert_eq!(small.rows().unwrap(), 4000);
+        assert_eq!(large.rows().unwrap(), 4000);
+        assert!(small.zone_count() > 1, "small rows fill several leaves");
+        assert!(
+            large.zone_count() > small.zone_count(),
+            "larger rows fill more leaves: {} against {}",
+            large.zone_count(),
+            small.zone_count()
+        );
+    }
+
+    /// Do: ask for zone maps of what holds no stored column. Expect: typed refusals.
+    #[test]
+    fn t_g5_4_1_no_table_or_column_is_refused() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a)")
+            .unwrap();
+        conn.execute("CREATE VIEW v AS SELECT a FROM t").unwrap();
+        assert!(matches!(
+            zone_map_of_table(&conn, "v", "a"),
+            Err(LeafBuildError::NoTable { .. })
+        ));
+        assert!(matches!(
+            zone_map_of_table(&conn, "t", "b"),
+            Err(LeafBuildError::NoColumn { .. })
+        ));
+        assert!(matches!(
+            zone_map_of_table(&conn, "t", "id"),
+            Err(LeafBuildError::NoColumn { .. })
+        ));
+        assert_eq!(
+            zone_map_of_table(&conn, "t", "a").unwrap().rows().unwrap(),
+            0
+        );
+    }
+
+    /// Do: zone maps built from a real table's leaves, SQL writes between scans fed to the hook,
+    /// each filter read only from the candidate ranges. Expect: the same rows as a plain scan.
+    #[test]
+    fn t_g5_4_1_real_leaves_writes_between_scans_match_a_plain_scan() {
+        let mut rng = ChaCha8Rng::seed_from_u64(54);
+        let conn = open();
+        conn.execute("CREATE TABLE t(a, pad BLOB)").unwrap();
+        // A time-ordered column (it follows the rowid), some values not integers.
+        conn.execute(
+            "INSERT INTO t SELECT CASE WHEN value % 97 = 0 THEN 'x' ELSE value / 3 END, \
+             randomblob(120) FROM generate_series(1, 3000)",
+        )
+        .unwrap();
+        let mut zones = build(&conn, "t");
+        let mut next = 3000i64;
+        let mut skipped_any = false;
+        for _ in 0..60 {
+            for _ in 0..10 {
+                let write = match rng.random_range(0..3) {
+                    0 => {
+                        next += 1;
+                        let value = next / 3 + rng.random_range(-5..=5);
+                        conn.execute(format!("INSERT INTO t VALUES ({value}, randomblob(120))"))
+                            .unwrap();
+                        RowWrite::Insert {
+                            rowid: next,
+                            value: Some(value),
+                        }
+                    }
+                    pick => {
+                        let rowid = rng.random_range(1..=next);
+                        if query(&conn, &format!("SELECT 1 FROM t WHERE rowid = {rowid}"))
+                            .is_empty()
+                        {
+                            continue;
+                        }
+                        let old = value_of(&conn, rowid);
+                        if pick == 1 {
+                            conn.execute(format!("DELETE FROM t WHERE rowid = {rowid}"))
+                                .unwrap();
+                            RowWrite::Delete { rowid, old }
+                        } else {
+                            let new = rng.random_range(-100..=1_200);
+                            conn.execute(format!("UPDATE t SET a = {new} WHERE rowid = {rowid}"))
+                                .unwrap();
+                            RowWrite::Update {
+                                rowid,
+                                old,
+                                new: Some(new),
+                            }
+                        }
+                    }
+                };
+                zones.on_write(write).unwrap();
+            }
+            let lo = rng.random_range(-50..=1_100);
+            let hi = lo + rng.random_range(0..60);
+            let filter = format!("typeof(a) = 'integer' AND a BETWEEN {lo} AND {hi}");
+            let plain = rowids(
+                &conn,
+                &format!("SELECT rowid FROM t WHERE {filter} ORDER BY rowid"),
+            );
+            let ranges = zones.candidate_ranges(lo, hi);
+            let mut found = Vec::new();
+            for range in &ranges {
+                found.extend(rowids(
+                    &conn,
+                    &format!(
+                        "SELECT rowid FROM t WHERE rowid BETWEEN {} AND {} AND {filter} ORDER BY rowid",
+                        range.first, range.last
+                    ),
+                ));
+            }
+            assert_eq!(found, plain, "filter {lo}..={hi}, ranges {ranges:?}");
+            skipped_any |= zones.stats().zones_skipped > 0;
+        }
+        assert!(skipped_any, "the zones skipped some leaves");
+    }
+}
