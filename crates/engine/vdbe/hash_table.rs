@@ -275,6 +275,11 @@ impl HashEntry {
         !self.payload_values.is_empty()
     }
 
+    /// Amphora (QT.5, T-QT.5.7): an entry's bytes past its keys and payload as the memory budget
+    /// counts them: its hash and its rowid, 8 bytes each. The planner's hash entry is a build row
+    /// plus these (`CostModelParams::with_hash_build`).
+    pub(crate) const FIXED_BYTES: usize = 8 + 8;
+
     /// Get the size of this entry in bytes (approximate).
     /// This is a lightweight estimate for memory budgeting, not a precise measurement.
     fn size_bytes(&self) -> usize {
@@ -290,7 +295,7 @@ impl HashEntry {
         };
         let key_size: usize = key_values.iter().map(value_size).sum();
         let payload_size: usize = payload_values.iter().map(value_size).sum();
-        key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
+        key_size + payload_size + Self::FIXED_BYTES
     }
 
     /// Calculate the serialized size of a single Value.
