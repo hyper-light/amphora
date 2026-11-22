@@ -304,6 +304,9 @@ struct Control {
     /// ([`ReplicaHandle::on_sent`]). One: a member's records have one host to take them.
     sent_waker: Mutex<Option<std::task::Waker>>,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
+    /// Told, under `status`, when the published status names another leader or term, and when the
+    /// owner ends ([`ReplicaHandle::wait_leader`]).
+    led: std::sync::Condvar,
     meter: Arc<ReplicaMeter>,
     local: Local,
     bell: Arc<Bell>,
@@ -1299,6 +1302,44 @@ impl ReplicaHandle {
         Ok(())
     }
 
+    /// Waits until this member's published status names a leader in a term past `past` (0: any
+    /// leader), and answers that status (lane ryw-5, kiln goal 8119f25d; replication.md, "A host
+    /// waits for a leader on the owner's word"). The owner tells this wait each time its step
+    /// publishes another leader or term, and as it ends, so a host waits for its group's first
+    /// leader, or for the next one after a call the lead's move refused, with no retry timer.
+    /// Refused Timeout at `until`; Fenced once the owner ended or is fenced.
+    pub fn wait_leader(&self, past: u64, until: Instant) -> Result<ReplicaStatus, Refusal> {
+        let mut status = locked(&self.shared.status)?;
+        loop {
+            // Read under `status`: an owner dropped mid-run releases its reads before it tells
+            // this wait, so the end is seen here or heard below.
+            if locked(&self.shared.local.open)?.is_none() {
+                return Err(fenced("replica owner ended"));
+            }
+            match &*status {
+                Err(ended) => return Err(ended.clone()),
+                Ok(now) => {
+                    if let Some(reason) = &now.fenced {
+                        return Err(fenced(reason));
+                    }
+                    if now.leader != 0 && now.term > past {
+                        return Ok(now.clone());
+                    }
+                }
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Refusal::Timeout);
+            }
+            status = self
+                .shared
+                .led
+                .wait_timeout(status, left)
+                .map_err(|_| fenced("the status lock was poisoned"))?
+                .0;
+        }
+    }
+
     pub fn status(&self) -> Result<ReplicaStatus, Refusal> {
         locked(&self.shared.status)?.clone()
     }
@@ -1621,6 +1662,7 @@ fn open_on<F: BlockFile + 'static>(
         sent: std::sync::Condvar::new(),
         sent_waker: Mutex::new(None),
         status: Mutex::new(Ok(status(&replica))),
+        led: std::sync::Condvar::new(),
         meter,
         local,
         bell: Arc::clone(&bell),
@@ -1888,6 +1930,12 @@ impl<F: BlockFile + 'static> Drop for Actor<F> {
             self.control.moved.notify_all();
             drop(closed);
         }
+        // And hosts waiting for a leader (under its lock, so none misses it): they find the
+        // local reads released, as the owner's end.
+        if let Ok(status) = self.control.status.lock() {
+            self.control.led.notify_all();
+            drop(status);
+        }
     }
 }
 impl<F: BlockFile + 'static> Actor<F> {
@@ -1987,6 +2035,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         }
         if let Ok(mut status) = self.control.status.lock() {
             *status = Err(reason.clone());
+            // Hosts waiting for a leader hear it ended.
+            self.control.led.notify_all();
         }
         // Local reads end with the owner: none opens again, and the idle readers let its lease go.
         self.control.local.release();
@@ -2254,7 +2304,16 @@ impl<F: BlockFile + 'static> Actor<F> {
         let entries = self.replica.applied().index.saturating_sub(applied);
         let took = (self.clock)().saturating_duration_since(at);
         self.spacing.stepped(entries, took, queued)?;
-        *locked(&self.control.status)? = Ok(status(&self.replica));
+        {
+            let now = status(&self.replica);
+            let mut published = locked(&self.control.status)?;
+            let led =
+                !matches!(&*published, Ok(was) if was.leader == now.leader && was.term == now.term);
+            *published = Ok(now);
+            if led {
+                self.control.led.notify_all();
+            }
+        }
         self.publish_closed()?;
         let commits = self.replica.core().raft.commit_stats();
         self.control.meter.stepped(
@@ -10351,6 +10410,54 @@ mod tests {
         );
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// Lane ryw-5 (kiln goal 8119f25d; replication.md, "A host waits for a leader on the owner's
+    /// word"): a host waits for a leader on the status its member's owner publishes, not on a
+    /// retry timer. Do: three voters; with no leader, wait for one with no time left; a waiter on
+    /// member 2 for any leader; elect one; wait for a leader past its term with no time left; a
+    /// waiter for one past that term; hand the lead to another member; a waiter for a term past
+    /// that one; member 2's owner dropped mid-run. Expect: Timeout with no leader; the first
+    /// waiter answered with the elected leader and its term; Timeout with none past it; the second
+    /// waiter answered with the new leader in a later term; the third refused Fenced as the owner
+    /// ends. Each waiter's guard is `HANG_READ`: a hang, never a verdict.
+    #[test]
+    fn a_host_waits_for_a_leader_on_the_owners_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let waiter = |past: u64| {
+            let handle = clients[1].handle();
+            std::thread::spawn(move || handle.wait_leader(past, Instant::now() + HANG_READ))
+        };
+        assert_eq!(
+            clients[1].handle().wait_leader(0, Instant::now()),
+            Err(Refusal::Timeout)
+        );
+        let first = waiter(0);
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        let led = first.join().unwrap().unwrap();
+        assert_eq!(led.leader, u64::try_from(leader + 1).unwrap());
+        assert!(led.term > 0);
+        assert_eq!(
+            clients[1].handle().wait_leader(led.term, Instant::now()),
+            Err(Refusal::Timeout)
+        );
+        let second = waiter(led.term);
+        let to = (leader + 1) % clients.len();
+        driven.transfer(&mut pump, &clients, leader, to);
+        let moved = second.join().unwrap().unwrap();
+        assert_eq!(moved.leader, u64::try_from(to + 1).unwrap());
+        assert!(moved.term > led.term);
+        driven.drain(&mut pump);
+        pump.finish();
+        let third = waiter(moved.term);
+        drop(driven.owners.get_mut(1).unwrap().take());
+        let ended = third.join().unwrap();
+        assert!(matches!(ended, Err(Refusal::Fenced(_))), "{ended:?}");
     }
 
     /// CP-T1.8, AC-WK.1.2: an owner with nothing to do waits until its next deadline: its next

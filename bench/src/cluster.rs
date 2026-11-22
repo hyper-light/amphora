@@ -43,6 +43,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use amphora::database::{Database, ReadMode};
+use amphora_api::Refusal;
 use amphora_api::replication::ReplicaConfig;
 
 use crate::{Hist, Rng, NONE, RARE, schema, summary};
@@ -264,20 +265,33 @@ fn relay(partitions: &[Partition], stop: &AtomicBool, bell: &Arc<Bell>, wait: Re
     }
 }
 
-/// The schema through member 1, once its group has a leader (a refusal before one is retried
-/// until the deadline).
+/// The schema through member 1, once its group has a leader: it waits on the status member 1's
+/// owner publishes (`ReplicaHandle::wait_leader`; lane ryw-5, replication.md, "A host waits for a
+/// leader on the owner's word"), never a retry timer. A call the lead's move refused (`NotLeader`,
+/// `UnknownOutcome`, `Unavailable`) is made again once a leader of a later term stands: the
+/// schema's statements are `IF NOT EXISTS`, so one that did commit commits nothing again. Any
+/// other refusal, or the deadline, ends the bench with the refusal.
 fn schema_on(partition: &Partition) -> anyhow::Result<()> {
     let until = Instant::now() + WAIT;
+    let member = partition.member(1)?;
+    let handle = member.replica().ok_or_else(|| anyhow::anyhow!("member 1 isn't a replica"))?;
+    let (mut past, mut refused): (u64, Option<Refusal>) = (0, None);
     loop {
-        match partition.member(1)?.call(until, |c| {
+        let led = handle
+            .wait_leader(past, until)
+            .map_err(|e| anyhow::anyhow!("no leader past term {past} for the schema: {e:?} (last refusal: {refused:?})"))?;
+        match member.call(until, |c| {
             for s in schema::SCHEMA {
                 c.execute_batch(s)?;
             }
             Ok(())
         }) {
             Ok(()) => return Ok(()),
-            Err(_) if Instant::now() < until => std::thread::park_timeout(Duration::from_millis(10)),
-            Err(e) => anyhow::bail!("no leader took the schema: {e:?}"),
+            Err(e @ (Refusal::NotLeader { .. } | Refusal::UnknownOutcome | Refusal::Unavailable(_))) => {
+                past = led.term;
+                refused = Some(e);
+            }
+            Err(e) => anyhow::bail!("the schema was refused: {e:?}"),
         }
     }
 }

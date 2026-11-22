@@ -2675,6 +2675,21 @@ client. Once that run decides, the loser is removed. Tested by
 `a_members_records_wake_the_waker_its_host_gave` (crates/amphora/src/database/replicated.rs): every member's
 election records wake its waker, and a write's records wake the waker that replaced it and not the one before.
 
+### A host waits for a leader on the owner's word
+
+Before its first write the bench needs its group's leader, and it used to find one by trying the schema every 10ms
+until a call went through. Lane ryw-5 (2026-11-22) makes it wait instead on what the member's owner publishes.
+`ReplicaHandle::wait_leader(past, until)` answers the member's status once it names a leader in a term past `past`
+(0 for any leader). The owner tells that wait whenever a step publishes another leader or term, and when it ends or
+its owner is dropped, so nothing waits on a timer and an owner that's gone is never waited on to the deadline. The
+bench's `schema_on` waits for any leader and calls. If the lead's move refused the call (`NotLeader`,
+`UnknownOutcome`, `Unavailable`), it waits for a leader of a later term than the one it called under and calls
+again. That is safe because the schema is `IF NOT EXISTS`. Any other refusal, or the deadline, ends the bench and
+names the refusal. Tested by `a_host_waits_for_a_leader_on_the_owners_word` (crates/amphora/src/database/replicated.rs):
+with no leader and no time left the wait is refused Timeout. A waiter for any leader gets the one elected, with its
+term, and with no later term and no time left the wait is refused Timeout again. A waiter past that term gets the
+member the lead moved to, in a later term. A waiter on an owner dropped mid-run is refused Fenced.
+
 ### Evidence
 
 - T-T1.10.R1 `t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower`: records to one follower are lost while 2 is
