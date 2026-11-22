@@ -18918,20 +18918,17 @@ pub fn op_join_switch_built(
         }
         _ => {
             program.connection.count_adaptive_join_switch();
-            let replanned = held
-                .is_some_and(|(_, (rows, bytes))| replan_on_built_rows(program, data, rows, bytes));
-            // The in-run hand-off: a run that may start again (read-only, no row returned) stops
-            // here, and `Statement` runs it from the start on the plan made on the counted rows.
-            // An implicit transaction it would end there must be its own: no other statement on
-            // the connection is under way in it (`ProgramState::can_autocommit_now`'s siblings).
-            let txn_its_own = !program.connection.get_auto_commit()
-                || program
-                    .connection
-                    .n_active_root_statements
-                    .load(crate::sync::atomic::Ordering::SeqCst)
-                    == 1;
-            if replanned && state.handoff_open && txn_its_own {
-                state.handoff_asked = true;
+            let replanned = held.is_some_and(|(_, (rows, bytes))| {
+                replan_on_built_rows(
+                    program,
+                    &data.table,
+                    data.analyzed_rows,
+                    data.estimate_error,
+                    rows,
+                    bytes,
+                )
+            });
+            if hand_off_now(program, state, replanned) {
                 return Ok(InsnFunctionStepResult::Done);
             }
             state.pc += 1;
@@ -18950,19 +18947,21 @@ pub fn op_join_switch_built(
 /// answer right and the rows it has returned not returned again.
 fn replan_on_built_rows(
     program: &Program,
-    data: &crate::vdbe::insn::JoinSwitchBuiltData,
+    table: &str,
+    analyzed_rows: f64,
+    estimate_error: f64,
     rows: usize,
     bytes: usize,
 ) -> bool {
     use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
-    let counter = program.connection.db.row_changes.counter(&data.table);
+    let counter = program.connection.db.row_changes.counter(table);
     let estimate = crate::row_changes::live_rows(
-        data.analyzed_rows,
+        analyzed_rows,
         counter.load(crate::sync::atomic::Ordering::Acquire),
     );
     // The table's bytes are already held to its share of memory: it spills past it, checked above.
     let verdict =
-        MaterializePoint::new(estimate, data.estimate_error, u64::MAX).and_then(|mut point| {
+        MaterializePoint::new(estimate, estimate_error, u64::MAX).and_then(|mut point| {
             point.rows(rows as u64, bytes as u64)?;
             Ok(point.verdict())
         });
@@ -18970,16 +18969,16 @@ fn replan_on_built_rows(
         Ok(Replan::Again { rows }) => {
             let changes = i64::try_from(rows)
                 .unwrap_or(i64::MAX)
-                .saturating_sub(data.analyzed_rows as i64);
+                .saturating_sub(analyzed_rows as i64);
             // A count the planner floors to the estimate it already has would plan the same.
-            if crate::row_changes::live_rows(data.analyzed_rows, changes) != estimate {
+            if crate::row_changes::live_rows(analyzed_rows, changes) != estimate {
                 counter.store(changes, crate::sync::atomic::Ordering::Release);
                 program.connection.count_adaptive_replan();
                 tracing::debug!(
-                    table = %data.table,
+                    table = %table,
                     estimate,
                     rows,
-                    "adaptive join's build counted past the estimate: planned again"
+                    "a materialization point counted past the estimate: planned again"
                 );
                 return true;
             }
@@ -18987,10 +18986,62 @@ fn replan_on_built_rows(
         }
         Ok(Replan::Keep) => false,
         Err(refused) => {
-            tracing::debug!(table = %data.table, %refused, "adaptive join's rows not checked");
+            tracing::debug!(table = %table, %refused, "a materialization point's rows not checked");
             false
         }
     }
+}
+
+/// Amphora (PL.13, the in-run hand-off): true when the run stops here for `Statement` to run it
+/// from the start on the plan made on the counted rows: it was planned again, it may start again
+/// (read-only, no row returned), and the implicit transaction it would end is its own (no other
+/// statement on the connection under way in it, `ProgramState::can_autocommit_now`'s siblings).
+fn hand_off_now(program: &Program, state: &mut ProgramState, replanned: bool) -> bool {
+    let txn_its_own = !program.connection.get_auto_commit()
+        || program
+            .connection
+            .n_active_root_statements
+            .load(crate::sync::atomic::Ordering::SeqCst)
+            == 1;
+    if replanned && state.handoff_open && txn_its_own {
+        state.handoff_asked = true;
+        return true;
+    }
+    false
+}
+
+/// Amphora (PL.13, a materialization point): [Insn::BuildCounted]. A planner-chosen hash join's
+/// build over its whole table, once finished, counted against the rows the plan counted the table
+/// at ([`replan_on_built_rows`]), and the run handed off as the adaptive join's is
+/// ([`hand_off_now`]). A spilled table holds only part of its rows in memory: not checked.
+pub fn op_build_counted(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(BuildCounted { data }, insn);
+    let held = state
+        .hash_tables
+        .get(&data.hash_table_id)
+        .filter(|table| !table.has_spilled())
+        .map(|table| table.held());
+    if let Some((rows, bytes)) = held {
+        program.connection.count_adaptive_build_check();
+        let replanned = replan_on_built_rows(
+            program,
+            &data.table,
+            data.analyzed_rows,
+            data.estimate_error,
+            rows,
+            bytes,
+        );
+        if hand_off_now(program, state, replanned) {
+            return Ok(InsnFunctionStepResult::Done);
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_hash_clear(

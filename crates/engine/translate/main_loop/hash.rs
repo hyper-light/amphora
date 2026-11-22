@@ -314,13 +314,15 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             });
         }
 
-        for cond_idx in build_prefilter_where_terms(
+        let prefilter = build_prefilter_where_terms(
             planner.predicates,
             planner.table_references,
             planner.non_from_clause_subqueries,
             planner.hash_join_op,
             config.uses_materialized_keys_and_payload,
-        )? {
+        )?;
+        let filtered = !prefilter.is_empty() || materialized_input.is_some();
+        for cond_idx in prefilter {
             let cond = &planner.predicates[cond_idx];
             super::conditions::emit_where_term(
                 planner.program,
@@ -494,6 +496,14 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         planner.program.emit_insn(Insn::HashBuildFinalize {
             hash_table_id: planner.hash_table_id,
         });
+        // PL.13: the build, its table whole, counted against the plan's estimate.
+        super::adaptive::emit_build_count(
+            planner.program,
+            planner.t_ctx,
+            &btree,
+            planner.hash_table_id,
+            filtered,
+        );
         planner
             .program
             .record_hash_build_signature(planner.hash_table_id, config.signature);

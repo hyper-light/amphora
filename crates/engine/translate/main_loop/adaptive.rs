@@ -20,6 +20,47 @@ use crate::translate::optimizer::adaptive::switch_point;
 use crate::translate::optimizer::learned_costs::LearnedWeights;
 use crate::vdbe::insn::{JoinSwitchBuiltData, JoinSwitchData};
 
+/// ANALYZE's count of a table's rows and its statistics' relative standard error; `None` without
+/// statistics.
+fn analyzed_table(t_ctx: &TranslateCtx, table: &str) -> Option<(f64, f64)> {
+    let stats = t_ctx.resolver.schema().analyze_stats.table_stats(table)?;
+    let analyzed_rows = stats
+        .row_count
+        .or_else(|| stats.index_stats.values().find_map(|stat| stat.total_rows))?
+        as f64;
+    Some((
+        analyzed_rows,
+        crate::row_changes::statistics_error(stats, analyzed_rows),
+    ))
+}
+
+/// Amphora (PL.13, a materialization point): after a planner-chosen hash join's build, the check
+/// of its rows against the plan's estimate, where the build holds its table whole: adaptive joins
+/// on, the table with statistics, and no filter in the build (a filtered build's count is the
+/// filter's, not the table's, and is not checked here).
+pub(super) fn emit_build_count(
+    program: &mut ProgramBuilder,
+    t_ctx: &TranslateCtx,
+    table: &crate::schema::BTreeTable,
+    hash_table_id: usize,
+    filtered: bool,
+) {
+    if filtered || !t_ctx.resolver.adaptive_joins() || !table.has_rowid {
+        return;
+    }
+    let Some((analyzed_rows, estimate_error)) = analyzed_table(t_ctx, &table.name) else {
+        return;
+    };
+    program.emit_insn(Insn::BuildCounted {
+        data: Box::new(crate::vdbe::insn::BuildCountedData {
+            hash_table_id,
+            table: table.name.clone(),
+            analyzed_rows,
+            estimate_error,
+        }),
+    });
+}
+
 /// An inner index seek that may switch to a hash join, with the switch's inputs.
 pub(super) struct AdaptiveSeek<'a> {
     index: &'a Arc<Index>,
@@ -82,16 +123,7 @@ impl<'a> AdaptiveSeek<'a> {
             return None;
         }
         let weights = t_ctx.resolver.learned_weights()?;
-        let stats = t_ctx
-            .resolver
-            .schema()
-            .analyze_stats
-            .table_stats(&btree.name)?;
-        let analyzed_rows = stats
-            .row_count
-            .or_else(|| stats.index_stats.values().find_map(|stat| stat.total_rows))?
-            as f64;
-        let estimate_error = crate::row_changes::statistics_error(stats, analyzed_rows);
+        let (analyzed_rows, estimate_error) = analyzed_table(t_ctx, &btree.name)?;
         // The rows the plan counts the table at (PL.9): ANALYZE's with the changes since.
         let build_rows = match t_ctx.resolver.plan_values() {
             Some(values) => values.live_rows(&btree.name, analyzed_rows, estimate_error),

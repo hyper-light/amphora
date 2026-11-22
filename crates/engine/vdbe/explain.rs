@@ -2726,6 +2726,15 @@ pub fn insn_to_row(
             0,
             format!("r[{target_reg}]=pages(cursor {cursor_id})"),
         ),
+        Insn::BuildCounted { data } => (
+            "BuildCounted",
+            i64::try_from(data.hash_table_id).unwrap_or(i64::MAX),
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            format!("count hash_table[{}] against {}", data.hash_table_id, data.table),
+        ),
         Insn::MorselNext {
             dest_start,
             count,

@@ -908,7 +908,7 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   it and switches at the learned costs' break-even; the hash table's build, the inner table whole,
   is checked against the plan's estimate and, past its error, the table's count is corrected and the
   statement planned again; a read-only run that has returned no row yet starts again on the new plan
-  at once (the in-run hand-off, `Connection::set_adaptive_handoff`), any other at its next run. The
+  at once (the in-run hand-off, `Connection::set_adaptive_handoff`), any other at its next run. A hash join the planner chose checks its unfiltered build the same way (lane pl13r); filtered builds, sorters and materialized subqueries are not checked yet. The
   engine's own tests (T-PL.13.1, T-PL.13.3, T-PL.13.4) pass on pinned weights. JOB's 20 slowest queries against the parent (AC-PL.13.1) are open.
   PL.8 is started (docs/design/planner.md "Decision (lane pl8)"): a RIGHT JOIN led by one
   table is planned as its mirrored LEFT JOIN, CD-C's commutativity rule, so the tables after it are no

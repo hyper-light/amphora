@@ -1648,7 +1648,16 @@ rows. In autocommit the implicit transaction it ends must be its own: with anoth
 connection under way in it, the run goes on as planned. A run is handed off once at most: the new plan is made on the counted rows, so its own build
 falls within the band, and were it not, it goes on as planned. A run that has returned rows, or
 writes, goes on as planned and the new plan waits for its next run: its answer is right and no row
-comes twice. The other materialization points (a sorter, a materialized subquery) are not built.
+comes twice.
+
+**A hash join the planner chose** (lane pl13r, `BuildCounted`, `Connection::adaptive_build_checks`).
+Where adaptive joins are on, a hash join the plan chose counts its build once it is finished, when the
+build holds its table whole: no filter applied while building and no materialized input, the table
+with statistics and not spilled. The rows are set against the rows the plan counted the table at, the
+same band and the same correction of the table's row counter as the switch's build, and the same
+hand-off. A filtered build counts the filter's rows, not the table's: correcting the table from it
+would be wrong, so it is not checked until a store for filter estimates' corrections is built. The
+sorter's and the materialized subquery's checks are not built.
 
 **Why.** Audit row 13 (`bench/planner/audit/10-no-adaptive.sql`): a nested loop chosen for an
 estimate ran on however many rows came, and an estimate wrong by orders of magnitude was never
