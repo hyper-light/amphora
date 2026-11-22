@@ -1018,6 +1018,9 @@ fn get_subquery_parser<'a>(
                 }) else {
                     unreachable!();
                 };
+                // PL.13 (lane replan-10): the key of the distinct values its index will count,
+                // taken from the syntax before planning rewrites it.
+                let in_identity = crate::subquery_rows::in_identity(&rhs);
                 let plan = prepare_select_plan(
                     *rhs,
                     resolver,
@@ -1029,6 +1032,9 @@ fn get_subquery_parser<'a>(
                 let mut plan = plan;
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
+                if let (false, Plan::Select(select_plan)) = (correlated, &mut plan) {
+                    select_plan.in_identity = in_identity;
+                }
                 if !correlated || origin.is_write_statement() {
                     match &mut plan {
                         Plan::Select(select_plan) => {
@@ -1921,6 +1927,7 @@ pub fn emit_from_clause_subqueries(
                         table_reference.internal_id,
                         direct_index.index,
                         direct_index.affinity_str,
+                        from_clause_subquery.identity,
                     )?;
                     None
                 }
@@ -2117,6 +2124,7 @@ fn emit_indexed_materialized_subquery(
     internal_id: ast::TableInternalId,
     index: Arc<Index>,
     affinity_str: Option<Arc<String>>,
+    identity: Option<u64>,
 ) -> Result<()> {
     let cursor_id = program
         .alloc_cursor_index_if_not_exists(CursorKey::index(internal_id, index.clone()), &index)?;
@@ -2199,6 +2207,19 @@ fn emit_indexed_materialized_subquery(
     }
 
     if let Some(build_end) = build_end {
+        // Amphora (PL.13, lane replan-8: the stored result's materialization point, as the
+        // table-backed one's below): once filled, inside the run-once block, its rows counted
+        // against the estimate the plan read. A correlated fill runs at each read: not counted.
+        if let Plan::Select(select_plan) = &*plan {
+            crate::translate::main_loop::emit_subquery_count(
+                program,
+                &t_ctx.resolver,
+                select_plan,
+                identity,
+                cursor_id,
+                MaterializedFromClauseSubqueryStorage::DirectIndex,
+            );
+        }
         program.preassign_label_to_next_insn(build_end);
     }
 
@@ -2338,10 +2359,11 @@ fn emit_materialized_subquery_table(
         if let Plan::Select(select_plan) = &*plan {
             crate::translate::main_loop::emit_subquery_count(
                 program,
-                t_ctx,
+                &t_ctx.resolver,
                 select_plan,
                 identity,
                 cursor_id,
+                MaterializedFromClauseSubqueryStorage::TableBacked,
             );
         }
     }
@@ -2474,6 +2496,20 @@ pub fn emit_non_from_clause_subquery(
         // from the enclosing scope; only `program` is passed explicitly so
         // that the outer scope can keep emitting instructions in between.
         // Called at most once, hence `FnOnce`.
+        // Amphora (PL.13, lane replan-10: an IN subquery's stored result): once its ephemeral
+        // index is filled, inside the run-once block, its distinct values are counted against the
+        // ones the plan read (`constraints::in_subquery_values`). Taken before the plan is
+        // emitted, which consumes it; a correlated one fills at each read: not counted.
+        let in_check = match (query_type, &plan) {
+            (SubqueryType::In { .. }, Plan::Select(select_plan)) if !is_correlated => {
+                crate::translate::main_loop::subquery_count_check(
+                    resolver,
+                    select_plan,
+                    select_plan.in_identity,
+                )
+            }
+            _ => None,
+        };
         let emit_plan = move |program: &mut ProgramBuilder| -> Result<()> {
             match plan {
                 Plan::Select(select_plan) => {
@@ -2518,6 +2554,14 @@ pub fn emit_non_from_clause_subquery(
                     is_table: false,
                 });
                 emit_plan(program)?;
+                if let Some(check) = in_check {
+                    crate::translate::main_loop::emit_subquery_counted(
+                        program,
+                        check,
+                        *cursor_id,
+                        MaterializedFromClauseSubqueryStorage::DirectIndex,
+                    );
+                }
             }
             SubqueryType::RowValue {
                 result_reg_start,

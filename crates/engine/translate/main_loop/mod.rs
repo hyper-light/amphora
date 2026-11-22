@@ -60,7 +60,10 @@ mod open;
 mod seek;
 mod star;
 
-pub(crate) use adaptive::{emit_sorter_count, emit_subquery_count};
+pub(crate) use adaptive::{
+    emit_sorter_count, emit_subquery_count, emit_subquery_counted, join_prefix_check,
+    subquery_count_check,
+};
 use body::emit_unmatched_row_conditions_and_loop;
 pub(crate) use body::LoopBodyEmitter;
 pub(crate) use close::CloseLoop;

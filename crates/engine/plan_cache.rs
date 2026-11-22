@@ -209,6 +209,25 @@ impl PlanValues {
         planned_rows
     }
 
+    /// Whether the store of counted rows is attached (adaptive joins on, PL.13).
+    pub(crate) fn reads_subquery_rows(&self) -> bool {
+        self.subquery_rows.get().is_some()
+    }
+
+    /// Whether the plan already read rows for `identity`, or a fill has counted them (PL.13, lane
+    /// replan-11): a set of tables the join search estimates reads a count only where one is
+    /// stored, so the sets it only tries leave no entry.
+    pub(crate) fn counted_subquery(&self, identity: u64) -> bool {
+        let Some(store) = self.subquery_rows.get() else {
+            return false;
+        };
+        self.subqueries
+            .lock()
+            .iter()
+            .any(|noted| noted.identity == identity)
+            || store.counted(identity)
+    }
+
     /// The rows the plan read for the subquery `identity`, if it read them.
     pub(crate) fn planned_subquery(
         &self,
@@ -238,6 +257,15 @@ impl PlanValues {
         self.bound
             .get(index)
             .filter(|value| !matches!(value, Value::Null))
+    }
+
+    /// Amphora (QT.5, lane qs5-18): whether `variable` is bound to NULL (or left unbound, which
+    /// runs as NULL); `None` with no value bound to it, the generic plan's.
+    pub(crate) fn is_null(&self, variable: &ast::Variable) -> Option<bool> {
+        let index = usize::try_from(variable.index.get()).ok()?.checked_sub(1)?;
+        self.bound
+            .get(index)
+            .map(|value| matches!(value, Value::Null))
     }
 
     /// Notes that an estimate would take a parameter's value, had it one.

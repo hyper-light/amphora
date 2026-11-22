@@ -100,20 +100,31 @@ impl FilterShares {
 pub(crate) fn fingerprint<'a>(terms: impl Iterator<Item = &'a ast::Expr>) -> Option<u64> {
     let mut each: Vec<u64> = Vec::new();
     for expr in terms {
-        let mut reads_parameter = false;
-        let _ = crate::translate::expr::walk_expr(expr, &mut |e: &ast::Expr| {
-            if matches!(e, ast::Expr::Variable(_)) {
-                reads_parameter = true;
-            }
-            Ok(crate::translate::expr::WalkControl::Continue)
-        });
-        if reads_parameter {
-            return None;
-        }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        format!("{expr:?}").hash(&mut hasher);
-        each.push(hasher.finish());
+        each.push(term_fingerprint(expr)?);
     }
+    combine(each)
+}
+
+/// One term's part of [fingerprint] (PL.13, lane replan-11): the hash of its printed form; `None`
+/// for a term that reads a parameter.
+pub(crate) fn term_fingerprint(expr: &ast::Expr) -> Option<u64> {
+    let mut reads_parameter = false;
+    let _ = crate::translate::expr::walk_expr(expr, &mut |e: &ast::Expr| {
+        if matches!(e, ast::Expr::Variable(_)) {
+            reads_parameter = true;
+        }
+        Ok(crate::translate::expr::WalkControl::Continue)
+    });
+    if reads_parameter {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{expr:?}").hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// [fingerprint] of the terms whose [term_fingerprint]s are `each`, in any order; `None` for none.
+pub(crate) fn combine(mut each: Vec<u64>) -> Option<u64> {
     if each.is_empty() {
         return None;
     }

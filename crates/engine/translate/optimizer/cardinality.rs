@@ -205,6 +205,103 @@ pub(super) struct JoinedSetRows<'a> {
     memo: HashMap<TableMask, f64>,
     /// Each set's proven upper bound, which its estimate never passes (PL.11).
     bound: DegreeBound,
+    /// PL.13 (lane replan-10): the identity of the whole join's rows, where a sorter fed by the
+    /// join may have counted them (`subquery_rows::join_identity`): a join of two tables or more,
+    /// inner, LEFT, semi or anti (lane replan-11), planned for one run (`initial` at most one
+    /// row); `None` otherwise.
+    joined: Option<u64>,
+    /// PL.13 (lane replan-10): each table's own filter terms, where it has a sample.
+    own_filters: Vec<Option<OwnFilter>>,
+    /// PL.13 (lane replan-11): what keys a set's rows as a join prefix's
+    /// (`subquery_rows::prefix_identity`), under the same conditions as `joined`.
+    prefixes: Option<PrefixKeys>,
+    /// PL.13 (lane replan-12): the join prefixes whose counted rows stood in for their estimate,
+    /// each with its correction, carried into the sets that hold it ([Corrections]).
+    corrected: Corrections,
+}
+
+/// The join prefixes a fill counted (PL.13, lane replan-12: a corrected prefix's count carried
+/// upward), each with its correction: its counted rows over its own estimate. A set of tables
+/// that holds one is joined from it, so the model's error on it is in the set's estimate too: the
+/// set's estimate is scaled by the correction of the largest corrected set it holds (the earliest
+/// recorded of the largest), whose count already holds any smaller one's. Two disjoint corrected
+/// sets are not multiplied together; only the largest is carried. A set is recorded where the
+/// search estimates it ([JoinedSetRows::rows]), before the sets built on it: the exact search goes
+/// by size, the greedy one prefix by prefix. Bound: one entry for each set with a count, at most
+/// as many as the memo holds (`MEMO_SETS`).
+#[derive(Debug, Default)]
+struct Corrections {
+    sets: Vec<(TableMask, usize, f64)>,
+}
+
+impl Corrections {
+    /// Records `set`'s correction, `counted` rows against its `own` estimate; none for an
+    /// estimate of no rows, which no ratio scales, or for a set held already.
+    fn record(&mut self, set: &TableMask, counted: f64, own: f64) {
+        if !own.is_finite() || own <= 0.0 || !counted.is_finite() || self.sets.len() >= MEMO_SETS {
+            return;
+        }
+        if self.sets.iter().any(|(held, ..)| held == set) {
+            return;
+        }
+        let Ok(held) = crate::alloc::TryClone::try_clone(set) else {
+            return;
+        };
+        self.sets.push((held, set.count(), counted / own));
+    }
+
+    /// The correction `set` carries: the largest recorded set it holds, other than itself.
+    fn carried(&self, set: &TableMask) -> Option<f64> {
+        let mut best: Option<(usize, f64)> = None;
+        for (held, tables, ratio) in &self.sets {
+            if held != set
+                && set.contains_all_set_bits_of(held)
+                && best.is_none_or(|(most, _)| *tables > most)
+            {
+                best = Some((*tables, *ratio));
+            }
+        }
+        best.map(|(_, ratio)| ratio)
+    }
+}
+
+/// The parts of a set of tables' identity as a join prefix (PL.13, lane replan-11), taken once:
+/// each table's part (`subquery_rows::table_part`, from its normalized name), and each WHERE
+/// term's tables with its fingerprint (`None` for a term reading a parameter). A set's identity is
+/// its tables' parts and the terms reading only them ([PrefixKeys::identity]), the same value
+/// `subquery_rows::prefix_identity` gives the plan.
+struct PrefixKeys {
+    names: Vec<u64>,
+    terms: Vec<(TableMask, Option<u64>)>,
+}
+
+impl PrefixKeys {
+    fn identity(&self, set: &TableMask) -> Option<u64> {
+        let mut names = Vec::new();
+        for table in set.iter() {
+            names.push(*self.names.get(table)?);
+        }
+        let mut terms = Vec::new();
+        for (mask, fingerprint) in &self.terms {
+            if set.contains_all_set_bits_of(mask) {
+                terms.push((*fingerprint)?);
+            }
+        }
+        crate::subquery_rows::join_identity_of(names, terms)
+    }
+}
+
+/// A table's own filter terms together (PL.13, lane replan-10): every term its sample ran and every
+/// one of its constraints counted as a filter that reads no other table. Their share, however the
+/// estimate combined it (the sample's, the column statistics', independent terms multiplied), is
+/// noted as the share the plan read for those terms (`PlanValues::filter_selectivity`), and a share
+/// a build or sorter counted for them is read in its place: a mix the sample did not run together
+/// is checked and corrected as one set is. The error is the sample's binomial one at the share,
+/// as for a set the sample ran.
+struct OwnFilter {
+    table: String,
+    fingerprint: u64,
+    sample_rows: usize,
 }
 
 impl<'a> JoinedSetRows<'a> {
@@ -217,6 +314,7 @@ impl<'a> JoinedSetRows<'a> {
         constraints: &'a [TableConstraints],
         where_clause: &[WhereTerm],
         homes: impl Fn(usize) -> Option<usize>,
+        masks: impl Fn(usize) -> Option<TableMask>,
         base_table_rows: &[RowCountEstimate],
         initial: f64,
         params: &'a CostModelParams,
@@ -579,6 +677,87 @@ impl<'a> JoinedSetRows<'a> {
         let none_pass = where_clause
             .iter()
             .any(|term| term.origin.join_origin().is_none() && never_true(&term.expr));
+        // PL.13 (lane replan-10): each table's own filter terms together, the sampled ones and
+        // those its constraints count, whose share a filtered build or sorter checks.
+        let own_filters: Vec<Option<OwnFilter>> = tables
+            .iter()
+            .enumerate()
+            .map(|(table_idx, t)| {
+                let btree = joined_tables.get(table_idx)?.btree()?;
+                let sample_rows = schema
+                    .analyze_stats
+                    .table_stats(&btree.name)?
+                    .sample
+                    .as_deref()?
+                    .rows
+                    .len();
+                let table_constraints = constraints.get(table_idx)?;
+                let mut terms: SmallVec<[usize; 8]> = t
+                    .sampled
+                    .iter()
+                    .flat_map(|sampled| sampled.terms.iter().copied())
+                    .collect();
+                for counted in t.counted.iter().filter(|c| c.class == Class::Filter) {
+                    if let Some(c) = table_constraints.constraints.get(counted.constraint) {
+                        if c.lhs_mask.is_empty() && !c.implied {
+                            terms.push(c.where_clause_pos.0);
+                        }
+                    }
+                }
+                terms.sort_unstable();
+                terms.dedup();
+                let fingerprint = crate::filter_shares::fingerprint(
+                    terms
+                        .iter()
+                        .filter_map(|pos| where_clause.get(*pos).map(|term| &term.expr)),
+                )?;
+                (sample_rows > 0).then(|| OwnFilter {
+                    table: btree.name.clone(),
+                    fingerprint,
+                    sample_rows,
+                })
+            })
+            .collect();
+        // PL.13 (lane replan-11): a LEFT JOIN's rows too, its right table's unmatched rows kept,
+        // and a semi or anti join's, the rows it keeps.
+        let joined = (joined_tables.len() > 1
+            && initial <= 1.0
+            && kinds
+                .iter()
+                .all(|kind| matches!(kind, Kind::Inner | Kind::Left | Kind::SemiOrAnti)))
+        .then(|| crate::subquery_rows::join_identity(joined_tables, where_clause))
+        .flatten();
+        // PL.13 (lane replan-11): a join prefix's rows are keyed as a whole join's, read only
+        // where a fill counted them; under the same conditions, and only with the store attached.
+        let prefixes = (joined_tables.len() > 2
+            && initial <= 1.0
+            && kinds.iter().all(|kind| matches!(kind, Kind::Inner))
+            && params
+                .plan_values
+                .as_deref()
+                .is_some_and(|values| values.reads_subquery_rows()))
+        .then(|| {
+            let terms = where_clause
+                .iter()
+                .enumerate()
+                .map(|(pos, term)| {
+                    masks(pos)
+                        .map(|mask| (mask, crate::filter_shares::term_fingerprint(&term.expr)))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(PrefixKeys {
+                names: joined_tables
+                    .iter()
+                    .map(|joined| {
+                        crate::subquery_rows::table_part(&crate::util::normalize_ident(
+                            joined.table.get_name(),
+                        ))
+                    })
+                    .collect(),
+                terms,
+            })
+        })
+        .flatten();
         Self {
             tables,
             columns,
@@ -589,6 +768,10 @@ impl<'a> JoinedSetRows<'a> {
             initial: if none_pass { 0.0 } else { initial },
             memo: HashMap::default(),
             bound,
+            joined,
+            own_filters,
+            prefixes,
+            corrected: Corrections::default(),
         }
     }
 
@@ -599,7 +782,39 @@ impl<'a> JoinedSetRows<'a> {
         }
         // PL.11: an estimate above the set's proven bound is cut to it; one below is left.
         // The bound is a join's for one row of its input, as `initial` counts them.
-        let rows = self.bound.cap(set, self.capped(set), self.initial);
+        let own = self.bound.cap(set, self.capped(set), self.initial);
+        // PL.13 (lane replan-12): a set holding a counted prefix carries its correction. Not cut to
+        // the bound again: the count is the rows, where the statistics the bound read are stale.
+        let rows = match self.corrected.carried(set) {
+            Some(ratio) => own * ratio,
+            None => own,
+        };
+        // PL.13 (lane replan-10): the whole join's rows a sorter fed by it counted past their
+        // estimate stand in for it, noted as the rows the plan read, so the sorter is checked
+        // against them and the plan made again when a count is stored.
+        let tables = set.iter().count();
+        let rows = match (self.joined, self.params.plan_values.as_deref()) {
+            (Some(identity), Some(values)) if tables == self.tables.len() => {
+                values.subquery_rows(identity, rows)
+            }
+            _ => rows,
+        };
+        // PL.13 (lane replan-11): a join prefix's rows a materialized build input counted stand in
+        // for its estimate, and are noted as read, as the whole join's are; a set no fill counted
+        // leaves no entry.
+        let rows = match (self.prefixes.as_ref(), self.params.plan_values.as_deref()) {
+            (Some(prefixes), Some(values)) if tables >= 2 && tables < self.tables.len() => {
+                match prefixes.identity(set) {
+                    Some(identity) if values.counted_subquery(identity) => {
+                        let counted = values.subquery_rows(identity, rows);
+                        self.corrected.record(set, counted, own);
+                        counted
+                    }
+                    _ => rows,
+                }
+            }
+            _ => rows,
+        };
         if self.memo.len() < MEMO_SETS {
             if let Ok(key) = crate::alloc::TryClone::try_clone(set) {
                 self.memo.insert(key, rows);
@@ -769,15 +984,29 @@ impl<'a> JoinedSetRows<'a> {
                 .any(|s| s.terms.contains(&c.where_clause_pos.0))
         };
         let shares: SmallVec<[f64; 2]> = sampled.iter().map(|s| s.selectivity).collect();
-        alone
-            * constraints_selectivity(
-                counted
-                    .filter(|c| !reads_a_table(c))
-                    .map(|(constraint, _)| constraint)
-                    .filter(|constraint| !in_sampled(constraint)),
-                &shares,
-                self.params,
-            )
+        let own = constraints_selectivity(
+            counted
+                .filter(|c| !reads_a_table(c))
+                .map(|(constraint, _)| constraint)
+                .filter(|constraint| !in_sampled(constraint)),
+            &shares,
+            self.params,
+        );
+        // PL.13 (lane replan-10): the table's own filters together, as a build checks them.
+        let own = match (
+            classes,
+            self.own_filters.get(table).and_then(Option::as_ref),
+            self.params.plan_values.as_deref(),
+        ) {
+            ([Class::Filter], Some(filter), Some(values)) => values.filter_selectivity(
+                &filter.table,
+                filter.fingerprint,
+                own,
+                filter.sample_rows,
+            ),
+            _ => own,
+        };
+        alone * own
     }
 
     /// The share of the pairs of an outer join's left rows and `table`'s rows its ON terms keep:
@@ -2089,6 +2318,40 @@ mod degree_bound_tests {
         assert_eq!(bound.upper_bound(&both), 5_000.0);
         bound.tables[1].role = Role::Unbounded;
         assert_eq!(bound.cap(&both, 1e9, 1.0), 1e9);
+    }
+
+    /// Do: record `{0, 1}` counted at 2,000 rows against its own 20, then `{0, 1, 2}` at 300
+    /// against 100, a set estimated at no rows, and `{0, 1}` again. Expect: a set carries the
+    /// correction of the largest recorded set it holds other than itself, none without one, none
+    /// from an estimate of no rows, and the first count kept (PL.13, lane replan-12, T-PL.13.22).
+    #[test]
+    fn pl_13_a_corrected_prefix_is_carried_into_the_sets_holding_it() {
+        let mut corrections = Corrections::default();
+        assert_eq!(corrections.carried(&mask(&[0, 1, 2, 3])), None);
+        corrections.record(&mask(&[0, 1]), 2_000.0, 20.0);
+        assert_eq!(corrections.carried(&mask(&[0, 1])), None, "its own");
+        assert_eq!(corrections.carried(&mask(&[0, 1, 2])), Some(100.0));
+        assert_eq!(corrections.carried(&mask(&[0, 1, 2, 3])), Some(100.0));
+        assert_eq!(corrections.carried(&mask(&[1, 2, 3])), None, "not held");
+        corrections.record(&mask(&[0, 1, 2]), 300.0, 100.0);
+        assert_eq!(
+            corrections.carried(&mask(&[0, 1, 2, 3])),
+            Some(3.0),
+            "the largest"
+        );
+        assert_eq!(corrections.carried(&mask(&[0, 1, 3])), Some(100.0));
+        corrections.record(&mask(&[2, 3]), 5.0, 0.0);
+        assert_eq!(
+            corrections.carried(&mask(&[1, 2, 3])),
+            None,
+            "no rows estimated"
+        );
+        corrections.record(&mask(&[0, 1]), 7.0, 1.0);
+        assert_eq!(
+            corrections.carried(&mask(&[0, 1, 3])),
+            Some(100.0),
+            "the first count"
+        );
     }
 
     /// Do: push an index's sorted values (a: 1 1 1 2 3 3; b distinct under each a) through

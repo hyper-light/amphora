@@ -268,6 +268,9 @@ pub struct HashBuildData {
     pub num_payload: usize,
     /// Whether to track which entries are matched (for FULL OUTER JOIN).
     pub track_matched: bool,
+    /// Amphora (QT.5 step 4, lane qs5-21): the join is a sort-merge (`HashJoinMethod::Merge`):
+    /// the table sorts its rows by key once built and is probed by merging (`HashTable::set_merge`).
+    pub merge: bool,
 }
 
 /// Amphora (PL.13): one adaptive join's switch (boxed to keep Insn small). The three weights are
@@ -286,6 +289,29 @@ pub struct JoinSwitchData {
     pub build_pc: BranchOffset,
     /// Where an outer row probes the hash table once it is built.
     pub probe_pc: BranchOffset,
+}
+
+/// Amphora (QT.5, T-QT.5.11): one of a star probe's filters: the dimension's Bloom filter, by its
+/// cursor, and the fact row's keys for it.
+#[derive(Debug, Clone)]
+pub struct StarProbeKeys {
+    pub cursor_id: CursorID,
+    /// Start register of the keys, already given the comparison's affinities.
+    pub key_reg: usize,
+    pub num_keys: usize,
+}
+
+/// Amphora (QT.5, T-QT.5.11): a fact row's checks against its star join's filters (boxed to keep
+/// Insn small).
+#[derive(Debug, Clone)]
+pub struct StarProbesData {
+    /// The filters, in the planner's order.
+    pub probes: Box<[StarProbeKeys]>,
+    /// Where a row a filter rejects goes.
+    pub target_pc: BranchOffset,
+    /// The order the filters are checked in: the planner's, or measured as the rows run, with
+    /// counts kept whole or fading (`Connection::set_star_filter_order`).
+    pub order: crate::StarFilterOrder,
 }
 
 /// Amphora (PL.13): an adaptive join's hash table, built (boxed to keep Insn small).
@@ -345,6 +371,22 @@ pub struct SorterCountedData {
     pub estimate_error: f64,
     /// The WHERE terms' share check; `None` for a scan with no WHERE term.
     pub filter: Option<FilteredBuild>,
+    /// Amphora (PL.13, lane replan-10): for a sorter fed by an inner join, the check of its rows
+    /// against the rows the plan read for the whole join, in place of `table`'s and `filter`'s.
+    pub joined: Option<CountedCheck>,
+    /// Amphora (PL.13, lane replan-12): whether `joined` is a SELECT DISTINCT's rows, the sorter
+    /// after it holding them, rather than a join's.
+    pub distinct: bool,
+}
+
+/// A stored result's rows checked against the rows the plan read for it (PL.13, lane replan-10):
+/// where a count past the estimate is stored (`subquery_rows`), the rows planned on, and the
+/// relative standard error of the statistics the estimate came from.
+#[derive(Debug, Clone)]
+pub struct CountedCheck {
+    pub rows: crate::sync::Arc<crate::subquery_rows::CountedRows>,
+    pub planned_rows: f64,
+    pub estimate_error: f64,
 }
 
 /// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
@@ -853,9 +895,6 @@ pub enum Insn {
         key_reg: usize,
         /// Number of key registers to hash together
         num_keys: usize,
-        /// Amphora (T-QT.5.3): a star join's filter at its fact scan, counted in the statement's
-        /// metrics (`star_filter_probes`, `star_filter_rejects`).
-        star: bool,
     },
     /// Compute a hash on num_keys registers starting with `r[key_reg]` and add that hash to
     /// the bloom filter associated with the cursor/hash_table.
@@ -2443,6 +2482,16 @@ pub enum Insn {
     SubqueryCounted {
         data: Box<SubqueryCountedData>,
     },
+
+    /// Amphora (QT.5, T-QT.5.11; `docs/design/planner.md`, "Decision (lane qs5-18): a star join's
+    /// filters checked in their measured order"): checks the fact row's keys against each of its
+    /// star join's Bloom filters, jumping to `target_pc` at the first that rejects them. In
+    /// `order`: the order the run has measured (each filter's checks and passes, kept in the
+    /// program's state, `vdbe/star_order.rs`), the filter passing the smallest share first, or the
+    /// planner's. Its first row ends every filter's build.
+    StarProbes {
+        data: Box<StarProbesData>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2699,6 +2748,7 @@ impl InsnVariants {
             InsnVariants::BuildCounted => execute::op_build_counted,
             InsnVariants::SorterCounted => execute::op_sorter_counted,
             InsnVariants::SubqueryCounted => execute::op_subquery_counted,
+            InsnVariants::StarProbes => execute::op_star_probes,
         }
     }
 }

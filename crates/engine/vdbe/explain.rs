@@ -2714,6 +2714,20 @@ pub fn insn_to_row(
                 data.aggregates
             ),
         ),
+        Insn::StarProbes { data } => (
+            "StarProbes",
+            i64::try_from(data.probes.len()).unwrap_or(i64::MAX),
+            data.target_pc.as_debug_int() as i64,
+            data.order as i64,
+            Value::build_text(""),
+            0,
+            format!(
+                "if !bloom_filter(...) of {} filters, {:?} order, goto {}",
+                data.probes.len(),
+                data.order,
+                data.target_pc.as_debug_int()
+            ),
+        ),
         Insn::TreePages {
             cursor_id,
             target_reg,
@@ -2748,9 +2762,17 @@ pub fn insn_to_row(
             0,
             Value::build_text(""),
             0,
-            match &data.filter {
-                None => format!("count sorter[{}] against {}", data.cursor_id, data.table),
-                Some(filter) => format!(
+            match (&data.joined, &data.filter) {
+                (Some(joined), _) if data.distinct => format!(
+                    "count sorter[{}] against the distinct rows from {} at {} rows",
+                    data.cursor_id, data.table, joined.planned_rows
+                ),
+                (Some(joined), _) => format!(
+                    "count sorter[{}] against the join from {} at {} rows",
+                    data.cursor_id, data.table, joined.planned_rows
+                ),
+                (None, None) => format!("count sorter[{}] against {}", data.cursor_id, data.table),
+                (None, Some(filter)) => format!(
                     "count sorter[{}] against {} filtered to share {}",
                     data.cursor_id, data.table, filter.planned_share
                 ),

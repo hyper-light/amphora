@@ -18480,7 +18480,10 @@ fn hash_build_run(
             track_matched: data.track_matched,
             partition_count: None,
         };
-        e.insert(HashTable::new(config, pager.io.clone())?);
+        let mut table = HashTable::new(config, pager.io.clone())?;
+        // Amphora (QT.5 step 4, lane qs5-21): a sort-merge join's table.
+        table.set_merge(data.merge);
+        e.insert(table);
     }
 
     // Read pre-computed key values directly from registers
@@ -19415,8 +19418,15 @@ pub fn op_sorter_counted(
         usize::try_from(cursor.as_sorter_mut().inserted()).unwrap_or(usize::MAX)
     };
     program.connection.count_adaptive_sort_check();
-    let replanned = match &data.filter {
-        None => replan_on_built_rows(
+    let replanned = match (&data.joined, &data.filter) {
+        (Some(joined), _) => replan_on_counted_rows(
+            program,
+            &joined.rows,
+            joined.planned_rows,
+            joined.estimate_error,
+            u64::try_from(rows).unwrap_or(u64::MAX),
+        ),
+        (None, None) => replan_on_built_rows(
             program,
             &data.table,
             data.analyzed_rows,
@@ -19424,7 +19434,7 @@ pub fn op_sorter_counted(
             rows,
             0,
         ),
-        Some(filter) => {
+        (None, Some(filter)) => {
             correct_filter_share(program, &data.table, data.analyzed_rows, filter, rows, 0)
         }
     };
@@ -19433,6 +19443,43 @@ pub fn op_sorter_counted(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13, lane replan-6): a stored result's `rows` against the `planned_rows` the plan
+/// read for it; past the estimate's error the count is stored in `store` for the planner and every
+/// plan that read the old rows is planned again. True when a new count was stored.
+fn replan_on_counted_rows(
+    program: &Program,
+    store: &crate::subquery_rows::CountedRows,
+    planned_rows: f64,
+    estimate_error: f64,
+    rows: u64,
+) -> bool {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    let verdict =
+        MaterializePoint::new(planned_rows, estimate_error, u64::MAX).and_then(|mut point| {
+            point.rows(rows, 0)?;
+            Ok(point.verdict())
+        });
+    match verdict {
+        Ok(Replan::Again { rows }) => {
+            let stored = store.set(rows);
+            if stored {
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    planned = planned_rows,
+                    rows,
+                    "a stored result counted past its estimate: planned again"
+                );
+            }
+            stored
+        }
+        Ok(Replan::Keep) => false,
+        Err(refused) => {
+            tracing::debug!(%refused, "a stored result's rows not checked");
+            false
+        }
+    }
 }
 
 /// Amphora (PL.13, lane replan-6): [Insn::SubqueryCounted]. A stored subquery result, filled,
@@ -19445,38 +19492,19 @@ pub fn op_subquery_counted(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
     load_insn!(SubqueryCounted { data }, insn);
     let rows = match state.get_register(data.rows_reg).get_value() {
         Value::Numeric(Numeric::Integer(rows)) => u64::try_from(*rows).unwrap_or(0),
         _ => 0,
     };
     program.connection.count_adaptive_subquery_check();
-    let verdict = MaterializePoint::new(data.planned_rows, data.estimate_error, u64::MAX).and_then(
-        |mut point| {
-            point.rows(rows, 0)?;
-            Ok(point.verdict())
-        },
+    let replanned = replan_on_counted_rows(
+        program,
+        &data.rows,
+        data.planned_rows,
+        data.estimate_error,
+        rows,
     );
-    let replanned = match verdict {
-        Ok(Replan::Again { rows }) => {
-            let stored = data.rows.set(rows);
-            if stored {
-                program.connection.count_adaptive_replan();
-                tracing::debug!(
-                    planned = data.planned_rows,
-                    rows,
-                    "a stored subquery result counted past its estimate: planned again"
-                );
-            }
-            stored
-        }
-        Ok(Replan::Keep) => false,
-        Err(refused) => {
-            tracing::debug!(%refused, "a stored subquery result's rows not checked");
-            false
-        }
-    };
     if hand_off_now(program, state, replanned) {
         return Ok(InsnFunctionStepResult::Done);
     }
@@ -20535,8 +20563,7 @@ pub fn op_filter(
             cursor_id,
             target_pc,
             key_reg,
-            num_keys,
-            star
+            num_keys
         },
         insn
     );
@@ -20549,36 +20576,141 @@ pub fn op_filter(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
-    let contains = if *num_keys == 1 {
+    let contains = filter_contains(filter, &state.registers, *key_reg, *num_keys);
+
+    if !contains {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Whether `filter` may hold the key in `registers[key_reg..key_reg + num_keys]`. A NULL key part
+/// matches nothing: the filter's join is an equality. A key past the registers passes, as a
+/// filter may always let a row through.
+fn filter_contains(
+    filter: &crate::vdbe::bloom_filter::BloomFilter,
+    registers: &[Register],
+    key_reg: usize,
+    num_keys: usize,
+) -> bool {
+    let key = |i: usize| {
+        key_reg
+            .checked_add(i)
+            .and_then(|reg| registers.get(reg))
+            .map(Register::get_value)
+    };
+    if num_keys == 1 {
         // Single key optimization, avoid allocating a Vec
-        let value = state.registers[*key_reg].get_value();
-        if matches!(value, Value::Null) {
+        match key(0) {
             // its always safe to fall through, so this *should* be `true` but
             // since it's always an equality predicate and we have a NULL value,
             // we can just short-circuit to false here.
-            false
-        } else {
-            filter.contains_value(value)
+            Some(Value::Null) => false,
+            Some(value) => filter.contains_value(value),
+            None => true,
         }
     } else {
-        let values: Vec<&Value> = (0..*num_keys)
-            .map(|i| state.registers[*key_reg + i].get_value())
-            .collect();
+        let Some(values) = (0..num_keys).map(key).collect::<Option<Vec<&Value>>>() else {
+            return true;
+        };
         if values.iter().any(|v| matches!(*v, Value::Null)) {
             false
         } else {
             filter.contains_values(&values)
         }
-    };
+    }
+}
 
-    if *star {
+/// Amphora (QT.5, T-QT.5.11): [Insn::StarProbes]. At the first row that reaches a filter still
+/// building, every filter's build ends (sealed, as [Insn::Filter]'s first probe seals it) and
+/// their bytes are counted; then the row's
+/// keys are checked against each filter, in the measured order or the planner's, to the first
+/// that rejects them. A filter not built passes the row, as [Insn::Filter] lets it.
+pub fn op_star_probes(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(StarProbes { data }, insn);
+    let pc = state.pc;
+    // A filter still building ends its build at the row that first reaches it, as at a run's
+    // first row, so does one built again (a star join run again within the statement).
+    let building = data.probes.iter().any(|probe| {
+        state
+            .bloom_filters
+            .get(&probe.cursor_id)
+            .is_some_and(crate::vdbe::bloom_filter::BloomFilter::building)
+    });
+    if building {
+        // The filters are sealed one after another: while one is, it holds its hashes and its
+        // finished filter at once (`BloomFilter::seal`), the ones before it their filters and the
+        // ones after it their hashes. The most they hold together is counted (lane qs5-19).
+        // Before that, as each filter's hashes grew, a growth held its old list and its new
+        // (`BloomFilter::peak`), beside the lists of the filters built before it: counted here
+        // beside every other filter's whole list, at least what they held then (lane qs5-20).
+        let mut held = data
+            .probes
+            .iter()
+            .filter_map(|probe| state.bloom_filters.get(&probe.cursor_id))
+            .fold(0usize, |held, filter| held.saturating_add(filter.bytes()));
+        let lists = held;
+        let mut most = held;
+        for probe in data.probes.iter() {
+            if let Some(filter) = state.bloom_filters.get_mut(&probe.cursor_id) {
+                let growing = lists
+                    .saturating_sub(filter.bytes())
+                    .saturating_add(filter.peak());
+                most = most.max(growing);
+                let others = held.saturating_sub(filter.bytes());
+                let sealing = filter.seal();
+                most = most.max(others.saturating_add(sealing));
+                held = others.saturating_add(filter.bytes());
+            }
+        }
+        let most = u64::try_from(most).unwrap_or(u64::MAX);
+        state.metrics.star_filter_bytes = state.metrics.star_filter_bytes.max(most);
+    }
+    if !state.star_orders.contains_key(&pc) {
+        state.star_orders.insert(
+            pc,
+            super::star_order::StarOrder::new(data.probes.len(), data.order),
+        );
+    }
+    let Some(order) = state.star_orders.get_mut(&pc) else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let mut rejected = false;
+    let measured = data.order != crate::StarFilterOrder::Planned;
+    for nth in 0..data.probes.len() {
+        let at = if measured { order.nth(nth) } else { Some(nth) };
+        let Some((at, probe)) = at.and_then(|at| data.probes.get(at).map(|p| (at, p))) else {
+            continue;
+        };
+        let passed = state
+            .bloom_filters
+            .get(&probe.cursor_id)
+            .is_none_or(|filter| {
+                filter_contains(filter, &state.registers, probe.key_reg, probe.num_keys)
+            });
         state.metrics.star_filter_probes = state.metrics.star_filter_probes.wrapping_add(1);
-        if !contains {
+        if measured {
+            order.observe(at, passed);
+        }
+        if !passed {
             state.metrics.star_filter_rejects = state.metrics.star_filter_rejects.wrapping_add(1);
+            rejected = true;
+            break;
         }
     }
-    if !contains {
-        state.pc = target_pc.as_offset_int();
+    if measured && order.settle() {
+        state.metrics.star_filter_reorders = state.metrics.star_filter_reorders.wrapping_add(1);
+    }
+    if rejected {
+        state.pc = data.target_pc.as_offset_int();
     } else {
         state.pc += 1;
     }

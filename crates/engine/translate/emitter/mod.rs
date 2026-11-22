@@ -214,6 +214,12 @@ pub struct Resolver<'a> {
     bushy_left_join_probes: bool,
     /// Amphora (T-QT.5.3): when a star join's fact scan checks its dimensions' filters.
     star_filters: crate::StarFilters,
+    /// Amphora (QT.5): how an `IS` of a value planning doesn't know is estimated
+    /// (`Connection::set_is_value_estimate`).
+    is_value_estimate: crate::IsValueEstimate,
+    /// Amphora (T-QT.5.11): the order a star join's fact row checks its filters in
+    /// (`Connection::set_star_filter_order`).
+    star_filter_order: crate::StarFilterOrder,
     /// Amphora (PL.8): what sizes the join search (`Connection::set_join_search_budget`).
     join_search: crate::translate::optimizer::search_budget::SearchBudget,
     /// Amphora (PL.8, lane pl8-16): where this plan notes each query block's join order, and the
@@ -366,6 +372,8 @@ impl<'a> Resolver<'a> {
             join_methods: crate::JoinMethods::ByCost,
             bushy_left_join_probes: false,
             star_filters: crate::StarFilters::ByCost,
+            is_value_estimate: crate::IsValueEstimate::Equality,
+            star_filter_order: crate::StarFilterOrder::Planned,
             join_search: crate::translate::optimizer::search_budget::SearchBudget::FIXED,
             join_orders: None,
             carried_join_orders: None,
@@ -489,6 +497,22 @@ impl<'a> Resolver<'a> {
         self.star_filters = rule;
     }
 
+    pub(crate) fn is_value_estimate(&self) -> crate::IsValueEstimate {
+        self.is_value_estimate
+    }
+
+    pub(crate) fn set_is_value_estimate(&mut self, rule: crate::IsValueEstimate) {
+        self.is_value_estimate = rule;
+    }
+
+    pub(crate) fn star_filter_order(&self) -> crate::StarFilterOrder {
+        self.star_filter_order
+    }
+
+    pub(crate) fn set_star_filter_order(&mut self, order: crate::StarFilterOrder) {
+        self.star_filter_order = order;
+    }
+
     pub(crate) fn join_search(&self) -> crate::translate::optimizer::search_budget::SearchBudget {
         self.join_search
     }
@@ -590,6 +614,8 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             bushy_left_join_probes: self.bushy_left_join_probes,
             star_filters: self.star_filters,
+            is_value_estimate: self.is_value_estimate,
+            star_filter_order: self.star_filter_order,
             join_search: self.join_search,
             join_orders: self.join_orders.clone(),
             carried_join_orders: self.carried_join_orders.clone(),
@@ -634,6 +660,8 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             bushy_left_join_probes: self.bushy_left_join_probes,
             star_filters: self.star_filters,
+            is_value_estimate: self.is_value_estimate,
+            star_filter_order: self.star_filter_order,
             join_search: self.join_search,
             join_orders: self.join_orders.clone(),
             carried_join_orders: self.carried_join_orders.clone(),

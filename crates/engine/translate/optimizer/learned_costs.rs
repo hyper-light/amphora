@@ -746,12 +746,14 @@ fn calibrate(clock: &mut dyn FnMut() -> f64) -> Rates {
     // A hash join's filter over the page's keys, sized as the planner sizes one (PL.5,
     // `FilterSizing`) for one false positive expected across a page of keys it doesn't hold,
     // and looked up for such a page: the probe rows a filter is for. Its memory is bounded by the
-    // page's keys' hashes, all it is given.
+    // page's keys' hashes and as many bytes again for the filter built beside them (QT.5, lane
+    // qs5-19: a sized filter's bound holds both at once): its rate, one in a page's keys, takes
+    // `ln(rows)/ln²2` bits a key, fewer than a hash's 64 for any page.
     let fp_per_key = 1.0 / (rows * rows);
     let mut filter =
         crate::vdbe::bloom_filter::BloomFilter::sized(crate::vdbe::bloom_filter::FilterSizing {
             fp_per_key,
-            max_bytes: n.saturating_mul(std::mem::size_of::<u64>()),
+            max_bytes: n.saturating_mul(2 * std::mem::size_of::<u64>()),
         });
     for k in &keys {
         filter.insert_i64(*k as i64);

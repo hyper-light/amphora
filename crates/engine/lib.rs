@@ -143,7 +143,8 @@ pub use cdc::{
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
     resolve_ext_path, BackgroundSearch, BushyLeftJoinProbes, CarriedJoinOrders, Connection,
-    JoinMethods, JoinSearchBudget, PrepareOptions, Row, StarFilters, StepResult, SymbolTable,
+    IsValueEstimate, JoinMethods, JoinSearchBudget, PrepareOptions, Row, StarFilterOrder,
+    StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use translate::optimizer::learned_costs::WeightRule;

@@ -22,8 +22,8 @@ use crate::vdbe::insn::{JoinSwitchBuiltData, JoinSwitchData};
 
 /// ANALYZE's count of a table's rows and its statistics' relative standard error; `None` without
 /// statistics.
-fn analyzed_table(t_ctx: &TranslateCtx, table: &str) -> Option<(f64, f64)> {
-    let stats = t_ctx.resolver.schema().analyze_stats.table_stats(table)?;
+fn analyzed_table(resolver: &Resolver, table: &str) -> Option<(f64, f64)> {
+    let stats = resolver.schema().analyze_stats.table_stats(table)?;
     let analyzed_rows = stats
         .row_count
         .or_else(|| stats.index_stats.values().find_map(|stat| stat.total_rows))?
@@ -81,7 +81,7 @@ fn counted_check(
     if !t_ctx.resolver.adaptive_joins() || !table.has_rowid {
         return None;
     }
-    let (analyzed_rows, estimate_error) = analyzed_table(t_ctx, &table.name)?;
+    let (analyzed_rows, estimate_error) = analyzed_table(&t_ctx.resolver, &table.name)?;
     let filter = match (prefiltered, fingerprint) {
         (false, _) => None,
         (true, None) => return None,
@@ -107,33 +107,93 @@ fn counted_check(
 /// the rows of that table its WHERE terms keep. Once the scan has put them all in, ahead of the
 /// sort, their count is checked as a hash join's build is: against the table's rows, or with WHERE
 /// terms against the share the plan read for exactly those terms (`counted_check`).
+///
+/// Fed by an index seek on the table (lane replan-9), it holds the rows the seek's terms and the
+/// rest keep: every WHERE term counts, the seek's (consumed by it) among them, so a seek by one
+/// `=` or IN list the column statistics estimate is checked against the share they gave.
+///
+/// A GROUP BY's sorter (`grouped`, lane replan-10) holds the same rows, one a row read, before
+/// they are grouped: its input is the table's rows its WHERE terms keep, checked and corrected the
+/// same way (the table's row counter, or the filter's stored share), and the GROUP BY's estimate is
+/// made from them again. Only a sorter that takes every row: one beside a hash table of groups
+/// (`GroupByRowSource::Sorter`'s `hash`) takes only the rows of groups past its budget, and is
+/// not checked; nor is a GROUP BY under a window.
+///
+/// After a SELECT DISTINCT (lane replan-12), the sorter holds the distinct rows, not the rows
+/// read: they are checked against the DISTINCT's own count ([distinct_sorter_check]).
 pub(crate) fn emit_sorter_count(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
     plan: &crate::translate::plan::SelectPlan,
     cursor_id: CursorID,
+    grouped: bool,
 ) {
-    use crate::translate::plan::{Distinctness, Operation, Scan};
-    let [joined] = plan.joined_tables() else {
-        return;
-    };
-    if plan.group_by.is_some()
-        || !plan.aggregates.is_empty()
+    use crate::translate::plan::{Distinctness, Operation, Scan, Search};
+    // An ORDER BY sorter after a GROUP BY or an aggregate holds groups, not the rows read.
+    if (!grouped && (plan.group_by.is_some() || !plan.aggregates.is_empty()))
+        || (grouped && plan.group_by.is_none())
         || plan.window.is_some()
         || plan.contains_constant_false_condition
-        || !matches!(plan.distinctness, Distinctness::NonDistinct)
     {
         return;
     }
-    let (Operation::Scan(Scan::BTreeTable { index: None, .. }), Table::BTree(btree)) =
-        (&joined.op, &joined.table)
-    else {
+    // PL.13 (lane replan-12): after a DISTINCT, the sorter holds its distinct rows, checked against
+    // the DISTINCT's own count.
+    if !matches!(plan.distinctness, Distinctness::NonDistinct) {
+        if grouped {
+            return;
+        }
+        if let Some((table, check)) = distinct_sorter_check(t_ctx, plan) {
+            program.emit_insn(Insn::SorterCounted {
+                data: Box::new(crate::vdbe::insn::SorterCountedData {
+                    cursor_id,
+                    table,
+                    analyzed_rows: 0.0,
+                    estimate_error: check.estimate_error,
+                    filter: None,
+                    joined: Some(check),
+                    distinct: true,
+                }),
+            });
+        }
         return;
+    }
+    let joined = match plan.joined_tables() {
+        [joined] => joined,
+        [_, _, ..] => {
+            if let Some((table, check)) = joined_sorter_check(t_ctx, plan) {
+                program.emit_insn(Insn::SorterCounted {
+                    data: Box::new(crate::vdbe::insn::SorterCountedData {
+                        cursor_id,
+                        table,
+                        analyzed_rows: 0.0,
+                        estimate_error: check.estimate_error,
+                        filter: None,
+                        joined: Some(check),
+                        distinct: false,
+                    }),
+                });
+            }
+            return;
+        }
+        [] => return,
+    };
+    let (seek, btree) = match (&joined.op, &joined.table) {
+        (Operation::Scan(Scan::BTreeTable { index: None, .. }), Table::BTree(btree)) => {
+            (false, btree)
+        }
+        (
+            Operation::Search(
+                Search::Seek { index: Some(_), .. } | Search::InSeek { index: Some(_), .. },
+            ),
+            Table::BTree(btree),
+        ) => (true, btree),
+        _ => return,
     };
     let mut terms = plan
         .where_clause
         .iter()
-        .filter(|term| !term.consumed)
+        .filter(|term| seek || !term.consumed)
         .peekable();
     let prefiltered = terms.peek().is_some();
     let fingerprint = crate::filter_shares::fingerprint(terms.map(|term| &term.expr));
@@ -149,72 +209,290 @@ pub(crate) fn emit_sorter_count(
             analyzed_rows,
             estimate_error,
             filter,
+            joined: None,
+            distinct: false,
         }),
     });
 }
 
-/// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
-/// uncorrelated FROM-clause subquery's result, once its fill has stored it whole in its ephemeral
-/// table, holds the rows the plan estimated. Its rows are counted there and checked against the
-/// rows the plan read for the subquery (`PlanValues::subquery_rows`: its estimate, or a count a
-/// fill stored). The estimate's error is the statistics' of each table the subquery reads,
-/// independent, in quadrature; a subquery reading anything else (another subquery, a table
-/// without statistics) or no table is not checked, as a build without statistics is not. The
-/// fill numbers its rows 1, 2, ... (`EphemeralRowidMode::Auto`'s `NewRowid` on a table it only
-/// inserts into), so the last row's rowid is the count, read without a scan.
-pub(crate) fn emit_subquery_count(
-    program: &mut ProgramBuilder,
+/// Amphora (PL.13, lane replan-10: a sorter fed by a join): an ORDER BY or GROUP BY sorter fed by
+/// an inner join of two tables or more, or a LEFT, semi or anti join (lane replan-11: a LEFT
+/// JOIN's unmatched rows kept, null-extended; the rows an EXISTS or NOT EXISTS keeps), holds the
+/// join's rows its WHERE and ON terms keep, one a row. They are checked against the rows the plan
+/// read for the whole join (`cardinality::JoinedSetRows::rows`), noted under the join's identity
+/// (`subquery_rows::join_identity`), where a count past them is stored for the planner. The band
+/// is the statistics' error of each table joined, independent, in quadrature, as a stored
+/// subquery result's over several tables is. `None` where it is not checked: adaptive joins off,
+/// a RIGHT or FULL JOIN, a table without statistics, terms reading a parameter, or no rows noted
+/// for the join. With the check, the name of the first table, for EXPLAIN.
+fn joined_sorter_check(
     t_ctx: &TranslateCtx,
     plan: &crate::translate::plan::SelectPlan,
-    identity: Option<u64>,
-    cursor_id: CursorID,
-) {
+) -> Option<(String, crate::vdbe::insn::CountedCheck)> {
     if !t_ctx.resolver.adaptive_joins() {
-        return;
+        return None;
     }
-    let Some(planned) = identity.and_then(|identity| {
-        t_ctx
-            .resolver
-            .plan_values()
-            .and_then(|values| values.planned_subquery(identity))
-    }) else {
-        return;
-    };
     let tables = plan.joined_tables();
-    if tables.is_empty() {
-        return;
+    // A LEFT, semi or anti join is checked (lane replan-11); a RIGHT or FULL JOIN, whose
+    // unmatched right rows come from a read of their own, is not.
+    if tables.iter().any(|joined| {
+        joined
+            .join_info
+            .as_ref()
+            .is_some_and(|info| info.keeps_right_rows())
+    }) {
+        return None;
     }
+    let identity = crate::subquery_rows::join_identity(tables, &plan.where_clause)?;
+    let planned = t_ctx
+        .resolver
+        .plan_values()
+        .and_then(|values| values.planned_subquery(identity))?;
     let mut squared_error = 0.0;
+    let mut first = None;
     for joined in tables {
         let Table::BTree(btree) = &joined.table else {
-            return;
+            return None;
         };
-        let Some((_, error)) = analyzed_table(t_ctx, &btree.name) else {
-            return;
-        };
+        let (_, error) = analyzed_table(&t_ctx.resolver, &btree.name)?;
         squared_error += error * error;
+        first.get_or_insert_with(|| btree.name.clone());
     }
-    let rows_reg = program.alloc_register();
-    let counted = program.allocate_label();
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: rows_reg,
-    });
-    program.emit_insn(Insn::Last {
-        cursor_id,
-        pc_if_empty: counted,
-    });
-    program.emit_insn(Insn::RowId {
-        cursor_id,
-        dest: rows_reg,
-    });
-    program.preassign_label_to_next_insn(counted);
-    program.emit_insn(Insn::SubqueryCounted {
-        data: Box::new(crate::vdbe::insn::SubqueryCountedData {
-            rows_reg,
+    Some((
+        first?,
+        crate::vdbe::insn::CountedCheck {
             rows: planned.rows,
             planned_rows: planned.planned_rows,
             estimate_error: f64::sqrt(squared_error),
+        },
+    ))
+}
+
+/// Amphora (PL.13, lane replan-12: a DISTINCT sorter's own count): an ORDER BY sorter after a
+/// SELECT DISTINCT takes a row only once the DISTINCT has dropped its duplicates
+/// (`EmitOrderBy::sorter_insert`), so it holds the DISTINCT's rows, not the rows read: they
+/// are checked against the rows the plan read for the DISTINCT (`optimizer::distinct_rows`), noted
+/// under its identity (`subquery_rows::distinct_identity`), where a count past them is stored for
+/// the planner. The estimate is the rows read, so the band is the statistics' error of each table
+/// read, independent, in quadrature, as a stored subquery result's ([tables_error]). `None` where
+/// it is not checked: adaptive joins off, a table without statistics, a term or column reading a
+/// parameter, or no rows noted for the DISTINCT. With the check, the name of the first table, for
+/// EXPLAIN.
+fn distinct_sorter_check(
+    t_ctx: &TranslateCtx,
+    plan: &crate::translate::plan::SelectPlan,
+) -> Option<(String, crate::vdbe::insn::CountedCheck)> {
+    if !t_ctx.resolver.adaptive_joins() {
+        return None;
+    }
+    let identity = crate::subquery_rows::distinct_identity(
+        plan.joined_tables(),
+        &plan.where_clause,
+        &plan.result_columns,
+    )?;
+    let planned = t_ctx
+        .resolver
+        .plan_values()
+        .and_then(|values| values.planned_subquery(identity))?;
+    let estimate_error = tables_error(&t_ctx.resolver, plan)?;
+    let first = plan.joined_tables().first()?.table.get_name().to_string();
+    Some((
+        first,
+        crate::vdbe::insn::CountedCheck {
+            rows: planned.rows,
+            planned_rows: planned.planned_rows,
+            estimate_error,
+        },
+    ))
+}
+
+/// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an
+/// uncorrelated FROM-clause subquery's result, once its fill has stored it whole, holds the rows
+/// the plan estimated. Its rows are counted there and checked against the rows the plan read for
+/// the subquery (`PlanValues::subquery_rows`: its estimate, or a count a fill stored).
+///
+/// The band is the estimate's own error. A GROUP BY whose rows ANALYZE's group count set is
+/// checked against that count's error (lane replan-8, `optimizer::group_count_error`). Any other
+/// estimate is the rows read: the statistics' error of each table the subquery reads, independent,
+/// in quadrature; a subquery reading anything else (another subquery, a table without statistics)
+/// or no table is not checked, as a build without statistics is not.
+///
+/// Where the result is stored decides the count. In its ephemeral table
+/// (`MaterializedFromClauseSubqueryStorage::TableBacked`), the fill numbers its rows 1, 2, ...
+/// (`EphemeralRowidMode::Auto`'s `NewRowid` on a table it only inserts into), so the last row's
+/// rowid is the count, read without a scan. In its seek index (`DirectIndex`, lane replan-8) there
+/// is no rowid to read: `Count` walks the index's pages once, each page's cells summed, no row
+/// decoded. The seek index holds an entry for each row (`ephemeral_subquery_*` has a rowid: a
+/// sequence column keeps equal rows apart), so its entries are the rows.
+pub(crate) fn emit_subquery_count(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &crate::translate::plan::SelectPlan,
+    identity: Option<u64>,
+    cursor_id: CursorID,
+    storage: crate::translate::subquery::MaterializedFromClauseSubqueryStorage,
+) {
+    if let Some(check) = subquery_count_check(resolver, plan, identity) {
+        emit_subquery_counted(program, check, cursor_id, storage);
+    }
+}
+
+/// What a stored subquery result is checked against: the rows the plan read for the subquery
+/// `identity` names, and the band's error. Taken from the subquery's plan, so it can be taken
+/// before the plan is emitted (an IN subquery's, lane replan-10, is consumed by its emission).
+pub(crate) struct SubqueryCheck {
+    planned: crate::subquery_rows::PlannedSubquery,
+    estimate_error: f64,
+}
+
+/// [emit_subquery_count]'s check, `None` where none is made: adaptive joins off, no identity, no
+/// rows the plan read for it, or an estimate whose error the statistics do not give.
+pub(crate) fn subquery_count_check(
+    resolver: &Resolver,
+    plan: &crate::translate::plan::SelectPlan,
+    identity: Option<u64>,
+) -> Option<SubqueryCheck> {
+    if !resolver.adaptive_joins() {
+        return None;
+    }
+    let planned = identity.and_then(|identity| {
+        resolver
+            .plan_values()
+            .and_then(|values| values.planned_subquery(identity))
+    })?;
+    let estimate_error =
+        match crate::translate::optimizer::group_count_error(plan, resolver.schema()) {
+            Some(error) => error,
+            None => tables_error(resolver, plan)?,
+        };
+    Some(SubqueryCheck {
+        planned,
+        estimate_error,
+    })
+}
+
+/// Amphora (PL.13, lane replan-11: a build fed by a materialized input): a hash join's build input
+/// materialized from a join prefix (`emitter::emit_materialized_build_inputs`, key and payload
+/// stored, one row of the ephemeral table a row of the prefix) holds the rows of the tables
+/// `prefix` names that every WHERE term reading only them keeps. Once filled they are checked
+/// against the rows the plan noted for the prefix (`optimizer::note_materialized_prefixes`, under
+/// `subquery_rows::prefix_identity`), as a stored subquery result is: the fill numbers its rows
+/// 1, 2, ... (`EphemeralRowidMode::Auto`), so the last rowid is the count. The band is each
+/// prefix table's statistics' error, independent, in quadrature, as for a sorter fed by a join.
+/// `None` where it is not checked: adaptive joins off, a table without statistics, terms reading
+/// a parameter, or no rows noted for the prefix (an outer, semi or anti join in the query, a plan
+/// for more than one run, a bushy plan).
+pub(crate) fn join_prefix_check(
+    resolver: &Resolver,
+    plan: &crate::translate::plan::SelectPlan,
+    prefix: &crate::translate::planner::TableMask,
+) -> Option<SubqueryCheck> {
+    if !resolver.adaptive_joins() {
+        return None;
+    }
+    let identity = crate::subquery_rows::prefix_identity(
+        &plan.table_references,
+        &plan.non_from_clause_subqueries,
+        &plan.where_clause,
+        prefix,
+    )?;
+    let planned = resolver
+        .plan_values()
+        .and_then(|values| values.planned_subquery(identity))?;
+    let tables = plan.joined_tables();
+    let mut squared_error = 0.0;
+    for table_idx in prefix.iter() {
+        let Table::BTree(btree) = &tables.get(table_idx)?.table else {
+            return None;
+        };
+        let (_, error) = analyzed_table(resolver, &btree.name)?;
+        squared_error += error * error;
+    }
+    Some(SubqueryCheck {
+        planned,
+        estimate_error: f64::sqrt(squared_error),
+    })
+}
+
+/// The relative error of the rows a query reads, its tables' statistics' errors, independent, in
+/// quadrature; `None` where one has none (a table without statistics, a table-valued function), or
+/// for a query reading no table. A FROM-clause subquery it reads (lane replan-10) adds its own:
+/// its GROUP BY's group count error where ANALYZE's group count set its rows, else the errors of
+/// the tables it reads, taken from a worklist of the plans still to read, bounded by the plan's own
+/// size (no recursion at run time).
+fn tables_error(resolver: &Resolver, plan: &crate::translate::plan::SelectPlan) -> Option<f64> {
+    let mut squared_error = 0.0;
+    let mut pending = vec![plan];
+    while let Some(select) = pending.pop() {
+        let tables = select.joined_tables();
+        if tables.is_empty() {
+            return None;
+        }
+        for joined in tables {
+            match &joined.table {
+                Table::BTree(btree) => {
+                    let (_, error) = analyzed_table(resolver, &btree.name)?;
+                    squared_error += error * error;
+                }
+                Table::FromClauseSubquery(subquery) => {
+                    let crate::translate::plan::Plan::Select(inner) = subquery.plan.as_ref() else {
+                        return None;
+                    };
+                    match crate::translate::optimizer::group_count_error(inner, resolver.schema()) {
+                        Some(error) => squared_error += error * error,
+                        None => pending.push(inner),
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(f64::sqrt(squared_error))
+}
+
+/// Counts a stored subquery result's rows where `storage` keeps them and checks them
+/// ([SubqueryCheck]). An IN subquery's ephemeral index (lane replan-10) is a seek index without a
+/// rowid whose inserts skip a key it holds (`IdxInsertFlags::no_op_duplicate`): its entries are the
+/// result's distinct values, counted as `DirectIndex`'s are.
+pub(crate) fn emit_subquery_counted(
+    program: &mut ProgramBuilder,
+    check: SubqueryCheck,
+    cursor_id: CursorID,
+    storage: crate::translate::subquery::MaterializedFromClauseSubqueryStorage,
+) {
+    use crate::translate::subquery::MaterializedFromClauseSubqueryStorage;
+    let rows_reg = program.alloc_register();
+    match storage {
+        MaterializedFromClauseSubqueryStorage::TableBacked => {
+            let counted = program.allocate_label();
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: rows_reg,
+            });
+            program.emit_insn(Insn::Last {
+                cursor_id,
+                pc_if_empty: counted,
+            });
+            program.emit_insn(Insn::RowId {
+                cursor_id,
+                dest: rows_reg,
+            });
+            program.preassign_label_to_next_insn(counted);
+        }
+        MaterializedFromClauseSubqueryStorage::DirectIndex => {
+            program.emit_insn(Insn::Count {
+                cursor_id,
+                target_reg: rows_reg,
+                exact: false,
+            });
+        }
+    }
+    program.emit_insn(Insn::SubqueryCounted {
+        data: Box::new(crate::vdbe::insn::SubqueryCountedData {
+            rows_reg,
+            rows: check.planned.rows,
+            planned_rows: check.planned.planned_rows,
+            estimate_error: check.estimate_error,
         }),
     });
 }
@@ -281,7 +559,7 @@ impl<'a> AdaptiveSeek<'a> {
             return None;
         }
         let weights = t_ctx.resolver.learned_weights()?;
-        let (analyzed_rows, estimate_error) = analyzed_table(t_ctx, &btree.name)?;
+        let (analyzed_rows, estimate_error) = analyzed_table(&t_ctx.resolver, &btree.name)?;
         // The rows the plan counts the table at (PL.9): ANALYZE's with the changes since.
         let build_rows = match t_ctx.resolver.plan_values() {
             Some(values) => values.live_rows(&btree.name, analyzed_rows, estimate_error),
@@ -389,6 +667,8 @@ impl<'a> AdaptiveSeek<'a> {
                 payload_start_reg: (num_payload > 0).then_some(build_keys + num_keys),
                 num_payload,
                 track_matched: false,
+                // An adaptive join's switch weighs a hash table, not a merge.
+                merge: false,
             }),
         });
         program.emit_insn(Insn::Next {

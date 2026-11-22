@@ -1,5 +1,5 @@
 use crate::{
-    alloc::{TursoFromIterator, TursoIteratorExt},
+    alloc::{TryClone, TursoFromIterator, TursoIteratorExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
@@ -348,6 +348,11 @@ struct MaterializationSpec {
     prefix_tables: TableMask,
     key_exprs: Vec<Expr>,
     payload_columns: Vec<MaterializedColumnRef>,
+    /// PL.13 (lane replan-11): the join prefix whose rows the input holds, one a row, where they
+    /// are checked against the plan's estimate (`main_loop::join_prefix_check`): a left-deep
+    /// prefix of two tables or more (its loops and the build tables their hash joins read, lane
+    /// replan-14), stored key and payload.
+    checked_prefix: Option<TableMask>,
 }
 
 /// Store filtered hash-build inputs before the hash table is built.
@@ -485,6 +490,18 @@ pub(crate) fn emit_materialized_build_inputs(
                 probe_table_idx,
                 &hash_join_op.build_group,
             )?;
+            // T-PL.13.18 (lane replan-14): the prefix the input holds is every table it joins,
+            // the loops before the probe and the build tables their hash joins read. A hash
+            // join's build table runs no loop of its own (the plan's join order leaves it out),
+            // so a two-table prefix whose second table probes the first has a join order of one
+            // table: the check goes by the tables joined, as the planner noted them
+            // (`optimizer::note_materialized_prefixes`, every table before the probe).
+            let checked_prefix =
+                if hash_join_op.build_group.is_empty() && included_tables.count() >= 2 {
+                    Some(included_tables.try_clone()?)
+                } else {
+                    None
+                };
             let prefix_has_other_tables = included_tables
                 .iter()
                 .any(|table_idx| table_idx != hash_join_op.build_table_idx);
@@ -513,6 +530,7 @@ pub(crate) fn emit_materialized_build_inputs(
                     prefix_tables: included_tables,
                     key_exprs,
                     payload_columns,
+                    checked_prefix,
                 });
             } else {
                 // Single-table prefix: a rowid list preserves the build-side filters
@@ -524,6 +542,7 @@ pub(crate) fn emit_materialized_build_inputs(
                     prefix_tables: TableMask::default(),
                     key_exprs: Vec::new(),
                     payload_columns: Vec::new(),
+                    checked_prefix: None,
                 });
             }
         }
@@ -602,6 +621,22 @@ pub(crate) fn emit_materialized_build_inputs(
             program.clear_hash_tables_to_keep_open();
             Ok(())
         })?;
+        // PL.13 (lane replan-11: a build fed by a materialized input): the prefix's rows, all in,
+        // counted against the rows the plan noted for it.
+        let check = match spec.checked_prefix.as_ref() {
+            Some(prefix) => {
+                crate::translate::main_loop::join_prefix_check(resolver, &*plan, prefix)
+            }
+            None => None,
+        };
+        if let Some(check) = check {
+            crate::translate::main_loop::emit_subquery_counted(
+                program,
+                check,
+                cursor_id,
+                crate::translate::subquery::MaterializedFromClauseSubqueryStorage::TableBacked,
+            );
+        }
         program.pop_current_parent_explain();
 
         build_inputs.insert(
@@ -1198,6 +1233,7 @@ fn build_materialized_build_input_plan(
         non_from_clause_subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        in_identity: None,
         estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],

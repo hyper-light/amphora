@@ -190,6 +190,8 @@ pub fn translate(
         connection.bushy_left_join_probes() == crate::BushyLeftJoinProbes::ByCost,
     );
     resolver.set_star_filters(connection.star_filters());
+    resolver.set_is_value_estimate(connection.is_value_estimate());
+    resolver.set_star_filter_order(connection.star_filter_order());
     // Amphora (PL.8): the join search's budget, from the rule and this database's measured rates.
     resolver.set_join_search(
         crate::translate::optimizer::search_budget::SearchBudget::new(

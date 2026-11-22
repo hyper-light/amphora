@@ -44,6 +44,7 @@ pub mod row_counts;
 pub mod row_header;
 pub mod rowset;
 pub mod sorter;
+pub(crate) mod star_order;
 #[cfg(test)]
 mod statement_lifecycle_tests;
 pub mod vacuum;
@@ -978,6 +979,9 @@ pub struct ProgramState {
     /// Amphora (PL.13): each adaptive join's switch, by switch id; None for one that cannot
     /// switch (`optimizer::adaptive::JoinSwitch`).
     join_switches: HashMap<usize, Option<crate::translate::optimizer::adaptive::JoinSwitch>>,
+    /// Amphora (QT.5, T-QT.5.11): each star probe's filters in their measured order, by the
+    /// instruction's address (`Insn::StarProbes`); made at its first row, dropped with the run.
+    star_orders: HashMap<InsnReference, star_order::StarOrder>,
     /// Amphora (PL.13, the in-run hand-off): this run may still be handed to a second prepare.
     /// `Statement` opens it as a read-only root statement's run starts and shuts it at the run's
     /// first row, so a run that has returned a row is never started again.
@@ -1139,6 +1143,7 @@ impl ProgramState {
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
             join_switches: HashMap::default(),
+            star_orders: HashMap::default(),
             handoff_open: false,
             handoff_asked: false,
             group_tables: HashMap::default(),
@@ -1335,6 +1340,9 @@ impl ProgramState {
         }
         if !self.join_switches.is_empty() {
             self.join_switches.clear();
+        }
+        if !self.star_orders.is_empty() {
+            self.star_orders.clear();
         }
         self.handoff_open = false;
         self.handoff_asked = false;

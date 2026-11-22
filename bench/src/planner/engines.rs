@@ -80,6 +80,11 @@ pub trait Target {
     fn amphora(&mut self) -> Option<&mut Amphora> {
         None
     }
+    /// PL.13 (lane replan-9, a cold run): how long ago the engine's server started, in seconds;
+    /// None for an engine embedded in this process, which starts with it.
+    fn server_started_s(&mut self) -> Option<f64> {
+        None
+    }
 }
 
 fn first_row(cells: impl Iterator<Item = String>) -> String {
@@ -128,6 +133,8 @@ pub struct Amphora {
     cache_kib: i64,
     /// QT.7: its scans decode each leaf once into column batches (`Connection::set_vectorized_scans`).
     vectorized: bool,
+    /// PL.13 (lane replan-6): adaptive joins and re-planning on (`Connection::set_adaptive_joins`).
+    adaptive: bool,
 }
 
 /// One table access's or join's estimate and count, as the record keeps it.
@@ -142,7 +149,7 @@ pub struct Count {
 }
 
 impl Amphora {
-    pub fn open(dir: &Path, cache_kib: i64, vectorized: bool) -> anyhow::Result<Self> {
+    pub fn open(dir: &Path, cache_kib: i64, vectorized: bool, adaptive: bool) -> anyhow::Result<Self> {
         use amphora_engine::{ConnectOpts, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect};
         std::fs::create_dir_all(dir)?;
         let io: Arc<dyn amphora_engine::IO> = Arc::new(PlatformIO::new().map_err(|e| anyhow::anyhow!("{e}"))?);
@@ -154,7 +161,9 @@ impl Amphora {
         counted.set_row_counters(true);
         conn.set_vectorized_scans(vectorized);
         counted.set_vectorized_scans(vectorized);
-        let mut a = Self { io, _db: db, conn, counted, cache_kib, vectorized };
+        conn.set_adaptive_joins(adaptive);
+        counted.set_adaptive_joins(adaptive);
+        let mut a = Self { io, _db: db, conn, counted, cache_kib, vectorized, adaptive };
         for c in [a.conn.clone(), a.counted.clone()] {
             a.exec_on(&c, &format!("PRAGMA cache_size = -{cache_kib}"))?;
         }
@@ -305,7 +314,11 @@ impl Amphora {
 
 impl Target for Amphora {
     fn name(&self) -> String {
-        if self.vectorized { "amphora-vectorized".into() } else { "amphora".into() }
+        match (self.vectorized, self.adaptive) {
+            (true, _) => "amphora-vectorized".into(),
+            (false, true) => "amphora-adaptive".into(),
+            (false, false) => "amphora".into(),
+        }
     }
 
     fn dialect(&self) -> Dialect {
@@ -313,7 +326,7 @@ impl Target for Amphora {
     }
 
     fn about(&mut self) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::json!({ "engine": "amphora", "cache_kib": self.cache_kib, "threads": 1, "vectorized_scans": self.vectorized }))
+        Ok(serde_json::json!({ "engine": "amphora", "cache_kib": self.cache_kib, "threads": 1, "vectorized_scans": self.vectorized, "adaptive_joins": self.adaptive }))
     }
 
     fn exec(&mut self, sql: &str) -> anyhow::Result<()> {
@@ -679,7 +692,7 @@ mod tests {
         let io: Arc<dyn amphora_engine::IO> = Arc::new(MemoryIO::new());
         let db = Database::open(io.clone(), &format!("planner-answers-{}.db", std::process::id()), OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).unwrap();
         let (conn, counted) = (db.connect(ConnectOpts::new()).unwrap(), db.connect(ConnectOpts::new()).unwrap());
-        let mut amphora = Amphora { io, _db: db, conn, counted, cache_kib: 0, vectorized: false };
+        let mut amphora = Amphora { io, _db: db, conn, counted, cache_kib: 0, vectorized: false, adaptive: false };
         let mut answer = writer();
         assert!(matches!(amphora.run(LITE_ROW, Duration::from_secs(60), Some(&mut answer)), Outcome::Done(Run { rows: 1, .. })));
         assert_eq!(answer.finish(), LITE_ANSWER);
@@ -778,6 +791,10 @@ impl Target for Postgres {
 
     fn loaded(&mut self, table: &str) -> anyhow::Result<bool> {
         Ok(self.client.query_opt(&format!("SELECT 1 FROM {table} LIMIT 1"), &[]).ok().flatten().is_some())
+    }
+
+    fn server_started_s(&mut self) -> Option<f64> {
+        self.client.query_one("SELECT extract(epoch FROM now() - pg_postmaster_start_time())::float8", &[]).ok().map(|row| row.get::<_, f64>(0))
     }
 
     fn run(&mut self, sql: &str, deadline: Duration, mut answer: Option<&mut Answer>) -> Outcome {

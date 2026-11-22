@@ -122,7 +122,9 @@ pub(super) fn emit_builds(
     Ok(probes)
 }
 
-/// Check the fact row's keys against each filter, in the planner's order; a miss goes to `skip`.
+/// Check the fact row's keys against each filter, in the planner's order or the run's measured one
+/// (`Connection::set_star_filter_order`, T-QT.5.11): one `StarProbes`; a miss goes to `skip`. Every
+/// filter's keys are read first, the fact row's columns, so the checks can run in any order.
 pub(super) fn emit_probes(
     program: &mut ProgramBuilder,
     t_ctx: &TranslateCtx,
@@ -131,6 +133,10 @@ pub(super) fn emit_probes(
     probes: &[StarProbe],
     skip: BranchOffset,
 ) -> Result<()> {
+    if probes.is_empty() {
+        return Ok(());
+    }
+    let mut keys = Vec::with_capacity(probes.len());
     for probe in probes {
         let num_keys = probe.keys.len();
         let key_reg = program.alloc_registers(num_keys);
@@ -150,13 +156,18 @@ pub(super) fn emit_probes(
                 affinities: probe.affinities.clone(),
             });
         }
-        program.emit_insn(Insn::Filter {
+        keys.push(crate::vdbe::insn::StarProbeKeys {
             cursor_id: probe.cursor_id,
-            target_pc: skip,
             key_reg,
             num_keys,
-            star: true,
         });
     }
+    program.emit_insn(Insn::StarProbes {
+        data: Box::new(crate::vdbe::insn::StarProbesData {
+            probes: keys.into_boxed_slice(),
+            target_pc: skip,
+            order: t_ctx.resolver.star_filter_order(),
+        }),
+    });
     Ok(())
 }

@@ -8,6 +8,14 @@
 //! table loaded and one a query and engine. bench/planner/summary.py reads them. With
 //! `--answers <dir>`, each query's first timed run on each engine writes its whole answer there
 //! (`answers.rs`), which bench/planner/answers.py compares.
+//!
+//! PL.13 (lane replan-9): every query's runs are warm, each engine having run it once before they
+//! are timed (Amphora's counted run, the other engines' warm-up run), and an adaptive engine's
+//! counted run has learned its corrections by then. `--phase cold` times the one query `--only`
+//! names once on each engine as this process opened it: no learned correction, no statement run
+//! before it, and, with the server restarted and the page cache dropped before the process starts
+//! (bench/planner/cold.sh), nothing cached. Its record is a `cold` one, which the readers of
+//! `query` records pass over.
 
 mod answers;
 mod data;
@@ -45,6 +53,12 @@ struct Opts {
     prepared: Option<PathBuf>,
     params: Option<PathBuf>,
     plan_cache_modes: Vec<String>,
+    /// PL.13 (lane replan-9): `cold` times the one query `--only` names once on each engine, as
+    /// this process opened it; `warm`, every query after a run that warms it.
+    cold: bool,
+    /// `--os-cache-dropped`: the script that started this process dropped the operating system's
+    /// page cache first (cold.sh's claim, recorded as such; `page_cache_kib` is the fact beside it).
+    os_cache_dropped: bool,
 }
 
 fn opts() -> anyhow::Result<Opts> {
@@ -69,6 +83,8 @@ fn opts() -> anyhow::Result<Opts> {
         prepared: None,
         params: None,
         plan_cache_modes: vec!["generic".into(), "auto".into()],
+        cold: false,
+        os_cache_dropped: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -95,12 +111,23 @@ fn opts() -> anyhow::Result<Opts> {
             "--prepared" => o.prepared = Some(v()?.into()),
             "--params" => o.params = Some(v()?.into()),
             "--plan-cache-modes" => o.plan_cache_modes = v()?.split(',').map(str::to_owned).collect(),
-            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes)"),
+            "--phase" => {
+                o.cold = match v()?.as_str() {
+                    "cold" => true,
+                    "warm" => false,
+                    p => anyhow::bail!("--phase is cold or warm, not {p}"),
+                }
+            }
+            "--os-cache-dropped" => o.os_cache_dropped = true,
+            other => anyhow::bail!("unknown argument {other} (--planner takes --bench job|tpch, --data, --queries, --sf, --dir, --targets, --runs, --timeout-s, --count-timeout-s, --dsn, --cache-mib, --only, --max-load, --load-wait-s, --out, --resume, --answers, --prepared, --params, --plan-cache-modes, --phase cold|warm, --os-cache-dropped)"),
         }
     }
     anyhow::ensure!(matches!(o.bench.as_str(), "job" | "tpch"), "--bench is job or tpch");
     anyhow::ensure!(!o.data.as_os_str().is_empty() && !o.queries.as_os_str().is_empty() && !o.dir.as_os_str().is_empty() && !o.out.as_os_str().is_empty(), "--planner needs --data, --queries, --dir and --out");
     anyhow::ensure!(o.runs > 0, "--runs is at least 1");
+    // A cold run is the first statement its process runs on each engine: one query a process, so
+    // no correction learned on another query's run reaches it.
+    anyhow::ensure!(!o.cold || (o.only.len() == 1 && o.only[0] != "-" && o.prepared.is_none() && o.answers.is_none() && !o.resume), "--phase cold times the one query --only names, without --prepared, --answers or --resume");
     if o.prepared.is_some() {
         anyhow::ensure!(o.bench == "tpch" && o.params.is_some() && o.targets == ["amphora"], "--prepared runs TPC-H on amphora alone, with --params");
         anyhow::ensure!(!o.plan_cache_modes.is_empty(), "--plan-cache-modes names at least one");
@@ -205,6 +232,24 @@ fn quiet(max: f64, wait: Duration) -> Option<f64> {
     }
 }
 
+/// The operating system's page cache now, in KiB (Linux's `Cached` in /proc/meminfo): beside a cold
+/// run, what was cached when it began.
+#[cfg(not(windows))]
+fn page_cache_kib() -> Option<u64> {
+    cached_kib(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// `Cached`'s KiB in /proc/meminfo's text (not `SwapCached`'s).
+#[cfg_attr(windows, allow(dead_code))]
+fn cached_kib(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| l.strip_prefix("Cached:"))?.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(windows)]
+fn page_cache_kib() -> Option<u64> {
+    None
+}
+
 /// The machine: its processor, memory, disk and system.
 #[cfg(not(windows))]
 fn host(dir: &Path) -> serde_json::Value {
@@ -266,9 +311,12 @@ fn sh(cmd: &str) -> String {
 fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
     let dir = o.dir.join(target);
     Ok(match target {
-        "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false)?),
+        "amphora" => Box::new(Amphora::open(&dir, o.cache_kib, false, false)?),
+        // PL.13 (lane replan-6): the same engine with adaptive joins and re-planning on
+        // (`Connection::set_adaptive_joins`), on a copy of its own; `amphora` is its control.
+        "amphora-adaptive" => Box::new(Amphora::open(&dir, o.cache_kib, false, true)?),
         // QT.7: the same engine, its scans by column batches, on a copy of its own.
-        "amphora-vectorized" => Box::new(Amphora::open(&dir, o.cache_kib, true)?),
+        "amphora-vectorized" => Box::new(Amphora::open(&dir, o.cache_kib, true, false)?),
         "sqlite" => Box::new(Sqlite::open(&dir, o.cache_kib)?),
         "duckdb" => Box::new(Duck::open(&dir, Some(1))?),
         // A database of its own: DuckDB locks its file to one database a process.
@@ -282,7 +330,7 @@ fn open(o: &Opts, target: &str) -> anyhow::Result<Box<dyn Target>> {
             }
             Box::new(Postgres::open(&format!("{} dbname={name}", o.dsn))?)
         }
-        t => anyhow::bail!("--planner runs amphora, amphora-vectorized, sqlite, duckdb, duckdb-mt or postgres, not {t}"),
+        t => anyhow::bail!("--planner runs amphora, amphora-adaptive, amphora-vectorized, sqlite, duckdb, duckdb-mt or postgres, not {t}"),
     })
 }
 
@@ -372,6 +420,7 @@ pub fn main() -> anyhow::Result<()> {
         "queries": b.queries.len(),
         "runs": o.runs, "timeout_s": o.timeout.as_secs(), "count_timeout_s": o.count_timeout.as_secs(),
         "max_load": o.max_load,
+        "phase": if o.cold { "cold" } else { "warm" },
         "engines": engines,
     }))?;
     // --prepared: each query prepared once and run with qgen's parameters under each plan cache
@@ -397,6 +446,22 @@ pub fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if o.cold {
+        for (name, sql) in b.queries.iter().filter(|(n, _)| o.only.contains(n)) {
+            for target in &mut targets {
+                let sql = for_dialect(sql.trim().trim_end_matches(';'), target.dialect());
+                let server_started_s = target.server_started_s();
+                let load = quiet(o.max_load, o.load_wait);
+                let page_cache_kib = page_cache_kib();
+                let outcome = target.run(&sql, o.timeout, None);
+                let state = serde_json::json!({ "first_query_since_open": true, "server_started_s": server_started_s, "os_cache_dropped": o.os_cache_dropped, "page_cache_kib": page_cache_kib });
+                let record = serde_json::json!({ "record": "cold", "bench": o.bench, "query": name, "target": target.name(), "run": outcome_json(&outcome, load), "state": state });
+                eprintln!("{name} {} cold: {}", target.name(), record["run"]["ms"].as_f64().map_or_else(|| "no time".to_owned(), |ms| format!("{ms:.1} ms")));
+                write(record)?;
+            }
+        }
+        return Ok(());
+    }
     // --answers: a directory for the benchmark (TPC-H's named with its scale factor, tpch-sf1, as
     // record.sh names its benchmarks), and in it one for each query.
     let answers_root = o.answers.as_ref().map(|dir| dir.join(if o.bench == "tpch" { format!("tpch-sf{}", o.sf) } else { o.bench.clone() }));
@@ -410,7 +475,7 @@ pub fn main() -> anyhow::Result<()> {
                 continue;
             }
             let sql = for_dialect(sql.trim().trim_end_matches(';'), target.dialect());
-            let mut record = serde_json::json!({ "record": "query", "bench": o.bench, "query": name, "target": target.name() });
+            let mut record = serde_json::json!({ "record": "query", "bench": o.bench, "query": name, "target": target.name(), "phase": "warm" });
             if let Some(amphora) = target.amphora() {
                 record["plan"] = match amphora.plan_json(&sql) {
                     Ok(plan) => serde_json::from_str(&plan).unwrap_or(serde_json::Value::String(plan)),
@@ -420,6 +485,13 @@ pub fn main() -> anyhow::Result<()> {
                 let (outcome, counts) = amphora.counted(&sql, o.count_timeout);
                 record["counted"] = outcome_json(&outcome, load);
                 record["counts"] = counts_json(&counts);
+                record["warmed_by"] = "counted".into();
+            } else {
+                // PL.13 (lane replan-9): the other engines run the query once before it is timed,
+                // as Amphora's counted run does, so every engine's timed runs are warm alike.
+                let load = quiet(o.max_load, o.load_wait);
+                record["warmup"] = outcome_json(&target.run(&sql, o.timeout, None), load);
+                record["warmed_by"] = "warmup".into();
             }
             // Under --answers the first timed run writes its rows; the runs after it are timed as
             // without.
@@ -473,5 +545,15 @@ mod tests {
         assert_eq!(civil(-1), Some((1969, 12, 31)));
         assert_eq!(civil(11_016), Some((2000, 2, 29)));
         assert_eq!(civil(i64::MAX), None);
+    }
+
+    /// Do: read the page cache from /proc/meminfo's text, a `SwapCached` line before `Cached`'s
+    /// (PL.13, lane replan-9: a cold run's record). Expect: `Cached`'s KiB, and None where the text
+    /// has only `SwapCached`.
+    #[test]
+    fn the_page_cache_is_cacheds_kib() {
+        let meminfo = "MemTotal:       65536000 kB\nSwapCached:          12 kB\nCached:          4096 kB\nActive:  1 kB\n";
+        assert_eq!(cached_kib(meminfo), Some(4096));
+        assert_eq!(cached_kib("MemTotal: 1 kB\nSwapCached: 12 kB\n"), None);
     }
 }
