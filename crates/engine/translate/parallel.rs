@@ -46,12 +46,27 @@ pub(crate) fn emit_morsel_hook(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
 ) -> Option<MorselHook> {
+    let window = window(plan)?;
     let data = shape(plan).or_else(|| shape_join(plan))?;
     let serial = program.allocate_label();
     let end = program.allocate_label();
     let next = program.allocate_label();
     let count = plan.result_columns.len();
     let dest_start = program.alloc_registers(count);
+    // A LIMIT and an OFFSET count the hook's rows down as the serial loop's do (QT.6, lane qs6-6).
+    let offset = (window.offset > 0).then(|| {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: window.offset,
+            dest: reg,
+        });
+        reg
+    });
+    let limit = window.limit.map(|value| {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::Integer { value, dest: reg });
+        reg
+    });
     program.emit_insn(Insn::MorselAggregate {
         data: Box::new(MorselAggregateData {
             target_pc_serial: serial,
@@ -64,13 +79,65 @@ pub(crate) fn emit_morsel_hook(
         count,
         target_pc_done: end,
     });
+    if let Some(reg) = offset {
+        program.emit_insn(Insn::IfPos {
+            reg,
+            target_pc: next,
+            decrement_by: 1,
+        });
+    }
     program.emit_insn(Insn::ResultRow {
         start_reg: dest_start,
         count,
     });
+    if let Some(reg) = limit {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg,
+            target_pc: end,
+        });
+    }
     program.emit_insn(Insn::Goto { target_pc: next });
     program.preassign_label_to_next_insn(serial);
     Some(MorselHook { end })
+}
+
+/// A statement's LIMIT and OFFSET as the hook's row loop counts them (QT.6, lane qs6-6).
+struct Window {
+    limit: Option<i64>,
+    offset: i64,
+}
+
+/// An integer literal, or the negation of one.
+fn integer(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(Literal::Numeric(text)) => text.parse::<i64>().ok(),
+        Expr::Unary(UnaryOperator::Negative, inner) => match inner.as_ref() {
+            Expr::Literal(Literal::Numeric(text)) => {
+                text.parse::<i64>().ok().and_then(i64::checked_neg)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The LIMIT and OFFSET when each is absent or an integer literal, read as SQLite reads them: a
+/// negative LIMIT is none, a negative OFFSET is none. LIMIT 0 and any other expression decline
+/// the hook; the serial loop answers them.
+fn window(plan: &SelectPlan) -> Option<Window> {
+    let limit = match plan.limit.as_deref() {
+        None => None,
+        Some(expr) => match integer(expr)? {
+            0 => return None,
+            n if n < 0 => None,
+            n => Some(n),
+        },
+    };
+    let offset = match plan.offset.as_deref() {
+        None => 0,
+        Some(expr) => integer(expr)?.max(0),
+    };
+    Some(Window { limit, offset })
 }
 
 fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
@@ -216,11 +283,16 @@ fn literal(expr: &Expr) -> Option<Value> {
 /// The checks every shape shares: a top-level SELECT whose rows are its aggregates' groups, with
 /// none of what the pipelines don't run (ORDER BY, LIMIT, DISTINCT, windows, subqueries).
 fn plain(plan: &SelectPlan) -> bool {
-    !plan.aggregates.is_empty() && plan.order_by.is_empty() && plain_any(plan)
+    !plan.aggregates.is_empty()
+        && plan.order_by.is_empty()
+        && plan.limit.is_none()
+        && plan.offset.is_none()
+        && plain_any(plan)
 }
 
-/// The checks a join's rows take (QT.6): no aggregates and no GROUP BY, an ORDER BY allowed, and
-/// the rest as [`plain`].
+/// The checks a join's rows take (QT.6): no aggregates and no GROUP BY, an ORDER BY allowed, a
+/// LIMIT and OFFSET allowed (`shape_join` asks the order that makes them exact), and the rest as
+/// [`plain`].
 fn plain_rows(plan: &SelectPlan) -> bool {
     plan.aggregates.is_empty()
         && plan.group_by.is_none()
@@ -228,11 +300,9 @@ fn plain_rows(plan: &SelectPlan) -> bool {
         && plain_any(plan)
 }
 
-/// What every shape refuses: LIMIT, OFFSET, DISTINCT, windows, subqueries, rows not returned.
+/// What every shape refuses: DISTINCT, windows, subqueries, rows not returned.
 fn plain_any(plan: &SelectPlan) -> bool {
-    !(plan.limit.is_some()
-        || plan.offset.is_some()
-        || plan.contains_constant_false_condition
+    !(plan.contains_constant_false_condition
         || !matches!(plan.query_destination, QueryDestination::ResultRows)
         || !matches!(plan.distinctness, Distinctness::NonDistinct)
         || !plan.values.is_empty()
@@ -396,23 +466,34 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
     let width = probe_table.columns().len();
     // A column the hook reads, and whether it is the probe table's.
     let side = |expr: &Expr| -> Option<(bool, usize)> {
-        let Expr::Column {
-            table: t, column, ..
-        } = expr
-        else {
-            return None;
+        let (t, column) = match expr {
+            Expr::Column {
+                table: t, column, ..
+            } => (*t, *column),
+            // A table's rowid is its INTEGER PRIMARY KEY column, where it has one (lane qs6-6).
+            Expr::RowId { table: t, .. } => {
+                let alias = if *t == probe.internal_id {
+                    rowid_alias(probe_table)?
+                } else if *t == build.internal_id {
+                    rowid_alias(build_table)?
+                } else {
+                    return None;
+                };
+                (*t, alias)
+            }
+            _ => return None,
         };
-        let (is_probe, table) = if *t == probe.internal_id {
+        let (is_probe, table) = if t == probe.internal_id {
             (true, probe_table)
-        } else if *t == build.internal_id {
+        } else if t == build.internal_id {
             (false, build_table)
         } else {
             return None;
         };
-        let col = table.columns().get(*column)?;
+        let col = table.columns().get(column)?;
         let plain = matches!(col.affinity(), Affinity::Integer | Affinity::Text)
             && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-        plain.then_some((is_probe, *column))
+        plain.then_some((is_probe, column))
     };
     let joined_at = |expr: &Expr| -> Option<usize> {
         let (is_probe, at) = side(expr)?;
@@ -473,6 +554,21 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
         }
     }
     let (group_by, aggregates, result_map, joined_rows) = if rows_mode {
+        // A LIMIT or OFFSET cuts rows in order, so the hook takes one only when its rows' order is
+        // the serial loop's to the row: the ORDER BY keys hold both tables' INTEGER PRIMARY KEYs,
+        // which tell every joined row apart (QT.6, lane qs6-6).
+        if plan.limit.is_some() || plan.offset.is_some() {
+            let ordered = |is_probe: bool, table: &BTreeTable| {
+                rowid_alias(table).is_some_and(|alias| {
+                    plan.order_by
+                        .iter()
+                        .any(|(expr, _, _)| side(expr) == Some((is_probe, alias)))
+                })
+            };
+            if !(ordered(true, probe_table) && ordered(false, build_table)) {
+                return None;
+            }
+        }
         let (project, rows) = joined_rows(plan, &joined_at)?;
         (Vec::new(), Vec::new(), project, Some(rows))
     } else {

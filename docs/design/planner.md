@@ -1481,6 +1481,48 @@ read by a key.
 **Falsified by.** An answer of a plan the hook splits that differs from its left-deep plan's; a CERT
 finding where an outer join's ON terms read only an earlier table.
 
+## Decision (lane pl8-9): the search makes bushy plans where they cost less
+
+**Decision.** PL.8, the search's half of bushy plans (lanes pl8-7 to pl8-9). After the left-deep
+search, `compute_best_join_order_with_context` (`optimizer/join.rs`) pairs each connected subset it
+planned (the run) with a table joined to it (the probe) and the connected rest of the tables (the
+loops): DPccp's connected complement pairs (Moerkotte and Neumann, VLDB 2006), in the one shape the
+emitter runs (decision pl8-5). The loops are the rest's best plan; the run is its plan ending at the
+table the probe joins; the probe is an inner hash join built once from the run's rows, materialized,
+and read once for each row of the loops. Its cost is the loops' plus the run's plus the hash join's
+(`estimate_hash_join_cost`, the probe table's scan at its own pages, PL.7) plus a row's visit for
+each row of the run materialized, the terms a left-deep plan's materialized build input pays. The
+bushy plan replaces the left-deep one only when it costs less. The pairs are walked on loops over
+the subsets found, not recursion (CLAUDE.md section 11), and each pair counts against what the
+subsets left of `JOIN_SEARCH_BUDGET` (decision 19): past it the left-deep plan stands. No bushy plan
+is tried for a join with an outer, semi or anti join, a RIGHT or FULL JOIN, or a table that must
+follow another (`bushy_plans_allowed`), and a bushy plan keeps no order, so it removes no sort.
+
+**Why.** A left-deep order joins one table at a time, so two selective joins whose small results
+meet only through each other force it to join one side's small result to the other side's whole
+table first and carry that large result to the last filter. A bushy plan joins each side on its own
+and meets their small results. The data where this holds is the test's below: two fact tables, each
+cut down by a filtered dimension, joined on a key of two values.
+
+**Evidence.** `optimizer::bushy_search_tests::tests::t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest`
+(T-PL.8.2): three queries over that data (rows, and two aggregates, with one or several rows of the
+second dimension). Each is planned bushy by the search alone (the planner counts each plan with a
+build group it hands the emitter, `BUSHY_PLANS`), and each answers as the plan of nested loops does.
+The learned hash probe weight rises about tenfold once the test's first statements have run (a debug
+build's hash join timed against a row's visit), so the data makes the left-deep orders' intermediate
+result large enough that the bushy plan wins at either weight. The hand-built test of decision pl8-5
+(`bushy_test_hook`) stays: it covers shapes the search's data does not (a range join before the run,
+a WHERE term between the run and the loop before it, a probe term reading the loop before the run).
+
+**Not yet built.** `JOIN_SEARCH_BUDGET` is still decision 19's 10,000 subsets from Neumann and Radke;
+deriving it from a plan-time target (the measured time a candidate takes against the planning time a
+query may take) needs that target defined first. Semi and anti joins placed before other loops. The
+probe is read whole; a probe that keeps its own access method would let the run's result join a loop
+read by a key.
+
+**Falsified by.** A bushy plan's answer that differs from the nested loops'; a JOB query whose plan
+turns bushy and runs slower than on its parent (AC-PL.8.1).
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
@@ -1609,18 +1651,46 @@ Two run-time checks, each a pure core the executor drives, each with a fixed few
   decision "lane pl9" uses it), the rest of the statement is due to be planned again on the counted
   rows. Within it, the estimate could not be told apart from its own noise, and nothing changes.
 - **Memory.** The switch's hash table is held to the hash table's share of the statement's budget
-  (`vdbe::hash_table::table_share`), measured before the switch by an upper bound known without
-  reading it (the inner table's pages). A materialization point counts the bytes it holds against
-  its budget. Past either, a typed refusal (`AdaptiveError`): the join stays a nested loop, the
-  plan under way goes on, both always correct answers.
+  (`vdbe::hash_table::table_share`): before the switch, by the bytes the statistics say it would
+  take (the inner rows, each its index entry's values at `Value`'s in-memory size, a format value);
+  after the build, by the table's own spill check, since the estimate can miss. A materialization
+  point counts the bytes it holds against its budget. Past either, a typed refusal (`AdaptiveError`)
+  or a spilled table freed: the join stays a nested loop, the plan under way goes on, both always
+  correct answers.
 - Nothing is picked: the point moves with the learned weights and the inner side's rows, the band
   with the statistics' own sample size.
 
-**Built so far.** The two cores and their tests. The executor's shell is the next piece: a join
-emitted with both inner loops (the seek and the hash probe, `main_loop/hash.rs`'s build emitted
-behind the switch's jump) and an instruction that steps the switch; and a materialization point
-that hands its counted rows to a second prepare of the statement's rest. Until it lands no plan
-switches.
+**The executor's shell** (`translate/main_loop/adaptive.rs`, `Connection::set_adaptive_joins`, off
+by default until AC-PL.13.1's measurement). An inner join's forward equality seek on a table's own
+index, in a query, with statistics and a break-even under the learned weights, is emitted with both
+inner loops: ahead of the seek, `JoinSwitchStep` counts the outer row and falls through to the seek,
+jumps once (at the point) to the hash table's build over the inner table, keyed on the seek's
+columns with the rest of the index entry and the rowid beside them, and from then on to its probe.
+A probe's match positions the index cursor on the very entry the seek would have found, so both
+loops share one body, and the loop's close reads the hash table's next match once switched
+(`JoinSwitchHash`). The table takes its own hash table id: a hash join the plan chose keys its table
+by its build table's id. A spilled build is freed and the switch refused (`JoinSwitchBuilt`); the
+adaptive join has no grace loop.
+
+**The re-plan.** The switch's build is the materialization point the executor drives: it holds the
+whole inner table. `JoinSwitchBuilt` sets its rows against the rows the plan counted the table at
+(ANALYZE's with the changes since, decision "lane pl9"). Past the band, the table's row counter is
+set to the rows counted, so the statement's planned table has moved: it is prepared again on the
+counted rows before its next run (`Statement::statistics_moved`), as is every other statement
+planned on the table.
+
+**The in-run hand-off** (`Statement::hand_off`, `Connection::set_adaptive_handoff`, on wherever
+adaptive joins are). The rest of the run goes to that second prepare where it can start again
+without a row twice: a read-only root statement that has returned no row yet. As such a run starts,
+`Statement` opens the hand-off; its first row shuts it. With it open, `JoinSwitchBuilt` stops the
+run past the band, and the statement starts it again on the plan made now, the way a schema change
+part way through restarts one: its implicit transaction ended, the statement prepared again, the
+same bound values. Nothing was written and nothing returned, so the new run's rows are the run's only
+rows. In autocommit the implicit transaction it ends must be its own: with another statement on the
+connection under way in it, the run goes on as planned. A run is handed off once at most: the new plan is made on the counted rows, so its own build
+falls within the band, and were it not, it goes on as planned. A run that has returned rows, or
+writes, goes on as planned and the new plan waits for its next run: its answer is right and no row
+comes twice. The other materialization points (a sorter, a materialized subquery) are not built.
 
 **Why.** Audit row 13 (`bench/planner/audit/10-no-adaptive.sql`): a nested loop chosen for an
 estimate ran on however many rows came, and an estimate wrong by orders of magnitude was never
@@ -1634,11 +1704,21 @@ observed cardinalities cut JOB's 20 longest queries by 27%. Karlin, Manasse, Rud
 "Competitive snoopy caching", Algorithmica 3, 1988: the ski-rental rule's bound of 2.
 
 **Evidence.** `adaptive.rs`'s unit tests: answers identical with the switch on and off over 300
-random joins with NULL and repeated keys (T-PL.13.1, against the cores' model join; the engine's
-own differential waits on the shell); the switch fires once past the point and never at an
-estimate below it, its cost under twice the best, refused over budget (T-PL.13.2); a new plan asked
-only outside the band, the bytes held bounded (T-PL.13.3). JOB's 20 slowest queries against the
-parent (AC-PL.13.1) are the coordinator's, once the shell lands.
+random joins with NULL and repeated keys (T-PL.13.1, against the cores' model join); the switch
+fires once past the point and never at an estimate below it, its cost under twice the best, refused
+over budget (T-PL.13.2); a new plan asked only outside the band, the bytes held bounded (T-PL.13.3).
+The engine's own (`crates/engine/tests/adaptive_joins.rs`, with the simulator's
+`Connection::pin_cost_weights` so the point holds on any machine): random joins (one key and two,
+filters, three tables, an aggregate) give one answer with the switch off and on and by cost, the
+model's for the plain join, and every plan whose point came under its outer rows switched
+(T-PL.13.1); one join switches at the point its plan states and not one row before; an inner table
+counted far past its rows (inserted, counted, rolled back) is counted at its build, planned again
+once, and the second plan's point comes sooner with no further re-plan (T-PL.13.3). The same
+build in an aggregate's run, which returns no row before its end, hands the run off once with the
+hand-off on and switches again on the new plan, none with it off, one answer both ways and the
+switch-off one; the plain join, its rows returned before the build, hands nothing off and returns
+each row once (T-PL.13.4). JOB's 20 slowest queries against the parent (AC-PL.13.1) are the
+coordinator's.
 
 **Falsified by.**
 - JOB's 20 slowest queries not faster than the parent with the shell in (AC-PL.13.1).
@@ -1881,6 +1961,36 @@ twice the build's rows".
   LIP (filters from several dimensions applied to the fact scan in their measured order) and
   predicate transfer across the join graph are not built yet.
 
+## Decision (lane qs5-10): calibration from repeated samples, and the filter's lookup and a WHERE step measured
+
+**Decision.** QT.5 and PL.5, query speed step 5. `learned_costs::calibrate` timed each kind of
+work once, so a moment of host load fell on one kind and moved the planner's weights from one run
+to the next, flipping plans whose costs sat close (the planner tests that failed now and then
+under load). It now samples:
+
+- **Rounds.** One sample of each kind a round (a sample is the kind's work repeated until it
+  reaches the slowest kind's single run, as before), so a stretch of load falls on every kind
+  alike and their ratios, the weights, stay.
+- **Medians.** Each kind's rate is the median of its samples. A preempted sample is one long time:
+  it moves a mean by its whole length, a median by one rank.
+- **Stopping from the spread** (`median_settled`). Among `n` samples the count below the true
+  median is binomial, `n/2` with standard deviation `sqrt(n)/2`, so the samples at ranks
+  `n/2 -+ sqrt(n)/2` bracket the median by about one standard error whatever the times'
+  distribution (Thompson, Annals of Mathematical Statistics 7(3), 1936). A kind stops once half
+  that bracket is within the timer's own cost, a pair of clock reads: no reading resolves finer.
+  The spread is read each time the samples double. The rounds stop at a page's keys, as a
+  sample's repetitions do, so calibration's time is bounded under any load.
+- **The filter's lookup** (`Work::BloomProbe`, `bloom_lookup_cost`). Calibration builds a hash
+  join's filter over a page of keys, sized as the planner sizes one for one false positive across
+  a page of keys it doesn't hold, and times lookups of such keys, the key's hash included.
+  `bloom_filter_rate_per_key` prices each probe row's lookup at that, in place of one key hash
+  (which the learned weights had made zero).
+- **A WHERE step** (`Work::WhereStep`, `cpu_cost_per_where_step`). Two of the engine's values
+  compared, timed per key; the planner's step cost is that weight times the row's, in place of
+  0.003. The defaults of both stand only where the clock never moved.
+- **Open.** `hash_bytes_per_row` (100) and the `rhs_has_selective_seek` gate are still to remove;
+  LIP and predicate transfer across star joins (T-QT.5.3), sort-merge and prefetched index joins
+  are not built.
 
 ## Decision (lane g6s3): learned plan hints, kept for a query class only where its held-out runs beat the cost model
 

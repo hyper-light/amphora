@@ -86,7 +86,7 @@ use std::{
 };
 
 pub(crate) mod access_method;
-mod adaptive;
+pub(crate) mod adaptive;
 mod cardinality;
 pub(crate) mod column_path;
 pub(crate) mod constraints;
@@ -3132,16 +3132,18 @@ fn find_table_access_plan(
         best_plan
     };
 
-    let sort_eliminated = maybe_order_target.as_ref().is_some_and(|order_target| {
-        plan_satisfies_order_target(
-            &best_plan,
-            &access_methods_arena,
-            table_references.joined_tables(),
-            &constraints_per_table,
-            order_target,
-            schema,
-        )
-    });
+    // PL.8: a bushy plan's run reads its rows before the loops, so it keeps no order.
+    let sort_eliminated = best_plan.is_left_deep()
+        && maybe_order_target.as_ref().is_some_and(|order_target| {
+            plan_satisfies_order_target(
+                &best_plan,
+                &access_methods_arena,
+                table_references.joined_tables(),
+                &constraints_per_table,
+                order_target,
+                schema,
+            )
+        });
     let subquery_calls = count_subquery_calls_for_plan(
         &best_plan,
         &access_methods_arena,
@@ -3857,6 +3859,100 @@ pub(crate) mod bushy_test_hook {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod bushy_search_tests {
+    //! PL.8 piece 2: the bushy plans the search makes, run by the emitter.
+    use std::cell::Cell;
+
+    thread_local! {
+        /// How many plans with a build group the planner handed to the emitter: what shows a
+        /// test's query was run bushy.
+        pub(crate) static BUSHY_PLANS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(
+            clippy::unwrap_used,
+            clippy::indexing_slicing,
+            clippy::arithmetic_side_effects
+        )]
+        use super::BUSHY_PLANS;
+        use crate::io::MemoryIO;
+        use crate::sync::Arc;
+        use crate::{ConnectOpts, Database, JoinMethods, SqliteDialect};
+        use std::cell::Cell;
+
+        fn rows(conn: &Arc<crate::Connection>, sql: &str) -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let mut rows: Vec<String> = stmt
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect();
+            rows.sort();
+            rows
+        }
+
+        /// PL.8 piece 2 (T-PL.8.2): two large fact tables, each cut down by a filtered dimension,
+        /// joined to each other on a key with few values. Every left-deep order joins one fact's
+        /// cut to the other whole fact first and drags the large result through the last
+        /// dimension's filter; the bushy plan builds `d1 ⋈ f1` once into a hash join's input and
+        /// probes it from `f2`, under the one row of `d2`. The search picks it, the emitter runs
+        /// it (`BUSHY_PLANS`), and it answers as the plan of nested loops does.
+        #[test]
+        fn t_pl_8_2_the_search_picks_the_bushy_plan_where_it_is_cheapest() {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TABLE d1(id INTEGER PRIMARY KEY, cat INT)",
+                "CREATE TABLE d2(id INTEGER PRIMARY KEY, cat INT)",
+                "CREATE TABLE f1(id INTEGER PRIMARY KEY, d1 INT, k INT)",
+                "CREATE TABLE f2(id INTEGER PRIMARY KEY, d2 INT, k INT)",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+                 INSERT INTO d1 SELECT x, x % 25 FROM n",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 50) \
+                 INSERT INTO d2 SELECT x, x % 25 FROM n",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
+                 INSERT INTO f1 SELECT x, x % 50 + 1, x % 2 FROM n",
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 3000) \
+                 INSERT INTO f2 SELECT x, x % 50 + 1, x % 2 FROM n",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let queries = [
+                "SELECT d1.id, f1.id, f2.id, d2.id FROM d1, f1, f2, d2 \
+                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
+                "SELECT count(*), sum(f1.id), sum(f2.id) FROM d1, f1, f2, d2 \
+                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.id = 7",
+                "SELECT count(*), sum(f1.id - f2.id) FROM d1, f1, f2, d2 \
+                 WHERE f1.d1 = d1.id AND d1.cat = 3 AND f2.k = f1.k AND f2.d2 = d2.id AND d2.cat = 7",
+            ];
+            for sql in queries {
+                conn.set_join_methods(JoinMethods::NestedLoopsOnly);
+                let nested_loops = rows(&conn, sql);
+                conn.set_join_methods(JoinMethods::ByCost);
+                BUSHY_PLANS.with(|plans| plans.set(0));
+                let searched = rows(&conn, sql);
+                let made_bushy = BUSHY_PLANS.with(Cell::get);
+                let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+                eprintln!("bushy={made_bushy}: {sql}: {plan:?}");
+                assert!(made_bushy > 0, "not planned bushy: {sql}: {plan:?}");
+                assert!(!nested_loops.is_empty(), "{sql}");
+                assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
+            }
+        }
+    }
+}
+
 fn apply_table_access_plan(
     resolver: &Resolver,
     table_references: &mut TableReferences,
@@ -3917,6 +4013,10 @@ fn apply_table_access_plan(
         table_references,
         sort_eliminated,
     )?;
+    #[cfg(test)]
+    if !build_groups.is_empty() {
+        bushy_search_tests::BUSHY_PLANS.with(|plans| plans.set(plans.get() + 1));
+    }
     let (best_access_methods, best_table_numbers) = (
         best_plan.best_access_methods().collect::<Vec<_>>(),
         best_plan.table_numbers().collect::<Vec<_>>(),

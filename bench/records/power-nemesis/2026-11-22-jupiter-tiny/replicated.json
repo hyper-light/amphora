@@ -1,0 +1,16 @@
+{
+ "class": "replicated",
+ "seeds": 100,
+ "shards": 2,
+ "commits": [
+  "f06d134395122f580ed962a49a48e616fec9c420"
+ ],
+ "hosts": [
+  "Jupiter"
+ ],
+ "acknowledged": 769,
+ "cuts": 300,
+ "unflushed_leader": 89,
+ "failed": [],
+ "problems": []
+}

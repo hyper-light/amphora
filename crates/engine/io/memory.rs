@@ -13,6 +13,9 @@ use tracing::debug;
 pub struct MemoryIO {
     registry_scope: super::RegistryScope,
     files: Arc<Mutex<MemoryFiles<MemoryFile>>>,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): each database's versioned storage, by its file's path,
+    /// kept while the file is ([`IO::versioned_beside`]).
+    versioned: Mutex<HashMap<String, crate::sync::Arc<crate::storage::versioned::switch::Storage>>>,
 }
 
 /// Per-backend file incarnations, assigned under its existing files mutex. IDs never
@@ -65,6 +68,7 @@ impl MemoryIO {
         Self {
             registry_scope: super::RegistryScope::default(),
             files: Arc::new(Mutex::new(MemoryFiles::default())),
+            versioned: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -88,6 +92,26 @@ impl Clock for MemoryIO {
 impl IO for MemoryIO {
     fn is_memory(&self) -> bool {
         true
+    }
+
+    fn versioned_kept(&self, path: &str) -> bool {
+        self.versioned.lock().contains_key(path)
+    }
+
+    fn versioned_beside(
+        &self,
+        path: &str,
+        make: &mut dyn FnMut() -> Result<
+            crate::sync::Arc<crate::storage::versioned::switch::Storage>,
+        >,
+    ) -> Result<Option<crate::sync::Arc<crate::storage::versioned::switch::Storage>>> {
+        let mut kept = self.versioned.lock();
+        if let Some(storage) = kept.get(path) {
+            return Ok(Some(storage.clone()));
+        }
+        let storage = make()?;
+        kept.insert(path.to_string(), storage.clone());
+        Ok(Some(storage))
     }
 
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
@@ -121,6 +145,7 @@ impl IO for MemoryIO {
     fn remove_file(&self, path: &str) -> Result<()> {
         let mut files = self.files.lock();
         files.files.remove(path);
+        self.versioned.lock().remove(path);
         Ok(())
     }
 

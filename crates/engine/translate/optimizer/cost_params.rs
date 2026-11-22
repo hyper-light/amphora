@@ -72,7 +72,9 @@ pub struct CostModelParams {
     /// CPU cost per row processed (relative to page IO = 1.0).
     pub cpu_cost_per_row: f64,
 
-    /// CPU cost for one extra operation in a `WHERE` condition.
+    /// CPU cost for one extra operation in a `WHERE` condition. Learned where the engine runs
+    /// (`learned_costs`, `Work::WhereStep`: two of the engine's values compared) and set by
+    /// `with_learned`; the default stands only where the clock never moved.
     pub cpu_cost_per_where_step: f64,
 
     /// CPU cost per index seek (key comparisons).
@@ -110,7 +112,17 @@ pub struct CostModelParams {
     /// CPU cost to probe hash table.
     pub hash_lookup_cost: f64,
 
-    /// Estimated bytes per row for hash table spill estimation.
+    /// Amphora (PL.5): CPU cost of one lookup of a hash join's Bloom filter, the key's hash
+    /// included (`bloom_filter_rate_per_key`). Learned where the engine runs (`learned_costs`,
+    /// `Work::BloomProbe`) and set by `with_learned`; the default, a key's hash
+    /// (`hash_cpu_cost`'s), stands only where the clock never moved.
+    pub bloom_lookup_cost: f64,
+
+    /// Amphora (QT.5, T-QT.5.7): a hash table entry's bytes, for its memory and spill estimates
+    /// and the Bloom filter's bit price: a build row's bytes, its table's page over its rows a
+    /// page, plus the entry's fixed bytes (`HashEntry::FIXED_BYTES`). Set for each hash join by
+    /// [Self::with_hash_build] from the build table's [Self::for_table]; until then, the format's
+    /// default page of the fewest-byte one-column records.
     pub hash_bytes_per_row: f64,
 
     /// Amphora (PL.12): the values the estimates may read for the statement's parameters, a run's
@@ -123,14 +135,15 @@ pub struct CostModelParams {
 impl CostModelParams {
     /// Create default parameters as a const fn (for compile-time static).
     pub const fn new() -> Self {
+        let rows_per_table_page = super::cost::rows_per_leaf_page(
+            super::cost::FORMAT_DEFAULT_PAGE_BYTES,
+            super::cost::least_record_bytes(1.0),
+            super::cost::varint_bytes(1_000_000.0),
+        );
         Self {
             // Cardinality fallbacks
             rows_per_table_fallback: 1_000_000.0,
-            rows_per_table_page: super::cost::rows_per_leaf_page(
-                super::cost::FORMAT_DEFAULT_PAGE_BYTES,
-                super::cost::least_record_bytes(1.0),
-                super::cost::varint_bytes(1_000_000.0),
-            ),
+            rows_per_table_page,
             page_bytes: super::cost::FORMAT_DEFAULT_PAGE_BYTES,
             index_rows_per_page: None,
 
@@ -161,11 +174,27 @@ impl CostModelParams {
             hash_cpu_cost: 0.001,
             hash_insert_cost: 0.002,
             hash_lookup_cost: 0.003,
-            hash_bytes_per_row: 100.0,
+            bloom_lookup_cost: 0.001,
+            hash_bytes_per_row: hash_entry_bytes(
+                super::cost::FORMAT_DEFAULT_PAGE_BYTES,
+                rows_per_table_page,
+            ),
 
             plan_values: None,
         }
     }
+}
+
+/// Amphora (QT.5, T-QT.5.7): a hash entry's bytes for a build table of `page_bytes` pages holding
+/// `rows_per_page` rows each: a row's share of its page plus the entry's fixed bytes
+/// (`HashEntry::FIXED_BYTES`). A page holds at least one row.
+const fn hash_entry_bytes(page_bytes: f64, rows_per_page: f64) -> f64 {
+    let rows = if rows_per_page < 1.0 {
+        1.0
+    } else {
+        rows_per_page
+    };
+    page_bytes / rows + crate::vdbe::hash_table::HashEntry::FIXED_BYTES as f64
 }
 
 /// Compile-time static default parameters (zero runtime overhead).
@@ -230,6 +259,16 @@ impl CostModelParams {
         }
     }
 
+    /// Amphora (QT.5, T-QT.5.7): these parameters for a hash join whose build side is the table
+    /// `build` was made for ([Self::for_table]): a hash entry holds one of its rows, its page over
+    /// its rows a page, plus the entry's fixed bytes.
+    pub(crate) fn with_hash_build(self, build: &Self) -> Self {
+        Self {
+            hash_bytes_per_row: hash_entry_bytes(build.page_bytes, build.rows_per_table_page),
+            ..self
+        }
+    }
+
     /// Amphora (PL.12): these parameters with the statement's parameter values, `values`.
     pub(crate) fn with_plan_values(
         self,
@@ -277,7 +316,8 @@ impl CostModelParams {
     /// Amphora (QT.5): these parameters with the seek's, the hash table's build and probe and the
     /// sort's weights learned where the engine runs (`learned_costs`), each its multiple of a row's
     /// visit times `cpu_cost_per_row`; and `cpu_cost_per_row` itself, the row's visit against a
-    /// page read, once the database has timed one. The learned build and probe times include
+    /// page read, once the database has timed one; and a `WHERE` step and a Bloom filter's lookup
+    /// the same way (PL.5). The learned build and probe times include
     /// hashing the key, so `hash_cpu_cost` adds nothing to them. None, a clock that never moved,
     /// leaves these.
     pub(crate) fn with_learned(
@@ -295,6 +335,8 @@ impl CostModelParams {
             hash_insert_cost: row * learned.hash_build,
             hash_lookup_cost: row * learned.hash_probe,
             sort_cpu_per_row: row * learned.sort,
+            cpu_cost_per_where_step: row * learned.where_step,
+            bloom_lookup_cost: row * learned.bloom_probe,
             page_miss: learned.page_miss.unwrap_or(1.0),
             ..self.clone()
         }
@@ -432,6 +474,7 @@ impl CostModelParams {
             ("hash_cpu_cost", self.hash_cpu_cost),
             ("hash_insert_cost", self.hash_insert_cost),
             ("hash_lookup_cost", self.hash_lookup_cost),
+            ("bloom_lookup_cost", self.bloom_lookup_cost),
         ];
 
         for (name, val) in cost_params {
@@ -446,6 +489,33 @@ impl CostModelParams {
 
 #[cfg(all(test, feature = "optimizer_params"))]
 mod tests {
+    /// T-QT.5.7: a hash entry's bytes are the build table's row, its page over its rows a page,
+    /// plus the entry's fixed bytes; the build's, not the probe's.
+    #[test]
+    fn t_qt_5_7_hash_entry_bytes_are_the_build_tables_row() {
+        let fixed = crate::vdbe::hash_table::HashEntry::FIXED_BYTES as f64;
+        let probe = CostModelParams {
+            page_bytes: 4096.0,
+            rows_per_table_page: 400.0,
+            ..CostModelParams::new()
+        };
+        let wide_build = CostModelParams {
+            page_bytes: 4096.0,
+            rows_per_table_page: 8.0,
+            ..CostModelParams::new()
+        };
+        let joined = probe.clone().with_hash_build(&wide_build);
+        assert_eq!(joined.hash_bytes_per_row, 4096.0 / 8.0 + fixed);
+        assert_eq!(joined.rows_per_table_page, 400.0);
+        let narrow = probe.clone().with_hash_build(&probe);
+        assert!(narrow.hash_bytes_per_row < joined.hash_bytes_per_row);
+        let defaults = CostModelParams::new();
+        assert_eq!(
+            defaults.hash_bytes_per_row,
+            defaults.page_bytes / defaults.rows_per_table_page + fixed
+        );
+    }
+
     use super::*;
 
     #[test]
