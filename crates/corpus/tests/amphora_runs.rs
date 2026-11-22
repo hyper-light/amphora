@@ -93,6 +93,55 @@ fn t_g2_7_2_a_file_runs_on_amphora_as_sqlite_runs_it() {
     assert_eq!((counts.agree, counts.skipped, counts.unsettled), (6, 1, 0));
 }
 
+/// T-T1.4.1: Do: run the file on Amphora on a file in a fresh directory (the commit bench's WAL
+/// and `synchronous = FULL`), then drop it. Expect: the same answers as in memory (every record
+/// agrees, the MySQL-only one skipped), its database's files on the disk while it runs, and none
+/// left once it drops.
+#[test]
+fn t_t1_4_1_a_file_runs_on_amphora_on_disk_and_leaves_nothing() {
+    let dir = std::env::temp_dir().join(format!("amphora-corpus-disk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let right = amphora_corpus::answer::md5_of(
+        &[
+            "1", "one", "1.500", "2", "two", "NULL", "3", "NULL", "2.250",
+        ]
+        .map(String::from),
+    );
+    let fixed = FILE
+        .replace("6 values", "9 values")
+        .replace("0123456789abcdef0123456789abcdef", &right);
+    let mut render = AmphoraRender::new().unwrap();
+    let mut engine = Amphora::on_disk(&dir).unwrap();
+    let mut off = Vec::new();
+    let counts = run_file(
+        &mut engine,
+        &mut render,
+        &fixed,
+        None,
+        None,
+        Limits::default(),
+        &mut |r| {
+            if r.outcome != Outcome::Agree {
+                off.push((r.record.line, r.outcome));
+            }
+        },
+    )
+    .unwrap();
+    assert!(off.is_empty(), "{off:?}");
+    assert_eq!((counts.agree, counts.skipped, counts.unsettled), (6, 1, 0));
+    assert!(
+        std::fs::read_dir(&dir).unwrap().next().is_some(),
+        "no database file on the disk"
+    );
+    drop(engine);
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    std::fs::remove_dir(&dir).unwrap();
+}
+
 /// Do: run a file with a deadline already past. Expect: no record run, each counted unreached.
 #[test]
 fn records_past_the_deadline_are_unreached_not_failed() {

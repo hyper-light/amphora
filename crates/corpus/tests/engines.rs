@@ -21,7 +21,7 @@ use amphora_corpus::run::{Limits, Outcome, run_file};
 #[test]
 fn t_g2_4_2_an_unknown_engine_is_refused() {
     assert_eq!(
-        open("oracle", None).err(),
+        open("oracle", None, None).err(),
         Some(Unavailable::Unknown("oracle".into()))
     );
     assert_eq!(ENGINES.len(), 9);
@@ -142,7 +142,7 @@ after
 /// the next record isn't reached; where it isn't, the engine is refused as Missing (not passed).
 #[test]
 fn t_g2_4_2_a_file_runs_on_sqlites_shell_or_is_refused() {
-    let mut engine = match open("sqlite", None) {
+    let mut engine = match open("sqlite", None, None) {
         Ok(e) => e,
         Err(Unavailable::Missing { engine, .. }) => {
             assert_eq!(engine, "sqlite");

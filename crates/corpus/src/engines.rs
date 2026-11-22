@@ -10,6 +10,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
@@ -80,16 +81,25 @@ fn dsn(engine: &str, default: &str) -> String {
 /// spaces, so a client inside a server's container runs as `docker exec -i <container> psql`.
 /// `bound` is how long each statement that opens it (its fresh database), settles it or drops it
 /// may take, the run's budget (G2 step 7): a server that doesn't answer within it is Unreachable,
-/// and None waits on it as long as it takes.
-pub fn open(name: &str, bound: Option<Duration>) -> Result<Box<dyn Engine>, Unavailable> {
+/// and None waits on it as long as it takes. `disk` puts Amphora's database on a file in that
+/// directory (crate::amphora::Amphora::on_disk) instead of in memory; the other engines' databases
+/// are their own (`main` refuses `--disk` for them).
+pub fn open(
+    name: &str,
+    bound: Option<Duration>,
+    disk: Option<&Path>,
+) -> Result<Box<dyn Engine>, Unavailable> {
     let shell = |spec: ShellSpec| Shell::open(spec, bound).map(boxed);
     match name {
-        "amphora" => crate::amphora::Amphora::in_memory()
-            .map(|a| Box::new(a) as Box<dyn Engine>)
-            .map_err(|why| Unavailable::Unreachable {
-                engine: "amphora",
-                why,
-            }),
+        "amphora" => match disk {
+            Some(dir) => crate::amphora::Amphora::on_disk(dir),
+            None => crate::amphora::Amphora::in_memory(),
+        }
+        .map(|a| Box::new(a) as Box<dyn Engine>)
+        .map_err(|why| Unavailable::Unreachable {
+            engine: "amphora",
+            why,
+        }),
         "sqlite" => shell(sqlite_shell("sqlite", bin("sqlite", "sqlite3"))),
         "duckdb" => shell(duckdb(bin("duckdb", "duckdb"))),
         "turso" => shell(turso(bin("turso", "tursodb"))),
@@ -122,12 +132,18 @@ fn bin(engine: &str, default: &str) -> String {
 /// The client `open(name)` runs: its program (or in-process library) and the address it reaches,
 /// as each record of a run names it. A comparison holds only between records of the same client on
 /// the same platform (`platform()`); one from another is experiment error, not a result.
-pub fn client(name: &str) -> String {
+pub fn client(name: &str, disk: Option<&Path>) -> String {
     let at = |program: String, engine: &str, default: &str| {
         format!("{program} at {}", dsn(engine, default))
     };
     match name {
-        "amphora" => "in process (the amphora crate, in memory)".to_owned(),
+        "amphora" => match disk {
+            Some(dir) => format!(
+                "in process (the amphora crate, on a file in {}: WAL, synchronous = FULL)",
+                dir.display()
+            ),
+            None => "in process (the amphora crate, in memory)".to_owned(),
+        },
         "sqlite" => bin("sqlite", "sqlite3"),
         "duckdb" => bin("duckdb", "duckdb"),
         "turso" => bin("turso", "tursodb"),
