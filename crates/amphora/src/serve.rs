@@ -9,7 +9,9 @@
 //! - `amphora health CONFIG`: asks every member for its status; healthy when every member answers,
 //!   all name the same leader, each holds the configured voters and none is fenced.
 //! - `amphora ask CONFIG NODE REQUEST`: one request to one member (`status`, `exec SQL`,
-//!   `count SQL`, and `cut on|off` where the member's config says `drills = on`).
+//!   `count SQL`, `cut on|off` where the member's config says `drills = on`, `member …`, and
+//!   `leader WAIT_MS`: wait until the member knows its group's leader, at most WAIT_MS, and answer
+//!   `leader=ID addr=HOST:PORT term=T`; woken by the election's step, never by polling).
 //! - `amphora drill load|check`: the fire drills' writers and their loss count ([`load`], [`check`]).
 //!
 //! The config, one per member (`key = value` lines, `#` comments; every key below but `drills`,
@@ -410,6 +412,8 @@ struct Shared {
     deadline: Duration,
     keys: Keys,
     drills: bool,
+    /// Each member's address as the config names it, for the `leader` request's answer.
+    addrs: BTreeMap<u64, String>,
     /// Each peer's records connection, to close it when the peer opens another.
     links: Mutex<BTreeMap<u64, TcpStream>>,
 }
@@ -454,6 +458,11 @@ pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
         deadline: config.deadline,
         keys,
         drills: config.drills,
+        addrs: config
+            .members
+            .iter()
+            .map(|m| (m.node, m.addr.clone()))
+            .collect(),
         links: Mutex::new(BTreeMap::new()),
     });
     let mut peers: BTreeMap<u64, mpsc::SyncSender<Vec<u8>>> = BTreeMap::new();
@@ -718,7 +727,29 @@ impl Shared {
                     list(&s.learners)
                 ))
             }
-            other => bail!("unknown request {other:?} (status, exec, count, cut, member)"),
+            // Waits for a leader (CP-T1.13): a client that must write waits here while its group
+            // elects, rather than retrying writes a follower refuses at once. It wakes on the
+            // step that names the leader ([`crate::database::replicated::ReplicaHandle::wait_leader`])
+            // and gives up at the caller's deadline, WAIT_MS from now.
+            "leader" => {
+                let wait: u64 = rest
+                    .trim()
+                    .parse()
+                    .context("leader WAIT_MS: how long to wait, in milliseconds")?;
+                let s = self
+                    .db
+                    .replica()
+                    .ok_or_else(|| anyhow!("no replica"))?
+                    .wait_leader(after(Duration::from_millis(wait))?)
+                    .map_err(|e| anyhow!("no leader within {wait} ms: {e:?}"))?;
+                Ok(format!(
+                    "leader={} addr={} term={}",
+                    s.leader,
+                    self.addrs.get(&s.leader).map_or("-", String::as_str),
+                    s.term
+                ))
+            }
+            other => bail!("unknown request {other:?} (status, exec, count, cut, member, leader)"),
         }
     }
 }
@@ -736,7 +767,7 @@ fn to_peer(
     for bytes in records {
         if conn.is_none() {
             conn = open(addr, keys, deadline, RECORDS)
-                .and_then(|mut s| {
+                .and_then(|(mut s, _)| {
                     s.get_mut().write_all(&node.to_le_bytes())?;
                     Ok(s)
                 })
@@ -757,8 +788,14 @@ fn to_peer(
     }
 }
 
-/// A connection to `addr` of `kind`, inside mutual TLS when `keys` hold it, the secret proved.
-fn open(addr: &str, keys: &Keys, deadline: Duration, kind: u8) -> anyhow::Result<BufReader<Link>> {
+/// A connection to `addr` of `kind`, inside mutual TLS when `keys` hold it, the secret proved; and
+/// the socket under it, for its timeouts.
+fn open(
+    addr: &str,
+    keys: &Keys,
+    deadline: Duration,
+    kind: u8,
+) -> anyhow::Result<(BufReader<Link>, TcpStream)> {
     let s = TcpStream::connect_timeout(&resolve(addr)?, deadline)
         .with_context(|| format!("connecting to {addr}"))?;
     s.set_nodelay(true)?;
@@ -776,20 +813,48 @@ fn open(addr: &str, keys: &Keys, deadline: Duration, kind: u8) -> anyhow::Result
     tag.update(&[kind]);
     r.get_mut().write_all(&tag.finalize().into_bytes())?;
     r.get_mut().flush()?;
-    Ok(r)
+    Ok((r, socket))
 }
 
 /// A client of one member: requests one line each, answered in order.
 pub struct Client {
     r: BufReader<Link>,
+    /// The socket under the link, for the read timeout of a request that waits.
+    socket: TcpStream,
+    deadline: Duration,
 }
 
 impl Client {
     /// A client of the member at `addr`, its link proving `keys`.
     pub fn connect(addr: &str, keys: &Keys, deadline: Duration) -> anyhow::Result<Self> {
+        let (r, socket) = open(addr, keys, deadline, CLIENT)?;
         Ok(Self {
-            r: open(addr, keys, deadline, CLIENT)?,
+            r,
+            socket,
+            deadline,
         })
+    }
+
+    /// The member's `leader` request: waits at most `wait` until the member knows its group's
+    /// leader and answers its ID and address as the member's config names it (`-` for a leader
+    /// it doesn't name). The connection waits `wait` and its own deadline for the answer.
+    pub fn leader(&mut self, wait: Duration) -> anyhow::Result<(u64, String)> {
+        let millis = u64::try_from(wait.as_millis()).context("a wait past u64 milliseconds")?;
+        self.socket
+            .set_read_timeout(Some(wait.saturating_add(self.deadline)))?;
+        let answer = self.ask(&format!("leader {millis}"));
+        self.socket.set_read_timeout(Some(self.deadline))?;
+        let f = fields(&answer?);
+        let id = f
+            .get("leader")
+            .ok_or_else(|| anyhow!("a leader answer without its leader"))?
+            .parse()
+            .context("the leader's ID")?;
+        let addr = f
+            .get("addr")
+            .cloned()
+            .ok_or_else(|| anyhow!("a leader answer without its address"))?;
+        Ok((id, addr))
     }
 
     /// The member's answer to `request`, past its `ok`; its `err` as the error.
@@ -1180,8 +1245,14 @@ pub fn command(args: &[String], ready: impl FnOnce(&str)) -> Option<crate::Reply
         ("ask", [config, node, request @ ..]) if !request.is_empty() => reply((|| {
             let c = Config::load(Path::new(config))?;
             let m = c.member(node.parse()?)?;
-            let answer =
-                Client::connect(&m.addr, &c.keys()?, c.deadline)?.ask(&request.join(" "))?;
+            let mut k = Client::connect(&m.addr, &c.keys()?, c.deadline)?;
+            let answer = match request {
+                [what, wait] if what == "leader" => {
+                    let (id, addr) = k.leader(Duration::from_millis(wait.parse()?))?;
+                    format!("leader={id} addr={addr}")
+                }
+                _ => k.ask(&request.join(" "))?,
+            };
             Ok((format!("{answer}\n"), true))
         })()),
         // The change goes to each voter in turn until one, the leader, makes it: a follower

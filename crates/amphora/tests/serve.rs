@@ -313,3 +313,65 @@ fn t_t1_13_1_links_run_inside_mutual_tls() {
         "another authority's client was answered: {refused:?}"
     );
 }
+
+/// One member started on its own, and a client's `leader` request to it (CP-T1.13): with one of
+/// three voters up there is no leader, so a request whose deadline passes is refused, and one made
+/// then is answered, with the leader's ID and address, once the other two start and the group
+/// elects. The answer comes from the step that names the leader: no client retries, no polling.
+#[test]
+fn cp_t1_13_a_leader_request_made_during_an_election_is_answered_once_it_is_chosen() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    let one = |c: Config| {
+        let (up, listening) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let node = c.node;
+            let ended = serve::serve(&c, move |_| {
+                let _ = up.send(());
+            });
+            eprintln!("member {node} ended: {ended:?}");
+        });
+        listening.recv().unwrap();
+    };
+    one(configs[0].clone());
+    let c = &configs[0];
+    let keys = c.keys().unwrap();
+
+    // One voter of three can't elect: a wait that ends first is refused with its reason.
+    let alone = Client::connect(&c.members[0].addr, &keys, c.deadline)
+        .unwrap()
+        .leader(Duration::from_millis(1));
+    let why = format!("{:#}", alone.unwrap_err());
+    assert!(why.contains("no leader within 1 ms"), "{why}");
+
+    // A request made while no leader can be chosen, answered once one is.
+    let mut waiting = Client::connect(&c.members[0].addr, &keys, c.deadline).unwrap();
+    let (sent, answered) = std::sync::mpsc::channel();
+    let (asking, asked) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = asking.send(());
+        let _ = sent.send(waiting.leader(Duration::from_secs(60)));
+    });
+    asked.recv().unwrap();
+    assert!(
+        answered.try_recv().is_err(),
+        "answered before a majority was up"
+    );
+    for m in configs[1..].iter().cloned() {
+        one(m);
+    }
+    let (id, addr) = answered.recv().unwrap().unwrap();
+    let leader = c
+        .members
+        .iter()
+        .find(|m| m.node == id)
+        .unwrap_or_else(|| panic!("leader {id} isn't a member"));
+    assert_eq!(addr, leader.addr);
+
+    // Another member, asked once the group has a leader, names the one it follows.
+    let (again, _) = Client::connect(&c.members[1].addr, &keys, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+    assert!(configs.iter().any(|m| m.node == again), "{again}");
+}
