@@ -1898,3 +1898,103 @@ fn t_t1_12_m5_chunks_kept_or_grown() {
     assert_eq!(grow.reused, 0, "grown: the whole file copied again");
     assert_eq!(grow.restore_gets, 1, "grown: one request");
 }
+
+/// A store that loses the answer to the first create of a base's chunk: the chunk is stored, the
+/// create refused. It counts the gets of a chunk whole.
+struct LosesAnswer<'a> {
+    inner: &'a dyn Blobs,
+    lost: AtomicU64,
+    wholes: AtomicU64,
+}
+
+impl Blobs for LosesAnswer<'_> {
+    fn object_max(&self) -> usize {
+        self.inner.object_max()
+    }
+    fn create(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        until: Instant,
+    ) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.create(key, bytes, until)?;
+        if key.contains("/pages/") && self.lost.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(amphora_api::blobs::BlobRefusal::Unavailable(
+                "the answer was lost".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn get(&self, key: &str, until: Instant) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        if key.contains("/pages/") {
+            self.wholes.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key, until)
+    }
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        self.inner.get_range(key, offset, len, until)
+    }
+    fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        until: Instant,
+    ) -> Result<amphora_api::blobs::Listing, amphora_api::blobs::BlobRefusal> {
+        self.inner.list(prefix, after, limit, until)
+    }
+    fn delete(&self, key: &str, until: Instant) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.delete(key, until)
+    }
+}
+
+/// T-T1.12.M4: a chunk whose create's answer was lost. Do: copy a base under a 64 KiB budget to a
+/// store that loses the first chunk's answer; copy that chunk again, then the rest; restore.
+/// Expect: the lost answer refused, the chunk found stored and compared in parts within its charge
+/// (never read whole), every charge given back, and the restore whole.
+#[test]
+fn t_t1_12_m4_a_lost_answer_compared_in_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
+    let (db, mut shipper, model, now, second) = written(dir.path(), 100, &blobs);
+    let memory = room(64 * 1024);
+    let lossy = LosesAnswer {
+        inner: &blobs,
+        lost: AtomicU64::new(0),
+        wholes: AtomicU64::new(0),
+    };
+    let mut copy = shipper
+        .begin_base(&db, &lossy, &memory, usize::MAX)
+        .unwrap();
+    assert!(shipper.copy_base(&db, &lossy, &mut copy, until()).is_err());
+    assert_eq!(memory.held(Use::Chunks), 0);
+    while shipper.copy_base(&db, &lossy, &mut copy, until()).unwrap() {
+        assert_eq!(memory.held(Use::Chunks), 0);
+    }
+    shipper.end_base(&db, &lossy, copy, until()).unwrap();
+    assert!(lossy.lost.load(Ordering::SeqCst) > 1);
+    assert_eq!(
+        lossy.wholes.load(Ordering::SeqCst),
+        0,
+        "no chunk read whole"
+    );
+    archive_through(&mut shipper, &db, &blobs, &now);
+    let target = dir.path().join("restored.db");
+    backup::restore_within(
+        &blobs,
+        "db",
+        second,
+        &target,
+        &mut backup::Unpaced,
+        &memory,
+        until(),
+    )
+    .unwrap();
+    assert_eq!(rows(&Db::open(&target).unwrap()), model);
+}
