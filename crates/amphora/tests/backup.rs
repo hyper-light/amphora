@@ -1094,12 +1094,23 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
 }
 
 /// The restore benchmark's Amphora leg (AC-T1.12.3; bench/backup_restore.sh runs it beside
-/// PostgreSQL with pgBackRest and SQLite with Litestream on the same machine). Do: back a database
-/// up to a folder (`AMPHORA_RESTORE_BENCH_DIR`, else a temporary one), write
-/// `AMPHORA_RESTORE_BENCH_BYTES` of 4096-byte rows (a page's worth, the engine's page size: a
-/// format value), a commit of `AMPHORA_RESTORE_BENCH_BATCH` rows each second, close it, then
-/// restore its last second. Expect: every row restored. Prints the bytes and the restore's
-/// nanoseconds. The sizes are the caller's; the defaults are a tiny instance.
+/// PostgreSQL with pgBackRest and SQLite with Litestream on the same machine, each leg timed by the
+/// same clock around its own restore command). Its phases, `AMPHORA_RESTORE_BENCH_PHASE`, each a
+/// process of its own so the restore's time includes its process start as the other legs' do:
+/// - `backup`: back a database up to a folder (`AMPHORA_RESTORE_BENCH_DIR`), write
+///   `AMPHORA_RESTORE_BENCH_BYTES` of 4096-byte rows (a page's worth, the engine's page size: a
+///   format value), a commit of `AMPHORA_RESTORE_BENCH_BATCH` rows each second, and close it;
+///   prints `backup source_bytes=` (the file and its log, as the other legs count theirs).
+/// - `restore`: restore the archive's newest second into `restored.db`, as a restore to the
+///   latest does: it finds the second itself.
+/// - `count`: count the restored rows with the database's own client; prints `count rows=`.
+///
+/// With no phase, all three in one process (a tiny instance; a temporary folder if no folder is
+/// given), printing the restore's nanoseconds. The sizes are the caller's; the defaults are a tiny
+/// instance. The memory a chunk may take is the process's room for an image
+/// (`amphora::memory`'s budget, read where it runs), and the folder store's objects are as large as
+/// that room, a get reading one whole; every other bound is the store's `object_max()`. Each phase
+/// gives up past the goal's bar, 30 minutes (AC-T1.12.3), as a restore past it has failed it.
 #[test]
 #[ignore = "a benchmark: run by bench/backup_restore.sh"]
 fn restore_bench_amphora() {
@@ -1109,55 +1120,104 @@ fn restore_bench_amphora() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
     };
-    let bytes = var("AMPHORA_RESTORE_BENCH_BYTES", 4 << 20);
-    let batch = var("AMPHORA_RESTORE_BENCH_BATCH", 256).max(1);
+    let phase = std::env::var("AMPHORA_RESTORE_BENCH_PHASE").ok();
     let temp = tempfile::tempdir().unwrap();
-    let root = std::env::var("AMPHORA_RESTORE_BENCH_DIR")
-        .map_or_else(|_| temp.path().to_path_buf(), std::path::PathBuf::from);
+    let root = match (std::env::var("AMPHORA_RESTORE_BENCH_DIR"), &phase) {
+        (Ok(dir), _) => std::path::PathBuf::from(dir),
+        (Err(_), None) => temp.path().to_path_buf(),
+        (Err(_), Some(phase)) => {
+            panic!("phase {phase} needs AMPHORA_RESTORE_BENCH_DIR: the phases share its folder")
+        }
+    };
     std::fs::create_dir_all(&root).unwrap();
+    // The goal's bar (AC-T1.12.3: 100 GB in at most 30 minutes): a phase past it has failed.
+    let bar = || Instant::now() + Duration::from_secs(30 * 60);
+    let room = amphora::memory::process().image_room().unwrap();
+    let blobs = Arc::new(backup::FolderBlobs::open(&root.join("archive"), room).unwrap());
     let path = root.join("source.db");
-    let blobs = Arc::new(backup::FolderBlobs::open(&root.join("archive"), 64 * 1024).unwrap());
-    let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
-    let (database, shipping) = open_backed_up(&path, &blobs, &now);
-    database
-        .call(until(), |c| {
-            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
-            Ok(())
-        })
-        .unwrap();
-    let rows = bytes.div_ceil(4096);
-    let mut id = 0u64;
-    while id < rows {
-        let end = (id + batch).min(rows);
-        now.fetch_add(SECOND_NS, Ordering::SeqCst);
-        let first = id;
+    let target = root.join("restored.db");
+    let run = |name: &str| phase.as_deref().is_none_or(|p| p == name);
+    assert!(
+        phase
+            .as_deref()
+            .is_none_or(|p| ["backup", "restore", "count"].contains(&p)),
+        "AMPHORA_RESTORE_BENCH_PHASE is backup, restore or count, not {phase:?}"
+    );
+
+    if run("backup") {
+        let bytes = var("AMPHORA_RESTORE_BENCH_BYTES", 4 << 20);
+        let batch = var("AMPHORA_RESTORE_BENCH_BATCH", 256).max(1);
+        let now = Arc::new(AtomicU64::new(1_000 * SECOND_NS + 1));
+        let read = Arc::clone(&now);
+        let archive = Archive {
+            blobs: Arc::clone(&blobs) as Arc<dyn Blobs>,
+            prefix: "db".into(),
+            clock: Arc::new(move || read.load(Ordering::SeqCst)),
+            memory: room,
+            patience: Duration::from_secs(30 * 60),
+            check: backup::CheckPolicy::Off,
+        };
+        let (database, shipping) = Database::open_backed_up(&path, archive, bar()).unwrap();
         database
-            .call(until(), move |c| {
-                for i in first..end {
-                    c.execute(
-                        "INSERT INTO t (id, v) VALUES (?1, ?2)",
-                        vec![
-                            amphora_api::Value::Integer(i64::try_from(i).unwrap()),
-                            amphora_api::Value::Text("x".repeat(4096)),
-                        ],
-                    )?;
-                }
+            .call(bar(), |c| {
+                c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
                 Ok(())
             })
             .unwrap();
-        id = end;
+        let rows = bytes.div_ceil(4096);
+        let mut id = 0u64;
+        while id < rows {
+            let end = (id + batch).min(rows);
+            now.fetch_add(SECOND_NS, Ordering::SeqCst);
+            let first = id;
+            database
+                .call(bar(), move |c| {
+                    for i in first..end {
+                        c.execute(
+                            "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                            vec![
+                                amphora_api::Value::Integer(i64::try_from(i).unwrap()),
+                                amphora_api::Value::Text("x".repeat(4096)),
+                            ],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            id = end;
+        }
+        now.fetch_add(SECOND_NS, Ordering::SeqCst);
+        drop(database);
+        let status = shipping.wait(bar(), |s| s.ended).unwrap();
+        assert_eq!(status.failures, 0, "{:?}", status.last_failure);
+        let size = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let source = size(&path) + size(std::path::Path::new(&wal));
+        println!("backup source_bytes={source}");
     }
-    let last = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
-    now.fetch_add(SECOND_NS, Ordering::SeqCst);
-    drop(database);
-    let status = shipping.wait(until(), |s| s.ended).unwrap();
-    assert_eq!(status.failures, 0, "{:?}", status.last_failure);
-    let source = std::fs::metadata(&path).unwrap().len();
-    let target = root.join("restored.db");
-    let began = Instant::now();
-    backup::restore(blobs.as_ref(), "db", last, &target, until()).unwrap();
-    let took = began.elapsed().as_nanos();
-    let restored = Db::open(&target).unwrap();
-    assert_eq!(self::rows(&restored).len(), usize::try_from(rows).unwrap());
-    println!("restore system=amphora rows={rows} source_bytes={source} ns={took}");
+
+    if run("restore") {
+        let began = Instant::now();
+        let newest = backup::newest_second(blobs.as_ref(), "db", bar())
+            .unwrap()
+            .expect("the archive holds no second to restore");
+        backup::restore(blobs.as_ref(), "db", newest, &target, bar()).unwrap();
+        println!(
+            "restore system=amphora second={newest} ns={}",
+            began.elapsed().as_nanos()
+        );
+    }
+
+    if run("count") {
+        let restored = Db::open(&target).unwrap();
+        let mut rows = 0i64;
+        restored
+            .query("SELECT count(*) FROM t", [], |r| {
+                rows = r.get::<i64>(0).map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(false)
+            })
+            .unwrap();
+        println!("count rows={rows}");
+    }
 }
