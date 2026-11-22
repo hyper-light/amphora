@@ -3332,6 +3332,7 @@ mod sessions {
         let txn = Txn {
             reads: Vec::new(),
             writes: (0..2).map(|k| (row(k), Some(vec![6]))).collect(),
+            conds: Vec::new(),
         };
         std::thread::scope(|scope| {
             let answer = {

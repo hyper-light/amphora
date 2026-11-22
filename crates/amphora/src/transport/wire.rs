@@ -25,7 +25,9 @@ pub(super) const GREETING_FRAME_MAX: usize = 256;
 /// Step and Answer Stepped, one step of a transaction across groups (CP-T1.10; xgroup.md, "Over the transport"). 9: Answer
 /// gained SteppedClosed, a step's answer with the group's closed time after it (AC-T1.10.1, T-T1.10.W4; xgroup.md,
 /// "Reading its own writes across groups"), and the greeting negotiates the version both ends use
-/// (local-owner-transport.md, "Negotiated versions").
+/// (local-owner-transport.md, "Negotiated versions"); Step gained LockIf, ResolveAt, DecideAt,
+/// RecoverAt and PreventAt and Reply what they answer, the one commit stamp across groups
+/// (CP-T1.9, T-T1.9.R27, R28, R30; sent only at 9 or later, `Request::since`).
 pub(super) const VERSION: u32 = 9;
 /// The oldest protocol this side still speaks: 8, the version before negotiation, whose owners
 /// take only a greeting of exactly 8 (local-owner-transport.md, "Negotiated versions"). A format
@@ -112,6 +114,13 @@ impl Request {
                 | crate::xgroup::Step::Recover { .. }
                 | crate::xgroup::Step::Prevent { .. }
                 | crate::xgroup::Step::Resolve { .. } => 8,
+                // Steps of version 9: a version-8 owner can't decode them, so a coordinator's
+                // step to one is refused before it goes out (nothing was done).
+                crate::xgroup::Step::LockIf { .. }
+                | crate::xgroup::Step::ResolveAt { .. }
+                | crate::xgroup::Step::DecideAt { .. }
+                | crate::xgroup::Step::RecoverAt { .. }
+                | crate::xgroup::Step::PreventAt { .. } => 9,
             },
             // Version 8 had every other request; this side speaks nothing older.
             Request::Session
