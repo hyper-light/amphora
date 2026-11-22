@@ -986,3 +986,165 @@ class DeclaredColumnClasses(unittest.TestCase):
             got = con.execute(sql).fetchall()
             if r.kind == "query":
                 self.assertEqual([tuple(float(v) if isinstance(v, (int, float)) else v for v in row) for row in got], [tuple(float(v) if isinstance(v, (int, float)) else v for v in row) for row in want])
+
+
+class TextIntegerCasts(unittest.TestCase):
+    """Do: CAST of text to an integer, of literals and of a TEXT column holding every form SQLite
+    reads (lang_expr.html#castexpr: the leading integer, 0 if none, clamped at 64 bits). Expect: a
+    plain integer literal is cast to BIGINT on every engine, another said by its reading on DuckDB
+    and PostgreSQL and refused on MySQL and ClickHouse, with the reason; DuckDB (when its Python
+    module is here) gives what SQLite gives for the literals and the column."""
+
+    TEXTS = ["1.5", " 12abc", "abc", "1e3", "-7.9", "+5", "  -0x10", "9223372036854775807", "9223372036854775808", "99999999999999999999",
+             "-9223372036854775808", "-99999999999999999999", "\t\n\x0b\x0c\r 3", "", ".5", "- 5", "+-5", "00000000000000000000000009223372036854775807",
+             "-0009223372036854775808", "１２", "  +0012x", "0"]
+
+    def test_literals_everywhere(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out, why = dialects.translate("SELECT CAST('12' AS INTEGER), CAST('-7' AS INT)", d)
+                self.assertIsNone(why)
+                self.assertNotIn("SUBSTRING", out.upper())
+                out, why = dialects.translate("SELECT CAST('1.5' AS INTEGER)", d)
+                if d in ("mysql", "clickhouse"):
+                    self.assertIn("castexpr", why)
+                else:
+                    self.assertIsNone(why)
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        for t in self.TEXTS:
+            q = "SELECT CAST('" + t.replace("'", "''") + "' AS INTEGER)"
+            with self.subTest(text=t):
+                out, why = dialects.translate(q, "duckdb")
+                self.assertIsNone(why)
+                self.assertEqual(duckdb.sql(out).fetchone()[0], db.execute(q).fetchone()[0])
+
+    def test_column_same_as_sqlite_on_duckdb(self):
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        import sqlite3
+
+        db, dd = sqlite3.connect(":memory:"), duckdb.connect()
+        rows = [(i, t) for i, t in enumerate(self.TEXTS)] + [(len(self.TEXTS), None)]
+        db.execute("CREATE TABLE t(k INTEGER, a TEXT)")
+        db.executemany("INSERT INTO t VALUES (?, ?)", rows)
+        dd.execute("CREATE TABLE t(k BIGINT, a TEXT)")
+        dd.executemany("INSERT INTO t VALUES (?, ?)", rows)
+        context = dialects.contexts([FileRecord(0, "CREATE TABLE t(k INTEGER, a TEXT)")])[0]
+        q = "SELECT k, CAST(a AS INTEGER), CAST(a || '' AS INT) FROM t ORDER BY k"
+        out, why = dialects.translate(q, "duckdb", context)
+        self.assertIsNone(why)
+        self.assertEqual(dd.execute(out).fetchall(), db.execute(q).fetchall())
+
+    def test_column_refused_where_unwritten(self):
+        context = dialects.contexts([FileRecord(0, "CREATE TABLE t(a TEXT)")])[0]
+        for d in ("mysql", "clickhouse"):
+            with self.subTest(dialect=d):
+                out, why = dialects.translate("SELECT CAST(a AS INTEGER) FROM t", d, context)
+                self.assertIsNone(out)
+                self.assertIn("castexpr", why)
+        out, why = dialects.translate("SELECT CAST(a AS INTEGER) FROM t", "postgres", context)
+        self.assertIsNone(why)
+        self.assertIn("SUBSTRING(", out.upper())
+
+
+class ConnectionFunctions(unittest.TestCase):
+    """Do: changes(), total_changes() and last_insert_rowid() (lang_corefunc.html), and unistr()
+    and unistr_quote() of literals and of a column. Expect: the first three and the column's are
+    not expressible anywhere, with the reason; the literals' are SQLite's values, and DuckDB (when
+    its Python module is here) gives what SQLite gives."""
+
+    def test_connection_functions_refused(self):
+        for f in ("changes", "total_changes", "last_insert_rowid"):
+            for d in ENGINES:
+                with self.subTest(f=f, dialect=d):
+                    out, why = dialects.translate(f"SELECT {f}()", d)
+                    self.assertIsNone(out)
+                    self.assertIn(f"lang_corefunc.html#{f}", why)
+
+    def test_unistr_of_a_column_refused(self):
+        context = dialects.contexts([FileRecord(0, "CREATE TABLE t(a TEXT)")])[0]
+        for f in ("unistr", "unistr_quote"):
+            for d in ENGINES:
+                with self.subTest(f=f, dialect=d):
+                    out, why = dialects.translate(f"SELECT {f}(a) FROM t", d, context)
+                    self.assertIsNone(out)
+                    self.assertIn(f"#{f}", why)
+
+    def test_unistr_literals_same_as_sqlite(self):
+        import sqlite3
+
+        db = sqlite3.connect(":memory:")
+        cases = ["unistr('\\u0041\\+01F600\\\\x')", "unistr_quote('a' || 'b''')", "unistr_quote(1)", "unistr(NULL)", "unistr_quote('it''s')"]
+        for case in cases:
+            for d in ENGINES:
+                with self.subTest(case=case, dialect=d):
+                    out, why = dialects.translate(f"SELECT {case}", d)
+                    self.assertIsNone(why)
+                    self.assertNotIn("UNISTR", out.upper().replace("'UNISTR", ""))
+        out, why = dialects.translate("SELECT unistr('\\0000')", "duckdb")
+        self.assertIsNone(out)
+        try:
+            import duckdb
+        except ImportError:
+            self.skipTest("DuckDB's Python module isn't installed")
+        for case in cases:
+            with self.subTest(case=case):
+                out, why = dialects.translate(f"SELECT {case}", "duckdb")
+                self.assertEqual(duckdb.sql(out).fetchone()[0], db.execute(f"SELECT {case}").fetchone()[0])
+
+
+class ConstraintSwitches(unittest.TestCase):
+    """Do: files with foreign keys and CHECK constraints, PRAGMA foreign_keys and
+    ignore_check_constraints off and on (foreignkeys.html, pragma.html), one inside a transaction.
+    Expect: with foreign keys never on, REFERENCES and FOREIGN KEY are left out and every write
+    translates; with them on somewhere, a write to a linked table while off is not expressible
+    (and on ClickHouse while on), with the reason; a write to a CHECKed table while checks are
+    ignored is not expressible; a PRAGMA foreign_keys inside BEGIN ... END does nothing."""
+
+    SCHEMA = ["CREATE TABLE p(k INTEGER PRIMARY KEY)", "CREATE TABLE c(k INTEGER, r INTEGER REFERENCES p(k) ON DELETE CASCADE, FOREIGN KEY (k) REFERENCES p(k))"]
+
+    def test_never_on_leaves_references_out(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in(self.SCHEMA + ["INSERT INTO c VALUES (1, 2)", "DELETE FROM p", "PRAGMA foreign_keys = OFF"], d)
+                self.assertNotIn("REFERENCES", out[1][0].upper())
+                self.assertIsNone(out[2][1])
+                self.assertIsNone(out[3][1])
+
+    def test_off_while_on_elsewhere(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in(self.SCHEMA + ["INSERT INTO c VALUES (1, 2)", "PRAGMA foreign_keys = ON", "INSERT INTO p VALUES (1)", "PRAGMA main.foreign_keys = 0", "DELETE FROM p", "SELECT 1"], d)
+                self.assertIn("REFERENCES", out[1][0].upper())
+                self.assertIn("foreign_keys is off", out[2][1])
+                self.assertIn("foreign_keys is off", out[6][1])
+                self.assertIsNone(out[7][1])
+                if d == "clickhouse":
+                    self.assertIn("no foreign keys", out[4][1])
+                else:
+                    self.assertIsNone(out[4][1])
+
+    def test_pragma_in_a_transaction_does_nothing(self):
+        out = file_in(self.SCHEMA + ["PRAGMA foreign_keys = ON", "BEGIN", "PRAGMA foreign_keys = OFF", "END", "INSERT INTO p VALUES (1)", "BEGIN", "PRAGMA foreign_keys = OFF", "COMMIT", "INSERT INTO p VALUES (2)",
+                                     "PRAGMA foreign_keys = OFF", "INSERT INTO p VALUES (3)"], "duckdb")
+        self.assertIsNone(out[6][1])
+        self.assertIsNone(out[10][1])
+        self.assertIn("foreign_keys is off", out[12][1])
+
+    def test_ignored_checks(self):
+        for d in ENGINES:
+            with self.subTest(dialect=d):
+                out = file_in(["CREATE TABLE k(a INTEGER CHECK (a > 0))", "CREATE TABLE n(a INTEGER)", "PRAGMA ignore_check_constraints = ON", "INSERT INTO k VALUES (-1)",
+                               "UPDATE k SET a = -2", "INSERT INTO n VALUES (-1)", "SELECT a FROM k", "PRAGMA ignore_check_constraints = FALSE", "INSERT INTO k VALUES (3)"], d)
+                self.assertIn("ignore_check_constraints is on", out[3][1])
+                self.assertIn("ignore_check_constraints is on", out[4][1])
+                for i in (5, 6, 8):
+                    self.assertNotIn("ignore_check_constraints", out[i][1] or "")

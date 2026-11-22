@@ -468,6 +468,8 @@ class Table:
 
     def __init__(self, name):
         self.name, self.columns, self.kinds, self.defaults, self.written, self.held = name, [], {}, {}, {}, {}
+        # The tables its foreign keys reference (upper-cased), and whether it has a CHECK constraint.
+        self.parents, self.checked = set(), False
 
     def write(self, column, cls):
         if column in self.written and cls is not None:
@@ -512,11 +514,16 @@ def _declared_class(kind):
 
 class Context:
     """What translate() needs of the file around a record: the tables defined once it has run, and
-    those it creates (by upper-cased name), their columns typed by what the whole file writes; and
-    whether PRAGMA case_sensitive_like is on when it runs (liked())."""
+    those it creates (by upper-cased name), their columns typed by what the whole file writes;
+    whether PRAGMA case_sensitive_like is on when it runs (liked()); and for enforced(): whether
+    PRAGMA foreign_keys is on when it runs and whether the file ever turns it on, whether PRAGMA
+    ignore_check_constraints is on, and the tables a foreign key links (children and parents) and
+    those with a CHECK constraint, as they stand before it runs."""
 
-    def __init__(self, tables=None, created=None, case_sensitive_like=False):
+    def __init__(self, tables=None, created=None, case_sensitive_like=False, foreign_keys=False, ignore_check_constraints=False, linked=(), checked=()):
         self.tables, self.created, self.case_sensitive_like = tables or {}, created or {}, case_sensitive_like
+        self.foreign_keys, self.ignore_check_constraints, self.linked, self.checked = foreign_keys, ignore_check_constraints, set(linked), set(checked)
+        self.foreign_keys_ever = foreign_keys
 
 
 def _pragma_set(e, name):
@@ -660,13 +667,22 @@ def contexts(records):
     """Each record's Context, the file's records read in order as SQLite runs them: a CREATE TABLE
     defines its table (one of IF NOT EXISTS whose table is there leaves it), DROP TABLE removes it,
     and each INSERT (its VALUES or SELECT, its columns' defaults, its upsert's SET), UPDATE ... SET
-    writes values to its columns. A `statement error` record SQLite refuses writes nothing."""
+    writes values to its columns. A `statement error` record SQLite refuses writes nothing.
+    PRAGMA case_sensitive_like, foreign_keys and ignore_check_constraints are carried into the
+    records after them, as SQLite keeps them for the connection (https://www.sqlite.org/pragma.html);
+    foreign_keys "is a no-op within a transaction" (pragma.html#pragma_foreign_keys), so one between
+    BEGIN and COMMIT, END or ROLLBACK leaves it as it was. SQLite's foreign keys are off and its
+    CHECK constraints enforced until a PRAGMA says otherwise ("Foreign key constraints are disabled
+    by default", foreignkeys.html section 2)."""
     import sqlglot
     from sqlglot import exp
 
     tables, out, case_sensitive_like = {}, [], False
+    foreign_keys, ignore_check, in_transaction = False, False, False
     for r in records:
         created = {}
+        linked = {n for n, t in tables.items() if t.parents} | {p for t in tables.values() for p in t.parents}
+        checked = {n for n, t in tables.items() if t.checked}
         try:
             statements = sqlglot.parse(comment_closed(defaults_dropped(r.sql)), read=reader())
         except Exception:  # sqlglot can't read it: translate() says why
@@ -689,8 +705,28 @@ def contexts(records):
                 _writes(e, tables)
             elif _pragma_set(e, "case_sensitive_like") is not None:
                 case_sensitive_like = _pragma_set(e, "case_sensitive_like")
-        out.append(Context(dict(tables), created, case_sensitive_like))
+            elif _pragma_set(e, "foreign_keys") is not None and not in_transaction:
+                foreign_keys = _pragma_set(e, "foreign_keys")
+            elif _pragma_set(e, "ignore_check_constraints") is not None:
+                ignore_check = _pragma_set(e, "ignore_check_constraints")
+            elif isinstance(e, exp.Transaction):
+                in_transaction = True
+            elif isinstance(e, exp.Commit) or (isinstance(e, exp.Rollback) and not e.args.get("savepoint")) or _end(e):
+                in_transaction = False
+        out.append(Context(dict(tables), created, case_sensitive_like, foreign_keys, ignore_check, linked, checked))
+    ever = any(c.foreign_keys for c in out)
+    for c in out:
+        c.foreign_keys_ever = ever
     return out
+
+
+def _end(e):
+    """Whether `e` is SQLite's END [TRANSACTION] (COMMIT's other name), which sqlglot reads as a column."""
+    from sqlglot import exp
+
+    if isinstance(e, exp.Alias) and e.alias.upper() == "TRANSACTION":
+        e = e.this
+    return isinstance(e, exp.Column) and not e.table and e.name.upper() == "END"
 
 
 def _table(create):
@@ -712,6 +748,8 @@ def _table(create):
         t.kinds[name], t.defaults[name] = kind, default
         if kind is None:
             t.written[name] = set()
+    t.parents = {r.this.this.name.upper() if isinstance(r.this, exp.Schema) else r.this.name.upper() for r in create.find_all(exp.Reference) if isinstance(r.this, (exp.Schema, exp.Table))}
+    t.checked = any(True for _ in create.find_all(exp.CheckColumnConstraint))
     return t
 
 
@@ -1076,6 +1114,99 @@ def _real_text(x, dialect, what):
     return exp.Anonymous(this="replace", expressions=[pointed, exp.Literal.string("inf"), exp.Literal.string("Inf")])
 
 
+def _sqlite_value(node, dialect, what):
+    """`node`, an expression of literals alone, as the literal SQLite gives for it (Python's sqlite3,
+    the SQLite the corpus's refusals are taken with): an INTEGER as a BIGINT, a TEXT as a string,
+    NULL as NULL. A value of another class, or text holding U+0000 (which no engine's string
+    literal carries alike), is not expressible."""
+    import sqlite3
+
+    from sqlglot import exp
+
+    db = sqlite3.connect(":memory:")
+    try:
+        value = db.execute(f"SELECT {node.sql(dialect='sqlite')}").fetchone()[0]
+    except sqlite3.Error as e:
+        raise NotExpressible(f"not expressible in {dialect}: {what}, which SQLite refuses ({e})")
+    finally:
+        db.close()
+    if value is None:
+        return exp.Null()
+    if isinstance(value, bool) or not isinstance(value, (int, str)) or (isinstance(value, str) and "\x00" in value):
+        raise NotExpressible(f"not expressible in {dialect}: {what}, whose value SQLite gives as {type(value).__name__}, which {dialect} has no literal alike of")
+    if isinstance(value, int):
+        return exp.cast(exp.Literal.number(value), exp.DataType.build("BIGINT"))
+    return exp.Literal.string(value)
+
+
+def _literals_only(node):
+    """Whether `node` is made of literals, NULLs, parentheses, signs and || alone: SQLite's value of
+    it is the same whenever it runs."""
+    from sqlglot import exp
+
+    return all(isinstance(n, (exp.Literal, exp.Null, exp.Paren, exp.Neg, exp.DPipe, exp.HexString)) for n in node.walk())
+
+
+# Text every engine's cast to an integer reads as SQLite does: an optional minus and at most 18
+# digits, inside BIGINT's range whatever they are.
+_PLAIN_INTEGER = re.compile(r"-?[0-9]{1,18}\Z")
+# The whitespace SQLite skips before a number in text: sqlite3Isspace(), its ctype map's 0x01 class
+# (sqlite3 3.51's global.c: '\t', '\n', '\v', '\f', '\r' and ' '); Python's sqlite3 3.51.0 skips each.
+_TEXT_INTEGER = "^[\\t\\n\\v\\f\\r ]*"
+
+
+def _text_integer(x, dialect):
+    """CAST(X AS INTEGER) of a TEXT X, as SQLite reads it (lang_expr.html#castexpr): "the longest
+    possible prefix of the value that can be interpreted as an integer number is extracted from the
+    TEXT value and the remainder ignored. Any leading spaces in the TEXT value when converting from
+    TEXT to INTEGER are ignored. If there is no prefix that can be interpreted as an integer number,
+    the result of the conversion is 0. If the prefix integer is greater than +9223372036854775807
+    then the result of the cast is exactly +9223372036854775807. Similarly, if the prefix integer is
+    less than -9223372036854775808 then the result of the cast is exactly -9223372036854775808"
+    ('1.5' is 1, '1e3' 1, 'abc' 0, ' -0x10' 0: Python's sqlite3 3.51.0). DuckDB and PostgreSQL cast
+    the whole text, rounding '1.5' to 2 and refusing 'abc': there the sign and the digits after the
+    leading zeros are taken with a regular expression (DuckDB's regexp_extract(X, P, group), RE2;
+    PostgreSQL's substring(X FROM P), its first group, manual 9.7.3), a run of more than 19 digits,
+    or 19 above 9223372036854775807, is the bound of its sign, and the rest is cast. X is read
+    several times, so one holding random() is not expressible. MySQL's CAST(... AS SIGNED) and
+    ClickHouse's toInt64 read text otherwise, and no translation for them has been run yet: not
+    expressible there."""
+    from sqlglot import exp
+
+    if dialect not in ("duckdb", "postgres"):
+        raise NotExpressible(f"not expressible in {dialect}: CAST of text to an integer, which SQLite reads as the text's leading integer, 0 if none (https://www.sqlite.org/lang_expr.html#castexpr), where {dialect}'s cast reads the whole text; no translation for {dialect} has been run yet")
+    if any(isinstance(n, exp.Rand) or (isinstance(n, exp.Anonymous) and n.name.lower() in ("random", "randomblob")) for n in x.walk()):
+        raise NotExpressible(f"not expressible in {dialect}: CAST of text to an integer of random(), which the translation of SQLite's reading (https://www.sqlite.org/lang_expr.html#castexpr) reads several times")
+
+    def group(pattern):
+        if dialect == "duckdb":
+            return exp.Anonymous(this="regexp_extract", expressions=[x.copy(), exp.Literal.string(pattern), exp.Literal.number(1)])
+        return exp.Substring(this=x.copy(), start=exp.Literal.string(pattern))
+
+    def sign():
+        return group(_TEXT_INTEGER + "([+-]?)")
+
+    def digits():
+        return group(_TEXT_INTEGER + "[+-]?0*([0-9]*)")
+
+    big = exp.or_(exp.GT(this=exp.Length(this=digits()), expression=exp.Literal.number(19)),
+                  exp.and_(exp.EQ(this=exp.Length(this=digits()), expression=exp.Literal.number(19)), exp.GT(this=digits(), expression=exp.Literal.string("9223372036854775807"))))
+    minus = exp.EQ(this=sign(), expression=exp.Literal.string("-"))
+    bound = exp.Case(ifs=[exp.If(this=minus.copy(), true=exp.Literal.number("-9223372036854775808"))], default=exp.Literal.number("9223372036854775807"))
+    value = exp.cast(exp.Case(ifs=[exp.If(this=exp.EQ(this=digits(), expression=exp.Literal.string("")), true=exp.Literal.string("0"))], default=digits()), exp.DataType.build("BIGINT"))
+    said = exp.Case(ifs=[exp.If(this=big, true=bound), exp.If(this=minus, true=exp.Neg(this=value.copy()))], default=value)
+    return exp.cast(said, exp.DataType.build("BIGINT"))
+
+
+# SQLite's functions of the connection (lang_corefunc.html): each reads what earlier statements of
+# the same connection did, which no other engine counts alike.
+_CONNECTION_FUNCTIONS = {
+    "CHANGES": "the rows the latest INSERT, UPDATE or DELETE changed, kept across the statements after it (https://www.sqlite.org/lang_corefunc.html#changes); MySQL's ROW_COUNT() is -1 after a SELECT and counts an UPDATE's rows otherwise, the others have none",
+    "TOTAL_CHANGES": "the rows every INSERT, UPDATE and DELETE since the connection opened changed (https://www.sqlite.org/lang_corefunc.html#total_changes), which no other engine counts",
+    "LAST_INSERT_ROWID": "the rowid of the latest successful INSERT into a rowid table (https://www.sqlite.org/lang_corefunc.html#last_insert_rowid), where MySQL's LAST_INSERT_ID() is an AUTO_INCREMENT column's first value of its latest INSERT and the others have no rowid",
+}
+
+
 def functions_said(expression, context, dialect):
     """`expression` with SQLite's built-in functions that sqlglot writes as functions of the same
     name that mean otherwise, said as SQLite's (lang_corefunc.html, "Built-In Scalar SQL Functions"):
@@ -1136,6 +1267,14 @@ def functions_said(expression, context, dialect):
       REAL value into an INTEGER, the result is the integer between the REAL value and zero that is
       closest to the REAL value", where DuckDB's, PostgreSQL's and MySQL's casts round (DuckDB 1.4.2
       gives CAST(3.9 AS INT) 4, SQLite 3): a REAL X (storage_classes()) is given trunc(X) first.
+    - CAST(X AS <a type of INTEGER affinity>) of a TEXT X: a literal of an optional '-' and at
+      most 18 digits (_PLAIN_INTEGER), which every engine's cast reads as SQLite does, is cast to
+      BIGINT; another X is _text_integer()'s, so the engine still does the reading.
+    - changes(), total_changes() and last_insert_rowid(): not expressible (_CONNECTION_FUNCTIONS).
+    - unistr(X) and unistr_quote(X) (lang_corefunc.html#unistr, #unistr_quote, SQLite 3.50): of a
+      literal X, SQLite's value of it (_sqlite_value()); PostgreSQL's unistr() reads escapes
+      alike but no translation of it has been run, and the others have none: another X is not
+      expressible.
     - SQLite's date and time functions: dated()'s.
     - total(X): "The sum() and total() aggregate functions return the sum of all non-NULL values
       in the group ... total() always returns a floating point value ... 0.0 if there are only
@@ -1268,6 +1407,18 @@ def functions_said(expression, context, dialect):
             node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
         elif type(node) is exp.Cast and dialect == "duckdb" and isinstance(node.to, exp.DataType) and node.to.sql(dialect="sqlite").strip() and affinity(node.to.sql(dialect="sqlite")) == "BLOB" and classes.get(id(node.this)) == "TEXT":
             same(node, exp.Anonymous(this="encode", expressions=[node.this.copy()]))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() in _CONNECTION_FUNCTIONS:
+            raise NotExpressible(f"not expressible in {dialect}: {node.name.lower()}(), {_CONNECTION_FUNCTIONS[node.name.upper()]}")
+        elif isinstance(node, exp.Anonymous) and node.name.upper() in ("UNISTR", "UNISTR_QUOTE"):
+            if not all(_literals_only(a) for a in node.expressions):
+                raise NotExpressible(f"not expressible in {dialect}: {node.name.lower()}() of a value read as it runs (https://www.sqlite.org/lang_corefunc.html#{node.name.lower()}), whose escapes no {dialect} function reads alike, or none has been run")
+            same(node, _sqlite_value(node, dialect, f"{node.name.lower()}()"))
+        elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and affinity(node.to.sql(dialect="sqlite")) == "INTEGER" and classes.get(id(node.this)) == "TEXT":
+            x = node.this
+            if isinstance(x, exp.Literal) and _PLAIN_INTEGER.match(x.this):
+                node.set("to", exp.DataType.build("BIGINT"))
+            else:
+                same(node, _text_integer(x, dialect))
         elif type(node) is exp.Cast and isinstance(node.to, exp.DataType) and affinity(node.to.sql(dialect="sqlite")) == "INTEGER":
             if classes.get(id(node.this)) == "REAL":
                 node.set("this", exp.Trunc(this=node.this.copy()))
@@ -1589,6 +1740,45 @@ def sqlite_own(expression, context, dialect):
     return expression
 
 
+def _written_table(e):
+    """The table (upper-cased) INSERT, UPDATE, DELETE or DROP TABLE `e` writes or drops, else None."""
+    from sqlglot import exp
+
+    if isinstance(e, (exp.Insert, exp.Update, exp.Delete)) or (isinstance(e, exp.Drop) and e.args.get("kind") == "TABLE"):
+        t = e.this.this if isinstance(e.this, exp.Schema) else e.this
+        return t.name.upper() if isinstance(t, exp.Table) else None
+    return None
+
+
+def enforced(expression, context, dialect):
+    """`expression` with SQLite's switches for its constraints as the file has them (contexts()):
+    - PRAGMA foreign_keys (https://www.sqlite.org/foreignkeys.html): "Foreign key constraints are
+      disabled by default", and while off SQLite neither checks a foreign key nor runs its ON
+      DELETE and ON UPDATE actions (section 2); PostgreSQL, DuckDB and MySQL always do. In a file
+      that never turns them on, each REFERENCES and FOREIGN KEY is left out of the statement, which
+      then means the same. In one that does, an INSERT, UPDATE, DELETE or DROP TABLE of a table a
+      foreign key links (child or parent) while they are off is not expressible; and while they are
+      on, on ClickHouse, which has no foreign keys.
+    - PRAGMA ignore_check_constraints (pragma.html#pragma_ignore_check_constraints): while on,
+      SQLite checks no CHECK constraint, where every engine checks them: an INSERT or UPDATE of a
+      table with one is not expressible then."""
+    from sqlglot import exp
+
+    if not context.foreign_keys_ever:
+        for node in [n for n in expression.walk() if isinstance(n, exp.ForeignKey) or (isinstance(n, exp.ColumnConstraint) and isinstance(n.args.get("kind"), exp.Reference))]:
+            node.pop()
+    target = _written_table(expression)
+    if target is None:
+        return expression
+    if target in context.linked and context.foreign_keys_ever and not context.foreign_keys:
+        raise NotExpressible(f"not expressible in {dialect}: a write to {target.lower()}, which a foreign key links, while PRAGMA foreign_keys is off (https://www.sqlite.org/foreignkeys.html#fk_enable): SQLite neither checks it nor runs its actions then, where {dialect} always does")
+    if target in context.linked and context.foreign_keys and dialect == "clickhouse":
+        raise NotExpressible(f"not expressible in {dialect}: a write to {target.lower()}, which a foreign key links, while PRAGMA foreign_keys is on (https://www.sqlite.org/foreignkeys.html): ClickHouse has no foreign keys to check")
+    if target in context.checked and context.ignore_check_constraints and isinstance(expression, (exp.Insert, exp.Update)):
+        raise NotExpressible(f"not expressible in {dialect}: a write to {target.lower()}, which has a CHECK constraint, while PRAGMA ignore_check_constraints is on (https://www.sqlite.org/pragma.html#pragma_ignore_check_constraints): SQLite checks none then, where {dialect} always does")
+    return expression
+
+
 def extremes(expression, dialect):
     """`expression` with each multi-argument max() and min() said as the dialect's GREATEST and LEAST
     with SQLite's NULL. SQLite's "Built-In Scalar SQL Functions" (https://www.sqlite.org/lang_corefunc.html#max_scalar):
@@ -1836,6 +2026,7 @@ def translate(sql, dialect, context=None):
             if not e:
                 out.append("")
                 continue
+            e = enforced(e, context or Context(), dialect)
             e = spoken(globbed(functions_said(extremes(dated(sqlite_own(keyed(typed(liked(divided(e, context or Context(), dialect), context or Context(), dialect), context, dialect), dialect), context or Context(), dialect), dialect), dialect), context or Context(), dialect), dialect), dialect)
             after = autoincremented(e) if dialect == "postgres" else []
             out += [e.sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE)] + after
