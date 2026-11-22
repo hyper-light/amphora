@@ -323,18 +323,24 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   its pool across a checkpoint and a reopen, a crash at every disk operation of a spilling,
   checkpointing workload losing no acknowledged commit, and the pool's model test with eviction
   under 32 threads. Not yet: the 10M-row corpus run and its resident memory (the coordinator's);
-  checkpoints still build their journal in memory; the shell passes the budget once the switch
+  checkpoints write and recovery reads their journal a page at a time; the shell passes the budget once the switch
   takes it from `amphora::memory::limit`.
 - **The switch: SQL on the versioned storage** (G7 step 2, `AC-NS.2.1`, docs/design/engine.md
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
   cursors, CREATE/DROP TABLE and INDEX, DELETE without WHERE, `sqlite_schema` (tree 1) and ANALYZE
   run on it, each SQL transaction one storage transaction, a failed statement undone alone by a
-  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. Not yet: a file
-  database reopened (recovery remakes every tree in rowid order; the header stays the pager's), SQL's
-  named SAVEPOINT, a database past the pool's frames or a transaction past
-  its budget (no eviction yet; the budget is the shell's to give); the engine's suites with the
-  switch on are the coordinator's run.
+  savepoint. `sql.rs` (`T-NS.2.6`) runs the same SQL on both storages and compares. A file database
+  reopens and recovers from a crash with its indexes (each tree's order in the redo log, the schema
+  read from tree 1); the storage's budget is `ConnectOpts::with_memory_budget` (the shell's quarter
+  of its process's memory), else a quarter of the machine's, its frames made as pages are handed
+  out (`T-NS.2.10`); DDL undone by a failed statement, a savepoint or a failed commit leaves no
+  orphan tree (`T-NS.2.11`). Not yet: the header (schema cookie, user version) on the versioned
+  storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
+  budget shared by a process's databases. On the pager as on the switch, `nested_loops`'
+  chain of hash joins, `row_counts`' hash join and `sample_filters`' outer join fail (planner
+  work in flight on main), and a failed CREATE TABLE ... AS in a transaction leaves the pager's
+  next statement refused `SchemaUpdated`.
 - **Three ways to reach a cached page** (G7 step 3, `NS.3`; `crates/engine/storage/reach`,
   `amphora-bench --reach`): behind one trait, sharing frames, CLOCK eviction and one miss path, (a) a
   page table in shards with pins and a private pin on a client's current page (PostgreSQL), (b)
@@ -461,7 +467,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   rule at an expansion learned from the owner's own measured image and replay costs a byte, its machine reporting its
   image's size (replication.md, "Decision (lane constants): the compaction's expansion learned where it runs"; CT.1); and a
   command's and an image's envelope is what their encoding adds ("Decision (lane constants): an envelope is what its
-  encoding adds"; EN.1).
+  encoding adds"; EN.1); and the process has one memory budget, its limit read where it runs (cgroups and RSS on
+  Linux, the platform's readings on macOS and Windows, a typed refusal where none can be read) and shared out by
+  measured use (store.md, "Decision (lane constants): one process memory budget"; MB.1), an image bounded by its room
+  for one in place of `SNAPSHOT_BYTES` (replication.md, "Decision (lane constants): an image is bounded by the memory
+  budget's room for one"; SB.1).
   Left: an owner's other descriptors (endpoint, engine files, a replica's log) charged by kind, the core's tick
   counts (twenty an election, two a heartbeat: raft-rs's defaults, fixed in tick mode), the owner's queue
   and outgoing bounds, and the rest of the list (handoff/amphora-constants-list.md).
@@ -488,8 +498,18 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   `export`, `changed`, `import`, `keep_log`, `sweep`); the old group's log is held from the first copy
   until the operation ends; `Groups::carry` carries every driver action to this node's groups, so a split
   or merge moves the range's rows, through repeated actions and driver restarts (T-T1.9.R4, R5), with the cutover-pause and lab harnesses (T-T1.9.P1, L1).
-  Left: `database::Local` as a group (its holding and log through a replicated command), moves across
-  nodes, load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
+  Bounded (lane split-merge-8): every copy-path batch holds no more units than the process's memory
+  budget (its pool of pages, decision 26) takes at the most bytes a unit has held, so a batch doubling on
+  an idle node stops there (T-T1.9.R8).
+  A local database's Records move (lane split-merge-8): a row routes by its namespace, family and key
+  (`reshard::row_key`; needs Ada's word), and `database::Local` carries the copy path over its Records
+  rows, indexed by position from its first holding, with a log of its commits and a feed while held
+  (`database/group.rs`; T-T1.9.R9).
+  Moved across nodes (lane split-merge-9): a copy or catch-up batch reads its old group through a
+  pull (`groups::Pull`, answered by `Groups::serve` where the group is, through `groups::Peers` from
+  another node), and a group moved to a second node under writes keeps every acknowledged write
+  (T-T1.9.R10). Left: `Peers` over a socket between machines, a `Database` over `Groups<Local>`,
+  load from the store's meter, and the full AC-T1.9.2 and AC-T1.9.3 runs.
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then
@@ -684,9 +704,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   overflow row or one over the budget is read row-at-a-time. Filters and aggregates read the batch through the
   VDBE's own evaluator. COUNT(*) over a table already reads only the leaves' cell counts (`Count`).
   `vdbe/leaf_batch/tests.rs` (T-QT.7.1 to .3) checks switch on against off on random tables. `amphora-bench
-  --planner` runs it as the target `amphora-vectorized`. Left: AC-QT.7.1 to .3 measured (the coordinator's);
-  filter and aggregate kernels over a batch with a selection vector (and, if G5 measures them better, compiled
-  pipelines instead); Windows's cache size, which needs an OS call this crate makes only with unsafe code.
+  --planner` runs it as the target `amphora-vectorized`. Lane qs7-3: a scan loop whose body only filters and
+  steps COUNT, SUM, TOTAL, AVG, MIN or MAX runs over the whole batch by selection vectors
+  (`vdbe/leaf_batch/fused.rs`, executor.md decision 10), through the opcodes' own comparison and aggregate code
+  (T-QT.7.4, .5). Left: AC-QT.7.1 to .3 measured (the coordinator's); GROUP BY bodies still run row-at-a-time
+  from the batch (a batch group lookup is the next piece); compiled pipelines if G5 measures them better;
+  Windows's cache size, which needs an OS call this crate makes only with unsafe code.
 - **G6 step 5, plans that read less, started** (lane g6s5): an `EXISTS` may now run as a hash semi join, chosen by
   cost against the nested loop's early out: the outer rows build the hash table, the subquery's table probes it, and
   `HashMarkFirstMatch` passes each build row on at its first match in a probe pass only (its matched bit, kept in
@@ -834,7 +857,8 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   size the sizer learns, now charged per row of the table so skipped granules count. Each carries
   min/max and null counts per column and its key range and position; filters skip granules their
   summaries exclude and run on whole vectors, as do COUNT, SUM (exact for reals), MIN, MAX and
-  group-by. A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
+  group-by (each row given its group's slot in one pass, each aggregate's vector folded by slot,
+  T-CS.4.5). A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
   key bounds, and filters its boundary granules by their key column. Blocks no change touches are
   decoded once a generation. Every class equals the row store's answer, whole-table and over key
   ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
@@ -845,9 +869,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   queued key read from the rows and merged (`translate/optimizer/column_path.rs`), against the
   row path's learned rates for a row's visit and a seek; a copy that can't answer the snapshot
   exactly is no path. `storage/versioned/columns_path.rs` reads by the choice and charges the
-  copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Open: SQL tables don't keep a copy yet, so
-  no SQL statement reaches it; step 4's vectorized scan replaces `Columns::scan` there; the
-  classes against CedarDB and ClickHouse (AC-CS.5.2) are the coordinator's.
+  copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Aggregates run on the copy through one
+  hook, `CopyScan`: step 4's vectorized scan as main has it (`Vectorized`, granules and `Plan`),
+  which a later scan replaces by implementing the trait, the choice unchanged; on the rows row by
+  row, with the same answer (T-CS.5.5, T-CS.5.6). Open: SQL tables don't keep a copy yet, so no
+  SQL statement reaches it; the classes against CedarDB and ClickHouse (AC-CS.5.2) are the
+  coordinator's.
 
 ## Open
 

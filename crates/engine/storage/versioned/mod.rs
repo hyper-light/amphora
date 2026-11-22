@@ -30,6 +30,7 @@ mod elle_sql;
 mod evict;
 #[cfg(test)]
 mod many_writers;
+pub mod memory;
 pub mod overflow;
 pub mod page;
 pub mod pool;

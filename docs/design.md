@@ -68,6 +68,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | executor | 7 | A row's header is parsed once, a cache hit takes no exclusive lock, and the index's terms run before the row is fetched | [executor.md](design/executor.md#7-a-rows-header-is-parsed-once-a-cache-hit-takes-no-exclusive-lock-and-the-indexs-terms-run-before-the-row-is-fetched) |
 | executor | 8 | A scan, its aggregates and a hash join's probe run on every core, in morsels | [executor.md](design/executor.md#8-a-scan-its-aggregates-and-a-hash-joins-probe-run-on-every-core-in-morsels) |
 | executor | 9 | A table scan decodes each leaf once into column batches, behind a switch | [executor.md](design/executor.md#9-a-table-scan-decodes-each-leaf-once-into-column-batches-behind-a-switch) |
+| executor | 10 | A scan loop's filters and aggregates run over a whole batch by selection | [executor.md](design/executor.md#10-a-scan-loops-filters-and-aggregates-run-over-a-whole-batch-by-selection) |
 | local-owner-transport | – | Versions (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#versions-2026-11-06) |
 | local-owner-transport | – | The tests' budgets (2026-10-31) | [local-owner-transport.md](design/local-owner-transport.md#the-tests-budgets-2026-10-31) |
 | local-owner-transport | – | Owner guards (2026-11-06) | [local-owner-transport.md](design/local-owner-transport.md#owner-guards-2026-11-06) |
@@ -138,11 +139,15 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | replication | – | Decision (lane constants): the owner's tick pace (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-owners-tick-pace-2026-11-21) |
 | replication | – | Decision (lane constants): the compaction's expansion learned where it runs (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-the-compactions-expansion-learned-where-it-runs-2026-11-21) |
 | replication | – | Decision (lane constants): an envelope is what its encoding adds (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-an-envelope-is-what-its-encoding-adds-2026-11-21) |
+| replication | – | Decision (lane constants): an image is bounded by the memory budget's room for one (2026-11-21) | [replication.md](design/replication.md#decision-lane-constants-an-image-is-bounded-by-the-memory-budgets-room-for-one-2026-11-21) |
 | regions | – | Decision (lane regions): region-local groups under a global root, placed by declared survival | [regions.md](design/regions.md#decision-lane-regions-region-local-groups-under-a-global-root-placed-by-declared-survival) |
 | reshard | – | Decision (lane split-merge): split, merge and move as one fenced hand-off, decided by measured share | [reshard.md](design/reshard.md#decision-lane-split-merge-split-merge-and-move-as-one-fenced-hand-off-decided-by-measured-share) |
 | reshard | – | Decision (lane split-merge-7): batches learned where they run | [reshard.md](design/reshard.md#decision-lane-split-merge-7-batches-learned-where-they-run) |
 | reshard | – | Decision (lane split-merge-7): retired groups kept | [reshard.md](design/reshard.md#decision-lane-split-merge-7-retired-groups-kept) |
 | reshard | – | Decision (lane split-merge-7): a local database keeps its holding through its command | [reshard.md](design/reshard.md#decision-lane-split-merge-7-a-local-database-keeps-its-holding-through-its-command) |
+| reshard | – | Decision (lane split-merge-8): a batch bounded by the process's memory | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-batch-bounded-by-the-processs-memory) |
+| reshard | – | Decision (lane split-merge-8): a row routes by its namespace, family and key | [reshard.md](design/reshard.md#decision-lane-split-merge-8-a-row-routes-by-its-namespace-family-and-key) |
+| reshard | – | Decision (lane split-merge-9): moves across nodes | [reshard.md](design/reshard.md#decision-lane-split-merge-9-moves-across-nodes) |
 | semantics | 1 | TEXT is well-formed UTF-8 | [semantics.md](design/semantics.md#1-text-is-well-formed-utf-8) |
 | semantics | 2 | atanh's last digit is its platform's C library's | [semantics.md](design/semantics.md#2-atanhs-last-digit-is-its-platforms-c-librarys) |
 | store | 1 | A group commit with no timer | [store.md](design/store.md#1-a-group-commit-with-no-timer) |
@@ -190,6 +195,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | store | – | Decision (lane wal-read): a commit's records published at a lookup's cost, its deltas found a word at a time | [store.md](design/store.md#decision-lane-wal-read-a-commits-records-published-at-a-lookups-cost-its-deltas-found-a-word-at-a-time) |
 | store | 42 | The page path SQLite takes: plain pins, the pool's buffer counted once, misses read in line, checksums once (prototype, behind a switch) | [store.md](design/store.md#42-the-page-path-sqlite-takes-plain-pins-the-pools-buffer-counted-once-misses-read-in-line-checksums-once-prototype-behind-a-switch) |
 | store | 43 | Point readers write no line another reader writes: the reader taken from a slot of its own, shared pages read under a version check (prototype, behind a switch) | [store.md](design/store.md#43-point-readers-write-no-line-another-reader-writes-the-reader-taken-from-a-slot-of-its-own-shared-pages-read-under-a-version-check-prototype-behind-a-switch) |
+| store | – | Decision (lane constants): one process memory budget (2026-11-21) | [store.md](design/store.md#decision-lane-constants-one-process-memory-budget-2026-11-21) |
 | without-rowid | – | Native primary-root query access | [without-rowid.md](design/without-rowid.md#native-primary-root-query-access) |
 | xgroup | – | The two protocols: two-phase commit and Parallel Commits behind a switch, two-phase locking without waiting | [xgroup.md](design/xgroup.md#the-two-protocols) |
 | xgroup | – | Crashes: every decision lives in a group, a new incarnation fences the old and finishes its transactions | [xgroup.md](design/xgroup.md#crashes) |
