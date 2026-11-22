@@ -4543,9 +4543,12 @@ pub(crate) mod bushy_search_tests {
         /// (`id = 7` or `id = 3`). Lane pl8-22: each side reaches its fact through an index made
         /// for the join, so the plan with the LEFT JOIN in the run and its mirror differ only by
         /// which side is built and which probes (kiln run r124 planned both for one query, the
-        /// mirror as it ran and the LEFT JOIN in the run at the EXPLAIN after, its weights moved
-        /// in between by a preempted timed run, T-PL.8.2). The plan's shape is checked before the
-        /// answers.
+        /// mirror as it ran and the LEFT JOIN in the run at the EXPLAIN after). On calibration's
+        /// weights alone the search picks the mirror (kiln run r298: an EXPLAIN before the first
+        /// run plans `d2`'s side as the run); once the query's first run has timed the seeks and
+        /// the hash joins, the learned weights make the LEFT JOIN's side the run (three runs of
+        /// three, r288). So each query runs once by cost first, its answer checked too, and the
+        /// plan's shape is checked on the run after, before the answers.
         #[test]
         fn t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows() {
             let (_db, conn) = facts();
@@ -4576,6 +4579,7 @@ pub(crate) mod bushy_search_tests {
                 ] {
                     let sql = format!("{select} {from} {filter}{above}");
                     conn.set_join_methods(JoinMethods::ByCost);
+                    let first = rows(&conn, &sql);
                     BUSHY_PLANS.with(|plans| plans.set(0));
                     LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
                     let searched = rows(&conn, &sql);
@@ -4589,6 +4593,7 @@ pub(crate) mod bushy_search_tests {
                     let nested_loops = rows(&conn, &sql);
                     assert!(!nested_loops.is_empty(), "{sql}");
                     assert_eq!(searched, nested_loops, "{sql}: {plan:?}");
+                    assert_eq!(first, nested_loops, "{sql}: the first run's plan");
                 }
             }
         }
