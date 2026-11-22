@@ -2858,6 +2858,9 @@ impl Database {
             is_value_estimate: crate::connection::AtomicIsValueEstimate::new(
                 crate::connection::IsValueEstimate::Equality,
             ),
+            star_filter_order: crate::connection::AtomicStarFilterOrder::new(
+                crate::connection::StarFilterOrder::Planned,
+            ),
             sorted_fetches: AtomicBool::new(false),
             adaptive_joins: AtomicBool::new(false),
             adaptive_join_switches: AtomicU64::new(0),

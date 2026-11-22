@@ -2213,3 +2213,49 @@ plans, and latency p50, p99 and p99.9. The default stays `Equality` until that d
 
 **What would falsify it.** The harness's mostly-NULL scenario at a million rows, if `Equality`'s
 latency there costs more than `WorstCase`'s costs in the distinct scenario across the ladder.
+
+## Decision (lane qs5-18): a star join's filters checked in their measured order
+
+**Decision.** QT.5, T-QT.5.11. A star join's fact row checked its dimensions' Bloom filters in
+the planner's order, the one it estimates passes the fewest rows first (`optimizer/lip.rs`), one
+`Filter` instruction each. Now the fact row's keys for every filter are read first and one
+`StarProbes` instruction checks them, to the first that rejects the row. Behind
+`Connection::set_star_filter_order`:
+
+- `Planned`, the control and the default: the planner's order, as before.
+- `Measured`: each filter's checks and passes are counted in the program's state as the rows run
+  (`vdbe/star_order.rs`), and the filters are kept sorted by their share of rows passed, by
+  Laplace's rule of succession, the lowest first. The order moves as each row's checks are
+  counted: no batch, no interval.
+
+**Why.** For filters of equal cost, checking the one that passes the smallest share first checks
+the fewest filters a row (Babu et al.); the planner's shares are estimates, and an estimate wrong
+by orders of magnitude makes every row pay for the filters before the one that rejects it. Lookahead
+information passing orders its filters by observed selectivity for the same reason (Zhu et al.,
+§4.3).
+
+**Sources.** Babu, Motwani, Munagala, Nishizawa and Widom, "Adaptive Ordering of Pipelined Stream
+Filters", SIGMOD 2004, §2 (the order by rank, and A-Greedy for correlated filters); Zhu, Potti,
+Saurabh and Patel, "Looking Ahead Makes Query Plans Robust", VLDB 2017, §4.3.
+
+**Evidence.** `star_order::tests::t_qt_5_11_*` (the filter passing 1 row in 10 moves first and the
+rows take fewer checks; equal shares keep the planner's order; the order follows a change in the
+rows); `tests/star_filters.rs`' `t_qt_5_11_star_filters_checked_in_their_measured_order_check_less`
+(one answer; fewer checks measured than planned where the planner's estimates tie) and
+`t_qt_5_3_star_filters_stay_within_the_statements_memory` (the filters' bytes within the smallest
+cache's statement memory, `StatementMetrics::star_filter_bytes`).
+
+`qt_5_11_star_order_harness` (ignored; the coordinator's) runs both orders at 2,000 and 1,000,000
+fact rows over a star whose estimates tie (the planned order's failure mode) and one whose rows
+drift halfway, so the order learned first is wrong after (the measured order's): checks and rejects
+a row, filter bytes, latency p50, p99 and p99.9.
+
+**Limits.** A filter checked after another is measured only on the rows that one passed, so
+correlated filters can be misordered (A-Greedy's case). The counts never decay, so after a drift
+the order turns only once the new rows outnumber the old. Every filter's keys are read before the
+first check, even for a row the first filter rejects. The `Filter` instruction's star flag is gone:
+`StarProbes` counts `star_filter_probes` and `star_filter_rejects`.
+
+**What would falsify it.** The coordinator's A/B (`StarFilterOrder::Planned` against `Measured`
+over JOB and TPC-H's star joins): `Measured` slower where the planner's order was already right,
+by more than the reading of the keys and the counting cost.

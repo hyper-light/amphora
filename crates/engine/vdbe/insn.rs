@@ -288,6 +288,29 @@ pub struct JoinSwitchData {
     pub probe_pc: BranchOffset,
 }
 
+/// Amphora (QT.5, T-QT.5.11): one of a star probe's filters: the dimension's Bloom filter, by its
+/// cursor, and the fact row's keys for it.
+#[derive(Debug, Clone)]
+pub struct StarProbeKeys {
+    pub cursor_id: CursorID,
+    /// Start register of the keys, already given the comparison's affinities.
+    pub key_reg: usize,
+    pub num_keys: usize,
+}
+
+/// Amphora (QT.5, T-QT.5.11): a fact row's checks against its star join's filters (boxed to keep
+/// Insn small).
+#[derive(Debug, Clone)]
+pub struct StarProbesData {
+    /// The filters, in the planner's order.
+    pub probes: Box<[StarProbeKeys]>,
+    /// Where a row a filter rejects goes.
+    pub target_pc: BranchOffset,
+    /// Whether the filters are checked in their measured order (`StarFilterOrder::Measured`),
+    /// else in the planner's.
+    pub measured: bool,
+}
+
 /// Amphora (PL.13): an adaptive join's hash table, built (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct JoinSwitchBuiltData {
@@ -853,9 +876,6 @@ pub enum Insn {
         key_reg: usize,
         /// Number of key registers to hash together
         num_keys: usize,
-        /// Amphora (T-QT.5.3): a star join's filter at its fact scan, counted in the statement's
-        /// metrics (`star_filter_probes`, `star_filter_rejects`).
-        star: bool,
     },
     /// Compute a hash on num_keys registers starting with `r[key_reg]` and add that hash to
     /// the bloom filter associated with the cursor/hash_table.
@@ -2443,6 +2463,16 @@ pub enum Insn {
     SubqueryCounted {
         data: Box<SubqueryCountedData>,
     },
+
+    /// Amphora (QT.5, T-QT.5.11; `docs/design/planner.md`, "Decision (lane qs5-18): a star join's
+    /// filters checked in their measured order"): checks the fact row's keys against each of its
+    /// star join's Bloom filters, jumping to `target_pc` at the first that rejects them. With
+    /// `measured`, in the order the run has measured (each filter's checks and passes, kept in the
+    /// program's state, `vdbe/star_order.rs`), the filter passing the smallest share first; else
+    /// in the planner's. Its first row ends every filter's build.
+    StarProbes {
+        data: Box<StarProbesData>,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2699,6 +2729,7 @@ impl InsnVariants {
             InsnVariants::BuildCounted => execute::op_build_counted,
             InsnVariants::SorterCounted => execute::op_sorter_counted,
             InsnVariants::SubqueryCounted => execute::op_subquery_counted,
+            InsnVariants::StarProbes => execute::op_star_probes,
         }
     }
 }

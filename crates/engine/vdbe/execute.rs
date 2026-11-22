@@ -20535,8 +20535,7 @@ pub fn op_filter(
             cursor_id,
             target_pc,
             key_reg,
-            num_keys,
-            star
+            num_keys
         },
         insn
     );
@@ -20549,36 +20548,115 @@ pub fn op_filter(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
-    let contains = if *num_keys == 1 {
+    let contains = filter_contains(filter, &state.registers, *key_reg, *num_keys);
+
+    if !contains {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Whether `filter` may hold the key in `registers[key_reg..key_reg + num_keys]`. A NULL key part
+/// matches nothing: the filter's join is an equality. A key past the registers passes, as a
+/// filter may always let a row through.
+fn filter_contains(
+    filter: &crate::vdbe::bloom_filter::BloomFilter,
+    registers: &[Register],
+    key_reg: usize,
+    num_keys: usize,
+) -> bool {
+    let key = |i: usize| {
+        key_reg
+            .checked_add(i)
+            .and_then(|reg| registers.get(reg))
+            .map(Register::get_value)
+    };
+    if num_keys == 1 {
         // Single key optimization, avoid allocating a Vec
-        let value = state.registers[*key_reg].get_value();
-        if matches!(value, Value::Null) {
+        match key(0) {
             // its always safe to fall through, so this *should* be `true` but
             // since it's always an equality predicate and we have a NULL value,
             // we can just short-circuit to false here.
-            false
-        } else {
-            filter.contains_value(value)
+            Some(Value::Null) => false,
+            Some(value) => filter.contains_value(value),
+            None => true,
         }
     } else {
-        let values: Vec<&Value> = (0..*num_keys)
-            .map(|i| state.registers[*key_reg + i].get_value())
-            .collect();
+        let Some(values) = (0..num_keys).map(key).collect::<Option<Vec<&Value>>>() else {
+            return true;
+        };
         if values.iter().any(|v| matches!(*v, Value::Null)) {
             false
         } else {
             filter.contains_values(&values)
         }
-    };
+    }
+}
 
-    if *star {
+/// Amphora (QT.5, T-QT.5.11): [Insn::StarProbes]. At its first row, each filter's build ends
+/// (sealed, as [Insn::Filter]'s first probe seals it) and its bytes are counted; then the row's
+/// keys are checked against each filter, in the measured order or the planner's, to the first
+/// that rejects them. A filter not built passes the row, as [Insn::Filter] lets it.
+pub fn op_star_probes(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(StarProbes { data }, insn);
+    let pc = state.pc;
+    if !state.star_orders.contains_key(&pc) {
+        let (mut building, mut sized) = (0usize, 0usize);
+        for probe in data.probes.iter() {
+            if let Some(filter) = state.bloom_filters.get_mut(&probe.cursor_id) {
+                building = building.saturating_add(filter.bytes());
+                filter.seal();
+                sized = sized.saturating_add(filter.bytes());
+            }
+        }
+        let held = u64::try_from(building.max(sized)).unwrap_or(u64::MAX);
+        state.metrics.star_filter_bytes = state.metrics.star_filter_bytes.max(held);
+        state
+            .star_orders
+            .insert(pc, super::star_order::StarOrder::new(data.probes.len()));
+    }
+    let Some(order) = state.star_orders.get_mut(&pc) else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let mut rejected = false;
+    for nth in 0..data.probes.len() {
+        let at = if data.measured {
+            order.nth(nth)
+        } else {
+            Some(nth)
+        };
+        let Some((at, probe)) = at.and_then(|at| data.probes.get(at).map(|p| (at, p))) else {
+            continue;
+        };
+        let passed = state
+            .bloom_filters
+            .get(&probe.cursor_id)
+            .is_none_or(|filter| {
+                filter_contains(filter, &state.registers, probe.key_reg, probe.num_keys)
+            });
         state.metrics.star_filter_probes = state.metrics.star_filter_probes.wrapping_add(1);
-        if !contains {
+        if data.measured {
+            order.observe(at, passed);
+        }
+        if !passed {
             state.metrics.star_filter_rejects = state.metrics.star_filter_rejects.wrapping_add(1);
+            rejected = true;
+            break;
         }
     }
-    if !contains {
-        state.pc = target_pc.as_offset_int();
+    if data.measured {
+        order.settle();
+    }
+    if rejected {
+        state.pc = data.target_pc.as_offset_int();
     } else {
         state.pc += 1;
     }

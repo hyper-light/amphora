@@ -2714,6 +2714,20 @@ pub fn insn_to_row(
                 data.aggregates
             ),
         ),
+        Insn::StarProbes { data } => (
+            "StarProbes",
+            i64::try_from(data.probes.len()).unwrap_or(i64::MAX),
+            data.target_pc.as_debug_int() as i64,
+            i64::from(data.measured),
+            Value::build_text(""),
+            0,
+            format!(
+                "if !bloom_filter(...) of {} filters, {} order, goto {}",
+                data.probes.len(),
+                if data.measured { "measured" } else { "planned" },
+                data.target_pc.as_debug_int()
+            ),
+        ),
         Insn::TreePages {
             cursor_id,
             target_reg,

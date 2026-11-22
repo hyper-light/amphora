@@ -140,7 +140,7 @@ pub use cdc::{
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
     resolve_ext_path, Connection, IsValueEstimate, JoinMethods, JoinSearchBudget, PrepareOptions,
-    Row, StarFilters, StepResult, SymbolTable,
+    Row, StarFilterOrder, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use translate::optimizer::search_budget::JoinSearchStats;

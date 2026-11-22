@@ -214,6 +214,9 @@ pub struct Resolver<'a> {
     /// Amphora (QT.5): how an `IS` of a value planning doesn't know is estimated
     /// (`Connection::set_is_value_estimate`).
     is_value_estimate: crate::IsValueEstimate,
+    /// Amphora (T-QT.5.11): the order a star join's fact row checks its filters in
+    /// (`Connection::set_star_filter_order`).
+    star_filter_order: crate::StarFilterOrder,
     /// Amphora (PL.8): what sizes the join search (`Connection::set_join_search_budget`).
     join_search: crate::translate::optimizer::search_budget::SearchBudget,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
@@ -359,6 +362,7 @@ impl<'a> Resolver<'a> {
             join_methods: crate::JoinMethods::ByCost,
             star_filters: crate::StarFilters::ByCost,
             is_value_estimate: crate::IsValueEstimate::Equality,
+            star_filter_order: crate::StarFilterOrder::Planned,
             join_search: crate::translate::optimizer::search_budget::SearchBudget::FIXED,
             sorted_fetches: false,
             adaptive_joins: false,
@@ -479,6 +483,14 @@ impl<'a> Resolver<'a> {
         self.is_value_estimate = rule;
     }
 
+    pub(crate) fn star_filter_order(&self) -> crate::StarFilterOrder {
+        self.star_filter_order
+    }
+
+    pub(crate) fn set_star_filter_order(&mut self, order: crate::StarFilterOrder) {
+        self.star_filter_order = order;
+    }
+
     pub(crate) fn join_search(&self) -> crate::translate::optimizer::search_budget::SearchBudget {
         self.join_search
     }
@@ -552,6 +564,7 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             star_filters: self.star_filters,
             is_value_estimate: self.is_value_estimate,
+            star_filter_order: self.star_filter_order,
             join_search: self.join_search,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
@@ -593,6 +606,7 @@ impl<'a> Resolver<'a> {
             join_methods: self.join_methods,
             star_filters: self.star_filters,
             is_value_estimate: self.is_value_estimate,
+            star_filter_order: self.star_filter_order,
             join_search: self.join_search,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,

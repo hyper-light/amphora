@@ -530,7 +530,6 @@ fn emit_unmatched_right_rows(
         target_pc: emit_row,
         key_reg: right_join.key_start_reg,
         num_keys: right_join.key_len(),
-        star: false,
     });
     program.emit_insn(Insn::Found {
         cursor_id: right_join.matched_rows_cursor_id,
