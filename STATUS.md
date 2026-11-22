@@ -5,10 +5,18 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **Read-your-writes by session tokens** (CP-T1.10, AC-T1.10.R1-R3, lane ryw-1; docs/design/replication.md):
+  `Database::session_token` after a write, and `Database::query_session(ReadMode, token, ..)`. `Latest` is today's read
+  (the control). `Session` serves a token read on any replica that has applied the token, waits only while that replica
+  is behind, and redirects past its measured apply lag. A read without a token never waits. `session_counters` holds the
+  instruments, and `amphora-bench --cluster --shapes ryw` runs the ladder. Waits on the coordinator: the A/B on
+  adacachy2, the power-cut case (after repl-measure-8's fix), and the overlay candidate (spec only).
 - **A refusal before a cross-group step** (CP-T1.10, AC-T1.10.6, lane xgroup-sql-4; docs/design/xgroup.md): `Options::on_refused`
   retries a step a group refused before taking it (`NotLeader`, `Full`) after the learned RFC 6298 back-off, with today's
   behaviour as the control; `Cluster::counted` gives the instruments. A group failing mid-commit is tested through a session
   over real groups. Waits on the coordinator: which setting stays, from live runs; the LAN p99 and 10,000-seed runs.
+  At scale (lane xgroup-sql-5): `xgroup_lan refusals` runs Stop against Retry under many callers and correlated
+  refusals, one JSON line a run; the SQL hookup waits on a Database over Groups and a Tablet over the records tables.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
@@ -1098,3 +1106,19 @@ commits). Their benchmarks against the commit before each have harnesses: `bench
 (amphora-bench at two commits, ABBA: finding 4's `--sql-api` with Linux CPU time, and the bulk
 statements with the bytes of log they leave). The runs of record are the coordinator's. amphora-bench
 does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` runs only at commits where it does.
+
+- **Amphora on its own across three machines (CP-T1.13, lane production-1, 2026-11-22):**
+  `amphora serve CONFIG` runs one member of a replicated database as a server, its peers and
+  clients over TCP, each connection proving the cluster's secret (HMAC-SHA256 over a challenge);
+  it reopens on its own data, so a killed member rejoins. `amphora health` checks every member
+  (one leader, the configured voters, none fenced); `scripts/cluster.sh` installs each member as a
+  systemd user unit or a LaunchAgent named amphora-member-N, nothing of kiln's touched;
+  `scripts/drills.sh` runs the kill, split and stall drills under load and counts acknowledged
+  writes on every member (`amphora drill load|check`, AC-T1.13.5). The replica's host now waits
+  for its next record (`ReplicaHandle::drain_wait`) instead of spinning. docs/runbook.md. Not done:
+  the drills of record across three machines, an encrypted link, and kiln opening these members
+  (its seam's client). Lane production-2: the serve test's open timeout was the test's own (one
+  process's opens take turns under its owner table; members now start one after another);
+  `amphora member CONFIG add|promote|demote|remove N` with a config `voters` key (spares start as
+  learners); the region-lost drill replaces a lost member with a spare. Mutual TLS waits on the
+  split-merge listener's TLS landing on t1/group-replication.

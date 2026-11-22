@@ -1275,3 +1275,19 @@ tests = [
   { id = "T-T1.10.R1", text = "xgroup::sql::sessions::ac_t1_10_6_refusals_before_a_step_retried_commit_and_the_control_aborts — passes when one group refusing three times and all three refusing twice commit with no stop under Retry, and abort under Stop, both protocols" },
   { id = "T-T1.10.R2", text = "xgroup::sql::sessions::ac_t1_10_1_a_group_failure_mid_commit_through_a_session_is_all_or_nothing — passes when a group failing at each of a session transaction's steps leaves its rows all written or none after recovery, equal to one group's, both protocols, both ends reached" },
 ]
+
+# lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session
+# tokens"). Ada's order 2026-11-22: built behind ReadMode, today's read the control.
+[[own]]
+id = "RYW.1"
+title = "Read-your-writes on any replica by session tokens, behind a read-mode switch (CP-T1.10)"
+criteria = [
+  { id = "AC-T1.10.R1", text = "A write's acknowledgement gives its session a token (the group's time and the commit index, published before the answer); a read that carries it is served by any replica once that has applied it, never without the session's own write, under a lagging follower and across changes of leader" },
+  { id = "AC-T1.10.R2", text = "A token read waits only on the replica it asked, only while that replica is behind, woken by the owner's publication; past the replica's measured apply lag (or at once with none measured) it is redirected to the leader's read; a read without a token never waits for the log" },
+  { id = "AC-T1.10.R3", text = "ReadMode::Latest (today's read, the control) and ReadMode::Session answer alike for a session that carries its tokens; tokens order time first, in the cross-group coordinator's time domain" },
+]
+tests = [
+  { id = "T-T1.10.R1", text = "t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower: records to one follower lost while 2 is written; its token read waits (counted, the follower shown behind) and answers 1 and 2 once it rejoins; a read with no token answers at once" },
+  { id = "T-T1.10.R2", text = "t_t1_10_r2_a_behind_replica_with_no_lag_learned_redirects: a follower that applied nothing stamped redirects at once, counted; once caught up every member serves the token with the write" },
+  { id = "T-T1.10.R3", text = "t_t1_10_r3_a_session_reads_its_writes_across_leader_changes: clocks an hour apart, the lead passed 1, 2, 3, 1; each token orders after the last, every token read sees the session's writes, and once caught up every member equals the leader's state" },
+]

@@ -28,7 +28,10 @@
 //! - [`memory`]: the memory this process may use, as the system says (the process's page pool is a
 //!   part of it).
 //!
-//! The `amphora` binary says what it is ([`reply`]).
+//! - [`serve`]: Amphora on its own (CP-T1.13): one member of a replicated database as a server,
+//!   its health, and the fire drills' load and loss count.
+//!
+//! The `amphora` binary says what it is ([`reply`]) and runs [`serve`]'s commands.
 
 pub mod audit;
 pub mod backup;
@@ -42,6 +45,7 @@ pub mod regions;
 pub mod replication;
 pub mod reshard;
 pub mod search;
+pub mod serve;
 pub mod sql;
 pub mod store;
 pub mod transport;
