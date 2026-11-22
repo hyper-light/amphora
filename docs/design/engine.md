@@ -547,9 +547,11 @@ crash between the two (the header moves into the catalog with `sqlite_schema`'s 
 (G7 step 4, `NS.4`; `crates/engine/storage/versioned/pool.rs`, tests in `evict.rs`.)
 
 **Decision.** A database's pool holds the frames its byte budget pays for (`pool::frames_within`:
-the budget over a page and its frame's state); the budget is the shell's, from the memory the process
-may use (`amphora::memory::limit`; `pool::machine_bytes` reads the machine's on Linux and refuses,
-naming the platform, where reading it needs `unsafe`). Pages are read in as they are asked for and
+the budget over a page and its frame's state); the budget is the shell's, learned from the memory the
+process may use: store decision 26's share (`amphora::db::default_pages`) of `amphora::memory::limit`
+(the smallest of its control groups' limits and the machine's memory on Linux; that decision's
+stated fallback elsewhere), the one reader of it, so a pool in a container sizes from its group's
+limit, never the host's memory. Pages are read in as they are asked for and
 evicted by CLOCK (decision 2's rule, the reach prototypes' shared eviction, G7 step 3): a frame whose
 reference bit is clear and whose latch no one holds; a clean frame is reused at once, a dirty one is
 first written to the spill file, page `n` at `n` pages in. The data file still changes only by

@@ -137,7 +137,9 @@ impl Slots {
 }
 
 /// The frames a byte budget holds: each a page and its frame's state. The budget is the shell's,
-/// from the memory the process may use (`amphora::memory::limit`, or [`machine_bytes`]).
+/// learned from the memory the process may use: decision 26's share (`amphora::db::default_pages`)
+/// of `amphora::memory::limit` (the smallest of its control groups' limits and the machine's
+/// memory on Linux; that decision's stated fallback where the system doesn't say).
 pub fn frames_within(bytes: u64) -> Result<usize> {
     let each = PAGE_SIZE.saturating_add(std::mem::size_of::<Frame>());
     let each = u64::try_from(each).map_err(|_| LimboError::IntegerOverflow)?;
@@ -151,31 +153,6 @@ pub fn frames_within(bytes: u64) -> Result<usize> {
         });
     }
     usize::try_from(n).map_err(|_| LimboError::IntegerOverflow)
-}
-
-/// The machine's memory in bytes, for a shell that wasn't given a budget: `/proc/meminfo`'s
-/// `MemTotal:` (in KiB). Elsewhere the system's interfaces need `unsafe`, which the crate denies:
-/// refused, naming the platform, so the shell passes the budget itself.
-pub fn machine_bytes() -> Result<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let info = std::fs::read_to_string("/proc/meminfo")
-            .map_err(|e| super::disk::io("/proc/meminfo", e))?;
-        info.lines()
-            .find_map(|l| l.strip_prefix("MemTotal:"))
-            .and_then(|l| l.split_whitespace().next())
-            .and_then(|kib| kib.parse::<u64>().ok())
-            .and_then(|kib| kib.checked_mul(1024))
-            .ok_or_else(|| LimboError::InternalError("/proc/meminfo has no MemTotal".into()))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(LimboError::InvalidArgument(format!(
-            "versioned storage: the machine's memory isn't readable on {} without unsafe code: \
-             give the page pool its budget",
-            std::env::consts::OS
-        )))
-    }
 }
 
 /// The pool's counts since it was made.
