@@ -722,11 +722,12 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   others), typeof() and quote() of a value of known storage class, `X IS Y` of values (IS NOT DISTINCT
   FROM), BINARY and NOCASE collations (DuckDB's "binary" and "nocase", PostgreSQL's "C"; RTRIM not
   expressible but on MySQL), and total() of numbers; date() with modifiers, which sqlglot wrote as a time
-  zone, is not expressible. Untranslatable on the gate's pool: 237, 359, 308, 460
+  zone, is not expressible; so is a PRAGMA inspecting a table with columns left out. Untranslatable on the
+  gate's pool: 267, 406, 338, 507
   (DuckDB, PostgreSQL, MySQL, ClickHouse), from 381, 381, 483, 480. The local check (as lane 9's, every
   written file now, DuckDB's Python replacement scans off, each statement given up after 10 s): of 3,544
-  queries 2,129 answered differently before and 1,269 now, none newly; 157 are untranslatable with their
-  reasons (156 more than before), so at least 704 now give SQLite's answer. The record that hung lane 9's check is written/syntax/recursive-cte's
+  queries 2,129 answered differently before and 1,239 now, none newly; 187 are untranslatable with their
+  reasons (186 more than before), so at least 704 now give SQLite's answer. The record that hung lane 9's check is written/syntax/recursive-cte's
   `WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT max(n) + 1 FROM c WHERE n < 3) SELECT * FROM c`, a
   `statement error` SQLite refuses (an aggregate in a recursive select) that DuckDB runs forever: the
   harness's own per-record bound covers it. Left: datetime() and the other date functions, JSON, PRAGMAs.
