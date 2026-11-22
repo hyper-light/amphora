@@ -189,6 +189,30 @@ fn owner_lock(path: &Path) -> Result<File, Refusal> {
     clone_lock(&private_lock)
 }
 
+/// A listening socket at `address`, nonblocking: the loopback endpoint's (port 0, the system's
+/// choice) and a network endpoint's ([`super::network`]).
+pub(super) fn listener(address: SocketAddr) -> Result<Listener, Refusal> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )
+    .map_err(unavailable)?;
+    // SO_REUSEADDR can otherwise redirect Windows connections to another local process.
+    // Microsoft: learn.microsoft.com/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse.
+    #[cfg(windows)]
+    socket.set_exclusive_address(true).map_err(unavailable)?;
+    // Fresh Unix sockets retain the OS defaults: SO_REUSEADDR and SO_REUSEPORT are disabled.
+    socket.bind(&address.into()).map_err(unavailable)?;
+    // The backlog is the system's own most: past it each system takes its limit (Linux's
+    // net.core.somaxconn, listen(2); XNU's kern.ipc.somaxconn, solisten), and Windows reads
+    // SOMAXCONN, 0x7fffffff, as "a maximum reasonable value" (Microsoft, listen function).
+    // Accepted connections are bounded by the process's descriptor budget, not here.
+    socket.listen(i32::MAX).map_err(unavailable)?;
+    socket.set_nonblocking(true).map_err(unavailable)?;
+    Ok(Listener::from(socket))
+}
+
 pub(super) fn bind(path: &Path) -> Result<Bound, Refusal> {
     let directory = PrivateDir::ensure(directory(path)?).map_err(unavailable)?;
     let private_lock = directory
@@ -204,23 +228,7 @@ pub(super) fn bind(path: &Path) -> Result<Bound, Refusal> {
     let lock = clone_lock(&private_lock)?;
     lock.try_lock().map_err(unavailable)?;
 
-    let socket =
-        Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).map_err(unavailable)?;
-    // SO_REUSEADDR can otherwise redirect Windows connections to another local process.
-    // Microsoft: learn.microsoft.com/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse.
-    #[cfg(windows)]
-    socket.set_exclusive_address(true).map_err(unavailable)?;
-    // Fresh Unix sockets retain the OS defaults: SO_REUSEADDR and SO_REUSEPORT are disabled.
-    socket
-        .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
-        .map_err(unavailable)?;
-    // The backlog is the system's own most: past it each system takes its limit (Linux's
-    // net.core.somaxconn, listen(2); XNU's kern.ipc.somaxconn, solisten), and Windows reads
-    // SOMAXCONN, 0x7fffffff, as "a maximum reasonable value" (Microsoft, listen function).
-    // Accepted connections are bounded by the process's descriptor budget, not here.
-    socket.listen(i32::MAX).map_err(unavailable)?;
-    socket.set_nonblocking(true).map_err(unavailable)?;
-    let listener = Listener::from(socket);
+    let listener = listener(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))?;
     let mut token = [0; 32];
     getrandom::fill(&mut token).map_err(unavailable)?;
     let mut record = Vec::with_capacity(RECORD_BYTES);

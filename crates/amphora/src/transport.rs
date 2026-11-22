@@ -5,6 +5,7 @@ mod auth;
 mod bounded;
 mod common;
 mod endpoint;
+pub mod network;
 mod watch;
 mod wire;
 pub use common::{Client, Namespace, Node, Nodes, Owner};
