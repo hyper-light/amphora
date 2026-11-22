@@ -2,11 +2,11 @@
 # dqlite, three voters over Raft, through go-dqlite's app package: the bench's shim (../shim/main.go,
 # built by setup.sh against the host's libdqlite) a process on this host for each node, /exec and
 # /count on 127.0.0.1:54240-54242, dqlite's own protocol on 54250-54252. go-dqlite sends every
-# statement to the leader; a commit is acknowledged once a quorum's Raft logs hold it on disk.
+# statement to the leader; a commit is acknowledged once a quorum's Raft logs hold it.
 set -euo pipefail
 SYS=dqlite
 PORT=${AMPHORA_BENCH_REPL_PORT:-54240}
-DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it on disk; go-dqlite app's defaults"
+DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it; libdqlite's and go-dqlite app's defaults"
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 run_node() {
@@ -32,5 +32,7 @@ leader() {
 }
 
 version() { cat "$BIN/dqlite.version"; }
+
+help_text() { :; }
 
 main "$@"

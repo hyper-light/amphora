@@ -104,8 +104,10 @@ about() {
   mkdir -p "$DATA"
   fs=$(stat -f -c %T "$DATA" 2>/dev/null || echo unknown)
   kernel=$(uname -srm)
-  python3 -I -c 'import json,sys; print(json.dumps({"system": sys.argv[1], "version": sys.argv[2], "platform": "native", "kernel": sys.argv[3], "data_fs": sys.argv[4], "durability": sys.argv[5]}))' \
-    "$SYS" "$(version 2>&1 | head -n 1)" "$kernel" "$fs" "$DURABILITY"
+  # Every option the binary's own help names for syncing or durability, so the record shows the
+  # defaults it ran with, not only what DURABILITY says of them.
+  python3 -I -c 'import json,sys; print(json.dumps({"system": sys.argv[1], "version": sys.argv[2], "platform": "native", "kernel": sys.argv[3], "data_fs": sys.argv[4], "durability": sys.argv[5], "sync_options": [l.strip() for l in sys.argv[6].splitlines() if l.strip()]}))' \
+    "$SYS" "$(version 2>&1 | head -n 1)" "$kernel" "$fs" "$DURABILITY" "$(help_text 2>&1 | grep -iE 'sync|durab|fsync' || true)"
 }
 
 main() {

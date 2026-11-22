@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # rqlite, three voters over Raft, each rqlited a process on this host (setup.sh's release binary):
 # HTTP on 127.0.0.1:54200-54202, Raft on 54210-54212. A write to a follower is forwarded to the
-# leader; it's acknowledged once a quorum's Raft logs hold it, each written to disk before it says so
-# (rqlite's one write durability). Reads with level=none come from the node's own copy.
+# leader; it's acknowledged once a quorum's Raft logs hold it (rqlite's one write durability; its
+# defaults, which `about` lists). Reads with level=none come from the node's own copy.
 set -euo pipefail
 SYS=rqlite
 PORT=${AMPHORA_BENCH_REPL_PORT:-54200}
-DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it on disk; rqlited's defaults, no flags changing durability"
+DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it; rqlited's defaults, no flag changing durability (sync_options lists the ones it has)"
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 run_node() {
@@ -30,5 +30,7 @@ leader() {
 }
 
 version() { "$BIN/rqlited" -version; }
+
+help_text() { "$BIN/rqlited" -h; }
 
 main "$@"

@@ -25,4 +25,6 @@ leader() { ready_node 0 && echo 0; }
 
 version() { "$BIN/sqld" --version; }
 
+help_text() { "$BIN/sqld" --help; }
+
 main "$@"

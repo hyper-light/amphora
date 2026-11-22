@@ -77,4 +77,6 @@ leader() {
 
 version() { "$BIN/litefs" version 2>&1 || true; }
 
+help_text() { "$BIN/litefs" mount -h; }
+
 main "$@"
