@@ -21,7 +21,7 @@ Nothing here touches kiln: the binary goes to `~/.local/lib/amphora/amphora`, co
 
 ```sh
 scripts/cluster.sh install --bin target/release/amphora --class persisted --deadline-ms MS \
-  [--drills on] HOST1:PORT HOST2:PORT HOST3:PORT
+  [--drills on] [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
 ```
 
 - `--class persisted`: a write is answered once a majority of members hold it on disk.
@@ -80,7 +80,9 @@ Each member is its own region (its own machine). When one is lost for good, the 
 hold the majority and keep taking writes; replace the lost one with a spare:
 
 1. Name the spare in every member's `members` (`4@HOST4:PORT`), its own config with `voters =` the
-   current voters (it starts as a learner), and restart the members one at a time.
+   current voters (it starts as a learner), and restart the members one at a time. Or set it up
+   with the cluster from the start: `scripts/cluster.sh install ... --spare HOST4:PORT HOST1:PORT
+   HOST2:PORT HOST3:PORT` writes every config with the spare in `members` and `voters = 1,2,3`.
 2. `amphora member CONFIG add 4`, then `amphora member CONFIG promote 4` once it has caught up
    (`amphora ask CONFIG 4 status`: its `applied` reaches the leader's).
 3. `amphora member CONFIG remove 3` (the lost one), then set `voters = 1,2,4` in every config:
@@ -96,7 +98,7 @@ is its test.
 ## Uninstall
 
 ```sh
-scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT    # services and configs; data kept
+scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]   # services and configs; data kept
 ```
 
 ## What isn't done
