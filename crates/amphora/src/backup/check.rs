@@ -161,6 +161,8 @@ pub fn newest_second(
         .map(|(m, _)| m)
         .collect();
     plan::raise_through(&mut segments, &marks);
+    // The log once over, as a restore reads it (T-T1.12.M6).
+    let segments = plan::covering(&segments);
     let Some(first) = segments
         .iter()
         .find_map(|s| s.marks)

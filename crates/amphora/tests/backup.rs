@@ -1426,6 +1426,18 @@ fn written_within(
     (db, shipper, model, now, second)
 }
 
+/// The newest base under "db": the latest to end, as a restore orders them.
+fn newest_base(blobs: &dyn Blobs) -> backup::plan::BaseKey {
+    blobs
+        .list("db/base/", None, 100_000, until())
+        .unwrap()
+        .objects
+        .iter()
+        .map(|(key, _)| backup::plan::BaseKey::parse("db", key).unwrap())
+        .max_by_key(|b| (b.end, b.id))
+        .unwrap()
+}
+
 /// Copies a base whole under `memory`: its chunks' size and count.
 fn copy_whole(
     shipper: &mut Shipper,
@@ -1547,6 +1559,7 @@ fn t_t1_12_m2_a_large_rooms_backup_restored_in_a_small_room() {
         .len();
     assert_eq!(chunks, 1, "the whole file fits one chunk of the large room");
     assert!(chunk >= file && file > 64 * 1024);
+    let copied = newest_base(&blobs);
     archive_through(&mut shipper, &db, &blobs, &now);
 
     let mut base = None;
@@ -1566,6 +1579,11 @@ fn t_t1_12_m2_a_large_rooms_backup_restored_in_a_small_room() {
         assert_eq!(rows(&Db::open(&target).unwrap()), model, "under {limit}");
         assert_eq!(memory.held(Use::Chunks), 0);
         assert_eq!(memory.streams(Use::Chunks), 0);
+        // The rule (`plan::chain`): the latest base that ended at or before the cut. This one was
+        // copied after the second's last commit with nothing committed since, so it ended at the
+        // cut's own frame and is the one taken.
+        assert_eq!(copied.end, restored.cut, "the base ended at the cut");
+        assert_eq!(restored.base, copied.id, "under {limit}");
         base = Some(restored.base);
     }
 
@@ -1846,6 +1864,7 @@ fn grown(growth: backup::ChunkGrowth) -> Grown {
     }
     let reused = copy.reused() as u64;
     shipper.end_base(&db, &blobs, copy, until()).unwrap();
+    let second_base = newest_base(&blobs);
     let file = std::fs::metadata(dir.path().join("source.db"))
         .unwrap()
         .len();
@@ -1864,7 +1883,14 @@ fn grown(growth: backup::ChunkGrowth) -> Grown {
     )
     .unwrap();
     assert_eq!(rows(&Db::open(&target).unwrap()), model);
-    assert_ne!(restored.base, 0);
+    // The latest base that ended at or before the cut (`plan::chain`): the second, copied after the
+    // last commit with nothing committed since, so ended at the cut's frame. Its chunks are the
+    // ones fetched.
+    assert_eq!(
+        second_base.end, restored.cut,
+        "the second base ended at the cut"
+    );
+    assert_eq!(restored.base, second_base.id);
     Grown {
         first_chunk,
         chunk,
@@ -2003,4 +2029,266 @@ fn t_t1_12_m4_a_lost_answer_compared_in_parts() {
     )
     .unwrap();
     assert_eq!(rows(&Db::open(&target).unwrap()), model);
+}
+
+/// A store that refuses the `n`th create of a log segment once armed: before storing it
+/// (`lose: false`), or after (`lose: true`, its answer lost).
+struct FailsMidSend<'a> {
+    inner: &'a dyn Blobs,
+    lose: bool,
+    /// Log creates to let through before the one refused; none while disarmed.
+    left: std::sync::Mutex<Option<u64>>,
+    refused: AtomicU64,
+}
+
+impl Blobs for FailsMidSend<'_> {
+    fn object_max(&self) -> usize {
+        self.inner.object_max()
+    }
+    fn create(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        until: Instant,
+    ) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        let refuse = key.contains("/log/") && {
+            let mut left = self.left.lock().unwrap();
+            match *left {
+                Some(0) => {
+                    *left = None;
+                    true
+                }
+                Some(n) => {
+                    *left = Some(n - 1);
+                    false
+                }
+                None => false,
+            }
+        };
+        if !refuse {
+            return self.inner.create(key, bytes, until);
+        }
+        self.refused.fetch_add(1, Ordering::SeqCst);
+        if self.lose {
+            self.inner.create(key, bytes, until)?;
+        }
+        Err(amphora_api::blobs::BlobRefusal::Unavailable(
+            "refused mid-send".into(),
+        ))
+    }
+    fn get(&self, key: &str, until: Instant) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        self.inner.get(key, until)
+    }
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: usize,
+        until: Instant,
+    ) -> Result<Vec<u8>, amphora_api::blobs::BlobRefusal> {
+        self.inner.get_range(key, offset, len, until)
+    }
+    fn list(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        until: Instant,
+    ) -> Result<amphora_api::blobs::Listing, amphora_api::blobs::BlobRefusal> {
+        self.inner.list(prefix, after, limit, until)
+    }
+    fn delete(&self, key: &str, until: Instant) -> Result<(), amphora_api::blobs::BlobRefusal> {
+        self.inner.delete(key, until)
+    }
+}
+
+/// The log segments under "db", parsed, in key order.
+fn segment_keys(blobs: &dyn Blobs) -> Vec<(backup::plan::SegmentKey, String)> {
+    blobs
+        .list("db/log/", None, 100_000, until())
+        .unwrap()
+        .objects
+        .into_iter()
+        .map(|(key, _)| (backup::plan::SegmentKey::parse("db", &key).unwrap(), key))
+        .collect()
+}
+
+/// T-T1.12.M6: a send the store refuses partway, sent again. Do: copy a base, commit about 400 KB
+/// to a store of 64 KiB objects, so it ships in several parts; refuse the third part's create
+/// (before storing it, and in a second run after, its answer lost); commit again; ship. Expect:
+/// the send refused, then sent again as it was, its parts stored found the same; no two segments
+/// over the same frames; the commit since shipped after it; restores of both seconds whole.
+#[test]
+fn t_t1_12_m6_a_send_refused_partway_sent_again() {
+    for lose in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = SimBlobs::new(64 * 1024, 1 << 20, 1 << 30);
+        let store = FailsMidSend {
+            inner: &blobs,
+            lose,
+            left: std::sync::Mutex::new(None),
+            refused: AtomicU64::new(0),
+        };
+        let (mut db, mut shipper, mut model, now, _) =
+            written_within(dir.path(), 10, &store, &room(1 << 30));
+        copy_whole(&mut shipper, &db, &store, &room(1 << 30));
+        one_commit(&mut db, &now, 100, 100, &mut model);
+        let first = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+        let first_model = model.clone();
+        *store.left.lock().unwrap() = Some(2);
+        assert!(shipper.ship(&db, &store, until()).is_err(), "lose {lose}");
+        assert_eq!(store.refused.load(Ordering::SeqCst), 1);
+        one_commit(&mut db, &now, 1000, 1, &mut model);
+        let shipped = shipper.ship(&db, &store, until()).unwrap();
+        assert!(shipped.segments > 2, "{} parts", shipped.segments);
+        let second = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+        archive_through(&mut shipper, &db, &store, &now);
+
+        let keys: Vec<_> = segment_keys(&blobs).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(
+            backup::plan::cover(&keys).len(),
+            keys.len(),
+            "lose {lose}: no segment over another's frames"
+        );
+        for pair in keys.windows(2) {
+            if pair[0].generation == pair[1].generation {
+                assert_eq!(pair[1].first, pair[0].last + 1, "lose {lose}: {pair:?}");
+            }
+        }
+        for (name, at, want) in [
+            ("first.db", first, &first_model),
+            ("second.db", second, &model),
+        ] {
+            let target = dir.path().join(name);
+            backup::restore_within(
+                &blobs,
+                "db",
+                at,
+                &target,
+                &mut backup::Unpaced,
+                &room(1 << 30),
+                until(),
+            )
+            .unwrap_or_else(|e| panic!("lose {lose}, {name}: {e:#}"));
+            assert_eq!(
+                &rows(&Db::open(&target).unwrap()),
+                want,
+                "lose {lose}, {name}"
+            );
+        }
+    }
+}
+
+/// A log segment's layout (the archive's format 1, `backup/object.rs`), as this test reads and
+/// makes one: its SHA-256, then its body in postcard.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SegmentIdentity {
+    seq: u32,
+    salt1: u32,
+    salt2: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SegmentMark {
+    frame: u64,
+    ns: u64,
+    unknown_from: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SegmentBody {
+    format: u8,
+    generation: u64,
+    identity: SegmentIdentity,
+    first: u64,
+    header: Vec<u8>,
+    marks: Vec<SegmentMark>,
+    frames: Vec<u8>,
+}
+
+fn segment_body(blobs: &dyn Blobs, key: &str) -> SegmentBody {
+    postcard::from_bytes(&blobs.get(key, until()).unwrap()[32..]).unwrap()
+}
+
+fn sealed_segment(body: &SegmentBody) -> Vec<u8> {
+    use sha2::Digest as _;
+    let plain = postcard::to_allocvec(body).unwrap();
+    let mut out = sha2::Sha256::digest(&plain).to_vec();
+    out.extend_from_slice(&plain);
+    out
+}
+
+/// T-T1.12.M6: segments that overlap, as a send made again in other parts leaves them. Do: ship
+/// about 400 KB in parts of 64 KiB; put the last part again beginning two frames earlier, inside
+/// the part before it, and remove it as it was; restore; then alter a byte of those two frames,
+/// sealed again, and restore. Expect: the restore whole, the overlap found to agree with the log it
+/// wrote; the altered one refused for differing there, though its sum holds.
+#[test]
+fn t_t1_12_m6_overlapping_segments_checked_to_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = SimBlobs::new(64 * 1024, 1 << 20, 1 << 30);
+    let (mut db, mut shipper, mut model, now, _) =
+        written_within(dir.path(), 10, &blobs, &room(1 << 30));
+    copy_whole(&mut shipper, &db, &blobs, &room(1 << 30));
+    one_commit(&mut db, &now, 100, 100, &mut model);
+    shipper.ship(&db, &blobs, until()).unwrap();
+    let second = now.load(Ordering::SeqCst).div_ceil(SECOND_NS);
+    archive_through(&mut shipper, &db, &blobs, &now);
+
+    let keys = segment_keys(&blobs);
+    let [.., (before_key, before_name), (last_key, last_name)] = keys.as_slice() else {
+        panic!("{} segments", keys.len());
+    };
+    assert_eq!(before_key.generation, last_key.generation);
+    assert!(before_key.marks.is_none() && last_key.marks.is_some());
+    let before = segment_body(&blobs, before_name);
+    let last = segment_body(&blobs, last_name);
+    let frame = before.frames.len() / (before_key.last - before_key.first + 1) as usize;
+    assert!(before_key.last - before_key.first >= 2);
+    let mut overlapping = last.clone();
+    overlapping.first = last.first - 2;
+    overlapping.frames = before.frames[before.frames.len() - 2 * frame..].to_vec();
+    overlapping.frames.extend_from_slice(&last.frames);
+    let key = backup::plan::SegmentKey {
+        first: overlapping.first,
+        ..last_key.clone()
+    }
+    .key("db");
+    blobs.delete(last_name, until()).unwrap();
+    blobs
+        .create(&key, &sealed_segment(&overlapping), until())
+        .unwrap();
+    let target = dir.path().join("restored.db");
+    backup::restore_within(
+        &blobs,
+        "db",
+        second,
+        &target,
+        &mut backup::Unpaced,
+        &room(1 << 30),
+        until(),
+    )
+    .unwrap();
+    assert_eq!(rows(&Db::open(&target).unwrap()), model);
+
+    let mut altered = overlapping;
+    altered.frames[frame + 100] ^= 1;
+    blobs.delete(&key, until()).unwrap();
+    blobs
+        .create(&key, &sealed_segment(&altered), until())
+        .unwrap();
+    let refused = backup::restore_within(
+        &blobs,
+        "db",
+        second,
+        &dir.path().join("altered.db"),
+        &mut backup::Unpaced,
+        &room(1 << 30),
+        until(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("differs from it"),
+        "{refused:#}"
+    );
 }

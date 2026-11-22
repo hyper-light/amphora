@@ -2,7 +2,7 @@
 //! written as the file, then each generation of log after it written as the log's file and
 //! replayed by the engine's own recovery, the last one up to the second's last commit.
 
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,7 +13,7 @@ use super::Mark;
 use super::drill::{Pace, Unpaced};
 use super::object::{self, SegmentHead};
 use super::plan::{self, BaseKey, SegmentKey, ThroughKey, Unrestorable};
-use super::ship::{FRAME_BYTES, fetch_charge, list_all};
+use super::ship::{FRAME_BYTES, fetch_charge, frame_offset, list_all};
 use crate::db::Db;
 use crate::memory::{Budget as Memory, Charge, Use};
 
@@ -188,10 +188,18 @@ pub fn restore_within(
     if path.try_exists()? || wal_path(path).try_exists()? {
         anyhow::bail!("{} exists: a restore makes a new database", path.display());
     }
-    let mut keys = Vec::new();
+    let mut listed = Vec::new();
     for (key, size) in list_all(blobs, &format!("{prefix}/log/"), until)? {
-        keys.push((SegmentKey::parse(prefix, &key)?, key, size));
+        listed.push((SegmentKey::parse(prefix, &key)?, key, size));
     }
+    // The log once over (T-T1.12.M6): where a retried send left segments over frames others
+    // hold, those a kept one covers are left out.
+    let parsed: Vec<SegmentKey> = listed.iter().map(|(s, _, _)| s.clone()).collect();
+    let keys: Vec<(SegmentKey, String, u64)> = plan::cover(&parsed)
+        .into_iter()
+        .filter_map(|i| listed.get(i).cloned())
+        .collect();
+    drop(listed);
     let mut segments: Vec<SegmentKey> = keys.iter().map(|(s, _, _)| s.clone()).collect();
     let marks: Vec<ThroughKey> = through_marks(blobs, prefix, until)?
         .into_iter()
@@ -294,6 +302,8 @@ pub fn restore_within(
             .create(true)
             .truncate(true)
             .open(wal_path(path))?;
+        // The log as written, read back where a segment overlaps the one before it.
+        let mut written_log = std::fs::File::open(wal_path(path))?;
         let mut written = 0u64;
         let mut header_written = false;
         while let Some(i) = plan.segments.get(index) {
@@ -310,32 +320,73 @@ pub fn restore_within(
             } else {
                 key.last
             };
-            let take = end.saturating_sub(written).saturating_mul(FRAME_BYTES);
+            if key.first > written.saturating_add(1) {
+                anyhow::bail!("segment {name} doesn't follow frame {written}");
+            }
+            // Its frames' bytes that are in the log already, from the segment before, which this
+            // one begins within (a send retried, [`plan::cover`]), and those up to the cut.
+            let first = key.first;
+            let overlap = written
+                .saturating_add(1)
+                .saturating_sub(first)
+                .saturating_mul(FRAME_BYTES);
+            let upto = end
+                .saturating_add(1)
+                .saturating_sub(first)
+                .saturating_mul(FRAME_BYTES);
+            let take = upto.saturating_sub(overlap);
+            let at_log = frame_offset(first.saturating_sub(1))?;
             // Its frames up to the cut written as their parts come (T-T1.12.M3), after the log's
-            // header where this is the generation's first segment.
+            // header where this is the generation's first segment; those the log holds already
+            // compared with it, a frame at a time, and refused where they differ (T-T1.12.M6).
             let mut put = |head: &SegmentHead, offset: u64, part: &[u8]| -> anyhow::Result<()> {
                 if offset == 0 {
-                    if head.first != written.saturating_add(1) {
-                        anyhow::bail!("segment {name} doesn't follow frame {written}");
+                    if head.first != first {
+                        anyhow::bail!(
+                            "segment {name} begins at frame {}, its key says {first}",
+                            head.first
+                        );
                     }
                     if !header_written {
                         log.write_all(&head.header)?;
                         header_written = true;
                     }
                 }
-                let keep = usize::try_from(take.saturating_sub(offset))
+                let to = offset.saturating_add(u64::try_from(part.len())?);
+                let mut at = offset;
+                while at < to.min(overlap) {
+                    let n = to.min(overlap).saturating_sub(at).min(FRAME_BYTES);
+                    let _held = memory.take(Use::Chunks, n)?;
+                    let mut ours = vec![0u8; usize::try_from(n)?];
+                    written_log.seek(SeekFrom::Start(at_log.saturating_add(at)))?;
+                    written_log.read_exact(&mut ours)?;
+                    let within = usize::try_from(at.saturating_sub(offset))?;
+                    let theirs = part.get(within..within.saturating_add(ours.len()));
+                    if theirs != Some(ours.as_slice()) {
+                        anyhow::bail!(
+                            "segment {name} overlaps the log before it and differs from it at its byte {at}"
+                        );
+                    }
+                    at = at.saturating_add(n);
+                }
+                let from = usize::try_from(overlap.saturating_sub(offset))
                     .unwrap_or(usize::MAX)
                     .min(part.len());
-                log.write_all(part.get(..keep).unwrap_or(part))?;
+                let keep = usize::try_from(upto.saturating_sub(offset))
+                    .unwrap_or(usize::MAX)
+                    .min(part.len());
+                if from < keep {
+                    log.write_all(part.get(from..keep).unwrap_or_default())?;
+                }
                 Ok(())
             };
             let head = read_segment(blobs, name, *size, log_part, memory, until, &mut put)?;
             bytes = bytes.saturating_add(*size);
             log_bytes = log_bytes.saturating_add(if *i == at { head.frames } else { *size });
-            if head.first != written.saturating_add(1) {
+            if head.first != first {
                 anyhow::bail!("segment {name} doesn't follow frame {written}");
             }
-            if head.frames < take {
+            if head.frames < upto {
                 anyhow::bail!("segment {name} holds fewer frames than it says");
             }
             if !header_written {

@@ -234,18 +234,63 @@ impl ThroughKey {
     }
 }
 
-/// Raises the through of each segment a through mark follows (the one ending at the mark's frame
-/// of its generation) to the mark's. `segments` are in key order, so in order of where they end.
+/// Raises the through of each segment a through mark follows (one ending at marks at the mark's
+/// frame of its generation) to the mark's. In any order: segments that overlap ([`cover`]) needn't
+/// be in order of where they end. The marks are few: a shipper keeps its latest only.
 pub fn raise_through(segments: &mut [SegmentKey], marks: &[ThroughKey]) {
     for mark in marks {
-        if let Ok(at) =
-            segments.binary_search_by_key(&(mark.generation, mark.last), |s| (s.generation, s.last))
-            && let Some(segment) = segments.get_mut(at)
-            && segment.marks.is_some()
+        for segment in segments
+            .iter_mut()
+            .filter(|s| (s.generation, s.last) == (mark.generation, mark.last) && s.marks.is_some())
         {
             segment.through = segment.through.max(mark.through);
         }
     }
+}
+
+/// The segments a restore reads (T-T1.12.M6), as indexes into `segments`, in key order: the log
+/// once over, where a send retried after the store refused it partway left segments over frames
+/// another holds (an answer lost, then the send made again in other parts or with more commits).
+/// Of a generation's segments that begin at one frame, the one reaching furthest is kept, one that
+/// ends at marks before a part of the same span; one ending within what is kept already is left
+/// out. Each kept segment reaches further than the one before it, though it may begin within it:
+/// a restore checks the two agree there ([`super::restore_within`]), and a hole stays a hole.
+///
+/// A shipper sends a retried send as it was, so it makes the same objects again; this is for an
+/// archive whose sends were made again otherwise (or by an older shipper).
+#[must_use]
+pub fn cover(segments: &[SegmentKey]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..segments.len()).collect();
+    order.sort_by_key(|&i| {
+        segments.get(i).map(|s| {
+            (
+                s.generation,
+                s.first,
+                std::cmp::Reverse(s.last),
+                s.marks.is_none(),
+            )
+        })
+    });
+    let mut kept = Vec::with_capacity(order.len());
+    let mut reach: Option<(u64, u64)> = None;
+    for i in order {
+        let Some(s) = segments.get(i) else { continue };
+        if reach.is_some_and(|(generation, last)| generation == s.generation && s.last <= last) {
+            continue;
+        }
+        reach = Some((s.generation, s.last));
+        kept.push(i);
+    }
+    kept
+}
+
+/// The segments of [`cover`], in key order.
+#[must_use]
+pub fn covering(segments: &[SegmentKey]) -> Vec<SegmentKey> {
+    cover(segments)
+        .into_iter()
+        .filter_map(|i| segments.get(i).cloned())
+        .collect()
 }
 
 /// The key of chunk `chunk` of base `id`'s pages.
@@ -360,6 +405,11 @@ pub struct Plan {
 
 /// The plan that restores the cut at `frame` of segment `at`'s generation: the latest base that
 /// ended at or before it on a log unbroken from the base's first generation to the cut.
+/// `segments` are a [`cover`]: within a generation a segment may begin inside the one before it.
+///
+/// A base ending after the cut is never taken, however close: its file may hold pages a checkpoint
+/// folded in from frames after the cut, which no replay takes out. One that ended at the cut's own
+/// frame (copied after the cut's commit, with no commit since) is the latest that may be.
 pub fn chain(
     segments: &[SegmentKey],
     bases: &[BaseKey],
@@ -372,21 +422,25 @@ pub fn chain(
     // Walk back from the cut: each generation's segments must run from frame 1 without a hole,
     // and a generation reached from the one after it only where that one's link says whole.
     let mut generation = segment.generation;
-    let mut expect_last: Option<u64> = None;
+    // The frame the next segment back must reach, and whether it must end there: across a
+    // generation's start it ends where the link says the generation before ended whole; within a
+    // generation it may reach past it, overlapping ([`cover`]).
+    let mut expect: Option<(u64, bool)> = None;
     let mut earliest = generation;
     let mut index = at;
     let mut taken = Vec::new();
     while let Some(s) = segments.get(index) {
+        let across = expect.is_some_and(|(_, exact)| exact);
         if s.generation != generation {
             // `s` ends the generation before, which `generation`'s link said was whole through its last
             // frame: reachable only then.
-            if s.generation.checked_add(1) != Some(generation) {
+            if !across || s.generation.checked_add(1) != Some(generation) {
                 break;
             }
             generation = s.generation;
         }
-        if let Some(expected) = expect_last
-            && s.last != expected
+        if let Some((expected, exact)) = expect
+            && (s.last < expected || (exact && s.last != expected) || s.first > expected)
         {
             break;
         }
@@ -399,14 +453,14 @@ pub fn chain(
             if index == 0 {
                 break;
             }
-            expect_last = Some(last);
+            expect = Some((last, true));
             // Only the generation before, from its last segment back.
             match segments.get(index.saturating_sub(1)) {
                 Some(prev) if prev.generation.checked_add(1) == Some(generation) => {}
                 _ => break,
             }
         } else {
-            expect_last = Some(s.first.saturating_sub(1));
+            expect = Some((s.first.saturating_sub(1), false));
         }
         let Some(prev) = index.checked_sub(1) else {
             break;
@@ -457,12 +511,14 @@ pub fn expired(
     retention_ns: u64,
 ) -> Vec<String> {
     let oldest = now_ns.saturating_sub(retention_ns).div_ceil(SECOND_NS);
-    let Ok(at) = locate(segments, oldest) else {
+    // Planned on the log once over; every segment of a generation let go goes, overlapping or not.
+    let covered = covering(segments);
+    let Ok(at) = locate(&covered, oldest) else {
         return Vec::new();
     };
     // The base the oldest second would use, at the latest cut that segment allows.
-    let frame = segments.get(at).map_or(0, |s| s.first);
-    let Ok(plan) = chain(segments, bases, at, frame, oldest) else {
+    let frame = covered.get(at).map_or(0, |s| s.first);
+    let Ok(plan) = chain(&covered, bases, at, frame, oldest) else {
         return Vec::new();
     };
     let keep_from = plan.base.start_gen;
@@ -739,6 +795,75 @@ mod tests {
             chain(&holed, &bases, 1, 4, 3).map(|p| p.base.id),
             Ok(2),
             "a missing tail of generation 1 leaves only generation 2's bases"
+        );
+    }
+
+    /// T-T1.12.P7: the rule for a base's end. Do: plan a cut at the very frame a base ended at, and
+    /// one a frame before it. Expect: the base that ended at the cut taken (copied after the cut's
+    /// commit, nothing committed since); a frame before, the base before it, as a base ending after
+    /// the cut may hold pages from after it.
+    #[test]
+    fn t_t1_12_p7_a_base_ending_at_the_cut() {
+        let segments = vec![
+            seg(1, 1, 10, Some((S, S)), S),
+            seg(1, 11, 20, Some((2 * S, 2 * S)), 2 * S),
+        ];
+        let base = |end, id| BaseKey {
+            end,
+            start_gen: 1,
+            id,
+        };
+        let bases = vec![base((1, 10), 1), base((1, 20), 2)];
+        assert_eq!(chain(&segments, &bases, 1, 20, 2).unwrap().base.id, 2);
+        assert_eq!(chain(&segments, &bases, 1, 19, 2).unwrap().base.id, 1);
+    }
+
+    /// T-T1.12.M6: segments a retried send left over frames others hold. Do: a generation shipped
+    /// as 1..=10 and 11..=15, sent again as 1..=8, 9..=20 and a part 1..=15 beside one ending at
+    /// marks; cover them and plan a cut in each. Expect: the log once over, the furthest of those
+    /// beginning at a frame kept (the one ending at marks over the part), the rest left out; the
+    /// plan walks back across the overlap; a hole still ends the walk; retention plans on the cover
+    /// and lets go of every segment of a generation it lets go.
+    #[test]
+    fn t_t1_12_m6_cover_of_overlapping_segments() {
+        let segments = vec![
+            seg(1, 1, 8, None, 0),
+            seg(1, 1, 10, Some((S, S)), S),
+            seg(1, 1, 15, None, 0),
+            seg(1, 1, 15, Some((S, 2 * S)), 2 * S),
+            seg(1, 9, 20, Some((S, 3 * S)), 3 * S),
+            seg(1, 11, 15, Some((2 * S, 2 * S)), 2 * S),
+            seg(2, 1, 5, Some((4 * S, 4 * S)), 4 * S),
+        ];
+        let kept = cover(&segments);
+        assert_eq!(kept, vec![3, 4, 6]);
+        let covered = covering(&segments);
+        assert!(covered.windows(2).all(|w| w[0].key("p") < w[1].key("p")));
+        let bases = vec![BaseKey {
+            end: (1, 1),
+            start_gen: 1,
+            id: 1,
+        }];
+        let plan = chain(&covered, &bases, 1, 18, 3).unwrap();
+        assert_eq!(plan.segments, vec![0, 1]);
+        let plan = chain(&covered, &bases, 2, 3, 4).unwrap();
+        assert_eq!(plan.segments, vec![0, 1, 2], "across generations as before");
+        let holed = vec![
+            seg(1, 1, 10, Some((S, S)), S),
+            seg(1, 12, 20, Some((2 * S, 2 * S)), 2 * S),
+        ];
+        assert_eq!(cover(&holed), vec![0, 1]);
+        assert_eq!(chain(&holed, &bases, 1, 20, 2), Err(Unrestorable::Gap(1)));
+        let later = BaseKey {
+            end: (2, 1),
+            start_gen: 2,
+            id: 2,
+        };
+        let gone = expired("p", &segments, &[bases[0].clone(), later], &[], 4 * S, 0);
+        let generation_1 = segments.iter().filter(|s| s.generation == 1).count();
+        assert_eq!(
+            gone.iter().filter(|k| k.starts_with("p/log/")).count(),
+            generation_1
         );
     }
 

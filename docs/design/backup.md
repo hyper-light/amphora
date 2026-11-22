@@ -67,6 +67,26 @@ point ("Continuous Archiving and Point-in-Time Recovery", postgresql.org/docs/cu
   their parts come, the sum checked over the parts (no room: `Unrestorable::SegmentPastRoom`). A
   create that finds its object there already (an earlier answer lost) compares it in ranged parts
   that its caller's charge covers, never reading it back whole.
+- **A retried send** (T-T1.12.M6). Each segment is named by its generation and its first and last
+  frame. A send the store refused partway (an error, or an answer lost after it stored the object)
+  is sent again as it was: the same marks, the same through and the same parts, whatever was
+  committed or freed since, so each object it stored before is made again under the same key and
+  found the same, and no segment of the retry lies over another's frames; the commits since go in
+  the next send. A shipper that opens carries on from the end of the log the archive covers. An
+  archive whose sends were made again otherwise (an older shipper's, with more commits or other
+  parts) can hold segments over the same frames: a restore reads the log once over
+  (`plan::cover`): of the segments a generation has from one frame, the one reaching furthest,
+  one ending at marks before a part of the same span, and none ending within what it kept. A kept
+  segment may begin inside the one before it: those frames are compared, a frame at a time, with
+  the log the restore wrote, and a segment that differs there is refused even when its sum holds.
+  The plan walks back across such an overlap within a generation; across generations a segment
+  still ends where the link says. Retention plans on the cover and lets go of every segment of a
+  generation it lets go.
+- **A base's end and the cut.** A restore takes the latest base that ended at or before the cut,
+  never one ending after it, however close: a checkpoint may have folded frames past the cut into
+  the file while the base was copied, and no replay takes those out. A base copied after the
+  cut's own commit with nothing committed since ends at the cut's frame, so it is the one taken
+  (T-T1.12.P7, M1, M2, M5).
 - **Growing chunks** (T-T1.12.M5, an A/B; `ChunkGrowth`, Keep the control). Keeping the latest
   base's chunk size keeps every unchanged chunk, but a backup begun with little room keeps small
   chunks, and a restore's many requests, for good. Growing doubles the size as often as the room

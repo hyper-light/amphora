@@ -260,9 +260,24 @@ pub struct Shipper {
     growth: ChunkGrowth,
     /// The budget each part of a segment is charged to while it's shipped (T-T1.12.M3).
     memory: Arc<Memory>,
-    /// A send that didn't end: the frame it began after, and the frames in each of its parts, so
-    /// sent again it makes the same objects whatever room there is now.
-    unfinished: Option<(u64, u64)>,
+    /// A send that didn't end, sent again as it was (T-T1.12.M6).
+    unfinished: Option<Unfinished>,
+}
+
+/// A send the store refused partway (an error, or an answer lost): what it was, so sent again it
+/// makes the same objects, under the same keys, whatever room there is now and whatever was
+/// committed since (T-T1.12.M6). The objects it stored are found the same ([`create`]), and no
+/// segment of the retry overlaps one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unfinished {
+    /// The frame it began after.
+    from: u64,
+    /// The frames in each of its parts.
+    per_object: u64,
+    /// The marks it carried: the first of those pending.
+    marks: usize,
+    /// The through its keys named.
+    through: u64,
 }
 
 pub(super) fn list_all(
@@ -414,8 +429,17 @@ impl Shipper {
                 .checked_div(2)
                 .unwrap_or(0),
         )?;
-        if let Some((key, size)) = segments.last() {
-            let last = SegmentKey::parse(prefix, key)?;
+        // Where the archive's log ends: the last of the segments covering it once over (a send
+        // retried by an older shipper may have left a segment beginning later that ends sooner,
+        // [`plan::cover`]).
+        let mut keys = Vec::with_capacity(segments.len());
+        for (key, _) in &segments {
+            keys.push(SegmentKey::parse(prefix, key)?);
+        }
+        let end = plan::cover(&keys)
+            .last()
+            .and_then(|i| segments.get(*i).zip(keys.get(*i)));
+        if let Some(((key, size), last)) = end {
             let body = read_segment(
                 blobs,
                 key,
@@ -610,6 +634,10 @@ impl Shipper {
             .iter()
             .take_while(|m| m.seq == identity.seq && m.frame <= durable)
             .count();
+        // A send refused partway goes again as it was: its marks only, the commits since in the
+        // next send (T-T1.12.M6). Its marks are still the first pending, and still durable.
+        let unfinished = self.unfinished.filter(|u| u.from == self.shipped);
+        let ready = unfinished.map_or(ready, |u| u.marks.min(ready));
         if ready == 0 {
             return Ok(Shipped::default());
         }
@@ -622,15 +650,16 @@ impl Shipper {
         let last = marks.last().map_or(self.shipped, |m| m.frame);
         // Every commit stamped at or before `through` is in this segment or before it: those after
         // it are in the next mark's second, or weren't drained yet.
-        let through = match self.pending.get(ready) {
-            Some(next) => {
+        let through = match (unfinished, self.pending.get(ready)) {
+            (Some(u), _) => u.through,
+            (None, Some(next)) => {
                 let second_before = second_of(next.ns)
                     .saturating_sub(1)
                     .saturating_mul(SECOND_NS);
                 next.unknown_from
                     .map_or(second_before, |u| u.min(second_before))
             }
-            None => self.through,
+            (None, None) => self.through,
         };
         let shipped = self.send(db, blobs, &marks, last, through, until)?;
         self.pending.drain(..ready);
@@ -735,7 +764,7 @@ impl Shipper {
             .unwrap_or(0);
         // A part of one frame at least: where there's no room for one, the charge is refused.
         let per_object = match self.unfinished {
-            Some((from, per)) if from == self.shipped => per,
+            Some(u) if u.from == self.shipped => u.per_object,
             _ => by_store.min(by_memory.max(1)),
         };
         let part_bytes = per_object
@@ -743,7 +772,12 @@ impl Shipper {
             .saturating_mul(FRAME_BYTES)
             .saturating_add(overhead);
         let _held = self.memory.take(Use::Chunks, ship_charge(part_bytes))?;
-        self.unfinished = Some((self.shipped, per_object));
+        self.unfinished = Some(Unfinished {
+            from: self.shipped,
+            per_object,
+            marks: marks.len(),
+            through,
+        });
         let mut stored = std::mem::take(&mut body.marks);
         let mut shipped = Shipped::default();
         let mut from = self.shipped;
