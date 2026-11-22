@@ -600,6 +600,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   disagreement; `CORPUS_BIN_<ENGINE>` may be a command (a client in its server's container). The five
   server engines ran a pool through the harness on jupiter's Docker (2026-11-21). Left: kiln's queries
   in the pool (kiln_queries.py needs sqlglot).
+  Lane corpus-dialects-2 (`bench/corpus/dialects.py`, `test_dialects.py`): the translator says SQLite's
+  blob literals in PostgreSQL's and ClickHouse's spelling and its collations in MySQL's; leaves out the
+  clauses that state what every engine does unasked (`OR ABORT`, `ON CONFLICT ABORT`, `NOT DEFERRABLE`,
+  `MATCH` on REFERENCES, `EXCLUDE NO OTHERS`), each by SQLite's documentation; and gives a record SQLite
+  refuses that sqlglot can't read as SQLite holds it. On the gate's pool (26,980 records) the records
+  sqlglot can't say fall from 43, 40, 237 and 234 (DuckDB, PostgreSQL, MySQL, ClickHouse) to 37, 34,
+  183 and 180 before the refused records given as written. Left: frame EXCLUDE other than NO OTHERS
+  on MySQL and ClickHouse (146, no spelling there), conflict clauses other than ABORT, GROUPS frames,
+  multi-word type names, RELEASE SAVEPOINT and REINDEX, which sqlglot's SQLite reader refuses.
 - **The correctness corpus, run on SQLite** (G2 step 2, `bench/corpus/corpus.sh`, sources and revisions
   in `bench/corpus/sources.json`; published in `bench/records/2026-10-24-adacachy-corpus/corpus.md`):
   114,556 distinct query types (a statement's shape with the inventory entries it exercises; 56,691

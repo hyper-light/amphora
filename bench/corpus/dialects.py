@@ -86,9 +86,18 @@ def spoken(expression, dialect):
       and converts it to the byte represented by the number") gives the bytes as a String, the type a
       BLOB column is there.
     - a collation SQLite names (NOCASE, RTRIM, BINARY) is MySQL's that compares the same
-      (MYSQL_COLLATIONS)."""
+      (MYSQL_COLLATIONS).
+    - a window frame's EXCLUDE NO OTHERS, its default, is left out."""
     from sqlglot import exp
 
+    # A window frame's `EXCLUDE NO OTHERS` is its default (SQLite's "Window Functions", 2.2.4 "The
+    # EXCLUDE clause": "the default is EXCLUDE NO OTHERS", as in standard SQL), which MySQL and
+    # ClickHouse, that have no EXCLUDE, do unasked: it is left out. The other three exclusions
+    # have no spelling there, and sqlglot says so.
+    for frame in expression.find_all(exp.WindowSpec):
+        exclude = frame.args.get("exclude")
+        if isinstance(exclude, exp.Var) and " ".join(exclude.name.upper().split()) == "NO OTHERS":
+            frame.set("exclude", None)
     if dialect in ("postgres", "clickhouse"):
         for blob in list(expression.find_all(exp.HexString)):
             digits = blob.this or ""
@@ -107,6 +116,73 @@ def spoken(expression, dialect):
     return expression
 
 
+# Clauses SQLite reads that state what every engine the corpus compares does unasked, so the record
+# means the same with them left out (each by SQLite's documentation):
+# - `OR ABORT` after INSERT or UPDATE, and `ON CONFLICT ABORT` on a constraint: "ABORT ... is the
+#   default behavior" (https://www.sqlite.org/lang_conflict.html), which is what PostgreSQL, MySQL,
+#   DuckDB and ClickHouse do on a violated constraint: the statement fails and its changes are undone.
+# - `NOT DEFERRABLE`, with or without `INITIALLY IMMEDIATE` or `INITIALLY DEFERRED`: "NOT DEFERRABLE
+#   INITIALLY DEFERRED ... An immediate foreign key constraint" and immediate "is the default"
+#   (https://www.sqlite.org/foreignkeys.html, section 4.2), PostgreSQL's default too (its manual,
+#   CREATE TABLE: "NOT DEFERRABLE is the default").
+# - `MATCH <name>` after a foreign key's REFERENCES: SQLite "parses MATCH clauses ... but does not
+#   enforce them. All foreign key constraints in SQLite are handled as if MATCH SIMPLE were
+#   specified" (foreignkeys.html, section 4.3); MATCH SIMPLE is PostgreSQL's default (CREATE TABLE:
+#   "MATCH SIMPLE ... is the default") and MySQL parses MATCH and ignores it.
+# sqlglot's SQLite reader refuses each of them, so they are taken out of the text before it reads it,
+# by SQLite's own tokens (a string or a quoted name is never touched).
+_REFERENCES_TAIL = {"ON", "DELETE", "UPDATE", "SET", "NULL", "DEFAULT", "CASCADE", "RESTRICT", "NO", "ACTION", ",", "(", ")", "."}
+
+
+def defaults_dropped(sql):
+    """`sql` without the clauses above, or as it is when SQLite's tokenizer can't read it."""
+    from sqlglot.dialects.sqlite import SQLite
+    from sqlglot.tokens import TokenType
+
+    try:
+        tokens = SQLite().tokenize(sql)
+    except Exception:  # sqlglot can't tokenize it: translate() says why
+        return sql
+    quoted = (TokenType.STRING, TokenType.IDENTIFIER, TokenType.HEX_STRING, TokenType.BIT_STRING, TokenType.NATIONAL_STRING)
+    words = [None if t.token_type in quoted else t.text.upper() for t in tokens]
+    names = [t.token_type == TokenType.VAR or (t.token_type not in quoted and t.text.isidentifier()) for t in tokens]
+
+    def after_references(i):
+        # The nearest REFERENCES before `i`, with only its table, columns and ON actions between.
+        for j in range(i - 1, -1, -1):
+            if words[j] == "REFERENCES":
+                return True
+            if words[j] not in _REFERENCES_TAIL and not names[j]:
+                return False
+        return False
+
+    drop, i = [], 0
+    while i < len(words):
+        w = words[i : i + 4] + [None] * 3
+        n = 0
+        if w[:2] == ["OR", "ABORT"] and i > 0 and words[i - 1] in ("INSERT", "UPDATE"):
+            n = 2
+        elif w[:3] == ["ON", "CONFLICT", "ABORT"]:
+            n = 3
+        elif w[:2] == ["NOT", "DEFERRABLE"]:
+            n = 4 if w[2] == "INITIALLY" and w[3] in ("IMMEDIATE", "DEFERRED") else 2
+        elif w[0] == "MATCH" and i + 1 < len(tokens) and names[i + 1] and after_references(i):
+            n = 2
+        if n:
+            drop.append((tokens[i].start, tokens[i + n - 1].end + 1))
+            i += n
+        else:
+            i += 1
+    if not drop:
+        return sql
+    out, at = [], 0
+    for start, end in drop:
+        out.append(sql[at:start])
+        at = end
+    out.append(sql[at:])
+    return "".join(out)
+
+
 def translate(sql, dialect):
     """`sql`, in SQLite's dialect, in `dialect`: (text, None), or (None, why) when sqlglot can't say
     it there. The one translation the corpus's tools share (probe.py's too)."""
@@ -118,7 +194,7 @@ def translate(sql, dialect):
         # sqlglot.transpile's steps, each statement given its untyped columns' types between them.
         out = [
             spoken(typed(e), dialect).sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE) if e else ""
-            for e in sqlglot.parse(sql, read="sqlite")
+            for e in sqlglot.parse(defaults_dropped(sql), read="sqlite")
         ]
     except Exception as e:  # sqlglot can't say it in this dialect
         return None, f"untranslatable: {type(e).__name__}: {str(e)[:200]}"
@@ -135,6 +211,19 @@ def translate(sql, dialect):
     if not out:
         return None, "untranslatable: sqlglot wrote nothing"
     return ";\n".join(out), None
+
+
+def record_in(record, dialect):
+    """`record` (slt.Record) in `dialect`, as translate() says it. A record SQLite refuses
+    (`statement error`) that sqlglot can't read either is given as SQLite holds it, its default
+    clauses left out: what the record asks of an engine is that it refuse the statement too, and an
+    engine that can't read it refuses it (the corpus's records, as sqllogictest's, don't say which
+    error). One sqlglot can read is translated, so an engine that refuses it does so for the
+    statement's sake, not its spelling."""
+    sql, why = translate(record.sql, dialect)
+    if why is not None and record.kind == "statement" and record.expect == "error":
+        return defaults_dropped(record.sql), None
+    return sql, why
 
 
 def files(pool):
@@ -159,7 +248,7 @@ def main():
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with open(out, "w", encoding="utf-8") as f:
                 for r in records:
-                    sql, why = translate(r.sql, d)
+                    sql, why = record_in(r, d)
                     counts[d][why is not None] += 1
                     f.write(json.dumps({"line": r.line, "sql": sql} if why is None else {"line": r.line, "untranslatable": why}) + "\n")
     for d, (ok, no) in counts.items():
