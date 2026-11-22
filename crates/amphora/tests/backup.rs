@@ -267,6 +267,7 @@ fn open_backed_up<B: Blobs + 'static>(
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
+        chunks: backup::ChunkGrowth::Keep,
         check: backup::CheckPolicy::Off,
     };
     Database::open_backed_up(path, archive, until()).unwrap()
@@ -397,6 +398,7 @@ fn t_t1_12_c3_the_shipping_thread_checks_itself() {
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
+        chunks: backup::ChunkGrowth::Keep,
         check: backup::CheckPolicy::Scratch(Some(scratch.clone())),
     };
     let (database, shipping) = Database::open_backed_up(&path, archive, until()).unwrap();
@@ -577,6 +579,7 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol, skew: u64) {
             }),
             memory: 32 * 1024,
             patience: Duration::from_secs(60),
+            chunks: backup::ChunkGrowth::Keep,
             check: backup::CheckPolicy::Off,
         };
         Database::open_backed_up(&dir.path().join(format!("g{group}.db")), archive, until())
@@ -834,6 +837,7 @@ fn t_t1_12_c4_continuous_drills_are_on_by_default() {
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: 32 * 1024,
         patience: Duration::from_secs(60),
+        chunks: backup::ChunkGrowth::Keep,
         check: backup::CheckPolicy::default(),
     };
     assert_eq!(archive.check, backup::CheckPolicy::Scratch(None));
@@ -1006,6 +1010,7 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
             clock: Arc::new(move || read.load(Ordering::SeqCst)),
             memory: 32 * 1024,
             patience: Duration::from_secs(60),
+            chunks: backup::ChunkGrowth::Keep,
             check: match policy {
                 "off" => backup::CheckPolicy::Off,
                 "scratch" => backup::CheckPolicy::Scratch(Some(dir.path().join("scratch.db"))),
@@ -1273,6 +1278,7 @@ fn restore_bench_amphora() {
             clock: Arc::new(move || read.load(Ordering::SeqCst)),
             memory: room,
             patience: Duration::from_secs(30 * 60),
+            chunks: backup::ChunkGrowth::Keep,
             check: backup::CheckPolicy::Off,
         };
         let (database, shipping) = Database::open_backed_up(&path, archive, bar()).unwrap();

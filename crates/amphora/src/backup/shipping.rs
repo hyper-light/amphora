@@ -25,8 +25,8 @@ use super::check::step_bytes;
 use super::drill::{Foreground, Pace, Pacer, Unpaced};
 use super::ship::FRAME_BYTES;
 use super::{
-    BaseCopy, Budget, Check, CheckCounters, CheckPolicy, Clock, DrillMeter, Drills, Hooks,
-    RowDigest, Shipped, Shipper, Stopped, admit, check_due, digest_paced, newest_second,
+    BaseCopy, Budget, Check, CheckCounters, CheckPolicy, ChunkGrowth, Clock, DrillMeter, Drills,
+    Hooks, RowDigest, Shipped, Shipper, Stopped, admit, check_due, digest_paced, newest_second,
     next_random, plan, restore_and_check_at,
 };
 use crate::db::Db;
@@ -52,6 +52,10 @@ pub struct Archive {
     /// each check, removed once it passes and kept on a failure to look into. By default
     /// ([`CheckPolicy::Continuous`]) beside the database, within the machine's budget.
     pub check: CheckPolicy,
+    /// Whether a new base's chunks grow with the room or keep the latest base's size
+    /// ([`ChunkGrowth`], T-T1.12.M5's A/B): `Keep`, today's behaviour, until the A/B of record
+    /// decides.
+    pub chunks: ChunkGrowth,
 }
 
 /// Nanoseconds since the Unix epoch by the system's clock: 0 before the epoch, the most a `u64`
@@ -322,13 +326,14 @@ impl Prepared {
             }
             None => None,
         };
-        let shipper = Shipper::open(
+        let mut shipper = Shipper::open(
             &archive.prefix,
             Arc::clone(&hooks),
             archive.blobs.as_ref(),
             &reader,
             until,
         )?;
+        shipper.set_chunk_growth(archive.chunks);
         Ok(Self {
             archive,
             shipper,

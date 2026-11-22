@@ -105,6 +105,7 @@ fn t_t1_12_n1_a_peer_store_in_another_process() {
         clock: Arc::new(move || read.load(Ordering::SeqCst)),
         memory: peer.object_max(),
         patience: HANG,
+        chunks: backup::ChunkGrowth::Keep,
         check: backup::CheckPolicy::Off,
     };
     let (database, shipping) =
