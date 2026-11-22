@@ -1756,6 +1756,73 @@ pub fn estimate_merge_join_cost(
     )
 }
 
+/// Amphora (QT.5, step 4, lane qs5-20): whether a sort-merge join's inputs come in its key order
+/// already, the build side read by `build_read` and the probe side by the hash join's own read of
+/// it, a forward scan of its table. The merge may lead with any of its keys, so it leads with the
+/// one that leaves the most inputs ordered ([read_in_key_order]).
+pub(super) fn merge_inputs_in_key_order(
+    build_table: &JoinedTable,
+    build_read: Option<&AccessMethod>,
+    probe_table: &JoinedTable,
+    join_keys: &[HashJoinKey],
+    where_clause: &[WhereTerm],
+) -> (bool, bool) {
+    join_keys
+        .iter()
+        .map(|key| {
+            (
+                read_in_key_order(build_table, build_read, key.get_build_expr(where_clause)),
+                read_in_key_order(probe_table, None, key.get_probe_expr(where_clause)),
+            )
+        })
+        .max_by_key(|&(build, probe)| u8::from(build) + u8::from(probe))
+        .unwrap_or((false, false))
+}
+
+/// Whether `read` gives `table`'s rows in the order of `key`, its side of a join key: a forward
+/// read of the table where the key is its rowid (`read` none is a forward scan of the table), or
+/// of an index whose first column is the key's column, ascending in its default collation. A read
+/// that seeks, builds an index or isn't a B-tree's gives no order a merge can rely on.
+fn read_in_key_order(table: &JoinedTable, read: Option<&AccessMethod>, key: &ast::Expr) -> bool {
+    let column = match key {
+        ast::Expr::Column {
+            table: id,
+            column,
+            is_rowid_alias,
+            ..
+        } if *id == table.internal_id => {
+            if *is_rowid_alias {
+                None
+            } else {
+                Some(*column)
+            }
+        }
+        ast::Expr::RowId { table: id, .. } if *id == table.internal_id => None,
+        _ => return false,
+    };
+    let rowid_order = column.is_none() && table.btree().is_some_and(|btree| btree.has_rowid);
+    match read.map(|method| &method.params) {
+        None => rowid_order,
+        Some(AccessMethodParams::BTreeTable {
+            iter_dir: IterationDirection::Forwards,
+            index,
+            build_index: false,
+            constraint_refs,
+        }) if constraint_refs.is_empty() => match index {
+            None => rowid_order,
+            Some(index) => column.is_some_and(|column| {
+                index.columns.first().is_some_and(|first| {
+                    first.expr.is_none()
+                        && first.pos_in_table == column
+                        && matches!(first.order, SortOrder::Asc)
+                        && first.collation.is_none()
+                })
+            }),
+        },
+        Some(_) => false,
+    }
+}
+
 /// Try to create a hash join access method for joining two tables.
 #[allow(clippy::too_many_arguments)]
 pub fn try_hash_join_access_method(

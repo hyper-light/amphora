@@ -1067,6 +1067,52 @@ fn join_lhs_and_rhs<'a>(
                             } else {
                                 *materialize_build_input = false;
                             }
+                            // Amphora (QT.5, step 4, lane qs5-20): a sort-merge join of the same
+                            // pair, costed beside the hash join and traced until its operator lands
+                            // (`estimate_merge_join_cost`). A materialized build input comes in
+                            // rowid order, not its keys'.
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                let build_read =
+                                    build_access_method.filter(|_| !*materialize_build_input);
+                                let (build_ordered, probe_ordered) =
+                                    super::access_method::merge_inputs_in_key_order(
+                                        build_table,
+                                        build_read,
+                                        rhs_table_reference,
+                                        join_keys,
+                                        where_clause,
+                                    );
+                                let merge_join_cost =
+                                    super::access_method::estimate_merge_join_cost(
+                                        super::access_method::MergeInput {
+                                            rows: effective_build_cardinality,
+                                            rows_per_page: params
+                                                .for_table(build_table, analyze_stats)
+                                                .rows_per_table_page,
+                                            ordered: build_ordered && build_read.is_some(),
+                                        },
+                                        super::access_method::MergeInput {
+                                            rows: probe_cardinality,
+                                            rows_per_page: hash_params.rows_per_table_page,
+                                            ordered: probe_ordered,
+                                        },
+                                        effective_build_cardinality
+                                            * hash_join_method.estimated_rows_per_outer_row,
+                                        *join_type,
+                                        mem_budget,
+                                        hash_probe_multiplier,
+                                        &hash_params,
+                                    );
+                                tracing::debug!(
+                                    lhs_table = build_table.table.get_name(),
+                                    rhs_table = rhs_table_reference.table.get_name(),
+                                    build_ordered,
+                                    probe_ordered,
+                                    merge_join_cost = ?merge_join_cost,
+                                    hash_join_cost = ?hash_join_method.cost,
+                                    "merge-join candidate"
+                                );
+                            }
                             tracing::debug!(
                                 lhs_table = build_table.table.get_name(),
                                 rhs_table = rhs_table_reference.table.get_name(),
@@ -2980,6 +3026,77 @@ mod tests {
             "{} {expected}",
             cost.0
         );
+    }
+
+    /// QT.5 step 4 (lane qs5-20, T-QT.5.15): which inputs of a sort-merge join already come in its
+    /// key order. Do: join `a` and `b` on their rowids, on `a.k = b.id` and on `a.k = b.k`, `a` read
+    /// by a forward scan, a backward one and its index on `k`, `b` by the probe's forward scan, with
+    /// one key and two. Expect: a forward scan orders a rowid key, a backward one doesn't, the index
+    /// orders its first column, and with two keys the merge leads with the one leaving most
+    /// inputs ordered.
+    #[test]
+    fn qt_5_15_merge_inputs_in_key_order_by_rowid_and_index() {
+        use crate::translate::optimizer::access_method::merge_inputs_in_key_order;
+
+        let columns = || {
+            vec![
+                _create_column_rowid_alias("id"),
+                _create_column_of_type("k", Type::Integer),
+            ]
+        };
+        let mut ids = TableRefIdCounter::new();
+        let (a_id, b_id) = (ids.next(), ids.next());
+        let a = _create_table_reference(_create_btree_table("a", columns()), None, a_id);
+        let b = _create_table_reference(_create_btree_table("b", columns()), None, b_id);
+        let equal = |left: (TableInternalId, usize, bool),
+                     right: (TableInternalId, usize, bool)| {
+            _create_binary_expr(
+                _create_column_expr(left.0, left.1, left.2),
+                Operator::Equals,
+                _create_column_expr(right.0, right.1, right.2),
+            )
+        };
+        let where_clause = vec![
+            equal((a_id, 0, true), (b_id, 0, true)),
+            equal((a_id, 1, false), (b_id, 0, true)),
+            equal((a_id, 1, false), (b_id, 1, false)),
+        ];
+        let scan = |index: Option<Arc<Index>>, iter_dir| AccessMethod {
+            cost: Cost(0.0),
+            estimated_rows_per_outer_row: 1.0,
+            consumed_where_terms: Default::default(),
+            params: AccessMethodParams::BTreeTable {
+                iter_dir,
+                index,
+                build_index: false,
+                constraint_refs: vec![],
+            },
+        };
+        let forwards = scan(None, IterationDirection::Forwards);
+        let backwards = scan(None, IterationDirection::Backwards);
+        let by_k = scan(
+            Some(_create_index("a_k", "a", &[("k", 1)], false)),
+            IterationDirection::Forwards,
+        );
+        let order = |read: &AccessMethod, keys: &[usize]| {
+            let keys: Vec<HashJoinKey> = keys
+                .iter()
+                .map(|&where_clause_idx| HashJoinKey {
+                    where_clause_idx,
+                    build_side: BinaryExprSide::Lhs,
+                })
+                .collect();
+            merge_inputs_in_key_order(&a, Some(read), &b, &keys, &where_clause)
+        };
+        assert_eq!(order(&forwards, &[0]), (true, true));
+        assert_eq!(order(&backwards, &[0]), (false, true));
+        assert_eq!(order(&forwards, &[1]), (false, true));
+        assert_eq!(order(&by_k, &[1]), (true, true));
+        assert_eq!(order(&forwards, &[2]), (false, false));
+        assert_eq!(order(&by_k, &[2]), (true, false));
+        assert_eq!(order(&forwards, &[2, 1]), (false, true));
+        assert_eq!(order(&forwards, &[2, 0]), (true, true));
+        assert_eq!(order(&forwards, &[]), (false, false));
     }
 
     fn default_base_rows(n: usize) -> Vec<RowCountEstimate> {

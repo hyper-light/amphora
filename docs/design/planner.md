@@ -2349,3 +2349,35 @@ its last growth's two lists); the qs5-19 sealing test, whose filled filter now s
 half its bound and passes every key as before. The learned-costs calibration's filter, given
 twice its page's hashes, still fits its hashes and a filter at its rate (at least a third of its
 bound remains, over 40 bits a key against the `ln(rows)/ln²2` its rate takes).
+
+## Decision (lane qs5-20): a sort-merge join costed beside the hash join, traced until its operator lands
+
+**Decision.** QT.5 step 4, T-QT.5.15. `estimate_merge_join_cost` prices a sort-merge join in the
+hash join's plan shape and units, so one choice point (`join.rs`, the hash join's candidate) can
+weigh the two: each input not already in key order is sorted (the build once, the probe on each
+pass), a sort that outgrows the statement's memory writes and reads its pages once, the merge
+compares each row once, and the matches and any unmatched build rows are visited.
+`merge_inputs_in_key_order` says which inputs are ordered: a forward read of a table whose key is
+its rowid, or of an index whose first column is the key, ascending in its default collation; the
+merge leads with the key that leaves the most inputs ordered. Until the plan node and its operator
+land, the choice point only traces the merge's cost beside the hash join's ("merge-join
+candidate"), so no plan changes.
+
+**Why.** A merge join wins where its inputs already come in key order or the hash table would
+spill: it holds one run of equal keys, not the build side. Every weight is the cost model's
+(`sort_cpu_per_row`, `cpu_cost_per_row`, the page reads), and the spill's shape is the sorter's
+own: it writes each full buffer as a sorted chunk and merges every chunk in one heap pass
+(`vdbe/sorter.rs`), so a spilled row is written and read once.
+
+**Evidence.** `access_method::merge_join_cost_tests` (ordered inputs sort nothing, unordered ones
+pay their sorts, a spilled sort its pages once, ordered inputs past memory cost less merged than
+hashed, unordered ones that fit cost less hashed, unmatched build rows a visit each, empty inputs
+only the probe's scan); `join::tests::qt_5_15_merge_inputs_in_key_order_by_rowid_and_index`;
+`tests/join_methods.rs`'s `qt_5_15_equi_joins_over_empty_null_repeated_and_mixed_keys_give_one_answer`
+(T-QT.5.17), the differential test the operator must pass.
+
+**Limits.** An index's order is a merge's only where its comparison is the equality's: an index of
+another collation, or keys whose affinities differ, aren't counted as ordered here, and the
+operator must sort them in the equality's terms. To be measured once the operator lands: merge
+against hash over the concurrency ladder, ordered and unordered inputs, builds that fit and that
+spill.
