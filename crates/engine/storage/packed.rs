@@ -422,18 +422,35 @@ pub(crate) fn one_slot_records(entries: &[(u32, Body<'_>)], page_size: usize) ->
 /// as much.
 const RUN_GAP: usize = RUN_HEADER;
 
-/// The runs that turn `base` into `new` (both a page long, at most 65,536 bytes), the last `tail`
-/// bytes always among them (a page checksum the page's buffer doesn't hold up to date), when they
-/// take fewer than `most` bytes; else none (the page is then written whole).
+/// The runs that turn `base` into `new`, as [`diff_into`] writes them.
+#[cfg(test)]
 pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<Vec<u8>> {
+    let mut runs = Vec::new();
+    diff_into(base, new, tail, most, &mut runs)?;
+    Some(runs)
+}
+
+/// Writes into `runs` (emptied first) the runs that turn `base` into `new` (both a page long, at
+/// most 65,536 bytes), the last `tail` bytes always among them (a page checksum the page's buffer
+/// doesn't hold up to date), when they take fewer than `most` bytes; else none (the page is then
+/// written whole). `runs` is the caller's to keep from page to page: a commit's deltas are written
+/// into one buffer it reuses, each kept at its own length (goal 85d06a30), where each delta
+/// allocated `most` bytes, up to a page, of which it used a few.
+pub(crate) fn diff_into(
+    base: &[u8],
+    new: &[u8],
+    tail: usize,
+    most: usize,
+    runs: &mut Vec<u8>,
+) -> Option<()> {
+    runs.clear();
     if base.len() != new.len() || new.len() > 65_536 {
         return None;
     }
     // The tail counts as changed byte by byte: where the buffer's stale copy happens to equal the
     // new one, the log's copy can still differ.
     let carried = new.len().saturating_sub(tail);
-    // Runs are written as their ranges close: one buffer, taken at the most a delta may hold.
-    let mut runs = Vec::with_capacity(most.min(new.len()));
+    // Runs are written as their ranges close, into the caller's buffer.
     let mut open: Option<(usize, usize)> = None;
     // A word of 8 bytes at a time, each compared as one integer (`differing`): a word as it was,
     // none of it carried, costs one comparison, and a page's changes are a few runs in it
@@ -465,16 +482,16 @@ pub(crate) fn diff(base: &[u8], new: &[u8], tail: usize, most: usize) -> Option<
                 Some((from.min(start), to.max(stop)))
             }
             Some(closed) => {
-                put_run(&mut runs, new, closed, most)?;
+                put_run(runs, new, closed, most)?;
                 Some((start, stop))
             }
             None => Some((start, stop)),
         };
     }
     if let Some(closed) = open {
-        put_run(&mut runs, new, closed, most)?;
+        put_run(runs, new, closed, most)?;
     }
-    Some(runs)
+    Some(())
 }
 
 /// The first and last byte at which two chunks of `diff` differ, if any: a whole word of 8 (a
