@@ -2,8 +2,8 @@
 # libSQL's server (sqld), one primary and two replicas, each a process on this host (setup.sh's
 # release binary): HTTP (Hrana over HTTP, /v2/pipeline) on 127.0.0.1:54220-54222, the primary's
 # gRPC for its replicas on 54230, its admin API on 54223 (PORT+3: between the node ports and the
-# gRPC ports, so it meets no other system's default range). Replicas forward writes to the primary and follow it; there is no election, so node 0 is always
-# the leader.
+# gRPC ports, so it meets no other system's default range). Replicas forward writes to the
+# primary and follow it; there is no election, so node 0 is always the leader.
 #
 # Durability, from libsql-server-v0.24.32's source (what setup.sh fetches; re-check on a newer tag):
 # - Each connection sets PRAGMA synchronous from its database's durability_mode

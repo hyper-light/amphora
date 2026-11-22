@@ -23,8 +23,9 @@ SYS=litefs
 PORT=${AMPHORA_BENCH_REPL_PORT:-54260}
 DURABILITY="acknowledged once the primary's SQLite WAL and LTX file hold it, fsynced (synchronous=FULL; LiteFS's CommitWAL syncs both); replicas stream it asynchronously and LiteFS has no mode that waits for one, so no quorum: one member's disk"
 # The shim's own ready line (../shim/main.go). LiteFS runs the shim only once its node holds the
-# lease or has connected to the holder ("connected to cluster, ready", cmd/litefs/mount_linux.go:265-270),
-# and passes its stdout and stderr on (mount_linux.go:617-623, the last exec entry runs in the background), so the line lands in the node's log.
+# lease or has connected to the holder ("connected to cluster, ready",
+# cmd/litefs/mount_linux.go:265-270), and passes its stdout and stderr on (mount_linux.go:617-623:
+# the last exec entry runs in the background), so the line lands in the node's log.
 READY='shim ready: listening on '
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 CONSUL_PORT=$((PORT + 20))
