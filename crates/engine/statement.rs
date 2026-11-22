@@ -2181,6 +2181,36 @@ mod tests {
         db.connect(ConnectOpts::new())
     }
 
+    /// Do: prepare a three-table join, then plan it again (`Statement::reprepare`) on the same
+    /// facts. Expect: the first plan notes the block's order under its tables, and the plan made
+    /// again, carrying it in, notes the same order (T-PL.8.9, lane pl8-16: a statement planned
+    /// again hands its join orders to the new search).
+    #[test]
+    fn t_pl_8_9_a_statement_planned_again_carries_its_join_order() {
+        let conn = open_test_connection().unwrap();
+        for sql in [
+            "CREATE TABLE a(id INTEGER PRIMARY KEY, b INT)",
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, c INT)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut stmt = conn
+            .prepare("SELECT a.id FROM a, b, c WHERE a.b = b.id AND b.c = c.id")
+            .unwrap();
+        let key: Vec<String> = ["a", "b", "c"].iter().map(|t| t.to_string()).collect();
+        let order = |stmt: &Statement| {
+            stmt.program
+                .join_orders
+                .as_ref()
+                .and_then(|orders| orders.get(&key))
+        };
+        let first = order(&stmt).expect("the first plan noted its join order");
+        assert_eq!(first.len(), 3);
+        stmt.reprepare().unwrap();
+        assert_eq!(order(&stmt), Some(first));
+    }
+
     #[test]
     fn test_expanded_sql() {
         let conn = open_test_connection().unwrap();
