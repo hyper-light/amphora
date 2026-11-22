@@ -12,8 +12,17 @@
 //! table, so it is marked [`SkipRefusal::Stale`] until built again.
 //!
 //! The registry is pure: the caller passes each connection's identity and WAL positions.
+//!
+//! Lane skip-8 (T-SKU.10): a measured summary's dropped method is built again by one builder at
+//! a time, off the scan's path. A builder claims the build ([`SkipRegistry::claim_build`]); while
+//! it holds the claim, no other gets one, so connections that find the same build due at once
+//! never duplicate it. A builder that reads the table pins its snapshot to the state the summary
+//! holds ([`SkipRegistry::pin_build`], the reader's rule above). Each write the hook takes while a
+//! build is claimed marks the build invalidated: the copy would miss it. The builder hands the
+//! claim back with what it built or with nothing, and only a build no write invalidated is
+//! installed ([`BuildEnd`]). Nothing waits on a clock: the write is the event that voids a build.
 
-use super::{Candidates, RowWrite, SkipError, SkipMethod, Skipping};
+use super::{Candidates, CrackerColumn, RowWrite, SkipError, SkipMethod, Skipping};
 use crate::sync::Mutex;
 
 /// A WAL position: `(checkpoint_seq, max_frame)`, as the pager reports a connection's snapshot
@@ -57,6 +66,14 @@ struct Pending {
     base: WalPos,
 }
 
+/// Lane skip-8 (T-SKU.10): a build of a dropped method one builder holds the claim to.
+#[derive(Debug)]
+struct Building {
+    ticket: u64,
+    /// A write came in since the build's snapshot: what it reads would miss the write.
+    invalidated: bool,
+}
+
 #[derive(Debug)]
 struct Entry {
     root_page: i64,
@@ -65,12 +82,46 @@ struct Entry {
     pending: Option<Pending>,
     stale: bool,
     counts: SkipCounts,
+    building: Option<Building>,
+}
+
+/// Lane skip-8 (T-SKU.10): the claim to build a summary's dropped `method` again, held by one
+/// builder at a time; hand it back with [`SkipRegistry::rebuild_zones`],
+/// [`SkipRegistry::install_cracker`] or [`SkipRegistry::abandon_build`].
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a claim not handed back keeps every other build of the summary out"]
+pub struct BuildClaim {
+    pub root_page: i64,
+    pub method: SkipMethod,
+    ticket: u64,
+}
+
+/// Lane skip-8 (T-SKU.10): how a claimed build ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildEnd {
+    /// Built and installed: the method is kept again, its trial next.
+    Installed,
+    /// A write came in during the build: nothing installed, the method stays dropped and the
+    /// next scan that finds its trial due claims a new build.
+    Invalidated,
+    /// The summary was replaced, dropped or went stale since the claim: nothing installed.
+    Superseded,
+    /// The summary refused the build (a cut out of order): it is stale until set again.
+    Refused,
+    /// The builder's snapshot isn't the state the summary holds (another connection's write is
+    /// open): nothing read, the claim handed back.
+    OlderSnapshot,
+    /// The builder couldn't read the table (its error is logged): nothing installed.
+    Failed,
 }
 
 /// The summaries one database keeps, by table root page.
 #[derive(Debug, Default)]
 pub struct SkipRegistry {
     entries: Mutex<Vec<Entry>>,
+    /// Lane skip-8: the last build claim's ticket, unique across summaries set again; locked only
+    /// under `entries`.
+    tickets: Mutex<u64>,
 }
 
 impl SkipRegistry {
@@ -88,6 +139,7 @@ impl SkipRegistry {
                 pending: None,
                 stale: false,
                 counts: SkipCounts::default(),
+                building: None,
             });
         }
     }
@@ -135,6 +187,10 @@ impl SkipRegistry {
             base: committed,
         });
         entry.counts.writes = entry.counts.writes.saturating_add(1);
+        // Lane skip-8 (T-SKU.10): the write is the event that voids a build under way.
+        if let Some(building) = entry.building.as_mut() {
+            building.invalidated = true;
+        }
         if entry.stale {
             return;
         }
@@ -237,7 +293,6 @@ impl SkipRegistry {
         }
     }
 
-    /// What the table at `root_page`'s summary has done, if one is kept.
     /// Lane skip-5 (T-SKU.5): the dropped method a measured summary's trial waits on, if any.
     pub fn rebuild_due(&self, root_page: i64) -> Option<SkipMethod> {
         let entries = self.entries.lock();
@@ -251,52 +306,170 @@ impl SkipRegistry {
         }
     }
 
-    /// Builds a dropped zone map again from the cracker (in memory, under the lock).
-    pub fn rebuild_zones(&self, root_page: i64, now: &mut dyn FnMut() -> u64) {
+    /// Lane skip-8 (T-SKU.10): claims the build of the table at `root_page`'s dropped method
+    /// whose trial is due. `None` when none is due, the summary is stale, or another builder holds
+    /// the claim: the caller goes on with the leader.
+    pub fn claim_build(&self, root_page: i64) -> Option<BuildClaim> {
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries
+        let entry = entries
             .iter_mut()
-            .find(|entry| entry.root_page == root_page)
-        {
-            if let Skipping::Measured(chooser) = &mut entry.skipping {
-                if chooser.rebuild_zones(now).is_err() {
-                    entry.stale = true;
-                }
-            }
+            .find(|entry| entry.root_page == root_page)?;
+        if entry.stale || entry.building.is_some() {
+            return None;
         }
+        let Skipping::Measured(chooser) = &entry.skipping else {
+            return None;
+        };
+        let method = chooser.rebuild_due()?;
+        let ticket = {
+            let mut tickets = self.tickets.lock();
+            *tickets = tickets.wrapping_add(1);
+            *tickets
+        };
+        entry.building = Some(Building {
+            ticket,
+            invalidated: false,
+        });
+        Some(BuildClaim {
+            root_page,
+            method,
+            ticket,
+        })
     }
 
-    /// Installs a cracker the caller built again from the table, read when `writes` writes had
-    /// come in: refused (`false`) when another came in since, as the copy would miss it. Lane
-    /// skip-7 (T-SKU.8): it is cut at the dropped cracker's cut points as it is installed, timed by
-    /// `now`; a cut it refuses makes the summary stale.
-    pub fn install_cracker(
+    /// Lane skip-8 (T-SKU.10): `builder`, at snapshot `builder_pos` when the newest commit is
+    /// `committed`, reads the table for `claim`'s build: `true` when its snapshot is exactly the
+    /// state the summary holds (by the reader's rule: no other writer open, the newest commit),
+    /// and the build counts writes from here. `false`: hand the claim back.
+    pub fn pin_build(
         &self,
-        root_page: i64,
-        writes: u64,
-        cracker: super::CrackerColumn,
-        cost: u64,
-        now: &mut dyn FnMut() -> u64,
+        claim: &BuildClaim,
+        builder: usize,
+        builder_pos: WalPos,
+        committed: WalPos,
     ) -> bool {
         let mut entries = self.entries.lock();
         let Some(entry) = entries
             .iter_mut()
-            .find(|entry| entry.root_page == root_page)
+            .find(|entry| entry.root_page == claim.root_page)
         else {
             return false;
         };
-        match &mut entry.skipping {
-            Skipping::Measured(chooser) if entry.counts.writes == writes && !entry.stale => {
-                if chooser.install_cracker(cracker, cost, now).is_err() {
-                    entry.stale = true;
-                    return false;
+        if entry.stale
+            || !entry
+                .building
+                .as_ref()
+                .is_some_and(|building| building.ticket == claim.ticket)
+        {
+            return false;
+        }
+        match &entry.pending {
+            Some(p) if p.writer == builder => {}
+            // The writer committed since its writes: the newest commit holds them.
+            Some(p) if p.base != committed => entry.pending = None,
+            Some(_) => return false,
+            None => {}
+        }
+        if builder_pos != committed {
+            return false;
+        }
+        if let Some(building) = entry.building.as_mut() {
+            building.invalidated = false;
+        }
+        true
+    }
+
+    /// Takes `claim`'s build off its entry: the entry, and whether a write invalidated the build,
+    /// when the claim is still the one under way and the summary isn't stale.
+    fn end_build<'a>(
+        entries: &'a mut [Entry],
+        claim: &BuildClaim,
+    ) -> Result<(&'a mut Entry, bool), BuildEnd> {
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.root_page == claim.root_page)
+            .ok_or(BuildEnd::Superseded)?;
+        match entry.building.take() {
+            Some(building) if building.ticket == claim.ticket => {
+                if entry.stale {
+                    Err(BuildEnd::Superseded)
+                } else {
+                    Ok((entry, building.invalidated))
                 }
-                true
             }
-            _ => false,
+            other => {
+                entry.building = other;
+                Err(BuildEnd::Superseded)
+            }
         }
     }
 
+    /// Lane skip-8 (T-SKU.10): hands `claim` back with nothing built.
+    pub fn abandon_build(&self, claim: BuildClaim) {
+        let mut entries = self.entries.lock();
+        let current = Self::end_build(&mut entries, &claim).is_ok();
+        tracing::debug!(target: "amphora.skipping", root = claim.root_page, method = ?claim.method, current, "skipping build handed back with nothing built");
+    }
+
+    /// Builds `claim`'s dropped zone map again from the cracker, timed by `now`. The cracker is
+    /// the summary's own copy and took every write, and the build runs under the lock, so no
+    /// write invalidates it.
+    pub fn rebuild_zones(&self, claim: BuildClaim, now: &mut dyn FnMut() -> u64) -> BuildEnd {
+        let mut entries = self.entries.lock();
+        let entry = match Self::end_build(&mut entries, &claim) {
+            Ok((entry, _)) => entry,
+            Err(end) => return end,
+        };
+        match &mut entry.skipping {
+            Skipping::Measured(chooser) if claim.method == SkipMethod::ZoneMaps => {
+                if chooser.rebuild_zones(now).is_err() {
+                    entry.stale = true;
+                    return BuildEnd::Refused;
+                }
+                BuildEnd::Installed
+            }
+            _ => BuildEnd::Superseded,
+        }
+    }
+
+    /// Installs the cracker `claim`'s builder read from the table at its pinned snapshot, its read
+    /// costing `cost`; not when a write came in since the pin ([`BuildEnd::Invalidated`]), as the
+    /// copy would miss it. Lane skip-7 (T-SKU.8): it is cut at the dropped cracker's cut points as
+    /// it is installed, timed by `now`; a cut it refuses makes the summary stale.
+    pub fn install_cracker(
+        &self,
+        claim: BuildClaim,
+        cracker: CrackerColumn,
+        cost: u64,
+        now: &mut dyn FnMut() -> u64,
+    ) -> BuildEnd {
+        let mut entries = self.entries.lock();
+        let entry = match Self::end_build(&mut entries, &claim) {
+            Ok((_, true)) => return BuildEnd::Invalidated,
+            Ok((entry, false)) => entry,
+            Err(end) => return end,
+        };
+        match &mut entry.skipping {
+            Skipping::Measured(chooser) if claim.method == SkipMethod::Cracking => {
+                if chooser.install_cracker(cracker, cost, now).is_err() {
+                    entry.stale = true;
+                    return BuildEnd::Refused;
+                }
+                BuildEnd::Installed
+            }
+            _ => BuildEnd::Superseded,
+        }
+    }
+
+    /// Lane skip-8: whether a build of the table at `root_page`'s summary is claimed now.
+    pub fn building(&self, root_page: i64) -> bool {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .any(|entry| entry.root_page == root_page && entry.building.is_some())
+    }
+
+    /// What the table at `root_page`'s summary has done, if one is kept.
     pub fn counts(&self, root_page: i64) -> Option<SkipCounts> {
         let entries = self.entries.lock();
         entries

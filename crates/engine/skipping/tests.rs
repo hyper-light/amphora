@@ -1747,6 +1747,12 @@ mod chooser {
             ];
             let capped = upkeep_run_led(seed, Upkeep::Capped, Lead::Scan, &phases);
             let kept = upkeep_run(seed, Upkeep::KeepBoth, &phases);
+            // Lane skip-8: which kind each ends led by is reported, not asserted (T-SKU.5's text
+            // claims none; skip-7's model had keeping both end led by cracking).
+            eprintln!(
+                "t_sku_5 seed {seed}: capped ends led by {:?}, kept both by {:?}",
+                capped.leader, kept.leader
+            );
             assert!(
                 capped.stats.zone_maps.dropped > 0,
                 "seed {seed}: {:?}",
@@ -2090,5 +2096,233 @@ mod chooser {
             trials += usize::from(method == SkipMethod::Cracking);
         }
         assert_eq!(trials, 1, "{:?}", chooser.stats());
+    }
+}
+
+/// Lane skip-8 (T-SKU.10): a measured summary's dropped method built again off the scan's path,
+/// one build per summary at a time, installed only when no write came in during it.
+mod builds {
+    use super::super::{
+        start_build, BuildEnd, Chooser, CrackerColumn, Lead, RowWrite, SkipMethod, SkipRegistry,
+        Skipping, Upkeep, ZoneMapBuilder,
+    };
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+    use crate::{Database, SqliteDialect};
+    use std::sync::Barrier;
+
+    const ROOT: i64 = 2;
+    const AT: (u32, u64) = (0, 1);
+
+    /// T-SKU.7's scenario: capped, the cracker dropped for its upkeep while zone maps led, then
+    /// zone maps measured costlier than the cracker's last scan, so the cracker's build is due.
+    fn cracker_due() -> Chooser {
+        let mut chooser = Chooser::with_rules(
+            ZoneMapBuilder::new().finish(),
+            CrackerColumn::new([]),
+            Upkeep::Capped,
+            Lead::Scan,
+            [Some(10), Some(10)],
+        );
+        let (_, first) = chooser.candidates(0, 0).unwrap();
+        chooser.record(first, 1);
+        let (_, second) = chooser.candidates(0, 0).unwrap();
+        chooser.record(second, 100);
+        chooser.record_upkeep(SkipMethod::Cracking, 11);
+        chooser.record(SkipMethod::ZoneMaps, 200);
+        assert_eq!(chooser.rebuild_due(), Some(SkipMethod::Cracking));
+        chooser
+    }
+
+    fn registry_due() -> SkipRegistry {
+        let registry = SkipRegistry::default();
+        registry.set(ROOT, 0, Skipping::Measured(Box::new(cracker_due())));
+        registry
+    }
+
+    fn copy() -> CrackerColumn {
+        CrackerColumn::new([(1, Some(5)), (2, Some(7))])
+    }
+
+    fn keeps_cracker(registry: &SkipRegistry, root: i64) -> bool {
+        registry.with_summary(
+            root,
+            |s| matches!(s, Skipping::Measured(chooser) if chooser.keeps(SkipMethod::Cracking)),
+        ) == Some(true)
+    }
+
+    /// Do: sixteen connections find the same build due at once. Expect: exactly one claims it;
+    /// while it holds the claim no other gets one; handed back, the still-due build can be
+    /// claimed again.
+    #[test]
+    fn t_sku_10_connections_asking_at_once_claim_one_build() {
+        let registry = std::sync::Arc::new(registry_due());
+        let askers = 16;
+        let barrier = std::sync::Arc::new(Barrier::new(askers));
+        let handles: Vec<_> = (0..askers)
+            .map(|_| {
+                let registry = std::sync::Arc::clone(&registry);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.claim_build(ROOT)
+                })
+            })
+            .collect();
+        let mut claims: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(claims.len(), 1, "{askers} askers: {claims:?}");
+        let claim = claims.pop().unwrap();
+        assert_eq!(claim.method, SkipMethod::Cracking);
+        assert!(registry.building(ROOT));
+        assert_eq!(registry.claim_build(ROOT), None);
+        registry.abandon_build(claim);
+        assert!(!registry.building(ROOT));
+        let again = registry.claim_build(ROOT).expect("the trial is still due");
+        registry.abandon_build(again);
+    }
+
+    /// Do: a build pinned at the newest commit, then a write reaches the summary before it hands
+    /// its copy back. Expect: nothing installed (the copy would miss the write), the cracker stays
+    /// dropped and the claim is free; a build pinned after the writer committed installs, and no
+    /// build is due after it.
+    #[test]
+    fn t_sku_10_a_write_during_the_build_voids_it() {
+        let registry = registry_due();
+        let claim = registry.claim_build(ROOT).unwrap();
+        assert!(registry.pin_build(&claim, 1, AT, AT));
+        registry.on_write(
+            ROOT,
+            9,
+            AT,
+            RowWrite::Insert {
+                rowid: 3,
+                value: Some(1),
+            },
+            &mut || 0,
+        );
+        assert_eq!(
+            registry.install_cracker(claim, copy(), 10, &mut || 0),
+            BuildEnd::Invalidated
+        );
+        assert!(!keeps_cracker(&registry, ROOT));
+        assert!(!registry.building(ROOT));
+        let committed = (0, 2);
+        let claim = registry.claim_build(ROOT).expect("the trial is still due");
+        assert!(registry.pin_build(&claim, 1, committed, committed));
+        assert_eq!(
+            registry.install_cracker(claim, copy(), 10, &mut || 0),
+            BuildEnd::Installed
+        );
+        assert!(keeps_cracker(&registry, ROOT));
+        assert_eq!(registry.claim_build(ROOT), None, "built: none is due");
+    }
+
+    /// Do: a build asked for while another connection's write is open, one whose summary is
+    /// set again during it, and one on a summary made stale. Expect: the first reads nothing (its
+    /// snapshot misses the open write); the second installs nothing and leaves the new summary's
+    /// own claim alone; a stale summary hands out no claim.
+    #[test]
+    fn t_sku_10_a_build_installs_only_on_the_state_it_read() {
+        let registry = registry_due();
+        registry.on_write(
+            ROOT,
+            9,
+            AT,
+            RowWrite::Insert {
+                rowid: 3,
+                value: Some(1),
+            },
+            &mut || 0,
+        );
+        let claim = registry.claim_build(ROOT).unwrap();
+        assert!(!registry.pin_build(&claim, 1, AT, AT));
+        registry.abandon_build(claim);
+        assert!(!registry.building(ROOT));
+
+        let old = registry.claim_build(ROOT).unwrap();
+        registry.set(ROOT, 0, Skipping::Measured(Box::new(cracker_due())));
+        let fresh = registry
+            .claim_build(ROOT)
+            .expect("the new summary's own build");
+        assert_eq!(
+            registry.install_cracker(old, copy(), 10, &mut || 0),
+            BuildEnd::Superseded
+        );
+        assert!(registry.building(ROOT), "the old claim freed the new one");
+        registry.abandon_build(fresh);
+
+        registry.on_write(
+            ROOT,
+            9,
+            AT,
+            RowWrite::Insert {
+                rowid: 4,
+                value: Some(2),
+            },
+            &mut || 0,
+        );
+        registry.rolled_back(9);
+        assert_eq!(registry.claim_build(ROOT), None);
+    }
+
+    /// Do: a real table whose summary's cracker is due a build, and eight connections that find
+    /// it due at once start the build. Expect: one build starts, on its own thread and
+    /// connection, and installs a cracker holding every row of the table; none is due after.
+    #[test]
+    fn t_sku_10_a_due_cracker_is_built_once_from_the_table_off_the_scan() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let rows = 500;
+        conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..rows {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'x')"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        let root = conn
+            .with_schema_mut(|s| s.get_btree_table("t"))
+            .unwrap()
+            .unwrap()
+            .root_page;
+        db.skipping
+            .set(root, 0, Skipping::Measured(Box::new(cracker_due())));
+        let askers = 8;
+        let barrier = std::sync::Arc::new(Barrier::new(askers));
+        let handles: Vec<_> = (0..askers)
+            .map(|_| {
+                let db = Arc::clone(&db);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    start_build(&db, root, 0, 2)
+                })
+            })
+            .collect();
+        let builds: Vec<_> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(builds.len(), 1, "{askers} askers started {}", builds.len());
+        let ends: Vec<BuildEnd> = builds
+            .into_iter()
+            .map(|build| build.join().unwrap())
+            .collect();
+        assert_eq!(ends, vec![BuildEnd::Installed]);
+        let held = db
+            .skipping
+            .with_summary(root, |s| match s {
+                Skipping::Measured(chooser) => chooser.cracker().map(|c| c.rows().len()),
+                _ => None,
+            })
+            .flatten();
+        assert_eq!(held, Some(500));
+        assert!(!db.skipping.building(root));
+        assert_eq!(db.skipping.claim_build(root), None);
     }
 }

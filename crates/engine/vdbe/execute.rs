@@ -1993,9 +1993,8 @@ fn skip_walk_for(
         _ => None,
     })?;
     let (reader_pos, committed) = conn.skipping_positions()?;
-    let writes = registry.counts(root).map(|counts| counts.writes);
     // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
-    let mut started = std::time::Instant::now();
+    let started = std::time::Instant::now();
     let (candidates, method) = registry
         .candidates_by(
             root,
@@ -2006,16 +2005,12 @@ fn skip_walk_for(
             bounds.hi,
         )
         .ok()?;
-    // Lane skip-5 (T-SKU.5): a method dropped for its upkeep whose trial is due is built again
-    // now, at the snapshot the summary just answered (so it holds what the summary holds).
-    if let Some(method) = registry.rebuild_due(root) {
-        let building = std::time::Instant::now();
-        skipping_rebuild(program, cursor_id, root, column, method, writes);
-        // Lane skip-7: the build is the dropped kind's cost (its own build cost), not this
-        // scan's: the scan's measure leaves it out, so the leader isn't charged for it.
-        started = started
-            .checked_add(building.elapsed())
-            .unwrap_or_else(std::time::Instant::now);
+    // Lane skip-8 (T-SKU.10): a method dropped for its upkeep whose trial is due is built again
+    // off this scan's path, one build per summary at a time; this scan goes on with the leader.
+    if let Some((_, super::builder::CursorType::BTreeTable(table))) =
+        program.cursor_ref.get(cursor_id)
+    {
+        let _detached = crate::skipping::start_build(&conn.db, root, column, table.columns().len());
     }
     let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
     walk.measure = method.map(|method| crate::skipping::WalkMeasure {
@@ -2024,52 +2019,6 @@ fn skip_walk_for(
         started,
     });
     Some(walk)
-}
-
-/// Lane skip-5 (T-SKU.5): builds a measured summary's dropped method again for its trial: zone
-/// maps from the cracker in memory, the cracker from the table's B-tree (a read of every row,
-/// timed: its cost to build). A build that fails, or a write that came in during it, leaves the
-/// method dropped: the leader keeps answering, and the next trial tries again.
-fn skipping_rebuild(
-    program: &Program,
-    cursor_id: crate::vdbe::CursorID,
-    root: i64,
-    column: usize,
-    method: crate::skipping::SkipMethod,
-    writes: Option<u64>,
-) {
-    let registry = &program.connection.db.skipping;
-    let origin = std::time::Instant::now();
-    match method {
-        crate::skipping::SkipMethod::ZoneMaps => {
-            registry.rebuild_zones(root, &mut || crate::skipping::nanos_since(origin))
-        }
-        crate::skipping::SkipMethod::Cracking => {
-            let (Some(writes), Some((_, super::builder::CursorType::BTreeTable(table)))) =
-                (writes, program.cursor_ref.get(cursor_id))
-            else {
-                return;
-            };
-            let built = crate::skipping::cracker_of_table(
-                program.connection.get_pager(),
-                root,
-                column,
-                table.columns().len(),
-            );
-            match built {
-                Ok(cracker) => {
-                    let cost = crate::skipping::nanos_since(origin);
-                    let now = &mut || crate::skipping::nanos_since(origin);
-                    if !registry.install_cracker(root, writes, cracker, cost, now) {
-                        tracing::debug!(target: "amphora.skipping", root, "cracker built again was refused: a write came in during the build");
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(target: "amphora.skipping", root, %error, "cracker could not be built again")
-                }
-            }
-        }
-    }
 }
 
 /// Lane skip-3 (T-SKU.2): a measured scan's end hands its cost (nanoseconds from asking for its

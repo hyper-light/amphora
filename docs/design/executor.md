@@ -747,9 +747,9 @@ upkeep it has cost since it last answered a filter passes its latest measured co
 rental's break-even rule (Karlin, Manasse, Rudolph and Sleator, Algorithmica 1988: rent until the
 rent paid equals the price, then buy, within twice the best choice in hindsight). The kind leading
 is never dropped. A dropped kind is still measured on the doubling schedule; its trial's budget
-adds its build cost, and when the trial is due the executor builds it again before the filter:
-zone maps from the cracker's own copy of the column, in the dropped map's zones; the cracker from
-the table at the snapshot the summary just answered, refused if a write came in during the build.
+adds its build cost, and when the trial is due it is built again: zone maps from the cracker's
+own copy of the column, in the dropped map's zones; the cracker from the table, refused if a write
+came in during the build. Lane skip-8 moved the build off the scan's path (T-SKU.10, below).
 The upkeep is timed per write by the executor's clock and handed in (`SkipRegistry::on_write`'s
 `now`); a build's cost is its own time. No number is picked: the threshold is the kind's own
 measured build cost.
@@ -807,6 +807,40 @@ each cut partitions only the piece between two cuts already made: about n log k 
 copy of n entries and k bounds, not the n k of cutting in ascending order. The cut is timed and
 added to the build's cost. Evidence: `t_sku_8_*` (the same cut points, the same rowids for each
 filter with nothing partitioned again, at most n entries moved per halving of the bounds).
+
+### Builds off the scan's path, one per summary at a time (lane skip-8, T-SKU.10)
+
+**Decision.** The scan that finds a dropped kind's trial due no longer builds it: it claims the
+build (`SkipRegistry::claim_build`) and goes on with the leader, and the build runs on a thread of
+its own (`skipping/build.rs`). A summary has at most one claim at a time, so connections that find
+the same build due at once start one build between them. Zone maps are built from the cracker's
+copy in memory under the registry's lock. The cracker is read from the table on the build's own
+connection, in a read transaction whose snapshot must be the state the summary holds (the reader's
+rule: no other writer open, the newest commit; `pin_build`), or nothing is read. Each write the
+hook takes while the build is claimed marks it invalidated, and an invalidated build is not
+installed (`BuildEnd::Invalidated`); the next scan that finds the trial due claims a new one. A
+claim that ends without being handed back (an error, a thread that could not start) is handed back
+by its holder's drop. Nothing waits on a clock or a poll: the build starts on the scan that finds
+it due, a write voids it, and its own end hands the claim back.
+
+**Why.** Inside the scan, the cracker's build read every row of the table on the path of one
+filter, which paid for it in latency, and every connection that found the trial due at once built
+its own copy. Comparing a count of writes before and after (skip-5) caught a write during the build
+but not the duplicate builds.
+
+**Bound.** One build, so one thread and one connection, per summary at a time; builds come only at
+a dropped kind's trials, which the doubling schedule spaces geometrically.
+
+**Evidence.** `skipping::tests::builds::t_sku_10_*`: sixteen threads asking for the same due build
+at once get one claim; a write between a build's pin and its install voids it, and a build pinned
+after the writer committed installs; a build beside another connection's open write reads nothing,
+a summary set again ignores the old claim, and a stale summary hands out none; on a real table,
+eight threads that find the cracker due at once start one build, which installs a cracker holding
+every row.
+
+**Falsified by.** A due build that, under writes, is voided at every trial: the dropped kind is
+never measured again. Under steady write churn that would show as `rebuilt` staying at 0 while
+trials come due.
 
 ### Fused batches (lane skip-5, T-SKU.4) that decode only the candidate run (lane skip-7, T-SKU.9)
 

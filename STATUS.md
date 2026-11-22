@@ -1097,5 +1097,6 @@ upkeep of the latest stretch between filters (`Lead::Total`; keeping both stays 
 as both upkeeps are paid either way) (T-SKU.7); a cracker built again is cut at the dropped one's
 cut points, middle first (T-SKU.8); and a skipping scan's batches stop decoding at its candidate
 run's end (T-SKU.9). Decision record: executor.md decision 11.
-Open: the benchmark against DuckDB and ClickHouse; a dropped kind is still built again inside the
-scan whose trial is due.
+Lane skip-8: a dropped kind is built again off the scan's path, on a thread and connection of its
+own, one build per summary at a time, and not installed if a write came in during it (T-SKU.10).
+Open: the benchmark against DuckDB and ClickHouse.

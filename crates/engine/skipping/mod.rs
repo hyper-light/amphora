@@ -27,6 +27,7 @@
 //!
 //! The switch is per table and per column: a connection that turns neither on pays nothing.
 
+mod build;
 mod choose;
 mod cracking;
 mod leaves;
@@ -34,13 +35,14 @@ mod registry;
 mod scan;
 mod zone_map;
 
+pub(crate) use build::start_build;
 pub use choose::{Chooser, ChooserStats, Lead, MethodStats, SkipMethod, Upkeep};
 pub use cracking::{CrackerColumn, CrackerStats};
 pub(crate) use leaves::{cracker_of_table, nanos_since};
 pub use leaves::{
     set_skipping, skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,
 };
-pub use registry::{SkipCounts, SkipRefusal, SkipRegistry, WalPos};
+pub use registry::{BuildClaim, BuildEnd, SkipCounts, SkipRefusal, SkipRegistry, WalPos};
 pub use scan::{
     bound_terms, BoundOp, BoundTerm, BoundValue, ColumnBounds, SkipHint, SkipWalk, SkipWalks,
     WalkMeasure, WalkPhase, WalkTarget,
