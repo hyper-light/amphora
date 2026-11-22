@@ -2881,12 +2881,11 @@ fn find_table_access_plan(
     if table_references.joined_tables().is_empty() {
         return Ok(None);
     }
-    if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
-        crate::bail_parse_error!(
-            "Only up to {} tables can be joined",
-            TableReferences::MAX_JOINED_TABLES
-        );
-    }
+    // PL.8 (T-PL.8.7): no cap on the tables a join names. A table set is a `TableMask`, a bitset
+    // whose words grow to the highest table the query names (`BitSet::set`, its allocation
+    // fallible), so its size comes from the query, which the statement's length bounds; the
+    // search's subsets are bounded by its budget (`search_budget`), past which the greedy search
+    // plans the join in the tables' count squared.
 
     // A WHERE term that is never true on a NULL row lets an outer join drop
     // the NULL rows it would add, which turns it into a stricter join:

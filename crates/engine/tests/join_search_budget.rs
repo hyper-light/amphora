@@ -5,8 +5,8 @@
 //! costs in planning and running, one line a scenario and rule.
 //!
 //! Scenarios, each forcing a rule's failure mode: tiny repeated queries (planning outweighs the
-//! run), chains of 50 and of 63 tables, the most a join may name (the exact search's subsets
-//! explode), an underestimated join (the bound the rules derive from is wrong), a cold database
+//! run), chains of 50, 63 and 100 tables (the exact search's subsets explode; past 63 the table
+//! sets outgrow one word), an underestimated join (the bound the rules derive from is wrong), a cold database
 //! against a warm one (no measured rates, then measured ones), and a statistics change under load
 //! (plans made again mid-stream). JOB is the coordinator's: `AMPHORA_JOB_DIR` names a directory of
 //! its `.sql` files and an `imdb.db` loaded with its data, and the harness runs each of its
@@ -169,7 +169,7 @@ fn scenarios(scale: usize, print: bool) {
         made += 1;
         open(&dir.path().join(format!("pl8-{made}.db")))
     };
-    let cases: [(&str, Setup, usize, bool); 6] = [
+    let cases: [(&str, Setup, usize, bool); 7] = [
         (
             "tiny-repeated-hits",
             |c, s| chain(c, 2, 4 * s),
@@ -183,9 +183,9 @@ fn scenarios(scale: usize, print: bool) {
             true,
         ),
         ("chain-50", |c, s| chain(c, 50, 3 * s), 3, true),
-        // 63 tables: the most a join may name (`TableMask` is a u64, as SQLite's `Bitmask`); 100 needs
-        // a wider mask first.
+        // 63 tables fill a table set's first word; 100 need more (T-PL.8.7).
         ("chain-63", |c, s| chain(c, 63, 3 * s), 3, true),
+        ("chain-100", |c, s| chain(c, 100, 3 * s), 3, true),
         ("underestimated", |c, s| skewed(c, 200 * s), 5 * scale, true),
         // A fresh database has measured nothing (the derived rules take the control's budget);
         // its later runs plan on the rates its first ones measured.
@@ -243,6 +243,27 @@ fn scenarios(scale: usize, print: bool) {
 #[test]
 fn t_pl_8_3_every_budget_rule_gives_the_controls_answers() {
     scenarios(1, false);
+}
+
+/// Do: a chain of 100 tables, past one 64-bit word of tables, each of 3 rows whose keys cycle
+/// (t1's row 1 reaches t100's row 1), planned by cost and as nested loops. Expect: one answer, the
+/// chain's (1 row, t100.v = 1), from both (T-PL.8.7: a join past 63 tables plans and runs).
+#[test]
+fn t_pl_8_7_a_join_of_100_tables_plans_and_answers() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let conn = open(&dir.path().join("chain100.db"));
+    let sql = chain(&conn, 100, 3);
+    let mut answers = Vec::new();
+    for methods in [
+        amphora_engine::JoinMethods::ByCost,
+        amphora_engine::JoinMethods::NestedLoopsOnly,
+    ] {
+        conn.set_join_methods(methods);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        answers.push(rows_of(stmt.run_collect_rows().unwrap()));
+    }
+    let chain_answer = vec!["1|1".to_owned()];
+    assert_eq!(answers, vec![chain_answer.clone(), chain_answer]);
 }
 
 /// The harness: every scenario at `AMPHORA_PL8_SCALE` (default 1), one line a scenario and rule.
