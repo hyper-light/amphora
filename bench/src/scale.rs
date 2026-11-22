@@ -92,12 +92,22 @@ pub struct Row {
 }
 
 /// One client's connection to one node; a worker thread holds one at a time.
+///
+/// Every system is sent the same work the same way (Ada's fair comparisons): each write, read and
+/// transaction is one SQL statement, sent as text with its values written in as literals
+/// ([`Dialect`]), answered in one round trip and committed on its own. Amphora's client protocol
+/// takes text only (`exec SQL`, `count SQL`), so CockroachDB gets Postgres's simple query protocol and
+/// TiDB MySQL's text protocol (COM_QUERY): each server parses every statement it gets. An explicit
+/// transaction with one statement a row, or a statement prepared before each run, would take more
+/// round trips on some systems than on others, which would be an error in the experiment.
+/// `amphora-inproc` makes in-process calls, and its records say so.
 pub trait Session {
-    /// `rows` in one transaction, into `regional` when `regional`; returns once acknowledged.
+    /// `rows` in one statement (so they commit together), into `regional` when `regional`; returns
+    /// once acknowledged.
     fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()>;
     /// Whether row (`session`, `seq`) is there: read by its leader, or as a follower read.
     fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool>;
-    /// One transaction setting every key to `value`.
+    /// One statement (one transaction) setting every key to `value`.
     fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()>;
     /// Rows of `session` up to `upto`: on this node's own copy when `own`, else by the leader.
     fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64>;
@@ -339,7 +349,10 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
     }
     if o.system == "amphora" {
         match need(o.class.as_deref(), "--class", &m)? {
-            "persisted" => {}
+            // Amphora's server refuses a member config naming both (serve::Config::parse).
+            "persisted" => {
+                anyhow::ensure!(o.spanning.is_none(), "--spanning is the replicated class's")
+            }
             "replicated" => anyhow::ensure!(
                 need(o.spanning, "--spanning", &m)? >= 2,
                 "--spanning takes at least 2"
@@ -358,7 +371,10 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--relay-pending takes at least 1"
         );
         match need(o.class.as_deref(), "--class", &m)? {
-            "persisted" => {}
+            // Amphora's server refuses a member config naming both (serve::Config::parse).
+            "persisted" => {
+                anyhow::ensure!(o.spanning.is_none(), "--spanning is the replicated class's")
+            }
             "replicated" => anyhow::ensure!(
                 need(o.spanning, "--spanning", &m)? >= 2,
                 "--spanning takes at least 2"
@@ -376,6 +392,91 @@ fn us(t: Instant) -> u64 {
 /// Writer `w`'s session name: the same in every system, so splits fall at the same points.
 pub fn session_name(w: usize) -> String {
     format!("s-{w:06}")
+}
+
+/// The SQL text each system over the network is sent ([`Session`]): one statement for each write,
+/// read or transaction, with its values as literals.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialect {
+    /// Amphora's server (SQLite's SQL) and CockroachDB: standard SQL's string literals.
+    Standard,
+    /// TiDB (MySQL's SQL).
+    Mysql,
+}
+
+impl Dialect {
+    /// `v` as a string literal. Standard SQL doubles `'`. MySQL also reads `\` in a string as an
+    /// escape, unless the server's sql_mode has NO_BACKSLASH_ESCAPES (TiDB's default doesn't), so
+    /// `\` is doubled there too.
+    pub fn lit(self, v: &str) -> String {
+        let v = v.replace('\'', "''");
+        match self {
+            Self::Standard => format!("'{v}'"),
+            Self::Mysql => format!("'{}'", v.replace('\\', "\\\\")),
+        }
+    }
+
+    /// The upsert of every row in `rows` as one statement: `events(session, seq, body)`, or, when
+    /// `regional`, the region measure's table (TiDB's names each row's region; CockroachDB's
+    /// REGIONAL BY ROW homes it at the gateway).
+    pub fn upsert(self, regional: bool, rows: &[Row]) -> String {
+        let table = if regional { "regional" } else { "events" };
+        let values = rows
+            .iter()
+            .map(|r| match (self, regional) {
+                (Self::Mysql, true) => format!(
+                    "({}, {}, {}, {})",
+                    self.lit(&format!("r{}", r.region)),
+                    self.lit(&r.session),
+                    r.seq,
+                    self.lit(&r.body)
+                ),
+                _ => format!(
+                    "({}, {}, {})",
+                    self.lit(&r.session),
+                    r.seq,
+                    self.lit(&r.body)
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        match (self, regional) {
+            (Self::Mysql, true) => format!(
+                "INSERT INTO regional (region, session, seq, body) VALUES {values} ON DUPLICATE KEY UPDATE body = VALUES(body)"
+            ),
+            (Self::Mysql, false) => format!(
+                "INSERT INTO events (session, seq, body) VALUES {values} ON DUPLICATE KEY UPDATE body = VALUES(body)"
+            ),
+            (Self::Standard, _) => format!(
+                "INSERT INTO {table} (session, seq, body) VALUES {values} ON CONFLICT (session, seq) DO UPDATE SET body = excluded.body"
+            ),
+        }
+    }
+
+    /// The cross-group measure's transaction as one statement: every key in `keys` set to `value`.
+    pub fn kv_upsert(self, keys: &[i64], value: i64) -> String {
+        let values = keys
+            .iter()
+            .map(|k| format!("({k}, {value})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match self {
+            Self::Mysql => format!(
+                "INSERT INTO kv (k, v) VALUES {values} ON DUPLICATE KEY UPDATE v = VALUES(v)"
+            ),
+            Self::Standard => format!("UPSERT INTO kv (k, v) VALUES {values}"),
+        }
+    }
+
+    /// The count of `session`'s rows at `seq` (`upto`: at or below it), `from` naming the table
+    /// and how it's read.
+    pub fn count(self, from: &str, session: &str, seq: u64, upto: bool) -> String {
+        format!(
+            "SELECT count(*) FROM {from} WHERE session = {} AND seq {} {seq}",
+            self.lit(session),
+            if upto { "<=" } else { "=" }
+        )
+    }
 }
 
 /// The first session of each group past the first: `writers` sessions in `groups` even runs.
@@ -1090,16 +1191,16 @@ fn record_head(o: &Opts) -> serde_json::Value {
     let (ran, client) = match o.system.as_str() {
         "amphora" => (
             "native: amphora serve, one process a member".to_owned(),
-            "Amphora's client protocol over TCP (amphora-bench scale::served)",
+            "Amphora's client protocol over TCP: amphora::serve::Client, the server's own",
         ),
         "amphora-inproc" => ("in the bench's process".to_owned(), "in-process calls"),
         "cockroach" => (
             format!("{mode}: cockroach start, one process a node"),
-            "Postgres wire: rust-postgres (postgres crate, sync)",
+            "Postgres wire, simple query protocol: rust-postgres (postgres crate, sync)",
         ),
         _ => (
             format!("{mode}: pd-server, tikv-server, tidb-server a node"),
-            "MySQL wire: rust-mysql-simple (mysql crate)",
+            "MySQL wire, text protocol (COM_QUERY): rust-mysql-simple (mysql crate)",
         ),
     };
     let os = std::fs::read_to_string("/etc/os-release")
@@ -1117,10 +1218,16 @@ fn record_head(o: &Opts) -> serde_json::Value {
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_owned());
+    // How each request is sent ([`Session`]).
+    let statements = if o.system == "amphora-inproc" {
+        "in-process calls, parameters bound"
+    } else {
+        "one SQL statement a write, read or transaction, as text with literals: one round trip, committed on its own"
+    };
     if let Some(h) = head.as_object_mut() {
         h.insert(
             "platform".into(),
-            serde_json::json!({ "os": os, "kernel": kernel, "arch": std::env::consts::ARCH, "ran": ran, "client": client, "driver": "amphora-bench --scale: closed-loop writers, Instant-timed per acknowledgement" }),
+            serde_json::json!({ "os": os, "kernel": kernel, "arch": std::env::consts::ARCH, "ran": ran, "client": client, "driver": "amphora-bench --scale: closed-loop writers, Instant-timed per acknowledgement", "statements": statements }),
         );
         if let Ok(b) = std::env::var("AMPHORA_BENCH_SCALE_BIN") {
             h.insert("binaries".into(), b.into());
@@ -1667,11 +1774,6 @@ mod served {
         deadline: Duration,
     }
 
-    /// A SQL text literal.
-    fn lit(v: &str) -> String {
-        format!("'{}'", v.replace('\'', "''"))
-    }
-
     fn no_concept(what: &str) -> anyhow::Error {
         anyhow::Error::from(Refusal::Unavailable(format!(
             "Amphora's server doesn't serve {what} yet (its client protocol takes exec, count and status)"
@@ -1740,7 +1842,6 @@ mod served {
         own: Link,
         /// The leader's node and a link to it, asked again after a refusal.
         lead: Option<(usize, Link)>,
-        node: usize,
     }
 
     impl S<'_> {
@@ -1768,13 +1869,7 @@ mod served {
             if rows.is_empty() {
                 return Ok(());
             }
-            // One statement, so the rows commit together.
-            let values = rows
-                .iter()
-                .map(|r| format!("({}, {}, {})", lit(&r.session), r.seq, lit(&r.body)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.to_leader(&format!("exec INSERT INTO events(session, seq, body) VALUES {values} ON CONFLICT(session, seq) DO UPDATE SET body = excluded.body"))
+            self.to_leader(&format!("exec {}", Dialect::Standard.upsert(false, rows)))
                 .map(|_| ())
         }
 
@@ -1784,8 +1879,8 @@ mod served {
             }
             let n: u64 = self
                 .to_leader(&format!(
-                    "count SELECT count(*) FROM events WHERE session = {} AND seq = {seq}",
-                    lit(session)
+                    "count {}",
+                    Dialect::Standard.count("events", session, seq, false)
                 ))?
                 .parse()?;
             Ok(n > 0)
@@ -1797,8 +1892,8 @@ mod served {
 
         fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64> {
             let q = format!(
-                "count SELECT count(*) FROM events WHERE session = {} AND seq <= {upto}",
-                lit(session)
+                "count {}",
+                Dialect::Standard.count("events", session, upto, true)
             );
             Ok(if own {
                 self.own.ask(&q)?
@@ -1844,7 +1939,6 @@ mod served {
                 a: self,
                 own: self.link(node)?,
                 lead: None,
-                node,
             }))
         }
 
@@ -2076,68 +2170,60 @@ pub mod sql {
         follower: bool,
     }
 
+    impl Pg {
+        /// A count's one row, by the simple query protocol (one round trip, the text parsed by the
+        /// server as Amphora's is).
+        fn counted(&mut self, sql: &str) -> anyhow::Result<u64> {
+            for m in self.c.simple_query(sql)? {
+                if let postgres::SimpleQueryMessage::Row(r) = m {
+                    let n = r
+                        .try_get(0)?
+                        .ok_or_else(|| anyhow::anyhow!("{sql}: a NULL count"))?;
+                    return Ok(n.parse()?);
+                }
+            }
+            anyhow::bail!("{sql}: no row")
+        }
+    }
+
     impl Session for Pg {
         fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()> {
-            let table = if regional { "regional" } else { "events" };
-            let sql = format!(
-                "INSERT INTO {table} (session, seq, body) VALUES ($1, $2, $3) ON CONFLICT (session, seq) DO UPDATE SET body = excluded.body"
-            );
-            let mut t = self.c.transaction()?;
-            for r in rows {
-                t.execute(sql.as_str(), &[&r.session, &i64::try_from(r.seq)?, &r.body])?;
+            if rows.is_empty() {
+                return Ok(());
             }
-            t.commit()?;
-            Ok(())
+            Ok(self
+                .c
+                .batch_execute(&Dialect::Standard.upsert(regional, rows))?)
         }
 
         fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
-            let sql = if follower {
-                "SELECT count(*) FROM events AS OF SYSTEM TIME follower_read_timestamp() WHERE session = $1 AND seq = $2"
+            let from = if follower {
+                "events AS OF SYSTEM TIME follower_read_timestamp()"
             } else {
-                "SELECT count(*) FROM events WHERE session = $1 AND seq = $2"
+                "events"
             };
-            let n: i64 = self
-                .c
-                .query_one(sql, &[&session, &i64::try_from(seq)?])?
-                .try_get(0)?;
-            Ok(n > 0)
+            Ok(self.counted(&Dialect::Standard.count(from, session, seq, false))? > 0)
         }
 
         fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()> {
-            let mut t = self.c.transaction()?;
-            for k in keys {
-                t.execute("UPSERT INTO kv (k, v) VALUES ($1, $2)", &[k, &value])?;
-            }
-            t.commit()?;
-            Ok(())
+            Ok(self
+                .c
+                .batch_execute(&Dialect::Standard.kv_upsert(keys, value))?)
         }
 
         fn count(&mut self, session: &str, upto: u64, _own: bool) -> anyhow::Result<u64> {
             // CockroachDB answers every read by its leaseholder: a node's own copy isn't readable.
-            let n: i64 = self
-                .c
-                .query_one(
-                    "SELECT count(*) FROM events WHERE session = $1 AND seq <= $2",
-                    &[&session, &i64::try_from(upto)?],
-                )?
-                .try_get(0)?;
-            Ok(u64::try_from(n)?)
+            self.counted(&Dialect::Standard.count("events", session, upto, true))
         }
     }
 
     impl Session for My {
         fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()> {
             use mysql::prelude::Queryable;
-            let mut t = self.c.start_transaction(mysql::TxOpts::default())?;
-            for r in rows {
-                if regional {
-                    t.exec_drop("INSERT INTO regional (region, session, seq, body) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE body = VALUES(body)", (format!("r{}", r.region), &r.session, r.seq, &r.body))?;
-                } else {
-                    t.exec_drop("INSERT INTO events (session, seq, body) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE body = VALUES(body)", (&r.session, r.seq, &r.body))?;
-                }
+            if rows.is_empty() {
+                return Ok(());
             }
-            t.commit()?;
-            Ok(())
+            Ok(self.c.query_drop(Dialect::Mysql.upsert(regional, rows))?)
         }
 
         fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
@@ -2150,24 +2236,15 @@ pub mod sql {
                 })?;
                 self.follower = follower;
             }
-            let n: Option<i64> = self.c.exec_first(
-                "SELECT count(*) FROM events WHERE session = ? AND seq = ?",
-                (session, seq),
-            )?;
+            let n: Option<i64> = self
+                .c
+                .query_first(Dialect::Mysql.count("events", session, seq, false))?;
             Ok(n.unwrap_or(0) > 0)
         }
 
         fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()> {
             use mysql::prelude::Queryable;
-            let mut t = self.c.start_transaction(mysql::TxOpts::default())?;
-            for k in keys {
-                t.exec_drop(
-                    "INSERT INTO kv (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)",
-                    (k, value),
-                )?;
-            }
-            t.commit()?;
-            Ok(())
+            Ok(self.c.query_drop(Dialect::Mysql.kv_upsert(keys, value))?)
         }
 
         fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64> {
@@ -2179,10 +2256,9 @@ pub mod sql {
                 "SET SESSION tidb_replica_read = 'leader'"
             })?;
             self.follower = own;
-            let n: Option<i64> = self.c.exec_first(
-                "SELECT count(*) FROM events WHERE session = ? AND seq <= ?",
-                (session, upto),
-            )?;
+            let n: Option<i64> = self
+                .c
+                .query_first(Dialect::Mysql.count("events", session, upto, true))?;
             Ok(u64::try_from(n.unwrap_or(0))?)
         }
     }
@@ -2572,10 +2648,53 @@ mod tests {
             )))
             .is_ok()
         );
+        let e = parse(&args(&format!(
+            "{served} --hosts local=127.0.0.1 --class persisted --spanning 2"
+        )))
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("--spanning"), "{e}");
         let e = parse(&args("--scale regionloss --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --lose 3 --settle-s 1 --after-s 1 --poll-us 10")).err().unwrap().to_string();
         assert!(e.contains("--lose"), "{e}");
         let e = parse(&args("--scale xgroup --system tidb --nodes 3 --groups 2 --writers 2 --deadline-s 5 --keys 30 --span 3 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
         assert!(e.contains("--span"), "{e}");
+    }
+
+    // AC-SH.3: every system over the network is sent a write as one statement, its rows as
+    // literals, quoted as its dialect reads them.
+    #[test]
+    fn ac_sh_3_every_system_is_sent_one_statement_a_write() {
+        let rows = [
+            Row {
+                session: "s-000001".into(),
+                seq: 7,
+                region: 2,
+                body: "it's a \\ b".into(),
+            },
+            Row {
+                session: "s-000001".into(),
+                seq: 8,
+                region: 2,
+                body: "c".into(),
+            },
+        ];
+        assert_eq!(
+            Dialect::Standard.upsert(false, &rows),
+            "INSERT INTO events (session, seq, body) VALUES ('s-000001', 7, 'it''s a \\ b'), ('s-000001', 8, 'c') ON CONFLICT (session, seq) DO UPDATE SET body = excluded.body"
+        );
+        assert_eq!(
+            Dialect::Mysql.upsert(true, &rows),
+            "INSERT INTO regional (region, session, seq, body) VALUES ('r2', 's-000001', 7, 'it''s a \\\\ b'), ('r2', 's-000001', 8, 'c') ON DUPLICATE KEY UPDATE body = VALUES(body)"
+        );
+        assert_eq!(
+            Dialect::Standard.kv_upsert(&[3, 13], 5),
+            "UPSERT INTO kv (k, v) VALUES (3, 5), (13, 5)"
+        );
+        assert_eq!(
+            Dialect::Mysql.count("events", "s-000001", 9, true),
+            "SELECT count(*) FROM events WHERE session = 's-000001' AND seq <= 9"
+        );
     }
 
     // G13 step 1: the competitors split where Amphora's groups divide, and a key's group is the

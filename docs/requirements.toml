@@ -1286,9 +1286,11 @@ title = "Amphora, CockroachDB and TiDB measured by one client on one platform: e
 criteria = [
   { id = "AC-SH.1", text = "amphora-bench --scale drives all three through the same closed-loop writers and timing, each over the network by its own wire client (Amphora's client protocol, Postgres wire, MySQL wire), each system's own processes on the same machines, OS, disk and filesystem (native by default; containers for all or none)" },
   { id = "AC-SH.2", text = "Every scale record says which client and platform produced it: host, OS, kernel, arch, how the system ran, its wire client and the binaries' folder" },
+  { id = "AC-SH.3", text = "Every system over the network is sent the same work the same way: each write, read and transaction one SQL statement as text with its values as literals, one round trip, committed on its own (Amphora's client protocol takes text only, so Postgres's simple query protocol and MySQL's text protocol for the others); each record says so" },
 ]
 tests = [
-  { id = "T-SH.1", text = "scale::tests::g13_scale_inputs_are_required_not_picked — passes when the served amphora system is refused without --hosts or --class, as the others are, and amphora-inproc keeps the in-process flags" },
+  { id = "T-SH.1", text = "scale::tests::g13_scale_inputs_are_required_not_picked — passes when the served amphora system is refused without --hosts or --class, as the others are, refused --spanning under the persisted class, and amphora-inproc keeps the in-process flags" },
+  { id = "T-SH.2", text = "scale::tests::ac_sh_3_every_system_is_sent_one_statement_a_write — passes when a write of several rows is one upsert statement in each dialect, its literals quoted as that dialect reads them" },
 ]
 
 # lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,
