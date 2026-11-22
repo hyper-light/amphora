@@ -1138,3 +1138,8 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   within W days from the install's authority and asks each member to `reload`: new links use the
   new files, no restart; the member wakes on that request (Amphora has no file-change source yet:
   inotify, kqueue and ReadDirectoryChangesW are the proposal). Untested on Linux yet.
+  Lane production-7: a log write the disk refuses ends the member at once: the replica fences,
+  and the fence now wakes the member's sender (`drain_wait`), which used to sleep out its
+  deadline. A member with `drills = off` refuses `disk` and `cut`, and `cluster.sh install`
+  refuses `--drills on` with the certificates it issues, so a production install can't hang a
+  disk. Untested on Linux yet.
