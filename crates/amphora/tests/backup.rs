@@ -1442,7 +1442,7 @@ fn archive_through(shipper: &mut Shipper, db: &Db, blobs: &dyn Blobs, now: &Atom
     shipper.ship(db, blobs, until()).unwrap();
 }
 
-/// T-T1.12.M1: a file far larger than the memory room. Do: write about 3 MB, copy a base under a
+/// T-T1.12.M1: a file far larger than the memory room. Do: write about 4 MB, copy a base under a
 /// 64 KiB budget, another use taking the room once mid-copy; restore under the same budget. Expect:
 /// each chunk, read and sealed, fits the room (so the first chunk is no larger than the rest), the
 /// chunk taken while the room is gone refused typed and copied once it's back, every charge given
@@ -1451,7 +1451,7 @@ fn archive_through(shipper: &mut Shipper, db: &Db, blobs: &dyn Blobs, now: &Atom
 fn t_t1_12_m1_a_file_far_larger_than_the_room() {
     let dir = tempfile::tempdir().unwrap();
     let blobs = SimBlobs::new(1 << 30, 1 << 20, 1 << 30);
-    let (db, mut shipper, model, now, second) = written(dir.path(), 700, &blobs);
+    let (db, mut shipper, model, now, second) = written(dir.path(), 1000, &blobs);
     let limit = 64 * 1024u64;
     let memory = room(limit);
     let file = std::fs::metadata(dir.path().join("source.db"))
