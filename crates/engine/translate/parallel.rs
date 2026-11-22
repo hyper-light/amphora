@@ -563,6 +563,7 @@ fn scan_order<'p>(
         if nulls.is_some() {
             return None;
         }
+        let expr: &'p Expr = expr;
         let column = match expr {
             Expr::Column {
                 table: t, column, ..
@@ -1107,7 +1108,7 @@ fn stored(joined: &JoinedTable) -> Option<&BTreeTable> {
         || table.root_page <= 0
         || table.has_virtual_columns()
         || table.columns().iter().any(|c| {
-            c.is_generated() || (c.default.is_some() && table.is_strict() && custom(&c.ty_str))
+            c.is_generated() || (c.default.is_some() && table.is_strict && custom(&c.ty_str))
         })
     {
         return None;
