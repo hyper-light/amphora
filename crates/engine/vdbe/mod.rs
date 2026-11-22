@@ -3016,8 +3016,21 @@ impl Program {
             if transaction_finished {
                 // Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage's transaction ends
                 // where the pager's does.
-                self.connection
-                    .each_versioned(|switch| switch.finish(rollback))?;
+                let ended = self
+                    .connection
+                    .each_versioned(|switch| switch.finish(rollback));
+                // A skipping summary that took this writer's writes holds the newest commit once
+                // it committed, and is stale if it didn't: on the versioned storage the writer's
+                // end is told, not read from the positions.
+                if self.connection.versioned_for(crate::MAIN_DB_ID).is_some() {
+                    let writer = self.connection.skipping_id();
+                    if rollback || ended.is_err() {
+                        self.connection.db.skipping.rolled_back(writer);
+                    } else {
+                        self.connection.db.skipping.committed(writer);
+                    }
+                }
+                ended?;
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
                 // snapshot after every statement inside an explicit

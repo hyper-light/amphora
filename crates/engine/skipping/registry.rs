@@ -12,6 +12,12 @@
 //! table, so it is marked [`SkipRefusal::Stale`] until built again.
 //!
 //! The registry is pure: the caller passes each connection's identity and WAL positions.
+//!
+//! On the versioned storage (G7 step 2, `AC-NS.2.1`) writers don't take one write lock: another
+//! may commit while one is open. So a write there is taken with [`SkipRegistry::on_write_told`]:
+//! the positions are commit timestamps, the writer's end is told ([`SkipRegistry::committed`],
+//! [`SkipRegistry::rolled_back`]) rather than read from them, and a second open writer's write
+//! makes the summary stale.
 
 use super::{Candidates, RowWrite, SkipError, SkipMethod, Skipping};
 use crate::sync::Mutex;
@@ -55,6 +61,9 @@ pub struct SkipCounts {
 struct Pending {
     writer: usize,
     base: WalPos,
+    /// Its end is told, not read from the positions: on the versioned storage another writer may
+    /// commit while it is open, so a newer commit doesn't mean it committed.
+    told: bool,
 }
 
 #[derive(Debug)]
@@ -123,6 +132,34 @@ impl SkipRegistry {
         write: RowWrite,
         now: &mut dyn FnMut() -> u64,
     ) {
+        self.write_by(root_page, writer, committed, false, write, now)
+    }
+
+    /// The write hook on the versioned storage (G7 step 2, `AC-NS.2.1`): as
+    /// [`SkipRegistry::on_write`], by `writer` whose snapshot is the newest commit `committed`,
+    /// whose end the caller tells with [`SkipRegistry::committed`] or
+    /// [`SkipRegistry::rolled_back`]. A write while another writer's is open makes the summary
+    /// stale: it would hold two open transactions' rows.
+    pub fn on_write_told(
+        &self,
+        root_page: i64,
+        writer: usize,
+        committed: WalPos,
+        write: RowWrite,
+        now: &mut dyn FnMut() -> u64,
+    ) {
+        self.write_by(root_page, writer, committed, true, write, now)
+    }
+
+    fn write_by(
+        &self,
+        root_page: i64,
+        writer: usize,
+        committed: WalPos,
+        told: bool,
+        write: RowWrite,
+        now: &mut dyn FnMut() -> u64,
+    ) {
         let mut entries = self.entries.lock();
         let Some(entry) = entries
             .iter_mut()
@@ -130,9 +167,17 @@ impl SkipRegistry {
         else {
             return;
         };
+        if entry
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.told && p.writer != writer)
+        {
+            entry.stale = true;
+        }
         entry.pending = Some(Pending {
             writer,
             base: committed,
+            told,
         });
         entry.counts.writes = entry.counts.writes.saturating_add(1);
         if entry.stale {
@@ -140,6 +185,17 @@ impl SkipRegistry {
         }
         if entry.skipping.on_write_timed(write, now).is_err() {
             entry.stale = true;
+        }
+    }
+
+    /// `writer` committed its transaction on the versioned storage (G7 step 2, `AC-NS.2.1`): the
+    /// newest commit holds the writes each summary took from it.
+    pub fn committed(&self, writer: usize) {
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            if entry.pending.as_ref().is_some_and(|p| p.writer == writer) {
+                entry.pending = None;
+            }
         }
     }
 
@@ -193,7 +249,7 @@ impl SkipRegistry {
         let own_write = match &entry.pending {
             Some(p) if p.writer == reader => true,
             // The writer committed since its writes: the newest commit holds them.
-            Some(p) if p.base != committed => {
+            Some(p) if !p.told && p.base != committed => {
                 entry.pending = None;
                 false
             }

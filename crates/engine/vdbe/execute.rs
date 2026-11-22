@@ -1975,15 +1975,17 @@ fn skip_walk_for(
     if conn.mvcc_enabled() {
         return None;
     }
-    let root = match state.get_cursor(cursor_id) {
-        Cursor::BTree(cursor, ..) => {
-            if !cursor.has_rowid() || !Arc::ptr_eq(&cursor.get_pager(), &conn.get_pager()) {
-                return None;
-            }
-            cursor.root_page()
-        }
-        _ => return None,
-    };
+    // G7 step 2 (`AC-NS.2.1`): a table on the versioned storage is read through a cursor of its
+    // own (`Cursor::Dyn`), its root page the tree's id the summary is kept by.
+    let cursor = state.get_cursor(cursor_id);
+    if !matches!(cursor, Cursor::BTree(..) | Cursor::Dyn(..)) {
+        return None;
+    }
+    let cursor = cursor.as_btree_mut();
+    if !cursor.has_rowid() || !Arc::ptr_eq(&cursor.get_pager(), &conn.get_pager()) {
+        return None;
+    }
+    let root = cursor.root_page();
     let registry = &conn.db.skipping;
     let column = registry.column_of(root)?;
     // Lane skip-usable (T-SKU.1): a parameter's bound value is read as the scan starts.
@@ -12958,18 +12960,17 @@ fn skipping_integer(value: Option<&Value>) -> Option<i64> {
 /// of the old row (captured before the write).
 fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite) {
     let registry = &program.connection.db.skipping;
-    match program.connection.skipping_positions() {
-        Some((_, committed)) => {
+    match program.connection.skipping_write_base() {
+        Some((committed, told)) => {
             // Lane skip-5 (T-SKU.5): each measured summary's write upkeep is timed.
             let origin = std::time::Instant::now();
             let mut now = || crate::skipping::nanos_since(origin);
-            registry.on_write(
-                root,
-                program.connection.skipping_id(),
-                committed,
-                write,
-                &mut now,
-            )
+            let writer = program.connection.skipping_id();
+            if told {
+                registry.on_write_told(root, writer, committed, write, &mut now)
+            } else {
+                registry.on_write(root, writer, committed, write, &mut now)
+            }
         }
         None => registry.mark_stale(root),
     }

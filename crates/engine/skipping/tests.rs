@@ -1728,3 +1728,133 @@ mod chooser {
         assert_eq!(trials, 1, "{:?}", chooser.stats());
     }
 }
+
+/// G7 step 2 (`AC-NS.2.1`): the summaries on the versioned storage, where writers take no single
+/// write lock: a scan asks the summary, and a writer's end is told rather than read from the
+/// positions.
+mod versioned {
+    use super::super::{
+        set_skipping, skipping_candidates, skipping_counts, RowWrite, SkipKind, SkipRefusal,
+        SkipRegistry, Skipping, ZoneMapBuilder,
+    };
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+    use crate::{ConnectOpts, Connection, Database, SqliteDialect, Value};
+
+    /// A query's rowids and the rows its scan read (the statement's counter).
+    fn rowids(conn: &Arc<Connection>, sql: &str) -> (Vec<i64>, u64) {
+        let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let rows = stmt
+            .run_collect_rows()
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .into_iter()
+            .map(|row| match row.first() {
+                Some(Value::Numeric(crate::Numeric::Integer(rowid))) => *rowid,
+                other => panic!("{sql}: rowid {other:?}"),
+            })
+            .collect();
+        (rows, stmt.metrics().rows_read)
+    }
+
+    /// Do: a told writer's write, another writer's commit beside it, then its own commit told.
+    /// Expect: a reader at the newest commit is refused until the writer's commit is told (a
+    /// newer commit isn't its commit); the writer sees its own rows; a second open writer's write
+    /// makes the summary stale.
+    #[test]
+    fn t_ns_2_1_a_told_writer_ends_only_when_told() {
+        let (root, writer, other, reader) = (5, 1, 2, 3);
+        let registry = SkipRegistry::default();
+        let mut zones = ZoneMapBuilder::new();
+        for rowid in 1..=8 {
+            zones.row(rowid, Some(rowid)).unwrap();
+        }
+        registry.set(root, 0, Skipping::ZoneMaps(zones.finish()));
+        let insert = |rowid| RowWrite::Insert {
+            rowid,
+            value: Some(rowid),
+        };
+        registry.on_write_told(root, writer, (0, 3), insert(9), &mut || 0);
+        // Another writer committed beside it: the newest commit is 4, without the open writes.
+        assert_eq!(
+            registry.candidates(root, reader, (0, 4), (0, 4), 1, 9),
+            Err(SkipRefusal::OlderSnapshot)
+        );
+        assert!(registry
+            .candidates(root, writer, (0, 3), (0, 4), 1, 9)
+            .is_ok());
+        registry.committed(writer);
+        assert!(registry
+            .candidates(root, reader, (0, 5), (0, 5), 1, 9)
+            .is_ok());
+        registry.on_write_told(root, writer, (0, 5), insert(10), &mut || 0);
+        registry.on_write_told(root, other, (0, 5), insert(11), &mut || 0);
+        assert_eq!(
+            registry.candidates(root, other, (0, 5), (0, 5), 1, 11),
+            Err(SkipRefusal::Stale)
+        );
+    }
+
+    /// Do: a summary of each kind on a versioned table, a SQL filter, writes through SQL, and a
+    /// reader whose snapshot is older than a commit. Expect: the scan asks the summary (counted
+    /// consulted, fewer rows read) and answers as without it; the older reader is refused and
+    /// still sees its snapshot's rows.
+    #[test]
+    fn t_ns_2_1_a_scan_on_the_versioned_storage_asks_the_summary() {
+        let sql = "SELECT rowid FROM t WHERE a BETWEEN 100 AND 120 ORDER BY rowid";
+        for kind in [SkipKind::ZoneMaps, SkipKind::Cracking, SkipKind::Measured] {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            assert!(conn.versioned_for(crate::MAIN_DB_ID).is_some());
+            conn.execute("CREATE TABLE t (a INTEGER, pad TEXT)")
+                .unwrap();
+            conn.execute("BEGIN").unwrap();
+            for i in 0..3000 {
+                conn.execute(format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(40)))
+                    .unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+            let (plain, read_plain) = rowids(&conn, sql);
+            assert_eq!(plain, (101..=121).collect::<Vec<_>>());
+            set_skipping(&conn, "t", "a", Some(kind)).unwrap();
+            let (skipped, read_skipped) = rowids(&conn, sql);
+            assert_eq!(skipped, plain, "{kind:?}");
+            assert!(
+                read_skipped < read_plain,
+                "{kind:?}: read {read_skipped} rows skipping, {read_plain} not"
+            );
+            assert_eq!(
+                skipping_counts(&conn, "t").unwrap().consulted,
+                1,
+                "{kind:?}"
+            );
+            // Writes reach the summary through the hook, each committed and told.
+            conn.execute("DELETE FROM t WHERE a = 110").unwrap();
+            conn.execute("INSERT INTO t VALUES (105, 'new')").unwrap();
+            let mut expected: Vec<i64> = (101..=121).filter(|rowid| *rowid != 111).collect();
+            expected.push(3001);
+            assert_eq!(rowids(&conn, sql).0, expected, "{kind:?}");
+            let counts = skipping_counts(&conn, "t").unwrap();
+            assert_eq!((counts.writes, counts.consulted), (2, 2), "{kind:?}");
+            // A reader whose snapshot a commit passed is refused, and reads its snapshot whole.
+            let reader = db
+                .connect(ConnectOpts::new().with_versioned_storage())
+                .unwrap();
+            reader.execute("BEGIN").unwrap();
+            let (before, _) = rowids(&reader, sql);
+            assert_eq!(before, expected, "{kind:?}");
+            conn.execute("DELETE FROM t WHERE a BETWEEN 100 AND 120")
+                .unwrap();
+            assert_eq!(
+                skipping_candidates(&reader, "t", 100, 120),
+                Err(SkipRefusal::OlderSnapshot),
+                "{kind:?}"
+            );
+            assert_eq!(rowids(&reader, sql).0, before, "{kind:?}");
+            reader.execute("COMMIT").unwrap();
+            assert!(rowids(&reader, sql).0.is_empty(), "{kind:?}");
+        }
+    }
+}

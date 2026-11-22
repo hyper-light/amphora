@@ -398,6 +398,19 @@ impl Switch {
             .is_some_and(|t| t.lock().as_ref().is_some_and(|t| t.wrote()))
     }
 
+    /// The connection's snapshot and the newest commit published, as commit timestamps, for the
+    /// skipping summaries (G7 step 2, `AC-NS.2.1`): the open transaction's start, or with none
+    /// open the newest commit, where the connection's next read begins.
+    pub(crate) fn skipping_positions(&self) -> (super::version::Ts, super::version::Ts) {
+        let newest = self.db.newest();
+        let start = self
+            .txn
+            .lock()
+            .as_ref()
+            .and_then(|shared| shared.lock().as_ref().map(|txn| txn.start));
+        (start.unwrap_or(newest), newest)
+    }
+
     /// The connection's transaction, begun if none is open.
     fn txn(&self) -> Result<SharedTxn> {
         let mut slot = self.txn.lock();
