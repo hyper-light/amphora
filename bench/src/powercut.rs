@@ -101,7 +101,12 @@ pub fn main() -> anyhow::Result<()> {
                 },
                 other => anyhow::bail!("--engine amphora|sqlite|postgres (got {other:?})"),
             };
-            bench(&target, writers()?, commits)
+            bench(
+                &target,
+                writers()?,
+                commits,
+                args.iter().any(|a| a == "--hold"),
+            )
         }
         Some("check") => {
             let acks = flag("--acks")
@@ -110,7 +115,7 @@ pub fn main() -> anyhow::Result<()> {
         }
         Some("span") => span(&name()?),
         other => anyhow::bail!(
-            "usage: amphora-bench --powercut write|check|span|bench --dir <dir> [--writers <n>] [--acks <file>] [--engine amphora|sqlite|postgres --commits <n> --dsn <libpq string>] (got {other:?})"
+            "usage: amphora-bench --powercut write|check|span|bench --dir <dir> [--writers <n>] [--acks <file>] [--engine amphora|sqlite|postgres --commits <n> --dsn <libpq string> --hold] (got {other:?})"
         ),
     }
 }
@@ -409,6 +414,9 @@ impl Target {
                     "engine": "postgres",
                     "version": show("server_version")?,
                     "fsync": show("fsync")?,
+                    "shared_buffers": show("shared_buffers")?,
+                    "work_mem": show("work_mem")?,
+                    "max_connections": show("max_connections")?,
                     "synchronous_commit": "on",
                     "wal_sync_method": show("wal_sync_method")?,
                     "full_page_writes": show("full_page_writes")?,
@@ -421,36 +429,64 @@ impl Target {
 /// `--powercut bench`: `commits` durable single-row commits from `writers` writers, each its own
 /// thread and connection running [`writes`], the same loop for every engine; prints one JSON line:
 /// commits a second and each commit's time from first try to acknowledgement at p50, p99 and p99.9.
-/// The clock starts once every writer has connected and stops when the last commit is in.
-fn bench(target: &Target, writers: u64, commits: u64) -> anyhow::Result<()> {
+/// The clock starts once every writer has connected and stops when the last commit is in. With
+/// `hold`, every connection stays open after the last commit while the harness reads what the run
+/// holds (bench/commits_fit.py: its open files, a server's memory): `held` on stderr, then it waits
+/// for stdin to close before the connections do (T-T1.4.1).
+fn bench(target: &Target, writers: u64, commits: u64, hold: bool) -> anyhow::Result<()> {
     let engine = target.prepare()?;
-    let start = std::sync::Barrier::new(usize::try_from(writers)?.saturating_add(1));
+    let all = usize::try_from(writers)?.saturating_add(1);
+    let (start, done, release) = (
+        std::sync::Barrier::new(all),
+        std::sync::Barrier::new(all),
+        std::sync::Barrier::new(all),
+    );
     let (began, results) = std::thread::scope(|s| -> anyhow::Result<_> {
         let threads = (0..writers)
             .map(|w| {
-                let start = &start;
+                let (start, done, release) = (&start, &done, &release);
                 // Writer w's share of the commits: an even split, the remainder to the first ones.
                 let quota = commits / writers + u64::from(w < commits % writers);
                 std::thread::Builder::new()
                     .name(format!("commits-{w}"))
                     .spawn_scoped(s, move || -> anyhow::Result<(Vec<u64>, u64)> {
-                        let c = target.connect();
+                        let mut c = target.connect();
                         start.wait();
-                        let mut c = c?;
-                        let mut times = Vec::with_capacity(usize::try_from(quota)?);
-                        if quota == 0 {
-                            return Ok((times, 0));
-                        }
-                        let refused = writes(c.as_mut(), w, writers, |_, took| {
-                            times.push(u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
-                            Ok(u64::try_from(times.len())? < quota)
-                        })?;
-                        Ok((times, refused))
+                        // Every writer reaches both barriers, its connection still open, whatever
+                        // its commits came to: none is left waiting on one that ended early.
+                        let got = (|| -> anyhow::Result<(Vec<u64>, u64)> {
+                            let c = c.as_mut().map_err(e)?;
+                            let mut times = Vec::with_capacity(usize::try_from(quota)?);
+                            if quota == 0 {
+                                return Ok((times, 0));
+                            }
+                            let refused = writes(c.as_mut(), w, writers, |_, took| {
+                                times.push(u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
+                                Ok(u64::try_from(times.len())? < quota)
+                            })?;
+                            Ok((times, refused))
+                        })();
+                        done.wait();
+                        release.wait();
+                        drop(c);
+                        got
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
         start.wait();
         let began = Instant::now();
+        done.wait();
+        let took = began.elapsed();
+        let held = if hold {
+            // Every connection open, the last commit in: the harness reads what the run holds.
+            eprintln!("held");
+            let mut rest = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut rest).map(|_| ())
+        } else {
+            Ok(())
+        };
+        release.wait();
+        held?;
         let mut results = Vec::with_capacity(threads.len());
         for t in threads {
             results.push(
@@ -458,7 +494,7 @@ fn bench(target: &Target, writers: u64, commits: u64) -> anyhow::Result<()> {
                     .map_err(|_| anyhow::anyhow!("a writer's thread panicked"))??,
             );
         }
-        Ok((began.elapsed(), results))
+        Ok((took, results))
     })?;
     let refused: u64 = results.iter().map(|(_, r)| r).sum();
     let mut times: Vec<u64> = results.into_iter().flat_map(|(t, _)| t).collect();
