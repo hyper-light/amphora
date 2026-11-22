@@ -254,6 +254,9 @@ pub struct Machine {
     // bound): usize::MAX where nothing carries it but memory. The image's room is the memory
     // budget's room for one, no more than this (SB.1).
     image_cap: usize,
+    /// The bytes an image may take on its log's filesystem, as its owner's flushing thread last
+    /// read them (`log_bound::image_disk_room`; QB.1).
+    image_disk: usize,
     // A test's stand-in for the filesystem's free bytes, read in place of the filesystem's own.
     #[cfg(test)]
     free_bytes: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
@@ -561,6 +564,7 @@ impl Machine {
             #[cfg(test)]
             class_changes: 0,
             image_cap: usize::MAX,
+            image_disk: usize::MAX,
             #[cfg(test)]
             free_bytes: std::sync::Arc::default(),
             #[cfg(test)]
@@ -617,10 +621,16 @@ impl Machine {
     pub(crate) fn set_snapshot_bytes(&mut self, bytes: usize) {
         self.image_cap = bytes;
     }
+    /// Bounds this machine's images to `bytes` on its log's filesystem: the share of its free
+    /// bytes an image may take beside the replica logs there, as a checkpoint pass read them
+    /// (`log_bound::image_disk_room`; QB.1).
+    pub(crate) fn set_image_disk(&mut self, bytes: u64) {
+        self.image_disk = usize::try_from(bytes).unwrap_or(usize::MAX);
+    }
     /// The most an image of this machine may take now: the memory budget's room for one, no more
-    /// than its carrier holds (SB.1).
+    /// than its carrier holds (SB.1) or its share of the disk (QB.1).
     fn snapshot_bytes(&self) -> Result<usize, Refusal> {
-        Ok(image_room()?.min(self.image_cap))
+        Ok(image_room()?.min(self.image_cap).min(self.image_disk))
     }
 
     /// The class this member's owner states, held to the group's record from now on: refused,

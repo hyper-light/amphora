@@ -909,6 +909,9 @@ struct Pass {
     /// The frames the log may hold, from the filesystem's free bytes as read after the pass
     /// (`log_bound::log_room`).
     room: u64,
+    /// The bytes one image may take on the log's filesystem, read with `room`
+    /// (`log_bound::image_disk_room`; QB.1); with the free bytes unread, no bound from the disk.
+    image: u64,
     /// Why the free bytes couldn't be read, if they couldn't: the log is then held to its file's
     /// room, and a submit refused past it says why.
     unread: Option<String>,
@@ -977,7 +980,7 @@ impl Flushing {
                             Err(e) => Err(format!("a checkpoint failed: {e:#}")),
                         };
                         match said.and_then(|copied| {
-                            let (room, unread) = room(&copier, &mut free, &share)?;
+                            let (room, image, unread) = room(&copier, &mut free, &share)?;
                             let through = copier.durable_frame();
                             let caught_up = copied.is_some_and(|c| {
                                 c.left == 0
@@ -987,6 +990,7 @@ impl Flushing {
                                 caught_up,
                                 busy: copied.is_none(),
                                 room,
+                                image,
                                 unread,
                             })
                         }) {
@@ -1001,7 +1005,7 @@ impl Flushing {
                 }
             })
             .map_err(unavailable)?;
-        let (room, unread) = first;
+        let (room, image, unread) = first;
         Ok(Self::Thread {
             ask,
             done,
@@ -1010,14 +1014,29 @@ impl Flushing {
                 caught_up: false,
                 busy: false,
                 room,
+                image,
                 unread,
             },
         })
     }
 }
 
-/// The most an image of this owner's machine may take now: the memory budget's room for one (SB.1).
-/// The owner's machine holds it inside its command queue's bound too (`queue_bounds`).
+impl Flushing {
+    /// The bytes one image may take on the log's filesystem, as the last checkpoint pass read
+    /// them (QB.1); a test's held flushing reads none.
+    fn image_disk(&self) -> u64 {
+        match self {
+            Self::Thread { pass, .. } => pass.image,
+            #[cfg(test)]
+            Self::Held => u64::MAX,
+        }
+    }
+}
+
+/// The most an image of this owner's machine may take now in memory: the memory budget's room for
+/// one (SB.1), held inside its command queue's bound too (`queue_bounds`). On disk it takes no more
+/// than its share beside the replica logs there (`log_bound::image_disk_room`; QB.1), read on the
+/// flushing thread and set on the machine (`Machine::set_image_disk`).
 fn owner_image_room() -> Result<usize, Refusal> {
     let room = crate::memory::process().room(crate::memory::Use::Queues)?;
     let room = usize::try_from(room).unwrap_or(usize::MAX);
@@ -1095,25 +1114,30 @@ fn queue_bounds(
 }
 
 /// The frames the database's log may hold now, read on the flushing thread: its file's room and
-/// an equal share of what its filesystem has free (`log_bound::log_room`). Free bytes that can't
-/// be read give no share, and say why; a file whose length can't be read fails the pass.
+/// an equal share of what its filesystem has free past one image (`log_bound::log_room`), with the
+/// bytes that image may take on the disk (`log_bound::image_disk_room`; QB.1). An image takes the
+/// smaller of its memory room and its disk share, so the log keeps room beside one image. Free
+/// bytes that can't be read give no share and no disk bound, and say why; a file whose length
+/// can't be read fails the pass.
 fn room(
     copier: &Db,
     free: &mut crate::replication::FreeSpace,
     share: &LogShare,
-) -> Result<(u64, Option<String>), String> {
+) -> Result<(u64, u64, Option<String>), String> {
     let kept = copier
         .log_frames()
         .map_err(|e| format!("the database log's length couldn't be read: {e:#}"))?;
     let logs = share.logs().map_err(|e| e.to_string())?;
     Ok(match free() {
         Ok(available) => {
+            let disk = log_bound::image_disk_room(available, logs);
             let image = owner_image_room().map_err(|e| e.to_string())?;
-            let image = u64::try_from(image).unwrap_or(u64::MAX);
-            (log_bound::log_room(available, image, logs, kept), None)
+            let image = u64::try_from(image).unwrap_or(u64::MAX).min(disk);
+            (log_bound::log_room(available, image, logs, kept), disk, None)
         }
         Err(e) => (
             kept,
+            u64::MAX,
             Some(format!("its filesystem's free bytes couldn't be read: {e}")),
         ),
     })
@@ -1639,6 +1663,7 @@ fn open_on<F: BlockFile + 'static>(
     let meter = Arc::new(ReplicaMeter::default());
     let bell = Bell::new();
     let flushing = Flushing::start(&machine, Arc::clone(&meter), account(), Arc::clone(&bell))?;
+    machine.set_image_disk(flushing.image_disk());
     let reader = machine.reader();
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
@@ -2363,6 +2388,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                         self.replica.machine_mut().flushed_through(flushed.at);
                         *out = false;
                         if let Some(said) = flushed.pass {
+                            self.replica.machine_mut().set_image_disk(said.image);
                             *pass = said;
                         }
                     }
@@ -8447,19 +8473,23 @@ mod tests {
         driven.owner(0).replica.core().raft.config().election_tick
     }
 
-    /// T-QB.1.4 (QB.1) on driven time: a bound that starts at one message grows before it fences.
-    /// Do: a lone member of three campaigns, sending its vote requests in one step (more than the
-    /// one message its outgoing queue starts bounded at), its host draining after each tick, for
-    /// ten election timeouts. Expect: never fenced, and the outgoing bound grown past one message
-    /// once the host's drain is measured.
+    /// T-QB.1.4 (QB.1) on driven time: a bound starts at the budget's room for queues, so a burst
+    /// before any drain is measured never fences, and is learned from the host's drain after.
+    /// Do: a lone member of three campaigns, sending its vote requests in one step (a burst past
+    /// one message), its host draining after each tick, for ten election timeouts. Expect: the
+    /// outgoing bound starts at the room, with no count of messages; never fenced; then held to
+    /// a count the host's measured drain gives, no less than one message.
     #[test]
-    fn queue_bound_a_burst_at_start_grows_before_it_fences() {
+    fn queue_bound_a_burst_at_start_is_held_by_the_room() {
         let dir = tempfile::tempdir().unwrap();
         let mut driven = Driven::new();
         let client = driven.open(dir.path(), 1, vec![1, 2, 3], None);
         let election = leader_core_election_tick(&driven);
-        let start = locked(&driven.owner(0).control.outgoing).unwrap().bound;
-        assert_eq!(start.messages, 1, "{start:?}");
+        let outgoing = locked(&driven.owner(0).control.outgoing).unwrap();
+        let (start, room) = (outgoing.bound, outgoing.room);
+        drop(outgoing);
+        assert_eq!(start.bytes, room, "{start:?}");
+        assert_eq!(start.messages, u64::MAX, "{start:?}");
         let mut drained = 0;
         let mut burst = 0;
         for _ in 0..10 * election {
@@ -8472,8 +8502,11 @@ mod tests {
         }
         assert!(burst > 1, "no burst past one message: {burst}");
         assert!(drained > burst, "{drained}");
-        let grown = locked(&driven.owner(0).control.outgoing).unwrap().bound;
-        assert!(grown.messages > 1, "{grown:?}");
+        let learned = locked(&driven.owner(0).control.outgoing).unwrap().bound;
+        assert!(
+            (1..u64::MAX).contains(&learned.messages),
+            "{learned:?}"
+        );
     }
 
     /// AC-T1.8.M1 (CP-T1.8) on driven time (replication.md, "Membership"; kiln plan 01a1a283e14c,
@@ -13688,9 +13721,18 @@ mod tests {
     }
     /// Free bytes that give each of `logs` replica logs on a filesystem `frames` frames past what
     /// its own file holds (`log_bound::log_room`).
+    /// The image takes the smaller of its memory room and its disk share (QB.1): past the memory
+    /// room's own frames, the free bytes are the logs' frames and that room; below it, the image
+    /// takes one log's share.
     fn free_for(frames: u64, logs: u64) -> u64 {
-        u64::try_from(owner_image_room().unwrap()).unwrap()
-            + frames * logs * (log_bound::FRAME_BYTES + crate::db::PAGE_BYTES)
+        let memory = u64::try_from(owner_image_room().unwrap()).unwrap();
+        let each = log_bound::FRAME_BYTES + crate::db::PAGE_BYTES;
+        let past = memory + frames * logs * each;
+        if memory <= log_bound::image_disk_room(past, logs) {
+            past
+        } else {
+            frames * (logs + 1) * each
+        }
     }
     /// The frames owner `owner`'s database log may hold, as it last learned them.
     fn room(clients: &[Client], owner: usize) -> u64 {
@@ -14136,6 +14178,7 @@ mod tests {
             caught_up,
             busy,
             room: 64,
+            image: u64::MAX,
             unread: None,
         };
         assert!(hold_due(&pass(false, false), true, true));
@@ -14443,8 +14486,11 @@ mod tests {
         }
         assert_eq!(logs(), 1);
         let free = free_for(64, 2);
-        let image = u64::try_from(owner_image_room().unwrap()).unwrap();
-        assert!(log_bound::log_room(free, image, 1, 0) > log_bound::log_room(free, image, 2, 0));
+        let memory = u64::try_from(owner_image_room().unwrap()).unwrap();
+        let image = |logs| memory.min(log_bound::image_disk_room(free, logs));
+        assert!(
+            log_bound::log_room(free, image(1), 1, 0) > log_bound::log_room(free, image(2), 2, 0)
+        );
         drop(clients);
     }
 
