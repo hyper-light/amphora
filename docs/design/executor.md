@@ -402,9 +402,10 @@ VDBE's join in its order (T-QT.6.8); an INTEGER PRIMARY KEY reads its rowid (T-Q
 whose whole work is one rowid table read whole with its filter and aggregates is emitted as
 `Insn::MorselAggregate` and a row loop over `Insn::MorselNext`, ahead of the statement's serial
 loop (`translate/parallel.rs`). Only shapes whose answers equal the serial loop's qualify: columns
-stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no defaults, no generated
-columns), terms comparing a column with a literal of its own kind or testing it for NULL,
-plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX, and no HAVING, ORDER BY,
+stored as written (INTEGER, TEXT or BLOB affinity, BINARY collation, no generated columns, a
+short row padded with its columns' defaults), terms comparing a column with a literal of its own kind or testing it for NULL,
+plain-column GROUP BY keys, COUNT, SUM over INTEGER columns, MIN and MAX (in the copied body, AVG
+and TOTAL over integers too), and no HAVING, ORDER BY,
 LIMIT, DISTINCT, window or subquery; MVCC and the versioned storage, whose rows are not in the
 pager's b-trees, never qualify. When the run meets a value its aggregates don't take (a SUM over
 text) it jumps to the serial loop, so the answer never depends on the switch. Groups come out in
@@ -500,7 +501,7 @@ serial loop at 1, 2, 3, 4 and 8 stated cores, and that the body ran over every r
 no GROUP BY and no ORDER BY emits the same copy of the loop body with the result columns as its
 outputs (`MorselBody::rows`); each worker (`TableBodyRows`) keeps the output rows of the rows that
 pass, tagged with its morsel's first leaf, and the runs are joined in leaf order, so the rows come
-out as the serial loop gives them. An ORDER BY stays serial: its sorter orders ties its own way.
+out as the serial loop gives them. An ORDER BY stayed serial here; lane qs6-17 sorts it on morsels (below).
 
 **Workers stop early under a LIMIT** (lane qs6-8). With a LIMIT, the body carries the rows the
 LIMIT and OFFSET take (`want`). A shared count of the rows kept is checked before each morsel is
@@ -531,8 +532,252 @@ taken only when the ORDER BY holds every table's INTEGER PRIMARY KEY. The counte
 `morsel_join_links` counts the hash tables built. T-QT.6.17 checks random joins of three and four
 tables against the serial loop at 1, 2, 3, 4 and 8 stated cores.
 
-**Not yet.** Joins still run the pipeline's own probe loop, so only the filters `Predicate` holds
-run in a join's workers; outer joins stay serial.
+**A join's workers run the copy of the loop body** (lane qs6-12). A join's filters and outputs
+are no longer only what `Predicate` and `Aggregate` hold: the hook emits the copy of the serial
+loop's body (`MorselBody`) over the joined row, each table's columns read from registers at its
+place in the chain (the probe's first, then each link's), the probe's rowid its own and a link's
+its INTEGER PRIMARY KEY. The equalities that key the chain stay the hash tables' keys, and a term a
+table's own `Predicate` holds is still tested on that table's rows, before the probe or the
+build; every other term (functions, CASE, LIKE, a comparison of two tables' columns, an equality of
+two kinds) and every output (GROUP BY values, aggregate inputs, result columns, then the ORDER BY
+keys) run in the body, per joined row, through the VDBE's own opcodes (`TableJoinAggregate` and
+`TableJoinRows` hold the body; a join has no other path). The tie argument that held a join's
+columns to INTEGER and TEXT now holds of any value but one: an INTEGER and a REAL can compare equal
+and differ, so a REAL in a GROUP BY value, a MIN's or a MAX's input (`MorselBody::no_real`), as in
+a SUM's, sends the statement to the serial loop, and the serial loop's order of a probe row's
+matches can't change the answer. ORDER BY keys stay plain columns of INTEGER or TEXT affinity, so
+the workers' sort is the serial sorter's. T-QT.6.18 checks random joins of two, three and four
+tables whose filters and outputs only the body states against the serial loop at 1, 2, 3, 4 and
+8 stated cores.
+
+**Outer joins** (lane qs6-12). A LEFT, RIGHT (which the planner turns into a LEFT with the tables
+swapped) or FULL join of two rowid tables runs on morsels too, whatever loop the planner chose for
+it (it makes no FULL hash join): the probe is the table the join may pad with NULLs, the build the
+other, keyed by the ON equalities of columns of one affinity (`MorselOuter`, `TableOuterJoin`).
+ON terms decide which rows match and WHERE terms test the joined row, matched or padded, so they
+are kept apart: only an ON equality is a key; the body's ON terms (`MorselBody::on`) run first, and
+a row that passes them matched; the WHERE terms and the outputs follow. A table's own term is
+tested on its rows only where that drops no row the join keeps: in a LEFT join an ON term on the
+probe and a WHERE term on the build; in a FULL join, none. The build keeps its rows with a NULL key
+(they match nothing, and still appear). Each worker marks the build rows its probe rows matched in
+a bitmap of its own, a bit per row charged to the statement's budget; the bitmaps merge by OR as
+the partials do, and the build rows no worker marked then run the body in morsels of build rows
+(`TableOuterRest`), padded with NULLs for the probe's side, its rowid NULL. A FULL join's probe row
+that matched nothing runs padded with NULLs for the build's side, by the worker that read it. Rows
+come out as the probe's morsels in leaf order, then the padded build rows in build order, sorted
+by a stable merge under an ORDER BY. A LIMIT or OFFSET, a join of more tables with an outer one, a
+RIGHT join the planner keeps as one, and semi and anti joins stay serial. T-QT.6.19 checks random
+LEFT, RIGHT and FULL joins, ON terms on either table or both beside the keys and WHERE terms that
+read the padded side's NULLs, against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**A body of nothing but reads** (lane qs6-13). Running the copied body on every joined row costs
+a simple join what the direct fold of lanes qs6-9 and qs6-10 did not: every column of every table
+written into registers and the body's code stepped, where the fold read only the columns its
+aggregates named. A join's body with no ON or WHERE term left past the hash keys and the tables'
+own `Predicate`s, and every output a column or a rowid of the joined row, gets `MorselBody::direct`,
+each output's place in the joined row (the very register the body's copy reads); with
+`Connection::set_parallel_join_direct` on, a worker copies those values and runs no code, `no_real`
+still checked. Off by default (the body runs, as lane qs6-12 left it) until the A/B decides:
+T-QT.6.20 times simple joins on 054ace65 (the fold) and here (body, and direct) at 1 to 32 cores,
+p50, p99 and p99.9; T-QT.6.21 checks direct against the serial loop. An outer join never copies.
+
+**Outer joins under a LIMIT, and LEFT joins among more tables** (lane qs6-13). An outer join's
+rows are cut by a LIMIT or OFFSET as an inner join's are: only when the ORDER BY holds every
+table's INTEGER PRIMARY KEY. A padded row's NULL key still tells it apart, since a row is padded at
+most once, so the sorted rows are the serial loop's to the row (T-QT.6.22). A LEFT join among
+three or more tables (`MorselOuter::LeftLink`) puts its padded table last in the chain of hash
+tables and probes with a table it keeps: each joined row of the others is probed in that last
+link, the ON terms run on each match (`MorselBody::on`), and a row none of whose matches passed
+them, or with none, runs once more padded with NULLs for that link's columns, tested by the WHERE
+terms alone. No bitmaps: the rows a LEFT join keeps are the probe's own walk. Only an ON equality
+with the padded table keys its link; an equality with it in the WHERE clause, or an ON term
+between the tables it keeps, is the body's; an ON term on the padded table alone filters its
+build, a WHERE term on it does not (T-QT.6.23).
+
+**Outer joins of any kind among any number of tables** (lane qs6-14). A RIGHT or FULL JOIN among
+three or more tables, or more than one outer join in a statement, runs as `MorselOuter::Chain`
+(`TableChain`): the tables joined in the FROM clause's order, as SQL states the joins, the first
+the probe and each other a link of the chain, keyed by its own ON equalities with the tables before
+it and marked with what it keeps (`MorselKeeps`: LEFT the left rows, RIGHT the right rows, FULL
+both). A probe row walks the chain depth first, an explicit stack as deep as the chain. At each
+link a match runs the link's own ON code (`MorselBody::links_on`, a block per link, over the row
+up to it); one that passes goes on to the next link, and a row of the tables before it that no
+match passed goes on once padded with NULLs when the link keeps the left rows. A link that keeps
+the right rows marks the build rows matched in each worker's own bitmap. The walk runs in phases:
+the probe's leaves, then for each link that keeps the right rows, in the chain's order, its build
+rows no worker marked, padded with NULLs for the tables before it, walk the rest of the chain. A
+link's bitmaps are merged only once every phase that can reach it has run: the probe's, and each
+earlier such link's padded rows. Every row at the chain's end runs the WHERE terms and the
+outputs. Where terms run: a link's own ON term over its table alone filters its build unless the
+link keeps its right rows; its other ON terms run in its ON code (an ON term reading a table after
+its link declines). A WHERE term acts early only at the probe or an inner link with no link after
+it that keeps its right rows (such a link's padded rows skip the earlier tests, and every row that
+reaches it marks its build rows whatever the WHERE terms later say): there a term over one table
+filters that table and an equality with an earlier table keys the link. Every other WHERE term runs
+over the whole row. The two-table shapes and one LEFT join among more keep their own paths
+(T-QT.6.24 for FULL joins among three and four tables, T-QT.6.25 for two or more outer joins).
+
+**Two orientations of a two-table outer join, behind a switch** (lane qs6-15; steps 1 and 2 of
+lane qs6-14's plan). `Connection::set_parallel_outer_probe` picks which table a two-table LEFT or
+FULL JOIN probes, for statements prepared after: `OuterJoinProbe::Padded` (the default, today's)
+probes the table the join pads and marks the kept table's matched rows in a bitmap per worker,
+padding the unmarked ones once the bitmaps merge (`TableOuterJoin`); `OuterJoinProbe::Kept` probes
+the kept table (a FULL join's left one) through the chain, padding a kept row no match passed
+during the walk (`TableChain`; a FULL join's right rows still take the link's bitmap). A LEFT join
+among more tables and the chain's joins have the one orientation the chain can state (the kept
+tables probe, the padded link pads in the walk), whatever the switch says. What each did is
+counted on the connection (`OuterCounters`: rows padded during the walk, rows padded after the
+bitmaps merged, the bitmap words the workers held, statements per path) and traced per statement
+(target `amphora.morsel`, "outer join on morsels"). Every outer-join test (T-QT.6.19, T-QT.6.22 to
+T-QT.6.25) runs at both settings; T-QT.6.19 also checks each setting ran its own path.
+
+**The extremes that tell them apart** (lane qs6-16; step 3 of qs6-14's plan). T-QT.6.26, a harness
+in `vdbe/morsel_join_ab.rs`, runs LEFT and FULL joins (counts, a GROUP BY, rows) at both settings
+and a ladder of stated cores on four pairs of tables with unique keys, each forcing one
+orientation's failure mode: a tiny padded table against a huge kept one (`Padded` hashes and marks
+the huge one), a huge padded table against a tiny kept one (`Kept` hashes the huge one), every key
+but one matched on each side (the bitmaps' rest pass finds nothing) and one key matched (all of it
+padded). Per scenario, query, setting and cores it reports p50, p99 and p99.9, the statements each
+path ran and those that fell back to the serial loop, the rows padded each way and the bitmap
+words per statement, and the bytes charged to the statement's memory budget, the mean and the most
+(`OuterCounters::charged_bytes`, `charged_peak`; a budget is not credited back within its
+statement, so a statement's charge bounds what it held at once).
+
+**A table the planner reads by a seek, as a link, behind a switch** (lane qs6-16).
+Planned by cost, a join onto a primary key or an indexed column is an index nested loop: the
+joined table is read by a seek per row of the tables before it (`Search::RowidEq`, `Search::Seek`),
+and the hook declined it, so the commonest join of all ran on the serial loop unless the planner
+chose a hash join somewhere in it. `Connection::set_parallel_searched_links` (`SearchedLinks::Off`,
+today's, the control) lets `shape_join` and `shape_chain` take such a table past the first as a
+link keyed by its equalities with the tables before it, as they already take a seek in an index
+the statement builds. It is correct because the hook tests every term, consumed or not, on the
+joined row: the rows a seek skips fail the terms it was made from. Two candidates, for the
+measurements to decide between: `Hash` reads the table whole into a hash link, which pays
+against a large probe and loses against a small one (a probe of a few rows, or a seek on a
+constant); `Seek` reads an inner join's link keyed by the table's INTEGER PRIMARY KEY by a seek per
+joined row, each worker with a cursor of its own (`SeekLink`, `TableSource::seek_row`; its other
+key pairs compared as the hash table compares keys, its own terms tested on the row found), no
+table built and nothing charged, as the serial loop reads it; any other searched link is a hash
+link there too. `MorselJoinData::searched` marks such a link; `morsel_searched_links` and
+`morsel_seek_links` count them (T-QT.6.27). T-QT.6.28, a harness beside T-QT.6.26, forces each
+candidate's failure mode on a join onto a primary key: a tiny probe against a huge table (`Hash`
+reads it all), a huge probe against a tiny one (`Seek` seeks per row where a small hash table
+would do), and equal sizes, with p50, p99 and p99.9 and the links per statement at each setting
+and stated cores.
+
+**A table with a DEFAULT on morsels** (lane qs6-17). A row written before ALTER TABLE ADD COLUMN
+is shorter than its table, and the serial loop's Column reads the missing column as its default,
+folded with the column's affinity (`vdbe/builder.rs`'s `folded_default`, SQLite's
+sqlite3ColumnDefault; NULL where there is none or it doesn't fold). `stored` refused every table
+with a default, so a table that had ever gained a column ran serially. Now `parallel.rs`'s
+`defaults` takes each column's value from the same `folded_default`, into
+`MorselAggregateData::defaults` and `MorselJoinData::defaults` (empty when all are NULL, so the
+common table pads nothing), and `TableSource` pads a short row with them, on scans and seeks
+alike. Left serial: a STRICT table's custom-typed column with a default (the serial loop ENCODEs
+it at run time), generated columns, and the versioned storage's column copy of such a table.
+T-QT.6.29 checks scans' aggregates, groups and rows and joins with such columns on either side
+against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**AVG and TOTAL on morsels** (lane qs6-17). The serial loop sums AVG's and TOTAL's values as
+doubles with a compensated (Kahan-Babuska-Neumaier) sum, in row order. Over integers whose
+magnitudes sum below 2^53, the integers a double holds exactly (its 53-bit significand, IEEE 754
+binary64), every partial sum in any order is exact and the compensation is zero, so the serial
+answer is the exact sum, as a double, divided by the count for AVG. The copied body's aggregates
+(`body_outputs`, scans and joins alike) now take `Aggregate::Avg` and `Aggregate::Total`: each
+worker keeps the exact sum, the sum of magnitudes and the count, merged once. A REAL among the
+values goes to the serial loop as a SUM's does (`no_real`), and so does a statement whose
+magnitudes reach 2^53 (`MorselError::Unsupported` at the finish). T-QT.6.30 checks them bit for
+bit against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**Aggregates with a FILTER on morsels** (lane qs6-17). An aggregate's FILTER (WHERE c) skips the
+rows where c doesn't hold; every aggregate the pipeline folds skips a NULL input, so the copied
+body reads the input as NULL on such a row (`BodyPlan::agg_filters`: the FILTER tested as the
+serial loop tests a condition, by `translate_condition_expr`, before the input's expression), and
+COUNT(*) FILTER (WHERE c) is COUNT over c itself, which is never NULL where it holds. With no row
+passing, each aggregate gives what it gives over no rows (COUNT 0, SUM, MIN, MAX and AVG NULL,
+TOTAL 0.0), as the serial loop does. A body that is nothing but reads has no FILTER to test, so a
+FILTER keeps the statement off the direct path. T-QT.6.31 checks them in scans and joins against
+the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**A HAVING over the aggregates on morsels** (lane qs6-17). The planner moves a HAVING's terms over
+the group keys alone into the WHERE; what is left is the row loop's to test once the groups are
+made. With a HAVING, the hook loads every aggregate's value after the result columns
+(`MorselAggregateData::result_map` grows by one place per aggregate, `MorselNext` fills them, and
+`ResultRow` returns only the result columns), rewrites each aggregate in the HAVING's terms to the
+register its value is loaded into (`having_terms`), and tests them with `translate_condition_expr`
+as the serial loop does, a group that fails going on to the next. Only terms over the aggregates
+and constants qualify: a group key or a bare column read through a register would lose its
+column's affinity in a comparison, which the serial loop applies, so those stay serial. A HAVING
+with no GROUP BY is a GROUP BY of no keys, its one group tested the same way. T-QT.6.32 checks
+them in scans and joins against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**A rowid range on morsels** (lane qs6-17). A one-table statement the planner reads by a forward
+search of the table b-tree between integer literals (`Search::Seek` with no index, no prefix, no
+skip: `WHERE id > 4000`, `rowid BETWEEN 300 AND 5500`) ran serially. `scanned_rowids` takes the
+search's least and greatest rowid, each inclusive, into `MorselAggregateData::rowid_range`, and
+`TableSource::restrict` keeps the leaves that may hold them: the first whose greatest rowid
+reaches the lower bound, through the first whose greatest rowid reaches the upper (two binary
+searches over the leaves' bounds the open already found), its first morsel seeking past the
+leaf before. The morsels are cut from those leaves as from a whole table. The rows of the end
+leaves past the bounds are still read, so the terms the search was made from are tested on every
+row, consumed or not. A backward search (its rows come out in the other order), a bound that is
+no integer literal (a parameter, an expression) and a seek through an index stay serial.
+T-QT.6.33 checks ranges against the serial loop at 1, 2, 3, 4 and 8
+stated cores, and that the body ran over fewer rows than the table holds. A join's tables take
+the same ranges (`shape_join` and `shape_chain`; `MorselJoinData::rowid_range` for a link, whose
+build reads only its leaves too), since the hook tests every term, consumed or not, on the joined
+row. Leaves drop the rows outside the range before the join, which is right only where each such
+row fails a term of an inner join, so in a statement with an outer join every range is read
+whole and the terms decide (a kept table's row outside an ON term's range is still kept).
+T-QT.6.35 checks inner and outer joins over ranges against the serial loop.
+
+**A scan's rows under ORDER BY on morsels** (lane qs6-17). A one-table scan's rows under an ORDER
+BY ran serially. They now sort as a join's rows do: `scan_order` takes keys that are the table's
+columns (or its rowid) of INTEGER or TEXT affinity and BINARY collation, no NULLS FIRST or LAST
+named, so the workers' comparison is the serial sorter's, and appends them to the body's outputs
+after the result columns (`MorselRows`, in `MorselAggregateData::joined_rows`). Each worker sorts
+its morsel's rows (`TableBodyRows::order`), and the runs, put in leaf order, are merged by a
+stable merge sort, so rows equal under the keys keep their rowid order. A sorted scan never stops
+early: the hook's row loop counts the LIMIT and OFFSET down over the merged rows, and it takes
+one only when the keys hold the rowid, which tells every row apart, so the rows cut are the
+serial loop's to the row. Only forward scans qualify now: a backward scan may stand for an ORDER
+BY ... DESC the planner removed, and the morsels' rows come out in rowid order. T-QT.6.34 checks
+them against the serial loop at 1, 2, 3, 4 and 8 stated cores.
+
+**What still runs on the serial loop** (lane qs6-16's audit, updated by lane qs6-17; each an open
+part of QT.6):
+- *A join's rows under a LIMIT whose ORDER BY doesn't hold every table's INTEGER PRIMARY KEY.* The
+  answer is the serial loop's rows exactly, and a probe row's matches come in its hash tables'
+  order, not the hook's. Parallel needs an order the hook can reproduce (or a check of any rows of
+  the right count, as SQL allows) and the scans' early stop.
+- *The merge join* (lane qs5-21): not on this branch; once it is an `Operation`, it is taken as a
+  hash link (as above), or run by key ranges cut at the driving table's leaves.
+- *Correlated subqueries* (`non_from_clause_subqueries`, `outer_query_refs`, `Exists`, `InSelect`):
+  the subquery's code needs cursors of its own in each worker; the unnesting the planner already
+  does turns some into joins, which do run on morsels.
+- *Window functions* (`plan.window`): need a parallel sort, partitioned by PARTITION BY across the
+  workers, and a frame pass per partition.
+- *Recursive CTEs*: each round needs the last; a round's scan or join could run on morsels once an
+  ephemeral table (the queue) is a morsel source (`stored` takes only b-tree tables with a root
+  page).
+- *Scans on the versioned storage*: its pager holds no table's rows, so every statement its column
+  copy doesn't take (joins, expressions only the body states, rows, a statement in a transaction
+  that wrote, a table with no copy yet, or the planner's choice of the rows) runs on the serial
+  loop. Needs a morsel source over the row versions at the statement's snapshot, cut by key ranges.
+- Also found: a table with a generated column (`stored`); a STRICT table's custom-typed column
+  with a DEFAULT, which the serial loop ENCODEs at run time; a table whose short rows read a
+  default, on the versioned storage's column copy, which decodes records as written; a scan
+  through an index or a rowid range whose bounds aren't integer literals (`Operation::Search`;
+  a rowid range is a run of leaves, `TableSource::restrict`); a one-table
+  scan's rows under an ORDER BY on an expression, with NULLS FIRST or LAST, or with a LIMIT whose
+  keys don't hold the rowid, and a backward scan; AVG and TOTAL over REALs or past 2^53, group_concat and DISTINCT
+  aggregates, a HAVING over a group key or a bare column, and
+  an ORDER BY the GROUP BY can't take (on an aggregate's value) or a LIMIT over groups; DISTINCT, compound SELECTs, INSERT ... SELECT and
+  other statements that don't return rows; joins with no equality of one affinity (a cross
+  product, a range join).
+
+**Not yet.** One path for LEFT joins: which orientation wins, or a choice per query from measured
+costs, is T-QT.6.26's run of record to say (qs6-14's plan, step 4: the leftover paths removed).
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

@@ -216,6 +216,43 @@ pub struct ReparseSchemaInner {
     phase: ReparsePhase,
 }
 
+/// Amphora (QT.6, lane qs6-15): which table an outer join of two tables probes when it runs on
+/// morsels (`Connection::set_parallel_outer_probe`): the two orientations of one join, both kept
+/// so measurements can decide between them (qs6-14's plan for unifying the outer-join paths, steps
+/// 1 and 2). A LEFT join's kept table is its left one; a FULL join keeps both, and its two
+/// orientations probe its right table or its left one. A LEFT join among more tables and the
+/// chain's joins have one orientation only (the kept tables probe and the padded link pads
+/// during the walk), whichever this says.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum OuterJoinProbe {
+    /// Probe the table the join pads with NULLs (a FULL join's right one): the kept table is the
+    /// hash table, each worker marks the rows of it that matched in a bitmap of its own, and the
+    /// rows no worker marked are padded once the bitmaps merge (lane qs6-12). Today's path, the
+    /// default.
+    Padded = 0,
+    /// Probe the kept table (a FULL join's left one): the padded table is the hash table, and a
+    /// kept row no match passed is padded during the walk, as the chain's LEFT link does (lane
+    /// qs6-14). A FULL join's right rows still take the chain's bitmap.
+    Kept = 1,
+}
+
+/// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row of
+/// the tables before it (a rowid lookup, or a seek in one of its indexes) runs on morsels
+/// (`Connection::set_parallel_searched_links`): the candidates, kept so measurements decide.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum SearchedLinks {
+    /// Today's, the default: the hook declines such a join unless the planner chose a hash join
+    /// somewhere in it, and the serial loop answers.
+    Off = 0,
+    /// The table is a hash link, read whole once and keyed by its equalities with the tables
+    /// before it: pays against a large probe, loses against a small one.
+    Hash = 1,
+    /// Each worker seeks the table's row by its rowid per joined row, with a cursor of its own,
+    /// as the serial loop does, no table built: an inner join keyed by the table's INTEGER
+    /// PRIMARY KEY only; any other such link is a hash link, as with `Hash`.
+    Seek = 2,
+}
+
 /// Amphora: the join methods newly prepared statements may plan (`Connection::set_join_methods`):
 /// by cost, or one method only, for the tests that run every join both ways and the measurement
 /// of each method's time (`bench/join_methods`; query-speed step 5, QT.5).
@@ -697,6 +734,14 @@ pub struct Connection {
     pub(super) parallel_mode: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_limit`].
     pub(super) parallel_limit: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_cores`]; 0 is the machine's every core.
+    pub(super) parallel_cores: std::sync::atomic::AtomicUsize,
+    /// Amphora: see [`Connection::set_parallel_join_direct`].
+    pub(super) parallel_join_direct: AtomicBool,
+    /// Amphora: see [`Connection::set_parallel_outer_probe`].
+    pub(super) parallel_outer_probe: AtomicOuterJoinProbe,
+    /// Amphora: see [`Connection::set_parallel_searched_links`].
+    pub(super) parallel_searched_links: AtomicSearchedLinks,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
@@ -704,6 +749,14 @@ pub struct Connection {
     pub(crate) morsel_body_rows: AtomicU64,
     /// Amphora (QT.6, lane qs6-10): the hash tables the hook built for joins, a chain's links each.
     pub(crate) morsel_join_links: AtomicU64,
+    /// Amphora: the joined rows whose outputs were copied, no body run (lane qs6-13).
+    pub(crate) morsel_join_direct_rows: AtomicU64,
+    /// Amphora (QT.6, lane qs6-15): what the outer joins on morsels did in each orientation.
+    pub(crate) morsel_outer: crate::vdbe::morsel_scan::OuterCounters,
+    /// Amphora (QT.6, lane qs6-16): the links built from a table the planner reads by a seek,
+    /// and of those, the ones read by a seek per joined row.
+    pub(crate) morsel_searched_links: AtomicU64,
+    pub(crate) morsel_seek_links: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.
@@ -1287,6 +1340,60 @@ impl Connection {
     /// control), the serial loop answers them. It counts only with the parallel mode on.
     pub fn set_parallel_limit(&self, on: bool) {
         self.parallel_limit.store(on, Ordering::Release);
+    }
+
+    /// Amphora (QT.6, lane qs6-12): the most cores the morsel workers may use, the machine's
+    /// measured count or fewer (`None`: every core). For the scaling harness's ladder of cores
+    /// (`amphora-bench --planner --cores`); the cost model still picks the workers up to it.
+    pub fn set_parallel_cores(&self, cores: Option<std::num::NonZeroUsize>) {
+        self.parallel_cores.store(
+            cores.map_or(0, std::num::NonZeroUsize::get),
+            Ordering::Release,
+        );
+    }
+
+    /// Amphora (QT.6, lane qs6-13, T-QT.6.21): whether a join's workers copy the outputs of a
+    /// loop body that is nothing but reads (no ON or WHERE term past the keys, every output a
+    /// column or rowid) straight from the joined row instead of running the body's code. Off
+    /// (the body runs on every joined row, lane qs6-12) until the A/B of T-QT.6.20 decides.
+    pub fn set_parallel_join_direct(&self, on: bool) {
+        self.parallel_join_direct.store(on, Ordering::Release);
+    }
+
+    /// Amphora (QT.6, lane qs6-15): which table an outer join of two tables probes on morsels,
+    /// for statements prepared after ([`OuterJoinProbe`]; `Padded`, today's, by default). Both
+    /// orientations answer alike; the switch is for the measurements that decide between them.
+    pub fn set_parallel_outer_probe(&self, probe: OuterJoinProbe) {
+        self.parallel_outer_probe.set(probe);
+        // The orientation is chosen at prepare: cached statements prepare again.
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn parallel_outer_probe(&self) -> OuterJoinProbe {
+        self.parallel_outer_probe.get()
+    }
+
+    /// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row
+    /// of the tables before it runs on morsels, for statements prepared after ([`SearchedLinks`];
+    /// `Off`, today's, by default: such a join, the commonest of foreign key to primary key, runs
+    /// on the serial loop unless the planner chose a hash join somewhere in it). Every setting
+    /// answers alike; the switch is for the measurements that decide between them.
+    pub fn set_parallel_searched_links(&self, links: SearchedLinks) {
+        self.parallel_searched_links.set(links);
+        // The shape is chosen at prepare: cached statements prepare again.
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn parallel_searched_links(&self) -> SearchedLinks {
+        self.parallel_searched_links.get()
+    }
+
+    pub(crate) fn parallel_join_direct(&self) -> bool {
+        self.parallel_join_direct.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn parallel_cores(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(self.parallel_cores.load(Ordering::Acquire))
     }
 
     pub(crate) fn parallel_limit(&self) -> bool {

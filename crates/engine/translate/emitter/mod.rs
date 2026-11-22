@@ -229,6 +229,12 @@ pub struct Resolver<'a> {
     /// Amphora (PL.8, lane pl8-16): the share of a plan's cost a carried join order may cost past
     /// the search's best (`LearnedCosts::cost_margin`); set at prepare.
     join_margin: f64,
+    /// Amphora (QT.6, lane qs6-15): which table a two-table outer join on morsels probes
+    /// (`Connection::set_parallel_outer_probe`).
+    outer_probe: crate::OuterJoinProbe,
+    /// Amphora (QT.6, lane qs6-16): whether a table read by a seek may be a morsel join's hash
+    /// link (`Connection::set_parallel_searched_links`).
+    searched_links: crate::SearchedLinks,
     /// Amphora: whether the planner may choose a sorted fetch (`Connection::set_sorted_fetches`).
     sorted_fetches: bool,
     /// Amphora (PL.13): whether index nested loops carry a hash join to switch to
@@ -378,6 +384,8 @@ impl<'a> Resolver<'a> {
             join_orders: None,
             carried_join_orders: None,
             join_margin: 0.0,
+            outer_probe: crate::OuterJoinProbe::Padded,
+            searched_links: crate::SearchedLinks::Off,
             sorted_fetches: false,
             adaptive_joins: false,
             automatic_indexes: true,
@@ -552,6 +560,22 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    pub(crate) fn outer_probe(&self) -> crate::OuterJoinProbe {
+        self.outer_probe
+    }
+
+    pub(crate) fn set_outer_probe(&mut self, probe: crate::OuterJoinProbe) {
+        self.outer_probe = probe;
+    }
+
+    pub(crate) fn searched_links(&self) -> crate::SearchedLinks {
+        self.searched_links
+    }
+
+    pub(crate) fn set_searched_links(&mut self, links: crate::SearchedLinks) {
+        self.searched_links = links;
+    }
+
     pub(crate) fn sorted_fetches(&self) -> bool {
         self.sorted_fetches
     }
@@ -620,6 +644,8 @@ impl<'a> Resolver<'a> {
             join_orders: self.join_orders.clone(),
             carried_join_orders: self.carried_join_orders.clone(),
             join_margin: self.join_margin,
+            outer_probe: self.outer_probe,
+            searched_links: self.searched_links,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,
@@ -666,6 +692,8 @@ impl<'a> Resolver<'a> {
             join_orders: self.join_orders.clone(),
             carried_join_orders: self.carried_join_orders.clone(),
             join_margin: self.join_margin,
+            outer_probe: self.outer_probe,
+            searched_links: self.searched_links,
             sorted_fetches: self.sorted_fetches,
             adaptive_joins: self.adaptive_joins,
             automatic_indexes: self.automatic_indexes,

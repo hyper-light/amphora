@@ -210,6 +210,8 @@ pub fn translate(
         prepare_options.carried_join_orders.clone(),
         connection.db.learned_costs.cost_margin(),
     );
+    resolver.set_outer_probe(connection.parallel_outer_probe());
+    resolver.set_searched_links(connection.parallel_searched_links());
     resolver.set_sorted_fetches(connection.sorted_fetches());
     resolver.set_adaptive_joins(connection.adaptive_joins());
     resolver.set_automatic_indexes(connection.automatic_indexes());

@@ -1350,6 +1350,37 @@ Lane qs6-10: inner joins of any number of tables run on morsels: every table but
 link of a chain of hash tables, each keyed by its equalities with the tables before it, and each
 probe row walks the chain (T-QT.6.17). Still open: the copy of the loop body for joins, outer joins.
 
+Lane qs6-12: a join's workers run the copy of the serial loop's body over each joined row, so any
+filter or output the serial loop runs runs in a join's workers too; a REAL where it could tie with
+an INTEGER sends the statement to the serial loop (T-QT.6.18). LEFT, RIGHT and FULL joins of two
+tables run on morsels: ON terms decide matches and WHERE terms test the padded rows; each worker
+marks the build rows it matched in its own bitmap, the bitmaps merge by OR, and the unmatched build
+rows run padded with NULLs in morsels of their own (T-QT.6.19). Lane qs6-13: a join whose body is nothing but
+reads can copy its outputs from the joined row without running the body, behind
+`set_parallel_join_direct` (off) until the A/B of simple joins against 054ace65 decides (T-QT.6.20,
+T-QT.6.21); ClickHouse loads JOB's backslash-escaped CSV as TabSeparated. Outer joins run on
+morsels under a LIMIT when the ORDER BY tells every row apart (T-QT.6.22), and a LEFT join among
+three or more tables runs with its padded table as the chain's last link (T-QT.6.23). Lane qs6-14:
+FULL and RIGHT joins among three or more tables, and statements with more than one outer join, run
+on morsels as one chain in the FROM clause's order, each link's ON terms tested at that link, the
+rows a link keeps padded there, and the build rows a RIGHT or FULL link keeps that nothing matched
+walked through the rest of the chain once its bitmaps merge (T-QT.6.24, T-QT.6.25). Lane qs6-15:
+a two-table LEFT or FULL join's orientation is a switch (`Connection::set_parallel_outer_probe`:
+the padded table probed with a bitmap, today's default, or the kept table probed through the
+chain, padded during the walk), counted and traced per statement; every outer-join test runs at
+both settings, and the scaling run decides between them. Lane qs6-16: T-QT.6.26, a harness of the two
+orientations at the extremes (a tiny padded table against a huge kept one and the reverse, nearly
+every row matched, nearly none), with each statement's memory; a join's table the planner reads
+by a seek (onto a primary key or an indexed column) runs on morsels behind
+`set_parallel_searched_links` (`Off` until measured): as a hash link read whole (`Hash`), or for an
+inner join onto a primary key, by a seek per joined row in each worker (`Seek`) (T-QT.6.27); the
+audit of what still runs serially is in docs/design/executor.md. Lane qs6-17 took the audit's cheap
+and common items: a table with a DEFAULT (short rows read their defaults, T-QT.6.29); AVG and TOTAL
+over integers (T-QT.6.30); aggregates with a FILTER (T-QT.6.31); a HAVING over the aggregates
+(T-QT.6.32); a rowid range, cut into morsels from the leaves that hold it, in scans and inner joins
+(T-QT.6.33, T-QT.6.35); and a scan's rows under ORDER BY, sorted per worker and merged (T-QT.6.34).
+Not yet compiled (kiln down).
+
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.
 

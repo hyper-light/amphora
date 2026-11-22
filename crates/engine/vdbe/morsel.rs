@@ -118,7 +118,10 @@ fn nanos(duration: Duration) -> f64 {
 /// run: its cores, what starting a worker costs, and what one dispatch (a morsel claimed) costs.
 #[derive(Clone, Debug)]
 pub struct MachineCosts {
+    /// The cores the runs may use: the machine's, or fewer when capped.
     cores: NonZeroUsize,
+    /// The machine's cores, measured or stated.
+    machine: NonZeroUsize,
     worker_start: MeanNanos,
     dispatch: MeanNanos,
 }
@@ -129,6 +132,7 @@ impl MachineCosts {
         let cores = std::thread::available_parallelism().map_err(MorselError::Cores)?;
         let mut costs = MachineCosts {
             cores,
+            machine: cores,
             worker_start: MeanNanos::default(),
             dispatch: MeanNanos::default(),
         };
@@ -155,6 +159,7 @@ impl MachineCosts {
     pub fn stated(cores: NonZeroUsize, worker_start_nanos: f64, dispatch_nanos: f64) -> Self {
         let mut costs = MachineCosts {
             cores,
+            machine: cores,
             worker_start: MeanNanos::default(),
             dispatch: MeanNanos::default(),
         };
@@ -165,6 +170,11 @@ impl MachineCosts {
 
     pub fn cores(&self) -> NonZeroUsize {
         self.cores
+    }
+
+    /// Caps the cores the runs may use at `cap`, never past the machine's (`None`: every core).
+    pub fn cap(&mut self, cap: Option<NonZeroUsize>) {
+        self.cores = cap.map_or(self.machine, |cap| cap.min(self.machine));
     }
 
     pub fn worker_start(&self) -> MeanNanos {
@@ -651,7 +661,7 @@ pub(crate) enum KeyPart {
 const I64_LOW: f64 = -9_223_372_036_854_775_808.0;
 const I64_HIGH: f64 = 9_223_372_036_854_775_808.0;
 
-fn key_part(value: &Value) -> KeyPart {
+pub(crate) fn key_part(value: &Value) -> KeyPart {
     match value {
         Value::Null => KeyPart::Null,
         Value::Numeric(Numeric::Integer(i)) => KeyPart::Int(*i),
@@ -765,7 +775,16 @@ pub enum Aggregate {
     Sum(usize),
     Min(usize),
     Max(usize),
+    /// AVG and TOTAL over integers (lane qs6-17): the serial loop sums them as doubles, which is
+    /// exact while the sum of their magnitudes stays within a double's exact integers.
+    Avg(usize),
+    Total(usize),
 }
+
+/// Integers a double holds exactly: below 2^53, its significand's 53 bits (IEEE 754 binary64).
+/// While the magnitudes of AVG's or TOTAL's integers sum below it, every partial sum the serial
+/// loop's compensated double sum takes, in any order, is exact, and so equals the exact sum.
+const DOUBLE_EXACT: u128 = 1 << 53;
 
 #[derive(Clone, Debug)]
 enum Accumulator {
@@ -777,6 +796,14 @@ enum Accumulator {
         reals: ExactSum,
         any_real: bool,
         seen: bool,
+    },
+    /// AVG or TOTAL over integers: their exact sum, the sum of their magnitudes (the bound of
+    /// every partial sum in any order) and how many there were (lane qs6-17).
+    Mean {
+        integers: i128,
+        magnitude: u128,
+        count: u64,
+        total: bool,
     },
     /// The least or greatest value with the row it came from; ties keep the earliest row.
     Extreme {
@@ -802,6 +829,12 @@ impl Accumulator {
             Aggregate::Max(_) => Accumulator::Extreme {
                 best: None,
                 greatest: true,
+            },
+            Aggregate::Avg(_) | Aggregate::Total(_) => Accumulator::Mean {
+                integers: 0,
+                magnitude: 0,
+                count: 0,
+                total: matches!(aggregate, Aggregate::Total(_)),
             },
         }
     }
@@ -842,6 +875,37 @@ impl Accumulator {
                     reals.add(f64::from(*f))?;
                     *any_real = true;
                     *seen = true;
+                }
+                Value::Text(_) => return Err(MorselError::Unsupported { kind: "TEXT" }),
+                Value::Blob(_) => return Err(MorselError::Unsupported { kind: "BLOB" }),
+            },
+            (
+                Accumulator::Mean {
+                    integers,
+                    magnitude,
+                    count,
+                    ..
+                },
+                Aggregate::Avg(at) | Aggregate::Total(at),
+            ) => match column(row, at)? {
+                Value::Null => {}
+                Value::Numeric(Numeric::Integer(i)) => {
+                    *integers =
+                        integers
+                            .checked_add(i128::from(*i))
+                            .ok_or(MorselError::Overflow {
+                                what: "an average's sum",
+                            })?;
+                    *magnitude = magnitude.checked_add(u128::from(i.unsigned_abs())).ok_or(
+                        MorselError::Overflow {
+                            what: "an average's sum",
+                        },
+                    )?;
+                    *count = count.saturating_add(1);
+                }
+                // The serial loop's compensated double sum over REALs isn't the exact sum.
+                Value::Numeric(Numeric::Float(_)) => {
+                    return Err(MorselError::Unsupported { kind: "REAL" })
                 }
                 Value::Text(_) => return Err(MorselError::Unsupported { kind: "TEXT" }),
                 Value::Blob(_) => return Err(MorselError::Unsupported { kind: "BLOB" }),
@@ -896,6 +960,31 @@ impl Accumulator {
                 reals.merge(&more_reals)?;
                 *any_real |= more_real;
                 *seen |= more_seen;
+            }
+            (
+                Accumulator::Mean {
+                    integers,
+                    magnitude,
+                    count,
+                    ..
+                },
+                Accumulator::Mean {
+                    integers: more,
+                    magnitude: more_magnitude,
+                    count: more_count,
+                    ..
+                },
+            ) => {
+                *integers = integers.checked_add(more).ok_or(MorselError::Overflow {
+                    what: "an average's sum",
+                })?;
+                *magnitude =
+                    magnitude
+                        .checked_add(more_magnitude)
+                        .ok_or(MorselError::Overflow {
+                            what: "an average's sum",
+                        })?;
+                *count = count.saturating_add(more_count);
             }
             (
                 Accumulator::Extreme { best, greatest },
@@ -960,6 +1049,31 @@ impl Accumulator {
                 reals.add(piece(50, LOW_50)?)?;
                 reals.add(piece(0, LOW_50)?)?;
                 Value::from_f64(reals.value())
+            }
+            // Past a double's exact integers the serial loop's rounding is its own: it answers.
+            Accumulator::Mean { magnitude, .. } if magnitude >= DOUBLE_EXACT => {
+                return Err(MorselError::Unsupported {
+                    kind: "an average past a double's exact integers",
+                })
+            }
+            Accumulator::Mean {
+                total: false,
+                count: 0,
+                ..
+            } => Value::Null,
+            Accumulator::Mean {
+                integers,
+                count,
+                total,
+                ..
+            } => {
+                // Below 2^53 in magnitude, so the conversion is exact.
+                let sum = i64::try_from(integers).map_err(|_| MorselError::IntegerOverflow)? as f64;
+                if total {
+                    Value::from_f64(sum)
+                } else {
+                    Value::from_f64(sum / count as f64)
+                }
             }
             Accumulator::Extreme { best, .. } => best.map_or(Value::Null, |(value, _)| value),
         })

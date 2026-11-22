@@ -21376,6 +21376,45 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     }
 }
 
+/// Amphora (QT.6, lane qs6-15): runs an outer join's pipeline and traces what its orientation did
+/// (`path`: the padded table probed with a bitmap, or the chain in the FROM clause's order): the
+/// rows padded during the walk and after the bitmaps merged, and the bitmap words held. The
+/// counters are the connection's, so the differences are this statement's while it alone runs
+/// on the connection, as a connection's statements do. The statement's `budget`, its hash tables
+/// already charged, gives the bytes it held (lane qs6-16).
+fn outer_traced<T>(
+    counts: &crate::vdbe::morsel_scan::OuterCounters,
+    path: &'static str,
+    budget: &crate::vdbe::morsel::MemoryBudget,
+    run: impl FnOnce() -> Result<T, crate::vdbe::morsel::MorselError>,
+) -> Result<T, crate::vdbe::morsel::MorselError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let read = || {
+        (
+            counts.walk_pads.load(Relaxed),
+            counts.bitmap_pads.load(Relaxed),
+            counts.bitmap_words.load(Relaxed),
+        )
+    };
+    let before = read();
+    let answer = run();
+    let after = read();
+    let charged = u64::try_from(budget.used()).unwrap_or(u64::MAX);
+    counts.charged_bytes.fetch_add(charged, Relaxed);
+    counts.charged_peak.fetch_max(charged, Relaxed);
+    tracing::debug!(
+        target: "amphora.morsel",
+        path,
+        walk_pads = after.0.saturating_sub(before.0),
+        bitmap_pads = after.1.saturating_sub(before.1),
+        bitmap_words = after.2.saturating_sub(before.2),
+        charged,
+        ok = answer.is_ok(),
+        "outer join on morsels"
+    );
+    answer
+}
+
 /// Amphora (QT.6): [Insn::MorselAggregate]. The statement's read transaction is open, so every
 /// worker's cursor reads its one snapshot through `pager`.
 pub fn op_morsel_aggregate(
@@ -21384,13 +21423,14 @@ pub fn op_morsel_aggregate(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    use crate::vdbe::insn::MorselOuter;
     use crate::vdbe::morsel::HashProbe;
     use crate::vdbe::morsel::{
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        JoinStage, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
-        TableJoinAggregate, TableJoinRows, TableSource,
+        JoinStage, SeekLink, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
+        TableChain, TableJoinAggregate, TableJoinRows, TableOuterJoin, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -21431,6 +21471,8 @@ pub fn op_morsel_aggregate(
         Some(costs) => costs,
         None => MachineCosts::measure().map_err(refused)?,
     };
+    // The scaling harness's ladder of cores caps them (lane qs6-12).
+    costs.cap(connection.parallel_cores());
     // Each worker's registers start as the statement's are now (the constants the program's
     // start computed among them), with its bound parameters (lane qs6-7).
     let mut registers = Vec::new();
@@ -21452,12 +21494,16 @@ pub fn op_morsel_aggregate(
         parameters.extend(state.parameters.iter().cloned());
     }
     let answered = (|| {
-        let table = TableSource::open(
+        let mut table = TableSource::open(
             pager.clone(),
             data.root_page,
             data.columns,
             data.rowid_alias,
+            data.defaults.clone(),
         )?;
+        // A search by a rowid range reads the leaves that hold it (lane qs6-17).
+        let (lower, upper) = data.rowid_range;
+        table.restrict(lower, upper);
         let budget = MemoryBudget::new(pager.statement_memory_budget());
         if data.joins.is_empty() {
             // A copy of the serial loop's body, run per row by each worker (lane qs6-7).
@@ -21477,6 +21523,7 @@ pub fn op_morsel_aggregate(
                     parameters: &parameters,
                     shape: &shape,
                     ran: &connection.morsel_body_rows,
+                    direct: None,
                 };
                 // A scan's rows: kept in leaf order, the result columns as they stand (lane qs6-8).
                 if body.rows {
@@ -21486,6 +21533,11 @@ pub fn op_morsel_aggregate(
                             .want
                             .map(|want| usize::try_from(want).unwrap_or(usize::MAX)),
                         kept: std::sync::atomic::AtomicUsize::new(0),
+                        // Under an ORDER BY each worker sorts its morsels' rows (lane qs6-17).
+                        order: data
+                            .joined_rows
+                            .as_ref()
+                            .map_or(&[][..], |rows| rows.order.as_slice()),
                     };
                     return rows
                         .run_mode(connection.parallel_mode(), &mut costs, &budget)
@@ -21520,35 +21572,218 @@ pub fn op_morsel_aggregate(
         let mut stages = Vec::new();
         stages.try_reserve_exact(data.joins.len())?;
         for join in &data.joins {
-            let build_table = TableSource::open(
+            let mut build_table = TableSource::open(
                 pager.clone(),
                 join.root_page,
                 join.columns,
                 join.rowid_alias,
+                join.defaults.clone(),
             )?;
+            // A link read by a rowid range reads the leaves that hold it (lane qs6-17).
+            let (lower, upper) = join.rowid_range;
+            build_table.restrict(lower, upper);
+            // A searched table of an inner join keyed by its INTEGER PRIMARY KEY is read by a
+            // seek per joined row when the switch says so (lane qs6-16): no table built.
+            let seek_pair = if join.searched
+                && data.outer.is_none()
+                && connection.parallel_searched_links() == crate::SearchedLinks::Seek
+            {
+                join.rowid_alias
+                    .and_then(|alias| join.build_key.iter().position(|key| *key == alias))
+            } else {
+                None
+            };
+            if let Some(pair) = seek_pair {
+                let rowid_at = *join
+                    .probe_key
+                    .get(pair)
+                    .ok_or(MorselError::Corrupt("a seek link's key without its pair"))?;
+                let mut also = Vec::new();
+                also.try_reserve_exact(join.build_key.len())?;
+                for (at, (probe_at, build_at)) in
+                    join.probe_key.iter().zip(&join.build_key).enumerate()
+                {
+                    if at != pair {
+                        also.push((*probe_at, *build_at));
+                    }
+                }
+                stages.push(JoinStage {
+                    probe: HashProbe::build(&[], &join.build_key, &[], &join.probe_key, &budget)?,
+                    rows: Vec::new(),
+                    seek: Some(SeekLink {
+                        table: build_table,
+                        rowid_at,
+                        also,
+                        filter: join.filter.clone(),
+                    }),
+                });
+                for counter in [
+                    &connection.morsel_join_links,
+                    &connection.morsel_searched_links,
+                    &connection.morsel_seek_links,
+                ] {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                continue;
+            }
             let (rows, hash_table, _) = TableBuild {
                 table: &build_table,
                 filter: &join.filter,
                 key: &join.build_key,
                 partitioner: &partitioner,
+                // An outer join's build rows with a NULL key match nothing, and still appear.
+                // (A LEFT join's last link among more tables pads only the others' rows; a
+                // chain's link keeps them when it keeps its right rows, lane qs6-14.)
+                keep_unkeyed: matches!(data.outer, Some(MorselOuter::Left | MorselOuter::Full))
+                    || join.keeps.right,
             }
             .run_mode(mode, &mut costs, &budget)?;
             stages.push(JoinStage {
                 probe: HashProbe::over(hash_table, &[], &join.probe_key),
                 rows,
+                seek: None,
             });
             connection
                 .morsel_join_links
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if join.searched {
+                connection
+                    .morsel_searched_links
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        // A join's rows, no aggregates: each worker keeps its own leaves' joined rows, merged
+        // Each joined row runs through the copy of the serial loop's body (lane qs6-12).
+        let Some(body) = &data.body else {
+            return Err(MorselError::Corrupt("a join's hook without its loop body"));
+        };
+        let shape = ScanAggregate {
+            rows: &[],
+            filter: &[],
+            group_by: &body.group_by,
+            aggregates: &body.aggregates,
+        };
+        // A join's body of nothing but reads is copied without running it when the switch says so
+        // (lane qs6-13, T-QT.6.21); its rows are counted apart.
+        let direct = if connection.parallel_join_direct() && data.outer.is_none() {
+            body.direct.as_deref()
+        } else {
+            None
+        };
+        let looped = TableBodyAggregate {
+            table: &table,
+            body,
+            program,
+            pager,
+            registers: &registers,
+            parameters: &parameters,
+            shape: &shape,
+            ran: if direct.is_some() {
+                &connection.morsel_join_direct_rows
+            } else {
+                &connection.morsel_body_rows
+            },
+            direct,
+        };
+        // A RIGHT or FULL JOIN among three or more tables, or more than one outer join (lane
+        // qs6-14): the chain walks in phases, its links' bitmaps merged between them.
+        if data.outer == Some(MorselOuter::Chain) {
+            let mut links = Vec::new();
+            links.try_reserve_exact(data.joins.len())?;
+            links.extend(data.joins.iter().map(|join| (join.keeps, join.columns)));
+            let pipeline = TableChain {
+                table: &table,
+                probe_filter: &data.filter,
+                stages: &stages,
+                links: &links,
+                probe_columns: data.columns,
+                body: &looped,
+                order: data
+                    .joined_rows
+                    .as_ref()
+                    .map(|rows| rows.order.as_slice())
+                    .unwrap_or_default(),
+                counts: &connection.morsel_outer,
+            };
+            let (mut out, _) = outer_traced(&connection.morsel_outer, "chain", &budget, || {
+                pipeline.run_mode(mode, &mut costs, &budget)
+            })?;
+            connection
+                .morsel_outer
+                .chains
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return match &data.joined_rows {
+                Some(rows) => {
+                    for row in &mut out {
+                        row.truncate(rows.width);
+                    }
+                    Ok((out, true))
+                }
+                None => Ok((out, false)),
+            };
+        }
+        // An outer join of two tables: the probe's morsels mark the build rows they match, the
+        // bitmaps merge, then the unmatched build rows run padded (lane qs6-12).
+        if let Some(kind @ (MorselOuter::Left | MorselOuter::Full)) = data.outer {
+            let (Some(stage), Some(link)) = (stages.first(), data.joins.first()) else {
+                return Err(MorselError::Corrupt(
+                    "an outer join's hook without its link",
+                ));
+            };
+            let pipeline = TableOuterJoin {
+                table: &table,
+                probe_filter: &data.filter,
+                stage,
+                probe_columns: data.columns,
+                build_columns: link.columns,
+                kind,
+                body: &looped,
+                order: data
+                    .joined_rows
+                    .as_ref()
+                    .map(|rows| rows.order.as_slice())
+                    .unwrap_or_default(),
+                counts: &connection.morsel_outer,
+            };
+            let (mut out, _) =
+                outer_traced(&connection.morsel_outer, "padded probe", &budget, || {
+                    pipeline.run_mode(mode, &mut costs, &budget)
+                })?;
+            connection
+                .morsel_outer
+                .padded_probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return match &data.joined_rows {
+                Some(rows) => {
+                    for row in &mut out {
+                        row.truncate(rows.width);
+                    }
+                    Ok((out, true))
+                }
+                None => Ok((out, false)),
+            };
+        }
+        // A LEFT join among more tables (lane qs6-13): its padded table is the last link, its
+        // columns the NULLs a row of the others that matched nothing there takes.
+        let pad_last = match data.outer {
+            Some(MorselOuter::LeftLink) => Some(
+                data.joins
+                    .last()
+                    .ok_or(MorselError::Corrupt(
+                        "an outer join's hook without its link",
+                    ))?
+                    .columns,
+            ),
+            _ => None,
+        };
+        // A join's rows, no aggregates: each worker keeps its own leaves' output rows, merged
         // in order; they are the answer's rows as they stand.
         if let Some(rows) = &data.joined_rows {
             let pipeline = TableJoinRows {
                 table: &table,
                 probe_filter: &data.filter,
                 stages: &stages,
-                project: &data.result_map,
+                body: &looped,
+                pad_last,
                 order: &rows.order,
             };
             let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
@@ -21557,17 +21792,12 @@ pub fn op_morsel_aggregate(
             }
             return Ok((out, true));
         }
-        let shape = ScanAggregate {
-            rows: &[],
-            filter: &[],
-            group_by: &data.group_by,
-            aggregates: &data.aggregates,
-        };
         let pipeline = TableJoinAggregate {
             table: &table,
             probe_filter: &data.filter,
             stages: &stages,
-            shape: &shape,
+            body: &looped,
+            pad_last,
         };
         pipeline
             .run_mode(mode, &mut costs, &budget)
