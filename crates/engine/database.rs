@@ -721,6 +721,8 @@ pub struct Database<
     F: alloc::ConcurrentAllocator = alloc::DynAllocator,
 > {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
+    /// Amphora (G5 step 4): the skipping summaries its connections share (executor.md decision 11).
+    pub(crate) skipping: crate::skipping::SkipRegistry,
     pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
@@ -905,6 +907,7 @@ impl Database {
 
         let db = Database {
             mv_store,
+            skipping: crate::skipping::SkipRegistry::default(),
             allocators,
             path,
             wal_path,

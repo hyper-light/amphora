@@ -23,6 +23,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   Amphora's own cases. Amphora (in memory, on a file, through the local owner) and the simulator
   pass it, and a seeded differential test holds the simulator's answers to Amphora's
   (`crates/amphora/tests/records_conformance.rs`).
+- **The Records suite past 200 cases** (CP-T1.5, AC-T1.5.3; kiln goal 0d717247, lanes kiln-records-2
+  and -3): `amphora_api::conformance` holds 209 cases, each id once: kiln-seams' RECORDS-1 to 14,
+  Amphora's three, and one case per row of `crates/api/src/conformance/table.rs` (key and value
+  shapes, each request with each refused family name and key, scan, snapshot and feed paging at each
+  page size, limits, transaction bounds, conditions, snapshots at each step of a history, `Ahead`,
+  waits). Amphora's Namespace (in memory, on a file, through the local owner, one voter and three)
+  and `SimRecords` pass every case with no answer different. kiln's side: `docs/records-inventory.md`
+  (kiln main) lists every SQLite table and JSON file kiln keeps, held to its code by a test. Open:
+  goals, plans and deploys moved onto Records and compared field by field; the production copy.
 - **The `amphora` binary** says what it is (`amphora --version`, `amphora --help`), and nothing more yet.
 - **The design's index and the README** (AC-T1.2.3, T-T1.13.2; lane docs): `docs/design.md` gives every
   decision of `docs/design/` one line and a link, held to the records by
@@ -707,6 +716,13 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   failover until its script runs a Consul lease (lane repl-measure-2: it does now; `bench/repl.sh RECORDS FLAGS...`
   runs every measure on every system, and all four clusters came up on jupiter). Closes with: the comparison set and Amphora's classes measured on
   adacachy, fedora and jupiter, best of 3, and Amphora's members across machines for the LAN p99.
+- **Replication measured: sharded seeds and the lab** (CP-T1.8, AC-T1.8.5; lane repl-measure-4): the power-cut
+  nemesis runs a seed range a machine in either class (`bench/power_nemesis.sh run CLASS FROM COUNT DIR`), one
+  record a shard, and `merge` checks the shards cover the seeds once each on one commit; seeds 2k and 2k + 1 no
+  longer share a schedule. 100 seeds a class in two shards passed on jupiter
+  (bench/records/power-nemesis/2026-11-22-jupiter-tiny). `bench/repl_lab.sh RUN HOST1 HOST2 HOST3` splits the
+  10,000 seeds a class across three named machines and runs the comparison set on each. Not yet: Amphora's
+  members on three machines (the LAN p99); the harness runs them in one process.
 - **Follower reads at a closed time and search over partitions** (G13 step 4; replication.md, "Follower reads at a
   closed time" and "Search over partitions"; lane follower-reads): built and unit-tested, not measured. Every proposed
   entry carries its proposer's clock; every member applies it at the larger of that and one past the time before it,
@@ -1002,3 +1018,13 @@ OFFSET runs on morsels too when its ORDER BY holds both tables' INTEGER PRIMARY 
 are the serial loop's to the row (T-QT.6.14). Still open: workers running a copy of the VDBE loop
 body (any expression in parallel), joins of three or more tables, outer joins, a LIMIT that stops
 the workers early.
+
+order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
+the VDBE loop body (any expression in parallel), joins of three or more tables.
+
+G5 step 4 wired (lanes g5s4c, g5s4d): the engine's Insert and Delete opcodes keep a per-database
+registry of skipping summaries (zone maps or cracking), and a SELECT's scan with integer bounds on
+a summarized column seeks past the rows the summary leaves out, consulting it only at the snapshot
+it holds (an older reader, or a rolled-back summary, is refused, counted, and reads every row).
+Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). Open: choosing a kind
+by measured cost, a SQL switch, parameter bounds (executor.md decision 11, "Not yet").

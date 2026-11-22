@@ -137,6 +137,52 @@ impl OpenLoop {
 
             let (table_cursor_id, index_cursor_id) =
                 table.resolve_cursors(program, mode.clone())?;
+            // Amphora (G5 step 4, T-G5.4.3): a SELECT's plain forward scan of a rowid table carries
+            // its WHERE terms' integer bounds, so a skipping summary can leave rows out at run
+            // time. Outer joins are left alone: their NULL rows aren't the filter's to drop.
+            if let (
+                true,
+                None,
+                None,
+                Some(cursor_id),
+                Operation::Scan(Scan::BTreeTable {
+                    iter_dir: IterationDirection::Forwards,
+                    index: None,
+                }),
+                Table::BTree(btree),
+            ) = (
+                matches!(mode, OperationMode::SELECT),
+                temp_cursor_id,
+                index_cursor_id,
+                table_cursor_id,
+                &table.op,
+                &table.table,
+            ) {
+                let outer = table_references
+                    .joined_tables()
+                    .iter()
+                    .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.is_outer()));
+                if btree.has_rowid && !outer {
+                    let bounds = crate::skipping::integer_bounds(
+                        predicates
+                            .iter()
+                            .filter(|t| {
+                                !t.consumed
+                                    && matches!(
+                                        t.origin,
+                                        crate::translate::plan::WhereTermOrigin::Where
+                                    )
+                            })
+                            .map(|t| &t.expr),
+                        table.internal_id,
+                    );
+                    if !bounds.is_empty() {
+                        program
+                            .skip_hints
+                            .push(crate::skipping::SkipHint { cursor_id, bounds });
+                    }
+                }
+            }
 
             match &table.op {
                 Operation::HashJoin(hash_join_op) => {
