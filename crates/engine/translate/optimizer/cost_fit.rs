@@ -188,6 +188,28 @@ impl Solution {
         self.weights.map(|w| w.is_some())
     }
 
+    /// The weights the samples tell from nothing, the ones the planner may read (T-PL.7.6): each
+    /// above zero by more than its standard error times [AGREE_Z]'s quantile for the weights
+    /// determined, the same two-sided 95% test, Bonferroni-corrected, that epochs agree by. A
+    /// weight within that of zero (few samples, a loaded host's spread, no degree of freedom left
+    /// and so an unbounded error) is no measurement of its cost: like a weight held at zero, it
+    /// keeps the learned value, so noise alone never moves a plan.
+    fn told_from_nothing(&self) -> FittedWeights {
+        let determined = self.weights.iter().filter(|w| w.is_some()).count();
+        let mut nanos = [None; TERMS];
+        let Some(z) = determined.checked_sub(1).and_then(|at| AGREE_Z.get(at)) else {
+            return FittedWeights { nanos };
+        };
+        for ((slot, w), e) in nanos
+            .iter_mut()
+            .zip(self.weights.iter())
+            .zip(self.errors.iter())
+        {
+            *slot = w.filter(|w| *w > z * e);
+        }
+        FittedWeights { nanos }
+    }
+
     /// Whether `other` agrees with this fit on every weight both determine.
     fn agrees(&self, other: &Solution) -> bool {
         let pairs = || {
@@ -323,8 +345,7 @@ impl CostFit {
 
     /// The weights as they stand; None before any term is determined.
     pub(crate) fn weights(&self) -> Option<FittedWeights> {
-        let fit = self.fitted.as_ref()?;
-        Some(FittedWeights { nanos: fit.weights })
+        Some(self.fitted.as_ref()?.told_from_nothing())
     }
 
     /// The relative spread of the measurement against the fit, the residuals' scale; None before
@@ -979,5 +1000,34 @@ mod tests {
     fn t_pl_7_5_clock_read_is_measured() {
         let c = clock_read_nanos();
         assert!(c.is_finite() && c >= 0.0, "{c}");
+    }
+
+    /// Do: a fit that determines three weights, one of them within its standard error times the
+    /// 95% Bonferroni quantile of zero, one with an unbounded error (no degree of freedom left).
+    /// Expect: the planner is given only the weight told from nothing; the other two keep the
+    /// learned value (T-PL.7.6).
+    #[test]
+    fn t_pl_7_6_weights_not_told_from_nothing_keep_the_learned_value() {
+        let mut fit = Solution::default();
+        let (row, seek, page) = (Term::Row.slot(), Term::Seek.slot(), Term::PageRead.slot());
+        fit.weights[row] = Some(10.0);
+        fit.errors[row] = 1.0;
+        fit.weights[seek] = Some(2.0);
+        fit.errors[seek] = 1.0;
+        fit.weights[page] = Some(500.0);
+        fit.errors[page] = f64::INFINITY;
+        let told = fit.told_from_nothing();
+        assert_eq!(told.nanos(Term::Row), Some(10.0));
+        assert_eq!(
+            told.nanos(Term::Seek),
+            None,
+            "2 is within 2.39 errors of zero"
+        );
+        assert_eq!(
+            told.nanos(Term::PageRead),
+            None,
+            "an unbounded error measures nothing"
+        );
+        assert_eq!(told.in_pages(Term::Seek, 0.25, 0.01), 0.25);
     }
 }
