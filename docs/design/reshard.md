@@ -208,11 +208,22 @@ deterministic simulator:
    wire, applied by the same `apply` a local writer and a replicated owner's log entry run
    (decision "A local database keeps its holding through its command", below; T-T1.9.R7).
 
-   Still left of this item: the rest of `database::Local` as a group's engine: its log of commits
-   and copy path (`head`, `export`, `changed`, `import`, `keep_log`, `sweep`), which needs its rows
-   indexed by position (today every command of a database is one key), and a `Database` over
-   `Groups<Local>`; moves to another node (the copy and catch-up over the network); a retired
-   group's files, which the shell's caller deletes.
+   Built (lane split-merge-8): every copy-path batch is bounded by the process's memory as well
+   as by time (decision "A batch bounded by the process's memory", T-T1.9.R8). `database::Local`
+   is a group's engine in full: a row routes by its namespace, family and key, and from its first
+   holding it keeps a log of its commits and its Records rows indexed by position, and carries the
+   copy path over them (decision "A row routes by its namespace, family and key", T-T1.9.R9).
+
+   Built (lane split-merge-9): moves to another node. A copy or catch-up batch reads its old group
+   through a pull (`groups::Pull`), answered by `Groups::serve` at the node the old group is on, on
+   its writer, through `groups::Peers` when that node is another; a node starts only the groups the
+   directory places on it (decision "Moves across nodes", T-T1.9.R10).
+
+   Still left of this item: a `Database` over `Groups<Local>` (a command routed by its row's key,
+   which needs the store's routing key to be bytes, not a `&str`, and a Records transaction kept to
+   one group), with a split and merge of it under writes through `carry`; `Peers` over a socket
+   between machines (the owner transport speaks to one owner; the pull would be its appended
+   request variants); a retired group's files, which the shell's caller deletes.
 2. **Load measured from the store's meter.** The writer's busy time per window, a bounded sample
    of written positions for the load cut, and the size cut from the B-tree's middle key. The
    window is the time between planner runs, and shares don't depend on its length.
@@ -265,3 +276,119 @@ table of its own, replaced whole. So a replicated database keeps a holding throu
 any write, and a local one as one commit of its writer, flushed with every commit before it
 before the shell acts on it (`Engine::keep_holding`). A remote client can't send it: a holding is
 the group's own engine's.
+
+## Decision (lane split-merge-8): a batch bounded by the process's memory
+
+A copy, catch-up or sweep batch is held in memory whole: its keys and rows are read out of one
+group and written into another. A batch learned from time is bounded by the time a commit takes,
+but on a node where nothing has committed a batch doubles from the last with no end, so a long
+copy on an idle node would grow its batch until the process runs out of memory: a resource with no
+bound (CLAUDE.md §2). Now every batch also holds no more units than the process's memory budget
+takes at the most bytes a unit of that work has held here.
+
+- The budget is the one the process already sets aside for what its databases hold in memory at
+  once: its pool of pages, a quarter of the memory the process may use, from its control groups'
+  limits and its machine's memory, with that decision's fallback where the system doesn't say
+  (docs/design/store.md, decision 26; `crate::memory::limit`). It is measured where the process
+  runs, at start, never picked.
+- A unit's bytes are learned from the batches run: each moved key's size and its rows' bytes, the
+  most a unit held in any batch of that work on that group, so a batch of larger rows is smaller.
+  A sweep's position holds the keys the group's own copies moved, so it is bounded by the most a
+  unit of any work there held.
+- The first batch of a work is one unit, as before, so its bytes are measured before the bound
+  applies; a unit larger than the whole budget is still taken one at a time.
+
+**Evidence.** `groups::tests`: with no commit measured, sixty-four batches of 4 KiB units under a
+budget of 1 MiB double 1, 2, 4, 8 and stop at 256 units, never past it; a batch learned from time
+whose units are too large is cut to what the memory holds (T-T1.9.R8).
+
+**Falsified by.** A copy, catch-up or sweep batch whose keys and rows hold more bytes than the
+budget; or, at equal load, a copy slower with the bound than without on a node whose memory the
+batches don't approach (the bound should never bind there).
+
+## Decision (lane split-merge-8): a row routes by its namespace, family and key
+
+A group's rows must be indexed by position, so a span can be copied and swept in position order.
+Amphora's own engine (`database::Local`) routed every command by one key (`"database"`), so a
+database was one position and could never be split. Its Records rows now each have a position:
+the position (`reshard::position_of`) of the row's namespace, family and key, written as one
+string of bytes (`reshard::row_key`: the namespace and the family each preceded by its length as
+a little-endian u32, a format value that makes the three parts unambiguous, then the key).
+
+**Why this key.** It is how Records already addresses a row: a row is a key in a family of a
+namespace (`amphora-api`'s `Records::get(family, key)` on a namespace; `__amphora_versions`'s
+primary key is (namespace, family, key, revision); docs/design/records.md). Every version of a
+key then lands in one group, so a read at any revision, a condition and the feed's order within a
+key are each one group's. Spreading by key, not by namespace or family, spreads one busy
+namespace or family over groups, which a prefix of the key would not (a hash's spans are what the
+planner splits by measured load; decision "split, merge and move as one fenced hand-off").
+
+**Built.** A local database becomes a group's when it first keeps a holding: in that commit its
+log starts and every Records key it holds is indexed by position (`__amphora_positions`); from
+then on each commit is one entry of its log, each Records key a commit writes (through a
+transaction or a bulk import) is indexed, and while the log is held, noted with its entry in the
+change feed (`__amphora_group_feed`). The copy path moves a key's every version; the namespace's
+head is raised to the newest revision moved in, and its live keys are counted again, so the new
+group's next revision is newer than every row it took (`database/group.rs`; T-T1.9.R9). A
+database that is no group's pays one lookup a write of a log row it doesn't have.
+
+**Reversible.** The position is derived, never stored as a key: the index and feed tables are a
+group's alone, rebuilt from `__amphora_versions` when a database becomes a group's. Another
+routing key means another `row_key` and the index built again, with no change to the rows.
+
+**Needs Ada's word.** This is the reversible option the evidence favours, taken by lane
+split-merge-8 without her. What it leaves open:
+- A namespace's revisions are one counter today. Once its keys are in more than one group, each
+  group counts its own: a revision orders the writes of one key, and of one group, but not of the
+  whole namespace, so `changes` and `head` over a namespace split across groups need the
+  cross-group order of CP-T1.10.
+- A Records transaction whose keys fall in more than one group is refused, as any batch across
+  groups is (`store::Refused::Groups`), until CP-T1.10's transactions across groups.
+- SQL tables (`Mutation::Sql`, `Migrate`, sessions) have no row key: they stay in the group the
+  database's first group holds, and don't move.
+
+**Falsified by.** A Records key whose versions are found in two groups, or in none, after a
+split, merge or move; a read at a revision answered differently after a move; a new group's next
+revision of a namespace not newer than one it took.
+
+## Decision (lane split-merge-9): moves across nodes
+
+A move's new group is on another node than the old one, so its copy and catch-up can't read the old
+group's engine in the same process. Every copy and catch-up batch now has two halves:
+- The old group's half is a pull (`groups::Pull`): a copy's next batch of positions, or the keys a
+  run of the old group's log changed. `Groups::serve` answers it at the node the old group is on, on
+  that group's writer, as the path within one node did: the operation's first read holds the old
+  group's log from the entry it reads at, on the same turn, and the batch is the fewer of the units
+  asked and those the old group's writer takes in about a commit's time (decision "Batches learned
+  where they run"), so the old group's writes wait no longer whichever node asks.
+- The new group's half stays in `Groups::carry`, at the new group's node: it asks for at most the
+  units its own writer takes, writes the batch with the stamps it was read at, and keeps its progress
+  in its holding, as before.
+
+`carry` answers a pull itself when the old group is on its node (a split or a merge) and otherwise
+sends it to the node the directory it routes by places the old group on, through `groups::Peers`.
+So a split, a merge and a move all read through `serve`: one path. A node starts only the groups the
+directory places on it (`Groups::on` takes its node) and refuses the keys of the others
+(`Away::Elsewhere`). A pull and its answer are serde types, encoded by postcard by variant index,
+variants only appended.
+
+Nothing else changes. The fence, flip, activate, release and retire are each carried at their own
+group's node, where the driver addresses them (`Do::group`). Correctness never rests on the channel:
+a pull or answer lost is an error, and the driver asks the action again; a stale one is refused by
+the new group's holding.
+
+**Evidence.** `tests/groups.rs`, T-T1.9.R10: two nodes, two groups on the first, the second moved to
+the second node by the driver while a row is written before every action, each pull and its answer
+carried as postcard bytes. The move ends flipped; the first node keeps one group and has retired the
+other; the second holds the moved span; every key's acknowledged rows read back at its group's node,
+and every key is in exactly one group's file. The tests within one node (T-T1.9.R4 to R6) pass
+unchanged through the same path. T-T1.9.R11: the same move with every third pull's answer lost on the way
+back, after the old group's node acted on it, each loss asked again by the driver: the same outcome.
+
+**Left.** `Peers` over a socket between machines: the owner transport (`crate::transport`) speaks to
+one database owner, and its authenticated frames are where the pull goes, as appended request
+variants (local-owner-transport.md, "Versions"), with loss and partition tests. That is the next
+piece of this item.
+
+**Falsified by.** A move under writes that loses an acknowledged write or leaves a key in two
+groups; or a pull's batch larger than the old group's writer's learned batch.

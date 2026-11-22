@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use amphora::db::Db;
-use amphora::groups::Groups;
+use amphora::groups::{Alone, Groups, Peers, Pull, Pulled};
 use amphora::reshard::directory::{Directory, Proposal};
 use amphora::reshard::driver::{Answer, Do, Driver, Failure, Out, Reply};
 use amphora::reshard::holding::{Away, Fenced, replays};
@@ -531,9 +531,13 @@ fn t_t1_9_r3_a_groups_holding_is_kept_with_its_rows_across_a_restart() {
 
 /// The groups `directory` places, on files in `dir`, the groups retired kept there too.
 fn on(dir: &std::path::Path, directory: &Directory) -> Groups<Events> {
-    Groups::on(directory, Config::default(), &dir.join("retired"), |g| {
-        events(dir, &g.0.to_string())
-    })
+    Groups::on(
+        NodeId(0),
+        directory,
+        Config::default(),
+        &dir.join("retired"),
+        |g| events(dir, &g.0.to_string()),
+    )
     .unwrap()
 }
 
@@ -568,7 +572,7 @@ fn drive(
                     Err(e) => panic!("a write refused: {e:?}"),
                 }
                 let reply = groups
-                    .carry(&a, soon(), |g| events(dir, &g.0.to_string()))
+                    .carry(&a, soon(), &Alone, |g| events(dir, &g.0.to_string()))
                     .unwrap();
                 pending.extend(
                     driver
@@ -759,7 +763,9 @@ fn t_t1_9_r6_a_retired_group_stays_retired_across_a_restart() {
     let again = on(dir.path(), &directory);
     assert_eq!(again.len(), 1);
     let reply = again
-        .carry(&create, soon(), |g| events(dir.path(), &g.0.to_string()))
+        .carry(&create, soon(), &Alone, |g| {
+            events(dir.path(), &g.0.to_string())
+        })
         .unwrap();
     assert_eq!(
         reply,
@@ -827,12 +833,12 @@ fn t_t1_9_r5_repeated_actions_and_driver_restarts_move_every_row_once() {
                         Err(e) => panic!("a write refused: {e:?}"),
                     }
                     let make = |g: GroupId| events(dir.path(), &g.0.to_string());
-                    let _lost = groups.carry(&a, soon(), make).unwrap();
+                    let _lost = groups.carry(&a, soon(), &Alone, make).unwrap();
                     // A stale action from a driver before the restart, carried late: harmless.
                     if let Some(old) = stale.pop() {
-                        let _ = groups.carry(&old, soon(), make).unwrap();
+                        let _ = groups.carry(&old, soon(), &Alone, make).unwrap();
                     }
-                    let reply = groups.carry(&a, soon(), make).unwrap();
+                    let reply = groups.carry(&a, soon(), &Alone, make).unwrap();
                     carried += 1;
                     // Restarts at actions 3, 6, 12, 24, ...: each driver after one gets twice
                     // as far before the next, so the operation gets past every stage (a driver
@@ -1047,7 +1053,7 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
                     Out::Commit(_) => groups.route(driver.directory()).unwrap(),
                     Out::Send(a) => {
                         let reply = groups
-                            .carry(&a, soon(), |g| events(dir.path(), &g.0.to_string()))
+                            .carry(&a, soon(), &Alone, |g| events(dir.path(), &g.0.to_string()))
                             .unwrap();
                         match (&a.what, &reply) {
                             (amphora::reshard::driver::Do::Fence { .. }, _) => {
@@ -1139,4 +1145,225 @@ fn t_t1_9_l1_automatic_operations_lose_no_write() {
         run.acked,
         p99(run.pauses.clone()),
     );
+}
+
+/// One node's peers in a lab of two nodes: the other node's groups, each pull and its answer
+/// carried as the bytes a network carries (postcard, both ways).
+struct Wire<'a> {
+    node: NodeId,
+    groups: &'a Groups<Events>,
+    /// The pulls answered so far, and, if some, every how many an answer is lost on the way back
+    /// (after the other node acted on it).
+    pulls: &'a std::cell::Cell<u64>,
+    lose_every: Option<u64>,
+}
+
+impl Peers for Wire<'_> {
+    fn pull(&self, node: NodeId, pull: &Pull, until: Instant) -> anyhow::Result<Pulled> {
+        if node != self.node {
+            return Ok(Pulled::NoGroup);
+        }
+        let bytes = postcard::to_allocvec(pull).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let asked: Pull = postcard::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let answer = self.groups.serve(&asked, until)?;
+        let n = self.pulls.get() + 1;
+        self.pulls.set(n);
+        if self.lose_every.is_some_and(|every| n.is_multiple_of(every)) {
+            anyhow::bail!("the pull's answer lost on the way back");
+        }
+        let bytes = postcard::to_allocvec(&answer).map_err(|e| anyhow::anyhow!("{e}"))?;
+        postcard::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// `node`'s place in a lab's nodes.
+fn ix(node: NodeId) -> usize {
+    usize::try_from(node.0).unwrap()
+}
+
+/// A row of `key` written at whichever node takes it, durable; false if none does (its span
+/// fenced for a cutover, or flipped to a group that hasn't taken it up yet).
+fn put_at(nodes: &[Groups<Events>; 2], key: &str, seq: i64) -> bool {
+    for groups in nodes {
+        match groups.put(vec![row(key, seq)]) {
+            Ok(t) => {
+                groups.durable(&t, soon()).unwrap();
+                return true;
+            }
+            Err(Refused::Away(_)) => {}
+            Err(e) => panic!("a write refused: {e:?}"),
+        }
+    }
+    false
+}
+
+/// T-T1.9.R10 (CP-T1.9; docs/design/reshard.md, "Moves across nodes"): two nodes, two groups on
+/// node 0, the second moved to node 1 by the driver while writes go on to every key, each action
+/// carried at its group's node, the new group reading the old one through node 0's
+/// [`Groups::serve`] as bytes; expect the move to end flipped, node 0 left with the first group and
+/// the moved one retired, node 1 holding the moved span, every key's acknowledged rows read back
+/// at the node its group is on, and every key in exactly one group's file.
+#[test]
+fn t_t1_9_r10_a_group_moves_to_another_node_under_writes_and_loses_no_acknowledged_write() {
+    assert_eq!(move_under_writes(None), 0);
+}
+
+/// T-T1.9.R11 (CP-T1.9; docs/design/reshard.md, "Moves across nodes": correctness never rests on
+/// the channel): the move of T-T1.9.R10 with every third pull's answer lost on the way back, after
+/// the old group's node acted on it; each loss an error of the action, which the driver asks again
+/// ([`Driver::restarted`]); expect some answers lost and the same outcome: the move flipped, every
+/// acknowledged write at its group's node, every key in exactly one group's file.
+#[test]
+fn t_t1_9_r11_a_move_whose_pull_answers_are_lost_asks_again_and_loses_no_acknowledged_write() {
+    assert!(move_under_writes(Some(3)) > 0);
+}
+
+/// The move of T-T1.9.R10, every `lose_every`th pull's answer lost if some: how many were lost.
+fn move_under_writes(lose_every: Option<u64>) -> u64 {
+    let (pulls, mut lost) = (std::cell::Cell::new(0u64), 0u64);
+    let dir = tempfile::tempdir().unwrap();
+    let dirs = [dir.path().join("n0"), dir.path().join("n1")];
+    for d in &dirs {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let directory = amphora::groups::even(NodeId(0), 2).unwrap();
+    let nodes = [
+        Groups::on(
+            NodeId(0),
+            &directory,
+            Config::default(),
+            &dirs[0].join("retired"),
+            |g| events(&dirs[0], &g.0.to_string()),
+        )
+        .unwrap(),
+        Groups::on(
+            NodeId(1),
+            &directory,
+            Config::default(),
+            &dirs[1].join("retired"),
+            |g| events(&dirs[1], &g.0.to_string()),
+        )
+        .unwrap(),
+    ];
+    assert_eq!((nodes[0].len(), nodes[1].len()), (2, 0));
+    let keys: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
+    let mut acked = vec![0i64; keys.len()];
+    for (i, key) in keys.iter().enumerate() {
+        assert!(put_at(&nodes, key, 0));
+        acked[i] = 1;
+    }
+    let (mut driver, _) = Driver::recover(directory, 1).unwrap();
+    let mut pending: std::collections::VecDeque<Out> = driver
+        .begin(&Proposal::Move {
+            group: GroupId(1),
+            to: NodeId(1),
+        })
+        .unwrap()
+        .into();
+    let (mut next, mut ended) = (0usize, 0);
+    while let Some(o) = pending.pop_front() {
+        match o {
+            Out::Commit(_) => {
+                for groups in &nodes {
+                    groups.route(driver.directory()).unwrap();
+                }
+            }
+            Out::Send(a) => {
+                let i = next % keys.len();
+                next += 1;
+                if put_at(&nodes, &keys[i], acked[i]) {
+                    acked[i] += 1;
+                }
+                let group = a.what.group();
+                let n = match a.what {
+                    Do::Create { node, .. } => node,
+                    _ => (0..2u64)
+                        .map(NodeId)
+                        .find(|n| nodes[ix(*n)].holding_of(group).is_some())
+                        .or_else(|| driver.directory().node_of(group))
+                        .unwrap_or(NodeId(0)),
+                };
+                let (here, there) = (ix(n), 1 - ix(n));
+                let peers = Wire {
+                    node: NodeId(u64::try_from(there).unwrap()),
+                    groups: &nodes[there],
+                    pulls: &pulls,
+                    lose_every,
+                };
+                let carried = nodes[here].carry(&a, soon(), &peers, |g| {
+                    events(&dirs[here], &g.0.to_string())
+                });
+                let reply = match carried {
+                    Ok(reply) => reply,
+                    // The answer lost: the action's error, asked again by the driver.
+                    Err(e) if lose_every.is_some() => {
+                        assert!(e.to_string().contains("lost on the way back"), "{e}");
+                        lost += 1;
+                        pending.extend(driver.restarted(group).unwrap());
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                pending.extend(
+                    driver
+                        .answer(Answer {
+                            ask: a.ask,
+                            op: a.op,
+                            reply,
+                        })
+                        .unwrap(),
+                );
+            }
+            Out::Ended(e) => {
+                assert!(e.done, "the move given up: {e:?}");
+                ended += 1;
+            }
+        }
+    }
+    assert!(driver.idle());
+    assert_eq!(ended, 1);
+    let directory = driver.directory();
+    let moved = directory.owner(u64::MAX).unwrap();
+    assert_ne!(moved, GroupId(1));
+    assert_eq!(directory.node_of(moved), Some(NodeId(1)));
+    assert_eq!(directory.node_of(GroupId(1)), None);
+    assert!(nodes[0].holding_of(GroupId(1)).is_none());
+    assert_eq!((nodes[0].len(), nodes[1].len()), (1, 1));
+    assert_eq!(
+        nodes[1].holding_of(moved).unwrap().owned(),
+        Span::new(1 << 63, u64::MAX)
+    );
+    let mut on_one = 0;
+    for (i, key) in keys.iter().enumerate() {
+        let group = directory.owner(position(key)).unwrap();
+        let n = ix(directory.node_of(group).unwrap());
+        on_one += usize::from(n == 1);
+        assert_eq!(count(&nodes[n], key), acked[i], "{key}'s rows");
+    }
+    // Some keys moved, some stayed, and writes went on through the move.
+    assert!(on_one > 0 && on_one < keys.len());
+    assert!(acked.iter().any(|&n| n > 1));
+    let mut seen = HashSet::new();
+    for groups in &nodes {
+        let held = groups
+            .read_each(
+                soon(),
+                false,
+                |db| {
+                    let mut keys = Vec::new();
+                    db.query(KEYS, [], |r| {
+                        keys.push(r.get::<String>(0).map_err(|e| anyhow::anyhow!("{e}"))?);
+                        Ok(true)
+                    })?;
+                    Ok(keys)
+                },
+                |_| Ok(Vec::new()),
+            )
+            .unwrap();
+        for key in held.into_iter().flatten() {
+            assert!(seen.insert(key.clone()), "{key} in two groups' files");
+        }
+    }
+    assert_eq!(seen.len(), keys.len());
+    lost
 }

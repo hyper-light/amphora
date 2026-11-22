@@ -393,6 +393,7 @@ fn op_bytes(op: &Op) -> u64 {
             .saturating_add(value.len()),
         Op::Remove { key, .. } => size_of::<Op>().saturating_add(key.len()),
         Op::Made { .. } | Op::Dropped { .. } => size_of::<Op>(),
+        Op::Ordered { order, .. } => size_of::<Op>().saturating_add(order.len()),
     };
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -974,9 +975,12 @@ impl VTree {
                 })
             }
             Op::Remove { key, .. } => self.tree.modify(pool, d, key, |_| Ok((Change::Remove, ()))),
-            Op::Made { .. } | Op::Dropped { .. } => Err(LimboError::InternalError(
-                "versioned storage: a tree made or dropped replayed as a row change".into(),
-            )),
+            Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => {
+                Err(LimboError::InternalError(
+                    "versioned storage: a tree made, dropped or ordered replayed as a row change"
+                        .into(),
+                ))
+            }
         }
     }
 
@@ -1636,7 +1640,7 @@ impl Versioned {
                 }
                 Op::Remove { tree, key } => then.insert((*tree, key.as_slice()), None),
                 // A transaction's changes are rows only: trees are made and dropped alone.
-                Op::Made { .. } | Op::Dropped { .. } => continue,
+                Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => continue,
             };
         }
         // Rows changed before the savepoint and after it, each once, with that value.
@@ -1645,7 +1649,7 @@ impl Versioned {
         for op in later {
             let row = match op {
                 Op::Put { tree, key, .. } | Op::Remove { tree, key } => (*tree, key.as_slice()),
-                Op::Made { .. } | Op::Dropped { .. } => continue,
+                Op::Made { .. } | Op::Dropped { .. } | Op::Ordered { .. } => continue,
             };
             if fresh_rows.contains(&row) || !seen.insert(row) {
                 continue;
