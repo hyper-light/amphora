@@ -423,6 +423,36 @@ impl Txn {
         }
     }
 
+    /// Keeps a span of `tree`'s keys, `from` to `to` (both included; none: unbounded), as read for
+    /// the commit's validation: what a cursor that copied a leaf could have seen (G7 step 2,
+    /// `AC-NS.2.3`). The span just kept again is not kept twice.
+    pub fn keep_span(
+        &mut self,
+        clock: &Clock,
+        tree: u64,
+        from: Option<&[u8]>,
+        to: Option<&[u8]>,
+    ) -> Result<()> {
+        if self
+            .reads
+            .spans
+            .last()
+            .is_some_and(|s| s.tree == tree && s.from.as_deref() == from && s.to.as_deref() == to)
+        {
+            return Ok(());
+        }
+        let span = Span {
+            tree,
+            from: from.map(<[u8]>::to_vec),
+            to: to.map(<[u8]>::to_vec),
+        };
+        let size = usize::try_from(span.bytes()).map_err(|_| LimboError::IntegerOverflow)?;
+        self.reads
+            .keep(&clock.budget, &mut self.read_bytes, tree, size, |r| {
+                r.spans.push(span);
+            })
+    }
+
     /// A savepoint here: [`Versioned::rollback_to`] puts the transaction's rows back as they are
     /// now.
     pub fn savepoint(&self) -> Savepoint {

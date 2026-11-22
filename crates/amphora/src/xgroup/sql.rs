@@ -3,7 +3,7 @@
 //! over [`Database`]s, each step one [`Database`] call: one atomic commit in its group, durable and,
 //! on a replicated group, committed by its quorum before it answers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -15,7 +15,8 @@ use amphora_engine::Value;
 
 use super::coordinator::{Answer, Config, Coordinator, Event, Lost, Protocol, Txn};
 use super::{
-    GroupId, Guard, Intent, Lock, Mark, OpenPage, Outcome, Record, Reply, Tablet, TxnId, apply,
+    Envelope, GroupId, Guard, Intent, Lock, Mark, OpenPage, Outcome, Record, Reply, Tablet, TxnId,
+    apply,
 };
 use crate::database::Database;
 use crate::db::Db;
@@ -392,6 +393,71 @@ impl Tablet for SqlTablet<'_> {
     }
 }
 
+/// A group as a coordinator reaches it (xgroup.md, "Over the transport"): its [`Database`] in this
+/// process, or its owner on a node, reached over the transport by [`crate::transport::Nodes`].
+#[derive(Clone)]
+pub enum Member {
+    Local(Database),
+    /// The group's owner at `node`'s endpoint in `nodes`; the node made its tables ([`prepare`]).
+    Node {
+        nodes: Arc<crate::transport::Nodes>,
+        node: crate::reshard::NodeId,
+    },
+}
+
+/// Makes a group's tables for transactions across groups, if it hasn't them: the node that owns a
+/// group does it before it serves steps over the transport.
+pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
+    group.call_internal(until, |db| db.exec(SCHEMA))
+}
+
+/// A step that came over the transport for this owner's group `here` (`Request::Step`): applied as
+/// a local one is, the coordinator's stamp `carried` taken in first; answers the reply and the
+/// group's newest stamp after it (none: the group makes no stamps).
+pub(crate) fn serve(
+    group: &Database,
+    here: GroupId,
+    carried: u64,
+    envelope: Envelope,
+    until: Instant,
+) -> Result<(Reply, Option<u64>), Refusal> {
+    let stamp = AtomicU64::new(carried);
+    let reply = step(group, &stamp, until, move |db| {
+        apply(here, &mut SqlTablet::new(db), &envelope)
+    })?;
+    Ok((reply, group.stamps().map(|_| stamp.load(Ordering::Acquire))))
+}
+
+/// Runs one step on `member`, its stamps carried either way.
+fn step_on(
+    member: &Member,
+    carried: &AtomicU64,
+    until: Instant,
+    here: GroupId,
+    envelope: Envelope,
+) -> Result<Reply, Refusal> {
+    match member {
+        Member::Local(group) => step(group, carried, until, move |db| {
+            apply(here, &mut SqlTablet::new(db), &envelope)
+        }),
+        Member::Node { nodes, node } => {
+            let (reply, latest) = nodes
+                .step(
+                    *node,
+                    here,
+                    carried.load(Ordering::Acquire),
+                    envelope,
+                    until,
+                )
+                .map_err(Refusal::from)?;
+            if let Some(latest) = latest {
+                carried.fetch_max(latest, Ordering::AcqRel);
+            }
+            Ok(reply)
+        }
+    }
+}
+
 /// Which group a key is in: the caller's, so the groups' routing stays the routing lanes' own.
 pub type Route = Arc<dyn Fn(&[u8]) -> GroupId + Send + Sync>;
 
@@ -508,7 +574,8 @@ fn retryable(refusal: &Refusal) -> bool {
 impl Cluster {
     /// Opens coordinator `id` over `groups` running `protocol`: makes each group's tables, takes a
     /// new incarnation, and finishes what earlier ones left, all by `until`. `in_flight`: the most
-    /// transactions it runs at once, the caller's (the threads it has calling [`Cluster::transact`]).
+    /// transactions it runs at once, the caller's (the threads it has calling [`Cluster::transact`]);
+    /// a begin that finds it full waits for one to finish (a caller's last one may still resolve).
     pub fn open(
         groups: Vec<Database>,
         route: Route,
@@ -518,8 +585,22 @@ impl Cluster {
         until: Instant,
     ) -> Result<Self, Refusal> {
         for group in &groups {
-            group.call_internal(until, |db| db.exec(SCHEMA))?;
+            prepare(group, until)?;
         }
+        let groups = groups.into_iter().map(Member::Local).collect();
+        Self::open_members(groups, route, id, protocol, in_flight, until)
+    }
+
+    /// [`Cluster::open`] over groups each reached as its [`Member`] says: a group on a node made its
+    /// tables when its node started serving ([`prepare`]).
+    pub fn open_members(
+        groups: Vec<Member>,
+        route: Route,
+        id: u64,
+        protocol: Protocol,
+        in_flight: usize,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
         let count = GroupId::try_from(groups.len())
             .map_err(|_| amphora_api::invalid("cross-group cluster", "too many groups"))?;
         let config = Config {
@@ -545,6 +626,8 @@ impl Cluster {
             coordinator,
             inputs: inputs.clone(),
             waiters: BTreeMap::new(),
+            parked: VecDeque::new(),
+            in_flight,
             deadlines: BTreeMap::new(),
             out: BTreeMap::new(),
             times: StepTimes::default(),
@@ -621,12 +704,20 @@ where
     Ok(reply)
 }
 
+/// Where a caller waits for its transaction's answer.
+type Waiter = SyncSender<Result<Answer, Refusal>>;
+
 struct Driver {
-    groups: Arc<Vec<Database>>,
+    groups: Arc<Vec<Member>>,
     route: Route,
     coordinator: Coordinator,
     inputs: SyncSender<Input>,
     waiters: BTreeMap<TxnId, SyncSender<Result<Answer, Refusal>>>,
+    /// Begins that found the coordinator full, begun in arrival order as transactions finish (a
+    /// caller's next transaction may arrive while its last one still resolves): at most
+    /// `in_flight`, the callers the shell was opened for; a begin past that is refused `Full`.
+    parked: VecDeque<(Txn, Instant, Waiter)>,
+    in_flight: usize,
     /// Each running transaction's deadline.
     deadlines: BTreeMap<TxnId, Deadline>,
     /// Each step out: its transaction, when it was sent, and whether it is a first send (only those
@@ -649,20 +740,27 @@ impl Driver {
                 self.stop(&refusal);
                 return;
             }
+            // Each transaction finished makes room for a parked begin.
+            events = self.admit_parked();
+            if !events.is_empty() {
+                continue;
+            }
             events = match receiver.recv() {
                 Ok(Input::Begin { txn, until, answer }) => {
-                    match self.coordinator.begin(txn, |key| (self.route)(key)) {
-                        Ok((id, events)) => {
-                            self.waiters.insert(id, answer);
-                            self.deadlines
-                                .insert(id, Deadline::Caller { until, lost: 0 });
-                            events
-                        }
-                        Err(refusal) => {
+                    // Parked begins went first while there was room: one arriving to a full
+                    // coordinator waits behind them.
+                    if self.coordinator.ready() && self.coordinator.in_flight() >= self.in_flight {
+                        if self.parked.len() < self.in_flight {
+                            self.parked.push_back((txn, until, answer));
+                        } else {
                             // A caller gone by now needs no answer.
-                            let _ = answer.send(Err(refusal));
-                            Vec::new()
+                            let _ = answer.send(Err(Refusal::Full {
+                                limit: self.in_flight,
+                            }));
                         }
+                        Vec::new()
+                    } else {
+                        self.begin(txn, until, answer)
                     }
                 }
                 Ok(Input::Reply { id, reply }) => {
@@ -756,9 +854,7 @@ impl Driver {
                     std::thread::Builder::new()
                         .name("amphora-xgroup-step".into())
                         .spawn(move || {
-                            let reply = step(&group, &carried, until, move |db| {
-                                apply(here, &mut SqlTablet::new(db), &envelope)
-                            });
+                            let reply = step_on(&group, &carried, until, here, envelope);
                             // A driver gone by now has stopped: its successor recovers the step.
                             let _ = inputs.send(Input::Reply { id, reply });
                         })
@@ -796,8 +892,50 @@ impl Driver {
         Ok(())
     }
 
+    /// Begins `txn` for the caller waiting on `answer`, its steps due by `until`.
+    fn begin(
+        &mut self,
+        txn: Txn,
+        until: Instant,
+        answer: SyncSender<Result<Answer, Refusal>>,
+    ) -> Vec<Event> {
+        match self.coordinator.begin(txn, |key| (self.route)(key)) {
+            Ok((id, events)) => {
+                self.waiters.insert(id, answer);
+                self.deadlines
+                    .insert(id, Deadline::Caller { until, lost: 0 });
+                events
+            }
+            Err(refusal) => {
+                // A caller gone by now needs no answer.
+                let _ = answer.send(Err(refusal));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Parked begins, oldest first, while the coordinator has room; one whose caller's deadline
+    /// passed while it waited is answered `Timeout` and never begun.
+    fn admit_parked(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        while self.coordinator.in_flight() < self.in_flight
+            && let Some((txn, until, answer)) = self.parked.pop_front()
+        {
+            if Instant::now() >= until {
+                // A caller gone by now needs no answer.
+                let _ = answer.send(Err(Refusal::Timeout));
+                continue;
+            }
+            events.extend(self.begin(txn, until, answer));
+        }
+        events
+    }
+
     fn stop(&mut self, refusal: &Refusal) {
         for (_, waiter) in std::mem::take(&mut self.waiters) {
+            let _ = waiter.send(Err(refusal.clone()));
+        }
+        for (_, _, waiter) in std::mem::take(&mut self.parked) {
             let _ = waiter.send(Err(refusal.clone()));
         }
         if let Some(ready) = self.ready.take() {

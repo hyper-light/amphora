@@ -1379,7 +1379,14 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
-    if let Some(switch) = program.connection.versioned.as_ref() {
+    // Only the main database's trees are on the versioned storage: a temp or attached database's
+    // tables stay on its own pager, their root pages its pages (G7 step 2, `AC-NS.2.1`).
+    if let Some(switch) = program
+        .connection
+        .versioned
+        .as_ref()
+        .filter(|_| *db == MAIN_DB_ID)
+    {
         if let Some(cursor) = versioned_cursor(switch, cursor_type, *root_page, &pager)? {
             replace_cursor(&mut state.cursors, *cursor_id, cursor)?;
             state.pc += 1;
@@ -3611,7 +3618,7 @@ pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         Next {
@@ -3655,7 +3662,7 @@ pub fn op_next(
             .as_deref()
             .and_then(|plan| plan.fused_loop(next_pc as usize))
         {
-            let rows = super::leaf_batch::fused::run(program, state, fused)?;
+            let rows = super::leaf_batch::fused::run(program, state, fused, pager)?;
             if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
                 let skipped = skipped as u64;
                 state.record_rows_read(skipped);
@@ -13493,10 +13500,16 @@ fn new_rowid_inner(
                     } else {
                         // Not an MvCursor — must be an ephemeral cursor or an attached
                         // DB cursor without MVCC (e.g., :memory: attached DBs skip MVCC).
-                        // Keep the downcast check as a safety net against unexpected cursor types.
+                        // Or a main database's cursor on the versioned storage, whose rows are
+                        // versioned already (G7 step 2, `AC-NS.2.1`): its last rowid is found as a
+                        // B-tree's is. Keep the downcast check as a safety net against unexpected
+                        // cursor types.
                         assert!(
-                            cursor.downcast_ref::<BTreeCursor>().is_some(),
-                            "Expected MvCursor or BTreeCursor in op_new_rowid"
+                            cursor.downcast_ref::<BTreeCursor>().is_some()
+                                || cursor
+                                    .downcast_ref::<crate::storage::versioned::cursor::VersionedCursor>()
+                                    .is_some(),
+                            "Expected MvCursor, BTreeCursor or VersionedCursor in op_new_rowid"
                         );
                         *state.active_op_state.new_rowid() = OpNewRowidState::SeekingToLast {
                             mvcc_already_initialized: false,
@@ -14015,7 +14028,13 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        if let Some(switch) = program.connection.versioned.as_ref() {
+        // The main database's trees only, as in `op_open_read`.
+        if let Some(switch) = program
+            .connection
+            .versioned
+            .as_ref()
+            .filter(|_| *db == MAIN_DB_ID)
+        {
             if let Some(cursor) = versioned_cursor(switch, cursor_type, root_page, &pager)? {
                 replace_cursor(cursors, *cursor_id, cursor)?;
                 state.pc += 1;
@@ -18785,6 +18804,195 @@ pub fn op_hash_close(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Amphora (PL.13): counts an outer row of an adaptive join and sends it to the seek, the hash
+/// table's build (once, when the switch comes) or the probe (`optimizer::adaptive::JoinSwitch`).
+/// The switch is made at the first row, with the hash table's share of the statement's memory as
+/// it is then; a refusal (over that share) leaves the join a nested loop, a correct answer.
+pub fn op_join_switch_step(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    use crate::translate::optimizer::adaptive::{weights, JoinStep, JoinSwitch};
+    load_insn!(JoinSwitchStep { data }, insn);
+    let switch = match state.join_switches.entry(data.switch_id) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            // As HashBuild sizes its table: no limit where temporary storage is memory.
+            let budget = if matches!(
+                program.connection.get_temp_store(),
+                crate::TempStore::Memory
+            ) {
+                u64::MAX
+            } else {
+                u64::try_from(table_share(
+                    pager.statement_memory_budget(),
+                    program.memory_tables,
+                ))
+                .unwrap_or(u64::MAX)
+            };
+            let made = JoinSwitch::new(
+                &weights(data.seek, data.hash_build, data.hash_probe),
+                data.build_rows,
+                data.build_bytes,
+                budget,
+            );
+            if let Err(refused) = &made {
+                tracing::debug!(switch = data.switch_id, %refused, "adaptive join stays a nested loop");
+            }
+            entry.insert(made.ok())
+        }
+    };
+    let step = match switch {
+        Some(switch) => switch.outer_row(),
+        None => Ok(JoinStep::NestedLoop),
+    };
+    state.pc = match step {
+        Ok(JoinStep::NestedLoop) => state.pc + 1,
+        Ok(JoinStep::SwitchNow) => data.build_pc.as_offset_int(),
+        Ok(JoinStep::Hash) => data.probe_pc.as_offset_int(),
+        Err(refused) => {
+            tracing::debug!(switch = data.switch_id, %refused, "adaptive join stays a nested loop");
+            state.pc + 1
+        }
+    };
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13): jumps if the adaptive join has switched to its hash table.
+pub fn op_join_switch_hash(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        JoinSwitchHash {
+            switch_id,
+            target_pc
+        },
+        insn
+    );
+    let switched = state
+        .join_switches
+        .get(switch_id)
+        .is_some_and(|switch| switch.as_ref().is_some_and(|switch| switch.switched()));
+    state.pc = if switched {
+        target_pc.as_offset_int()
+    } else {
+        state.pc + 1
+    };
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13): an adaptive join's hash table, built: kept for probing if it fits its share
+/// of memory, else freed and the switch refused (a probe of a spilled table needs the grace
+/// loop a hash join plans, which an adaptive join has not), the join going on as a nested loop.
+/// Kept, it is the inner table held whole, a materialization point
+/// (`optimizer::adaptive::MaterializePoint`): see [`replan_on_built_rows`].
+pub fn op_join_switch_built(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(JoinSwitchBuilt { data }, insn);
+    let held = state
+        .hash_tables
+        .get(&data.hash_table_id)
+        .map(|table| (table.has_spilled(), table.held()));
+    match held {
+        Some((true, _)) => {
+            if let Some(mut table) = state.hash_tables.remove(&data.hash_table_id) {
+                table.close();
+            }
+            if let Some(Some(switch)) = state.join_switches.get_mut(&data.switch_id) {
+                switch.refuse();
+            }
+            tracing::debug!(
+                switch = data.switch_id,
+                "adaptive join's hash table spilled: it stays a nested loop"
+            );
+            state.pc = data.target_pc.as_offset_int();
+        }
+        _ => {
+            program.connection.count_adaptive_join_switch();
+            let replanned = held
+                .is_some_and(|(_, (rows, bytes))| replan_on_built_rows(program, data, rows, bytes));
+            // The in-run hand-off: a run that may start again (read-only, no row returned) stops
+            // here, and `Statement` runs it from the start on the plan made on the counted rows.
+            // An implicit transaction it would end there must be its own: no other statement on
+            // the connection is under way in it (`ProgramState::can_autocommit_now`'s siblings).
+            let txn_its_own = !program.connection.get_auto_commit()
+                || program
+                    .connection
+                    .n_active_root_statements
+                    .load(crate::sync::atomic::Ordering::SeqCst)
+                    == 1;
+            if replanned && state.handoff_open && txn_its_own {
+                state.handoff_asked = true;
+                return Ok(InsnFunctionStepResult::Done);
+            }
+            state.pc += 1;
+        }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13, the re-plan): the rows an adaptive join's hash table holds, the whole inner
+/// table, set against the rows the plan counted it at (ANALYZE's with the changes since, PL.9).
+/// Within the estimate's own error the plan stands. Past it the table's row counter is set to the
+/// rows counted, so the statement's planned table has moved and the statement is handed to a
+/// second prepare, on the counted rows (`Statement::statistics_moved`); every other statement
+/// planned on the table is too. True when it did: the caller hands the rest of a run that may
+/// start again to that prepare (`op_join_switch_built`); any other run goes on as planned, its
+/// answer right and the rows it has returned not returned again.
+fn replan_on_built_rows(
+    program: &Program,
+    data: &crate::vdbe::insn::JoinSwitchBuiltData,
+    rows: usize,
+    bytes: usize,
+) -> bool {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    let counter = program.connection.db.row_changes.counter(&data.table);
+    let estimate = crate::row_changes::live_rows(
+        data.analyzed_rows,
+        counter.load(crate::sync::atomic::Ordering::Acquire),
+    );
+    // The table's bytes are already held to its share of memory: it spills past it, checked above.
+    let verdict =
+        MaterializePoint::new(estimate, data.estimate_error, u64::MAX).and_then(|mut point| {
+            point.rows(rows as u64, bytes as u64)?;
+            Ok(point.verdict())
+        });
+    match verdict {
+        Ok(Replan::Again { rows }) => {
+            let changes = i64::try_from(rows)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(data.analyzed_rows as i64);
+            // A count the planner floors to the estimate it already has would plan the same.
+            if crate::row_changes::live_rows(data.analyzed_rows, changes) != estimate {
+                counter.store(changes, crate::sync::atomic::Ordering::Release);
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    table = %data.table,
+                    estimate,
+                    rows,
+                    "adaptive join's build counted past the estimate: planned again"
+                );
+                return true;
+            }
+            false
+        }
+        Ok(Replan::Keep) => false,
+        Err(refused) => {
+            tracing::debug!(table = %data.table, %refused, "adaptive join's rows not checked");
+            false
+        }
+    }
+}
+
 pub fn op_hash_clear(
     _program: &Program,
     state: &mut ProgramState,
@@ -20406,8 +20614,12 @@ pub fn op_morsel_aggregate(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     use crate::vdbe::morsel::HashProbe;
-    use crate::vdbe::morsel::{MachineCosts, MemoryBudget, MorselError, ScanAggregate};
-    use crate::vdbe::morsel_scan::{TableAggregate, TableJoinAggregate, TableSource};
+    use crate::vdbe::morsel::{
+        MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
+    };
+    use crate::vdbe::morsel_scan::{
+        TableAggregate, TableBuild, TableJoinAggregate, TableJoinRows, TableSource,
+    };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
         Box::new(LimboError::InternalError(format!(
@@ -20440,18 +20652,49 @@ pub fn op_morsel_aggregate(
                 table: &table,
                 shape: &shape,
             };
-            return pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget);
+            return pipeline
+                .run_mode(connection.parallel_mode(), &mut costs, &budget)
+                .map(|(rows, _)| (rows, false));
         };
-        // A hash join's probe: the build side read and its table built once, on this thread,
-        // charged to the statement's one budget; the joined rows' filter is the probe's.
+        // A hash join's probe: the build side read and its table built once, by the workers
+        // together (a partition per core the switch lets run), charged to the statement's one
+        // budget; the joined rows' filter is the probe's.
         let build_table = TableSource::open(
             pager.clone(),
             join.root_page,
             join.columns,
             join.rowid_alias,
         )?;
-        let build = build_table.filtered_rows(&join.filter, &budget)?;
-        let probe = HashProbe::build(&build, &join.build_key, &[], &join.probe_key, &budget)?;
+        let mode = connection.parallel_mode();
+        let partitioner = Partitioner::new(match mode {
+            ParallelMode::On => costs.cores(),
+            ParallelMode::Off => std::num::NonZeroUsize::MIN,
+        });
+        let (build, hash_table, _) = TableBuild {
+            table: &build_table,
+            filter: &join.filter,
+            key: &join.build_key,
+            partitioner: &partitioner,
+        }
+        .run_mode(mode, &mut costs, &budget)?;
+        let probe = HashProbe::over(hash_table, &[], &join.probe_key);
+        // A join's rows, no aggregates: each worker keeps its own leaves' joined rows, merged
+        // in order; they are the answer's rows as they stand.
+        if let Some(rows) = &data.joined_rows {
+            let pipeline = TableJoinRows {
+                table: &table,
+                probe_filter: &data.filter,
+                probe: &probe,
+                build: &build,
+                project: &data.result_map,
+                order: &rows.order,
+            };
+            let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
+            for row in &mut out {
+                row.truncate(rows.width);
+            }
+            return Ok((out, true));
+        }
         let shape = ScanAggregate {
             rows: &[],
             filter: &[],
@@ -20465,11 +20708,18 @@ pub fn op_morsel_aggregate(
             build: &build,
             shape: &shape,
         };
-        pipeline.run_mode(connection.parallel_mode(), &mut costs, &budget)
+        pipeline
+            .run_mode(mode, &mut costs, &budget)
+            .map(|(rows, _)| (rows, false))
     })();
     *connection.morsel_costs.lock() = Some(costs);
     let mut rows = match answered {
-        Ok((rows, _)) => rows,
+        Ok((rows, true)) => {
+            state.morsel_rows = Some(rows.into_iter());
+            state.pc = next_pc(state)?;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        Ok((rows, false)) => rows,
         // A value the parallel aggregates don't take (a SUM over text), or groups past the
         // statement's memory that the serial loop's spilling GROUP BY can hold: it answers.
         Err(MorselError::Unsupported { .. } | MorselError::MemoryBudget { .. }) => {

@@ -1182,7 +1182,7 @@ enum BlobSpan {
 /// `hpos0` the offset of the first serial type, i.e. the width of the header-size
 /// varint. Returns the value's payload-relative byte offset, its byte length, and
 /// its serial type, after checking the range lies inside `payload_size`.
-fn blob_locate_column_in_header(
+pub(crate) fn blob_locate_column_in_header(
     header: &[u8],
     hpos0: usize,
     payload_size: usize,
@@ -1215,6 +1215,22 @@ fn blob_locate_column_in_header(
         body = end;
         col += 1;
     }
+}
+
+/// Error unless a value of serial type `serial` is byte-addressable, stored as TEXT or BLOB: SQLite
+/// refuses incremental I/O on NULL, integer and real values, whose bytes are an encoding.
+pub(crate) fn blob_text_or_blob(serial: u64) -> Result<()> {
+    if serial >= 12 {
+        return Ok(());
+    }
+    let type_name = match serial {
+        0 => "null",
+        7 => "real",
+        _ => "integer",
+    };
+    Err(LimboError::InternalError(format!(
+        "cannot open value of type {type_name}"
+    )))
 }
 
 crate::assert::assert_send!(BTreeCursor);
@@ -1404,6 +1420,23 @@ impl BTreeCursor {
     /// False, and the cursor unmoved, when it can't: a pending advance, another page type, or
     /// a cell behind it or past the leaf.
     pub(crate) fn advance_within_leaf_to(&mut self, cell: usize) -> bool {
+        if !self.can_advance_within_leaf_to(cell) {
+            return false;
+        }
+        let Ok(target) = i32::try_from(cell) else {
+            return false;
+        };
+        let (_, cell_idx) = self.stack.top_and_cell_index();
+        if target != cell_idx {
+            self.stack.set_cell_index(target);
+            self.invalidate_record();
+        }
+        true
+    }
+
+    /// Whether `advance_within_leaf_to(cell)` would move the cursor (QT.7: a fused run checks
+    /// before its body runs and moves once it knows where the run ends).
+    pub(crate) fn can_advance_within_leaf_to(&self, cell: usize) -> bool {
         if self.has_pending_advance_state() {
             return false;
         }
@@ -1412,14 +1445,7 @@ impl BTreeCursor {
         };
         let (page, cell_idx) = self.stack.top_and_cell_index();
         let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
-        if !is_leaf || cell_idx < 0 || target < cell_idx || cell >= cell_count {
-            return false;
-        }
-        if target != cell_idx {
-            self.stack.set_cell_index(target);
-            self.invalidate_record();
-        }
-        true
+        is_leaf && cell_idx >= 0 && target >= cell_idx && cell < cell_count
     }
 
     pub(crate) fn table_leaf_under_cursor(&self) -> Option<TableLeafUnderCursor<'_>> {
@@ -6360,18 +6386,7 @@ impl BTreeCursor {
             self.blob_cache.col_valid,
             "column tier must be cached before the type check"
         );
-        let serial = self.blob_cache.col_serial;
-        if serial >= 12 {
-            return Ok(());
-        }
-        let type_name = match serial {
-            0 => "null",
-            7 => "real",
-            _ => "integer",
-        };
-        Err(LimboError::InternalError(format!(
-            "cannot open value of type {type_name}"
-        )))
+        blob_text_or_blob(self.blob_cache.col_serial)
     }
 
     /// Ensure `blob_cache.overflow_pages` holds at least `upto + 1` entries, extending

@@ -222,3 +222,8 @@ sorted-vec = "0.8.6"
 [[test]]
 name = "unnesting"
 required-features = ["simulator"]
+
+# T-PL.13.1 pins the cost weights (the simulator's control) so its switch points hold on any machine.
+[[test]]
+name = "adaptive_joins"
+required-features = ["simulator"]
