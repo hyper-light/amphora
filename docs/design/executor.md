@@ -630,9 +630,20 @@ bitmaps merged, the bitmap words the workers held, statements per path) and trac
 (target `amphora.morsel`, "outer join on morsels"). Every outer-join test (T-QT.6.19, T-QT.6.22 to
 T-QT.6.25) runs at both settings; T-QT.6.19 also checks each setting ran its own path.
 
+**The extremes that tell them apart** (lane qs6-16; step 3 of qs6-14's plan). T-QT.6.26, a harness
+in `vdbe/morsel_join_ab.rs`, runs LEFT and FULL joins (counts, a GROUP BY, rows) at both settings
+and a ladder of stated cores on four pairs of tables with unique keys, each forcing one
+orientation's failure mode: a tiny padded table against a huge kept one (`Padded` hashes and marks
+the huge one), a huge padded table against a tiny kept one (`Kept` hashes the huge one), every key
+but one matched on each side (the bitmaps' rest pass finds nothing) and one key matched (all of it
+padded). Per scenario, query, setting and cores it reports p50, p99 and p99.9, the statements each
+path ran and those that fell back to the serial loop, the rows padded each way and the bitmap
+words per statement, and the bytes charged to the statement's memory budget, the mean and the most
+(`OuterCounters::charged_bytes`, `charged_peak`; a budget is not credited back within its
+statement, so a statement's charge bounds what it held at once).
+
 **Not yet.** One path for LEFT joins: which orientation wins, or a choice per query from measured
-costs, is the scaling run's to say (qs6-14's plan, steps 3 and 4: the extreme-case scenario in the
-A/B harness, then the leftover paths removed).
+costs, is T-QT.6.26's run of record to say (qs6-14's plan, step 4: the leftover paths removed).
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

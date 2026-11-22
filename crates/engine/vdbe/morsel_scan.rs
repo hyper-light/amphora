@@ -1383,6 +1383,13 @@ pub struct OuterCounters {
     /// Statements run as a chain in the FROM clause's order ([`TableChain`]), a two-table outer
     /// join that probes its kept table among them.
     pub chains: std::sync::atomic::AtomicU64,
+    /// The bytes the outer-join statements charged to their memory budgets, summed (lane qs6-16):
+    /// the hash tables, the bitmaps and the partials. A budget is charged and never credited back
+    /// within its statement, so a statement's charge is all it held at once at most.
+    pub charged_bytes: std::sync::atomic::AtomicU64,
+    /// The most bytes any one outer-join statement charged (lane qs6-16); a reader may store 0 to
+    /// start a fresh maximum.
+    pub charged_peak: std::sync::atomic::AtomicU64,
 }
 
 impl OuterCounters {

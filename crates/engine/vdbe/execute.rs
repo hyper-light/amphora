@@ -21057,10 +21057,12 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 /// (`path`: the padded table probed with a bitmap, or the chain in the FROM clause's order): the
 /// rows padded during the walk and after the bitmaps merged, and the bitmap words held. The
 /// counters are the connection's, so the differences are this statement's while it alone runs
-/// on the connection, as a connection's statements do.
+/// on the connection, as a connection's statements do. The statement's `budget`, its hash tables
+/// already charged, gives the bytes it held (lane qs6-16).
 fn outer_traced<T>(
     counts: &crate::vdbe::morsel_scan::OuterCounters,
     path: &'static str,
+    budget: &crate::vdbe::morsel::MemoryBudget,
     run: impl FnOnce() -> Result<T, crate::vdbe::morsel::MorselError>,
 ) -> Result<T, crate::vdbe::morsel::MorselError> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -21074,12 +21076,16 @@ fn outer_traced<T>(
     let before = read();
     let answer = run();
     let after = read();
+    let charged = u64::try_from(budget.used()).unwrap_or(u64::MAX);
+    counts.charged_bytes.fetch_add(charged, Relaxed);
+    counts.charged_peak.fetch_max(charged, Relaxed);
     tracing::debug!(
         target: "amphora.morsel",
         path,
         walk_pads = after.0.saturating_sub(before.0),
         bitmap_pads = after.1.saturating_sub(before.1),
         bitmap_words = after.2.saturating_sub(before.2),
+        charged,
         ok = answer.is_ok(),
         "outer join on morsels"
     );
@@ -21312,7 +21318,7 @@ pub fn op_morsel_aggregate(
                     .unwrap_or_default(),
                 counts: &connection.morsel_outer,
             };
-            let (mut out, _) = outer_traced(&connection.morsel_outer, "chain", || {
+            let (mut out, _) = outer_traced(&connection.morsel_outer, "chain", &budget, || {
                 pipeline.run_mode(mode, &mut costs, &budget)
             })?;
             connection
@@ -21352,9 +21358,10 @@ pub fn op_morsel_aggregate(
                     .unwrap_or_default(),
                 counts: &connection.morsel_outer,
             };
-            let (mut out, _) = outer_traced(&connection.morsel_outer, "padded probe", || {
-                pipeline.run_mode(mode, &mut costs, &budget)
-            })?;
+            let (mut out, _) =
+                outer_traced(&connection.morsel_outer, "padded probe", &budget, || {
+                    pipeline.run_mode(mode, &mut costs, &budget)
+                })?;
             connection
                 .morsel_outer
                 .padded_probes
