@@ -1152,7 +1152,7 @@ mod tests {
     /// what changed after nothing and after the head; then 2b written, and what changed after the
     /// head again. Expect: each row with its own stamp as its revision (the changes' stamps), the
     /// key never written none, 1a before its stamp none; what changed after nothing the newest
-    /// stamp (1b's), after the head none, and after 2b its stamp, past the head.
+    /// stamp (1a's: the second group's clock is behind), after the head none, and after 2b its stamp, past the head.
     #[test]
     fn t_t1_9_r24_one_key_and_what_changed_across_groups() {
         let dir = tempfile::tempdir().unwrap();
