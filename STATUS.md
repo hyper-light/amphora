@@ -5,6 +5,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
+- **Column copies within a fixed memory limit** (kiln goal c436eeb5, CB, lanes colcopy-bound to
+  colcopy-4; docs/design/columnar.md decision 2): each block and change of a copy asks the memory
+  source for its bytes before it is built or applied, a refused build gives back what it took, and a
+  refused copy is bought again by A (rent and rebuy) or B (wait for room) behind
+  `AMPHORA_COLUMN_REBUY`, counted and traced. Open: the A/B run of record and the default it picks.
 - **A SQL session's commit across groups** (CP-T1.10, AC-T1.10.1, lane xgroup-sql; docs/design/xgroup.md):
   `Cluster::commit` keeps a one-group transaction on its group's own commit and sends rows in several
   groups through the coordinator, both protocols; seeded answers equal the same on one group. Open: the
@@ -356,8 +361,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   statement writes its row; SQL there is serializable: the cursor keeps each leaf span it copies as
   read for its commit's precision-locking validation, and Elle's histories through SQL show no
   anomaly on either storage (`T-G8.4.1`); an in-memory IO keeps a database's storage beside its
-  file, so a database reopened on it finds its trees. With the switch on, 55 of the engine's lib
-  tests still fail (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
+  file, so a database reopened on it finds its trees. Attached databases keep their trees on their own
+  versioned storage; the versioned cursor stops at the next leaf once its statement is interrupted
+  and pauses where the pager's cursor does in tests (`AC-NS.2.7`, lane g7s2-11). With the switch on,
+  44 of the engine's lib tests still fail (2866 pass, lane g7s2-11, before the pause points; 6 more
+  pass after) (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
   batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and
   page-codec tests). Not yet: the header (schema cookie, user version) on the versioned
   storage (still the pager's); a database past the budget's frames (G7 step 4's eviction); one
@@ -1067,9 +1075,15 @@ G5 step 4 wired (lanes g5s4c, g5s4d): the engine's Insert and Delete opcodes kee
 registry of skipping summaries (zone maps or cracking), and a SELECT's scan with integer bounds on
 a summarized column seeks past the rows the summary leaves out, consulting it only at the snapshot
 it holds (an older reader, or a rolled-back summary, is refused, counted, and reads every row).
-Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). Open: choosing a kind
-by measured cost and a SQL switch (executor.md decision 11, "Not yet").
+Answers equal the unswitched ones under random writes (T-G5.4.2, T-G5.4.3). A kind chosen by measured
+cost and a SQL setting followed (T-SKU.2, T-SKU.3).
 
 Row skipping usable by real statements (lane skip-usable, kiln goal 99e6cc88; executor.md decision
 11): a scan's bounds come from bound parameters too, read as the scan starts, so prepared statements
 skip (T-SKU.1).
+Lanes skip-3 and skip-4 (kiln goal 623adc1c): `PRAGMA skipping = 'table.column'` turns skipping
+on (T-SKU.3), and by default it keeps both kinds and answers each filter with whichever measured
+cheaper on that column's own scans, measuring the other again on a doubling schedule (T-SKU.2).
+Lane skip-5: a skipping scan runs its body over the fused column batches up to each candidate
+run's end (T-SKU.4).
+Open: the benchmark against DuckDB and ClickHouse.

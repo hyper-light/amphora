@@ -714,8 +714,42 @@ anything but an integer (NULL, a real, a text, a blob) gives its term no bound: 
 the same rule as the summaries' (a bound parameter has no affinity, as a numeric literal has none,
 so the comparison it makes is the constant's).
 
-**Not yet.** Neither kind is chosen by measured cost (the harness's numbers aren't recorded), and a
-summary is turned on by `skipping::set_skipping` (no SQL).
+### Choosing a kind by measured cost (lanes skip-3 and skip-4, T-SKU.2)
+
+`SkipKind::Measured` keeps both a zone map and a cracked copy of the column, each fed every write
+(`skipping::Chooser`, `choose.rs`), and answers each filter with one of them. The executor times
+the scan from asking for its candidates to its end and hands the time back
+(`SkipRegistry::record_cost`); a scan stopped early (a LIMIT) hands back nothing. The core reads no
+clock. Each kind is tried once; the kind whose latest measured scan was cheaper leads; the other is
+measured again once the leader has spent as much as the other's last scan cost, times 2 to the
+number of measures in a row that confirmed the leader (the doubling trick, Auer, Cesa-Bianchi,
+Freund and Schapire 2002; ski rental's break-even rule, Karlin et al. 1988, for the first trial).
+The 2 is the doubling trick's base, not a tuned number. A burst of scans issues one trial, not one
+each. Instruments: `ChooserStats` (per kind: filters it answered as leader, trials, costs measured,
+latest and total cost; how often the leader changed) and a debug event on `amphora.skipping` with
+both costs whenever the leader changes.
+
+The scenarios that force each kind's failure mode (`skipping::tests::chooser`): a scattered column
+with narrow filters fails zone maps, and the chooser settles on cracking; a column that follows the
+rowid, with heavy write churn and wide filters, fails cracking, and it settles on zone maps. In
+both, the other kind is measured a logarithmic number of times, and the chooser's total stays
+within twice the better kind alone, plus the kept kind's write upkeep.
+
+**Cost of keeping both.** Both summaries take every write, so the losing kind's write upkeep is paid
+for as long as the column is measured; the doubling bound covers scans, not that upkeep. Dropping
+the loser once its excess cost passes a rebuild's (ski rental again) would bound it; not built.
+
+### A SQL setting (lane skip-4, T-SKU.3)
+
+`PRAGMA skipping = 'table.column'` keeps a measured summary of the column; `'table.column
+zone_maps'`, `'table.column cracking'` and `'table.column off'` pick one kind or drop the summary.
+The summary is built when the statement is prepared, as the other connection settings take effect,
+and as `skipping::set_skipping` builds it: holding the write lock, refused inside an open
+transaction, under MVCC, or for a column the record doesn't hold, with the reason. `PRAGMA skipping`
+with no value is refused: the setting is set, not read.
+
+**Not yet.** A walking scan runs its body row by row, not in fused column batches; rows read and
+latency against DuckDB and ClickHouse are not measured.
 
 **Overlap.** G11's column copy (`storage/versioned/columns.rs`, lane g11s4's summaries) keeps its
 own per-block summaries over the copy, fed by commits; these zone maps summarize the row store's

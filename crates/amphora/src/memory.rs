@@ -261,6 +261,14 @@ impl amphora_engine::storage::versioned::memory::Source for StorageMemory {
     fn give(&self, bytes: u64) {
         self.0.give(Use::Caches, bytes);
     }
+
+    fn room(&self) -> amphora_engine::Result<u64> {
+        self.0.room(Use::Caches).map_err(|refusal| {
+            amphora_engine::LimboError::InternalError(format!(
+                "versioned storage: the memory budget's room: {refusal}"
+            ))
+        })
+    }
 }
 
 impl Budget {

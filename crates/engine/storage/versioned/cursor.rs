@@ -34,17 +34,19 @@ use super::durable::Database;
 use super::overflow;
 use super::version::{Snapshot, Txn, VTree};
 use crate::error::LimboError;
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::cursor::CursorYieldPoint;
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeKey, CursorTrait};
 use crate::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex, Weak};
 use crate::types::{
     compare_immutable_iter, find_compare, get_tie_breaker_from_seek_op, AsValueRef, IOResult,
     IOResultOr, ImmutableRecord, ImmutableRecordRef, IndexInfo, RecordCompare, SeekKey, SeekOp,
     SeekResult, Value, ValueRef,
 };
 use crate::vdbe::Register;
-use crate::{Pager, Result};
+use crate::{Connection, Pager, Result};
 use std::cmp::Ordering;
 
 /// A table's key for `rowid`: big-endian with the sign bit flipped, so the bytes order as the
@@ -377,6 +379,22 @@ pub struct VersionedCursor {
     /// Whether the blob handle's row was written by another cursor or removed: refused for good
     /// (SQLite's expired handle, `SQLITE_ABORT`).
     blob_expired: bool,
+    /// Amphora (G7 step 2, `AC-NS.2.7`): the connection whose statement steps this cursor. A walk
+    /// over many leaves (a count, a clear, a skip past rows the snapshot can't see) asks it at
+    /// each leaf whether the statement was interrupted, so it stops there, not at the tree's end.
+    conn: Weak<Connection>,
+    /// This cursor among the connection's, for its yield injector's bookkeeping (tests only).
+    #[cfg(any(test, injected_yields))]
+    yield_instance: u64,
+}
+
+/// Refuses with `Interrupt` once `conn`'s statement is interrupted (`sqlite3_interrupt`); asked a
+/// leaf at a time, never a row at a time.
+fn stop_if_interrupted(conn: &Weak<Connection>) -> Result<()> {
+    match conn.upgrade() {
+        Some(conn) if conn.is_interrupted() => Err(LimboError::Interrupt),
+        _ => Ok(()),
+    }
 }
 
 /// The row a blob handle stands on: its key, and its record as the handle last read or wrote it.
@@ -419,7 +437,35 @@ impl VersionedCursor {
             record: None,
             blob: None,
             blob_expired: false,
+            conn: Weak::new(),
+            #[cfg(any(test, injected_yields))]
+            yield_instance: 0,
         })
+    }
+
+    /// The cursor watched by `conn` (G7 step 2, `AC-NS.2.7`): its long walks stop at the next leaf
+    /// once `conn`'s statement is interrupted, and in tests the connection's yield injector pauses
+    /// it where it pauses the pager's cursor.
+    pub(crate) fn watched_by(mut self, conn: &Arc<Connection>) -> Self {
+        self.conn = Arc::downgrade(conn);
+        #[cfg(any(test, injected_yields))]
+        {
+            self.yield_instance = conn.next_yield_instance_id();
+        }
+        self
+    }
+
+    /// The pause the connection's yield injector asks for at `point`, before the step does any of
+    /// its work, so the step re-entered does it all once.
+    #[cfg(any(test, injected_yields))]
+    fn injected<T>(&self, point: CursorYieldPoint) -> Option<IOResult<T>> {
+        let conn = self.conn.upgrade()?;
+        crate::mvcc::yield_hooks::maybe_inject_io_yield(
+            conn.yield_injector().as_ref(),
+            self.yield_instance,
+            self.tree,
+            point,
+        )
     }
 
     /// Whether the copy is still the leaf's rows.
@@ -483,6 +529,7 @@ impl VersionedCursor {
             }
             leaf = right;
             low = rows.high.take();
+            stop_if_interrupted(&self.conn)?;
         };
         self.note(from_key.as_deref(), found.as_deref())?;
         Ok(found.is_some())
@@ -809,6 +856,7 @@ impl VersionedCursor {
         let mut n = 0usize;
         let mut found = self.first_after(&Point::First, None)?;
         while found {
+            stop_if_interrupted(&self.conn)?;
             n = n
                 .checked_add(self.rows.len())
                 .ok_or(LimboError::IntegerOverflow)?;
@@ -839,6 +887,7 @@ impl VersionedCursor {
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut found = self.first_after(&Point::First, None)?;
         while found {
+            stop_if_interrupted(&self.conn)?;
             keys.clear();
             for i in 0..self.rows.len() {
                 keys.push(self.rows.key(i)?.to_vec());
@@ -1076,6 +1125,10 @@ impl CursorTrait for VersionedCursor {
     }
 
     fn next(&mut self) -> IOResultOr<()> {
+        #[cfg(any(test, injected_yields))]
+        if let Some(paused) = self.injected(CursorYieldPoint::NextStart) {
+            return Ok(paused);
+        }
         done(self.step_next())
     }
 
@@ -1096,6 +1149,10 @@ impl CursorTrait for VersionedCursor {
     }
 
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        #[cfg(any(test, injected_yields))]
+        if let Some(paused) = self.injected(CursorYieldPoint::SeekStart) {
+            return Ok(paused);
+        }
         match key {
             SeekKey::TableRowId(rowid) => done(self.seek_rowid(rowid, op)),
             SeekKey::IndexKey(record) => {
@@ -1151,6 +1208,10 @@ impl CursorTrait for VersionedCursor {
     }
 
     fn count(&mut self) -> IOResultOr<usize> {
+        #[cfg(any(test, injected_yields))]
+        if let Some(paused) = self.injected(CursorYieldPoint::CountProgress) {
+            return Ok(paused);
+        }
         done(self.count_rows())
     }
 

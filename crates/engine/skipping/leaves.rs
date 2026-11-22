@@ -6,7 +6,7 @@
 //! This is the one place the skipping module reads storage; the summaries themselves stay pure.
 
 use super::{
-    Candidates, CrackerColumn, SkipCounts, SkipError, SkipRefusal, Skipping, ZoneMap,
+    Candidates, Chooser, CrackerColumn, SkipCounts, SkipError, SkipRefusal, Skipping, ZoneMap,
     ZoneMapBuilder,
 };
 use crate::numeric::Numeric;
@@ -111,6 +111,9 @@ pub(crate) fn zone_map_from_leaves(
 pub enum SkipKind {
     ZoneMaps,
     Cracking,
+    /// Both, each filter answered by whichever measures cheaper on this column (lane skip-3,
+    /// T-SKU.2).
+    Measured,
 }
 
 /// The table's root page and the record index of its summarized column, refusing what can't be
@@ -194,6 +197,11 @@ pub fn set_skipping(
         SkipKind::Cracking => {
             rows_of(&mut cursor, index).map(|rows| Skipping::Cracking(CrackerColumn::new(rows)))
         }
+        SkipKind::Measured => zone_map_from_leaves(&mut cursor, index).and_then(|zones| {
+            rows_of(&mut cursor, index).map(|rows| {
+                Skipping::Measured(Box::new(Chooser::new(zones, CrackerColumn::new(rows))))
+            })
+        }),
     };
     match built {
         Ok(skipping) => {

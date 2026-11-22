@@ -1383,7 +1383,13 @@ pub fn op_open_read(
     // own; a temp database's tables stay on its pager, their root pages its pages (G7 step 2,
     // `AC-NS.2.1`).
     if let Some(switch) = program.connection.versioned_for(*db) {
-        if let Some(cursor) = versioned_cursor(&switch, cursor_type, *root_page, &pager)? {
+        if let Some(cursor) = versioned_cursor(
+            &program.connection,
+            &switch,
+            cursor_type,
+            *root_page,
+            &pager,
+        )? {
             replace_cursor(&mut state.cursors, *cursor_id, cursor)?;
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -1913,7 +1919,7 @@ pub fn op_rewind(
             .filter(|walk| walk.phase != crate::skipping::WalkPhase::Idle)
         {
             let on_row = state.pc + 1;
-            return skip_walk_step(state, walk, pc_if_empty.as_offset_int(), on_row);
+            return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
         }
     }
     // Clear any bloom filter associated with this cursor so stale filter data
@@ -1942,7 +1948,7 @@ pub fn op_rewind(
         if !program.skip_hints.is_empty() {
             if let Some(walk) = skip_walk_for(program, state, *cursor_id) {
                 let on_row = state.pc + 1;
-                return skip_walk_step(state, walk, pc_if_empty.as_offset_int(), on_row);
+                return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
             }
         }
         // Rewind positions to the first row, which is effectively a read
@@ -1987,8 +1993,10 @@ fn skip_walk_for(
         _ => None,
     })?;
     let (reader_pos, committed) = conn.skipping_positions()?;
-    let candidates = registry
-        .candidates(
+    // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
+    let started = std::time::Instant::now();
+    let (candidates, method) = registry
+        .candidates_by(
             root,
             conn.skipping_id(),
             reader_pos,
@@ -1997,12 +2005,32 @@ fn skip_walk_for(
             bounds.hi,
         )
         .ok()?;
-    crate::skipping::SkipWalk::new(cursor_id, candidates)
+    let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
+    walk.measure = method.map(|method| crate::skipping::WalkMeasure {
+        root,
+        method,
+        started,
+    });
+    Some(walk)
+}
+
+/// Lane skip-3 (T-SKU.2): a measured scan's end hands its cost (nanoseconds from asking for its
+/// candidates) to the summary's chooser, once. A scan stopped early (a LIMIT) hands back nothing.
+fn skip_walk_ended(program: &Program, walk: &mut crate::skipping::SkipWalk) {
+    if let Some(measure) = walk.measure.take() {
+        let cost = u64::try_from(measure.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        program
+            .connection
+            .db
+            .skipping
+            .record_cost(measure.root, measure.method, cost);
+    }
 }
 
 /// Moves a skipping scan's cursor to its next candidate row (`on_row`) or ends it (`on_end`),
 /// keeping the walk across an I/O wait.
 fn skip_walk_step(
+    program: &Program,
     state: &mut ProgramState,
     mut walk: crate::skipping::SkipWalk,
     on_end: crate::vdbe::InsnReference,
@@ -2015,6 +2043,9 @@ fn skip_walk_step(
     };
     state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(seeks);
     state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(seeks);
+    if matches!(moved, Ok(crate::types::IOResult::Done(false))) {
+        skip_walk_ended(program, &mut walk);
+    }
     state.skip_walks.put(walk);
     match moved? {
         crate::types::IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
@@ -2085,6 +2116,24 @@ fn skip_settle(
                 CursorStep::IO(io) => return Ok(IOResult::IO(io)),
             },
         }
+    }
+}
+
+/// A fused run's rows past the one its Next stepped onto, counted as that many Next steps.
+fn record_fused_rows(state: &mut ProgramState, rows: usize, fullscan: bool, is_index: bool) {
+    if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
+        let skipped = skipped as u64;
+        state.record_rows_read(skipped);
+        state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
+        state.metrics.search_count = state.metrics.search_count.wrapping_add(skipped as i64);
+        state.metrics.fullscan_steps = state
+            .metrics
+            .fullscan_steps
+            .wrapping_add(fullscan as u64 * skipped);
+        state.metrics.index_steps = state
+            .metrics
+            .index_steps
+            .wrapping_add(is_index as u64 * skipped);
     }
 }
 
@@ -3780,7 +3829,9 @@ pub fn op_next(
         insn
     );
     // Amphora (G5 step 4, T-G5.4.3): a scan skipping by a summary steps, then seeks past the rows
-    // its candidates leave out (its body runs row by row: no fused batch).
+    // its candidates leave out. Lane skip-5 (T-SKU.4): on a candidate row, a fused loop's body
+    // runs over the batch up to the candidate run's end, as an unskipped scan's does to the
+    // batch's end.
     if !state.skip_walks.is_empty() {
         if let Some(mut walk) = state.skip_walks.take(*cursor_id) {
             if walk.phase == crate::skipping::WalkPhase::Idle {
@@ -3788,6 +3839,7 @@ pub fn op_next(
                 match step {
                     CursorStep::Row => walk.phase = crate::skipping::WalkPhase::Settle,
                     CursorStep::Empty => {
+                        skip_walk_ended(program, &mut walk);
                         state.skip_walks.put(walk);
                         state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
@@ -3802,8 +3854,24 @@ pub fn op_next(
                     }
                 }
             }
-            let on_end = state.pc + 1;
-            return skip_walk_step(state, walk, on_end, pc_if_next.as_offset_int());
+            let next_pc = state.pc;
+            let on_end = next_pc + 1;
+            let stepped = skip_walk_step(program, state, walk, on_end, pc_if_next.as_offset_int())?;
+            if state.pc == pc_if_next.as_offset_int() {
+                let fused = program
+                    .leaf_batch_plan
+                    .as_deref()
+                    .and_then(|plan| plan.fused_loop(next_pc as usize));
+                if let Some((fused, until)) = fused.zip(state.skip_walks.run_end(*cursor_id)) {
+                    let rows =
+                        super::leaf_batch::fused::run(program, state, fused, pager, Some(until))?;
+                    record_fused_rows(state, rows, *fullscan, *is_index);
+                    if rows > 0 {
+                        state.pc = next_pc;
+                    }
+                }
+            }
+            return Ok(stepped);
         }
     }
     let is_empty = {
@@ -3839,22 +3907,8 @@ pub fn op_next(
             .as_deref()
             .and_then(|plan| plan.fused_loop(next_pc as usize))
         {
-            let rows = super::leaf_batch::fused::run(program, state, fused, pager)?;
-            if let Some(skipped) = rows.checked_sub(1).filter(|skipped| *skipped > 0) {
-                let skipped = skipped as u64;
-                state.record_rows_read(skipped);
-                state.metrics.btree_next = state.metrics.btree_next.wrapping_add(skipped);
-                state.metrics.search_count =
-                    state.metrics.search_count.wrapping_add(skipped as i64);
-                state.metrics.fullscan_steps = state
-                    .metrics
-                    .fullscan_steps
-                    .wrapping_add(*fullscan as u64 * skipped);
-                state.metrics.index_steps = state
-                    .metrics
-                    .index_steps
-                    .wrapping_add(*is_index as u64 * skipped);
-            }
+            let rows = super::leaf_batch::fused::run(program, state, fused, pager, None)?;
+            record_fused_rows(state, rows, *fullscan, *is_index);
             if rows > 0 {
                 state.pc = next_pc;
             }
@@ -14197,6 +14251,7 @@ pub fn op_offset_limit(
 /// Amphora (G7 step 2, `AC-NS.2.1`): with the connection's switch on, the cursor on the versioned
 /// storage's tree at `root_page` for a table or an index; `None` for a cursor of another kind.
 fn versioned_cursor(
+    conn: &Arc<Connection>,
     switch: &crate::storage::versioned::switch::Switch,
     cursor_type: &CursorType,
     root_page: i64,
@@ -14216,7 +14271,9 @@ fn versioned_cursor(
         CursorType::BTreeIndex(index) => Some(Arc::new(IndexInfo::new_from_index(index)?)),
         _ => return Ok(None),
     };
-    let cursor = switch.cursor(root_page, index, pager.clone())?;
+    let cursor = switch
+        .cursor(root_page, index, pager.clone())?
+        .watched_by(conn);
     Ok(Some(Cursor::new_btree_dyn(Box::new(cursor))))
 }
 
@@ -14317,7 +14374,9 @@ pub fn op_open_write(
     if !can_reuse_cursor {
         // By database, as in `op_open_read`.
         if let Some(switch) = program.connection.versioned_for(*db) {
-            if let Some(cursor) = versioned_cursor(&switch, cursor_type, root_page, &pager)? {
+            if let Some(cursor) =
+                versioned_cursor(&program.connection, &switch, cursor_type, root_page, &pager)?
+            {
                 replace_cursor(cursors, *cursor_id, cursor)?;
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);

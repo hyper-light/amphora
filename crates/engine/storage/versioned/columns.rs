@@ -64,6 +64,9 @@ struct Queue {
 pub struct FeedCounts {
     pub offered: u64,
     pub lost: u64,
+    /// The keys' and rows' bytes of every put offered, queued or not: how far the table grew by
+    /// the commit stream (what a copy waiting for room re-estimates its size by, AC-CB.2.2).
+    pub put_bytes: u64,
 }
 
 /// The copy's queue: the commits' records for one tree, handed over under the publish lock.
@@ -120,10 +123,15 @@ impl Feed {
         let bytes = changes
             .iter()
             .fold(0usize, |n, c| n.saturating_add(change_bytes(c)));
+        let puts = changes
+            .iter()
+            .filter(|c| c.value.is_some())
+            .fold(0usize, |n, c| n.saturating_add(change_bytes(c)));
         let at = (self.tick)();
         let mut q = self.queue.lock();
         let fits = self.room.take(QUEUE, as_u64(bytes)).is_ok();
         let mut counts = self.counts.lock();
+        counts.put_bytes = counts.put_bytes.saturating_add(as_u64(puts));
         if fits {
             q.bytes = q.bytes.saturating_add(bytes);
             q.records.push_back(Queued { ts, at, changes });
@@ -166,6 +174,42 @@ impl Drop for Feed {
 /// What a copy's queue takes its bytes from its memory source as.
 pub const QUEUE: &str = "a column copy's queue";
 
+/// What a copy's generations (blocks and deltas) take their bytes from its memory source as.
+pub const BLOCKS: &str = "a column copy's blocks";
+
+/// The bytes a memory source granted one generation, given back when the generation goes. Each
+/// piece is taken before what it pays for is built or changed (lane colcopy-bound, AC-CB.1.1), so
+/// a copy never holds a byte it wasn't granted; a build refused part way drops its grant with the
+/// blocks it made, giving back what it took (AC-CB.1.2).
+struct Grant {
+    room: Arc<dyn Source>,
+    bytes: usize,
+}
+
+impl Grant {
+    fn new(room: Arc<dyn Source>) -> Self {
+        Self { room, bytes: 0 }
+    }
+
+    /// `bytes` more, taken from the source before they're spent; its typed refusal
+    /// ([`LimboError::MemoryBudget`]) when it has no room.
+    fn take(&mut self, bytes: usize) -> Result<()> {
+        if bytes > 0 {
+            self.room.take(BLOCKS, as_u64(bytes))?;
+            self.bytes = self.bytes.saturating_add(bytes);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Grant {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.room.give(as_u64(self.bytes));
+        }
+    }
+}
+
 /// A count of bytes as a memory source counts them.
 pub(crate) fn as_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
@@ -181,6 +225,10 @@ pub type RowVisit<'a> = dyn FnMut(usize, &[u8], &[u8]) -> Result<bool> + 'a;
 pub trait Block: Send + Sync + Sized {
     /// The block of `rows` (in key order, none empty of keys).
     fn make(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<Self>;
+    /// The bytes `make(rows)` keeps resident, from the format alone, before it's made: what the
+    /// block is granted before it's built (AC-CB.1.1). Equal to the made block's
+    /// [`Block::resident`].
+    fn bytes(rows: &[(Vec<u8>, Vec<u8>)]) -> usize;
     fn first(&self) -> &[u8];
     fn last(&self) -> &[u8];
     fn len(&self) -> usize;
@@ -205,6 +253,13 @@ pub struct Plain {
 const VEC_HEAD: usize = std::mem::size_of::<Vec<u8>>();
 
 impl Block for Plain {
+    fn bytes(rows: &[(Vec<u8>, Vec<u8>)]) -> usize {
+        rows.iter().fold(0usize, |n, (k, v)| {
+            n.saturating_add(k.len())
+                .saturating_add(v.len())
+                .saturating_add(VEC_HEAD.saturating_mul(2))
+        })
+    }
     fn make(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<Self> {
         Ok(Self {
             keys: rows.iter().map(|(k, _)| k.clone()).collect(),
@@ -248,6 +303,16 @@ fn push_leb(out: &mut Vec<u8>, mut v: usize) {
         }
         out.push(low | 0x80);
     }
+}
+
+/// The bytes [`push_leb`] writes for `v`.
+fn leb_len(mut v: usize) -> usize {
+    let mut n = 1usize;
+    while v >= 0x80 {
+        v >>= 7;
+        n = n.saturating_add(1);
+    }
+    n
 }
 
 fn corrupt(what: &str) -> LimboError {
@@ -325,6 +390,24 @@ impl Packed {
         out.extend_from_slice(&self.last);
     }
 
+    /// The bytes the block encoded at `at` keeps resident once decoded, read from its lengths
+    /// alone: what it is granted before it's decoded (AC-CB.1.1). `at` is left where it was.
+    fn known_size(bytes: &[u8], at: usize) -> Result<usize> {
+        let mut at = at;
+        let _n = read_leb(bytes, &mut at)?;
+        let _values_at = read_leb(bytes, &mut at)?;
+        let len = read_leb(bytes, &mut at)?;
+        take(bytes, &mut at, len)?;
+        let fl = read_leb(bytes, &mut at)?;
+        take(bytes, &mut at, fl)?;
+        let ll = read_leb(bytes, &mut at)?;
+        take(bytes, &mut at, ll)?;
+        Ok(len
+            .saturating_add(fl)
+            .saturating_add(ll)
+            .saturating_add(VEC_HEAD.saturating_mul(3)))
+    }
+
     fn decode(bytes: &[u8], at: &mut usize) -> Result<Self> {
         let n = read_leb(bytes, at)?;
         let values_at = read_leb(bytes, at)?;
@@ -348,6 +431,28 @@ impl Packed {
 }
 
 impl Block for Packed {
+    fn bytes(rows: &[(Vec<u8>, Vec<u8>)]) -> usize {
+        let mut n = 0usize;
+        let mut prev: &[u8] = &[];
+        for (k, _) in rows {
+            let shared = prev.iter().zip(k).take_while(|(a, b)| a == b).count();
+            let rest = k.len().saturating_sub(shared);
+            n = n
+                .saturating_add(leb_len(shared))
+                .saturating_add(leb_len(rest))
+                .saturating_add(rest);
+            prev = k;
+        }
+        for (_, v) in rows {
+            n = n.saturating_add(leb_len(v.len())).saturating_add(v.len());
+        }
+        let ends = rows
+            .first()
+            .map_or(0, |(k, _)| k.len())
+            .saturating_add(rows.last().map_or(0, |(k, _)| k.len()));
+        n.saturating_add(ends)
+            .saturating_add(VEC_HEAD.saturating_mul(3))
+    }
     fn make(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<Self> {
         let mut bytes = Vec::new();
         let mut prev: &[u8] = &[];
@@ -434,6 +539,9 @@ struct Generation<B> {
     delta_bytes: usize,
     /// The deltas' versions: what a rebuild folds.
     delta_versions: u64,
+    /// The bytes its memory source granted its blocks and deltas, each taken before it was built
+    /// or applied: never less than [`Generation::resident`].
+    grant: Grant,
 }
 
 /// Generations made in this process so far: each one's id.
@@ -444,16 +552,28 @@ fn next_generation() -> u64 {
 }
 
 impl<B: Block> Generation<B> {
-    fn new(made: Ts, rows: &[(Vec<u8>, Vec<u8>)], size: usize) -> Result<Self> {
+    /// The generation of `rows` cut in blocks of `size`, each block's bytes taken from `room`
+    /// before it is made; refused, what it took goes back with the blocks made (AC-CB.1.2).
+    fn new(
+        made: Ts,
+        rows: &[(Vec<u8>, Vec<u8>)],
+        size: usize,
+        room: &Arc<dyn Source>,
+    ) -> Result<Self> {
+        // Declared before the blocks, so the blocks go first when a refusal returns early.
+        let mut grant = Grant::new(room.clone());
         let mut blocks = Vec::new();
         for chunk in rows.chunks(size.max(1)) {
+            grant.take(B::bytes(chunk))?;
             blocks.push(B::make(chunk)?);
         }
         // An empty table's generation still has a block, for its deltas to be filed under.
         if blocks.is_empty() {
+            grant.take(B::bytes(&[]))?;
             blocks.push(B::make(&[])?);
         }
         Ok(Self {
+            grant,
             id: next_generation(),
             made,
             blocks,
@@ -475,7 +595,9 @@ impl<B: Block> Generation<B> {
         Ok((j, pos))
     }
 
+    /// Files change `c`, its bytes taken from the source first (AC-CB.1.1).
     fn apply(&mut self, ts: Ts, c: Change) -> Result<()> {
+        self.grant.take(change_bytes(&c))?;
         let (j, pos) = self.locate(&c.key)?;
         self.delta_bytes = self.delta_bytes.saturating_add(change_bytes(&c));
         self.delta_versions = self.delta_versions.saturating_add(1);
@@ -490,6 +612,10 @@ impl<B: Block> Generation<B> {
         self.blocks
             .iter()
             .fold(self.delta_bytes, |n, b| n.saturating_add(b.resident()))
+    }
+
+    fn granted(&self) -> usize {
+        self.grant.bytes
     }
 
     fn rows(&self) -> usize {
@@ -675,14 +801,19 @@ pub struct ScanCounts {
 /// A table's column copy in format `B`: the core both prototypes share.
 pub struct Columns<B> {
     feed: Arc<Feed>,
+    /// Where its generations' blocks and deltas take their bytes from, each piece before it is
+    /// built or applied (AC-CB.1.1).
+    room: Arc<dyn Source>,
     state: RwLock<State<B>>,
 }
 
 impl<B: Block> Columns<B> {
     /// A copy fed by `feed`, empty until [`Columns::rebuild`] makes its first generation.
-    pub fn new(feed: Arc<Feed>) -> Self {
+    /// Its blocks and deltas take their bytes from `room`.
+    pub fn new(feed: Arc<Feed>, room: Arc<dyn Source>) -> Self {
         Self {
             feed,
+            room,
             state: RwLock::new(State {
                 current: None,
                 previous: None,
@@ -722,17 +853,32 @@ impl<B: Block> Columns<B> {
         self.feed.released(freed);
         let n = records.len();
         let st = &mut *st;
+        // A change the source refuses room for isn't applied: the copy is behind from its commit
+        // on (scans after it read the rows), and the refusal is the caller's (AC-CB.1.1).
+        let mut refused = None;
         for r in records {
             st.lags.push(now.saturating_sub(r.at));
             if let Some(g) = st.current.as_mut() {
-                if r.ts > g.made {
+                if r.ts > g.made && refused.is_none() {
                     for c in r.changes {
-                        g.apply(r.ts, c)?;
+                        if let Err(e) = g.apply(r.ts, c) {
+                            refused = Some(e);
+                            break;
+                        }
                     }
+                }
+                if refused.is_some() && r.ts > g.made {
+                    st.behind = Some(
+                        st.behind
+                            .map_or((r.ts, r.ts), |(f, l)| (f.min(r.ts), l.max(r.ts))),
+                    );
                 }
             }
         }
-        Ok(n)
+        match refused {
+            Some(e) => Err(e),
+            None => Ok(n),
+        }
     }
 
     /// Whether a rebuild pays now (see [`Rebuilds`]); always, before the first generation or while
@@ -755,7 +901,7 @@ impl<B: Block> Columns<B> {
         self.catch_up(now)?;
         let mut st = self.state.write();
         let size = st.sizer.size(rows.len());
-        let mut g = Generation::<B>::new(made, rows, size)?;
+        let mut g = Generation::<B>::new(made, rows, size, &self.room)?;
         if let Some(old) = st.current.take() {
             for ((_, _, key), versions) in &old.deltas {
                 for (ts, value) in versions.iter().filter(|(ts, _)| *ts > made) {
@@ -903,6 +1049,14 @@ impl<B: Block> Columns<B> {
     pub fn blocks_resident(&self) -> usize {
         let st = self.state.read();
         let g = |g: &Option<Generation<B>>| g.as_ref().map_or(0, Generation::resident);
+        g(&st.current).saturating_add(g(&st.previous))
+    }
+
+    /// The bytes its memory source granted its generations' blocks and deltas: never less than
+    /// [`Columns::blocks_resident`] (AC-CB.1.1).
+    pub fn granted(&self) -> usize {
+        let st = self.state.read();
+        let g = |g: &Option<Generation<B>>| g.as_ref().map_or(0, Generation::granted);
         g(&st.current).saturating_add(g(&st.previous))
     }
 
@@ -1064,7 +1218,13 @@ impl Columns<Packed> {
     /// The copy `shelf` holds, if it is current as of `newest` (the database's newest commit at
     /// open): every commit up to it applied. Else None: the caller rebuilds from the rows, as a
     /// checkpoint may have cut the redo that held the changes after it.
-    pub fn reopen(feed: Arc<Feed>, shelf: &dyn Shelf, newest: Ts) -> Result<Option<Self>> {
+    /// Its blocks take their bytes from `room`, each before it is decoded.
+    pub fn reopen(
+        feed: Arc<Feed>,
+        room: Arc<dyn Source>,
+        shelf: &dyn Shelf,
+        newest: Ts,
+    ) -> Result<Option<Self>> {
         let Some(bytes) = shelf.get()? else {
             return Ok(None);
         };
@@ -1083,11 +1243,14 @@ impl Columns<Packed> {
         }
         let made = u64_at(&mut at)?;
         let n = read_leb(&bytes, &mut at)?;
+        let mut grant = Grant::new(room.clone());
         let mut blocks = Vec::new();
         for _ in 0..n {
+            grant.take(Packed::known_size(&bytes, at)?)?;
             blocks.push(Packed::decode(&bytes, &mut at)?);
         }
         let mut g = Generation {
+            grant,
             id: next_generation(),
             made,
             blocks,
@@ -1109,7 +1272,7 @@ impl Columns<Packed> {
             };
             g.apply(vts, Change { key, value })?;
         }
-        let copy = Self::new(feed);
+        let copy = Self::new(feed, room);
         copy.state.write().current = Some(g);
         Ok(Some(copy))
     }
@@ -1181,6 +1344,71 @@ mod tests {
         old_snapshots: u64,
     }
 
+    /// T-CB.1.1, T-CB.1.2: a copy whose source has room for one generation and a half, built, fed
+    /// and built again. Expect: each format's bytes before a block is made equal what the made
+    /// block keeps resident; at every step the source holds exactly the bytes granted the
+    /// generations and the queue, the generations never more than granted; a build refused part
+    /// way gives back all it took and leaves the copy as it was; all given back when it goes.
+    #[test]
+    fn cb1_blocks_are_granted_before_they_are_built() {
+        let rows: Rowset = (0u32..600)
+            .map(|i| {
+                (
+                    i.to_be_bytes().to_vec(),
+                    vec![7u8; usize::try_from(i % 37).unwrap()],
+                )
+            })
+            .collect();
+        let empty: &[(Vec<u8>, Vec<u8>)] = &[];
+        for chunk in rows.chunks(64).chain([empty]) {
+            assert_eq!(Plain::bytes(chunk), Plain::make(chunk).unwrap().resident());
+            assert_eq!(
+                Packed::bytes(chunk),
+                Packed::make(chunk).unwrap().resident()
+            );
+        }
+        let whole = as_u64(Plain::bytes(&rows));
+        let room = Arc::new(crate::storage::versioned::memory::Capped::new(
+            whole + whole / 2,
+        ));
+        let feed = Arc::new(Feed::new(7, room.clone(), Box::new(|| 0)));
+        let copy = Columns::<Plain>::new(feed.clone(), room.clone());
+        let check = |label: &str| {
+            assert!(copy.blocks_resident() <= copy.granted(), "{label}");
+            assert_eq!(
+                room.held(),
+                as_u64(copy.granted() + feed.queued_bytes()),
+                "{label}"
+            );
+        };
+        check("empty");
+        copy.rebuild(1, &rows, 0).unwrap();
+        check("built");
+        assert_eq!(copy.granted(), copy.blocks_resident());
+        feed.offer(
+            2,
+            &[Op::Put {
+                tree: 7,
+                key: vec![9; 5],
+                value: vec![1; 40],
+            }],
+        );
+        check("queued");
+        copy.catch_up(0).unwrap();
+        check("applied");
+        let before = copy.granted();
+        let refused = copy.rebuild(3, &rows, 0);
+        assert!(
+            matches!(refused, Err(LimboError::MemoryBudget { what, .. }) if what == BLOCKS),
+            "{refused:?}"
+        );
+        check("refused");
+        assert_eq!(copy.granted(), before);
+        assert_eq!(copy.shape().0, rows.len());
+        drop(copy);
+        assert_eq!(room.held(), 0);
+    }
+
     /// T-CS.5.10: a feed whose memory source has room for one record, offered two. Expect: the
     /// first record's bytes held by the source, the second lost, not queued; all given back when
     /// the feed goes.
@@ -1201,7 +1429,8 @@ mod tests {
             feed.counts(),
             FeedCounts {
                 offered: 1,
-                lost: 1
+                lost: 1,
+                put_bytes: 6,
             }
         );
         drop(feed);
@@ -1221,7 +1450,7 @@ mod tests {
             Box::new(move || t2.fetch_add(1, Ordering::Relaxed)),
         ));
         db.keep_columns(feed.clone()).unwrap();
-        let copy = Columns::<B>::new(feed);
+        let copy = Columns::<B>::new(feed, crate::storage::versioned::memory::machine());
         // Rows before the copy's first generation.
         let mut d = Descender::new();
         let mut t = db.begin().unwrap();
@@ -1363,7 +1592,7 @@ mod tests {
             Box::new(|| 0),
         ));
         db.keep_columns(feed.clone()).unwrap();
-        let copy = Columns::<Packed>::new(feed);
+        let copy = Columns::<Packed>::new(feed, crate::storage::versioned::memory::machine());
         rebuild(&db, &copy, 0);
         let mut d = Descender::new();
         for round in 0..3u8 {
@@ -1384,9 +1613,14 @@ mod tests {
             crate::storage::versioned::memory::capped(u64::MAX),
             Box::new(|| 0),
         ));
-        let again = Columns::<Packed>::reopen(feed.clone(), &shelf, db.newest())
-            .unwrap()
-            .expect("current");
+        let again = Columns::<Packed>::reopen(
+            feed.clone(),
+            crate::storage::versioned::memory::machine(),
+            &shelf,
+            db.newest(),
+        )
+        .unwrap()
+        .expect("current");
         let snap = db.snapshot().unwrap();
         let rows = At {
             db: &db,
@@ -1397,7 +1631,13 @@ mod tests {
         assert_eq!(c.fallbacks, 0);
         assert!(c.deltas > 0);
         db.close_snapshot(snap);
-        let stale = Columns::<Packed>::reopen(feed, &shelf, db.newest() + 1).unwrap();
+        let stale = Columns::<Packed>::reopen(
+            feed,
+            crate::storage::versioned::memory::machine(),
+            &shelf,
+            db.newest() + 1,
+        )
+        .unwrap();
         assert!(stale.is_none());
     }
 
@@ -1419,7 +1659,13 @@ mod tests {
             crate::storage::versioned::memory::capped(u64::MAX),
             Box::new(|| 0),
         ));
-        assert!(Columns::<Packed>::reopen(feed, &shelf, 0).is_err());
+        assert!(Columns::<Packed>::reopen(
+            feed,
+            crate::storage::versioned::memory::machine(),
+            &shelf,
+            0
+        )
+        .is_err());
     }
 
     /// Do: give the sizer measurements where half the size costs less per row, then where it

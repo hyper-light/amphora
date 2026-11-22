@@ -515,17 +515,19 @@ fn push_vector(
 }
 
 /// Runs `fused`'s body over the batch from the row under its cursor: as many rows as the batch
-/// holds from there, up to a row it left out or a row its full group table refused. Leaves the
-/// cursor on the last row it ran and returns how many it ran: none when the row under the
-/// cursor isn't in a batch or is refused (it runs row-at-a-time).
+/// holds from there, up to a row it left out, a row its full group table refused, or (`until`,
+/// a skipping scan's candidate run: lane skip-5, T-SKU.4) the last row whose rowid is at most
+/// `until`. Leaves the cursor on the last row it ran and returns how many it ran: none when the
+/// row under the cursor isn't in a batch or is refused (it runs row-at-a-time).
 pub(crate) fn run(
     program: &Program,
     state: &mut ProgramState,
     fused: &FusedLoop,
     pager: &Arc<Pager>,
+    until: Option<i64>,
 ) -> Result<usize> {
     let mut batches = std::mem::take(&mut state.leaf_batches);
-    let ran = run_batch(program, state, &mut batches, fused, pager);
+    let ran = run_batch(program, state, &mut batches, fused, pager, until);
     state.leaf_batches = batches;
     ran
 }
@@ -540,6 +542,7 @@ fn run_batch(
     batches: &mut LeafBatches,
     fused: &FusedLoop,
     pager: &Arc<Pager>,
+    until: Option<i64>,
 ) -> Result<usize> {
     let Some(plan) = program.leaf_batch_plan.as_deref() else {
         return Ok(0);
@@ -579,6 +582,23 @@ fn run_batch(
             }
         }
         rows += 1;
+    }
+    // Lane skip-5 (T-SKU.4): a skipping scan's run stops at its candidate run's last rowid. A
+    // leaf's rowids ascend, so the rows up to `until` are a prefix: found by halving.
+    if let Some(until) = until {
+        let leaf = cursor
+            .table_leaf_under_cursor()
+            .ok_or_else(|| internal("no table leaf under a skipping cursor"))?;
+        let (mut keep, mut over) = (0usize, rows);
+        while keep < over {
+            let mid = keep + (over - keep) / 2;
+            if leaf.contents.cell_table_leaf_read_rowid(cell + mid)? <= until {
+                keep = mid + 1;
+            } else {
+                over = mid;
+            }
+        }
+        rows = keep;
     }
     // The cursor moves once the body has run, to the last row it ran: a refused row ends the
     // run short of the batch's end.
