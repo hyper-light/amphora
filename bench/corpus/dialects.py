@@ -1072,7 +1072,15 @@ def functions_said(expression, context, dialect):
       byte (unhex('00'), "repeat(string, count)" takes a BLOB there, none for a count below one)
       and PostgreSQL's decode(repeat('00', N), 'hex') (9.4 and 9.5: repeat gives '' for a count
       below one), N coalesced to 0. Another N, which SQLite takes as an integer its own way, is
-      left as it is, for the engine to refuse."""
+      left as it is, for the engine to refuse.
+    - length(X): "For a string value X, the length(X) function returns the number of characters
+      ... If X is a blob, then length(X) returns the number of bytes in the blob ... If X is numeric
+      then length(X) returns the length of a string representation of X" (lang_corefunc.html#length).
+      DuckDB's, PostgreSQL's and ClickHouse's take no integer: an INTEGER X (storage_classes()),
+      whose text is the same on every engine, is cast to text first (a REAL's isn't: each writes a
+      real its own way). A BLOB X is DuckDB's octet_length() (its length() takes no BLOB) and
+      ClickHouse's length(), its bytes, where sqlglot writes CHAR_LENGTH, its UTF-8 characters.
+      PostgreSQL's length() of a bytea and MySQL's CHAR_LENGTH() of a binary string count bytes."""
     from sqlglot import exp
 
     classes = storage_classes(expression, context.tables)
@@ -1130,6 +1138,12 @@ def functions_said(expression, context, dialect):
             else:
                 said = exp.Anonymous(this="decode", expressions=[exp.Anonymous(this="repeat", expressions=[exp.Literal.string("00"), count]), exp.Literal.string("hex")])
             same(node, said)
+        elif isinstance(node, exp.Length) and dialect in ("duckdb", "postgres", "clickhouse"):
+            arg = classes.get(id(node.this))
+            if arg == "INTEGER":
+                node.set("this", exp.cast(node.this.copy(), exp.DataType.build("TEXT")))
+            elif arg == "BLOB" and dialect != "postgres":
+                same(node, exp.Anonymous(this="octet_length" if dialect == "duckdb" else "length", expressions=[node.this.copy()]))
     return expression
 
 

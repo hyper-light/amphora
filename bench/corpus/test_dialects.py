@@ -502,11 +502,12 @@ class Like(unittest.TestCase):
 class FunctionsSaid(unittest.TestCase):
     """Do: likely(), unlikely(), likelihood(), upper() and lower() of letters beyond ASCII, round()
     to negative digits, char() of several code points and of NULL, format(), hex() of integers,
-    text, a blob and NULL, zeroblob() of a count, a negative one and NULL. Expect: DuckDB (when its Python
+    text, a blob and NULL, zeroblob() of a count, a negative one and NULL, length() of an
+    integer, a blob and text. Expect: DuckDB (when its Python
     module is here) gives what SQLite gives, values compared as numbers; PostgreSQL's round() digits
     guarded; a likelihood() SQLite refuses left for the engine to refuse."""
 
-    CASES = ["likely(1 > 0)", "unlikely(3) + 1", "likelihood(2, 0.5)", "upper('héllo')", "lower('ÉaB')", "round(2.5, -1)", "round(25, -2)", "char(72, 105)", "char(NULL)", "char(97)", "format('%d-%s', 7, 'x')", "format('%05.1f', 3.14159)", "hex(1)", "hex(-7)", "hex(NULL)", "hex('ab')", "hex(x'00ff')", "hex(1 + 2)", "zeroblob(3)", "zeroblob(-1)", "zeroblob(NULL)"]
+    CASES = ["likely(1 > 0)", "unlikely(3) + 1", "likelihood(2, 0.5)", "upper('héllo')", "lower('ÉaB')", "round(2.5, -1)", "round(25, -2)", "char(72, 105)", "char(NULL)", "char(97)", "format('%d-%s', 7, 'x')", "format('%05.1f', 3.14159)", "hex(1)", "hex(-7)", "hex(NULL)", "hex('ab')", "hex(x'00ff')", "hex(1 + 2)", "zeroblob(3)", "zeroblob(-1)", "zeroblob(NULL)", "length(-7)", "length(x'00ff')", "length(1 + 22)", "length('é')"]
 
     def test_same_answers_as_sqlite_on_duckdb(self):
         try:
