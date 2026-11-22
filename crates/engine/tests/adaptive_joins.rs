@@ -1455,19 +1455,19 @@ fn t_pl_13_18_a_build_fed_by_a_materialized_prefix_plans_again() {
     // `{r, s}`'s 20 rows or `{s, t}`'s 2,000: the nearer, by ratio.
     let (updates, count): (&[&str], u64) = if estimate * estimate < 20.0 * 2000.0 {
         // r's ten rows with k = 1, each with all of s; s.j 1 to 199 ten rows of t each, 200 none.
-        (&["UPDATE s SET k = 1"], 10 * 199 * 10)
+        (&["UPDATE s SET k = 1"][..], 10 * 199 * 10)
     } else {
         // s's ids 1 and 2 (j 1 and 2) with r's ten rows with k = 1, each with t's ten rows of its j.
         (
             &[
                 "UPDATE s SET k = 1 WHERE id <= 2",
                 "UPDATE t SET j = j + 1000 WHERE j > 20",
-            ],
+            ][..],
             2 * 10 * 10,
         )
     };
     for update in updates {
-        conn.execute(update).unwrap();
+        conn.execute(*update).unwrap();
     }
 
     conn.set_adaptive_joins(false);
