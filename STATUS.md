@@ -17,6 +17,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   over real groups. Waits on the coordinator: which setting stays, from live runs; the LAN p99 and 10,000-seed runs.
   At scale (lane xgroup-sql-5): `xgroup_lan refusals` runs Stop against Retry under many callers and correlated
   refusals, one JSON line a run; the SQL hookup waits on a Database over Groups and a Tablet over the records tables.
+- **A cross-group commit's stamp in its answer** (CP-T1.10, AC-T1.10.1, lane xgroup-sql-10; docs/design/xgroup.md):
+  `Answer::Committed` carries `at: Option<u64>`, the commit's hybrid-logical-clock microseconds, stamped by the
+  coordinator's shell on both paths, for conditional commits across groups (lane split-merge-20).
 - **Cross-group tokens over nodes and followers behind** (CP-T1.10, AC-T1.10.1, lane xgroup-sql-9;
   docs/design/xgroup.md): a step's answer over the transport carries its group's closed time (wire version 9), so a
   group on another node adds to `commit_records`' token; tests cover a replicated group on a second node and a

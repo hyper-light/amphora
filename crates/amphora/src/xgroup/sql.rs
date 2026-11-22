@@ -520,7 +520,7 @@ pub(crate) fn serve(
 }
 
 /// Runs one step on `member`, its stamps carried either way. A group on a node answers its closed
-/// time after the step too, kept in `closed` as the newest heard from it ([`closed_after`]); a
+/// time after the step too, kept in `closed` as the newest heard from it ([`closed_at`]); a
 /// local group's is read where it is.
 fn step_on(
     member: &Member,
@@ -616,6 +616,8 @@ pub struct Counted {
     /// Answers decided and held for their resolution ([`AnswerAt::Resolved`]): now, and at most.
     pub answers_held: u64,
     pub answers_held_most: u64,
+    /// Commits answered unknown because their commit stamp couldn't be read ([`Cluster::stamped`]).
+    pub stamps_unread: u64,
     pub latencies: Latencies,
 }
 
@@ -632,6 +634,7 @@ impl std::fmt::Debug for Counted {
             .field("stops", &self.stops)
             .field("answers_held", &self.answers_held)
             .field("answers_held_most", &self.answers_held_most)
+            .field("stamps_unread", &self.stamps_unread)
             .field("answered", &self.latencies.count())
             .field("p50_p99_p999", &self.percentiles())
             .finish()
@@ -687,7 +690,7 @@ pub struct Cluster {
     route: Route,
     carried: Arc<AtomicU64>,
     /// Each group's newest closed time a step on it answered with, by group: only groups on a
-    /// node fill theirs ([`closed_after`]); 0, none heard.
+    /// node fill theirs ([`closed_at`]); 0, none heard.
     closed: Arc<Vec<AtomicU64>>,
     instruments: Instruments,
 }
@@ -900,8 +903,10 @@ impl Cluster {
 
     /// Runs `txn`: committed in every group or aborted in every group, as the answer says.
     /// Unanswered by `until`, its outcome is unknown ([`Refusal::UnknownOutcome`]).
+    /// A committed answer carries its commit stamp ([`Cluster::stamped`]).
     pub fn transact(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
         let began = Instant::now();
+        let touched = self.touched(&txn);
         let (answer, answered) = mpsc::sync_channel(1);
         self.inputs
             .send(Input::Begin { txn, until, answer })
@@ -911,10 +916,48 @@ impl Cluster {
             Err(RecvTimeoutError::Timeout) => Err(Refusal::UnknownOutcome),
             Err(RecvTimeoutError::Disconnected) => Err(stopped()),
         };
+        let result = self.stamped(result, &touched, until);
         if result.is_ok() {
             counted(&self.instruments, |c| c.latencies.record(began.elapsed()));
         }
         result
+    }
+
+    /// The groups `txn`'s keys are in: the groups the coordinator steps it through.
+    fn touched(&self, txn: &Txn) -> BTreeSet<GroupId> {
+        txn.reads
+            .iter()
+            .chain(txn.writes.iter().map(|(key, _)| key))
+            .map(|key| (self.route)(key))
+            .collect()
+    }
+
+    /// `answer` with its commit stamp when it committed (AC-T1.10.1, lane xgroup-sql-10): the
+    /// newest closed time of the `touched` groups, read once it answered ([`closed_at`]). Read
+    /// after the answer, it is at or past the commit in every group that resolved it by then:
+    /// every one under [`AnswerAt::Resolved`]. A stamp that can't be read by `until` leaves the
+    /// caller no token past the commit's rows, so it hears the outcome as unknown, as a commit
+    /// whose answer was lost ([`Counted::stamps_unread`]).
+    fn stamped(
+        &self,
+        answer: Result<Answer, Refusal>,
+        touched: &BTreeSet<GroupId>,
+        until: Instant,
+    ) -> Result<Answer, Refusal> {
+        match answer {
+            Ok(Answer::Committed { reads, .. }) => {
+                match closed_at(&self.groups, &self.closed, touched, until) {
+                    Ok(at) => Ok(Answer::Committed { reads, at }),
+                    Err(_) => {
+                        counted(&self.instruments, |c| {
+                            c.stamps_unread = c.stamps_unread.saturating_add(1);
+                        });
+                        Err(Refusal::UnknownOutcome)
+                    }
+                }
+            }
+            other => other,
+        }
     }
 
     /// What it counted so far (AC-T1.10.6).
@@ -934,21 +977,18 @@ impl Cluster {
     pub fn commit(&self, txn: Txn, until: Instant) -> Result<Answer, Refusal> {
         // Refused as the coordinator refuses it, whichever path it takes.
         super::coordinator::validate(&txn)?;
-        let one = {
-            let mut keys = txn
-                .reads
-                .iter()
-                .chain(txn.writes.iter().map(|(key, _)| key));
-            let first = keys.next().map(|key| (self.route)(key));
-            first.filter(|group| keys.all(|key| (self.route)(key) == *group))
+        let touched = self.touched(&txn);
+        let one = match (touched.first(), touched.len()) {
+            (Some(group), 1) => usize::try_from(*group).ok(),
+            _ => None,
         };
-        let local = one
-            .and_then(|group| usize::try_from(group).ok())
-            .and_then(|i| self.groups.get(i));
-        match local {
-            Some(Member::Local(group)) => step(group, &self.carried, until, move |db| {
-                one_group(&mut SqlTablet::new(db), &txn)
-            }),
+        match one.and_then(|i| self.groups.get(i)) {
+            Some(Member::Local(group)) => {
+                let answer = step(group, &self.carried, until, move |db| {
+                    one_group(&mut SqlTablet::new(db), &txn)
+                });
+                self.stamped(answer, &touched, until)
+            }
             _ => self.transact(txn, until),
         }
     }
@@ -959,7 +999,8 @@ impl Cluster {
 /// group's rows at one revision there; a row written twice keeps its last write, as a single-group
 /// commit does. Answers the cross-group timestamp, a hybrid logical clock's (Ada's decision: the
 /// commit's revision across groups is the one the session tokens use, [`Token::at`]): the newest
-/// closed time of every group it touched, taken once the commit answered ([`closed_after`]). Under
+/// closed time of every group it touched, taken once the commit answered: the answer's commit stamp
+/// ([`Cluster::stamped`]). Under
 /// [`AnswerAt::Resolved`] every group has applied its rows by then, so a read that carries the
 /// token reads them in any group; under the control a group may not have yet.
 /// Conditions aren't carried into the coordinator's prepare yet: a transaction with any is refused.
@@ -990,13 +1031,9 @@ pub fn commit_records(
         reads: Vec::new(),
         writes: writes.into_iter().collect(),
     };
-    let touched: BTreeSet<GroupId> = txn
-        .writes
-        .iter()
-        .map(|(key, _)| (cluster.route)(key))
-        .collect();
     match cluster.commit(txn, until)? {
-        Answer::Committed { .. } => closed_after(cluster, &touched, until),
+        // No group it touched keeps a closed time: its reads see every write, at any token.
+        Answer::Committed { at, .. } => Ok(Token::at(at.unwrap_or(0))),
         Answer::Aborted(Why::Conflict(key)) => Err(match record_of(&key) {
             Ok(Some((_, family, row))) => Refusal::Conflict {
                 family: family.into(),
@@ -1012,34 +1049,37 @@ pub fn commit_records(
     }
 }
 
-/// The token past a commit's writes in `touched` groups, taken after it answered: the newest closed
+/// The commit stamp of a commit in `touched` groups, read after it answered: the newest closed
 /// time any of them published ([`Database::session_token`], microseconds since the Unix epoch, the
 /// groups' one hybrid logical clock), so a replica of any of them serves a read that carries it
 /// once it has applied everything up to that time. A group that keeps no closed time (standalone:
-/// its reads see every write) adds nothing. A group on a node adds the newest closed time its
-/// steps answered with (T-T1.10.W4): under [`AnswerAt::Resolved`] its last step resolved the
-/// commit there before the answer came, so that time is at or past the commit's rows.
-fn closed_after(
-    cluster: &Cluster,
+/// its reads see every write) adds nothing; none of them keeping one, none. A group on a node adds
+/// the newest closed time its steps answered with, kept in `closed` (T-T1.10.W4): under
+/// [`AnswerAt::Resolved`] its last step resolved the commit there before the answer came, so that
+/// time is at or past the commit's rows.
+fn closed_at(
+    groups: &[Member],
+    closed: &[AtomicU64],
     touched: &BTreeSet<GroupId>,
     until: Instant,
-) -> Result<Token, Refusal> {
-    let mut micros = 0;
+) -> Result<Option<u64>, Refusal> {
+    let mut newest = None;
     for i in touched
         .iter()
         .filter_map(|group| usize::try_from(*group).ok())
     {
-        let heard = match cluster.groups.get(i) {
+        let heard = match groups.get(i) {
             Some(Member::Local(database)) => database.session_token(until)?.map(|t| t.micros),
-            Some(Member::Node { .. }) => cluster
-                .closed
+            // 0: nothing heard from it yet.
+            Some(Member::Node { .. }) => closed
                 .get(i)
-                .map(|closed| closed.load(Ordering::Acquire)),
+                .map(|closed| closed.load(Ordering::Acquire))
+                .filter(|micros| *micros > 0),
             None => None,
         };
-        micros = micros.max(heard.unwrap_or(0));
+        newest = newest.max(heard);
     }
-    Ok(Token::at(micros))
+    Ok(newest)
 }
 
 /// A transaction whose rows are all in this group, in the group's one database transaction:
@@ -1066,6 +1106,8 @@ fn one_group(tablet: &mut impl Tablet, txn: &Txn) -> anyhow::Result<Answer> {
     }
     Ok(Answer::Committed {
         reads: reads.into_iter().collect(),
+        // Stamped by its shell ([`Cluster::stamped`]).
+        at: None,
     })
 }
 
@@ -1616,13 +1658,14 @@ mod sessions {
         }
     }
 
-    /// A SQL answer's rows are a set: the coordinator answers reads as their groups reply.
+    /// A SQL answer's rows are a set: the coordinator answers reads as their groups reply. Its
+    /// commit stamp is a clock's, so two clusters' answers compare without it.
     fn in_key_order(answer: Answer) -> Answer {
         match answer {
-            Answer::Committed { mut reads } => {
+            Answer::Committed { mut reads, .. } => {
                 reads.sort();
                 reads.dedup();
-                Answer::Committed { reads }
+                Answer::Committed { reads, at: None }
             }
             other => other,
         }
@@ -1824,7 +1867,7 @@ mod sessions {
                     };
                     let got = commit(&recovered, &all);
                     let reads = match &got {
-                        Answer::Committed { reads } => reads.clone(),
+                        Answer::Committed { reads, .. } => reads.clone(),
                         Answer::Aborted(_) | Answer::Unknown => Vec::new(),
                     };
                     let written = reads
@@ -2475,6 +2518,59 @@ mod sessions {
                 "{protocol:?}: {counted:?}"
             );
             drop(cluster);
+        }
+    }
+
+    /// T-T1.10.W6 (AC-T1.10.1, lane xgroup-sql-10; for lane split-merge-20's conditional commits
+    /// across groups): a committed answer carries its commit stamp. Do: group 0 standalone in this
+    /// process, group 1 one replicated member; a cluster reaching group 1 over the transport and
+    /// one holding it in process, answered once resolved, both protocols; through each, a commit
+    /// across both groups, a second, then one in group 1 alone (in process, the one-group fast
+    /// path); and a commit across two standalone groups. Expect: each stamp is past 0, no later
+    /// than group 1's own token taken after it, and no earlier than the stamp before it; the
+    /// standalone groups' answer has none (they keep no closed time).
+    #[test]
+    fn t_t1_10_w6_a_committed_answer_carries_its_commit_stamp() {
+        let stamp = |answer: Answer| match answer {
+            Answer::Committed { at, .. } => at,
+            other => panic!("{other:?}"),
+        };
+        let writes = |rows: &[u8], v: u8| Txn {
+            reads: Vec::new(),
+            writes: rows.iter().map(|k| (row(*k), Some(vec![v]))).collect(),
+        };
+        for protocol in [Protocol::TwoPhase, Protocol::Parallel] {
+            let dir = tempfile::tempdir().unwrap();
+            let replicas = Replicas::open(dir.path(), "group1", 1);
+            let leader = replicas.leader();
+            let group1 = replicas.dbs[leader].clone();
+            let local = Database::open(&dir.path().join("group0.db"), until()).unwrap();
+            let over = across_nodes(&local, &replicas, leader, protocol);
+            let options = Options {
+                answer_at: AnswerAt::Resolved,
+                ..Options::default()
+            };
+            let members = vec![Member::Local(local.clone()), Member::Local(group1.clone())];
+            let here =
+                Cluster::open_with(members, route_of(2), 2, protocol, 1, options, until()).unwrap();
+            let mut last = 0;
+            for (cluster, reached) in [(&over, "over the transport"), (&here, "in process")] {
+                for (rows, v) in [(&[0u8, 1][..], 1u8), (&[0, 1][..], 2), (&[1][..], 3)] {
+                    let at = stamp(cluster.commit(writes(rows, v), until()).unwrap());
+                    let after = group1.session_token(until()).unwrap().unwrap();
+                    assert!(
+                        at.is_some_and(|at| at > 0 && at >= last && at <= after.micros),
+                        "{protocol:?} {reached} {rows:?}: {at:?} after {last}, before {after:?}"
+                    );
+                    last = at.unwrap_or(last);
+                }
+            }
+            drop(here);
+            drop(over);
+            let standalone = tempfile::tempdir().unwrap();
+            let cluster = open(standalone.path(), 2, 3, protocol);
+            let at = stamp(cluster.commit(writes(&[0, 1], 4), until()).unwrap());
+            assert_eq!(at, None, "{protocol:?}");
         }
     }
 }

@@ -662,7 +662,7 @@ fn cross_group_cut(protocol: amphora::xgroup::Protocol, skew: u64) {
             reads: vec![b"a".to_vec(), b"b".to_vec()],
             writes: vec![],
         };
-        let Answer::Committed { reads } = reader.transact(read, until()).unwrap() else {
+        let Answer::Committed { reads, .. } = reader.transact(read, until()).unwrap() else {
             panic!("second {second}: the read didn't commit");
         };
         drop(reader);

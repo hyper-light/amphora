@@ -119,6 +119,15 @@ publication, until the follower has applied the token's time, or is redirected t
 the follower's measured apply lag; it never answers without the commit (`t_t1_10_w5_*`, a follower
 cut off before the commit and reached again while the read waits).
 
+Every committed answer carries that stamp (lane xgroup-sql-10, for lane split-merge-20's conditional
+commits across groups): `Answer::Committed`'s `at`, an `Option<u64>` of the same microseconds, the
+last field. The sans-IO coordinator has no clock, so its shell stamps the answer (`Cluster::stamped`),
+the cross-group path and the one-group fast path alike, from the groups the transaction touched, read
+once it answered; none when no group it touched keeps a closed time. `commit_records` answers
+`Token::at` of it. A stamp that can't be read by the caller's deadline leaves the caller no token past
+the commit's rows, so the caller hears `UnknownOutcome`, as for a commit whose answer was lost
+(counted, `Counted::stamps_unread`; `t_t1_10_w6_*`).
+
 Each mode's failure mode is forced in `xgroup::sql::sessions`: one group's resolution held back (a
 group behind the decision), a read of it straight after the answer
 (`ac_t1_10_1_a_read_straight_after_the_answer_in_a_group_behind`), and an abort with every lock held,

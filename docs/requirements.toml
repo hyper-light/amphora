@@ -1305,6 +1305,18 @@ tests = [
   { id = "T-T1.10.W5", text = "xgroup::sql::sessions::t_t1_10_w5_a_token_read_at_a_follower_behind_waits_or_is_redirected — passes when, with one of group 1's three members cut off before a cross-group commit, a read with no token there misses it and a read carrying the token, begun while it is cut off, either sees the commit once it is reached again or is redirected to the leader, where the token sees it, both protocols" },
 ]
 
+# lane xgroup-sql-10: a cross-group commit's answer carries its commit stamp, for lane split-merge-20's
+# conditional commits across groups (kiln goal e25ba5fe; xgroup.md, "Reading its own writes across groups").
+[[own]]
+id = "T1.10.WS"
+title = "A committed answer across groups carries its commit stamp, the cross-group hybrid-logical-clock timestamp"
+criteria = [
+  { id = "AC-T1.10.W5", text = "Answer::Committed carries at, an Option<u64> of microseconds on the groups' hybrid logical clock (Token::at's): stamped by the coordinator's shell, through the coordinator and the one-group fast path alike, from the newest closed time of the groups it touched read once it answered; none when none of them keeps one; a stamp unread by the deadline answers UnknownOutcome, counted" },
+]
+tests = [
+  { id = "T-T1.10.W6", text = "xgroup::sql::sessions::t_t1_10_w6_a_committed_answer_carries_its_commit_stamp — passes when commits across a standalone group and a replicated one, reached over the transport and in process, and one in the replicated group alone, each answer a stamp past 0, no later than that group's token after it and no earlier than the stamp before; two standalone groups' answer none; both protocols" },
+]
+
 # lane ryw-1 (kiln goal 8119f25d; docs/design/replication.md, "Decision (lane ryw-1): read-your-writes by session
 # tokens"). Ada's order 2026-11-22: built behind ReadMode, today's read the control.
 [[own]]

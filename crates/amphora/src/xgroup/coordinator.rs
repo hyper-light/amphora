@@ -47,6 +47,14 @@ pub enum Answer {
     /// Committed in every group; the reads' values, as committed before it.
     Committed {
         reads: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        /// Its commit stamp across groups (AC-T1.10.1, lane xgroup-sql-10; for conditional commits
+        /// across groups, lane split-merge-20): microseconds since the Unix epoch on the groups'
+        /// one hybrid logical clock, a session token's ([`crate::database::Token::at`]), at or past
+        /// the commit in every group it touched once they resolved it. This sans-IO coordinator
+        /// has no clock and answers none; its shell stamps the answer ([`super::sql::Cluster`]).
+        /// None there too when no group it touched keeps a closed time (standalone groups, whose
+        /// reads see every write).
+        at: Option<u64>,
     },
     /// Aborted in every group.
     Aborted(Why),
@@ -648,6 +656,7 @@ impl Coordinator {
                         // its committed done row) and commits too.
                         answer = Some(Answer::Committed {
                             reads: std::mem::take(&mut run.reads),
+                            at: None,
                         });
                         run.phase = Phase::Resolving {
                             outcome: Outcome::Committed,
@@ -682,6 +691,7 @@ impl Coordinator {
                         answer = Some(match outcome {
                             Outcome::Committed => Answer::Committed {
                                 reads: std::mem::take(&mut run.reads),
+                                at: None,
                             },
                             Outcome::Aborted => {
                                 Answer::Aborted(run.why.take().unwrap_or(Why::Late))

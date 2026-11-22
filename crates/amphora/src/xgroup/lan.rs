@@ -417,7 +417,7 @@ pub fn elle(
                         }
                         let invoke = Instant::now();
                         let (heard, reads) = match cluster.transact(txn, until) {
-                            Ok(Answer::Committed { reads }) => {
+                            Ok(Answer::Committed { reads, .. }) => {
                                 (Heard::Committed, reads.into_iter().collect())
                             }
                             Ok(Answer::Aborted(_)) => (Heard::Aborted, BTreeMap::new()),
@@ -464,7 +464,7 @@ pub fn elle(
             writes: Vec::new(),
         };
         match cluster.transact(txn, until)? {
-            Answer::Committed { reads } => break reads.into_iter().collect::<BTreeMap<_, _>>(),
+            Answer::Committed { reads, .. } => break reads.into_iter().collect::<BTreeMap<_, _>>(),
             Answer::Aborted(_) | Answer::Unknown if Instant::now() < until => {
                 std::thread::yield_now()
             }

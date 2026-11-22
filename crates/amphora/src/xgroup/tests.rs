@@ -796,7 +796,7 @@ fn check(sim: &Sim, ops: &[Op]) -> Vec<String> {
         }
         if outcome(&op.id) == Outcome::Committed {
             let seen = match answered {
-                Some(Answer::Committed { reads }) => reads.iter().cloned().collect(),
+                Some(Answer::Committed { reads, .. }) => reads.iter().cloned().collect(),
                 _ => sim
                     .applied_reads
                     .get(&op.id)
