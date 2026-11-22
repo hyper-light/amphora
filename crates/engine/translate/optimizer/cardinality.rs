@@ -207,7 +207,7 @@ pub(super) struct JoinedSetRows<'a> {
     bound: DegreeBound,
     /// PL.13 (lane replan-10): the identity of the whole join's rows, where a sorter fed by the
     /// join may have counted them (`subquery_rows::join_identity`): a join of two tables or more,
-    /// inner or LEFT (lane replan-11), planned for one run (`initial` at most one row); `None`
+    /// inner, LEFT, semi or anti (lane replan-11), planned for one run (`initial` at most one row); `None`
     /// otherwise.
     joined: Option<u64>,
     /// PL.13 (lane replan-10): each table's own filter terms, where it has a sample.
@@ -669,12 +669,13 @@ impl<'a> JoinedSetRows<'a> {
                 })
             })
             .collect();
-        // PL.13 (lane replan-11): a LEFT JOIN's rows too, its right table's unmatched rows kept.
+        // PL.13 (lane replan-11): a LEFT JOIN's rows too, its right table's unmatched rows kept,
+        // and a semi or anti join's, the rows it keeps.
         let joined = (joined_tables.len() > 1
             && initial <= 1.0
             && kinds
                 .iter()
-                .all(|kind| matches!(kind, Kind::Inner | Kind::Left)))
+                .all(|kind| matches!(kind, Kind::Inner | Kind::Left | Kind::SemiOrAnti)))
         .then(|| crate::subquery_rows::join_identity(joined_tables, where_clause))
         .flatten();
         // PL.13 (lane replan-11): a join prefix's rows are keyed as a whole join's, read only

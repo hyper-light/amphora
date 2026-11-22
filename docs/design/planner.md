@@ -1824,8 +1824,15 @@ unmatched rows, kept null-extended, and its identity adds a part for each LEFT J
 each of its ON terms, which keep rows an inner join or a WHERE term of the same text would drop;
 `t_pl_13_19_a_sorter_fed_by_a_left_join_past_the_estimate_plans_again` (T-PL.13.19): T-PL.13.15's
 join as a LEFT JOIN, 1,000 rows estimated and 5,491 counted, one answer in order with adaptive
-joins off and on, one re-plan, none after. A RIGHT or FULL JOIN (its unmatched right rows read
-apart), a semi or anti join, a DISTINCT sorter, or a table without statistics, is not checked.
+joins off and on, one re-plan, none after. So is a semi or anti join (an EXISTS or NOT EXISTS
+unnested), whose whole set's estimate is the rows it keeps, its table adding a part of its own to
+the identity, one for a semi and another for an anti join:
+`t_pl_13_20_a_sorter_fed_by_a_semi_or_anti_join_past_the_estimate_plans_again` (T-PL.13.20), by
+hash joins only, `b`'s keys ten values none of `a`'s at ANALYZE (10 rows kept by the EXISTS and 990
+by the NOT EXISTS, estimated) and covering all of `a`'s after (1,000 and none): one answer in order
+each way, one re-plan each, none after. A RIGHT or FULL JOIN (its unmatched right rows read apart),
+a DISTINCT sorter (it holds the distinct rows, not the join's), or a table without statistics, is
+not checked.
 `t_pl_13_15_a_sorter_fed_by_a_join_past_the_estimate_plans_again` (T-PL.13.15): a join estimated
 at 1,000 rows from distinct keys, holding 4,500 after an UPDATE: one answer, in order, with adaptive
 joins off and on, one re-plan, none on the second run or in a new statement.

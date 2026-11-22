@@ -1520,3 +1520,74 @@ fn t_pl_13_19_a_sorter_fed_by_a_left_join_past_the_estimate_plans_again() {
         "a new statement planned again"
     );
 }
+
+/// Do: an EXISTS and a NOT EXISTS of `b` on `a`'s key, planned by hash joins only (each unnested
+/// to a hash semi or anti join), ORDER BY `a.k` DESC (no index on it: a sorter holds the rows kept).
+/// At ANALYZE `b`'s 5,000 keys are ten values none of `a`'s 1,000 holds, which the estimate takes
+/// for ten of them (each distinct value of the fewer among the more): 10 rows kept by the EXISTS,
+/// 990 by the NOT EXISTS; then `b`'s keys set to cover all of `a`'s (1,000 kept and none), the
+/// tables' counts unchanged. Run each with adaptive joins off, then on twice in one prepared
+/// statement, and in a statement prepared after. Expect: one answer, in order, every way; on, the
+/// sorter counted against the rows the plan read for the whole join, past its error the count
+/// stored and the statement planned again once; nothing plans again after (PL.13, lane replan-11,
+/// T-PL.13.20: a semi or anti join feeding a sorter, at its materialization point).
+#[test]
+fn t_pl_13_20_a_sorter_fed_by_a_semi_or_anti_join_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("semi_joined_sorter.db");
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k)",
+        "INSERT INTO a(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) SELECT i FROM n",
+        "INSERT INTO b(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT 2000 + i % 10 FROM n",
+        "ANALYZE",
+        "UPDATE b SET k = id % 1000 + 1",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn.set_join_methods(JoinMethods::HashJoinsOnly);
+    for (case, sql, rows_expected) in [
+        (
+            "an EXISTS",
+            "SELECT a.id, a.k FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY a.k DESC",
+            1000,
+        ),
+        (
+            "a NOT EXISTS",
+            "SELECT a.id, a.k FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k) ORDER BY a.k DESC",
+            0,
+        ),
+    ] {
+        conn.set_adaptive_joins(false);
+        let checks = conn.adaptive_sort_checks();
+        let off = run_rows(&mut conn.prepare(sql).unwrap());
+        assert_eq!(off.len(), rows_expected, "{case}: the rows");
+        assert_eq!(conn.adaptive_sort_checks(), checks, "{case}: counted off");
+
+        conn.set_adaptive_joins(true);
+        let replans = conn.adaptive_replans();
+        let mut held = conn.prepare(sql).unwrap();
+        assert_eq!(run_rows(&mut held), off, "{case}: on and off differ");
+        assert!(
+            conn.adaptive_sort_checks() > checks,
+            "{case}: the sorter was not counted"
+        );
+        assert_eq!(
+            conn.adaptive_replans() - replans,
+            1,
+            "{case}: planned again once"
+        );
+        let replans = conn.adaptive_replans();
+        assert_eq!(run_rows(&mut held), off, "{case}: the second run's answer");
+        assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
+        assert_eq!(
+            run_rows(&mut conn.prepare(sql).unwrap()),
+            off,
+            "{case}: a new statement's answer"
+        );
+        assert_eq!(
+            conn.adaptive_replans(),
+            replans,
+            "{case}: a new statement planned again"
+        );
+    }
+}

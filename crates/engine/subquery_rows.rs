@@ -133,8 +133,10 @@ pub(crate) fn in_identity(select: &impl std::fmt::Debug) -> Option<u64> {
 /// Its count is the rows a sorter fed by the join held; the planner reads it for the set of all
 /// the join's tables (`cardinality::JoinedSetRows::rows`). A LEFT JOIN (lane replan-11) keeps its
 /// right table's unmatched rows, which an inner join of the same terms drops, and an ON term of it
-/// keeps rows a WHERE term of the same text would drop: each such table and term adds a part of
-/// its own, so an inner join's identity is the one [prefix_identity] gives the same tables.
+/// keeps rows a WHERE term of the same text would drop; a semi or anti join's table (an EXISTS or
+/// NOT EXISTS unnested) keeps or drops the other tables' rows and adds none: each such table and
+/// term adds a part of its own, so an inner join's identity is the one [prefix_identity] gives the
+/// same tables.
 pub(crate) fn join_identity(
     tables: &[crate::translate::plan::JoinedTable],
     where_clause: &[crate::translate::plan::WhereTerm],
@@ -151,12 +153,11 @@ pub(crate) fn join_identity(
     let mut names = Vec::new();
     for joined in tables {
         let name = crate::util::normalize_ident(joined.table.get_name());
-        if joined
-            .join_info
-            .as_ref()
-            .is_some_and(|info| info.is_outer())
-        {
-            each.push(identity(&("LEFT", &name))?);
+        match joined.join_info.as_ref() {
+            Some(info) if info.is_outer() => each.push(identity(&("LEFT", &name))?),
+            Some(info) if info.is_semi() => each.push(identity(&("SEMI", &name))?),
+            Some(info) if info.is_anti() => each.push(identity(&("ANTI", &name))?),
+            _ => {}
         }
         names.push(name);
     }
