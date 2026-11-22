@@ -2513,7 +2513,8 @@ budget's room fences at once, since memory can't be lent; one past what its host
 only once it has stayed past it for a whole election timeout, so that a burst at start, before any drain is measured,
 waits for the host's drain to be measured and the bound to grow.
 
-**What is left.** `COMMANDS` and `MEMBERS` (64), to be derived from the budget and the measured message sizes. The
+**What is left.** `MEMBERS` (64), which needs a group-wide value (below); `COMMANDS` is derived (lane
+constants-20). The
 framing a wire record adds (`FRAMING_BYTES`) is derived (below). The image cap set on
 the owner's machine is the wire record's room at open; the room read later bounds images through `image_room`.
 
@@ -2552,20 +2553,39 @@ wire records queued beside them (`Control::called`).
 - `unstable_entries` and `entries_per_message` are no longer overridden (lane constants-19). `hyper_raft::Limits::derive`
   derives them, the first from the memory stated over `size_of::<Entry>()` and the second from a message's payload
   over `ENTRY_FIXED_BYTES`. The memory stated is the budget's room for queues (MB.1), read at open, in place of the
-  picked `64 << 20`. `pending_reads` stays the command queue's slots, which hold every read asked, and `proposals`
-  stays one, since one command at a time crosses ReadIndex.
-- `COMMANDS` (64) is the command queue's slots. Its bytes are the memory room and its calls are counted by the
-  learned message rate (QB.1, lane constants-19). The slots are what the owner takes in an election timeout, counted in
-  messages (`Drain::bound(..).messages`), at most the budget's room over the smallest input's charge. Not built yet:
-  the command queue is a `std::sync::mpsc::sync_channel(COMMANDS)`, whose bounded flavour allocates its slots when it
-  is made, so a bound of the room over a heartbeat's bytes would allocate the room up front. The derivation needs an
-  unbounded channel whose admission `Control` holds by count, as it already holds bytes and calls; the test arrays
-  sized by `COMMANDS` (`Pump::receipts`) go with it.
-- `MEMBERS` (64) is the most members a configuration names. A leader holds up to a message's payload of votes and
-  progress for each member (`Limits::vote_bytes = payload × members`), so `MEMBERS` is the budget's room for queues over
-  a message's payload, at most what a `ConfState` in one wire record can name. Not built yet: `MEMBERS` is a constant
-  of `IMAGE_FRAMING_BYTES`, `patience::PEERS` and the class record's bound (`replication/class.rs`), so a learned
-  `MEMBERS` makes each of those a value read at open.
+  picked `64 << 20`. `pending_reads` is no longer overridden either (lane constants-20): `Limits::derive` takes it
+  from the memory stated over `size_of::<PendingRead>()`, and every read asked comes through the command queue, whose
+  inputs are bounded apart. `proposals` stays one, since one command at a time crosses ReadIndex.
+- A leader's uncommitted bytes and a ready's committed bytes (`max_uncommitted_size`, `max_committed_size_per_ready`)
+  are the budget's room for queues, at least one message (lane constants-20; were a picked 64 MiB each): both are held
+  in memory beside the queues.
+- A seed chunk's framing (`bootstrap::FRAMING`) is derived from its postcard encoding (lane constants-20; was a picked
+  1024): the prefix, the declaration's node varint and 32-byte identity, and the offset, total and image length
+  varints.
+- `COMMANDS` is derived (lane constants-20). The command queue is an unbounded channel whose inputs `Control` counts
+  (`Control::commands`), each held at enqueue to `Bounds::commands`: what the owner takes in the learned election
+  timeout at its learned message rate (`Drain::bound(..).messages`), at least a call and a wire record, and no more
+  than the budget's room for queues holds of an input's least in memory, its own envelope (`size_of::<Envelope>()`):
+  a wire record may carry no bytes, so bytes alone would not bound the count. Before anything is measured, the room's
+  envelopes. Calls are counted one fewer, so a wire record always finds a place. An input's place is given back when
+  the owner takes it from the channel (`Reservation::taken`), as a bounded channel's slot was; waiting calls are held
+  to the same bound. The pump's receipts in the tests grow to the bound (`Pump::receipts`). T-QB.1.6 tests the counts.
+- `MEMBERS` (64) is the most members a configuration names. Not derived yet, because it has to be one value for the
+  whole group: hyper-raft refuses to apply a configuration of more members than the member was opened for
+  (`Progress::apply`, "a configuration of more members than the member was opened for"), which stops that member, so
+  every member must state the same bound (hyper-raft's `Stated::members`). Three candidates, each with its failure:
+  (a) the budget's room for queues over a message's payload (`vote_bytes = payload × members`) differs between hosts
+  of different memory, so a group that grows past the smallest host's bound stops that host; (b) the voters and
+  learners a member is configured with differ between a founding member and a joiner, and a group configured with one
+  voter could then never add a learner (AC-T1.8.M1, T-T1.8.M3 add member 2 to a group whose config named one); (c) a
+  format bound every member computes alike (the most members whose class entry and `ConfState` fit one command,
+  `COMMAND_BYTES`) is about 1.6 million, and `IMAGE_FRAMING_BYTES` and the class entry's bound, sized by it, would
+  then take megabytes of every image record's room. What would work: the group states its bound once, in its log, as
+  it states its class (replication.md, "The class stated once per group"), from what its founding members can all
+  hold, and every member reads it at open; `IMAGE_FRAMING_BYTES` is then sized by the configuration an image carries.
+  This needs Ada's word. Meanwhile the voters a leader measures are the members its core was opened for
+  (`patience::Answers::new(election, members)`, from `Limits::members`; T-QB.1.7), so `MEMBERS` is read in one place
+  on the owner's side.
 
 **To remove: event-driven (Ada, 2026-11-22).** `TICK`, `POLL` and `DRIVE_QUANTUM`, and any driver that wakes on a timer,
 are to be removed, with that work driven from events, not given better intervals. The election and heartbeat
@@ -2574,7 +2594,9 @@ timeouts stay learned, since they are truly about time. Lane repl-measure-8 owns
 
 **Tests.** `drain::tests::drain_nothing_measured_bounds_one_record` (T-QB.1.1),
 `drain_bound_is_rate_times_election_timeout_within_room` (T-QB.1.2), `drain_bound_follows_the_reader_and_ignores_no_time`
-(T-QB.1.3), and `replicated::tests::queue_bound_a_burst_at_start_grows_before_it_fences` (T-QB.1.4).
+(T-QB.1.3), `replicated::tests::queue_bound_a_burst_at_start_grows_before_it_fences` (T-QB.1.4),
+`replicated::tests::t_qb_1_6_command_queue_inputs_counted_by_rate_within_the_room` (T-QB.1.6) and
+`patience::tests::t_qb_1_7_a_leader_measures_the_members_its_core_was_opened_for` (T-QB.1.7).
 
 ## A follower's write that read nothing written since its base: read sets (built 2026-11-21, Amphora goal ceea4e0a)
 
