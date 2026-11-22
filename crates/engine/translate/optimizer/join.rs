@@ -22,7 +22,7 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::expr_references_subquery_id,
+        expr::{expr_references_any_subquery, expr_references_subquery_id},
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
@@ -1993,6 +1993,16 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 if build_mask.get(probe) || !tables_are_connected(build_mask, probe, &where_terms) {
                     continue;
                 }
+                // The core's LEFT JOINs keep their NULL rows in this pair (lane pl8-19).
+                if !bushy_pair_keeps_left_joins(
+                    joined_tables,
+                    where_clause,
+                    &where_terms,
+                    build_mask,
+                    probe,
+                ) {
+                    continue;
+                }
                 let mut inner_mask = build_mask.try_clone()?;
                 inner_mask.set(probe)?;
                 let mut outer_mask = all.try_clone()?;
@@ -2042,7 +2052,18 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                             })
                         )
                     });
-                    if run_reads_materialized {
+                    // A LEFT JOIN in the run is read by a loop there, whose NULL row the build
+                    // input keeps (lane pl8-19).
+                    let run_hashes_left_join = build.data.iter().any(|&(table, method)| {
+                        joined_tables.get(table).is_some_and(is_movable_left_join)
+                            && matches!(
+                                access_methods_arena
+                                    .get(method)
+                                    .map(|method| &method.params),
+                                Some(AccessMethodParams::HashJoin { .. })
+                            )
+                    });
+                    if run_reads_materialized || run_hashes_left_join {
                         continue;
                     }
                     join_order.clear();
@@ -2053,6 +2074,9 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                         join_order.push(JoinOrderMember {
                             table_id: joined.internal_id,
                             original_idx: table,
+                            // A LEFT JOIN of the run too (lane pl8-19): the run is materialized,
+                            // its NULL rows rows of the build input, so the probe's hash join is
+                            // no chain across an outer join (`try_hash_join_access_method`).
                             is_outer: false,
                         });
                     }
@@ -2254,15 +2278,17 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 }
 
 /// PL.8: the tables the search may plan bushy, `joined_tables[..core]`, None where it tries no
-/// bushy plan. The core's tables are inner joins free to move (no conflict rule orders them); the
-/// rest, `joined_tables[core..]`, are semi and anti joins (EXISTS, NOT EXISTS) and LEFT JOINs,
-/// which CD-C keeps after every table before them and the emitter runs as the last loops
-/// (`required_lhs_by_table`), so a bushy plan of the core is followed by them in their order (lane
-/// pl8-15; LEFT JOINs, lane pl8-16: each is a loop over its right table for each row of the plan
-/// so far, null-extended where none matches, as in a left-deep plan). None for fewer than three
-/// tables in the core, a lateral join or one that keeps its place, a semi, anti or LEFT JOIN before
-/// an inner one, a RIGHT or FULL JOIN, or a connection that asks for nested loops only: the cases
-/// the emitter's build groups refuse (`bushy_build_groups`) or the tail can't follow.
+/// bushy plan. The core's tables are inner joins free to move (no conflict rule orders them) and
+/// (lane pl8-19) LEFT JOINs the search may move (`is_movable_left_join`), which a bushy pair takes
+/// only as `bushy_pair_keeps_left_joins` allows; the rest, `joined_tables[core..]`, the longest run
+/// of semi and anti joins (EXISTS, NOT EXISTS) and LEFT JOINs that ends the FROM list, which the
+/// emitter runs as the last loops (`required_lhs_by_table`), so a bushy plan of the core is
+/// followed by them in their order (lane pl8-15; LEFT JOINs, lane pl8-16: each is a loop over its
+/// right table for each row of the plan so far, null-extended where none matches, as in a
+/// left-deep plan). None for fewer than three tables in the core, a lateral join or one that keeps
+/// its place, a semi or anti join before an inner one, a RIGHT or FULL JOIN, or a connection that
+/// asks for nested loops only: the cases the emitter's build groups refuse (`bushy_build_groups`)
+/// or the tail can't follow.
 fn bushy_core(
     joined_tables: &[JoinedTable],
     table_references: &TableReferences,
@@ -2275,33 +2301,85 @@ fn bushy_core(
         return None;
     }
     let follows = |table: &JoinedTable| {
-        table.join_info.as_ref().is_some_and(|info| {
-            ((info.is_semi_or_anti() && !info.is_outer()) || info.join_type == JoinType::LeftOuter)
-                && !info.no_reorder
-                && !info.lateral
-        })
+        is_movable_left_join(table)
+            || table.join_info.as_ref().is_some_and(|info| {
+                info.is_semi_or_anti() && !info.is_outer() && !info.no_reorder && !info.lateral
+            })
     };
     let core = joined_tables
         .iter()
-        .position(follows)
-        .unwrap_or(joined_tables.len());
-    let (inner, tail) = joined_tables.split_at_checked(core)?;
+        .rposition(|table| !follows(table))
+        .map_or(0, |last_inner| last_inner.saturating_add(1));
+    let inner = joined_tables.get(..core)?;
     let free = inner.iter().all(|table| {
-        !table
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::is_ordering_constrained)
+        is_movable_left_join(table)
+            || !table
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::is_ordering_constrained)
     });
     let ordered = required_lhs_by_table.is_none_or(|required| {
         required.iter().enumerate().all(|(table, lhs)| {
-            if table < core {
-                lhs.is_empty()
-            } else {
-                lhs.iter().all(|before| before < table)
+            let earlier = lhs.iter().all(|before| before < table);
+            match inner.get(table) {
+                Some(core_table) => lhs.is_empty() || (is_movable_left_join(core_table) && earlier),
+                None => earlier,
             }
         })
     });
-    (core >= 3 && free && ordered && tail.iter().all(follows)).then_some(core)
+    (core >= 3 && free && ordered).then_some(core)
+}
+
+/// PL.8 (lane pl8-19): whether `table` is the right table of a LEFT JOIN the search may move, one
+/// no CROSS or LATERAL join keeps in place: its conflict rule is the tables its ON terms read
+/// (`required_lhs_by_table`).
+pub(crate) fn is_movable_left_join(table: &JoinedTable) -> bool {
+    table.join_info.as_ref().is_some_and(|info| {
+        info.join_type == JoinType::LeftOuter && !info.no_reorder && !info.lateral
+    })
+}
+
+/// PL.8 (lane pl8-19): whether the bushy pair of the run `build_mask` and the probe `probe` keeps
+/// the LEFT JOINs of the core as their outer joins are. The run's rows are joined and
+/// null-extended in the probe's build input before any table outside the run is read, so a LEFT
+/// JOIN's right table may stand in the run only with the tables its ON terms read, all in the run:
+/// then `(outer, probe, run's left side) LEFT JOIN t ON p` is `outer JOIN (probe JOIN (run's left
+/// side LEFT JOIN t ON p))` by the left-asscom and associativity rules (Moerkotte, Fender and Eich,
+/// SIGMOD 2013), each of the run's null-extended rows a row of the tree. A term above the outer
+/// join that reads its right table (a WHERE term, or an inner join's ON term) is not one of `p`,
+/// so it stays above it: it runs on the run's rows at the probe, NULL rows included, or in the
+/// build input after the NULL row is made (`emitter::select`'s materialization), never inside the
+/// ON's test, where it would turn a NULL row into none. The right table is never the probe (an
+/// inner hash join's probe makes no NULL row), and an ON term holding a subquery keeps it out of
+/// the run (the emitter can't place the subquery's tables there). A LEFT JOIN outside the pair is
+/// one of the outer loops, where the subsets the search builds already hold its ON's tables before
+/// it.
+fn bushy_pair_keeps_left_joins(
+    joined_tables: &[JoinedTable],
+    where_clause: &[WhereTerm],
+    where_terms: &[WhereTermInfo],
+    build_mask: &TableMask,
+    probe: usize,
+) -> bool {
+    let keeps = |table: usize| {
+        let Some(joined) = joined_tables.get(table) else {
+            return false;
+        };
+        if !is_movable_left_join(joined) {
+            return true;
+        }
+        let on_origin = JoinOrigin::Outer(joined.internal_id);
+        table != probe
+            && where_clause
+                .iter()
+                .zip(where_terms)
+                .filter(|(term, _)| term.origin.join_origin() == Some(on_origin))
+                .all(|(term, info)| {
+                    build_mask.contains_all_set_bits_of(&info.table_mask)
+                        && !expr_references_any_subquery(&term.expr)
+                })
+    };
+    keeps(probe) && build_mask.iter().all(keeps)
 }
 
 fn has_connected_legal_candidate(
@@ -4848,6 +4926,111 @@ mod tests {
             let (order, _) = linked_list_plan_with_carried(Some(wrong), 1e9);
             assert_eq!(order, chain, "{wrong:?}");
         }
+    }
+
+    /// Do: plan the conflict rules of `a, b LEFT JOIN l ON l.id = b.x, e`, with `a.id = b.x` and
+    /// `e.x = b.id`, and ask which pairs of a run and a probe keep the LEFT JOIN. Expect: the bushy
+    /// core holds all four tables (a LEFT JOIN with an inner join after it), a pair keeps the LEFT
+    /// JOIN where its run holds it with `b`, the table its ON reads, or where it stays one of the
+    /// outer loops, and refuses it in a run without `b` or as the probe; with nested loops only,
+    /// no core (T-PL.8.13, lane pl8-19).
+    #[test]
+    fn t_pl_8_13_a_left_join_stands_in_a_bushy_run_only_with_its_on_tables() {
+        let mut ids = TableRefIdCounter::new();
+        let table = |name: &str| {
+            _create_btree_table(
+                name,
+                vec![
+                    _create_column_rowid_alias("id"),
+                    _create_column_of_type("x", Type::Integer),
+                ],
+            )
+        };
+        let join = |join_type| {
+            Some(JoinInfo {
+                join_type,
+                using: vec![],
+                no_reorder: false,
+                lateral: false,
+            })
+        };
+        let a = _create_table_reference(table("a"), None, ids.next());
+        let b = _create_table_reference(table("b"), join(JoinType::Inner), ids.next());
+        let l = _create_table_reference(table("l"), join(JoinType::LeftOuter), ids.next());
+        let e = _create_table_reference(table("e"), join(JoinType::Inner), ids.next());
+        let (a_id, b_id, l_id, e_id) = (a.internal_id, b.internal_id, l.internal_id, e.internal_id);
+        let mut on = _create_binary_expr(
+            _create_column_expr(l_id, 0, true),
+            Operator::Equals,
+            _create_column_expr(b_id, 1, false),
+        );
+        on.origin = WhereTermOrigin::Join(JoinOrigin::Outer(l_id));
+        let where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(a_id, 0, true),
+                Operator::Equals,
+                _create_column_expr(b_id, 1, false),
+            ),
+            on,
+            _create_binary_expr(
+                _create_column_expr(e_id, 1, false),
+                Operator::Equals,
+                _create_column_expr(b_id, 0, true),
+            ),
+        ];
+        let table_references = TableReferences::new(vec![a, b, l, e], vec![]);
+        let available_indexes = AvailableIndexes::default();
+        let constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+        let where_terms =
+            build_where_term_info(&where_clause, &table_references, &[], &constraints).unwrap();
+        let joined = table_references.joined_tables();
+        let required = required_lhs_by_table(joined, &where_clause, &where_terms).unwrap();
+        let context = JoinPlanningContext::default_with_order_target(None);
+        assert_eq!(
+            bushy_core(
+                joined,
+                &table_references,
+                context,
+                Some(required.as_slice())
+            ),
+            Some(4)
+        );
+        let nested_loops = JoinPlanningContext {
+            join_methods: crate::JoinMethods::NestedLoopsOnly,
+            ..context
+        };
+        assert_eq!(
+            bushy_core(
+                joined,
+                &table_references,
+                nested_loops,
+                Some(required.as_slice())
+            ),
+            None
+        );
+        let keeps = |run: &[usize], probe: usize| {
+            let mut mask = TableMask::default();
+            for &table in run {
+                mask.set(table).unwrap();
+            }
+            bushy_pair_keeps_left_joins(joined, &where_clause, &where_terms, &mask, probe)
+        };
+        // `a JOIN (b LEFT JOIN l)` and `a JOIN ((b LEFT JOIN l) JOIN e)`.
+        assert!(keeps(&[1, 2], 0));
+        assert!(keeps(&[1, 2, 3], 0));
+        // `l` one of the outer loops.
+        assert!(keeps(&[0, 1], 3));
+        // `l` in a run without `b`, and `l` as the probe.
+        assert!(!keeps(&[2, 3], 1));
+        assert!(!keeps(&[1, 3], 2));
     }
 
     /// Do: note two blocks' orders, one twice. Expect: each block's latest order, under its own

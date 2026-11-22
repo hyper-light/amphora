@@ -382,6 +382,8 @@ tests = [
   # lane pl8-18
   { id = "T-PL.8.11", text = "statement::tests::t_pl_8_11_* — passes when the exact search plans on the schema and statistics taken at hand-off, a plan whose settings' generation moved after hand-off is counted stale and never taken, only a SELECT hands its search off, and statements (a transaction firing a trigger, a schema change, a setting) run on the connection while the worker plans for it with every answer and trigger firing unchanged" },
   { id = "T-PL.8.12", text = "statement::tests::t_pl_8_12_each_idle_runs_one_search — passes when, under BackgroundSearch::Idle, each time the connection goes idle it runs one waiting search, the oldest first" },
+  # lane pl8-19
+  { id = "T-PL.8.13", text = "join::tests::t_pl_8_13_a_left_join_stands_in_a_bushy_run_only_with_its_on_tables and bushy_search_tests::t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows — passes when a LEFT JOIN with an inner join after it is in the bushy core, a bushy pair takes it into its run only with every table its ON reads and never as the probe, and every query with it inside a run (matched and NULL-extended rows, an ON term no index reads, WHERE terms on the padded side alone and with the probe) answers as nested loops do, planned bushy with the LEFT JOIN inside a build group" },
 ]
 
 [[own]]

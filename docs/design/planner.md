@@ -1774,6 +1774,62 @@ runs there; `Connection` is `Send`, so that is allowed, but the close's work lan
 thread. A write whose SELECT the greedy search orders is planned in full at prepare, so it never
 has a fast plan.
 
+## Decision (lane pl8-19): LEFT JOINs inside a bushy run
+
+**Decision.** PL.8, T-PL.8.13 (`join::bushy_core`, `join::bushy_pair_keeps_left_joins`,
+`optimizer::bushy_build_groups`, `emitter::select::prune_join_order_for_materialized_inputs`). A
+LEFT JOIN with an inner join after it used to keep a query out of the bushy search. Now such a LEFT
+JOIN, one the search may move (no CROSS or LATERAL join keeps it in place), is in the bushy core, and
+a bushy pair (outer loops, a run built into a hash join's input, the probe) takes it under three
+rules:
+
+- *In the run, only with its ON's tables.* The run's rows are joined and NULL-extended in the
+  probe's build input before any table outside the run is read. So the right table may stand in the
+  run only if every table its ON terms read is in the run too. Then `(outer, probe, left side) LEFT
+  JOIN t ON p` is `outer JOIN (probe JOIN (left side LEFT JOIN t ON p))`, by the left-asscom and
+  associativity rules (Moerkotte, Fender and Eich, SIGMOD 2013).
+- *Never the probe.* An inner hash join's probe makes no NULL row.
+- *Read by a loop in the run.* Its NULL row is the loop's, as in a left-deep plan.
+
+An ON term holding a subquery keeps the table out of the run. A LEFT JOIN outside the pair is one of
+the outer loops, where the subsets the search builds already hold its ON's tables before it.
+
+A term above the outer join that reads its right table (a WHERE term, or an inner join's ON term) is
+not one of the ON's terms, so it stays above the join:
+
+- If it reads only the run's tables, the build input runs it after the NULL row is made, as a
+  left-deep plan does.
+- Otherwise the main plan runs it at the probe, on the payload's rows, NULL rows included.
+
+The ON's own terms run inside the build input. The main plan now counts them as spent, where before
+it kept every outer-join term for a loop the main plan no longer has. A term the ON's test ran above
+the join would have turned NULL rows into no rows.
+
+LEFT JOINs at the end of the FROM list still follow the bushy plan as its last loops (lane pl8-16):
+the core is everything before the longest run of semi, anti and LEFT JOINs that ends the list.
+
+This is behind the switch every bushy plan is behind: `JoinMethods::NestedLoopsOnly` plans none, and
+those plans are the control the tests compare against.
+
+**Why.** It is the one placement of an outer join in the emitter's bushy shape whose rows are
+provably the query's: the NULL rows are made where the left-deep plan makes them, inside a
+materialization that is a left-deep plan of the run's tables. The other placement, a LEFT JOIN as
+the probe, needs a hash join that keeps the build side's unmatched rows once for each outer row.
+That is new emitter work, not taken here.
+
+**Evidence.** Written while kiln's server was down, not run yet (lane pl8-19):
+
+- `join::tests::t_pl_8_13_a_left_join_stands_in_a_bushy_run_only_with_its_on_tables`: the conflict
+  rules on a hand-built join.
+- `bushy_search_tests::t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`: differential
+  against nested loops, on the fact tables, with a LEFT JOIN hung on either dimension. It covers
+  matched and NULL-extended rows, an ON term no index reads, a WHERE `IS NULL` on the padded side,
+  and a WHERE term on the padded side and the probe. Non-vacuity: `BUSHY_PLANS`, and
+  `LEFT_JOINS_IN_RUNS` for at least one side.
+
+**Falsified by.** An answer that differs from nested loops; a LEFT JOIN planned as a probe, or in a
+run without a table its ON reads; a NULL row dropped by an ON term run at the probe.
+
 ## Decision (lane pl12): custom plans, then a generic one, for prepared statements
 
 **Decision.** PL.12 (docs/research/planner.md section 9, rank 12; `crates/engine/plan_cache.rs`).
