@@ -695,6 +695,32 @@ change, and a power cut leaves the old schema or the new. DROP COLUMN is built P
 catalog change hides the column as a slot (no name finds it, `*` and inserts pass it, every write
 stores NULL in it), learned rowid batches clear its old values, then the drop is recorded.
 
+Scale harness made fair (lane scaleout-harness, kiln goal 45b65f3e; AC-SH.1, AC-SH.2): `amphora-bench --scale`
+drives Amphora, CockroachDB and TiDB with one client and one timing, each as its own server over the network:
+Amphora through `amphora serve` (CP-T1.13's server, bench/servers/scale/amphora.sh) and its client protocol,
+CockroachDB through Postgres wire, TiDB through MySQL wire. The nodes run natively by default, from each system's
+release binaries (bench/servers/scale/fetch.sh) with data on the machine's own disk; containers stay as
+`AMPHORA_BENCH_SCALE_MODE=docker` (not for Amphora's server; native mode refuses `delay`, which takes root). Every
+record carries `platform` (OS, kernel, arch, how the system ran, its wire client). Every system is sent each write,
+read and transaction as one SQL statement in text, one round trip (AC-SH.3): Amphora's protocol takes text only, so the
+others get Postgres's simple query protocol and MySQL's text protocol, not a transaction of a statement a row. `amphora-inproc` keeps the
+in-process groups for the measures the server doesn't serve (follower, xgroup, region). Not yet: the smoke on
+adacachy2 end to end; Amphora's server serves one database (`--groups 1`) and refuses cutover until the reshard
+shell is built. Every client gives a request up after `--deadline-s` (AC-SH.4): CockroachDB's through
+the bench's own simple-query Postgres client (bench/src/pgtext.rs), its socket's read timeout the give-up; each record
+says how each system routes a write (CockroachDB and TiDB forward it through the node it was sent to, Amphora's client
+sends it to the leader) and that no system is given prepared statements. The in-process relay waits on one wake across
+its members (`ReplicaHandle::listen`, AC-SH.5) rather than spinning, and Amphora's schema setup (served and in-process)
+waits on a member's election instead of asking again at once. Nothing asks again at once (lane scaleout-harness-10):
+the read measures' warm-up is one read of the last preloaded row, waiting on Amphora's session token from that write
+(in-process) and otherwise one read at each system's strongest consistency (AC-SH.6); `regionloss` counts the
+region's own copy once a writer, each read waiting on that writer's last write by the system's own control, with
+Amphora's server's figure refused until its protocol carries tokens (AC-SH.7); schema setup asks each node in the
+configured order and gives up at `--deadline-s` (AC-SH.8). TiDB's waits on PD's background work (placement in the region
+measure, leader and replica moves in cutover) read PD's state at PD's own `schedule.patrol-region-interval`, read from
+the cluster, as PD has no watch or long-poll for Region or placement changes; `--poll-us` is gone from every scale
+measure and each record's `waits` says so (lane scaleout-harness-11, AC-SH.11).
+
 ## Measured
 
 - **The oracles: wrong answers and slow plans** (G2 step 3; `amphora-bench --oracle`, `bench/src/oracle`,

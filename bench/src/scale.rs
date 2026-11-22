@@ -6,7 +6,10 @@
 //! - `write` (the scale-out write class): `--writers` closed-loop writers, each its own session of
 //!   `--batch` rows a write, through node `writer % nodes`, for `--seconds` after `--warmup-s`.
 //! - `read` (the scale-out read class): `--rows` rows written first, then `--writers` closed-loop
-//!   readers of one row each by its key, answered by its group's leader (leaseholder).
+//!   readers of one row each by its key, answered by its group's leader (leaseholder). Before they
+//!   start, one read of the last row preloaded ([`Session::read_after`]): it waits by the system's
+//!   own control for that write where the system has one (Amphora's session token from the write's
+//!   answer), else it is one read at the system's strongest consistency; never asked again.
 //! - `follower` (AC-T1.10.C2): the same rows read on a member that doesn't lead their group, at
 //!   the time it can read without waiting: Amphora's closed time, CockroachDB's
 //!   `follower_read_timestamp()`, TiDB's `tidb_replica_read = 'follower'`.
@@ -19,8 +22,11 @@
 //! - `regionloss` (G14 step 2; AC-T1.11.3, T-T1.11.1): writers run; after `--settle-s` region
 //!   `--lose`'s nodes are killed (SIGKILL; Amphora's members cut off) and a probe writes through the
 //!   rest until one write is acknowledged: the time to that acknowledgement. Writers go on for
-//!   `--after-s`, the region is started again, and its own copy is polled every `--poll-us` until
-//!   it holds every acknowledged row: the time to serve again. Every writer resends a refused write
+//!   `--after-s`, the region is started again, and its own copy is read once for each writer's
+//!   acknowledged rows ([`Session::count_own_after`]), each read waiting on that writer's last
+//!   acknowledged write by the system's own control: the time to serve again. A system with no read
+//!   that waits for a write on a node's own copy has that figure refused, typed and said why, and
+//!   the rest of the measure stands. Every writer resends a refused write
 //!   unchanged, so every row up to its last acknowledged one was acknowledged; `lost` counts those
 //!   missing, read through the leader, and must be 0.
 //! - `cutover` (G13 steps 1 and 2; AC-T1.9.2, AC-T1.9.3): writers run; after `--settle-s`, `--ops`
@@ -45,27 +51,40 @@
 //!   shell that carries out its splits, merges and moves over replicated groups is built
 //!   (docs/design/reshard.md, "What is left").
 //!
-//! CockroachDB's and TiDB's nodes run on the machines `--hosts` names (`ENDPOINT=ADDR,...`, node `n`
-//! on machine `n` mod their count; bench/servers/scale/lib.sh): one a machine for the runs of
-//! record, all on one for a lab. Amphora's groups run in this process on the bench's machine.
+//! Every system's nodes run on the machines `--hosts` names (`ENDPOINT=ADDR,...`, node `n` on
+//! machine `n` mod their count; bench/servers/scale/lib.sh): one a machine for the runs of record,
+//! all on one for a lab. Natively by default (each system's own release binaries as processes, data
+//! on the machine's disk; Ada's fair comparisons: the same client, OS, disk and filesystem for all),
+//! or in containers (`AMPHORA_BENCH_SCALE_MODE=docker`, not Amphora's server). `amphora` is
+//! Amphora's own server (`amphora serve`), reached over TCP by its client protocol as the others
+//! are by theirs ([`served`]); `amphora-inproc` keeps its groups in this process for the measures
+//! the server doesn't serve yet (follower, xgroup, region). Each record says which client and
+//! platform produced it (`platform`).
 //!
 //! Every size, duration and interval is an input with no default: nothing is picked here. A system
 //! without a measure's concept, or whose cluster can't be brought up here, is refused, typed (the
 //! same record as `repl.rs`'s: `"refused": "no-concept" | "unavailable"`, with why).
 //!
-//! Amphora's groups run in this process, each `--nodes` members relayed as `repl.rs` relays them
-//! (member `n` of every group is node `n`, in region `n`). CockroachDB and TiDB run in containers
-//! through `bench/servers/scale/<system>.sh up N|down|kill N|start N|endpoint N|delay MS|images`.
+//! TiDB's placement (the region measure) and PD's operators (cutover's leader and replica moves) are
+//! applied in the background, and PD offers no watch or long-poll for Region or placement changes:
+//! those waits read PD's state every `schedule.patrol-region-interval`, PD's own period for checking
+//! each Region against its rules, read from the cluster (`SHOW CONFIG`), never a picked interval;
+//! each record says so (`waits`; lane scaleout-harness-11).
+//!
+//! `amphora-inproc`'s groups run in this process, each `--nodes` members relayed as `repl.rs` relays
+//! them (member `n` of every group is node `n`, in region `n`). The others are brought up through
+//! `bench/servers/scale/<system>.sh up N|down|kill N|start N|endpoint N|delay MS|rmi`.
 //!
 //! usage: amphora-bench --scale <write|read|follower|xgroup|region|regionloss|cutover>
-//!        --system <amphora|cockroach|tidb> --nodes N --groups N --writers N --deadline-s N [--record FILE]
-//!        write, region: --batch N --text-bytes N --warmup-s N --seconds N (region: --between-ms N --poll-us N)
+//!        --system <amphora|amphora-inproc|cockroach|tidb> --nodes N --groups N --writers N --deadline-s N [--record FILE]
+//!        write, region: --batch N --text-bytes N --warmup-s N --seconds N (region: --between-ms N)
 //!        read, follower: --rows N --batch N --text-bytes N --warmup-s N --seconds N
 //!        xgroup:     --keys N --span N --warmup-s N --seconds N (amphora: --protocol 2pc|parallel)
-//!        regionloss: --batch N --text-bytes N --lose N --settle-s N --after-s N --poll-us N
-//!        cutover:    --batch N --text-bytes N --ops N --concurrent-ops N --settle-s N --poll-us N
-//!        amphora:    --dir DIR --class persisted|replicated [--spanning N] --relay-records N --relay-pending N
-//!        others:     --hosts ENDPOINT=ADDR,... [--scripts DIR (bench/servers/scale)] [--shell PROGRAM (bash)]
+//!        regionloss: --batch N --text-bytes N --lose N --settle-s N --after-s N
+//!        cutover:    --batch N --text-bytes N --ops N --concurrent-ops N --settle-s N
+//!        amphora:    --class persisted|replicated [--spanning N]
+//!        amphora-inproc: --dir DIR --class persisted|replicated [--spanning N] --relay-records N --relay-pending N
+//!        all but amphora-inproc: --hosts ENDPOINT=ADDR,... [--scripts DIR (bench/servers/scale)] [--shell PROGRAM (bash)]
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -85,15 +104,121 @@ pub struct Row {
 }
 
 /// One client's connection to one node; a worker thread holds one at a time.
+///
+/// Every system is sent the same work the same way (Ada's fair comparisons): each write, read and
+/// transaction is one SQL statement, sent as text with its values written in as literals
+/// ([`Dialect`]), answered in one round trip and committed on its own. Amphora's client protocol
+/// takes text only (`exec SQL`, `count SQL`), so CockroachDB gets Postgres's simple query protocol and
+/// TiDB MySQL's text protocol (COM_QUERY): each server parses every statement it gets. An explicit
+/// transaction with one statement a row, or a statement prepared before each run, would take more
+/// round trips on some systems than on others, which would be an error in the experiment.
+/// `amphora-inproc` makes in-process calls, and its records say so.
 pub trait Session {
-    /// `rows` in one transaction, into `regional` when `regional`; returns once acknowledged.
+    /// `rows` in one statement (so they commit together), into `regional` when `regional`; returns
+    /// once acknowledged.
     fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()>;
     /// Whether row (`session`, `seq`) is there: read by its leader, or as a follower read.
     fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool>;
-    /// One transaction setting every key to `value`.
+    /// One statement (one transaction) setting every key to `value`.
     fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()>;
     /// Rows of `session` up to `upto`: on this node's own copy when `own`, else by the leader.
     fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64>;
+    /// [`Session::write`], and the write's [`Mark`]: what a read waits on to see it.
+    fn write_marked(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<Mark> {
+        self.write(regional, rows).map(|()| None)
+    }
+    /// The read measures' warm-up: one read of row (`session`, `seq`), written with `mark`, as
+    /// [`Session::read`] reads it. Where the system has a control that makes a read wait for a
+    /// given write, the read waits on it; else it is the system's read as it is (the leader's,
+    /// the strongest consistency the bench asks). It is asked once, never again.
+    fn read_after(
+        &mut self,
+        session: &str,
+        seq: u64,
+        follower: bool,
+        _mark: Mark,
+    ) -> anyhow::Result<bool> {
+        self.read(session, seq, follower)
+    }
+    /// Rows of `session` up to `upto` on this node's own copy, once it holds the write `mark`
+    /// names: one read that waits by the system's own control, never a poll. By default the
+    /// system's own-copy count as it is, for systems whose reads are current wherever they're
+    /// asked (CockroachDB's go to the leaseholder; TiDB's follower reads are ReadIndex reads).
+    fn count_own_after(&mut self, session: &str, upto: u64, _mark: Mark) -> anyhow::Result<u64> {
+        self.count(session, upto, true)
+    }
+}
+
+/// What a read waits on to see a given write: Amphora's session token from the write's answer
+/// (replication.md, "Decision (lane ryw-1): read-your-writes by session tokens"), None for a
+/// system that gives a client no such mark.
+pub type Mark = Option<amphora::database::Token>;
+
+/// `f` on each node in the configured order, from node 0, until one succeeds (schema setup's
+/// reach, lane scaleout-harness-10): the next node is tried only once the one before has failed,
+/// each try bounded by --deadline-s through its own client, so no node is asked again at once. Given
+/// up at `until`, or once every node failed, naming each failure.
+fn first_reachable<T>(
+    nodes: usize,
+    until: Instant,
+    mut f: impl FnMut(usize) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut failed = Vec::new();
+    for n in 0..nodes {
+        if Instant::now() >= until {
+            failed.push(format!("--deadline-s passed before node {n}"));
+            break;
+        }
+        match f(n) {
+            Ok(v) => return Ok(v),
+            Err(e) => failed.push(format!("node {n}: {e:#}")),
+        }
+    }
+    anyhow::bail!("no node answered: {}", failed.join("; "))
+}
+
+/// A measure's first failure, and the phases that end on it (lane scaleout-harness-10): a phase
+/// (`--settle-s`, `--after-s`) lasts its length, an input and the one wait here that is about
+/// time, or ends as soon as a worker fails, woken by that failure. A condition variable's wait for
+/// a duration, so a spurious wake doesn't cut a phase short as a bare park_timeout's would.
+#[derive(Default)]
+struct Halt {
+    failed: Mutex<Option<anyhow::Error>>,
+    told: std::sync::Condvar,
+}
+
+impl Halt {
+    /// Keeps the first failure and wakes the phase waiting.
+    fn fail(&self, e: anyhow::Error) {
+        if let Ok(mut f) = self.failed.lock() {
+            f.get_or_insert(e);
+            self.told.notify_all();
+        }
+    }
+    /// Whether a worker failed (a poisoned slot counts as one).
+    fn failed(&self) -> bool {
+        self.failed.lock().map_or(true, |f| f.is_some())
+    }
+    /// Waits `d`, or until a worker fails: whether the phase ran its length with none failed.
+    fn hold(&self, d: Duration) -> bool {
+        let Ok(f) = self.failed.lock() else {
+            return false;
+        };
+        self.told
+            .wait_timeout_while(f, d, |f| f.is_none())
+            .is_ok_and(|(f, _)| f.is_none())
+    }
+    /// The first failure, if any: the measure's error.
+    fn take(self) -> anyhow::Result<()> {
+        match self
+            .failed
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("a failure was poisoned"))?
+        {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 /// A cluster of `nodes()` nodes, 0 up.
@@ -108,6 +233,11 @@ pub trait System: Sync {
     fn reshard(&self, op: usize, o: &Opts) -> anyhow::Result<()>;
     /// The system's own count, summed over its nodes, of requests it sent on a stale route.
     fn stale_routes(&self) -> anyhow::Result<u64>;
+    /// What the measure's waits on the system's background work woke on, for the record, when
+    /// any read its state at the system's own period (TiDB's: PD has no watch).
+    fn waits(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 pub struct Opts {
@@ -129,7 +259,6 @@ pub struct Opts {
     pub lose: Option<usize>,
     pub settle: Option<Duration>,
     pub after: Option<Duration>,
-    pub poll: Option<Duration>,
     pub protocol: Option<String>,
     pub dir: Option<PathBuf>,
     pub class: Option<String>,
@@ -179,7 +308,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
         lose: None,
         settle: None,
         after: None,
-        poll: None,
         protocol: None,
         dir: None,
         class: None,
@@ -223,7 +351,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--lose" => o.lose = Some(v()?.parse()?),
             "--settle-s" => o.settle = Some(secs(&v()?)?),
             "--after-s" => o.after = Some(secs(&v()?)?),
-            "--poll-us" => o.poll = Some(Duration::from_micros(v()?.parse()?)),
             "--protocol" => o.protocol = Some(v()?),
             "--dir" => o.dir = Some(PathBuf::from(v()?)),
             "--class" => o.class = Some(v()?),
@@ -290,7 +417,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
                 "--span takes 2 to --groups: one key in each of that many groups"
             );
             anyhow::ensure!(keys >= o.groups, "--keys takes at least --groups");
-            if o.system == "amphora" {
+            if o.system == "amphora-inproc" {
                 need(o.protocol.as_deref(), "--protocol", &m)?;
             }
         }
@@ -298,7 +425,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             rows(&o)?;
             timed(&o)?;
             need(o.between, "--between-ms", &m)?;
-            need(o.poll, "--poll-us", &m)?;
         }
         "cutover" => {
             rows(&o)?;
@@ -308,7 +434,6 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
                 "--concurrent-ops takes at least 1"
             );
             need(o.settle, "--settle-s", &m)?;
-            need(o.poll, "--poll-us", &m)?;
         }
         _ => {
             rows(&o)?;
@@ -318,10 +443,9 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             );
             need(o.settle, "--settle-s", &m)?;
             need(o.after, "--after-s", &m)?;
-            need(o.poll, "--poll-us", &m)?;
         }
     }
-    if o.system != "amphora" {
+    if o.system != "amphora-inproc" {
         let hosts = need(o.hosts.as_deref(), "--hosts", &m)?;
         anyhow::ensure!(
             hosts.split(',').all(|h| h
@@ -331,6 +455,19 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
         );
     }
     if o.system == "amphora" {
+        match need(o.class.as_deref(), "--class", &m)? {
+            // Amphora's server refuses a member config naming both (serve::Config::parse).
+            "persisted" => {
+                anyhow::ensure!(o.spanning.is_none(), "--spanning is the replicated class's")
+            }
+            "replicated" => anyhow::ensure!(
+                need(o.spanning, "--spanning", &m)? >= 2,
+                "--spanning takes at least 2"
+            ),
+            other => anyhow::bail!("unknown class {other} (persisted, replicated)"),
+        }
+    }
+    if o.system == "amphora-inproc" {
         need(o.dir.as_ref(), "--dir", &m)?;
         anyhow::ensure!(
             need(o.relay_records, "--relay-records", &m)? > 0,
@@ -341,7 +478,10 @@ pub fn parse(args: &[String]) -> anyhow::Result<Opts> {
             "--relay-pending takes at least 1"
         );
         match need(o.class.as_deref(), "--class", &m)? {
-            "persisted" => {}
+            // Amphora's server refuses a member config naming both (serve::Config::parse).
+            "persisted" => {
+                anyhow::ensure!(o.spanning.is_none(), "--spanning is the replicated class's")
+            }
             "replicated" => anyhow::ensure!(
                 need(o.spanning, "--spanning", &m)? >= 2,
                 "--spanning takes at least 2"
@@ -359,6 +499,91 @@ fn us(t: Instant) -> u64 {
 /// Writer `w`'s session name: the same in every system, so splits fall at the same points.
 pub fn session_name(w: usize) -> String {
     format!("s-{w:06}")
+}
+
+/// The SQL text each system over the network is sent ([`Session`]): one statement for each write,
+/// read or transaction, with its values as literals.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialect {
+    /// Amphora's server (SQLite's SQL) and CockroachDB: standard SQL's string literals.
+    Standard,
+    /// TiDB (MySQL's SQL).
+    Mysql,
+}
+
+impl Dialect {
+    /// `v` as a string literal. Standard SQL doubles `'`. MySQL also reads `\` in a string as an
+    /// escape, unless the server's sql_mode has NO_BACKSLASH_ESCAPES (TiDB's default doesn't), so
+    /// `\` is doubled there too.
+    pub fn lit(self, v: &str) -> String {
+        let v = v.replace('\'', "''");
+        match self {
+            Self::Standard => format!("'{v}'"),
+            Self::Mysql => format!("'{}'", v.replace('\\', "\\\\")),
+        }
+    }
+
+    /// The upsert of every row in `rows` as one statement: `events(session, seq, body)`, or, when
+    /// `regional`, the region measure's table (TiDB's names each row's region; CockroachDB's
+    /// REGIONAL BY ROW homes it at the gateway).
+    pub fn upsert(self, regional: bool, rows: &[Row]) -> String {
+        let table = if regional { "regional" } else { "events" };
+        let values = rows
+            .iter()
+            .map(|r| match (self, regional) {
+                (Self::Mysql, true) => format!(
+                    "({}, {}, {}, {})",
+                    self.lit(&format!("r{}", r.region)),
+                    self.lit(&r.session),
+                    r.seq,
+                    self.lit(&r.body)
+                ),
+                _ => format!(
+                    "({}, {}, {})",
+                    self.lit(&r.session),
+                    r.seq,
+                    self.lit(&r.body)
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        match (self, regional) {
+            (Self::Mysql, true) => format!(
+                "INSERT INTO regional (region, session, seq, body) VALUES {values} ON DUPLICATE KEY UPDATE body = VALUES(body)"
+            ),
+            (Self::Mysql, false) => format!(
+                "INSERT INTO events (session, seq, body) VALUES {values} ON DUPLICATE KEY UPDATE body = VALUES(body)"
+            ),
+            (Self::Standard, _) => format!(
+                "INSERT INTO {table} (session, seq, body) VALUES {values} ON CONFLICT (session, seq) DO UPDATE SET body = excluded.body"
+            ),
+        }
+    }
+
+    /// The cross-group measure's transaction as one statement: every key in `keys` set to `value`.
+    pub fn kv_upsert(self, keys: &[i64], value: i64) -> String {
+        let values = keys
+            .iter()
+            .map(|k| format!("({k}, {value})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match self {
+            Self::Mysql => format!(
+                "INSERT INTO kv (k, v) VALUES {values} ON DUPLICATE KEY UPDATE v = VALUES(v)"
+            ),
+            Self::Standard => format!("UPSERT INTO kv (k, v) VALUES {values}"),
+        }
+    }
+
+    /// The count of `session`'s rows at `seq` (`upto`: at or below it), `from` naming the table
+    /// and how it's read.
+    pub fn count(self, from: &str, session: &str, seq: u64, upto: bool) -> String {
+        format!(
+            "SELECT count(*) FROM {from} WHERE session = {} AND seq {} {seq}",
+            self.lit(session),
+            if upto { "<=" } else { "=" }
+        )
+    }
 }
 
 /// The first session of each group past the first: `writers` sessions in `groups` even runs.
@@ -578,8 +803,14 @@ fn write(sys: &dyn System, o: &Opts, regional: bool) -> anyhow::Result<serde_jso
     Ok(v)
 }
 
-/// `--rows` rows over the writers' sessions, `--batch` a write; returns each session's last seq.
-fn preload(sys: &dyn System, o: &Opts) -> anyhow::Result<Vec<u64>> {
+/// What [`preload`] wrote: each session's last seq, and the last write's session, seq and mark.
+struct Preloaded {
+    last: Vec<u64>,
+    end: (usize, u64, Mark),
+}
+
+/// `--rows` rows over the writers' sessions, `--batch` a write.
+fn preload(sys: &dyn System, o: &Opts) -> anyhow::Result<Preloaded> {
     let m = &o.measure;
     let (rows, batch, text) = (
         need(o.rows, "--rows", m)?,
@@ -593,39 +824,75 @@ fn preload(sys: &dyn System, o: &Opts) -> anyhow::Result<Vec<u64>> {
         .collect();
     let mut left = rows;
     let mut w = 0usize;
+    let mut end = (0, 0, None);
     while left > 0 {
         let n = left.min(batch);
         let wr = writers
             .get_mut(w % o.writers)
             .ok_or_else(|| anyhow::anyhow!("no writer"))?;
         let r = wr.next(n, text);
-        conn.run(o.deadline, |s| s.write(false, &r))?;
+        let mark = conn.run(o.deadline, |s| s.write_marked(false, &r))?;
+        end = (w % o.writers, wr.seq, mark);
         left -= n;
         w += 1;
     }
-    Ok(writers.iter().map(|w| w.seq).collect())
+    Ok(Preloaded {
+        last: writers.iter().map(|w| w.seq).collect(),
+        end,
+    })
+}
+
+/// What the read measures' warm-up does on each system (the same rule for all, lane
+/// scaleout-harness-10: a system's own control for reading a given write where it has one, else one
+/// read at its strongest consistency), for the record.
+fn warmup_rule(system: &str, follower: bool) -> &'static str {
+    match (system, follower) {
+        ("amphora-inproc", false) => {
+            "one read on the group's leader carrying the session token of the preload's last write (Database::query_session, ReadMode::Session): it waits until the leader has applied that write"
+        }
+        ("amphora-inproc", true) => {
+            "one follower read at the closed time of the preload's last write, from its session token (Database::query_closed): it waits until the follower's closed time passes that write. Follower reads after it read at Database::follower_read_micros (now less the replica's measured lag), so those asked within that lag of the last write can miss rows: those count in `missed`, as CockroachDB's do"
+        }
+        ("amphora", _) => {
+            "one read through the leader, which answers a write once it has applied it: amphora serve's protocol carries no session token yet, so there is no write to wait on over the wire"
+        }
+        ("cockroach", false) => {
+            "one read, served by the range's leaseholder: CockroachDB's reads are consistent (serializable), so it sees every acknowledged write"
+        }
+        ("cockroach", true) => {
+            "one read by the leaseholder, at the strongest consistency: CockroachDB has no control that makes a follower read wait for a given write (docs.cockroachlabs.com/docs/stable/follower-reads: an AS OF SYSTEM TIME not far enough in the past reads the leaseholder; bounded staleness reads the least stale time served locally without blocking). Follower reads at follower_read_timestamp() can miss rows written within its lag: those count in `missed`"
+        }
+        (_, false) => {
+            "one read by the Region's leader: TiDB's reads are consistent, so it sees every acknowledged write"
+        }
+        (_, true) => {
+            "one follower read (tidb_replica_read = 'follower'): a ReadIndex read, which asks the leader for its commit index and waits until the follower has applied it (docs.pingcap.com/tidb/stable/follower-read), so it sees every acknowledged write"
+        }
+    }
 }
 
 fn read(sys: &dyn System, o: &Opts, follower: bool) -> anyhow::Result<serde_json::Value> {
-    let last = preload(sys, o)?;
-    // Before counting: a read of the last row written finds it, so every read after can.
+    let Preloaded {
+        last,
+        end: (lw, ls, mark),
+    } = preload(sys, o)?;
+    // Before counting: one read of the last row written, waiting for it by the system's own
+    // control where it has one (`warmup_rule` says what each system's does). It is asked once: a
+    // miss is the system's answer, and an error (lane scaleout-harness-10).
     let down: Vec<AtomicBool> = (0..sys.nodes()).map(|_| AtomicBool::new(false)).collect();
     let mut conn = Conn::new(sys, &down, 1 % sys.nodes());
-    let (lw, ls) = last
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, s)| **s > 0)
-        .map(|(w, s)| (w, *s))
-        .ok_or_else(|| anyhow::anyhow!("nothing preloaded"))?;
-    let until = Instant::now() + o.deadline;
-    while !conn.run(o.deadline, |s| s.read(&session_name(lw), ls, follower))? {
-        anyhow::ensure!(
-            Instant::now() < until,
-            "the last row preloaded wasn't readable within --deadline-s"
-        );
-        std::thread::yield_now();
-    }
+    anyhow::ensure!(ls > 0, "nothing preloaded");
+    anyhow::ensure!(
+        conn.run(o.deadline, |s| s.read_after(
+            &session_name(lw),
+            ls,
+            follower,
+            mark
+        ))?,
+        "the warm-up's read didn't find the last row preloaded ({}, {ls}): {}",
+        session_name(lw),
+        warmup_rule(&o.system, follower)
+    );
     let missed = AtomicU64::new(0);
     let mut v = closed_loop(sys, o, |_, conn, rng| {
         let w = rng.below(last.len());
@@ -642,6 +909,7 @@ fn read(sys: &dyn System, o: &Opts, follower: bool) -> anyhow::Result<serde_json
     if let Some(m) = v.as_object_mut() {
         m.insert("rows".into(), need(o.rows, "--rows", &o.measure)?.into());
         m.insert("missed".into(), missed.load(Ordering::Relaxed).into());
+        m.insert("warmup".into(), warmup_rule(&o.system, follower).into());
     }
     Ok(v)
 }
@@ -688,36 +956,33 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
         need(o.text_bytes, "--text-bytes", m)?,
         need(o.lose, "--lose", m)?,
     );
-    let (settle, after, poll) = (
+    let (settle, after) = (
         need(o.settle, "--settle-s", m)?,
         need(o.after, "--after-s", m)?,
-        need(o.poll, "--poll-us", m)?,
     );
     let nodes = sys.nodes();
     let down: Vec<AtomicBool> = (0..nodes).map(|_| AtomicBool::new(false)).collect();
     let stop = AtomicBool::new(false);
-    let acked: Vec<AtomicU64> = (0..o.writers).map(|_| AtomicU64::new(0)).collect();
-    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    // Each writer's last acknowledged seq and that write's mark, which the region's copy waits on.
+    let acked: Vec<Mutex<(u64, Mark)>> = (0..o.writers).map(|_| Mutex::new((0, None))).collect();
+    let halt = Halt::default();
     let mut first_ack_ms = 0.0;
-    let serve_ms;
     std::thread::scope(|scope| -> anyhow::Result<()> {
         for w in 0..o.writers {
-            let (down, stop, acked, failed) = (&down, &stop, &acked, &failed);
+            let (down, stop, acked, halt) = (&down, &stop, &acked, &halt);
             scope.spawn(move || {
                 let mut wr = Writer::new(w, w % nodes);
                 let mut conn = Conn::new(sys, down, w % nodes);
                 while !stop.load(Ordering::Relaxed) {
                     let rows = wr.next(batch, text);
-                    match conn.run(o.deadline, |s| s.write(false, &rows)) {
-                        Ok(()) => {
-                            if let Some(a) = acked.get(w) {
-                                a.store(wr.seq, Ordering::Relaxed);
+                    match conn.run(o.deadline, |s| s.write_marked(false, &rows)) {
+                        Ok(mark) => {
+                            if let Some(Ok(mut a)) = acked.get(w).map(Mutex::lock) {
+                                *a = (wr.seq, mark);
                             }
                         }
                         Err(e) => {
-                            if let Ok(mut f) = failed.lock() {
-                                f.get_or_insert(e);
-                            }
+                            halt.fail(e);
                             return;
                         }
                     }
@@ -725,7 +990,9 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
             });
         }
         let ran = (|| -> anyhow::Result<()> {
-            std::thread::park_timeout(settle);
+            if !halt.hold(settle) {
+                return Ok(());
+            }
             let mut probe = Writer::new(o.writers, (lose + 1) % nodes);
             let rows = probe.next(batch, text);
             let mut pc = Conn::new(sys, &down, (lose + 1) % nodes);
@@ -736,59 +1003,81 @@ fn region_loss(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> 
             sys.kill(lose)?;
             pc.run(o.deadline, |s| s.write(false, &rows))?;
             first_ack_ms = us(at) as f64 / 1000.0;
-            std::thread::park_timeout(after);
+            halt.hold(after);
             stop.store(true, Ordering::Relaxed);
             Ok(())
         })();
         stop.store(true, Ordering::Relaxed);
         ran
     })?;
-    if let Some(e) = failed
-        .lock()
-        .map_err(|_| anyhow::anyhow!("a writer's failure was poisoned"))?
-        .take()
-    {
-        return Err(e);
-    }
-    // The region back: its own copy polled until it holds every acknowledged row.
+    halt.take()?;
+    let acked = acked
+        .into_iter()
+        .map(|a| a.into_inner())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| anyhow::anyhow!("a writer's acknowledgement was poisoned"))?;
+    // The region back (`start` returns once its node is ready): its own copy read once for each
+    // writer, each read waiting on the writer's last acknowledged write by the system's own control
+    // (Session::count_own_after), never a poll (lane scaleout-harness-10). A system with no such
+    // read has this figure refused, typed and said why; the rest of the measure stands.
     let at = Instant::now();
     sys.start(lose)?;
     if let Some(d) = down.get(lose) {
         d.store(false, Ordering::Relaxed);
     }
-    let until = Instant::now() + o.deadline;
-    loop {
-        let caught = sys.connect(lose).and_then(|mut s| {
-            for (w, a) in acked.iter().enumerate() {
-                let want = a.load(Ordering::Relaxed);
-                if s.count(&session_name(w), want, true)? < want {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        });
-        if caught.is_ok_and(|c| c) {
-            serve_ms = us(at) as f64 / 1000.0;
-            break;
+    let caught = (|| -> anyhow::Result<f64> {
+        let mut s = sys.connect(lose)?;
+        for (w, (want, mark)) in acked.iter().enumerate() {
+            let held = s.count_own_after(&session_name(w), *want, *mark)?;
+            anyhow::ensure!(
+                held >= *want,
+                "region {lose}'s copy held {held} of writer {w}'s {want} acknowledged rows once it had waited for them"
+            );
         }
-        anyhow::ensure!(
-            Instant::now() < until,
-            "region {lose} didn't serve every acknowledged row within --deadline-s"
-        );
-        std::thread::park_timeout(poll);
-    }
+        Ok(us(at) as f64 / 1000.0)
+    })();
+    let serve_ms = match caught {
+        Ok(ms) => serde_json::json!(ms),
+        Err(e) => match e.downcast_ref::<Refusal>() {
+            Some(Refusal::NoConcept(why)) => {
+                serde_json::json!({ "refused": "no-concept", "why": why })
+            }
+            Some(Refusal::Unavailable(why)) => {
+                serde_json::json!({ "refused": "unavailable", "why": why })
+            }
+            None => return Err(e),
+        },
+    };
     let mut conn = Conn::new(sys, &down, (lose + 1) % nodes);
     let (mut acknowledged, mut lost) = (0u64, 0u64);
-    for (w, a) in acked.iter().enumerate() {
-        let want = a.load(Ordering::Relaxed);
-        let held = conn.run(o.deadline, |s| s.count(&session_name(w), want, false))?;
+    for (w, (want, _)) in acked.iter().enumerate() {
+        let held = conn.run(o.deadline, |s| s.count(&session_name(w), *want, false))?;
         acknowledged += want;
         lost += want.saturating_sub(held);
     }
     Ok(serde_json::json!({
         "writers": o.writers, "batch": batch, "text_bytes": text, "lose": lose, "settle_s": settle.as_secs_f64(), "after_s": after.as_secs_f64(),
-        "first_ack_ms": first_ack_ms, "serve_again_ms": serve_ms, "acknowledged_rows": acknowledged, "lost": lost,
+        "first_ack_ms": first_ack_ms, "serve_again_ms": serve_ms, "serve_again": serve_rule(&o.system), "acknowledged_rows": acknowledged, "lost": lost,
     }))
+}
+
+/// How each system's region-loss measure waits for the region's copy to serve again, for the
+/// record (lane scaleout-harness-10).
+fn serve_rule(system: &str) -> &'static str {
+    match system {
+        "amphora-inproc" => {
+            "each writer's rows counted on the region's own member at the closed time of the writer's last acknowledged write, from its session token (Database::query_closed): the read waits until the member's closed time passes that write"
+        }
+        "amphora" => {
+            "refused: amphora serve's protocol has no read that waits for a write (no session token on the wire yet), and its count on a member's own copy (query_local) doesn't wait"
+        }
+        "cockroach" => {
+            "each writer's rows counted once through the region's node: CockroachDB reads by the leaseholder, consistent, so one read sees every acknowledged row once the node answers"
+        }
+        _ => {
+            "each writer's rows counted once through the region's tidb-server as a follower read (tidb_replica_read = 'follower', ReadIndex: it waits until the follower has applied the leader's commit index; docs.pingcap.com/tidb/stable/follower-read)"
+        }
+    }
 }
 
 /// The operations a write overlapped: it began after `ended` operations had ended and was
@@ -916,12 +1205,8 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
     // is bounded by --ops and --deadline-s, so they are too).
     let sent: Vec<Mutex<Vec<Sent>>> = (0..o.writers).map(|_| Mutex::new(Vec::new())).collect();
     let spans: Mutex<Vec<Moved>> = Mutex::new(Vec::new());
-    let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let fail = |e: anyhow::Error| {
-        if let Ok(mut f) = failed.lock() {
-            f.get_or_insert(e);
-        }
-    };
+    let halt = Halt::default();
+    let fail = |e: anyhow::Error| halt.fail(e);
     let start = Instant::now();
     let at = || u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     let stale_before = sys.stale_routes()?;
@@ -958,13 +1243,13 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
                 }
             });
         }
-        std::thread::park_timeout(settle);
+        halt.hold(settle);
         let runners: Vec<_> = (0..concurrent)
             .map(|_| {
-                let (next, spans, failed, fail, at) = (&next, &spans, &failed, &fail, &at);
+                let (next, spans, halt, fail, at) = (&next, &spans, &halt, &fail, &at);
                 scope.spawn(move || {
                     loop {
-                        if failed.lock().map_or(true, |f| f.is_some()) {
+                        if halt.failed() {
                             return;
                         }
                         let k = next.fetch_add(1, Ordering::SeqCst);
@@ -995,13 +1280,7 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
         stop.store(true, Ordering::Relaxed);
         Ok(())
     })?;
-    if let Some(e) = failed
-        .lock()
-        .map_err(|_| anyhow::anyhow!("a failure was poisoned"))?
-        .take()
-    {
-        return Err(e);
-    }
+    halt.take()?;
     let stale = sys.stale_routes()?.saturating_sub(stale_before);
     let mut writes = Vec::new();
     for s in &sent {
@@ -1038,8 +1317,15 @@ fn cutover(sys: &dyn System, o: &Opts) -> anyhow::Result<serde_json::Value> {
 }
 
 fn record_head(o: &Opts) -> serde_json::Value {
+    // bash doesn't export HOSTNAME to its children: the kernel's name is the fallback.
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|h| h.trim().to_owned())
+        })
         .unwrap_or_default();
     let commit = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -1059,6 +1345,78 @@ fn record_head(o: &Opts) -> serde_json::Value {
         "bench": format!("scale_{}", o.measure), "system": o.system, "nodes": o.nodes, "groups": o.groups,
         "host": host, "cpus": std::thread::available_parallelism().map_or(0, usize::from), "commit": commit, "unix_s": date, "load1": load,
     });
+    // Which client and platform produced the record (Ada's fair comparisons): the OS, how the
+    // system ran (natively as its own processes, in containers, or in the bench's process) and the
+    // wire client the bench drove it through.
+    let mode = std::env::var("AMPHORA_BENCH_SCALE_MODE").unwrap_or_else(|_| "native".into());
+    let (ran, client) = match o.system.as_str() {
+        "amphora" => (
+            "native: amphora serve, one process a member".to_owned(),
+            "Amphora's client protocol over TCP: amphora::serve::Client, the server's own",
+        ),
+        "amphora-inproc" => ("in the bench's process".to_owned(), "in-process calls"),
+        "cockroach" => (
+            format!("{mode}: cockroach start, one process a node"),
+            "Postgres wire, simple query protocol: the bench's own client (bench/src/pgtext.rs), over std's TcpStream",
+        ),
+        _ => (
+            format!("{mode}: pd-server, tikv-server, tidb-server a node"),
+            "MySQL wire, text protocol (COM_QUERY): rust-mysql-simple (mysql crate)",
+        ),
+    };
+    let os = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                l.strip_prefix("PRETTY_NAME=")
+                    .map(|v| v.trim_matches('"').to_owned())
+            })
+        })
+        .unwrap_or_else(|| std::env::consts::OS.to_owned());
+    let kernel = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_owned());
+    // How each request is sent ([`Session`]): no system over a wire is given prepared statements,
+    // as Amphora's protocol is text only (lane scaleout-harness-9).
+    let statements = if o.system == "amphora-inproc" {
+        "in-process calls, each statement prepared and its parameters bound (no wire)"
+    } else {
+        "one SQL statement a write, read or transaction, as text with literals: one round trip, committed on its own; no prepared statements, on any system"
+    };
+    // How each system routes a write: forwarded by the node it was sent to, or sent straight to
+    // the leader. Each is how that system is built to be used, stated so the paths are compared
+    // as they are (lane scaleout-harness-9).
+    let routes = match o.system.as_str() {
+        "amphora" => {
+            "straight to the leader: the session asks the member it was given which member leads, then sends each write on its own link to the leader (asked again after a refusal)"
+        }
+        "amphora-inproc" => "straight to the leader: each write is a call on the group's leader",
+        "cockroach" => {
+            "forwarded: each write goes to the node the session connected to (its gateway), which sends it on to the range's leaseholder"
+        }
+        _ => {
+            "forwarded: each write goes to the tidb-server the session connected to, which sends it on to the Region's leader on TiKV"
+        }
+    };
+    // What gives a request up: --deadline-s for every system, through its client's own bound.
+    let deadline = match o.system.as_str() {
+        "amphora" => "--deadline-s: amphora::serve::Client's deadline on each request",
+        "amphora-inproc" => "--deadline-s: each call's deadline",
+        "cockroach" => "--deadline-s: the socket's read and write timeouts",
+        _ => "--deadline-s: rust-mysql-simple's read and write timeouts",
+    };
+    if let Some(h) = head.as_object_mut() {
+        h.insert(
+            "platform".into(),
+            serde_json::json!({ "os": os, "kernel": kernel, "arch": std::env::consts::ARCH, "ran": ran, "client": client, "driver": "amphora-bench --scale: closed-loop writers, Instant-timed per acknowledgement", "statements": statements, "routes": routes, "deadline": deadline }),
+        );
+        if let Ok(b) = std::env::var("AMPHORA_BENCH_SCALE_BIN") {
+            h.insert("binaries".into(), b.into());
+        }
+    }
     if let (Some(h), Some(class)) = (head.as_object_mut(), &o.class) {
         h.insert("class".into(), class.clone().into());
     }
@@ -1097,9 +1455,10 @@ fn emit(o: &Opts, mut head: serde_json::Value, body: serde_json::Value) -> anyho
 
 fn open(o: &Opts) -> anyhow::Result<Box<dyn System>> {
     Ok(match o.system.as_str() {
-        "amphora" => Box::new(inproc::Amphora::open(o)?),
+        "amphora" => Box::new(served::Amphora::up(o)?),
+        "amphora-inproc" => Box::new(inproc::Amphora::open(o)?),
         "cockroach" | "tidb" => Box::new(sql::Containers::up(o)?),
-        other => anyhow::bail!("unknown system {other} (amphora, cockroach, tidb)"),
+        other => anyhow::bail!("unknown system {other} (amphora, amphora-inproc, cockroach, tidb)"),
     })
 }
 
@@ -1114,7 +1473,7 @@ pub fn main() -> anyhow::Result<()> {
     let o = parse(&args)?;
     let ran = open(&o).and_then(|sys| {
         sys.prepare(&o)?;
-        match o.measure.as_str() {
+        let mut body = match o.measure.as_str() {
             "write" => write(sys.as_ref(), &o, false),
             "read" => read(sys.as_ref(), &o, false),
             "follower" => read(sys.as_ref(), &o, true),
@@ -1122,7 +1481,11 @@ pub fn main() -> anyhow::Result<()> {
             "region" => write(sys.as_ref(), &o, true),
             "cutover" => cutover(sys.as_ref(), &o),
             _ => region_loss(sys.as_ref(), &o),
+        }?;
+        if let (Some(b), Some(w)) = (body.as_object_mut(), sys.waits()) {
+            b.insert("waits".into(), w);
         }
+        Ok(body)
     });
     let head = record_head(&o);
     match ran {
@@ -1148,15 +1511,79 @@ mod inproc {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
-    use amphora::database::Database;
+    use amphora::database::{Database, ReadMode};
     use amphora::xgroup;
     use amphora_api::Value;
     use amphora_api::replication::{Durability, Fates, ReplicaConfig};
 
     struct Group {
         members: Vec<Database>,
-        stop: Arc<AtomicBool>,
+        bell: Arc<Bell>,
         relay: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// The relay's one wake across a group's members: each member's listener rings it when a
+    /// record joins that member's outgoing queue or its owner ends (`ReplicaHandle::listen`), and
+    /// the group's drop stops it. A ring given before the relay waits is kept, so none is missed
+    /// between its last drain and its wait.
+    #[derive(Default)]
+    struct Bell {
+        rung: Mutex<Rung>,
+        ringing: std::sync::Condvar,
+    }
+    #[derive(Default)]
+    struct Rung {
+        rung: bool,
+        stopped: bool,
+    }
+    impl Bell {
+        fn ring(&self) {
+            if let Ok(mut r) = self.rung.lock() {
+                r.rung = true;
+                self.ringing.notify_one();
+            }
+        }
+        fn stop(&self) {
+            if let Ok(mut r) = self.rung.lock() {
+                r.stopped = true;
+                self.ringing.notify_one();
+            }
+        }
+        /// Whether the relay goes on: not stopped, and the bell not poisoned.
+        fn going(&self) -> bool {
+            self.rung.lock().is_ok_and(|r| !r.stopped)
+        }
+        /// Waits for a ring or the stop, and no later than `due` when it's given, then takes the
+        /// ring: whether the relay goes on.
+        fn wait(&self, due: Option<Instant>) -> bool {
+            let Ok(r) = self.rung.lock() else {
+                return false;
+            };
+            let idle = |r: &mut Rung| !r.rung && !r.stopped;
+            let r = match due {
+                None => self.ringing.wait_while(r, idle).ok(),
+                Some(due) => self
+                    .ringing
+                    .wait_timeout_while(r, due.saturating_duration_since(Instant::now()), idle)
+                    .ok()
+                    .map(|(r, _)| r),
+            };
+            match r {
+                Some(mut r) => {
+                    r.rung = false;
+                    !r.stopped
+                }
+                None => false,
+            }
+        }
+    }
+    impl std::task::Wake for Bell {
+        fn wake(self: Arc<Self>) {
+            self.ring();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.ring();
+        }
     }
 
     pub struct Amphora {
@@ -1172,13 +1599,15 @@ mod inproc {
         CREATE TABLE IF NOT EXISTS regional(region TEXT NOT NULL, session TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(region, session, seq));";
 
     /// Every member's outgoing records to the member they name, held `between` first (the
-    /// region measure's one-way time; zero elsewhere), until `stop`. A cut member's records, out
+    /// region measure's one-way time; zero elsewhere), until `bell` is stopped. A cut member's records, out
     /// or in, are lost as a dead node's are. At most `pending` records are held: past it the relay
-    /// takes no more from the members until the oldest are delivered.
+    /// takes no more from the members until the oldest are delivered. With nothing to move it
+    /// waits on `bell` (a member's record or end, or the stop), and while records are held, no
+    /// later than the oldest's due time: it never spins (Ada's event-driven rule).
     fn relay(
         handles: &[amphora::replication::ReplicaHandle],
         cut: &[AtomicBool],
-        stop: &AtomicBool,
+        bell: &Bell,
         wait: Duration,
         records: usize,
         between: Duration,
@@ -1186,7 +1615,7 @@ mod inproc {
     ) {
         let is_cut = |i: usize| cut.get(i).is_some_and(|c| c.load(Ordering::Relaxed));
         let mut held = VecDeque::new();
-        while !stop.load(Ordering::Relaxed) {
+        while bell.going() {
             let mut moved = 0usize;
             for (from, handle) in handles.iter().enumerate() {
                 let room = pending.saturating_sub(held.len());
@@ -1212,14 +1641,78 @@ mod inproc {
                     let _ = target.receive(from as u64 + 1, record.bytes, Instant::now() + wait);
                 }
             }
-            if moved == 0 {
-                std::thread::yield_now();
+            if moved == 0 && !bell.wait(held.front().map(|(due, _, _)| *due)) {
+                break;
             }
         }
     }
 
     fn value_of(v: &str) -> Value {
         Value::Text(v.to_owned())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // Lane scaleout-harness-10 (T-SH.10): a write's session token makes the warm-up's read and
+        // the region's catch-up wait for that write, by the replica's own events. Do: three
+        // members, one group; write a row and take its mark; read it once on the leader and once
+        // as a follower read; cut a member off, write a second row, put the member back and count
+        // on its own copy once. Expect: a mark; both reads find the row; the member's one count
+        // holds both rows, no poll in between.
+        #[test]
+        fn scaleout_harness_10_a_token_read_waits_for_its_write() {
+            let dir = std::env::temp_dir().join(format!("amphora-sh10-{}", std::process::id()));
+            let o = parse(
+                &format!("--scale follower --system amphora-inproc --nodes 3 --groups 1 --writers 1 --deadline-s 60 --batch 1 --text-bytes 8 --rows 2 --warmup-s 1 --seconds 1 --class persisted --relay-records 64 --relay-pending 4096 --dir {}", dir.display())
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let a = Amphora::open(&o).unwrap();
+            a.prepare(&o).unwrap();
+            let mut w = Writer::new(0, 0);
+            let mut s = a.connect(0).unwrap();
+            let first = w.next(1, 8);
+            let mark = s.write_marked(false, &first).unwrap();
+            assert!(mark.is_some(), "a replicated write gives its session token");
+            assert!(s.read_after(&session_name(0), 1, false, mark).unwrap());
+            assert!(s.read_after(&session_name(0), 1, true, mark).unwrap());
+            let (back, _) = a.follower(0).unwrap();
+            a.kill(back).unwrap();
+            // The second write through a node still up: it goes to the group's leader.
+            let mut up = a.connect((back + 1) % 3).unwrap();
+            let second = w.next(1, 8);
+            let mark = up.write_marked(false, &second).unwrap();
+            a.start(back).unwrap();
+            let mut own = a.connect(back).unwrap();
+            assert_eq!(own.count_own_after(&session_name(0), 2, mark).unwrap(), 2);
+            drop((s, up, own));
+            drop(a);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Lane scaleout-harness-9 (AC-SH.5): the relay's bell keeps a ring given before its wait,
+        // a due time ends a wait no ring came to, and the stop ends the relay, its own ring kept
+        // as well. Do: ring then wait; wait on a due time already past; stop then wait, from
+        // another thread too. Expect: go on, go on, then stopped.
+        #[test]
+        fn scaleout_harness_9_the_relays_bell_keeps_a_ring_and_stops() {
+            let bell = Arc::new(Bell::default());
+            bell.ring();
+            assert!(bell.wait(None), "a ring before the wait is kept");
+            assert!(bell.wait(Some(Instant::now())), "a due time ends the wait");
+            assert!(bell.going());
+            let b = Arc::clone(&bell);
+            let stopper = std::thread::spawn(move || b.stop());
+            assert!(!bell.wait(None), "the stop ends the wait");
+            stopper.join().unwrap();
+            assert!(!bell.going());
+            std::task::Waker::from(Arc::clone(&bell)).wake();
+            assert!(!bell.wait(None), "a ring after the stop doesn't undo it");
+        }
     }
 
     impl Amphora {
@@ -1275,14 +1768,18 @@ mod inproc {
                     handles.len() == o.nodes,
                     "a member of group {g} has no replica handle"
                 );
-                let stop = Arc::new(AtomicBool::new(false));
-                let (c, s, wait) = (cut.clone(), stop.clone(), o.deadline);
+                let bell = Arc::new(Bell::default());
+                for h in &handles {
+                    h.listen(std::task::Waker::from(Arc::clone(&bell)))
+                        .map_err(|e| anyhow::anyhow!("group {g}'s relay can't listen: {e:?}"))?;
+                }
+                let (c, b, wait) = (cut.clone(), bell.clone(), o.deadline);
                 let relay = std::thread::spawn(move || {
-                    relay(&handles, &c, &s, wait, records, between, pending)
+                    relay(&handles, &c, &b, wait, records, between, pending)
                 });
                 groups.push(Group {
                     members,
-                    stop,
+                    bell,
                     relay: Some(relay),
                 });
             }
@@ -1306,25 +1803,53 @@ mod inproc {
                 .ok_or_else(|| anyhow::anyhow!("no group {g}"))
         }
 
-        /// The leader a live member of group `g` names, if it's live too.
+        /// The leader a live member of group `g` names, if it's live too. While no live member
+        /// names a live leader (none elected yet, or the one named is cut off), it waits on a
+        /// live member for the leader change: a leader of a later term than the one it names, on
+        /// the owner's word (ReplicaHandle::wait_leader, lane ryw-5), up to --deadline-s, never
+        /// a retry (lane scaleout-harness-10).
         fn leader(&self, g: usize) -> anyhow::Result<&Database> {
             let group = self.group(g)?;
+            let named = |l: u64| {
+                usize::try_from(l)
+                    .ok()
+                    .and_then(|l| l.checked_sub(1))
+                    .filter(|&i| !self.is_cut(i))
+                    .and_then(|i| group.members.get(i))
+            };
+            let mut waiting = None;
             for (i, m) in group.members.iter().enumerate() {
                 if self.is_cut(i) {
                     continue;
                 }
-                let Some(status) = m.replica().and_then(|h| h.status().ok()) else {
+                let Some(h) = m.replica() else {
                     continue;
                 };
-                let l = usize::try_from(status.leader).unwrap_or(0);
-                if l >= 1 && !self.is_cut(l - 1) {
-                    return group
-                        .members
-                        .get(l - 1)
-                        .ok_or_else(|| anyhow::anyhow!("no member {l}"));
+                let Ok(status) = h.status() else {
+                    continue;
+                };
+                if let Some(leader) = named(status.leader) {
+                    return Ok(leader);
                 }
+                // A leader of the term it names, when it names none; else one of a later term.
+                let past = if status.leader == 0 {
+                    status.term.saturating_sub(1)
+                } else {
+                    status.term
+                };
+                waiting.get_or_insert((h, past));
             }
-            anyhow::bail!("group {g} names no live leader")
+            let (h, past) =
+                waiting.ok_or_else(|| anyhow::anyhow!("group {g} has no live member"))?;
+            let status = h
+                .wait_leader(past, Instant::now() + self.deadline)
+                .map_err(|e| anyhow::anyhow!("group {g} elected no leader: {e:?}"))?;
+            named(status.leader).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "group {g}'s next leader, member {}, is cut off",
+                    status.leader
+                )
+            })
         }
 
         /// The group a session's rows are in: the writers' sessions in even runs, where
@@ -1338,15 +1863,34 @@ mod inproc {
                 .unwrap_or(0)
         }
 
-        fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<()> {
+        /// `rows` on group `g`'s leader, answered with the write's own session token
+        /// (Database::call_session).
+        fn exec(&self, g: usize, rows: Vec<(String, Vec<Value>)>) -> anyhow::Result<Mark> {
             self.leader(g)?
-                .call(Instant::now() + self.deadline, move |c| {
+                .call_session(Instant::now() + self.deadline, move |c| {
                     for (sql, args) in rows {
                         c.prepare_cached(&sql)?.execute(args)?;
                     }
                     Ok(())
                 })
+                .map(|((), token)| token)
                 .map_err(|e| anyhow::anyhow!("group {g} refused a write: {e:?}"))
+        }
+
+        /// A live member of group `g` that doesn't lead it, for a follower read.
+        fn follower(&self, g: usize) -> anyhow::Result<(usize, &Database)> {
+            let leader = self
+                .leader(g)?
+                .replica()
+                .and_then(|h| h.status().ok())
+                .map(|s| s.leader)
+                .unwrap_or(0);
+            self.group(g)?
+                .members
+                .iter()
+                .enumerate()
+                .find(|(i, _)| *i as u64 + 1 != leader && !self.is_cut(*i))
+                .ok_or_else(|| anyhow::anyhow!("group {g} has no live follower"))
         }
     }
 
@@ -1356,7 +1900,7 @@ mod inproc {
                 xg.take();
             }
             for g in &mut self.groups {
-                g.stop.store(true, Ordering::Relaxed);
+                g.bell.stop();
                 if let Some(r) = g.relay.take() {
                     let _ = r.join();
                 }
@@ -1382,14 +1926,29 @@ mod inproc {
             }
         };
     }
+    /// The group time a mark names, which a closed-time read waits for: every write at or before it
+    /// is applied once a replica's closed time has passed it.
+    fn closed_at(token: amphora::database::Token) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            token.micros > 0,
+            "the write's session token names no group time to wait for: {token:?}"
+        );
+        Ok(token.micros)
+    }
+
     const ONE: &str = "SELECT count(*) FROM events WHERE session = ?1 AND seq = ?2";
     const UPTO: &str = "SELECT count(*) FROM events WHERE session = ?1 AND seq <= ?2";
 
     impl Session for S<'_> {
         fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()> {
+            self.write_marked(regional, rows).map(drop)
+        }
+
+        /// The write, and its own session token from the write's answer.
+        fn write_marked(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<Mark> {
             anyhow::ensure!(!self.a.is_cut(self.node), "node {} is down", self.node);
             let Some(first) = rows.first() else {
-                return Ok(());
+                return Ok(None);
             };
             let g = self.a.group_of(&first.session);
             let stmts = rows
@@ -1413,20 +1972,7 @@ mod inproc {
             let (session, seq) = (session.to_owned(), i64::try_from(seq)?);
             let n = if follower {
                 // A member that doesn't lead the group, at the time it can read without waiting.
-                let leader = self
-                    .a
-                    .leader(g)?
-                    .replica()
-                    .and_then(|h| h.status().ok())
-                    .map(|s| s.leader)
-                    .unwrap_or(0);
-                let group = self.a.group(g)?;
-                let (i, m) = group
-                    .members
-                    .iter()
-                    .enumerate()
-                    .find(|(i, _)| *i as u64 + 1 != leader && !self.a.is_cut(*i))
-                    .ok_or_else(|| anyhow::anyhow!("group {g} has no live follower"))?;
+                let (i, m) = self.a.follower(g)?;
                 let at = m
                     .follower_read_micros(until)
                     .map_err(|e| anyhow::anyhow!("member {i}: {e:?}"))?;
@@ -1440,6 +1986,65 @@ mod inproc {
                     .map_err(|e| anyhow::anyhow!("group {g} refused a read: {e:?}"))?
             };
             Ok(n > 0)
+        }
+
+        /// One read carrying the preload's last token: on the leader, once it has applied it
+        /// (ReadMode::Session); as a follower read, at the token's closed time, once the
+        /// follower's closed time has passed it. Each waits on the replica's own events.
+        fn read_after(
+            &mut self,
+            session: &str,
+            seq: u64,
+            follower: bool,
+            mark: Mark,
+        ) -> anyhow::Result<bool> {
+            anyhow::ensure!(!self.a.is_cut(self.node), "node {} is down", self.node);
+            let token = mark
+                .ok_or_else(|| anyhow::anyhow!("the preload's last write gave no session token"))?;
+            let g = self.a.group_of(session);
+            let until = Instant::now() + self.a.deadline;
+            let (session, seq) = (session.to_owned(), i64::try_from(seq)?);
+            let n = if follower {
+                let (i, m) = self.a.follower(g)?;
+                m.query_closed(closed_at(token)?, until, counted!(ONE, session, seq))
+                    .map_err(|e| anyhow::anyhow!("member {i} refused a follower read: {e:?}"))?
+                    .value
+            } else {
+                self.a
+                    .leader(g)?
+                    .query_session(
+                        ReadMode::Session,
+                        Some(token),
+                        until,
+                        counted!(ONE, session, seq),
+                    )
+                    .map_err(|e| anyhow::anyhow!("group {g} refused a read: {e:?}"))?
+            };
+            Ok(n > 0)
+        }
+
+        /// The count on this node's own member at the closed time of `mark` (the writer's last
+        /// acknowledged write): it waits until the member's closed time passes that write.
+        fn count_own_after(&mut self, session: &str, upto: u64, mark: Mark) -> anyhow::Result<u64> {
+            anyhow::ensure!(!self.a.is_cut(self.node), "node {} is down", self.node);
+            let Some(token) = mark else {
+                // Nothing acknowledged for this writer: nothing to wait for.
+                return self.count(session, upto, true);
+            };
+            let g = self.a.group_of(session);
+            let until = Instant::now() + self.a.deadline;
+            let (session, upto) = (session.to_owned(), i64::try_from(upto)?);
+            let m = self
+                .a
+                .group(g)?
+                .members
+                .get(self.node)
+                .ok_or_else(|| anyhow::anyhow!("no member {}", self.node))?;
+            let n = m
+                .query_closed(closed_at(token)?, until, counted!(UPTO, session, upto))
+                .map_err(|e| anyhow::anyhow!("member {} refused a count: {e:?}", self.node))?
+                .value;
+            Ok(u64::try_from(n)?)
         }
 
         fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()> {
@@ -1502,19 +2107,55 @@ mod inproc {
             }
             let until = Instant::now() + o.deadline;
             for g in 0..self.groups.len() {
+                let members = &self.group(g)?.members;
+                // The schema goes to the leader a member names or, with none named yet or a member
+                // out of reach, to the next member in the configured order, from the first (lane
+                // scaleout-harness-10): a call waits in its member's queue until a leader is
+                // known, then runs or is refused naming the leader, which takes it next. Each try
+                // waits on the replica's own events, never a spin (lane scaleout-harness-9), and
+                // all are given up at --deadline-s. The schema's statements are idempotent, so a
+                // try whose outcome is unknown is made again.
+                let mut to = self.leader(g).ok();
+                let (mut next, mut out) = (0usize, 0usize);
                 loop {
-                    let done = self.leader(g).and_then(|l| {
-                        l.call(until, |c| Ok(c.execute_batch(EVENTS)?))
-                            .map_err(|e| anyhow::anyhow!("{e:?}"))
-                    });
-                    match done {
+                    let member = match to {
+                        Some(m) => m,
+                        None => {
+                            let m = members
+                                .get(next % members.len().max(1))
+                                .ok_or_else(|| anyhow::anyhow!("group {g} has no members"))?;
+                            next += 1;
+                            m
+                        }
+                    };
+                    let refused = match member.call(until, |c| Ok(c.execute_batch(EVENTS)?)) {
                         Ok(()) => break,
-                        Err(e) => anyhow::ensure!(
-                            Instant::now() < until,
-                            "group {g} took no schema within --deadline-s: {e}"
-                        ),
-                    }
-                    std::thread::yield_now();
+                        Err(e) => e,
+                    };
+                    anyhow::ensure!(
+                        Instant::now() < until,
+                        "group {g} took no schema within --deadline-s: {refused:?}"
+                    );
+                    to = match refused {
+                        amphora_api::Refusal::NotLeader { leader: Some(l) } => usize::try_from(l)
+                            .ok()
+                            .and_then(|l| l.checked_sub(1))
+                            .and_then(|i| members.get(i)),
+                        amphora_api::Refusal::NotLeader { leader: None }
+                        | amphora_api::Refusal::UnknownOutcome => self.leader(g).ok(),
+                        // This member can't take it (out of reach or ended): the next in order,
+                        // each once; given up once every member was.
+                        e @ (amphora_api::Refusal::Unavailable(_)
+                        | amphora_api::Refusal::Fenced(_)) => {
+                            out += 1;
+                            anyhow::ensure!(
+                                out < members.len(),
+                                "group {g}: no member could take its schema: {e:?}"
+                            );
+                            None
+                        }
+                        other => anyhow::bail!("group {g} refused its schema: {other:?}"),
+                    };
                 }
             }
             if o.measure == "xgroup" {
@@ -1580,6 +2221,222 @@ mod inproc {
     }
 }
 
+/// Amphora as its own server (`amphora serve`, CP-T1.13), one member a node, brought up and down by
+/// bench/servers/scale/amphora.sh as CockroachDB's and TiDB's are by theirs, and reached over TCP by
+/// the server's own client (`amphora::serve::Client`, one code path with the server's): one request a
+/// line (`exec SQL`, `count SQL`, `status`), one answer a line (`ok ...` or `err ...`). The server serves one
+/// replicated database: `--groups` takes 1. A write goes to the member that leads (a member's
+/// `status` names it), as a client of a single-leader database sends it; a refused one is sent again
+/// by the bench's closed loop after the leader is asked again.
+mod served {
+    use super::*;
+    use amphora::serve::Client as Link;
+
+    const EVENTS: &str = "CREATE TABLE IF NOT EXISTS events(session TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(session, seq))";
+
+    pub struct Amphora {
+        c: sql::Scripted,
+        /// Each node's address and the cluster's secret.
+        members: Vec<(String, Vec<u8>)>,
+        deadline: Duration,
+    }
+
+    fn no_concept(what: &str) -> anyhow::Error {
+        anyhow::Error::from(Refusal::Unavailable(format!(
+            "Amphora's server doesn't serve {what} yet (its client protocol takes exec, count and status)"
+        )))
+    }
+
+    impl Amphora {
+        pub fn up(o: &Opts) -> anyhow::Result<Self> {
+            if o.groups != 1 {
+                return Err(anyhow::Error::from(Refusal::Unavailable("Amphora's server serves one replicated database: --groups 1 (groups across servers aren't served yet)".into())));
+            }
+            let mut env = vec![
+                (
+                    "CLASS".to_owned(),
+                    need(o.class.clone(), "--class", &o.measure)?,
+                ),
+                ("DEADLINE_MS".to_owned(), o.deadline.as_millis().to_string()),
+            ];
+            if let Some(sp) = o.spanning {
+                env.push(("SPANNING".to_owned(), sp.to_string()));
+            }
+            let c = sql::Scripted::up(o, env)?;
+            let mut members = Vec::new();
+            for n in 0..o.nodes {
+                let ep = c.run(&["endpoint", &n.to_string()])?;
+                let ep = ep.trim();
+                let (addr, secret) = ep.split_once(' ').ok_or_else(|| {
+                    anyhow::anyhow!("amphora.sh's endpoint {ep}: not ADDR SECRET_FILE")
+                })?;
+                let mut bytes = std::fs::read(secret)?;
+                while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+                    bytes.pop();
+                }
+                members.push((addr.to_owned(), bytes));
+            }
+            Ok(Self {
+                c,
+                members,
+                deadline: o.deadline,
+            })
+        }
+
+        fn link(&self, node: usize) -> anyhow::Result<Link> {
+            let (addr, secret) = self
+                .members
+                .get(node)
+                .ok_or_else(|| anyhow::anyhow!("no node {node}"))?;
+            Link::connect(addr, secret, self.deadline)
+        }
+
+        /// The node that leads, as node `via` names it.
+        fn leader(&self, via: &mut Link) -> anyhow::Result<usize> {
+            let status = via.ask("status")?;
+            let l: usize = status
+                .split_whitespace()
+                .find_map(|f| f.strip_prefix("leader="))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            anyhow::ensure!(l >= 1 && l <= self.members.len(), "no leader yet: {status}");
+            Ok(l - 1)
+        }
+    }
+
+    struct S<'a> {
+        a: &'a Amphora,
+        own: Link,
+        /// The leader's node and a link to it, asked again after a refusal.
+        lead: Option<(usize, Link)>,
+    }
+
+    impl S<'_> {
+        fn to_leader(&mut self, line: &str) -> anyhow::Result<String> {
+            if self.lead.is_none() {
+                let l = self.a.leader(&mut self.own)?;
+                self.lead = Some((l, self.a.link(l)?));
+            }
+            let Some((_, link)) = self.lead.as_mut() else {
+                anyhow::bail!("no leader link");
+            };
+            let answer = link.ask(line);
+            if answer.is_err() {
+                self.lead = None;
+            }
+            answer
+        }
+    }
+
+    impl Session for S<'_> {
+        fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()> {
+            if regional {
+                return Err(no_concept("regional tables"));
+            }
+            if rows.is_empty() {
+                return Ok(());
+            }
+            self.to_leader(&format!("exec {}", Dialect::Standard.upsert(false, rows)))
+                .map(|_| ())
+        }
+
+        fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
+            if follower {
+                return Err(no_concept("follower reads"));
+            }
+            let n: u64 = self
+                .to_leader(&format!(
+                    "count {}",
+                    Dialect::Standard.count("events", session, seq, false)
+                ))?
+                .parse()?;
+            Ok(n > 0)
+        }
+
+        fn add(&mut self, _keys: &[i64], _value: i64) -> anyhow::Result<()> {
+            Err(no_concept("transactions across groups"))
+        }
+
+        fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64> {
+            let q = format!(
+                "count {}",
+                Dialect::Standard.count("events", session, upto, true)
+            );
+            Ok(if own {
+                self.own.ask(&q)?
+            } else {
+                self.to_leader(&q)?
+            }
+            .parse()?)
+        }
+
+        fn count_own_after(
+            &mut self,
+            _session: &str,
+            _upto: u64,
+            _mark: Mark,
+        ) -> anyhow::Result<u64> {
+            Err(anyhow::Error::from(Refusal::Unavailable("amphora serve's protocol has no read that waits for a write on a member's own copy (no session token on the wire yet; its count is a local read, which doesn't wait)".into())))
+        }
+    }
+
+    impl System for Amphora {
+        fn nodes(&self) -> usize {
+            self.members.len()
+        }
+
+        fn prepare(&self, o: &Opts) -> anyhow::Result<()> {
+            match o.measure.as_str() {
+                "write" | "read" | "regionloss" => {}
+                "cutover" => return Err(anyhow::Error::from(Refusal::Unavailable("Amphora's splits, merges and moves are a pure core so far: the shell that carries them out over replicated groups isn't built (docs/design/reshard.md, \"What is left\")".into()))),
+                other => return Err(no_concept(&format!("the {other} measure"))),
+            }
+            // The schema through the leader a member names. With no leader named yet, the member
+            // asked takes it itself: its call waits in its queue until a leader is known, then
+            // runs there or is refused. Each try waits on the member's answer and its election:
+            // no timer, no spin (lane scaleout-harness-9). The members are asked in the
+            // configured order, from member 0, each only once the one before failed (it couldn't
+            // be reached, or its try was refused), all given up at --deadline-s: none is asked
+            // again at once (lane scaleout-harness-10). The schema's statements are idempotent.
+            let until = Instant::now() + o.deadline;
+            let exec = format!("exec {EVENTS}");
+            first_reachable(self.members.len(), until, |n| {
+                let mut via = self.link(n)?;
+                match self.leader(&mut via) {
+                    Ok(l) => self.link(l)?.ask(&exec),
+                    Err(_) => via.ask(&exec),
+                }
+            })
+            .map(drop)
+            .map_err(|e| anyhow::anyhow!("Amphora took no schema: {e}"))
+        }
+
+        fn connect(&self, node: usize) -> anyhow::Result<Box<dyn Session + '_>> {
+            Ok(Box::new(S {
+                a: self,
+                own: self.link(node)?,
+                lead: None,
+            }))
+        }
+
+        fn kill(&self, node: usize) -> anyhow::Result<()> {
+            self.c.run(&["kill", &node.to_string()]).map(|_| ())
+        }
+
+        fn start(&self, node: usize) -> anyhow::Result<()> {
+            self.c.run(&["start", &node.to_string()]).map(|_| ())
+        }
+
+        fn stale_routes(&self) -> anyhow::Result<u64> {
+            Err(no_concept("a count of stale routes"))
+        }
+
+        fn reshard(&self, _op: usize, _o: &Opts) -> anyhow::Result<()> {
+            Err(no_concept("range operations"))
+        }
+    }
+}
+
 /// CockroachDB (Postgres's protocol) and TiDB (MySQL's), each cluster brought up and down by its
 /// script; each node in region `r<n>` (CockroachDB's `--locality`, TiKV's labels).
 pub mod sql {
@@ -1591,13 +2448,78 @@ pub mod sql {
         Tidb,
     }
 
-    pub struct Containers {
-        kind: Kind,
+    /// A cluster brought up by its script (bench/servers/scale/<system>.sh) and taken down by it
+    /// when dropped.
+    pub struct Scripted {
         script: PathBuf,
         shell: String,
         hosts: String,
+        deadline: Duration,
+        env: Vec<(String, String)>,
+    }
+
+    impl Scripted {
+        /// `up --nodes` through the system's script, `env` added to what it's given.
+        pub fn up(o: &Opts, env: Vec<(String, String)>) -> anyhow::Result<Self> {
+            let c = Self {
+                script: PathBuf::from(format!("{}/{}.sh", o.scripts.display(), o.system)),
+                shell: o.shell.clone(),
+                hosts: need(o.hosts.clone(), "--hosts", &o.measure)?,
+                deadline: o.deadline,
+                env,
+            };
+            c.run(&["up", &o.nodes.to_string()]).map_err(|e| {
+                Refusal::Unavailable(format!(
+                    "{}'s cluster didn't come up through {}: {e}",
+                    o.system,
+                    c.script.display()
+                ))
+            })?;
+            Ok(c)
+        }
+
+        /// The script run by `--shell`, given the run's deadline as its bound on waiting.
+        pub fn run(&self, args: &[&str]) -> anyhow::Result<String> {
+            let out = std::process::Command::new(&self.shell)
+                .arg(&self.script)
+                .args(args)
+                .env("WAIT_S", self.deadline.as_secs().max(1).to_string())
+                .env("HOSTS", &self.hosts)
+                .envs(self.env.iter().map(|(k, v)| (k, v)))
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "{} {}: {}",
+                self.script.display(),
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            Ok(String::from_utf8(out.stdout)?)
+        }
+    }
+
+    impl Drop for Scripted {
+        fn drop(&mut self) {
+            if let Err(e) = self.run(&["down"]) {
+                use std::io::Write;
+                // Drop can't return the failure: it goes to stderr, and the nodes stay for `down`.
+                writeln!(
+                    std::io::stderr().lock(),
+                    "{} down: {e}",
+                    self.script.display()
+                )
+                .ok();
+            }
+        }
+    }
+
+    pub struct Containers {
+        kind: Kind,
+        s: Scripted,
         endpoints: Vec<String>,
         deadline: Duration,
+        /// PD's `schedule.patrol-region-interval`, read once, when a wait first needs it.
+        patrol: std::sync::OnceLock<Duration>,
     }
 
     /// The statements that make a measure's tables, splits and regions, in the system's dialect.
@@ -1695,19 +2617,11 @@ pub mod sql {
             };
             let mut c = Self {
                 kind,
-                script: PathBuf::from(format!("{}/{}.sh", o.scripts.display(), o.system)),
-                shell: o.shell.clone(),
-                hosts: need(o.hosts.clone(), "--hosts", &o.measure)?,
+                s: Scripted::up(o, Vec::new())?,
                 endpoints: Vec::new(),
                 deadline: o.deadline,
+                patrol: std::sync::OnceLock::new(),
             };
-            c.script(&["up", &o.nodes.to_string()]).map_err(|e| {
-                Refusal::Unavailable(format!(
-                    "{}'s cluster didn't come up through {}: {e}",
-                    o.system,
-                    c.script.display()
-                ))
-            })?;
             for n in 0..o.nodes {
                 c.endpoints
                     .push(c.script(&["endpoint", &n.to_string()])?.trim().to_owned());
@@ -1715,22 +2629,8 @@ pub mod sql {
             Ok(c)
         }
 
-        /// The script run by `--shell`, given the run's deadline as its bound on waiting.
         fn script(&self, args: &[&str]) -> anyhow::Result<String> {
-            let out = std::process::Command::new(&self.shell)
-                .arg(&self.script)
-                .args(args)
-                .env("WAIT_S", self.deadline.as_secs().max(1).to_string())
-                .env("HOSTS", &self.hosts)
-                .output()?;
-            anyhow::ensure!(
-                out.status.success(),
-                "{} {}: {}",
-                self.script.display(),
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            Ok(String::from_utf8(out.stdout)?)
+            self.s.run(args)
         }
 
         fn endpoint(&self, n: usize) -> anyhow::Result<&str> {
@@ -1739,25 +2639,101 @@ pub mod sql {
                 .map(String::as_str)
                 .ok_or_else(|| anyhow::anyhow!("no node {n}"))
         }
-    }
 
-    impl Drop for Containers {
-        fn drop(&mut self) {
-            if let Err(e) = self.script(&["down"]) {
-                use std::io::Write;
-                // Drop can't return the failure: it goes to stderr, and the containers stay for `down`.
-                writeln!(
-                    std::io::stderr().lock(),
-                    "{} down: {e}",
-                    self.script.display()
-                )
-                .ok();
+        /// How often a wait on PD's background work reads its state: PD's own
+        /// `schedule.patrol-region-interval`, the period at which its checker inspects each
+        /// Region against its placement rules (docs.pingcap.com/tidb/stable/pd-configuration-file).
+        /// PD has no watch or long-poll for Region, operator or placement changes (its HTTP API
+        /// and pd-ctl answer each request with the state then; the gRPC `SyncRegions` stream is
+        /// PD's own leader-to-follower copy), so the cluster's own period is the wait's, never a
+        /// picked one. The slowest PD's, should they differ (lane scaleout-harness-11).
+        fn pd_patrol(&self, c: &mut mysql::Conn) -> anyhow::Result<Duration> {
+            use mysql::prelude::Queryable;
+            if let Some(d) = self.patrol.get() {
+                return Ok(*d);
             }
+            let rows: Vec<(String, String, String, String)> = c.query(
+                "SHOW CONFIG WHERE type = 'pd' AND name = 'schedule.patrol-region-interval'",
+            )?;
+            let mut slowest: Option<Duration> = None;
+            for (_, instance, _, value) in &rows {
+                let d = go_duration(value).map_err(|e| {
+                    anyhow::anyhow!(
+                        "PD {instance}'s schedule.patrol-region-interval {value:?}: {e}"
+                    )
+                })?;
+                slowest = Some(slowest.map_or(d, |s| s.max(d)));
+            }
+            let d = slowest.ok_or_else(|| {
+                anyhow::anyhow!("SHOW CONFIG names no PD's schedule.patrol-region-interval")
+            })?;
+            anyhow::ensure!(!d.is_zero(), "PD's schedule.patrol-region-interval is zero");
+            Ok(*self.patrol.get_or_init(|| d))
         }
     }
 
+    /// A Go duration as PD's configuration prints it (Go's `time.Duration` text: decimal numbers,
+    /// each with a unit of ns, us, µs, ms, s, m or h, as `10ms` or `1m30s`).
+    pub fn go_duration(text: &str) -> anyhow::Result<Duration> {
+        let mut total = Duration::ZERO;
+        let mut rest = text.trim();
+        anyhow::ensure!(!rest.is_empty(), "no duration");
+        if rest == "0" {
+            return Ok(total);
+        }
+        while !rest.is_empty() {
+            let digits = rest
+                .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+                .ok_or_else(|| anyhow::anyhow!("{text:?}: a number without a unit"))?;
+            let (number, after) = rest.split_at(digits);
+            let unit_len = after
+                .find(|ch: char| ch.is_ascii_digit() || ch == '.')
+                .unwrap_or(after.len());
+            let (unit, next) = after.split_at(unit_len);
+            let unit_ns: u128 = match unit {
+                "ns" => 1,
+                "us" | "µs" | "μs" => 1_000,
+                "ms" => 1_000_000,
+                "s" => 1_000_000_000,
+                "m" => 60_000_000_000,
+                "h" => 3_600_000_000_000,
+                _ => anyhow::bail!("{text:?}: unknown unit {unit:?}"),
+            };
+            // Whole and fractional parts in integers, so `10ms` is exactly 10 ms.
+            let (whole, frac) = number.split_once('.').unwrap_or((number, ""));
+            anyhow::ensure!(
+                !(whole.is_empty() && frac.is_empty()) && !frac.contains('.'),
+                "{text:?}: no number before {unit:?}"
+            );
+            let digits_of = |d: &str| -> anyhow::Result<u128> {
+                if d.is_empty() {
+                    Ok(0)
+                } else {
+                    d.parse::<u128>()
+                        .map_err(|e| anyhow::anyhow!("{text:?}: {e}"))
+                }
+            };
+            let scale = u32::try_from(frac.len())
+                .ok()
+                .and_then(|n| 10u128.checked_pow(n))
+                .ok_or_else(|| anyhow::anyhow!("{text:?}: too many decimals"))?;
+            let (whole, frac) = (digits_of(whole)?, digits_of(frac)?);
+            let ns = whole
+                .checked_mul(unit_ns)
+                .zip(frac.checked_mul(unit_ns))
+                .and_then(|(w, f)| w.checked_add(f / scale))
+                .ok_or_else(|| anyhow::anyhow!("{text:?}: too long"))?;
+            let ns = u64::try_from(ns).map_err(|_| anyhow::anyhow!("{text:?}: too long"))?;
+            total = total
+                .checked_add(Duration::from_nanos(ns))
+                .ok_or_else(|| anyhow::anyhow!("{text:?}: too long"))?;
+            rest = next;
+        }
+        Ok(total)
+    }
+
     struct Pg {
-        c: postgres::Client,
+        c: crate::pgtext::Client,
     }
 
     struct My {
@@ -1765,68 +2741,60 @@ pub mod sql {
         follower: bool,
     }
 
+    impl Pg {
+        /// A count's one row, by the simple query protocol (one round trip, the text parsed by the
+        /// server as Amphora's is).
+        fn counted(&mut self, sql: &str) -> anyhow::Result<u64> {
+            let rows = self.c.simple_query(sql)?;
+            let n = rows
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("{sql}: no row"))?
+                .first()
+                .cloned()
+                .flatten()
+                .ok_or_else(|| anyhow::anyhow!("{sql}: a NULL count"))?;
+            Ok(n.parse()?)
+        }
+    }
+
     impl Session for Pg {
         fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()> {
-            let table = if regional { "regional" } else { "events" };
-            let sql = format!(
-                "INSERT INTO {table} (session, seq, body) VALUES ($1, $2, $3) ON CONFLICT (session, seq) DO UPDATE SET body = excluded.body"
-            );
-            let mut t = self.c.transaction()?;
-            for r in rows {
-                t.execute(sql.as_str(), &[&r.session, &i64::try_from(r.seq)?, &r.body])?;
+            if rows.is_empty() {
+                return Ok(());
             }
-            t.commit()?;
-            Ok(())
+            self.c
+                .simple_query(&Dialect::Standard.upsert(regional, rows))
+                .map(drop)
         }
 
         fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
-            let sql = if follower {
-                "SELECT count(*) FROM events AS OF SYSTEM TIME follower_read_timestamp() WHERE session = $1 AND seq = $2"
+            let from = if follower {
+                "events AS OF SYSTEM TIME follower_read_timestamp()"
             } else {
-                "SELECT count(*) FROM events WHERE session = $1 AND seq = $2"
+                "events"
             };
-            let n: i64 = self
-                .c
-                .query_one(sql, &[&session, &i64::try_from(seq)?])?
-                .try_get(0)?;
-            Ok(n > 0)
+            Ok(self.counted(&Dialect::Standard.count(from, session, seq, false))? > 0)
         }
 
         fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()> {
-            let mut t = self.c.transaction()?;
-            for k in keys {
-                t.execute("UPSERT INTO kv (k, v) VALUES ($1, $2)", &[k, &value])?;
-            }
-            t.commit()?;
-            Ok(())
+            self.c
+                .simple_query(&Dialect::Standard.kv_upsert(keys, value))
+                .map(drop)
         }
 
         fn count(&mut self, session: &str, upto: u64, _own: bool) -> anyhow::Result<u64> {
             // CockroachDB answers every read by its leaseholder: a node's own copy isn't readable.
-            let n: i64 = self
-                .c
-                .query_one(
-                    "SELECT count(*) FROM events WHERE session = $1 AND seq <= $2",
-                    &[&session, &i64::try_from(upto)?],
-                )?
-                .try_get(0)?;
-            Ok(u64::try_from(n)?)
+            self.counted(&Dialect::Standard.count("events", session, upto, true))
         }
     }
 
     impl Session for My {
         fn write(&mut self, regional: bool, rows: &[Row]) -> anyhow::Result<()> {
             use mysql::prelude::Queryable;
-            let mut t = self.c.start_transaction(mysql::TxOpts::default())?;
-            for r in rows {
-                if regional {
-                    t.exec_drop("INSERT INTO regional (region, session, seq, body) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE body = VALUES(body)", (format!("r{}", r.region), &r.session, r.seq, &r.body))?;
-                } else {
-                    t.exec_drop("INSERT INTO events (session, seq, body) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE body = VALUES(body)", (&r.session, r.seq, &r.body))?;
-                }
+            if rows.is_empty() {
+                return Ok(());
             }
-            t.commit()?;
-            Ok(())
+            Ok(self.c.query_drop(Dialect::Mysql.upsert(regional, rows))?)
         }
 
         fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
@@ -1839,24 +2807,15 @@ pub mod sql {
                 })?;
                 self.follower = follower;
             }
-            let n: Option<i64> = self.c.exec_first(
-                "SELECT count(*) FROM events WHERE session = ? AND seq = ?",
-                (session, seq),
-            )?;
+            let n: Option<i64> = self
+                .c
+                .query_first(Dialect::Mysql.count("events", session, seq, false))?;
             Ok(n.unwrap_or(0) > 0)
         }
 
         fn add(&mut self, keys: &[i64], value: i64) -> anyhow::Result<()> {
             use mysql::prelude::Queryable;
-            let mut t = self.c.start_transaction(mysql::TxOpts::default())?;
-            for k in keys {
-                t.exec_drop(
-                    "INSERT INTO kv (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)",
-                    (k, value),
-                )?;
-            }
-            t.commit()?;
-            Ok(())
+            Ok(self.c.query_drop(Dialect::Mysql.kv_upsert(keys, value))?)
         }
 
         fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64> {
@@ -1868,10 +2827,9 @@ pub mod sql {
                 "SET SESSION tidb_replica_read = 'leader'"
             })?;
             self.follower = own;
-            let n: Option<i64> = self.c.exec_first(
-                "SELECT count(*) FROM events WHERE session = ? AND seq <= ?",
-                (session, upto),
-            )?;
+            let n: Option<i64> = self
+                .c
+                .query_first(Dialect::Mysql.count("events", session, upto, true))?;
             Ok(u64::try_from(n.unwrap_or(0))?)
         }
     }
@@ -1883,13 +2841,21 @@ pub mod sql {
 
         fn prepare(&self, o: &Opts) -> anyhow::Result<()> {
             let stmts = setup(self.kind, o);
+            // The schema through the first node, in the configured order, that can be reached:
+            // the next is tried once the one before failed to connect, all given up at
+            // --deadline-s (lane scaleout-harness-10).
+            let until = Instant::now() + o.deadline;
+            let nodes = self.nodes();
             match self.kind {
                 Kind::Cockroach => {
-                    let ep = self.endpoint(0)?;
-                    let mut c = ep
-                        .parse::<postgres::Config>()?
-                        .connect_timeout(self.deadline)
-                        .connect(postgres::NoTls)?;
+                    let mut c = first_reachable(nodes, until, |n| {
+                        Ok(self
+                            .endpoint(n)?
+                            .parse::<postgres::Config>()?
+                            .connect_timeout(self.deadline)
+                            .connect(postgres::NoTls)?)
+                    })
+                    .map_err(|e| anyhow::anyhow!("CockroachDB took no schema: {e}"))?;
                     for q in &stmts {
                         c.batch_execute(q)
                             .map_err(|e| anyhow::anyhow!("{q}: {e}"))?;
@@ -1897,12 +2863,23 @@ pub mod sql {
                 }
                 Kind::Tidb => {
                     use mysql::prelude::Queryable;
-                    let mut c = mysql::Conn::new(mysql::Opts::from_url(self.endpoint(0)?)?)?;
+                    let mut c = first_reachable(nodes, until, |n| {
+                        let opts = mysql::OptsBuilder::from_opts(mysql::Opts::from_url(
+                            self.endpoint(n)?,
+                        )?)
+                        .tcp_connect_timeout(Some(self.deadline))
+                        .read_timeout(Some(self.deadline))
+                        .write_timeout(Some(self.deadline));
+                        Ok(mysql::Conn::new(opts)?)
+                    })
+                    .map_err(|e| anyhow::anyhow!("TiDB took no schema: {e}"))?;
                     for q in &stmts {
                         c.query_drop(q).map_err(|e| anyhow::anyhow!("{q}: {e}"))?;
                     }
                     if o.measure == "region" {
-                        // Placement is applied in the background: wait until every policy is.
+                        // Placement is applied in the background: wait until every policy is,
+                        // reading it at PD's own period (no watch: Self::pd_patrol).
+                        let patrol = self.pd_patrol(&mut c)?;
                         let until = Instant::now() + o.deadline;
                         loop {
                             let states: Vec<(String, String, String)> =
@@ -1916,7 +2893,7 @@ pub mod sql {
                                 Instant::now() < until,
                                 "TiDB's placement wasn't scheduled within --deadline-s: {states:?}"
                             );
-                            std::thread::park_timeout(need(o.poll, "--poll-us", &o.measure)?);
+                            std::thread::sleep(patrol);
                         }
                     }
                 }
@@ -1931,11 +2908,9 @@ pub mod sql {
         fn connect(&self, node: usize) -> anyhow::Result<Box<dyn Session + '_>> {
             let ep = self.endpoint(node)?;
             Ok(match self.kind {
+                // Each read and write given up after --deadline-s, as TiDB's below.
                 Kind::Cockroach => Box::new(Pg {
-                    c: ep
-                        .parse::<postgres::Config>()?
-                        .connect_timeout(self.deadline)
-                        .connect(postgres::NoTls)?,
+                    c: crate::pgtext::Client::connect(ep, self.deadline)?,
                 }),
                 Kind::Tidb => {
                     let opts = mysql::OptsBuilder::from_opts(mysql::Opts::from_url(ep)?)
@@ -1981,6 +2956,19 @@ pub mod sql {
                 Kind::Tidb => self.reshard_tidb(what, &session, op, o),
             }
         }
+
+        fn waits(&self) -> Option<serde_json::Value> {
+            self.patrol.get().map(|d| waits_record(*d))
+        }
+    }
+
+    /// The record's `waits` for TiDB: what its waits on PD's background work read, and how often.
+    pub fn waits_record(patrol: Duration) -> serde_json::Value {
+        serde_json::json!({
+            "on": "TiDB's placement (SHOW PLACEMENT) and PD's operators (the Region's peers and leader), read until applied",
+            "every_us": u64::try_from(patrol.as_micros()).unwrap_or(u64::MAX),
+            "every_is": "PD's schedule.patrol-region-interval, read from the cluster by SHOW CONFIG: PD's own period for checking each Region against its rules; PD has no watch or long-poll for Region or placement changes",
+        })
     }
 
     /// The sum of the samples of metrics `names` in a Prometheus text exposition (every label set).
@@ -2195,7 +3183,9 @@ pub mod sql {
                 ])?;
                 Box::new(move |peers, _| peers.contains(&to) && !peers.contains(&from))
             };
-            // PD's operators run in the background: the operation has taken effect once the Region shows it.
+            // PD's operators run in the background: the operation has taken effect once the Region
+            // shows it, read at PD's own period (no watch: Self::pd_patrol).
+            let patrol = self.pd_patrol(&mut c)?;
             let until = Instant::now() + o.deadline;
             loop {
                 let now = Self::tidb_regions(&mut c)?;
@@ -2209,7 +3199,7 @@ pub mod sql {
                     Instant::now() < until,
                     "Region {region}'s {what:?} operation didn't take effect within --deadline-s"
                 );
-                std::thread::park_timeout(need(o.poll, "--poll-us", &o.measure)?);
+                std::thread::sleep(patrol);
             }
         }
     }
@@ -2244,12 +3234,209 @@ mod tests {
         assert!(e.contains("--nodes"), "{e}");
         let e = parse(&args("--scale region --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
         assert!(e.contains("--between-ms"), "{e}");
-        let e = parse(&args("--scale xgroup --system amphora --nodes 3 --groups 3 --writers 2 --deadline-s 5 --keys 30 --span 2 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
+        let e = parse(&args("--scale xgroup --system amphora-inproc --nodes 3 --groups 3 --writers 2 --deadline-s 5 --keys 30 --span 2 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
         assert!(e.contains("--protocol"), "{e}");
-        let e = parse(&args("--scale regionloss --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --lose 3 --settle-s 1 --after-s 1 --poll-us 10")).err().unwrap().to_string();
+        // Amphora's server is brought up on the machines it's given, as the others are.
+        let served = "--scale write --system amphora --nodes 3 --groups 1 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1";
+        let e = parse(&args(served)).err().unwrap().to_string();
+        assert!(e.contains("--hosts"), "{e}");
+        let e = parse(&args(&format!("{served} --hosts local=127.0.0.1")))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("--class"), "{e}");
+        assert!(
+            parse(&args(&format!(
+                "{served} --hosts local=127.0.0.1 --class persisted"
+            )))
+            .is_ok()
+        );
+        let e = parse(&args(&format!(
+            "{served} --hosts local=127.0.0.1 --class persisted --spanning 2"
+        )))
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("--spanning"), "{e}");
+        let e = parse(&args("--scale regionloss --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --lose 3 --settle-s 1 --after-s 1")).err().unwrap().to_string();
         assert!(e.contains("--lose"), "{e}");
         let e = parse(&args("--scale xgroup --system tidb --nodes 3 --groups 2 --writers 2 --deadline-s 5 --keys 30 --span 3 --warmup-s 1 --seconds 1")).err().unwrap().to_string();
         assert!(e.contains("--span"), "{e}");
+    }
+
+    // AC-SH.3: every system over the network is sent a write as one statement, its rows as
+    // literals, quoted as its dialect reads them.
+    #[test]
+    fn ac_sh_3_every_system_is_sent_one_statement_a_write() {
+        let rows = [
+            Row {
+                session: "s-000001".into(),
+                seq: 7,
+                region: 2,
+                body: "it's a \\ b".into(),
+            },
+            Row {
+                session: "s-000001".into(),
+                seq: 8,
+                region: 2,
+                body: "c".into(),
+            },
+        ];
+        assert_eq!(
+            Dialect::Standard.upsert(false, &rows),
+            "INSERT INTO events (session, seq, body) VALUES ('s-000001', 7, 'it''s a \\ b'), ('s-000001', 8, 'c') ON CONFLICT (session, seq) DO UPDATE SET body = excluded.body"
+        );
+        assert_eq!(
+            Dialect::Mysql.upsert(true, &rows),
+            "INSERT INTO regional (region, session, seq, body) VALUES ('r2', 's-000001', 7, 'it''s a \\\\ b'), ('r2', 's-000001', 8, 'c') ON DUPLICATE KEY UPDATE body = VALUES(body)"
+        );
+        assert_eq!(
+            Dialect::Standard.kv_upsert(&[3, 13], 5),
+            "UPSERT INTO kv (k, v) VALUES (3, 5), (13, 5)"
+        );
+        assert_eq!(
+            Dialect::Mysql.count("events", "s-000001", 9, true),
+            "SELECT count(*) FROM events WHERE session = 's-000001' AND seq <= 9"
+        );
+    }
+
+    // Lane scaleout-harness-9 (G13): each system's record says how it routes a write (forwarded
+    // or straight to the leader), what gives a request up, and that no system over a wire is
+    // given prepared statements.
+    #[test]
+    fn scaleout_harness_9_records_name_routes_deadlines_and_statements() {
+        let tail = "--nodes 3 --groups 1 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1 --class persisted --hosts local=127.0.0.1";
+        for (system, route) in [
+            ("amphora", "straight to the leader"),
+            ("cockroach", "forwarded"),
+            ("tidb", "forwarded"),
+        ] {
+            let o = parse(&args(&format!("--scale write --system {system} {tail}"))).unwrap();
+            let p = &record_head(&o)["platform"];
+            let routes = p["routes"].as_str().unwrap();
+            assert!(routes.starts_with(route), "{system}: {routes}");
+            assert!(
+                p["deadline"].as_str().unwrap().starts_with("--deadline-s"),
+                "{system}"
+            );
+            assert!(
+                p["statements"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no prepared statements"),
+                "{system}"
+            );
+        }
+    }
+
+    // Lane scaleout-harness-10 (T-SH.8): schema setup asks each node in the configured order, the
+    // next only once the one before failed, and gives up naming each failure, or at its deadline.
+    #[test]
+    fn scaleout_harness_10_schema_asks_each_node_in_turn_then_gives_up() {
+        let later = Instant::now() + Duration::from_secs(3600);
+        let mut asked = Vec::new();
+        let got = first_reachable(3, later, |n| {
+            asked.push(n);
+            if n == 1 {
+                Ok(n)
+            } else {
+                anyhow::bail!("refused")
+            }
+        });
+        assert_eq!(got.unwrap(), 1);
+        assert_eq!(
+            asked,
+            vec![0, 1],
+            "node 0 failed, so node 1 was asked, and no more"
+        );
+        let mut asked = Vec::new();
+        let e = first_reachable(3, later, |n| -> anyhow::Result<()> {
+            asked.push(n);
+            anyhow::bail!("unreachable {n}")
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(asked, vec![0, 1, 2], "each node once, none asked again");
+        for n in 0..3 {
+            assert!(e.contains(&format!("node {n}: unreachable {n}")), "{e}");
+        }
+        let mut asked = 0;
+        let e = first_reachable(3, Instant::now(), |_| -> anyhow::Result<()> {
+            asked += 1;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(asked, 0);
+        assert!(e.contains("--deadline-s passed before node 0"), "{e}");
+    }
+
+    // Lane scaleout-harness-10 (T-SH.11): a measure's phase lasts its length unless a worker
+    // fails, and then ends on the failure, which the measure returns. Do: hold a zero-length
+    // phase; fail from another thread while a long phase holds; fail again. Expect: the first
+    // ran its length, the second ended on the failure, and the first failure is the error.
+    #[test]
+    fn scaleout_harness_10_a_phase_ends_on_a_workers_failure() {
+        let halt = Halt::default();
+        assert!(halt.hold(Duration::ZERO));
+        assert!(!halt.failed());
+        std::thread::scope(|scope| {
+            scope.spawn(|| halt.fail(anyhow::anyhow!("first")));
+            assert!(
+                !halt.hold(Duration::from_secs(3600)),
+                "the failure ends the phase"
+            );
+        });
+        halt.fail(anyhow::anyhow!("second"));
+        assert!(halt.failed());
+        assert_eq!(halt.take().unwrap_err().to_string(), "first");
+    }
+
+    /// A session that counts what it's asked, for the default warm-up and catch-up reads.
+    #[derive(Default)]
+    struct Asked {
+        reads: Vec<(String, u64, bool)>,
+        counts: Vec<(String, u64, bool)>,
+    }
+
+    impl Session for Asked {
+        fn write(&mut self, _regional: bool, _rows: &[Row]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn read(&mut self, session: &str, seq: u64, follower: bool) -> anyhow::Result<bool> {
+            self.reads.push((session.to_owned(), seq, follower));
+            Ok(true)
+        }
+        fn add(&mut self, _keys: &[i64], _value: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn count(&mut self, session: &str, upto: u64, own: bool) -> anyhow::Result<u64> {
+            self.counts.push((session.to_owned(), upto, own));
+            Ok(upto)
+        }
+    }
+
+    // Lane scaleout-harness-10 (T-SH.9): a system with no control for waiting on a write gets one
+    // read for the warm-up and one own-copy count for the region's catch-up, never asked again;
+    // regionloss takes no --poll-us; each record says what each system's warm-up and catch-up do.
+    #[test]
+    fn scaleout_harness_10_warmup_and_catch_up_read_once_by_each_systems_rule() {
+        let mut s = Asked::default();
+        assert_eq!(s.write_marked(false, &[]).unwrap(), None);
+        assert!(s.read_after("s-000001", 7, true, None).unwrap());
+        assert_eq!(s.reads, vec![("s-000001".to_owned(), 7, true)]);
+        assert_eq!(s.count_own_after("s-000002", 9, None).unwrap(), 9);
+        assert_eq!(s.counts, vec![("s-000002".to_owned(), 9, true)]);
+        assert!(parse(&args("--scale regionloss --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --lose 1 --settle-s 1 --after-s 1 --hosts local=a")).is_ok());
+        for system in ["amphora", "amphora-inproc", "cockroach", "tidb"] {
+            for follower in [false, true] {
+                assert!(!warmup_rule(system, follower).is_empty(), "{system}");
+            }
+            assert!(!serve_rule(system).is_empty(), "{system}");
+        }
+        assert!(warmup_rule("amphora-inproc", true).contains("session token"));
+        assert!(warmup_rule("tidb", true).contains("ReadIndex"));
+        assert!(serve_rule("amphora").starts_with("refused"));
     }
 
     // G13 step 1: the competitors split where Amphora's groups divide, and a key's group is the
@@ -2279,7 +3466,7 @@ mod tests {
     // region (CockroachDB's REGIONAL BY ROW, TiDB's partition a placement policy each).
     #[test]
     fn g13_scale_setup_dialects() {
-        let o = parse(&args("--scale region --system cockroach --nodes 3 --groups 2 --writers 4 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1 --between-ms 30 --poll-us 1000 --hosts local=127.0.0.1")).unwrap();
+        let o = parse(&args("--scale region --system cockroach --nodes 3 --groups 2 --writers 4 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1 --between-ms 30 --hosts local=127.0.0.1")).unwrap();
         let c = sql::setup(sql::Kind::Cockroach, &o);
         assert!(
             c.iter()
@@ -2312,7 +3499,7 @@ mod tests {
     // takes its operations' count.
     #[test]
     fn g13_scale_machines_are_arguments() {
-        let base = "--scale cutover --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --ops 4 --concurrent-ops 1 --settle-s 1 --poll-us 1000";
+        let base = "--scale cutover --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --ops 4 --concurrent-ops 1 --settle-s 1";
         let e = parse(&args(base)).err().unwrap().to_string();
         assert!(e.contains("--hosts"), "{e}");
         let e = parse(&args(&format!("{base} --hosts local")))
@@ -2332,8 +3519,44 @@ mod tests {
             record_head(&o)["machines"],
             serde_json::json!(["10.0.0.1", "10.0.0.2"])
         );
-        let e = parse(&args("--scale cutover --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --settle-s 1 --poll-us 1 --hosts local=a")).err().unwrap().to_string();
+        let e = parse(&args("--scale cutover --system cockroach --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --settle-s 1 --hosts local=a")).err().unwrap().to_string();
         assert!(e.contains("--ops"), "{e}");
+    }
+
+    // Lane scaleout-harness-11 (T-SH.12): TiDB's waits on PD's background work read its state at
+    // PD's own schedule.patrol-region-interval, as PD prints it; --poll-us isn't taken by region or
+    // cutover, and the record says what the waits read and at which of the system's own periods.
+    #[test]
+    fn scaleout_harness_11_pd_waits_read_at_pds_own_period() {
+        let d = |t: &str| sql::go_duration(t);
+        assert_eq!(d("10ms").unwrap(), Duration::from_millis(10));
+        assert_eq!(d("1m30s").unwrap(), Duration::from_secs(90));
+        assert_eq!(d("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(d("500µs").unwrap(), Duration::from_micros(500));
+        assert_eq!(d("2h0m0s").unwrap(), Duration::from_secs(7200));
+        assert_eq!(d("0").unwrap(), Duration::ZERO);
+        for bad in ["", "10", "ms", "10x", "1..5s", "99999999999999999999h"] {
+            assert!(d(bad).is_err(), "{bad:?} was taken");
+        }
+        let region = "--scale region --system tidb --nodes 3 --groups 2 --writers 4 --deadline-s 5 --batch 1 --text-bytes 1 --warmup-s 1 --seconds 1 --between-ms 30 --hosts local=127.0.0.1";
+        let cutover = "--scale cutover --system tidb --nodes 3 --groups 3 --writers 2 --deadline-s 5 --batch 1 --text-bytes 1 --ops 4 --concurrent-ops 1 --settle-s 1 --hosts local=127.0.0.1";
+        for base in [region, cutover] {
+            assert!(parse(&args(base)).is_ok(), "{base}");
+            let e = parse(&args(&format!("{base} --poll-us 1000")))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains("--poll-us"), "{e}");
+        }
+        let w = sql::waits_record(Duration::from_millis(10));
+        assert_eq!(w["every_us"], serde_json::json!(10_000));
+        assert!(
+            w["every_is"]
+                .as_str()
+                .unwrap()
+                .contains("schedule.patrol-region-interval"),
+            "{w}"
+        );
     }
 
     // G13 step 2: a write counts toward every operation it was in flight during, and only those.

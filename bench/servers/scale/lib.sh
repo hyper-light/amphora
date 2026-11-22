@@ -30,8 +30,20 @@
 #
 # `metrics N`: node N's Prometheus text, from the script's `metrics_url N`.
 #
+# MODE (AMPHORA_BENCH_SCALE_MODE): `native` (the default, the runs of record) runs each node as
+# processes of the system's own release binaries, from BIN (AMPHORA_BENCH_SCALE_BIN, the folder
+# bench/servers/scale/fetch.sh fills), with its data under DATA (AMPHORA_BENCH_SCALE_DATA) on the
+# machine's own disk: no container between the bench and any system, so every system runs on the same
+# OS, disk and filesystem as Amphora's own server does. ENDPOINT is then `local` or an ssh
+# destination. `docker` runs the containers described above. A native node's processes are started
+# from command files kept beside their logs and pid files, so `kill N` (SIGKILL) and `start N` act
+# on the same processes and data; `down` kills them by the pids it recorded and removes DATA's run
+# folder. `delay` takes root (tc on the machine's own interface): native mode refuses it.
+#
 # usage: HOSTS=... <system>.sh up N|down|kill N|start N|endpoint N|metrics N|delay MS|rmi|ids|exec N ARGS...
 set -euo pipefail
+MODE=${AMPHORA_BENCH_SCALE_MODE:-native}
+[[ $MODE == native || $MODE == docker ]] || { echo "AMPHORA_BENCH_SCALE_MODE $MODE: native or docker" >&2; exit 2; }
 # Git for Windows' bash rewrites arguments that look like paths (/data, /etc/...): not the containers'.
 export MSYS_NO_PATHCONV=1
 # RUN (AMPHORA_BENCH_SCALE_RUN) names this run's containers apart from other runs sharing a Docker
@@ -66,6 +78,41 @@ dk() {
   ep=${m%%=*}
   if [[ $ep == local ]]; then docker "$@"; else docker -H "$ep" "$@"; fi
 }
+# Native mode: the run's folder (data, logs, pids, command files) on each node's machine.
+RUNDIR="${AMPHORA_BENCH_SCALE_DATA:-${XDG_CACHE_HOME:-$HOME/.cache}/amphora-bench-scale/data}/$SYS${RUN:+-$RUN}"
+# A bash script run on node n's machine.
+on_node() {
+  local m ep
+  m=$(machine "$1")
+  ep=${m%%=*}
+  if [[ $ep == local ]]; then bash -c "$2"; else ssh -o BatchMode=yes "${ep#ssh://}" bash -c "$(printf %q "$2")"; fi
+}
+# proc N NAME ARGS...: process NAME of node n, started from its command file (exec: its pid is the
+# binary's), its output to NAME.log in the node's folder.
+proc() {
+  local n=$1 name=$2 dir cmd
+  shift 2
+  dir=$(printf %q "$RUNDIR/$n")
+  cmd="ulimit -n \$(ulimit -Hn); exec $(printf '%q ' "$@")"
+  on_node "$n" "mkdir -p $dir && cd $dir && printf '%s\\n' $(printf %q "$cmd") >$name.cmd && { nohup bash $name.cmd >$name.log 2>&1 </dev/null & echo \$! >$name.pid; }"
+}
+# Node n's processes started again from their command files, on the data they left.
+restart_native() {
+  local dir="$RUNDIR/$1"
+  on_node "$1" "cd $(printf %q "$dir") && for c in *.cmd; do nohup bash \$c >\${c%.cmd}.log.\$(date +%s) 2>&1 </dev/null & echo \$! >\${c%.cmd}.pid; done"
+}
+kill_native() { on_node "$1" "cd $(printf %q "$RUNDIR/$1") 2>/dev/null && for p in *.pid; do kill -KILL \$(cat \$p) 2>/dev/null || true; done; true"; }
+# Every native process of this run on machine i killed, waited for, and its folder removed.
+down_native_on() {
+  on_node "$1" "cd $(printf %q "$RUNDIR") 2>/dev/null || exit 0; for p in */*.pid; do kill -KILL \$(cat \$p) 2>/dev/null || true; done; for p in */*.pid; do while kill -0 \$(cat \$p) 2>/dev/null; do sleep 0.1; done; done; cd / && rm -rf $(printf %q "$RUNDIR")"
+}
+# Whether every port of node n's block is free on its machine (native mode's publish check).
+ports_free() {
+  local n=$1 j s=""
+  for ((j = 0; j < PORTS; j++)); do s+=" sport = :$(port "$n" "$j") or"; done
+  ! on_node "$n" "ss -Htln '(${s% or} )' | grep -q ."
+}
+
 # -p for each of node n's ports, the same number inside.
 publish() {
   local n=$1 j p
@@ -100,7 +147,7 @@ down_on() {
   done
 }
 down() {
-  each_machine down_on
+  if [[ $MODE == native ]]; then each_machine down_native_on; else each_machine down_on; fi
   rm -f "$STATE"
 }
 
@@ -114,6 +161,18 @@ up() {
     ((BASE + count * PORTS - 1 <= 65535)) || { echo "no block of $((count * PORTS)) ports from the starting port up that every machine publishes" >&2; return 1; }
     echo "$count $BASE" >"$STATE"
     placed=1
+    if [[ $MODE == native ]]; then
+      for ((n = 0; n < count; n++)); do
+        if ! ports_free "$n"; then
+          placed=0
+          BASE=$((BASE + count * PORTS))
+          break
+        fi
+      done
+      ((placed == 1)) || continue
+      for ((n = 0; n < count; n++)); do run_native "$n" || return 1; done
+      break
+    fi
     for ((n = 0; n < count; n++)); do
       # In the background so that set -e still stops run_node at its first failed docker run.
       run_node "$n" >/dev/null 2>"$err" &
@@ -143,6 +202,7 @@ up() {
 
 delay() {
   local ms=${1:?delay takes milliseconds} n m j c count
+  [[ $MODE == docker ]] || { echo "native mode doesn't inject latency: tc on a machine's own interface takes root (AMPHORA_BENCH_SCALE_MODE=docker does it per container)" >&2; return 3; }
   count=$(nodes)
   for ((n = 0; n < count; n++)); do
     for c in $(containers "$n"); do
@@ -173,15 +233,18 @@ main() {
   case "${1:-}" in
     up) up "${2:-}" ;;
     down) down ;;
-    kill) for c in $(containers "$2"); do dk "$2" kill --signal KILL "$c" >/dev/null; done ;;
+    kill)
+      if [[ $MODE == native ]]; then kill_native "$2"; else for c in $(containers "$2"); do dk "$2" kill --signal KILL "$c" >/dev/null; done; fi
+      ;;
     start)
-      for c in $(containers "$2"); do dk "$2" start "$c" >/dev/null; done
+      if [[ $MODE == native ]]; then restart_native "$2"; else for c in $(containers "$2"); do dk "$2" start "$c" >/dev/null; done; fi
       wait_for ready_node "$2"
       ;;
+    mode) echo "$MODE" ;;
     endpoint) endpoint "$2" ;;
     metrics) curl -sf --max-time "$WAIT_S" "$(metrics_url "$2")" ;;
     delay) delay "$2" ;;
-    rmi) each_machine rmi_on ;;
+    rmi) [[ $MODE == native ]] || each_machine rmi_on ;;
     ids) ids ;;
     exec)
       local n=$2

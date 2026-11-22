@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CockroachDB, one node a region (--locality=region=r<n>), insecure, for bench/src/scale.rs's
+# CockroachDB, one node a region (--locality=region=r<n>), insecure, natively or in containers (lib.sh's MODE), for bench/src/scale.rs's
 # `cockroach` system, on the machines HOSTS names (lib.sh): node n's SQL and RPC on its machine's
 # address at port BASE + 2n, its HTTP at BASE + 2n + 1. A commit is acknowledged once a quorum of its
 # range's replicas holds it (Raft), with Parallel Commits across ranges.
@@ -10,6 +10,7 @@ IMAGES=$IMAGE
 PORTS=2
 BASE=56200
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
+[[ $MODE == docker ]] || BIN=${AMPHORA_BENCH_SCALE_BIN:?AMPHORA_BENCH_SCALE_BIN: the folder holding the cockroach release binary (bench/servers/scale/fetch.sh)}
 
 containers() { name "$1"; }
 sql_at() { echo "$(addr "$1"):$(port "$1" 0)"; }
@@ -22,10 +23,23 @@ run_node() {
     start --insecure --join="$join" --advertise-addr="$(sql_at "$n")" --listen-addr="0.0.0.0:$(port "$n" 0)" --http-addr="0.0.0.0:$(port "$n" 1)" --locality="region=r$n"
 }
 
+# Native mode: BIN holds the release's `cockroach` (bench/servers/scale/fetch.sh); node n's store in
+# its folder.
+run_native() {
+  local n=$1 join="" m
+  for ((m = 0; m < $(nodes); m++)); do join+="${join:+,}$(sql_at "$m")"; done
+  proc "$n" cockroach "$BIN/cockroach" start --insecure --join="$join" --advertise-addr="$(sql_at "$n")" --listen-addr="0.0.0.0:$(port "$n" 0)" \
+    --http-addr="0.0.0.0:$(port "$n" 1)" --locality="region=r$n" --store="path=$RUNDIR/$n/store"
+}
+
 node_exec() {
   local n=$1
   shift
-  dk "$n" exec "$(name "$n")" ./cockroach "$@" --insecure --host="$(sql_at "$n")"
+  if [[ $MODE == native ]]; then
+    "$BIN/cockroach" "$@" --insecure --host="$(sql_at "$n")"
+  else
+    dk "$n" exec "$(name "$n")" ./cockroach "$@" --insecure --host="$(sql_at "$n")"
+  fi
 }
 
 after_up() {

@@ -25,6 +25,7 @@ mod eqp;
 mod mysql;
 mod oracle;
 mod pg;
+mod pgtext;
 mod planner;
 mod pool;
 mod powercut;

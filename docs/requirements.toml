@@ -1598,3 +1598,44 @@ tests = [
 # own records are counted from its files before the runs (storages.py count, called by storages.sh), and
 # SAME needs both runs to reach every one: two runs stopped at the same record are PARTIAL; an empty pool
 # or another pool's runs are refused (bench/corpus/test_storages.py).
+
+# lane scaleout-harness: the scale harness made fair (kiln goal 45b65f3e; bench/src/scale.rs, bench/servers/scale).
+[[own]]
+id = "SH"
+title = "Amphora, CockroachDB and TiDB measured by one client on one platform: each its own server over the network, natively by default"
+criteria = [
+  { id = "AC-SH.1", text = "amphora-bench --scale drives all three through the same closed-loop writers and timing, each over the network by its own wire client (Amphora's client protocol, Postgres wire, MySQL wire), each system's own processes on the same machines, OS, disk and filesystem (native by default; containers for all or none)" },
+  { id = "AC-SH.2", text = "Every scale record says which client and platform produced it: host, OS, kernel, arch, how the system ran, its wire client and the binaries' folder" },
+  { id = "AC-SH.3", text = "Every system over the network is sent the same work the same way: each write, read and transaction one SQL statement as text with its values as literals, one round trip, committed on its own (Amphora's client protocol takes text only, so Postgres's simple query protocol and MySQL's text protocol for the others); each record says so" },
+  # lane scaleout-harness-9
+  { id = "AC-SH.4", text = "Every system's client gives a request up after --deadline-s: Amphora's client by its deadline, TiDB's MySQL client and the bench's Postgres client by their sockets' read and write timeouts (the give-up only, never a wake); each record says how, how the system routes a write (forwarded by the node it was sent to, or straight to the leader), and that no system over a wire is given prepared statements" },
+  { id = "AC-SH.5", text = "The in-process relay waits on one wake across its group's members (each replica's listener, rung for an outgoing record or the owner's end) and on held records' due times, never a spin" },
+  # lane scaleout-harness-10
+  { id = "AC-SH.6", text = "The read measures' warm-up is one read of the last preloaded row, never asked again: it waits on the write by the system's own control where there is one (Amphora's session token from the write's answer), else it is one read at the system's strongest consistency (CockroachDB's leaseholder, TiDB's ReadIndex follower read); each record says what each system's warm-up did" },
+  { id = "AC-SH.7", text = "regionloss's time to serve again is one count a writer on the region's own copy, each waiting on that writer's last acknowledged write by the system's own control, never a poll; a system with no such read has the figure refused, typed and said why, and the rest of the measure stands; --poll-us isn't taken" },
+  { id = "AC-SH.8", text = "Schema setup asks each node in the configured order, from node 0, the next only once the one before failed, and gives up at --deadline-s or once every node failed, naming each failure" },
+  { id = "AC-SH.9", text = "In-process, a write or read that finds no live member naming a live leader (none elected yet, or the one named cut off, as after regionloss's kill) waits on a live member for the leader change (ReplicaHandle::wait_leader, a leader of a later term), up to --deadline-s, never a retry" },
+  { id = "AC-SH.10", text = "regionloss's and cutover's phases (--settle-s, --after-s) last their length, a condition variable's wait for a duration that a spurious wake can't cut short, or end as soon as a worker fails, woken by that failure" },
+  # lane scaleout-harness-11
+  { id = "AC-SH.11", text = "TiDB's waits on PD's background work (the region measure's placement, cutover's leader and replica moves) read PD's state every schedule.patrol-region-interval, PD's own period for checking each Region against its rules, read from the cluster by SHOW CONFIG (PD offers no watch or long-poll for Region or placement changes); --poll-us isn't taken by any scale measure; each such record's waits says what was read, how often, and that the period is PD's" },
+]
+tests = [
+  { id = "T-SH.1", text = "scale::tests::g13_scale_inputs_are_required_not_picked — passes when the served amphora system is refused without --hosts or --class, as the others are, refused --spanning under the persisted class, and amphora-inproc keeps the in-process flags" },
+  { id = "T-SH.2", text = "scale::tests::ac_sh_3_every_system_is_sent_one_statement_a_write — passes when a write of several rows is one upsert statement in each dialect, its literals quoted as that dialect reads them" },
+  # lane scaleout-harness-9
+  { id = "T-SH.3", text = "pgtext::tests::scaleout_harness_9_postgres_client_gives_up_at_its_deadline — passes when a server that never answers is given up at the client's deadline, as a typed error, not a hang" },
+  { id = "T-SH.4", text = "pgtext::tests::scaleout_harness_9_postgres_messages_decode — passes when a DataRow's text and NULL columns and an ErrorResponse's fields decode, and a cut-short row is refused" },
+  { id = "T-SH.5", text = "scale::tests::scaleout_harness_9_records_name_routes_deadlines_and_statements — passes when each served system's record names its write route, its give-up and no prepared statements" },
+  { id = "T-SH.6", text = "database::replicated::tests::a_members_listener_wakes_for_its_records_and_its_owners_end (lane ryw-5's, which made ryw-4's on_sent and scaleout-harness-9's listen one hook) — passes when a member's listener is woken by an election's records, a write's records wake only the listener that replaced the first, and every owner's drop wakes its own" },
+  { id = "T-SH.7", text = "scale::inproc::tests::scaleout_harness_9_the_relays_bell_keeps_a_ring_and_stops — passes when the relay's bell keeps a ring given before its wait, a due time ends a wait, and the stop ends it from another thread" },
+  # lane scaleout-harness-10
+  { id = "T-SH.8", text = "scale::tests::scaleout_harness_10_schema_asks_each_node_in_turn_then_gives_up — passes when node 1 is asked only after node 0 failed and no node after the one that answered, every node once when all fail (each failure named), and none past the deadline" },
+  { id = "T-SH.9", text = "scale::tests::scaleout_harness_10_warmup_and_catch_up_read_once_by_each_systems_rule — passes when a system with no wait control gets one read for the warm-up and one own-copy count for the catch-up, regionloss parses without --poll-us, and each system's warm-up and catch-up rules are stated" },
+  { id = "T-SH.11", text = "scale::tests::scaleout_harness_10_a_phase_ends_on_a_workers_failure — passes when a phase with no failure runs its length, a failure from another thread ends a long phase at once, and the first failure is the measure's error" },
+  { id = "T-SH.10", text = "scale::inproc::tests::scaleout_harness_10_a_token_read_waits_for_its_write — passes when a replicated write gives a session token, one leader read and one follower read carrying it find the row, and a member cut off then put back holds both rows at its first count" },
+  # lane scaleout-harness-11
+  { id = "T-SH.12", text = "scale::tests::scaleout_harness_11_pd_waits_read_at_pds_own_period — passes when PD's printed durations (10ms, 1m30s, 1.5s, 500µs) read exactly and malformed ones are refused, region and cutover parse without --poll-us and refuse it, and the waits record names PD's schedule.patrol-region-interval as the period" },
+]
+
+# lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,
+# "A refusal before the step")
