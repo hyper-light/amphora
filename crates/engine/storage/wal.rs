@@ -4212,6 +4212,7 @@ impl WalFile {
         let mut images = vec![0u8; len];
         let mut numbers = Vec::with_capacity(pages.len());
         let mut logging = Vec::with_capacity(pages.len());
+        let mut scratch = Vec::new();
         for (page, image) in pages.iter().zip(images.chunks_exact_mut(page_size)) {
             let number = u32::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
             Self::transform_page(&page_transform, number, page.get_contents().as_ptr(), image)?;
@@ -4222,13 +4223,19 @@ impl WalFile {
             let logged = page.logged();
             page.clear_logged();
             let how = match (tail, base.as_deref(), logged) {
-                (Some(tail), Some(base), _) => {
-                    self.delta(number, base.version, &base.image, image, tail, &against)
-                }
+                (Some(tail), Some(base), _) => self.delta(
+                    number,
+                    base.version,
+                    &base.image,
+                    image,
+                    tail,
+                    &against,
+                    &mut scratch,
+                ),
                 // Spilled and unchanged since: the buffer is its base.
                 (Some(tail), None, Some(version)) => {
                     let buffer = page.get_contents().as_ptr();
-                    self.delta(number, version, buffer, image, tail, &against)
+                    self.delta(number, version, buffer, image, tail, &against, &mut scratch)
                 }
                 _ => Logging::New,
             };
@@ -4349,6 +4356,7 @@ impl WalFile {
     /// other while `version` is of this generation of the log and the page's latest in it
     /// (`chains_from`), within the chain's bounds (`extend`, decision 17); its image ending the
     /// chain where the delta would pass them; else its image, the page new to the log's chains.
+    #[allow(clippy::too_many_arguments)]
     fn delta(
         &self,
         page: u32,
@@ -4357,11 +4365,12 @@ impl WalFile {
         image: &[u8],
         tail: usize,
         against: &Against,
+        scratch: &mut Vec<u8>,
     ) -> Logging {
         if !self.chains_from(page, version, against) {
             return Logging::New;
         }
-        Self::extend(version, base, image, tail, against)
+        Self::extend(version, base, image, tail, against, scratch)
     }
 
     /// Amphora: whether a commit can chain from `version` of `page`: it is of this generation of
@@ -4388,6 +4397,7 @@ impl WalFile {
         image: &[u8],
         tail: usize,
         against: &Against,
+        scratch: &mut Vec<u8>,
     ) -> Logging {
         if version.depth >= against.deepest {
             return Logging::Ends;
@@ -4399,9 +4409,11 @@ impl WalFile {
         else {
             return Logging::Ends;
         };
-        let Some(runs) = packed::diff(base, image, tail, left) else {
+        // The runs found in the commit's buffer (`scratch`), kept at their own length.
+        if packed::diff_into(base, image, tail, left, scratch).is_none() {
             return Logging::Ends;
-        };
+        }
+        let runs = scratch.as_slice().to_vec();
         let chain = u32::try_from(runs.len())
             .ok()
             .and_then(|bytes| bytes.checked_add(version.chain));
@@ -4458,10 +4470,12 @@ impl WalFile {
             ))
         };
         // Each page frame by its page's place in the commit; each entry of a chain with its page's
-        // place, number and logging, its image the next page of `images`.
+        // place, number and logging, its image transformed into a frame of the buffer pool as a
+        // page frame's is (goal 85d06a30): a commit allocates no buffer of its chains' images, and
+        // an entry the packing leaves a page frame is written from that frame as it is.
         let mut framed: Vec<(usize, Arc<Buffer>)> = Vec::with_capacity(pages.len());
-        let mut chained: Vec<(usize, u32, Logging)> = Vec::new();
-        let mut images: Vec<u8> = Vec::new();
+        let mut chained: Vec<(usize, u32, Logging, Arc<Buffer>)> = Vec::new();
+        let mut scratch = Vec::new();
         for (index, page) in pages.iter().enumerate() {
             let number = u32::try_from(page.get().id()).map_err(|_| LimboError::IntegerOverflow)?;
             // The base is used up whatever is written, and the buffer holds no version of the log
@@ -4486,50 +4500,59 @@ impl WalFile {
                 framed.push((index, frame));
                 continue;
             };
-            let from = images.len();
-            let to = from
-                .checked_add(page_size)
-                .ok_or(LimboError::IntegerOverflow)?;
-            images.resize(to, 0);
-            let image = images.get_mut(from..to).ok_or_else(past)?;
+            let frame = frame_of(number)?;
+            let image = frame
+                .as_mut_slice()
+                .get_mut(WAL_FRAME_HEADER_SIZE..)
+                .filter(|body| body.len() == page_size)
+                .ok_or_else(unframed)?;
             Self::transform_page(&page_transform, number, page.get_contents().as_ptr(), image)?;
             let how = match base.as_deref() {
-                Some(base) => Self::extend(version, &base.image, image, tail, &against),
-                None => Self::extend(version, page.get_contents().as_ptr(), image, tail, &against),
+                Some(base) => {
+                    Self::extend(version, &base.image, image, tail, &against, &mut scratch)
+                }
+                None => Self::extend(
+                    version,
+                    page.get_contents().as_ptr(),
+                    image,
+                    tail,
+                    &against,
+                    &mut scratch,
+                ),
             };
-            chained.push((index, number, how));
+            chained.push((index, number, how, frame));
         }
-        let chain = chained
-            .iter()
-            .zip(images.chunks_exact(page_size))
-            .map(|((_, number, how), image)| {
-                let body = match how {
-                    Logging::Delta(depth, _, runs) => packed::Body::Delta {
-                        depth: *depth,
-                        runs,
-                    },
-                    Logging::Ends | Logging::New => packed::Body::Image(image),
-                };
-                (*number, body)
-            })
-            .collect::<Vec<_>>();
-        let packing = packed::one_slot_records(&chain, page_size)?;
+        // The entries borrow their frames' images only while they are packed: the frames are
+        // written to (their checksums) after.
+        let packing = {
+            let chain = chained
+                .iter()
+                .map(|(_, number, how, frame)| {
+                    let body = match how {
+                        Logging::Delta(depth, _, runs) => packed::Body::Delta {
+                            depth: *depth,
+                            runs,
+                        },
+                        Logging::Ends | Logging::New => packed::Body::Image(
+                            frame
+                                .as_slice()
+                                .get(WAL_FRAME_HEADER_SIZE..)
+                                .ok_or_else(unframed)?,
+                        ),
+                    };
+                    Ok((*number, body))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            packed::one_slot_records(&chain, page_size)?
+        };
         for &at in &packing.frames {
-            let (index, number, _) = chained.get(at).ok_or_else(past)?;
-            let (_, body) = chain.get(at).ok_or_else(past)?;
-            let packed::Body::Image(image) = body else {
+            let (index, _, how, frame) = chained.get(at).ok_or_else(past)?;
+            if matches!(how, Logging::Delta(..)) {
                 return Err(LimboError::InternalError(
                     "a delta laid out as a page frame".into(),
                 ));
-            };
-            let frame = frame_of(*number)?;
-            frame
-                .as_mut_slice()
-                .get_mut(WAL_FRAME_HEADER_SIZE..)
-                .filter(|body| body.len() == image.len())
-                .ok_or_else(unframed)?
-                .copy_from_slice(image);
-            framed.push((*index, frame));
+            }
+            framed.push((*index, frame.clone()));
         }
         framed.sort_unstable_by_key(|&(index, _)| index);
         let mut bufs = Vec::with_capacity(pages.len());
@@ -4581,14 +4604,12 @@ impl WalFile {
                 bufs.push(frame);
             }
             for &k in &held {
-                let (index, _, how) = chained.get(k).ok_or_else(past)?;
-                let (_, body) = chain.get(k).ok_or_else(past)?;
+                let (index, _, how, _) = chained.get(k).ok_or_else(past)?;
                 metadata.push((pages.get(*index).ok_or_else(past)?.clone(), next, checksum));
-                let bytes = match how {
-                    Logging::Delta(_, bytes, _) => *bytes,
-                    Logging::Ends | Logging::New => 0,
-                };
-                depths.push((body.depth(), bytes));
+                depths.push(match how {
+                    Logging::Delta(depth, bytes, _) => (*depth, *bytes),
+                    Logging::Ends | Logging::New => (0, 0),
+                });
             }
             records.push((next, slots));
             decoded.push(Arc::new(record));

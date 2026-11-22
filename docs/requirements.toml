@@ -819,6 +819,7 @@ tests = [
   { id = "T-T1.9.R14", text = "A thousand weights added at positions, kept to eight entries — passes when no more than eight are ever kept, their total is exact, the cut leaves weight on each side, and four single weights cut exactly at the middle" },
   { id = "T-T1.9.R15", text = "One group measured by the shell with nothing written, after sixty-four keys are written, and again after — passes when the first has no load cut, the second has load above zero and a cut that counts each key on the side its position falls, the plan on two cores splits the group at that cut, and the third has no load" },
   { id = "T-T1.9.R16", text = "A split and a merge back, then a restart, the groups whose files are found asked of the node before and after — passes when only the retired group is named both times, never the group held nor an id never given out, and once its files are deleted every key still reads back from its group" },
+  { id = "T-T1.9.R17", text = "Local databases as groups, one split by the driver, then measured by the shell — passes when each group's size is above zero" },
 ]
 
 # lane qs5
@@ -855,6 +856,20 @@ criteria = [
 tests = [
   { id = "T-RA.1.1", text = "the_simulator_answers_as_amphora_does over AMPHORA_RECORDS_SEEDS seeded histories — passes when every answer is equal and every kind of request was answered and refused" },
   { id = "T-RA.1.2", text = "index_keys_keep_term_order_and_prefixes_reach_one_term over every term of up to three bytes from {0x00, 0x01, 0xFF, a} — passes when keys sort as (term, key) and a prefix reaches its own term only" },
+]
+
+# lane kiln-records: the Records suite past 200 cases (CP-T1.5's AC-T1.5.3; kiln goal 0d717247,
+# G9 step 2). AC-T1.5.3 is the goal's criterion; RA.2 is this lane's evidence for it.
+[[own]]
+id = "RA.2"
+title = "The Records suite past 200 cases, every case passed by Amphora and the simulator alike"
+criteria = [
+  { id = "AC-RA.2.1", text = "amphora_api::conformance holds more than 200 cases, each id once: kiln-seams' RECORDS-1 to 14, Amphora's own, and one case per row of crates/api/src/conformance/table.rs" },
+  { id = "AC-RA.2.2", text = "Amphora's Namespace (in memory, on a file, through the local owner, at one voter and three) and SimRecords pass every case, and no answer differs between them" },
+]
+tests = [
+  { id = "T-RA.2.1", text = "cp_t1_5_the_records_suite_is_past_200_cases_each_id_once (crates/amphora/tests/records_conformance.rs) — passes when the suite holds more than 200 cases and no id twice (209 at 556910e7)" },
+  { id = "T-RA.2.2", text = "records_conformance's per-implementation suites and the_simulator_answers_as_amphora_does — passes when every case passes on each implementation and every answer equals the simulator's" },
 ]
 
 # lane columnar-decision
@@ -981,6 +996,8 @@ tests = [
   { id = "T-QT.6.11", text = "Random inner equi-joins of two tables of many leaf pages on one or two columns, with filters on either table and groupings and aggregates over both, in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores and the planner held to hash joins (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook probed for most of them" },
   { id = "T-QT.6.12", text = "t_qt_6_12_partitioned_parallel_build_matches_the_serial_join (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when a hash join's table built by 1, 2, 3, 4 and 8 workers into 1, 2, 3, 4 and 8 partitions gives the serial join's matches in order, most runs parallel and partitioned, and a budget too small is refused by type at every degree" },
   { id = "T-QT.6.13", text = "t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when random two-table hash joins returning rows, with or without ORDER BY, answer as the serial loop at 2, 3, 4 and 8 stated cores (in ORDER BY order, ties as sets) and the hook ran for most" },
+  # lane qs6-6
+  { id = "T-QT.6.14", text = "t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-6) — passes when random two-table hash joins returning rows under LIMIT and OFFSET, ordered by keys holding both tables' INTEGER PRIMARY KEYs, answer row for row as the serial loop at 2, 3, 4 and 8 stated cores, the hook ran for most, and a LIMIT over an order with ties stays serial" },
 ]
 
 # lane g3s2
@@ -1127,10 +1144,25 @@ tests = [
 # G12 step 1's comparison set (dqlite, rqlite, LiteFS and libSQL through bench/servers/repl/). Its
 # tests: bench/src/repl.rs g12_repl_*. The measurements are the coordinator's.
 
+# lane g5s4c: G5 step 4 wired in (executor.md decision 11, "Wired").
+[[own]]
+id = "G5.4w"
+title = "Skipping rows wired into the engine's writes, read at the summary's snapshot only (G5 step 4)"
+criteria = []
+tests = [
+  { id = "T-G5.4.2", text = "skipping::tests::wired::t_g5_4_2_* — passes when, with SQL inserts, updates and deletes between scans, each kind's candidates read through SQL answer exactly as a plain scan and something was skipped; a reader at an older snapshot, or beside an open writer, is refused (OlderSnapshot) and its plain scan keeps its rows; a rollback makes the summary Stale until built again" },
+  { id = "T-G5.4.3", text = "skipping::tests::scans::t_g5_4_3_* (lane g5s4d) — passes when, for each kind, SQL filters (BETWEEN, >= and <=, a flipped <, =) on a summarized column answer exactly as the same SQL on a database without the summary, with random SQL inserts, updates and deletes between queries; every query consulted the summary, the statement's rows_read summed lower than without it, and zones were skipped or the column cracked; an open writer reads its own writes through it, a rollback makes it Stale (counted, every row read, right answer), and a reader at an older snapshot is refused (counted) and keeps its snapshot's rows" },
+]
+
 # lane repl-measure-2 (G12 steps 1 and 3-5, CP-T1.8): no new IDs. bench/repl.sh runs every measure on
 # every system with one command; LiteFS fails over on Consul's lease (servers/repl/litefs.sh); dqlite's
 # shim builds and its cluster comes up. libSQL's failover and dqlite's member catch-up stay refused,
 # typed: sqld has no election, and dqlite reads only through its leader.
+
+# lane repl-measure-4 (CP-T1.8, AC-T1.8.5): no new IDs. bench/power_nemesis.sh shards the 10,000-seed
+# power-cut nemesis by seed range in both classes, a record a shard, merged with a coverage check;
+# records under bench/records/power-nemesis/<run>/. bench/repl_lab.sh runs the seeds and the
+# comparison set on three machines named as its arguments. The runs of record are the coordinator's.
 
 # lane g5s4: G5 step 4 (kiln plan 01a16b0f46ab717ea1e3c87c7f5e0b92), skipping rows.
 [[own]]
@@ -1156,6 +1188,24 @@ tests = [
   { id = "T-G6.3.1", text = "crates/engine/tests/plan_hints.rs t_g6_3_1_* — passes when every hint set's answers equal the unhinted plan's and a computed nested loop's, and the planner obeys each mask; bench/plan_hints compares hinted answers with SQLite's" },
   { id = "T-G6.3.2", text = "translate::optimizer::plan_hints::tests::t_g6_3_2_* — passes when the guard admits a faster hint, drops it once its held-out runs are slower, and never admits one no faster" },
   { id = "T-G6.3.3", text = "translate::optimizer::plan_hints::tests::t_g6_3_3_memory_stays_bounded — passes when the model's size is constant over 10,000 runs and the guard holds no more classes than it was given" },
+]
+
+# lane qs2
+[[own]]
+id = "QT.2"
+title = "The page-miss path: read-ahead runs and cheaper misses in the versioned storage's pool (query-time step 2; engine.md decision 15)"
+criteria = [
+  { id = "AC-QT.2.1", text = "Behind AMPHORA_READ_AHEAD=runs, a miss on the page after the last read in reads a run of pages in one read (preadv on Unix), its length ceil(fixed / each) from the least-squares line through the pool's measured reads, bounded by the pool's frames (cold frames only, at most the frames less one)" },
+  { id = "AC-QT.2.2", text = "A miss allocates nothing, checks its checksum once and ends inline with no completion callback" },
+  { id = "AC-QT.2.3", text = "TPC-H SF 10 median best time, 2 GiB cache, one thread, at most 8,385 ms and JOB's median at most 1.05x the parent's, by bench/planner/record.sh on jupiter (measured by the coordinator)" },
+]
+tests = [
+  { id = "T-QT.2.1", text = "qs2_answers_are_identical_with_read_ahead_on_and_off (crates/engine/storage/versioned/pool.rs) — passes when every walk reads the same bytes with the switch on and off, and on reads fewer times than pages" },
+  { id = "T-QT.2.2", text = "qs2_read_ahead_never_reads_past_the_budget — passes when no run is longer than the frames less one and no frame is made past the pool's" },
+  { id = "T-QT.2.3", text = "qs2_a_page_read_ahead_that_fails_its_checksum_is_not_served — passes when the damaged page is refused as corrupt and the pages around it read as written" },
+  { id = "T-QT.2.4", text = "qs2_runs_over_files_read_each_page_as_written and qs2_a_run_is_the_measured_fixed_cost_over_the_cost_of_a_page — passes when preadv's runs read as written and the run follows the fit" },
+  { id = "T-QT.2.5", text = "versioned_crash with AMPHORA_READ_AHEAD=runs and without — passes when both pass" },
+  { id = "T-QT.2.6", text = "qs2_read_ahead_takes_only_the_frames_a_shared_source_grants and qs2_a_run_past_iov_max_reads_every_page (pool.rs) — passes when a run under a shared source makes no frame past those granted and is never refused, and a run of 2,000 pages over a file (past IOV_MAX) reads every page as written" },
 ]
 
 # lane xgroup-lan: G13 step 3's measurement (kiln goal c2e7f9ebe5678ec5a6edc38baec7f3f8; xgroup.md,

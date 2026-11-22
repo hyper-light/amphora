@@ -552,7 +552,7 @@ fn t_t1_9_r15_the_shell_measures_each_groups_load_and_the_plan_splits_the_hot_on
     let dir = tempfile::tempdir().unwrap();
     let directory = Directory::new(NodeId(0));
     let groups = on(dir.path(), &directory);
-    let first = groups.measure();
+    let first = groups.measure(soon()).unwrap();
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].by_load, None);
     let keys: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
@@ -560,7 +560,7 @@ fn t_t1_9_r15_the_shell_measures_each_groups_load_and_the_plan_splits_the_hot_on
         let t = groups.put_wait(vec![row(k, 0)], soon()).unwrap();
         groups.durable(&t, soon()).unwrap();
     }
-    let measured = groups.measure();
+    let measured = groups.measure(soon()).unwrap();
     assert_eq!(measured.len(), 1);
     assert!(measured[0].load > 0);
     let c = measured[0].by_load.unwrap();
@@ -578,7 +578,7 @@ fn t_t1_9_r15_the_shell_measures_each_groups_load_and_the_plan_splits_the_hot_on
             at: c.at
         }]
     );
-    let after = groups.measure();
+    let after = groups.measure(soon()).unwrap();
     assert_eq!(after[0].load, 0);
     assert_eq!(after[0].by_load, None);
     assert!(room(NodeId(0)).cores >= 1);
@@ -1064,7 +1064,7 @@ fn lab_run(keys: usize, preload: usize, clients: usize, target: u64) -> LabRun {
         planned_at = seen;
         // What the shell measured of each group this window, and this machine's cores.
         let dirc = driver.directory().clone();
-        let proposals = plan(&dirc, &[room(NodeId(0))], &groups.measure());
+        let proposals = plan(&dirc, &[room(NodeId(0))], &groups.measure(soon()).unwrap());
         if proposals.is_empty() {
             hot.fetch_add(keys.len() / 7 + 1, Ordering::Relaxed);
         }

@@ -1895,7 +1895,7 @@ pub fn op_open_pseudo(
 }
 
 pub fn op_rewind(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -1908,6 +1908,18 @@ pub fn op_rewind(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    // Amphora (G5 step 4, T-G5.4.3): a scan that skips resumes moving to its first candidate; a
+    // walk an earlier pass finished is dropped, as this Rewind starts the scan again.
+    if !state.skip_walks.is_empty() {
+        if let Some(walk) = state
+            .skip_walks
+            .take(*cursor_id)
+            .filter(|walk| walk.phase != crate::skipping::WalkPhase::Idle)
+        {
+            let on_row = state.pc + 1;
+            return skip_walk_step(state, walk, pc_if_empty.as_offset_int(), on_row);
+        }
+    }
     // Clear any bloom filter associated with this cursor so stale filter data
     // does not incorrectly reject valid matches in subsequent iterations.
     if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
@@ -1931,11 +1943,148 @@ pub fn op_rewind(
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
     } else {
+        if !program.skip_hints.is_empty() {
+            if let Some(walk) = skip_walk_for(program, state, *cursor_id) {
+                let on_row = state.pc + 1;
+                return skip_walk_step(state, walk, pc_if_empty.as_offset_int(), on_row);
+            }
+        }
         // Rewind positions to the first row, which is effectively a read
         state.record_rows_read(1);
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (G5 step 4, T-G5.4.3): the walk cursor `cursor_id`'s scan takes when its program hints
+/// a filter's bounds on the column a summary keeps, the cursor reads the main database's rowid
+/// table, and the summary answers this reader (a refusal, counted by the registry, scans every
+/// row).
+fn skip_walk_for(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: crate::vdbe::CursorID,
+) -> Option<crate::skipping::SkipWalk> {
+    let hint = program
+        .skip_hints
+        .iter()
+        .find(|h| h.cursor_id == cursor_id)?;
+    let conn = &program.connection;
+    if conn.mvcc_enabled() {
+        return None;
+    }
+    let root = match state.get_cursor(cursor_id) {
+        Cursor::BTree(cursor, ..) => {
+            if !cursor.has_rowid() || !Arc::ptr_eq(&cursor.get_pager(), &conn.get_pager()) {
+                return None;
+            }
+            cursor.root_page()
+        }
+        _ => return None,
+    };
+    let registry = &conn.db.skipping;
+    let column = registry.column_of(root)?;
+    let bounds = hint.bounds.iter().find(|b| b.column == column)?;
+    let (reader_pos, committed) = conn.skipping_positions()?;
+    let candidates = registry
+        .candidates(
+            root,
+            conn.skipping_id(),
+            reader_pos,
+            committed,
+            bounds.lo,
+            bounds.hi,
+        )
+        .ok()?;
+    crate::skipping::SkipWalk::new(cursor_id, candidates)
+}
+
+/// Moves a skipping scan's cursor to its next candidate row (`on_row`) or ends it (`on_end`),
+/// keeping the walk across an I/O wait.
+fn skip_walk_step(
+    state: &mut ProgramState,
+    mut walk: crate::skipping::SkipWalk,
+    on_end: crate::vdbe::InsnReference,
+    on_row: crate::vdbe::InsnReference,
+) -> InsnResult {
+    let mut seeks = 0u64;
+    let moved = {
+        let cursor = state.get_cursor(walk.cursor_id).as_btree_mut();
+        skip_settle(cursor, &mut walk, &mut seeks)
+    };
+    state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(seeks);
+    state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(seeks);
+    state.skip_walks.put(walk);
+    match moved? {
+        crate::types::IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+        crate::types::IOResult::Done(true) => {
+            state.record_rows_read(1);
+            state.pc = on_row;
+        }
+        crate::types::IOResult::Done(false) => state.pc = on_end,
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// From the row the cursor is on, seeks past each run of rows the walk's candidates leave out;
+/// `true` when it stands on a candidate, `false` when none is left.
+fn skip_settle(
+    cursor: &mut dyn crate::storage::btree::CursorTrait,
+    walk: &mut crate::skipping::SkipWalk,
+    seeks: &mut u64,
+) -> crate::types::IOResultOr<bool> {
+    use crate::skipping::{WalkPhase, WalkTarget};
+    use crate::types::IOResult;
+    loop {
+        match walk.phase {
+            WalkPhase::Idle | WalkPhase::Settle => {
+                walk.phase = WalkPhase::Settle;
+                let rowid = match cursor.rowid()? {
+                    IOResult::Done(rowid) => rowid,
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                };
+                let target = match rowid {
+                    Some(rowid) => walk.target(rowid),
+                    None => WalkTarget::Past,
+                };
+                match target {
+                    WalkTarget::Here => {
+                        walk.phase = WalkPhase::Idle;
+                        return Ok(IOResult::Done(true));
+                    }
+                    WalkTarget::Past => {
+                        walk.phase = WalkPhase::Idle;
+                        return Ok(IOResult::Done(false));
+                    }
+                    WalkTarget::Seek(first) => {
+                        *seeks = seeks.wrapping_add(1);
+                        walk.phase = WalkPhase::Seeking(first);
+                    }
+                }
+            }
+            WalkPhase::Seeking(first) => {
+                let key = SeekKey::TableRowId(first);
+                match cursor.seek(key, SeekOp::GE { eq_only: false })? {
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    IOResult::Done(SeekResult::Found) => walk.phase = WalkPhase::Settle,
+                    IOResult::Done(SeekResult::NotFound) => {
+                        walk.phase = WalkPhase::Idle;
+                        return Ok(IOResult::Done(false));
+                    }
+                    IOResult::Done(SeekResult::TryAdvance) => walk.phase = WalkPhase::Advancing,
+                }
+            }
+            WalkPhase::Advancing => match cursor.next_row() {
+                CursorStep::Row => walk.phase = WalkPhase::Settle,
+                CursorStep::Empty => {
+                    walk.phase = WalkPhase::Idle;
+                    return Ok(IOResult::Done(false));
+                }
+                CursorStep::Error(err) => return Err(err),
+                CursorStep::IO(io) => return Ok(IOResult::IO(io)),
+            },
+        }
+    }
 }
 
 pub fn op_last(
@@ -3629,6 +3778,33 @@ pub fn op_next(
         },
         insn
     );
+    // Amphora (G5 step 4, T-G5.4.3): a scan skipping by a summary steps, then seeks past the rows
+    // its candidates leave out (its body runs row by row: no fused batch).
+    if !state.skip_walks.is_empty() {
+        if let Some(mut walk) = state.skip_walks.take(*cursor_id) {
+            if walk.phase == crate::skipping::WalkPhase::Idle {
+                let step = state.get_cursor(*cursor_id).as_btree_mut().next_row();
+                match step {
+                    CursorStep::Row => walk.phase = crate::skipping::WalkPhase::Settle,
+                    CursorStep::Empty => {
+                        state.skip_walks.put(walk);
+                        state.pc += 1;
+                        return Ok(InsnFunctionStepResult::Step);
+                    }
+                    CursorStep::Error(err) => {
+                        state.skip_walks.put(walk);
+                        return Err(err);
+                    }
+                    CursorStep::IO(io) => {
+                        state.skip_walks.put(walk);
+                        return Ok(state.suspend_on_io(io));
+                    }
+                }
+            }
+            let on_end = state.pc + 1;
+            return skip_walk_step(state, walk, on_end, pc_if_next.as_offset_int());
+        }
+    }
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
@@ -12583,6 +12759,8 @@ pub fn op_yield(
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
     pub has_dependent_views: bool,
+    /// Amphora (G5 step 4): a skipping summary watches the table, so the old row is captured.
+    pub skip_on: bool,
     pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
@@ -12617,6 +12795,109 @@ pub enum OpInsertSubState {
     ApplyViewChange,
 }
 
+/// Amphora (G5 step 4): the root page of the main-database table `cursor_id` writes, when a
+/// skipping summary watches it (executor.md decision 11).
+fn skipping_watched_root(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: crate::vdbe::CursorID,
+) -> Option<i64> {
+    let cursor = state.get_cursor(cursor_id);
+    let cursor = cursor.as_btree_mut();
+    if !cursor.has_rowid()
+        || !Arc::ptr_eq(
+            &Arc::clone(&cursor.get_pager()),
+            &program.connection.get_pager(),
+        )
+    {
+        return None;
+    }
+    let root = cursor.root_page();
+    program.connection.db.skipping.column_of(root).map(|_| root)
+}
+
+fn skipping_integer(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Numeric(Numeric::Integer(v))) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Hands the write hook the summarized column's value of the written row and, if it overwrote one,
+/// of the old row (captured before the write).
+fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite) {
+    let registry = &program.connection.db.skipping;
+    match program.connection.skipping_positions() {
+        Some((_, committed)) => {
+            registry.on_write(root, program.connection.skipping_id(), committed, write)
+        }
+        None => registry.mark_stale(root),
+    }
+}
+
+fn skipping_on_insert(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: crate::vdbe::CursorID,
+    key_reg: usize,
+    record_reg: usize,
+) {
+    let Some(root) = skipping_watched_root(program, state, cursor_id) else {
+        return;
+    };
+    let Some(column) = program.connection.db.skipping.column_of(root) else {
+        return;
+    };
+    let Value::Numeric(Numeric::Integer(rowid)) = state.registers[key_reg].get_value() else {
+        program.connection.db.skipping.mark_stale(root);
+        return;
+    };
+    let rowid = *rowid;
+    let new = match &state.registers[record_reg] {
+        Register::Record(record) => match record.get_value_opt(column) {
+            Some(ValueRef::Numeric(Numeric::Integer(v))) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    };
+    let old = state
+        .active_op_state
+        .insert()
+        .old_record
+        .as_ref()
+        .filter(|(key, _)| *key == rowid)
+        .map(|(_, values)| skipping_integer(values.get(column)));
+    let write = match old {
+        Some(old) => crate::skipping::RowWrite::Update { rowid, old, new },
+        None => crate::skipping::RowWrite::Insert { rowid, value: new },
+    };
+    skipping_hand(program, root, write);
+}
+
+fn skipping_on_delete(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: crate::vdbe::CursorID,
+) {
+    let Some(root) = skipping_watched_root(program, state, cursor_id) else {
+        return;
+    };
+    let Some(column) = program.connection.db.skipping.column_of(root) else {
+        return;
+    };
+    let write = match state.active_op_state.delete().deleted_record.as_ref() {
+        Some((rowid, values)) => crate::skipping::RowWrite::Delete {
+            rowid: *rowid,
+            old: skipping_integer(values.get(column)),
+        },
+        None => {
+            program.connection.db.skipping.mark_stale(root);
+            return;
+        }
+    };
+    skipping_hand(program, root, write);
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -12644,12 +12925,15 @@ pub fn op_insert(
                         .is_empty()
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
+                let skip_on = !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+                    && skipping_watched_root(program, state, *cursor_id).is_some();
+                state.active_op_state.insert().skip_on = skip_on;
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
                 // op_delete already captured the deletion for IVM, and this insert only needs to
                 // record the new row (which ApplyViewChange handles without old_record).
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                let needs_capture = (has_dependent_views || state.active_op_state.insert().skip_on)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -12686,8 +12970,8 @@ pub fn op_insert(
                     return Ok(state.suspend_on_io(io));
                 }
                 let has_dependent_views = state.active_op_state.insert().has_dependent_views;
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                let needs_capture = (has_dependent_views || state.active_op_state.insert().skip_on)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -12819,6 +13103,9 @@ pub fn op_insert(
                             state,
                             cursor.insert(&BTreeKey::new_index_key(record.as_record_ref()))
                         );
+                    }
+                    if state.active_op_state.insert().skip_on {
+                        skipping_on_insert(program, state, *cursor_id, *key_reg, *record_reg);
                     }
                     state.record_rows_written(1);
                 }
@@ -13009,9 +13296,10 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
+                let skip_on = skipping_watched_root(program, state, *cursor_id).is_some();
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
-                if dependent_views.is_empty() {
+                if dependent_views.is_empty() && !skip_on {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 }
@@ -13053,6 +13341,7 @@ pub fn op_delete(
                     return_if_io!(state, cursor.delete());
                 }
                 // Increment metrics for row write (DELETE is a write operation)
+                skipping_on_delete(program, state, *cursor_id);
                 state.record_rows_written(1);
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
