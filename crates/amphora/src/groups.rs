@@ -22,14 +22,25 @@ use crate::meter::Counters;
 use crate::reshard::directory::{Change, Directory, Proposal};
 use crate::reshard::driver::{Action, Do, Failure, Reply};
 use crate::reshard::holding::{Away, Fenced, Holding};
+use crate::reshard::plan::{GroupLoad, NodeRoom, Weights};
 use crate::reshard::{self, GroupId, NodeId, Pos, Span, position};
 use crate::store::{Config, Engine, Refused, Store, Ticket};
 
-/// A group: its store, what it holds, and what the copy path's work has cost its writer.
+/// A group: its store, what it holds, what the copy path's work has cost its writer, and what was
+/// measured of it since [`Groups::measure`] last asked.
 struct Group<E: Engine> {
     store: Store<E>,
     holding: Holding,
     costs: Arc<Mutex<Costs>>,
+    window: Arc<Mutex<Window>>,
+}
+
+/// What a group's load is measured from between two [`Groups::measure`] calls: its meter's commit
+/// time when last asked, and the positions written since, each weighted one a key.
+#[derive(Debug, Default)]
+struct Window {
+    apply_us: u64,
+    written: Weights,
 }
 
 impl<E: Engine> Clone for Group<E> {
@@ -38,6 +49,7 @@ impl<E: Engine> Clone for Group<E> {
             store: self.store.clone(),
             holding: self.holding,
             costs: Arc::clone(&self.costs),
+            window: Arc::clone(&self.window),
         }
     }
 }
@@ -48,6 +60,7 @@ impl<E: Engine> Group<E> {
             store,
             holding,
             costs: Arc::default(),
+            window: Arc::default(),
         }
     }
 }
@@ -299,6 +312,27 @@ impl GroupTicket {
     }
 }
 
+/// The positions of the keys `rows` route by ([`Engine::routes`]), in bytes.
+fn routes<E: Engine>(rows: &[E::Row]) -> Vec<Pos> {
+    let mut positions = Vec::with_capacity(rows.len());
+    for row in rows {
+        E::routes(row, &mut |key| positions.push(reshard::position_of(key)));
+    }
+    positions
+}
+
+/// `node`'s room for groups' writers as this process measures it: the cores the operating system
+/// lets it run on ([`std::thread::available_parallelism`]), one if it can't say (CP-T1.9; decision
+/// "Load from the store's meter").
+#[must_use]
+pub fn room(node: NodeId) -> NodeRoom {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    NodeRoom {
+        node,
+        cores: u64::try_from(cores).unwrap_or(u64::MAX),
+    }
+}
+
 /// FNV-1a: a key's position stays put from build to build and machine to machine.
 pub(crate) fn fnv_bytes(key: &[u8]) -> u64 {
     key.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
@@ -525,6 +559,21 @@ impl<E: Engine> Groups<E> {
     fn store_of(&self, group: GroupId) -> Option<Store<E>> {
         let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
         route.groups.get(&group).map(|g| g.store.clone())
+    }
+
+    /// Of `found`, the groups whose files the caller found on this node, those retired: retired
+    /// here, or shown retired by the directory routed by, and not held here (CP-T1.9;
+    /// docs/design/reshard.md, decision "A retired group's files"). This node never opens one of
+    /// them again (a restart doesn't start it, and a create asked of it again is refused), so the
+    /// caller, who knows where a group's files are, deletes theirs. A group of `found` that is
+    /// held here, being made, or never given out isn't named.
+    #[must_use]
+    pub fn retired_of(&self, found: impl IntoIterator<Item = GroupId>) -> Vec<GroupId> {
+        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        found
+            .into_iter()
+            .filter(|g| !route.groups.contains_key(g) && route.was_retired(*g))
+            .collect()
     }
 
     /// The holding `group` answers from now, if it is on this node.
@@ -950,8 +999,14 @@ impl<E: Engine> Groups<E> {
     /// memory, which [`Groups::route`] never takes).
     #[must_use]
     pub fn group(&self, key: &str) -> Option<GroupId> {
+        self.group_of(key.as_bytes())
+    }
+
+    /// [`Groups::group`] of a key in bytes, as [`Engine::routes`] gives them.
+    #[must_use]
+    pub fn group_of(&self, key: &[u8]) -> Option<GroupId> {
         let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
-        route.directory.owner(position(key))
+        route.directory.owner(reshard::position_of(key))
     }
 
     /// The store of the group `positions` all route to, once its holding answers every one of
@@ -985,23 +1040,78 @@ impl<E: Engine> Groups<E> {
         Ok(then(&held.store))
     }
 
+    /// `positions`, handed to `group`'s writer, kept in its window for the load's cut: at most as
+    /// many entries as the process's memory for batches ([`batch_memory`]) holds, shared among
+    /// this node's groups (decision "Load from the store's meter").
+    fn wrote(&self, group: GroupId, positions: &[Pos]) {
+        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        let Some(held) = route.groups.get(&group) else {
+            return;
+        };
+        let entry = u64::try_from(std::mem::size_of::<(Pos, u64)>()).unwrap_or(u64::MAX);
+        let shares = u64::try_from(route.groups.len()).unwrap_or(u64::MAX).max(1);
+        let most = self
+            .memory
+            .checked_div(entry.saturating_mul(shares))
+            .unwrap_or(0);
+        let most = usize::try_from(most).unwrap_or(usize::MAX);
+        let mut window = held.window.lock().unwrap_or_else(PoisonError::into_inner);
+        for pos in positions {
+            window.written.add(*pos, 1, most);
+        }
+    }
+
+    /// What each group on this node was measured doing since the last call, for
+    /// [`crate::reshard::plan::plan`] (CP-T1.9; docs/design/reshard.md, decision "Load from the
+    /// store's meter"): its load, the time its writer spent committing ([`Counters::apply_us`]),
+    /// and the load's cut, where the keys written to it fall half each side. Each call starts the
+    /// next window, so the window is the time between planner runs, and the shares the plan
+    /// compares don't depend on its length. A group's size isn't measured yet: its bytes are none
+    /// and it has no size cut, so it splits and merges by its load alone.
+    #[must_use]
+    pub fn measure(&self) -> Vec<GroupLoad> {
+        let route = self.route.read().unwrap_or_else(PoisonError::into_inner);
+        route
+            .groups
+            .iter()
+            .map(|(group, held)| {
+                let now = held.store.counters().apply_us;
+                let mut window = held.window.lock().unwrap_or_else(PoisonError::into_inner);
+                let load = now.saturating_sub(window.apply_us);
+                window.apply_us = now;
+                let written = std::mem::take(&mut window.written);
+                GroupLoad {
+                    group: *group,
+                    bytes: 0,
+                    load,
+                    by_size: None,
+                    by_load: written.cut(),
+                }
+            })
+            .collect()
+    }
+
     /// [`Store::put`] to the rows' group.
     pub fn put(&self, rows: Vec<E::Row>) -> Result<GroupTicket, Refused> {
-        let positions: Vec<Pos> = rows.iter().map(|r| position(E::key(r))).collect();
-        self.routed(positions.into_iter(), |group, store| {
+        let positions = routes::<E>(&rows);
+        let ticket = self.routed(positions.iter().copied(), |group, store| {
             let ticket = store.put(rows)?;
             Ok(GroupTicket { group, ticket })
-        })
+        })?;
+        self.wrote(ticket.group, &positions);
+        Ok(ticket)
     }
 
     /// [`Store::put_wait`] to the rows' group. It waits for room under the route's read lock, so a
     /// fence waits for it too, no longer than `until`.
     pub fn put_wait(&self, rows: Vec<E::Row>, until: Instant) -> Result<GroupTicket, Refused> {
-        let positions: Vec<Pos> = rows.iter().map(|r| position(E::key(r))).collect();
-        self.routed(positions.into_iter(), |group, store| {
+        let positions = routes::<E>(&rows);
+        let ticket = self.routed(positions.iter().copied(), |group, store| {
             let ticket = store.put_wait(rows, until)?;
             Ok(GroupTicket { group, ticket })
-        })
+        })?;
+        self.wrote(ticket.group, &positions);
+        Ok(ticket)
     }
 
     /// [`Store::put_then`] to the rows' group.
@@ -1011,11 +1121,13 @@ impl<E: Engine> Groups<E> {
         until: Instant,
         then: impl FnOnce(Result<(), Refused>) + Send + 'static,
     ) -> Result<GroupTicket, Refused> {
-        let positions: Vec<Pos> = rows.iter().map(|r| position(E::key(r))).collect();
-        self.routed(positions.into_iter(), |group, store| {
+        let positions = routes::<E>(&rows);
+        let ticket = self.routed(positions.iter().copied(), |group, store| {
             let ticket = store.put_then(rows, until, then)?;
             Ok(GroupTicket { group, ticket })
-        })
+        })?;
+        self.wrote(ticket.group, &positions);
+        Ok(ticket)
     }
 
     /// [`Store::durable`] in the ticket's group.
@@ -1039,8 +1151,22 @@ impl<E: Engine> Groups<E> {
         f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
         on_writer: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
-        self.routed(std::iter::once(position(key)), |_, store| {
-            Ok(store.read(Some(key), until, f, on_writer))
+        self.read_routed(key.as_bytes(), Some(key), until, f, on_writer)
+    }
+
+    /// [`Store::read`] in the group of `route` (a key in bytes, as [`Engine::routes`] gives
+    /// them), once the writes of `key` handed to it before are committed (none: every write
+    /// handed to it before), under the route's read lock as [`Groups::read`] is.
+    pub fn read_routed<T: Send + 'static>(
+        &self,
+        route: &[u8],
+        key: Option<&str>,
+        until: Instant,
+        f: impl FnOnce(&mut E::Reader) -> anyhow::Result<T>,
+        on_writer: impl FnOnce(&mut E) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        self.routed(std::iter::once(reshard::position_of(route)), |_, store| {
+            Ok(store.read(key, until, f, on_writer))
         })?
     }
 
