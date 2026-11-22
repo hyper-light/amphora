@@ -282,6 +282,9 @@ struct Control {
     /// Application calls in the command queue: no more than its slots less one, so that a wire
     /// record always finds a slot while calls wait for a leader (QB.1).
     calls: AtomicUsize,
+    /// The bytes application calls hold of the command queue, held to `applications` apart from
+    /// the wire records beside them (QB.1).
+    called: AtomicUsize,
     // The command queue's bound in bytes and a wire record's most, as the owner last learned them
     // (`queue_bounds`; QB.1).
     queued: AtomicUsize,
@@ -296,6 +299,8 @@ struct Control {
     floor_status: Mutex<amphora_api::replication::FloorStatus>,
     floor_meter: FloorMeter,
     outgoing: Mutex<Outgoing>,
+    /// What the owner does past the outgoing queue's bound: QB.2's switch, `Egress`'s code.
+    egress: std::sync::atomic::AtomicU8,
     status: Mutex<Result<ReplicaStatus, Refusal>>,
     meter: Arc<ReplicaMeter>,
     local: Local,
@@ -618,12 +623,19 @@ struct Outgoing {
     room: u64,
     /// The owner's clock reading since which the queue has held more than its bound.
     over: Option<u64>,
+    /// Records shed past the bound (`Egress::Shed`), pauses begun and whether one holds
+    /// (`Egress::Pause`; QB.2).
+    shed: u64,
+    pauses: u64,
+    paused: bool,
 }
 struct Reservation {
     control: Arc<Control>,
     bytes: usize,
     /// An application call's slot in the command queue, given back with its bytes (QB.1).
     call: bool,
+    /// An application call's bytes in `called`, given back with it.
+    called: usize,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
@@ -632,6 +644,7 @@ impl Drop for Reservation {
             .fetch_sub(self.bytes, Ordering::AcqRel);
         if self.call {
             self.control.calls.fetch_sub(1, Ordering::AcqRel);
+            self.control.called.fetch_sub(self.called, Ordering::AcqRel);
         }
     }
 }
@@ -804,6 +817,8 @@ struct Actor<F: BlockFile + 'static = DeviceFile> {
     // Whether this step's drive left more to drive without waiting for the log
     // (`Driven::more`): the next step comes at once, without waiting for an input.
     driving: bool,
+    /// Inputs taken while QB.2's pause held the owner, in order.
+    paused_inputs: VecDeque<Envelope>,
     // The log's writes and compactions wake the owner through this, its bell's waker.
     waker: std::task::Waker,
     // The instant this owner last read from its clock: at its step's start, and again after a
@@ -1235,16 +1250,26 @@ impl ReplicaHandle {
             control: Arc::clone(&self.shared),
             bytes: 0,
             call,
+            called: 0,
         };
+        // A call's bytes are held to the calls' bound on their own: the wire records queued beside
+        // it are the rest of the queue's, not the calls'.
+        if call {
+            self.shared
+                .called
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                    held.checked_add(bytes)
+                        .filter(|next| *next <= application_limit)
+                })
+                .map_err(|_| Refusal::Full {
+                    limit: application_limit,
+                })?;
+            reservation.called = bytes;
+        }
         let mut charged = self.shared.admitted.load(Ordering::Acquire);
         let mut reserved = false;
         for _ in 0..COMMANDS {
             let next = charged.checked_add(bytes).ok_or(Refusal::Full { limit })?;
-            if call && next > application_limit {
-                return Err(Refusal::Full {
-                    limit: application_limit,
-                });
-            }
             api::bound("replica command queue bytes", next, limit)?;
             match self.shared.admitted.compare_exchange_weak(
                 charged,
@@ -1397,6 +1422,10 @@ impl ReplicaHandle {
         if outgoing.messages.is_empty() {
             outgoing.over = None;
         }
+        // A paused owner waits for the host's drain (QB.2).
+        if outgoing.paused && !messages.is_empty() {
+            self.shared.bell.ring();
+        }
         Ok(messages)
     }
 
@@ -1414,6 +1443,19 @@ impl ReplicaHandle {
     #[cfg(test)]
     fn wire_bytes(&self) -> usize {
         self.shared.wire.load(Ordering::Acquire)
+    }
+    /// QB.2's switch: what this replica's owner does past its outgoing bound.
+    #[cfg(test)]
+    fn set_egress(&self, egress: super::drain::Egress) {
+        self.shared.egress.store(egress.code(), Ordering::Release);
+    }
+    /// QB.2's instruments: records shed, pauses begun, the outgoing queue's depth in messages and
+    /// its bound.
+    #[cfg(test)]
+    fn egress(&self) -> Result<(u64, u64, u64, super::drain::Bound), Refusal> {
+        let outgoing = locked(&self.shared.outgoing)?;
+        let depth = u64::try_from(outgoing.messages.len()).unwrap_or(u64::MAX);
+        Ok((outgoing.shed, outgoing.pauses, depth, outgoing.bound))
     }
 
     pub fn status(&self) -> Result<ReplicaStatus, Refusal> {
@@ -1744,6 +1786,7 @@ fn open_on<F: BlockFile + 'static>(
     let control = Arc::new(Control {
         admitted: AtomicUsize::new(0),
         calls: AtomicUsize::new(0),
+        called: AtomicUsize::new(0),
         queued: AtomicUsize::new(first.queued),
         applications: AtomicUsize::new(first.applications),
         wire: AtomicUsize::new(first.wire),
@@ -1756,6 +1799,7 @@ fn open_on<F: BlockFile + 'static>(
             room: first.room,
             ..Outgoing::default()
         }),
+        egress: std::sync::atomic::AtomicU8::new(super::drain::Egress::DEFAULT.code()),
         status: Mutex::new(Ok(status(&replica))),
         meter,
         local,
@@ -1838,6 +1882,7 @@ fn open_on<F: BlockFile + 'static>(
         lag: crate::replication::closed::Lag::default(),
         ticked: at,
         driving: false,
+        paused_inputs: VecDeque::new(),
         waker: std::task::Waker::from(Arc::clone(&bell)),
         at,
     };
@@ -2249,6 +2294,26 @@ impl<F: BlockFile + 'static> Actor<F> {
         let queued = self.queued();
         self.step_queued = queued;
         let applied = self.replica.applied().index;
+        // QB.2's pause: while the outgoing queue is at its bound the owner takes no input and
+        // makes no raft step; what comes waits in order, its bytes still charged to the command
+        // queue, so the queue's admission bound holds the callers back.
+        let paused = self.paused()?;
+        let input = if paused {
+            if let Some(envelope) = input {
+                self.paused_inputs.push_back(envelope);
+            }
+            None
+        } else {
+            match self.paused_inputs.pop_front() {
+                Some(first) => {
+                    if let Some(envelope) = input {
+                        self.paused_inputs.push_back(envelope);
+                    }
+                    Some(first)
+                }
+                None => input,
+            }
+        };
         if let Some(envelope) = input {
             // The command queue's reader is this intake (QB.1).
             let bytes = u64::try_from(envelope._reservation.bytes).unwrap_or(u64::MAX);
@@ -2288,7 +2353,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .and_then(|ticks| self.pace.period().checked_mul(ticks))
                 .ok_or_else(|| fenced("the quorum patience overflowed its gauge"))?;
             self.control.meter.patience(shown);
-            self.replica.tick().map_err(raft_error)?;
+            if !paused {
+                self.replica.tick().map_err(raft_error)?;
+            }
             #[cfg(test)]
             if let Some(stalls) = &self.stalls {
                 locked(stalls)?.ticked(at);
@@ -2300,6 +2367,13 @@ impl<F: BlockFile + 'static> Actor<F> {
         // Round Robin", SIGCOMM 1995, Theorem 4.5: fair within one unit when every quantum is at
         // least the largest unit, here one `Ready`), so no count of drives is picked. A drive that
         // leaves more steps again at once (`run_loop`).
+        if paused {
+            self.driving = false;
+            self.expire();
+            self.expire_change();
+            *locked(&self.control.status)? = Ok(status(&self.replica));
+            return Ok(());
+        }
         let mut output = Output::default();
         let nanos = self.now()?;
         let (began, applying) = ((self.clock)(), self.replica.machine().applied_bytes());
@@ -2323,7 +2397,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             locked(stalls)?.wrote(Duration::from_nanos(taken.saturating_sub(submitted)));
         }
         self.release(output)?;
-        self.driving = driven.more;
+        // Inputs a pause kept are taken at once, one a step.
+        self.driving = driven.more || !self.paused_inputs.is_empty();
         #[cfg(test)]
         if driven.more {
             self.drove_more = self.drove_more.saturating_add(1);
@@ -2520,6 +2595,28 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// timeout in force, and the queues' bytes charged to the memory budget, so that its other uses'
     /// room leaves them out (MB.1). A charge past the room is refused, and the bounds then refuse
     /// more; the resident bytes count them still.
+    /// QB.2's pause: whether the outgoing queue is at its bound (one more record would pass it)
+    /// under `Egress::Pause`, each pause begun counted.
+    fn paused(&self) -> Result<bool, Refusal> {
+        let egress = super::drain::Egress::from_code(self.control.egress.load(Ordering::Acquire));
+        if !matches!(egress, super::drain::Egress::Pause) {
+            return Ok(false);
+        }
+        let mut outgoing = locked(&self.control.outgoing)?;
+        let held = u64::try_from(outgoing.bytes).unwrap_or(u64::MAX);
+        let count = u64::try_from(outgoing.messages.len()).unwrap_or(u64::MAX);
+        let paused = count > 0
+            && super::drain::past(
+                outgoing.bound,
+                held.saturating_add(1),
+                count.saturating_add(1),
+            );
+        if paused && !outgoing.paused {
+            outgoing.pauses = outgoing.pauses.saturating_add(1);
+        }
+        outgoing.paused = paused;
+        Ok(paused)
+    }
     fn rebound(&mut self) -> Result<(), Refusal> {
         let now = self.now()?;
         let timeout = super::drain::election_timeout(
@@ -3668,12 +3765,41 @@ impl<F: BlockFile + 'static> Actor<F> {
         )
         .unwrap_or(u64::MAX);
         let wire = self.control.wire.load(Ordering::Acquire);
+        let egress = super::drain::Egress::from_code(self.control.egress.load(Ordering::Acquire));
+        // The members a shed record was for: told to the core as unreachable, as etcd's
+        // transport reports a peer whose stream dropped a message (QB.2).
+        let mut unreachable: Vec<u64> = Vec::new();
         let mut outgoing = locked(&self.control.outgoing)?;
         for message in output.messages {
             self.pace.sent(&message, now, lost);
             let mut bytes = Vec::new();
             message.encode(&mut bytes);
             api::bound("replica outgoing record", bytes.len(), wire)?;
+            // QB.2's shed: the oldest records go until the new one fits the bound, each counted;
+            // raft sends again what a member still lacks, as over a lossy link.
+            if matches!(egress, super::drain::Egress::Shed) {
+                loop {
+                    let held = u64::try_from(outgoing.bytes.saturating_add(bytes.len()))
+                        .unwrap_or(u64::MAX);
+                    let count = u64::try_from(outgoing.messages.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1);
+                    if !super::drain::past(outgoing.bound, held, count) {
+                        break;
+                    }
+                    let Some(oldest) = outgoing.messages.pop_front() else {
+                        break;
+                    };
+                    outgoing.bytes = outgoing
+                        .bytes
+                        .checked_sub(oldest.bytes.len())
+                        .ok_or_else(|| fenced("outgoing accounting underflow"))?;
+                    outgoing.shed = outgoing.shed.saturating_add(1);
+                    if !unreachable.contains(&oldest.to) {
+                        unreachable.push(oldest.to);
+                    }
+                }
+            }
             let total = outgoing
                 .bytes
                 .checked_add(bytes.len())
@@ -3691,7 +3817,9 @@ impl<F: BlockFile + 'static> Actor<F> {
             let count = u64::try_from(outgoing.messages.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(1);
-            if total_bytes > outgoing.bound.bytes || count > outgoing.bound.messages {
+            if matches!(egress, super::drain::Egress::Fence)
+                && super::drain::past(outgoing.bound, total_bytes, count)
+            {
                 let since = *outgoing.over.get_or_insert(now);
                 if now.saturating_sub(since) > timeout {
                     return Err(fenced(
@@ -3704,6 +3832,17 @@ impl<F: BlockFile + 'static> Actor<F> {
                 to: message.to,
                 bytes,
             });
+        }
+        drop(outgoing);
+        for member in unreachable {
+            // A report the core refuses short of a fence changes nothing: raft's next heartbeat
+            // finds what the member lacks all the same.
+            if let Err(error) = self.replica.report_unreachable(member) {
+                let error = raft_error(error);
+                if matches!(error, Refusal::Fenced(_)) {
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
@@ -3828,6 +3967,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 control: Arc::clone(&self.control),
                 bytes: 0,
                 call: false,
+                called: 0,
             },
         });
         Ok(())
@@ -4000,6 +4140,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 control: Arc::clone(&self.control),
                 bytes: 0,
                 call: false,
+                called: 0,
             },
         });
         self.floor_inflight = true;
@@ -9128,6 +9269,288 @@ mod tests {
         write(&mut driven, &mut pump, led, 1);
         driven.drain(&mut pump);
         pump.finish();
+    }
+
+    /// QB.2's scenario, the A/B of what an owner does past its outgoing bound (`Egress`): the
+    /// fence (the control), shedding the oldest records, or pausing the owner. Do, for each: a
+    /// group of `QB2_MEMBERS` voters (5 when unset) on driven time, every clock a tick on each
+    /// round; `QB2_WRITES` writes (8) at its leader; then every member's host stops draining at
+    /// once for two election timeouts while a write is asked of the leader; then every host drains
+    /// again but the leader's, which stays stalled for good, and writes go on at whichever member
+    /// the others name leader. Prints, by candidate: members fenced, records shed, pauses begun,
+    /// the deepest queue against its bound, writes answered before and after the stall, refusals by
+    /// kind, and the writes' latency in driven ticks at p50, p99 and p99.9 (nearest rank). Expect,
+    /// under the default candidate: no member fenced, and the group writes again after its
+    /// leader's host stalls.
+    #[test]
+    #[ignore = "QB.2 harness unfinished (lane constants-17): the first write at the leader goes unanswered once every clock ticks each round; QB2_TRACE=1 shows the leader holding"]
+    fn qb2_many_slow_one_stalled_for_good_by_egress() {
+        use super::super::drain::Egress;
+        let members: u64 = std::env::var("QB2_MEMBERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5);
+        let writes: usize = std::env::var("QB2_WRITES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        for egress in [Egress::Fence, Egress::Shed, Egress::Pause] {
+            let report = qb2_scenario(egress, members, writes);
+            println!("QB.2 egress={egress:?} members={members} writes={writes} {report}");
+            if egress == Egress::DEFAULT {
+                assert_eq!(report.fenced, 0, "{report}");
+                assert!(report.after > 0, "{report}");
+            }
+        }
+    }
+    /// What [`qb2_scenario`] measured.
+    #[derive(Default)]
+    struct Qb2Report {
+        fenced: usize,
+        shed: u64,
+        pauses: u64,
+        deepest: u64,
+        bound: u64,
+        before: usize,
+        after: usize,
+        refused: BTreeMap<String, usize>,
+        unanswered: usize,
+        latencies: Vec<u64>,
+    }
+    impl std::fmt::Display for Qb2Report {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let mut sorted = self.latencies.clone();
+            sorted.sort_unstable();
+            // Nearest rank: the ceil(q·n)-th smallest, q in thousandths.
+            let rank = |per_mille: usize| {
+                let n = sorted.len();
+                (n > 0).then(|| sorted[(per_mille * n).div_ceil(1000).max(1) - 1])
+            };
+            write!(
+                f,
+                "fenced={} shed={} pauses={} deepest={}/{} ok_before={} ok_after={} unanswered={} refused={:?} ticks_p50={:?} p99={:?} p99.9={:?}",
+                self.fenced,
+                self.shed,
+                self.pauses,
+                self.deepest,
+                self.bound,
+                self.before,
+                self.after,
+                self.unanswered,
+                self.refused,
+                rank(500),
+                rank(990),
+                rank(999),
+            )
+        }
+    }
+    /// One driven tick of [`qb2_scenario`]: every clock a tick on, then relay rounds and steps until
+    /// the group is quiet but for what its hosts hold.
+    fn qb2_round(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        clients: &[Client],
+        fenced: &mut std::collections::BTreeSet<usize>,
+        report: &mut Qb2Report,
+    ) {
+        for owner in 0..clients.len() {
+            driven.advance_tick(owner);
+        }
+        // Rounds at this tick until the group is quiet but for what its hosts hold: nothing to
+        // relay, and no write out on the disk of an owner that runs (one fenced or paused waits).
+        for _ in 0..ROUNDS {
+            let admitted = pump.drive_until(driven.until());
+            let writing = driven.owners.iter().enumerate().any(|(index, slot)| {
+                !fenced.contains(&index)
+                    && slot.as_ref().is_some_and(|(owner, _)| {
+                        !owner.paused().unwrap_or(false) && owner.replica.in_flight() != 0
+                    })
+            });
+            if admitted == 0 && !writing {
+                break;
+            }
+            if admitted == 0 {
+                std::thread::park_timeout(POLL);
+            }
+            qb2_steps(driven, pump, fenced);
+        }
+        for index in fenced.iter() {
+            if !pump.held.contains(index) {
+                pump.held.push(*index);
+            }
+        }
+        report.fenced = fenced.len();
+        let (mut shed, mut pauses) = (0, 0);
+        for client in clients {
+            let (s, p, depth, bound) = client.handle().egress().unwrap();
+            shed += s;
+            pauses += p;
+            if depth > report.deepest {
+                report.deepest = depth;
+                report.bound = bound.messages;
+            }
+        }
+        report.shed = shed;
+        report.pauses = pauses;
+    }
+    /// Every owner not fenced steps through its inputs; an owner that fences is counted, and its
+    /// records are lost from then on.
+    fn qb2_steps(
+        driven: &mut Driven,
+        pump: &mut Pump<'_>,
+        fenced: &mut std::collections::BTreeSet<usize>,
+    ) {
+        for (index, slot) in driven.owners.iter_mut().enumerate() {
+            if fenced.contains(&index) {
+                continue;
+            }
+            let Some((owner, inputs)) = slot.as_mut() else {
+                continue;
+            };
+            let mut result = Ok(());
+            while result.is_ok()
+                && let Ok(input) = inputs.try_recv()
+            {
+                result = owner.run_step(Some(input));
+            }
+            if let Err(error) = result.and_then(|()| owner.run_step(None)) {
+                assert!(matches!(error, Refusal::Fenced(_)), "{error:?}");
+                fenced.insert(index);
+                pump.lost.push(u64::try_from(index + 1).unwrap());
+                pump.held.push(index);
+            }
+        }
+    }
+    fn qb2_scenario(egress: super::super::drain::Egress, members: u64, writes: usize) -> Qb2Report {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let voters: Vec<u64> = (1..=members).collect();
+        let clients: Vec<Client> = voters
+            .iter()
+            .map(|n| driven.open(dir.path(), *n, voters.clone(), None))
+            .collect();
+        for client in &clients {
+            client.handle().set_egress(egress);
+        }
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven.drain(&mut pump);
+        let election = u64::try_from(
+            driven
+                .owner(leader)
+                .replica
+                .core()
+                .raft
+                .config()
+                .election_tick,
+        )
+        .unwrap();
+        let mut report = Qb2Report::default();
+        let mut fenced = std::collections::BTreeSet::new();
+        // Phases by round: writes until `writes` are answered, every host stalled for two election
+        // timeouts, then the leader's host stalled for good.
+        let mut stall: Option<(u64, bool)> = None;
+        let mut pending: Option<(mpsc::Receiver<Result<Answer, Refusal>>, u64)> = None;
+        let most = election
+            .saturating_mul(400)
+            .saturating_add(u64::try_from(writes).unwrap() * election * 40);
+        for round in 0..most {
+            let after = stall.is_some_and(|(_, released)| released);
+            if after && report.after >= writes {
+                break;
+            }
+            if stall.is_none() && report.before >= writes {
+                pump.held = (0..clients.len()).collect();
+                stall = Some((round, false));
+            }
+            if let Some((at, false)) = stall
+                && round >= at + 2 * election
+            {
+                pump.held = vec![leader];
+                stall = Some((at, true));
+            }
+            if pending.is_none() {
+                // The member the others name leader; the stalled one names itself while it leads.
+                let named = clients
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !after || *index != leader)
+                    .filter_map(|(_, client)| client.handle().status().ok())
+                    .map(|status| status.leader)
+                    .find(|named| *named != 0)
+                    .and_then(|named| usize::try_from(named).ok())
+                    .and_then(|named| named.checked_sub(1))
+                    .filter(|named| !fenced.contains(named));
+                if let Some(target) = named {
+                    let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
+                        db.exec("CREATE TABLE IF NOT EXISTS qb2(value)")?;
+                        db.exec("INSERT INTO qb2 VALUES(1)")?;
+                        Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
+                    }))));
+                    let (response, receiver) = mpsc::sync_channel(1);
+                    let asked = clients[target].handle.enqueue(
+                        Input::Submit {
+                            namespace: String::new(),
+                            operation,
+                            application: None,
+                            until: driven.until(),
+                            response,
+                        },
+                        api::REQUEST_MAX,
+                    );
+                    match asked {
+                        Ok(()) => pending = Some((receiver, round)),
+                        Err(refusal) => {
+                            let kind = format!("{refusal:?}");
+                            let kind = kind.split(['(', ' ', '{']).next().unwrap_or("").to_string();
+                            *report.refused.entry(kind).or_default() += 1;
+                        }
+                    }
+                }
+            }
+            qb2_round(&mut driven, &mut pump, &clients, &mut fenced, &mut report);
+            if std::env::var("QB2_TRACE").is_ok() && round < 60 {
+                let seen: Vec<(u64, u64)> = clients
+                    .iter()
+                    .filter_map(|client| client.handle().status().ok())
+                    .map(|status| (status.leader, status.term))
+                    .collect();
+                eprintln!(
+                    "QB.2 trace round={round} pending={} (leader, term)={seen:?} refused={:?}",
+                    pending.is_some(),
+                    report.refused
+                );
+            }
+            if let Some((receiver, asked)) = pending.take() {
+                match receiver.try_recv() {
+                    Ok(Ok(_)) => {
+                        report.latencies.push(round - asked + 1);
+                        if after {
+                            report.after += 1;
+                        } else {
+                            report.before += 1;
+                        }
+                    }
+                    Ok(Err(refusal)) => {
+                        let kind = format!("{refusal:?}");
+                        let kind = kind.split(['(', ' ', '{']).next().unwrap_or("").to_string();
+                        *report.refused.entry(kind).or_default() += 1;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        *report.refused.entry("ended".to_string()).or_default() += 1;
+                    }
+                    // A write unanswered for ten election timeouts is given up on, counted.
+                    Err(mpsc::TryRecvError::Empty) if round - asked > 10 * election => {
+                        report.unanswered += 1;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => pending = Some((receiver, asked)),
+                }
+            }
+        }
+        // Records held for fenced or stalled members are never settled: the pump goes without its
+        // settling checks.
+        std::mem::forget(pump);
+        report
     }
 
     /// AC-T1.8.M1, T-T1.8.M3 (CP-T1.8) on driven time (replication.md, "Membership"): a change at

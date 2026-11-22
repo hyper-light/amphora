@@ -99,6 +99,50 @@ impl Drain {
     }
 }
 
+/// What a replicated owner does when its outgoing queue is past its learned bound (QB.2): three
+/// candidates behind one switch, decided by the A/B scenario
+/// (`qb2_many_slow_one_stalled_for_good_by_egress`), the fence its control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Egress {
+    /// QB.1's rule: the owner fences once the queue has stayed past its bound an election timeout.
+    Fence,
+    /// The oldest records past the bound are dropped, counted, and their members reported
+    /// unreachable, so raft sends again what each still lacks: etcd's transport drops a message
+    /// whose peer's buffer is full and reports the peer unreachable (etcd server/etcdserver/api/
+    /// rafthttp/peer.go, `send`; raft's `ReportUnreachable`).
+    Shed,
+    /// The owner takes no input and makes no raft step while the queue is at its bound.
+    Pause,
+}
+
+impl Egress {
+    /// The candidate in force unless a test switches it.
+    pub(super) const DEFAULT: Self = Self::Shed;
+
+    pub(super) fn code(self) -> u8 {
+        match self {
+            Self::Fence => 0,
+            Self::Shed => 1,
+            Self::Pause => 2,
+        }
+    }
+
+    /// The candidate a code names; an unknown code is the default.
+    pub(super) fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Fence,
+            1 => Self::Shed,
+            2 => Self::Pause,
+            _ => Self::DEFAULT,
+        }
+    }
+}
+
+/// Whether a queue holding `bytes` in `messages` is past `bound`.
+pub(super) fn past(bound: Bound, bytes: u64, messages: u64) -> bool {
+    bytes > bound.bytes || messages > bound.messages
+}
+
 /// The learned election timeout: `election_tick` periods of the owner's pace.
 pub(super) fn election_timeout(election_tick: usize, period: Duration) -> Duration {
     period.saturating_mul(u32::try_from(election_tick).unwrap_or(u32::MAX))
@@ -113,6 +157,19 @@ mod tests {
         messages: 1,
     };
     const MS: u64 = 1_000_000;
+
+    /// T-QB.2.1: each candidate's code names it again, and a queue is past its bound once either
+    /// its bytes or its messages are.
+    #[test]
+    fn qb2_egress_codes_and_past() {
+        for egress in [Egress::Fence, Egress::Shed, Egress::Pause] {
+            assert_eq!(Egress::from_code(egress.code()), egress);
+        }
+        assert_eq!(Egress::from_code(u8::MAX), Egress::DEFAULT);
+        assert!(!past(LEAST, 100, 1));
+        assert!(past(LEAST, 101, 1));
+        assert!(past(LEAST, 1, 2));
+    }
 
     /// T-QB.1.1: nothing measured, then an interval with nothing queued and nothing read: passes
     /// when the bound is one record (`least`), the room no matter how large.
