@@ -12,12 +12,13 @@
 //! plain-column GROUP BY keys; COUNT, SUM over INTEGER columns, MIN and MAX; no HAVING, ORDER
 //! BY, LIMIT, DISTINCT, window or subquery.
 //!
-//! A hash join's probe with its aggregates qualifies too (`shape_join`): two rowid tables the
-//! planner joins inner by a hash join on equalities of columns of one affinity, every other term
-//! a filter on one table, every column read of INTEGER or TEXT affinity and BINARY collation.
-//! The build side is read and its hash table built once, by the workers together (each scans its
-//! own build leaves and scatters its rows by partition; each partition is filled by one worker);
-//! each worker probes over its own run of the probe table's leaves and folds the joined rows into
+//! A join's probe with its aggregates qualifies too (`shape_join`): two or more rowid tables the
+//! planner joins inner, by hash joins and scans, on equalities of columns of one affinity, every
+//! other term a filter on one table, every column read of INTEGER or TEXT affinity and BINARY
+//! collation. Each table but the probe is a link of a chain of hash tables (lane qs6-10), read and
+//! built once, by the workers together (each scans its own build leaves and scatters its rows by
+//! partition; each partition is filled by one worker); each worker probes over its own run of the
+//! probe table's leaves, each probe row through every link in turn, and folds the joined rows into
 //! its partial aggregates. Such a join with no aggregates returns its rows instead: each worker
 //! keeps its joined rows, sorted when there is an ORDER BY over the tables' columns, and the runs
 //! merge in leaf order, stably, so the rows come out as the serial loop gives them.
@@ -30,7 +31,7 @@ use crate::translate::expr::{
     translate_condition_expr, translate_expr, walk_expr, ConditionMetadata, WalkControl,
 };
 use crate::translate::plan::{
-    Distinctness, HashJoinType, JoinType, JoinedTable, Operation, QueryDestination, Scan,
+    Distinctness, HashJoinType, JoinType, JoinedTable, Operation, QueryDestination, Scan, Search,
     SelectPlan, WhereTermOrigin,
 };
 use crate::types::Value;
@@ -69,7 +70,7 @@ pub(crate) fn emit_morsel_hook(
             group_by: looped.group_by.clone(),
             aggregates: looped.aggregates.clone(),
             result_map: looped.result_map.clone(),
-            join: None,
+            joins: Vec::new(),
             joined_rows: None,
             body: None,
             target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
@@ -477,7 +478,7 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         group_by,
         aggregates,
         result_map,
-        join: None,
+        joins: Vec::new(),
         joined_rows: None,
         body: None,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
@@ -500,6 +501,21 @@ fn predicate(
         Expr::NotNull(inner) => Some(Predicate::NotNull {
             column: column(inner)?,
         }),
+        // `x IS NULL` and `x IS NOT NULL` as the parser may give them (lane qs6-10).
+        Expr::Binary(inner, Operator::Is, null)
+            if matches!(null.as_ref(), Expr::Literal(Literal::Null)) =>
+        {
+            Some(Predicate::IsNull {
+                column: column(inner)?,
+            })
+        }
+        Expr::Binary(inner, Operator::IsNot, null)
+            if matches!(null.as_ref(), Expr::Literal(Literal::Null)) =>
+        {
+            Some(Predicate::NotNull {
+                column: column(inner)?,
+            })
+        }
         Expr::Binary(left, op, right) => {
             let (at, op, value) = match (column(left), column(right)) {
                 (Some(at), None) => (at, *op, literal(right)?),
@@ -709,13 +725,20 @@ fn joined_rows(
     Some((project, MorselRows { order, width }))
 }
 
-/// A hash join's probe with the aggregates over its matches (QT.6): two rowid tables joined inner
-/// by the planner's hash join on equalities of columns of one affinity, every other term a filter
-/// on one table's columns. The pipeline's row is the probe table's columns, then the build's.
+/// A join's probe with the aggregates over its rows, or its rows (QT.6): two or more rowid tables,
+/// each joined inner and read whole, by a scan of its own rows or the planner's hash join (at least
+/// one hash join; a seek in an index the statement builds from the table, an ephemeral one, reads
+/// it whole as well), every term an equality of two tables' columns of one affinity or a filter on
+/// one table's columns. The hook's probe is the first table in the join order that no hash join
+/// builds from; every other table is a link of a chain of hash tables (lane qs6-10), keyed by its
+/// equalities with the tables before it in the chain, and taken in the join order among the tables
+/// such an equality links to the chain. Every equality is a key of the link that joins the later
+/// of its two tables, so no join term is left to test. The pipeline's row is the probe table's
+/// columns, then each link's.
 ///
 /// Every column read has INTEGER or TEXT affinity and BINARY collation: two such values that
 /// compare equal are the same value, so which joined row a MIN, a MAX or a group's key values take
-/// on a tie (the serial loop's order of a probe row's matches is its hash table's) cannot change
+/// on a tie (the serial loop's order of a probe row's matches is its hash tables') cannot change
 /// the answer.
 fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
     // A join with no aggregates returns its rows (QT.6): the workers' runs merge in order.
@@ -727,131 +750,162 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
     }) {
         return None;
     }
-    let [first, second] = plan.table_references.joined_tables() else {
-        return None;
-    };
-    let tables = [first, second];
-    let hash = tables.iter().find_map(|t| match &t.op {
-        Operation::HashJoin(op) => Some(op),
-        _ => None,
-    })?;
-    if hash.join_type != HashJoinType::Inner
-        || hash.probe_table_idx == hash.build_table_idx
-        || tables.iter().any(|t| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|j| j.join_type != JoinType::Inner)
-        })
-    {
+    let joined = plan.table_references.joined_tables();
+    if joined.len() < 2 {
         return None;
     }
-    let probe = tables.get(hash.probe_table_idx)?;
-    let build = tables.get(hash.build_table_idx)?;
-    let probe_table = stored(probe)?;
-    let build_table = stored(build)?;
-    let width = probe_table.columns().len();
-    // A column the hook reads, and whether it is the probe table's.
-    let side = |expr: &Expr| -> Option<(bool, usize)> {
-        let (t, column) = match expr {
-            Expr::Column {
-                table: t, column, ..
-            } => (*t, *column),
-            // A table's rowid is its INTEGER PRIMARY KEY column, where it has one (lane qs6-6).
-            Expr::RowId { table: t, .. } => {
-                let alias = if *t == probe.internal_id {
-                    rowid_alias(probe_table)?
-                } else if *t == build.internal_id {
-                    rowid_alias(build_table)?
-                } else {
-                    return None;
-                };
-                (*t, alias)
+    let mut built = Vec::new();
+    let mut tables: Vec<&BTreeTable> = Vec::new();
+    for table in joined {
+        if table
+            .join_info
+            .as_ref()
+            .is_some_and(|j| j.join_type != JoinType::Inner)
+        {
+            return None;
+        }
+        match &table.op {
+            Operation::Scan(Scan::BTreeTable { index: None, .. }) => {}
+            // A seek in an index the statement builds from the whole table reads it whole too.
+            Operation::Search(Search::Seek {
+                index: Some(index), ..
+            }) if index.ephemeral => {}
+            Operation::HashJoin(op)
+                if op.join_type == HashJoinType::Inner
+                    && op.probe_table_idx != op.build_table_idx =>
+            {
+                built.push(op.build_table_idx)
             }
             _ => return None,
+        }
+        tables.push(stored(table)?);
+    }
+    if built.is_empty() {
+        return None;
+    }
+    let probe_at = (0..tables.len()).find(|at| !built.contains(at))?;
+    // A column the hook reads: its table's place in the join order, and its own place.
+    let side = |expr: &Expr| -> Option<(usize, usize)> {
+        let (id, column) = match expr {
+            Expr::Column {
+                table: t, column, ..
+            } => (*t, Some(*column)),
+            Expr::RowId { table: t, .. } => (*t, None),
+            _ => return None,
         };
-        let (is_probe, table) = if t == probe.internal_id {
-            (true, probe_table)
-        } else if t == build.internal_id {
-            (false, build_table)
-        } else {
-            return None;
+        let at = joined.iter().position(|t| t.internal_id == id)?;
+        let table = tables.get(at)?;
+        // A table's rowid is its INTEGER PRIMARY KEY column, where it has one (lane qs6-6).
+        let column = match column {
+            Some(column) => column,
+            None => rowid_alias(table)?,
         };
         let col = table.columns().get(column)?;
         let plain = matches!(col.affinity(), Affinity::Integer | Affinity::Text)
             && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-        plain.then_some((is_probe, column))
+        plain.then_some((at, column))
     };
-    let joined_at = |expr: &Expr| -> Option<usize> {
-        let (is_probe, at) = side(expr)?;
-        if is_probe {
-            Some(at)
-        } else {
-            width.checked_add(at)
-        }
+    let affinity = |(at, column): (usize, usize)| {
+        tables
+            .get(at)
+            .and_then(|t| t.columns().get(column))
+            .map(|c| c.affinity())
     };
-    let integer = |at: usize| -> bool {
-        let col = match at.checked_sub(width) {
-            None => probe_table.columns().get(at),
-            Some(at) => build_table.columns().get(at),
-        };
-        col.is_some_and(|c| c.affinity() == Affinity::Integer)
-    };
-    let mut probe_key = Vec::new();
-    let mut build_key = Vec::new();
-    let mut keys = Vec::new();
-    for key in &hash.join_keys {
-        let term = plan.where_clause.get(key.where_clause_idx)?;
-        let Expr::Binary(left, Operator::Equals, right) = &term.expr else {
-            return None;
-        };
-        let (at_probe, at_build) = match (side(left)?, side(right)?) {
-            ((true, p), (false, b)) | ((false, b), (true, p)) => (p, b),
-            _ => return None,
-        };
-        // Keys of one affinity compare with no conversion, as the join's hash table does.
-        if probe_table.columns().get(at_probe)?.affinity()
-            != build_table.columns().get(at_build)?.affinity()
-        {
-            return None;
-        }
-        probe_key.push(at_probe);
-        build_key.push(at_build);
-        keys.push(key.where_clause_idx);
-    }
-    if keys.is_empty() {
-        return None;
-    }
-    let on_probe = |expr: &Expr| side(expr).and_then(|(p, at)| p.then_some(at));
-    let on_build = |expr: &Expr| side(expr).and_then(|(p, at)| (!p).then_some(at));
-    let mut probe_filter = Vec::new();
-    let mut build_filter = Vec::new();
-    // Every term that is not a key is a filter on one table, consumed or not: one the planner
-    // made into a seek still holds of every row the join reads.
-    for (at, term) in plan.where_clause.iter().enumerate() {
-        if keys.contains(&at) {
-            continue;
-        }
+    // Every term, consumed or not (one the planner made into a hash join's key still holds of
+    // every row the join reads): an equality of two tables' columns, or a filter on one table.
+    let mut edges: Vec<((usize, usize), (usize, usize))> = Vec::new();
+    let mut filters: Vec<Vec<Predicate>> = tables.iter().map(|_| Vec::new()).collect();
+    for term in &plan.where_clause {
         if matches!(term.origin, WhereTermOrigin::TableFunction(_)) {
             return None;
         }
-        match predicate(&term.expr, &on_probe, probe_table) {
-            Some(found) => probe_filter.push(found),
-            None => build_filter.push(predicate(&term.expr, &on_build, build_table)?),
+        if let Expr::Binary(left, Operator::Equals, right) = &term.expr {
+            if let (Some(l), Some(r)) = (side(left), side(right)) {
+                if l.0 != r.0 {
+                    // Keys of one affinity compare with no conversion, as a hash table does.
+                    if affinity(l)? != affinity(r)? {
+                        return None;
+                    }
+                    edges.push((l, r));
+                    continue;
+                }
+            }
         }
+        let (at, found) = (0..tables.len()).find_map(|at| {
+            let on = |expr: &Expr| side(expr).and_then(|(t, c)| (t == at).then_some(c));
+            let table: &BTreeTable = tables.get(at)?;
+            predicate(&term.expr, &on, table).map(|p| (at, p))
+        })?;
+        filters.get_mut(at)?.push(found);
     }
+    // The chain: each table's place in the joined row once it is joined.
+    let mut offsets: Vec<Option<usize>> = tables.iter().map(|_| None).collect();
+    *offsets.get_mut(probe_at)? = Some(0);
+    let probe_table: &BTreeTable = tables.get(probe_at)?;
+    let mut width = probe_table.columns().len();
+    let mut kinds: Vec<Affinity> = probe_table.columns().iter().map(|c| c.affinity()).collect();
+    let mut joins = Vec::new();
+    while joins.len().saturating_add(1) < tables.len() {
+        let joined_place = |at: usize| offsets.get(at).copied().flatten();
+        // The next link: the first table in the join order an equality links to the chain; none
+        // is a cross product, which the hook declines.
+        let next = (0..tables.len()).find(|at| {
+            joined_place(*at).is_none()
+                && edges.iter().any(|(l, r)| {
+                    (l.0 == *at && joined_place(r.0).is_some())
+                        || (r.0 == *at && joined_place(l.0).is_some())
+                })
+        })?;
+        let mut probe_key = Vec::new();
+        let mut build_key = Vec::new();
+        for (l, r) in &edges {
+            let (other, own) = if l.0 == next {
+                (r, l)
+            } else if r.0 == next {
+                (l, r)
+            } else {
+                continue;
+            };
+            let Some(base) = joined_place(other.0) else {
+                continue;
+            };
+            probe_key.push(base.checked_add(other.1)?);
+            build_key.push(own.1);
+        }
+        let table: &BTreeTable = tables.get(next)?;
+        *offsets.get_mut(next)? = Some(width);
+        width = width.checked_add(table.columns().len())?;
+        kinds.extend(table.columns().iter().map(|c| c.affinity()));
+        joins.push(MorselJoinData {
+            root_page: table.root_page,
+            columns: table.columns().len(),
+            rowid_alias: rowid_alias(table),
+            filter: std::mem::take(filters.get_mut(next)?),
+            probe_key,
+            build_key,
+        });
+    }
+    let joined_at = |expr: &Expr| -> Option<usize> {
+        let (at, column) = side(expr)?;
+        offsets.get(at).copied().flatten()?.checked_add(column)
+    };
+    let integer = |at: usize| kinds.get(at).is_some_and(|k| *k == Affinity::Integer);
     let (group_by, aggregates, result_map, joined_rows) = if rows_mode {
         // A LIMIT or OFFSET cuts rows in order, so the hook takes one only when its rows' order is
-        // the serial loop's to the row: the ORDER BY keys hold both tables' INTEGER PRIMARY KEYs,
-        // which tell every joined row apart (QT.6, lane qs6-6).
+        // the serial loop's to the row: the ORDER BY keys hold every table's INTEGER PRIMARY KEY,
+        // which tell every joined row apart (QT.6, lanes qs6-6 and qs6-10).
         if plan.limit.is_some() || plan.offset.is_some() {
-            let ordered = |is_probe: bool, table: &BTreeTable| {
-                rowid_alias(table).is_some_and(|alias| {
-                    plan.order_by
-                        .iter()
-                        .any(|(expr, _, _)| side(expr) == Some((is_probe, alias)))
-                })
-            };
-            if !(ordered(true, probe_table) && ordered(false, build_table)) {
+            let ordered = (0..tables.len()).all(|at| {
+                tables
+                    .get(at)
+                    .and_then(|table| rowid_alias(table))
+                    .is_some_and(|alias| {
+                        plan.order_by
+                            .iter()
+                            .any(|(expr, _, _)| side(expr) == Some((at, alias)))
+                    })
+            });
+            if !ordered {
                 return None;
             }
         }
@@ -863,20 +917,13 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
     };
     Some(MorselAggregateData {
         root_page: probe_table.root_page,
-        columns: width,
+        columns: probe_table.columns().len(),
         rowid_alias: rowid_alias(probe_table),
-        filter: probe_filter,
+        filter: std::mem::take(filters.get_mut(probe_at)?),
         group_by,
         aggregates,
         result_map,
-        join: Some(MorselJoinData {
-            root_page: build_table.root_page,
-            columns: build_table.columns().len(),
-            rowid_alias: rowid_alias(build_table),
-            filter: build_filter,
-            probe_key,
-            build_key,
-        }),
+        joins,
         joined_rows,
         body: None,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,

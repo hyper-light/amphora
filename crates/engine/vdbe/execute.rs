@@ -20897,8 +20897,8 @@ pub fn op_morsel_aggregate(
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
     };
     use crate::vdbe::morsel_scan::{
-        TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild, TableJoinAggregate,
-        TableJoinRows, TableSource,
+        JoinStage, TableAggregate, TableBodyAggregate, TableBodyRows, TableBuild,
+        TableJoinAggregate, TableJoinRows, TableSource,
     };
     load_insn!(MorselAggregate { data }, insn);
     let refused = |error: MorselError| -> Box<LimboError> {
@@ -20967,7 +20967,7 @@ pub fn op_morsel_aggregate(
             data.rowid_alias,
         )?;
         let budget = MemoryBudget::new(pager.statement_memory_budget());
-        let Some(join) = &data.join else {
+        if data.joins.is_empty() {
             // A copy of the serial loop's body, run per row by each worker (lane qs6-7).
             if let Some(body) = &data.body {
                 let shape = ScanAggregate {
@@ -21016,37 +21016,46 @@ pub fn op_morsel_aggregate(
             return pipeline
                 .run_mode(connection.parallel_mode(), &mut costs, &budget)
                 .map(|(rows, _)| (rows, false));
-        };
-        // A hash join's probe: the build side read and its table built once, by the workers
+        }
+        // A join's probe: each build side read and its hash table built once, by the workers
         // together (a partition per core the switch lets run), charged to the statement's one
-        // budget; the joined rows' filter is the probe's.
-        let build_table = TableSource::open(
-            pager.clone(),
-            join.root_page,
-            join.columns,
-            join.rowid_alias,
-        )?;
+        // budget, a chain's links in turn (lane qs6-10); the joined rows' filter is the probe's.
         let mode = connection.parallel_mode();
         let partitioner = Partitioner::new(match mode {
             ParallelMode::On => costs.cores(),
             ParallelMode::Off => std::num::NonZeroUsize::MIN,
         });
-        let (build, hash_table, _) = TableBuild {
-            table: &build_table,
-            filter: &join.filter,
-            key: &join.build_key,
-            partitioner: &partitioner,
+        let mut stages = Vec::new();
+        stages.try_reserve_exact(data.joins.len())?;
+        for join in &data.joins {
+            let build_table = TableSource::open(
+                pager.clone(),
+                join.root_page,
+                join.columns,
+                join.rowid_alias,
+            )?;
+            let (rows, hash_table, _) = TableBuild {
+                table: &build_table,
+                filter: &join.filter,
+                key: &join.build_key,
+                partitioner: &partitioner,
+            }
+            .run_mode(mode, &mut costs, &budget)?;
+            stages.push(JoinStage {
+                probe: HashProbe::over(hash_table, &[], &join.probe_key),
+                rows,
+            });
+            connection
+                .morsel_join_links
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        .run_mode(mode, &mut costs, &budget)?;
-        let probe = HashProbe::over(hash_table, &[], &join.probe_key);
         // A join's rows, no aggregates: each worker keeps its own leaves' joined rows, merged
         // in order; they are the answer's rows as they stand.
         if let Some(rows) = &data.joined_rows {
             let pipeline = TableJoinRows {
                 table: &table,
                 probe_filter: &data.filter,
-                probe: &probe,
-                build: &build,
+                stages: &stages,
                 project: &data.result_map,
                 order: &rows.order,
             };
@@ -21065,8 +21074,7 @@ pub fn op_morsel_aggregate(
         let pipeline = TableJoinAggregate {
             table: &table,
             probe_filter: &data.filter,
-            probe: &probe,
-            build: &build,
+            stages: &stages,
             shape: &shape,
         };
         pipeline

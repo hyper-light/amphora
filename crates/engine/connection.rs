@@ -549,6 +549,8 @@ pub struct Connection {
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
     /// Amphora (QT.6, lane qs6-7): the rows workers ran through a copy of a statement's loop body.
     pub(crate) morsel_body_rows: AtomicU64,
+    /// Amphora (QT.6, lane qs6-10): the hash tables the hook built for joins, a chain's links each.
+    pub(crate) morsel_join_links: AtomicU64,
     /// Amphora: see [`Connection::set_vectorized_scans`].
     pub(super) vectorized_scans: AtomicBool,
     /// Per-connection runtime extension loading flag.

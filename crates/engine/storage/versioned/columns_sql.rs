@@ -448,7 +448,7 @@ pub(crate) fn aggregate(
     }
     let storage = switch.storage();
     let copies = &storage.copies;
-    if !copies.on() || data.join.is_some() || !connection.get_auto_commit() || switch.wrote() {
+    if !copies.on() || !data.joins.is_empty() || !connection.get_auto_commit() || switch.wrote() {
         return Ok(None);
     }
     let db = storage.db();

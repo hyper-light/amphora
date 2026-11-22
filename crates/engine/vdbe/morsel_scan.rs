@@ -896,16 +896,75 @@ impl TableBuild<'_> {
     }
 }
 
-/// A hash join's probe side read from a table's leaves, each joined row (the probe row's columns,
-/// then the build row's) folded into the aggregates: the probe and the aggregates are one loop
-/// body, run by every worker over its own leaves (QT.6).
+/// One link of a join's chain of hash tables (QT.6, lane qs6-10): the table, keyed by places in
+/// the row joined before it (the probe row's columns, then each earlier link's build row's), and
+/// the build rows it numbers.
+pub struct JoinStage<'a> {
+    pub probe: HashProbe<'a>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// A link's place in a probe row's walk through the chain: its matches, the next one to take, and
+/// the joined row's length before the link's build row.
+type Step<'s> = (&'s [usize], usize, usize);
+
+/// Calls `visit` with each joined row the probe row `row` makes through the chain `stages`, depth
+/// first: the first link's matches in build order, each one's matches in the next link, and so on.
+/// The walk is an explicit stack as deep as the chain, no recursion; `joined` and `walk` are the
+/// worker's, reused from row to row.
+fn each_joined<'s>(
+    stages: &'s [JoinStage<'_>],
+    row: &[Value],
+    joined: &mut Vec<Value>,
+    walk: &mut Vec<Step<'s>>,
+    mut visit: impl FnMut(&[Value]) -> Result<(), MorselError>,
+) -> Result<(), MorselError> {
+    joined.clear();
+    joined.try_reserve(row.len())?;
+    joined.extend_from_slice(row);
+    walk.clear();
+    let Some(first) = stages.first() else {
+        return visit(joined);
+    };
+    walk.try_reserve(stages.len())?;
+    walk.push((first.probe.matches(joined)?, 0, joined.len()));
+    while let Some(top) = walk.last_mut() {
+        let (matches, next, base) = *top;
+        let Some(build) = matches.get(next) else {
+            walk.pop();
+            continue;
+        };
+        top.1 = next.saturating_add(1);
+        let level = walk.len().saturating_sub(1);
+        let stage = stages.get(level).ok_or(MorselError::Overflow {
+            what: "a join's link",
+        })?;
+        let build_row = stage.rows.get(*build).ok_or(MorselError::Overflow {
+            what: "a match's build row",
+        })?;
+        joined.truncate(base);
+        joined.try_reserve(build_row.len())?;
+        joined.extend_from_slice(build_row);
+        match stages.get(level.saturating_add(1)) {
+            None => visit(joined)?,
+            Some(link) => {
+                let found = link.probe.matches(joined)?;
+                walk.push((found, 0, joined.len()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A join's probe side read from a table's leaves, each joined row (the probe row's columns, then
+/// each link's build row's) folded into the aggregates: the probe through the chain and the
+/// aggregates are one loop body, run by every worker over its own leaves (QT.6).
 pub struct TableJoinAggregate<'a> {
     pub table: &'a TableSource,
     /// Terms over the probe row alone, tested before it is probed.
     pub probe_filter: &'a [Predicate],
-    pub probe: &'a HashProbe<'a>,
-    /// The build side's rows, as `probe` numbers them.
-    pub build: &'a [Vec<Value>],
+    /// The chain of hash tables, one link per build side.
+    pub stages: &'a [JoinStage<'a>],
     /// The grouping and the aggregates over a joined row (its filter is not read).
     pub shape: &'a ScanAggregate<'a>,
 }
@@ -928,30 +987,18 @@ impl Pipeline for TableJoinAggregate<'_> {
         budget: &MemoryBudget,
     ) -> Result<(), MorselError> {
         let mut joined: Vec<Value> = Vec::new();
+        let mut walk = Vec::new();
         self.table.scan(leaves, |rowid, row| {
             for term in self.probe_filter {
                 if !term.holds(row)? {
                     return Ok(());
                 }
             }
-            let matches = self.probe.matches(row)?;
-            if matches.is_empty() {
-                return Ok(());
-            }
-            // A probe row's matches share its place: the hook takes only columns whose equal
+            // A probe row's joined rows share its place: the hook takes only columns whose equal
             // values are the same value (translate/parallel.rs), so a tie among them is no choice.
-            let at = position(rowid)?;
-            for build in matches {
-                let build_row = self.build.get(*build).ok_or(MorselError::Overflow {
-                    what: "a match's build row",
-                })?;
-                joined.clear();
-                joined.try_reserve(row.len().saturating_add(build_row.len()))?;
-                joined.extend_from_slice(row);
-                joined.extend_from_slice(build_row);
-                self.shape.fold(&joined, at, partial, budget)?;
-            }
-            Ok(())
+            each_joined(self.stages, row, &mut joined, &mut walk, |joined| {
+                self.shape.fold(joined, position(rowid)?, partial, budget)
+            })
         })
     }
 
@@ -987,10 +1034,9 @@ pub struct TableJoinRows<'a> {
     pub table: &'a TableSource,
     /// Terms over the probe row alone, tested before it is probed.
     pub probe_filter: &'a [Predicate],
-    pub probe: &'a HashProbe<'a>,
-    /// The build side's rows, as `probe` numbers them.
-    pub build: &'a [Vec<Value>],
-    /// The joined row's columns (the probe row's, then the build row's) each output row takes.
+    /// The chain of hash tables, one link per build side.
+    pub stages: &'a [JoinStage<'a>],
+    /// The joined row's columns (the probe row's, then each link's) each output row takes.
     pub project: &'a [usize],
     /// The sort keys: each one's place in the output row, and whether it descends.
     pub order: &'a [(usize, bool)],
@@ -1074,27 +1120,22 @@ impl Pipeline for TableJoinRows<'_> {
     ) -> Result<(), MorselError> {
         let first = leaves.start;
         let mut found: Vec<Vec<Value>> = Vec::new();
+        let mut joined: Vec<Value> = Vec::new();
+        let mut walk = Vec::new();
         self.table.scan(leaves, |_, row| {
             for term in self.probe_filter {
                 if !term.holds(row)? {
                     return Ok(());
                 }
             }
-            for build in self.probe.matches(row)? {
-                let build_row = self.build.get(*build).ok_or(MorselError::Overflow {
-                    what: "a match's build row",
-                })?;
+            each_joined(self.stages, row, &mut joined, &mut walk, |joined| {
                 let mut out = Vec::new();
                 out.try_reserve_exact(self.project.len())?;
                 let mut bytes = std::mem::size_of::<Value>().saturating_mul(self.project.len());
                 for at in self.project {
-                    let value = match at.checked_sub(row.len()) {
-                        None => row.get(*at),
-                        Some(at) => build_row.get(at),
-                    }
-                    .ok_or_else(|| MorselError::NoColumn {
+                    let value = joined.get(*at).ok_or(MorselError::NoColumn {
                         column: *at,
-                        width: row.len().saturating_add(build_row.len()),
+                        width: joined.len(),
                     })?;
                     bytes = bytes.saturating_add(match value {
                         Value::Text(text) => text.as_str().len(),
@@ -1106,8 +1147,8 @@ impl Pipeline for TableJoinRows<'_> {
                 budget.charge(bytes)?;
                 found.try_reserve(1)?;
                 found.push(out);
-            }
-            Ok(())
+                Ok(())
+            })
         })?;
         if !self.order.is_empty() {
             found.sort_by(|a, b| self.compare(a, b));

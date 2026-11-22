@@ -1056,8 +1056,9 @@ are the serial loop's to the row (T-QT.6.14). Lane qs6-7: workers run a copy of 
 body, each with its own registers, so any filter or expression runs in parallel (T-QT.6.15).
 Lane qs6-8: a scan's rows run through the copy too, and under a LIMIT with no ORDER BY
 (behind its switch, serial the control) the workers stop once they hold the LIMIT's rows (T-QT.6.16).
-Still open: the copy for joins, joins of three or more tables, outer joins, a LIMIT that stops
-the workers early.
+Lane qs6-10: inner joins of any number of tables run on morsels: every table but the probe is a
+link of a chain of hash tables, each keyed by its equalities with the tables before it, and each
+probe row walks the chain (T-QT.6.17). Still open: the copy of the loop body for joins, outer joins.
 
 order-preserving merge under ORDER BY (T-QT.6.12, T-QT.6.13). Still open: workers running a copy of
 the VDBE loop body (any expression in parallel), joins of three or more tables.

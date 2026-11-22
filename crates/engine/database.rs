@@ -2856,6 +2856,7 @@ impl Database {
             parallel_limit: AtomicBool::new(false),
             morsel_costs: crate::sync::Mutex::new(None),
             morsel_body_rows: AtomicU64::new(0),
+            morsel_join_links: AtomicU64::new(0),
             vectorized_scans: AtomicBool::new(false),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
