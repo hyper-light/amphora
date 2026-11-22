@@ -1703,7 +1703,7 @@ impl Database {
         let mut waited = false;
         loop {
             let before = match joined.as_ref() {
-                Some((row, _)) => Some(rung(&locked(&changed.lock_waiters)?, row)),
+                Some((row, _)) => Some(rung(&*locked(&changed.lock_waiters)?, row)),
                 None => None,
             };
             let row = match try_read()? {
@@ -3025,7 +3025,7 @@ fn commit(
         (family, key)
     });
     for (family, key) in conds.chain(writes) {
-        if crate::xgroup::sql::locked(db, ns, family, key)? {
+        if crate::xgroup::sql::locked(db, ns, family, key)?.is_some() {
             return Ok(Err(Refusal::Conflict {
                 family: family.clone(),
                 key: key.clone(),

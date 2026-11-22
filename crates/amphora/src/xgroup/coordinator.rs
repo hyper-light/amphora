@@ -515,7 +515,7 @@ impl Coordinator {
                 Ok(other) => return Err(unexpected(sent.kind, &other)),
             },
             Kind::Scan => self.on_scan(&mut out, sent, reply)?,
-            _ => self.on_run(&mut out, sent, reply)?,
+            _ => self.on_run(&mut out, sent, reply, clock)?,
         }
         Ok(out)
     }
@@ -634,6 +634,7 @@ impl Coordinator {
         out: &mut Vec<Event>,
         sent: Sent,
         reply: Result<Reply, Lost>,
+        clock: Option<u64>,
     ) -> Result<(), Refusal> {
         let Some(txn) = sent.txn else {
             return Err(broken(
