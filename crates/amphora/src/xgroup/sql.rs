@@ -873,6 +873,12 @@ impl Cluster {
         result
     }
 
+    /// The groups, group `i` at `i`: what a database's reads across groups read
+    /// ([`Database::across`]).
+    pub(crate) fn groups(&self) -> &[Member] {
+        &self.groups
+    }
+
     /// What it counted so far (AC-T1.10.6).
     pub fn counted(&self) -> Counted {
         let mut out = Counted::default();

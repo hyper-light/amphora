@@ -107,6 +107,7 @@ pub(super) fn publish(database: &Database, path: &Path) -> Result<(), Refusal> {
             weak.upgrade().map(|shared| Database {
                 shared,
                 application: None,
+                cluster: None,
             })
         })?);
     }
@@ -145,6 +146,7 @@ pub(super) fn attach(
     };
     Ok(Database {
         application: None,
+        cluster: None,
         shared: Arc::new(Shared {
             transport: Mutex::new(None),
             path: OnceLock::new(),
@@ -331,6 +333,7 @@ impl Database {
                             return Ok(Some(Self {
                                 shared,
                                 application: None,
+                                cluster: None,
                             }));
                         }
                         Err(
@@ -347,6 +350,7 @@ impl Database {
                         return Ok(Some(Self {
                             shared,
                             application: None,
+                            cluster: None,
                         }));
                     }
                     _ => {
@@ -567,6 +571,7 @@ impl Database {
             weak.upgrade().map(|shared| Database {
                 shared,
                 application: None,
+                cluster: None,
             })
         })
     }

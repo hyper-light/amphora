@@ -26,6 +26,7 @@ use crate::db::Db;
 use crate::reshard;
 use crate::store::{self, Checkpointed, Engine, Flush, Opener, Store};
 
+mod across;
 mod application;
 pub(crate) use application::Application;
 
@@ -63,7 +64,9 @@ CREATE TABLE IF NOT EXISTS __amphora_versions (namespace TEXT NOT NULL, family T
 CREATE INDEX IF NOT EXISTS __amphora_feed ON __amphora_versions(namespace, family, rev, seq);
 CREATE TABLE IF NOT EXISTS __amphora_families (namespace TEXT NOT NULL, family TEXT NOT NULL, newest INTEGER NOT NULL, PRIMARY KEY(namespace, family));
 CREATE TABLE IF NOT EXISTS __amphora_migrations (name TEXT PRIMARY KEY, sql TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS __amphora_holding (one INTEGER PRIMARY KEY CHECK (one = 0), holding BLOB NOT NULL);";
+CREATE TABLE IF NOT EXISTS __amphora_holding (one INTEGER PRIMARY KEY CHECK (one = 0), holding BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS __amphora_rev_stamps (namespace TEXT NOT NULL, rev INTEGER NOT NULL, stamp INTEGER NOT NULL, PRIMARY KEY(namespace, rev));
+CREATE INDEX IF NOT EXISTS __amphora_rev_stamps_order ON __amphora_rev_stamps(namespace, stamp);";
 const LIVE_MAX: u64 = 10_000_000;
 const QUEUED_BYTES: usize = 512 << 20;
 struct Admission(Arc<AtomicUsize>);
@@ -90,6 +93,10 @@ impl Drop for Admission {
 pub struct Database {
     shared: Arc<Shared>,
     application: Option<Application>,
+    /// The groups a namespace's rows are spread over (CP-T1.9, lane split-merge-18; the field
+    /// agreed with lane xgroup-sql-6): with one, a namespace's scans, changes and head are read
+    /// across every group, in the order of their commit stamps ([`Database::across`]).
+    cluster: Option<Arc<crate::xgroup::sql::Cluster>>,
 }
 
 struct Shared {
@@ -769,6 +776,7 @@ impl Database {
                                 return Ok(Self {
                                     shared,
                                     application: None,
+                                    cluster: None,
                                 });
                             }
                             // Identity probes cannot submit application work. Only a successful
@@ -802,11 +810,13 @@ impl Database {
                         return Ok(Self {
                             shared,
                             application: None,
+                            cluster: None,
                         });
                     } else {
                         return Ok(Self {
                             shared,
                             application: None,
+                            cluster: None,
                         });
                     }
                 }
@@ -1037,6 +1047,7 @@ impl Database {
                 )?;
                 Ok(Self {
                     application: None,
+                    cluster: None,
                     shared: Arc::new(Shared {
                         transport: Mutex::new(None),
                         path: OnceLock::new(),
@@ -1112,6 +1123,7 @@ impl Database {
         *locked(&changed.published)? = read_published(&db)?;
         let database = Self {
             application: None,
+            cluster: None,
             shared: Arc::new(Shared {
                 transport: Mutex::new(None),
                 path: OnceLock::new(),
@@ -1129,6 +1141,20 @@ impl Database {
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
         database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
         Ok(database)
+    }
+
+    /// This database's handle over `cluster`'s groups (lane split-merge-18, T-T1.9.R20): its
+    /// namespaces' scans, changes and heads read every group, each revision in the order of its
+    /// commit stamp, the hybrid logical clock the cross-group steps carry
+    /// (docs/design/reshard.md, "Decision (lane split-merge-18): reads across groups by commit
+    /// stamp"). Every group must be backed up, so that it stamps its commits. The groups' own
+    /// handles are the ones the cluster was opened over, without it.
+    #[must_use]
+    pub fn across(&self, cluster: Arc<crate::xgroup::sql::Cluster>) -> Self {
+        Self {
+            cluster: Some(cluster),
+            ..self.clone()
+        }
     }
 
     pub fn namespace(&self, name: &str) -> Result<Namespace, Refusal> {
@@ -1715,6 +1741,9 @@ impl Records for Namespace {
         if let Some(k) = &scan.after {
             api::key(k)?;
         }
+        if let Some(cluster) = &self.database.cluster {
+            return across::scan(cluster.groups(), &self.name, family, &scan, until);
+        }
         match self
             .database
             .submit(&self.name, Operation::Scan(family.into(), scan), until)?
@@ -1746,6 +1775,9 @@ impl Records for Namespace {
     ) -> Result<Changes, Refusal> {
         api::family(family)?;
         let limit = api::limit(limit)?;
+        if let Some(cluster) = &self.database.cluster {
+            return across::changes(cluster.groups(), &self.name, family, after, limit, until);
+        }
         match self.database.submit(
             &self.name,
             Operation::Changes(family.into(), after, limit),
@@ -1760,6 +1792,9 @@ impl Records for Namespace {
             .try_wait_selected(family, after, until)
     }
     fn head(&self, until: Instant) -> Result<Rev, Refusal> {
+        if let Some(cluster) = &self.database.cluster {
+            return across::head(cluster.groups(), &self.name, until);
+        }
         match self.database.submit(&self.name, Operation::Head, until)? {
             Answer::Rev(v) => Ok(v),
             _ => Err(unavailable("wrong head answer")),
@@ -2425,6 +2460,7 @@ pub(crate) fn write_across(
         None => EValue::Null,
     };
     db.query("INSERT INTO __amphora_versions(namespace, family, key, rev, seq, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", [text(ns), text(family), blob(key)?, integer(at)?, integer(seq)?, stored], |_| Ok(true))?;
+    across::stamp(db, ns, at)?;
     group::wrote(db, ns, family, key)?;
     db.query("INSERT INTO __amphora_families(namespace, family, newest) VALUES (?1, ?2, ?3) ON CONFLICT(namespace, family) DO UPDATE SET newest = excluded.newest", [text(ns), text(family), integer(at)?], |_| Ok(true))?;
     db.query(
@@ -2510,6 +2546,7 @@ fn commit(
     let at = head
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("revision overflow"))?;
+    across::stamp(db, ns, at)?;
     for ((family, key), (seq, w)) in final_writes {
         let value = match w {
             Write::Put { value, .. } => blob(value)?,

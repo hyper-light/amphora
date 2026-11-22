@@ -202,6 +202,15 @@ impl Marks {
         Ok(())
     }
 
+    /// A stamp later than every one made or seen here, under the lock commits are stamped by: every
+    /// stamp after it is later still. On the writer, a Records revision's place in the order across
+    /// groups as its commit writes it, and the time through which a group has made every revision
+    /// it will (lane split-merge-18, T-T1.9.R20); the commit's own mark, made as it ends, is later.
+    pub fn next(&self) -> anyhow::Result<u64> {
+        let mut state = self.state()?;
+        Ok(self.stamp(&mut state))
+    }
+
     /// The latest stamp made or seen here: every commit stamped so far is at or before it.
     pub fn latest(&self) -> anyhow::Result<u64> {
         Ok(self.state()?.last)

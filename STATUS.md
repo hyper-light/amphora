@@ -576,7 +576,8 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   a network address under the replicated transport's mutual TLS (T-T1.9.R18). Left: a `Database` over `Groups<Local>`, a group's size from its B-tree, and the
   full AC-T1.9.2 and AC-T1.9.3 runs. A retired group's files are named to the caller, who deletes
   them (T-T1.9.R16). Size cut (lane split-merge-15): a group's size cut is its position index's middle key, read
-  from the index's root page alone (T-T1.9.R19).
+  from the index's root page alone (T-T1.9.R19). Reads across groups (lane split-merge-18): a database handed the groups'
+  coordinator scans, reads changes and heads across every group, each revision by its commit stamp (T-T1.9.R20).
 
 - **Online index builds by F1's states** (CP-T1.12, T-T1.12.1, docs/design/online-schema.md):
   `Database::change_schema` builds a `CREATE [UNIQUE] INDEX` absent, delete-only, write-only, then

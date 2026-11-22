@@ -605,3 +605,49 @@ count. If a lab shows cuts far from the middle of the bytes, the root's children
 
 **Falsified by.** A size cut with no key on one side; a measure that reads more than the root page
 of the position index for it.
+
+## Decision (lane split-merge-18): reads across groups by commit stamp
+
+Each group counts its own revisions, so once a namespace's keys are in more than one group a
+revision orders one group's writes only, and a scan, the changes and the head went to one group
+(decision "The routing key is bytes"). Ada's decision (2026-11-22, 07:17Z) is that a revision
+across groups is the cross-group timestamp, the one the session tokens use. Now a database handed
+the groups' coordinator (`Database::across`, the optional `Cluster` agreed with lane xgroup-sql-6)
+reads its namespaces across every group, ordered by each revision's commit stamp:
+- The stamp is the backup's hybrid logical clock (`backup::Marks`; Kulkarni et al., "Logical
+  Physical Clocks", OPODIS 2014), which the cross-group steps already carry from group to group
+  (T-T1.12.X2), so a commit made after another, by any path of steps, is stamped after it, whatever
+  the two machines' clocks read. A backed-up writer takes a stamp for each revision as its commit
+  writes it (`Marks::next`) and keeps it beside the revision (`__amphora_rev_stamps`).
+- A read takes a stamp from every group, and its cut is the latest; every group then observes the
+  cut, so each commit it stamps from then on is later; then one call on each group's writer reads as
+  of the cut, after every commit that took its stamp before. The cut is closed in every group: no
+  revision is ever made at or before it later, so a cursor at the head never passes a change, and
+  the cut holds every write answered before the read began.
+- `head` is the cut. `changes` are every group's after the cursor through the cut, in stamp order;
+  a group with more than the limit bounds the page at its last stamp returned, and no page cuts a
+  stamp. `scan` reads each group as of its newest revision at or before the cut (or a stamp asked
+  as a snapshot), merged by key. The revision answered is the stamp.
+- A group must stamp its commits (opened backed up) and be in this process; otherwise the read is
+  refused, typed, naming the group.
+
+**Evidence.** `database::across`, T-T1.9.R20: two backed-up groups, the second's clock 500
+seconds behind the first's, rows written in turn through their coordinator; the changes across
+them come in the order written, in pages of one alike, a scan merges them by key, and a row written
+after the head is stamped past it.
+
+**Left.**
+- One candidate is built. Its rival is a cut from each group's own stamp alone, the earliest of
+  them, with no observe: one call fewer a group, but a quiet group holds the head back. They want a
+  switch and the lab's numbers (head latency p50/p99/p99.9 and how far the head trails, at 1 to
+  4096 groups) before either is kept.
+- A revision made before its group stamped, or moved in from another group, has no stamp: a scan
+  answers it at 0, and the changes refuse it. The copy path doesn't move the stamps with the rows
+  yet.
+- Compaction keeps every stamp, one row a revision: it must trim the stamps of the revisions it
+  took, within its bounded steps, before this is bounded.
+- `get`, `commit`, `changed` and `wait` still answer from this database alone; groups on a node are
+  read through their own endpoint once it answers Records.
+
+**Falsified by.** A change across groups answered after one that was written after it; a change
+made at or before a head answered earlier; a page that cuts a stamp.
