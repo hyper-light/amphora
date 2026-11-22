@@ -5,8 +5,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
 
 ## Implemented
 
-- **Read-your-writes by session tokens** (CP-T1.10, AC-T1.10.R1-R3, lane ryw-1; docs/design/replication.md):
-  `Database::session_token` after a write, and `Database::query_session(ReadMode, token, ..)`. `Latest` is today's read
+- **Read-your-writes by session tokens** (CP-T1.10, AC-T1.10.R1-R4, lanes ryw-1 and ryw-3; docs/design/replication.md):
+  each write's answer carries its own token (`Database::call_session`, `execute_session`), so a session waits for its
+  own writes and no one else's, and `Database::query_session(ReadMode, token, ..)` reads with it. `Latest` is today's read
   (the control). `Session` serves a token read on any replica that has applied the token, waits only while that replica
   is behind, and redirects past its measured apply lag. A read without a token never waits. `session_counters` holds the
   instruments, and `amphora-bench --cluster --shapes ryw` runs the ladder. Waits on the coordinator: the A/B on
@@ -1173,3 +1174,12 @@ does not build at main 0ace0e0d (bench/src/columns.rs:174), so `commits_ab.sh` r
   `amphora member CONFIG add|promote|demote|remove N` with a config `voters` key (spares start as
   learners); the region-lost drill replaces a lost member with a spare. Mutual TLS waits on the
   split-merge listener's TLS landing on t1/group-replication.
+  Lane production-6: three more drills, `hang` (a member's log disk hung, its network going on),
+  `disk` (its log disk cut: every read, write and flush of it fails, the replica fences and the
+  member ends, then starts again with its disk back) and `roll` (a rolling restart, the leader
+  last, each member caught up before the next); `all` runs kill, split, stall, hang, disk and roll,
+  each counted on every member. A test cuts the leader's disk
+  under load and finds every acknowledged write on the two left. Untested on Linux yet.
+  Lane production-7: a log write the disk refuses ends the member at once: the replica fences,
+  and the fence now wakes the member's sender (`drain_wait`), which used to sleep out its
+  deadline. A member with `drills = off` refuses `disk` and `cut`. Untested on Linux yet.

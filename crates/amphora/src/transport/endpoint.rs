@@ -85,11 +85,25 @@ fn database_path(path: &Path) -> Result<PathBuf, Refusal> {
 }
 
 fn directory(path: &Path) -> Result<PathBuf, Refusal> {
-    let canonical = database_path(path)?;
-    let mut sidecar = canonical.into_os_string();
-    sidecar.push(".client");
-    Ok(PathBuf::from(sidecar))
+    Ok(sidecar(&database_path(path)?))
 }
+
+/// The private directory beside the database at `canonical`, a path already made canonical.
+fn sidecar(canonical: &Path) -> PathBuf {
+    let mut sidecar = canonical.as_os_str().to_os_string();
+    sidecar.push(".client");
+    PathBuf::from(sidecar)
+}
+
+/// The file [`try_lease`] locks for the database at `canonical`, a path already made canonical,
+/// which may not exist yet. Every path that reaches the database's directory reaches this file, so
+/// its identity names the lease whatever path an open took (CP-T1.13).
+pub(crate) fn lease_file(canonical: &Path) -> PathBuf {
+    sidecar(canonical).join(LEASE)
+}
+
+/// The name of the lease's file in a database's private directory.
+const LEASE: &str = "database-owner";
 
 fn remaining(until: Instant) -> Result<Duration, Refusal> {
     let left = until.saturating_duration_since(Instant::now());
@@ -178,7 +192,7 @@ fn owner_lock(path: &Path) -> Result<File, Refusal> {
     single_database_link(&canonical)?;
     let private_lock = directory
         .open_file_with(
-            "database-owner",
+            LEASE,
             OpenOptions {
                 access: FileAccess::ReadWrite,
                 creation: FileCreation::OpenOrCreate,

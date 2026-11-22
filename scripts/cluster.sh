@@ -6,15 +6,18 @@
 #
 # usage: scripts/cluster.sh install --bin BIN --class persisted|replicated --deadline-ms MS
 #                                    [--spanning N] [--drills on|off] [--service auto|none]
-#                                    HOST1:PORT HOST2:PORT HOST3:PORT
+#                                    [--spare HOST4:PORT] HOST1:PORT HOST2:PORT HOST3:PORT
 #        scripts/cluster.sh health HOST:PORT N        (member N's host asks every member)
-#        scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT   (keeps the data)
+#        scripts/cluster.sh uninstall HOST1:PORT HOST2:PORT HOST3:PORT [HOST4:PORT]   (keeps the data)
 #   HOSTn:PORT  each member's address as its peers reach it; member n listens there. A host that is
 #               this machine (localhost, 127.0.0.1, `hostname`) is set up here; any other by ssh.
 #               One host three times on three ports is three members on one machine.
 #   --bin       the amphora binary built for those machines (cargo build --release -p amphora).
 #   --service   none writes the configs and the secret only (a machine without systemd or launchd,
 #               or members run by hand: `amphora serve CONFIG`).
+#   --spare     a fourth member, 4, set up beside the three as a learner: every config names it in
+#               `members` and says `voters = 1,2,3`, so it holds no vote until `amphora member
+#               CONFIG add 4` and `promote 4` (docs/runbook.md, "A region lost"; drills.sh region).
 # Every size and duration is an argument: nothing is picked here.
 set -euo pipefail
 LIB='$HOME/.local/lib/amphora' CONF='$HOME/.config/amphora' DATA='$HOME/.local/share/amphora'
@@ -27,25 +30,26 @@ put() { # put HOST LOCAL REMOTE_DIR NAME
 }
 
 install() {
-  local bin='' class='' deadline='' spanning='' drills=off service=auto addrs=()
+  local bin='' class='' deadline='' spanning='' drills=off service=auto spare='' addrs=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --bin) bin=$2; shift 2 ;; --class) class=$2; shift 2 ;; --deadline-ms) deadline=$2; shift 2 ;;
       --spanning) spanning=$2; shift 2 ;; --drills) drills=$2; shift 2 ;; --service) service=$2; shift 2 ;;
-      --*) die "unknown flag $1" ;; *) addrs+=("$1"); shift ;;
+      --spare) spare=$2; shift 2 ;; --*) die "unknown flag $1" ;; *) addrs+=("$1"); shift ;;
     esac
   done
   [[ -n $bin && -n $class && -n $deadline ]] || die "install needs --bin, --class and --deadline-ms"
   [[ ${#addrs[@]} -eq 3 ]] || die "install takes three HOST:PORT members, not ${#addrs[@]}"
   [[ -x $bin ]] || die "no binary at $bin"
-  local members='' n
-  for n in 1 2 3; do members+="${members:+,}$n@${addrs[$((n - 1))]}"; done
+  [[ -n $spare ]] && addrs+=("$spare")
+  local members='' n count=${#addrs[@]}
+  for n in $(seq 1 "$count"); do members+="${members:+,}$n@${addrs[$((n - 1))]}"; done
   # One secret for the cluster, made here once (48 random bytes as base64: past RFC 2104's 32-byte
   # minimum for HMAC-SHA256), readable by its owner only.
   local secret; secret=$(mktemp "${TMPDIR:-$HOME}/amphora-secret.XXXXXX")
   trap 'rm -f "$secret"' RETURN
   (umask 077; head -c 48 /dev/urandom | base64 >"$secret")
-  for n in 1 2 3; do
+  for n in $(seq 1 "$count"); do
     local addr=${addrs[$((n - 1))]} host=${addrs[$((n - 1))]%:*}
     echo "== member $n on $addr" >&2
     put "$host" "$bin" "$LIB" amphora
@@ -60,6 +64,7 @@ members = $members
 data = $DATA/member-$n
 class = $class
 ${spanning:+spanning = $spanning}
+${spare:+voters = 1,2,3}
 secret_file = $CONF/secret
 deadline_ms = $deadline
 drills = $drills
@@ -112,7 +117,7 @@ health() {
 }
 
 uninstall() {
-  [[ $# -eq 3 ]] || die "uninstall takes three HOST:PORT members"
+  [[ $# -eq 3 || $# -eq 4 ]] || die "uninstall takes three HOST:PORT members and the spare's, if any"
   local n=0 addr
   for addr in "$@"; do
     n=$((n + 1))

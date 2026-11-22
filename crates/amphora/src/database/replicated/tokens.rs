@@ -1,8 +1,8 @@
 //! Session tokens: a session reads its own writes on any replica (replication.md, "Decision (lane
-//! ryw-1): read-your-writes by session tokens"; kiln goal 8119f25d, AC-T1.10.R1 to R3).
+//! ryw-1): read-your-writes by session tokens"; kiln goal 8119f25d, AC-T1.10.R1 to R4).
 //!
-//! A write's acknowledgement gives its session a [`Token`]: the point of the group's committed
-//! log the write is at or before. A read that carries one is served by any replica whose applied
+//! A write's acknowledgement gives its session a [`Token`]: the point of its own entry in the
+//! group's committed log, so a session waits for its own writes and no one else's. A read that carries one is served by any replica whose applied
 //! point is at or past it; it waits on that replica alone, only while the replica is behind, and
 //! only up to the replica's measured apply lag, past which it is redirected to the leader's read.
 //! A read with no token is a local read, which never waits for the log.
@@ -87,16 +87,10 @@ pub struct SessionCounters {
 }
 
 impl Client {
-    /// The token of what this replica's owner last acknowledged: taken after a write's answer,
-    /// it is at or past that write (the owner publishes its point before it answers). Under
-    /// concurrent writers it may name a later write than the caller's, which reads only wait for
-    /// longer, never miss.
-    pub(in crate::database) fn token(&self) -> Result<Token, Refusal> {
-        let point = locked(&self.handle.shared.closed)?;
-        Ok(Token {
-            micros: point.time.unwrap_or(0),
-            index: point.answered,
-        })
+    /// This replica's closed time in microseconds (0 before the group's first stamped entry): the
+    /// replicated group's clock on the one cross-group clock ([`crate::Database::cross_clock`]).
+    pub(in crate::database) fn closed_micros(&self) -> Result<u64, Refusal> {
+        Ok(locked(&self.handle.shared.closed)?.time.unwrap_or(0))
     }
     /// `read` on a local reader once this replica has applied `token`; `read` answers `Err` with
     /// the time it found if its own transaction's state is earlier than the token's time, and the

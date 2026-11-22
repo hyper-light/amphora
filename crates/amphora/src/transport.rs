@@ -10,7 +10,7 @@ mod peer;
 mod watch;
 mod wire;
 pub use common::{Client, Namespace, Node, Nodes, Owner};
-pub(crate) use endpoint::try_lease;
+pub(crate) use endpoint::{lease_file, try_lease};
 pub use peer::{PeerBlobs, PeerStore};
 #[cfg(test)]
 pub(crate) use endpoint::wait_lease;

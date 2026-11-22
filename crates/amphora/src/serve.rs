@@ -9,7 +9,11 @@
 //! - `amphora health CONFIG`: asks every member for its status; healthy when every member answers,
 //!   all name the same leader, each holds the configured voters and none is fenced.
 //! - `amphora ask CONFIG NODE REQUEST`: one request to one member (`status`, `exec SQL`,
-//!   `count SQL`, and `cut on|off` where the member's config says `drills = on`).
+//!   `count SQL`, `cut on|off` and `disk cut|hang|back` where the member's config says
+//!   `drills = on`,
+//!   `member …`, and
+//!   `leader WAIT_MS`: wait until the member knows its group's leader, at most WAIT_MS, and answer
+//!   `leader=ID addr=HOST:PORT term=T`; woken by the election's step, never by polling).
 //! - `amphora drill load|check`: the fire drills' writers and their loss count ([`load`], [`check`]).
 //!
 //! The config, one per member (`key = value` lines, `#` comments; every key below but `drills` and
@@ -23,6 +27,7 @@
 //! secret_file = /home/me/.config/amphora/secret
 //! deadline_ms = 5000                         # how long one request, connect or open may take
 //! drills = off                               # on: the member takes `cut` (a split at its transport)
+//!                                            # and `disk` (its log's disk cut or hung)
 //! ```
 //!
 //! A connection's first byte says what it carries: `R` (a peer's Raft records) or `C` (a client's
@@ -43,16 +48,16 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use amphora_api::replication::{Durability, Fates, MemberChange, ReplicaConfig};
-use anyhow::{anyhow, bail, ensure, Context};
+use anyhow::{Context, anyhow, bail, ensure};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::database::replicated::{OUTGOING_MESSAGES, WIRE_BYTES};
-use crate::database::Database;
+use crate::database::{Database, LogDisk};
 
 const RECORDS: u8 = b'R';
 const CLIENT: u8 = b'C';
@@ -253,6 +258,10 @@ struct Shared {
     deadline: Duration,
     secret: Vec<u8>,
     drills: bool,
+    /// This member's raft log, whose disk `disk` cuts or hangs.
+    log: PathBuf,
+    /// Each member's address as the config names it, for the `leader` request's answer.
+    addrs: BTreeMap<u64, String>,
     /// Each peer's records connection, to close it when the peer opens another.
     links: Mutex<BTreeMap<u64, TcpStream>>,
 }
@@ -297,6 +306,12 @@ pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
         deadline: config.deadline,
         secret,
         drills: config.drills,
+        log: config.data.join("raft.log"),
+        addrs: config
+            .members
+            .iter()
+            .map(|m| (m.node, m.addr.clone()))
+            .collect(),
         links: Mutex::new(BTreeMap::new()),
     });
     let mut peers: BTreeMap<u64, mpsc::SyncSender<Vec<u8>>> = BTreeMap::new();
@@ -523,6 +538,25 @@ impl Shared {
                 self.cut.store(to, Ordering::Relaxed);
                 Ok(String::new())
             }
+            // A disk cut or hung (T-T1.13.1): cut, every read, write and flush of this member's
+            // log fails as a disk gone away fails them, its replica fences on the first and the
+            // process ends with the reason; hung, each waits, its network going on, until the
+            // disk is back or cut. A member started again finds its disk back.
+            "disk" => {
+                ensure!(
+                    self.drills,
+                    "drills are off in this member's config (drills = on takes disk)"
+                );
+                let disk = match rest {
+                    "cut" => LogDisk::Cut,
+                    "hang" => LogDisk::Hung,
+                    "back" => LogDisk::Back,
+                    other => bail!("disk {other}: cut, hang or back"),
+                };
+                Database::set_log_disk(&self.log, disk)
+                    .map_err(|e| anyhow!("disk {rest}: {e:?}"))?;
+                Ok(String::new())
+            }
             // A membership change, made by the leader (T-T1.13.1): a spare added as a learner,
             // promoted once it holds the log, a lost member demoted or removed.
             "member" => {
@@ -556,7 +590,31 @@ impl Shared {
                     list(&s.learners)
                 ))
             }
-            other => bail!("unknown request {other:?} (status, exec, count, cut, member)"),
+            // Waits for a leader (CP-T1.13): a client that must write waits here while its group
+            // elects, rather than retrying writes a follower refuses at once. It wakes on the
+            // step that names the leader ([`crate::database::replicated::ReplicaHandle::wait_leader`])
+            // and gives up at the caller's deadline, WAIT_MS from now.
+            "leader" => {
+                let wait: u64 = rest
+                    .trim()
+                    .parse()
+                    .context("leader WAIT_MS: how long to wait, in milliseconds")?;
+                let s = self
+                    .db
+                    .replica()
+                    .ok_or_else(|| anyhow!("no replica"))?
+                    .wait_leader(0, after(Duration::from_millis(wait))?)
+                    .map_err(|e| anyhow!("no leader within {wait} ms: {e:?}"))?;
+                Ok(format!(
+                    "leader={} addr={} term={}",
+                    s.leader,
+                    self.addrs.get(&s.leader).map_or("-", String::as_str),
+                    s.term
+                ))
+            }
+            other => {
+                bail!("unknown request {other:?} (status, exec, count, cut, disk, member, leader)")
+            }
         }
     }
 }
@@ -621,12 +679,36 @@ fn open(
 pub struct Client {
     r: BufReader<TcpStream>,
     w: TcpStream,
+    deadline: Duration,
 }
 
 impl Client {
     pub fn connect(addr: &str, secret: &[u8], deadline: Duration) -> anyhow::Result<Self> {
         let (r, w) = open(addr, secret, deadline, CLIENT)?;
-        Ok(Self { r, w })
+        Ok(Self { r, w, deadline })
+    }
+
+    /// The member's `leader` request: waits at most `wait` until the member knows its group's
+    /// leader and answers its ID and address as the member's config names it (`-` for a leader
+    /// it doesn't name). The connection waits `wait` and its own deadline for the answer.
+    pub fn leader(&mut self, wait: Duration) -> anyhow::Result<(u64, String)> {
+        let millis = u64::try_from(wait.as_millis()).context("a wait past u64 milliseconds")?;
+        self.r
+            .get_ref()
+            .set_read_timeout(Some(wait.saturating_add(self.deadline)))?;
+        let answer = self.ask(&format!("leader {millis}"));
+        self.r.get_ref().set_read_timeout(Some(self.deadline))?;
+        let f = fields(&answer?);
+        let id = f
+            .get("leader")
+            .ok_or_else(|| anyhow!("a leader answer without its leader"))?
+            .parse()
+            .context("the leader's ID")?;
+        let addr = f
+            .get("addr")
+            .cloned()
+            .ok_or_else(|| anyhow!("a leader answer without its address"))?;
+        Ok((id, addr))
     }
 
     /// The member's answer to `request`, past its `ok`; its `err` as the error.
@@ -864,8 +946,20 @@ pub fn load(
                     }
                     Err(_) => {
                         conn = None;
-                        via = via.saturating_add(1).checked_rem(n).unwrap_or(0);
                         retries.fetch_add(1, Ordering::Relaxed);
+                        // Sent again where the leader is: the next member asked for it (the
+                        // `leader` request, answered once the group has one, woken by the
+                        // election), as the bench's client finds it; that member itself when it
+                        // can't say.
+                        via = via.saturating_add(1).checked_rem(n).unwrap_or(0);
+                        let named = addrs
+                            .get(via)
+                            .and_then(|a| Client::connect(a, &secret, deadline).ok())
+                            .and_then(|mut c| c.leader(deadline).ok())
+                            .and_then(|(_, at)| addrs.iter().position(|a| *a == at));
+                        if let Some(at) = named {
+                            via = at;
+                        }
                     }
                 }
             }
@@ -1016,8 +1110,14 @@ pub fn command(args: &[String], ready: impl FnOnce(&str)) -> Option<crate::Reply
         ("ask", [config, node, request @ ..]) if !request.is_empty() => reply((|| {
             let c = Config::load(Path::new(config))?;
             let m = c.member(node.parse()?)?;
-            let answer =
-                Client::connect(&m.addr, &c.secret()?, c.deadline)?.ask(&request.join(" "))?;
+            let mut k = Client::connect(&m.addr, &c.secret()?, c.deadline)?;
+            let answer = match request {
+                [what, wait] if what == "leader" => {
+                    let (id, addr) = k.leader(Duration::from_millis(wait.parse()?))?;
+                    format!("leader={id} addr={addr}")
+                }
+                _ => k.ask(&request.join(" "))?,
+            };
             Ok((format!("{answer}\n"), true))
         })()),
         // The change goes to each voter in turn until one, the leader, makes it: a follower
@@ -1038,7 +1138,7 @@ pub fn command(args: &[String], ready: impl FnOnce(&str)) -> Option<crate::Reply
 "
                             ),
                             true,
-                        ))
+                        ));
                     }
                     Err(e) => refused.push(format!("member {}: {e:#}", m.node)),
                 }

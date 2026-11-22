@@ -1,7 +1,7 @@
 //! Session tokens (replication.md, "Decision (lane ryw-1): read-your-writes by session tokens";
-//! kiln goal 8119f25d, AC-T1.10.R1 and R2, T-T1.10.R1 to R3), on the driven shell: a session
-//! reads its own writes on a lagging follower and across a change of leader, and a read with no
-//! token never waits.
+//! kiln goal 8119f25d, AC-T1.10.R1, R2 and R4, T-T1.10.R1 to R4), on the driven shell: a session
+//! reads its own writes on a lagging follower and across a change of leader, waits for its own
+//! writes and no one else's, and a read with no token never waits.
 
 use super::*;
 
@@ -24,10 +24,19 @@ fn read_token(client: &Client, token: Token) -> Result<Served<Vec<u8>>, Refusal>
     })
 }
 
-/// Writes `value` through `client` and gives back the session's token taken after the answer.
+/// The call that writes `value` to member_items.
+fn insert(value: u8) -> impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static {
+    move |db| {
+        db.exec("CREATE TABLE IF NOT EXISTS member_items(value)")?;
+        db.exec(&format!("INSERT INTO member_items VALUES({value})"))?;
+        Ok(Vec::new())
+    }
+}
+
+/// Writes `value` through `client` and gives back the token its answer carries.
 fn write_token(driven: &mut Driven, pump: &mut Pump<'_>, client: &Client, value: u8) -> Token {
-    write(driven, pump, client, value);
-    client.token().unwrap()
+    let answer = submit(client, driven.until(), insert(value));
+    driven.answer(pump, &answer).unwrap().token.unwrap()
 }
 
 /// Every record to member `owner` lost from now on: it falls behind, and the group commits
@@ -246,6 +255,69 @@ fn t_t1_10_r3_a_session_reads_its_writes_across_leader_changes() {
     }
     assert!(served > 0);
     let _ = redirected;
+    driven.drain(&mut pump);
+    pump.finish();
+}
+
+/// T-T1.10.R4 (AC-T1.10.R4): concurrent writers, each session waiting only for its own writes.
+/// Do: three voters, a follower's clock an hour ahead (so a read there waits rather than
+/// redirects); sessions A and B submit 1 and 2 through the leader at once, and every member
+/// catches up; the follower cut off, B writes 3. Expect: each answer carries its own write's
+/// token (A's names 1's entry, before B's); on the follower, which holds A's write but not B's
+/// last, A's read is served at once (counted at once, no wait, no redirect) though B wrote since;
+/// B's read is answered once the follower rejoins, with 3.
+#[test]
+fn t_t1_10_r4_each_session_waits_only_for_its_own_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut driven = Driven::new();
+    let clients: Vec<Client> = (1..=3)
+        .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+        .collect();
+    let mut pump = Pump::new(&clients);
+    let leader = driven.elect(&mut pump, &clients, 0, 0);
+    let follower = (leader + 1) % clients.len();
+    let wall = driven.owner(follower).wall;
+    driven.owner_mut(follower).wall = wall + HOUR;
+    let writer = clients.get(leader).unwrap();
+    // Both in flight at once: neither is answered before the other is submitted.
+    let a = submit(writer, driven.until(), insert(1));
+    let b = submit(writer, driven.until(), insert(2));
+    let a = driven.answer(&mut pump, &a).unwrap().token.unwrap();
+    let b = driven.answer(&mut pump, &b).unwrap().token.unwrap();
+    assert!(
+        a.index < b.index && a < b,
+        "A's token {a:?} names a write at or after B's {b:?}"
+    );
+    for owner in 0..clients.len() {
+        catch_up(&mut driven, &mut pump, &clients, leader, owner);
+    }
+    cut_off(&mut pump, follower);
+    let b = b.after(write_token(&mut driven, &mut pump, writer, 3));
+    let reader = clients.get(follower).unwrap();
+    let behind = reader.handle().status().unwrap().applied < b.index;
+    let before = reader.session_counters().unwrap();
+    assert!(before.apply_lag_micros.is_some(), "{before:?}");
+    assert_eq!(read_token(reader, a).unwrap(), Served::Here(vec![1, 2]));
+    let after = reader.session_counters().unwrap();
+    assert_eq!(after.at_once, before.at_once + 1, "{after:?}");
+    assert_eq!(after.waited, before.waited, "{after:?}");
+    assert_eq!(after.redirects, before.redirects, "{after:?}");
+    let waiting = {
+        let reader = reader.clone();
+        std::thread::spawn(move || read_token(&reader, b))
+    };
+    rejoin(&mut driven, &mut pump, &clients, leader, follower);
+    for owner in 0..clients.len() {
+        catch_up(&mut driven, &mut pump, &clients, leader, owner);
+    }
+    assert_eq!(
+        waiting.join().unwrap().unwrap(),
+        Served::Here(vec![1, 2, 3])
+    );
+    assert!(
+        behind,
+        "the follower had applied B's 3 before A's read: nothing was tested"
+    );
     driven.drain(&mut pump);
     pump.finish();
 }
