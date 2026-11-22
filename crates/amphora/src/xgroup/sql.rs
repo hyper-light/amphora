@@ -15,7 +15,8 @@ use amphora_engine::Value;
 
 use super::coordinator::{Answer, Config, Coordinator, Event, Lost, Protocol, Txn};
 use super::{
-    GroupId, Guard, Intent, Lock, Mark, OpenPage, Outcome, Record, Reply, Tablet, TxnId, apply,
+    Envelope, GroupId, Guard, Intent, Lock, Mark, OpenPage, Outcome, Record, Reply, Tablet, TxnId,
+    apply,
 };
 use crate::database::Database;
 use crate::db::Db;
@@ -392,6 +393,65 @@ impl Tablet for SqlTablet<'_> {
     }
 }
 
+/// A group as a coordinator reaches it (xgroup.md, "Over the transport"): its [`Database`] in this
+/// process, or its owner on a node, reached over the transport by [`crate::transport::Nodes`].
+#[derive(Clone)]
+pub enum Member {
+    Local(Database),
+    /// The group's owner at `node`'s endpoint in `nodes`; the node made its tables ([`prepare`]).
+    Node {
+        nodes: Arc<crate::transport::Nodes>,
+        node: crate::reshard::NodeId,
+    },
+}
+
+/// Makes a group's tables for transactions across groups, if it hasn't them: the node that owns a
+/// group does it before it serves steps over the transport.
+pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
+    group.call_internal(until, |db| db.exec(SCHEMA))
+}
+
+/// A step that came over the transport for this owner's group `here` (`Request::Step`): applied as
+/// a local one is, the coordinator's stamp `carried` taken in first; answers the reply and the
+/// group's newest stamp after it (none: the group makes no stamps).
+pub(crate) fn serve(
+    group: &Database,
+    here: GroupId,
+    carried: u64,
+    envelope: Envelope,
+    until: Instant,
+) -> Result<(Reply, Option<u64>), Refusal> {
+    let stamp = AtomicU64::new(carried);
+    let reply = step(group, &stamp, until, move |db| {
+        apply(here, &mut SqlTablet::new(db), &envelope)
+    })?;
+    Ok((reply, group.stamps().map(|_| stamp.load(Ordering::Acquire))))
+}
+
+/// Runs one step on `member`, its stamps carried either way.
+fn step_on(
+    member: &Member,
+    carried: &AtomicU64,
+    until: Instant,
+    here: GroupId,
+    envelope: Envelope,
+) -> Result<Reply, Refusal> {
+    match member {
+        Member::Local(group) => step(group, carried, until, move |db| {
+            apply(here, &mut SqlTablet::new(db), &envelope)
+        }),
+        Member::Node { nodes, node } => {
+            let (reply, latest) = nodes
+                .step(*node, here, carried.load(Ordering::Acquire), envelope, until)
+                .map_err(Refusal::from)?;
+            if let Some(latest) = latest {
+                carried.fetch_max(latest, Ordering::AcqRel);
+            }
+            Ok(reply)
+        }
+    }
+}
+
 /// Which group a key is in: the caller's, so the groups' routing stays the routing lanes' own.
 pub type Route = Arc<dyn Fn(&[u8]) -> GroupId + Send + Sync>;
 
@@ -518,8 +578,22 @@ impl Cluster {
         until: Instant,
     ) -> Result<Self, Refusal> {
         for group in &groups {
-            group.call_internal(until, |db| db.exec(SCHEMA))?;
+            prepare(group, until)?;
         }
+        let groups = groups.into_iter().map(Member::Local).collect();
+        Self::open_members(groups, route, id, protocol, in_flight, until)
+    }
+
+    /// [`Cluster::open`] over groups each reached as its [`Member`] says: a group on a node made its
+    /// tables when its node started serving ([`prepare`]).
+    pub fn open_members(
+        groups: Vec<Member>,
+        route: Route,
+        id: u64,
+        protocol: Protocol,
+        in_flight: usize,
+        until: Instant,
+    ) -> Result<Self, Refusal> {
         let count = GroupId::try_from(groups.len())
             .map_err(|_| amphora_api::invalid("cross-group cluster", "too many groups"))?;
         let config = Config {
@@ -622,7 +696,7 @@ where
 }
 
 struct Driver {
-    groups: Arc<Vec<Database>>,
+    groups: Arc<Vec<Member>>,
     route: Route,
     coordinator: Coordinator,
     inputs: SyncSender<Input>,
@@ -756,9 +830,7 @@ impl Driver {
                     std::thread::Builder::new()
                         .name("amphora-xgroup-step".into())
                         .spawn(move || {
-                            let reply = step(&group, &carried, until, move |db| {
-                                apply(here, &mut SqlTablet::new(db), &envelope)
-                            });
+                            let reply = step_on(&group, &carried, until, here, envelope);
                             // A driver gone by now has stopped: its successor recovers the step.
                             let _ = inputs.send(Input::Reply { id, reply });
                         })

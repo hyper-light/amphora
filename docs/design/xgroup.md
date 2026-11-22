@@ -58,6 +58,53 @@ doubled for each resolution step lost (RFC 6298 §5.5). It follows the groups wh
 their load moves; nothing in it is tuned. A step past its deadline stops the incarnation, as a crash
 would, and the next open finishes it.
 
+## Over the transport
+
+A group on another node is reached as `Member::Node` (`xgroup::sql`): each step is one request over
+the owner transport, `Request::Step { here, carried, envelope }`, answered `Answer::Stepped { reply,
+latest }` (wire version 8; both variants appended after every existing one). `transport::Nodes`
+(CP-T1.9, lane split-merge-10's) carries it as it carries a pull: one authenticated connection and
+one request, to the endpoint of the group's database, whose owner applies the step as a local one
+is applied, one `call_internal` and one atomic commit. The coordinator's newest commit stamp goes
+with the step and the group's newest comes back with the reply, so the hybrid logical clock each
+step carries (T-T1.12.X2) crosses nodes as it crosses threads. A reply lost after the request went
+out is `UnknownOutcome`, which the protocol already treats as a step that may have landed. The node
+makes its group's tables before it serves (`sql::prepare`). Values introduced: none; a step's size
+is held by the frame's bound, as every request's is. The listener is still loopback: reaching
+another machine waits on split-merge-11's network listener, which `Nodes` addresses through
+unchanged.
+
+The harness that chooses the protocol is `xgroup::lan` with its command line,
+`crates/amphora/examples/xgroup_lan.rs`: `node` serves one group at an endpoint; `bench` runs
+transactions each spanning `--span` groups through each protocol for `--secs`, `--clients` at once
+over `--keys` keys per group, and writes p50, p99, p99.9 commit latency and commits a second to
+bench/records (latencies in fixed log-linear buckets, HdrHistogram's way, under 1% high); `elle`
+runs `--seeds` seeded histories and checks each Elle-style, as the simulator's runs are checked. The
+seed fixes the workload; the interleaving is the network's.
+
+## Decision (lane xgroup-lan): which protocol stays, the faster at zero anomalies
+
+The rule (G13 step 3): of two-phase commit over groups and Parallel Commits, the protocol that stays
+is the one with the lower cross-group p99 on the LAN among those with exactly 0 anomalies over
+10,000 Elle seeds over the transport; the other is removed after this record is filled in. A
+protocol with any anomaly is out whatever its speed. If neither has a p99 at most 10 ms, neither
+meets AC-T1.10.2 and the faster is kept only as the step's state, with AC-T1.10.2 open.
+
+The coordinator's measurement (blanks to fill):
+
+| | two-phase | Parallel Commits |
+|---|---|---|
+| hosts, groups, clients, keys per group, span, seconds | ___ | ___ |
+| p50 / p99 / p99.9 commit latency (ms) | ___ / ___ / ___ | ___ / ___ / ___ |
+| commits a second | ___ | ___ |
+| aborted / unknown | ___ / ___ | ___ / ___ |
+| anomalies over 10,000 seeds (unknown outcomes) | ___ (___) | ___ (___) |
+| record | bench/records/___ | bench/records/___ |
+
+Decision: ___ stays; ___ is removed (commit ___). Expected from the simulator: Parallel Commits,
+one group commit before the client hears against two; falsified if its p99 is not below two-phase
+commit's on the LAN, or if it shows an anomaly two-phase commit doesn't.
+
 ## Evidence so far
 
 - In the simulator, Parallel Commits answers after one group commit and two-phase commit after two
