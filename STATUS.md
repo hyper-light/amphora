@@ -1103,4 +1103,7 @@ Lane skip-9: how a dropped kind is built is a per-summary switch, inline (the co
 or replay (the default: the writes during the build are applied before it installs, up to the
 rows the summary holds, then void) (T-SKU.11); the build's own connection opens an encrypted
 database with the scan's key (T-SKU.12). The bench runs each mode up a write-rate ladder.
+Lane skip-10: an IN list bounds a skipping scan by its smallest and largest value, read from its
+parameters on each run (T-SKU.13); each bound shape (BETWEEN ? AND ?, >= ?, <= ?, IN (?, ?), = ?)
+is tested prepared once and re-bound.
 Open: the benchmark against DuckDB and ClickHouse; which build mode leads at which write rate.

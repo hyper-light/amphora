@@ -1,10 +1,10 @@
 //! Amphora (G5 step 4, T-G5.4.3; executor.md decision 11): a SQL filter's table scan skipping the
 //! rows its summary rules out.
 //!
-//! Two halves. At translation, [`bound_terms`] reads a SELECT's WHERE terms that bound a column by
-//! an integer constant or a parameter (`a BETWEEN 10 AND 20`, `a >= ?`, `5 < a`, `a = :v`), and
-//! the scan's cursor is given a [`SkipHint`] with them; this costs a scan nothing when no summary
-//! is kept. At run time the Rewind reads the parameters' bound values ([`SkipHint::bounds`]: a
+//! Two halves. At translation, [`SkipHint::of`] reads a SELECT's WHERE terms that bound a column
+//! by an integer constant or a parameter (`a BETWEEN 10 AND 20`, `a >= ?`, `5 < a`, `a = :v`, and
+//! lane skip-10's `a IN (?, ?)`), and the scan's cursor is given the hint; this costs a scan
+//! nothing when no summary is kept. At run time the Rewind reads the parameters' bound values ([`SkipHint::bounds`]: a
 //! prepared statement skips by whatever it is bound to on each run) and asks the database's summary for the hinted column (if one is kept and the reader
 //! sees exactly what it holds), and a [`SkipWalk`] then moves the cursor past each run of rows the
 //! candidates leave out with one seek, instead of reading them. The filter is still evaluated on
@@ -13,8 +13,11 @@
 //! Only rows whose value is an integer are left out: a NULL, real, text or blob value makes its
 //! row a candidate (the summaries' rule, `skipping/mod.rs`), so SQLite's affinity and mixed-type
 //! comparisons never reach the summaries. A term that isn't a plain integer comparison (a real or
-//! text constant, a parameter bound to anything but an integer, a COLLATE, an IN list, NOT BETWEEN)
-//! gives no bound: loose, never wrong.
+//! text constant, a parameter bound to anything but an integer, a COLLATE, NOT IN, NOT BETWEEN)
+//! gives no bound: loose, never wrong. An IN list bounds its column by its smallest and largest
+//! value (lane skip-10, T-SKU.13): a row it matches equals one of them, so lies between the two;
+//! one value that isn't an integer (as bound on this run) leaves the whole list unbounded, as a
+//! row could match that value.
 
 use super::{Candidates, RowidRange, SkipMethod};
 use amphora_engine_parser::ast::{Expr, Literal, Operator, TableInternalId, UnaryOperator};
@@ -55,14 +58,43 @@ pub struct BoundTerm {
     pub value: BoundValue,
 }
 
+/// One AND-ed `column IN (value, ...)` term (lane skip-10, T-SKU.13): a row it matches has one of
+/// the values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListTerm {
+    pub column: usize,
+    pub values: Vec<BoundValue>,
+}
+
 /// What a scan's cursor may skip by, set at translation: its filter's bounding terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkipHint {
     pub cursor_id: usize,
     pub terms: Vec<BoundTerm>,
+    /// Lane skip-10 (T-SKU.13): its IN lists.
+    pub lists: Vec<ListTerm>,
 }
 
 impl SkipHint {
+    /// The bounding terms AND-ed `terms` put on `table`'s rows, for cursor `cursor_id`'s scan, a
+    /// parameter's value left to be read when the scan starts; `None` when no term bounds a
+    /// column. The caller passes only terms every result row must satisfy.
+    pub fn of<'a>(
+        cursor_id: usize,
+        terms: impl IntoIterator<Item = &'a Expr>,
+        table: TableInternalId,
+    ) -> Option<Self> {
+        let mut hint = Self {
+            cursor_id,
+            terms: Vec::new(),
+            lists: Vec::new(),
+        };
+        for term in terms {
+            push_terms(term, table, &mut hint);
+        }
+        (!hint.terms.is_empty() || !hint.lists.is_empty()).then_some(hint)
+    }
+
     /// `column`'s bounds from the hint's terms, intersected, each parameter's value read by
     /// `parameter` (`None`: the value isn't an integer, so its term gives no bound: loose, never
     /// wrong); `None` when no term bounds the column.
@@ -71,25 +103,43 @@ impl SkipHint {
         column: usize,
         parameter: impl Fn(NonZeroUsize) -> Option<i64>,
     ) -> Option<ColumnBounds> {
-        let mut out: Option<ColumnBounds> = None;
-        for term in self.terms.iter().filter(|t| t.column == column) {
-            let value = match term.value {
-                BoundValue::Integer(value) => Some(value),
-                BoundValue::Parameter(index) => parameter(index),
-            };
-            let Some(b) = value.and_then(|value| bound(column, term.op, value)) else {
-                continue;
-            };
-            out = Some(match out {
-                Some(o) => ColumnBounds {
-                    column,
-                    lo: o.lo.max(b.lo),
-                    hi: o.hi.min(b.hi),
-                },
-                None => b,
+        let read = |value: BoundValue| match value {
+            BoundValue::Integer(value) => Some(value),
+            BoundValue::Parameter(index) => parameter(index),
+        };
+        let terms = self
+            .terms
+            .iter()
+            .filter(|t| t.column == column)
+            .filter_map(|term| read(term.value).and_then(|value| bound(column, term.op, value)));
+        // Lane skip-10 (T-SKU.13): an IN list's hull, when every value it holds is an integer.
+        let lists = self
+            .lists
+            .iter()
+            .filter(|list| list.column == column)
+            .filter_map(|list| {
+                let mut values = list.values.iter().map(|value| read(*value));
+                let first = values.next()??;
+                values.try_fold(
+                    ColumnBounds {
+                        column,
+                        lo: first,
+                        hi: first,
+                    },
+                    |hull, value| {
+                        value.map(|value| ColumnBounds {
+                            column,
+                            lo: hull.lo.min(value),
+                            hi: hull.hi.max(value),
+                        })
+                    },
+                )
             });
-        }
-        out
+        terms.chain(lists).reduce(|a, b| ColumnBounds {
+            column,
+            lo: a.lo.max(b.lo),
+            hi: a.hi.min(b.hi),
+        })
     }
 }
 
@@ -165,7 +215,8 @@ fn flipped(op: BoundOp) -> BoundOp {
     }
 }
 
-fn push_terms(expr: &Expr, table: TableInternalId, out: &mut Vec<BoundTerm>) {
+fn push_terms(expr: &Expr, table: TableInternalId, hint: &mut SkipHint) {
+    let out = &mut hint.terms;
     match expr {
         Expr::Binary(lhs, op, rhs) => {
             let Some(op) = op_of(*op) else {
@@ -196,21 +247,23 @@ fn push_terms(expr: &Expr, table: TableInternalId, out: &mut Vec<BoundTerm>) {
                 out.extend(value_of(side).map(|value| BoundTerm { column, op, value }));
             }
         }
+        // Lane skip-10 (T-SKU.13): `a IN (1, ?, :v)`, every value an integer constant or a
+        // parameter; any other value leaves the list unbounded.
+        Expr::InList {
+            lhs,
+            not: false,
+            rhs,
+        } => {
+            let Some(column) = column_of(lhs, table) else {
+                return;
+            };
+            let values: Option<Vec<BoundValue>> = rhs.iter().map(|value| value_of(value)).collect();
+            if let Some(values) = values.filter(|values| !values.is_empty()) {
+                hint.lists.push(ListTerm { column, values });
+            }
+        }
         _ => {}
     }
-}
-
-/// The bounding terms AND-ed `terms` put on `table`'s rows, a parameter's value left to be read
-/// when the scan starts. The caller passes only terms every result row must satisfy.
-pub fn bound_terms<'a>(
-    terms: impl IntoIterator<Item = &'a Expr>,
-    table: TableInternalId,
-) -> Vec<BoundTerm> {
-    let mut out = Vec::new();
-    for term in terms {
-        push_terms(term, table, &mut out);
-    }
-    out
 }
 
 /// Where a walk sends its cursor from the row it is on.

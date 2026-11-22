@@ -714,6 +714,15 @@ anything but an integer (NULL, a real, a text, a blob) gives its term no bound: 
 the same rule as the summaries' (a bound parameter has no affinity, as a numeric literal has none,
 so the comparison it makes is the constant's).
 
+Lane skip-10 (T-SKU.13): an `IN` list bounds its column too (`a IN (?, ?)`, `a IN (1, :v)`). Each of
+its values is a constant or a parameter (`ListTerm`), read as the scan starts like a term's, and
+the list bounds its column by its smallest and largest value: a row it matches equals one of them,
+so lies between the two. One value that isn't an integer on this run leaves the whole list
+unbounded, as a row could match that value; `NOT IN` and a list holding any other expression give
+no bound. The hull is loose for values far apart (it reads the rows between them): asking the
+summary once per value and joining the candidates is tighter, at one summary call per value and
+one measured cost per filter split across them; the hull keeps one call and one cost.
+
 ### Choosing a kind by measured cost (lanes skip-3 and skip-4, T-SKU.2)
 
 `SkipKind::Measured` keeps both a zone map and a cracked copy of the column, each fed every write

@@ -1113,6 +1113,139 @@ mod scans {
         );
     }
 
+    /// Lane skip-10 (T-SKU.13, kiln goal 623adc1c). Do: one prepared statement for each bound
+    /// shape on the skipping column (`BETWEEN ? AND ?`, `>= ?`, `<= ?`, `IN (?, ?)`, `= ?`), each
+    /// prepared once; each round, random writes, then the round's statement bound and run, then
+    /// re-bound to other values and run again with no write between (the summary is the same,
+    /// only the parameters moved); some IN runs bind one value to a real far from the other.
+    /// Expect: every run answers as the database without a summary (a bound kept from the earlier
+    /// binding would leave out rows the new one matches), every run bound by integers consulted
+    /// the summary and none with a real did, and each shape read fewer rows in all than the plain
+    /// scan.
+    fn every_bound_shape_reads_its_parameters(kind: SkipKind) {
+        use crate::Value;
+        let rows = 4000i64;
+        let (_db, on) = open();
+        let (_off_db, off) = open();
+        fill([&on, &off], rows);
+        set_skipping(&on, "t", "a", Some(kind)).unwrap();
+        let sqls = [
+            "SELECT rowid, a, b FROM t WHERE a BETWEEN ? AND ? ORDER BY rowid",
+            "SELECT count(*), sum(b) FROM t WHERE a >= ?",
+            "SELECT count(*), sum(b) FROM t WHERE a <= ?",
+            "SELECT rowid, a, b FROM t WHERE a IN (?, ?) ORDER BY rowid",
+            "SELECT rowid, a, b FROM t WHERE a = ? ORDER BY rowid",
+        ];
+        let mut stmts: Vec<_> = sqls
+            .iter()
+            .map(|sql| (on.prepare(sql).unwrap(), off.prepare(sql).unwrap()))
+            .collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(13);
+        let mut read = [(0u64, 0u64); 5];
+        let (mut runs, mut unbounded) = (0u64, 0u64);
+        for round in 0..40u64 {
+            for _ in 0..rng.random_range(0..15) {
+                let sql = random_write(&mut rng, rows);
+                on.execute(&sql).unwrap();
+                off.execute(&sql).unwrap();
+            }
+            let at = usize::try_from(round).unwrap() % sqls.len();
+            for bind in 0..2u64 {
+                let lo = rng.random_range(0..rows);
+                let near = lo.saturating_add(rng.random_range(0..rows / 40));
+                let values = match at {
+                    0 => vec![Value::from_i64(lo), Value::from_i64(near)],
+                    // A tail and a head of the values: up to a twentieth of the rows each.
+                    1 => vec![Value::from_i64(rows - rng.random_range(0..rows / 20))],
+                    2 => vec![Value::from_i64(rng.random_range(0..rows / 20))],
+                    3 if (round / 5 + bind) % 3 == 2 => {
+                        unbounded += 1;
+                        vec![Value::from_i64(lo), Value::from_f64((rows - 1 - lo) as f64)]
+                    }
+                    3 => vec![Value::from_i64(lo), Value::from_i64(near)],
+                    _ => vec![Value::from_i64(lo)],
+                };
+                let (stmt_on, stmt_off) = &mut stmts[at];
+                let (answer_on, r_on) = run_bound(stmt_on, &values);
+                let (answer_off, r_off) = run_bound(stmt_off, &values);
+                assert_eq!(
+                    answer_on, answer_off,
+                    "{kind:?} round {round} bind {bind}: {} {values:?}",
+                    sqls[at]
+                );
+                runs += 1;
+                read[at].0 += r_on;
+                read[at].1 += r_off;
+            }
+        }
+        let counts = skipping_counts(&on, "t").unwrap();
+        assert!(unbounded > 0, "no run bound an IN value to a real");
+        assert_eq!(counts.consulted, runs - unbounded, "{kind:?}: {counts:?}");
+        for (at, (r_on, r_off)) in read.iter().enumerate() {
+            assert!(
+                r_on < r_off,
+                "{kind:?} {}: read {r_on} rows skipping, {r_off} without",
+                sqls[at]
+            );
+        }
+    }
+
+    /// Lane skip-10 (T-SKU.13). Do: a hint with an IN list of a constant and two parameters,
+    /// and a `>=` term on the same column, read under three bindings. Expect: the list bounds its
+    /// column by its smallest and largest value, intersected with the term; a parameter bound to
+    /// anything but an integer leaves the list unbounded (the term alone bounds); another column
+    /// is unbounded.
+    #[test]
+    fn t_sku_13_an_in_list_bounds_by_its_values_as_bound() {
+        use super::super::{BoundOp, BoundTerm, BoundValue, ColumnBounds, ListTerm, SkipHint};
+        let p = |index: usize| BoundValue::Parameter(std::num::NonZeroUsize::new(index).unwrap());
+        let hint = SkipHint {
+            cursor_id: 0,
+            terms: vec![BoundTerm {
+                column: 1,
+                op: BoundOp::GreaterEquals,
+                value: BoundValue::Integer(20),
+            }],
+            lists: vec![ListTerm {
+                column: 1,
+                values: vec![BoundValue::Integer(50), p(1), p(2)],
+            }],
+        };
+        let bound = |lo, hi| Some(ColumnBounds { column: 1, lo, hi });
+        // Parameters ?1 and ?2 bound to `values` (`None`: not an integer).
+        let bound_to = |values: [Option<i64>; 2]| {
+            move |index: std::num::NonZeroUsize| values.get(index.get() - 1).copied().flatten()
+        };
+        assert_eq!(
+            hint.bounds(1, bound_to([Some(10), Some(90)])),
+            bound(20, 90)
+        );
+        assert_eq!(
+            hint.bounds(1, bound_to([Some(70), Some(60)])),
+            bound(50, 70)
+        );
+        assert_eq!(
+            hint.bounds(1, bound_to([Some(70), None])),
+            bound(20, i64::MAX)
+        );
+        assert_eq!(hint.bounds(0, |_| Some(1)), None);
+    }
+
+    #[test]
+    fn t_sku_13_zone_maps_every_bound_shape_reads_its_parameters() {
+        every_bound_shape_reads_its_parameters(SkipKind::ZoneMaps);
+    }
+
+    #[test]
+    fn t_sku_13_cracking_every_bound_shape_reads_its_parameters() {
+        every_bound_shape_reads_its_parameters(SkipKind::Cracking);
+    }
+
+    #[test]
+    fn t_sku_13_measured_every_bound_shape_reads_its_parameters() {
+        every_bound_shape_reads_its_parameters(SkipKind::Measured);
+    }
+
     /// Lane skip-5 (T-SKU.4): a skipping scan runs its body over column batches (QT.7's fused
     /// loops) up to each candidate run's end. Four databases, batches on and off by skipping on and
     /// off, take the same random writes and answer every filtered aggregate and row query alike;

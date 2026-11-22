@@ -47,7 +47,7 @@ pub use registry::{
     BuildClaim, BuildEnd, BuildMode, SkipCounts, SkipRefusal, SkipRegistry, WalPos,
 };
 pub use scan::{
-    bound_terms, BoundOp, BoundTerm, BoundValue, ColumnBounds, SkipHint, SkipWalk, SkipWalks,
+    BoundOp, BoundTerm, BoundValue, ColumnBounds, ListTerm, SkipHint, SkipWalk, SkipWalks,
     WalkMeasure, WalkPhase, WalkTarget,
 };
 pub use zone_map::{RowidRange, ZoneMap, ZoneMapBuilder, ZoneStats};
