@@ -504,6 +504,11 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   bounded by its stream's share and a refused send's commits kept for the next round; a lost
   create's object compared in parts (T-T1.12.M3, M4); an A/B of growing a base's chunks with the
   room against keeping them (`ChunkGrowth`, T-T1.12.M5).
+  Lane backups-9 (not yet built or run): a send the store refused partway is sent again as it
+  was, so it makes the same objects, and a restore reads overlapping segments once and checks
+  where they overlap that they agree (`plan::cover`, T-T1.12.M6); a send carries only the marks
+  its room holds, so a backlog of marks ships (T-T1.12.M3); the rule for a base's end stated in
+  its tests (the latest that ended at or before the cut).
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
