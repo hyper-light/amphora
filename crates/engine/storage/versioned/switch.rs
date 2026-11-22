@@ -9,7 +9,9 @@
 //! root page in `sqlite_schema` (tree 1 is `sqlite_schema` itself), and each SQL transaction is one
 //! transaction of the storage, begun by its first cursor and committed or rolled back where the
 //! pager's ends. The pager still runs beside it for what the trees don't hold yet: the database
-//! header (the schema cookie, the user version). An index tree's order is recorded in the storage
+//! header (the schema cookie, the user version). Only a program that writes that header takes the
+//! pager's write lock, so writers of rows run beside each other and conflict only on the rows
+//! they touch (`PreparedProgram::writes_pager_header`). An index tree's order is recorded in the storage
 //! when its first cursor brings it ([`encode_order`]), so a reopened database orders the tree as
 //! before it replays a row of it.
 

@@ -2024,6 +2024,21 @@ pub struct PreparedProgram {
     /// Amphora (G5 step 4, T-G5.4.3): the scan cursors that may skip rows by a summary, with
     /// their filters' integer bounds (`skipping/scan.rs`).
     pub skip_hints: Vec<crate::skipping::SkipHint>,
+    /// Amphora (G7 step 2, `AC-NS.2.1`): the program writes the pager's database header (a
+    /// schema or user cookie, the journal mode, a vacuum). On the versioned storage the rows are
+    /// the storage's, so only such a program takes the pager's write lock: other writers run
+    /// beside each other and conflict only on the rows they touch (engine.md, decision 13).
+    pub writes_pager_header: bool,
+}
+
+/// Whether `insns` write the pager's database header (`PreparedProgram::writes_pager_header`).
+pub(crate) fn writes_pager_header(insns: &[(Insn, usize)]) -> bool {
+    insns.iter().any(|(insn, _)| {
+        matches!(
+            insn,
+            Insn::SetCookie { .. } | Insn::JournalMode { .. } | Insn::Vacuum { .. }
+        )
+    })
 }
 
 #[derive(Clone)]

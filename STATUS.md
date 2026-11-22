@@ -365,7 +365,9 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   anomaly on either storage (`T-G8.4.1`); an in-memory IO keeps a database's storage beside its
   file, so a database reopened on it finds its trees. Attached databases keep their trees on their own
   versioned storage; the versioned cursor stops at the next leaf once its statement is interrupted
-  and pauses where the pager's cursor does in tests (`AC-NS.2.7`, lane g7s2-11). With the switch on,
+  and pauses where the pager's cursor does in tests (`AC-NS.2.7`, lane g7s2-11). Only a program
+  that writes the pager's header takes its write lock, so SQL writers run at once and conflict only
+  on rows (lane g7s2-16, uncompiled until run). With the switch on,
   44 of the engine's lib tests still fail (2866 pass, lane g7s2-11, before the pause points; 6 more
   pass after) (lane g7s2-8 grouped them: tests that inject the pager's IO yields, the leaf
   batches, morsels and zones read from the pager's pages, attached databases, MVCC-store and

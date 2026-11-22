@@ -5354,10 +5354,23 @@ pub fn op_transaction_inner(
                         }
                     }
 
-                    if !is_secondary_db
-                        && updated
-                        && matches!(new_transaction_state, TransactionState::Write { .. })
-                    {
+                    // Amphora (G7 step 2, `AC-NS.2.1`): on the versioned storage the rows are the
+                    // storage's, and its writers conflict only on the rows they touch, so a write
+                    // transaction takes the pager's write lock only for a program that writes the
+                    // pager's header (a cookie, the journal mode, a vacuum), when that program runs,
+                    // even inside a transaction that began without it.
+                    let versioned = !is_secondary_db && conn.versioned_for(*db).is_some();
+                    let takes_write_lock = if versioned {
+                        matches!(new_transaction_state, TransactionState::Write { .. })
+                            && !conn.is_nested_stmt()
+                            && program.writes_pager_header
+                            && !pager.holds_write_lock()
+                    } else {
+                        !is_secondary_db
+                            && updated
+                            && matches!(new_transaction_state, TransactionState::Write { .. })
+                    };
+                    if takes_write_lock {
                         turso_assert!(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
@@ -5383,6 +5396,9 @@ pub fn op_transaction_inner(
                                 | TransactionState::PendingUpgrade { has_read_txn: true } => {
                                     conn.set_tx_state(TransactionState::Read);
                                 }
+                                // A versioned writer refused the pager's lock for its header:
+                                // its transaction stays as it was, for its caller to roll back.
+                                TransactionState::Write { .. } if versioned => {}
                                 TransactionState::Write { .. } => {
                                     panic!("impossible state: {current_state:?}")
                                 }
@@ -5393,7 +5409,10 @@ pub fn op_transaction_inner(
                             // set the transaction state to pending so we don't have to
                             // end the read transaction.
                             conn.set_tx_state(TransactionState::PendingUpgrade {
-                                has_read_txn: matches!(current_state, TransactionState::Read),
+                                has_read_txn: matches!(
+                                    current_state,
+                                    TransactionState::Read | TransactionState::Write { .. }
+                                ),
                             });
                             return Ok(state.suspend_on_io(io));
                         }

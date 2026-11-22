@@ -2578,6 +2578,7 @@ impl ProgramBuilder {
             .map(|counters| counters.sites)
             .unwrap_or_default();
         let memory_tables = memory_tables(&self.insns);
+        let writes_pager_header = super::writes_pager_header(&self.insns);
         let prepared = PreparedProgram {
             row_count_sites,
             max_registers: self.next_free_register,
@@ -2612,6 +2613,7 @@ impl ProgramBuilder {
             skip_hints: self.skip_hints,
             read_databases: self.read_databases,
             leaf_batch_plan: None,
+            writes_pager_header,
         };
         Ok(prepared)
     }

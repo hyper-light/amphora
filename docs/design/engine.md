@@ -526,7 +526,11 @@ frame, and the pager's miss ratio, from fetches it no longer makes, would price 
 the file. Tree 0 is never named (SQLite's pages
 start at 1), tree 1 is `sqlite_schema`, tree 2 the overflow tree, and each tree made later takes the
 next id, which `sqlite_schema` records as its root page. The pager still runs beside it for the
-database header (schema cookie, user version). The storage sets no memory aside: it takes its
+database header (schema cookie, user version), and only a program that writes the header (a
+`SetCookie`, the journal mode, a vacuum: `PreparedProgram::writes_pager_header`) takes the pager's
+write lock, as it runs, even in a transaction that began without it; every other write transaction
+holds only the pager's read, so writers through SQL run at once and conflict only on the rows they
+touch, as the storage's first writer's win decides (lane g7s2-16). The storage sets no memory aside: it takes its
 pages' frames and its row versions' bytes from a memory source as they grow, and gives them back as
 it lets them go (`storage::versioned::memory::Source`, `ConnectOpts::with_memory`). Amphora's shell
 gives its process memory budget (`amphora::memory::StorageMemory`, as caches; store.md, "Decision
@@ -549,7 +553,9 @@ means to every reader of the schema.
 
 **Evidence.** `sql.rs`'s `t_ns_2_6_*` tests: the same CREATE TABLE, INSERT (a row past a page among
 them), SELECT, explicit transactions, rollback, UPDATE and DELETE through both storages answer alike,
-and the versioned run's table sits on tree 3.
+and the versioned run's table sits on tree 3. `sql.rs`'s `ac_ns_2_1_*` tests: two connections'
+open transactions writing different rows both commit (BEGIN and BEGIN IMMEDIATE), two writing one
+row see the second refused with a conflict, and two schema changes still run one at a time.
 
 **Falsified by.** An engine suite that passes on the pager and fails on the switch for a reason the
 cursor interface can't carry; or the header kept by the pager disagreeing with the trees after a

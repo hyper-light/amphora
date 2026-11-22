@@ -435,3 +435,136 @@ fn ns_2_1_a_file_database_reopens_after_a_close_and_a_crash() {
         vec![vec![Value::build_text("ok")]]
     );
 }
+
+/// Whether `e` is the versioned storage's refusal of a write that met another open writer's row:
+/// its first writer's win, or its commit's validation.
+fn conflict(e: &crate::LimboError) -> bool {
+    matches!(
+        e,
+        crate::LimboError::WriteWriteConflict | crate::LimboError::SerializationFailure
+    )
+}
+
+/// Two connections to one database on the versioned storage, a table of two committed rows.
+fn two_writers() -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+    let (db, a) = connect(true);
+    run(
+        &a,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    );
+    run(&a, "INSERT INTO t VALUES (1, 0), (2, 0)");
+    let b = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    (db, a, b)
+}
+
+/// AC-NS.2.1: do open two write transactions through SQL on the versioned storage at once, each
+/// changing and inserting rows of its own, and commit both; expect neither refused (no pager write
+/// lock between them: they conflict only on the rows they touch) and both one's rows in the table.
+#[test]
+fn ac_ns_2_1_writers_of_different_rows_both_commit() {
+    let (_db, a, b) = two_writers();
+    run(&a, "BEGIN");
+    run(&b, "BEGIN");
+    run(&a, "UPDATE t SET v = 10 WHERE id = 1");
+    run(&b, "UPDATE t SET v = 20 WHERE id = 2");
+    run(&a, "INSERT INTO t VALUES (3, 30)");
+    run(&b, "INSERT INTO t VALUES (4, 40)");
+    run(&a, "COMMIT");
+    run(&b, "COMMIT");
+    let want: Vec<Vec<Value>> = [(1, 10), (2, 20), (3, 30), (4, 40)]
+        .into_iter()
+        .map(|(id, v)| vec![Value::from_i64(id), Value::from_i64(v)])
+        .collect();
+    assert_eq!(rows(&a, "SELECT id, v FROM t ORDER BY id"), want);
+    assert_eq!(rows(&b, "SELECT id, v FROM t ORDER BY id"), want);
+    // The same through BEGIN IMMEDIATE, which on the pager's storage refuses the second writer.
+    run(&a, "BEGIN IMMEDIATE");
+    run(&b, "BEGIN IMMEDIATE");
+    run(&a, "UPDATE t SET v = 11 WHERE id = 1");
+    run(&b, "UPDATE t SET v = 21 WHERE id = 2");
+    run(&b, "COMMIT");
+    run(&a, "COMMIT");
+    assert_eq!(
+        rows(&a, "SELECT v FROM t WHERE id IN (1, 2) ORDER BY id"),
+        vec![vec![Value::from_i64(11)], vec![Value::from_i64(21)]]
+    );
+}
+
+/// AC-NS.2.1: do open two write transactions through SQL on the versioned storage at once, both
+/// changing one row; expect the second refused with a conflict (at its write or its commit), and
+/// after it rolls back, the first's commit to stand alone.
+#[test]
+fn ac_ns_2_1_writers_of_one_row_one_conflicts() {
+    let (_db, a, b) = two_writers();
+    run(&a, "BEGIN");
+    run(&b, "BEGIN");
+    run(&a, "UPDATE t SET v = 10 WHERE id = 1");
+    let refused = match b.execute("UPDATE t SET v = 20 WHERE id = 1") {
+        Err(e) => {
+            assert!(conflict(&e), "the second writer's refusal: {e:?}");
+            true
+        }
+        Ok(()) => false,
+    };
+    run(&a, "COMMIT");
+    if !refused {
+        let e = b
+            .execute("COMMIT")
+            .expect_err("the second writer of one row commits");
+        assert!(conflict(&e), "the second writer's refusal at commit: {e:?}");
+    }
+    if !b.get_auto_commit() {
+        run(&b, "ROLLBACK");
+    }
+    assert_eq!(
+        rows(&b, "SELECT id, v FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(0)],
+        ]
+    );
+}
+
+/// AC-NS.2.1: what writes the pager's header (here a schema change, its cookie) still takes the
+/// pager's write lock, one at a time, beside a writer of rows that holds none: do run a row writer
+/// open and one connection's CREATE TABLE in an open transaction, then another's; expect the first
+/// schema change to pass beside the row writer, the second to be refused busy until it ends, and
+/// every commit after to stand.
+#[test]
+fn ac_ns_2_1_header_writers_still_take_the_pager_lock() {
+    let (db, a, b) = two_writers();
+    let c = db
+        .connect(ConnectOpts::new().with_versioned_storage())
+        .unwrap();
+    run(&a, "BEGIN");
+    run(&a, "UPDATE t SET v = 10 WHERE id = 1");
+    run(&b, "BEGIN");
+    run(&b, "CREATE TABLE u (x)");
+    run(&c, "BEGIN");
+    let e = c
+        .execute("CREATE TABLE w (x)")
+        .expect_err("a second schema change beside an open one");
+    assert!(
+        matches!(e, crate::LimboError::Busy | crate::LimboError::BusySnapshot),
+        "the second schema change's refusal: {e:?}"
+    );
+    if !c.get_auto_commit() {
+        run(&c, "ROLLBACK");
+    }
+    run(&b, "COMMIT");
+    run(&a, "COMMIT");
+    run(&c, "CREATE TABLE w (x)");
+    assert_eq!(
+        rows(&c, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::from_i64(10)]]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT name FROM sqlite_schema WHERE name IN ('u', 'w') ORDER BY name"
+        ),
+        vec![vec![Value::build_text("u")], vec![Value::build_text("w")]]
+    );
+}
