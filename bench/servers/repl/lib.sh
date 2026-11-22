@@ -2,7 +2,8 @@
 # IMAGE and PORT (the first node's HTTP port on 127.0.0.1; node n takes PORT+n), defines
 # `run_node N` (its `docker run -d` on the cluster's network), `ready_node N` (true once node N
 # answers) and `leader` (prints the leader's node number, 0 to 2, or nothing), then calls
-# `main "$@"`.
+# `main "$@"`. A system with a service beside its nodes (LiteFS's Consul) defines `before_up`
+# (run once the network exists) and `after_down`, and names its image in EXTRA_IMAGE.
 #
 # The nodes share a docker network of their own, amphora-bench-repl-<system>, and reach each other
 # by container name; each publishes its HTTP port on 127.0.0.1 only. Their data stays inside the
@@ -12,6 +13,8 @@
 #
 # usage: <system>.sh up|down|kill N|start N|leader|endpoint N|images
 set -euo pipefail
+# Git for Windows' bash rewrites arguments that look like paths (/data, /etc/...): not the containers'.
+export MSYS_NO_PATHCONV=1
 NET="amphora-bench-repl-$SYS"
 node() { echo "amphora-bench-repl-$SYS-$1"; }
 port() { echo $((PORT + $1)); }
@@ -33,12 +36,14 @@ down() {
   for n in 0 1 2; do
     docker rm -f -v "$(node "$n")" >/dev/null 2>&1 || true
   done
+  if declare -F after_down >/dev/null; then after_down; fi
   docker network rm "$NET" >/dev/null 2>&1 || true
 }
 
 up() {
   down
   docker network create "$NET" >/dev/null
+  if declare -F before_up >/dev/null; then before_up; fi
   local n
   for n in 0 1 2; do
     run_node "$n" >/dev/null
@@ -69,7 +74,7 @@ main() {
       ;;
     leader) leader ;;
     endpoint) echo "http://127.0.0.1:$(port "$2")" ;;
-    images) docker image inspect -f '{{.Id}}' "$IMAGE" ;;
+    images) docker image inspect -f '{{.Id}}' "$IMAGE" ${EXTRA_IMAGE:-} ;;
     *)
       echo "usage: $0 up|down|kill N|start N|leader|endpoint N|images" >&2
       return 2

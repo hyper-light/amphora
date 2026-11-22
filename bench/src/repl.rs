@@ -862,7 +862,6 @@ mod http {
         fn no_failover(&self) -> Option<String> {
             match self.system.as_str() {
                 "libsql" => Some("sqld runs one primary and its replicas follow it: no election, so no failover to time".into()),
-                "litefs" => Some("servers/repl/litefs.sh runs LiteFS's static lease (one fixed primary); failover needs its Consul lease, which the script doesn't run yet".into()),
                 _ => None,
             }
         }

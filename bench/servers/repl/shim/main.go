@@ -3,7 +3,9 @@
 //   POST /exec  {"stmts": [[sql, arg...], ...]}  the statements in one transaction: {} or {"error": ...}
 //   POST /count {"stmts": [[sql, arg...]]}       the first column of the first row: {"count": n}
 //   GET  /ready                                  200 once the database takes statements
-//   GET  /leader                                 dqlite's leader address
+//   GET  /leader                                 dqlite's leader address; on LiteFS the lease holder's
+//                                                hostname: this node's when it takes a write
+//                                                transaction, else its .primary file's
 package main
 
 import (
@@ -13,9 +15,11 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/canonical/go-dqlite/app"
+	"github.com/canonical/go-dqlite/v2/app"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -85,8 +89,9 @@ func main() {
 			log.Fatal(err)
 		}
 	case "sqlite":
-		// The WAL journal LiteFS replicates; synchronous=FULL so a commit is acknowledged durable.
-		if db, err = sql.Open("sqlite3", "file:"+*path+"?_journal_mode=WAL&_synchronous=FULL&_busy_timeout=5000"); err != nil {
+		// The WAL journal LiteFS replicates; synchronous=FULL so a commit is acknowledged durable;
+		// every transaction takes the write lock at BEGIN, which only the primary grants.
+		if db, err = sql.Open("sqlite3", "file:"+*path+"?_journal_mode=WAL&_synchronous=FULL&_busy_timeout=5000&_txlock=immediate"); err != nil {
 			log.Fatal(err)
 		}
 		db.SetMaxOpenConns(1)
@@ -95,6 +100,13 @@ func main() {
 	}
 
 	http.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		// LiteFS starts the shim once its node holds the lease or follows its holder, and a
+		// replica's database file doesn't exist until the primary's first write: only dqlite's
+		// database is pinged.
+		if dq == nil {
+			reply(w, map[string]any{})
+			return
+		}
 		if err := db.PingContext(r.Context()); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
@@ -103,7 +115,22 @@ func main() {
 	})
 	http.HandleFunc("/leader", func(w http.ResponseWriter, r *http.Request) {
 		if dq == nil {
-			http.Error(w, "no leader concept", http.StatusNotFound)
+			if tx, err := db.BeginTx(r.Context(), nil); err == nil {
+				_ = tx.Rollback()
+				host, err := os.Hostname()
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = w.Write([]byte(host))
+				return
+			}
+			primary, err := os.ReadFile(filepath.Join(filepath.Dir(*path), ".primary"))
+			if err != nil {
+				http.Error(w, "no primary", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(strings.TrimSpace(string(primary))))
 			return
 		}
 		cli, err := dq.Leader(r.Context())
