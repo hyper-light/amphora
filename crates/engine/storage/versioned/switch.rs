@@ -691,4 +691,98 @@ mod tests {
             vec![vec![crate::Value::from_i64(2), crate::Value::from_i64(4)]]
         );
     }
+
+    /// A versioned database whose table `t` spans many leaves: `rows` rows of 100 bytes each.
+    fn many_leaves(rows: i64) -> (Arc<crate::Connection>, i64) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_versioned_storage())
+            .unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER, pad BLOB)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..rows {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, zeroblob(100))"))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT rootpage FROM sqlite_schema WHERE name = 't'")
+            .unwrap();
+        let found = stmt.run_collect_rows().unwrap();
+        let root = found
+            .first()
+            .and_then(|row| row.first())
+            .map(|v| v.to_string().parse::<i64>().unwrap())
+            .unwrap();
+        (conn, root)
+    }
+
+    /// AC-NS.2.7 (G7 step 2): a count over many leaves on the versioned storage, interrupted,
+    /// stops at the next leaf refused `Interrupt`; not interrupted, the same cursor counts every
+    /// row.
+    #[test]
+    fn ns_2_7_an_interrupted_count_stops_at_the_next_leaf() {
+        use crate::storage::btree::CursorTrait;
+        use crate::sync::atomic::Ordering;
+        use crate::types::IOResult;
+        let (conn, root) = many_leaves(2000);
+        let switch = conn.versioned_for(crate::MAIN_DB_ID).unwrap();
+        let pager = conn.pager.load().clone();
+        let mut cursor = switch
+            .cursor(root, None, pager.clone())
+            .unwrap()
+            .watched_by(&conn);
+        assert!(matches!(cursor.count(), Ok(IOResult::Done(2000))));
+        conn.interrupt_requested.store(true, Ordering::SeqCst);
+        let mut cursor = switch.cursor(root, None, pager).unwrap().watched_by(&conn);
+        let stopped = cursor.count();
+        conn.interrupt_requested.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(stopped.as_ref().map_err(|e| &**e), Err(LimboError::Interrupt)),
+            "{stopped:?}"
+        );
+        switch.finish(true).unwrap();
+    }
+
+    /// Pauses the first time it's asked at `NextStart`, never again.
+    #[derive(Debug, Default)]
+    struct PauseOnce(crate::sync::atomic::AtomicBool);
+
+    impl crate::mvcc::yield_points::YieldInjector for PauseOnce {
+        fn should_yield(
+            &self,
+            _instance_id: u64,
+            _selection_key: u64,
+            point: crate::mvcc::yield_points::YieldPoint,
+        ) -> bool {
+            use crate::mvcc::yield_hooks::YieldPointMarker;
+            point == crate::mvcc::cursor::CursorYieldPoint::NextStart.point()
+                && !self.0.swap(true, crate::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// AC-NS.2.7 (G7 step 2): the connection's yield injector pauses a scan on the versioned
+    /// storage where it pauses the pager's cursor (a step's start), and the statement resumed
+    /// returns every row once.
+    #[test]
+    fn ns_2_7_a_scan_paused_at_a_steps_start_resumes_whole() {
+        let (conn, _) = many_leaves(300);
+        let injector = Arc::new(PauseOnce::default());
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        let (mut rows, mut paused) = (0i64, 0);
+        loop {
+            match stmt.step().unwrap() {
+                crate::StepResult::Row => rows += 1,
+                crate::StepResult::Yield => paused += 1,
+                crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+                crate::StepResult::Done => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        conn.set_yield_injector(None);
+        assert_eq!((rows, paused), (300, 1));
+    }
 }
