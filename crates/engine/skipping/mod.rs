@@ -27,12 +27,14 @@
 //!
 //! The switch is per table and per column: a connection that turns neither on pays nothing.
 
+mod choose;
 mod cracking;
 mod leaves;
 mod registry;
 mod scan;
 mod zone_map;
 
+pub use choose::{Chooser, ChooserStats, MethodStats, SkipMethod};
 pub use cracking::{CrackerColumn, CrackerStats};
 pub use leaves::{
     set_skipping, skipping_candidates, skipping_counts, zone_map_of_table, LeafBuildError, SkipKind,
@@ -40,7 +42,7 @@ pub use leaves::{
 pub use registry::{SkipCounts, SkipRefusal, SkipRegistry, WalPos};
 pub use scan::{
     bound_terms, BoundOp, BoundTerm, BoundValue, ColumnBounds, SkipHint, SkipWalk, SkipWalks,
-    WalkPhase, WalkTarget,
+    WalkMeasure, WalkPhase, WalkTarget,
 };
 pub use zone_map::{RowidRange, ZoneMap, ZoneMapBuilder, ZoneStats};
 
@@ -92,6 +94,9 @@ pub enum Skipping {
     Off,
     ZoneMaps(ZoneMap),
     Cracking(CrackerColumn),
+    /// Both, each filter answered by whichever measures cheaper (lane skip-3, T-SKU.2;
+    /// `choose.rs`).
+    Measured(Box<Chooser>),
 }
 
 /// The rows a filter `lo <= value <= hi` may need, as a summary names them.
@@ -113,15 +118,32 @@ impl Skipping {
             Skipping::Off => Ok(()),
             Skipping::ZoneMaps(zones) => zones.on_write(write),
             Skipping::Cracking(cracker) => cracker.on_write(write),
+            Skipping::Measured(chooser) => chooser.on_write(write),
         }
     }
 
     /// The rows a filter `lo <= value <= hi` on the summarized column may need.
     pub fn candidates(&mut self, lo: i64, hi: i64) -> Result<Candidates, SkipError> {
+        self.candidates_by(lo, hi).map(|(candidates, _)| candidates)
+    }
+
+    /// [`Skipping::candidates`], with the method a [`Skipping::Measured`] answered by (its scan's
+    /// cost goes back to [`Chooser::record`]).
+    pub fn candidates_by(
+        &mut self,
+        lo: i64,
+        hi: i64,
+    ) -> Result<(Candidates, Option<SkipMethod>), SkipError> {
         Ok(match self {
-            Skipping::Off => Candidates::All,
-            Skipping::ZoneMaps(zones) => Candidates::Ranges(zones.candidate_ranges(lo, hi)),
-            Skipping::Cracking(cracker) => Candidates::Rowids(cracker.candidate_rowids(lo, hi)?),
+            Skipping::Off => (Candidates::All, None),
+            Skipping::ZoneMaps(zones) => (Candidates::Ranges(zones.candidate_ranges(lo, hi)), None),
+            Skipping::Cracking(cracker) => {
+                (Candidates::Rowids(cracker.candidate_rowids(lo, hi)?), None)
+            }
+            Skipping::Measured(chooser) => {
+                let (candidates, method) = chooser.candidates(lo, hi)?;
+                (candidates, Some(method))
+            }
         })
     }
 }

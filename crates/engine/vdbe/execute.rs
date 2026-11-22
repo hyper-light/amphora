@@ -1917,7 +1917,7 @@ pub fn op_rewind(
             .filter(|walk| walk.phase != crate::skipping::WalkPhase::Idle)
         {
             let on_row = state.pc + 1;
-            return skip_walk_step(state, walk, pc_if_empty.as_offset_int(), on_row);
+            return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
         }
     }
     // Clear any bloom filter associated with this cursor so stale filter data
@@ -1946,7 +1946,7 @@ pub fn op_rewind(
         if !program.skip_hints.is_empty() {
             if let Some(walk) = skip_walk_for(program, state, *cursor_id) {
                 let on_row = state.pc + 1;
-                return skip_walk_step(state, walk, pc_if_empty.as_offset_int(), on_row);
+                return skip_walk_step(program, state, walk, pc_if_empty.as_offset_int(), on_row);
             }
         }
         // Rewind positions to the first row, which is effectively a read
@@ -1991,8 +1991,10 @@ fn skip_walk_for(
         _ => None,
     })?;
     let (reader_pos, committed) = conn.skipping_positions()?;
-    let candidates = registry
-        .candidates(
+    // Lane skip-3 (T-SKU.2): a measured summary's scan is timed from here to its end.
+    let started = std::time::Instant::now();
+    let (candidates, method) = registry
+        .candidates_by(
             root,
             conn.skipping_id(),
             reader_pos,
@@ -2001,12 +2003,32 @@ fn skip_walk_for(
             bounds.hi,
         )
         .ok()?;
-    crate::skipping::SkipWalk::new(cursor_id, candidates)
+    let mut walk = crate::skipping::SkipWalk::new(cursor_id, candidates)?;
+    walk.measure = method.map(|method| crate::skipping::WalkMeasure {
+        root,
+        method,
+        started,
+    });
+    Some(walk)
+}
+
+/// Lane skip-3 (T-SKU.2): a measured scan's end hands its cost (nanoseconds from asking for its
+/// candidates) to the summary's chooser, once. A scan stopped early (a LIMIT) hands back nothing.
+fn skip_walk_ended(program: &Program, walk: &mut crate::skipping::SkipWalk) {
+    if let Some(measure) = walk.measure.take() {
+        let cost = u64::try_from(measure.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        program
+            .connection
+            .db
+            .skipping
+            .record_cost(measure.root, measure.method, cost);
+    }
 }
 
 /// Moves a skipping scan's cursor to its next candidate row (`on_row`) or ends it (`on_end`),
 /// keeping the walk across an I/O wait.
 fn skip_walk_step(
+    program: &Program,
     state: &mut ProgramState,
     mut walk: crate::skipping::SkipWalk,
     on_end: crate::vdbe::InsnReference,
@@ -2019,6 +2041,9 @@ fn skip_walk_step(
     };
     state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(seeks);
     state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(seeks);
+    if matches!(moved, Ok(crate::types::IOResult::Done(false))) {
+        skip_walk_ended(program, &mut walk);
+    }
     state.skip_walks.put(walk);
     match moved? {
         crate::types::IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
@@ -3792,6 +3817,7 @@ pub fn op_next(
                 match step {
                     CursorStep::Row => walk.phase = crate::skipping::WalkPhase::Settle,
                     CursorStep::Empty => {
+                        skip_walk_ended(program, &mut walk);
                         state.skip_walks.put(walk);
                         state.pc += 1;
                         return Ok(InsnFunctionStepResult::Step);
@@ -3807,7 +3833,7 @@ pub fn op_next(
                 }
             }
             let on_end = state.pc + 1;
-            return skip_walk_step(state, walk, on_end, pc_if_next.as_offset_int());
+            return skip_walk_step(program, state, walk, on_end, pc_if_next.as_offset_int());
         }
     }
     let is_empty = {
