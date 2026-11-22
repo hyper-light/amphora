@@ -2367,7 +2367,8 @@ fn chain_runs(conn: &Arc<Connection>, sql: &str, rows: bool, tables: usize) -> O
 /// terms beside the keys, WHERE terms that read the padded sides' NULLs, with aggregates,
 /// returning rows, or ordered by every table's INTEGER PRIMARY KEY under a LIMIT and an OFFSET,
 /// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores (row for row with aggregates or a
-/// LIMIT; as the same rows otherwise). Joins of both sizes took the hook.
+/// LIMIT; as the same rows otherwise). Joins of both sizes with no WHERE term (every outer join
+/// kept as written, so only the chain takes them) took the hook.
 #[test]
 fn t_qt_6_24_full_joins_of_three_and_four_tables_answer_as_the_serial_loop() {
     let conn = open(":memory:qt-6-24");
@@ -2394,7 +2395,11 @@ fn t_qt_6_24_full_joins_of_three_and_four_tables_answer_as_the_serial_loop() {
         link_kinds[full] = "FULL JOIN";
         let (sql, rows) = random_outer_chain(&mut rng, names, &link_kinds);
         if let Some(runs) = chain_runs(&conn, &sql, rows, names.len()) {
-            hooked[names.len() - 3] += runs;
+            // With no WHERE term the optimizer keeps every outer join as written, so only the
+            // chain could have taken it.
+            if !sql.contains(" WHERE ") {
+                hooked[names.len() - 3] += runs;
+            }
         }
     }
     conn.set_join_methods(crate::JoinMethods::ByCost);
@@ -2406,7 +2411,7 @@ fn t_qt_6_24_full_joins_of_three_and_four_tables_answer_as_the_serial_loop() {
 /// T-QT.6.25 (lane qs6-14): more than one outer join in a statement runs on morsels. Random joins
 /// of three and four tables with two or more LEFT, RIGHT or FULL joins (at random links, an inner
 /// join at the rest), as T-QT.6.24's, answer as the serial loop at 1, 2, 3, 4 and 8 stated cores.
-/// Joins of both sizes took the hook, and so did a statement of LEFT joins alone.
+/// Joins of both sizes with no WHERE term took the hook, and so did one of LEFT joins alone.
 #[test]
 fn t_qt_6_25_more_than_one_outer_join_answers_as_the_serial_loop() {
     let conn = open(":memory:qt-6-25");
@@ -2456,9 +2461,12 @@ fn t_qt_6_25_more_than_one_outer_join_answers_as_the_serial_loop() {
             .all(|kind| *kind != "RIGHT JOIN" && *kind != "FULL JOIN");
         let (sql, rows) = random_outer_chain(&mut rng, names, &link_kinds);
         if let Some(runs) = chain_runs(&conn, &sql, rows, names.len()) {
-            hooked[names.len() - 3] += runs;
-            if lefts {
-                left_only += runs;
+            // As in T-QT.6.24: with no WHERE term only the chain could have taken it.
+            if !sql.contains(" WHERE ") {
+                hooked[names.len() - 3] += runs;
+                if lefts {
+                    left_only += runs;
+                }
             }
         }
     }
