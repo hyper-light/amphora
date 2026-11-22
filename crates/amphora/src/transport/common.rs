@@ -614,7 +614,18 @@ impl Client {
     }
     pub(super) fn request(&self, request: Request, until: Instant) -> Result<Answer, Error> {
         let encoded = encode(&request, FRAME_MAX)?;
-        let mut stream = self.stream(until)?;
+        let (mut stream, version) = self.greet(until)?;
+        // A request is sent only to an owner that agreed on a version that has it, and refused
+        // before it goes out otherwise: nothing was done (local-owner-transport.md, "Negotiated
+        // versions").
+        let since = request.since();
+        if version < since {
+            return Err(api::invalid(
+                "owner request",
+                &format!("the request needs version {since}, the owner agreed on {version}"),
+            )
+            .into());
+        }
         send(&mut stream, &encoded, until).map_err(|_| Error::UnknownOutcome)?;
         read::<Response>(&mut stream, until)
             .map_err(|_| Error::UnknownOutcome)?

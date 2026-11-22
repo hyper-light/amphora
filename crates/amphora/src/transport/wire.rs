@@ -97,6 +97,39 @@ pub(super) enum Request {
         envelope: crate::xgroup::Envelope,
     },
 }
+impl Request {
+    /// The first version that has this request, as sent (local-owner-transport.md, "Negotiated
+    /// versions"): a client sends it only on a connection that agreed on that version or a later
+    /// one. Every match here names every variant, so a variant added to `Request` or to
+    /// [`crate::xgroup::Step`] has to say its version before it compiles.
+    pub(super) fn since(&self) -> u32 {
+        match self {
+            Request::Step { envelope, .. } => match envelope.step {
+                crate::xgroup::Step::Begin
+                | crate::xgroup::Step::Scan { .. }
+                | crate::xgroup::Step::Lock { .. }
+                | crate::xgroup::Step::Decide { .. }
+                | crate::xgroup::Step::Recover { .. }
+                | crate::xgroup::Step::Prevent { .. }
+                | crate::xgroup::Step::Resolve { .. } => 8,
+            },
+            // Version 8 had every other request; this side speaks nothing older.
+            Request::Session
+            | Request::Execute(_)
+            | Request::Migrate(_)
+            | Request::Records { .. }
+            | Request::Probe
+            | Request::Identity
+            | Request::RestoreProgress
+            | Request::WatchBatch(_)
+            | Request::ReplicaStatus
+            | Request::Capabilities
+            | Request::Application(_)
+            | Request::LocalSession
+            | Request::Pull(_) => VERSION_MIN,
+        }
+    }
+}
 #[derive(Serialize, Deserialize)]
 pub(super) enum Record {
     Get(String, Vec<u8>, Consistency),

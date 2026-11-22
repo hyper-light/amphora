@@ -170,7 +170,9 @@ across a drain. Each side says the versions it speaks and both use the newest on
   two cut off on the way then fails authentication instead of quietly agreeing on 8. Cutting both
   looks exactly like a version-8 peer, which no scheme a version-8 peer accepts can tell apart.
 - Messages keep their shape at every version. A version adds variants after every existing one,
-  and a variant is sent only on a connection that agreed on a version that has it. Version 9's
+  and a variant is sent only on a connection that agreed on a version that has it: a request
+  (`Request::since`, which names every request and every `xgroup::Step`) is refused before it goes
+  out, `Invalid`, on a connection that agreed on an older version. Version 9's
   `Answer::SteppedClosed` is `Stepped` plus the group's closed time; an owner answers a step at 8
   with `Stepped`, as version 8 did.
 - What a version-8 peer can't say is missing, not guessed: a step a version-8 node answers adds no
