@@ -906,10 +906,10 @@ fn emit(o: &Opts, mut head: serde_json::Value, body: serde_json::Value) -> anyho
             h.insert(k.clone(), v.clone());
         }
     }
+    use std::io::Write;
     let line = head.to_string();
-    println!("{line}");
+    writeln!(std::io::stdout().lock(), "{line}")?;
     if let Some(path) = &o.record {
-        use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -928,7 +928,13 @@ fn open(o: &Opts) -> anyhow::Result<Box<dyn System>> {
 }
 
 pub fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = std::env::args_os()
+        .skip(1)
+        .map(|a| {
+            a.into_string()
+                .map_err(|a| anyhow::anyhow!("argument {a:?} isn't Unicode"))
+        })
+        .collect::<anyhow::Result<Vec<String>>>()?;
     let o = parse(&args)?;
     let ran = open(&o).and_then(|sys| {
         sys.prepare(&o)?;
@@ -1557,7 +1563,9 @@ pub mod sql {
     impl Drop for Containers {
         fn drop(&mut self) {
             if let Err(e) = self.script(&["down"]) {
-                eprintln!("{} down: {e}", self.script.display());
+                use std::io::Write;
+                // Drop can't return the failure: it goes to stderr, and the containers stay for `down`.
+                writeln!(std::io::stderr().lock(), "{} down: {e}", self.script.display()).ok();
             }
         }
     }
@@ -1812,6 +1820,9 @@ pub mod sql {
         ))
     }
 
+    /// Whether a Region's peers' stores and its leader's store show an operation taken effect.
+    type Taken = Box<dyn Fn(&[i64], i64) -> bool>;
+
     impl Containers {
         fn reshard_cockroach(&self, what: Op, session: &str, op: usize) -> anyhow::Result<()> {
             let mut c = self
@@ -1899,7 +1910,7 @@ pub mod sql {
                 .get((op / 3) % regions.len())
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("no Region"))?;
-            let done: Box<dyn Fn(&[i64], i64) -> bool> = if what == Op::Leader {
+            let done: Taken = if what == Op::Leader {
                 let to = *replicas
                     .iter()
                     .find(|&&r| r != leader)
