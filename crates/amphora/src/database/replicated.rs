@@ -1568,7 +1568,7 @@ static DISKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<AtomicBool>>>> = OnceLock::ne
 
 fn disk_switch(log_path: &Path) -> Result<Arc<AtomicBool>, Refusal> {
     let mut disks = locked(DISKS.get_or_init(Mutex::default))?;
-    disks.retain(|_, cut| Arc::strong_count(cut) > 1);
+    disks.retain(|_, cut| Arc::strong_count(&*cut) > 1);
     let cut = Arc::new(AtomicBool::new(false));
     disks.insert(log_path.to_path_buf(), Arc::clone(&cut));
     Ok(cut)
@@ -1582,7 +1582,7 @@ pub(super) fn cut_disk(log_path: &Path, on: bool) -> Result<(), Refusal> {
     let disks = locked(DISKS.get_or_init(Mutex::default))?;
     let cut = disks
         .get(log_path)
-        .filter(|cut| Arc::strong_count(cut) > 1)
+        .filter(|cut| Arc::strong_count(*cut) > 1)
         .ok_or_else(|| api::invalid("log path", "no replicated log is open there"))?;
     cut.store(on, Ordering::Relaxed);
     Ok(())
