@@ -1,0 +1,1 @@
+{"class": "replicated", "from": 0, "count": 50, "acknowledged": 391, "cuts": 150, "unflushed_leader": 46, "failed": [], "host": "Jupiter", "commit": "f06d134395122f580ed962a49a48e616fec9c420"}

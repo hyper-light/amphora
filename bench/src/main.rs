@@ -30,6 +30,7 @@ mod probe;
 mod query;
 mod reach;
 mod repl;
+mod scale;
 mod schema;
 mod sqlapi;
 mod store;
@@ -535,6 +536,10 @@ fn main() -> anyhow::Result<()> {
     }
     // Replication measured: commit classes, failover and catch-up on Amphora and the other
     // replicated SQLites (`repl.rs`; CP-T1.8, G12 steps 1 and 3).
+    // G13 steps 1, 2 and 5, G14 steps 1 and 2: scale-out and regions measured (bench/src/scale.rs).
+    if std::env::args().any(|a| a == "--scale") {
+        return scale::main();
+    }
     if std::env::args().any(|a| a == "--repl") {
         return repl::main();
     }
