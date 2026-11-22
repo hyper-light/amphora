@@ -490,6 +490,11 @@ mod tests {
 
     #[test]
     fn test_seek_key_exists_in_btree() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with test data: rows 1, 3, 5, 7
@@ -540,6 +545,11 @@ mod tests {
 
     #[test]
     fn test_seek_key_exists_only_uncommitted() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 5, 7
@@ -592,6 +602,11 @@ mod tests {
 
     #[test]
     fn test_seek_key_deleted_by_uncommitted() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5, 7
@@ -641,6 +656,11 @@ mod tests {
 
     #[test]
     fn test_seek_with_updates() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5
@@ -672,6 +692,11 @@ mod tests {
 
     #[test]
     fn test_seek_boundary_conditions() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 5, 10
@@ -705,6 +730,11 @@ mod tests {
 
     #[test]
     fn test_seek_complex_uncommitted_weights() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with row 5
@@ -739,6 +769,11 @@ mod tests {
 
     #[test]
     fn test_seek_affected_by_transaction_state_changes() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1 and 3
@@ -773,6 +808,11 @@ mod tests {
 
     #[test]
     fn test_rewind_btree_first_uncommitted_later() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5
@@ -803,6 +843,11 @@ mod tests {
 
     #[test]
     fn test_rewind_with_uncommitted_first() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 5, 7
@@ -828,6 +873,11 @@ mod tests {
 
     #[test]
     fn test_rewind_skip_deleted_first() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5
@@ -852,6 +902,11 @@ mod tests {
 
     #[test]
     fn test_rewind_empty_btree_with_uncommitted() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Create cursor for testing
@@ -877,6 +932,11 @@ mod tests {
 
     #[test]
     fn test_rewind_all_deleted() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 2, 4
@@ -904,6 +964,11 @@ mod tests {
 
     #[test]
     fn test_rewind_with_updates() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3
@@ -934,6 +999,11 @@ mod tests {
 
     #[test]
     fn test_next_btree_only_sequential() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5, 7
@@ -967,6 +1037,11 @@ mod tests {
 
     #[test]
     fn test_next_uncommitted_only() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Create cursor for testing (no btree data)
@@ -1003,6 +1078,11 @@ mod tests {
 
     #[test]
     fn test_next_mixed_btree_uncommitted() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 5, 9
@@ -1044,6 +1124,11 @@ mod tests {
 
     #[test]
     fn test_next_skip_deleted_rows() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 2, 3, 4, 5
@@ -1079,6 +1164,11 @@ mod tests {
 
     #[test]
     fn test_next_with_updates() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5
@@ -1114,6 +1204,11 @@ mod tests {
 
     #[test]
     fn test_next_from_uninitialized() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 2, 4
@@ -1158,6 +1253,11 @@ mod tests {
 
     #[test]
     fn test_next_all_deleted() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 2, 3
@@ -1185,6 +1285,11 @@ mod tests {
 
     #[test]
     fn test_next_complex_interleaving() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 2, 4, 6, 8
@@ -1249,6 +1354,11 @@ mod tests {
 
     #[test]
     fn test_next_after_seek() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5, 7, 9
@@ -1280,6 +1390,11 @@ mod tests {
 
     #[test]
     fn test_next_multiple_weights_same_row() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with row 1
@@ -1310,6 +1425,11 @@ mod tests {
 
     #[test]
     fn test_next_only_uncommitted_large_gaps() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Create cursor for testing (no btree data)
@@ -1342,6 +1462,11 @@ mod tests {
 
     #[test]
     fn test_multiple_updates_same_row_single_transaction() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 2, 3
@@ -1392,6 +1517,11 @@ mod tests {
 
     #[test]
     fn test_empty_materialized_view_with_uncommitted() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Don't populate any data - view is created but empty
@@ -1441,6 +1571,11 @@ mod tests {
 
     #[test]
     fn test_exact_match_btree_uncommitted_same_rowid_different_values() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5
@@ -1476,6 +1611,11 @@ mod tests {
 
     #[test]
     fn test_boundary_value_seeks() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with some normal values
@@ -1552,6 +1692,11 @@ mod tests {
 
     #[test]
     fn test_next_concurrent_btree_uncommitted_advance() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 2, 3, 4, 5
@@ -1591,6 +1736,11 @@ mod tests {
 
     #[test]
     fn test_transaction_state_changes_mid_iteration() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5
@@ -1651,6 +1801,11 @@ mod tests {
 
     #[test]
     fn test_rewind_after_failed_seek() -> Result<()> {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the incremental view cursor over the pager's B-tree cursor and its pages",
+        ) {
+            return Ok(());
+        }
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5

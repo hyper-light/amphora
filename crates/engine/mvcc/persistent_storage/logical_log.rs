@@ -4334,6 +4334,11 @@ mod tests {
     /// Why this matters: This is the baseline durability/recovery guarantee for MVCC commits.
     #[test]
     fn test_logical_log_read() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the MVCC store's logical log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         init_tracing();
         // Load a transaction
         // let's not drop db as we don't want files to be removed
@@ -4399,6 +4404,11 @@ mod tests {
     /// Why this matters: Recovery must preserve commit order to maintain MVCC visibility semantics.
     #[test]
     fn test_logical_log_read_multiple_transactions() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the MVCC store's logical log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         init_tracing();
         let table_id: MVTableId = (-100).into();
         let values = (0..100)
@@ -4480,6 +4490,11 @@ mod tests {
     /// Why this matters: Fuzz-style coverage catches edge combinations that hand-written examples miss.
     #[test]
     fn test_logical_log_read_fuzz() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the MVCC store's logical log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         init_tracing();
         let table_id: MVTableId = (-100).into();
         let seed = rng().random();
@@ -4615,6 +4630,11 @@ mod tests {
     /// Why this matters: Table/index divergence after restart would break query correctness.
     #[test]
     fn test_logical_log_read_table_and_index_rows() {
+        if crate::storage::versioned::switch::pager_only(
+            "this test exercises the MVCC store's logical log; the versioned storage writes its own redo log",
+        ) {
+            return;
+        }
         init_tracing();
         // Test that both table rows and index rows can be read back after recovery
         let mut db = MvccTestDbNoConn::new_with_random_db();

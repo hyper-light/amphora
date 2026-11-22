@@ -635,6 +635,11 @@ fn mvcc_pragma_page_size_propagates_to_global_header() {
 
 #[test]
 fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
     db.conn
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -1050,6 +1055,11 @@ fn debug_gc_metrics_truncate_vs_passive() {
 /// Passive checkpoint publishes nbackfills and reclaims superseded versions.
 #[test]
 fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -1114,6 +1124,11 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
 /// exclusive `read_locks[0]` is still held forces every new begin onto slot 0.
 #[test]
 fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -1219,6 +1234,11 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
 /// GC has already run.
 #[test]
 fn passive_reader_snapshot_survives_later_write_after_row_versions_gc() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -1267,6 +1287,11 @@ fn passive_reader_snapshot_survives_later_write_after_row_versions_gc() {
 /// Passive checkpoint may run btree writes while a pinned reader is active.
 #[test]
 fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let writer = db.connect();
     let reader = db.connect();
@@ -1310,6 +1335,11 @@ fn mvcc_passive_checkpoint_busy_under_pinned_reader_no_corruption() {
 /// Auto passive checkpoint retries publish when a reader holds the checkpoint lock.
 #[test]
 fn mvcc_passive_auto_checkpoint_retries_publish_while_reader_pinned() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let mv_store = db.get_mvcc_store();
     mv_store.set_checkpoint_threshold(0);
@@ -1366,6 +1396,11 @@ fn mvcc_passive_auto_checkpoint_retries_publish_while_reader_pinned() {
 /// dropped/reused at its snapshot — not whenever any concurrent checkpoint publishes some root.
 #[test]
 fn mvcc_passive_unrelated_root_publication_does_not_invalidate_open_txn() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let writer = db.connect();
     let reader = db.connect();
@@ -1389,6 +1424,11 @@ fn mvcc_passive_unrelated_root_publication_does_not_invalidate_open_txn() {
 
 #[test]
 fn mvcc_passive_drop_index_then_reuse_page_integrity() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = &db.connect();
     let assert_ok = |conn: &Arc<Connection>, label: &str| {
@@ -1545,6 +1585,11 @@ fn mvcc_try_get_table_id_stale_schema_read_returns_none() {
 
 #[test]
 fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
     db.conn
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -2358,6 +2403,11 @@ fn rewrite_wal_frames_as_non_commit(path: &std::path::Path) {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_recovery_clock_monotonicity() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let max_commit_ts = {
         let conn = db.connect();
@@ -2425,6 +2475,11 @@ fn test_recover_logical_log_short_file_ignored() {
 /// before the schema row. Recovery must stay tolerant to logs written by those older versions.
 #[test]
 fn test_recovery_replays_schema_op_after_data_op_in_frame() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     {
@@ -2506,6 +2561,11 @@ fn test_journal_mode_switch_from_mvcc_to_wal_without_log_frames() {
 
 #[test]
 fn abandoned_journal_mode_checkpoint_releases_pager_transaction_and_lock() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -2546,6 +2606,11 @@ fn abandoned_journal_mode_checkpoint_releases_pager_transaction_and_lock() {
 
 #[amphora_engine_macros::test(encryption)]
 fn test_recovery_checkpoint_then_more_writes() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
@@ -2573,6 +2638,11 @@ fn test_recovery_checkpoint_then_more_writes() {
 /// constraints stay associated with the columns they were created for.
 #[test]
 fn test_restart_preserves_autoindex_to_column_mapping() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
     {
         let conn = db.connect();
@@ -2608,6 +2678,11 @@ fn test_restart_preserves_autoindex_to_column_mapping() {
 /// §2.5 Table 1 (speculative read of preparing writer), §2.7 (commit deps).
 #[test]
 fn test_concurrent_update_then_delete_serializes_correctly_across_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
 
     {
@@ -2684,6 +2759,11 @@ fn test_concurrent_update_then_delete_serializes_correctly_across_restart() {
 /// Why this matters: Trigger definitions are stored without btrees and should not break recovery.
 #[test]
 fn test_restart_with_trigger_rootpage_zero() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
     {
         let conn = db.connect();
@@ -2713,6 +2793,11 @@ fn test_restart_with_trigger_rootpage_zero() {
 
 #[amphora_engine_macros::test(encryption)]
 fn test_btree_resident_recovery_then_checkpoint_delete_stays_deleted() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
@@ -2753,6 +2838,11 @@ fn test_btree_resident_recovery_then_checkpoint_delete_stays_deleted() {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_recovery_overwrites_torn_tail_on_next_append() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -2851,6 +2941,11 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_bootstrap_completes_interrupted_checkpoint_with_committed_wal() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
@@ -2899,6 +2994,11 @@ fn test_bootstrap_completes_interrupted_checkpoint_with_committed_wal() {
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
 fn test_checkpoint_truncates_wal_last() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let wal_path = wal_path_for_db(&db_path);
@@ -2970,6 +3070,11 @@ fn test_checkpoint_truncates_wal_last() {
 /// Truncate checkpoint must collect commits that land while waiting for `AcquireLock`, and zero the logical log.
 #[test]
 fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let _ = tracing_subscriber::fmt::try_init();
@@ -3085,6 +3190,11 @@ fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
 /// file.
 #[test]
 fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -3169,6 +3279,11 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
 /// Treating that as an impossible state crashes checkpoint.
 #[test]
 fn test_checkpoint_allows_index_schema_update_after_rename_column() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -3190,6 +3305,11 @@ fn test_checkpoint_allows_index_schema_update_after_rename_column() {
 
 #[test]
 fn test_bootstrap_recovers_committed_wal_without_log_file() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     // A Passive checkpoint truncates the logical log to 0 but leaves the WAL non-empty,
     // so reopen sees NoLog + committed WAL — the normal steady state, not corruption.
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -3233,6 +3353,11 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
 /// header is missing" back when FULL kept the WAL while truncating the logical log.
 #[test]
 fn test_full_checkpoint_reopen_recovers_truncate_mode() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
@@ -3266,6 +3391,11 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
 /// no-op. An open transaction holds the checkpoint lock for its lifetime.
 #[test]
 fn test_flag_off_truncate_busy_when_lock_contended() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let c1 = db.connect();
     c1.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
@@ -3328,6 +3458,11 @@ fn test_checkpoint_snapshot_ts_clamps_below_inflight_preparing() {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let wal_path = wal_path_for_db(&db_path);
@@ -3364,6 +3499,11 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
@@ -3397,6 +3537,11 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_bootstrap_handles_committed_wal_when_log_truncated() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     {
@@ -3436,6 +3581,11 @@ fn test_bootstrap_handles_committed_wal_when_log_truncated() {
 /// Why this matters: Recovery must preserve availability by discarding invalid WAL tail bytes instead of failing startup.
 #[test]
 fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let wal_path = wal_path_for_db(&db_path);
@@ -3466,6 +3616,11 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
 /// Why this matters: Timestamp rewind below checkpointed boundary would break MVCC ordering.
 #[test]
 fn test_empty_log_recovery_loads_checkpoint_watermark() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let persistent_tx_ts_max = {
         let conn = db.connect();
@@ -3528,6 +3683,11 @@ fn test_empty_log_recovery_loads_checkpoint_watermark() {
 /// 12. Replay gate correctness: never apply `commit_ts <= persistent_tx_ts_max`.
 #[test]
 fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let wal_path = wal_path_for_db(&db_path);
@@ -3569,6 +3729,11 @@ fn test_meta_recovery_case_1_no_wal_no_log_metadata_present_clean_boot() {
 /// With no committed WAL and metadata present, replay includes only frames above `persistent_tx_ts_max`.
 #[amphora_engine_macros::test(encryption)]
 fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
@@ -3610,6 +3775,11 @@ fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
 /// both before and after log truncation, including implicit autocommit statement transactions.
 #[amphora_engine_macros::test(encryption)]
 fn test_header_only_mutation_is_replayed_and_checkpointed() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
 
     {
@@ -3739,6 +3909,11 @@ fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_clos
 /// Why this matters: Ordering prevents double-apply and loss when WAL and logical log both exist.
 #[test]
 fn test_meta_recovery_case_4_committed_wal_reconcile_before_metadata_boundary_replay() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let wal_path = wal_path_for_db(&db_path);
@@ -3815,6 +3990,11 @@ fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
 /// Why this matters: Corrupt internal metadata must never be interpreted best-effort.
 #[test]
 fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let wal_path = wal_path_for_db(&db_path);
@@ -3849,6 +4029,11 @@ fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
 /// Why this matters: Schema/shape corruption in internal state must not be silently tolerated.
 #[test]
 fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let metadata_root_page = {
@@ -3915,6 +4100,11 @@ fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
 /// Why this matters: This is the atomicity mechanism replacing logical-log header checkpoint timestamps.
 #[test]
 fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -3974,6 +4164,11 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
 /// Why this matters: root publication invalidates compiled bytecode generally, not only PRAGMA integrity_check.
 #[test]
 fn test_prepared_select_reprepares_after_checkpoint_root_publish() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -3996,6 +4191,11 @@ fn test_prepared_select_reprepares_after_checkpoint_root_publish() {
 /// Why this matters: only root/drop publication should force reprepare; ordinary row checkpointing should leave prepared bytecode reusable.
 #[test]
 fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -4022,6 +4222,11 @@ fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
 /// Why this matters: table and index roots are published independently, and stale index bytecode must not survive checkpoint.
 #[test]
 fn test_prepared_index_lookup_reprepares_after_checkpoint_root_publish() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, payload TEXT)")
@@ -4052,6 +4257,11 @@ fn test_prepared_index_lookup_reprepares_after_checkpoint_root_publish() {
 /// pages and report a clean database.
 #[test]
 fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses_user_apis() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
@@ -4153,6 +4363,11 @@ fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses
 /// 5. Resume the stale statement; it must force one reprepare and then report `ok`.
 #[test]
 fn test_running_integrity_check_reprepares_after_checkpoint_root_publish() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
     writer
@@ -4199,6 +4414,11 @@ fn test_running_integrity_check_reprepares_after_checkpoint_root_publish() {
 /// 6. Resume the deferred statement; it must force one reprepare, report `ok`, and leave the transaction committable.
 #[test]
 fn test_deferred_begin_integrity_check_reprepares_after_checkpoint_root_publish() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
     writer
@@ -4245,6 +4465,11 @@ fn test_deferred_begin_integrity_check_reprepares_after_checkpoint_root_publish(
 /// 7. Resume the stale statement; it must force one reprepare and then report `ok`.
 #[test]
 fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
     writer
@@ -4295,6 +4520,11 @@ fn test_running_integrity_check_reprepares_without_schema_cookie_bump() {
 
 #[test]
 fn reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -4354,6 +4584,11 @@ fn reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
 
 #[test]
 fn integrity_check_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -4428,6 +4663,11 @@ fn integrity_check_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
 
 #[test]
 fn integrity_check_does_not_report_freelist_count_mismatch_after_checkpoint_begin_race() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
     writer
@@ -4481,6 +4721,11 @@ fn integrity_check_does_not_report_freelist_count_mismatch_after_checkpoint_begi
 
 #[test]
 fn integrity_check_does_not_report_page_never_used_after_checkpoint_begin_race() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let writer = db.connect();
     writer
@@ -4553,6 +4798,11 @@ fn step_until_done(stmt: &mut crate::Statement, io: &Arc<dyn IO>, context: &str)
 
 #[test]
 fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
@@ -4637,6 +4887,11 @@ fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
 
 #[test]
 fn drop_attached_checkpoint_paused_at_before_pager_commit() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let (db, writer, aux_path_str, _aux_dir) =
         drop_attached_statement_paused_at_checkpoint_before_pager_commit(
             "INSERT INTO aux.t VALUES (2, 'checkpointed')",
@@ -4660,6 +4915,11 @@ fn drop_attached_checkpoint_paused_at_before_pager_commit() {
 
 #[test]
 fn drop_attached_ddl_checkpoint_paused_at_before_pager_commit_keeps_new_schema() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let (db, writer, aux_path_str, _aux_dir) =
         drop_attached_statement_paused_at_checkpoint_before_pager_commit("CREATE TABLE aux.t2(x)");
     assert_eq!(
@@ -4737,6 +4997,11 @@ fn drop_attached_statement_paused_at_checkpoint_before_pager_commit(
 
 #[test]
 fn savepoint_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -4806,6 +5071,11 @@ fn savepoint_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
 /// Why this matters: Commit contract must remain stable even when checkpoint cleanup fails mid-flight.
 #[test]
 fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_recoverable() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -4881,6 +5151,11 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
 /// which uses only user facing APIs to simulate the same error.
 #[test]
 fn test_checkpoint_resamples_boundary_before_starting() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -5012,6 +5287,11 @@ fn test_checkpoint_resamples_boundary_before_starting() {
 
 #[test]
 fn test_reader_consistent_during_large_indexed_commit_rewrite() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let c1 = db.connect();
@@ -5081,6 +5361,11 @@ fn test_reader_consistent_during_large_indexed_commit_rewrite() {
 
 #[test]
 fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -5178,6 +5463,11 @@ fn test_checkpoint_two_scan_toctou_orphans_first_checkpoint_unique_index() {
 
 #[test]
 fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -5268,12 +5558,22 @@ fn test_checkpoint_gc_anchor_loss_update_then_delete_strands_stale_row() {
 /// Concurrent checkpoint + WWC abort stress; oracle is `integrity_check` only.
 #[test]
 fn test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     conflict_abort_ckpt_indexed_update_body(MvccTestDbNoConn::new_with_random_db());
 }
 
 /// Same workload with passive checkpoint enabled.
 #[test]
 fn test_conflict_abort_ckpt_indexed_update_savepoint_integrity_check_passive() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     conflict_abort_ckpt_indexed_update_body(MvccTestDbNoConn::new_with_random_db_passive());
 }
 
@@ -5475,6 +5775,11 @@ fn conflict_abort_ckpt_indexed_update_body(db: MvccTestDbNoConn) {
 /// every commit, so every reader snapshot must see the exact unchanged SUM and row COUNT.
 #[test]
 fn test_passive_concurrent_transfer_preserves_sum_and_count() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     const N: i64 = 50;
     const INIT: i64 = 1000;
     const TOTAL: i64 = N * INIT;
@@ -5622,6 +5927,11 @@ fn test_passive_concurrent_transfer_preserves_sum_and_count() {
 
 #[test]
 fn test_reader_does_not_see_inflight_index_tombstone() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let c1 = db.connect();
     c1.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
@@ -5654,6 +5964,11 @@ fn test_reader_does_not_see_inflight_index_tombstone() {
 /// leave the pre-update index entry tombstoned (regression guard; this path is correct).
 #[test]
 fn test_rollback_of_indexed_update_keeps_btree_resident_index_entry() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     // Repro for the turso_stress "row missing from index" bug: an UPDATE of an indexed
     // UNIQUE column inside a tx that ROLLS BACK must not leave the pre-update index entry
     // tombstoned — especially when it's already btree-resident (the UPDATE then creates a
@@ -5690,6 +6005,11 @@ fn test_rollback_of_indexed_update_keeps_btree_resident_index_entry() {
 
 #[test]
 fn test_conflict_abort_of_indexed_update_keeps_btree_resident_index_entry() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let c1 = db.connect();
     c1.execute("CREATE TABLE t(pk NUMERIC PRIMARY KEY, v NUMERIC UNIQUE)")
@@ -5729,6 +6049,11 @@ fn test_conflict_abort_of_indexed_update_keeps_btree_resident_index_entry() {
 
 #[test]
 fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v TEXT)")
@@ -5822,6 +6147,11 @@ fn test_passive_checkpoint_tolerates_concurrent_create_after_snapshot() {
 ///    `Corrupt("MVCC delete ... not found")`.
 #[test]
 fn test_checkpoint_retry_does_not_replay_checkpointed_btree_resident_unique_delete() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -5914,6 +6244,11 @@ fn test_checkpoint_retry_does_not_replay_checkpointed_btree_resident_unique_dele
 /// What this test checks: user-facing SQL plus a commit yield can produce out-of-order commit completion without lowering checkpoint metadata.
 #[test]
 fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -5979,6 +6314,11 @@ fn test_checkpoint_stale_unique_index_delete_with_out_of_order_commit_yield() {
 ///    `CREATE TABLE` frame whose schema row still has the negative MVCC root page.
 #[test]
 fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_after_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -6039,6 +6379,11 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
 
 #[test]
 fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoindex_entry() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -6090,6 +6435,11 @@ fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoind
 
 #[test]
 fn test_checkpoint_post_durable_failure_then_delete_removes_stale_table_row() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -6902,6 +7252,11 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
 
 #[test]
 fn test_mvcc_cursor_next_yields_with_injected_yield() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
     db.conn
         .execute("CREATE TABLE cursor_yield_test(x INTEGER PRIMARY KEY, v TEXT)")
@@ -7029,6 +7384,11 @@ fn test_sequence_watermark_tracks_lowest_active_allocation() {
 
 #[test]
 fn test_sequence_watermark_function_returns_current_watermark_without_active_allocations() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     let mv_store = db.get_mvcc_store();
@@ -7057,6 +7417,11 @@ fn test_sequence_watermark_function_returns_current_watermark_without_active_all
 
 #[test]
 fn test_sequence_watermark_tracks_nextval_allocations() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup.execute("CREATE SEQUENCE s START WITH 1").unwrap();
@@ -7105,6 +7470,11 @@ fn test_sequence_watermark_tracks_nextval_allocations() {
 /// advance past a row it had not yet seen.
 #[test]
 fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -7279,6 +7649,11 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
 fn test_lazy_scan_cursor_basic() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2, 3, 4, 5]);
 
     let mut cursor = MvccLazyCursor::new(
@@ -7332,6 +7707,11 @@ fn test_lazy_scan_cursor_basic() {
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
 fn test_lazy_scan_cursor_with_gaps() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let (db, tx_id, table_id, btree_root_page) = setup_test_db();
 
     let mut cursor = MvccLazyCursor::new(
@@ -7392,6 +7772,11 @@ fn test_lazy_scan_cursor_with_gaps() {
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
 fn test_cursor_basic() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2, 3, 4, 5]);
 
     let mut cursor = MvccLazyCursor::new(
@@ -7476,6 +7861,11 @@ fn test_cursor_with_empty_table() {
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
 fn test_cursor_modification_during_scan() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let (db, tx_id, table_id, btree_root_page) = setup_lazy_db(&[1, 2, 4, 5]);
 
@@ -7760,6 +8150,11 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
 
 #[test]
 fn test_read_only_commit_does_not_cache_finalized_state() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     let mvcc_store = db.get_mvcc_store();
@@ -7783,6 +8178,11 @@ fn test_read_only_commit_does_not_cache_finalized_state() {
 
 #[test]
 fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     let mvcc_store = db.get_mvcc_store();
@@ -7811,6 +8211,11 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
 
 #[test]
 fn test_gc_keeps_finalized_tx_state_of_tx_still_in_txs() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     let mvcc_store = db.get_mvcc_store();
@@ -8133,6 +8538,11 @@ fn test_commit_dependency_multiple_reads_dedup() {
 ///   5. Reader COMMIT → CommitDependencyAborted
 #[test]
 fn test_commit_dep_threaded_abort_cascades() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -8246,6 +8656,11 @@ fn test_commit_dep_threaded_abort_cascades() {
 /// all cascade-abort when the writer aborts.
 #[test]
 fn test_commit_dep_threaded_multiple_dependents_abort() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -8338,6 +8753,11 @@ fn test_commit_dep_threaded_multiple_dependents_abort() {
 /// reader's CommitDepCounter is decremented and the reader can proceed.
 #[test]
 fn test_commit_dep_threaded_commit_resolves() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -8455,6 +8875,11 @@ fn test_commit_dep_threaded_commit_resolves() {
 /// speculatively read from a Preparing writer must still honour AbortNow.
 #[test]
 fn test_commit_dep_threaded_readonly_abort_cascades() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -8597,6 +9022,11 @@ fn test_commit_dependency_missing_tx_assumes_committed() {
 /// from acquire_exclusive_tx.
 #[test]
 fn test_commit_dep_readonly_does_not_advance_timestamp() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -8694,6 +9124,11 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
 /// Why this matters: checkpoints use this cache as a durable replay boundary; lowering it can make DB pages advance past MVCC metadata.
 #[test]
 fn test_last_committed_timestamp_is_monotonic_for_out_of_order_commits() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -8757,6 +9192,11 @@ fn test_last_committed_timestamp_is_monotonic_for_out_of_order_commits() {
 /// return Busy for transactions that started before the read.
 #[test]
 fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -8855,6 +9295,11 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
 
 #[test]
 fn test_exclusive_tx_does_not_deadlock_behind_preparing_concurrent_commit() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn_a = db.connect();
     conn_a
@@ -8980,6 +9425,11 @@ fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
 /// Why this matters: This path runs automatically after crashes; errors here can duplicate effects or drop durable data.
 #[test]
 fn test_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     write_synthetic_row(&db, "foo");
     db.restart();
@@ -9020,6 +9470,11 @@ fn test_restart() {
 /// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
 #[test]
 fn test_connection_sees_other_connection_changes() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn0 = db.connect();
     conn0
@@ -9045,6 +9500,11 @@ fn test_connection_sees_other_connection_changes() {
 /// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
 #[test]
 fn test_delete_with_conn() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn0 = db.connect();
     conn0.execute("CREATE TABLE test(t)").unwrap();
@@ -9081,6 +9541,11 @@ fn get_record_value(row: &Row) -> ImmutableRecord {
 /// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
 #[test]
 fn test_interactive_transaction() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -9103,6 +9568,11 @@ fn test_interactive_transaction() {
 /// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
 #[test]
 fn test_commit_without_tx() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     // do not start interactive transaction
@@ -9136,6 +9606,11 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
 /// regular concurrent insert that will not take into account new index.
 #[test]
 fn test_insert_in_middle_commit_of_create_index_returns_err() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db();
     {
@@ -9212,6 +9687,11 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
 /// Here the old schema still has the index while the snapshot has no rows left in the table.
 #[test]
 fn test_integrity_check_in_middle_commit_of_drop_index_and_delete() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn_a = db.connect();
     let conn_b = db.connect();
@@ -9420,6 +9900,11 @@ fn test_should_checkpoint() {
 /// Why this matters: Shadow-offset drift can suppress auto-checkpoint despite a large recovered log tail.
 #[test]
 fn test_should_checkpoint_after_recovery_uses_recovered_offset() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -9446,6 +9931,11 @@ fn test_should_checkpoint_after_recovery_uses_recovered_offset() {
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
 fn test_insert_with_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv_store = db.get_mvcc_store();
     // force checkpoint on every transaction
@@ -9502,6 +9992,11 @@ fn test_auto_checkpoint_busy_is_ignored() {
 /// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
 #[test]
 fn test_mvcc_read_tx_lifecycle() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -9521,6 +10016,11 @@ fn test_mvcc_read_tx_lifecycle() {
 /// Why this matters: These are foundational invariants; regressions here invalidate higher-level SQL behavior.
 #[test]
 fn test_mvcc_conn_drop_releases_read_tx() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -9539,6 +10039,11 @@ fn test_mvcc_conn_drop_releases_read_tx() {
 /// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
 #[test]
 fn test_select_empty_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv_store = db.get_mvcc_store();
     // force checkpoint on every transaction
@@ -9553,6 +10058,11 @@ fn test_select_empty_table() {
 /// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[amphora_engine_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
@@ -9576,6 +10086,11 @@ fn test_cursor_with_btree_and_mvcc() {
 /// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[amphora_engine_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_2() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
@@ -9603,6 +10118,11 @@ fn test_cursor_with_btree_and_mvcc_2() {
 /// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[amphora_engine_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
@@ -9629,6 +10149,11 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
 /// Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 #[amphora_engine_macros::test(encryption)]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
@@ -9862,6 +10387,11 @@ pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
 fn test_cursor_with_btree_and_mvcc_insert_after_checkpoint_repeated_key() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
@@ -9884,6 +10414,11 @@ fn test_cursor_with_btree_and_mvcc_insert_after_checkpoint_repeated_key() {
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
 fn test_cursor_with_btree_and_mvcc_seek_after_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
@@ -9907,6 +10442,11 @@ fn test_cursor_with_btree_and_mvcc_seek_after_checkpoint() {
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
 fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
@@ -9963,6 +10503,11 @@ fn test_skips_updated_rowid() {
 /// Why this matters: The invariant protects correctness across commit, replay, and query execution paths.
 #[test]
 fn test_mvcc_integrity_check() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -10128,6 +10673,11 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
 
 #[test]
 fn test_sql_checkpoint_reinsert_existing_interior_index_key_keeps_sqlite_integrity() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
     let conn = db.connect();
@@ -10208,6 +10758,11 @@ fn assert_checkpointed_replace_delete_result(conn: &Arc<Connection>) {
 
 #[test]
 fn test_mvcc_checkpoint_insert_or_replace_then_delete_removes_checkpointed_index_entries() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     setup_mvcc_checkpointed_indexed_table(&conn, false);
@@ -10221,6 +10776,11 @@ fn test_mvcc_checkpoint_insert_or_replace_then_delete_removes_checkpointed_index
 
 #[test]
 fn test_mvcc_checkpoint_update_or_replace_then_delete_removes_checkpointed_index_entries() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     setup_mvcc_checkpointed_indexed_table(&conn, true);
@@ -10234,6 +10794,11 @@ fn test_mvcc_checkpoint_update_or_replace_then_delete_removes_checkpointed_index
 
 #[test]
 fn test_mvcc_repeated_delete_after_replace_delete_checkpoint_is_noop() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     setup_mvcc_checkpointed_indexed_table(&conn, false);
@@ -10252,6 +10817,11 @@ fn test_mvcc_repeated_delete_after_replace_delete_checkpoint_is_noop() {
 
 #[test]
 fn test_mvcc_checkpoint_reopen_text_pk_upsert_delete_removes_autoindex_entry() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let mut conn = db.connect();
     conn.execute("PRAGMA journal_mode=mvcc").unwrap();
@@ -10290,6 +10860,11 @@ fn test_mvcc_checkpoint_reopen_text_pk_upsert_delete_removes_autoindex_entry() {
 
 #[test]
 fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -10365,6 +10940,11 @@ fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
 
 #[test]
 fn test_mvcc_cached_insert_reprepared_after_index_create() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -10396,6 +10976,11 @@ fn test_mvcc_cached_insert_reprepared_after_index_create() {
 
 #[test]
 fn test_mvcc_integrity_after_mixed_dml_create_index_transaction() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -10455,6 +11040,11 @@ fn test_mvcc_integrity_after_mixed_dml_create_index_transaction() {
 /// tracked by the schema. The fix is to track dropped root pages until checkpoint.
 #[test]
 fn test_integrity_check_after_drop_table_before_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -10490,6 +11080,11 @@ fn test_integrity_check_after_drop_table_before_checkpoint() {
 /// tracked by the schema. The fix is to track dropped root pages until checkpoint.
 #[test]
 fn test_integrity_check_after_drop_index_before_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -10521,6 +11116,11 @@ fn test_integrity_check_after_drop_index_before_checkpoint() {
 
 #[test]
 fn test_integrity_check_after_drop_autoincrement_table_before_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -10537,6 +11137,11 @@ fn test_integrity_check_after_drop_autoincrement_table_before_checkpoint() {
 
 #[test]
 fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:interrupted-drop-table-schema-rollback";
     let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
@@ -10603,6 +11208,11 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
 /// Why this matters: Partial rollback mistakes leave data in impossible intermediate states.
 #[test]
 fn test_rollback_with_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -10625,6 +11235,11 @@ fn test_rollback_with_index() {
 
 #[test]
 fn test_stale_update_of_deleted_row_is_refused_before_it_can_corrupt_indexes() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup.execute("PRAGMA page_size = 512").unwrap();
@@ -10717,6 +11332,11 @@ fn test_stale_update_of_deleted_row_is_refused_before_it_can_corrupt_indexes() {
 ///    because table row has old value but index has new value
 #[test]
 fn test_update_multiple_unique_columns_partial_rollback() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -11499,6 +12119,11 @@ fn transaction_rollback_removes_created_versions_immediately() {
 
 #[test]
 fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
     let conn = &db.conn;
     // Nothing else may reclaim slots: disable the checkpoint and inline GC.
@@ -11560,6 +12185,11 @@ fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
 
 #[test]
 fn rollback_of_created_index_keeps_open_reader_valid() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
     let conn = &db.conn;
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -11592,6 +12222,11 @@ fn rollback_of_created_index_keeps_open_reader_valid() {
 
 #[test]
 fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
     let conn = &db.conn;
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -11624,6 +12259,11 @@ fn insert_or_rollback_into_created_table_can_be_reset_after_rollback() {
 
 #[test]
 fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     for (begin, end_transaction) in [
         (None, "INSERT OR ROLLBACK INTO other VALUES (6)"),
         (Some("BEGIN"), "ROLLBACK"),
@@ -12162,6 +12802,11 @@ fn test_gc_incremental_concurrent_is_safe() {
 /// driving it in tiny chunks reclaims exactly what a full sweep would.
 #[test]
 fn test_gc_incremental_reclaims_index_chains_resumably() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
     let conn = &db.conn;
     // Drive GC manually: disable both the checkpoint and the inline-GC trigger.
@@ -12448,6 +13093,11 @@ fn test_gc_incremental_respects_held_snapshot() {
 /// ends, a later sweep reclaims the SkipMap copies.
 #[test]
 fn test_gc_current_serves_older_reader_then_reclaims() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -12512,6 +13162,11 @@ fn test_gc_current_serves_older_reader_then_reclaims() {
 /// the assertion is a table scan of `rowid`.
 #[test]
 fn test_gc_unwritten_text_pk_upsert_does_not_fork() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -12577,6 +13232,11 @@ fn test_gc_unwritten_text_pk_upsert_does_not_fork() {
 /// of `[]` from the B-tree.
 #[test]
 fn test_gc_reclaimed_text_pk_same_txn_sees_own_append() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -12630,6 +13290,11 @@ fn test_gc_reclaimed_text_pk_same_txn_sees_own_append() {
 
 #[test]
 fn test_gc_unstamped_text_pk_unique_lookup_still_sees_key() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -12665,6 +13330,11 @@ fn test_gc_unstamped_text_pk_unique_lookup_still_sees_key() {
 
 #[test]
 fn test_passive_finalize_reclaim_text_pk_unique_lookup_still_sees_key() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -12728,6 +13398,11 @@ fn test_passive_finalize_reclaim_text_pk_unique_lookup_still_sees_key() {
 
 #[test]
 fn test_unique_lookup_survives_passive_checkpoint_mid_seek() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let setup = db.connect();
@@ -12797,6 +13472,11 @@ fn test_unique_lookup_survives_passive_checkpoint_mid_seek() {
 
 #[test]
 fn test_same_txn_unique_lookup_stable_across_passive_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let setup = db.connect();
@@ -12867,6 +13547,11 @@ fn test_same_txn_unique_lookup_stable_across_passive_checkpoint() {
 
 #[test]
 fn test_same_txn_first_unique_lookup_after_aborted_seek_still_sees_reclaimed_key() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(key TEXT PRIMARY KEY, vals TEXT NOT NULL DEFAULT '')")
@@ -12909,6 +13594,11 @@ fn test_same_txn_first_unique_lookup_after_aborted_seek_still_sees_reclaimed_key
 
 #[test]
 fn test_idxdelete_after_truncate_clears_checkpointed_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
@@ -12933,6 +13623,11 @@ fn test_idxdelete_after_truncate_clears_checkpointed_index() {
 
 #[test]
 fn test_delete_via_unique_index_removes_checkpointed_rows() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c INTEGER UNIQUE)")
@@ -12965,6 +13660,11 @@ fn test_delete_via_unique_index_removes_checkpointed_rows() {
 /// GC must keep it even though `durable_txid_max` claims everything is durable.
 #[test]
 fn test_gc_keeps_columns_of_positioned_reader() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv = db.get_mvcc_store();
     let conn = db.connect();
@@ -13052,6 +13752,11 @@ fn test_gc_incremental_keeps_held_reader_row() {
 /// snapshot values.
 #[test]
 fn test_gc_retire_snapshot_stable_with_overlapping_writers() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv = db.get_mvcc_store();
     let setup = db.connect();
@@ -13108,6 +13813,11 @@ fn test_gc_retire_snapshot_stable_with_overlapping_writers() {
 /// where index GC removes versions that the dual cursor still needs.
 #[test]
 fn test_gc_e2e_index_rows_collected_after_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -13504,6 +14214,11 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
 /// This verifies snapshot isolation.
 #[test]
 fn test_mvcc_snapshot_isolation() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
 
     let conn1 = db.connect();
@@ -13546,6 +14261,11 @@ fn test_mvcc_snapshot_isolation() {
 /// Uses interactive transaction (BEGIN CONCURRENT) to reproduce the bug.
 #[test]
 fn test_update_three_unique_columns_partial_rollback() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -13615,6 +14335,11 @@ fn test_update_three_unique_columns_partial_rollback() {
 /// - tx 1324: UPDATE same row -> CRASH "IdxDelete: no matching index entry found"
 #[test]
 fn test_sequential_updates_with_constraint_errors() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -13690,6 +14415,11 @@ fn test_sequential_updates_with_constraint_errors() {
 /// This tests the statement-level savepoint functionality.
 #[test]
 fn test_savepoint_multiple_statements_last_fails() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -13728,6 +14458,11 @@ fn test_savepoint_multiple_statements_last_fails() {
 /// and the second modification fails, the first modification is preserved.
 #[test]
 fn test_savepoint_same_row_multiple_statements() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -13768,6 +14503,11 @@ fn test_savepoint_same_row_multiple_statements() {
 /// only that statement's index changes are rolled back.
 #[test]
 fn test_savepoint_index_multiple_statements() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -13830,6 +14570,11 @@ fn test_savepoint_index_multiple_statements() {
 /// The insert+delete should be preserved (row shouldn't exist).
 #[test]
 fn test_savepoint_insert_delete_then_fail() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -13869,6 +14614,11 @@ fn test_savepoint_insert_delete_then_fail() {
 
 #[test]
 fn test_delete_row_is_hidden_from_desc_unique_index_scan() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -13887,6 +14637,11 @@ fn test_delete_row_is_hidden_from_desc_unique_index_scan() {
 
 #[test]
 fn test_delete_row_is_skipped_by_desc_explicit_index_scan() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -13909,6 +14664,11 @@ fn test_delete_row_is_skipped_by_desc_explicit_index_scan() {
 
 #[test]
 fn test_delete_btree_resident_row_is_skipped_by_desc_unique_index_scan() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     {
@@ -13941,6 +14701,11 @@ fn test_delete_btree_resident_row_is_skipped_by_desc_unique_index_scan() {
 /// also produced phantom NULL results from `MAX()` on an indexed column.
 #[test]
 fn test_desc_index_scan_respects_mvcc_snapshot_for_concurrent_insert() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
 
     let setup = db.connect();
@@ -13990,6 +14755,11 @@ fn test_desc_index_scan_respects_mvcc_snapshot_for_concurrent_insert() {
 /// Fixed by implementing dual-peek in the exists() method to check MVCC tombstones.
 #[test]
 fn test_mvcc_dual_cursor_delete_all_btree_reinsert() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
@@ -14022,6 +14792,11 @@ fn test_mvcc_dual_cursor_delete_all_btree_reinsert() {
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
 fn test_checkpoint_root_page_mismatch_with_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     // Strategy:
     // 1. Create table1 with index, insert many rows to allocate many pages (e.g., pages 2-30)
     // 2. Create table2 with index (will get negative IDs like -35, -36)
@@ -14120,6 +14895,11 @@ fn test_checkpoint_root_page_mismatch_with_index() {
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
 fn test_checkpoint_drop_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -14150,6 +14930,11 @@ fn test_checkpoint_drop_table() {
 /// stale table cursor (which lacks index_info) when writing index rows.
 #[test]
 fn test_checkpoint_drop_table_then_create_index_page_reuse() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -14184,6 +14969,11 @@ fn test_checkpoint_drop_table_then_create_index_page_reuse() {
 
 #[test]
 fn test_checkpoint_drop_table_removes_stale_rootpage_mapping() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
 
     db.conn
@@ -14213,6 +15003,11 @@ fn test_checkpoint_drop_table_removes_stale_rootpage_mapping() {
 
 #[test]
 fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mapping() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDb::new();
 
     db.conn
@@ -14257,6 +15052,11 @@ fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mappin
 /// was committed before this transaction started (and thus is visible).
 #[test]
 fn test_mvcc_same_primary_key() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -14280,6 +15080,11 @@ fn test_mvcc_same_primary_key() {
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
 fn test_mvcc_same_primary_key_concurrent() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     // Pure optimistic concurrency: both transactions can INSERT the same rowid,
     // but only one can commit (first-committer-wins based on end_ts comparison).
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -14311,6 +15116,11 @@ fn test_mvcc_same_primary_key_concurrent() {
 /// the SkipMap. Readers must still see the data via B-tree fallthrough.
 #[test]
 fn test_gc_e2e_checkpointed_row_readable_after_gc() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -14339,6 +15149,11 @@ fn test_gc_e2e_checkpointed_row_readable_after_gc() {
 /// by GC. The deleted row must stay invisible (B-tree no longer has it).
 #[amphora_engine_macros::test(encryption)]
 fn test_gc_e2e_deleted_row_stays_hidden_after_gc() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
@@ -14375,6 +15190,11 @@ fn test_gc_e2e_deleted_row_stays_hidden_after_gc() {
 /// The updated value must be visible (from B-tree after GC).
 #[amphora_engine_macros::test(encryption)]
 fn test_gc_e2e_updated_row_correct_after_gc() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);
     {
         let conn = db.connect();
@@ -14409,6 +15229,11 @@ fn test_gc_e2e_updated_row_correct_after_gc() {
 /// Verifies cumulative correctness across GC cycles.
 #[test]
 fn test_gc_e2e_multiple_checkpoint_gc_cycles() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)")
@@ -14446,6 +15271,11 @@ fn test_gc_e2e_multiple_checkpoint_gc_cycles() {
 
 #[test]
 fn test_mvcc_unique_constraint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -14475,6 +15305,11 @@ fn test_mvcc_unique_constraint() {
 /// calling COMMIT.
 #[test]
 fn test_concurrent_commit_yield_spin() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new();
     let conn = db.connect();
 
@@ -14534,6 +15369,11 @@ fn abandon_commit_after_first_io(conn: &Arc<Connection>, mv_store: &Arc<crate::M
 
 #[test]
 fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
     let conn = db.connect();
 
@@ -14666,6 +15506,11 @@ fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
 /// final yield. Expected: 4 chunked yields between Start and Prepared.
 #[test]
 fn test_build_log_record_yields_for_large_write_set() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use super::MVCC_COMMIT_BATCH_SIZE;
 
     /// Yields once at each of the bracketing points and toggles the
@@ -14793,6 +15638,11 @@ fn test_build_log_record_yields_for_large_write_set() {
 /// follow-up read on the connection sees a clean state.
 #[test]
 fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new();
     let conn = db.connect();
 
@@ -14853,6 +15703,11 @@ fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
 /// inserted rows should not be visible
 #[test]
 fn test_abandoned_commit_rolls_back_insert() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new();
     let conn = db.connect();
 
@@ -14877,6 +15732,11 @@ fn test_abandoned_commit_rolls_back_insert() {
 /// those rows should not become deleted
 #[test]
 fn test_abandoned_commit_rolls_back_delete() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new();
     let conn = db.connect();
 
@@ -14906,6 +15766,11 @@ fn test_abandoned_commit_rolls_back_delete() {
 /// session open. Reproduces the issue with 3 separate sessions (DB restarts).
 #[test]
 fn test_alter_table_rename_with_index_panics_on_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     // Session 1: Create indexed table + checkpoint
     {
@@ -14942,6 +15807,11 @@ fn test_alter_table_rename_with_index_panics_on_restart() {
 /// Same as above but with a UNIQUE constraint (autoindex).
 #[test]
 fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
     // Session 1
@@ -14976,6 +15846,11 @@ fn test_alter_table_rename_with_unique_constraint_panics_on_restart() {
 
 #[test]
 fn test_checkpoint_skips_uncheckpointed_view_and_trigger_deletes_after_recovery() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -15022,6 +15897,11 @@ fn test_checkpoint_skips_uncheckpointed_view_and_trigger_deletes_after_recovery(
 
 #[test]
 fn test_checkpoint_deletes_checkpointed_view_and_trigger_schema_rows_after_recovery() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -15117,6 +15997,11 @@ fn test_checkpoint_deletes_checkpointed_view_and_trigger_schema_rows_after_recov
 /// transaction frame, not with a schema rebuilt halfway through the frame.
 #[test]
 fn test_alter_add_column_with_index_dml_does_not_corrupt_on_reopen() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
@@ -15171,6 +16056,11 @@ fn test_alter_add_column_with_index_dml_does_not_corrupt_on_reopen() {
 /// the old schema for entries that existed before the transaction.
 #[test]
 fn test_delete_then_drop_index_with_index_dml_replays_on_reopen() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
@@ -15221,6 +16111,11 @@ fn test_delete_then_drop_index_with_index_dml_replays_on_reopen() {
 /// log op for an index that has no durable schema row.
 #[test]
 fn test_create_then_drop_index_in_one_tx_replays_on_reopen() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
@@ -15268,6 +16163,11 @@ fn test_create_then_drop_index_in_one_tx_replays_on_reopen() {
 /// schemas.
 #[test]
 fn test_schema_frame_recovery_drop_index_with_remaining_index_matrix() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     for checkpoint_base in [false, true] {
         let mut db = MvccTestDbNoConn::new_with_random_db();
         {
@@ -15343,6 +16243,11 @@ fn test_schema_frame_recovery_drop_index_with_remaining_index_matrix() {
 
 #[test]
 fn test_schema_frame_recovery_create_index_with_mixed_dml_matrix() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     for checkpoint_base in [false, true] {
         let mut db = MvccTestDbNoConn::new_with_random_db();
         {
@@ -15407,6 +16312,11 @@ fn test_schema_frame_recovery_create_index_with_mixed_dml_matrix() {
 
 #[test]
 fn test_schema_frame_recovery_drop_recreate_table_indexes_matrix() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     for checkpoint_base in [false, true] {
         let mut db = MvccTestDbNoConn::new_with_random_db();
         {
@@ -15472,6 +16382,11 @@ fn test_schema_frame_recovery_drop_recreate_table_indexes_matrix() {
 
 #[test]
 fn test_schema_frame_recovery_same_name_partial_index_redefinition() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -15529,6 +16444,11 @@ fn test_schema_frame_recovery_same_name_partial_index_redefinition() {
 
 #[test]
 fn test_schema_rewrites_do_not_drop_table_versions_from_recovery_log() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     for checkpoint_base in [false, true] {
         let mut db = MvccTestDbNoConn::new_with_random_db();
         {
@@ -15614,6 +16534,11 @@ fn test_schema_rewrites_do_not_drop_table_versions_from_recovery_log() {
 /// only the old row ever existed in the db file.
 #[test]
 fn test_btree_resident_update_then_delete_checkpoints_after_reopen() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -15649,6 +16574,11 @@ fn test_btree_resident_update_then_delete_checkpoints_after_reopen() {
 
 #[test]
 fn test_schema_frame_recovery_rename_column_then_drop_index_checkpoints_after_reopen() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -15692,6 +16622,11 @@ fn test_schema_frame_recovery_rename_column_then_drop_index_checkpoints_after_re
 /// Session 1: create + insert + checkpoint. Session 2: drop. Session 3: reopen.
 #[test]
 fn test_close_persists_drop_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     // Session 1: create table, insert data, checkpoint to DB file
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -15730,6 +16665,11 @@ fn test_close_persists_drop_table() {
 
 #[test]
 fn test_abandoned_drop() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:";
@@ -15786,6 +16726,11 @@ fn test_abandoned_drop() {
 /// Session 1: create table + index + insert + checkpoint. Session 2: drop index. Session 3: reopen.
 #[test]
 fn test_close_persists_drop_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     // Session 1: create table/index, insert data, checkpoint to DB file
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -15821,6 +16766,11 @@ fn test_close_persists_drop_index() {
 
 #[test]
 fn test_partial_commit_visibility_bug() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use crate::sync::Arc;
     use std::collections::HashMap;
@@ -16018,6 +16968,11 @@ fn test_partial_commit_visibility_bug() {
 
 #[test]
 fn test_double_delete_btree_resident_row_with_unique_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -16068,6 +17023,11 @@ fn test_double_delete_btree_resident_row_with_unique_index() {
 /// Verify that CREATE TABLE with AUTOINCREMENT and INSERT work.
 #[test]
 fn test_autoincrement_works_in_mvcc() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -16093,6 +17053,11 @@ fn test_autoincrement_works_in_mvcc() {
 /// INSERT into that table should work in MVCC mode using sequences.
 #[test]
 fn test_autoincrement_insert_works_for_preexisting_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let temp_dir = tempfile::TempDir::new().unwrap();
     let path = temp_dir
         .path()
@@ -16152,6 +17117,11 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
 /// distinct rowids, so they must not conflict with each other.
 #[test]
 fn test_concurrent_autoincrement_inserts() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
 
@@ -16190,6 +17160,11 @@ fn test_concurrent_autoincrement_inserts() {
 /// must reflect the true maximum rowid.
 #[test]
 fn test_autoincrement_sqlite_sequence_after_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
 
@@ -16226,6 +17201,11 @@ fn test_autoincrement_sqlite_sequence_after_checkpoint() {
 /// must all succeed and produce unique, increasing rowids.
 #[test]
 fn test_three_concurrent_autoincrement_inserts() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -16274,6 +17254,11 @@ fn test_three_concurrent_autoincrement_inserts() {
 /// the leak.
 #[test]
 fn test_inner_tx_cleanup_after_sequence_exhaustion() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -16322,6 +17307,11 @@ fn test_inner_tx_cleanup_after_sequence_exhaustion() {
 /// the outer's begin timestamp.
 #[test]
 fn test_auto_commit_coherent_after_sequence_exhaustion_in_outer_tx() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
     let conn2 = db.connect();
@@ -16420,6 +17410,11 @@ fn test_auto_commit_coherent_after_sequence_exhaustion_in_outer_tx() {
 /// This violates AUTOINCREMENT's contract that rowids must never decrease.
 #[test]
 fn test_autoincrement_no_reuse_after_delete_and_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt().try_init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
@@ -16519,6 +17514,11 @@ fn test_autoincrement_no_reuse_after_delete_and_restart() {
 /// tx2: upserts the same row, should get WriteWriteConflict at commit time because tx1 committed previously
 #[test]
 fn test_speculative_delete_hides_committed_version_sql() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -16588,6 +17588,11 @@ fn test_speculative_delete_hides_committed_version_sql() {
 /// 7. T3 eventually aborts, restoring T1's version, but T2 already committed.
 #[test]
 fn test_elle_lost_update_exclusive_concurrent() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     // Setup: create the elle-style table and seed initial data into the B-tree
@@ -16829,6 +17834,11 @@ fn test_committed_update_version_conflict() {
 /// Then swap to a wrong key and verify that restart fails.
 #[test]
 fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
     write_synthetic_row(&db, "encrypted_value");
@@ -16927,6 +17937,11 @@ fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
 /// logical-log recovery, even if there is an outstanding MVCC log tail on disk.
 #[test]
 fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
     let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
@@ -16954,6 +17969,11 @@ fn test_mvcc_encrypted_restart_without_key_fails_before_recovery() {
 
 #[test]
 fn test_encrypted_recovery_large_payload_multi_chunk() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let large_value = "x".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
@@ -16989,6 +18009,11 @@ fn test_encrypted_recovery_large_payload_multi_chunk() {
 
 #[test]
 fn test_encrypted_recovery_corrupted_later_chunk_keeps_checkpointed_prefix() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let large_value = "z".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 3);
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
@@ -17531,6 +18556,11 @@ fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
 
 #[test]
 fn test_mvcc_mode_supports_cdc_for_client_push() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -18101,6 +19131,11 @@ fn test_mvcc_portable_changes_resolve_checkpointed_table_despite_counter_id_alia
 /// Checkpoint some rows, write more without checkpointing, restart, verify all rows survive.
 #[test]
 fn test_encrypted_recovery_checkpoint_then_more_writes() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
     {
@@ -18136,6 +19171,11 @@ fn test_encrypted_recovery_checkpoint_then_more_writes() {
 /// Write, restart, write more, restart again, verify all data accumulates correctly.
 #[test]
 fn test_encrypted_recovery_multiple_restart_cycles() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
     let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
@@ -18178,6 +19218,11 @@ fn test_encrypted_recovery_multiple_restart_cycles() {
 /// corrupted frame as a torn tail and stop cleanly without losing earlier valid frames.
 #[test]
 fn test_encrypted_recovery_corrupted_ciphertext() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let mut db = MvccTestDbNoConn::new_encrypted(hex_key);
     let log_path = std::path::PathBuf::from(db.path.as_ref().unwrap()).with_extension("db-log");
@@ -18243,6 +19288,11 @@ fn test_encrypted_recovery_corrupted_ciphertext() {
 ///    sees row inserts for table IDs that may not match the bootstrap mapping
 #[test]
 fn test_recovery_many_tables_checkpoint_restart_checkpoint_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let num_initial_tables = 50;
     let num_extra_tables = 30;
@@ -18328,6 +19378,11 @@ fn test_recovery_many_tables_checkpoint_restart_checkpoint_restart() {
 /// This stresses the table_id_to_rootpage mapping more aggressively.
 #[test]
 fn test_recovery_three_restarts_with_table_creation() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     // Incarnation 1: create tables, checkpoint
@@ -18562,6 +19617,11 @@ fn insert_wide_table_like_batch(conn: &Arc<Connection>, start_row_number: i64, r
 /// even when sqlite_schema rowids are reused across a crash + restart cycle.
 #[test]
 fn test_checkpoint_recovers_after_crash_restart_drop_recreate_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     {
@@ -18624,6 +19684,11 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_table() {
 /// even when sqlite_schema reuses the same rowid for the recreated index.
 #[test]
 fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     {
@@ -18693,6 +19758,11 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
 ///    alongside the durable watermark so `WriteIndexRow` can open the index.
 #[test]
 fn test_auto_checkpoint_refreshes_index_metadata_after_schema_change() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db();
 
@@ -18773,6 +19843,11 @@ fn test_auto_checkpoint_refreshes_index_metadata_after_schema_change() {
 /// retire the dropped index without losing its object identity.
 #[test]
 fn test_checkpoint_recovers_after_restart_drop_checkpointed_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     {
@@ -18813,6 +19888,11 @@ fn test_checkpoint_recovers_after_restart_drop_checkpointed_index() {
 
 #[test]
 fn test_recovery_after_drop_table_with_uncheckpointed_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     {
@@ -18838,6 +19918,11 @@ fn test_recovery_after_drop_table_with_uncheckpointed_index() {
 
 #[test]
 fn test_recovery_after_drop_checkpointed_table_with_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     {
@@ -18865,6 +19950,11 @@ fn test_recovery_after_drop_checkpointed_table_with_index() {
 
 #[test]
 fn test_recovery_after_drop_checkpointed_table_with_if_not_exists_index() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let table = "mvcc_sync_items_1777416431036232886";
     let index = "mvcc_sync_items_1777416431036232886_owner_rev_idx";
@@ -18905,6 +19995,11 @@ fn test_recovery_after_drop_checkpointed_table_with_if_not_exists_index() {
 
 #[test]
 fn test_recovery_after_drop_table_with_many_schema_rows() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let target = "mvcc_sync_items_1777416431036232886";
     let target_index = "mvcc_sync_items_1777416431036232886_owner_rev_idx";
@@ -18955,6 +20050,11 @@ fn test_recovery_after_drop_table_with_many_schema_rows() {
 
 #[test]
 fn test_drop_recreate_indexed_table_many_inserts_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     for round in 0..2 {
@@ -19003,6 +20103,11 @@ fn test_drop_recreate_indexed_table_many_inserts_restart() {
 /// stayed false and the second connection never reloaded the schema.
 #[test]
 fn test_create_type_visible_to_second_connection_under_mvcc() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db =
         MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_custom_types(true));
 
@@ -19027,6 +20132,11 @@ fn test_create_type_visible_to_second_connection_under_mvcc() {
 /// Dropped roots that are still live roots must not be walked twice.
 #[test]
 fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -19062,6 +20172,11 @@ fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
 /// report double-reference.
 #[test]
 fn test_integrity_check_tolerates_dropped_root_reused_as_btree_child() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -19137,6 +20252,11 @@ fn test_begin_tx_schema_generation_gate() {
 /// Passive mode: freelist fields must come from the pager's live page 1, not a stale MVCC header.
 #[test]
 fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -19175,6 +20295,11 @@ fn test_integrity_check_passive_reads_freelist_from_pager_not_stale_mvcc_header(
 /// survives while its index entry is removed -> "row missing from index".
 #[test]
 fn test_mvcc_passive_replace_then_delete_keeps_table_and_index_consistent() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name, iq, year)")
@@ -19222,6 +20347,11 @@ fn test_mvcc_passive_replace_then_delete_keeps_table_and_index_consistent() {
 ///   REPRO_READER_OPS=N     count samples per reader transaction (default 8)
 #[test]
 fn test_snapshot_stability_full() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
@@ -19513,6 +20643,11 @@ fn test_snapshot_stability_full() {
 
 #[test]
 fn test_read_lock_leak_deferred_then_concurrent() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn0 = db.connect();
     conn0
@@ -19534,6 +20669,11 @@ fn test_read_lock_leak_deferred_then_concurrent() {
 
 #[test]
 fn test_schema_change_succeeds_while_concurrent_writer_aborts_at_commit() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19573,6 +20713,11 @@ fn test_schema_change_succeeds_while_concurrent_writer_aborts_at_commit() {
 
 #[test]
 fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19609,6 +20754,11 @@ fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
 
 #[test]
 fn test_schema_row_insert_does_not_count_as_statement_change() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY)")
@@ -19641,6 +20791,11 @@ fn test_schema_row_insert_does_not_count_as_statement_change() {
 
 #[test]
 fn test_exclusive_update_conflicts_with_concurrent_delete_without_replacing_marker() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19679,6 +20834,11 @@ fn test_exclusive_update_conflicts_with_concurrent_delete_without_replacing_mark
 
 #[test]
 fn test_explicit_delete_conflicts_with_concurrent_delete_without_replacing_marker() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19716,6 +20876,11 @@ fn test_explicit_delete_conflicts_with_concurrent_delete_without_replacing_marke
 
 #[test]
 fn test_delete_of_btree_row_conflicts_with_committed_concurrent_delete() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19760,6 +20925,11 @@ fn test_delete_of_btree_row_conflicts_with_committed_concurrent_delete() {
 
 #[test]
 fn test_delete_of_btree_row_conflicts_with_active_concurrent_delete() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19806,6 +20976,11 @@ fn test_delete_of_btree_row_conflicts_with_active_concurrent_delete() {
 /// next INSERT into the same table from any connection makes progress.
 #[test]
 fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use std::time::{Duration, Instant};
 
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -19860,6 +21035,11 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
 // https://github.com/tursodatabase/turso/issues/6752
 #[test]
 fn exclusive_commit_failure_at_after_remove_tx_strands_exclusive_atom() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new();
     let conn_a = db.connect();
     let conn_b = db.connect();
@@ -19906,6 +21086,11 @@ fn exclusive_commit_failure_at_after_remove_tx_strands_exclusive_atom() {
 /// back the orphan tx so a follow-up INSERT works against a fresh tx.
 #[test]
 fn dropped_concurrent_commit_does_not_strand_connection() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -19967,6 +21152,11 @@ fn dropped_concurrent_commit_does_not_strand_connection() {
 /// released and a second connection's BEGIN IMMEDIATE makes progress.
 #[test]
 fn dropped_exclusive_commit_releases_locks() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -20022,6 +21212,11 @@ fn dropped_exclusive_commit_releases_locks() {
 /// also roll back attached MVCC txs opened by the same SQL transaction.
 #[test]
 fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
     let aux_dir = tempfile::TempDir::new().unwrap();
     let aux_path = aux_dir.path().join("aux.db");
@@ -20080,6 +21275,11 @@ fn dropped_main_commit_rolls_back_attached_mvcc_txs() {
 
 #[test]
 fn dropped_main_commit_rolls_back_temp_schema_changes() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
@@ -20128,6 +21328,11 @@ fn dropped_main_commit_rolls_back_temp_schema_changes() {
 /// MVCC phase into an attached MVCC CommitStateMachine.
 #[test]
 fn dropped_attached_commit_releases_attached_read_lock() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
     let aux_dir = tempfile::TempDir::new().unwrap();
     let aux_path = aux_dir.path().join("aux.db");
@@ -20179,6 +21384,11 @@ fn dropped_attached_commit_releases_attached_read_lock() {
 /// paused mid-commit and another attached MVCC transaction is still pending.
 #[test]
 fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
     let aux_dir = tempfile::TempDir::new().unwrap();
     let aux1_path = aux_dir.path().join("aux1.db");
@@ -20257,11 +21467,21 @@ fn dropped_attached_commit_rolls_back_remaining_attached_mvcc_txs() {
 /// https://github.com/tursodatabase/turso/issues/6753.
 #[test]
 fn busy_from_log_tx_does_not_block_subsequent_commit_with_group_commit() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     busy_from_log_tx_does_not_block_subsequent_commit(true);
 }
 
 #[test]
 fn busy_from_log_tx_does_not_block_subsequent_commit_without_group_commit() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     busy_from_log_tx_does_not_block_subsequent_commit(false);
 }
 
@@ -20479,6 +21699,11 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
 /// finishes.
 #[test]
 fn logical_log_offset_advances_only_after_on_log_write_complete() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::io::FileSyncType;
     use crate::mvcc;
     use crate::mvcc::database::{LogRecord, RowVersion};
@@ -20743,6 +21968,11 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
 // https://github.com/tursodatabase/turso/issues/6757
 #[test]
 fn test_dropped_commit_corrupts_subsequent_insert() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -20769,6 +21999,11 @@ fn test_dropped_commit_corrupts_subsequent_insert() {
 
 #[test]
 fn abandoned_committed_writer_notifies_dependents() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     for group_commit in [false, true] {
         for (reset, n_rows) in [
             (false, 1),
@@ -20905,6 +22140,11 @@ fn abandoned_committed_writer_notifies_dependents() {
 // https://github.com/tursodatabase/turso/issues/6755
 #[test]
 fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn_a = db.connect();
     let conn_b = db.connect();
@@ -20942,6 +22182,11 @@ fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
 // https://github.com/tursodatabase/turso/issues/6751
 #[test]
 fn abandoned_commit_in_committed_state_should_not_block_subsequent_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn_a = db.connect();
     let conn_b = db.connect();
@@ -20972,6 +22217,11 @@ fn abandoned_commit_in_committed_state_should_not_block_subsequent_checkpoint() 
 /// inserts can overwrite the explicit row and leave secondary indexes stale.
 #[test]
 fn test_concurrent_explicit_rowid_high_watermark_not_clobbered() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn0 = db.connect();
     let conn1 = db.connect();
@@ -21001,6 +22251,11 @@ fn test_concurrent_explicit_rowid_high_watermark_not_clobbered() {
 
 #[test]
 fn test_concurrent_explicit_rowid_auto_rowid_does_not_walk_back_into_collision() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn0 = db.connect();
     let conn1 = db.connect();
@@ -21038,6 +22293,11 @@ fn test_concurrent_explicit_rowid_auto_rowid_does_not_walk_back_into_collision()
 
 #[test]
 fn test_concurrent_explicit_rowid_preserves_auto_rowid_watermark() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn1 = db.connect();
     let conn2 = db.connect();
@@ -21085,6 +22345,11 @@ fn test_concurrent_explicit_rowid_preserves_auto_rowid_watermark() {
 
 #[test]
 fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -21111,6 +22376,11 @@ fn test_auto_rowid_after_negative_explicit_rowid_uses_next_negative() {
 /// checkpointed, causing "MVCC delete: rowid N not found".
 #[test]
 fn test_checkpoint_after_create_and_drop_sequence() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -21132,6 +22402,11 @@ fn test_checkpoint_after_create_and_drop_sequence() {
 /// the backing table was materialized).
 #[test]
 fn test_passive_checkpoint_skips_late_tombstone_after_prior_destroy() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
 
@@ -21174,6 +22449,11 @@ fn test_passive_checkpoint_skips_late_tombstone_after_prior_destroy() {
 /// After restart, nextval should resume from the most advanced value.
 #[test]
 fn test_descending_sequence_compaction() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -21233,6 +22513,11 @@ fn test_descending_sequence_compaction() {
 /// and the checkpoint compaction only read main's schema — values silently reset on restart.
 #[test]
 fn test_autoincrement_in_attached_mvcc_database() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt().try_init();
     let opts = DatabaseOpts::new().with_attach(true);
     let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
@@ -21288,6 +22573,11 @@ fn test_autoincrement_in_attached_mvcc_database() {
 /// Explicit sequences in an ATTACH'd MVCC database must persist across checkpoint + restart.
 #[test]
 fn test_create_sequence_in_attached_mvcc_database() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt().try_init();
     let opts = DatabaseOpts::new().with_attach(true);
     let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(opts);
@@ -21376,6 +22666,11 @@ fn test_create_sequence_in_attached_mvcc_database() {
 /// scenario.
 #[test]
 fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let setup = db.connect();
@@ -21505,6 +22800,11 @@ fn test_nextval_no_inner_tx_retry_on_concurrent_mvcc() {
 
 #[test]
 fn test_nextval_inner_tx_retry_keeps_outer_concurrent_tx_committable() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let setup = db.connect();
@@ -21568,6 +22868,11 @@ fn test_nextval_inner_tx_retry_keeps_outer_concurrent_tx_committable() {
 
 #[test]
 fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new();
     let setup = db.connect();
     setup.execute("CREATE TABLE t(a INTEGER)").unwrap();
@@ -21643,6 +22948,11 @@ fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
 /// Both halves of the fix must hold for this test to pass.
 #[test]
 fn test_multi_row_autoincrement_insert_atomic_on_sequence_exhaustion() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -21694,6 +23004,11 @@ fn test_multi_row_autoincrement_insert_atomic_on_sequence_exhaustion() {
 /// rollback.
 #[test]
 fn test_per_statement_atomicity_across_multi_statement_autoincrement_tx() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
     setup
@@ -21759,6 +23074,11 @@ fn test_per_statement_atomicity_across_multi_statement_autoincrement_tx() {
 /// not move `global_header.schema_cookie` backward.
 #[test]
 fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let setup = db.connect();
@@ -21863,6 +23183,11 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
 /// user_version move backward.
 #[test]
 fn test_global_header_regression_would_lose_committed_user_version() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     {
         let setup = db.connect();
@@ -21931,6 +23256,11 @@ fn test_global_header_regression_would_lose_committed_user_version() {
 
 #[test]
 fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
 
     let setup = db.connect();
@@ -22005,6 +23335,11 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
 /// possibly after doing other work first.
 #[test]
 fn injected_yield_surfaces_as_step_result_yield() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
@@ -22033,6 +23368,11 @@ fn injected_yield_surfaces_as_step_result_yield() {
 
 #[test]
 fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -22079,6 +23419,11 @@ fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
 /// Regression test for https://github.com/tursodatabase/turso/issues/7477.
 #[test]
 fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
 
     let setup = db.connect();
@@ -22209,6 +23554,11 @@ fn assert_table_counts(conn: &Arc<Connection>, expected_t: i64, expected_u: i64)
 /// a physical root mapping for a page that was never written to the database.
 #[test]
 fn test_read_after_database_full_checkpoint_remains_usable() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -22238,6 +23588,11 @@ fn test_read_after_database_full_checkpoint_remains_usable() {
 /// root belonging to a different table when the database is reopened.
 #[test]
 fn test_auto_checkpoint_update_stays_with_source_table_after_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -22282,6 +23637,11 @@ fn test_auto_checkpoint_update_stays_with_source_table_after_restart() {
 /// source table both before and after recovery.
 #[test]
 fn test_delete_after_failed_checkpoint_stays_with_source_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -22324,6 +23684,11 @@ fn test_delete_after_failed_checkpoint_stays_with_source_table() {
 /// used by a subsequent writer connection.
 #[test]
 fn test_failed_checkpoint_does_not_move_other_connection_insert() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn1 = db.connect();
@@ -22368,6 +23733,11 @@ fn test_failed_checkpoint_does_not_move_other_connection_insert() {
 /// split-brain that only becomes visible after a later successful checkpoint.
 #[test]
 fn test_failed_checkpoint_preserves_secondary_index_consistency() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
@@ -22420,6 +23790,11 @@ fn test_failed_checkpoint_preserves_secondary_index_consistency() {
 /// Concurrent DROP of a checkpointed table during a parked passive checkpoint must not panic.
 #[test]
 fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointed_table() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
     let _ = tracing_subscriber::fmt::try_init();
     let db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -22504,6 +23879,11 @@ fn test_passive_checkpoint_truncate_wal_tolerates_concurrent_drop_of_checkpointe
 /// schema version (which would resurrect the table).
 #[test]
 fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let _ = tracing_subscriber::fmt::try_init();
@@ -22629,6 +24009,11 @@ fn test_passive_checkpoint_preserves_drop_committed_after_collection() {
 /// until a later checkpoint actually frees that btree.
 #[test]
 fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let _ = tracing_subscriber::fmt::try_init();
@@ -22755,6 +24140,11 @@ fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
 /// Unlocking before `on_checkpoint_end` races writers and the next checkpoint.
 #[test]
 fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::io::FileSyncType;
     use crate::mvcc;
     use crate::mvcc::database::{LogRecord, RowVersion};
@@ -22965,6 +24355,11 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
 /// `gc_version_chain` doc comment.
 #[test]
 fn truncate_checkpoint_is_busy_while_a_reader_transaction_is_open() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, bal INTEGER NOT NULL)")
@@ -23110,6 +24505,11 @@ impl YieldInjector for ResumeCheckpointAtSeekStartInjector {
 
 #[test]
 fn issue_8467_seek_after_checkpoint_publish_does_not_read_negative_root() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let setup = db.connect();
     setup
@@ -23163,6 +24563,11 @@ fn issue_8467_seek_after_checkpoint_publish_does_not_read_negative_root() {
 
 #[test]
 fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_twice() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let setup = db.connect();
     setup
@@ -23246,6 +24651,11 @@ fn step_until_yield_or_done_pumping_io(
 /// to the caller instead and finish once the writer commits.
 #[test]
 fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let database = db.get_db();
     let writer = db.connect();
@@ -23338,6 +24748,11 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
 /// `sqlite_stat1` statement, whose reset only rolls a read transaction back.
 #[test]
 fn dropping_connect_async_state_mid_wait_does_not_block() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db();
     let database = db.get_db();
     let writer = db.connect();
@@ -23409,6 +24824,11 @@ fn drive_statement_to_done(statement: &mut crate::Statement, pager_io: &Arc<dyn 
 
 #[test]
 fn commit_between_checkpoint_snapshot_and_collection_survives_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let mut db = MvccTestDbNoConn::new_with_random_db_passive();
@@ -23478,6 +24898,11 @@ fn commit_between_checkpoint_snapshot_and_collection_survives_restart() {
 
 #[test]
 fn rolled_back_insert_leaves_no_dirty_key() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let db = MvccTestDbNoConn::new_with_random_db_passive();
     let conn = db.connect();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
@@ -23501,6 +24926,11 @@ fn rolled_back_insert_leaves_no_dirty_key() {
 
 #[test]
 fn late_commit_of_low_rowid_is_written_by_the_next_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db_passive();
     {
         let setup = db.connect();
@@ -23535,6 +24965,11 @@ fn late_commit_of_low_rowid_is_written_by_the_next_checkpoint() {
 
 #[test]
 fn index_row_updated_after_checkpoint_is_written_by_the_next_checkpoint() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db_passive();
     {
         let conn = db.connect();
@@ -23565,6 +25000,11 @@ fn index_row_updated_after_checkpoint_is_written_by_the_next_checkpoint() {
 
 #[test]
 fn recovered_rows_are_written_by_the_first_checkpoint_after_restart() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     let mut db = MvccTestDbNoConn::new_with_random_db_passive();
     {
         let conn = db.connect();
@@ -23591,6 +25031,11 @@ fn recovered_rows_are_written_by_the_first_checkpoint_after_restart() {
 
 #[test]
 fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
+    if crate::storage::versioned::switch::pager_only(
+        "this test exercises the MVCC store (its log, checkpoints and transactions over the pager); the versioned storage keeps its own row versions",
+    ) {
+        return;
+    }
     use crate::StepResult;
 
     let _ = tracing_subscriber::fmt::try_init();

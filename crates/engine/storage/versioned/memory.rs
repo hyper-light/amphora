@@ -1,26 +1,85 @@
-//! Amphora: the machine's memory, for the versioned storage's budget when the shell gives none
-//! (G7 step 2, `AC-NS.2.1`; `docs/design/engine.md`, decision 13). The shell sets the budget from
-//! the memory its process may use (`amphora::memory`, which reads the control groups on Linux) with
-//! [`ConnectOpts::with_memory_budget`](crate::ConnectOpts::with_memory_budget); without it the
-//! engine takes [`SHARE_DIVISOR`]th of the machine's memory.
+//! Amphora: where the versioned storage's memory comes from (G7 step 2, `AC-NS.2.1`;
+//! `docs/design/engine.md`, decision 13). The storage holds no share of its own: it asks a
+//! [`Source`] for each piece it grows by (a run of pool frames, a step of its row versions'
+//! reservation) and gives it back as it lets it go. The shell's source is its process memory
+//! budget (`amphora::memory`, MB.1), which every database of the process shares and which grants a
+//! use what the rest of the process leaves it, by measured use: no fraction is picked. Without
+//! one ([`ConnectOpts::with_memory`](crate::ConnectOpts::with_memory)) every storage of the process
+//! shares [`machine`]: the machine's memory less what those storages hold.
 //!
 //! The system's interfaces here need `unsafe` (CLAUDE.md §12 names this file): `sysconf` on Unix,
 //! `GlobalMemoryStatusEx` on Windows; elsewhere a typed refusal naming the platform.
 
 use crate::error::LimboError;
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::{Arc, OnceLock};
 use crate::Result;
 
-/// The part of the machine's memory the storage takes by default: a quarter, as the shell's
-/// process pool takes of the memory it may use (`amphora::db`, decision 26 of
-/// `docs/design/store.md`): PostgreSQL's documentation advises a quarter of a dedicated server's
-/// memory for its shared buffers ("Resource Consumption", `shared_buffers`), the cautious end of
-/// what databases that size from memory take (CedarDB's buffer pool up to 45%, DuckDB 80%).
-pub const SHARE_DIVISOR: u64 = 4;
+/// Where a versioned storage takes its memory from, shared by every storage given it.
+pub trait Source: Send + Sync {
+    /// `bytes` more held for `what`, refused typed ([`LimboError::MemoryBudget`]) when the room
+    /// the source has for the storage now is less.
+    fn take(&self, what: &'static str, bytes: u64) -> Result<()>;
+    /// `bytes` taken given back.
+    fn give(&self, bytes: u64);
+}
 
-/// The budget a storage takes when the shell gives none: [`SHARE_DIVISOR`]th of the machine's
-/// memory.
-pub fn default_budget() -> Result<u64> {
-    Ok(machine_bytes()?.checked_div(SHARE_DIVISOR).unwrap_or(0))
+/// The source every storage opened without one shares: the machine's memory, read again at every
+/// take, less what the storages hold. A process with a budget of its own gives that instead.
+pub struct Machine {
+    held: AtomicU64,
+}
+
+impl Machine {
+    /// A source over the machine's memory with nothing held.
+    pub fn new() -> Self {
+        Self {
+            held: AtomicU64::new(0),
+        }
+    }
+
+    /// The bytes held now.
+    pub fn held(&self) -> u64 {
+        self.held.load(Ordering::Acquire)
+    }
+}
+
+impl Default for Machine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Source for Machine {
+    fn take(&self, what: &'static str, bytes: u64) -> Result<()> {
+        let limit = machine_bytes()?;
+        self.held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(bytes).filter(|after| *after <= limit)
+            })
+            .map(|_| ())
+            .map_err(|held| LimboError::MemoryBudget {
+                what,
+                asked: bytes,
+                held,
+                limit,
+            })
+    }
+
+    fn give(&self, bytes: u64) {
+        let _ = self
+            .held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(bytes))
+            });
+    }
+}
+
+/// The source every storage of this process opened without one shares.
+pub fn machine() -> Arc<dyn Source> {
+    static MACHINE: OnceLock<Arc<Machine>> = OnceLock::new();
+    let m: Arc<Machine> = MACHINE.get_or_init(|| Arc::new(Machine::new())).clone();
+    m
 }
 
 /// The machine's physical memory in bytes: its pages times their size.
@@ -95,13 +154,24 @@ pub fn machine_bytes() -> Result<u64> {
 mod tests {
     use super::*;
 
-    /// T-NS.2.10: ask the machine's memory and the default budget. Expect: some bytes, the budget a
-    /// quarter of them.
+    /// T-NS.2.10: take from the machine's source up to its memory, past it, and give back.
+    /// Expect: the machine's memory read; a take within it held, one past what is left refused
+    /// typed naming the use, and what is given back taken again (no share picked).
     #[test]
-    fn ns2_default_budget_is_a_share_of_the_machines_memory() {
+    fn ns2_the_machines_source_grants_what_the_storages_leave() {
         let machine = machine_bytes();
         assert!(matches!(machine, Ok(n) if n > 0));
-        let budget = default_budget();
-        assert_eq!(budget.ok(), machine.ok().map(|n| n / SHARE_DIVISOR));
+        let total = machine.unwrap_or(0);
+        let source = Machine::new();
+        source.take("a test's frames", total / 2).unwrap();
+        assert_eq!(source.held(), total / 2);
+        let refused = source.take("a test's versions", total - total / 2 + 1);
+        assert!(
+            matches!(refused, Err(LimboError::MemoryBudget { what, .. }) if what == "a test's versions")
+        );
+        source.give(total / 2);
+        assert_eq!(source.held(), 0);
+        source.take("a test's versions", total).unwrap();
+        source.give(total);
     }
 }

@@ -7,7 +7,7 @@ mod common;
 mod endpoint;
 mod watch;
 mod wire;
-pub use common::{Client, Namespace, Owner};
+pub use common::{Client, Namespace, Node, Nodes, Owner};
 pub(crate) use endpoint::try_lease;
 pub use watch::Watch;
 
