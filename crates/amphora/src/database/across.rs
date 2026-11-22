@@ -709,8 +709,7 @@ mod tests {
         }
     }
 
-    /// `groups` backed-up groups in `dir`, each read by `clock(group)`, under one coordinator
-    /// routing a row by its key's first byte.
+    /// `groups` backed-up groups in `dir`, each read by `clock(group)`, under one coordinator.
     fn groups_on(
         dir: &std::path::Path,
         groups: u64,
@@ -733,8 +732,8 @@ mod tests {
             dbs.push(db);
             sinks.push(sink);
         }
-        let route: crate::xgroup::Route =
-            Arc::new(|key: &[u8]| u32::from(key.first().copied().unwrap_or(0)));
+        // Rows are written into each group directly, so the route is never asked.
+        let route: crate::xgroup::Route = Arc::new(|_: &[u8]| 0);
         let cluster =
             Arc::new(Cluster::open(dbs.clone(), route, 5, Protocol::TwoPhase, 1, until()).unwrap());
         (dbs, sinks, cluster)
