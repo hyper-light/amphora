@@ -60,6 +60,7 @@ mod open;
 mod seek;
 mod star;
 
+pub(crate) use adaptive::emit_sorter_count;
 use body::emit_unmatched_row_conditions_and_loop;
 pub(crate) use body::LoopBodyEmitter;
 pub(crate) use close::CloseLoop;

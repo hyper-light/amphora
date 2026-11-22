@@ -56,6 +56,10 @@ pub(crate) struct PlanValues {
     /// tables the plan counted, so the statement can tell when they have moved past its estimates.
     row_changes: crate::sync::OnceLock<crate::sync::Arc<crate::row_changes::RowChanges>>,
     planned: crate::sync::Mutex<Vec<crate::row_changes::PlannedTable>>,
+    /// Amphora (PL.13, lane replan-5): the filter shares builds counted, attached only with
+    /// adaptive joins on, and the shares the plan read.
+    filter_shares: crate::sync::OnceLock<crate::sync::Arc<crate::filter_shares::FilterShares>>,
+    filters: crate::sync::Mutex<Vec<crate::filter_shares::PlannedFilter>>,
 }
 
 impl PlanValues {
@@ -103,6 +107,70 @@ impl PlanValues {
         let rows = noted.planned_rows();
         planned.push(noted);
         rows
+    }
+
+    /// Where the filter estimates read the shares builds counted (PL.13, lane replan-5). Set once,
+    /// at translate, with adaptive joins on.
+    pub(crate) fn attach_filter_shares(
+        &self,
+        shares: crate::sync::Arc<crate::filter_shares::FilterShares>,
+    ) {
+        let _already_attached = self.filter_shares.set(shares);
+    }
+
+    /// The share of `table`'s rows the terms `fingerprint` names keep: the one a build counted
+    /// where one did, else `sampled`, the share `sample_rows` sample rows gave; noted as a share the
+    /// plan read. Without the store attached, `sampled`.
+    pub(crate) fn filter_selectivity(
+        &self,
+        table: &str,
+        fingerprint: u64,
+        sampled: f64,
+        sample_rows: usize,
+    ) -> f64 {
+        let Some(shares) = self.filter_shares.get() else {
+            return sampled;
+        };
+        let table = crate::util::normalize_ident(table);
+        let mut filters = self.filters.lock();
+        if let Some(noted) = filters
+            .iter()
+            .find(|noted| noted.table == table && noted.fingerprint == fingerprint)
+        {
+            return noted.planned_share;
+        }
+        let share = shares.share(&table, fingerprint);
+        let read = share.bits();
+        let counted = share.get();
+        let planned_share = counted.unwrap_or(sampled);
+        filters.push(crate::filter_shares::PlannedFilter {
+            table,
+            fingerprint,
+            share,
+            read,
+            planned_share,
+            sample_rows: counted.is_none().then_some(sample_rows),
+        });
+        planned_share
+    }
+
+    /// The share the plan read for `table`'s terms `fingerprint`, if it read one.
+    pub(crate) fn planned_filter(
+        &self,
+        table: &str,
+        fingerprint: u64,
+    ) -> Option<crate::filter_shares::PlannedFilter> {
+        let table = crate::util::normalize_ident(table);
+        self.filters
+            .lock()
+            .iter()
+            .find(|noted| noted.table == table && noted.fingerprint == fingerprint)
+            .cloned()
+    }
+
+    /// The filter shares the plan read (PL.13), taken once the statement is planned.
+    pub(crate) fn take_planned_filters(&self) -> Vec<crate::filter_shares::PlannedFilter> {
+        std::mem::take(&mut *self.filters.lock())
     }
 
     /// The tables the plan counted (PL.9), taken once the statement is planned.
