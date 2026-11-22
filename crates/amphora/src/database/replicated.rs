@@ -5287,7 +5287,56 @@ mod tests {
                     Err(error) => panic!("owner ended: {error}"),
                 }
             }
-            panic!("a driven operation was unanswered after {ROUNDS} rounds");
+            // Where each member stands, to tell what the call waits on.
+            let members: Vec<String> = self
+                .owners
+                .iter()
+                .flatten()
+                .map(|(owner, _)| {
+                    let log = owner.replica.core().raft.log();
+                    let phase = owner.pending.as_ref().map(|pending| {
+                        let phase = match &pending.phase {
+                            Phase::Barrier(Some(_)) => "barrier".to_string(),
+                            Phase::Barrier(None) => "barrier(none)".to_string(),
+                            Phase::Proposed(_) => "proposed".to_string(),
+                            Phase::Bootstrap(_) => "bootstrap".to_string(),
+                            Phase::Answered { index, .. } => format!("answered@{index}"),
+                        };
+                        (phase, pending.term, pending.leader, pending.until > owner.at)
+                    });
+                    format!(
+                        "id {} term {} leader {} leads {} applied {} committed {} last {:?} in_flight {} driving {} pending {phase:?} tail {:?} slot_deferred {} slot_left {:?} slot_holds {} flush_out {} waiting {} floor_inflight {} changing {} transferring {}",
+                        owner.replica.id(),
+                        owner.replica.term(),
+                        owner.replica.leader(),
+                        owner.replica.is_leader(),
+                        owner.replica.applied().index,
+                        log.committed(),
+                        log.last_index(),
+                        owner.replica.in_flight(),
+                        owner.driving,
+                        owner.tail,
+                        owner.slot_deferred,
+                        owner.slots.until().map(|until| until.saturating_duration_since(owner.at)),
+                        owner.slots.holds(),
+                        matches!(owner.flushing, Flushing::Thread { out: true, .. }),
+                        owner.waiting.len(),
+                        owner.floor_inflight,
+                        owner.changing.is_some(),
+                        owner.transferring.is_some(),
+                    )
+                })
+                .collect();
+            panic!(
+                "a driven operation was unanswered after {ROUNDS} rounds: moving {} moved {} looked {}; pump records {} delivered {:?} lost {:?} held {:?}; members {members:#?}",
+                self.moving(),
+                self.moved.seen(),
+                self.looked,
+                pump.records,
+                pump.delivered,
+                pump.lost,
+                pump.held,
+            );
         }
         /// Time moves for a write slot alone. Once the group is quiet (nothing relayed or held in
         /// transit, no write out on any disk, and no member but a slot's leader with work in
@@ -12721,9 +12770,23 @@ mod tests {
                             }
                             pump.lost.clear();
                             // Time passes, as it does after an outage: a session whose records
-                            // were lost ends at its deadline, and its owner tries again.
+                            // were lost ends at its deadline, and its owner tries again; and the
+                            // follower gets what was lost on its way to it, which only the
+                            // leader's next heartbeat (time) sends again. Until both, the outage
+                            // is work still out: a later call at that follower would wait on a
+                            // heartbeat its driver, time standing still, never brings.
+                            let mut ended = false;
                             for _ in 0..ROUNDS {
-                                if (0..4).all(|owner| driven.owner(owner).pending.is_none()) {
+                                let committed = (0..3)
+                                    .map(|owner| {
+                                        driven.owner(owner).replica.core().raft.log().committed()
+                                    })
+                                    .max()
+                                    .unwrap_or(0);
+                                if (0..4).all(|owner| driven.owner(owner).pending.is_none())
+                                    && driven.owner(follower).replica.applied().index >= committed
+                                {
+                                    ended = true;
                                     break;
                                 }
                                 for owner in 0..4 {
@@ -12731,6 +12794,10 @@ mod tests {
                                 }
                                 driven.round(&mut pump);
                             }
+                            assert!(
+                                ended,
+                                "seed {seed} step {step}: the outage of owner {follower} didn't end in {ROUNDS} driven rounds"
+                            );
                             reached.records_lost += 1;
                         }
                     }
