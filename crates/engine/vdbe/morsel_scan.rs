@@ -402,6 +402,24 @@ impl TableBodyAggregate<'_> {
         self.passes(worker, self.body.start, self.body.keep)
     }
 
+    /// A join's joined row (lane qs6-13): whether it matched and whether it passed. An inner
+    /// join's always matched; with `pad_last` (a LEFT join's last link) a padded row did not and
+    /// is tested by the WHERE terms alone, any other by the ON terms first.
+    fn joined_row(
+        &self,
+        worker: &mut BodyWorker,
+        rowid: i64,
+        row: &[Value],
+        pad_last: Option<usize>,
+        padded: bool,
+    ) -> Result<(bool, bool), MorselError> {
+        match (pad_last, padded) {
+            (None, _) => Ok((true, self.row(worker, rowid, row)?)),
+            (Some(_), true) => Ok((false, self.padded_row(worker, Some(rowid), row)?)),
+            (Some(_), false) => self.on_row(worker, Some(rowid), row),
+        }
+    }
+
     /// An outer join's joined row (lane qs6-12): whether it passed the ON terms (it matched), and
     /// whether it then passed the rest of the body, its values then in `worker.out`.
     fn on_row(
@@ -1052,6 +1070,48 @@ fn each_joined<'s>(
     Ok(())
 }
 
+/// Calls `visit` with each joined row the probe row `row` makes, as [`each_joined`] does. With
+/// `pad_last` (lane qs6-13, a LEFT join among more than two tables: the last link's columns), each
+/// joined row of the links before the last is probed in the last link; `visit` says whether a
+/// joined row matched (passed the ON terms), and a row of the others that no match passed, or that
+/// has none, is visited once more padded with NULLs for the last link's columns (`padded` true).
+/// The scratch rows and the walk are the worker's, reused from row to row.
+fn each_row<'s>(
+    stages: &'s [JoinStage<'_>],
+    pad_last: Option<usize>,
+    row: &[Value],
+    (joined, last_row, walk): (&mut Vec<Value>, &mut Vec<Value>, &mut Vec<Step<'s>>),
+    mut visit: impl FnMut(&[Value], bool) -> Result<bool, MorselError>,
+) -> Result<(), MorselError> {
+    let (Some(width), Some((last, before))) = (pad_last, stages.split_last()) else {
+        return each_joined(stages, row, joined, walk, |joined| {
+            visit(joined, false).map(|_| ())
+        });
+    };
+    each_joined(before, row, joined, walk, |prefix| {
+        let mut matched = false;
+        for build in last.probe.matches(prefix)? {
+            let build_row = last.rows.get(*build).ok_or(MorselError::Overflow {
+                what: "a match's build row",
+            })?;
+            last_row.clear();
+            last_row.try_reserve(prefix.len().saturating_add(build_row.len()))?;
+            last_row.extend_from_slice(prefix);
+            last_row.extend_from_slice(build_row);
+            matched |= visit(last_row, false)?;
+        }
+        if !matched {
+            let padded = prefix.len().saturating_add(width);
+            last_row.clear();
+            last_row.try_reserve(padded)?;
+            last_row.extend_from_slice(prefix);
+            last_row.resize(padded, Value::Null);
+            visit(last_row, true)?;
+        }
+        Ok(())
+    })
+}
+
 /// A join's probe side read from a table's leaves, each joined row (the probe row's columns, then
 /// each link's build row's) run through the copy of the serial loop's body (lane qs6-12): its
 /// filter terms the hash keys and the tables' own `Predicate`s don't hold, its GROUP BY values and
@@ -1067,6 +1127,9 @@ pub struct TableJoinAggregate<'a> {
     /// The loop body over a joined row, its columns written from `columns_start` on, and the
     /// grouping and aggregates over its outputs.
     pub body: &'a TableBodyAggregate<'a>,
+    /// A LEFT join among more than two tables (lane qs6-13, `MorselOuter::LeftLink`): the last
+    /// link's columns, the padded table's.
+    pub pad_last: Option<usize>,
 }
 
 impl Pipeline for TableJoinAggregate<'_> {
@@ -1092,6 +1155,7 @@ impl Pipeline for TableJoinAggregate<'_> {
             None => worker.insert(Box::new(self.body.worker()?)),
         };
         let mut joined: Vec<Value> = Vec::new();
+        let mut last: Vec<Value> = Vec::new();
         let mut walk = Vec::new();
         let mut ran = 0u64;
         let scanned = self.table.scan(leaves, |rowid, row| {
@@ -1103,15 +1167,24 @@ impl Pipeline for TableJoinAggregate<'_> {
             // A probe row's joined rows share its place: a value the body's outputs could tie
             // on and still differ in (a REAL beside an INTEGER) sends the statement to the serial
             // loop (`MorselBody::no_real`), so a tie among them is no choice.
-            each_joined(self.stages, row, &mut joined, &mut walk, |joined| {
-                ran = ran.saturating_add(1);
-                if !self.body.row(worker, rowid, joined)? {
-                    return Ok(());
-                }
-                self.body
-                    .shape
-                    .fold(&worker.out, position(rowid)?, aggregate, budget)
-            })
+            each_row(
+                self.stages,
+                self.pad_last,
+                row,
+                (&mut joined, &mut last, &mut walk),
+                |joined, padded| {
+                    ran = ran.saturating_add(1);
+                    let (matched, passed) =
+                        self.body
+                            .joined_row(worker, rowid, joined, self.pad_last, padded)?;
+                    if passed {
+                        self.body
+                            .shape
+                            .fold(&worker.out, position(rowid)?, aggregate, budget)?;
+                    }
+                    Ok(matched)
+                },
+            )
         });
         if scanned.is_ok() {
             self.body
@@ -1160,6 +1233,8 @@ pub struct TableJoinRows<'a> {
     pub stages: &'a [JoinStage<'a>],
     /// The loop body over a joined row; its outputs are the output row.
     pub body: &'a TableBodyAggregate<'a>,
+    /// As [`TableJoinAggregate::pad_last`].
+    pub pad_last: Option<usize>,
     /// The sort keys: each one's place in the output row, and whether it descends.
     pub order: &'a [(usize, bool)],
 }
@@ -1234,6 +1309,7 @@ impl Pipeline for TableJoinRows<'_> {
         let first = leaves.start;
         let mut found: Vec<Vec<Value>> = Vec::new();
         let mut joined: Vec<Value> = Vec::new();
+        let mut last: Vec<Value> = Vec::new();
         let mut walk = Vec::new();
         let mut ran = 0u64;
         let scanned = self.table.scan(leaves, |rowid, row| {
@@ -1242,15 +1318,23 @@ impl Pipeline for TableJoinRows<'_> {
                     return Ok(());
                 }
             }
-            each_joined(self.stages, row, &mut joined, &mut walk, |joined| {
-                ran = ran.saturating_add(1);
-                if !self.body.row(worker, rowid, joined)? {
-                    return Ok(());
-                }
-                found.try_reserve(1)?;
-                found.push(kept(&worker.out, budget)?);
-                Ok(())
-            })
+            each_row(
+                self.stages,
+                self.pad_last,
+                row,
+                (&mut joined, &mut last, &mut walk),
+                |joined, padded| {
+                    ran = ran.saturating_add(1);
+                    let (matched, passed) =
+                        self.body
+                            .joined_row(worker, rowid, joined, self.pad_last, padded)?;
+                    if passed {
+                        found.try_reserve(1)?;
+                        found.push(kept(&worker.out, budget)?);
+                    }
+                    Ok(matched)
+                },
+            )
         });
         if scanned.is_ok() {
             self.body

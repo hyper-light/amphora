@@ -2053,3 +2053,145 @@ fn t_qt_6_22_outer_joins_under_limit_answer_as_the_serial_loop() {
         assert!(runs > 0, "no {kind} JOIN under a LIMIT took the hook");
     }
 }
+
+/// T-QT.6.23 (lane qs6-13): a LEFT join among three and four tables runs on morsels, its padded
+/// table the chain's last link. Random queries joining inner tables in any order around one LEFT
+/// JOIN (before or after it in the SQL), ON terms beside its key on either side or both, WHERE
+/// terms that read the padded side's NULLs, with aggregates, returning rows, or ordered by every
+/// table's INTEGER PRIMARY KEY under a LIMIT and an OFFSET, answer as the serial loop at 1, 2, 3,
+/// 4 and 8 stated cores (row for row with aggregates or a LIMIT; in ORDER BY order with ties as
+/// sets, or as the same rows, otherwise). Runs of both sizes took the hook (a link per table past
+/// the probe, the body run).
+#[test]
+fn t_qt_6_23_left_joins_of_three_and_four_tables_pad_the_last_link() {
+    let conn = open(":memory:qt-6-23");
+    let mut rng = ChaCha8Rng::seed_from_u64(623);
+    let pad = "x".repeat(48);
+    for (name, rows) in [("t", 700usize), ("u", 160), ("v", 60), ("w", 30)] {
+        conn.execute(format!(
+            "CREATE TABLE {name}(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)"
+        ))
+        .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for _ in 0..rows {
+            let a = if rng.random_range(0..10) == 0 {
+                "NULL".to_string()
+            } else {
+                rng.random_range(-20i64..20).to_string()
+            };
+            let b = rng.random_range(-1000i64..1000);
+            let c = rng.random_range(0..12);
+            conn.execute(format!(
+                "INSERT INTO {name}(a, b, c, p) VALUES ({a}, {b}, 't{c}', '{pad}')"
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let mut hooked = [0usize; 2];
+    let queries = 40usize;
+    for query in 0..queries {
+        let four = query % 2 == 1;
+        let on_extra = match rng.random_range(0..4) {
+            0 => String::new(),
+            1 => format!(" AND u.b > {}", rng.random_range(-1000i64..1000)),
+            2 => format!(" AND t.b < {}", rng.random_range(-1000i64..1000)),
+            _ => " AND t.b + u.b > 0".to_string(),
+        };
+        let left = format!("LEFT JOIN u ON u.c = t.c{on_extra}");
+        let mut inner = vec!["JOIN v ON v.a = t.a".to_string()];
+        if four {
+            inner.push("JOIN w ON w.a = v.a".to_string());
+        }
+        // The LEFT JOIN last in the SQL, or first with the inner joins after it.
+        let from = if rng.random_bool(0.5) {
+            format!("t {} {left}", inner.join(" "))
+        } else {
+            format!("t {left} {}", inner.join(" "))
+        };
+        let filter = match rng.random_range(0..4) {
+            0 | 1 => String::new(),
+            2 => " WHERE u.id IS NULL OR u.b > 0".to_string(),
+            _ => format!(
+                " WHERE coalesce(u.a, 0) >= {}",
+                rng.random_range(-20i64..20)
+            ),
+        };
+        let tables = if four {
+            "t.id, v.id, w.id, u.id"
+        } else {
+            "t.id, v.id, u.id"
+        };
+        let (sql, rows) = match rng.random_range(0..3) {
+            0 => (
+                format!(
+                    "SELECT u.c IS NULL, count(*), count(u.a), sum(t.b), min(u.c), max(v.b) FROM {from}{filter} GROUP BY u.c IS NULL"
+                ),
+                false,
+            ),
+            1 => (
+                format!("SELECT t.a, u.c, coalesce(u.b, -1) + v.b FROM {from}{filter}"),
+                true,
+            ),
+            _ => {
+                let dir = |rng: &mut ChaCha8Rng| if rng.random_bool(0.5) { " DESC" } else { "" };
+                let mut keys: Vec<String> = tables
+                    .split(", ")
+                    .map(|key| format!("{key}{}", dir(&mut rng)))
+                    .collect();
+                if rng.random_bool(0.5) {
+                    keys.reverse();
+                }
+                (
+                    format!(
+                        "SELECT {tables}, u.b FROM {from}{filter} ORDER BY {} LIMIT {} OFFSET {}",
+                        keys.join(", "),
+                        rng.random_range(1i64..150),
+                        rng.random_range(0i64..100)
+                    ),
+                    false,
+                )
+            }
+        };
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let links_before = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let body_before = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let parallel = sql_rows(&conn, &sql);
+            let links = conn
+                .morsel_join_links
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - links_before;
+            let body = conn
+                .morsel_body_rows
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - body_before;
+            same_answer(&sql, rows, &parallel, &serial, &format!("on {cores} cores"));
+            let want = if four { 3 } else { 2 };
+            assert!(
+                links == 0 || links == want,
+                "{sql} on {cores} cores built {links} links"
+            );
+            if links == want && body > 0 {
+                hooked[usize::from(four)] += 1;
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: joins of three and of four tables ran on morsels.
+    assert!(hooked[0] > 0, "no LEFT join of three tables took the hook");
+    assert!(hooked[1] > 0, "no LEFT join of four tables took the hook");
+}

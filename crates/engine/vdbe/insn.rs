@@ -475,6 +475,11 @@ pub enum MorselOuter {
     Left,
     /// FULL JOIN: every row of both tables appears.
     Full,
+    /// A LEFT JOIN among more than two tables (lane qs6-13): the padded table is the chain's last
+    /// link, probed per joined row of the others; a joined row of the others whose matches there
+    /// all fail the ON terms, or that has none, runs once padded with NULLs for that link's
+    /// columns. No bitmaps: the rows it keeps are the probe's walk itself.
+    LeftLink,
 }
 
 /// Amphora (QT.6, lane qs6-7): a one-table scan's loop body, emitted as its own range of the

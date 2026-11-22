@@ -580,7 +580,22 @@ still checked. Off by default (the body runs, as lane qs6-12 left it) until the 
 T-QT.6.20 times simple joins on 054ace65 (the fold) and here (body, and direct) at 1 to 32 cores,
 p50, p99 and p99.9; T-QT.6.21 checks direct against the serial loop. An outer join never copies.
 
-**Not yet.** Outer joins of more than two tables, and an outer join under a LIMIT.
+**Outer joins under a LIMIT, and LEFT joins among more tables** (lane qs6-13). An outer join's
+rows are cut by a LIMIT or OFFSET as an inner join's are: only when the ORDER BY holds every
+table's INTEGER PRIMARY KEY. A padded row's NULL key still tells it apart, since a row is padded at
+most once, so the sorted rows are the serial loop's to the row (T-QT.6.22). A LEFT join among
+three or more tables (`MorselOuter::LeftLink`) puts its padded table last in the chain of hash
+tables and probes with a table it keeps: each joined row of the others is probed in that last
+link, the ON terms run on each match (`MorselBody::on`), and a row none of whose matches passed
+them, or with none, runs once more padded with NULLs for that link's columns, tested by the WHERE
+terms alone. No bitmaps: the rows a LEFT join keeps are the probe's own walk. Only an ON equality
+with the padded table keys its link; an equality with it in the WHERE clause, or an ON term
+between the tables it keeps, is the body's; an ON term on the padded table alone filters its
+build, a WHERE term on it does not (T-QT.6.23).
+
+**Not yet.** FULL joins among more than two tables, more than one outer join in a statement, and
+a two-table LEFT join through the last-link walk (it keeps lane qs6-12's bitmaps: one path for
+both is the next step once the scaling run says which is faster).
 
 ## 9. A table scan decodes each leaf once into column batches, behind a switch
 

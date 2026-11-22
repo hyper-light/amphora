@@ -928,6 +928,8 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
     // as an inner join's are, only when the ORDER BY holds every table's INTEGER PRIMARY KEY
     // (below): a padded row's NULL key still tells it apart, since a probe row is padded at most
     // once and a build row too, so the order is the serial loop's to the row.
+    // The table an outer join pads with NULLs: the probe of two tables', the last link of more.
+    let padded_at = outer.map(|(at, _)| at);
     let (probe_at, outer) = match outer {
         None => {
             if built.is_empty() {
@@ -935,13 +937,23 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
             }
             ((0..tables.len()).find(|at| !built.contains(at))?, None)
         }
-        Some((at, kind)) => {
-            if tables.len() != 2 || built.contains(&at) {
+        Some((at, kind)) if tables.len() == 2 => {
+            if built.contains(&at) {
                 return None;
             }
             (at, Some(kind))
         }
+        // A LEFT join among more tables (lane qs6-13): the padded table is the chain's last link,
+        // probed per joined row of the others; the probe is one of the tables it keeps.
+        Some((at, MorselOuter::Left)) => {
+            let probe = (0..tables.len())
+                .find(|t| *t != at && !built.contains(t))
+                .or_else(|| (0..tables.len()).find(|t| *t != at))?;
+            (probe, Some(MorselOuter::LeftLink))
+        }
+        Some(_) => return None,
     };
+
     // A column the hook reads: its table's place in the join order, and its own place.
     let side = |expr: &Expr| -> Option<(usize, usize)> {
         let (id, column) = match expr {
@@ -987,7 +999,11 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
             if let (Some(l), Some(r)) = (side(left), side(right)) {
                 // Keys of one affinity compare with no conversion, as a hash table does; an
                 // equality of two kinds is the body's to test.
-                if l.0 != r.0 && affinity(l)? == affinity(r)? && (outer.is_none() || on_term) {
+                // An outer join's ON equality with its padded table keys that link; every other
+                // equality with it (a WHERE term, or an ON term between the tables it keeps) is
+                // the body's to test (lanes qs6-12 and qs6-13).
+                let keys = padded_at.is_none_or(|p| on_term == (l.0 == p || r.0 == p));
+                if l.0 != r.0 && affinity(l)? == affinity(r)? && keys {
                     edges.push((l, r));
                     continue;
                 }
@@ -1005,7 +1021,9 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
         let pushed = match (outer, found) {
             (_, None) => None,
             (None, found) => found,
-            (Some(MorselOuter::Left), Some((at, p))) if on_term == (at == probe_at) => {
+            (Some(MorselOuter::Left | MorselOuter::LeftLink), Some((at, p)))
+                if padded_at.is_some_and(|padded| on_term == (at == padded)) =>
+            {
                 Some((at, p))
             }
             (Some(_), Some(_)) => None,
@@ -1026,8 +1044,11 @@ fn shape_join(plan: &SelectPlan) -> Option<(MorselAggregateData, BodyPlan<'_>)> 
         let joined_place = |at: usize| offsets.get(at).copied().flatten();
         // The next link: the first table in the join order an equality links to the chain; none
         // is a cross product, which the hook declines.
+        // A LEFT join's padded table among more (lane qs6-13) links last.
+        let last = joins.len().saturating_add(2) == tables.len();
         let next = (0..tables.len()).find(|at| {
             joined_place(*at).is_none()
+                && (outer != Some(MorselOuter::LeftLink) || last || Some(*at) != padded_at)
                 && edges.iter().any(|(l, r)| {
                     (l.0 == *at && joined_place(r.0).is_some())
                         || (r.0 == *at && joined_place(l.0).is_some())

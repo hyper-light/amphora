@@ -21061,6 +21061,7 @@ pub fn op_morsel_aggregate(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    use crate::vdbe::insn::MorselOuter;
     use crate::vdbe::morsel::HashProbe;
     use crate::vdbe::morsel::{
         MachineCosts, MemoryBudget, MorselError, ParallelMode, Partitioner, ScanAggregate,
@@ -21212,7 +21213,8 @@ pub fn op_morsel_aggregate(
                 key: &join.build_key,
                 partitioner: &partitioner,
                 // An outer join's build rows with a NULL key match nothing, and still appear.
-                keep_unkeyed: data.outer.is_some(),
+                // (A LEFT join's last link among more tables pads only the others' rows.)
+                keep_unkeyed: matches!(data.outer, Some(MorselOuter::Left | MorselOuter::Full)),
             }
             .run_mode(mode, &mut costs, &budget)?;
             stages.push(JoinStage {
@@ -21257,7 +21259,7 @@ pub fn op_morsel_aggregate(
         };
         // An outer join of two tables: the probe's morsels mark the build rows they match, the
         // bitmaps merge, then the unmatched build rows run padded (lane qs6-12).
-        if let Some(kind) = data.outer {
+        if let Some(kind @ (MorselOuter::Left | MorselOuter::Full)) = data.outer {
             let (Some(stage), Some(link)) = (stages.first(), data.joins.first()) else {
                 return Err(MorselError::Corrupt(
                     "an outer join's hook without its link",
@@ -21288,6 +21290,19 @@ pub fn op_morsel_aggregate(
                 None => Ok((out, false)),
             };
         }
+        // A LEFT join among more tables (lane qs6-13): its padded table is the last link, its
+        // columns the NULLs a row of the others that matched nothing there takes.
+        let pad_last = match data.outer {
+            Some(MorselOuter::LeftLink) => Some(
+                data.joins
+                    .last()
+                    .ok_or(MorselError::Corrupt(
+                        "an outer join's hook without its link",
+                    ))?
+                    .columns,
+            ),
+            _ => None,
+        };
         // A join's rows, no aggregates: each worker keeps its own leaves' output rows, merged
         // in order; they are the answer's rows as they stand.
         if let Some(rows) = &data.joined_rows {
@@ -21296,6 +21311,7 @@ pub fn op_morsel_aggregate(
                 probe_filter: &data.filter,
                 stages: &stages,
                 body: &looped,
+                pad_last,
                 order: &rows.order,
             };
             let (mut out, _) = pipeline.run_mode(mode, &mut costs, &budget)?;
@@ -21309,6 +21325,7 @@ pub fn op_morsel_aggregate(
             probe_filter: &data.filter,
             stages: &stages,
             body: &looped,
+            pad_last,
         };
         pipeline
             .run_mode(mode, &mut costs, &budget)
