@@ -971,6 +971,8 @@ tests = [
   { id = "T-QT.6.11", text = "Random inner equi-joins of two tables of many leaf pages on one or two columns, with filters on either table and groupings and aggregates over both, in SQL with Connection::set_parallel_mode off and on, the machine stated as 2, 3, 4 and 8 cores and the planner held to hash joins (vdbe/morsel_scan_tests.rs) — passes when the answers are the same row for row and in order, and the VDBE's hook probed for most of them" },
   { id = "T-QT.6.12", text = "t_qt_6_12_partitioned_parallel_build_matches_the_serial_join (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when a hash join's table built by 1, 2, 3, 4 and 8 workers into 1, 2, 3, 4 and 8 partitions gives the serial join's matches in order, most runs parallel and partitioned, and a budget too small is refused by type at every degree" },
   { id = "T-QT.6.13", text = "t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-4) — passes when random two-table hash joins returning rows, with or without ORDER BY, answer as the serial loop at 2, 3, 4 and 8 stated cores (in ORDER BY order, ties as sets) and the hook ran for most" },
+  # lane qs6-6
+  { id = "T-QT.6.14", text = "t_qt_6_14_vdbe_hook_limits_a_hash_joins_rows_as_the_serial_loop (vdbe/morsel_scan_tests.rs; lane qs6-6) — passes when random two-table hash joins returning rows under LIMIT and OFFSET, ordered by keys holding both tables' INTEGER PRIMARY KEYs, answer row for row as the serial loop at 2, 3, 4 and 8 stated cores, the hook ran for most, and a LIMIT over an order with ties stays serial" },
 ]
 
 # lane g3s2
