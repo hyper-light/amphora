@@ -116,6 +116,21 @@ pub(crate) fn in_identity(select: &impl std::fmt::Debug) -> Option<u64> {
     identity(&("IN", select))
 }
 
+/// The identity of an inner join's whole result (PL.13, lane replan-10): its tables' names, in any
+/// order, and the fingerprint of its WHERE and ON terms (`filter_shares::fingerprint`, order-free).
+/// `None` for terms that read a parameter, whose rows change with the value bound, or for no term.
+/// Its count is the rows a sorter fed by the join held; the planner reads it for the set of all
+/// the join's tables (`cardinality::JoinedSetRows::rows`).
+pub(crate) fn join_identity<'a>(
+    tables: impl Iterator<Item = &'a str>,
+    terms: impl Iterator<Item = &'a amphora_engine_parser::ast::Expr>,
+) -> Option<u64> {
+    let terms = crate::filter_shares::fingerprint(terms)?;
+    let mut names: Vec<String> = tables.map(crate::util::normalize_ident).collect();
+    names.sort_unstable();
+    identity(&("JOIN", names, terms))
+}
+
 /// A subquery's rows a plan read: its identity, where a count is stored, the count's bits when the
 /// plan read it, and the rows planned on (the counted ones where a fill counted them, else the
 /// subquery's own estimate).

@@ -345,6 +345,19 @@ pub struct SorterCountedData {
     pub estimate_error: f64,
     /// The WHERE terms' share check; `None` for a scan with no WHERE term.
     pub filter: Option<FilteredBuild>,
+    /// Amphora (PL.13, lane replan-10): for a sorter fed by an inner join, the check of its rows
+    /// against the rows the plan read for the whole join, in place of `table`'s and `filter`'s.
+    pub joined: Option<CountedCheck>,
+}
+
+/// A stored result's rows checked against the rows the plan read for it (PL.13, lane replan-10):
+/// where a count past the estimate is stored (`subquery_rows`), the rows planned on, and the
+/// relative standard error of the statistics the estimate came from.
+#[derive(Debug, Clone)]
+pub struct CountedCheck {
+    pub rows: crate::sync::Arc<crate::subquery_rows::CountedRows>,
+    pub planned_rows: f64,
+    pub estimate_error: f64,
 }
 
 /// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an

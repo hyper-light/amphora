@@ -2748,9 +2748,13 @@ pub fn insn_to_row(
             0,
             Value::build_text(""),
             0,
-            match &data.filter {
-                None => format!("count sorter[{}] against {}", data.cursor_id, data.table),
-                Some(filter) => format!(
+            match (&data.joined, &data.filter) {
+                (Some(joined), _) => format!(
+                    "count sorter[{}] against the join from {} at {} rows",
+                    data.cursor_id, data.table, joined.planned_rows
+                ),
+                (None, None) => format!("count sorter[{}] against {}", data.cursor_id, data.table),
+                (None, Some(filter)) => format!(
                     "count sorter[{}] against {} filtered to share {}",
                     data.cursor_id, data.table, filter.planned_share
                 ),

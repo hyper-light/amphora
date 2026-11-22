@@ -205,6 +205,10 @@ pub(super) struct JoinedSetRows<'a> {
     memo: HashMap<TableMask, f64>,
     /// Each set's proven upper bound, which its estimate never passes (PL.11).
     bound: DegreeBound,
+    /// PL.13 (lane replan-10): the identity of the whole join's rows, where a sorter fed by the
+    /// join may have counted them (`subquery_rows::join_identity`): an inner join of two tables or
+    /// more, planned for one run (`initial` at most one row); `None` otherwise.
+    joined: Option<u64>,
 }
 
 impl<'a> JoinedSetRows<'a> {
@@ -579,6 +583,16 @@ impl<'a> JoinedSetRows<'a> {
         let none_pass = where_clause
             .iter()
             .any(|term| term.origin.join_origin().is_none() && never_true(&term.expr));
+        let joined = (joined_tables.len() > 1
+            && initial <= 1.0
+            && kinds.iter().all(|kind| matches!(kind, Kind::Inner)))
+        .then(|| {
+            crate::subquery_rows::join_identity(
+                joined_tables.iter().map(|joined| joined.table.get_name()),
+                where_clause.iter().map(|term| &term.expr),
+            )
+        })
+        .flatten();
         Self {
             tables,
             columns,
@@ -589,6 +603,7 @@ impl<'a> JoinedSetRows<'a> {
             initial: if none_pass { 0.0 } else { initial },
             memo: HashMap::default(),
             bound,
+            joined,
         }
     }
 
@@ -600,6 +615,15 @@ impl<'a> JoinedSetRows<'a> {
         // PL.11: an estimate above the set's proven bound is cut to it; one below is left.
         // The bound is a join's for one row of its input, as `initial` counts them.
         let rows = self.bound.cap(set, self.capped(set), self.initial);
+        // PL.13 (lane replan-10): the whole join's rows a sorter fed by it counted past their
+        // estimate stand in for it, noted as the rows the plan read, so the sorter is checked
+        // against them and the plan made again when a count is stored.
+        let rows = match (self.joined, self.params.plan_values.as_deref()) {
+            (Some(identity), Some(values)) if set.iter().count() == self.tables.len() => {
+                values.subquery_rows(identity, rows)
+            }
+            _ => rows,
+        };
         if self.memo.len() < MEMO_SETS {
             if let Ok(key) = crate::alloc::TryClone::try_clone(set) {
                 self.memo.insert(key, rows);

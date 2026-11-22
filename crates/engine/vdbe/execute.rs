@@ -19415,8 +19415,15 @@ pub fn op_sorter_counted(
         usize::try_from(cursor.as_sorter_mut().inserted()).unwrap_or(usize::MAX)
     };
     program.connection.count_adaptive_sort_check();
-    let replanned = match &data.filter {
-        None => replan_on_built_rows(
+    let replanned = match (&data.joined, &data.filter) {
+        (Some(joined), _) => replan_on_counted_rows(
+            program,
+            &joined.rows,
+            joined.planned_rows,
+            joined.estimate_error,
+            u64::try_from(rows).unwrap_or(u64::MAX),
+        ),
+        (None, None) => replan_on_built_rows(
             program,
             &data.table,
             data.analyzed_rows,
@@ -19424,7 +19431,7 @@ pub fn op_sorter_counted(
             rows,
             0,
         ),
-        Some(filter) => {
+        (None, Some(filter)) => {
             correct_filter_share(program, &data.table, data.analyzed_rows, filter, rows, 0)
         }
     };
@@ -19433,6 +19440,43 @@ pub fn op_sorter_counted(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Amphora (PL.13, lane replan-6): a stored result's `rows` against the `planned_rows` the plan
+/// read for it; past the estimate's error the count is stored in `store` for the planner and every
+/// plan that read the old rows is planned again. True when a new count was stored.
+fn replan_on_counted_rows(
+    program: &Program,
+    store: &crate::subquery_rows::CountedRows,
+    planned_rows: f64,
+    estimate_error: f64,
+    rows: u64,
+) -> bool {
+    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
+    let verdict =
+        MaterializePoint::new(planned_rows, estimate_error, u64::MAX).and_then(|mut point| {
+            point.rows(rows, 0)?;
+            Ok(point.verdict())
+        });
+    match verdict {
+        Ok(Replan::Again { rows }) => {
+            let stored = store.set(rows);
+            if stored {
+                program.connection.count_adaptive_replan();
+                tracing::debug!(
+                    planned = planned_rows,
+                    rows,
+                    "a stored result counted past its estimate: planned again"
+                );
+            }
+            stored
+        }
+        Ok(Replan::Keep) => false,
+        Err(refused) => {
+            tracing::debug!(%refused, "a stored result's rows not checked");
+            false
+        }
+    }
 }
 
 /// Amphora (PL.13, lane replan-6): [Insn::SubqueryCounted]. A stored subquery result, filled,
@@ -19445,38 +19489,19 @@ pub fn op_subquery_counted(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    use crate::translate::optimizer::adaptive::{MaterializePoint, Replan};
     load_insn!(SubqueryCounted { data }, insn);
     let rows = match state.get_register(data.rows_reg).get_value() {
         Value::Numeric(Numeric::Integer(rows)) => u64::try_from(*rows).unwrap_or(0),
         _ => 0,
     };
     program.connection.count_adaptive_subquery_check();
-    let verdict = MaterializePoint::new(data.planned_rows, data.estimate_error, u64::MAX).and_then(
-        |mut point| {
-            point.rows(rows, 0)?;
-            Ok(point.verdict())
-        },
+    let replanned = replan_on_counted_rows(
+        program,
+        &data.rows,
+        data.planned_rows,
+        data.estimate_error,
+        rows,
     );
-    let replanned = match verdict {
-        Ok(Replan::Again { rows }) => {
-            let stored = data.rows.set(rows);
-            if stored {
-                program.connection.count_adaptive_replan();
-                tracing::debug!(
-                    planned = data.planned_rows,
-                    rows,
-                    "a stored subquery result counted past its estimate: planned again"
-                );
-            }
-            stored
-        }
-        Ok(Replan::Keep) => false,
-        Err(refused) => {
-            tracing::debug!(%refused, "a stored subquery result's rows not checked");
-            false
-        }
-    };
     if hand_off_now(program, state, replanned) {
         return Ok(InsnFunctionStepResult::Done);
     }

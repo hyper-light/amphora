@@ -1778,6 +1778,21 @@ one beside a hash table of groups takes only the rows of groups past its budget 
 and over a range whose share an UPDATE moved: one answer with adaptive joins off and on, one
 re-plan, none on the second run.
 
+A sorter fed by an inner join of two tables or more (lane replan-10, ORDER BY's or GROUP BY's)
+holds the join's rows its WHERE and ON terms keep, one a row, which no table's counter or share
+can correct. Its correction is the rows of the whole join, stored in the database's `SubqueryRows`
+under the join's identity (`subquery_rows::join_identity`: the tables' names in any order and the
+fingerprint of every term, never for terms reading a parameter). The estimate of the set of all a
+join's tables (`cardinality::JoinedSetRows::rows`, for one run: `initial` at most one row, inner
+joins only) reads a count stored there in its place and notes the rows it read, and the sorter,
+once all in, is checked against them (`SorterCounted` with a `CountedCheck`); the band is each
+joined table's statistics' error, independent, in quadrature, and past it the count is stored,
+the plan made again and the run handed off as a stored subquery result's is. An outer, semi or
+anti join, or a table without statistics, is not checked.
+`t_pl_13_15_a_sorter_fed_by_a_join_past_the_estimate_plans_again` (T-PL.13.15): a join estimated
+at 1,000 rows from distinct keys, holding 4,500 after an UPDATE: one answer, in order, with adaptive
+joins off and on, one re-plan, none on the second run or in a new statement.
+
 **Stored subquery results (lane replan-6).** An uncorrelated FROM-clause subquery stored whole in
 an ephemeral table (a CTE read more than once, or one declared `MATERIALIZED`, or a source a
 RIGHT or FULL JOIN reads again) holds the rows the planner estimated for it. Once its fill
@@ -1843,8 +1858,8 @@ root's cap took both for 70 values.
 
 **Not checked yet (lane replan-9's audit of the points this decision names).** A hash join's build
 fed by a materialized input, or filtered by terms that are neither one column statistics term nor
-a set the sample ran together; a sorter fed by anything but one table's full scan or index seek
-(a join), a GROUP BY's hash table of groups (a store of group counts), a DISTINCT, or by a seek whose terms the plan read no one share
+a set the sample ran together; a sorter fed by an outer, semi or anti join, a GROUP BY's hash table of groups (a store of group
+counts), a DISTINCT, or a sorter fed by a seek whose terms the plan read no one share
 for (an `=` its column statistics price beside a range the sample runs, say); a stored subquery result over another subquery or
 a table without statistics. Each needs a store for its own
 correction (a join's or a group's rows, keyed as a filter share is), or the new plan would be the

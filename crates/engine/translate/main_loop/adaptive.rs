@@ -126,9 +126,6 @@ pub(crate) fn emit_sorter_count(
     grouped: bool,
 ) {
     use crate::translate::plan::{Distinctness, Operation, Scan, Search};
-    let [joined] = plan.joined_tables() else {
-        return;
-    };
     // An ORDER BY sorter after a GROUP BY or an aggregate holds groups, not the rows read.
     if (!grouped && (plan.group_by.is_some() || !plan.aggregates.is_empty()))
         || (grouped && plan.group_by.is_none())
@@ -138,6 +135,25 @@ pub(crate) fn emit_sorter_count(
     {
         return;
     }
+    let joined = match plan.joined_tables() {
+        [joined] => joined,
+        [_, _, ..] => {
+            if let Some((table, check)) = joined_sorter_check(t_ctx, plan) {
+                program.emit_insn(Insn::SorterCounted {
+                    data: Box::new(crate::vdbe::insn::SorterCountedData {
+                        cursor_id,
+                        table,
+                        analyzed_rows: 0.0,
+                        estimate_error: check.estimate_error,
+                        filter: None,
+                        joined: Some(check),
+                    }),
+                });
+            }
+            return;
+        }
+        [] => return,
+    };
     let (seek, btree) = match (&joined.op, &joined.table) {
         (Operation::Scan(Scan::BTreeTable { index: None, .. }), Table::BTree(btree)) => {
             (false, btree)
@@ -169,8 +185,61 @@ pub(crate) fn emit_sorter_count(
             analyzed_rows,
             estimate_error,
             filter,
+            joined: None,
         }),
     });
+}
+
+/// Amphora (PL.13, lane replan-10: a sorter fed by a join): an ORDER BY or GROUP BY sorter fed by
+/// an inner join of two tables or more holds the join's rows its WHERE and ON terms keep, one a
+/// row. They are checked against the rows the plan read for the whole join
+/// (`cardinality::JoinedSetRows::rows`), noted under the join's identity
+/// (`subquery_rows::join_identity`), where a count past them is stored for the planner. The band
+/// is the statistics' error of each table joined, independent, in quadrature, as a stored
+/// subquery result's over several tables is. `None` where it is not checked: adaptive joins off,
+/// an outer, semi or anti join, a table without statistics, terms reading a parameter, or no rows
+/// noted for the join. With the check, the name of the first table, for EXPLAIN.
+fn joined_sorter_check(
+    t_ctx: &TranslateCtx,
+    plan: &crate::translate::plan::SelectPlan,
+) -> Option<(String, crate::vdbe::insn::CountedCheck)> {
+    if !t_ctx.resolver.adaptive_joins() {
+        return None;
+    }
+    let tables = plan.joined_tables();
+    if tables.iter().any(|joined| {
+        joined.join_info.as_ref().is_some_and(|info| {
+            info.is_outer() || info.is_semi_or_anti() || info.keeps_right_rows()
+        })
+    }) {
+        return None;
+    }
+    let identity = crate::subquery_rows::join_identity(
+        tables.iter().map(|joined| joined.table.get_name()),
+        plan.where_clause.iter().map(|term| &term.expr),
+    )?;
+    let planned = t_ctx
+        .resolver
+        .plan_values()
+        .and_then(|values| values.planned_subquery(identity))?;
+    let mut squared_error = 0.0;
+    let mut first = None;
+    for joined in tables {
+        let Table::BTree(btree) = &joined.table else {
+            return None;
+        };
+        let (_, error) = analyzed_table(&t_ctx.resolver, &btree.name)?;
+        squared_error += error * error;
+        first.get_or_insert_with(|| btree.name.clone());
+    }
+    Some((
+        first?,
+        crate::vdbe::insn::CountedCheck {
+            rows: planned.rows,
+            planned_rows: planned.planned_rows,
+            estimate_error: f64::sqrt(squared_error),
+        },
+    ))
 }
 
 /// Amphora (PL.13, lane replan-6: a stored subquery result's materialization point): an

@@ -1207,3 +1207,65 @@ fn t_pl_13_14_a_group_by_sorters_input_past_the_estimate_plans_again() {
         assert_eq!(conn.adaptive_replans(), replans, "{case}: a second re-plan");
     }
 }
+
+/// Do: an ORDER BY over an inner join `a.k = b.k`, `b.k` distinct in every row as ANALYZE counted
+/// it (the join's estimate a's 1,000 rows), then updated to ten values (the rows and both row
+/// counters unchanged), so the join holds 4,500 rows; run with adaptive joins off, then on twice
+/// in one prepared statement, and in a statement prepared after. Expect: one answer, in order,
+/// every way; off, no sorter counted; on, the sorter's input counted once all in against the rows
+/// the plan read for the whole join, past its error stored and the statement planned again once;
+/// the second run's sorter counted on the stored rows and nothing plans again (PL.13, lane
+/// replan-10, T-PL.13.15: a sorter fed by a join at its materialization point).
+#[test]
+fn t_pl_13_15_a_sorter_fed_by_a_join_past_the_estimate_plans_again() {
+    let (_dir, conn) = open("joined_sorter.db");
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k, v)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO a(k) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) SELECT i FROM n",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO b(k, v) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000) SELECT i, i % 7 FROM n",
+    )
+    .unwrap();
+    conn.execute("ANALYZE").unwrap();
+    conn.execute("UPDATE b SET k = k % 10").unwrap();
+    let sql = "SELECT a.id, b.id, b.v FROM a JOIN b ON b.k = a.k ORDER BY b.v, b.id, a.id";
+
+    conn.set_adaptive_joins(false);
+    let checks = conn.adaptive_sort_checks();
+    let off = run_rows(&mut conn.prepare(sql).unwrap());
+    // a.k 1 to 9 each meets the 500 rows of b holding it.
+    assert_eq!(off.len(), 4500, "the rows");
+    assert_eq!(conn.adaptive_sort_checks(), checks, "counted off");
+
+    conn.set_adaptive_joins(true);
+    let replans = conn.adaptive_replans();
+    let mut held = conn.prepare(sql).unwrap();
+    assert_eq!(run_rows(&mut held), off, "on and off differ");
+    assert!(
+        conn.adaptive_sort_checks() > checks,
+        "the join's sorter was not counted"
+    );
+    assert_eq!(conn.adaptive_replans() - replans, 1, "planned again once");
+    let (checks, replans) = (conn.adaptive_sort_checks(), conn.adaptive_replans());
+    assert_eq!(run_rows(&mut held), off, "the second run's answer");
+    assert!(
+        conn.adaptive_sort_checks() > checks,
+        "the second sorter was not counted"
+    );
+    assert_eq!(conn.adaptive_replans(), replans, "a second re-plan");
+    assert_eq!(
+        run_rows(&mut conn.prepare(sql).unwrap()),
+        off,
+        "a new statement's answer"
+    );
+    assert_eq!(
+        conn.adaptive_replans(),
+        replans,
+        "a new statement planned again"
+    );
+}
