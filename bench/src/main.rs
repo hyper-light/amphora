@@ -33,6 +33,7 @@ mod reach;
 mod repl;
 mod scale;
 mod schema;
+mod skipping;
 mod sqlapi;
 mod store;
 mod suite;
@@ -547,6 +548,10 @@ fn main() -> anyhow::Result<()> {
     // G11 step 2's column copies, A and B, against none (`columns.rs`).
     if std::env::args().any(|a| a == "--columns") {
         return columns::main();
+    }
+    // Row skipping against DuckDB, one driver for both (`skipping.rs`, lane skip-7).
+    if std::env::args().any(|a| a == "--skipping") {
+        return skipping::main();
     }
     // Column copies within a fixed memory limit against DuckDB, one driver for both (`colcopy.rs`).
     if std::env::args().any(|a| a == "--colcopy") {
