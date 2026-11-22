@@ -159,6 +159,8 @@ fn to_sql(
             Aggregate::Sum(c) => format!("sum({})", COLUMNS[*c]),
             Aggregate::Min(c) => format!("min({})", COLUMNS[*c]),
             Aggregate::Max(c) => format!("max({})", COLUMNS[*c]),
+            Aggregate::Avg(c) => format!("avg({})", COLUMNS[*c]),
+            Aggregate::Total(c) => format!("total({})", COLUMNS[*c]),
         });
     }
     let terms: Vec<String> = filter

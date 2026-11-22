@@ -305,7 +305,7 @@ impl TableSource {
         row.clear();
         row.try_reserve(self.columns)?;
         row.extend(values.into_iter().take(self.columns));
-        self.pad(&mut row);
+        self.pad(row);
         if let Some(at) = self.rowid_alias {
             let slot = row.get_mut(at).ok_or(MorselError::NoColumn {
                 column: at,
