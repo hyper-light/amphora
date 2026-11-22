@@ -878,6 +878,37 @@ impl<B: Block> Columns<B> {
             st.previous_behind = None;
         }
     }
+
+    /// What the planner costs the copy by at snapshot `s` (G11 step 5,
+    /// `translate::optimizer::column_path`): whether a generation answers `s` exactly, by the
+    /// rule every scan of the copy reads by (`Columns::pick`); the rows that generation holds;
+    /// the distinct keys the queue holds at or before `s`, read from the rows; and the copy's
+    /// measured nanoseconds per row of the table at its current block size, as its scans charge
+    /// it ([`Columns::measured`], [`Columns::measured_scan`]; None before a scan at that size).
+    pub fn plan_view(&self, s: Ts) -> PlanView {
+        let st = self.state.read();
+        let picked = self.pick(&st, s);
+        let nanos_per_row = st
+            .sizer
+            .current
+            .and_then(|size| st.sizer.cost(size))
+            .map(|(nanos, rows)| nanos as f64 / rows as f64);
+        PlanView {
+            exact: picked.is_some(),
+            rows: picked.as_ref().map_or(0, |(g, _)| g.rows()),
+            queued: picked.as_ref().map_or(0, |(_, skip)| skip.len()),
+            nanos_per_row,
+        }
+    }
+}
+
+/// The copy at one snapshot, as the planner costs it ([`Columns::plan_view`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlanView {
+    pub exact: bool,
+    pub rows: usize,
+    pub queued: usize,
+    pub nanos_per_row: Option<f64>,
 }
 
 /// Where prototype B keeps its file, outside the redo log.

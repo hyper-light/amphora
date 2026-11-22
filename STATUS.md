@@ -99,6 +99,13 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   (Unix), the checksum checked once as a page enters the process. Built and tested (the shared-pages
   model on the plain path; each path reads today's rows; a flipped byte refused on each path); not
   yet measured. The miss still allocates the page and its buffer's `Arc`.
+- **Point readers that write no shared line** (G3 step 6, docs/design/store.md decision 43), two
+  prototypes, each behind its switch and off by default: `AMPHORA_READ_CHECKOUT=slots` takes a
+  store's reader from a slot of its own, with no pool mutex or shared gate per read;
+  `AMPHORA_SHARED_PAGE_READS=optimistic` reads shared pages from frames of atomic words under a
+  version check, without the shard's lock. Built and tested (slot readers, and 32 readers and a
+  writer under the model: no image past a reader's snapshot, none torn); not yet measured (60 s
+  run, perf c2c and the 32-client suite are the coordinator's).
 - **The mixed log's commit costs** (docs/design/store.md, Decision (lane wal-read)): publishing a
   commit's records costs a lookup each, not a pass over the records kept decoded or over the
   commit's pages, and deltas are found a word at a time. Built, not merged; whether the bulk
@@ -308,6 +315,16 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   near the largest size gathered on one side). Trees made and dropped while running (`AC-NS.2.5`): a
   redo record each, a dropped tree's root listed as 0 in the checkpoint, both replayed; dropped
   trees' pages stay unreferenced (the pool has no free list yet).
+- **Eviction on the versioned storage** (G7 step 4, `NS.4`, docs/design/engine.md decision 14,
+  `crates/engine/storage/versioned/{pool,evict}.rs`): a database's pool holds the frames its byte
+  budget pays for and evicts by CLOCK; dirty pages go to a spill file recovery never reads (the data
+  file still changes only by checkpoints), pages read in are checked once against a checksum, and a
+  pool whose every frame is latched refuses typed (`MemoryBudget`). Tests: a database over ten times
+  its pool across a checkpoint and a reopen, a crash at every disk operation of a spilling,
+  checkpointing workload losing no acknowledged commit, and the pool's model test with eviction
+  under 32 threads. Not yet: the 10M-row corpus run and its resident memory (the coordinator's);
+  checkpoints still build their journal in memory; the shell passes the budget once the switch
+  takes it from `amphora::memory::limit`.
 - **The switch: SQL on the versioned storage** (G7 step 2, `AC-NS.2.1`, docs/design/engine.md
   decision 13, `crates/engine/storage/versioned/{switch,sql}.rs`): `ConnectOpts::with_versioned_storage`
   or `AMPHORA_STORAGE=versioned` puts a database's B-trees on the versioned storage; the executor's
@@ -402,6 +419,15 @@ macOS and Windows lints) and the evidence its requirement names is recorded.
   equal (T-T1.12.D1). `Database::open_backed_up` backs a local writer up: its commits stamped and a
   thread that ships and copies bases as it commits, across a close and a reopen (T-T1.12.D2). Not
   yet: kiln's adapter to Mantle, and the 100 GB restore measurement (AC-T1.12.3).
+  The folder store (`backup::FolderBlobs`, lane pitr-7): the owned default, a peer's folder over a
+  mount the same, passing the seam's suite and answering as the simulator (AMPHORA-BLOBS-8).
+  Restore-and-check (`backup::restore_and_check`): the newest whole second restored to a scratch file,
+  integrity-checked and its rows compared with the source's, typed and counted, due on the archive's
+  cadence (T-T1.12.C1, C2). One cut across groups (`backup::restore_cut`): every group restored to
+  one second, half-done cross-group transactions finished by their records (T-T1.12.X1). Not yet:
+  the source's digest taken by the shipping thread itself; cuts across nodes' clocks. Incremental
+  bases (T-T1.12.I1 to I3): a new base keeps the latest's chunks the log left unchanged, due once the
+  log outweighs what it would copy, after a reopen too.
 
 - **Transactions across groups** (CP-T1.10, G13 step 3; `amphora::xgroup`, docs/design/xgroup.md): two-phase commit
   over groups and Parallel Commits, behind `Protocol`, sharing one group-side step logic on the simulator's tablet and
@@ -612,9 +638,16 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
 - **Query speed step 6 (QT.6), started** (lane qs6; docs/design/executor.md section 8): built and unit-tested, not
   measured, not yet in the VDBE's loops. `vdbe/morsel.rs` runs a scan with its filter and aggregates, and a hash join's
   probe side, in morsels on several threads behind `ParallelMode` (off by default); the worker count and morsel size
-  come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5). Closes with:
-  the VDBE's scan and join loops run through it (a cursor per worker over one snapshot), a shared hash build, loom or
-  shuttle on the dispatcher, worker and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
+  come from costs measured where it runs, answers equal at every worker count (T-QT.6.1 to T-QT.6.5).
+  `vdbe/morsel_scan.rs` (lane qs6-2) reads a table b-tree in morsels of leaf pages: the leaves come from its interior
+  pages, each worker opens its own cursor over its leaves through the statement's pager (one snapshot), and the scan
+  pipeline's filter and aggregates, or a hash join's probe, run over the rows; `choose_degree` sizes the morsels in
+  pages. Answers equal the VDBE's serial SQL answers at every worker count (T-QT.6.7 to T-QT.6.9). The VDBE's hook:
+  `Connection::set_parallel_mode` (off by default) lets a single-table scan with its filter and aggregates run as
+  `Insn::MorselAggregate` ahead of its serial loop, which answers when the run declines a value (`translate/parallel.rs`;
+  T-QT.6.10). Closes with: the hash join's probe loop handed over the same way, expressions beyond column-against-
+  literal terms (a program's own loop body per worker), a shared hash build, loom or shuttle on the dispatcher, worker
+  and morsel metrics, and AC-QT.6.1 to AC-QT.6.4 measured.
 - **Query speed step 5 (QT.5), started** (lane qs5): `Connection::set_join_methods` plans a connection's new
   statements by cost, with index nested loops only, or with hash joins only; `tests/join_methods.rs` (T-QT.5.1) runs
   inner, left, semi and anti joins with NULL and duplicate keys all three ways and against a model. The harness
@@ -730,6 +763,15 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   attached table's largest degree, or two tables' ℓ2 norms); underestimates are left as they are
   (docs/design/planner.md, "Decision (lane pl11)"). Open: the bound holds for PL.9's net row
   change, not for updates or cancelled inserts between ANALYZE runs.
+- **PL.7** (b6a2313e, built and tested on main, behind a switch, its JOB measurement
+  open): with `Connection::set_fitted_costs` (or `AMPHORA_FITTED_COSTS=1`) on, the database times a
+  share of its statements, the share learned against the timer's cost and the measurement's spread,
+  and fits the planner's weights to their counted work (rows, seeks, hash rows added and looked up,
+  sort work, file page reads) by non-negative least squares with Huber weights, in bounded memory;
+  weights no sample determines, or none tells from nothing at 95%, keep the learned calibration's
+  (docs/design/planner.md, "Decision (lane pl7)"; lane pl7b, T-PL.7.6, after a loaded run's noisy
+  weights flipped a plan in `tests/planner.rs`). Open: tables' pages from the file (T-PL.7.1), the P-error harness (AC-PL.7.2), and
+  AC-PL.7.1's JOB rank correlation with the switch on and off.
 - **PL.6** (5e23ff8b, built and tested on t1/lane-pl6, its measurement open): no table is read whole
   beneath loops that can give more than one row. A scan stays only beneath one-row loops (a lookup by a
   unique key) or where no equality joins the table; elsewhere a seek, an automatic index or a hash join
@@ -788,12 +830,21 @@ stores NULL in it), learned rowid batches clear its old values, then the drop is
   size the sizer learns, now charged per row of the table so skipped granules count. Each carries
   min/max and null counts per column and its key range and position; filters skip granules their
   summaries exclude and run on whole vectors, as do COUNT, SUM (exact for reals), MIN, MAX and
-  group-by. A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
+  group-by (each row given its group's slot in one pass, each aggregate's vector folded by slot,
+  T-CS.4.5). A key range (a wide-range statement) skips blocks outside it undecoded, by the blocks'
   key bounds, and filters its boundary granules by their key column. Blocks no change touches are
   decoded once a generation. Every class equals the row store's answer, whole-table and over key
   ranges, with writes between scans, serially and on the morsel executor's workers (`Plan` is a
   `vdbe/morsel.rs` pipeline, granules its unit) (T-CS.4.1 to T-CS.4.3). Open: the planner's use
   (step 5), and the benches against CedarDB and ClickHouse (AC-CS.4.1, AC-CS.4.2).
+  Step 5's choice is built, behind `AMPHORA_COLUMN_PATH=on` (CS.5, lane g11s5): the planner prices
+  "scan the column copy" from the copy's measured nanoseconds per row at its block size plus each
+  queued key read from the rows and merged (`translate/optimizer/column_path.rs`), against the
+  row path's learned rates for a row's visit and a seek; a copy that can't answer the snapshot
+  exactly is no path. `storage/versioned/columns_path.rs` reads by the choice and charges the
+  copy's scan time back to it (T-CS.5.1 to T-CS.5.4). Open: SQL tables don't keep a copy yet, so
+  no SQL statement reaches it; step 4's vectorized scan replaces `Columns::scan` there; the
+  classes against CedarDB and ClickHouse (AC-CS.5.2) are the coordinator's.
 
 ## Open
 
