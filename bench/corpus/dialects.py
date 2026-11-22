@@ -38,6 +38,8 @@ class NotExpressible(Exception):
 
 # Words that end a column's type name: a column constraint starts with one of them (SQLite's
 # "CREATE TABLE", column-constraint syntax, https://www.sqlite.org/lang_createtable.html).
+# Words that start a table constraint (lang_createtable.html, table-constraint syntax).
+_TABLE_CONSTRAINT_WORDS = {"CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"}
 _CONSTRAINT_WORDS = {"CONSTRAINT", "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT", "COLLATE", "REFERENCES", "GENERATED", "AS", "ON"}
 
 
@@ -127,7 +129,61 @@ def _reader():
                     return kind
             return super()._parse_types(check_func=check_func, schema=schema, allow_identifiers=allow_identifiers, with_collation=with_collation)
 
+        def _parse_primary_key_part(self):
+            # A table PRIMARY KEY's indexed-column: "expr [COLLATE name] [ASC|DESC]" (SQLite's "CREATE
+            # TABLE", table-constraint and indexed-column syntax, https://www.sqlite.org/lang_createtable.html),
+            # which SQLite's grammar also takes with AUTOINCREMENT after it. ASC and DESC order the key's
+            # index alone: "CREATE TABLE t(x INTEGER, y, z, PRIMARY KEY(x ASC))" and "PRIMARY KEY(x DESC)"
+            # make x the same rowid alias as "x INTEGER PRIMARY KEY ASC" (lang_createtable.html, "ROWIDs
+            # and the INTEGER PRIMARY KEY"), so they are left out. COLLATE and AUTOINCREMENT are kept
+            # on the column for keyed() to say.
+            part = super()._parse_primary_key_part()
+            if part is None:
+                return part
+            if self._match(TokenType.COLLATE):
+                name = self._curr.text if self._curr else ""
+                self._advance()
+                part.meta["sqlite_collate"] = name.strip('"`[]').upper()
+            self._match_set((TokenType.ASC, TokenType.DESC))
+            if self._curr and self._curr.text.upper() == "AUTOINCREMENT":
+                self._advance()
+                part.meta["sqlite_autoincrement"] = True
+            return part
+
+        def _parse_schema(self, this=None):
+            # sqlglot's own, with SQLite's table constraints taken without a comma between them:
+            # SQLite's grammar reads "conslist ::= conslist tconscomma tcons" with "tconscomma ::= ."
+            # beside "tconscomma ::= COMMA." (src/parse.y, https://sqlite.org/src/file?name=src/parse.y),
+            # so "CHECK (a > 0) CHECK (a < 9)" is two constraints, as with the comma.
+            index = self._index
+            if not self._match(TokenType.L_PAREN):
+                return this
+            if self._match_set(self.SELECT_START_TOKENS):
+                self._retreat(index)
+                return this
+            args = []
+            while True:
+                args.extend(self._parse_csv(lambda: self._parse_constraint() or self._parse_field_def()))
+                if not (args and self._curr and self._curr.text.upper() in _TABLE_CONSTRAINT_WORDS):
+                    break
+            self._match_r_paren()
+            return self.expression(exp.Schema(this=this, expressions=args))
+
         def _parse_statement(self):
+            # VALUES after a WITH clause's common table expressions: SQLite's "SELECT" (https://www.sqlite.org/lang_select.html,
+            # 2.6 "The VALUES clause"): "The phrase "VALUES(expr-list)" means the same thing as "SELECT
+            # expr-list". The phrase "VALUES(expr-list-1),...,(expr-list-N)" means the same thing as
+            # "SELECT expr-list-1 UNION ALL ... UNION ALL SELECT expr-list-N"", its columns named
+            # column1, column2, ... (the same section), which sqlglot refuses after WITH ("values does
+            # not support CTE"): said as those SELECTs.
+            if self._curr and self._curr.token_type == TokenType.VALUES and self._prev and self._prev.token_type == TokenType.R_PAREN:
+                self._advance()
+                rows = self._parse_csv(self._parse_value)
+                selects = [exp.select(*[(e.as_(f"column{i + 1}") if n == 0 else e) for i, e in enumerate(row.expressions)]) for n, row in enumerate(rows)]
+                said = selects[0]
+                for more in selects[1:]:
+                    said = exp.union(said, more, distinct=False)
+                return said
             # SAVEPOINT name, RELEASE [SAVEPOINT] name (https://www.sqlite.org/lang_savepoint.html)
             # and REINDEX [name] (https://www.sqlite.org/lang_reindex.html), which sqlglot reads as a
             # column and its alias: each as a command, RELEASE in its full spelling, which
@@ -222,6 +278,25 @@ def conflict_clause(sql):
     return None
 
 
+def upserts(sql):
+    """How many upsert clauses (ON CONFLICT followed by a conflict target or DO) the most of any one
+    statement in `sql` has, by SQLite's tokens."""
+    from sqlglot.dialects.sqlite import SQLite
+    from sqlglot.tokens import TokenType
+
+    try:
+        tokens = SQLite().tokenize(sql)
+    except Exception:  # sqlglot can't tokenize it: translate() says why
+        return 0
+    most, n = 0, 0
+    for i, t in enumerate(tokens):
+        if t.token_type == TokenType.SEMICOLON:
+            most, n = max(most, n), 0
+        elif t.token_type != TokenType.STRING and t.text.upper() == "ON" and i + 2 < len(tokens) and tokens[i + 1].text.upper() == "CONFLICT" and (tokens[i + 2].token_type == TokenType.L_PAREN or tokens[i + 2].text.upper() == "DO"):
+            n += 1
+    return max(most, n)
+
+
 def _offset(value, side):
     """A frame bound as a signed row offset (None: not a literal), PRECEDING negative."""
     from sqlglot import exp
@@ -233,6 +308,50 @@ def _offset(value, side):
     if isinstance(value, exp.Literal) and value.is_int:
         return -int(value.this) if side == "PRECEDING" else int(value.this)
     return None
+
+
+def _around(window, lo, hi):
+    """min, max, first_value or last_value over a ROWS frame [lo, hi] holding the current row, with
+    EXCLUDE CURRENT ROW: the frame without the current row is the rows before it in the frame (ROWS
+    lo .. 1 PRECEDING) and the rows after it (ROWS 1 FOLLOWING .. hi), as SQLite's 2.2.4 says
+    ("EXCLUDE CURRENT ROW: the current row is excluded from the frame"). Over an empty frame each is
+    NULL (windowfunctions.html 2.2, and an aggregate of no rows, lang_aggfunc.html: "max() returns
+    NULL if and only if there are no non-NULL values in the group"). Exact, each part by the same
+    function:
+    - min (max) is the smaller (larger) of the two parts' min (max), NULLs skipped as min skips them;
+    - first_value is the first row's: the part before when it has rows, else the part after;
+      last_value the other way round."""
+    from sqlglot import exp
+
+    func = window.this
+
+    def part(start, start_side, end, end_side, fn=None):
+        w = window.copy()
+        if fn is not None:
+            w.set("this", fn)
+        spec = w.args["spec"]
+        spec.set("exclude", None)
+        spec.set("start", start)
+        spec.set("start_side", start_side)
+        spec.set("end", end)
+        spec.set("end_side", end_side)
+        return w
+
+    spec = window.args["spec"]
+    before = part(spec.args.get("start"), spec.args.get("start_side"), exp.Literal.number(1), "PRECEDING") if lo < 0 else None
+    after = part(exp.Literal.number(1), "FOLLOWING", spec.args.get("end"), spec.args.get("end_side")) if hi > 0 else None
+    if before is None and after is None:
+        return exp.Null()
+    if before is None or after is None:
+        return before or after
+    if isinstance(func, (exp.Min, exp.Max)):
+        pick = exp.LTE if isinstance(func, exp.Min) else exp.GTE
+        return exp.Case(ifs=[exp.If(this=exp.Is(this=before.copy(), expression=exp.Null()), true=after.copy()), exp.If(this=exp.Is(this=after.copy(), expression=exp.Null()), true=before.copy()), exp.If(this=pick(this=before.copy(), expression=after.copy()), true=before.copy())], default=after.copy())
+    rows = exp.Count(this=exp.Star())
+    first, second = (before, after) if isinstance(func, exp.FirstValue) else (after, before)
+    counted = first.copy()
+    counted.set("this", rows)
+    return exp.Case(ifs=[exp.If(this=exp.GT(this=counted, expression=exp.Literal.number(0)), true=first.copy())], default=second.copy())
 
 
 def excluded(window, dialect):
@@ -251,8 +370,11 @@ def excluded(window, dialect):
       of the current row (a RANGE or GROUPS frame that holds it, bounded by peer groups, or ROWS from
       UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING); EXCLUDE TIES is GROUP's with the current row's
       own count given back. Integer arithmetic, so exact.
-    Every other function (sum, total, avg over values of any type, min, max, first_value, ...) has no
-    exact arithmetic: not expressible."""
+    - min, max, first_value and last_value with EXCLUDE CURRENT ROW on a ROWS frame that holds the
+      current row: the frame's two parts around it (_around()).
+    Every other function (sum, total and avg, whose floating-point sums depend on the order they add
+    in; nth_value, whose N would move with the part before's size), and EXCLUDE GROUP or TIES on
+    anything but count(): not expressible."""
     from sqlglot import exp
 
     spec = window.args.get("spec")
@@ -269,8 +391,10 @@ def excluded(window, dialect):
         spec.set("exclude", None)
         return window
     func = window.this
+    if exclude == "CURRENT ROW" and kind == "ROWS" and holds and isinstance(func, (exp.Min, exp.Max, exp.FirstValue, exp.LastValue)):
+        return _around(window, lo, hi)
     if not isinstance(func, exp.Count) or isinstance(func.this, exp.Distinct) or not holds:
-        raise NotExpressible(why + "; only count() over a frame holding the current row has an exact rewrite)")
+        raise NotExpressible(why + "; only count(), min(), max(), first_value() and last_value() over a frame holding the current row have an exact rewrite)")
     all_peers = kind in ("RANGE", "GROUPS") or (lo == float("-inf") and hi == float("inf"))
     if exclude in ("GROUP", "TIES") and not all_peers:
         raise NotExpressible(why + "; a ROWS frame may hold only some of the current row's peers)")
@@ -336,6 +460,44 @@ def typed(expression):
     return expression
 
 
+def keyed(expression, dialect):
+    """`expression` with a table PRIMARY KEY's indexed columns said as each dialect can:
+    - AUTOINCREMENT on the one column of the key: "CREATE TABLE t(x INTEGER, y, z, PRIMARY KEY(x
+      ASC))" is the same table as "x INTEGER PRIMARY KEY" (lang_createtable.html, "ROWIDs and the
+      INTEGER PRIMARY KEY"), so the key and its AUTOINCREMENT move onto the column, the form
+      https://www.sqlite.org/autoinc.html describes, which sqlglot writes in each dialect;
+    - COLLATE: the key's uniqueness compares by that collation while the column compares by its own
+      (lang_createtable.html: an indexed column's collation is the index's; datatype3.html 7.1).
+      BINARY on a column without a collation is the column's own and is left out; any other has no
+      spelling in a dialect whose PRIMARY KEY names columns only (PostgreSQL's CREATE TABLE
+      "PRIMARY KEY ( column_name [, ... ] )", MySQL's "PRIMARY KEY (key_part,...)", DuckDB's and
+      ClickHouse's alike): not expressible."""
+    from sqlglot import exp
+
+    for key in list(expression.find_all(exp.PrimaryKey)):
+        parts = key.expressions
+        schema = key.find_ancestor(exp.Schema)
+        columns = {c.name.upper(): c for c in schema.expressions if isinstance(c, exp.ColumnDef)} if schema else {}
+        for part in parts:
+            collate = part.meta.get("sqlite_collate")
+            if collate is None:
+                continue
+            column = columns.get(part.name.upper())
+            own = column is not None and not any(isinstance(c.args.get("kind"), exp.CollateColumnConstraint) for c in column.args.get("constraints") or [])
+            if collate == "BINARY" and own:
+                continue
+            raise NotExpressible(f"not expressible in {dialect}: a PRIMARY KEY column's own collation (COLLATE {collate}, lang_createtable.html) has no spelling in {dialect}'s PRIMARY KEY, which names columns only")
+        if any(p.meta.get("sqlite_autoincrement") for p in parts):
+            column = columns.get(parts[0].name.upper()) if len(parts) == 1 else None
+            if column is None:
+                raise NotExpressible(f"not expressible in {dialect}: AUTOINCREMENT on a PRIMARY KEY that isn't one column of the table (https://www.sqlite.org/autoinc.html)")
+            constraints = list(column.args.get("constraints") or [])
+            constraints += [exp.ColumnConstraint(kind=exp.PrimaryKeyColumnConstraint()), exp.ColumnConstraint(kind=exp.AutoIncrementColumnConstraint())]
+            column.set("constraints", constraints)
+            (key.parent if isinstance(key.parent, exp.Constraint) else key).pop()
+    return expression
+
+
 # SQLite's built-in collations (https://www.sqlite.org/datatype3.html#collating_sequences, section
 # 7.1: BINARY "compares string data using memcmp()", NOCASE "is the same as binary, except the 26
 # upper case characters of ASCII are folded to their lower case equivalents", RTRIM "is the same as
@@ -380,6 +542,14 @@ def spoken(expression, dialect):
         exclude = frame.args.get("exclude")
         if isinstance(exclude, exp.Var) and " ".join(exclude.name.upper().split()) == "NO OTHERS":
             frame.set("exclude", None)
+    if dialect == "mysql":
+        # MySQL has no FULL JOIN (MySQL 8.4 Reference Manual, 15.2.13.2 "JOIN Clause": its
+        # joined_table takes INNER, CROSS, LEFT, RIGHT and NATURAL [LEFT|RIGHT] joins only); sqlglot
+        # says a FULL JOIN ON a condition as a LEFT and a RIGHT join, which a NATURAL join, whose
+        # columns come from the tables' schemas (lang_select.html 2.2), can't give it.
+        for join in expression.find_all(exp.Join):
+            if str(join.args.get("side") or "").upper() == "FULL" and str(join.args.get("method") or "").upper() == "NATURAL":
+                raise NotExpressible("not expressible in mysql: a NATURAL FULL JOIN (MySQL has no FULL JOIN, and its LEFT and RIGHT rewrite needs the join's columns, which a NATURAL join takes from the tables' schemas)")
     if dialect in ("mysql", "clickhouse"):
         for window in list(expression.find_all(exp.Window)):
             spec = window.args.get("spec")
@@ -387,6 +557,13 @@ def spoken(expression, dialect):
                 said = excluded(window, dialect)
                 if said is not window:
                     window.replace(said)
+    if dialect == "duckdb" and any(True for _ in expression.find_all(exp.AutoIncrementColumnConstraint)):
+        # AUTOINCREMENT: a new row's key is one more than the largest the table has ever held, an
+        # explicitly written one included (https://www.sqlite.org/autoinc.html, "The AUTOINCREMENT
+        # Keyword"). DuckDB's CREATE TABLE has no AUTOINCREMENT or identity column; its sequences
+        # (CREATE SEQUENCE, a column's DEFAULT nextval()) count on their own and don't move past a
+        # key written explicitly, so the next key differs: not expressible.
+        raise NotExpressible("not expressible in duckdb: AUTOINCREMENT (https://www.sqlite.org/autoinc.html: one more than the largest key the table has held), which DuckDB's CREATE TABLE has no spelling of and its sequences don't count the same")
     if dialect in ("postgres", "clickhouse"):
         for blob in list(expression.find_all(exp.HexString)):
             digits = blob.this or ""
@@ -484,9 +661,14 @@ def translate(sql, dialect):
     clause = conflict_clause(text)
     if clause is not None:
         return None, f"not expressible in {dialect}: SQLite's conflict resolution {clause} (https://www.sqlite.org/lang_conflict.html) has no equivalent there"
+    if upserts(text) > 1:
+        # SQLite's "UPSERT" (https://www.sqlite.org/lang_upsert.html): "there can be multiple upsert
+        # clauses", each tried in turn. PostgreSQL's and DuckDB's INSERT take one ON CONFLICT clause,
+        # MySQL's ON DUPLICATE KEY UPDATE acts on any key, ClickHouse has no upsert.
+        return None, f"not expressible in {dialect}: several upsert clauses (https://www.sqlite.org/lang_upsert.html) where {dialect} takes at most one"
     try:
         # sqlglot.transpile's steps, each statement given its untyped columns' types between them.
-        out = [spoken(typed(e), dialect).sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE) if e else "" for e in sqlglot.parse(text, read=reader())]
+        out = [spoken(keyed(typed(e), dialect), dialect).sql(dialect=dialect, unsupported_level=sqlglot.ErrorLevel.RAISE) if e else "" for e in sqlglot.parse(text, read=reader())]
     except NotExpressible as e:
         return None, str(e)
     except Exception as e:  # sqlglot can't say it in this dialect
