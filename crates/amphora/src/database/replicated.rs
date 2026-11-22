@@ -1884,6 +1884,8 @@ fn open_on<F: BlockFile + 'static>(
     let mut machine = machine;
     machine.state_class(&durability)?;
     let settings = settings(config.node_id, &durability)?;
+    // A class entry is bounded by the members the core is opened for (lane constants-20).
+    machine.set_members(settings.core.limits.members);
     let meter = Arc::new(ReplicaMeter::default());
     let bell = Bell::new();
     let flushing = Flushing::start(&machine, Arc::clone(&meter), account(), Arc::clone(&bell))?;
@@ -3887,7 +3889,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some(class) = self.replica.machine().class_proposal() else {
             return Ok(());
         };
-        let bytes = crate::replication::class::entry(&class)?;
+        let members = self.replica.machine().members();
+        let bytes = crate::replication::class::entry(&class, members)?;
         let context = self.context()?;
         match self.propose(&context, bytes) {
             Ok(()) => {

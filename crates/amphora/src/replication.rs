@@ -250,6 +250,9 @@ pub struct Machine {
     // A test's count of the class entries this machine applied that changed its record.
     #[cfg(test)]
     class_changes: u64,
+    // The most members a configuration of this machine's group names, as its core's settings state
+    // them (`Limits::members`): what a class entry is bounded by (lane constants-20).
+    members: usize,
     // The most an image of this machine's carrier holds (its owner's transport, or a test's lower
     // bound): usize::MAX where nothing carries it but memory. The image's room is the memory
     // budget's room for one, no more than this (SB.1).
@@ -563,6 +566,7 @@ impl Machine {
             stated: None,
             #[cfg(test)]
             class_changes: 0,
+            members: crate::database::replicated::MEMBERS,
             image_cap: usize::MAX,
             image_disk: usize::MAX,
             #[cfg(test)]
@@ -618,6 +622,15 @@ impl Machine {
     }
     /// Bounds this machine's images to `bytes` beside the memory budget's room: its carrier's
     /// most (the replicated owner's transport), or a test's.
+    /// The most members a configuration of this machine's group names: its core's
+    /// `Limits::members`, set before the replica opens (lane constants-20).
+    pub(crate) fn set_members(&mut self, members: usize) {
+        self.members = members;
+    }
+    /// The most members a configuration of this machine's group names.
+    pub(crate) fn members(&self) -> usize {
+        self.members
+    }
     pub(crate) fn set_snapshot_bytes(&mut self, bytes: usize) {
         self.image_cap = bytes;
     }
@@ -1147,7 +1160,7 @@ impl StateMachine for Machine {
         if class::is_class(data) {
             // The last compatible entry is the record; one that isn't changes nothing, on every
             // member alike, as it depends on the log alone.
-            let stated = class::decode(data).map_err(failed)?;
+            let stated = class::decode(data, self.members).map_err(failed)?;
             let supersedes = self
                 .class
                 .as_ref()
