@@ -169,7 +169,7 @@ Every flush call returned success (the program asserts each).
 `sh bench/versioned/reopen_ab.sh` (before = a07b635e = ac58af91^1, after = ac58af91, each from its
 own clone and target under `~/.cache/versioned-ab`, the example copied in, 5 reps alternating, the
 load beside each) runs as kiln run r288 on adacachy2 with needs `linux/amd64,cpus=16,mem=24g`. The
-before build alone took 22 min there. Numbers were not in when this lane's hour ended.
+before build alone took 22 min there. Numbers were not in when this lane's hour ended. r288 was stopped by the coordinator during adacachy2's disk stall (2026-11-23, RULES 5d: load 379, metadata 96.8%), so it has no numbers: A/B stopped by the disk stall, to rerun once the stall is lifted.
 
 ## perf-C4 unit 3: read-only snapshots for autocommit statements (verified, not implemented)
 
