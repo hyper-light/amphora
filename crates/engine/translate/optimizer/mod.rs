@@ -4469,7 +4469,7 @@ pub(crate) mod bushy_test_hook {
 
         /// Lane T8 (TPC-H q19 at SF1, 17x SQLite's time): q19's shape at small scale, an OR of
         /// three branches each joining `p` to `l` with terms on each table alone. `p`'s terms
-        /// keep 96 of its 2,000 rows, yet they stayed inside the OR, which also reads `l`, so
+        /// keep 120 of its 2,000 rows, yet they stayed inside the OR, which also reads `l`, so
         /// `p` was priced at every row and the plan read all 60,000 of `l`. Each table's share of
         /// the OR now filters it alone, so the plan starts from `p`'s few rows and seeks `l` by
         /// its index. Expect: full-scan steps fewer than `l`'s rows, and the answer of the same
@@ -4484,11 +4484,13 @@ pub(crate) mod bushy_test_hook {
                 "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT, mode INT, instr INT, \
                  price INT)",
                 "CREATE INDEX l_pk ON l(pk)",
+                // One part for each brand, container and size; each part's 30 lines take each
+                // quantity once, and every mode and instruction in turn.
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
-                 INSERT INTO p SELECT i, i * 7 % 5, i * 13 % 10, i * 31 % 50 + 1 FROM x",
+                 INSERT INTO p SELECT i, i % 5, i / 5 % 10, i / 50 % 50 + 1 FROM x",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
-                 INSERT INTO l SELECT i, i * 7919 % 2000 + 1, i * 17 % 50 + 1, i * 3 % 7, \
-                 i * 5 % 4, i % 1000 FROM x",
+                 INSERT INTO l SELECT i, i % 2000 + 1, i / 2000 % 50 + 1, (i * 3 + i / 2000) % 7, \
+                 (i + i / 2000) % 4, i % 1000 FROM x",
                 "ANALYZE",
             ] {
                 conn.execute(sql).unwrap();
@@ -4507,7 +4509,7 @@ pub(crate) mod bushy_test_hook {
                 &conn,
                 &format!(
                     "SELECT count(*), sum(l.price) FROM l, p \
-                     WHERE CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
+                     WHERE p.id = l.pk AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
                 ),
             );
             let count = |sql: &str| -> u64 { rows(&conn, sql)[0].parse().unwrap() };
