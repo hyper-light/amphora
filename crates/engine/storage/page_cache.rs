@@ -403,9 +403,9 @@ impl PageCache {
 
         // Amphora (decision 19, lane Q2): a new page joins just behind the hand, where the sweep
         // looks last, so the hand reaches it after every page already cached. Inserted just after
-        // the hand, a page read once was the next one examined; at the queue's back, it came after
-        // only the pages between the hand and the back, which point lookups leave a few pages
-        // long: a count's 531 pages then evicted one another before each was read again.
+        // the hand, a page read once was the next one examined. At the queue's back it came after
+        // only the pages between the hand and the back: with the hand 143 pages from the back after
+        // point lookups, a count's 607 pages evicted one another before each was read again.
         let entry_ptr = if self.clock_hand.is_null() {
             self.queue.push_back(entry);
             self.queue.back().get().map(std::ptr::from_ref)
