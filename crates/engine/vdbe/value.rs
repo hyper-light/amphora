@@ -671,9 +671,9 @@ impl Value {
             (start, end)
         }
 
-        let start_value = start_value.exec_cast("INT")?;
+        let start_value = start_value.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)?;
         let length_value = length_value
-            .map(|value| value.exec_cast("INT"))
+            .map(|value| value.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT))
             .transpose()?;
 
         // If length is explicitly NULL, return NULL (SQLite behavior)
@@ -873,7 +873,7 @@ impl Value {
     /// offset falls outside `0..length-1`, matching PostgreSQL exactly. A `NULL`
     /// input or offset yields `NULL`.
     pub fn exec_get_byte(&self, offset: &Value) -> Result<Value> {
-        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
+        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)? else {
             return Ok(Value::Null);
         };
         let Some(bytes) = self.byte_view() else {
@@ -894,10 +894,10 @@ impl Value {
     /// Raises an error when the offset falls outside `0..length-1`, matching
     /// PostgreSQL exactly. A `NULL` input, offset, or value yields `NULL`.
     pub fn exec_set_byte(&self, offset: &Value, new_value: &Value) -> Result<Value> {
-        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT")? else {
+        let Value::Numeric(Numeric::Integer(offset)) = offset.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)? else {
             return Ok(Value::Null);
         };
-        let Value::Numeric(Numeric::Integer(new_value)) = new_value.exec_cast("INT")? else {
+        let Value::Numeric(Numeric::Integer(new_value)) = new_value.exec_cast("INT", crate::numeric::fp::FpDigits::DEFAULT)? else {
             return Ok(Value::Null);
         };
         let Some(bytes) = self.byte_view() else {
@@ -1239,8 +1239,8 @@ impl Value {
             return Ok(Value::Null);
         }
 
-        let source = source.exec_cast("TEXT")?;
-        let pattern = pattern.exec_cast("TEXT")?;
+        let source = source.exec_cast("TEXT", crate::numeric::fp::FpDigits::DEFAULT)?;
+        let pattern = pattern.exec_cast("TEXT", crate::numeric::fp::FpDigits::DEFAULT)?;
         if let (Value::Text(source), Value::Text(pattern)) = (&source, &pattern) {
             if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
                 return Ok(Value::Text(source.clone()));
@@ -1249,7 +1249,7 @@ impl Value {
         if matches!(replacement, Value::Null) {
             return Ok(Value::Null);
         }
-        let replacement = replacement.exec_cast("TEXT")?;
+        let replacement = replacement.exec_cast("TEXT", crate::numeric::fp::FpDigits::DEFAULT)?;
 
         // If any of the casts failed, panic as text casting is not expected to fail.
         match (&source, &pattern, &replacement) {
@@ -1569,7 +1569,7 @@ impl Value {
         match self {
             Value::Null => Ok(None),
             Value::Text(s) => Ok(Some(std::borrow::Cow::Borrowed(s.as_str()))),
-            v => match v.exec_cast("TEXT")? {
+            v => match v.exec_cast("TEXT", crate::numeric::fp::FpDigits::DEFAULT)? {
                 Value::Text(s) => Ok(Some(std::borrow::Cow::Owned(s.to_string()))),
                 _ => Ok(None),
             },
@@ -2944,7 +2944,7 @@ mod tests {
         let input_blob = blob(&[0xd2, 0x64, 0xc0, 0x07, 0xf6, 0x44, 0xe4, 0x59]);
         let expected = input_blob.clone();
 
-        assert_eq!(allocated(input_blob.exec_cast("BLOB")), expected);
+        assert_eq!(allocated(input_blob.exec_cast("BLOB", crate::numeric::fp::FpDigits::DEFAULT)), expected);
     }
 
     #[test]

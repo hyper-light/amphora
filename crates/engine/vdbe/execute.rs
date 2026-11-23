@@ -2902,7 +2902,7 @@ pub fn op_column_has_field(
 }
 
 pub fn op_type_check(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -2995,7 +2995,7 @@ pub fn op_is_type(
 /// against the declared element type using STRICT type-checking logic, then
 /// serialize to a native record-format BLOB for storage.
 pub fn op_array_encode(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -3637,7 +3637,7 @@ pub fn op_array_slice(
 }
 
 pub fn op_make_record(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -17136,7 +17136,7 @@ pub fn op_is_true(
 }
 
 pub fn op_concat(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -17643,7 +17643,7 @@ pub fn op_found(
 }
 
 pub fn op_affinity(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -22273,7 +22273,7 @@ fn morsel_rows(
 
 /// Amphora (QT.6): [Insn::MorselNext].
 pub fn op_morsel_next(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
