@@ -560,24 +560,25 @@ impl DrillMeter {
             .fold(0, u64::saturating_add)
     }
 
-    /// The cost at quantile `q` (0 to 1) as its bucket's upper bound in nanoseconds, so within a
-    /// factor of two above; none before a check.
+    /// The cost at quantile `per / of` (`per` above `of` counts as 1) as its bucket's upper bound
+    /// in nanoseconds, so within a factor of two above; none before a check or for `of` of 0.
     #[must_use]
-    pub fn cost_quantile(&self, q: f64) -> Option<u64> {
-        let total = self.checks();
-        if total == 0 {
+    pub fn cost_quantile(&self, per: u64, of: u64) -> Option<u64> {
+        let total = u128::from(self.checks());
+        if total == 0 || of == 0 {
             return None;
         }
-        // The rank of the quantile among `total` checks, 1-based (nearest rank).
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let rank = ((q.clamp(0.0, 1.0) * total as f64).ceil() as u64).max(1);
-        let mut seen = 0u64;
+        // The rank of the quantile among `total` checks, 1-based (nearest rank): the ceiling of
+        // total * per / of, exact in u128 (a u64 product never overflows it).
+        let (per, of) = (u128::from(per.min(of)), u128::from(of));
+        let rank = total
+            .checked_mul(per)?
+            .checked_add(of.checked_sub(1)?)?
+            .checked_div(of)?
+            .max(1);
+        let mut seen = 0u128;
         for (bits, bucket) in self.buckets.iter().enumerate() {
-            seen = seen.saturating_add(bucket.load(Ordering::Relaxed));
+            seen = seen.saturating_add(u128::from(bucket.load(Ordering::Relaxed)));
             if seen >= rank {
                 let bits = u32::try_from(bits).unwrap_or(u64::BITS);
                 return Some(
@@ -796,14 +797,17 @@ mod tests {
     #[test]
     fn t_t1_12_c5_cost_quantiles() {
         let meter = DrillMeter::default();
-        assert_eq!(meter.cost_quantile(0.5), None);
+        assert_eq!(meter.cost_quantile(1, 2), None);
         for ns in [1, 3, 3, 100, 1_000_000] {
             meter.cost(ns);
         }
         assert_eq!(meter.checks(), 5);
-        assert_eq!(meter.cost_quantile(0.5), Some(3));
-        assert_eq!(meter.cost_quantile(0.8), Some(127));
-        assert_eq!(meter.cost_quantile(0.999), Some((1 << 20) - 1));
+        assert_eq!(meter.cost_quantile(1, 2), Some(3));
+        assert_eq!(meter.cost_quantile(4, 5), Some(127));
+        assert_eq!(meter.cost_quantile(999, 1000), Some((1 << 20) - 1));
+        assert_eq!(meter.cost_quantile(0, 1), Some(1));
+        assert_eq!(meter.cost_quantile(3, 1), Some((1 << 20) - 1));
+        assert_eq!(meter.cost_quantile(1, 0), None);
         assert_eq!(meter.cost_ns.load(Ordering::Relaxed), 1_000_107);
     }
 }

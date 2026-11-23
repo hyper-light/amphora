@@ -184,11 +184,14 @@ clippy clean. r800 at f986aa0b (`r` holds 1,000 rows so `r.id = 1` seeks one row
 with 399,800 full-scan steps against a bound of 5,275, on q05's slow shape (`MATERIALIZE ...
 HASH JOIN c / SCAN l / SCAN o`). Merged: main 3b7e8121.
 
-Not measured yet: q05 at SF0.1 before and after. r805 (queued 14:00Z, needs cpus=16) builds T3's
-probe at 74e832a2 (before) and 3b7e8121 (after) and alternates them 3 rounds, 4 runs each, 20 s
+Not measured yet: q05 at SF0.1 before and after. kiln refused the A/B four times, 14:00Z to
+14:05Z, because adacachy2 had 2 to 12 of its 32 cores idle and the A/B asks for 16. Its script,
+`~/.cache/amphora-perf/tpch-t4/q05_ab.sh` (on adacachy2 and adacachy), builds T3's probe at
+74e832a2 (before) and 3b7e8121 (after) and alternates them for 3 rounds of 4 runs, with a 20 s
 timeout. Each process gets a fresh calibration cache, and each run's answer is checked against
-NestedLoopsOnly's. Load and CPU and I/O pressure are logged beside each run. Logs on adacachy2:
-`~/.cache/amphora-perf/tpch-t4/logs/q05-ab-<sha>-<round>.log`.
+NestedLoopsOnly's. Load and CPU and I/O pressure are logged beside each run, and the logs go to
+`~/.cache/amphora-perf/tpch-t4/logs/q05-ab-<sha>-<round>.log`. Run it with `on` 00aad8da and
+needs `linux/amd64,cpus=16,mem=24g`.
 
 ## 3. Versioned learned costs: not started this hour
 

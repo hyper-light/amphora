@@ -175,6 +175,7 @@ change call, asked before the round that relays, is inferred, not traced.
 
 | on the merge with main, d201b0c2 (r801, load 26 to 67) | | T-QB.1.17 3/3, the deadline test 12/12, drain and patience 19/19, clippy clean |
 | `database::replicated::`, 4 threads, d201b0c2 (r801) | main 1e874db1: 127/131 (r628) | 134/134, 4 ignored, 45.8 s |
+| after the merge, on main 46abb6c0 (r810, load 27 to 48) | | T-QB.1.17 3/3, the deadline test 12/12, drain and patience 19/19, clippy clean, `database::replicated::` 134/134 (4 ignored, 46.0 s) |
 
 r781 ran an earlier head (056449fd, the same product change) whose T-QB.1.17 dropped its pump
 unfinished (2 of 3 runs: "fixture pump dropped with unsettled records"); ed277869 finishes it as
