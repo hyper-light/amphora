@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use amphora_pg_oracle::{Oracle, Verdict, split};
+use amphora_pg_oracle::{Oracle, Token, Verdict, split, tokens};
 
 fn env(name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is unset: see this file's head")))
@@ -58,4 +58,17 @@ fn t_pg_3_4_every_regression_statement_gets_a_verdict() {
     }
     println!("{} files, {statements} statements ({bytes} bytes): {accepted} accepted, refused by SQLSTATE {refused:?}; {not_utf8} not UTF-8, not sent", files.len());
     assert!(!files.is_empty() && accepted > 0, "the corpus ran no accepted statement");
+}
+
+/// T-PG.4.2: the oracle's tokens are what 19's grammar receives: parser.c's filter turns NOT before
+/// LIKE into NOT_LA, and keeps NOT before anything else.
+#[test]
+#[ignore = "needs AMPHORA_PG_ORACLE, built by scripts/postgres-oracle-extract.sh"]
+fn t_pg_4_2_tokens_are_what_19s_grammar_receives() {
+    let mut oracle = Oracle::spawn_tokens(&env("AMPHORA_PG_ORACLE")).unwrap();
+    let Verdict::Tree(body) = oracle.parse(b"SELECT a NOT LIKE b, NOT c").unwrap() else { panic!("refused") };
+    let got: Vec<Token> = tokens(&body).unwrap();
+    let names: Vec<(&str, u32)> = got.iter().map(|t| (t.value.as_str(), t.offset)).collect();
+    assert_eq!(names, [("select", 0), ("a", 7), ("not", 9), ("like", 13), ("b", 18), ("", 19), ("not", 21), ("c", 25)]);
+    assert_ne!(got[2].token, got[6].token, "NOT before LIKE is NOT_LA, NOT before c is NOT");
 }
