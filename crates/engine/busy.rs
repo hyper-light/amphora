@@ -119,7 +119,7 @@ impl LockRelease {
 crate::thread::thread_local! {
     /// The log whose releases this thread is counting (its [`LockRelease`]'s address, 0: none),
     /// and how many it has made since it began counting.
-    static OWN: std::cell::Cell<(usize, u64)> = std::cell::Cell::new((0, 0));
+    static OWN: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// Amphora (lane perf-A5, fixing lane constants-22's wait): the releases one step makes itself of
