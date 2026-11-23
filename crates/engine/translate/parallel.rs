@@ -955,7 +955,11 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
             col.affinity(),
             Affinity::Integer | Affinity::Text | Affinity::Blob | Affinity::None
         ) && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-        plain.then_some(*column)
+        if plain {
+            Some(*column)
+        } else {
+            None
+        }
     };
     let mut filter = Vec::new();
     for term in &plan.where_clause {
@@ -1043,11 +1047,15 @@ fn predicate(
                 }
                 _ => false,
             };
-            same_kind.then_some(Predicate::Compare {
-                column: at,
-                op,
-                value,
-            })
+            if same_kind {
+                Some(Predicate::Compare {
+                    column: at,
+                    op,
+                    value,
+                })
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -1387,7 +1395,11 @@ fn shape_join(
         let col = table.columns().get(column)?;
         let plain = matches!(col.affinity(), Affinity::Integer | Affinity::Text)
             && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-        plain.then_some((at, column))
+        if plain {
+            Some((at, column))
+        } else {
+            None
+        }
     };
     let affinity = |(at, column): (usize, usize)| {
         tables
@@ -1424,7 +1436,7 @@ fn shape_join(
             }
         }
         let found = (0..tables.len()).find_map(|at| {
-            let on = |expr: &Expr| side(expr).and_then(|(t, c)| (t == at).then_some(c));
+            let on = |expr: &Expr| side(expr).filter(|&(t, _)| t == at).map(|(_, c)| c);
             let table: &BTreeTable = tables.get(at)?;
             predicate(&term.expr, &on, table).map(|p| (at, p))
         });
@@ -1649,7 +1661,11 @@ fn join_side(
     let col = table.columns().get(column)?;
     let plain = matches!(col.affinity(), Affinity::Integer | Affinity::Text)
         && matches!(col.collation(), CollationSeq::Binary | CollationSeq::Unset);
-    plain.then_some((at, column))
+    if plain {
+        Some((at, column))
+    } else {
+        None
+    }
 }
 
 /// The last place in the FROM clause among the tables `expr` reads (0 when it reads none); none
@@ -1667,7 +1683,11 @@ fn reach(joined: &[JoinedTable], expr: &Expr) -> Option<usize> {
         Ok(WalkControl::Continue)
     })
     .ok()?;
-    known.then_some(last)
+    if known {
+        Some(last)
+    } else {
+        None
+    }
 }
 
 /// Joins of three or more tables with a RIGHT or FULL JOIN among them, or with more than one outer
@@ -1815,7 +1835,7 @@ fn shape_chain(
             }
         }
         let found = (0..tables.len()).find_map(|at| {
-            let on = |expr: &Expr| side(expr).and_then(|(t, c)| (t == at).then_some(c));
+            let on = |expr: &Expr| side(expr).filter(|&(t, _)| t == at).map(|(_, c)| c);
             let table: &BTreeTable = tables.get(at)?;
             predicate(&term.expr, &on, table).map(|p| (at, p))
         });

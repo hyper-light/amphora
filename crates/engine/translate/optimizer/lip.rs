@@ -177,12 +177,18 @@ fn keys_between(
         }
         let side = match (column_of(lhs), column_of(rhs)) {
             (Some((l, lc)), Some((r, rc))) if l == fact.internal_id && r == dim.internal_id => {
-                { binary_collation(fact, lc) && binary_collation(dim, rc) }
-                    .then_some(BinaryExprSide::Rhs)
+                if binary_collation(fact, lc) && binary_collation(dim, rc) {
+                    Some(BinaryExprSide::Rhs)
+                } else {
+                    None
+                }
             }
             (Some((l, lc)), Some((r, rc))) if l == dim.internal_id && r == fact.internal_id => {
-                { binary_collation(dim, lc) && binary_collation(fact, rc) }
-                    .then_some(BinaryExprSide::Lhs)
+                if binary_collation(dim, lc) && binary_collation(fact, rc) {
+                    Some(BinaryExprSide::Lhs)
+                } else {
+                    None
+                }
             }
             _ => None,
         };

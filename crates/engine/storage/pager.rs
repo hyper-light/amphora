@@ -1146,7 +1146,13 @@ impl Page {
             let inner = Arc::get_mut(&mut page)?.inner.get_mut();
             let buffer = inner
                 .take_buffer()
-                .and_then(|mut buffer| Arc::get_mut(&mut buffer).is_some().then_some(buffer));
+                .and_then(|mut buffer| {
+                    if Arc::get_mut(&mut buffer).is_some() {
+                        Some(buffer)
+                    } else {
+                        None
+                    }
+                });
             *inner = PageInner::unloaded(id);
             inner.flags.store(PAGE_PLAIN, Ordering::Relaxed);
             buffer

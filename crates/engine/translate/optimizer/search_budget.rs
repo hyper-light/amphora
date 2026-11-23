@@ -108,7 +108,11 @@ impl SearchBudget {
         let per_candidate = self.nanos_per_candidate.filter(|nanos| *nanos > 0.0)?;
         let candidates = running / per_candidate;
         // `as` saturates: an unbounded run allows every subset.
-        (!candidates.is_nan() && candidates >= 0.0).then_some(candidates as usize)
+        if !candidates.is_nan() && candidates >= 0.0 {
+            Some(candidates as usize)
+        } else {
+            None
+        }
     }
 }
 

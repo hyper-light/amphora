@@ -2511,7 +2511,11 @@ fn bushy_core(
             }
         })
     });
-    (core >= 3 && free && ordered).then_some(core)
+    if core >= 3 && free && ordered {
+        Some(core)
+    } else {
+        None
+    }
 }
 
 /// PL.8 (lane pl8-19): whether `table` is the right table of a LEFT JOIN the search may move, one

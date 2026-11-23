@@ -159,7 +159,11 @@ fn move_t_expanded(nu: f64) -> Option<f64> {
         last = term / power;
         t += last;
     }
-    (last.abs() <= f64::EPSILON * t).then_some(t)
+    if last.abs() <= f64::EPSILON * t {
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// Student's t quantile for `nu` degrees of freedom (a whole number, at least one) at central
@@ -186,7 +190,11 @@ fn student_t(level: f64, nu: f64) -> Option<f64> {
         }
     }
     let t = nu.sqrt() * high.tan();
-    t.is_finite().then_some(t)
+    if t.is_finite() {
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// `P(|T| <= sqrt(nu) tan(theta))` for Student's t with `nu` degrees of freedom, a whole number
@@ -890,7 +898,9 @@ mod stored {
         let mut lines = body.split('\n');
         let bits = |line: Option<&str>, name: &str| -> Option<Vec<f64>> {
             let mut words = line?.split(' ');
-            (words.next()? == name).then_some(())?;
+            if words.next()? != name {
+                return None;
+            }
             words
                 .map(|w| {
                     let digits = w.len() == 16 && w.bytes().all(|b| b.is_ascii_hexdigit());
@@ -917,7 +927,11 @@ mod stored {
             timing_nanos: *timing_nanos,
             kinds,
         };
-        kept.timed().then_some(kept)
+        if kept.timed() {
+            Some(kept)
+        } else {
+            None
+        }
     }
 
     pub(super) fn render(key: &Key, calibration: &Calibration) -> String {

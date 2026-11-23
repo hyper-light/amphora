@@ -647,7 +647,11 @@ impl<'a> JoinedSetRows<'a> {
                         if filters.terms.contains(&pos) {
                             Some(true)
                         } else {
-                            on.terms.contains(&pos).then_some(false)
+                            if on.terms.contains(&pos) {
+                                Some(false)
+                            } else {
+                                None
+                            }
                         }
                     },
                     schema,

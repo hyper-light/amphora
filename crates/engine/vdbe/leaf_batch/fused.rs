@@ -112,12 +112,16 @@ impl GroupBounds {
             return None;
         };
         let after = offset(target_pc)?;
-        (find < save && after > full).then_some(Self {
-            find,
-            save,
-            full,
-            after,
-        })
+        if find < save && after > full {
+            Some(Self {
+                find,
+                save,
+                full,
+                after,
+            })
+        } else {
+            None
+        }
     }
 
     /// Between GroupFind and GroupSave: the aggregate steps and their arguments' columns.
@@ -350,7 +354,11 @@ fn loop_at(insns: &[(Insn, usize)], cursor_id: usize, head: usize) -> Option<Fus
         }
         // Written in the body but not (yet) a column: read before its Column, or an
         // accumulator.
-        (!written.contains(&reg)).then_some(Operand::Register(reg))
+        if written.contains(&reg) {
+            None
+        } else {
+            Some(Operand::Register(reg))
+        }
     };
     let forward = |pc: usize, target: &BranchOffset| -> Option<usize> {
         offset(target).filter(|target| {

@@ -664,7 +664,11 @@ impl<'a> AdaptiveSeek<'a> {
                 hash_table_id,
                 mem_budget: t_ctx.resolver.statement_memory(),
                 collations,
-                payload_start_reg: (num_payload > 0).then_some(build_keys + num_keys),
+                payload_start_reg: if num_payload > 0 {
+                    Some(build_keys + num_keys)
+                } else {
+                    None
+                },
                 num_payload,
                 track_matched: false,
                 // An adaptive join's switch weighs a hash table, not a merge.
@@ -713,7 +717,11 @@ impl<'a> AdaptiveSeek<'a> {
                 target_pc: loop_end,
             });
         }
-        let payload_reg = (num_payload > 0).then_some(probe_keys + num_keys);
+        let payload_reg = if num_payload > 0 {
+            Some(probe_keys + num_keys)
+        } else {
+            None
+        };
         let match_reg = probe_keys + num_keys + num_payload;
         program.emit_insn(Insn::HashProbe {
             hash_table_id: to_u32(hash_table_id),

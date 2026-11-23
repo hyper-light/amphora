@@ -97,7 +97,11 @@ impl SkipHint {
         for term in terms {
             push_terms(term, table, &mut hint);
         }
-        (!hint.terms.is_empty() || !hint.lists.is_empty()).then_some(hint)
+        if hint.terms.is_empty() && hint.lists.is_empty() {
+            None
+        } else {
+            Some(hint)
+        }
     }
 
     /// `column`'s bounds from the hint's terms, intersected, each parameter's value read by

@@ -351,7 +351,11 @@ impl Chooser {
     /// [`Chooser::install_cracker`]). Until then the leader answers.
     pub fn rebuild_due(&self) -> Option<SkipMethod> {
         let (method, trial) = self.next_method();
-        (trial && !self.keeps(method)).then_some(method)
+        if trial && !self.keeps(method) {
+            Some(method)
+        } else {
+            None
+        }
     }
 
     /// Builds the dropped zone map again from the cracker's copy of the column, in the dropped

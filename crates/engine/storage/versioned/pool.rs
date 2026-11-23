@@ -225,8 +225,11 @@ impl Fit {
         }
         let each = (self.k * self.nt - self.n * self.t) / det;
         let fixed = (self.t - each * self.n) / self.k;
-        (each.is_finite() && fixed.is_finite() && each > 0.0 && fixed > 0.0)
-            .then_some((fixed, each))
+        if each.is_finite() && fixed.is_finite() && each > 0.0 && fixed > 0.0 {
+            Some((fixed, each))
+        } else {
+            None
+        }
     }
 
     /// The pages a run reads: `ceil(fixed / each)`, the run whose transfer takes as long as the

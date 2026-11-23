@@ -7937,7 +7937,11 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn counted_pages(&self) -> Option<usize> {
-        matches!(self.count_state, CountState::Finish).then_some(self.pages)
+        if matches!(self.count_state, CountState::Finish) {
+            Some(self.pages)
+        } else {
+            None
+        }
     }
 
     #[inline]
