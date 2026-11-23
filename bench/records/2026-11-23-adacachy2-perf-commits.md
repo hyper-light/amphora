@@ -529,6 +529,7 @@ harness doesn't.
 | amphora replicated suite and the `v3_` tests | 140 of 141, 5 ignored, 131.7 s; both `v3_` tests pass. The one failure is main's own, `a_write_at_a_follower_is_answered_on_its_groups_commit` (V4: 6 of 6 on main; unchanged on main `5e6c619f`) | r1217 |
 | `scripts/vendor.py check hyper-raft` | 8 recorded changes, 0 differences | local |
 | merged with origin/main (`faaf2a7d`): clippy `-p amphora --all-targets`, clippy `-p hyper-raft -p hyper-durable`, the `v3_` tests | clean, clean, 2 of 2 | r1236 |
+| merged with origin/main again (`32f9a6ce`, lane W5's hyper-raft 0011 beside 0009; `vendor.py check`: 9 recorded changes, 0 differences): hyper-raft lib, `differential.rs`, `pipeline.rs`, clippy hyper-raft all targets, clippy `-p amphora --all-targets`, the `v3_` tests | 163 of 163, 8 of 8, 12 of 12 (1 ignored), clean, clean, 2 of 2 | r1244 |
 
 Load on adacachy2 during r1216: 9 to 33 (1 min), CPU pressure "some" avg10 3 to 7%, I/O under 5%.
 
