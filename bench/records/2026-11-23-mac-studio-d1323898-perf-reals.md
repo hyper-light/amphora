@@ -417,6 +417,10 @@ nothing about the engine.
   `translate::parallel` for 17 min without ending and was stopped so clippy could run. Rule 5b puts
   them after the merge. r1671 (Mac Studio 2, from 22:47Z, on main 4927f1aa) runs them and prints
   each test as it ends, so a slow or stuck one shows by name: read it with kiln's `output`.
+- **Not known: whether this lane broke `t_qt_6_35_joins_over_rowid_ranges_run_on_morsels_as_the_serial_loop`.**
+  It FAILED in r1671 on main 4927f1aa (seen at 22:48Z, run still going). Not yet A/B'd. Run it
+  alone at 6a3e8ebb (main just before this lane's merge, with T13's planner changes) and at
+  55513d95 (this lane merged): failing at both means it predates this lane.
 - **No timings.** Parallel mode adds one Noop per row to each worker's body run (a fence `keep` is
   placed after). Its cost is not measured.
 - **Done: the lost-row bug is fixed** (9a83c1eb). R2's test and the new constant-columns test pass.
