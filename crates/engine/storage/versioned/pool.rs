@@ -1216,10 +1216,7 @@ mod tests {
             pool.read(pages[2]),
             Err(LimboError::MemoryBudget(_))
         ));
-        assert!(matches!(
-            pool.allocate(),
-            Err(LimboError::MemoryBudget(_))
-        ));
+        assert!(matches!(pool.allocate(), Err(LimboError::MemoryBudget(_))));
         drop((a, b));
         assert!(pool.read(pages[2]).is_ok());
     }
@@ -1251,10 +1248,7 @@ mod tests {
         let none = Arc::new(Capped::new(frame_bytes() - 1));
         let disk: Arc<dyn Disk> = Arc::new(Simulated::new(6, 1).unwrap());
         let pool = Pool::backed_in(Room::Shared(none), disk, 0).unwrap();
-        assert!(matches!(
-            pool.allocate(),
-            Err(LimboError::MemoryBudget(_))
-        ));
+        assert!(matches!(pool.allocate(), Err(LimboError::MemoryBudget(_))));
     }
 
     /// Do: write 12 pages in a pool of 3 frames, end the epoch, write some again (some evicted,

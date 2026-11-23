@@ -225,12 +225,14 @@ impl Budget {
     fn reserve(&self, what: &'static str, n: usize) -> Result<u64> {
         let asked = u64::try_from(n).map_err(|_| LimboError::IntegerOverflow)?;
         let mut held = self.held.lock();
-        let refused = |held: u64| LimboError::MemoryBudget(Box::new(crate::BudgetFull {
-            what,
-            asked,
-            held,
-            limit: self.limit,
-        }));
+        let refused = |held: u64| {
+            LimboError::MemoryBudget(Box::new(crate::BudgetFull {
+                what,
+                asked,
+                held,
+                limit: self.limit,
+            }))
+        };
         let after = held
             .held
             .checked_add(asked)

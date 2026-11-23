@@ -3788,8 +3788,7 @@ mod versioned {
                                 match conn.execute(&insert) {
                                     Ok(()) => break,
                                     Err(crate::LimboError::SerializationFailure) => {
-                                        refusals
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         if !conn.get_auto_commit() {
                                             conn.execute("ROLLBACK").unwrap();
                                         }
