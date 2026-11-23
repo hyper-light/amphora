@@ -835,7 +835,10 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// An extension aggregate's accumulator. It owns `state`: finishing it (or dropping it unfinished,
+/// as a window does when a partition ends) runs the extension's finalize, which frees the state,
+/// as SQLite's release of an aggregate register runs xFinalize (vdbemem.c, vdbeMemClear).
+#[derive(Debug, PartialEq)]
 #[allow(unpredictable_function_pointer_comparisons)] // kiln: as upstream compares them
 pub struct ExternalAggState {
     pub context: usize,
@@ -845,6 +848,37 @@ pub struct ExternalAggState {
     pub finalize_fn: FinalizeFunction,
     pub aggregate_destructor: Option<ContextDestructor>,
     pub value_destructor: Option<ValueDestructor>,
+}
+
+impl ExternalAggState {
+    /// Runs finalize once and frees the state; None when it was already finished.
+    pub(crate) fn finish(&mut self) -> Option<ExtValue> {
+        let state = std::mem::replace(&mut self.state, std::ptr::null_mut());
+        if state.is_null() {
+            return None;
+        }
+        let result = unsafe { (self.finalize_fn)(self.context, state) };
+        if let Some(destructor) = self.aggregate_destructor {
+            unsafe { destructor(state as usize) };
+        }
+        Some(result)
+    }
+
+    pub(crate) fn free_value(&self, mut value: ExtValue) {
+        if let Some(destructor) = self.value_destructor {
+            unsafe { destructor(&mut value) };
+        } else {
+            unsafe { value.__free_internal_type() };
+        }
+    }
+}
+
+impl Drop for ExternalAggState {
+    fn drop(&mut self) {
+        if let Some(value) = self.finish() {
+            self.free_value(value);
+        }
+    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -1080,25 +1114,6 @@ pub enum AggContext {
 }
 
 impl AggContext {
-    pub fn compute_external(self) -> Result<Value> {
-        if let Self::External(ext_state) = &self {
-            let mut final_value =
-                unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state) };
-            let value = Value::from_ffi_ref(&final_value);
-            if let Some(value_destructor) = ext_state.value_destructor {
-                unsafe { value_destructor(&mut final_value) };
-            } else {
-                unsafe { final_value.__free_internal_type() };
-            }
-            if let Some(aggregate_destructor) = ext_state.aggregate_destructor {
-                unsafe { aggregate_destructor(ext_state.state as usize) };
-            }
-            value
-        } else {
-            panic!("AggContext::compute_external() expected External, found {self:?}");
-        }
-    }
-
     /// Get a mutable reference to the builtin payload as a slice
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {

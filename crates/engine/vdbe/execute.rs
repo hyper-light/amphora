@@ -8622,7 +8622,7 @@ pub(crate) fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<
         }
         AggFunc::External(_) => {
             mark_unlikely();
-            // External aggregates are finalized via AggContext::compute_external()
+            // External aggregates are finalized by ExtFunc::finalize_aggregate.
             return Err(LimboError::InternalError(
                 "finalize_agg_payload called for External aggregate".to_string(),
             ));
@@ -9334,6 +9334,11 @@ pub fn op_agg_inverse(
         return op_window_inverse(state, *acc_reg, *col, win_func);
     }
     let func = func.expect_agg();
+    if let AggFunc::External(ext_func) = func {
+        ext_func.inverse_aggregate(&mut state.registers, *acc_reg, *col)?;
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     // Run xInverse to undo a prior xStep when a row leaves the frame
     // from the left. min/max are handled separately using SQLite's
@@ -9610,7 +9615,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             unreachable!("planner should reject moving-start frame over non-invertible {func}");
         }
         AggFunc::External(_) => {
-            unreachable!("planner rejects moving-start frames over external aggregates");
+            unreachable!("extension aggregates take rows back in op_agg_inverse");
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject
@@ -9956,10 +9961,14 @@ pub fn op_agg_final(
     let func = func.expect_agg();
 
     if let AggFunc::External(ext_func) = func {
-        let value = return_if_io!(
-            state,
-            ext_func.finalize_aggregate(&mut state.registers[acc_reg])
-        );
+        let value = if matches!(insn, Insn::AggValue { .. }) {
+            ext_func.value_aggregate(&mut state.registers[acc_reg])?
+        } else {
+            return_if_io!(
+                state,
+                ext_func.finalize_aggregate(&mut state.registers[acc_reg])
+            )
+        };
         state.registers[dest_reg].set_value(value);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
