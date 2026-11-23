@@ -61,7 +61,19 @@ pub struct Oracle {
 
 impl Oracle {
     pub fn spawn(program: &Path) -> Result<Self, OracleError> {
-        let mut child = Command::new(program).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        Self::start(Command::new(program))
+    }
+
+    /// The oracle in its `--tokens` mode: a statement's `Verdict::Tree` is then the token lines
+    /// [`tokens`] reads, as 19's grammar receives them (scan.l's scanner under parser.c's filter).
+    pub fn spawn_tokens(program: &Path) -> Result<Self, OracleError> {
+        let mut command = Command::new(program);
+        command.arg("--tokens");
+        Self::start(command)
+    }
+
+    fn start(mut command: Command) -> Result<Self, OracleError> {
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(OracleError::Ended);
         };
@@ -128,9 +140,46 @@ pub fn read_verdict(r: &mut impl BufRead) -> Result<Verdict, OracleError> {
     })
 }
 
+/// One token as 19's grammar receives it: gram.h's token number, its byte offset in the statement,
+/// and its value (an identifier's or literal's string, an integer's digits, a keyword's name; empty
+/// for the rest).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub token: u16,
+    pub offset: u32,
+    pub value: String,
+}
+
+/// The token lines of a `--tokens` answer: `<token> <offset> <bytes> <value>\n` each.
+pub fn tokens(body: &str) -> Result<Vec<Token>, OracleError> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let mut words = rest.splitn(4, ' ');
+        let token = number(words.next(), "a token number that isn't one")?;
+        let offset = number(words.next(), "a token offset that isn't a number")?;
+        let len: usize = number(words.next(), "a token length that isn't a number")?;
+        let tail = words.next().ok_or(OracleError::Frame("a token line cut short"))?;
+        let value = tail.get(..len).ok_or(OracleError::Frame("a token value shorter than its length"))?;
+        rest = tail.get(len..).and_then(|r| r.strip_prefix('\n')).ok_or(OracleError::Frame("a token value longer than its length"))?;
+        out.push(Token { token, offset, value: value.to_owned() });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OracleError, Verdict, read_verdict};
+    use super::{OracleError, Token, Verdict, read_verdict, tokens};
+
+    /// T-PG.4.2: the oracle's token lines read back as tokens, values with spaces and newlines whole.
+    #[test]
+    fn t_pg_4_2_token_lines_read_back() {
+        let t = |token, offset, value: &str| Token { token, offset, value: value.into() };
+        assert_eq!(tokens("655 0 6 select\n258 7 1 a\n44 8 0 \n261 10 4 a\nb \n").unwrap(), [t(655, 0, "select"), t(258, 7, "a"), t(44, 8, ""), t(261, 10, "a\nb ")]);
+        for bad in ["655 0 7 select\n", "655 0 5 select\n", "x 0 0 \n", "655 0", "655 0 0 "] {
+            assert!(tokens(bad).is_err(), "{bad:?}");
+        }
+    }
 
     fn read(frames: &str) -> Result<Verdict, OracleError> {
         read_verdict(&mut frames.as_bytes())
