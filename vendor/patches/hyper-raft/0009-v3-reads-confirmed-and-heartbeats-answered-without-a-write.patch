@@ -236,7 +236,7 @@ index adba8f74c92547cad8ff2fcc9b00cd8f6f9f88f8..1b3c185cc2aff4f7f22d04771966d52e
          self.raft.held_durable(taken.number)?;
          // Nothing is out and nothing is left to write: what follows leaves
 diff --git a/crates/hyper-raft/src/raft.rs b/crates/hyper-raft/src/raft.rs
-index 493c154146d0c2a2ce686eccbd2f366e8673c464..d902938ec7e45fea1b2c0ac488bbb54ea2d7c633 100644
+index 493c154146d0c2a2ce686eccbd2f366e8673c464..eebde9c7977c627c151b399dc141d1ddaee59b46 100644
 --- a/crates/hyper-raft/src/raft.rs
 +++ b/crates/hyper-raft/src/raft.rs
 @@ -288,6 +288,14 @@ pub struct Config {
@@ -295,7 +295,7 @@ index 493c154146d0c2a2ce686eccbd2f366e8673c464..d902938ec7e45fea1b2c0ac488bbb54e
          answer.commit = self.log.committed();
          if self.config.heartbeat_answers == HeartbeatAnswers::Position {
              // How far this log goes. It is sent once what the log holds is
-@@ -4563,6 +4584,39 @@ impl<S: Storage> Raft<S> {
+@@ -4563,6 +4584,41 @@ impl<S: Storage> Raft<S> {
          }
          self.send(answer)
      }
@@ -321,7 +321,9 @@ index 493c154146d0c2a2ce686eccbd2f366e8673c464..d902938ec7e45fea1b2c0ac488bbb54e
 +        answer.commit = self.durable_commit.min(self.log.committed());
 +        if self.config.heartbeat_answers == HeartbeatAnswers::Position {
 +            let durable = self.log.persisted();
-+            if let Ok(term) = self.log.term(durable) {
++            if let Ok(term) = self.log.term(durable)
++                && term != 0
++            {
 +                answer.index = durable;
 +                answer.log_term = term;
 +            }
@@ -335,7 +337,7 @@ index 493c154146d0c2a2ce686eccbd2f366e8673c464..d902938ec7e45fea1b2c0ac488bbb54e
      fn handle_snapshot(&mut self, mut message: Message) -> Result<()> {
          let snapshot = message
              .snapshot
-@@ -5313,13 +5367,20 @@ impl<S: Storage> Raft<S> {
+@@ -5313,13 +5369,20 @@ impl<S: Storage> Raft<S> {
                  .iter()
                  .all(|(_, promise, _)| promise.term == 0)
      }
@@ -363,7 +365,7 @@ index 493c154146d0c2a2ce686eccbd2f366e8673c464..d902938ec7e45fea1b2c0ac488bbb54e
  }
  
 diff --git a/crates/hyper-raft/src/tests.rs b/crates/hyper-raft/src/tests.rs
-index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..5adb1aadd9f2062e5ad18a236e30ea6f5707128e 100644
+index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..112fc5363c56e0941024ee752d30a59f08dbea8c 100644
 --- a/crates/hyper-raft/src/tests.rs
 +++ b/crates/hyper-raft/src/tests.rs
 @@ -47,6 +47,7 @@ fn drain(node: &mut RawNode<Memory>) -> Vec<Message> {
@@ -374,7 +376,7 @@ index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..5adb1aadd9f2062e5ad18a236e30ea6f
          messages.extend(ready.take_messages());
          messages.extend(ready.take_persisted_messages());
          let mut applied = ready.committed_entries().last().map(|entry| entry.index);
-@@ -1461,6 +1462,49 @@ fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
+@@ -1461,6 +1462,76 @@ fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
      assert_eq!(light.messages()[0].index, 5);
  }
  
@@ -421,10 +423,37 @@ index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..5adb1aadd9f2062e5ad18a236e30ea6f
 +    assert_eq!((said[0].index, said[0].log_term), (5, 1));
 +}
 +
++/// Under `Config::answer_beats_now`, a follower whose restored snapshot is not yet durable can't
++/// read the term of its disk's end (the log answers 0 below the snapshot), so its early heartbeat
++/// answer states no position (Amphora's lane V6, AC-T1.8.3).
++#[test]
++fn an_early_heartbeat_answer_names_no_position_below_an_unwritten_snapshot() {
++    let mut node = follower_with(Config {
++        answer_beats_now: true,
++        ..with_depth(2, 2)
++    });
++    let mut sent = answer(MessageType::MsgSnapshot, 1, 2, 1);
++    sent.snapshot = Some(Box::new(snapshot(7, 1, &[1, 2, 3])));
++    node.step(sent).unwrap();
++    let mut ready = node.ready().unwrap();
++    assert!(ready.snapshot().is_some());
++    ready.take_persisted_messages();
++    node.advance_issued(ready).unwrap();
++    assert_eq!(node.raft.log().persisted(), 3);
++    assert_eq!(node.raft.log().term(3).unwrap(), 0);
++    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
++    beat.commit = 2;
++    node.step(beat).unwrap();
++    let said = node.messages_now();
++    assert_eq!(said.len(), 1);
++    assert_eq!(said[0].msg_type, MessageType::MsgHeartbeatResponse);
++    assert_eq!((said[0].index, said[0].log_term), (0, 0));
++}
++
  /// Election Safety across a crash: a candidate counts its vote for itself only once the hard state
  /// naming it is durable, so a sole voter leads only from then. Counted at once, the sole voter led on
  /// a vote it could lose: hyper-durable's simulation, seed 206 of its first shape, had member 3 elected
-@@ -2673,6 +2717,7 @@ fn drain_applying(node: &mut RawNode<Memory>) -> Vec<Message> {
+@@ -2673,6 +2744,7 @@ fn drain_applying(node: &mut RawNode<Memory>) -> Vec<Message> {
              let hard = *hard;
              node.store_mut().hard_state = hard;
          }
