@@ -104,6 +104,31 @@ the writer; a PostgreSQL session holds its transaction across messages, so it ne
 transaction API on `Database`. Whichever of lanes P and PG1 adds that API first owns it, and the
 other uses it; neither edits the other's protocol files.
 
+### Interactive transactions never hold the writer
+
+Every PostgreSQL client runs transactions across round trips (`BEGIN`, statements, `COMMIT`);
+pgbench's TPC-B script is seven of them. A session that held Amphora's writer across those round
+trips would let one slow client stall every writer in the process, which fails the 10x bar at every
+scale past one client. So a session's transaction runs on the versioned storage's optimistic path:
+it reads from its snapshot (each statement's, under READ COMMITTED, section 8), its writes are its
+own uncommitted versions held per session, and it is validated at COMMIT and made durable by the
+group commit, with serializable behaviour exactly where PostgreSQL promises it (SERIALIZABLE) and
+PostgreSQL's weaker rules where it promises those. A conflict waits only on the row it is about
+(section 8's wait queue), never on another session's round trips. The writer-holding design is
+the A/B's other arm (section 11): both run 1 to 10,000 sessions, with clients that answer at once and
+clients that pause between statements, reporting throughput and p50, p99 and p99.9; the versioned
+path stays unless the numbers say otherwise.
+
+### Answers stream
+
+PostgreSQL sends a result as DataRow messages with no cap on their number or total size, so
+Amphora streams them too: rows go out as the statement steps, each chunk of output charged to the
+session's memory budget at its real size while it waits for the socket and released when the socket
+takes it. A reader slower than its result stops its own statement's stepping until its socket can
+take more (a writability event, never a timer); it slows nothing else, and there is no fixed
+result-size refusal. A snapshot held open by a long result keeps its versions as PostgreSQL's
+would, charged to the engine's version budget and spilled as engine.md §10 and §14 say.
+
 **The client-protocol record's condition.** client-protocol.md §1 left the network listener open,
 to be "judged first on whether it can carry an unknown outcome typed". PostgreSQL carries it in its
 own vocabulary: a client reads `pg_current_xact_id()` before COMMIT and, after a lost answer,
@@ -511,6 +536,7 @@ correctly. A unit that outgrows its hour splits at its check.
 | 15 | EvalPlanQual recheck, deadlock refusal, `lock_timeout` | TPC-B at 32 clients: no failed transaction, balances agree (milestone one) |
 | 16 | The bench harness: PostgreSQL 19 and Amphora on one machine, the stub server, the flush floor, percentiles | The first 10x table for TPC-B and select-only at 1 to 10,000 clients, floors beside each ratio |
 | 17 | The regression harness: upstream `pg_regress --use-existing`, per-file results kept in `bench/records/` | The first per-file pass table for 19's 243 files |
+| 18 | The A/B of section 2: session transactions on the versioned path against a writer held per session | Both arms at 1 to 10,000 sessions, clients prompt and pausing between statements: throughput, p50, p99 and p99.9 recorded, and the design kept or changed by them |
 
 After milestone one, units follow the regression suite's failing files and the benchmark's largest
 server-attributable gaps, alternating, with TLS (SCRAM-PLUS, direct TLS), CancelRequest and
