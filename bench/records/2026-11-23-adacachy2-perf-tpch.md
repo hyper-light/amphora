@@ -1107,3 +1107,125 @@ One line each, untraced:
 - r1644 (29ce832d, the tree pushed to main: the merge with main's G15 `decimal.rs`, and the planning
   test moved above t7_q05's doc comment, which it had split from its test): clippy clean; the same
   tests 43 of 43.
+
+# Lane T14 (tpch), 2026-11-23 22:22Z to 23:17Z: outside load reaches the page read's rate, not the seek or hash weights; not fixed
+
+Losses first:
+- The deliverable is not met. The learned weights are not yet held within their noise under load. No fix is
+  built, no test is added, and nothing but this record and the coordinator's check-production fix (below)
+  reaches main.
+- The trace points somewhere other than the brief's premise. The seek, hash build and hash probe weights are
+  not moved by outside load. The page read's rate is. Its fix needs a choice from Ada (section 3).
+- "Quiet" was not quiet. adacachy2 stood at load 53 to 58 (CPU pressure avg10 47%) from other lanes during the
+  quiet trace. The busy trace ran at load up to 109.65 (CPU pressure 88%).
+- From run 1 on, the quiet and busy traces chose different plans. Only the counted run's prepares and run 0
+  compare the same work.
+
+Machine: adacachy2 (runner 00aad8da), named, `needs linux/amd64,cpus=8,mem=24g`, from `tpch-remote`
+(worktree `~/.cache/tpch-ab/t14`), the lane's one target dir. Scripts (local copies in
+`~/.cache/amphora-perf/tpch-t14/`): `run.sh` (build, quiet trace, burner, busy trace), `summ.py` and
+`run0.py` (the summaries below), `check.sh` (check-production, clippy, tests).
+
+## 1. The trace (r1673, 434978e0 on perf/tpch-t14-trace, not for main)
+
+434978e0 adds a debug event on `amphora::join_search` each time a weight's batch is judged. For the
+sampled kinds (seek, hash build, hash probe; a batch of single timed runs closes at its median) it logs
+the runs' wall-time quantiles and, for the same runs, their thread CPU time (`CLOCK_THREAD_CPUTIME_ID`
+through rustix). For the page read (a batch of 64 reads closes at its mean) it logs the batch's mean.
+Each event carries the standing value, the spread between batch means, the gap over the spread (`ratio`)
+and whether the batch moved the rate.
+
+r1673 ran `SHA=434978e0 bash ~/.cache/tpch-t14/run.sh` with T11's `db-sf1` and its calibration (body
+sha256 faba8ac5eb119381). q03 at SF1, target `amphora`, the counted run then 5 timed runs on one
+connection, `AMPHORA_PLAN_TRACE=1`. The quiet trace ran first (22:49:36Z, load 57.7). Then the lane's
+burner started: 96 busy-loop shells at nice 10 (3 x nproc; the run's cgroup has no CPU quota, `cpu.max
+max`), one process group, PID 585646. The busy trace followed, the burner's group was stopped by that PID
+at 22:51:01Z, and 0 processes were left in it. Output: `~/.cache/tpch-t14/{quiet,busy}-434978e0.{jsonl,log}`
+on adacachy2.
+
+| | quiet | busy |
+|---|---|---|
+| counted run, ms | 4,465 | 18,288 |
+| plans, runs 0 to 4 | SCAN lineitem / orders by rowid / customer by rowid, all five | the same; SCAN orders / customer by rowid / lineitem by index; MATERIALIZE orders, HASH JOIN orders / SCAN customer / HASH JOIN lineitem; HASH JOIN orders / lineitem by index / SCAN customer; HASH JOIN customer / lineitem by index / SCAN orders |
+| row in pages, per prepare pair | 9.81e-5, 1.379e-4, then 9.89e-5 | 1.49e-5, 2.71e-5, 3.545e-4, then 9.66e-6 |
+| seek, rows' visits | 16.88 throughout (no index seek ran) | 16.88, then 1,035.6 after run 1, 1,554.3 after run 4 |
+| hash build / probe at the end | 498.9 / 119.3 | 558.5 / 1,174.7 |
+| page read, open anchor then final standing | 5,126 ns, then 5,086 ns | 33,746 ns, then 52,104 ns |
+
+## 2. Which batches move the weights, and why the test let them through
+
+**Seek, hash build, hash probe: the load does not reach their batch medians.**
+- Under the burner, each batch's wall median sits a constant step below its CPU median. That step is
+  the CPU clock's own cost inside the interval. It was 210 ns for seek, 241 for build and 190 for probe
+  busy, and 251 for build and 179 for probe quiet, each the median over batches.
+- The preempted runs sit at each batch's maximum. Busy wall-time maxima had medians of 990 us (seek), 509 us
+  (probe) and 93 us (build). The CPU-time maxima were 6 to 8 us. The median never sees those runs.
+- Every move of these three weights moved the CPU median by the same factor. None of them was the load.
+  The moves came from three causes:
+  - The first batch replaces calibration's rate unjudged (decision pl8-15). Calibration's seek is a binary
+    search over 512 keys in memory, 8.5 ns (16.88 rows' visits). The first B-tree index seek batch was
+    521 ns wall and 732 ns CPU (1,035.6 rows' visits). That is T12's 16.9 to 876.5.
+  - A plan change changes the work. Busy run 4 (HASH JOIN customer / SEARCH lineitem by index) seeked at
+    2,264 ns wall and 2,485 CPU, against 782 and 972 before: ratio 50.3. That is T12's 3,603.6. The probe's
+    71 to 541 ns move (ratio 24.2) has CPU medians of 251 and 771.
+  - Within one plan, batch medians wander 5 to 15%, and the CPU medians wander with them. Against spreads of
+    0.021 to 0.028 these batches stand 2.8 to 6.4 spreads off, past Student's t. Busy saw 15 such seek moves,
+    52 build and 21 probe. Quiet saw 7 build and 4 probe.
+- So T12's guess fails for these three. Load-slowed runs do not pass the test, because a batch's median
+  never includes them.
+- T13's seek "stayed at 16.88 at load 46 to 49" because its plan never ran an index seek. A rowid search
+  (SeekRowid) is not timed. The quiet trace here is the same: no seek batch was judged.
+
+**The page read: outside load moves it.** The page read is `Work::PageRead`: wall time from a read's
+submission to its completion, closed in batches of 64 at their mean. Run 0 ran the same plan in both traces
+and judged the same 4,017 batches (`run0.py`):
+
+| run 0, page-read batches | p10 | p50 | p90 | p99 | over 10 us | moved | standing, start to end |
+|---|---|---|---|---|---|---|---|
+| quiet | 1,395 ns | 2,124 | 11,196 | 46,840 | 441 | 39 | 3,648 to 5,086 ns |
+| busy | 1,428 ns | 1,753 | 25,738 | 64,312 | 1,183 | 285 | 18,535 to 1,419 ns |
+
+- The typical batch is unchanged by the burner. The slowed batches nearly tripled, and the moves rose 7.3x.
+- Over all runs the rate moved 99 times quiet and 406 times busy, swinging between about 1.6 us and 30 to
+  73 us.
+- The open's anchor (`time_page_read`, also wall-timed) read 33,746 ns busy against 5,126 ns quiet.
+- The page read's rate scales every weight to the planner's unit (row in pages = a row's visit over a page
+  read). Within the busy trace it swung 37x between prepares (3.545e-4 to 9.66e-6). Within the quiet trace it
+  swung 1.4x.
+- The busy plans flipped with it: four plans in runs 1 to 4, against one quiet. Those flips gave the seek
+  and probe new work to time (above).
+
+Why the test lets these batches through: one slowed read lifts the mean of its 64. A 2 ms read adds 31 us to
+the mean. Clean and lifted batches alternate, so the spread between batch means is itself about 1.0 in
+logarithm (0.76 to 1.07). A 20x to 40x jump is ln(30) / 1.0 = 3.4 spreads, past Student's t (about 2.8 at
+these degrees of freedom). The other weights were made robust to this by pl8-22's median. The page read
+was not.
+
+Not traced, one line each:
+- Whether a lifted page-read batch holds a preempted read or a read the disk served slowly. The page read
+  has no CPU clock beside it in this trace.
+- Why preemptions land inside page reads more often than inside seeks. A guess: a synchronous `pread`
+  returns to user space through a point where the scheduler preempts.
+
+## 3. The choice for Ada, and what the next lane does
+
+How should a page read be timed, so outside load can't inflate it while the disk's own latency stays in?
+- Close page-read batches at their median, as the seeks are. Cheap. But a page read is bimodal: about 2 us
+  from the OS cache, 30 to 100 us from the disk. When under half the reads go to the disk, the median drops
+  the disk's share and plans underprice IO.
+- Subtract the reading thread's run-queue wait, `run_delay` in `/proc/thread-self/schedstat`, read before
+  and after a timed read. This keeps the disk's latency and removes waiting for a CPU. It costs a file read
+  per timed read, so page reads would be sampled one in k as the seeks are. It is Linux only, with wall
+  time on macOS and Windows.
+- Time page reads with the thread CPU clock. This drops the disk wait itself, which is the work, so it is
+  not faithful.
+
+The open's anchor needs the same answer: it is timed the same way.
+
+## 4. Checks
+
+44515444 rewrites `Batches::spread` without `bool::then_some`, the coordinator's order. It was the 41st
+`clippy::disallowed_methods` count in the engine against `scripts/engine-ratchet.toml`'s 40 (B14's r1663),
+from T13's 9ac9687b. r1696: `SHA=44515444 bash ~/.cache/tpch-t14/check.sh` runs `scripts/check-production.sh`,
+then `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings`, then `cargo test -p
+amphora-engine --lib --locked -- learned_costs t13_ storage::pager::tests`.
