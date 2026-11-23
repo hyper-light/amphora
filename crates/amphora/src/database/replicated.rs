@@ -18441,6 +18441,90 @@ mod tests {
         pump.finish();
     }
 
+    /// Lane V6's fifth test, the acceptance test for lane V7's designs A and B
+    /// (bench/records/2026-11-23-adacachy2-perf-commits.md, "Unit 2"): 128 writers at once in
+    /// each class, writer w at member w % 3, each one write outstanding, appending a row to one
+    /// table (every write conflicts with every other). Expect: every write answered Ok before its
+    /// deadline, none refused for a stale base, the run ending within ROUNDS (no livelock), and
+    /// each row on every replica once. Red today: a follower prepares on its own base and loses to
+    /// the leader's log (V6's r1238, V7's r1312 and r1346).
+    #[test]
+    fn v7_a_hundred_and_twenty_eight_spread_writers_are_each_answered_with_no_stale_base() {
+        const WRITERS: usize = 128;
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL, body TEXT NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            let write = |id: usize| {
+                move |db: &mut Db| {
+                    db.exec(&format!(
+                        "INSERT INTO events VALUES ({id}, '{}')",
+                        "x".repeat(600)
+                    ))?;
+                    Ok(Vec::new())
+                }
+            };
+            let mut inflight: Vec<Option<Answering>> = (0..WRITERS)
+                .map(|id| Some(submit(&clients[id % 3], driven.until(), write(id))))
+                .collect();
+            let mut rounds = 0;
+            while inflight.iter().any(Option::is_some) {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: unanswered: {}",
+                    inflight.iter().flatten().count()
+                );
+                for (id, slot) in inflight.iter_mut().enumerate() {
+                    let Some(answer) = slot.take() else {
+                        continue;
+                    };
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => *slot = Some(answer),
+                        Err(error) => panic!("owner ended: {error}"),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(refusal)) => {
+                            panic!("{durability:?}: writer {id} at member {}: {refusal:?}", id % 3 + 1)
+                        }
+                    }
+                }
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            driven.quiet(&mut pump);
+            driven.tick(&mut pump, leader);
+            driven.tick(&mut pump, leader);
+            for owner in 0..3 {
+                let ids = driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .read_db(|db| {
+                        let mut ids = Vec::new();
+                        db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                            ids.push(usize::try_from(row.get::<i64>(0)?).unwrap());
+                            Ok(true)
+                        })?;
+                        Ok(ids)
+                    })
+                    .unwrap();
+                assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "{durability:?}: owner {owner}");
+            }
+            driven.drain(&mut pump);
+            pump.finish();
+        }
+    }
+
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
     /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
     /// on the persisted class, every member at once appends a row to one table (each write
