@@ -301,7 +301,7 @@ impl Default for Config {
             // A commit's pages fit its writer's cache: at 10,000 writers a commit of 512 rows wrote
             // 35,000-41,000 rows a second, of 2,048 rows 22,000-24,000 (fedora, 2026-10-20).
             commit_rows: 512,
-            readers: 4,
+            readers: machine_readers(),
             checkpoint_every: Duration::from_millis(25),
             // Each restart of the log holds the writer for 10-14 ms (on fedora's btrfs: what is
             // left copied, the file flushed, a new header synced). At 32 writers, whose commits
@@ -314,6 +314,41 @@ impl Default for Config {
             flushers: 1,
         }
     }
+}
+
+/// The readers a store keeps at most, from the machine (AUDIT 2.5): one a core the operating system
+/// lets the process run on (a reader reads on its caller's thread, so more readers than cores only
+/// take turns on them), and no more than the share of memory the process's page pool may take
+/// ([`crate::db::default_pages`], a quarter, cited there) holds readers' own caches
+/// ([`crate::db::READER_PAGES`] pages each, 8 MiB). One at least; one a core when the system says
+/// nothing of its memory.
+#[must_use]
+pub fn reader_room(cores: Option<usize>, memory: Option<u64>) -> usize {
+    let cores = cores.unwrap_or(1).max(1);
+    let Some(memory) = memory else {
+        return cores;
+    };
+    let reader_bytes = u64::try_from(crate::db::READER_PAGES)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(crate::db::PAGE_BYTES);
+    let fit = u64::try_from(crate::db::default_pages(Some(memory)))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(crate::db::PAGE_BYTES)
+        .checked_div(reader_bytes)
+        .unwrap_or(0);
+    cores.min(usize::try_from(fit).unwrap_or(usize::MAX)).max(1)
+}
+
+/// [`reader_room`] of this machine, read once a process, as the page pool it shares is sized
+/// ([`crate::db::process_pages`]).
+fn machine_readers() -> usize {
+    static ROOM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROOM.get_or_init(|| {
+        reader_room(
+            std::thread::available_parallelism().ok().map(usize::from),
+            crate::memory::limit(),
+        )
+    })
 }
 
 /// Why a store didn't take or answer something.
@@ -1409,6 +1444,23 @@ impl<E: Engine> Store<E> {
             }
             None => self.run(until, on_writer),
         }
+    }
+
+    /// Waits until the writes of `key` (of every key: None) handed over before now are committed,
+    /// up to `until`: what [`Store::read`] waits for before it reads.
+    pub fn committed(&self, key: Option<&str>, until: Instant) -> Result<(), Refused> {
+        if self.sends.wait(key, until) {
+            Ok(())
+        } else {
+            self.meter.timed_out();
+            Err(Refused::Timeout)
+        }
+    }
+
+    /// The readers this store reads on at most ([`Config::readers`]).
+    #[must_use]
+    pub fn readers(&self) -> usize {
+        self.readers.most
     }
 
     /// Run `f` on a reader, on this thread, on what is committed now, waiting for no write: what a

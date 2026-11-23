@@ -196,6 +196,8 @@ struct Shared {
     /// A backed-up writer's foreground, the calls it runs counted for its checks' pace
     /// (T-T1.12.C8).
     foreground: OnceLock<Arc<crate::backup::Foreground>>,
+    /// Records reads waiting for a reader (AUDIT 2.5).
+    reads: Reads,
     // The engine, readers and flusher retain the same lease until asynchronous drain ends.
     _owner: Option<Owned>,
 }
@@ -709,6 +711,241 @@ where
         return Err(Refusal::Timeout.into());
     }
     done
+}
+/// Where a Records read went ([`read_records`]).
+enum ReadRoute {
+    /// Answered on a reader.
+    Answered(Result<Answer, Refusal>),
+    /// The writer's to answer, the operation handed back: anything but a Records read, a read
+    /// while a restore is unfinished (the writer knows whether it is the restore), or while the
+    /// store has no reader to lend.
+    Writer(Operation),
+}
+
+/// A Records read waiting for a reader ([`Reads`]): what it asks and, once read, its answer.
+struct WaitingRead {
+    namespace: String,
+    operation: Mutex<Option<Operation>>,
+    claim: Option<Application>,
+    until: Instant,
+    slot: Mutex<ReadSlot>,
+    read: Condvar,
+}
+
+/// Where a waiting read is.
+#[derive(Default)]
+struct ReadSlot {
+    /// Read: its answer, or None when the writer must answer it.
+    answer: Option<Option<Result<Answer, Refusal>>>,
+    /// Readers that stopped handed the reads still waiting to it, each its place among the
+    /// readers: it reads them, once a hand-over, before it answers, even once its own read is
+    /// answered (another reader may take it meanwhile). Counted: two readers may hand over to the
+    /// same first waiting read before it wakes, and neither place is lost.
+    leads: usize,
+}
+
+/// The Records reads waiting for a reader, and how many readers are reading them (AUDIT 2.5). A
+/// read that finds fewer reading than the store has readers reads, taking every read waiting
+/// with it into one read transaction, as the writer takes every queued write into one commit; one
+/// that finds them all reading waits to be taken. A reader whose own read is answered stops after
+/// its batch, handing what still waits to the first waiting (so no caller reads for others
+/// without end), and one that finds none waiting stops: while reads wait, one of their callers
+/// reads.
+#[derive(Default)]
+struct Reads {
+    queue: Mutex<ReadQueue>,
+}
+
+#[derive(Default)]
+struct ReadQueue {
+    waiting: Vec<Arc<WaitingRead>>,
+    reading: usize,
+}
+
+/// A Records read (get, scan, changes, head) answered on a reader beside the writer (AUDIT 2.5):
+/// no writer transaction, no group log entry, no flush of its own. It keeps the writer path's
+/// guarantees: it reads once every write handed over before it is committed (read-your-writes,
+/// the order a writer batch gave it), on a snapshot taken after that, and answers once what it
+/// read is durable, as an answer given after its batch's flush was. Reads waiting together share
+/// one read transaction on one reader ([`Reads`]).
+fn read_records(
+    store: &Store<Local>,
+    reads: &Reads,
+    namespace: &str,
+    operation: Operation,
+    claim: &Option<Application>,
+    until: Instant,
+) -> Result<ReadRoute, Refusal> {
+    if !matches!(
+        operation,
+        Operation::Get(..) | Operation::Scan(..) | Operation::Changes(..) | Operation::Head
+    ) {
+        return Ok(ReadRoute::Writer(operation));
+    }
+    store.committed(None, until).map_err(admission_refusal)?;
+    let mine = Arc::new(WaitingRead {
+        namespace: namespace.to_owned(),
+        operation: Mutex::new(Some(operation)),
+        claim: claim.clone(),
+        until,
+        slot: Mutex::new(ReadSlot::default()),
+        read: Condvar::new(),
+    });
+    let reader = {
+        let mut queue = locked(&reads.queue)?;
+        queue.waiting.push(Arc::clone(&mine));
+        let reader = queue.reading < store.readers();
+        if reader {
+            queue.reading = queue.reading.saturating_add(1);
+        }
+        reader
+    };
+    if reader {
+        read_waiting(store, reads, &mine)?;
+    }
+    let answer = loop {
+        let mut slot = locked(&mine.slot)?;
+        if slot.leads > 0 {
+            slot.leads = slot.leads.saturating_sub(1);
+            drop(slot);
+            read_waiting(store, reads, &mine)?;
+            continue;
+        }
+        if let Some(answer) = slot.answer.take() {
+            break answer;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            drop(slot);
+            return read_late(store, reads, &mine);
+        }
+        drop(
+            mine.read
+                .wait_timeout(slot, left)
+                .map_err(|_| unavailable("a database response lock was poisoned"))?,
+        );
+    };
+    let Some(result) = answer else {
+        let operation = locked(&mine.operation)?
+            .take()
+            .ok_or_else(|| unavailable("a read was handed to the writer without its operation"))?;
+        return Ok(ReadRoute::Writer(operation));
+    };
+    match store.sync(until) {
+        Ok(()) => Ok(ReadRoute::Answered(result)),
+        Err(store::Refused::Timeout) => Err(Refusal::Timeout),
+        Err(_) => Err(Refusal::UnknownOutcome),
+    }
+}
+
+/// A read whose deadline passed while it waited: it leaves the queue (nothing was written: it is
+/// refused for its deadline), unless it was handed the reads still waiting, which it reads first.
+fn read_late(store: &Store<Local>, reads: &Reads, mine: &Arc<WaitingRead>) -> Result<ReadRoute, Refusal> {
+    let lead = {
+        let mut queue = locked(&reads.queue)?;
+        queue.waiting.retain(|w| !Arc::ptr_eq(w, mine));
+        // A hand-over is made under the queue's lock: none comes after this.
+        std::mem::take(&mut locked(&mine.slot)?.leads)
+    };
+    for _ in 0..lead {
+        read_waiting(store, reads, mine)?;
+    }
+    Err(Refusal::Timeout)
+}
+
+/// Reads the reads waiting, a batch of one read transaction at a time, until none waits or
+/// `mine` is answered; then stops reading, handing what still waits to the first of it. Every
+/// read it took is answered, whatever happens to its batch.
+fn read_waiting(store: &Store<Local>, reads: &Reads, mine: &WaitingRead) -> Result<(), Refusal> {
+    loop {
+        let batch = {
+            let mut queue = locked(&reads.queue)?;
+            let answered = locked(&mine.slot)?.answer.is_some();
+            match queue.waiting.first() {
+                None => {
+                    queue.reading = queue.reading.saturating_sub(1);
+                    return Ok(());
+                }
+                Some(next) if answered => {
+                    let mut slot = locked(&next.slot)?;
+                    slot.leads = slot.leads.saturating_add(1);
+                    drop(slot);
+                    next.read.notify_all();
+                    return Ok(());
+                }
+                Some(_) => std::mem::take(&mut queue.waiting),
+            }
+        };
+        let answers = read_batch(store, &batch);
+        let mut answers = match answers {
+            Ok(Some(answers)) => answers.into_iter().map(Some).collect::<Vec<_>>(),
+            Ok(None) => batch.iter().map(|_| None).collect(),
+            Err(refusal) => batch.iter().map(|_| Some(Err(refusal.clone()))).collect(),
+        }
+        .into_iter();
+        for waiting in &batch {
+            let answer = answers
+                .next()
+                .unwrap_or_else(|| Some(Err(unavailable("a read went unanswered"))));
+            if let Ok(mut slot) = waiting.slot.lock() {
+                slot.answer = Some(answer);
+            }
+            waiting.read.notify_all();
+        }
+    }
+}
+
+/// `batch` read in one read transaction on a reader: each read's answer, in order; None when the
+/// writer must answer them (a restore unfinished, or no reader now).
+fn read_batch(
+    store: &Store<Local>,
+    batch: &[Arc<WaitingRead>],
+) -> Result<Option<Vec<Result<Answer, Refusal>>>, Refusal> {
+    let until = batch
+        .iter()
+        .map(|w| w.until)
+        .max()
+        .unwrap_or_else(Instant::now);
+    store
+        .read_committed(
+            until,
+            |db| {
+                db.query_transaction(|db| {
+                    if restore::incomplete(db)? {
+                        return Ok(None);
+                    }
+                    let mut answers = Vec::with_capacity(batch.len());
+                    for waiting in batch {
+                        answers.push(read_one(db, waiting));
+                    }
+                    Ok(Some(answers))
+                })
+            },
+            |_| Ok(None),
+        )
+        .map_err(|e| match e.downcast_ref::<store::Refused>() {
+            Some(store_refused) => admission_refusal(*store_refused),
+            None => refused(&e),
+        })
+}
+
+/// One read of a batch, on the batch's snapshot, its own deadline and claim checked.
+fn read_one(db: &mut Db, waiting: &WaitingRead) -> Result<Answer, Refusal> {
+    if Instant::now() >= waiting.until {
+        return Err(Refusal::Timeout);
+    }
+    let operation = locked(&waiting.operation)?;
+    let Some(operation) = operation.as_ref() else {
+        return Err(unavailable("a read was taken without its operation"));
+    };
+    let _deadline = db.deadline(waiting.until);
+    let result = application::check(db, waiting.claim.as_ref(), operation)
+        .and_then(|()| apply(db, &waiting.namespace, operation))
+        .unwrap_or_else(|e| Err(refused(&e)));
+    if result.is_err() && Instant::now() >= waiting.until {
+        return Err(Refusal::Timeout);
+    }
+    result
 }
 /// A read's answer and the time it was answered at (replication.md, "Follower reads at a closed
 /// time"): the state it read is its group's at that time, every write at it or before and none
@@ -1403,6 +1640,7 @@ impl Database {
                         admitted: Arc::new(AtomicUsize::new(0)),
                         stamps: OnceLock::new(),
                         foreground: OnceLock::new(),
+                        reads: Reads::default(),
                         _owner: Some(owner),
                     }),
                 })
@@ -1497,6 +1735,7 @@ impl Database {
                 admitted: Arc::new(AtomicUsize::new(0)),
                 stamps: OnceLock::new(),
                 foreground: OnceLock::new(),
+                reads: Reads::default(),
                 _owner: owner,
             }),
         };
@@ -2211,6 +2450,17 @@ impl Database {
             .foreground
             .get()
             .map(crate::backup::Foreground::call);
+        let operation = match read_records(
+            store,
+            &self.shared.reads,
+            namespace,
+            operation,
+            &self.application,
+            until,
+        )? {
+            ReadRoute::Answered(answer) => return answer.map(|answer| (answer, None)),
+            ReadRoute::Writer(operation) => operation,
+        };
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
             || matches!(
                 &operation,
@@ -3242,6 +3492,13 @@ fn snapshot(at: Consistency, head: Rev, horizon: Rev) -> Result<Rev, Refusal> {
         Consistency::Snapshot(r) => Ok(r),
     }
 }
+/// Whether a Records row has a value at `at` (its newest version by then is no deletion), as
+/// [`get`] would say by answering one, without copying the value out (AUDIT 4.2).
+fn live_at(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<bool> {
+    let mut live = false;
+    db.query("SELECT value IS NOT NULL FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev <= ?4 ORDER BY rev DESC LIMIT 1", [text(ns), text(family), blob(key)?, integer(at)?], |r| { live = r.get::<i64>(0).map_err(unavailable)? != 0; Ok(false) })?;
+    Ok(live)
+}
 fn get(db: &Db, ns: &str, family: &str, key: &[u8], at: Rev) -> anyhow::Result<Option<Row>> {
     let mut out = None;
     db.query("SELECT rev, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND key = ?3 AND rev <= ?4 ORDER BY rev DESC LIMIT 1", [text(ns), text(family), blob(key)?, integer(at)?], |r| { out = bytes(r, 1)?.map(|value| Ok::<_, anyhow::Error>(Row { key: key.into(), value, rev: rev(r, 0)? })).transpose()?; Ok(false) })?;
@@ -3408,7 +3665,7 @@ fn commit(
     }
     let mut live = live;
     for ((family, key), (_, w)) in &final_writes {
-        let before = get(db, ns, family, key, head)?.is_some();
+        let before = live_at(db, ns, family, key, head)?;
         match (before, matches!(w, Write::Put { .. })) {
             (false, true) => {
                 live = live
@@ -4197,5 +4454,124 @@ mod group_holding {
             engine.holding().unwrap(),
             Some(postcard::to_allocvec(&held).unwrap())
         );
+    }
+}
+
+#[cfg(test)]
+mod records_reads {
+    use super::*;
+
+    /// Do: size a store's readers for machines of 1 to 64 cores and of 1 GiB to 1 TiB, and one
+    /// that says nothing. Expect: one a core while a quarter of memory holds that many readers'
+    /// 8 MiB caches, fewer when it doesn't, never none (AUDIT 2.5: no picked reader count).
+    #[test]
+    fn audit_2_5_readers_are_sized_from_cores_and_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(store::reader_room(Some(32), Some(64 * GIB)), 32);
+        assert_eq!(store::reader_room(Some(1), Some(1024 * GIB)), 1);
+        // A quarter of 128 MiB is 32 MiB: four 8 MiB caches, though there are 64 cores.
+        assert_eq!(store::reader_room(Some(64), Some(128 << 20)), 4);
+        // The page pool's floor (16 MiB) holds two.
+        assert_eq!(store::reader_room(Some(64), Some(1 << 20)), 2);
+        assert_eq!(store::reader_room(Some(8), None), 8);
+        assert_eq!(store::reader_room(None, None), 1);
+        assert_eq!(store::reader_room(Some(0), Some(0)), 1);
+    }
+
+    fn put(key: &[u8], value: &[u8]) -> Tx {
+        Tx {
+            conds: Vec::new(),
+            writes: vec![Write::Put {
+                family: "f".into(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+        }
+    }
+
+    /// Do: from many more threads than the store has readers, each commit a key and get it at
+    /// once, over and over, so reads wait for readers and share their read transactions. Expect:
+    /// every get answers the value its own commit just wrote, at its revision or later
+    /// (read-your-writes on readers batched together, AUDIT 2.5), and none is refused.
+    #[test]
+    fn audit_2_5_batched_reads_see_their_callers_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let until = || Instant::now() + Duration::from_secs(60);
+        let db = Database::open(&dir.path().join("r.db"), until()).unwrap();
+        let ns = db.namespace("t").unwrap();
+        let clients = 4 * match &db.shared.writer {
+            Writer::Local(store) => store.readers(),
+            _ => panic!("a local database"),
+        };
+        std::thread::scope(|s| {
+            for c in 0..clients {
+                let ns = &ns;
+                s.spawn(move || {
+                    let key = format!("k{c}").into_bytes();
+                    for round in 0..20u32 {
+                        let value = round.to_le_bytes();
+                        let at = ns.commit(put(&key, &value), until()).unwrap();
+                        let row = ns
+                            .get("f", &key, Consistency::Linearizable, until())
+                            .unwrap()
+                            .expect("the row just written");
+                        assert_eq!(row.value, value, "client {c} round {round}");
+                        assert!(row.rev >= at, "client {c} round {round}");
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            locked(&db.shared.reads.queue).unwrap().reading,
+            0,
+            "every reader stopped once none waited"
+        );
+    }
+
+    /// Do: release 8x as many gets as the store has readers at once, so readers finish their
+    /// batches together and hand their places to the same first waiting reads; a quarter of them
+    /// with deadlines short enough to run out while waiting, so some leave with places handed to
+    /// them. Fifty rounds. Expect: after every round no read waits and no reader is counted (each
+    /// hand-over gives back exactly one place, AUDIT 2.5), every get either answers the row or is
+    /// refused for its deadline, and a get afterwards still finds a reader.
+    #[test]
+    fn audit_2_5_readers_finishing_together_lose_no_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let until = || Instant::now() + Duration::from_secs(60);
+        let db = Database::open(&dir.path().join("r.db"), until()).unwrap();
+        let ns = db.namespace("t").unwrap();
+        ns.commit(put(b"k", b"v"), until()).unwrap();
+        let clients = 8 * match &db.shared.writer {
+            Writer::Local(store) => store.readers(),
+            _ => panic!("a local database"),
+        };
+        let start = std::sync::Barrier::new(clients);
+        for round in 0..50 {
+            std::thread::scope(|s| {
+                for c in 0..clients {
+                    let (ns, start) = (&ns, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        let deadline = if c % 4 == 0 {
+                            Instant::now() + Duration::from_micros(200)
+                        } else {
+                            until()
+                        };
+                        match ns.get("f", b"k", Consistency::Linearizable, deadline) {
+                            Ok(row) => assert_eq!(row.expect("the row").value, b"v", "round {round} client {c}"),
+                            Err(refusal) => assert!(
+                                c % 4 == 0 && matches!(refusal, Refusal::Timeout),
+                                "round {round} client {c}: {refusal:?}"
+                            ),
+                        }
+                    });
+                }
+            });
+            let queue = locked(&db.shared.reads.queue).unwrap();
+            assert!(queue.waiting.is_empty(), "round {round}: no read left waiting");
+            assert_eq!(queue.reading, 0, "round {round}: every place given back");
+        }
+        let row = ns.get("f", b"k", Consistency::Linearizable, until()).unwrap();
+        assert_eq!(row.expect("the row").value, b"v");
     }
 }

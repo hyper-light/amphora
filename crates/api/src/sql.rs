@@ -401,6 +401,10 @@ pub trait Session {
         ))
     }
     fn column_count(&self, sql: &str) -> Result<usize>;
+    /// The names of `sql`'s result columns, in order. A session that can't name them refuses.
+    fn column_names(&self, _sql: &str) -> Result<Vec<String>> {
+        Err(crate::invalid("SQL column names", "unsupported by this session").into())
+    }
     fn changes(&self) -> i64;
     fn last_insert_rowid(&self) -> i64;
 }
@@ -460,6 +464,11 @@ impl<'db> Connection<'db> {
         rows.first()
             .ok_or(Error::QueryReturnedNoRows)
             .and_then(&mut map)
+    }
+
+    /// The names of `sql`'s result columns, in order.
+    pub fn column_names(&self, sql: &str) -> Result<Vec<String>> {
+        self.db.column_names(sql)
     }
 
     pub fn prepare<'c>(&'c self, sql: &str) -> Result<Statement<'c, 'db>> {

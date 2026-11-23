@@ -97,6 +97,7 @@ const ENVELOPE_BYTES: usize = std::mem::size_of::<Envelope>();
 // Session tokens: read-your-writes on any replica (replication.md, "Decision (lane ryw-1):
 // read-your-writes by session tokens").
 mod tokens;
+mod waiting;
 pub use tokens::{ReadMode, Served, SessionCounters, Token};
 
 /// One of the floor's own sessions: the work it does on the database at its base.
@@ -953,7 +954,7 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     floor_published: Option<u32>,
     // At most the command queue's inputs' bound of admitted operations wait behind the sole
     // prepared transaction (`Control::command_bound`).
-    waiting: VecDeque<Envelope>,
+    waiting: waiting::Waiting<Envelope>,
     // The leader's write slot (replication.md, "A follower's write under steady leader writes"):
     // the members whose writes it refused, queued, and the forwards and barrier it holds, each
     // still charged to the inbound queue by its reservation; and whether this leader's own
@@ -2465,7 +2466,7 @@ fn open_on<F: BlockFile + 'static>(
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
-        waiting: VecDeque::new(),
+        waiting: waiting::Waiting::new(),
         slots,
         slot_deferred: false,
         serial: 0,
@@ -2860,10 +2861,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             self.control.moved.notify_all();
             drop(closed);
         }
-        for _ in 0..self.waiting.len() {
-            let Some(envelope) = self.waiting.pop_front() else {
-                break;
-            };
+        while let Some(envelope) = self.waiting.pop_front() {
             if let Input::Submit { response, .. } = envelope.command {
                 answer(response, Err(reason.clone()));
             }
@@ -2894,10 +2892,16 @@ impl<F: BlockFile + 'static> Actor<F> {
             let input = match receiver.try_recv() {
                 Ok(envelope) => Some(envelope),
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-                Err(mpsc::TryRecvError::Empty) if self.driving => None,
+                Err(mpsc::TryRecvError::Empty) if self.driving => {
+                    let now = (self.clock)();
+                    self.ran_dry(now)?;
+                    None
+                }
                 Err(mpsc::TryRecvError::Empty) => {
+                    let now = (self.clock)();
+                    self.ran_dry(now)?;
                     let deadline = self.deadline();
-                    let wait = deadline.saturating_duration_since((self.clock)());
+                    let wait = deadline.saturating_duration_since(now);
                     self.control.bell.wait(wait)?;
                     // A wait begun before its deadline and ended at or past it, whatever ended
                     // it, is one the timer's lateness is measured on (`hyper_timing::Lateness`).
@@ -2918,6 +2922,16 @@ impl<F: BlockFile + 'static> Actor<F> {
             };
             self.run_step(input)?;
         }
+    }
+    /// The intake found its channel empty at `now`: unless inputs wait behind a pause, the
+    /// command queue's busy time ends there (`Drain::dry`; QB.1, lane constants-K3).
+    fn ran_dry(&mut self, now: Instant) -> Result<(), Refusal> {
+        if self.paused_inputs.is_empty() {
+            let now = u64::try_from(now.saturating_duration_since(self.started).as_nanos())
+                .map_err(unavailable)?;
+            self.intake.dry(now);
+        }
+        Ok(())
     }
     /// The tick pace from what this owner measured (`pace`), derived once an election timeout:
     /// the core draws each timeout over that many ticks, so a pace derived oftener changes no
@@ -2950,14 +2964,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             .ticked
             .checked_add(self.pace.period())
             .unwrap_or(self.at);
-        let waiting = self
-            .waiting
-            .iter()
-            .filter_map(|envelope| match &envelope.command {
-                Input::Submit { until, .. } => Some(*until),
-                _ => None,
-            });
         let held = [
+            self.waiting.next_deadline(),
             self.pending.as_ref().map(|pending| pending.until),
             self.changing.as_ref().map(|changing| changing.until),
             self.transferring
@@ -2965,9 +2973,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .map(|transferring| transferring.until),
             self.slots.until(),
         ];
-        waiting
-            .chain(held.into_iter().flatten())
-            .fold(tick, Instant::min)
+        held.into_iter().flatten().fold(tick, Instant::min)
     }
     /// One step at its clock's reading: the input first, then a tick if one is due, the core's
     /// work, deadlines, and what waits.
@@ -2983,6 +2989,10 @@ impl<F: BlockFile + 'static> Actor<F> {
         // makes no raft step; what comes waits in order, its bytes still charged to the command
         // queue, so the queue's admission bound holds the callers back.
         let paused = self.paused()?;
+        if input.is_some() {
+            // Work came to the command queue: its busy time begins (`Drain::came`).
+            self.intake.came(self.now()?);
+        }
         let mut input = input;
         if let Some(envelope) = input.as_mut() {
             // Taken from the channel: its place there is free, its bytes still held (lane
@@ -3466,21 +3476,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         Ok(())
     }
     fn expire(&mut self) {
-        // Expired callers relinquish queued operations even while a seed or proposal is held.
-        // Rotate the bounded queue once; surviving requests retain their FIFO order.
-        let queued = self.waiting.len();
-        for _ in 0..queued {
-            let Some(envelope) = self.waiting.pop_front() else {
-                break;
-            };
-            let expired =
-                matches!(&envelope.command, Input::Submit { until, .. } if self.at >= *until);
-            if expired {
-                if let Input::Submit { response, .. } = envelope.command {
-                    answer(response, Err(Refusal::Timeout));
-                }
-            } else {
-                self.waiting.push_back(envelope);
+        // Expired callers relinquish queued operations even while a seed or proposal is held;
+        // surviving requests retain their FIFO order.
+        for envelope in self.waiting.expire(self.at) {
+            if let Input::Submit { response, .. } = envelope.command {
+                answer(response, Err(Refusal::Timeout));
             }
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -3559,16 +3559,19 @@ impl<F: BlockFile + 'static> Actor<F> {
                 }),
             );
         } else {
-            self.waiting.push_front(Envelope {
-                command: Input::Submit {
-                    namespace: pending.namespace,
-                    operation,
-                    application,
-                    until: pending.until,
-                    response,
+            self.waiting.push_front(
+                pending.until,
+                Envelope {
+                    command: Input::Submit {
+                        namespace: pending.namespace,
+                        operation,
+                        application,
+                        until: pending.until,
+                        response,
+                    },
+                    _reservation: pending._reservation,
                 },
-                _reservation: pending._reservation,
-            });
+            );
         }
     }
     /// The change under way, once its barrier shows this leader current: proposed, or answered
@@ -3776,16 +3779,19 @@ impl<F: BlockFile + 'static> Actor<F> {
                             }),
                         );
                     } else {
-                        self.waiting.push_back(Envelope {
-                            command: Input::Submit {
-                                namespace,
-                                operation,
-                                application,
-                                until,
-                                response,
+                        self.waiting.push_back(
+                            until,
+                            Envelope {
+                                command: Input::Submit {
+                                    namespace,
+                                    operation,
+                                    application,
+                                    until,
+                                    response,
+                                },
+                                _reservation: reservation,
                             },
-                            _reservation: reservation,
-                        });
+                        );
                     }
                 } else {
                     let context = match self.context() {
@@ -10653,7 +10659,8 @@ mod tests {
     }
     /// T-QB.1.9 (QB.1, lane constants-21; replication.md, "The member bound stated once per group"):
     /// a group's member bound is its log's, so growth always works. Do: open one voter, and a
-    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running), and catch
+    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running, so every
+    /// record to them is lost: the pump has no owner to hand it to), and catch
     /// member 2 up; restart the voter from the configuration it first opened with. Expect: the
     /// voter opened for 2 (twice its first configuration); each change past the bound raised it
     /// first, to 4, then 8 by the fifth member, then 16 by the ninth, every change answered;
@@ -10679,6 +10686,7 @@ mod tests {
         };
         assert_eq!(bound(&driven, 0), 2);
         let mut pump = Pump::new(&clients);
+        pump.lost.extend(3..=9);
         driven.elect(&mut pump, &clients[..1], 0, 1);
         for member in 2..=9 {
             let until = driven.until();
@@ -18069,8 +18077,9 @@ mod tests {
     /// slot's start lands on its next try. Do: the leader appends a write of its own, W, with one
     /// follower's answers held and its appends to the other, the slot's holder, lost, so W is
     /// neither committed nor sent to the holder; then the holder, queued by a refusal, writes,
-    /// its barrier beginning its slot with W the leader's last entry. Expect: its barrier held
-    /// while W is uncommitted, and its write, prepared on W once answers and appends flow again,
+    /// its barrier beginning its slot with W the leader's last entry; then answers and appends
+    /// flow again and the leader's clock moves until the holder has W, within an election
+    /// timeout. Expect: its barrier held while W is uncommitted, and its write, prepared on W,
     /// applied; W too. With the tail rule alone (the barrier answered at the older commit) the
     /// holder's write was refused: the commit's red run.
     #[test]
@@ -18137,6 +18146,16 @@ mod tests {
         }
         pump.held.clear();
         pump.losing = None;
+        // W's lost append fills the holder's window, learned from its path (`Window::Carried`),
+        // and holds back the commit's broadcast too: the leader asks where the holder is once a
+        // beat of its ticks passed with nothing out answered, and sends W again from there.
+        let election = driven.owner(0).replica.core().raft.config().election_tick;
+        for _ in 0..election {
+            if driven.owner(2).replica.applied().index >= w {
+                break;
+            }
+            driven.tick(&mut pump, leader);
+        }
         assert_eq!(
             driven.settle(&mut pump, &retry),
             Ok(Vec::new()),

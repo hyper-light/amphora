@@ -1280,6 +1280,9 @@ tests = [
   # lane constants-22
   { id = "T-QB.1.13", text = "A lock-release event, released before a wait and after: passes when a wait after a release it hadn't counted says try again, a waiting waker is woken once by the next release and let go, and one waker waiting twice is held once" },
   { id = "T-QB.1.14", text = "Two connections, one holding the write lock while the other's insert waits, then the holder commits, under each busy wake: passes when under the release wake nothing woke the waiter before the commit and the commit did, both inserts commit, and the time from commit to the waiter's insert done is printed for each" },
+  # lane constants-K3
+  { id = "T-QB.1.15", text = "Ten messages come to the command queue each 10 ms and its reader takes them in 1 ms, then finds the queue empty, under a 100 ms election timeout: passes when the bound is what the reader takes in the timeout, about 1000 messages, not the 100 that come in it; a stall then a reader that keeps up is not held to the least; what is taken within one tick of a driven clock is not weighed over the empty time after it" },
+  { id = "T-QB.1.16", text = "The outgoing queue's equivalent: a host that drains each burst and then finds the queue empty, under a 100 ms election timeout: passes when the bound is what the host drains in the timeout, not what comes in it, and a stall then a host that keeps up is not held to one broadcast" },
 ]
 
 # lane many-writers
@@ -1662,3 +1665,27 @@ tests = [
 
 # lane xgroup-sql-4: G13 step 3, retrying a refusal before the step (kiln goal e25ba5fe; xgroup.md,
 # "A refusal before the step")
+
+# lane PG2: PostgreSQL 19's wire core, sans-IO (docs/design/postgres.md, decision 2 and section 11's unit 1;
+# crates/amphora/src/postgres/, its check crates/amphora/tests/postgres_protocol.rs).
+[[own]]
+id = "PG"
+title = "PostgreSQL 19 clients and tools work against Amphora as against PostgreSQL 19.0, about 10x faster at every scale"
+criteria = [
+  { id = "AC-PG.1.1", text = "SCRAM-SHA-256 and SCRAM-SHA-256-PLUS (tls-server-end-point) run as PostgreSQL 19 runs them: RFC 7677's vectors reproduce byte for byte, a verifier reads from PostgreSQL's stored form, each malformed or mismatched message is refused with PostgreSQL's SQLSTATE" },
+  { id = "AC-PG.1.2", text = "Start-up at protocol 3.0 and 3.2; a newer minor (3.9999) or a _pq_. option is answered with NegotiateProtocolVersion and the session carries on, never refused; a major other than 3 is refused 0A000" },
+  { id = "AC-PG.1.3", text = "The 15 ParameterStatus values PostgreSQL 19 reports (GUC_REPORT), then BackendKeyData with a 4-byte key at 3.0 and 32 bytes at 3.2, then ReadyForQuery I" },
+  { id = "AC-PG.1.4", text = "SSLRequest answered S with TLS and N without, GSSENCRequest N, bytes sent before the handshake refused 08P01; direct TLS decided by its first byte and taken only with ALPN postgresql; CancelRequest read with a 1 to 256 byte key and never answered" },
+  { id = "AC-PG.1.5", text = "A wrong password and a role that doesn't exist are refused alike: the exchange runs to its end and fails FATAL 28P01" },
+  { id = "AC-PG.1.6", text = "A simple Query is answered ErrorResponse 0A000 then ReadyForQuery I (an empty one EmptyQueryResponse); extended-protocol messages get one 0A000 and are skipped to Sync; Terminate ends the session" },
+  { id = "AC-PG.1.7", text = "Every parser is bounded: a frame's announced length is checked against PostgreSQL's limit for its type before the caller charges and holds it, and truncated frames, bad lengths, wrong orders and noise get ErrorResponse and never a panic" },
+]
+tests = [
+  { id = "T-PG.1.1", text = "postgres_protocol::t_pg_1_1_rfc7677_scram_sha_256_vectors, t_pg_1_1_base64_is_rfc4648s_and_strict, t_pg_1_1_scram_sha_256_plus_binds_to_the_certificate — pass when RFC 7677's server-first and server-final messages come out exactly and each refusal carries PostgreSQL's message and SQLSTATE" },
+  { id = "T-PG.1.2", text = "postgres_protocol::t_pg_1_2_startup_at_3_0_and_3_2_reports_and_keys_by_version, t_pg_1_2_grease_3_9999_is_negotiated_down_never_refused — pass when 3.9999 with _pq_.test_protocol_negotiation gets NegotiateProtocolVersion 3.2 listing the option and reaches ReadyForQuery, fed whole frames and one byte at a time" },
+  { id = "T-PG.1.3", text = "postgres_protocol::t_pg_1_3_parameter_status_is_postgresql_19s_fifteen and session::tests — pass when the reported names are exactly PostgreSQL 19's 15 with its values" },
+  { id = "T-PG.1.4", text = "postgres_protocol::t_pg_1_4_ssl_gss_and_direct_tls_are_decided — passes when each opening request gets PostgreSQL's answer or decision" },
+  { id = "T-PG.1.5", text = "postgres_protocol::t_pg_1_5_a_wrong_password_and_an_unknown_role_are_refused_28p01" },
+  { id = "T-PG.1.6", text = "postgres_protocol::t_pg_1_6_a_query_is_refused_0a000_then_ready — passes when the message sequence is E Z I Z E Z E Z for a query, an empty query, a non-UTF-8 query and an extended batch" },
+  { id = "T-PG.1.7", text = "postgres_protocol::t_pg_1_7_hostile_input_to_every_parser, t_pg_1_7_lengths_past_each_limit_are_refused_before_they_are_held — pass when every cut, mutation, length word and noise run at each of the four parsers never panics and every close says why" },
+]

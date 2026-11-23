@@ -41,13 +41,17 @@
 //! clients reach it by, and the protocol agreed is [`ALPN`]. A client (`amphora ask`, `health`,
 //! `drill`) presents the chain of the config it reads. Without them the link is not encrypted.
 //!
-//! A connection's first byte says what it carries: `R` (a peer's Raft records) or `C` (a client's
-//! requests). The member answers with a challenge (32 random bytes) and the other side proves it
-//! holds the cluster's secret with HMAC-SHA256(secret, challenge || kind) (RFC 2104); the secret
-//! never crosses the link.
+//! A connection's first byte says what it carries: `R` (a peer's Raft records), `C` (a client's
+//! requests) or `Q` (a client's SQL). The member answers with a challenge (32 random bytes) and the
+//! other side proves it holds the cluster's secret with HMAC-SHA256(secret, challenge || kind)
+//! (RFC 2104); the secret never crosses the link.
 //! Then `R`: the sender's node ID (u64, little endian) and records, each its length (u32, little
 //! endian, at most the replica's own record bound) and its bytes; `C`: requests, one line each,
-//! each answered by one line, `ok …` or `err …`, a line at most the API's request bound.
+//! each answered by one line, `ok …` or `err …`, a line at most the API's request bound; `Q`:
+//! frames, each its length (u32, little endian) and a postcard value, a request at most the API's
+//! request bound and an answer at most its result bound: statements with bound parameters,
+//! answered with typed rows and their columns' names ([`SqlClient`]; docs/design/client-protocol.md,
+//! decision 2).
 //!
 //! Bounds: one records connection per peer (a new one from the same peer closes the old); each
 //! client connection takes a descriptor from the process's budget ([`crate::descriptors`]) and is
@@ -63,11 +67,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use amphora_api::replication::{Durability, Fates, MemberChange, ReplicaConfig};
+use amphora_api::{Refusal, Statement, Value};
 use anyhow::{Context, anyhow, bail, ensure};
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::database::{Database, LogDisk};
+use crate::memory::{self, Use};
 use crate::transport::network::{self, Credentials};
 
 /// The records a peer's sender holds and one drain takes: the 4096 that
@@ -77,6 +84,13 @@ const OUTGOING_MESSAGES: usize = 4096;
 
 const RECORDS: u8 = b'R';
 const CLIENT: u8 = b'C';
+const SQL: u8 = b'Q';
+/// The newest version of a `Q` connection's frames this side speaks. A variant appended to
+/// [`SqlRequest`] or [`SqlAnswer`] raises it and is sent only at a version agreed that takes it
+/// (docs/design/client-protocol.md, decision 2). A format value.
+pub const SQL_VERSION: u32 = 1;
+/// The oldest version of a `Q` connection's frames this side speaks. A format value.
+const SQL_VERSION_MIN: u32 = 1;
 /// The challenge's length: SHA-256's output length (FIPS 180-4), HMAC-SHA256's block of proof.
 const NONCE: usize = 32;
 /// HMAC-SHA256's tag length (RFC 2104 with SHA-256: 32 bytes).
@@ -644,8 +658,281 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
             r.get_mut().write_all(answer.as_bytes())?;
             r.get_mut().flush()?;
         },
+        [SQL] => {
+            let mut agreed = None;
+            loop {
+                let answer = match read_frame(&mut r, amphora_api::REQUEST_MAX)? {
+                    None => return Ok(()),
+                    Some(Frame::Refused(refusal)) => refused_frame(refusal)?,
+                    Some(Frame::Held(bytes, _charge)) => {
+                        match postcard::from_bytes::<SqlRequest>(&bytes) {
+                            Ok(request) => match Charged::request(&request) {
+                                Ok(_decoded) => shared.sql(request, &mut agreed)?,
+                                Err(refusal) => refused_frame(refusal)?,
+                            },
+                            Err(e) => refused_frame(amphora_api::invalid(
+                                "SQL request",
+                                &format!(
+                                    "{e}: this member speaks versions {SQL_VERSION_MIN} to {SQL_VERSION}"
+                                ),
+                            ))?,
+                        }
+                    }
+                };
+                write_frame(r.get_mut(), &answer.bytes)?;
+            }
+        }
         _ => bail!("a connection opened with {kind:?}"),
     }
+}
+
+/// What a `Q` connection asks (docs/design/client-protocol.md, decision 2). Postcard encodes a
+/// variant by its index: variants are only appended, each with the version that brought it.
+#[derive(Debug, Serialize, Deserialize)]
+enum SqlRequest {
+    /// The versions the client speaks, oldest and newest: answered [`SqlAnswer::Agreed`], the
+    /// newest both speak, before any other request.
+    Hello { oldest: u32, newest: u32 },
+    /// Statements run in order as one transaction on the group's writer: all of them, or none.
+    Write(#[serde(deserialize_with = "crate::transport::bounded::statements")] Vec<Statement>),
+    /// One statement run on this member's own state, asking no leader, as `count` reads.
+    Read(#[serde(deserialize_with = "crate::transport::bounded::statement")] Statement),
+}
+
+/// A `Q` connection's answer to one request ([`SqlRequest`]); variants only appended.
+#[derive(Debug, Serialize, Deserialize)]
+enum SqlAnswer {
+    Agreed(u32),
+    /// Each statement's table, in the order asked.
+    Tables(Vec<Table>),
+    /// The request refused, and why: a write's statements all rolled back, unless the refusal is
+    /// `Timeout` or `UnknownOutcome`, whose write may have committed. The connection goes on.
+    Refused(Refusal),
+}
+
+/// One statement's answer: its columns' names, its rows of SQLite's typed values, and what SQLite
+/// counts after it (the rows the last insert, update or delete changed, and the last rowid).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Table {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+    pub affected: u64,
+    pub last_insert_rowid: i64,
+}
+
+/// A frame read: its bytes, charged to the process's memory budget while they are held; or the
+/// budget's refusal, the frame's bytes read past without being held.
+enum Frame {
+    Held(Vec<u8>, memory::Charge),
+    Refused(Refusal),
+}
+
+/// One frame of at most `max` bytes ([`SqlRequest`], [`SqlAnswer`]); `None` at the end of the
+/// stream. Its bytes are charged to the process's memory budget before they are read.
+fn read_frame(r: &mut impl Read, max: usize) -> anyhow::Result<Option<Frame>> {
+    let mut first = [0u8; 1];
+    let n = loop {
+        match r.read(&mut first) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            read => break read?,
+        }
+    };
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut rest = [0u8; 3];
+    r.read_exact(&mut rest)?;
+    let ([b0], [b1, b2, b3]) = (first, rest);
+    let len = u32::from_le_bytes([b0, b1, b2, b3]);
+    let size = usize::try_from(len)?;
+    let refusal = match amphora_api::bound("a SQL frame", size, max) {
+        Err(refusal) => refusal,
+        Ok(()) => match memory::process().take(Use::Queues, u64::from(len)) {
+            Ok(charge) => {
+                let mut bytes = vec![0u8; size];
+                r.read_exact(&mut bytes)?;
+                return Ok(Some(Frame::Held(bytes, charge)));
+            }
+            Err(refusal) => refusal,
+        },
+    };
+    // Read past through a fixed buffer, never held: the refusal is answered, the connection goes on.
+    let skipped = std::io::copy(&mut r.by_ref().take(u64::from(len)), &mut std::io::sink())?;
+    ensure!(
+        skipped == u64::from(len),
+        "the connection ended inside a frame"
+    );
+    Ok(Some(Frame::Refused(refusal)))
+}
+
+fn write_frame(w: &mut impl Write, bytes: &[u8]) -> anyhow::Result<()> {
+    w.write_all(&u32::try_from(bytes.len())?.to_le_bytes())?;
+    w.write_all(bytes)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// An answer's frame, encoded, and what it holds of the process's memory budget until written.
+struct Encoded {
+    bytes: Vec<u8>,
+    _held: Option<memory::Charge>,
+}
+
+/// `refusal`'s frame: a few bytes, written at once, uncharged.
+fn refused_frame(refusal: Refusal) -> anyhow::Result<Encoded> {
+    Ok(Encoded {
+        bytes: postcard::to_allocvec(&SqlAnswer::Refused(refusal))?,
+        _held: None,
+    })
+}
+
+/// `statements`' tables run on `c`, encoded and charged inside `c`'s session: a write commits only
+/// once its answer is encoded and held, so no committed write is answered refused for want of room
+/// to answer it. Past the API's result bound, TooLarge.
+fn answered(c: &crate::sql::Connection<'_>, statements: Vec<Statement>) -> anyhow::Result<Encoded> {
+    let mut rows = Charged::new();
+    let answer = SqlAnswer::Tables(tables(c, statements, &mut rows)?);
+    let bytes = postcard::to_allocvec(&answer)?;
+    amphora_api::bound("a SQL answer", bytes.len(), amphora_api::RESULT_MAX)?;
+    let held = memory::process().take(Use::Queues, u64::try_from(bytes.len())?)?;
+    Ok(Encoded {
+        bytes,
+        _held: Some(held),
+    })
+}
+
+/// What a request or an answer's rows hold as they're built: their memory, charged to the
+/// process's budget (past its room, its refusal), and their encoded bytes, counted against the
+/// API's result bound (past it, TooLarge); the memory given back when it drops.
+struct Charged {
+    budget: Arc<memory::Budget>,
+    held: u64,
+    encoded: usize,
+}
+
+impl Charged {
+    fn new() -> Self {
+        Self {
+            budget: memory::process(),
+            held: 0,
+            encoded: 0,
+        }
+    }
+
+    /// A decoded request's memory, charged while it runs: its frame was charged by its length, but
+    /// a value decodes to [`Value`]'s size from as little as one byte (bounded in count by
+    /// `transport::bounded`'s decoders, as `C` connections' requests are).
+    fn request(request: &SqlRequest) -> Result<Self, Refusal> {
+        let statement = |s: &Statement| {
+            s.params.iter().map(value_bytes).fold(
+                std::mem::size_of::<Statement>().saturating_add(s.sql.len()),
+                usize::saturating_add,
+            )
+        };
+        let bytes = match request {
+            SqlRequest::Hello { .. } => 0,
+            SqlRequest::Write(statements) => statements
+                .iter()
+                .map(statement)
+                .fold(0, usize::saturating_add),
+            SqlRequest::Read(s) => statement(s),
+        };
+        let mut charged = Self::new();
+        charged.hold(bytes)?;
+        Ok(charged)
+    }
+
+    fn hold(&mut self, bytes: usize) -> Result<(), Refusal> {
+        let bytes =
+            u64::try_from(bytes).map_err(|_| amphora_api::invalid("SQL bytes", "past u64"))?;
+        let after = self
+            .held
+            .checked_add(bytes)
+            .ok_or_else(|| amphora_api::invalid("SQL bytes", "past u64"))?;
+        self.budget.hold(Use::Queues, bytes)?;
+        self.held = after;
+        Ok(())
+    }
+
+    /// `value` read into an answer: refused before it's kept when the answer would pass the
+    /// result bound or the budget's room.
+    fn value(&mut self, value: &Value) -> Result<(), Refusal> {
+        let encoded = postcard::experimental::serialized_size(value)
+            .map_err(|e| amphora_api::invalid("SQL value", &e.to_string()))?;
+        self.encoded(encoded)?;
+        self.hold(value_bytes(value))
+    }
+
+    fn encoded(&mut self, bytes: usize) -> Result<(), Refusal> {
+        let after = self.encoded.saturating_add(bytes);
+        amphora_api::bound("a SQL answer", after, amphora_api::RESULT_MAX)?;
+        self.encoded = after;
+        Ok(())
+    }
+}
+
+impl Drop for Charged {
+    fn drop(&mut self) {
+        self.budget.give(Use::Queues, self.held);
+    }
+}
+
+/// The bytes `value` takes in memory: the value itself and what it points to.
+fn value_bytes(value: &Value) -> usize {
+    let held = match value {
+        Value::Text(text) => text.len(),
+        Value::Blob(bytes) => bytes.len(),
+        Value::Null | Value::Integer(_) | Value::Real(_) => 0,
+    };
+    std::mem::size_of::<Value>().saturating_add(held)
+}
+
+/// `statements` run in order on `c`, each one's table, each value charged to `charged` as it's
+/// read. A statement the engine refuses is refused as `statement N` (counted from 0), typed.
+fn tables(
+    c: &crate::sql::Connection<'_>,
+    statements: Vec<Statement>,
+    charged: &mut Charged,
+) -> anyhow::Result<Vec<Table>> {
+    let mut out = Vec::new();
+    for (i, s) in statements.into_iter().enumerate() {
+        let refused = |e: crate::sql::Error| -> anyhow::Error {
+            match e {
+                crate::sql::Error::Refusal(refusal) => refusal.into(),
+                other => amphora_api::invalid(&format!("statement {i}"), &other.to_string()).into(),
+            }
+        };
+        let columns = c.column_names(&s.sql).map_err(refused)?;
+        charged.encoded(postcard::experimental::serialized_size(&columns)?)?;
+        charged.hold(
+            columns
+                .iter()
+                .map(|name| name.len().saturating_add(std::mem::size_of::<String>()))
+                .fold(std::mem::size_of::<Table>(), usize::saturating_add),
+        )?;
+        let mut rows = Vec::new();
+        {
+            let mut statement = c.prepare(&s.sql).map_err(refused)?;
+            let mut cursor = statement.query(s.params).map_err(refused)?;
+            while let Some(row) = cursor.next().map_err(refused)? {
+                charged.hold(std::mem::size_of::<Vec<Value>>())?;
+                let mut values = Vec::with_capacity(columns.len());
+                for column in 0..columns.len() {
+                    let value = row.get::<_, Value>(column).map_err(refused)?;
+                    charged.value(&value)?;
+                    values.push(value);
+                }
+                rows.push(values);
+            }
+        }
+        out.push(Table {
+            columns,
+            rows,
+            affected: c.changes(),
+            last_insert_rowid: c.last_insert_rowid(),
+        });
+    }
+    Ok(out)
 }
 
 /// One line of at most [`LINE_MAX`] bytes, its end dropped; `None` at the end of the stream.
@@ -663,6 +950,44 @@ fn read_line(r: &mut BufReader<Link>) -> anyhow::Result<Option<String>> {
 }
 
 impl Shared {
+    /// One `Q` request's answer ([`SqlRequest`]), and what its rows hold of the memory budget.
+    fn sql(&self, request: SqlRequest, agreed: &mut Option<u32>) -> anyhow::Result<Encoded> {
+        let until = match after(self.deadline) {
+            Ok(until) => until,
+            Err(e) => return refused_frame(amphora_api::invalid("deadline", &e.to_string())),
+        };
+        let result = match request {
+            SqlRequest::Hello { oldest, newest } => {
+                let both = newest.min(SQL_VERSION);
+                if both < oldest.max(SQL_VERSION_MIN) {
+                    return refused_frame(amphora_api::invalid(
+                        "SQL versions",
+                        &format!(
+                            "the client speaks {oldest} to {newest}, this member {SQL_VERSION_MIN} to {SQL_VERSION}"
+                        ),
+                    ));
+                }
+                *agreed = Some(both);
+                return Ok(Encoded {
+                    bytes: postcard::to_allocvec(&SqlAnswer::Agreed(both))?,
+                    _held: None,
+                });
+            }
+            _ if agreed.is_none() => Err(amphora_api::invalid("SQL request", "asked before Hello")),
+            SqlRequest::Write(_) if self.cut.load(Ordering::Relaxed) => Err(Refusal::Unavailable(
+                "this member is cut off (a drill)".into(),
+            )),
+            SqlRequest::Write(statements) => self.db.call(until, move |c| answered(c, statements)),
+            SqlRequest::Read(statement) => self
+                .db
+                .query_local(until, move |c| answered(c, vec![statement])),
+        };
+        match result {
+            Ok(encoded) => Ok(encoded),
+            Err(refusal) => refused_frame(refusal),
+        }
+    }
+
     fn answer(&self, line: &str) -> String {
         match self.request(line) {
             Ok(v) if v.is_empty() => "ok".to_owned(),
@@ -962,6 +1287,77 @@ impl Client {
             .unwrap_or(&back)
             .trim_start()
             .to_owned())
+    }
+}
+
+/// A client of one member's SQL (`Q` connections; docs/design/client-protocol.md, decision 2):
+/// statements with bound parameters, answered with SQLite's typed rows and their columns' names,
+/// over one connection kept for every request.
+pub struct SqlClient {
+    r: BufReader<Link>,
+    /// An exchange failed partway (a timeout, a cut link, an answer this process couldn't hold):
+    /// its answer may still come, so no later request may read it as its own.
+    broken: bool,
+}
+
+impl SqlClient {
+    /// A SQL client of the member at `addr`, its link proving `keys`, the versions agreed.
+    pub fn connect(addr: &str, keys: &Keys, deadline: Duration) -> anyhow::Result<Self> {
+        let (r, _socket) = open(addr, keys, deadline, SQL)?;
+        let mut client = Self { r, broken: false };
+        match client.ask(&SqlRequest::Hello {
+            oldest: SQL_VERSION_MIN,
+            newest: SQL_VERSION,
+        })? {
+            SqlAnswer::Agreed(_) => Ok(client),
+            SqlAnswer::Refused(refusal) => Err(refusal.into()),
+            SqlAnswer::Tables(_) => bail!("the member answered its greeting with tables"),
+        }
+    }
+
+    /// `statements` run in order as one transaction on the member's group's writer: each one's
+    /// table; or the member's refusal (a [`Refusal`] inside the error), every statement rolled back.
+    pub fn write(&mut self, statements: Vec<Statement>) -> anyhow::Result<Vec<Table>> {
+        self.tables(&SqlRequest::Write(statements))
+    }
+
+    /// `statement` run on the member's own state, asking no leader: its table.
+    pub fn read(&mut self, statement: Statement) -> anyhow::Result<Table> {
+        self.tables(&SqlRequest::Read(statement))?
+            .pop()
+            .ok_or_else(|| anyhow!("a read answered with no table"))
+    }
+
+    fn tables(&mut self, request: &SqlRequest) -> anyhow::Result<Vec<Table>> {
+        match self.ask(request)? {
+            SqlAnswer::Tables(tables) => Ok(tables),
+            SqlAnswer::Refused(refusal) => Err(refusal.into()),
+            SqlAnswer::Agreed(_) => bail!("the member answered a request with a greeting"),
+        }
+    }
+
+    fn ask(&mut self, request: &SqlRequest) -> anyhow::Result<SqlAnswer> {
+        ensure!(
+            !self.broken,
+            "an earlier request on this connection failed partway: open another"
+        );
+        let bytes = postcard::to_allocvec(request)?;
+        amphora_api::bound("a SQL request", bytes.len(), amphora_api::REQUEST_MAX)?;
+        self.broken = true;
+        write_frame(self.r.get_mut(), &bytes)?;
+        let answer = match read_frame(&mut self.r, amphora_api::RESULT_MAX)? {
+            Some(Frame::Held(bytes, _charge)) => postcard::from_bytes(&bytes)?,
+            // Not the member's refusal: a write's outcome is unknown here, so no `Refusal` to read
+            // as rolled back.
+            Some(Frame::Refused(refusal)) => {
+                bail!(
+                    "this process's memory budget refused the member's answer ({refusal}): its outcome is unknown here"
+                )
+            }
+            None => bail!("the member closed the connection"),
+        };
+        self.broken = false;
+        Ok(answer)
     }
 }
 
@@ -1503,5 +1899,158 @@ mod tests {
         assert_eq!(h.at(500), 1024);
         assert_eq!(h.at(999), 131_072);
         assert_eq!(Hist::default().at(500), 0);
+    }
+
+    fn statement(sql: &str, params: Vec<Value>) -> Statement {
+        Statement {
+            sql: sql.to_owned(),
+            params,
+        }
+    }
+
+    fn sql_until() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2's bounds): do decode a `Q` request with one parameter past
+    /// the API's transaction bound, as a write and as a read; expect both refused while decoding,
+    /// as a `C` connection's are, and the same request at the bound decoded and its memory charged.
+    #[test]
+    fn cp_t1_13_a_sql_request_past_the_parameter_bound_is_refused_while_decoding() {
+        let nulls = |n| vec![Value::Null; n];
+        for request in [
+            SqlRequest::Write(vec![statement("SELECT 1", nulls(amphora_api::TX_MAX + 1))]),
+            SqlRequest::Read(statement("SELECT 1", nulls(amphora_api::TX_MAX + 1))),
+            SqlRequest::Write(vec![statement("SELECT 1", vec![]); amphora_api::TX_MAX + 1]),
+        ] {
+            let bytes = postcard::to_allocvec(&request).unwrap();
+            assert!(
+                postcard::from_bytes::<SqlRequest>(&bytes).is_err(),
+                "decoded {} bytes past the bound",
+                bytes.len()
+            );
+        }
+        let at = SqlRequest::Read(statement("SELECT 1", nulls(amphora_api::TX_MAX)));
+        let decoded: SqlRequest =
+            postcard::from_bytes(&postcard::to_allocvec(&at).unwrap()).unwrap();
+        let charged = Charged::request(&decoded).unwrap();
+        assert!(
+            charged.held
+                >= u64::try_from(amphora_api::TX_MAX * std::mem::size_of::<Value>()).unwrap(),
+            "charged {} for {} decoded values",
+            charged.held,
+            amphora_api::TX_MAX
+        );
+    }
+
+    /// CP-T1.13, AC-T1.2.3: do read a row of two values, each one byte past half the API's result
+    /// bound (its request within the request bound); expect the read refused TooLarge (not
+    /// Invalid), and a write whose answer passes the bound refused TooLarge with its insert rolled
+    /// back: the answer is held inside the write's transaction.
+    #[test]
+    fn cp_t1_13_a_sql_answer_past_the_result_bound_is_refused_too_large_and_its_write_rolled_back()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("q.db"), sql_until()).unwrap();
+        db.call(sql_until(), |c| {
+            answered(
+                c,
+                vec![statement("CREATE TABLE t (id INTEGER PRIMARY KEY)", vec![])],
+            )
+        })
+        .unwrap();
+        let half = || Value::Blob(vec![0; amphora_api::RESULT_MAX / 2 + 1]);
+        let read = db.query_local(sql_until(), move |c| {
+            answered(c, vec![statement("SELECT ?1, ?1", vec![half()])])
+        });
+        assert!(
+            matches!(read, Err(Refusal::TooLarge { .. })),
+            "{:?}",
+            read.map(|e| e.bytes.len())
+        );
+        let write = db.call(sql_until(), move |c| {
+            answered(
+                c,
+                vec![
+                    statement("INSERT INTO t VALUES (1)", vec![]),
+                    statement("SELECT ?1, ?1", vec![half()]),
+                ],
+            )
+        });
+        assert!(
+            matches!(write, Err(Refusal::TooLarge { .. })),
+            "{:?}",
+            write.map(|e| e.bytes.len())
+        );
+        let count = db
+            .query_local(sql_until(), |c| {
+                answered(c, vec![statement("SELECT count(*) FROM t", vec![])])
+            })
+            .unwrap();
+        let SqlAnswer::Tables(tables) = postcard::from_bytes::<SqlAnswer>(&count.bytes).unwrap()
+        else {
+            panic!("not tables");
+        };
+        assert_eq!(
+            tables[0].rows,
+            vec![vec![Value::Integer(0)]],
+            "the refused write's insert stayed"
+        );
+    }
+
+    /// CP-T1.13, AC-T1.2.3: do ask a member that takes a request and never answers it, past the
+    /// client's deadline; expect that request to fail and the next on the same connection refused
+    /// before it is sent, so no later request reads the late answer as its own.
+    #[test]
+    fn cp_t1_13_a_sql_connection_is_not_reused_after_a_request_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (done, wait) = mpsc::channel::<()>();
+        let member = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut kind = [0u8; 1];
+            s.read_exact(&mut kind).unwrap();
+            s.write_all(&[0u8; NONCE]).unwrap();
+            let mut tag = [0u8; TAG];
+            s.read_exact(&mut tag).unwrap();
+            let Some(Frame::Held(hello, _)) = read_frame(&mut s, amphora_api::REQUEST_MAX).unwrap()
+            else {
+                panic!("no greeting");
+            };
+            assert!(matches!(
+                postcard::from_bytes::<SqlRequest>(&hello).unwrap(),
+                SqlRequest::Hello { .. }
+            ));
+            write_frame(
+                &mut s,
+                &postcard::to_allocvec(&SqlAnswer::Agreed(SQL_VERSION)).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                read_frame(&mut s, amphora_api::REQUEST_MAX)
+                    .unwrap()
+                    .is_some(),
+                "the request"
+            );
+            wait.recv().unwrap();
+            matches!(read_frame(&mut s, amphora_api::REQUEST_MAX), Ok(None))
+        });
+        let keys = Keys {
+            secret: vec![7; 32],
+            tls: None,
+        };
+        let mut client = SqlClient::connect(&addr, &keys, Duration::from_millis(200)).unwrap();
+        assert!(
+            client.read(statement("SELECT 1", vec![])).is_err(),
+            "an unanswered request"
+        );
+        let again = client.read(statement("SELECT 1", vec![])).unwrap_err();
+        assert!(format!("{again:#}").contains("failed partway"), "{again:#}");
+        drop(client);
+        done.send(()).unwrap();
+        assert!(
+            member.join().unwrap(),
+            "a second request reached the member"
+        );
     }
 }

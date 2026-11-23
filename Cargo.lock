@@ -98,6 +98,7 @@ dependencies = [
  "hyper-durable",
  "hyper-log",
  "hyper-raft",
+ "hyper-rt",
  "hyper-timing",
  "hyper-tls",
  "memory-stats",
