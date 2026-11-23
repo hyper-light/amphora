@@ -20,6 +20,7 @@ pub(crate) mod encryption;
 pub(crate) mod journal_mode;
 pub(crate) mod key_heads;
 pub mod log_index;
+pub mod log_segments;
 pub mod optimistic_pages;
 pub(crate) mod packed;
 #[cfg(feature = "aristo-instr")]

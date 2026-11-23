@@ -1604,10 +1604,6 @@ impl BuildSharedWal {
                 frame_cache_high_water: AtomicU64::new(0),
                 file: Some(file.clone()),
                 read_locks,
-                vacuum_lock: PaddedLock::new(TursoRwLock::new()),
-                write_lock: PaddedLock::new(TursoRwLock::new()),
-                checkpoint_lock: PaddedLock::new(TursoRwLock::new()),
-                released: Arc::default(),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),

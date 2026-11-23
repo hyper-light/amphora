@@ -491,7 +491,8 @@ its owner asks again on the leader change.
   shown gone by the two tests and their red arm.
 - Re-checked after merging main again (its 0009 update, lane V6) at f0fb2e8f (r1306): clippy clean as above, the three
   tests pass, the `database::replicated` suite 143 passed, 0 failed, 5 ignored; `vendor.py check hyper-raft` 8 recorded
-  changes, 0 differences.
+  changes, 0 differences. Main moved once more (lane K8's replicated.rs): at 124ef7e9, the tip merged to main, the same
+  checks again (18:03-18:05Z): clippy clean, the three tests pass, the suite 143 passed, 0 failed, 5 ignored.
 
 ## 4. The read-or-write tag on member requests (not started)
 
