@@ -240,6 +240,7 @@ impl ExternalFunc {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_aggregate(
         name: String,
         argc: i32,

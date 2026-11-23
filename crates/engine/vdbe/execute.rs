@@ -8622,7 +8622,7 @@ pub(crate) fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<
         }
         AggFunc::External(_) => {
             mark_unlikely();
-            // External aggregates are finalized via AggContext::compute_external()
+            // External aggregates are finalized by ExtFunc::finalize_aggregate.
             return Err(LimboError::InternalError(
                 "finalize_agg_payload called for External aggregate".to_string(),
             ));
