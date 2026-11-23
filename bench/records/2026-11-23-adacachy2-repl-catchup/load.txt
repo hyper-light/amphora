@@ -1,0 +1,60 @@
+amphora-procs-persisted behind 0 start 2026-11-23T16:36:00Z load 7.29 13.04 26.64 | cpu some avg10=0.12 avg60=1.00 avg300=1.75 total=11629061902 | io full avg10=1.12 avg60=0.92 avg300=2.51 total=15785808162
+amphora-procs-persisted behind 0 exit 0
+amphora-procs-replicated behind 0 start 2026-11-23T16:36:01Z load 7.29 13.04 26.64 | cpu some avg10=0.12 avg60=1.00 avg300=1.75 total=11629064802 | io full avg10=1.12 avg60=0.92 avg300=2.51 total=15785817267
+amphora-procs-replicated behind 0 exit 0
+rqlite behind 0 start 2026-11-23T16:36:01Z load 7.29 13.04 26.64 | cpu some avg10=0.12 avg60=1.00 avg300=1.75 total=11629068309 | io full avg10=1.12 avg60=0.92 avg300=2.51 total=15785822690
+rqlite behind 0 exit 0
+dqlite behind 0 start 2026-11-23T16:36:04Z load 7.02 12.89 26.52 | cpu some avg10=0.08 avg60=0.93 avg300=1.72 total=11629087903 | io full avg10=0.90 avg60=0.89 avg300=2.48 total=15785864189
+dqlite behind 0 exit 0
+libsql behind 0 start 2026-11-23T16:36:08Z load 6.78 12.74 26.40 | cpu some avg10=0.05 avg60=0.87 avg300=1.70 total=11629106691 | io full avg10=0.93 avg60=0.90 avg300=2.46 total=15785911475
+libsql behind 0 exit 0
+litefs behind 0 start 2026-11-23T16:36:08Z load 6.78 12.74 26.40 | cpu some avg10=0.05 avg60=0.87 avg300=1.70 total=11629109741 | io full avg10=0.93 avg60=0.90 avg300=2.46 total=15785920098
+litefs behind 0 exit 0
+litefs behind 0 start 2026-11-23T16:36:09Z load 6.78 12.74 26.40 | cpu some avg10=0.05 avg60=0.87 avg300=1.70 total=11629115730 | io full avg10=0.93 avg60=0.90 avg300=2.46 total=15785928963
+litefs behind 0 exit 0
+libsql behind 0 start 2026-11-23T16:36:11Z load 6.78 12.74 26.40 | cpu some avg10=0.04 avg60=0.84 avg300=1.69 total=11629120564 | io full avg10=0.94 avg60=0.90 avg300=2.45 total=15785934948
+libsql behind 0 exit 0
+dqlite behind 0 start 2026-11-23T16:36:11Z load 6.78 12.74 26.40 | cpu some avg10=0.04 avg60=0.84 avg300=1.69 total=11629122205 | io full avg10=0.94 avg60=0.90 avg300=2.45 total=15785940029
+dqlite behind 0 exit 0
+rqlite behind 0 start 2026-11-23T16:36:14Z load 6.80 12.64 26.29 | cpu some avg10=0.02 avg60=0.79 avg300=1.66 total=11629141064 | io full avg10=0.63 avg60=0.85 avg300=2.41 total=15785969666
+rqlite behind 0 exit 0
+amphora-procs-replicated behind 0 start 2026-11-23T16:36:17Z load 6.80 12.64 26.29 | cpu some avg10=0.38 avg60=0.83 avg300=1.67 total=11629209203 | io full avg10=1.60 avg60=1.01 avg300=2.44 total=15786257025
+amphora-procs-replicated behind 0 exit 0
+amphora-procs-persisted behind 0 start 2026-11-23T16:36:18Z load 6.90 12.56 26.20 | cpu some avg10=0.31 avg60=0.80 avg300=1.65 total=11629211036 | io full avg10=2.76 avg60=1.24 avg300=2.48 total=15786263088
+amphora-procs-persisted behind 0 exit 0
+amphora-procs-persisted behind 0 start 2026-11-23T16:36:18Z load 6.90 12.56 26.20 | cpu some avg10=0.31 avg60=0.80 avg300=1.65 total=11629214349 | io full avg10=2.76 avg60=1.24 avg300=2.48 total=15786270072
+amphora-procs-persisted behind 0 exit 0
+amphora-procs-replicated behind 0 start 2026-11-23T16:36:19Z load 6.90 12.56 26.20 | cpu some avg10=0.31 avg60=0.80 avg300=1.65 total=11629216032 | io full avg10=2.76 avg60=1.24 avg300=2.48 total=15786274889
+amphora-procs-replicated behind 0 exit 0
+rqlite behind 0 start 2026-11-23T16:36:19Z load 6.90 12.56 26.20 | cpu some avg10=0.31 avg60=0.80 avg300=1.65 total=11629218193 | io full avg10=2.76 avg60=1.24 avg300=2.48 total=15786280629
+rqlite behind 0 exit 0
+dqlite behind 0 start 2026-11-23T16:36:21Z load 6.90 12.56 26.20 | cpu some avg10=0.25 avg60=0.77 avg300=1.64 total=11629228078 | io full avg10=2.44 avg60=1.23 avg300=2.47 total=15786297245
+dqlite behind 0 exit 0
+libsql behind 0 start 2026-11-23T16:36:22Z load 6.90 12.56 26.20 | cpu some avg10=0.21 avg60=0.75 avg300=1.63 total=11629230498 | io full avg10=2.00 avg60=1.19 avg300=2.45 total=15786301565
+libsql behind 0 exit 0
+litefs behind 0 start 2026-11-23T16:36:22Z load 6.90 12.56 26.20 | cpu some avg10=0.21 avg60=0.75 avg300=1.63 total=11629231149 | io full avg10=2.00 avg60=1.19 avg300=2.45 total=15786302730
+litefs behind 0 exit 0
+litefs behind 0 start 2026-11-23T16:36:23Z load 6.90 12.47 26.09 | cpu some avg10=0.21 avg60=0.75 avg300=1.63 total=11629236737 | io full avg10=2.00 avg60=1.19 avg300=2.45 total=15786308393
+litefs behind 0 exit 0
+libsql behind 0 start 2026-11-23T16:36:24Z load 6.90 12.47 26.09 | cpu some avg10=0.17 avg60=0.72 avg300=1.62 total=11629242198 | io full avg10=1.63 avg60=1.15 avg300=2.43 total=15786314284
+libsql behind 0 exit 0
+dqlite behind 0 start 2026-11-23T16:36:24Z load 6.90 12.47 26.09 | cpu some avg10=0.17 avg60=0.72 avg300=1.62 total=11629243463 | io full avg10=1.63 avg60=1.15 avg300=2.43 total=15786315319
+dqlite behind 0 exit 0
+rqlite behind 0 start 2026-11-23T16:36:25Z load 6.90 12.47 26.09 | cpu some avg10=0.17 avg60=0.72 avg300=1.62 total=11629245013 | io full avg10=1.63 avg60=1.15 avg300=2.43 total=15786319367
+rqlite behind 0 exit 0
+amphora-procs-replicated behind 0 start 2026-11-23T16:36:29Z load 6.75 12.35 25.98 | cpu some avg10=0.11 avg60=0.68 avg300=1.60 total=11629264773 | io full avg10=1.09 avg60=1.08 avg300=2.40 total=15786346070
+amphora-procs-replicated behind 0 exit 0
+amphora-procs-persisted behind 0 start 2026-11-23T16:36:29Z load 6.75 12.35 25.98 | cpu some avg10=0.11 avg60=0.68 avg300=1.60 total=11629267030 | io full avg10=1.09 avg60=1.08 avg300=2.40 total=15786350405
+amphora-procs-persisted behind 0 exit 0
+amphora-procs-persisted behind 0 start 2026-11-23T16:36:29Z load 6.75 12.35 25.98 | cpu some avg10=0.11 avg60=0.68 avg300=1.60 total=11629269940 | io full avg10=1.09 avg60=1.08 avg300=2.40 total=15786356807
+amphora-procs-persisted behind 0 exit 0
+amphora-procs-replicated behind 0 start 2026-11-23T16:36:30Z load 6.75 12.35 25.98 | cpu some avg10=0.09 avg60=0.65 avg300=1.59 total=11629272900 | io full avg10=0.89 avg60=1.04 avg300=2.38 total=15786363219
+amphora-procs-replicated behind 0 exit 0
+rqlite behind 0 start 2026-11-23T16:36:30Z load 6.75 12.35 25.98 | cpu some avg10=0.09 avg60=0.65 avg300=1.59 total=11629276146 | io full avg10=0.89 avg60=1.04 avg300=2.38 total=15786368323
+rqlite behind 0 exit 0
+dqlite behind 0 start 2026-11-23T16:36:33Z load 6.69 12.24 25.87 | cpu some avg10=0.07 avg60=0.63 avg300=1.57 total=11629290494 | io full avg10=0.91 avg60=1.04 avg300=2.37 total=15786397568
+dqlite behind 0 exit 0
+libsql behind 0 start 2026-11-23T16:36:33Z load 6.69 12.24 25.87 | cpu some avg10=0.07 avg60=0.63 avg300=1.57 total=11629292568 | io full avg10=0.91 avg60=1.04 avg300=2.37 total=15786400661
+libsql behind 0 exit 0
+litefs behind 0 start 2026-11-23T16:36:34Z load 6.69 12.24 25.87 | cpu some avg10=0.06 avg60=0.61 avg300=1.56 total=11629293588 | io full avg10=0.75 avg60=1.01 avg300=2.36 total=15786401454
+litefs behind 0 exit 0
