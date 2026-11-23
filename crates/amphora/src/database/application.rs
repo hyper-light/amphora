@@ -120,15 +120,14 @@ impl Database {
         };
         let outcome = database
             .call_db(until, move |db| raise(db, wanted, replicated))
-            .map_err(|refusal| {
+            .inspect_err(|refusal| {
                 if let Writer::Replicated { client, .. } = &self.shared.writer
-                    && matches!(&refusal, Refusal::Serialization { .. })
+                    && matches!(refusal, Refusal::Serialization { .. })
                 {
                     client
                         .handle()
-                        .floor_refused(FloorRefusal::StaleBase, &refusal);
+                        .floor_refused(FloorRefusal::StaleBase, refusal);
                 }
-                refusal
             })?;
         match outcome {
             Ok(floor) => Ok(WriterBoundary { database, floor }),
