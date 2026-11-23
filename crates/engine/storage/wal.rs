@@ -10195,7 +10195,13 @@ pub mod test {
                         // Past the bitmap's words too: 64 and up are past every page written.
                         for page in (0..48u64).chain([64, 200, 1 << 40]) {
                             let locked =
-                                coordination.find_frame_locked(page, min_frame, max_frame, None);
+                                coordination.find_frame_locked(
+                                    shared.current_id(),
+                                    page,
+                                    min_frame,
+                                    max_frame,
+                                    None,
+                                );
                             let index = |build: &mut super::super::log_index::FromIndex<'_>| {
                                 let guard = shared.current().read();
                                 let frame_cache = guard.runtime.frame_cache.lock();
@@ -10309,7 +10315,13 @@ pub mod test {
                                 let fast =
                                     coordination.find_frame(page, min_frame, max_frame, None);
                                 let locked = coordination
-                                    .find_frame_locked(page, min_frame, max_frame, None);
+                                    .find_frame_locked(
+                                        coordination.log.current_id(),
+                                        page,
+                                        min_frame,
+                                        max_frame,
+                                        None,
+                                    );
                                 assert_eq!(
                                     fast, locked,
                                     "{mode:?} page {page} {min_frame}..={max_frame}"
