@@ -264,7 +264,7 @@ mod tests {
     fn run_rows<A: AggFunc<State = PctState>>(rows: &[(f64, f64)]) -> Result<Value, A::Error> {
         let mut state = PctState::default();
         for (y, p) in rows {
-            A::step(&mut state, &[Value::from_float(*y), Value::from_float(*p)]);
+            A::step(&mut state, &[Value::from_float(*y), Value::from_float(*p)])?;
         }
         A::finalize(state)
     }
