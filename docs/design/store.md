@@ -2185,9 +2185,13 @@ before any frame of the current one.
 
 - **The shape.** Each segment is `Current`, `Closing { reads, copied, shipped }` or `Free`. A switch turns the current
   segment into `Closing` and a `Free` one into `Current`. A reset turns `Closing { reads: 0, copied: true, shipped:
-  true }` into `Free`. The writer switches only into a `Free` segment. A read's snapshot is the closing segment
-  whole, if there is one, plus the current one up to its last commit. A page is looked up in the current segment,
-  then the closing one, then the file. Each segment keeps its own frame index: the frame cache and decision 40's
+  true }` into `Free`. The writer switches only into a `Free` segment. A read begun while the closing segment is not
+  yet copied whole into a flushed file takes that segment whole in its snapshot, plus the current one up to its last
+  commit, and counts itself on both. A read begun once it is copied takes the current segment alone and reads the
+  rest from the file, where every closing frame now is, and counts itself on the current one only. Without that
+  rule, reads that overlap with no gap between them would keep the closing segment's count above zero for ever, and
+  the writer could never switch again (revised 2026-11-23, lane B6). A page is looked up in the current segment,
+  then the closing one if the read counts on it, then the file. Each segment keeps its own frame index: the frame cache and decision 40's
   lock-free index are per segment, because frame numbers start again in each.
 - **Checkpoints.** The checkpointer copies the closing segment first and the current one's frames only after it. The
   other order is wrong: a frame copied from the current segment would be overwritten by an older one copied after it.
@@ -2198,13 +2202,15 @@ before any frame of the current one.
   (10-14 ms on fedora, decision 4).
 - **The reset, on an event.** The closing segment is reset (`Free`) once it is copied whole, the file is flushed, a
   backup has shipped it (decision 31's backup rule moves from the restart to the reset), and no read can look into
-  it. Each read counts itself on the segments its snapshot reaches. The reset is made by whichever of two events
-  comes last: the give-back of the last read counted on the segment (its count reaching zero), or the checkpointer's
-  pass that copies its last frame. Each already happens, so the reset needs no timer and no poll. It writes nothing.
+  it. Each read counts itself on the segments its snapshot reaches (The shape). The reset is made by whichever of
+  its events comes last: the give-back of the last read counted on the segment (its count reaching zero), the
+  checkpointer's pass that copies its last frame and flushes the file, or, for a backed-up database, the backup's
+  word that it shipped the segment. Each already happens, so the reset needs no timer and no poll. It writes nothing.
   The segment's frames stay until the next switch writes a new header over them (decision 13). Decision 31's cut of
   a log past twice its bound applies to a segment at its reset.
 - **Bounded.** A read holds a segment for at most its request's deadline D. Reads begun before the switch end by D
-  after it. Reads begun before the closing segment's copy finished end by D after that. So a closing segment is free
+  after it. Reads begun before the closing segment's copy finished end by D after that, and no read begun after
+  it counts on the segment (The shape). So a closing segment is free
   within 2D plus one copy of it after the switch. If the current segment reaches its bound first, the writer keeps
   appending to it past the bound and switches at its first turn after the reset. It waits for nothing either way.
   Each segment then holds at most its bound plus what the writer appends in 2D plus one copy. The A/B below measures
