@@ -5,6 +5,18 @@
 
 use std::iter;
 
+/// [`Segments::pack`]'s word: bits 0-29 count the current segment's reads and bits 30-59 the
+/// closing one's; bit 60 says the closing segment is shipped, 61 that it is copied, 62 that the
+/// other segment is closing rather than free, and 63 that the second segment is current. The
+/// word is 64 bits, the widest every platform swaps without a lock; the four flags take four, and
+/// the two counts take half each of the 60 left.
+const READS: u64 = 0x3FFF_FFFF;
+const CLOSING_READS_SHIFT: u32 = 30;
+const SHIPPED: u64 = 0x1000_0000_0000_0000;
+const COPIED: u64 = 0x2000_0000_0000_0000;
+const CLOSING: u64 = 0x4000_0000_0000_0000;
+const SECOND_CURRENT: u64 = 0x8000_0000_0000_0000;
+
 /// One of the log's two files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SegmentId {
@@ -152,6 +164,13 @@ impl Segments {
     /// thing it waited for. A segment a read counts on is never reset under it, so each segment in
     /// `span` is still current or closing.
     pub fn end_read(&mut self, span: ReadSpan) -> Option<SegmentId> {
+        self.release(&span)
+    }
+
+    /// [`Self::end_read`] for a state kept in the shared memory, which another process can change
+    /// between a load and the swap that stores the result: the caller applies the same span to
+    /// what it loads again until its swap holds.
+    pub fn release(&mut self, span: &ReadSpan) -> Option<SegmentId> {
         for segment in span.lookup_order() {
             if segment == self.current {
                 self.reads = self.reads.saturating_sub(1);
@@ -196,6 +215,64 @@ impl Segments {
             closing.shipped = true;
         }
         self.reset_if_done()
+    }
+
+    /// This state with the read counts of `counted`: what a process recovered at open, published
+    /// over the shared memory's word without losing a read another connection counted there.
+    pub fn with_reads_of(self, counted: Self) -> Self {
+        Self {
+            current: self.current,
+            reads: counted.reads,
+            other: self.other.map(|closing| Closing {
+                reads: counted.other.map_or(0, |counted| counted.reads),
+                ..closing
+            }),
+        }
+    }
+
+    /// This state as one word of the multi-process shared memory, so that every process's reads
+    /// count where every process's checkpointer sees them, and a read's begin and its end each
+    /// change it with one swap. None when a count is past what its bits hold: the read that would
+    /// take it there is refused.
+    pub fn pack(&self) -> Option<u64> {
+        let mut word = self.reads;
+        if word > READS {
+            return None;
+        }
+        if self.current == SegmentId::Second {
+            word |= SECOND_CURRENT;
+        }
+        if let Some(closing) = self.other {
+            if closing.reads > READS {
+                return None;
+            }
+            word |= CLOSING | closing.reads.wrapping_shl(CLOSING_READS_SHIFT);
+            if closing.copied {
+                word |= COPIED;
+            }
+            if closing.shipped {
+                word |= SHIPPED;
+            }
+        }
+        Some(word)
+    }
+
+    /// The state [`Self::pack`] stored in `word`.
+    pub fn unpack(word: u64) -> Self {
+        let current = if word & SECOND_CURRENT == 0 {
+            SegmentId::First
+        } else {
+            SegmentId::Second
+        };
+        Self {
+            current,
+            reads: word & READS,
+            other: (word & CLOSING != 0).then(|| Closing {
+                reads: word.wrapping_shr(CLOSING_READS_SHIFT) & READS,
+                copied: word & COPIED != 0,
+                shipped: word & SHIPPED != 0,
+            }),
+        }
     }
 
     fn reset_if_done(&mut self) -> Option<SegmentId> {
@@ -359,6 +436,46 @@ mod tests {
         assert_eq!(backed_up.copied(), None);
         assert_eq!(backed_up.shipped(), Some(SegmentId::Second));
         assert_eq!(backed_up.switch(true), Some(SegmentId::Second));
+    }
+
+    /// Do: pack each kind of state into the shared memory's word, counts at their widest too, and
+    /// one count past it. Expect: each unpacks to itself, and a count past its bits is refused.
+    #[test]
+    fn d45_the_shared_word_holds_every_state_and_refuses_a_count_past_its_bits() {
+        let mut log = Segments::new(SegmentId::Second);
+        let mut states = vec![log];
+        let read = log.begin_read();
+        states.push(log);
+        assert_eq!(log.switch(true), Some(SegmentId::First));
+        states.push(log);
+        assert_eq!(log.copied(), None);
+        states.push(log);
+        let widest = Segments {
+            current: SegmentId::First,
+            reads: READS,
+            other: Some(Closing {
+                reads: READS,
+                copied: false,
+                shipped: true,
+            }),
+        };
+        states.push(widest);
+        for state in states {
+            let word = state.pack().expect("fits");
+            assert_eq!(Segments::unpack(word), state);
+        }
+        let past = Segments {
+            reads: READS + 1,
+            ..widest
+        };
+        assert_eq!(past.pack(), None);
+        let mut closing_past = widest;
+        closing_past.reads = 0;
+        if let Some(closing) = &mut closing_past.other {
+            closing.reads = READS + 1;
+        }
+        assert_eq!(closing_past.pack(), None);
+        assert_eq!(log.end_read(read), None);
     }
 
     /// Do: recover from each pair of headers a switch or a crash in one can leave, at the

@@ -23,6 +23,7 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
+use crate::storage::log_segments::{ReadSpan, SegmentId, Segments};
 use crate::{
     io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
     sync::{
@@ -38,7 +39,7 @@ use std::ptr::NonNull;
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 /// Durable `.tshm` file-format version. Bump whenever persisted layout changes.
-const SHARED_WAL_COORDINATION_VERSION: u32 = 1;
+const SHARED_WAL_COORDINATION_VERSION: u32 = 2;
 /// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.
@@ -588,6 +589,34 @@ struct SharedWalCoordinationMapHeader {
     backfill_proof_crc32c: AtomicU32,
     writer_owner: AtomicU64,
     checkpoint_owner: AtomicU64,
+    /// Decision 45: the log's two segments and every process's reads on each
+    /// ([`Segments::pack`]), so a checkpointer sees the reads of other processes.
+    segments: AtomicU64,
+    /// The other segment's header, beside the current one's above, written and
+    /// read under `snapshot_seq` like it ([`SharedSegmentHeader`]).
+    other_max_frame: AtomicU64,
+    other_nbackfills: AtomicU64,
+    other_checkpoint_seq: AtomicU32,
+    other_page_size: AtomicU32,
+    other_salt_1: AtomicU32,
+    other_salt_2: AtomicU32,
+    other_checksum_1: AtomicU32,
+    other_checksum_2: AtomicU32,
+}
+
+/// One segment's header as the shared memory carries it for the segment that is
+/// not current (decision 45): its log header, its last commit frame and what of
+/// it is copied into the database file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SharedSegmentHeader {
+    pub max_frame: u64,
+    pub nbackfills: u64,
+    pub checkpoint_seq: u32,
+    pub page_size: u32,
+    pub salt_1: u32,
+    pub salt_2: u32,
+    pub checksum_1: u32,
+    pub checksum_2: u32,
 }
 
 #[repr(C)]
@@ -1231,6 +1260,116 @@ impl MappedSharedWalCoordination {
             }
             std::hint::spin_loop();
         }
+    }
+
+    /// The log's segments as every process has counted its reads on them.
+    pub(crate) fn segments(&self) -> Segments {
+        Segments::unpack(self.header().segments.load(Ordering::Acquire))
+    }
+
+    /// A read begins in some process: counted on the segments it reaches, where
+    /// every process sees it. None when a count is at the most its bits hold: the
+    /// read is refused and tried again. The swap is lock-free: it is tried again
+    /// only after another read's begin or end changed the word, and that one's
+    /// swap held.
+    pub(crate) fn begin_read(&self) -> Option<ReadSpan> {
+        let word = &self.header().segments;
+        let mut seen = word.load(Ordering::Acquire);
+        loop {
+            let mut segments = Segments::unpack(seen);
+            let span = segments.begin_read();
+            let next = segments.pack()?;
+            match word.compare_exchange_weak(seen, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(span),
+                Err(now) => seen = now,
+            }
+        }
+    }
+
+    /// The read that began with `span` is done: the segment this resets, if the
+    /// read was the last thing it waited for. A state loaded and lowered always
+    /// packs; were it not to, the count would stay, holding the segment rather
+    /// than freeing it under a read.
+    pub(crate) fn end_read(&self, span: ReadSpan) -> Option<SegmentId> {
+        let word = &self.header().segments;
+        let mut seen = word.load(Ordering::Acquire);
+        loop {
+            let mut segments = Segments::unpack(seen);
+            let reset = segments.release(&span);
+            let next = segments.pack()?;
+            match word.compare_exchange_weak(seen, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return reset,
+                Err(now) => seen = now,
+            }
+        }
+    }
+
+    /// Publish what this process recovered at open (which segment is current, and
+    /// the other's state), keeping every read already counted.
+    pub(crate) fn seed_segments(&self, recovered: Segments) {
+        let word = &self.header().segments;
+        let mut seen = word.load(Ordering::Acquire);
+        loop {
+            let Some(next) = recovered.with_reads_of(Segments::unpack(seen)).pack() else {
+                return;
+            };
+            match word.compare_exchange_weak(seen, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(now) => seen = now,
+            }
+        }
+    }
+
+    /// The header of the segment that is not current.
+    pub(crate) fn other_segment(&self) -> SharedSegmentHeader {
+        let header = self.header();
+        loop {
+            let seq_before = header.snapshot_seq.load(Ordering::Acquire);
+            if seq_before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let other = SharedSegmentHeader {
+                max_frame: header.other_max_frame.load(Ordering::Acquire),
+                nbackfills: header.other_nbackfills.load(Ordering::Acquire),
+                checkpoint_seq: header.other_checkpoint_seq.load(Ordering::Acquire),
+                page_size: header.other_page_size.load(Ordering::Acquire),
+                salt_1: header.other_salt_1.load(Ordering::Acquire),
+                salt_2: header.other_salt_2.load(Ordering::Acquire),
+                checksum_1: header.other_checksum_1.load(Ordering::Acquire),
+                checksum_2: header.other_checksum_2.load(Ordering::Acquire),
+            };
+            if seq_before == header.snapshot_seq.load(Ordering::Acquire) {
+                return other;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Replace the header of the segment that is not current.
+    pub(crate) fn install_other_segment(&self, other: SharedSegmentHeader) {
+        self.with_snapshot_write(|header| {
+            header
+                .other_max_frame
+                .store(other.max_frame, Ordering::Release);
+            header
+                .other_nbackfills
+                .store(other.nbackfills, Ordering::Release);
+            header
+                .other_checkpoint_seq
+                .store(other.checkpoint_seq, Ordering::Release);
+            header
+                .other_page_size
+                .store(other.page_size, Ordering::Release);
+            header.other_salt_1.store(other.salt_1, Ordering::Release);
+            header.other_salt_2.store(other.salt_2, Ordering::Release);
+            header
+                .other_checksum_1
+                .store(other.checksum_1, Ordering::Release);
+            header
+                .other_checksum_2
+                .store(other.checksum_2, Ordering::Release);
+        });
     }
 
     pub(crate) const fn open_mode(&self) -> SharedWalCoordinationOpenMode {
@@ -2903,6 +3042,8 @@ impl MappedSharedWalCoordination {
             std::ptr::addr_of_mut!((*header).writer_owner).write(AtomicU64::new(UNOWNED_LOCK));
             std::ptr::addr_of_mut!((*header).checkpoint_owner).write(AtomicU64::new(UNOWNED_LOCK));
         }
+        self.header().segments.store(0, Ordering::Release);
+        self.install_other_segment(SharedSegmentHeader::default());
         // A freshly truncated file-backed mapping is already zero-filled. Avoid
         // touching the full reserved region here, because large sparse `.tshm`
         // files can SIGBUS on tmpfs/quota-constrained test environments if we
