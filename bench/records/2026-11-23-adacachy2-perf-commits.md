@@ -118,6 +118,12 @@ flushes before an answer:
   `answers_held()`. If either stops it at what the follower's disk holds, held answers trail the flush.
 - The leader's answer waits for hyper-durable's durable application (`behind_fence`, `fence_covered`).
 
+Held commits do happen in a driven group: the test at replicated.rs about 9380 to 9478 asserts `commits_held`
+rises once each voter has stated a durable promise. So the mechanism exists, and the question is why it doesn't
+shorten the real members' path. The cheapest next measurement: a `counters` op on the bench member
+(`ReplicaHandle::counters`, `commits_held` against `commits_classic`, `flush_backlog`), read before and after a
+window on btrfs and on tmpfs. It needs a bench rebuild, which didn't fit this hour.
+
 The fix for this is a correctness question about R-8 in vendored hyper-raft, so it is the hyper-raft owner's call
 before anyone changes it. It is listed under the decisions below.
 
