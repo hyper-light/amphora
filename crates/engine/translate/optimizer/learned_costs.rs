@@ -2167,6 +2167,68 @@ mod tests {
         assert_eq!(costs.weights().unwrap().row_in_pages, Some(2.0 / 400.0));
     }
 
+    /// The page read's rate after batches of reads 10% either way of 1,000 ns, then one batch whose
+    /// reads are `last`, each read as `timing` takes it (lane T15).
+    fn t15_rate_after(timing: PageReadTiming, last: [TimedRead; 4]) -> (f64, f64) {
+        let costs = LearnedCosts::from_rates(&fixed_rates(2.0, 10.0, 20.0, 15.0, 2.0))
+            .with_page_timing(timing);
+        for i in 0..8 {
+            let wall = if i % 2 == 0 { 900.0 } else { 1100.0 };
+            for _ in 0..4 {
+                costs.observe_page_read(TimedRead {
+                    wall,
+                    waited: Some((0.0, 500.0)),
+                });
+            }
+        }
+        let before = costs.weights().unwrap().row_in_pages.unwrap();
+        for read in last {
+            costs.observe_page_read(read);
+        }
+        (before, costs.weights().unwrap().row_in_pages.unwrap())
+    }
+
+    /// T14's failure (lane T15): a batch with one read preempted for 2 ms of its 2,001 us.
+    fn t15_one_preempted() -> [TimedRead; 4] {
+        let read = |wall, waited| TimedRead {
+            wall,
+            waited: Some((waited, 500.0)),
+        };
+        [
+            read(1000.0, 0.0),
+            read(1000.0, 0.0),
+            read(1000.0, 0.0),
+            read(2_001_000.0, 2_000_000.0),
+        ]
+    }
+
+    /// Do (lane T15, arm A): settle the page read's rate, then close a batch with one read preempted
+    /// for 2 ms. Expect: the rate stands where it stood (the median holds the preempted read at one
+    /// rank); the mean it replaces moved it 500-fold.
+    #[test]
+    fn t15_a_preempted_read_does_not_move_the_page_rate_median() {
+        let (before, after) = t15_rate_after(PageReadTiming::Median, t15_one_preempted());
+        assert_eq!(after, before);
+        let (before, after) = t15_rate_after(PageReadTiming::Mean, t15_one_preempted());
+        assert!(after < before / 100.0, "{before} {after}");
+    }
+
+    /// Do (lane T15, arm B): as above, each read's wait for a CPU given. Expect: the rate stands
+    /// where it stood (the preempted read's 2 ms wait subtracted, its own 1 us kept).
+    #[test]
+    fn t15_a_preempted_read_does_not_move_the_page_rate_run_delay() {
+        let (before, after) = t15_rate_after(PageReadTiming::RunDelay, t15_one_preempted());
+        assert_eq!(after, before);
+    }
+
+    /// Do (lane T15, arm B): read the thread's run-queue wait twice. Expect: a count, never falling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn t15_the_run_queue_wait_is_read_on_linux() {
+        let first = run_delay().unwrap();
+        assert!(run_delay().unwrap() >= first);
+    }
+
     /// Do: time a scratch page read beside a new database file. Expect: a time, and the
     /// directory left as it was (the scratch page removed).
     #[cfg(feature = "fs")]
