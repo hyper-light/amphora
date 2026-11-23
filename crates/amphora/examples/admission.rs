@@ -104,7 +104,8 @@ fn main() {
                     while !stop.load(Ordering::Relaxed) {
                         let until = Instant::now() + Duration::from_secs(60);
                         let answered = if get {
-                            ns.get("f", b"k", Consistency::Linearizable, until).map(drop)
+                            ns.get("f", b"k", Consistency::Linearizable, until)
+                                .map(drop)
                         } else {
                             db.call(until, |_| Ok(()))
                         };
@@ -118,11 +119,17 @@ fn main() {
             .collect();
         // Warm up a second, then count.
         std::thread::sleep(Duration::from_secs(1));
-        let (d0, r0) = (done.load(Ordering::Relaxed), refused.load(Ordering::Relaxed));
+        let (d0, r0) = (
+            done.load(Ordering::Relaxed),
+            refused.load(Ordering::Relaxed),
+        );
         let started = Instant::now();
         std::thread::sleep(Duration::from_secs_f64(seconds));
         let elapsed = started.elapsed().as_secs_f64();
-        let (d1, r1) = (done.load(Ordering::Relaxed), refused.load(Ordering::Relaxed));
+        let (d1, r1) = (
+            done.load(Ordering::Relaxed),
+            refused.load(Ordering::Relaxed),
+        );
         stop.store(true, Ordering::Relaxed);
         for t in threads {
             t.join().expect("client");
@@ -150,7 +157,8 @@ fn declared() -> usize {
 }
 
 fn read(c: &mut amphora::sql::Connection<'_>, from: i64) -> anyhow::Result<Rows> {
-    let mut statement = c.prepare_cached("SELECT id, v FROM t WHERE id >= ?1 ORDER BY id LIMIT ?2")?;
+    let mut statement =
+        c.prepare_cached("SELECT id, v FROM t WHERE id >= ?1 ORDER BY id LIMIT ?2")?;
     let rows = statement
         .query_map(
             vec![
@@ -166,7 +174,11 @@ fn read(c: &mut amphora::sql::Connection<'_>, from: i64) -> anyhow::Result<Rows>
 
 fn machine() -> String {
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
-    let load = load.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let load = load
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
     let pressure = |what: &str| {
         std::fs::read_to_string(format!("/proc/pressure/{what}"))
             .unwrap_or_default()
@@ -431,7 +443,9 @@ fn nowait(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize, 
     })
     .expect("seed");
     let declared = declared();
-    println!("{{\"what\":\"nowait\",\"declared_bytes\":{declared},\"rows\":{ROWS},\"limit\":{LIMIT},\"pool\":{pool}}}");
+    println!(
+        "{{\"what\":\"nowait\",\"declared_bytes\":{declared},\"rows\":{ROWS},\"limit\":{LIMIT},\"pool\":{pool}}}"
+    );
     let arms = [
         ("flat", AnswerCharge::Flat),
         ("declared", AnswerCharge::Declared(declared)),

@@ -120,9 +120,7 @@ fn hash_key_part(
                     hasher.write(&collation.hash_key(text.as_str()));
                 }
                 CollationSeq::Custom(_) => {
-                    unreachable!(
-                        "custom collations are rejected before hash table construction"
-                    )
+                    unreachable!("custom collations are rejected before hash table construction")
                 }
             }
         }
@@ -1211,7 +1209,12 @@ impl HashTable {
         let bytes = self
             .num_entries
             .saturating_mul(std::mem::size_of::<(usize, usize)>());
-        if self.mem_used.saturating_add(self.bucket_mem).saturating_add(bytes) > self.mem_budget {
+        if self
+            .mem_used
+            .saturating_add(self.bucket_mem)
+            .saturating_add(bytes)
+            > self.mem_budget
+        {
             return Ok(false);
         }
         let mut order: Vec<(usize, usize)> = vec![];
@@ -1305,7 +1308,9 @@ impl HashTable {
             .buckets
             .get(bucket_idx)
             .and_then(|bucket| bucket.entries.get(entry_idx))
-            .is_some_and(|entry| keys_equal_values(&entry.key_values, probe_keys, &self.collations));
+            .is_some_and(|entry| {
+                keys_equal_values(&entry.key_values, probe_keys, &self.collations)
+            });
         if !matches {
             return Ok(None);
         }
@@ -2929,7 +2934,9 @@ impl HashTable {
         self.current_spill_partition_idx = partition_idx;
 
         for (idx, entry) in bucket.entries.iter().enumerate() {
-            if entry.hash == hash && keys_equal_values(&entry.key_values, probe_keys, &self.collations) {
+            if entry.hash == hash
+                && keys_equal_values(&entry.key_values, probe_keys, &self.collations)
+            {
                 self.probe_entry_idx = idx + 1;
                 return Ok(Some(entry));
             }
@@ -2939,7 +2946,10 @@ impl HashTable {
 
     /// AUDIT 3.1: keeps a partition probe's keys for [Self::next_match], copied into the kept buffer.
     fn keep_probe_keys(&mut self, probe_keys: &[Value]) -> Result<()> {
-        refill_keys(self.current_probe_keys.get_or_insert_default(), probe_keys.iter())
+        refill_keys(
+            self.current_probe_keys.get_or_insert_default(),
+            probe_keys.iter(),
+        )
     }
 
     /// Get the partition index for a given probe key hash.
@@ -3709,7 +3719,9 @@ mod hashtests {
         let mut ht = HashTable::new(config, io).unwrap();
         let key = |i: i64| [Value::from_i64(i), Value::from_text(format!("Key-{i}"))];
         for i in 0..1000i64 {
-            let _ = ht.insert(key(i % 500).to_vec(), i + 1, vec![], None).unwrap();
+            let _ = ht
+                .insert(key(i % 500).to_vec(), i + 1, vec![], None)
+                .unwrap();
         }
         let _ = ht.finalize_build(None);
         let probes: std::vec::Vec<[Value; 2]> = (0..1000).map(key).collect();
@@ -3843,7 +3855,9 @@ mod hashtests {
             let mut ht = HashTable::new(config, io).unwrap();
             let n = 10_000i64;
             for i in 0..n {
-                let _ = ht.insert(vec![Value::from_i64(i)], i + 1, vec![], None).unwrap();
+                let _ = ht
+                    .insert(vec![Value::from_i64(i)], i + 1, vec![], None)
+                    .unwrap();
             }
             assert!(!ht.has_spilled());
             assert!(ht.buckets.len() >= n as usize, "{}", ht.buckets.len());
@@ -3903,7 +3917,9 @@ mod hashtests {
         };
         let mut ht = HashTable::new(small, Arc::new(MemoryIO::new())).unwrap();
         for i in 0..64i64 {
-            let _ = ht.insert(vec![Value::from_i64(i)], i, vec![], None).unwrap();
+            let _ = ht
+                .insert(vec![Value::from_i64(i)], i, vec![], None)
+                .unwrap();
             assert!(ht.has_spilled() || ht.mem_used + ht.bucket_mem <= ht.mem_budget);
         }
     }

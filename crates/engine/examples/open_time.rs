@@ -14,7 +14,10 @@ fn summary(name: &str, micros: &mut [f64]) {
     let median = micros.get(micros.len() / 2).copied().unwrap_or(f64::NAN);
     let max = micros.last().copied().unwrap_or(f64::NAN);
     let first = micros.first().copied().unwrap_or(f64::NAN);
-    println!("{name}: n={} min={first:.1}us median={median:.1}us max={max:.1}us", micros.len());
+    println!(
+        "{name}: n={} min={first:.1}us median={median:.1}us max={max:.1}us",
+        micros.len()
+    );
 }
 
 fn open(path: &str) -> Result<(f64, f64), Box<dyn std::error::Error>> {
@@ -32,11 +35,17 @@ fn open(path: &str) -> Result<(f64, f64), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let dir = args.next().ok_or("usage: open_time <dir> <opens>")?;
-    let opens: usize = args.next().ok_or("usage: open_time <dir> <opens>")?.parse()?;
+    let opens: usize = args
+        .next()
+        .ok_or("usage: open_time <dir> <opens>")?
+        .parse()?;
     std::fs::create_dir_all(&dir)?;
     let start = Instant::now();
     let (process_first, _) = open(&format!("{dir}/first.db"))?;
-    println!("process's first open: {process_first:.1}us (wall {:.1}us)", start.elapsed().as_secs_f64() * 1e6);
+    println!(
+        "process's first open: {process_first:.1}us (wall {:.1}us)",
+        start.elapsed().as_secs_f64() * 1e6
+    );
     for phase in ["new", "reopen"] {
         let mut opened = Vec::with_capacity(opens);
         let mut first = Vec::with_capacity(opens);
