@@ -19,6 +19,9 @@ count against sqlite3 3.54.0.
   2.87819999999999964757...; correctly rounded to 17 digits that is 2.8781999999999996. The page's
   answer comes from rounding to 18 digits first, then rounding at the 18th. Amphora reproduces the
   page's answer (SQLite's sqlite3FpDecode at 17, kept from the 3.54 port). Ada's choice is below.
+- **The cost of the 15-digit try is not measured.** Each REAL written as text now formats 15
+  digits with Rust's `{:.14e}` and parses them back before SQLite's 17-digit path; no A/B of CAST
+  throughput ran this hour.
 - **Not done this hour:** `SQLITE_DBCONFIG_FP_DIGITS` (the page's option to round at 15 digits
   always), the pages the doc links (printf.html, lang_expr CAST, the decimal and ieee754
   extensions' own docs), and a fresh read of SQLite's C source (the names below come from the 3.54
@@ -72,6 +75,7 @@ own port (`functions/printf.rs`): printf.html governs them, not this page.
 | r1251 | 924a3524 | `--lib -- numeric:: printf json::` | 230 passed, 1 failed: `test_decode_float` still held 3.54's 17-digit subnormals; 5a058fdd sets them to the page's (`9.93071948140906e-322`) |
 | r1251 | 924a3524 | corpus (304,713 finite doubles: the fixture's, then 100,000 each of random bits, decimals of 0 to 15 places, products of two 2-place decimals) and `bench/real_text_sqlite.py`, SQLite 3.54.0 | below |
 | r1256 | 2a42f9ac (merged with main) | clippy; `floating_point_doc real_text oracle_findings`; `--lib numeric:: printf json:: vdbe::value vdbe::affinity g9_` | clippy clean; 9 + 83 + 2 passed, 0 failed; lib 282 passed, 0 failed |
+| r1260 | 2bfe58cd (merged with main b6c9ddaa; pushed to main) | the same | clippy clean; 9 + 83 + 2 passed, 0 failed; lib 282 passed, 0 failed |
 
 The corpus, by which path the page's algorithm takes for the double:
 
