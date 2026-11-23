@@ -322,7 +322,10 @@ fn rows(
         rows.push(values);
         Ok(!first)
     })
-    .map_err(failed)?;
+    .map_err(|e| match e.downcast::<amphora_api::Refusal>() {
+        Ok(refusal) => Error::Refusal(refusal),
+        Err(e) => failed(e),
+    })?;
     Ok(rows)
 }
 
