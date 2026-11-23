@@ -111,11 +111,15 @@ impl Decimal {
         }
         let lead = self.digits.iter().take_while(|d| **d == 0).count();
         let trail = self.digits.iter().rev().take_while(|d| **d == 0).count();
-        let digits = self.digits.get(lead..self.digits.len().checked_sub(trail)?)?;
+        let digits = self
+            .digits
+            .get(lead..self.digits.len().checked_sub(trail)?)?;
         if digits.is_empty() {
             return None;
         }
-        let point = i32::try_from(self.int_len()).ok()?.checked_sub(i32::try_from(lead).ok()?)?;
+        let point = i32::try_from(self.int_len())
+            .ok()?
+            .checked_sub(i32::try_from(lead).ok()?)?;
         Some((digits, point))
     }
 
@@ -615,9 +619,18 @@ mod tests {
 
     #[test]
     fn significant_digits_drop_leading_and_trailing_zeros_and_place_the_point() {
-        let sig = |r: f64| decimal_from_double(r).and_then(|d| d.significant_digits().map(|(s, p)| (s.to_vec(), p)));
-        assert_eq!(sig(47.49).map(|(s, p)| (s.len(), s.get(..4).map(<[u8]>::to_vec), p)), Some((49, Some(vec![4, 7, 4, 9]), 2)));
-        assert_eq!(sig(0.001).map(|(s, p)| (s.first().copied(), p)), Some((Some(1), -2)));
+        let sig = |r: f64| {
+            decimal_from_double(r)
+                .and_then(|d| d.significant_digits().map(|(s, p)| (s.to_vec(), p)))
+        };
+        assert_eq!(
+            sig(47.49).map(|(s, p)| (s.len(), s.get(..4).map(<[u8]>::to_vec), p)),
+            Some((49, Some(vec![4, 7, 4, 9]), 2))
+        );
+        assert_eq!(
+            sig(0.001).map(|(s, p)| (s.first().copied(), p)),
+            Some((Some(1), -2))
+        );
         assert_eq!(sig(-0.25), Some((vec![2, 5], 0)));
         assert_eq!(sig(1200.0), Some((vec![1, 2], 4)));
         assert_eq!(sig(0.0625), Some((vec![6, 2, 5], -1)));

@@ -313,8 +313,14 @@ mod fp_digits {
         // 0.1 is 0.1000000000000000055511151231257827...: past 17 its exact digits, rounded (SQLite
         // 3.54.0's decode carries 19, 0.1000000000000000056 at 20; the document wins)
         assert_eq!(real_to_text_digits(0.1, at(20)), "0.10000000000000000555");
-        assert_eq!(real_to_text_digits(0.1, at(23)), "0.10000000000000000555112");
-        assert_eq!(real_to_text_digits(1e-5, at(20)), "1.0000000000000000818e-05");
+        assert_eq!(
+            real_to_text_digits(0.1, at(23)),
+            "0.10000000000000000555112"
+        );
+        assert_eq!(
+            real_to_text_digits(1e-5, at(20)),
+            "1.0000000000000000818e-05"
+        );
     }
 }
 
@@ -743,7 +749,11 @@ mod page_sentences {
         conn.execute("INSERT INTO t VALUES (ieee754_from_blob(x'7FF8000000000000')), (ieee754_from_blob(x'FFF0000000000001')), (1e999 - 1e999), (0.0 * 1e999)")
             .unwrap();
         assert_eq!(
-            texts(&io, &conn, "SELECT count(*), count(r), group_concat(typeof(r)) FROM t"),
+            texts(
+                &io,
+                &conn,
+                "SELECT count(*), count(r), group_concat(typeof(r)) FROM t"
+            ),
             ["4", "0", "null,null,null,null"]
         );
     }
