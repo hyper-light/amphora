@@ -220,9 +220,11 @@ fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
                             .spawn(move || {
                                 let mut latencies = Vec::new();
                                 let mut refused = 0u64;
+                                let mut answered_at_all = 0u64;
                                 let mut from = (client as i64 * 7) % (ROWS - LIMIT as i64);
                                 while !stop.load(Ordering::Relaxed) {
-                                    let counted = measuring.load(Ordering::Relaxed);
+                                    let counted = measuring.load(Ordering::Relaxed)
+                                        && !stop.load(Ordering::Relaxed);
                                     let until = Instant::now() + Duration::from_secs(60);
                                     let started = Instant::now();
                                     let start = from;
@@ -234,7 +236,8 @@ fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
                                     };
                                     let took = started.elapsed().as_nanos() as u64;
                                     from = (from + 1) % (ROWS - LIMIT as i64);
-                                    if !counted || stop.load(Ordering::Relaxed) {
+                                    answered_at_all += 1;
+                                    if !counted {
                                         continue;
                                     }
                                     match answered {
@@ -245,7 +248,7 @@ fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
                                         Err(_) => refused += 1,
                                     }
                                 }
-                                (latencies, refused)
+                                (latencies, refused, answered_at_all)
                             })
                             .expect("spawn a client")
                     })
@@ -257,17 +260,20 @@ fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
                 let before = machine();
                 std::thread::sleep(Duration::from_secs_f64(seconds));
                 stop.store(true, Ordering::Relaxed);
-                let elapsed = started.elapsed().as_secs_f64();
                 let mut latencies = Vec::new();
                 let mut refused = 0;
+                let mut all = 0;
                 for t in threads {
-                    let (l, r) = t.join().expect("client");
+                    let (l, r, a) = t.join().expect("client");
                     latencies.extend(l);
                     refused += r;
+                    all += a;
                 }
+                // Every call started in the window is counted, however late it answers.
+                let elapsed = started.elapsed().as_secs_f64();
                 latencies.sort_unstable();
                 println!(
-                    "{{\"what\":\"ab\",\"arm\":\"{arm}\",\"round\":{round},\"clients\":{clients},\"calls\":{},\"per_s\":{:.0},\"p50_us\":{:.1},\"p99_us\":{:.1},\"p999_us\":{:.1},\"refused\":{refused},{before},\"after\":{{{}}}}}",
+                    "{{\"what\":\"ab\",\"arm\":\"{arm}\",\"round\":{round},\"clients\":{clients},\"calls\":{},\"per_s\":{:.0},\"p50_us\":{:.1},\"p99_us\":{:.1},\"p999_us\":{:.1},\"refused\":{refused},\"answered_at_all\":{all},\"window_s\":{elapsed:.1},{before},\"after\":{{{}}}}}",
                     latencies.len(),
                     latencies.len() as f64 / elapsed,
                     percentile(&latencies, 0.50),
