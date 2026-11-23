@@ -112,12 +112,16 @@ impl GroupBounds {
             return None;
         };
         let after = offset(target_pc)?;
-        (find < save && after > full).then_some(Self {
-            find,
-            save,
-            full,
-            after,
-        })
+        if find < save && after > full {
+            Some(Self {
+                find,
+                save,
+                full,
+                after,
+            })
+        } else {
+            None
+        }
     }
 
     /// Between GroupFind and GroupSave: the aggregate steps and their arguments' columns.
@@ -133,7 +137,8 @@ impl GroupBounds {
     /// Whether a filter's jump may not land on `target`: in the block, on the Goto after it, or
     /// in the sorter's insert.
     fn closed_to(&self, target: usize) -> bool {
-        (target > self.find && target <= self.save + 1) || self.refused_only(target)
+        (target > self.find && self.save.checked_add(1).is_none_or(|goto| target <= goto))
+            || self.refused_only(target)
     }
 }
 
@@ -343,14 +348,18 @@ fn loop_at(insns: &[(Insn, usize)], cursor_id: usize, head: usize) -> Option<Fus
     let mut steps: Vec<Step> = Vec::new();
     let mut group_step: Option<GroupStep> = None;
     let mut aggs: Vec<(usize, Operand)> = Vec::new();
-    steps.try_reserve_exact(next_pc - head).ok()?;
+    steps.try_reserve_exact(next_pc.checked_sub(head)?).ok()?;
     let resolve = |vectors: &[Vector], reg: usize| -> Option<Operand> {
         if let Some(at) = vectors.iter().position(|vector| vector.reg == reg) {
             return Some(Operand::Vector(at));
         }
         // Written in the body but not (yet) a column: read before its Column, or an
         // accumulator.
-        (!written.contains(&reg)).then_some(Operand::Register(reg))
+        if written.contains(&reg) {
+            None
+        } else {
+            Some(Operand::Register(reg))
+        }
     };
     let forward = |pc: usize, target: &BranchOffset| -> Option<usize> {
         offset(target).filter(|target| {
@@ -588,7 +597,9 @@ fn run_batch(
                 break 'rows;
             }
         }
-        rows += 1;
+        rows = rows
+            .checked_add(1)
+            .ok_or_else(|| internal("too many rows"))?;
     }
     // Lane skip-5 (T-SKU.4): a skipping scan's run stops at its candidate run's last rowid. A
     // leaf's rowids ascend, so the rows up to `until` are a prefix: found by halving. A window
@@ -600,9 +611,17 @@ fn run_batch(
             .ok_or_else(|| internal("no table leaf under a skipping cursor"))?;
         let (mut keep, mut over) = (0usize, rows);
         while keep < over {
-            let mid = keep + (over - keep) / 2;
-            if leaf.contents.cell_table_leaf_read_rowid(cell + mid)? <= until {
-                keep = mid + 1;
+            let mid = over
+                .checked_sub(keep)
+                .and_then(|span| keep.checked_add(span / 2))
+                .ok_or_else(|| internal("a halving out of range"))?;
+            let at = cell
+                .checked_add(mid)
+                .ok_or_else(|| internal("a row out of range"))?;
+            if leaf.contents.cell_table_leaf_read_rowid(at)? <= until {
+                keep = mid
+                    .checked_add(1)
+                    .ok_or_else(|| internal("a halving out of range"))?;
             } else {
                 over = mid;
             }
@@ -611,7 +630,13 @@ fn run_batch(
     }
     // The cursor moves once the body has run, to the last row it ran: a refused row ends the
     // run short of the batch's end.
-    if rows == 0 || !cursor.can_advance_within_leaf_to(cell + rows - 1) {
+    let Some(last_row) = rows.checked_sub(1) else {
+        return Ok(0);
+    };
+    let last_cell = cell
+        .checked_add(last_row)
+        .ok_or_else(|| internal("a row out of range"))?;
+    if !cursor.can_advance_within_leaf_to(last_cell) {
         return Ok(0);
     }
     let reader = Reader {
@@ -633,7 +658,7 @@ fn run_batch(
             .ok_or_else(|| internal("selection overflows"))?,
     )?;
     for row in 0..rows {
-        set(reach, 0, words, row);
+        set(reach, 0, words, row)?;
     }
     let mut selected: Vec<usize> = Vec::new();
     selected
@@ -643,26 +668,39 @@ fn run_batch(
     let mut ran = rows;
     for (index, step) in fused.steps.iter().enumerate() {
         selected.clear();
-        for word in 0..words {
-            let mut bits = reach.get(index * words + word).copied().unwrap_or(0);
+        let base = index
+            .checked_mul(words)
+            .ok_or_else(|| internal("selection overflows"))?;
+        for (word, mut bits) in reach.iter().copied().skip(base).take(words).enumerate() {
             while bits != 0 {
-                selected.push(word * 64 + bits.trailing_zeros() as usize);
-                bits &= bits - 1;
+                let row = word
+                    .checked_mul(64)
+                    .and_then(|first| first.checked_add(bits.trailing_zeros() as usize))
+                    .ok_or_else(|| internal("a row out of range"))?;
+                selected.push(row);
+                // Clears the lowest set bit; `bits != 0` here, so it never wraps.
+                bits &= bits.wrapping_sub(1);
             }
         }
         if selected.is_empty() {
             continue;
         }
-        let next = index + 1;
+        let next = index
+            .checked_add(1)
+            .ok_or_else(|| internal("too many steps"))?;
         match *step {
-            Step::Fall => selected
-                .iter()
-                .for_each(|row| set(reach, next, words, *row)),
+            Step::Fall => {
+                for row in &selected {
+                    set(reach, next, words, *row)?;
+                }
+            }
             Step::Inner => {}
             Step::Refused => return Err(internal("a row reached the sorter's insert")),
             Step::Goto(target) => {
-                let to = target - fused.head;
-                selected.iter().for_each(|row| set(reach, to, words, *row));
+                let to = step_index(target, fused.head)?;
+                for row in &selected {
+                    set(reach, to, words, *row)?;
+                }
             }
             Step::Compare {
                 lhs,
@@ -672,7 +710,7 @@ fn run_batch(
                 collation,
                 op,
             } => {
-                let to = target - fused.head;
+                let to = step_index(target, fused.head)?;
                 for row in &selected {
                     let jumps = comparison_jumps(
                         program,
@@ -682,7 +720,7 @@ fn run_batch(
                         collation,
                         op,
                     )?;
-                    set(reach, if jumps { to } else { next }, words, *row);
+                    set(reach, if jumps { to } else { next }, words, *row)?;
                 }
             }
             Step::Null {
@@ -690,7 +728,7 @@ fn run_batch(
                 target,
                 jump_if_null,
             } => {
-                let to = target - fused.head;
+                let to = step_index(target, fused.head)?;
                 for row in &selected {
                     let null =
                         matches!(*reader.value(operand, *row, &state.registers)?, Value::Null);
@@ -699,16 +737,16 @@ fn run_batch(
                         if null == jump_if_null { to } else { next },
                         words,
                         *row,
-                    );
+                    )?;
                 }
             }
             Step::Agg { pc, arg } => {
                 for row in &selected {
                     agg_row(program, state, &reader, pc, arg, *row)?;
                 }
-                selected
-                    .iter()
-                    .for_each(|row| set(reach, next, words, *row));
+                for row in &selected {
+                    set(reach, next, words, *row)?;
+                }
             }
             Step::Group => {
                 let group = fused
@@ -718,11 +756,16 @@ fn run_batch(
                 let (stepped, refused) =
                     group_rows(program, state, pager, &reader, group, &selected)?;
                 // The rows it stepped went through the block and on to the Goto after it.
-                let first = group.find_pc + 1 - fused.head;
-                let goto = group.save_pc + 1 - fused.head;
+                let after = |pc: usize| {
+                    pc.checked_add(1)
+                        .ok_or_else(|| internal("address out of range"))
+                        .and_then(|pc| step_index(pc, fused.head))
+                };
+                let first = after(group.find_pc)?;
+                let goto = after(group.save_pc)?;
                 for row in selected.iter().take(stepped) {
                     for index in first..=goto {
-                        set(reach, index, words, *row);
+                        set(reach, index, words, *row)?;
                     }
                 }
                 #[cfg(test)]
@@ -733,12 +776,15 @@ fn run_batch(
             }
         }
     }
-    if ran == 0 {
+    let Some(last) = ran.checked_sub(1) else {
         return Ok(0);
-    }
+    };
+    let last_cell = cell
+        .checked_add(last)
+        .ok_or_else(|| internal("a row out of range"))?;
     let moved = match state.cursors.get_mut(fused.cursor_id) {
         Some(Some(crate::types::Cursor::BTree(cursor, ..))) => {
-            cursor.advance_within_leaf_to(cell + ran - 1)
+            cursor.advance_within_leaf_to(last_cell)
         }
         _ => false,
     };
@@ -748,10 +794,9 @@ fn run_batch(
     #[cfg(test)]
     super::tests::note_fused(ran);
     // The last row leaves its columns in their registers, as row-at-a-time does.
-    let last = ran - 1;
     for (at, vector) in fused.vectors.iter().enumerate() {
-        let index = vector.pc - fused.head;
-        if get(reach, index, words, last) {
+        let index = step_index(vector.pc, fused.head)?;
+        if get(reach, index, words, last)? {
             let read = reader
                 .value(Operand::Vector(at), last, &state.registers)?
                 .into_owned();
@@ -828,7 +873,11 @@ fn group_rows(
     ) else {
         return Err(internal("no group step"));
     };
-    let found = u32::try_from(group.find_pc + 1).map_err(|_| internal("address out of range"))?;
+    let found = group
+        .find_pc
+        .checked_add(1)
+        .and_then(|pc| u32::try_from(pc).ok())
+        .ok_or_else(|| internal("address out of range"))?;
     let pc = state.pc;
     let mut loaded: Option<usize> = None;
     let mut refused = None;
@@ -847,9 +896,10 @@ fn group_rows(
             for (at, operand) in group.values.iter().enumerate() {
                 if let Operand::Vector(_) = operand {
                     let read = reader.value(*operand, *row, &state.registers)?.into_owned();
-                    let reg = state
-                        .registers
-                        .get_mut(group.values_start + at)
+                    let reg = group
+                        .values_start
+                        .checked_add(at)
+                        .and_then(|reg| state.registers.get_mut(reg))
                         .ok_or_else(|| internal("a group value out of range"))?;
                     *reg = Register::Value(read);
                 }
@@ -864,7 +914,9 @@ fn group_rows(
         for (agg_pc, arg) in group.aggs.iter() {
             agg_row(program, state, reader, *agg_pc, *arg, *row)?;
         }
-        stepped += 1;
+        stepped = stepped
+            .checked_add(1)
+            .ok_or_else(|| internal("too many rows"))?;
     }
     if loaded.is_some() {
         group_op(op_group_save, program, state, pager, save, group.save_pc)?;
@@ -959,7 +1011,11 @@ impl<'a> Reader<'a> {
                     .get(at)
                     .ok_or_else(|| internal("no vector"))?;
                 let slot = self.slots.get(at).ok_or_else(|| internal("no slot"))?;
-                let read: &'a Value = match self.batch.slot(*slot, self.cell + row) {
+                let at = self
+                    .cell
+                    .checked_add(row)
+                    .ok_or_else(|| internal("a row out of range"))?;
+                let read: &'a Value = match self.batch.slot(*slot, at) {
                     Some(Slot::Value(value)) => value,
                     Some(Slot::PastEnd) => &vector.default,
                     _ => return Err(internal("a row left out of the batch")),
@@ -984,14 +1040,29 @@ fn batches_scratch(len: usize) -> Result<Vec<u64>> {
     Ok(bits)
 }
 
-fn set(reach: &mut [u64], index: usize, words: usize, row: usize) {
-    if let Some(word) = reach.get_mut(index * words + row / 64) {
-        *word |= 1 << (row % 64);
-    }
+/// The step a body address runs as: its offset from the loop's head.
+fn step_index(pc: usize, head: usize) -> Result<usize> {
+    pc.checked_sub(head)
+        .ok_or_else(|| internal("an address before the body"))
 }
 
-fn get(reach: &[u64], index: usize, words: usize, row: usize) -> bool {
-    reach
-        .get(index * words + row / 64)
-        .is_some_and(|word| word & (1 << (row % 64)) != 0)
+/// The word of `reach` holding `row`'s bit of step `index`.
+fn word_at(index: usize, words: usize, row: usize) -> Result<usize> {
+    index
+        .checked_mul(words)
+        .and_then(|base| base.checked_add(row / 64))
+        .ok_or_else(|| internal("selection overflows"))
+}
+
+fn set(reach: &mut [u64], index: usize, words: usize, row: usize) -> Result<()> {
+    if let Some(word) = reach.get_mut(word_at(index, words, row)?) {
+        *word |= 1 << (row % 64);
+    }
+    Ok(())
+}
+
+fn get(reach: &[u64], index: usize, words: usize, row: usize) -> Result<bool> {
+    Ok(reach
+        .get(word_at(index, words, row)?)
+        .is_some_and(|word| word & (1 << (row % 64)) != 0))
 }

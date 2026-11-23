@@ -7818,7 +7818,9 @@ impl CursorTrait for BTreeCursor {
                     }
                     // Each pass of this arm stands on a page just entered: the root, then each
                     // child the descents below push (PL.7).
-                    self.pages += 1;
+                    self.pages = self.pages.checked_add(1).ok_or_else(|| {
+                        LimboError::InternalError("count: page tally overflowed".into())
+                    })?;
 
                     let cell_idx = self.stack.current_cell_index() as usize;
 
@@ -7937,7 +7939,11 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn counted_pages(&self) -> Option<usize> {
-        matches!(self.count_state, CountState::Finish).then_some(self.pages)
+        if matches!(self.count_state, CountState::Finish) {
+            Some(self.pages)
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -11213,17 +11219,25 @@ mod tests {
 
     fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
         let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
-        }
+        step_to_row(&mut stmt);
+        stmt.row().unwrap().get::<i64>(0).unwrap()
     }
 
     fn query_single_text(conn: &Arc<Connection>, sql: &str) -> String {
         let mut stmt = conn.prepare(sql).unwrap();
-        match stmt.step().unwrap() {
-            StepResult::Row => stmt.row().unwrap().get::<String>(0).unwrap(),
-            other => panic!("expected a row, got {other:?}"),
+        step_to_row(&mut stmt);
+        stmt.row().unwrap().get::<String>(0).unwrap()
+    }
+
+    /// Steps `stmt` to its first row. `PRAGMA integrity_check` yields after each read from the
+    /// file and takes the same page on re-entry (29cd28f4, T-T1.12.C8), so a caller steps again.
+    fn step_to_row(stmt: &mut crate::Statement) {
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => return,
+                StepResult::IO | StepResult::Yield => continue,
+                other => panic!("expected a row, got {other:?}"),
+            }
         }
     }
 

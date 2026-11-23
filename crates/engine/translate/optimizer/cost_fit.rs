@@ -719,8 +719,7 @@ impl DatabaseFit {
 /// reads), or the reads number calibration's repetition bound, one per key of a page
 /// (`learned_costs::calibrate`).
 pub(crate) fn clock_read_nanos() -> f64 {
-    let most =
-        crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE / std::mem::size_of::<u64>();
+    let most = super::learned_costs::PAGE_KEYS;
     let origin = Instant::now();
     let mut reads: usize = 1;
     let mut last: Option<f64> = None;

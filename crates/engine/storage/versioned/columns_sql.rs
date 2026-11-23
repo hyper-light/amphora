@@ -67,7 +67,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-/// What the copies have counted: the evidence that SQL reads them.
+/// What the copies have counted: the evidence that SQL reads them. Each count saturates at
+/// `u64::MAX`: a count is evidence, and no statement fails for its count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyCounts {
     /// Copies made (a table's second analytic statement).
@@ -526,7 +527,8 @@ impl Copies {
             held,
             limit,
         });
-        self.counts.lock().dropped += 1;
+        let mut c = self.counts.lock();
+        c.dropped = c.dropped.saturating_add(1);
         Ok(())
     }
 
@@ -553,7 +555,8 @@ impl Copies {
                 }
                 self.waiting.lock().remove(&tree);
                 db.drop_columns(tree);
-                self.counts.lock().resumed += 1;
+                let mut c = self.counts.lock();
+                c.resumed = c.resumed.saturating_add(1);
                 tracing::debug!(target: "amphora::columns", tree, bytes, room, "column copy: room for it again");
             }
             None => {
@@ -579,9 +582,9 @@ impl Copies {
         let rebuy = self.absent.lock().contains_key(&tree);
         {
             let mut c = self.counts.lock();
-            c.kept += 1;
+            c.kept = c.kept.saturating_add(1);
             if rebuy {
-                c.rebuys += 1;
+                c.rebuys = c.rebuys.saturating_add(1);
             }
         }
         tracing::debug!(target: "amphora::columns", tree, rebuy, "column copy bought");
@@ -938,14 +941,15 @@ fn read(
             // answer (lane colcopy-10, AC-CB.4.7).
             {
                 let mut c = copies.counts.lock();
-                c.rows += 1;
+                c.rows = c.rows.saturating_add(1);
                 c.unserved = c.unserved.saturating_add(1);
             }
             tracing::debug!(target: "amphora::columns", tree, snapshot = snap.start, "column copy refused: no generation answers the statement's snapshot");
             None
         }
         _ => {
-            copies.counts.lock().rows += 1;
+            let mut c = copies.counts.lock();
+            c.rows = c.rows.saturating_add(1);
             None
         }
     };
@@ -999,7 +1003,7 @@ fn rebuild(
 
 fn count_copy(copies: &Copies, counts: &Counts, _sources: &Sources) {
     let mut c = copies.counts.lock();
-    c.copy += 1;
+    c.copy = c.copy.saturating_add(1);
     c.granules = c.granules.saturating_add(counts.granules);
     c.granule_rows = c.granule_rows.saturating_add(counts.rows);
 }
@@ -1831,7 +1835,7 @@ mod tests {
         fn cb4_ab_both_rebuy_policies_at_the_extremes() {
             let k = scale();
             let mut out = Vec::new();
-            for s in scenarios(k) {
+            for s in scenarios(k).expect("the scenarios at this scale") {
                 let need = need_of(s.rows);
                 for rebuy in [Rebuy::Rent, Rebuy::Room] {
                     let traces = Traces::default();

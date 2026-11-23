@@ -332,7 +332,11 @@ impl Latest {
             slot = slot.wrapping_add(1) & mask;
         }
         fence(Ordering::Acquire);
-        (shard.version.load(Ordering::Relaxed) == before).then_some(found)
+        if shard.version.load(Ordering::Relaxed) == before {
+            Some(found)
+        } else {
+            None
+        }
     }
 
     /// Under the frame index's lock. False when the shard would pass half full: the caller

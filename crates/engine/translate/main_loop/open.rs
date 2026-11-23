@@ -172,7 +172,7 @@ impl OpenLoop {
                                     && matches!(
                                         t.origin,
                                         crate::translate::plan::WhereTermOrigin::Where
-                                        | crate::translate::plan::WhereTermOrigin::Implied
+                                            | crate::translate::plan::WhereTermOrigin::Implied
                                     )
                             })
                             .map(|t| &t.expr),
