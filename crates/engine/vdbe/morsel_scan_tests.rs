@@ -3012,6 +3012,20 @@ fn t_qt_6_30_avg_and_total_run_on_morsels_as_the_serial_loop() {
     conn.set_parallel_mode(ParallelMode::Off);
 }
 
+#[test]
+fn an_aggregate_filter_can_read_a_column_absent_from_its_input() {
+    let conn = open(":memory:qt-filter-column");
+    conn.execute("CREATE TABLE t(v INTEGER, keep INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 0), (4, 1), (8, NULL)")
+        .unwrap();
+    let sql = "SELECT sum(v) FILTER (WHERE keep > 0) FROM t";
+    for mode in [ParallelMode::Off, ParallelMode::On] {
+        conn.set_parallel_mode(mode);
+        assert_eq!(sql_rows(&conn, sql), vec![vec![Value::from_i64(4)]]);
+    }
+}
+
 /// T-QT.6.31 (lane qs6-17): aggregates with a FILTER run on morsels: a row that fails an
 /// aggregate's FILTER gives its input NULL in the copied body, which every aggregate the pipeline
 /// folds skips. COUNT(*), COUNT, SUM, MIN, MAX, AVG and TOTAL with a FILTER, beside unfiltered
