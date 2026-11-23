@@ -24,16 +24,31 @@ pub(crate) trait Id: Copy {
     fn slot(self) -> usize;
 }
 
+/// Hash and group tables are keyed either by a table's internal id (small, from 0) or by an id
+/// `ProgramBuilder::alloc_hash_table_id` counts up from `HASH_TABLE_ID_BASE` (1 << 30), so the
+/// two never meet. Indexing by the raw id made a slot for every id below 2^30: the first
+/// allocated table's id made a billion slots, and a hash join's run took tens of GiB until the
+/// OOM killer stopped it. Each range counts from 0 instead, interleaved: an id below the base at
+/// an even slot, one at or above it at an odd one. Both stay dense, and distinct ids stay apart.
+const fn dense_slot(id: usize) -> usize {
+    let base = crate::vdbe::builder::HASH_TABLE_ID_BASE;
+    if id >= base {
+        (id - base).saturating_mul(2).saturating_add(1)
+    } else {
+        id.saturating_mul(2)
+    }
+}
+
 impl Id for usize {
     fn slot(self) -> usize {
-        self
+        dense_slot(self)
     }
 }
 
 impl Id for u32 {
     fn slot(self) -> usize {
         // Every target Amphora builds for has a pointer of at least 32 bits.
-        usize::try_from(self).unwrap_or(usize::MAX)
+        dense_slot(usize::try_from(self).unwrap_or(usize::MAX))
     }
 }
 
@@ -127,6 +142,18 @@ mod tests {
         assert!(!map.is_empty(), "7 is still held");
         assert_eq!(map.remove(&7usize).as_deref(), Some("b"));
         assert!(map.is_empty());
+        // An allocated table id (from `HASH_TABLE_ID_BASE`) and a table's internal id share
+        // the map without one making room for the other's whole range.
+        let base = crate::vdbe::builder::HASH_TABLE_ID_BASE;
+        map.clear();
+        map.insert(base, "first allocated".into());
+        map.insert(base + 1, "second allocated".into());
+        map.insert(1usize, "internal".into());
+        assert!(map.slots.len() <= 4, "{} slots", map.slots.len());
+        assert_eq!(map.get(&base).map(String::as_str), Some("first allocated"));
+        assert_eq!(map.get(&u32::try_from(base + 1).unwrap()).map(String::as_str), Some("second allocated"));
+        assert_eq!(map.get(&1usize).map(String::as_str), Some("internal"));
+        assert_eq!(map.get(&0usize), None);
         map.insert(1usize, "d".into());
         map.clear();
         assert!(map.is_empty());
