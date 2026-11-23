@@ -4585,13 +4585,22 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.step_ready()
     }
     /// Begins the next write slot if a barrier waits for one and none is held; none while this
-    /// member doesn't lead, or a change of members, a hand-off or a bootstrap is under way.
+    /// member doesn't lead, or a change of members, a hand-off or a bootstrap is under way. None
+    /// either while the leader's own write is out on the session worker: it is appended when it
+    /// comes back, which a slot begun meanwhile would not hold, so the holder would prepare on a
+    /// base that write then passes (replication.md, "the write slot": the leader appends nothing
+    /// of its own while a slot is held; "Decision (lane P6)": the worker moves where a session
+    /// runs, not when).
     fn start_slot(&mut self) -> Result<(), Refusal> {
         if !self.replica.is_leader()
             || self.slot_off()
             || self.changing.is_some()
             || self.transferring.is_some()
             || self.replica.machine().bootstrap_pending()
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.phase, Phase::Running))
         {
             return Ok(());
         }
