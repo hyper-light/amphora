@@ -280,7 +280,11 @@ impl BusyHandlerState {
         self.invocation_count = self.invocation_count.saturating_add(1);
         self.timeout = now;
         let left = max_duration.saturating_sub(now.duration_since(first));
-        (!left.is_zero()).then_some(left)
+        if left.is_zero() {
+            None
+        } else {
+            Some(left)
+        }
     }
 
     /// Get the current timeout instant

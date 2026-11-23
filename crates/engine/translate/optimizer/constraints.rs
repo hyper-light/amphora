@@ -3062,7 +3062,8 @@ fn apply_column_stats(
                 table.table.get_name(),
                 fingerprint,
                 selectivity,
-                n as usize,
+                // A sample's row count, a whole number; `as` saturated past usize, as this does.
+                num_traits::ToPrimitive::to_usize(&n).unwrap_or(usize::MAX),
             ),
             _ => selectivity,
         };
