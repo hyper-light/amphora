@@ -1,5 +1,10 @@
 //! Lane perf-A7: a dropped `Calling` gives back its charge. Alone in its binary: it reads the
 //! process's memory budget, which every test in a binary shares.
+#![allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros
+)]
 
 use std::time::{Duration, Instant};
 
