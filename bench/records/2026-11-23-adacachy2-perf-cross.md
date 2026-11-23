@@ -69,3 +69,44 @@ Under 1 GiB, refusals began between 16 and 64 in flight before, between 256 and 
 1024 x ~1 MiB the gets now ask passes the room: refused typed `Full`, the budget never overrun).
 Admitted gets a second ~1.8x (no client spends its turn being refused). The scope's limit held:
 no run was OOM-killed.
+
+## The db:: hang (perf-A5)
+
+Named: `db::tests::constants_22_a_busy_write_wakes_on_the_write_locks_release`. Every other test
+whose name holds `db` passed on both trees. Run r484 (adacachy2, needs cpus=8,mem=24g): one test
+binary per tree, each test alone (`--exact`, `--test-threads=1`) under `timeout 120`:
+
+| tree | constants_22 | the other db tests |
+|---|---|---|
+| perf/cross a913aa42 | timed out (124) | 9 passed |
+| main 62687f5d (its merge base) | timed out (124) | 7 passed |
+
+The branch does not cause it: main hangs the same way, and a third copy from T1's land-noqb
+build (lib test binary of 2026-11-22 16:14 PST, before A3's waker commit) had spun 12 h 15 m at
+98.7% CPU on adacachy2 when looked at: its test thread waiting on a futex, one thread it
+spawned running (utime 43,524 s). The test steps with a waker of its own, not the per-thread
+`UNPARK`, so A3's waker reuse is not on its path.
+
+Cause (lane constants-22's `LockRelease`, crates/engine/busy.rs): a busy statement reads the
+log's release count before it tries its locks and, when busy, waits only if the count has not
+moved. A write busy on another connection's write lock ends the read transaction its failed
+upgrade began (`Insn::Transaction` on `Busy`, execute.rs), and that unlock notifies the same
+`LockRelease`: the count moved by the waiter's own release, `wait` said "a release came, try
+again now", the step returned `Sleep { 0 }`, and the next try did the same, for as long as the
+other connection held the lock. In the test the holder commits only once the waiter parks, so
+the two never finish.
+
+Fix (2286cfb9): a step counts its own releases of the log it may wait on (a thread-local count
+keyed by the log's `LockRelease`, begun where the step reads the count), and `wait` waits when
+the count moved by exactly those: `generation == seen + own`. Another connection's release
+still ends the wait at once. A step inside a step on the same log shares the count; one on
+another log counts its own and gives the outer's back when it ends (an outer that lost its
+count only tries once more, never misses a release).
+
+The waker reuse (A3) checked for soundness: the shared `Unpark` wakes the thread a fresh one
+would, a stale wake only ends a park early and the loop tries the step again, and
+`LockRelease::wait` holds a waker once by `will_wake`, which one waker per thread keeps
+exact. Kept.
+
+Test that fails on the hang: `busy::tests::a5_a_steps_own_releases_never_end_its_wait` (the
+old `wait` says try again after the step's own release).
