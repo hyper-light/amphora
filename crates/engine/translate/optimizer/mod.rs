@@ -4963,6 +4963,11 @@ pub(crate) mod bushy_search_tests {
         #[test]
         fn t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows() {
             let (_db, conn) = facts();
+            if std::env::var("T9_PIN").is_ok() {
+                let pinned = _db.learned_costs.weights();
+                eprintln!("T9 pinned: {pinned:?}");
+                conn.pin_cost_weights(pinned);
+            }
             let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
             for (on_extra, above) in [
                 ("", ""),
