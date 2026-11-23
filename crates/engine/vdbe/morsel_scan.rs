@@ -436,8 +436,8 @@ pub struct TableBodyAggregate<'a> {
 }
 
 /// The outputs of `body` where a REAL sends the statement to the serial loop: its `no_real`,
-/// except under [`crate::RealSums::Exact`] (lane G8) the inputs of SUM, AVG and TOTAL, whose exact
-/// sums are the serial loop's in any order.
+/// except under [`crate::RealSums::Exact`] (lane G8) and [`crate::RealSums::RowOrder`] (lane G9)
+/// the inputs of SUM, AVG and TOTAL, whose sums are then the serial loop's at any worker count.
 pub fn no_real_outputs(
     body: &crate::vdbe::insn::MorselBody,
     sums: crate::RealSums,
@@ -446,7 +446,7 @@ pub fn no_real_outputs(
     let mut kept = Vec::new();
     kept.try_reserve_exact(body.no_real.len())?;
     for at in &body.no_real {
-        let summed = sums == crate::RealSums::Exact
+        let summed = matches!(sums, crate::RealSums::Exact | crate::RealSums::RowOrder)
             && body.aggregates.iter().any(|aggregate| {
                 matches!(aggregate, Aggregate::Sum(x) | Aggregate::Avg(x) | Aggregate::Total(x) if x == at)
             });

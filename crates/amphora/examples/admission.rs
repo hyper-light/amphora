@@ -11,15 +11,15 @@
 //! for each client count, requests a second over <seconds> seconds: `Database::call`s of an empty
 //! closure (`call`, the default), or Records gets of one absent key (`get`), and the refused ones.
 //!
-//! `ab` is Ada's A/B of a call's admission charge (AUDIT §1): each call reads `LIMIT` rows of a
-//! seeded table, charged the flat `REQUEST_MAX` (`flat`, today's `Database::call`), its declared
-//! bound (`declared`, arm a) or its measured answer (`measured`, arm b). The arms take turns,
-//! round after round, each over the client ladder; a line a run gives every call's own latency's
-//! p50, p99 and p99.9 (no sampling), calls a second, refusals and the machine's load and pressure.
+//! `ab` measures a call charged its declared answer (AUDIT §1; the only charge since Ada's
+//! decision on lane perf-A8's A/B, lane perf-A9): each call reads `LIMIT` rows of a seeded table,
+//! declaring their bound, round after round over the client ladder; a line a run gives every
+//! call's own latency's p50, p99 and p99.9 (no sampling), calls a second, refusals and the
+//! machine's load and pressure.
 //!
-//! `nowait` is the same A/B at 1k-10k calls in flight (lane perf-A7): a pool of <pool> threads
-//! keeps each count of calls in flight through `Database::call_nowait`, each call's answer taken by
-//! its waker as it is woken; a call's latency runs from its submission to its answer.
+//! `nowait` is the same at 1k-10k calls in flight (lane perf-A7): a pool of <pool> threads keeps
+//! each count of calls in flight through `Database::call_nowait`, each call's answer taken by its
+//! waker as it is woken; a call's latency runs from its submission to its answer.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use amphora::database::{AnswerBytes, AnswerCharge, Database};
+use amphora::database::{AnswerBytes, AnswerMax, Database};
 use amphora::memory::{self, Use};
 use amphora_api::{Consistency, Records};
 
@@ -107,7 +107,7 @@ fn main() {
                             ns.get("f", b"k", Consistency::Linearizable, until)
                                 .map(drop)
                         } else {
-                            db.call(until, |_| Ok(()))
+                            db.call(until, AnswerMax::fixed(), |_| Ok(()))
                         };
                         match answered {
                             Ok(()) => done.fetch_add(1, Ordering::Relaxed),
@@ -236,7 +236,7 @@ fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
     let _ = std::fs::remove_file(&path);
     let until = || Instant::now() + Duration::from_secs(600);
     let db = Database::open(&path, until()).expect("open");
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
         for id in 0..ROWS {
             c.execute(
@@ -252,11 +252,7 @@ fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
     .expect("seed");
     let declared = declared();
     println!("{{\"what\":\"ab\",\"declared_bytes\":{declared},\"rows\":{ROWS},\"limit\":{LIMIT}}}");
-    let arms = [
-        ("flat", None),
-        ("declared", Some(AnswerCharge::Declared(declared))),
-        ("measured", Some(AnswerCharge::Measured)),
-    ];
+    let arms = [("declared", AnswerMax::<Rows>::bytes(declared))];
     for round in 0..rounds {
         for (arm, charge) in arms {
             for &clients in ladder {
@@ -277,12 +273,7 @@ fn ab(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize) {
                                     let until = Instant::now() + Duration::from_secs(60);
                                     let started = Instant::now();
                                     let start = from;
-                                    let answered = match charge {
-                                        None => db.call(until, move |c| read(c, start)),
-                                        Some(charge) => {
-                                            db.call_charged(until, charge, move |c| read(c, start))
-                                        }
-                                    };
+                                    let answered = db.call(until, charge, move |c| read(c, start));
                                     let took = started.elapsed().as_nanos() as u64;
                                     from = (from + 1) % (ROWS - LIMIT as i64);
                                     answered_at_all += 1;
@@ -431,7 +422,7 @@ fn nowait(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize, 
     let _ = std::fs::remove_file(&path);
     let until = || Instant::now() + Duration::from_secs(600);
     let db = Database::open(&path, until()).expect("open");
-    db.call(until(), |c| {
+    db.call(until(), AnswerMax::fixed(), |c| {
         c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
         for id in 0..ROWS {
             c.execute(
@@ -449,11 +440,7 @@ fn nowait(dir: &std::path::Path, seconds: f64, ladder: &[usize], rounds: usize, 
     println!(
         "{{\"what\":\"nowait\",\"declared_bytes\":{declared},\"rows\":{ROWS},\"limit\":{LIMIT},\"pool\":{pool}}}"
     );
-    let arms = [
-        ("flat", AnswerCharge::Flat),
-        ("declared", AnswerCharge::Declared(declared)),
-        ("measured", AnswerCharge::Measured),
-    ];
+    let arms = [("declared", AnswerMax::<Rows>::bytes(declared))];
     for round in 0..rounds {
         for (arm, charge) in arms {
             for &in_flight in ladder {
