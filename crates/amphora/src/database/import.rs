@@ -474,6 +474,9 @@ mod tests {
         let db = Db::open(path)?;
         db.exec(super::super::SCHEMA)?;
         db.exec(super::SCHEMA)?;
+        // A database's group tables, as its open makes them (CP-T1.9): an imported row is
+        // indexed by position and fed to a held log (`group::wrote`).
+        db.exec(super::super::group::SCHEMA)?;
         Ok(db)
     }
     #[test]
