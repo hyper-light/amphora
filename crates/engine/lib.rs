@@ -199,7 +199,9 @@ pub use storage::{
     packed::LogFormat,
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Access, Page, PagePath, PageRef, Pager},
-    wal::{CheckpointMode, CheckpointResult, SharedLog, Wal, WalAutoActions, WalFile, WalFileShared},
+    wal::{
+        CheckpointMode, CheckpointResult, SharedLog, Wal, WalAutoActions, WalFile, WalFileShared,
+    },
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use translate::optimizer::join::join_search_ns;
