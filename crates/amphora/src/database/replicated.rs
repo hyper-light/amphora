@@ -900,6 +900,9 @@ pub(super) struct Answered {
 }
 enum Phase {
     Barrier(Option<Operation>),
+    /// A caller's session out on the owner's session worker (replication.md, "Decision (lane
+    /// P6)"): past its barrier, nothing proposed for it yet, its result decided when it comes back.
+    Running,
     Proposed(Answer),
     Bootstrap(Option<Operation>),
     /// A follower's write in the replicated class, answered on its group's commit with `result`,
@@ -983,6 +986,10 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     published: u64,
     transferred: Option<(u64, Instant)>,
     flushing: Flushing,
+    sessions: Sessions,
+    // The session worker's result, taken as the step began: decided once its drive applied what
+    // committed while the session ran (`Actor::decide`).
+    ran: Option<Ran>,
     // What this owner's restarts of its database's log held, against what it applied
     // (replication.md, "A replica's database log bounded by what it measures").
     spacing: log_bound::Spacing,
@@ -1066,6 +1073,114 @@ enum Flushing {
     /// A test's: the log is flushed when the test says so (`Driven::flush`).
     #[cfg(test)]
     Held,
+}
+
+/// The owner's session worker (replication.md, "Decision (lane P6)"): a thread of its own that
+/// runs each caller's session on a connection of its own, lent the database's one write lock
+/// while the owner holds what is committed from its machine (`Replica::hold_apply`), so a long
+/// session never stops the owner's ticks, heartbeats and votes. Its result comes back on `done`,
+/// and the owner's bell rings: the owner takes it on the step the ring wakes, never by polling.
+struct Sessions {
+    ask: mpsc::SyncSender<Session>,
+    done: mpsc::Receiver<Ran>,
+    /// Whether a session is out: the write lock is lent and applies are held until it comes back.
+    out: bool,
+}
+/// A caller's session as the worker runs it: prepared at the base the owner handed over.
+type Session = Box<dyn FnOnce(&mut Db) -> Ran + Send>;
+/// What a session prepared, and its answer, or why it failed.
+type Ran = Result<(crate::replication::Prepared, Answer), Refusal>;
+
+impl Sessions {
+    /// The worker, its connection opened as the owner starts: it waits on its job channel and
+    /// wakes on a job, never on a timer.
+    fn start(machine: &crate::replication::Machine, bell: Arc<Bell>) -> Result<Self, Refusal> {
+        let mut db = machine
+            .session_connection()
+            .map_err(|error| refused(&error))?;
+        let (ask, asked) = mpsc::sync_channel::<Session>(1);
+        let (finished, done) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("amphora.replica.session".into())
+            .spawn(move || {
+                for session in asked {
+                    if finished.send(session(&mut db)).is_err() {
+                        return;
+                    }
+                    bell.ring();
+                }
+            })
+            .map_err(unavailable)?;
+        Ok(Self {
+            ask,
+            done,
+            out: false,
+        })
+    }
+    /// Hands `session` to the worker. One is out at a time: the owner prepares one write at once.
+    fn hand(&mut self, session: Session) -> Result<(), Refusal> {
+        if self.out {
+            return Err(fenced("a second session handed to the session worker"));
+        }
+        self.ask
+            .try_send(session)
+            .map_err(|_| fenced("the replica's session worker ended"))?;
+        self.out = true;
+        Ok(())
+    }
+    /// The session's result if it came back.
+    fn take(&mut self) -> Result<Option<Ran>, Refusal> {
+        if !self.out {
+            return Ok(None);
+        }
+        match self.done.try_recv() {
+            Ok(ran) => {
+                self.out = false;
+                Ok(Some(ran))
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(fenced("the replica's session worker ended"))
+            }
+        }
+    }
+}
+
+/// A caller's session, as the owner ran it and the worker runs it now: under its deadline, on a
+/// restored database, its application's claim checked inside it.
+fn run_session(
+    db: &mut Db,
+    operation: &Operation,
+    namespace: &str,
+    claim: Option<&Option<crate::database::Application>>,
+    until: Instant,
+    clock: Clock,
+) -> anyhow::Result<Answer> {
+    // The guard ends with application evaluation, before prepare_pages rolls back its
+    // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
+    let _deadline = db.deadline_on(until, move || clock());
+    if restore::incomplete(db)? {
+        return Err(api::invalid("database", "restore is incomplete").into());
+    }
+    // The floor its claim was checked against, read again inside the traced session:
+    // its pages join the write's read set, so a raise appended after its base
+    // conflicts in the leader's walk (`rebase`) and the exact base refuses it, as the
+    // claim's check above assumes.
+    if let Some(application) = claim
+        && let Some(refused) =
+            super::application::claim_refused(db, application.as_ref(), operation)?
+    {
+        return Err(refused.refusal.into());
+    }
+    match operation {
+        Operation::Call(call) => {
+            let call = locked(call)?
+                .take()
+                .ok_or_else(|| unavailable("SQL session already executed"))?;
+            call(db).map(Answer::Called)
+        }
+        other => apply(db, namespace, other)?.map_err(Into::into),
+    }
 }
 
 /// What the owner asks of its flushing thread: a flush of what was applied through `at`, and
@@ -2348,6 +2463,7 @@ fn open_on<F: BlockFile + 'static>(
     let bell = Bell::new();
     let flushing = Flushing::start(&machine, Arc::clone(&meter), account(), Arc::clone(&bell))?;
     machine.set_image_disk(flushing.image_disk());
+    let sessions = Sessions::start(&machine, Arc::clone(&bell))?;
     let reader = machine.reader();
     let log_config = hyper_log::Config {
         segment_bytes: 64 << 20,
@@ -2442,6 +2558,8 @@ fn open_on<F: BlockFile + 'static>(
     let mut actor = Actor {
         published: replica.applied().index,
         flushing,
+        sessions,
+        ran: None,
         replica,
         _log: log,
         _log_owner: log_owner,
@@ -2752,6 +2870,10 @@ impl<F: BlockFile + 'static> Actor<F> {
             .map_err(unavailable)
     }
     fn refresh(&mut self) -> Result<(), Refusal> {
+        // The database's write lock is lent to a session: the refresh reads once it comes back.
+        if self.sessions.out {
+            return Ok(());
+        }
         if self.replica.machine().bootstrap_pending() {
             self.published = self.replica.applied().index;
             return Ok(());
@@ -2832,7 +2954,13 @@ impl<F: BlockFile + 'static> Actor<F> {
         if let Some(mut pending) = self.pending.take()
             && let Some(response) = pending.response.take()
         {
-            answer(response, Err(unknown()));
+            // A session out on the worker proposed nothing: its outcome is known.
+            let result = if matches!(pending.phase, Phase::Running) {
+                Err(reason.clone())
+            } else {
+                Err(unknown())
+            };
+            answer(response, result);
         }
         if let Some(changing) = self.changing.take() {
             let result = match changing.stage {
@@ -3085,6 +3213,12 @@ impl<F: BlockFile + 'static> Actor<F> {
             *locked(&self.control.status)? = Ok(status(&self.replica));
             return Ok(());
         }
+        // A session back from the worker gives the write lock back: the hold lifts, so this
+        // step's drive applies what committed while it ran, and the write is decided after it.
+        if let Some(ran) = self.sessions.take()? {
+            self.replica.hold_apply(false);
+            self.ran = Some(ran);
+        }
         self.resend()?;
         let mut output = Output::default();
         let nanos = self.now()?;
@@ -3120,6 +3254,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         if self.replica.applied().index != self.published {
             self.refresh()?;
         }
+        self.decide()?;
         self.expire();
         self.expire_change();
         self.settle_change();
@@ -3219,6 +3354,9 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// (`log_bound::Spacing`), or past the log's room whatever the share says: disk before
     /// latency. A failed flush or checkpoint leaves the log's state unknown, so the owner fences.
     fn flush(&mut self) -> Result<(), Refusal> {
+        // While a session holds the database's write lock the log is neither restarted nor are
+        // reads held for a restart: nothing applies meanwhile, so the log does not grow.
+        let lent = self.sessions.out;
         match &mut self.flushing {
             Flushing::Thread {
                 ask,
@@ -3259,10 +3397,10 @@ impl<F: BlockFile + 'static> Actor<F> {
                     .log_limit_bytes(pass.room.saturating_mul(log_bound::FRAME_BYTES));
                 let past = frames > pass.room;
                 let due = past || (frames > 0 && self.spacing.due()?);
-                if hold_due(pass, due, past) {
+                if hold_due(pass, due, past) && !lent {
                     self.control.local.hold_reads()?;
                 }
-                if due && pass.caught_up && !*out {
+                if due && pass.caught_up && !*out && !lent {
                     // The queue as this step began, on the basis each later step reads it.
                     let queued = self.step_queued;
                     let machine = self.replica.machine_mut();
@@ -3550,6 +3688,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                     self.requeue(pending);
                 }
             }
+            // Its session's deadline guard ends it on the worker, and its result is decided
+            // when it comes back (`Actor::decide`): nothing was proposed, so it is never unknown.
+            Phase::Running => self.pending = Some(pending),
             Phase::Proposed(_) | Phase::Bootstrap(_) | Phase::Answered { .. } => {
                 if let Some(response) = pending.response.take() {
                     answer(response, Err(unknown()));
@@ -4090,6 +4231,15 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// on a quiescent tail, so the state read is the state at the change's index; a tail still to
     /// apply is answered at once, never waited on. A group with no floor promotes as before.
     fn admits_voter(&mut self, member: u64) -> Result<(), Refusal> {
+        // A caller's session holds the database's write lock: refused at once, as a tail still to
+        // apply is, never waited on.
+        if self.sessions.out {
+            let refusal = unavailable(format!(
+                "a caller's session holds the database; promote {member} once it ends"
+            ));
+            floor_refused(&self.control, FloorRefusal::Busy, &refusal);
+            return Err(refusal);
+        }
         let (floor, attested) = self.replica.machine_mut().read_db(|db| {
             let Some(floor) = super::application::policy(db)? else {
                 return Ok((None, None));
@@ -4614,7 +4764,7 @@ impl<F: BlockFile + 'static> Actor<F> {
                         }
                         continue;
                     }
-                    Phase::Barrier(_) => {
+                    Phase::Barrier(_) | Phase::Running => {
                         Err(fenced("a read barrier matched an unapplied proposal"))
                     }
                     Phase::Bootstrap(operation) => match applied.result {
@@ -4927,6 +5077,10 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// its own knowledge of the last change is above theirs. Only a fenced machine ends the owner:
     /// any other failure is reported and the keeper looks again on its next pass.
     fn keep_floor(&mut self) -> Result<(), Refusal> {
+        // The database's write lock is lent to a session: the keeper looks once it comes back.
+        if self.sessions.out {
+            return Ok(());
+        }
         // A floor session that ended, applied or refused or dropped, is looked at again at once,
         // so a quiet group never leaves one lost.
         if self.floor_inflight && self.pending.is_none() {
@@ -5325,34 +5479,15 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .machine_mut()
                 .prepare_compaction(&pending.namespace, *before, pending.until, room)
                 .map(|(prepared, progress)| (prepared, Answer::Compacted(progress)))
+        } else if matches!(pending.author, Author::Application(_)) {
+            // A caller's session runs on the session worker, lent the write lock, while this
+            // owner goes on ticking, heartbeating and voting (replication.md, "Decision (lane
+            // P6)").
+            return self.hand_off(pending, operation, claim);
         } else {
             let clock = Arc::clone(&self.clock);
             self.replica.machine_mut().prepare_db(|db| {
-                // The guard ends with application evaluation, before prepare_pages rolls back its
-                // speculative transaction. Cleanup must run even after the SQL deadline elapsed.
-                let _deadline = db.deadline_on(pending.until, move || clock());
-                if restore::incomplete(db)? {
-                    return Err(api::invalid("database", "restore is incomplete").into());
-                }
-                // The floor its claim was checked against, read again inside the traced session:
-                // its pages join the write's read set, so a raise appended after its base
-                // conflicts in the leader's walk (`rebase`) and the exact base refuses it, as the
-                // claim's check above assumes.
-                if let Some(application) = &claim
-                    && let Some(refused) =
-                        super::application::claim_refused(db, application.as_ref(), &operation)?
-                {
-                    return Err(refused.refusal.into());
-                }
-                match &operation {
-                    Operation::Call(call) => {
-                        let call = locked(call)?
-                            .take()
-                            .ok_or_else(|| unavailable("SQL session already executed"))?;
-                        call(db).map(Answer::Called)
-                    }
-                    other => apply(db, &pending.namespace, other)?.map_err(Into::into),
-                }
+                run_session(db, &operation, &pending.namespace, None, pending.until, clock)
             })
         };
         // The preparation ran the caller's work, which takes time of its own: its deadline is
@@ -5363,6 +5498,65 @@ impl<F: BlockFile + 'static> Actor<F> {
         if bounded && let Err(Refusal::Fenced(reason)) = &prepared {
             return Err(fenced(reason));
         }
+        self.settle(pending, prepared, false)
+    }
+    /// Hands a caller's session to the session worker, lent the database's write lock: this
+    /// owner applies nothing until it comes back (replication.md, "Decision (lane P6)"). Its base
+    /// is the applied point now, read while nothing applies.
+    fn hand_off(
+        &mut self,
+        mut pending: Pending,
+        operation: Operation,
+        claim: Option<Option<crate::database::Application>>,
+    ) -> Result<(), Refusal> {
+        let base = match self.replica.machine().session_base() {
+            Ok(base) => base,
+            Err(refusal) => {
+                if let Some(response) = pending.response.take() {
+                    answer(response, Err(refusal));
+                }
+                return Ok(());
+            }
+        };
+        let (namespace, until, clock) = (
+            pending.namespace.clone(),
+            pending.until,
+            Arc::clone(&self.clock),
+        );
+        self.sessions.hand(Box::new(move |db: &mut Db| {
+            crate::replication::prepare_at(db, &base, |db| {
+                run_session(db, &operation, &namespace, claim.as_ref(), until, clock)
+            })
+        }))?;
+        self.replica.hold_apply(true);
+        pending.phase = Phase::Running;
+        self.pending = Some(pending);
+        Ok(())
+    }
+    /// Decides the write whose session came back from the worker, once this step's drive applied
+    /// what committed while it ran: proposed if this member keeps the lead it had in the write's
+    /// term, else refused `NotLeader`, a known outcome since nothing was proposed for it. Its
+    /// session is spent and never runs again.
+    fn decide(&mut self) -> Result<(), Refusal> {
+        let Some(ran) = self.ran.take() else {
+            return Ok(());
+        };
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        if !matches!(pending.phase, Phase::Running) {
+            self.pending = Some(pending);
+            return Err(fenced("a session came back to no write waiting for it"));
+        }
+        self.at = (self.clock)();
+        let moved = pending.term != self.replica.term()
+            || pending.leader != self.replica.leader()
+            || self.replica.leader() == 0;
+        self.settle(pending, ran, moved)
+    }
+    /// A prepared write proposed, or answered: at once if it wrote nothing, refused if past its
+    /// deadline, or `NotLeader` if the lead `moved` while its session ran.
+    fn settle(&mut self, mut pending: Pending, prepared: Ran, moved: bool) -> Result<(), Refusal> {
         let result = match prepared {
             Ok((prepared, value)) => {
                 if self.at >= pending.until {
@@ -5372,6 +5566,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                         answer: value,
                         token: None,
                     })
+                } else if moved {
+                    Err(not_leader(self.replica.leader()))
                 } else {
                     match prepared
                         .encode()
@@ -6507,8 +6703,10 @@ mod tests {
                         .get(&at)
                         .is_some_and(|gate| gate.is_held() && gate.waiting());
                     let writes = if parked { 0 } else { owner.replica.in_flight() };
-                    let flush = matches!(owner.flushing, Flushing::Thread { out: true, .. })
-                        && !owner.replica.machine().flush_gate().is_held();
+                    // A session out on the worker ends off this thread too, and rings the bell.
+                    let flush = (matches!(owner.flushing, Flushing::Thread { out: true, .. })
+                        && !owner.replica.machine().flush_gate().is_held())
+                        || owner.sessions.out;
                     if writes != 0 || flush {
                         Some((at, writes, flush))
                     } else {
@@ -6784,6 +6982,7 @@ mod tests {
                         let phase = match &pending.phase {
                             Phase::Barrier(Some(_)) => "barrier".to_string(),
                             Phase::Barrier(None) => "barrier(none)".to_string(),
+                            Phase::Running => "running".to_string(),
                             Phase::Proposed(_) => "proposed".to_string(),
                             Phase::Bootstrap(_) => "bootstrap".to_string(),
                             Phase::Answered { index, .. } => format!("answered@{index}"),
@@ -11269,6 +11468,7 @@ mod tests {
                     slot.as_ref().filter(|(owner, _)| {
                         running(index, owner)
                             && (owner.replica.in_flight() != 0
+                                || owner.sessions.out
                                 || matches!(owner.flushing, Flushing::Thread { out: true, .. }))
                     })
                 })

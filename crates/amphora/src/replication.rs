@@ -163,6 +163,50 @@ pub struct Prepared {
     reads: Option<readsets::ReadSet>,
 }
 
+/// The state a session is prepared at (`Machine::session_base`).
+pub(crate) struct SessionBase {
+    point: Point,
+    baseline: Option<api::replication::Bootstrap>,
+    timed: bool,
+}
+
+/// Runs `f` in a traced session on `db` at `base`, as the owner's own preparation does, on its
+/// connection or on one of its own (replication.md, "Decision (lane P6)"): the same bounds, and
+/// the transaction always rolled back.
+pub(crate) fn prepare_at<R>(
+    db: &mut Db,
+    base: &SessionBase,
+    f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
+) -> Result<(Prepared, R), Refusal> {
+    // Each page number takes at least one byte of the entry, so a session that read more
+    // pages than the entry has bytes could not carry its read set.
+    let bound = u64::try_from(COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE)).unwrap_or(u64::MAX);
+    let (answer, pages, traced) = db
+        .prepare_traced(COMMAND_BYTES, bound, f)
+        .map_err(|e| crate::database::refused(&e))?;
+    validate_pages(&pages, COMMAND_BYTES)?;
+    let page1 = match pages.iter().find(|(page, _)| *page == 1) {
+        Some((_, image)) => readsets::page1_change(&traced.page_one, image),
+        None => readsets::Page1::Unwritten,
+    };
+    Ok((
+        Prepared {
+            base_index: base.point.index,
+            base_term: base.point.term,
+            pages,
+            baseline: base.baseline.clone(),
+            // Only on a base whose state has the closed time's table: an apply that makes it
+            // (the group's first stamped entry) changes the schema beyond any entry's pages,
+            // so a write prepared before it must not move past it (`readsets`).
+            reads: traced
+                .reads
+                .filter(|_| base.timed)
+                .map(|reads| readsets::ReadSet { reads, page1 }),
+        },
+        answer,
+    ))
+}
+
 impl Prepared {
     #[cfg(test)]
     pub(crate) fn for_test(
@@ -879,36 +923,30 @@ impl Machine {
         &mut self,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R>,
     ) -> Result<(Prepared, R), Refusal> {
+        let base = self.session_base()?;
+        prepare_at(&mut self.db, &base, f)
+    }
+
+    /// A connection of its own for the owner's session worker, its page cache the owner's own: a
+    /// session's dirty pages stay in it until its image is taken, as on the owner's connection
+    /// (replication.md, "Decision (lane P6)").
+    pub(crate) fn session_connection(&self) -> anyhow::Result<Db> {
+        let db = self.db.reader()?;
+        db.keep_pages(self.db.cache_pages()?)?;
+        Ok(db)
+    }
+
+    /// What a session prepared on this machine's applied state is prepared at: its point, its
+    /// baseline, and whether that state has the closed time's table. Read once, as a session is
+    /// handed to a connection of its own, while the owner applies nothing (replication.md,
+    /// "Decision (lane P6)").
+    pub(crate) fn session_base(&self) -> Result<SessionBase, Refusal> {
         self.require_baseline()?;
-        // Each page number takes at least one byte of the entry, so a session that read more
-        // pages than the entry has bytes could not carry its read set.
-        let bound =
-            u64::try_from(COMMAND_BYTES.saturating_add(COMMAND_ENVELOPE)).unwrap_or(u64::MAX);
-        let (answer, pages, traced) = self
-            .db
-            .prepare_traced(COMMAND_BYTES, bound, f)
-            .map_err(|e| crate::database::refused(&e))?;
-        validate_pages(&pages, COMMAND_BYTES)?;
-        let page1 = match pages.iter().find(|(page, _)| *page == 1) {
-            Some((_, image)) => readsets::page1_change(&traced.page_one, image),
-            None => readsets::Page1::Unwritten,
-        };
-        Ok((
-            Prepared {
-                base_index: self.point.index,
-                base_term: self.point.term,
-                pages,
-                baseline: self.baseline.declaration().cloned(),
-                // Only on a base whose state has the closed time's table: an apply that makes it
-                // (the group's first stamped entry) changes the schema beyond any entry's pages,
-                // so a write prepared before it must not move past it (`readsets`).
-                reads: traced
-                    .reads
-                    .filter(|_| self.time.is_some())
-                    .map(|reads| readsets::ReadSet { reads, page1 }),
-            },
-            answer,
-        ))
+        Ok(SessionBase {
+            point: self.point,
+            baseline: self.baseline.declaration().cloned(),
+            timed: self.time.is_some(),
+        })
     }
 
     pub(crate) fn prepare_compaction(

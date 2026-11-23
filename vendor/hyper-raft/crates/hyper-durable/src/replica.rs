@@ -377,6 +377,9 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     fence: Option<(u64, u64)>,
     /// The entries that wait are past a drive's page, not behind the commit fence.
     paged: bool,
+    /// The owner holds what is committed from its state machine (`Replica::hold_apply`): the
+    /// entries given to apply meanwhile wait behind the fence, and the fence's release waits too.
+    held: bool,
     /// The bytes of entries a drive applies at most, as the core counts them
     /// (`EntryRef::encoded_bytes`): its committed page (`max_committed_size_per_ready`), or one
     /// entry larger than it.
@@ -541,6 +544,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             conf_index: durable.index,
             fence: None,
             paged: false,
+            held: false,
             page,
             drive_applied: 0,
             reads: VecDeque::new(),
@@ -623,6 +627,27 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// Committed entries that wait for the commit fence: the first and the last.
     pub fn behind_fence(&self) -> Option<(u64, u64)> {
         self.fence.filter(|_| !self.paged)
+    }
+
+    /// Holds what is committed from the state machine while `held`, its owner's reason beside
+    /// the commit fence's (Amphora's replication.md, "Decision (lane P6)": a caller's session runs
+    /// on a connection of its own, lent the database's one write lock). Committed entries given to
+    /// apply wait behind the fence, the core gives out no more (`RawNode::pause_apply`), and
+    /// everything else goes on: ticks, votes, appends and their writes. Lifted, what waits is
+    /// applied by the fence's own rule at the next drive: once the durable commit covers its first
+    /// entry, or at once when it waits past a drive's page.
+    pub fn hold_apply(&mut self, held: bool) {
+        self.held = held;
+        if held {
+            self.node.pause_apply();
+        } else if self.fence.is_none() {
+            self.node.resume_apply();
+        }
+    }
+
+    /// Whether the owner holds what is committed from the state machine (`Replica::hold_apply`).
+    pub fn apply_held(&self) -> bool {
+        self.held
     }
 
     /// Writes out.
@@ -2314,6 +2339,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 self.fence = Some((held, last));
                 Ok(())
             }
+            None if self.held => {
+                self.fence = Some((first, last));
+                self.paged = false;
+                self.node.pause_apply();
+                Ok(())
+            }
             None => self.apply_from(first, last, out),
         }
     }
@@ -2324,7 +2355,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let Some((first, last)) = self.fence else {
             return Ok(());
         };
-        if !self.paged && first > self.durable_commit() {
+        if self.held || (!self.paged && first > self.durable_commit()) {
             return Ok(());
         }
         self.fence = None;
