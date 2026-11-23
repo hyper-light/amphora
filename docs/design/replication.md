@@ -3043,9 +3043,10 @@ length, and the owner takes none until it has the result back.
    decides the pending write, which waited in a phase of its own (running, between `Barrier` and `Proposed`):
    - still leader, in the pending write's term, with the same leader: proposed as today (`Actor::propose`, which moves
      a base made stale by entries appended since by its read set, `rebase`), then `Proposed`;
-   - lead lost or term moved: refused `NotLeader` with the leader it knows. Nothing was proposed, so nothing was
-     written: a known outcome. Its session is spent (a call is `FnOnce`), so it is never run again, unlike a pending
-     write requeued before its preparation;
+   - lead lost or term moved: nothing was proposed, so nothing was written. Data (a mutation, an import: anything
+     but a caller's closure) comes back from the worker with its result and is requeued for the next lead, as a
+     pending write requeued before its preparation is (lane P8). A call is refused `NotLeader` with the leader it
+     knows, a known outcome: its session is spent (a call is `FnOnce`), so it is never run again;
    - past its deadline: `Timeout`, as today (the deadline guard ends the SQL inside the worker too);
    - the session's error: that error, as today.
 5. **Ordering.** Unchanged: one pending write per owner; later submits wait in `waiting` in arrival order and are
