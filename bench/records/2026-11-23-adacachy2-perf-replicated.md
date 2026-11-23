@@ -88,8 +88,18 @@ reaches them. They are open for the next lane:
   .unwrap()` on `Err(Full { limit: 2 })`, alone on both arms and in the fix arm's suite; "the group
   settled not reached in 60000 driven rounds" in main's suite. The limit is the member's command
   queue bound (`Control::command_bound`, learned as `Bounds::commands`, lane constants-20) at 2:
-  the test pump unwraps a refusal of admission at that bound (not yet traced: why 2, and whether
-  the pump should hold the record as a host would).
+  the test pump unwraps a refusal of admission at that bound. r683 (main plus a print of each
+  member's bounds at the refusal, 12 runs alone, load 200 to 300): 8 passed, 3 `Full`, 1 "settled
+  not reached". At each `Full` the leader (member 1) had learned a command bound of 2, the other
+  three about 485 million (485001426, 484991969, 484982528), and the refused record was a
+  `MsgAppendResponse` from 4 to 1 with the pump's records at 2. The pump checks its room against
+  `clients.first()`'s bounds and its own records only, not the destination's inputs already
+  queued (a call takes one of a bound of 2's places). The production host drops a record refused
+  for room (`serve.rs`, `let _ = handle.receive(..)`); the pump panics. K3's busy-time Drain
+  (b64bdc2a, not on main) is not its fix: r691, alone, one at a time, load 100 to 250: main
+  1e874db1 9/12, db677a78 (main 9462f146 plus b64bdc2a) 8/12, `Full { limit: 2 }` on both. Open:
+  why the leader alone learns 2 (the test moves its clock a second at a time past each change's
+  deadline) and whether that bound is right for a member whose clock jumped.
 - every_falsifier_of_the_floor_holds_under_a_nemesis: the pump's admission panicked on
   "MsgPropose from 2 (wire 4) to 1 (wire 1), term 0 refused: Invalid { what: \"replica sender\",
   why: \"authenticated sender or destination differs from record\" }"; a lone pass printed a
