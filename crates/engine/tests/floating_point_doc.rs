@@ -310,8 +310,17 @@ mod fp_digits {
         assert_eq!(real_to_text_digits(1.0 / 3.0, at(3)), "0.333");
         assert_eq!(real_to_text_digits(2.0 / 3.0, at(5)), "0.66667");
         assert_eq!(real_to_text_digits(123_456.0, at(3)), "1.23e+05");
-        // sqlite3FpDecode carries 19 digits at most (its 64-bit product), so 20 asks more than it has
-        assert_eq!(real_to_text_digits(0.1, at(20)), "0.1000000000000000056");
+        // 0.1 is 0.1000000000000000055511151231257827...: past 17 its exact digits, rounded (SQLite
+        // 3.54.0's decode carries 19, 0.1000000000000000056 at 20; the document wins)
+        assert_eq!(real_to_text_digits(0.1, at(20)), "0.10000000000000000555");
+        assert_eq!(
+            real_to_text_digits(0.1, at(23)),
+            "0.10000000000000000555112"
+        );
+        assert_eq!(
+            real_to_text_digits(1e-5, at(20)),
+            "1.0000000000000000818e-05"
+        );
     }
 }
 
@@ -716,6 +725,48 @@ mod page_sentences {
         assert_eq!(
             one("SELECT group_concat(x, ',') FROM (SELECT x FROM (SELECT '10' AS x UNION ALL SELECT '9' UNION ALL SELECT '1.5' UNION ALL SELECT '-2') ORDER BY x COLLATE decimal)"),
             "-2,1.5,9,10"
+        );
+    }
+
+    /// Lane G14: "The binary-64 floating-point format uses 64 bits per number. Hence there are
+    /// 1.845e+19 different possible floating point values." A REAL's encoding is 8 bytes, 2^64
+    /// encodings, and each class's edges keep all 64 bits as distinct values.
+    #[test]
+    fn g14_64_bits_make_1_845e19_different_values() {
+        assert_eq!(
+            one("WITH b(x) AS (VALUES (x'0000000000000000'), (x'8000000000000000'), (x'0000000000000001'), (x'8000000000000001'), (x'000FFFFFFFFFFFFF'), (x'0010000000000000'), (x'7FEFFFFFFFFFFFFF'), (x'FFEFFFFFFFFFFFFF'), (x'7FF0000000000000'), (x'FFF0000000000000')) SELECT printf('%.4g', CAST(decimal_pow2(8 * length(ieee754_to_blob(47.49))) AS REAL)), count(DISTINCT ieee754_to_blob(ieee754_from_blob(x))), sum(ieee754_to_blob(ieee754_from_blob(x)) = x) FROM b"),
+            "1.845e+19|10|10"
+        );
+    }
+
+    /// Lane G14: "A binary-64 can also be 0.0 (and -0.0), positive and negative infinity and "NaN" or
+    /// "Not-a-Number"." A NaN is stored as NULL, as sqlite3_result_double stores one (sqlite3 3.54.0:
+    /// a quiet NaN, a signalling NaN, Inf - Inf and 0 * Inf all read back null).
+    #[test]
+    fn g14_a_nan_is_stored_as_null() {
+        let (io, conn) = open();
+        conn.execute("CREATE TABLE t(r REAL)").unwrap();
+        conn.execute("INSERT INTO t VALUES (ieee754_from_blob(x'7FF8000000000000')), (ieee754_from_blob(x'FFF0000000000001')), (1e999 - 1e999), (0.0 * 1e999)")
+            .unwrap();
+        assert_eq!(
+            texts(
+                &io,
+                &conn,
+                "SELECT count(*), count(r), group_concat(typeof(r)) FROM t"
+            ),
+            ["4", "0", "null,null,null,null"]
+        );
+    }
+
+    /// Lane G14, printf.html: "The floating-point to text conversion subfunction for the built-in
+    /// printf() is limited in precision to 16 significant digits or 26 significant digits if the "!"
+    /// alternate-form-2 flag is used." 0.1 is 0.1000000000000000055511151231257827...; SQLite 3.54.0
+    /// writes 19 of its digits at most.
+    #[test]
+    fn g14_printf_bang_writes_up_to_26_significant_digits() {
+        assert_eq!(
+            one("SELECT printf('%!.26g', 0.1), printf('%!.40g', 0.1), printf('%.26g', 0.1), printf('%!.25e', 0.1), printf('%!.30f', 0.1), printf('%!.26g', 1.23*2.34), printf('%!.26g', 47.49)"),
+            "0.10000000000000000555111512|0.10000000000000000555111512|0.1|1.0000000000000000555111512e-01|0.10000000000000000555111512|2.8781999999999996475708031|47.49000000000000198951966"
         );
     }
 }

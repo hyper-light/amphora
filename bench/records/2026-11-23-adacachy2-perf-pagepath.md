@@ -609,3 +609,47 @@ failed 2 and ignored 14 in 205 s. The two are main's own (`cb4_a_…` and `cb4_a
 --test store` passed 15. Run r1475 (same needs, load 25-54) on c5963de9, this branch with origin/main eb365f3d merged (main
 touched none of this lane's files): the workspace clippy exit 0; the same engine tests passed 715, failed the same 2 and
 ignored 14 in 203 s; the store test passed 15.
+
+## perf-B12 (2026-11-23, 20:01-20:56Z)
+
+**Losses first.** The brief's one unit is built and checked; nothing beyond it. The switch still does not exist, so
+nothing in production can yet hold a guard on a segment that is not current: unit 2 changes no behaviour until
+unit 5. No A/B ran (the brief: none). What unit 2 leaves for later, by the brief's scope:
+- `find_frame` searches the read's current segment only. Searching the span's closing segment after it
+  (`ReadSpan::lookup_order`) needs that segment's frame range in the read, and `find_frame`'s early return for a
+  fully backfilled snapshot must then not skip the closing segment. Both belong with the switch.
+- Every read transaction now takes `SharedLog::segments`' spin lock twice (begin and end), shared by every
+  connection of the log. Not measured.
+- The shared-memory backend counts only this process's reads in its fallback's `Segments`; the authority still
+  holds one segment's frames (unit 3).
+
+**Unit 2, built** (perf/pagepath-d45 89465d69, 62f5c1bc; merged with origin/main cf820fc5 as 55a805d0).
+1. A read's span is kept in the connection state: the coordination's `try_begin_read_tx` takes it
+   (`SharedLog::begin_read`) before it chooses a read mark and returns it with the guard, giving it back on every
+   path that returns none; `WalFile` keeps it in `read_span` and `end_read_tx` gives it back with the guard.
+2. `ReadGuardKind::DbFile` and `ReadMark` name their segment. The lock index `WalFile` stores keeps the bare slot for
+   the first segment and sets the top bit for the second (bitwise only, so the ratchet's arithmetic count does not
+   rise). `end_read_tx` unlocks the slot on that segment (`unlock_segment_read_mark`); the checkpointer's own
+   read-mark 0 calls still act on the current segment (unit 4).
+3. `find_frame` passes the read's segment to the coordination's `find_frame` (a new first argument) and
+   `frame_generation` compares against it. With no read mark held (VACUUM's exclusive transaction) both use the
+   current segment.
+4. Rule 2: both backends take read mark 0 only when `span.closing()` is none.
+The two read-mark bodies moved unchanged into `try_read_mark` on each backend, apart from the segment, rule 2 and
+three `expect`s gone (`NonZeroUsize::new` mapped or `?`-ed).
+
+New test: `storage::wal::test::d45_a_read_guard_unlocks_the_slot_of_the_segment_it_locked`. A read on the first
+segment, a switch made by hand (`Segments::switch`, then `second_current`), two reads on the second (one on a fully
+backfilled snapshot), then the first read ends. Its slot is free on the first segment, the second segment's slot is
+still held, the backfilled read holds a read mark on the second segment (not read mark 0), and once all three end
+both segments' counts are zero. Before this unit the first read's unlock went to the current (second) segment.
+
+**Checks.** Run r1538 on 89465d69 found two test lookups (`exclusive_coordination`, `reopened_coordination`)
+without the new argument (fixed in 62f5c1bc). Run r1540 (adacachy2, needs `linux/amd64,cpus=8,mem=24g`, load
+32-27) on 62f5c1bc: `cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0 in 37 s;
+`cargo test -p amphora-engine --lib --locked -- d45_` passed 8; `cargo test -p amphora-engine --lib --locked -- storage:: vdbe::vacuum --test-threads=8` passed 716,
+failed 2 and ignored 14 in 236 s: the two are main's own (`cb4_a_…` and `cb4_ab_…`), and 716 is main's 715 plus
+the new test; `cargo test -p amphora --locked
+--test store` passed 15. Run r1549 (same needs, load 13-17) on 55a805d0,
+the merge with origin/main cf820fc5 (main touched no file under `storage/` or `vdbe/`): the workspace clippy exit 0
+in 28 s; the `d45_`, coordination-guard and reader tests passed 16; the store test passed 15.
