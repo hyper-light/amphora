@@ -685,13 +685,23 @@ fn cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names()
     ];
 
     let made = sql
-        .write(vec![st("CREATE TABLE t (id INTEGER PRIMARY KEY, r REAL, s TEXT, b BLOB, n)", vec![])])
+        .write(vec![st(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, r REAL, s TEXT, b BLOB, n)",
+            vec![],
+        )])
         .unwrap();
     assert_eq!(made.len(), 1, "{made:?}");
     let wrote = sql
-        .write(vec![st("INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)", row.clone())])
+        .write(vec![st(
+            "INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)",
+            row.clone(),
+        )])
         .unwrap();
-    assert_eq!((wrote[0].affected, wrote[0].last_insert_rowid), (1, 7), "{wrote:?}");
+    assert_eq!(
+        (wrote[0].affected, wrote[0].last_insert_rowid),
+        (1, 7),
+        "{wrote:?}"
+    );
 
     let refused = sql
         .write(vec![
@@ -717,28 +727,54 @@ fn cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names()
         }
     );
     let one = sql
-        .read(st("SELECT s AS name FROM t WHERE id = ?1", vec![Value::Integer(7)]))
+        .read(st(
+            "SELECT s AS name FROM t WHERE id = ?1",
+            vec![Value::Integer(7)],
+        ))
         .unwrap();
     assert_eq!(
         (one.columns, one.rows),
-        (vec!["name".to_owned()], vec![vec![Value::Text("seven".into())]])
+        (
+            vec!["name".to_owned()],
+            vec![vec![Value::Text("seven".into())]]
+        )
     );
 
     // Version 2: a read and a write whose answers pass one frame come whole, in order.
-    sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])])
-        .unwrap();
+    sql.write(vec![st(
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)",
+        vec![],
+    )])
+    .unwrap();
     let mib = 1 << 20;
     for half in 0..2i64 {
         let rows = (1..=20i64)
-            .map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(half * 20 + n), Value::Blob(vec![9; mib])]))
+            .map(|n| {
+                st(
+                    "INSERT INTO big VALUES (?1, ?2)",
+                    vec![Value::Integer(half * 20 + n), Value::Blob(vec![9; mib])],
+                )
+            })
             .collect();
         sql.write(rows).unwrap();
     }
-    let ids = |table: &Table| table.rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>();
+    let ids = |table: &Table| {
+        table
+            .rows
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>()
+    };
     let every = (1..=40).map(Value::Integer).collect::<Vec<_>>();
-    let big = sql.read(st("SELECT id, v FROM big ORDER BY id", vec![])).unwrap();
+    let big = sql
+        .read(st("SELECT id, v FROM big ORDER BY id", vec![]))
+        .unwrap();
     assert_eq!(ids(&big), every);
-    assert!(big.rows.iter().all(|row| row[1] == Value::Blob(vec![9; mib])));
+    assert!(
+        big.rows
+            .iter()
+            .all(|row| row[1] == Value::Blob(vec![9; mib]))
+    );
     let held = sql
         .write(vec![
             st("INSERT INTO t (id) VALUES (9)", vec![]),

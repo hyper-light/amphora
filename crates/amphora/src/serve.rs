@@ -870,7 +870,11 @@ impl Answering {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 )
             });
-            return Err(if timed_out { Refusal::Timeout.into() } else { e });
+            return Err(if timed_out {
+                Refusal::Timeout.into()
+            } else {
+                e
+            });
         }
         Ok(())
     }
@@ -1122,7 +1126,12 @@ impl Shared {
     ) -> anyhow::Result<Vec<Encoded>> {
         let until = match after(self.deadline) {
             Ok(until) => until,
-            Err(e) => return Ok(vec![refused_frame(amphora_api::invalid("deadline", &e.to_string()))?]),
+            Err(e) => {
+                return Ok(vec![refused_frame(amphora_api::invalid(
+                    "deadline",
+                    &e.to_string(),
+                ))?]);
+            }
         };
         let streams = agreed.is_some_and(|version| version >= 2);
         let result = match request {
@@ -1152,8 +1161,7 @@ impl Shared {
                 } else {
                     Spill::None
                 };
-                self.db
-                    .call(until, move |c| answered(c, statements, spill))
+                self.db.call(until, move |c| answered(c, statements, spill))
             }
             SqlRequest::Read(statement) => {
                 let spill = if streams {
@@ -1563,7 +1571,10 @@ fn answer(r: &mut impl Read, statements: usize) -> anyhow::Result<SqlAnswer> {
             None => bail!("the member closed the connection"),
         };
         match answer {
-            SqlAnswer::Rows { statement, mut rows } => {
+            SqlAnswer::Rows {
+                statement,
+                mut rows,
+            } => {
                 let statement = usize::try_from(statement)?;
                 ensure!(
                     statement < statements,
@@ -2372,7 +2383,11 @@ mod tests {
             for frame in &frames {
                 write_frame(&mut wire, &postcard::to_allocvec(frame).unwrap()).unwrap();
             }
-            assert!(answer(&mut wire.as_slice(), 1).is_err(), "{} bytes decoded", wire.len());
+            assert!(
+                answer(&mut wire.as_slice(), 1).is_err(),
+                "{} bytes decoded",
+                wire.len()
+            );
         }
         let within = vec![vec![Value::Null]; 1000];
         let mut wire = Vec::new();
@@ -2408,7 +2423,11 @@ mod tests {
             })
             .unwrap();
         assert!(frames.len() > 1, "{} frames", frames.len());
-        assert!(frames.iter().all(|f| f.bytes.len() <= amphora_api::RESULT_MAX));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.bytes.len() <= amphora_api::RESULT_MAX)
+        );
         let mut wire = Vec::new();
         for frame in &frames {
             write_frame(&mut wire, &frame.bytes).unwrap();
@@ -2419,7 +2438,12 @@ mod tests {
         assert_eq!(tables[0].affected, 1);
         let ids: Vec<_> = tables[1].rows.iter().map(|row| row[0].clone()).collect();
         assert_eq!(ids, (1..=40).map(Value::Integer).collect::<Vec<_>>());
-        assert!(tables[1].rows.iter().all(|row| row[1] == Value::Blob(vec![7; MIB])));
+        assert!(
+            tables[1]
+                .rows
+                .iter()
+                .all(|row| row[1] == Value::Blob(vec![7; MIB]))
+        );
         let count = db
             .query_local(sql_until(), |c| {
                 Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))?)
@@ -2446,7 +2470,12 @@ mod tests {
             answers
         });
         let until = sql_until();
-        serve_read(&db, &answering, until, "SELECT id, v FROM t WHERE id < 40 ORDER BY id");
+        serve_read(
+            &db,
+            &answering,
+            until,
+            "SELECT id, v FROM t WHERE id < 40 ORDER BY id",
+        );
         serve_read(&db, &answering, until, "SELECT id, v, v FROM t ORDER BY id");
         serve_read(&db, &answering, until, "SELECT count(*) FROM t");
         let answers = reader.join().unwrap();
@@ -2500,16 +2529,24 @@ mod tests {
         let reading = Instant::now() + Duration::from_secs(120);
         let streamed = {
             let (db, answering) = (db.clone(), Arc::clone(&answering));
-            std::thread::spawn(move || serve_read(&db, &answering, reading, "SELECT id, v FROM t ORDER BY id"))
+            std::thread::spawn(move || {
+                serve_read(&db, &answering, reading, "SELECT id, v FROM t ORDER BY id")
+            })
         };
         let write = |id: i64| {
             db.call(sql_until(), move |c| {
-                c.execute("INSERT INTO t VALUES (?1, ?2)", [Value::Integer(id), Value::Blob(vec![])])?;
+                c.execute(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    [Value::Integer(id), Value::Blob(vec![])],
+                )?;
                 Ok(())
             })
         };
         let wrote = write(41);
-        assert!(wrote.is_ok(), "a write while every reader is busy and a read waits: {wrote:?}");
+        assert!(
+            wrote.is_ok(),
+            "a write while every reader is busy and a read waits: {wrote:?}"
+        );
         for release in releases {
             release.send(()).unwrap();
         }
@@ -2518,14 +2555,21 @@ mod tests {
         }
         client.peek(&mut [0u8; 1]).unwrap();
         let wrote = write(42);
-        assert!(wrote.is_ok(), "a write while a read is held on its client: {wrote:?}");
+        assert!(
+            wrote.is_ok(),
+            "a write while a read is held on its client: {wrote:?}"
+        );
         let got = answer(&mut BufReader::new(&mut client), 1).unwrap();
         streamed.join().unwrap();
         let SqlAnswer::Tables(tables) = got else {
             panic!("{got:?}");
         };
         let ids: Vec<_> = tables[0].rows.iter().map(|row| row[0].clone()).collect();
-        assert_eq!(ids, (1..=41).map(Value::Integer).collect::<Vec<_>>(), "whole, read once the first write committed");
+        assert_eq!(
+            ids,
+            (1..=41).map(Value::Integer).collect::<Vec<_>>(),
+            "whole, read once the first write committed"
+        );
     }
 
     /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do read an answer of 40 MiB through a link
@@ -2553,6 +2597,10 @@ mod tests {
         );
         let mut got = Vec::new();
         let _ = client.read_to_end(&mut got);
-        assert!(got.len() <= amphora_api::RESULT_MAX + 4, "{} bytes", got.len());
+        assert!(
+            got.len() <= amphora_api::RESULT_MAX + 4,
+            "{} bytes",
+            got.len()
+        );
     }
 }

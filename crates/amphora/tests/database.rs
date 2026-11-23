@@ -950,3 +950,49 @@ fn a7_a_refused_or_oversize_nowait_call_is_typed_and_rolls_back() {
     assert_eq!(fits.unwrap().len(), 100);
     assert_eq!(ids(&db), vec![3]);
 }
+
+/// Lane perf-A8: 10,000 calls in flight at once, queued behind a held writer by a pool of one
+/// thread a core, are each admitted and each answered: the writer's queue refuses none for room
+/// (it held 4,096 before), its memory charge is its only bound.
+#[test]
+fn a8_ten_thousand_nowait_calls_in_flight_are_all_answered_none_refused_for_queue_room() {
+    use amphora::database::AnswerCharge;
+    const IN_FLIGHT: usize = 10_000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("in-flight.db"), until()).unwrap();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let holding = db
+        .call_nowait(until(), AnswerCharge::Declared(0), move |_| {
+            let _ = held.recv();
+            Ok(())
+        })
+        .unwrap();
+    let pool = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let submitted = Arc::new(Barrier::new(pool + 1));
+    let threads: Vec<_> = (0..pool)
+        .map(|t| {
+            let (db, submitted) = (db.clone(), Arc::clone(&submitted));
+            std::thread::spawn(move || {
+                let mine: Vec<usize> = (t..IN_FLIGHT).step_by(pool).collect();
+                let calling: Vec<_> = mine
+                    .iter()
+                    .map(|&n| {
+                        db.call_nowait(until(), AnswerCharge::Declared(8), move |_| Ok(n))
+                            .unwrap()
+                    })
+                    .collect();
+                submitted.wait();
+                mine.into_iter()
+                    .zip(calling)
+                    .map(|(n, calling)| block_on(calling).0.unwrap() == n)
+                    .filter(|&same| same)
+                    .count()
+            })
+        })
+        .collect();
+    submitted.wait();
+    release.send(()).unwrap();
+    block_on(holding).0.unwrap();
+    let answered: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+    assert_eq!(answered, IN_FLIGHT);
+}

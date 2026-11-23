@@ -882,12 +882,18 @@ mod stored {
         /// executable's path, so a rebuild replaces its own file instead of adding one.
         pub(super) fn file(&self) -> PathBuf {
             let path = self.exe.rsplitn(3, ' ').last().unwrap_or(&self.exe);
-            self.dir
-                .join(format!("{:016x}", fnv1a(&[self.cpu.as_bytes(), b"\0", path.as_bytes()])))
+            self.dir.join(format!(
+                "{:016x}",
+                fnv1a(&[self.cpu.as_bytes(), b"\0", path.as_bytes()])
+            ))
         }
 
         fn header(&self) -> String {
-            format!("amphora-calibration 1\ncpu {}\nexe {}\n", escape(&self.cpu), escape(&self.exe))
+            format!(
+                "amphora-calibration 1\ncpu {}\nexe {}\n",
+                escape(&self.cpu),
+                escape(&self.exe)
+            )
         }
     }
 
@@ -957,9 +963,16 @@ mod stored {
 
     pub(super) fn render(key: &Key, calibration: &Calibration) -> String {
         let mut text = key.header();
-        text.push_str(&format!("timing {:016x}\n", calibration.timing_nanos.to_bits()));
+        text.push_str(&format!(
+            "timing {:016x}\n",
+            calibration.timing_nanos.to_bits()
+        ));
         for (kind, (units, nanos)) in CALIBRATED.iter().zip(calibration.kinds) {
-            text.push_str(&format!("{kind:?} {:016x} {:016x}\n", units.to_bits(), nanos.to_bits()));
+            text.push_str(&format!(
+                "{kind:?} {:016x} {:016x}\n",
+                units.to_bits(),
+                nanos.to_bits()
+            ));
         }
         text
     }
@@ -978,7 +991,10 @@ mod stored {
             .and_then(|()| std::fs::rename(&partial, &file));
         if let Err(err) = written {
             let _ = std::fs::remove_file(&partial);
-            tracing::debug!("AUDIT 7.1: calibration not kept at {}: {err}", file.display());
+            tracing::debug!(
+                "AUDIT 7.1: calibration not kept at {}: {err}",
+                file.display()
+            );
         }
     }
 
@@ -1613,7 +1629,9 @@ mod tests {
             assert!(costs.sampled(Work::Seek, &runs));
             costs.observe_sampled(Work::Seek, if i % 2 == 0 { 100.0 } else { 150.0 });
         }
-        let timed = (0..120).filter(|_| costs.sampled(Work::Seek, &runs)).count();
+        let timed = (0..120)
+            .filter(|_| costs.sampled(Work::Seek, &runs))
+            .count();
         assert!(timed > 0 && timed < 120, "{timed}");
         let weights = costs.weights().unwrap();
         assert!((weights.seek - 125.0).abs() < 1e-9, "{weights:?}");
@@ -2003,7 +2021,10 @@ mod tests {
         page_read_anchor(":memory:", &timer_io, 4096, 8, true).unwrap();
         let reader = counting(Some("audit-7-1-read-only"));
         let reader_io: crate::sync::Arc<dyn crate::io::IO> = reader.clone();
-        assert_eq!(page_read_anchor(":memory:", &reader_io, 4096, 8, false), None);
+        assert_eq!(
+            page_read_anchor(":memory:", &reader_io, 4096, 8, false),
+            None
+        );
         assert_eq!(reader.opened.load(Ordering::SeqCst), 0);
     }
 
