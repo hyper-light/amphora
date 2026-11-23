@@ -449,10 +449,12 @@ pub fn skipping_candidates(
         .flatten()
         .map(|btree| btree.root_page)
         .ok_or(SkipRefusal::Off)?;
-    let (reader_pos, committed) = conn.skipping_positions().ok_or(SkipRefusal::Off)?;
     conn.db
         .skipping
-        .candidates(root, conn.skipping_id(), reader_pos, committed, lo, hi)
+        .probe(root, conn.skipping_id(), None, &[(lo, hi)], || {
+            conn.skipping_positions()
+        })
+        .map(|(candidates, _)| candidates)
 }
 
 /// Lane skip-11 (T-SKU.14): how scans of `table` ask its summary for an IN list's rows (span or

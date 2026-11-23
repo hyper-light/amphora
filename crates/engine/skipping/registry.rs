@@ -201,6 +201,7 @@ struct Entry {
 pub struct BuildClaim {
     pub root_page: i64,
     pub method: SkipMethod,
+    pub(crate) column: usize,
     ticket: u64,
 }
 
@@ -610,11 +611,30 @@ impl SkipRegistry {
         committed: WalPos,
         spans: &[(i64, i64)],
     ) -> Result<(Candidates, Option<SkipMethod>), SkipRefusal> {
+        self.probe(root_page, reader, None, spans, || {
+            Some((reader_pos, committed))
+        })
+    }
+
+    /// The bounds were computed for `column`. Validate it and sample the commit position
+    /// while holding the entry, so a replacement or a writer's commit cannot split the check.
+    pub(crate) fn probe(
+        &self,
+        root_page: i64,
+        reader: usize,
+        column: Option<usize>,
+        spans: &[(i64, i64)],
+        positions: impl FnOnce() -> Option<(WalPos, WalPos)>,
+    ) -> Result<(Candidates, Option<SkipMethod>), SkipRefusal> {
         let mut entries = self.entries.lock();
         let entry = entries
             .iter_mut()
             .find(|entry| entry.root_page == root_page)
             .ok_or(SkipRefusal::Off)?;
+        if column.is_some_and(|expected| expected != entry.column) {
+            return Err(SkipRefusal::Off);
+        }
+        let (reader_pos, committed) = positions().ok_or(SkipRefusal::Off)?;
         if entry.stale {
             entry.counts.refused_stale = entry.counts.refused_stale.saturating_add(1);
             return Err(SkipRefusal::Stale);
@@ -709,6 +729,7 @@ impl SkipRegistry {
         });
         Some(BuildClaim {
             root_page,
+            column: entry.column,
             method,
             ticket,
         })

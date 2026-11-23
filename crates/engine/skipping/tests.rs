@@ -2788,7 +2788,7 @@ mod builds {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    start_build(&asker, root, 0, 2)
+                    start_build(&asker, root, 2)
                 })
             })
             .collect();
@@ -3093,7 +3093,7 @@ mod builds {
         let root = fill_table(&conn, rows);
         for mode in [BuildMode::VoidOnWrite, BuildMode::Replay] {
             set_due(&conn, root, rows, mode);
-            let build = start_build(&conn, root, 0, 2).expect("the cracker's build is due");
+            let build = start_build(&conn, root, 2).expect("the cracker's build is due");
             assert_eq!(build.join().unwrap(), BuildEnd::Installed, "{mode:?}");
             let held = cracker_rows(&db.skipping, root).map(|rows| rows.len());
             assert_eq!(held, Some(300), "{mode:?}");
@@ -3278,6 +3278,51 @@ mod versioned {
             })
             .collect();
         (rows, stmt.metrics().rows_read)
+    }
+
+    #[test]
+    fn t_ns_2_1_a_filter_uses_the_column_and_snapshot_checked_at_the_probe() {
+        use super::super::{Candidates, CrackerColumn};
+        let registry = SkipRegistry::default();
+        let root = 5;
+        let install = |column, value| {
+            registry.set(
+                root,
+                column,
+                Skipping::Cracking(CrackerColumn::new(vec![(1, Some(value))])),
+            )
+        };
+        install(0, 7);
+        let column = registry.column_of(root).unwrap();
+        // The scan has computed bounds for column 0; an install on column 1 wins the race.
+        install(1, 9);
+        let snap = (0, 3);
+        let candidates = registry.probe(root, 1, Some(column), &[(7, 7)], || Some((snap, snap)));
+        assert_eq!(
+            candidates,
+            Err(SkipRefusal::Off),
+            "column {column} still has row 1"
+        );
+        install(0, 7);
+        registry.on_write_told(
+            root,
+            2,
+            snap,
+            RowWrite::Update {
+                rowid: 1,
+                old: Some(7),
+                new: Some(9),
+            },
+            &mut || 0,
+        );
+        registry.committed(2);
+        let newest = (0, 4);
+        let candidates = registry.probe(root, 1, Some(column), &[(7, 7)], || Some((snap, newest)));
+        assert_eq!(candidates, Err(SkipRefusal::OlderSnapshot));
+        assert_eq!(
+            registry.candidates(root, 1, newest, newest, 9, 9),
+            Ok(Candidates::Rowids(vec![1]))
+        );
     }
 
     /// Do: a told writer's write, another writer's commit beside it, then its own commit told.
