@@ -1347,6 +1347,13 @@ impl Held {
         self.statement.num_columns()
     }
 
+    /// Its result columns' names, in order.
+    pub(crate) fn column_names(&self) -> Vec<String> {
+        (0..self.statement.num_columns())
+            .map(|i| self.statement.get_column_name(i).into_owned())
+            .collect()
+    }
+
     pub(crate) fn validated(&self) -> bool {
         self.validated
     }

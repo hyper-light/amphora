@@ -238,6 +238,12 @@ impl Session for Db {
         self.give_back(held).map_err(failed)?;
         Ok(columns)
     }
+    fn column_names(&self, sql: &str) -> Result<Vec<String>> {
+        let held = held(self, sql)?;
+        let names = held.column_names();
+        self.give_back(held).map_err(failed)?;
+        Ok(names)
+    }
     fn changes(&self) -> i64 {
         Db::changes(self)
     }
