@@ -783,3 +783,34 @@ fn p5_probe_large_replicated_writes() {
         eprintln!("P5PROBE end {count} MiB leader now {now}");
     }
 }
+
+#[test]
+fn p5_probe_replicated_write_answering_40_mib() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    start(&configs);
+    let c = &configs[0];
+    healthy(c);
+    let keys = c.keys().unwrap();
+    let (_, leader) = Client::connect(&c.members[0].addr, &keys, c.deadline).unwrap().leader(Duration::from_secs(60)).unwrap();
+    let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
+    let st = |text: &str, params: Vec<Value>| Statement { sql: text.to_owned(), params };
+    let status = |when: &str| for m in &c.members { eprintln!("P5PROBE40 {when} {}: {:?}", m.addr, Client::connect(&m.addr, &keys, c.deadline).and_then(|mut k| k.ask("status")).map(|s| s.replace('\n', " | "))); };
+    sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])]).unwrap();
+    let mib = 1 << 20;
+    for part in 0..10i64 {
+        let rows = (0..4i64).map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(part * 4 + n), Value::Blob(vec![9; mib])])).collect();
+        let began = Instant::now();
+        let got = sql.write(rows);
+        eprintln!("P5PROBE40 part {part}: {:?} after {:?}", got.as_ref().map(|t| t.len()).map_err(|e| format!("{e:#}")), began.elapsed());
+    }
+    let began = Instant::now();
+    let read = sql.read(st("SELECT id, v FROM big ORDER BY id", vec![]));
+    eprintln!("P5PROBE40 read: {:?} after {:?}", read.as_ref().map(|t| t.rows.len()).map_err(|e| format!("{e:#}")), began.elapsed());
+    status("before");
+    let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
+    let began = Instant::now();
+    let held = sql.write(vec![st("INSERT INTO big (id) VALUES (100000)", vec![]), st("SELECT id, v FROM big ORDER BY id", vec![])]);
+    eprintln!("P5PROBE40 write+select: {:?} after {:?}", held.as_ref().map(|t| t.iter().map(|t| t.rows.len()).collect::<Vec<_>>()).map_err(|e| format!("{e:#}")), began.elapsed());
+    status("after");
+}
