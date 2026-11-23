@@ -671,12 +671,15 @@ struct WaitingRead {
 }
 
 /// Where a waiting read is.
-enum ReadSlot {
-    Waiting,
-    /// A reader that stopped handed the reads still waiting to it: it reads them.
-    Lead,
+#[derive(Default)]
+struct ReadSlot {
     /// Read: its answer, or None when the writer must answer it.
-    Done(Option<Result<Answer, Refusal>>),
+    answer: Option<Option<Result<Answer, Refusal>>>,
+    /// Readers that stopped handed the reads still waiting to it, each its place among the
+    /// readers: it reads them, once a hand-over, before it answers, even once its own read is
+    /// answered (another reader may take it meanwhile). Counted: two readers may hand over to the
+    /// same first waiting read before it wakes, and neither place is lost.
+    leads: usize,
 }
 
 /// The Records reads waiting for a reader, and how many readers are reading them (AUDIT 2.5). A
@@ -723,7 +726,7 @@ fn read_records(
         operation: Mutex::new(Some(operation)),
         claim: claim.clone(),
         until,
-        slot: Mutex::new(ReadSlot::Waiting),
+        slot: Mutex::new(ReadSlot::default()),
         read: Condvar::new(),
     });
     let reader = {
@@ -740,14 +743,14 @@ fn read_records(
     }
     let answer = loop {
         let mut slot = locked(&mine.slot)?;
-        match std::mem::replace(&mut *slot, ReadSlot::Waiting) {
-            ReadSlot::Done(answer) => break answer,
-            ReadSlot::Lead => {
-                drop(slot);
-                read_waiting(store, reads, &mine)?;
-                continue;
-            }
-            ReadSlot::Waiting => {}
+        if slot.leads > 0 {
+            slot.leads = slot.leads.saturating_sub(1);
+            drop(slot);
+            read_waiting(store, reads, &mine)?;
+            continue;
+        }
+        if let Some(answer) = slot.answer.take() {
+            break answer;
         }
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -780,9 +783,9 @@ fn read_late(store: &Store<Local>, reads: &Reads, mine: &Arc<WaitingRead>) -> Re
         let mut queue = locked(&reads.queue)?;
         queue.waiting.retain(|w| !Arc::ptr_eq(w, mine));
         // A hand-over is made under the queue's lock: none comes after this.
-        matches!(*locked(&mine.slot)?, ReadSlot::Lead)
+        std::mem::take(&mut locked(&mine.slot)?.leads)
     };
-    if lead {
+    for _ in 0..lead {
         read_waiting(store, reads, mine)?;
     }
     Err(Refusal::Timeout)
@@ -795,14 +798,16 @@ fn read_waiting(store: &Store<Local>, reads: &Reads, mine: &WaitingRead) -> Resu
     loop {
         let batch = {
             let mut queue = locked(&reads.queue)?;
-            let answered = matches!(*locked(&mine.slot)?, ReadSlot::Done(_));
+            let answered = locked(&mine.slot)?.answer.is_some();
             match queue.waiting.first() {
                 None => {
                     queue.reading = queue.reading.saturating_sub(1);
                     return Ok(());
                 }
                 Some(next) if answered => {
-                    *locked(&next.slot)? = ReadSlot::Lead;
+                    let mut slot = locked(&next.slot)?;
+                    slot.leads = slot.leads.saturating_add(1);
+                    drop(slot);
                     next.read.notify_all();
                     return Ok(());
                 }
@@ -821,7 +826,7 @@ fn read_waiting(store: &Store<Local>, reads: &Reads, mine: &WaitingRead) -> Resu
                 .next()
                 .unwrap_or_else(|| Some(Err(unavailable("a read went unanswered"))));
             if let Ok(mut slot) = waiting.slot.lock() {
-                *slot = ReadSlot::Done(answer);
+                slot.answer = Some(answer);
             }
             waiting.read.notify_all();
         }
@@ -4316,7 +4321,6 @@ mod group_holding {
 #[cfg(test)]
 mod records_reads {
     use super::*;
-    use amphora_api::Records as _;
 
     /// Do: size a store's readers for machines of 1 to 64 cores and of 1 GiB to 1 TiB, and one
     /// that says nothing. Expect: one a core while a quarter of memory holds that many readers'
