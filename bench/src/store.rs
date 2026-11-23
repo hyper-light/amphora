@@ -192,7 +192,7 @@ impl Amphora {
             // AMPHORA_COMMIT_ROWS: rows that make a commit at once.
             commit_rows: env("AMPHORA_COMMIT_ROWS").and_then(|r| usize::try_from(r).ok()).unwrap_or(defaults.commit_rows),
             // AMPHORA_QUEUE: batches a group's writer queues at most.
-            queue: env("AMPHORA_QUEUE").and_then(|q| usize::try_from(q).ok()).unwrap_or(defaults.queue),
+            queue: env("AMPHORA_QUEUE").and_then(|q| usize::try_from(q).ok()).or(defaults.queue),
             ..defaults
         };
         // AMPHORA_PACK_LOG=1: packed logs (docs/design/store.md, decisions 16 and 17).

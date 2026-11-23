@@ -258,7 +258,7 @@ it does with no leader) instead of forwarding a record the next hop must refuse,
 `settle` excuses this refusal. Either way the requester's barrier waits for its requeue, as now; what would shorten that
 wait (the relay answering the requester that it no longer leads) is a wire question. Not done here.
 
-## 2. The leader-tail A/B (driven counts done; bench timings pending)
+## 2. The leader-tail A/B (done: mixed; the switch stays off main)
 
 The switch (commit cf62b1f3 on perf/persisted-w4, not on main): `AMPHORA_LEADER_TAIL=1` adds the leader to
 `prepare_barrier`'s tail rule, so its every write waits until it has applied its own log through the last index it
@@ -284,15 +284,29 @@ unanswered" (the harness's round limit): both build a leader raise prepared besi
 rule makes wait for that entry's apply. Six other slot and floor tests pass with it on (the nemesis, the slot holder,
 the three W tests, the retry race).
 
-Bench timings (in-process persisted commit, 3, 32 and 128 writers, 5 alternated rounds, latency by acknowledging node
-and Serialization refusals by node: bench/src/repl.rs `by_node`, `leader`): not measured. The bench does not compile on
-main (r1104): perf-A8's 80c3a431 made `store::Config::queue` an `Option`, and bench/src/store.rs still unwraps it
-(`AMPHORA_QUEUE`); the one-line fix (`.or(defaults.queue)`) is bc856f59 on perf/persisted-w4, which builds (r1148, release, 32 s with the
-lane's warm target; bench clippy not run). The bench
-also has no Cargo.lock of its own (its workspace sits outside the root's), so `--locked` refuses; r1104 built it
-`--offline` against lane bench-s's CARGO_HOME and its stale lock. r1148's rungs all exited at once: `--repl commit` now takes `--dir`
-(the bench's "every size and duration is an input"), which lane W's repro.sh predates. `persisted-scripts/ab4.sh` runs
-the rungs on that binary with `--dir`; it waited for room on adacachy2 (0 to 3 of 32 cores idle) at the hour's end.
+Bench timings, r1158 (`persisted-scripts/ab4.sh`, the bench at bc856f59 built once, both arms that one binary, so
+one calibration, measured by the first run and read by the other 29; in-process persisted commit, `--batch 1
+--text-bytes 600 --deadline-s 10`, 5 s after 1 s warmup, 5 rounds alternated; load 26-82, CPU pressure avg10 1-50%,
+I/O 0-10%, other lanes running). The leader was node 2 in 18 of the 20 runs that finished; the two whose leader had
+changed by the end (r2 w3 tail, r3 w32 today) are left out. Leader rows are its own acknowledged writes; medians of the
+runs, range in brackets:
+
+| writers | arm | runs | leader p50 ms | leader p99 ms | leader refused per write | followers refused per run | writes/s |
+|---|---|---|---|---|---|---|---|
+| 3 | today | 5 | 104 [78-150] | 573 [141-680] | 0.36 (71 / 195) | 46 | 14.8 [12.2-22.2] |
+| 3 | leader tail | 4 | 100 [67-128] | 350 [274-401] | 0.14 (27 / 190) | 52 | 16.4 [13.6-24.0] |
+| 32 | today | 4 | 1024 [713-1147] | 2392 [2163-3277] | 0.23 (39 / 173) | | 14.0 [11.6-21.8] |
+| 32 | leader tail | 5 | 1065 [786-1491] | 2523 [1786-4981] | 0.27 (54 / 202) | | 16.0 [12.4-20.4] |
+| 128 | both | 5 + 5 | every run ended at once: a writer's 10 s deadline (UnknownOutcome or "the deadline elapsed") | | | | |
+
+Verdict: mixed, and the timings inconclusive. At 3 writers the leader's refusals per write fall 0.36 to 0.14, as the
+driven counts said, and its p50 shows no measurable difference. Its p99 looks lower, but with 25 to 68 leader writes a
+run the p99 and the p99.9 are each run's slowest write, so neither is resolved. At 32 writers, no measurable difference
+in any column. The limiter is not named: writes take hundreds of ms at about 15 a second, which reads as the persisted
+class's quorum flush under the host's load, not measured. The 128-writer rung fails on both arms, as S4 saw: the bench
+aborts the run on one writer's deadline. So the switch stays off main, on perf/persisted-w4. What would decide it: the
+same rungs on an idle machine (the coordinator's new room, Mac Studio 2, both arms there at cpus=16), more seconds a
+run so p99.9 has 1,000 leader writes, and the 128 rung reporting its deadline misses per arm instead of aborting.
 
 ## 3. The read-or-write tag on member requests (not started)
 
