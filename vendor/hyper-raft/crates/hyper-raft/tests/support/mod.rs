@@ -656,6 +656,9 @@ pub struct Settings {
     /// Whether a heartbeat's answer says nothing of the member's log and
     /// frees a full window's first message, as in `raft-rs`.
     pub bare_answers: bool,
+    /// Whether a member whose term and vote are durable answers a heartbeat at once
+    /// (`Config::answer_beats_now`); in `raft-rs` the answer waits for the member's write.
+    pub answer_beats_now: bool,
     /// Whether a member keeps nothing of an append that arrives ahead of a
     /// hole in its log, as in `raft-rs` (`Ahead::Refused`).
     pub refuse_ahead: bool,
@@ -775,6 +778,7 @@ impl Settings {
             by_length: true,
             round_each: true,
             bare_answers: true,
+            answer_beats_now: false,
             refuse_ahead: true,
             fast: false,
             in_place: false,
@@ -1385,6 +1389,7 @@ impl Replica for New {
             } else {
                 hyper_raft::HeartbeatAnswers::Position
             },
+            answer_beats_now: settings.answer_beats_now,
             ahead: if settings.refuse_ahead {
                 hyper_raft::Ahead::Refused
             } else {
