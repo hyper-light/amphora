@@ -42,6 +42,9 @@ use std::collections::HashMap;
 
 const HEADER_MAGIC: u64 = 0x4144_4548_4f52_5041;
 const JOURNAL_MAGIC: u64 = 0x4c4e_524a_4f52_5041;
+/// The word after a header's stamp: the header was written only once its checkpoint's pages were
+/// flushed (AUDIT 7.5). A header written before this order has no word after its stamp.
+const PAGES_FLUSHED: u64 = 1;
 
 /// A checkpoint as a header or journal names it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -50,6 +53,25 @@ struct Stamp {
     ts: Ts,
     allocated: u64,
     roots: Vec<u64>,
+}
+
+/// The data file's header: its checkpoint, and whether that checkpoint's pages were flushed before
+/// the header was written, so a reopen that finds it needn't write them again (AUDIT 7.5).
+struct Header {
+    stamp: Stamp,
+    pages_flushed: bool,
+}
+
+impl Header {
+    fn decode(body: &[u8]) -> Option<Self> {
+        let mut at = 0;
+        let stamp = Stamp::decode(body, &mut at)?;
+        let pages_flushed = take_u64(body, &mut at) == Some(PAGES_FLUSHED);
+        Some(Self {
+            stamp,
+            pages_flushed,
+        })
+    }
 }
 
 fn corrupt(what: &str) -> LimboError {
@@ -343,8 +365,10 @@ impl Journal {
         }))
     }
 
-    /// Writes a journal's pages, then `stamp` as the header, over the data file a page at a time,
-    /// flushed: a checkpoint's second half, and recovery's finishing of it.
+    /// Writes a journal's pages over the data file a page at a time, flushed, then `stamp` as the
+    /// header, flushed: a checkpoint's second half, and recovery's finishing of it. The pages are
+    /// flushed before the header is written, so a header found on reopen says its pages are in the
+    /// file (AUDIT 7.5).
     fn apply(disk: &dyn Disk, stamp: &Stamp, pages: &JournalPages) -> Result<()> {
         let entry_len = to_u64(ENTRY_BYTES)?;
         let mut buf = vec![0u8; ENTRY_BYTES];
@@ -365,6 +389,7 @@ impl Journal {
                 .ok_or_else(|| corrupt("a checkpoint journal's page cut short"))?;
             disk.write_at(File::Data, page_offset(no)?, page)?;
         }
+        disk.sync(File::Data)?;
         Database::write_header(disk, stamp)?;
         disk.sync(File::Data)
     }
@@ -442,7 +467,7 @@ impl Database {
         let header = first
             .get(..n)
             .and_then(|h| unseal(HEADER_MAGIC, h))
-            .and_then(|body| Stamp::decode(body, &mut 0));
+            .and_then(Header::decode);
         // The header's checkpoint's journal, or the next one's if it was flushed before the power
         // went; with the header damaged, the newer of the two.
         let mut newest: Option<Journal> = None;
@@ -450,7 +475,7 @@ impl Database {
             let Some(j) = Journal::read(&*disk, file)? else {
                 continue;
             };
-            let current = header.as_ref().is_none_or(|h| j.stamp.seq >= h.seq);
+            let current = header.as_ref().is_none_or(|h| j.stamp.seq >= h.stamp.seq);
             if current && newest.as_ref().is_none_or(|o| j.stamp.seq > o.stamp.seq) {
                 newest = Some(j);
             }
@@ -466,7 +491,14 @@ impl Database {
                 "no complete checkpoint journal at or after the data file's header",
             ));
         };
-        Journal::apply(&*disk, &journal.stamp, &journal.pages)?;
+        // A header written after its pages were flushed, naming this journal's checkpoint: the
+        // checkpoint finished, its pages in the file. Any other is finished from the journal.
+        let finished = header
+            .as_ref()
+            .is_some_and(|h| h.pages_flushed && h.stamp == journal.stamp);
+        if !finished {
+            Journal::apply(&*disk, &journal.stamp, &journal.pages)?;
+        }
         let Journal { stamp, list, .. } = journal;
         // A checkpoint that switched turns and never finished leaves commits after T in both.
         let replay = redo::merge(redo::read(&*disk)?, disk.lanes(), stamp.ts)?;
@@ -715,6 +747,7 @@ impl Database {
     fn write_header(disk: &dyn Disk, stamp: &Stamp) -> Result<()> {
         let mut body = Vec::new();
         stamp.encode(&mut body)?;
+        body.extend_from_slice(&PAGES_FLUSHED.to_le_bytes());
         let mut page = seal(HEADER_MAGIC, &body)?;
         if page.len() > PAGE_SIZE {
             return Err(LimboError::TooBig);
@@ -1324,10 +1357,10 @@ mod tests {
         assert_eq!(rows(&db), want);
     }
 
-    /// Do: commit rows and checkpoint, twice; write zeros over the page the second checkpoint
-    /// wrote, as a power cut that kept its header and not its page leaves the file; reopen.
-    /// Expect: the rows as last committed: recovery writes the newest journal's pages again
-    /// (T-T1.3.1).
+    /// Do: commit rows and checkpoint, twice; write the header again as one written before AUDIT
+    /// 7.5's order and zeros over the page the second checkpoint wrote, as a power cut under that
+    /// order could leave the file (its header kept, its page not); reopen. Expect: the rows as last
+    /// committed: recovery writes the newest journal's pages again (T-T1.3.1).
     #[test]
     fn a_checkpoint_whose_header_outlived_its_pages_is_finished_from_its_journal() {
         let disk = Arc::new(Simulated::new(11, 1).unwrap());
@@ -1350,11 +1383,170 @@ mod tests {
                 "the rows fit the root leaf; page 2 is the overflow tree's root"
             );
         }
+        write_unordered_header(&*disk);
         disk.write_at(File::Data, page_offset(1).unwrap(), &[0u8; PAGE_SIZE])
             .unwrap();
         disk.sync(File::Data).unwrap();
         let db = Database::open(disk, 2_000, 1, cmp).unwrap();
         assert_eq!(rows(&db), want);
+    }
+
+    /// Writes `disk`'s header again as one written before AUDIT 7.5's order: its stamp alone.
+    fn write_unordered_header(disk: &dyn Disk) {
+        let mut first = vec![0u8; PAGE_SIZE];
+        disk.read_at(File::Data, 0, &mut first).unwrap();
+        let header = unseal(HEADER_MAGIC, &first)
+            .and_then(Header::decode)
+            .unwrap();
+        assert!(header.pages_flushed);
+        let mut body = Vec::new();
+        header.stamp.encode(&mut body).unwrap();
+        let mut page = seal(HEADER_MAGIC, &body).unwrap();
+        page.resize(PAGE_SIZE, 0);
+        disk.write_at(File::Data, 0, &page).unwrap();
+        disk.sync(File::Data).unwrap();
+    }
+
+    /// A simulated disk that counts the data file's writes and flushes.
+    struct DataCounts {
+        inner: Arc<Simulated>,
+        writes: std::sync::atomic::AtomicU64,
+        syncs: std::sync::atomic::AtomicU64,
+    }
+
+    impl DataCounts {
+        fn counted(&self) -> (u64, u64) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (self.writes.load(Relaxed), self.syncs.load(Relaxed))
+        }
+    }
+
+    impl Disk for DataCounts {
+        fn lanes(&self) -> usize {
+            self.inner.lanes()
+        }
+        fn read_at(&self, file: File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            self.inner.read_at(file, offset, buf)
+        }
+        fn reads_runs(&self) -> bool {
+            self.inner.reads_runs()
+        }
+        fn read_run(&self, file: File, offset: u64, bufs: &mut [&mut [u8]]) -> Result<usize> {
+            self.inner.read_run(file, offset, bufs)
+        }
+        fn write_at(&self, file: File, offset: u64, data: &[u8]) -> Result<()> {
+            if matches!(file, File::Data) {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.write_at(file, offset, data)
+        }
+        fn sync(&self, file: File) -> Result<()> {
+            if matches!(file, File::Data) {
+                self.syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.sync(file)
+        }
+        fn len(&self, file: File) -> Result<u64> {
+            self.inner.len(file)
+        }
+        fn truncate(&self, file: File, len: u64) -> Result<()> {
+            self.inner.truncate(file, len)
+        }
+    }
+
+    /// AUDIT 7.5. Do: commit rows and checkpoint; reopen; write the header again as one written
+    /// before AUDIT 7.5's order; reopen twice. Expect: the rows each time. The clean reopen writes
+    /// and flushes nothing in the data file. The old header's reopen writes its checkpoint's pages
+    /// again, flushing them before a header in the new order, so the reopen after it writes nothing.
+    #[test]
+    fn audit_7_5_a_clean_reopen_writes_no_checkpoint_again() {
+        let sim = Arc::new(Simulated::new(17, 1).unwrap());
+        let mut want = BTreeMap::new();
+        {
+            let db = Database::open(sim.clone(), 2_000, 1, cmp).unwrap();
+            let mut d = Descender::new();
+            let mut t = db.begin().unwrap();
+            for k in 0..200u16 {
+                db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &[7; 40])
+                    .unwrap();
+                want.insert(k.to_be_bytes().to_vec(), vec![7; 40]);
+            }
+            db.commit(t, &mut d, db.lane(), true).unwrap();
+            db.checkpoint().unwrap();
+        }
+        let reopen = || {
+            let disk = Arc::new(DataCounts {
+                inner: sim.clone(),
+                writes: std::sync::atomic::AtomicU64::new(0),
+                syncs: std::sync::atomic::AtomicU64::new(0),
+            });
+            let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+            assert_eq!(rows(&db), want);
+            disk.counted()
+        };
+        assert_eq!(reopen(), (0, 0), "a clean reopen's data file writes and flushes");
+        write_unordered_header(&*sim);
+        let (writes, syncs) = reopen();
+        assert!(
+            writes > 1 && syncs == 2,
+            "an old header's reopen wrote {writes} and flushed {syncs} times"
+        );
+        assert_eq!(reopen(), (0, 0), "the reopen after an old header's");
+    }
+
+    /// AUDIT 7.5, T-T1.3.1. Do: commit rows durably, checkpoint, commit more durably; checkpoint
+    /// again on a disk that crashes after each of its operations in turn (its journal, its pages,
+    /// their flush, the header, its flush), cut the power (by seed, each unflushed write kept
+    /// whole, cut short or lost), reopen, and reopen again. Expect: every commit's rows at each
+    /// reopen, and a database that checkpoints and reopens after.
+    #[test]
+    fn audit_7_5_a_crash_at_each_step_of_a_checkpoint_recovers_every_commit() {
+        fn workload(disk: &Arc<Simulated>) -> (Database, BTreeMap<Vec<u8>, Vec<u8>>) {
+            let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+            let mut d = Descender::new();
+            let mut want = BTreeMap::new();
+            for round in 0..2u8 {
+                let mut t = db.begin().unwrap();
+                for k in (0..200u16).filter(|k| round == 0 || k % 3 == 0) {
+                    db.put(&mut d, &mut t, 0, &k.to_be_bytes(), &[round; 40])
+                        .unwrap();
+                    want.insert(k.to_be_bytes().to_vec(), vec![round; 40]);
+                }
+                db.commit(t, &mut d, db.lane(), true).unwrap();
+                if round == 0 {
+                    db.checkpoint().unwrap();
+                }
+            }
+            (db, want)
+        }
+        let probe = Arc::new(Simulated::new(1, 1).unwrap());
+        let (db, _) = workload(&probe);
+        let before = probe.operations();
+        db.checkpoint().unwrap();
+        let steps = probe.operations() - before;
+        drop(db);
+        for crash in 0..=steps {
+            for seed in [3, 5, 7, 11, 13] {
+                let disk = Arc::new(Simulated::new(seed, 1).unwrap());
+                let (db, want) = workload(&disk);
+                disk.crash_after(crash);
+                let finished = db.checkpoint().is_ok();
+                drop(db);
+                disk.power_cut().unwrap();
+                let at = format!("crash after {crash} of {steps}, seed {seed}, finished {finished}");
+                for reopen in 0..2 {
+                    let db = Database::open(disk.clone(), 2_000, 1, cmp)
+                        .unwrap_or_else(|e| panic!("{at}, reopen {reopen}: {e}"));
+                    assert_eq!(rows(&db), want, "{at}, reopen {reopen}");
+                }
+                let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+                db.checkpoint().unwrap();
+                drop(db);
+                let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
+                assert_eq!(rows(&db), want, "{at}, after a checkpoint");
+            }
+        }
     }
 
     /// Do: commit rows and checkpoint; damage the data file's header and reopen; then empty both
