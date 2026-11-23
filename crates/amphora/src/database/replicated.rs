@@ -6158,14 +6158,30 @@ mod tests {
     /// that rings an owner's bell (its log's write or compaction done, its database's flush done,
     /// an input queued, a handle dropped), or a flush come to a held gate. The driver reads the
     /// count before it steps and waits only for a count past it, so nothing that happens between
-    /// its look and its wait is lost; it waits on these events, never on a timer.
-    #[derive(Default)]
+    /// its look and its wait is lost; it waits on these events, never on a timer. A ring on the
+    /// driver's own thread (its steps queue inputs and wake owners) is no news of work off it, and
+    /// isn't counted: counted, it ended every wait at once, so the driver spun its rounds out
+    /// before a slow disk's log write or flush ended (macOS's F_FULLFSYNC; CP-T1.8, AC-T1.8.5).
     struct OffThread {
         count: Mutex<u64>,
         rang: std::sync::Condvar,
+        /// The thread that made the shell and steps it.
+        driver: std::thread::ThreadId,
+    }
+    impl Default for OffThread {
+        fn default() -> Self {
+            Self {
+                count: Mutex::new(0),
+                rang: std::sync::Condvar::new(),
+                driver: std::thread::current().id(),
+            }
+        }
     }
     impl OffThread {
         fn ring(&self) {
+            if std::thread::current().id() == self.driver {
+                return;
+            }
             // A poisoned count follows only a test thread's panic, which ends the test.
             if let Ok(mut count) = self.count.lock() {
                 *count += 1;
