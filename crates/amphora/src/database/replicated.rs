@@ -5309,6 +5309,16 @@ impl<F: BlockFile + 'static> Actor<F> {
                 if restore::incomplete(db)? {
                     return Err(api::invalid("database", "restore is incomplete").into());
                 }
+                // The floor its claim was checked against, read again inside the traced session:
+                // its pages join the write's read set, so a raise appended after its base
+                // conflicts in the leader's walk (`rebase`) and the exact base refuses it, as the
+                // claim's check above assumes.
+                if let Some(application) = &claim
+                    && let Some(refused) =
+                        super::application::claim_refused(db, application.as_ref(), &operation)?
+                {
+                    return Err(refused.refusal.into());
+                }
                 match &operation {
                     Operation::Call(call) => {
                         let call = locked(call)?
