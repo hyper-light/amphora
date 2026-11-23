@@ -236,6 +236,18 @@ pub enum OuterJoinProbe {
     Kept = 1,
 }
 
+/// Amphora (audit 3, lane G8): how SUM, AVG and TOTAL add REALs (`Connection::set_real_sums`), the
+/// two designs Ada decides between by their A/B kept beside today's. Read when a statement runs.
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+pub enum RealSums {
+    /// Today's, the default: SQLite's compensated sum (Kahan-Babuska-Neumaier) in row order, on
+    /// the serial loop only; a statement whose workers meet a REAL to sum goes back to it.
+    Serial = 0,
+    /// Arm (b): every path sums exactly and rounds once (`morsel::ExactSum`), the serial loop
+    /// included, so the workers' answer is the serial loop's at any worker count.
+    Exact = 1,
+}
+
 /// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row of
 /// the tables before it (a rowid lookup, or a seek in one of its indexes) runs on morsels
 /// (`Connection::set_parallel_searched_links`): the candidates, kept so measurements decide.
@@ -745,6 +757,8 @@ pub struct Connection {
     pub(super) parallel_outer_probe: AtomicOuterJoinProbe,
     /// Amphora: see [`Connection::set_parallel_searched_links`].
     pub(super) parallel_searched_links: AtomicSearchedLinks,
+    /// Amphora: see [`Connection::set_real_sums`].
+    pub(super) real_sums: AtomicRealSums,
     /// Amphora: the machine's measured costs of a worker and a morsel (QT.6), measured by the
     /// first parallel statement and learned by every one after.
     pub(crate) morsel_costs: crate::sync::Mutex<Option<crate::vdbe::morsel::MachineCosts>>,
@@ -1389,6 +1403,17 @@ impl Connection {
 
     pub(crate) fn parallel_searched_links(&self) -> SearchedLinks {
         self.parallel_searched_links.get()
+    }
+
+    /// Amphora (audit 3, lane G8): how SUM, AVG and TOTAL add REALs from now on, in statements
+    /// prepared before too ([`RealSums`]; `Serial`, today's, by default). For the A/B that decides
+    /// between the designs.
+    pub fn set_real_sums(&self, sums: RealSums) {
+        self.real_sums.set(sums);
+    }
+
+    pub(crate) fn real_sums(&self) -> RealSums {
+        self.real_sums.get()
     }
 
     pub(crate) fn parallel_join_direct(&self) -> bool {

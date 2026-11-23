@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::alloc::TryClone;
 use crate::numeric::Numeric;
 use crate::types::Value;
+use crate::RealSums;
 
 /// The switch: parallel execution is off until a caller turns it on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -612,6 +613,50 @@ impl ExactSum {
         Ok(())
     }
 
+    /// The sum as a payload slot's bytes (lane G8, the serial loop under `RealSums::Exact`): a tag
+    /// for `special` (0 none, 1 plus infinity, 2 minus infinity), then each partial's bits. A NaN
+    /// special has none: the caller keeps it as SQLite's NULL.
+    pub(crate) fn write_to(&self, out: &mut crate::alloc::Vec<u8>) -> Result<(), MorselError> {
+        out.clear();
+        out.try_reserve_exact(self.partials.len().saturating_mul(8).saturating_add(1))?;
+        out.push(match self.special {
+            Some(special) if special > 0.0 => 1,
+            Some(_) => 2,
+            None => 0,
+        });
+        for partial in &self.partials {
+            out.extend_from_slice(&partial.to_bits().to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// The sum [`ExactSum::write_to`] wrote.
+    pub(crate) fn read_from(bytes: &[u8]) -> Result<ExactSum, MorselError> {
+        let (tag, rest) = bytes
+            .split_first()
+            .ok_or(MorselError::Corrupt("an exact sum's bytes are empty"))?;
+        let special = match tag {
+            0 => None,
+            1 => Some(f64::INFINITY),
+            2 => Some(f64::NEG_INFINITY),
+            _ => return Err(MorselError::Corrupt("an exact sum's tag")),
+        };
+        let mut partials = Vec::new();
+        partials.try_reserve_exact(rest.len() / 8)?;
+        for chunk in rest.chunks(8) {
+            let bits: [u8; 8] = chunk
+                .try_into()
+                .map_err(|_| MorselError::Corrupt("an exact sum's partial"))?;
+            partials.push(f64::from_bits(u64::from_le_bytes(bits)));
+        }
+        Ok(ExactSum { partials, special })
+    }
+
+    /// Whether the sum met both infinities: SQLite's sum is then NULL.
+    pub(crate) fn is_nan(&self) -> bool {
+        self.special.is_some_and(f64::is_nan)
+    }
+
     /// The exact sum rounded once to the nearest double, ties to even (`math.fsum`'s last step).
     pub fn value(&self) -> f64 {
         if let Some(special) = self.special {
@@ -797,13 +842,16 @@ enum Accumulator {
         any_real: bool,
         seen: bool,
     },
-    /// AVG or TOTAL over integers: their exact sum, the sum of their magnitudes (the bound of
-    /// every partial sum in any order) and how many there were (lane qs6-17).
+    /// AVG or TOTAL: the integers' exact sum, the sum of their magnitudes (the bound of every
+    /// partial sum in any order) and how many values there were (lane qs6-17); under
+    /// [`RealSums::Exact`] the REALs' exact sum too (lane G8).
     Mean {
         integers: i128,
         magnitude: u128,
         count: u64,
         total: bool,
+        reals: ExactSum,
+        exact: bool,
     },
     /// The least or greatest value with the row it came from; ties keep the earliest row.
     Extreme {
@@ -813,7 +861,7 @@ enum Accumulator {
 }
 
 impl Accumulator {
-    fn new(aggregate: Aggregate) -> Self {
+    fn new(aggregate: Aggregate, sums: RealSums) -> Self {
         match aggregate {
             Aggregate::CountStar | Aggregate::Count(_) => Accumulator::Count(0),
             Aggregate::Sum(_) => Accumulator::Sum {
@@ -835,6 +883,8 @@ impl Accumulator {
                 magnitude: 0,
                 count: 0,
                 total: matches!(aggregate, Aggregate::Total(_)),
+                reals: ExactSum::default(),
+                exact: sums == RealSums::Exact,
             },
         }
     }
@@ -884,6 +934,8 @@ impl Accumulator {
                     integers,
                     magnitude,
                     count,
+                    reals,
+                    exact,
                     ..
                 },
                 Aggregate::Avg(at) | Aggregate::Total(at),
@@ -901,6 +953,10 @@ impl Accumulator {
                             what: "an average's sum",
                         },
                     )?;
+                    *count = count.saturating_add(1);
+                }
+                Value::Numeric(Numeric::Float(f)) if *exact => {
+                    reals.add(f64::from(*f))?;
                     *count = count.saturating_add(1);
                 }
                 // The serial loop's compensated double sum over REALs isn't the exact sum.
@@ -966,15 +1022,18 @@ impl Accumulator {
                     integers,
                     magnitude,
                     count,
+                    reals,
                     ..
                 },
                 Accumulator::Mean {
                     integers: more,
                     magnitude: more_magnitude,
                     count: more_count,
+                    reals: more_reals,
                     ..
                 },
             ) => {
+                reals.merge(&more_reals)?;
                 *integers = integers.checked_add(more).ok_or(MorselError::Overflow {
                     what: "an average's sum",
                 })?;
@@ -1025,30 +1084,31 @@ impl Accumulator {
             }
             Accumulator::Sum {
                 integers,
-                mut reals,
+                reals,
                 any_real: true,
                 ..
+            } => Value::from_f64(exact_total(integers, reals)?),
+            // Lane G8: the exact sum rounded once, as the serial loop's under `RealSums::Exact`.
+            Accumulator::Mean {
+                total: false,
+                count: 0,
+                exact: true,
+                ..
+            } => Value::Null,
+            Accumulator::Mean {
+                integers,
+                count,
+                total,
+                reals,
+                exact: true,
+                ..
             } => {
-                // The integer part enters the exact sum in three pieces each a double holds exactly.
-                // `integers` is top * 2^100 + middle * 2^50 + low, with middle and low in [0, 2^50)
-                // and top within 2^28 of zero: each converts to a double exactly.
-                let piece = |shift: u32, mask: i128| -> Result<f64, MorselError> {
-                    let part = integers.checked_shr(shift).ok_or(MorselError::Overflow {
-                        what: "a sum's piece",
-                    })? & mask;
-                    let whole = i64::try_from(part).map_err(|_| MorselError::Overflow {
-                        what: "a sum's piece",
-                    })? as f64;
-                    Ok(whole
-                        * 2f64.powi(i32::try_from(shift).map_err(|_| MorselError::Overflow {
-                            what: "a sum's piece",
-                        })?))
-                };
-                const LOW_50: i128 = 0x3_ffff_ffff_ffff;
-                reals.add(piece(100, -1)?)?;
-                reals.add(piece(50, LOW_50)?)?;
-                reals.add(piece(0, LOW_50)?)?;
-                Value::from_f64(reals.value())
+                let sum = exact_total(integers, reals)?;
+                if total {
+                    Value::from_f64(sum)
+                } else {
+                    Value::from_f64(sum / count as f64)
+                }
             }
             // Past a double's exact integers the serial loop's rounding is its own: it answers.
             Accumulator::Mean { magnitude, .. } if magnitude >= DOUBLE_EXACT => {
@@ -1080,6 +1140,29 @@ impl Accumulator {
     }
 }
 
+/// The exact sum of `integers` and `reals`, rounded once. The integer part enters the exact sum in
+/// three pieces each a double holds exactly: `integers` is top * 2^100 + middle * 2^50 + low, with
+/// middle and low in [0, 2^50) and top within 2^28 of zero, so each converts to a double exactly.
+fn exact_total(integers: i128, mut reals: ExactSum) -> Result<f64, MorselError> {
+    let piece = |shift: u32, mask: i128| -> Result<f64, MorselError> {
+        let part = integers.checked_shr(shift).ok_or(MorselError::Overflow {
+            what: "a sum's piece",
+        })? & mask;
+        let whole = i64::try_from(part).map_err(|_| MorselError::Overflow {
+            what: "a sum's piece",
+        })? as f64;
+        Ok(whole
+            * 2f64.powi(i32::try_from(shift).map_err(|_| MorselError::Overflow {
+                what: "a sum's piece",
+            })?))
+    };
+    const LOW_50: i128 = 0x3_ffff_ffff_ffff;
+    reals.add(piece(100, -1)?)?;
+    reals.add(piece(50, LOW_50)?)?;
+    reals.add(piece(0, LOW_50)?)?;
+    Ok(reals.value())
+}
+
 #[derive(Clone, Debug)]
 struct Group {
     first_row: usize,
@@ -1094,6 +1177,8 @@ pub struct ScanAggregate<'a> {
     pub filter: &'a [Predicate],
     pub group_by: &'a [usize],
     pub aggregates: &'a [Aggregate],
+    /// How AVG and TOTAL take REALs (lane G8; SUM keeps them exact under every setting).
+    pub sums: RealSums,
 }
 
 /// The partial state of a [`ScanAggregate`]: its groups by key.
@@ -1114,7 +1199,7 @@ impl ScanAggregate<'_> {
                 accumulators: self
                     .aggregates
                     .iter()
-                    .map(|a| Accumulator::new(*a))
+                    .map(|a| Accumulator::new(*a, self.sums))
                     .collect(),
             });
         }
@@ -1173,7 +1258,7 @@ impl ScanAggregate<'_> {
                 let accumulators = self
                     .aggregates
                     .iter()
-                    .map(|a| Accumulator::new(*a))
+                    .map(|a| Accumulator::new(*a, self.sums))
                     .collect();
                 partial.groups.try_reserve(1)?;
                 partial.groups.entry(key).or_insert(Group {
@@ -1737,6 +1822,7 @@ mod tests {
                 filter: &filter,
                 group_by: &group_by,
                 aggregates: &aggregates,
+                sums: RealSums::Serial,
             };
             let budget = MemoryBudget::new(BIG);
             let serial = execute_at(&pipeline, 0, Degree::Serial, None, &budget)
@@ -1855,6 +1941,7 @@ mod tests {
             filter: &[],
             group_by: &group_by,
             aggregates: &aggregates,
+            sums: RealSums::Serial,
         };
         let limit = pipeline.group_bytes() * 10;
         for workers in [1, 2, 4, 8] {
@@ -1926,6 +2013,7 @@ mod tests {
             filter: &[],
             group_by: &group_by,
             aggregates: &aggregates,
+            sums: RealSums::Serial,
         };
         let budget = MemoryBudget::new(BIG);
         let (serial, _) = execute(&pipeline, ParallelMode::Off, &mut costs, &budget).unwrap();
