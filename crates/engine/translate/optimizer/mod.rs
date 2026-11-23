@@ -4434,15 +4434,6 @@ pub(crate) mod bushy_test_hook {
             );
         }
 
-        /// Lane T7 (TPC-H q05, option i): the late terms each visit runs are priced per visit.
-        /// Every weight is pinned at the planner bench's calibration on adacachy2 (T6's, at
-        /// 952f5766: in rows' visits a seek 18.55, a hash build 25.81, a probe 4.82, a sort 1.27,
-        /// a Bloom lookup 4.99, a WHERE step 6.77; a row's visit 0.00027 of a page read at SF1;
-        /// every page read from the file). With seeks and builds dearer by a growing factor and
-        /// the WHERE step at nothing, the pricing before this lane, the first state that takes
-        /// the late match (some step count at or past what it visits) is the slow plan's; with
-        /// the WHERE step at its measured price, that same state takes a plan doing less work,
-        /// and answers as the nested loops do.
         /// Lane T13 (PL.13, the versioned cost snapshot; `docs/design/planner.md`): do plan q05's
         /// shape against one version of the cost inputs, then move the database's learned seek
         /// weight a millionfold and plan again against that same version; expect one plan, and
@@ -4466,6 +4457,15 @@ pub(crate) mod bushy_test_hook {
             assert_eq!(first_rows, second_rows);
         }
 
+        /// Lane T7 (TPC-H q05, option i): the late terms each visit runs are priced per visit.
+        /// Every weight is pinned at the planner bench's calibration on adacachy2 (T6's, at
+        /// 952f5766: in rows' visits a seek 18.55, a hash build 25.81, a probe 4.82, a sort 1.27,
+        /// a Bloom lookup 4.99, a WHERE step 6.77; a row's visit 0.00027 of a page read at SF1;
+        /// every page read from the file). With seeks and builds dearer by a growing factor and
+        /// the WHERE step at nothing, the pricing before this lane, the first state that takes
+        /// the late match (some step count at or past what it visits) is the slow plan's; with
+        /// the WHERE step at its measured price, that same state takes a plan doing less work,
+        /// and answers as the nested loops do.
         #[test]
         fn t7_q05_late_terms_priced_per_visit_keep_the_late_match_out() {
             use crate::translate::optimizer::learned_costs::LearnedWeights;

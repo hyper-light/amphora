@@ -90,7 +90,8 @@ const MOVE_Z: f64 = 2.734_368_786_533_176;
 /// itself rather than its logarithm (a share of 0 has none).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Batches {
-    /// The last batch mean's logarithm; None before the first batch closed.
+    /// The last batch mean, on the scale judged (a rate's logarithm); None before the first batch
+    /// closed.
     last: Option<f64>,
     /// How many successive differences `squares` sums the squares of.
     differences: f64,
