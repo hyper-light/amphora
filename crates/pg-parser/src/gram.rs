@@ -261,7 +261,7 @@ fn end(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
 /// ported action's otherwise, and [`Value::Unported`] when the action isn't ported (or was ported
 /// from a text that has since changed) or a value it reads came from such a rule.
 fn act(rule: i32, mut r: Reduce<'_>) -> Result<Value, Refusal> {
-    if r.rhs.iter().any(|v| *v == Value::Unported) {
+    if r.rhs.contains(&Value::Unported) {
         return Ok(Value::Unported);
     }
     let Some(hash) = usize::try_from(rule)
@@ -311,7 +311,7 @@ pub fn parse_tree(sql: &[u8]) -> Result<Parsed, Refusal> {
         }
         if state == FINAL {
             return Ok(match parsetree {
-                Some(statements) if values.iter().all(|v| *v != Value::Unported) => {
+                Some(statements) if !values.contains(&Value::Unported) => {
                     Parsed::Tree { tree, statements }
                 }
                 _ => Parsed::Unported,
@@ -477,7 +477,11 @@ mod tests {
         let mut n = 0;
         for rule in 0..=NRULES {
             if let Some((from, _)) = ported(rule) {
-                assert_eq!(ACTION_HASH[usize::try_from(rule).unwrap()], Some(from), "rule {rule}");
+                assert_eq!(
+                    ACTION_HASH[usize::try_from(rule).unwrap()],
+                    Some(from),
+                    "rule {rule}"
+                );
                 n += 1;
             }
         }
