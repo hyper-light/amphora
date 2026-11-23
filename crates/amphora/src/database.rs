@@ -4401,7 +4401,10 @@ mod admission_charge {
             cursor: vec![1, 2],
             done: false,
         };
-        assert_eq!(progress.answer_bytes(), std::mem::size_of_val(&progress) + 5);
+        assert_eq!(
+            progress.answer_bytes(),
+            std::mem::size_of_val(&progress) + 5
+        );
         let reads = vec![(vec![1u8; 3], Some(vec![2u8; 4])), (vec![5u8], None)];
         let heap = 2 * std::mem::size_of::<(Vec<u8>, Option<Vec<u8>>)>() + 3 + 4 + 1;
         let locked = crate::xgroup::Reply::Locked {
@@ -4411,7 +4414,10 @@ mod admission_charge {
         let resolved = crate::xgroup::Reply::Resolved;
         assert_eq!(resolved.answer_bytes(), std::mem::size_of_val(&resolved));
         let committed = crate::xgroup::coordinator::Answer::Committed { reads, at: None };
-        assert_eq!(committed.answer_bytes(), std::mem::size_of_val(&committed) + heap);
+        assert_eq!(
+            committed.answer_bytes(),
+            std::mem::size_of_val(&committed) + heap
+        );
         let stepped = online::Stepped::Public {
             held: Duration::from_millis(1),
         };
