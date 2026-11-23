@@ -7863,7 +7863,9 @@ fn exact_sum_step(arg: &Value, payload: &mut [Value]) -> Result<()> {
 /// An AVG step under `RealSums::Exact`.
 fn exact_avg_step(arg: &Value, payload: &mut [Value]) -> Result<()> {
     let [acc, _, count_val, ..] = payload else {
-        return Err(LimboError::InternalError("Avg: payload too short".to_string()));
+        return Err(LimboError::InternalError(
+            "Avg: payload too short".to_string(),
+        ));
     };
     // Both infinities met: NULL, which stays.
     if matches!(acc, Value::Null) {
@@ -7895,10 +7897,12 @@ fn exact_inverse(arg: NumericArg, payload: &mut [Value], count_at: usize) -> Res
         ));
     };
     *count = count.checked_sub(1).or_overflow()?;
-    let integer_sum = count_at == 4
-        && matches!(payload.get(2), Some(Value::Numeric(Numeric::Integer(0))));
+    let integer_sum =
+        count_at == 4 && matches!(payload.get(2), Some(Value::Numeric(Numeric::Integer(0))));
     let Some(acc) = payload.first_mut() else {
-        return Err(LimboError::InternalError("an exact sum's payload is empty".to_string()));
+        return Err(LimboError::InternalError(
+            "an exact sum's payload is empty".to_string(),
+        ));
     };
     if let (true, Value::Numeric(Numeric::Integer(total)), NumericArg::Integer(sub)) =
         (integer_sum, &mut *acc, &arg)

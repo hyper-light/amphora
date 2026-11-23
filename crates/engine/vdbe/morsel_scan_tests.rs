@@ -3519,7 +3519,11 @@ fn g8_answers_at_every_core_count(conn: &Arc<Connection>, sql: &str, rows: u64) 
             .morsel_body_rows
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(parallel, serial, "{sql} on {cores} cores");
-        assert_eq!(after - before, rows, "{sql} on {cores} cores: the body's rows");
+        assert_eq!(
+            after - before,
+            rows,
+            "{sql} on {cores} cores: the body's rows"
+        );
     }
     conn.set_parallel_mode(ParallelMode::Off);
     serial
@@ -3543,15 +3547,28 @@ fn g8_exact_real_sums_answer_as_the_serial_loop_at_every_worker_count() {
     let rows = 3000u64;
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, r REAL, a INTEGER, p TEXT)")
         .unwrap();
-    let reals = ["NULL", "-0.0", "1e300", "-1e300", "1e-300", "5e-324", "0.1", "-0.3", "1e16"];
-    let integers = ["NULL", "0", "1", "-7", "9007199254740993", "-4611686018427387905"];
+    let reals = [
+        "NULL", "-0.0", "1e300", "-1e300", "1e-300", "5e-324", "0.1", "-0.3", "1e16",
+    ];
+    let integers = [
+        "NULL",
+        "0",
+        "1",
+        "-7",
+        "9007199254740993",
+        "-4611686018427387905",
+    ];
     conn.execute("BEGIN").unwrap();
     for _ in 0..rows {
         let g = rng.random_range(0i64..4);
         let r = if rng.random_range(0..3) == 0 {
             reals[rng.random_range(0..reals.len())].to_string()
         } else {
-            format!("{}.{:02}", rng.random_range(-100_000i64..100_000), rng.random_range(0..100))
+            format!(
+                "{}.{:02}",
+                rng.random_range(-100_000i64..100_000),
+                rng.random_range(0..100)
+            )
         };
         let a = integers[rng.random_range(0..integers.len())];
         conn.execute(format!(
@@ -3584,21 +3601,37 @@ fn g8_exact_real_sums_hold_the_hard_cases() {
     conn.set_real_sums(crate::RealSums::Exact);
     let pad = "x".repeat(64);
     let rows = 1500usize;
-    let cases: [(&str, &[&str], Option<f64>); 9] = [
-        ("cancellation", &["1e16", "1.0", "-1e16"], Some(1.0)),
-        ("tenths", &["0.1", "0.2", "-0.3"], Some(2f64.powi(-55))),
-        ("huge with tiny", &["1e300", "1e-300", "-1e300"], Some(1e-300)),
-        ("subnormals", &["5e-324"; 7], Some(f64::from_bits(7))),
-        ("zeros", &["-0.0", "-0.0"], Some(0.0)),
-        ("plus infinity", &["9e999", "1.0"], Some(f64::INFINITY)),
-        ("minus infinity", &["-9e999", "-1.0"], Some(f64::NEG_INFINITY)),
-        ("both infinities", &["9e999", "-9e999", "1.0"], None),
-        ("past 2^53", &["9007199254740992.0", "1.0", "1.0"], Some(9007199254740994.0)),
+    // Each case's exact sum from the values as the engine parsed them (its decimal parsing is
+    // not this test's subject): `stored` in row order.
+    type Exact = fn(&[f64]) -> Option<f64>;
+    let cases: [(&str, &[&str], Exact); 9] = [
+        ("cancellation", &["1e16", "1.0", "-1e16"], |v| Some(v[1])),
+        ("tenths", &["0.1", "0.2", "-0.3"], |v| {
+            // Each is a multiple of 2^-60 below 2^4: their sum in 2^-60ths is exact in an i128,
+            // and an i128's conversion rounds to nearest, ties to even.
+            let sixtieths: i128 = v.iter().map(|x| (x * 2f64.powi(60)) as i128).sum();
+            Some(sixtieths as f64 * 2f64.powi(-60))
+        }),
+        ("huge with tiny", &["1e300", "1e-300", "-1e300"], |v| {
+            Some(v[1])
+        }),
+        ("subnormals", &["5e-324"; 7], |v| Some(v[0] * 7.0)),
+        ("zeros", &["-0.0", "-0.0"], |_| Some(0.0)),
+        ("plus infinity", &["9e999", "1.0"], |_| Some(f64::INFINITY)),
+        ("minus infinity", &["-9e999", "-1.0"], |_| {
+            Some(f64::NEG_INFINITY)
+        }),
+        ("both infinities", &["9e999", "-9e999", "1.0"], |_| None),
+        ("past 2^53", &["9007199254740992.0", "1.0", "1.0"], |v| {
+            Some(v[0] + 2.0)
+        }),
     ];
-    for (at, (name, values, sum)) in cases.iter().enumerate() {
+    for (at, (name, values, exact)) in cases.iter().enumerate() {
         let table = format!("h{at}");
-        conn.execute(format!("CREATE TABLE {table}(id INTEGER PRIMARY KEY, r REAL, p TEXT)"))
-            .unwrap();
+        conn.execute(format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, r REAL, p TEXT)"
+        ))
+        .unwrap();
         conn.execute("BEGIN").unwrap();
         for row in 0..rows {
             // The case's values spread over the table's leaves, NULLs between them.
@@ -3610,13 +3643,24 @@ fn g8_exact_real_sums_hold_the_hard_cases() {
         conn.execute("COMMIT").unwrap();
         let sql = format!("SELECT SUM(r), TOTAL(r), AVG(r) FROM {table}");
         let answer = g8_answers_at_every_core_count(&conn, &sql, rows as u64);
+        let stored: Vec<f64> = sql_rows(
+            &conn,
+            &format!("SELECT r FROM {table} WHERE r IS NOT NULL ORDER BY id"),
+        )
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Numeric(crate::numeric::Numeric::Float(f)) => f64::from(*f),
+            other => panic!("{name}: a stored REAL is {other:?}"),
+        })
+        .collect();
+        let sum = exact(&stored);
         let real = |value: Option<f64>| match value {
             Some(value) => Value::from_f64(value),
             None => Value::Null,
         };
         let expected = vec![vec![
-            real(*sum),
-            real(*sum),
+            real(sum),
+            real(sum),
             real(sum.map(|sum| sum / values.len() as f64)),
         ]];
         assert_eq!(answer, format!("{expected:?}"), "{name}");
