@@ -465,3 +465,61 @@ hyper-raft), merged without a re-run (RULES 5).
 7. `begin_restart`, `end_restart`, `try_restart_log_for_write`'s restart, the store's `restart_if_asked` gate and its
    call of `Slots::take_all` are deleted.
 8. The five tests in the brief.
+
+## perf-B10 (2026-11-23, 18:11-19:10Z)
+
+**Losses first: the switch is not built, so neither A/B the brief asks for has numbers.** Of B9's eight step-2 items
+one is done: item 3, a lookup searches the lock-free index of its segment. The writer still never switches. Reads keep
+no span, `find_frame` does not answer with its segment, the checkpointer and recovery act on one segment, neither
+restart is deleted, and none of the five tests exists. The slow-reader A/B needs the switch and did not run. RULES 5b's
+point-read A/B of step 1 (after = main a3642e93, base = its other parent 0d87fcdd, `~/.cache/amphora-perf/pagepath-b10/
+ab10-point.sh` on adacachy2: both arms built in the lane's target dir, RULES 5e's calibration copied, 5 alternated
+rounds of `point_pk` and `point_secondary` at 1, 32 and 128 clients) has no result in the hour: r1362 stopped at its
+first build (`--locked`, and the bench workspace has no lock file; B6's build had no `--locked`), r1393 was refused
+(2 of 32 cores idle), and r1404 was queued for room at 18:43Z. Its records go to adacachy2
+`~/.cache/amphora-perf-bin/pagepath/ab10-point-<HHMM>.jsonl`.
+
+**Item 3, built and checked** (perf/pagepath-d45 f1351a6c, be348834, then bae557bb, rustfmt only). The in-process
+backend took the current segment's `ReadIndex` once, when it was built, so after a switch it would search the other
+segment's index. `SharedLog` now holds both segments' indexes outside their locks (`read_index(SegmentId)`), and
+`find_frame`, `find_frame_locked` and the header's lock-free copy take the segment they search (`current_id()`, the
+published flag). The backend keeps only whether it may go lock-free (`lock_free`, false for the shared-memory backend's
+fallback as before). Each index's header is now set where the log is made: the header `Arc` is replaced only by the
+restart and the restore, and both set it again there. No behaviour change, since the searched segment is always the
+current one until the switch. A lookup now loads the flag once more than before; the A/B above measures step 1's
+load, not this one.
+
+**Two rules decision 45 does not state** (found reading the read and checkpoint paths for the switch; the coordinator
+decides the first).
+1. *The checkpointer must not copy the current segment while a read begun before the switch is under way.* Such a
+   read searches the closing segment up to its mark and then the file. It never searches the current segment. If its
+   mark is the closing segment's last frame, the closing segment's passive copy goes whole while it reads (the copy
+   stops at the oldest mark, which is the end). If the checkpointer then copies the current segment, a page written
+   only after the switch reaches the file, and the read finds it there: a version newer than its snapshot. One log has
+   no such case, because a read mark bounds every backfill. Two ways to hold it: (a) copy the current segment only
+   once the closing one is reset, which needs no new state and delays that copy by at most 2D plus one copy after a
+   switch, inside the bound the decision already states; (b) count the reads begun before the switch in `Closing`
+   and copy the current segment once that count is zero, which is sooner and costs one more counter.
+2. *A read may take read mark 0 (the file alone, `ReadGuardKind::DbFile`) only when its span has no closing segment.*
+   Right after a switch the current segment is empty, so `max_frame == nbackfills` (0 and 0), and today's test sends
+   the read to the file alone, which lacks the closing segment's uncopied frames.
+
+**Step 2 as units that each land alone** (behaviour unchanged until the last).
+1. `find_frame` answers with a `FrameRef { segment, frame }`; `read_frame`, `read_frames_batch` and `read_frame_raw`
+   take it; the pager's `Version::Frame` key takes that segment's checkpoint sequence (item 4). The `Wal` trait's
+   `find_frame` has four production callers (pager.rs 4160, 4320, 4785; vacuum.rs 1527; database.rs 3566 calls the
+   coordination's); a script like B9's moves the tests.
+2. A read's span kept in the connection state beside its `WalSnapshot`, `ReadGuardKind::ReadMark` naming its segment,
+   `begin_read` and `end_read` per read (item 2). This puts `Segments`' spin lock on every read transaction, so it
+   lands with a point-read A/B at 1, 32 and 128 clients.
+3. `-wal2` opened beside `-wal`, both recovered through `Segments::recover`, the shared-memory authority carrying both
+   headers (item 6 and item 1's file).
+4. The checkpointer: the closing segment first, `copied` after the file's flush, and the two rules above (item 5).
+5. The switch, both restarts deleted, the five tests (items 1, 7 and 8). Then the slow-reader A/B.
+
+**Checks.** Run r1344 (adacachy2, needs `linux/amd64,cpus=4,mem=16g`, load 22-31) on abb69a82, perf/pagepath-d45 with
+origin/main e7d64bbb merged: `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` exit 0. Run r1380 on
+f1351a6c found two test calls of `find_frame_locked` without the new argument (fixed in be348834). Run r1401 (same
+needs, load 12-17) on be348834: clippy exit 0; RESULTS_STORAGE; RESULTS_STORE. `cargo fmt --all --check` fails on
+origin/main itself in seven files (69 places; wal.rs's 30 are step 1's rerouted chains, the rest not traced); after
+bae557bb wal.rs is clean by the local rustfmt.
