@@ -1172,28 +1172,37 @@ mod tests {
         assert!(got == want || got == with_late, "{} rows", got.len());
     }
 
-    /// T-T1.3.1, AUDIT 2.4. Publish a buffered write after a reader takes its snapshot and
-    /// before it finishes durably. Its snapshot still misses the write. Recovery must keep it.
+    /// T-T1.3.1, AUDIT 2.4. Publish a buffered write on each of two lanes after a reader
+    /// takes its snapshot. Neither row is visible to the reader. Its finish must make both durable.
     #[test]
     fn audit_review_unwritten_commit_flushes_the_prefix_at_finish() {
-        let disk = Arc::new(Simulated::new(5, 1).unwrap());
+        let disk = Arc::new(Simulated::new(5, 2).unwrap());
         let db = Database::open(disk.clone(), 2_000, 1, cmp).unwrap();
         let mut d = Descender::new();
         let reader = db.begin().unwrap();
-        let mut writer = db.begin().unwrap();
-        db.put(&mut d, &mut writer, 0, b"key", b"value").unwrap();
-        db.commit(writer, &mut d, db.lane(), false).unwrap();
-        assert_eq!(db.get(&mut d, &reader.snapshot(), 0, b"key").unwrap(), None);
+        let lanes = [db.lane(), db.lane()];
+        assert_ne!(lanes[0], lanes[1]);
+        let writes = [(b"a", b"first".as_slice()), (b"b", b"second".as_slice())];
+        for ((key, value), lane) in writes.into_iter().zip(lanes) {
+            let mut writer = db.begin().unwrap();
+            db.put(&mut d, &mut writer, 0, key, value).unwrap();
+            db.commit(writer, &mut d, lane, false).unwrap();
+            assert_eq!(db.get(&mut d, &reader.snapshot(), 0, key).unwrap(), None);
+        }
+        assert_eq!(db.log_counters().records, 0);
         assert!(db.end_unwritten(reader).unwrap().is_none());
         let flushed = db.log_counters().records;
         drop(db);
         disk.power_cut().unwrap();
         let reopened = Database::open(disk, 2_000, 1, cmp).unwrap();
-        assert_eq!(
-            rows(&reopened).get(b"key".as_slice()).map(Vec::as_slice),
-            Some(b"value".as_slice())
-        );
-        assert_eq!(flushed, 1, "only the writer logged a record");
+        let recovered = rows(&reopened);
+        for (key, value) in writes {
+            assert_eq!(
+                recovered.get(key.as_slice()).map(Vec::as_slice),
+                Some(value)
+            );
+        }
+        assert_eq!(flushed, 2, "only the writers logged records");
     }
 
     /// The rows of tree `tree`, as a snapshot begun now sees them.
