@@ -1235,4 +1235,8 @@ amphora-engine --lib --locked -- learned_costs t13_ storage::pager::tests`.
 - r1696 (44515444): check-production passed ("engine-ratchet: 10913 left in the engine's production code
   across 17 lints, as the ratchet holds"), clippy clean, tests 43 of 43.
 - r1709 (59d6e2cd, the merge with main, whose new commits touched `crates/amphora` only): the same three, at
-  `cpus=2,mem=8g` (r1705 at `cpus=4,mem=12g` was refused: 2 of 32 cores idle).
+  `cpus=2,mem=8g` (r1705 at `cpus=4,mem=12g` was refused: 2 of 32 cores idle). All passed.
+- r1714 (5a51f950, merged again: G16's engine commits): clippy clean, tests 43 of 43. check-production failed
+  only on counts below the ratchet, from G16's work: panic 198 (199 held), indexing_slicing 3,184 (3,186),
+  cast_possible_truncation 549 (550), cast_possible_wrap 685 (686). `scripts/engine-ratchet.toml` is lowered
+  to those, as B13 did. disallowed_methods holds at 40 with the rewrite.
