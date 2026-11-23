@@ -18309,6 +18309,7 @@ mod tests {
         let mut rounds = 0;
         while inflight.iter().any(Option::is_some) {
             assert!(rounds < ROUNDS, "unanswered after {crashes} crashes");
+            let (mut acked_now, mut resent_now) = (Vec::new(), Vec::new());
             for (id, slot) in inflight.iter_mut().enumerate() {
                 let Some((via, answer)) = slot.take() else {
                     continue;
@@ -18321,15 +18322,22 @@ mod tests {
                     Err(mpsc::TryRecvError::Disconnected) => true,
                     Ok(Ok(_)) => {
                         acknowledged += 1;
+                        acked_now.push((id, via));
                         false
                     }
-                    Ok(Err(Refusal::Serialization { .. })) => true,
+                    Ok(Err(Refusal::Serialization { .. })) => {
+                        resent_now.push((id, via, "ser"));
+                        true
+                    }
                     Ok(Err(
-                        Refusal::NotLeader { .. }
+                        ref r @ (Refusal::NotLeader { .. }
                         | Refusal::Unavailable(_)
                         | Refusal::UnknownOutcome
-                        | Refusal::Timeout,
-                    )) => true,
+                        | Refusal::Timeout),
+                    )) => {
+                        resent_now.push((id, via, match r { Refusal::NotLeader { .. } => "nl", Refusal::Unavailable(_) => "un", Refusal::UnknownOutcome => "uo", _ => "to" }));
+                        true
+                    }
                     Ok(Err(other)) => panic!("writer {id} via {via}: {other:?}"),
                 };
                 if resend {
@@ -18338,7 +18346,11 @@ mod tests {
                     *slot = Some((next, submit(&clients[next], driven.until(), write(id))));
                 }
             }
+            if !acked_now.is_empty() || !resent_now.is_empty() {
+                eprintln!("TRACE r={rounds} c={crashes} t={}ms acked={acknowledged} +{acked_now:?} again {resent_now:?}", (driven.until() - driven.base).as_millis());
+            }
             if crashes < CRASHES && acknowledged * (CRASHES + 1) >= WRITERS * (crashes + 1) {
+                eprintln!("TRACE crash {} r={rounds} acked={acknowledged} leader={leader} t={}ms", crashes + 1, (driven.until() - driven.base).as_millis());
                 driven.drain(&mut pump);
                 pump.finish();
                 let restarted = driven.restart(dir.path(), leader, vec![1, 2, 3], Vec::new());
@@ -18346,6 +18358,7 @@ mod tests {
                 pump = Pump::new(&clients);
                 pump.refusals = Some(0);
                 leader = driven.elect_after_cut(&mut pump, &clients, 1);
+                eprintln!("TRACE elected {leader} t={}ms", (driven.until() - driven.base).as_millis());
                 crashes += 1;
             }
             driven.round(&mut pump);
