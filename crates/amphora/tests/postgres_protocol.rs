@@ -1081,7 +1081,11 @@ fn t_pg_1_7_lengths_past_each_limit_are_refused_before_they_are_held() {
         assert_eq!(next, Some(Next::Close));
         assert_eq!(sqlstate(&messages(&out)[0].1), code);
     };
-    wrong(&[], &query(b"SELECT 1"), "08P01");
+    // A typed message first reads as a startup length out of range: closed with nothing sent.
+    let mut session = Session::new(config(false), seed());
+    let (out, next) = drive(&mut session, roles, &query(b"SELECT 1"), Pace::Frames);
+    assert!(out.is_empty());
+    assert!(matches!(next, Some(Next::CloseLogged(_))), "{next:?}");
     wrong(&start.1, &query(b"SELECT 1"), "08P01");
     wrong(&sasl_final.1, &frontend(b'X', b""), "08P01");
     wrong(&ready.1, &frontend(b'p', b"c=biws"), "08P01");
