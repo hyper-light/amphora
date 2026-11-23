@@ -673,19 +673,19 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
                 let frame = read_frame(&mut *answering.lock()?, amphora_api::REQUEST_MAX)?;
                 let answer = match frame {
                     None => return Ok(()),
-                    Some(Frame::Refused(refusal)) => vec![refused_frame(refusal)?],
+                    Some(Frame::Refused(refusal)) => Frames::one(refused_frame(refusal)?),
                     Some(Frame::Held(bytes, _charge)) => {
                         match postcard::from_bytes::<SqlRequest>(&bytes) {
                             Ok(request) => match Charged::request(&request) {
                                 Ok(_decoded) => shared.sql(request, &mut agreed, &answering)?,
-                                Err(refusal) => vec![refused_frame(refusal)?],
+                                Err(refusal) => Frames::one(refused_frame(refusal)?),
                             },
-                            Err(e) => vec![refused_frame(amphora_api::invalid(
+                            Err(e) => Frames::one(refused_frame(amphora_api::invalid(
                                 "SQL request",
                                 &format!(
                                     "{e}: this member speaks versions {SQL_VERSION_MIN} to {SQL_VERSION}"
                                 ),
-                            ))?],
+                            ))?),
                         }
                     }
                 };
@@ -815,16 +815,83 @@ struct Encoded {
     _held: Option<memory::Charge>,
 }
 
-/// A frame in a call's answer ([`crate::database::AnswerMax`]): its bytes count only when no
-/// charge of its own holds them, so the budget is never charged them twice.
-impl crate::database::AnswerBytes for Encoded {
-    fn answer_bytes(&self) -> usize {
-        let unheld = if self._held.is_some() {
+impl Encoded {
+    /// Its bytes no charge of its own holds: none for a frame built by [`frame`].
+    fn unheld(&self) -> usize {
+        if self._held.is_some() {
             0
         } else {
             self.bytes.capacity()
-        };
-        std::mem::size_of::<Self>().saturating_add(unheld)
+        }
+    }
+}
+
+/// An answer's frames, in order, the list's own slots charged to the process's memory budget as
+/// it grows and each frame holding its own bytes (lane perf-A11, AUDIT §1), so a write's call
+/// declares only the list's fixed size ([`Frames::DECLARED`]) however many frames it fills.
+struct Frames {
+    list: Vec<Encoded>,
+    spine: Charged,
+}
+
+impl Frames {
+    /// What a call answering `Frames` declares ([`crate::database::AnswerMax`]): the list's own
+    /// size, everything past it held by a charge.
+    const DECLARED: usize = std::mem::size_of::<Self>();
+
+    fn new() -> Self {
+        Self {
+            list: Vec::new(),
+            spine: Charged::new(),
+        }
+    }
+
+    /// One frame, uncharged: a refusal's or an agreement's, a few bytes written at once.
+    fn one(frame: Encoded) -> Self {
+        Self {
+            list: vec![frame],
+            spine: Charged::new(),
+        }
+    }
+
+    /// `frame` appended, the slots the list grows by charged before they're taken: past the
+    /// budget's room, its refusal, typed.
+    fn push(&mut self, frame: Encoded) -> anyhow::Result<()> {
+        if self.list.len() == self.list.capacity() {
+            let grow = self.list.capacity().max(1);
+            self.spine
+                .hold(grow.saturating_mul(std::mem::size_of::<Encoded>()))?;
+            self.list.try_reserve_exact(grow)?;
+        }
+        self.list.push(frame);
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for Frames {
+    type Target = Vec<Encoded>;
+
+    fn deref(&self) -> &Vec<Encoded> {
+        &self.list
+    }
+}
+
+impl<'a> IntoIterator for &'a Frames {
+    type Item = &'a Encoded;
+    type IntoIter = std::slice::Iter<'a, Encoded>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.iter()
+    }
+}
+
+/// A call's answer of frames: its own size and any frame's bytes no charge holds.
+impl crate::database::AnswerBytes for Frames {
+    fn answer_bytes(&self) -> usize {
+        self.list
+            .iter()
+            .map(Encoded::unheld)
+            .fold(Self::DECLARED, usize::saturating_add)
     }
 }
 
@@ -898,7 +965,7 @@ impl Answering {
 /// write's are held until its transaction commits, so no write waits on a client's network.
 enum Spill {
     None,
-    Held(Vec<Encoded>),
+    Held(Frames),
     Sent(Arc<Answering>, Instant),
 }
 
@@ -916,7 +983,7 @@ impl Spill {
             })?;
             match self {
                 Self::None => bail!("a version 1 answer spilled rows"),
-                Self::Held(frames) => frames.push(encoded),
+                Self::Held(frames) => frames.push(encoded)?,
                 Self::Sent(link, until) => link.send(*until, &encoded)?,
             }
         }
@@ -933,15 +1000,15 @@ fn answered(
     c: &crate::sql::Connection<'_>,
     statements: Vec<Statement>,
     mut spill: Spill,
-) -> anyhow::Result<Vec<Encoded>> {
+) -> anyhow::Result<Frames> {
     let mut charged = Charged::new();
     let tables = tables(c, statements, &mut charged, &mut spill)?;
     let last = frame(&SqlAnswer::Tables(tables))?;
     let mut frames = match spill {
         Spill::Held(frames) => frames,
-        Spill::None | Spill::Sent(..) => Vec::new(),
+        Spill::None | Spill::Sent(..) => Frames::new(),
     };
-    frames.push(last);
+    frames.push(last)?;
     Ok(frames)
 }
 
@@ -1136,14 +1203,14 @@ impl Shared {
         request: SqlRequest,
         agreed: &mut Option<u32>,
         answering: &Arc<Answering>,
-    ) -> anyhow::Result<Vec<Encoded>> {
+    ) -> anyhow::Result<Frames> {
         let until = match after(self.deadline) {
             Ok(until) => until,
             Err(e) => {
-                return Ok(vec![refused_frame(amphora_api::invalid(
+                return Ok(Frames::one(refused_frame(amphora_api::invalid(
                     "deadline",
                     &e.to_string(),
-                ))?]);
+                ))?));
             }
         };
         let streams = agreed.is_some_and(|version| version >= 2);
@@ -1151,18 +1218,18 @@ impl Shared {
             SqlRequest::Hello { oldest, newest } => {
                 let both = newest.min(SQL_VERSION);
                 if both < oldest.max(SQL_VERSION_MIN) {
-                    return Ok(vec![refused_frame(amphora_api::invalid(
+                    return Ok(Frames::one(refused_frame(amphora_api::invalid(
                         "SQL versions",
                         &format!(
                             "the client speaks {oldest} to {newest}, this member {SQL_VERSION_MIN} to {SQL_VERSION}"
                         ),
-                    ))?]);
+                    ))?));
                 }
                 *agreed = Some(both);
-                return Ok(vec![Encoded {
+                return Ok(Frames::one(Encoded {
                     bytes: postcard::to_allocvec(&SqlAnswer::Agreed(both))?,
                     _held: None,
-                }]);
+                }));
             }
             _ if agreed.is_none() => Err(amphora_api::invalid("SQL request", "asked before Hello")),
             SqlRequest::Write(_) if self.cut.load(Ordering::Relaxed) => Err(Refusal::Unavailable(
@@ -1170,15 +1237,15 @@ impl Shared {
             )),
             SqlRequest::Write(statements) => {
                 let spill = if streams {
-                    Spill::Held(Vec::new())
+                    Spill::Held(Frames::new())
                 } else {
                     Spill::None
                 };
-                // A write's tables are at most the API's result bound a frame, as an SQL batch's
-                // are (lane perf-A5); each frame's bytes are charged as it's built (`frame`).
+                // Each frame's bytes are charged as it's built (`frame`), and the list's slots as
+                // it grows (`Frames::push`): the call declares the list's fixed size alone.
                 self.db.call(
                     until,
-                    crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX),
+                    crate::database::AnswerMax::bytes(Frames::DECLARED),
                     move |c| answered(c, statements, spill),
                 )
             }
@@ -1195,9 +1262,9 @@ impl Shared {
         match result {
             Ok(frames) => Ok(frames),
             Err(refusal) if agreed.is_some_and(|v| v >= SQL_VERSION_SERIALIZATION) => {
-                Ok(vec![refused_frame(refusal)?])
+                Ok(Frames::one(refused_frame(refusal)?))
             }
-            Err(refusal) => Ok(vec![refused_frame(refusal.without_serialization())?]),
+            Err(refusal) => Ok(Frames::one(refused_frame(refusal.without_serialization())?)),
         }
     }
 
@@ -2376,7 +2443,7 @@ mod tests {
         let read = statement(sql, vec![]);
         let frames = db
             .query_local(until, move |c| answered(c, vec![read], spill))
-            .unwrap_or_else(|refusal| vec![refused_frame(refusal).unwrap()]);
+            .unwrap_or_else(|refusal| Frames::one(refused_frame(refusal).unwrap()));
         let mut link = answering.lock().unwrap();
         for frame in &frames {
             let _ = write_frame(link.get_mut(), &frame.bytes);
@@ -2432,7 +2499,8 @@ mod tests {
     /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do write a row and read back 40 rows of a MiB
     /// each in one write, an answer past one frame; expect it in more than one frame, each within
     /// the result bound, held until the write commits, read by the client as one table of every
-    /// row in order, and the write committed.
+    /// row in order, and the write committed. The call declares only the frame list's fixed size
+    /// (`Frames::DECLARED`; lane perf-A11): the frames and the list's slots hold their own charges.
     #[test]
     fn cp_t1_13_a_sql_write_answer_past_one_frame_is_held_in_frames_and_commits() {
         let dir = tempfile::tempdir().unwrap();
@@ -2440,7 +2508,7 @@ mod tests {
         let frames = db
             .call(
                 sql_until(),
-                crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX),
+                crate::database::AnswerMax::bytes(Frames::DECLARED),
                 |c| {
                     answered(
                         c,
@@ -2448,7 +2516,7 @@ mod tests {
                             statement("INSERT INTO t VALUES (41, NULL)", vec![]),
                             statement("SELECT id, v FROM t WHERE id <= 40 ORDER BY id", vec![]),
                         ],
-                        Spill::Held(Vec::new()),
+                        Spill::Held(Frames::new()),
                     )
                 },
             )

@@ -263,7 +263,10 @@ mod fp_digits {
     #[test]
     fn g11_fp_digits_default_is_17_and_takes_the_pages_steps() {
         assert_eq!(FpDigits::DEFAULT.get(), 17);
-        assert_eq!(real_to_text_digits(0.1 + 0.2, FpDigits::DEFAULT), "0.30000000000000004");
+        assert_eq!(
+            real_to_text_digits(0.1 + 0.2, FpDigits::DEFAULT),
+            "0.30000000000000004"
+        );
         assert_eq!(real_to_text_digits(47.49, FpDigits::DEFAULT), "47.49");
     }
 
@@ -286,11 +289,17 @@ mod fp_digits {
     #[test]
     fn g11_fp_digits_15_rounds_to_15_always() {
         let product = 6_481_130_223_748_880.0 * 2f64.powi(-51);
-        assert_eq!(real_to_text_digits(product, FpDigits::DEFAULT), "2.8781999999999997");
+        assert_eq!(
+            real_to_text_digits(product, FpDigits::DEFAULT),
+            "2.8781999999999997"
+        );
         assert_eq!(real_to_text_digits(product, at(15)), "2.8782");
         assert_eq!(real_to_text_digits(0.1 + 0.2, at(15)), "0.3");
         assert_eq!(real_to_text_digits(1e16, at(15)), "1.0e+16");
-        assert_eq!(real_to_text_digits(1e16, FpDigits::DEFAULT), "10000000000000000.0");
+        assert_eq!(
+            real_to_text_digits(1e16, FpDigits::DEFAULT),
+            "10000000000000000.0"
+        );
         assert_eq!(real_to_text_digits(-0.5, at(15)), "-0.5");
     }
 
@@ -316,7 +325,10 @@ mod fp_digits_per_connection {
 
     const SUM: &str = "(0.1 + 0.2)";
 
-    fn at_15() -> (std::sync::Arc<amphora_engine::MemoryIO>, std::sync::Arc<amphora_engine::Connection>) {
+    fn at_15() -> (
+        std::sync::Arc<amphora_engine::MemoryIO>,
+        std::sync::Arc<amphora_engine::Connection>,
+    ) {
         let (io, conn) = open();
         assert_eq!(conn.db_config_fp_digits(15), 15);
         (io, conn)
@@ -337,7 +349,11 @@ mod fp_digits_per_connection {
         assert_eq!(conn.db_config_fp_digits(23), 23);
         assert_eq!(conn.db_config_fp_digits(0), 23);
         let (_io, other) = open();
-        assert_eq!(other.db_config_fp_digits(0), 17, "a setting of one connection only");
+        assert_eq!(
+            other.db_config_fp_digits(0),
+            17,
+            "a setting of one connection only"
+        );
     }
 
     /// lang_expr.html: "Casting an INTEGER or REAL value into TEXT renders the value as if via
@@ -348,12 +364,21 @@ mod fp_digits_per_connection {
         let sql = format!("SELECT CAST({SUM} AS TEXT), CAST({SUM} AS BLOB)");
         assert_eq!(
             row(&io, &conn, &sql, None),
-            vec![Value::build_text("0.30000000000000004"), Value::Blob(b"0.30000000000000004".to_vec())]
+            vec![
+                Value::build_text("0.30000000000000004"),
+                Value::Blob(b"0.30000000000000004".to_vec())
+            ]
         );
         conn.db_config_fp_digits(15);
-        assert_eq!(row(&io, &conn, &sql, None), vec![Value::build_text("0.3"), Value::Blob(b"0.3".to_vec())]);
+        assert_eq!(
+            row(&io, &conn, &sql, None),
+            vec![Value::build_text("0.3"), Value::Blob(b"0.3".to_vec())]
+        );
         conn.db_config_fp_digits(5);
-        assert_eq!(texts(&io, &conn, "SELECT CAST(2.0/3.0 AS TEXT)"), vec!["0.66667"]);
+        assert_eq!(
+            texts(&io, &conn, "SELECT CAST(2.0/3.0 AS TEXT)"),
+            vec!["0.66667"]
+        );
     }
 
     /// `||`, concat() and concat_ws() write each REAL operand as text.
@@ -361,7 +386,11 @@ mod fp_digits_per_connection {
     fn g12_concatenation_writes_at_the_connections_digits() {
         let (io, conn) = at_15();
         assert_eq!(
-            texts(&io, &conn, &format!("SELECT 'x' || {SUM}, concat({SUM}, 'y'), concat_ws({SUM}, 'a', {SUM})")),
+            texts(
+                &io,
+                &conn,
+                &format!("SELECT 'x' || {SUM}, concat({SUM}, 'y'), concat_ws({SUM}, 'a', {SUM})")
+            ),
             vec!["x0.3", "0.3y", "a0.30.3"]
         );
     }
@@ -373,8 +402,12 @@ mod fp_digits_per_connection {
     fn g12_text_affinity_stores_at_the_connections_digits() {
         let (io, conn) = at_15();
         conn.execute("CREATE TABLE t(c TEXT)").unwrap();
-        conn.execute(format!("INSERT INTO t VALUES ({SUM})")).unwrap();
-        assert_eq!(row(&io, &conn, "SELECT c FROM t", None), vec![Value::build_text("0.3")]);
+        conn.execute(format!("INSERT INTO t VALUES ({SUM})"))
+            .unwrap();
+        assert_eq!(
+            row(&io, &conn, "SELECT c FROM t", None),
+            vec![Value::build_text("0.3")]
+        );
     }
 
     /// datatype3.html: "If one operand has TEXT affinity and the other has no affinity, then TEXT
@@ -394,7 +427,10 @@ mod fp_digits_per_connection {
     #[test]
     fn g12_like_reads_a_real_at_the_connections_digits() {
         let (io, conn) = at_15();
-        assert_eq!(texts(&io, &conn, &format!("SELECT {SUM} LIKE '0.3'")), vec!["1"]);
+        assert_eq!(
+            texts(&io, &conn, &format!("SELECT {SUM} LIKE '0.3'")),
+            vec!["1"]
+        );
     }
 
     /// printf.html: "%s ... the argument is a string"; a REAL argument is read as text, as is a REAL
@@ -413,8 +449,16 @@ mod fp_digits_per_connection {
     #[test]
     fn g12_value_display_writes_the_default_whatever_the_connection() {
         let (io, conn) = at_15();
-        let values = row(&io, &conn, &format!("SELECT {SUM}, CAST({SUM} AS TEXT)"), None);
-        assert_eq!(values.iter().map(ToString::to_string).collect::<Vec<_>>(), vec!["0.30000000000000004", "0.3"]);
+        let values = row(
+            &io,
+            &conn,
+            &format!("SELECT {SUM}, CAST({SUM} AS TEXT)"),
+            None,
+        );
+        assert_eq!(
+            values.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["0.30000000000000004", "0.3"]
+        );
     }
 }
 

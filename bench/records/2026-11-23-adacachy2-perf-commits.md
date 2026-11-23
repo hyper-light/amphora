@@ -882,3 +882,60 @@ each, needs cpus=16. Report p50, p99, p99.9 and commits/s. Keep the winner and d
     . ~/.cache/amphora-perf/bench-s2/env.sh; cd ~/.cache/amphora-perf/commits-remote   # at c8ff608f
     $B/2431406e --repl commit --system dqlite|rqlite --scripts bench/servers/repl --record R --batch 1 --text-bytes 600 \
       --deadline-s 10 --relay-records 128 --spanning 2 --warmup-s 1 --seconds 5 --writers 1|32   # r1337
+
+# Lane V8 (commits) on adacachy2: a follower's write takes its slot from its first try (2026-11-23, 18:47Z to 19:42Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, never refusing writes under load. At
+19:16Z the coordinator set rule 0: this lane's one deliverable is test 5
+(`v7_a_hundred_and_twenty_eight_spread_writers_are_each_answered_with_no_stale_base`) passing on main in both
+classes with no stale-base refusals. Measurement stopped at that order.
+
+## Losses first
+
+1. **Test 5's verdict on the change is r1460's** (8600350e, `cargo test -p amphora --lib` filtered to test 5 and
+   `slot`, then clippy). If r1460 is red or did not finish by 19:42Z, the change is on `perf/commits-v8`, not main.
+2. **0009's split was measured in part and decided nothing.** Cell 1 ran (below) and is inside its noise. Cell 3's
+   point reads all failed with "no such table: t", so it measured nothing (the driver's table is not where the
+   member's `get` read looks; not traced). Cell 2 (20 MiB writes, beats on and off) never ran. Rule 0 parks all of it.
+3. **The batching core and path B are not built.** Under rule 0 they wait unless test 5 needs them.
+
+## The change (8600350e): slot first, not after a refusal
+
+A follower's barrier answered with the leader's commit. The follower then prepared at its log tail while the
+leader's own entries were in flight, and the stale-base rule refused the write at apply. Only then did the leader
+queue the follower for a write slot (`Slots::refused`). Now the leader queues every follower's barrier
+(`Slots::ask`), except the holder's second barrier, which still ends its slot. A slot's barrier steps once the
+leader's commit reaches its last entry, and the leader appends nothing of its own while a slot is held, so the base
+a follower prepares on is current when its write appends. A follower whose work forwarded nothing always sends the
+ending barrier, so the per-refusal `slotted` term is deleted. Nothing new on the wire.
+
+What it costs (inferred from the code, not measured): every follower operation, reads through `Database::query`
+included, waits its turn for a slot. Followers' writes serialize with the leader's turns. That is rule 0's order:
+working first, fast after.
+
+## 0009's reads half, cell 1 (r1440, before rule 0)
+
+One A/B binary (`perf/commits-v8-ab` 08812f1b, never merged): `AB_READS_OFF` turns off a new hyper-raft switch,
+`Config::confirm_reads_now`, that gates `light_now`'s `ask_reads` and its read states. `bench/v8_ab.py` on that
+branch: three members on btrfs, the commit driver at writer w to member w % 3, replicated class, 8 s windows,
+3 rounds, arm order alternated. needs cpus=8; load 23.5 to 29.5, CPU "some" avg10 0.5 to 13.5%, I/O 2.7 to 6.6%.
+
+| writers | reads half | commits/s, per round | median |
+|---|---|---|---|
+| 16 | on | 29.9, 11.9, 13.0 | 13.0 |
+| 16 | off | 25.6, 15.1, 14.6 | 15.1 |
+| 32 | on | 17.3, 11.9, 12.6 | 12.6 |
+| 32 | off | 12.9, 13.9, 14.4 | 13.9 |
+
+No measurable difference: each arm's range holds the other's median. No run aborted in either arm at 32, unlike
+V7's 6 of 6 with 0009 (V7 sampled threads during its runs and ran an older main).
+
+## Commands
+
+    # r1440: kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false,
+    # cwd ~/.cache/amphora-perf/commits-remote at 08812f1b, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits
+    cargo build --release --manifest-path bench/Cargo.toml     # 1 min 08 s; copied to ~/.cache/amphora-perf-bin/commits/08812f1b
+    [AB_READS_OFF=1] python3 -I bench/v8_ab.py $B 29490 DIR 16|32 8 3 0 replicated
+    # r1460 at 8600350e, same needs and folders
+    cargo test -p amphora --lib --locked -- --test-threads=8 v7_a_hundred_and_twenty_eight_spread_writers slot
+    cargo clippy -p amphora --all-targets --locked -- -D warnings

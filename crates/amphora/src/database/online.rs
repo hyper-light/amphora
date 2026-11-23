@@ -222,6 +222,14 @@ pub enum Stepped {
     Public { held: Duration },
 }
 
+impl AnswerBytes for Stepped {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+impl FixedAnswer for Stepped {}
+
 /// What a change did, for its caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SchemaChange {

@@ -150,9 +150,9 @@ pub use connection::{
     SearchedLinks, StarFilterOrder, StarFilters, StepResult, SymbolTable,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
-pub use translate::optimizer::learned_costs::WeightRule;
 #[cfg(feature = "simulator")]
 pub use translate::optimizer::learned_costs::LearnedWeights;
+pub use translate::optimizer::learned_costs::WeightRule;
 pub use translate::optimizer::search_budget::JoinSearchStats;
 // Amphora (G6 step 3): learned plan hints, a prototype behind `HintSet::apply`.
 #[cfg(feature = "simulator")]

@@ -336,7 +336,10 @@ fn order(l: &Value, r: &Value, compare: Compare) -> Option<Ordering> {
 fn as_text(value: &Value) -> Option<String> {
     match value {
         Value::Text(t) => Some(t.as_str().to_owned()),
-        other => match other.exec_cast("TEXT", crate::numeric::fp::FpDigits::DEFAULT).ok()? {
+        other => match other
+            .exec_cast("TEXT", crate::numeric::fp::FpDigits::DEFAULT)
+            .ok()?
+        {
             Value::Text(t) => Some(t.as_str().to_owned()),
             _ => None,
         },

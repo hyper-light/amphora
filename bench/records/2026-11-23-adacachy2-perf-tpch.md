@@ -827,3 +827,75 @@ in). Same debug test binary, run 4 at a time, pinned and learned interleaved.
 - Not measured: p50, p99 and p99.9 of any timed query with and without a pin. No timed runs this hour.
 
 ## 3. q03, q06, q01: not started
+
+# Lane T10 (tpch), 2026-11-23 18:46Z to 19:41Z: the 22 queries at SF1 on main, answers all the same; nothing fixed
+
+Machine: adacachy2 (runner 00aad8da), every run named onto it, `needs linux/amd64,cpus=8,mem=24g`, from
+the GitHub clone there (`tpch-remote`, worktrees under `~/.cache/tpch-ab`), the lane's one target dir.
+Bench: `amphora-bench` release at main d5e901f3 (`~/.cache/amphora-perf-bin/tpch/amphora-bench-d5e901f3`),
+data `~/.cache/planner-bench/tpch-sf1`, the databases a reflink copy of T5's `db-sf1-B`.
+
+## 1. The 22 queries at SF1 (r1453), losses first
+
+`amphora-bench --planner --bench tpch --sf 1 --targets amphora,sqlite,duckdb --runs 3 --timeout-s 120
+--answers ...` (no `--only`), one process, each engine's counted warm-up then 3 timed runs per query.
+Medians in ms, 3 runs each. Load 18 to 49 on 32 cores (first run's load in the last column). One
+process per engine, not alternated: read a ratio under 2x as noise. answers.py: 22 queries compared,
+0 differ. No query errored or timed out.
+
+| query | Amphora (range) | SQLite | DuckDB | against the faster | load |
+|---|---|---|---|---|---|
+| q03 | 1,317 (656 to 1,342) | 564 | 83.1 | 15.8x slower | 18 |
+| q07 | 1,225 (1,130 to 2,511) | 7,563 | 113 | 10.9x slower | 18 |
+| q01 | 1,900 (1,751 to 2,029) | 3,245 | 190 | 10.0x slower | 19 |
+| q06 | 611 (533 to 662) | 399 | 64.4 | 9.5x slower | 18 |
+| q05 | 1,098 (1,085 to 1,437) | 1,750 | 133 | 8.3x slower | 18 |
+| q22 | 230 (218 to 241) | 34.1 | 104 | 6.8x slower | 37 |
+| q14 | 531 (488 to 1,217) | 5,369 | 85.1 | 6.2x slower | 45 |
+| q12 | 676 (650 to 1,688) | 859 | 117 | 5.8x slower | 39 |
+| q18 | 2,252 (2,134 to 4,308) | 526 | 46,409 | 4.3x slower | 37 |
+| q09 | 1,104 (1,100 to 3,413) | 1,190 | 259 | 4.3x slower | 44 |
+| q21 | 736 (703 to 1,564) | 427 | 186 | 4.0x slower | 39 |
+| q20 | 292 (290 to 768) | 74.4 | 124 | 3.9x slower | 41 |
+| q04 | 248 (245 to 261) | 151 | 73.5 | 3.4x slower | 18 |
+| q10 | 563 (550 to 706) | 1,195 | 172 | 3.3x slower | 41 |
+| q13 | 1,991 (1,928 to 2,015) | 1,209 | 935 | 2.1x slower | 49 |
+| q17 | 103 (96.3 to 154) | 54.4 | 114 | 1.9x slower | 35 |
+| q11 | 93.0 (91.3 to 618) | 51.5 | 107 | 1.8x slower | 37 |
+| q15 | 1,035 (1,023 to 1,198) | 5,027 | 575 | 1.8x slower | 39 |
+| q16 | 160 (154 to 299) | 105 | 355 | 1.5x slower | 34 |
+| q19 | 37.5 (35.1 to 217) | 25.6 | 85.4 | 1.5x slower | 43 |
+| q08 | 164 (153 to 226) | 8,709 | 120 | 1.4x slower | 34 |
+| q02 | 22.3 (22.2 to 36.2) | 129 | 49.4 | 2.2x faster | 18 |
+
+- Against the bar (10x faster than both): 0 of 22. Faster than both: 1 (q02).
+- q19 holds T8's number: 37.5 ms here against 42 ms then (SQLite 25.6, DuckDB 85.4).
+
+## 2. q01, q03, q06 at 1 and 32 cores (r1431, one run of 5 each, load 18 to 29)
+
+- Default (serial), best of 5: q01 1,744 against DuckDB's 188; q03 999 against 87.6; q06 504 against 60.7.
+- Scaling ladder (`--cores 1,32`), Amphora best: q01 2,032 then 1,819; q03 1,030 then 896; q06 525
+  then 535. 32 cores buy Amphora nothing on these three. DuckDB's ladder lines were not captured.
+- No limiter named: adacachy2 has no `perf`. Next: profile on a machine that has one, or install it there.
+
+## 3. The tests, and whether a real query hits them
+
+- r1425, 3 debug runs at 97a9f956 (main 0e4a7028+ and a probe), fresh XDG each: t_pl_8_13's
+  `..._keeps_its_null_rows` failed 3 of 3 at "no LEFT JOIN inside a run"; t_qt_6_30, 6_32, 6_35 failed
+  3 of 3 and 6_29 2 of 3, every one at its non-vacuity assert ("the hook didn't run", "built no link")
+  after its answer checks passed.
+- Release probe (97a9f956): at the starting weights (seek 10.98, hash build 17.89, hash probe 3.36),
+  the test's first query plans bushy with the run `(d2, f2)` and the LEFT JOIN an outer loop. Hash
+  build cut to 1.0 to 0.1 of hash probe moved its cost 458 to 455 and never put the LEFT JOIN in the
+  run (both FROM forms). So the build-against-probe trade is not what flips it; there was no plan to
+  time. Probe 55330285 (branch perf/tpch-t10-probe2) sweeps each weight x1/64 to x64; not run.
+- No benchmark query reaches the LEFT JOIN in a bushy run: TPC-H's one LEFT JOIN (q13) joins two
+  tables, and JOB has none. The morsel hook's symptom does show: q01, q03, q06 no faster on 32 cores
+  (section 2), which is parallel aggregation (lane R1's A/B).
+
+## 4. T9's edges
+
+- The IN filter on a custom-typed column: test f9082cc7 and fix 3a5aa8e1 on perf/tpch, not run, not
+  merged. No TPC-H column has a custom type in the SQLite dialect, so no benchmark query hits it.
+- q19 under the Postgres dialect: not checked.
+- clippy --all-features: not touched; it does not block the bench build.

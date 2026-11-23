@@ -1,0 +1,1 @@
+../tpch/indexes.sql

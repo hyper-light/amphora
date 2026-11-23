@@ -4157,8 +4157,8 @@ impl Pager {
             return Ok((page, c));
         };
 
-        if let Some(frame_id) = wal.find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone(), group)?;
+        if let Some(frame) = wal.find_frame(page_idx as u64, frame_watermark)? {
+            let c = wal.read_frame(frame, page.clone(), self.buffer_pool.clone(), group)?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             return Ok((page, c));
@@ -4784,14 +4784,14 @@ impl Pager {
         let page_no = u64::try_from(page_idx).map_err(|_| LimboError::IntegerOverflow)?;
         let frame = wal.find_frame(page_no, None)?;
         if let (Some(base), Some(frame)) = (own_after, frame) {
-            if frame > base {
+            if frame.frame > base {
                 return Ok(None);
             }
         }
         let version = match frame {
             Some(frame) => Version::Frame {
-                generation: wal.connection_wal_pos().0,
-                frame,
+                generation: wal.frame_generation(frame),
+                frame: frame.frame,
             },
             None => Version::File,
         };

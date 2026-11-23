@@ -81,6 +81,17 @@ pub enum Why {
     Unmet(Vec<u8>),
 }
 
+impl crate::database::AnswerBytes for Answer {
+    fn answer_bytes(&self) -> usize {
+        let heap = match self {
+            Answer::Committed { reads, .. } => crate::database::heap_bytes(reads),
+            Answer::Aborted(Why::Conflict(key) | Why::Unmet(key)) => key.capacity(),
+            Answer::Aborted(Why::Lost | Why::Late) | Answer::Unknown => 0,
+        };
+        std::mem::size_of::<Self>().saturating_add(heap)
+    }
+}
+
 /// A step's outcome the shell couldn't learn: it may land later, or never.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lost;

@@ -779,9 +779,7 @@ impl Drop for Reservation {
         self.control
             .admitted
             .fetch_sub(self.bytes, Ordering::AcqRel);
-        self.control
-            .called
-            .fetch_sub(self.called, Ordering::AcqRel);
+        self.control.called.fetch_sub(self.called, Ordering::AcqRel);
     }
 }
 struct Envelope {
@@ -939,11 +937,6 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     // A floor session, a follower's write, or the leader's in its turn after a slot, past its
     // barrier, waiting for this member to apply its own log up to the last index it held then.
     tail: Option<u64>,
-    // The term in which one of this follower's writes was refused as stale, so its leader queued
-    // it for a write slot its next barrier begins: if that barrier's work forwards nothing, a
-    // second barrier tells the leader at once, which ends the slot (`Slots::read`) instead of its
-    // length (replication.md, "the write slot").
-    slotted: Option<u64>,
     floor_requests_applied: u64,
     floor_requests_stale: u64,
     // The floor version this owner last published, none before its first: a raise is it rising.
@@ -2435,7 +2428,6 @@ fn open_on<F: BlockFile + 'static>(
         floor_failures: 0,
         floor_requesting: false,
         tail: None,
-        slotted: None,
         floor_requests_applied: 0,
         floor_requests_stale: 0,
         floor_published: None,
@@ -4174,6 +4166,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                     return stepped;
                 }
                 hyper_raft::proto::MessageType::MsgReadIndex => {
+                    // A follower's write prepares in a slot from its first try, so no base it
+                    // prepares on is passed before its write appends (CP-T1.8, lane V8).
+                    self.slots.ask(from);
                     let read = self.slots.read(from, self.at, (message, reservation));
                     self.slot_ended(read.ended);
                     let stepped = match read.step {
@@ -4561,9 +4556,6 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .as_ref()
                 .is_some_and(|p| p.context == applied.context);
             if matches && let Some(mut pending) = self.pending.take() {
-                if matches!(pending.phase, Phase::Proposed(_)) {
-                    self.queued_by(&applied.result);
-                }
                 let result = match pending.phase {
                     // The write's own token: its entry's index and time (`tokens`).
                     Phase::Proposed(value) => applied.result.map(|()| Answered {
@@ -4801,7 +4793,6 @@ impl<F: BlockFile + 'static> Actor<F> {
             // A malformed entry fences at its apply, which answers.
             Err(_) => return,
         };
-        self.queued_by(&result);
         let Some(mut pending) = self.pending.take() else {
             return;
         };
@@ -5157,17 +5148,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         self.control.moved.notify_all();
         Ok(())
     }
-    /// A follower's write refused as stale queued it at its leader (`Slots::refused`).
-    fn queued_by<T>(&mut self, result: &Result<T, Refusal>) {
-        if matches!(result, Err(Refusal::Serialization { .. })) && !self.replica.is_leader() {
-            self.slotted = Some(self.replica.term());
-        }
-    }
-    /// Prepares the operation past its barrier. A follower whose barrier began its write slot and
-    /// whose work ended forwarding nothing (a read, a refused or failed write) sends a second
-    /// barrier, which ends the slot at its leader at once; a forward ends it there itself. A
-    /// leader of any version ends a holder's slot on its second barrier, so this needs nothing new
-    /// on the wire, and a stray barrier's read state matches nothing here and is dropped.
+    /// Prepares the operation past its barrier. Each follower's barrier begins its write slot, so
+    /// a follower whose work ended forwarding nothing (a read, a refused or failed write) sends a
+    /// second barrier, which ends the slot at its leader at once; a forward ends it there itself.
+    /// A leader of any version ends a holder's slot on its second barrier, so this needs nothing
+    /// new on the wire, and a stray barrier's read state matches nothing here and is dropped.
     fn prepare(&mut self) -> Result<(), Refusal> {
         let work = self
             .pending
@@ -5178,13 +5163,7 @@ impl<F: BlockFile + 'static> Actor<F> {
             .pending
             .as_ref()
             .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_)));
-        if work
-            && ended
-            && let Some(term) = self.slotted.take()
-            && self.pending.is_none()
-            && term == self.replica.term()
-            && !self.replica.is_leader()
-        {
+        if work && ended && self.pending.is_none() && !self.replica.is_leader() {
             let context = self.context()?;
             self.replica.read(context).map_err(raft_error)?;
         }
@@ -8616,9 +8595,12 @@ mod tests {
         until: Instant,
         f: impl FnOnce(&mut Db) -> anyhow::Result<Vec<u8>> + Send + 'static,
     ) -> mpsc::Receiver<Result<Answered, Refusal>> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(move |db| {
+                Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         enqueue(client, until, "", operation)
     }
     /// Tells owner `owner` the host detector's `verdict` and steps every owner once: what the
@@ -11619,11 +11601,14 @@ mod tests {
                     .and_then(|named| named.checked_sub(1))
                     .filter(|named| !fenced.contains(named));
                 if let Some(target) = named {
-                    let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-                        db.exec("CREATE TABLE IF NOT EXISTS qb2(value)")?;
-                        db.exec("INSERT INTO qb2 VALUES(1)")?;
-                        Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
-                    }))), api::REQUEST_MAX);
+                    let operation = Operation::Call(
+                        Mutex::new(Some(Box::new(|db: &mut Db| {
+                            db.exec("CREATE TABLE IF NOT EXISTS qb2(value)")?;
+                            db.exec("INSERT INTO qb2 VALUES(1)")?;
+                            Ok(Box::new(Vec::<u8>::new()) as Box<dyn Any + Send>)
+                        }))),
+                        api::REQUEST_MAX,
+                    );
                     let (response, receiver) = mpsc::sync_channel(1);
                     let asked = clients[target].handle.enqueue(
                         Input::Submit {
@@ -12617,7 +12602,10 @@ mod tests {
         let seen = std::rc::Rc::clone(&in_another_name);
         pump.losing = Some(Box::new(move |from, record: &Message| {
             if record.from != from {
-                seen.borrow_mut().push(format!("{:?} from {from} in {}'s name to {}", record.msg_type, record.from, record.to));
+                seen.borrow_mut().push(format!(
+                    "{:?} from {from} in {}'s name to {}",
+                    record.msg_type, record.from, record.to
+                ));
             }
             false
         }));
@@ -12629,7 +12617,10 @@ mod tests {
         driven.drain(&mut pump);
         quiet(&mut driven, &mut pump);
         assert_eq!(*in_another_name.borrow(), Vec::<String>::new());
-        assert_eq!(clients[deposed].handle().status().unwrap().leader, id(leader));
+        assert_eq!(
+            clients[deposed].handle().status().unwrap().leader,
+            id(leader)
+        );
     }
 
     #[test]
@@ -13714,9 +13705,12 @@ mod tests {
         application: crate::database::Application,
         f: impl FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     ) -> Result<R, Refusal> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db| {
-            Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(move |db| {
+                Ok(Box::new(f(db)?) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, receiver) = mpsc::sync_channel(1);
         client
             .handle
@@ -13904,13 +13898,16 @@ mod tests {
         let leader = tracked_group(&mut driven, &mut pump, &clients);
         let until = driven.until();
         let added = change(&clients[leader], until, MemberChange::AddLearner(5));
-        let operation = Operation::Call(Mutex::new(Some(Box::new(move |db: &mut Db| {
-            let floor = crate::database::application::raise(db, kiln(7), true)?
-                .map_err(|refused| anyhow::Error::from(refused.refusal))?;
-            // The configuration at the raise's base, which the stale-base rule makes its own at apply.
-            let learners = crate::replication::floor::configuration(db)?.learners;
-            Ok(Box::new((floor.version, learners)) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(move |db: &mut Db| {
+                let floor = crate::database::application::raise(db, kiln(7), true)?
+                    .map_err(|refused| anyhow::Error::from(refused.refusal))?;
+                // The configuration at the raise's base, which the stale-base rule makes its own at apply.
+                let learners = crate::replication::floor::configuration(db)?.learners;
+                Ok(Box::new((floor.version, learners)) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, raised) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14133,11 +14130,14 @@ mod tests {
             driven.round(&mut pump);
         }
         pump.appends_lost = true;
-        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
-            db.exec("INSERT INTO floor_items VALUES(7)")?;
-            Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|db: &mut Db| {
+                db.exec("CREATE TABLE IF NOT EXISTS floor_items(version)")?;
+                db.exec("INSERT INTO floor_items VALUES(7)")?;
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14251,11 +14251,14 @@ mod tests {
     /// Enqueues a raise of kiln.host-store's floor to 7 at `client`, by a handle bound to it,
     /// without waiting.
     fn raise_at(client: &Client, until: Instant) -> mpsc::Receiver<Result<Answered, Refusal>> {
-        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            let floor = crate::database::application::raise(db, kiln(7), true)?
-                .map_err(|refused| anyhow::Error::from(refused.refusal))?;
-            Ok(Box::new(floor.version) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|db: &mut Db| {
+                let floor = crate::database::application::raise(db, kiln(7), true)?
+                    .map_err(|refused| anyhow::Error::from(refused.refusal))?;
+                Ok(Box::new(floor.version) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, raised) = mpsc::sync_channel(1);
         client
             .handle
@@ -14598,10 +14601,13 @@ mod tests {
         let member = u64::try_from(follower + 1).unwrap();
         let proposed = driven.owner(follower).floor_attestations;
         pump.hold_durable();
-        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
-            Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|db: &mut Db| {
+                db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -14697,10 +14703,13 @@ mod tests {
             }
             _ => false,
         }));
-        let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-            db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
-            Ok(Box::new(()) as Box<dyn Any + Send>)
-        }))), api::REQUEST_MAX);
+        let operation = Operation::Call(
+            Mutex::new(Some(Box::new(|db: &mut Db| {
+                db.exec("CREATE TABLE IF NOT EXISTS ahead(x)")?;
+                Ok(Box::new(()) as Box<dyn Any + Send>)
+            }))),
+            api::REQUEST_MAX,
+        );
         let (response, written) = mpsc::sync_channel(1);
         clients[leader]
             .handle
@@ -15384,10 +15393,13 @@ mod tests {
                 quiet(&mut driven, &mut pump);
                 pump.appends_lost = true;
                 // Claimed at 9, the highest floor a run raises, so only the tail holds it back.
-                let operation = Operation::Call(Mutex::new(Some(Box::new(|db: &mut Db| {
-                    db.exec("CREATE TABLE IF NOT EXISTS in_flight(x)")?;
-                    Ok(Box::new(()) as Box<dyn Any + Send>)
-                }))), api::REQUEST_MAX);
+                let operation = Operation::Call(
+                    Mutex::new(Some(Box::new(|db: &mut Db| {
+                        db.exec("CREATE TABLE IF NOT EXISTS in_flight(x)")?;
+                        Ok(Box::new(()) as Box<dyn Any + Send>)
+                    }))),
+                    api::REQUEST_MAX,
+                );
                 let (response, written) = mpsc::sync_channel(1);
                 clients[leader]
                     .handle
@@ -18441,6 +18453,104 @@ mod tests {
         pump.finish();
     }
 
+    /// Lane V6's fifth test, the acceptance test for lane V7's designs A and B
+    /// (bench/records/2026-11-23-adacachy2-perf-commits.md, "Unit 2"): 128 writers at once in
+    /// each class, writer w at member w % 3, each one write outstanding, appending a row to one
+    /// table (every write conflicts with every other), a write refused for a stale base made again
+    /// at the same member, as the bench's driver does. Expect: every write answered Ok before its
+    /// deadline, the run ending within ROUNDS (no livelock), each row on every replica once, and in
+    /// neither class any write refused for a stale base. Red today: a follower prepares on its own
+    /// base and loses to the leader's log (V6's r1238, V7's r1312 and r1346).
+    #[test]
+    fn v7_a_hundred_and_twenty_eight_spread_writers_are_each_answered_with_no_stale_base() {
+        const WRITERS: usize = 128;
+        let mut stale = Vec::new();
+        for durability in [Durability::Persisted, three_fates()] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut driven = Driven::new();
+            let clients: Vec<Client> = (1..=3)
+                .map(|n| driven.open_with(dir.path(), n, vec![1, 2, 3], None, durability.clone()))
+                .collect();
+            let mut pump = Pump::new(&clients);
+            let leader = driven.elect(&mut pump, &clients, 0, 1);
+            driven
+                .call(&mut pump, &clients[leader], |db| {
+                    db.exec("CREATE TABLE events(id INTEGER NOT NULL, body TEXT NOT NULL)")?;
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            driven.tick(&mut pump, leader);
+            let write = |id: usize| {
+                move |db: &mut Db| {
+                    db.exec(&format!(
+                        "INSERT INTO events VALUES ({id}, '{}')",
+                        "x".repeat(600)
+                    ))?;
+                    Ok(Vec::new())
+                }
+            };
+            let mut inflight: Vec<Option<Answering>> = (0..WRITERS)
+                .map(|id| Some(submit(&clients[id % 3], driven.until(), write(id))))
+                .collect();
+            let mut refused = vec![0u64; WRITERS];
+            let mut rounds = 0;
+            while inflight.iter().any(Option::is_some) {
+                assert!(
+                    rounds < ROUNDS,
+                    "{durability:?}: unanswered: {}",
+                    inflight.iter().flatten().count()
+                );
+                for (id, slot) in inflight.iter_mut().enumerate() {
+                    let Some(answer) = slot.take() else {
+                        continue;
+                    };
+                    match answer.try_recv() {
+                        Err(mpsc::TryRecvError::Empty) => *slot = Some(answer),
+                        Err(error) => panic!("owner ended: {error}"),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(Refusal::Serialization { .. })) => {
+                            refused[id] += 1;
+                            *slot = Some(submit(&clients[id % 3], driven.until(), write(id)));
+                        }
+                        Ok(Err(refusal)) => {
+                            panic!("{durability:?}: writer {id} at member {}: {refusal:?}", id % 3 + 1)
+                        }
+                    }
+                }
+                driven.round(&mut pump);
+                rounds += 1;
+            }
+            driven.quiet(&mut pump);
+            driven.tick(&mut pump, leader);
+            driven.tick(&mut pump, leader);
+            for owner in 0..3 {
+                let ids = driven
+                    .owner_mut(owner)
+                    .replica
+                    .machine_mut()
+                    .read_db(|db| {
+                        let mut ids = Vec::new();
+                        db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                            ids.push(usize::try_from(row.get::<i64>(0)?).unwrap());
+                            Ok(true)
+                        })?;
+                        Ok(ids)
+                    })
+                    .unwrap();
+                assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "{durability:?}: owner {owner}");
+            }
+            driven.drain(&mut pump);
+            pump.finish();
+            let writes = refused.iter().filter(|n| **n > 0).count();
+            let most = refused.iter().max().copied().unwrap_or(0);
+            stale.push((
+                refused.iter().sum::<u64>(),
+                format!("{durability:?}: over {writes} writes, at most {most} for one, in {rounds} rounds"),
+            ));
+        }
+        assert!(stale.iter().all(|(n, _)| *n == 0), "stale-base refusals: {stale:?}");
+    }
+
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
     /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
     /// on the persisted class, every member at once appends a row to one table (each write
@@ -18561,8 +18671,8 @@ mod tests {
     /// appends a write of its own on the same base, then let through; the follower's write made
     /// again, its forward held the same way while the leader is asked for a second write, then let
     /// through. Expect, with the slot off: the follower refused both times, stale. With the slot
-    /// on: refused once, then applied on its next try, the leader's second write held until it
-    /// lands and then applied too.
+    /// on: applied both times, its barrier beginning its slot from its first try (lane V8), the
+    /// leader's writes held until it lands and then applied too.
     #[test]
     fn todays_rule_refuses_a_follower_twice_in_a_row_where_the_slot_lands_its_retry() {
         for slot_off in [true, false] {
@@ -18640,8 +18750,10 @@ mod tests {
             if slot_off {
                 assert!(outcomes.iter().all(stale), "today's rule: {outcomes:?}");
             } else {
-                assert!(stale(&outcomes[0]), "the slot: {outcomes:?}");
-                assert_eq!(outcomes[1], Ok(Vec::new()), "the slot: {outcomes:?}");
+                assert!(
+                    outcomes.iter().all(|outcome| *outcome == Ok(Vec::new())),
+                    "the slot: {outcomes:?}"
+                );
             }
             driven.quiet(&mut pump);
             driven.drain(&mut pump);
@@ -18977,8 +19089,6 @@ mod tests {
         driven.quiet(&mut pump);
         let holder = 3;
         driven.owner_mut(0).slots.refused(holder);
-        let term = driven.owner(2).replica.term();
-        driven.owner_mut(2).slotted = Some(term);
         let failed = submit(&clients[2], driven.until(), |db| {
             db.exec("INSERT INTO missing VALUES (1)")?;
             Ok(Vec::new())
