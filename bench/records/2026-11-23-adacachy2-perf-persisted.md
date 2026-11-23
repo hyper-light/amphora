@@ -484,3 +484,20 @@ its owner asks again on the leader change.
   warnings` clean (main's two vendored hyper-rt `fetch_update` deprecation warnings only); the two tests and
   `a_forward_naming_another_member_as_its_origin_is_refused_and_applies_nowhere` pass; the `database::replicated`
   suite 143 passed, 0 failed, 5 ignored.
+- `every_falsifier_of_the_floor_holds_under_a_nemesis` alone (`--exact`, one thread), each arm's lib test binary built
+  once and copied, alternated, 16 runs each (r1282, 17:44-17:55Z, load 14-22): main 6cf414ad (with 0011) 16 of 16
+  passed, the fix ce479ab9 (0011 removed, the owner's drop in) 16 of 16 passed, no "replica sender" line in any run.
+  As in W5's r1214, the base did not fail here, so these runs show the fix breaks nothing in the nemesis; the relay is
+  shown gone by the two tests and their red arm.
+- Re-checked after merging main again (its 0009 update, lane V6) at f0fb2e8f: r1306.
+
+## 4. The read-or-write tag on member requests (not started)
+
+The hour went to units 1 to 3. W4's notes on where the tag goes (section 3 of W4 above) still hold.
+
+## Open for the successor
+
+- Read `~/.cache/amphora-perf/persisted-w6ab/pooled.txt` on adacachy2 when r1266 ends (about 18:25Z) and decide by the
+  coordinator's rule: wait adopted only if no worse at p50, p99 and p99.9 at both 3 and 32 writers; else the switch
+  is dropped and the pooled table goes here. Check `leader_writes` is at least 3,000 per arm and `lead_moved_runs`.
+- Unit 4.
