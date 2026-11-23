@@ -20,7 +20,7 @@ A=$!
 (cd "$BASE" && CARGO_TARGET_DIR="$HOME/.cache/amphora-perf-target/versioned-base" nice -n 10 cargo build --release --locked -p amphora-engine --example versioned_point_reads > "$OUT/before.log" 2>&1) &
 B=$!
 wait $A; wait $B
-tail -2 "$OUT/after.log" "$OUT/before.log"
+tail -n 2 "$OUT/after.log" "$OUT/before.log"
 cp "$HOME/.cache/amphora-perf-target/versioned-rel/release/examples/versioned_point_reads" "$OUT/after"
 cp "$HOME/.cache/amphora-perf-target/versioned-base/release/examples/versioned_point_reads" "$OUT/before"
 echo "base $BASE_SHA head $(git rev-parse HEAD) dirty $(git status --porcelain | wc -l) host $(hostname -s) $(sysctl -n machdep.cpu.brand_string 2>/dev/null) load $(sysctl -n vm.loadavg 2>/dev/null) $(cat /proc/loadavg 2>/dev/null) cpus $(nproc 2>/dev/null)"
