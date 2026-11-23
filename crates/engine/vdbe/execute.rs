@@ -17700,6 +17700,41 @@ pub fn op_affinity(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Lane Q2 diag: AMPHORA_CACHE_CENSUS=<dir> writes the pager's cache census before and after
+/// each of its first four counts (b<n>, a<n>).
+fn q2_census_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var("AMPHORA_CACHE_CENSUS").ok())
+        .as_deref()
+}
+
+fn q2_census(dir: &str, pager: &Arc<Pager>, before: bool) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, (u32, bool)>>> =
+        std::sync::Mutex::new(None);
+    let key = Arc::as_ptr(pager) as usize;
+    let label = {
+        let Ok(mut seen) = SEEN.lock() else { return };
+        let seen = seen.get_or_insert_with(std::collections::HashMap::new);
+        let (n, started) = seen.get(&key).copied().unwrap_or((0, false));
+        if n >= 4 {
+            return;
+        }
+        match (before, started) {
+            (true, false) => {
+                seen.insert(key, (n, true));
+                format!("b{n}")
+            }
+            (false, true) => {
+                seen.insert(key, (n + 1, false));
+                format!("a{n}")
+            }
+            _ => return,
+        }
+    };
+    let text = pager.cache_census();
+    let _ = std::fs::write(format!("{dir}/{key:x}-{label}.txt"), text);
+}
+
 pub fn op_count(
     program: &Program,
     state: &mut ProgramState,
@@ -17715,11 +17750,18 @@ pub fn op_count(
         insn
     );
 
+    let census = q2_census_dir();
+    if let Some(dir) = census {
+        q2_census(dir, _pager, true);
+    }
     let count = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Count");
         let cursor = cursor.as_btree_mut();
         return_if_io!(state, cursor.count())
     };
+    if let Some(dir) = census {
+        q2_census(dir, _pager, false);
+    }
 
     state.registers[*target_reg].set_int(count as i64);
 

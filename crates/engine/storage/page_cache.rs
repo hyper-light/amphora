@@ -1,4 +1,4 @@
-use crate::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use crate::sync::{Arc, Weak};
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use rustc_hash::FxHashMap as HashMap;
@@ -64,6 +64,9 @@ struct Slot {
     /// it holds the exclusive lock, so a bump never races a decrement, and two
     /// hits at once may count as one.
     ref_bit: AtomicU8,
+    /// Lane Q2 diag: accesses counted since the page joined, and the cache's insert count then.
+    hits: AtomicU32,
+    born: u64,
 }
 
 impl Slot {
@@ -72,6 +75,7 @@ impl Slot {
     /// recency hint allows, and no hit waits or retries.
     #[inline]
     fn bump_ref(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
         let old = self.ref_bit.load(Ordering::Relaxed);
         if old < REF_MAX {
             self.ref_bit
@@ -150,6 +154,9 @@ pub struct PageCache {
     spare: Option<PageRef>,
     /// Amphora: spare pages taken by misses so far.
     recycled: u64,
+    /// Lane Q2 diag: pages inserted and evicted so far.
+    inserts: u64,
+    evictions: u64,
 }
 
 unsafe impl Send for PageCache {}
@@ -221,7 +228,54 @@ impl PageCache {
             evictable_count: 0,
             spare: None,
             recycled: 0,
+            inserts: 0,
+            evictions: 0,
         }
+    }
+
+    /// Lane Q2 diag: the cache as it stands, a line a page in queue order (front = tail first).
+    pub fn census(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let mut hand_at = usize::MAX;
+        let mut lines = String::new();
+        let mut cursor = self.queue.front();
+        let mut i = 0usize;
+        while let Some(entry) = cursor.get() {
+            if std::ptr::eq(entry, self.clock_hand) {
+                hand_at = i;
+            }
+            let page = &entry.page;
+            let (r, hits, born) = self.map.get(&entry.key).map_or((9, 0, 0), |slot| {
+                (slot.ref_count(), slot.hits.load(Ordering::Relaxed), slot.born)
+            });
+            let _ = writeln!(
+                lines,
+                "{i} {} {r} {hits} {born} {} {} {} {} {} {}",
+                entry.key.0,
+                u8::from(Self::evictable(page)),
+                u8::from(page.is_dirty()),
+                u8::from(page.is_locked()),
+                u8::from(page.is_pinned()),
+                Arc::strong_count(page),
+                u8::from(page.is_shared()),
+            );
+            cursor.move_next();
+            i += 1;
+        }
+        let _ = writeln!(
+            out,
+            "capacity {} len {} inserts {} evictions {} hand {} evictable_count {}",
+            self.capacity,
+            self.map.len(),
+            self.inserts,
+            self.evictions,
+            hand_at,
+            self.evictable_count
+        );
+        out.push_str("idx pgno ref hits born evictable dirty locked pinned strong shared\n");
+        out.push_str(&lines);
+        out
     }
 
     /// Amphora (decision 42): the page the last eviction left spare, for a miss to read into.
@@ -416,8 +470,11 @@ impl PageCache {
                 entry: entry_ptr,
                 page: slot_page,
                 ref_bit: AtomicU8::new(CLEAR),
+                hits: AtomicU32::new(0),
+                born: self.inserts,
             },
         );
+        self.inserts = self.inserts.saturating_add(1);
         if self.clock_hand.is_null() {
             self.clock_hand = entry_ptr;
         }
@@ -849,6 +906,7 @@ impl PageCache {
 
                 // Update evictable count after successful eviction
                 self.evictable_count = self.evictable_count.saturating_sub(1);
+                self.evictions = self.evictions.saturating_add(1);
 
                 return Ok(());
             } else if evictable {

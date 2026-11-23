@@ -4547,6 +4547,16 @@ impl Pager {
     /// Amphora: the pages a read finds without reading the file: this connection's page cache and
     /// the pages its database shares (decision 20), as the planner counts them
     /// (`docs/design/planner.md`, decision 5).
+    /// Lane Q2 diag: this pager's fetches and file reads, then its private cache's census.
+    pub(crate) fn cache_census(&self) -> String {
+        format!(
+            "fetches {} file_reads {}\n{}",
+            self.page_fetches.load(Ordering::Relaxed),
+            self.page_file_reads.load(Ordering::Relaxed),
+            self.page_cache.read().census()
+        )
+    }
+
     pub fn cached_page_capacity(&self) -> usize {
         let private = self.page_cache.read().capacity();
         let shared = self
