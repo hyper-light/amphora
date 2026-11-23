@@ -6,6 +6,7 @@
 //! 19's regression SQL is a corpus.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing, clippy::arithmetic_side_effects, clippy::disallowed_macros))]
 
+pub mod digest;
 pub mod split;
 
 use std::fmt;

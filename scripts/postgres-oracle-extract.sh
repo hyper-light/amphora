@@ -14,10 +14,18 @@
 # usage: scripts/postgres-oracle-extract.sh <work dir under ~/.cache>
 set -euo pipefail
 W=${1:?usage: postgres-oracle-extract.sh <work dir>}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# The oracle is the vendored commit's parser, so the digest it writes holds for vendor/postgres.
+COMMIT=$(sed -n '/^\[projects.postgres\]/,/^commit/s/^commit = "\(.*\)"/\1/p' "$ROOT/vendor/MANIFEST.toml")
 mkdir -p "$W"
-cp "$(dirname "$0")/postgres-oracle.c" "$W/oracle.c"
+cp "$ROOT/scripts/postgres-oracle.c" "$W/oracle.c"
 cd "$W"
-[ -d postgres/.git ] || git clone -q --depth 1 --branch REL_19_0 https://github.com/postgres/postgres.git postgres
+if [ ! -d postgres/.git ]; then
+  git init -q postgres
+  git -C postgres fetch -q --depth 1 https://github.com/postgres/postgres.git "${COMMIT:?no postgres commit in vendor/MANIFEST.toml}"
+  git -C postgres checkout -q FETCH_HEAD
+fi
+[ "$(git -C postgres rev-parse HEAD)" = "$COMMIT" ] || { echo "$W/postgres is not vendor/postgres's commit $COMMIT: use a new work dir"; exit 1; }
 [ -d libpg_query/.git ] || git clone -q https://github.com/pganalyze/libpg_query.git libpg_query
 git -C libpg_query checkout -q 7663e07
 grep -q "deep_resolve('nodeToStringWithLocations')" libpg_query/scripts/extract_source.rb ||
