@@ -10260,6 +10260,78 @@ pub mod test {
         }
     }
 
+    /// AUDIT 2.1 (decision 40): what a page read's frame lookup costs with the log full, each way,
+    /// at one reader and at every thread the machine runs. The suite's reads can't show it: its
+    /// settle truncates the log, so `find_frame` is reached with no frames. Run it, release:
+    /// `cargo test -p amphora-engine --release --lib g3_2_log_lookup_bench -- --ignored --nocapture`
+    /// (`AMPHORA_LOOKUP_BENCH_PAGES`, the database's pages the log holds, default the suite's
+    /// 200,000-item database: 32,612 pages; `_LOOKUPS`, a thread's). Half the pages read aren't in
+    /// the log (the filter's case). It prints lookups a second, each way; it asserts nothing about
+    /// time, only that every way answers as the lock does.
+    #[test]
+    #[ignore = "micro-benchmark: run on a quiet machine, release"]
+    fn g3_2_log_lookup_bench() {
+        use super::super::log_index::LogReadIndex;
+        use rand_chacha::{
+            rand_core::{RngCore, SeedableRng},
+            ChaCha8Rng,
+        };
+        let size = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let pages = size("AMPHORA_LOOKUP_BENCH_PAGES", 32_612);
+        let lookups = size("AMPHORA_LOOKUP_BENCH_LOOKUPS", 2_000_000);
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        for threads in [1, cores] {
+            for mode in [
+                LogReadIndex::Locked,
+                LogReadIndex::Filtered,
+                LogReadIndex::Published,
+                LogReadIndex::Optimistic,
+            ] {
+                let shared = WalFileShared::new_noop();
+                shared.read().runtime.read_index.set_mode(mode);
+                let coordination = make_test_coordination(&shared);
+                // Every page written twice, as a run of commits does: 2 x pages frames.
+                let mut frame = 0u64;
+                for _ in 0..2 {
+                    for page in 1..=pages {
+                        frame += 1;
+                        coordination.cache_frame(page, frame);
+                    }
+                }
+                let max_frame = frame;
+                let began = std::time::Instant::now();
+                std::thread::scope(|scope| {
+                    for reader in 0..threads {
+                        let coordination = &coordination;
+                        scope.spawn(move || {
+                            let mut rng = ChaCha8Rng::seed_from_u64(reader as u64);
+                            for _ in 0..lookups {
+                                let page = 1 + rng.next_u64() % (2 * pages);
+                                let found = coordination.find_frame(page, 1, max_frame, None);
+                                let expected = (page <= pages).then_some(page + pages);
+                                assert_eq!(found, expected, "{mode:?} page {page}");
+                            }
+                        });
+                    }
+                });
+                let seconds = began.elapsed().as_secs_f64();
+                let total = lookups as f64 * threads as f64;
+                println!(
+                    "g3_2_log_lookup_bench threads={threads} way={mode:?} lookups_per_s={:.0} ns_per_lookup_per_thread={:.1}",
+                    total / seconds,
+                    seconds * 1e9 / lookups as f64
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_in_process_coordination_uses_shared_authority() {
         let (shared, _wal) = make_test_wal();
