@@ -939,16 +939,19 @@ fn survives(phase: &str, prefix: &[u8], hostile: &[u8], pace: Pace) -> bool {
     let (_, next) = drive(&mut session, roles, prefix, Pace::Frames);
     assert_eq!(next, None, "the prefix leaves the {phase} parser waiting");
     let (out, next) = drive(&mut session, roles, hostile, pace);
-    if next == Some(Next::Close) && !out.is_empty() {
-        let all = messages(&out);
-        assert_eq!(
-            all.last().unwrap().0,
-            b'E',
-            "the {phase} parser closed for {hostile:?} says why"
-        );
-        return true;
+    match next {
+        Some(Next::Close) if !out.is_empty() => {
+            let all = messages(&out);
+            assert_eq!(
+                all.last().unwrap().0,
+                b'E',
+                "the {phase} parser closed for {hostile:?} says why"
+            );
+            true
+        }
+        Some(Next::CloseLogged(_)) => true,
+        _ => false,
     }
-    false
 }
 
 #[test]
@@ -1034,13 +1037,27 @@ fn t_pg_1_7_lengths_past_each_limit_are_refused_before_they_are_held() {
         h
     };
     let [_, start, sasl_final, ready] = <[(&str, Vec<u8>); 4]>::try_from(prefixes()).unwrap();
-    refused(
-        &[],
-        &u32::try_from(wire::MAX_STARTUP_PACKET_LENGTH + 5)
-            .unwrap()
-            .to_be_bytes(),
-    );
-    refused(&[], &7u32.to_be_bytes());
+    // PostgreSQL answers a startup length out of range with nothing: it logs the violation and
+    // closes (`backend_startup.c:566-571`, COMMERROR), so the client can't tell the servers apart.
+    for length in [
+        u32::try_from(wire::MAX_STARTUP_PACKET_LENGTH + 5).unwrap(),
+        7,
+        3,
+        0,
+        u32::MAX,
+    ] {
+        let mut session = Session::new(config(false), seed());
+        let mut out = Vec::new();
+        let step = session.step(&length.to_be_bytes(), roles, &mut out).unwrap();
+        assert!(out.is_empty(), "nothing is sent for length {length}");
+        match step.next {
+            Next::CloseLogged(error) => {
+                assert_eq!(error.code, SqlState::PROTOCOL_VIOLATION);
+                assert_eq!(error.message, "invalid length of startup packet");
+            }
+            other => panic!("length {length}: {other:?}"),
+        }
+    }
     refused(
         &start.1,
         &header(b'p', u32::try_from(wire::AUTH_TOKEN_LIMIT + 5).unwrap()),
@@ -1075,4 +1092,31 @@ fn t_pg_1_7_lengths_past_each_limit_are_refused_before_they_are_held() {
     );
     wrong(&ready.1, &frontend(b'Q', b"SELECT 1"), "08P01");
     wrong(&ready.1, &frontend(b'Q', b"SELECT 1\0extra"), "08P01");
+}
+
+#[test]
+fn t_pg_2_2_a_refused_session_is_answered_after_its_startup_packet_as_postgresql_answers() {
+    let roles = roles();
+    let mut session = Session::new(config(false), seed());
+    session.refuse(PgError::fatal(
+        SqlState::TOO_MANY_CONNECTIONS,
+        "sorry, too many clients already",
+    ));
+    let (out, next) = drive(&mut session, roles, &request(wire::GSS_REQUEST_CODE, &[]), Pace::Frames);
+    assert_eq!(next, None, "the opening's requests are answered first");
+    assert_eq!(out, b"N");
+    let (out, next) = drive(
+        &mut session,
+        roles,
+        &startup_packet(wire::PROTOCOL_3_2, &[("user", "ada")]),
+        Pace::Bytes,
+    );
+    assert_eq!(next, Some(Next::Close));
+    let sent = messages(&out);
+    assert_eq!(sent.len(), 1, "no authentication request before the refusal");
+    assert_eq!(sent[0].0, b'E');
+    let fields = error_fields(&sent[0].1);
+    assert!(fields.contains(&(b'S', "FATAL".to_owned())));
+    assert!(fields.contains(&(b'C', "53300".to_owned())));
+    assert!(fields.contains(&(b'M', "sorry, too many clients already".to_owned())));
 }

@@ -161,17 +161,25 @@ pub fn resident() -> Option<u64> {
 /// What the process's memory is shared out to, each by its own measured use (MB.1): the owners'
 /// queues (commands waiting, messages going out), the images a replica makes and installs, the
 /// caches (the page pool and what else keeps data to read again), and the chunks of a database's
-/// file a backup copies and a restore fetches (T-T1.12.M1).
+/// file a backup copies and a restore fetches (T-T1.12.M1), and the PostgreSQL sessions, each its
+/// state and the frame it holds (docs/design/postgres.md, decision 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Use {
     Queues,
     Images,
     Caches,
     Chunks,
+    Sessions,
 }
 
 impl Use {
-    const ALL: [Self; 4] = [Self::Queues, Self::Images, Self::Caches, Self::Chunks];
+    const ALL: [Self; 5] = [
+        Self::Queues,
+        Self::Images,
+        Self::Caches,
+        Self::Chunks,
+        Self::Sessions,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -179,6 +187,7 @@ impl Use {
             Self::Images => "an image",
             Self::Caches => "the caches",
             Self::Chunks => "a backup's chunk",
+            Self::Sessions => "the PostgreSQL sessions",
         }
     }
 }
@@ -398,9 +407,9 @@ impl Readings for System {
 /// No share is picked: a use has what the others leave, as measured now.
 pub struct Budget {
     readings: Box<dyn Readings>,
-    held: [AtomicU64; 4],
+    held: [AtomicU64; 5],
     /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
-    streams: [AtomicU64; 4],
+    streams: [AtomicU64; 5],
 }
 
 /// One stream of a use's that may hold a charge at any moment while it lives (a backup's base copy,
@@ -499,13 +508,14 @@ impl Budget {
         Self::of(&self.streams, used)
     }
 
-    fn of(counters: &[AtomicU64; 4], used: Use) -> &AtomicU64 {
-        let [queues, images, caches, chunks] = counters;
+    fn of(counters: &[AtomicU64; 5], used: Use) -> &AtomicU64 {
+        let [queues, images, caches, chunks, sessions] = counters;
         match used {
             Use::Queues => queues,
             Use::Images => images,
             Use::Caches => caches,
             Use::Chunks => chunks,
+            Use::Sessions => sessions,
         }
     }
 

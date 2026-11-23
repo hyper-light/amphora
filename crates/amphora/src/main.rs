@@ -8,11 +8,17 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|a| a.into_string().ok())
         .collect();
-    // serve, health, ask and drill (CP-T1.13); anything else is `reply`'s.
+    // postgres (docs/design/postgres.md), serve, health, ask and drill (CP-T1.13); anything else is
+    // `reply`'s.
     let plain: Option<Vec<String>> = args.iter().cloned().collect();
     let served = plain.and_then(|plain| {
-        amphora::serve::command(&plain, |addr| {
-            let _ = writeln!(std::io::stderr().lock(), "amphora: serving on {addr}");
+        amphora::postgres::listener::command(&plain, |addr| {
+            let _ = writeln!(std::io::stderr().lock(), "amphora: PostgreSQL listening on {addr}");
+        })
+        .or_else(|| {
+            amphora::serve::command(&plain, |addr| {
+                let _ = writeln!(std::io::stderr().lock(), "amphora: serving on {addr}");
+            })
         })
     });
     let reply = served.unwrap_or_else(|| amphora::reply(&args));
