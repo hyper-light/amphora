@@ -50,7 +50,10 @@ fn put(i: u64) -> Tx {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let dir = PathBuf::from(args.next().ok_or("usage: records_load <folder> <seconds> <clients,...> [get|commit|both]")?);
+    let dir = PathBuf::from(
+        args.next()
+            .ok_or("usage: records_load <folder> <seconds> <clients,...> [get|commit|both]")?,
+    );
     let seconds: u64 = args
         .next()
         .ok_or("seconds")?

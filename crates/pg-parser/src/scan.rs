@@ -22,7 +22,9 @@ pub fn longest_match(condition: usize, input: &[u8]) -> Option<(u16, usize)> {
         state = state.checked_add(i64::from(*NEXT.get(at)?))?;
         taken = taken.checked_add(1)?;
     }
-    let action = NEXT.get(usize::try_from(state.checked_sub(1)?).ok()?).copied()?;
+    let action = NEXT
+        .get(usize::try_from(state.checked_sub(1)?).ok()?)
+        .copied()?;
     Some((u16::try_from(action).ok()?, taken))
 }
 
@@ -42,8 +44,16 @@ mod tests {
     fn t_pg_4_1_longest_match_takes_scan_ls_lexemes() {
         assert_eq!(taken(INITIAL, "SELECT x"), 6);
         assert_eq!(taken(INITIAL, " \n\t x"), 4);
-        assert_eq!(taken(INITIAL, "-- c\nx"), 4, "a comment is whitespace up to its newline");
-        assert_eq!(taken(INITIAL, "123abc "), 6, "integer_junk takes the junk with the number");
+        assert_eq!(
+            taken(INITIAL, "-- c\nx"),
+            4,
+            "a comment is whitespace up to its newline"
+        );
+        assert_eq!(
+            taken(INITIAL, "123abc "),
+            6,
+            "integer_junk takes the junk with the number"
+        );
         assert_eq!(taken(INITIAL, "$1abc "), 5, "param_junk");
         assert_eq!(taken(INITIAL, ":: int"), 2);
         assert_eq!(taken(INITIAL, "'abc'"), 1, "xqstart, then BEGIN(xq)");
@@ -56,7 +66,10 @@ mod tests {
     fn t_pg_4_1_every_byte_matches_a_rule_in_initial() {
         for b in 1..=255u8 {
             let (rule, len) = longest_match(INITIAL, &[b]).unwrap();
-            assert!(len == 1 && (1..=RULES).contains(&rule), "byte {b}: rule {rule}, {len} bytes");
+            assert!(
+                len == 1 && (1..=RULES).contains(&rule),
+                "byte {b}: rule {rule}, {len} bytes"
+            );
         }
     }
 }

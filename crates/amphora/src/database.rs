@@ -486,7 +486,10 @@ impl<T: AnswerBytes> AnswerBytes for Vec<T> {
 impl<T: AnswerBytes> AnswerBytes for Option<T> {
     fn answer_bytes(&self) -> usize {
         let outer = std::mem::size_of::<Self>().saturating_sub(std::mem::size_of::<T>());
-        outer.saturating_add(self.as_ref().map_or(std::mem::size_of::<T>(), T::answer_bytes))
+        outer.saturating_add(
+            self.as_ref()
+                .map_or(std::mem::size_of::<T>(), T::answer_bytes),
+        )
     }
 }
 
@@ -1092,7 +1095,11 @@ fn read_records(
 
 /// A read whose deadline passed while it waited: it leaves the queue (nothing was written: it is
 /// refused for its deadline), unless it was handed the reads still waiting, which it reads first.
-fn read_late(store: &Store<Local>, reads: &Reads, mine: &Arc<WaitingRead>) -> Result<ReadRoute, Refusal> {
+fn read_late(
+    store: &Store<Local>,
+    reads: &Reads,
+    mine: &Arc<WaitingRead>,
+) -> Result<ReadRoute, Refusal> {
     let lead = {
         let mut queue = locked(&reads.queue)?;
         queue.waiting.retain(|w| !Arc::ptr_eq(w, mine));
@@ -2078,7 +2085,12 @@ impl Database {
     /// answer past its declared bound, or past the budget's room when measured, rolls the call
     /// back and is refused. A measured answer's charge is held until the caller has it. An
     /// attached client runs it as [`Database::call`].
-    pub fn call_charged<R, F>(&self, until: Instant, charge: AnswerCharge, f: F) -> Result<R, Refusal>
+    pub fn call_charged<R, F>(
+        &self,
+        until: Instant,
+        charge: AnswerCharge,
+        f: F,
+    ) -> Result<R, Refusal>
     where
         R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
@@ -2124,12 +2136,14 @@ impl Database {
             until,
             Instant::now(),
             move |result: Result<Answer, Refusal>| {
-                answerer.answer(result.and_then(|answer| match answer {
-                    Answer::Called(v) => v
-                        .downcast::<(R, Option<crate::memory::Charge>)>()
-                        .map(|v| *v)
-                        .map_err(|_| unavailable("wrong SQL session answer")),
-                    _ => Err(unavailable("wrong SQL session answer")),
+                answerer.answer(result.and_then(|answer| {
+                    match answer {
+                        Answer::Called(v) => v
+                            .downcast::<(R, Option<crate::memory::Charge>)>()
+                            .map(|v| *v)
+                            .map_err(|_| unavailable("wrong SQL session answer")),
+                        _ => Err(unavailable("wrong SQL session answer")),
+                    }
                 }));
             },
         )?;
@@ -2779,10 +2793,17 @@ impl Database {
             }
         }
         let (tx, rx) = mpsc::sync_channel(1);
-        self.submit_local(namespace, operation, call_answer, until, until, move |result| {
-            // A caller whose deadline elapsed no longer waits, but the committed result stands.
-            let _ = tx.send(result);
-        })?;
+        self.submit_local(
+            namespace,
+            operation,
+            call_answer,
+            until,
+            until,
+            move |result| {
+                // A caller whose deadline elapsed no longer waits, but the committed result stands.
+                let _ = tx.send(result);
+            },
+        )?;
         rx.recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|e| match e {
                 mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
@@ -4374,7 +4395,10 @@ mod admission_charge {
             }
         }
         assert_eq!(scanned, keys);
-        assert!(pages > 1, "a page of 40 MiB ended at RESULT_MAX, before its limit");
+        assert!(
+            pages > 1,
+            "a page of 40 MiB ended at RESULT_MAX, before its limit"
+        );
         let (mut after, mut changed, mut pages) = (0, Vec::new(), 0);
         loop {
             let page = records.changes("f", after, api::SCAN_MAX, until()).unwrap();
@@ -4396,7 +4420,10 @@ mod admission_charge {
             }
         }
         assert_eq!(changed, keys);
-        assert!(pages > 1, "a page of changes ended at RESULT_MAX, before its limit");
+        assert!(
+            pages > 1,
+            "a page of changes ended at RESULT_MAX, before its limit"
+        );
     }
 }
 
@@ -5058,7 +5085,11 @@ mod records_reads {
                             until()
                         };
                         match ns.get("f", b"k", Consistency::Linearizable, deadline) {
-                            Ok(row) => assert_eq!(row.expect("the row").value, b"v", "round {round} client {c}"),
+                            Ok(row) => assert_eq!(
+                                row.expect("the row").value,
+                                b"v",
+                                "round {round} client {c}"
+                            ),
                             Err(refusal) => assert!(
                                 c % 4 == 0 && matches!(refusal, Refusal::Timeout),
                                 "round {round} client {c}: {refusal:?}"
@@ -5068,10 +5099,15 @@ mod records_reads {
                 }
             });
             let queue = locked(&db.shared.reads.queue).unwrap();
-            assert!(queue.waiting.is_empty(), "round {round}: no read left waiting");
+            assert!(
+                queue.waiting.is_empty(),
+                "round {round}: no read left waiting"
+            );
             assert_eq!(queue.reading, 0, "round {round}: every place given back");
         }
-        let row = ns.get("f", b"k", Consistency::Linearizable, until()).unwrap();
+        let row = ns
+            .get("f", b"k", Consistency::Linearizable, until())
+            .unwrap();
         assert_eq!(row.expect("the row").value, b"v");
     }
 }

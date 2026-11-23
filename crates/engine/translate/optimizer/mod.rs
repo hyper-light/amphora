@@ -4289,10 +4289,11 @@ pub(crate) mod bushy_test_hook {
             let nested_loops = rows(&conn, sql);
             // Each table read whole once, and the run's rows once more from its input.
             let count = |sql: &str| -> u64 { rows(&conn, sql)[0].parse().unwrap() };
-            let once = count(
-                "SELECT (SELECT count(*) FROM r) + (SELECT count(*) FROM o) \
+            let once =
+                count(
+                    "SELECT (SELECT count(*) FROM r) + (SELECT count(*) FROM o) \
                  + (SELECT count(*) FROM c) + (SELECT count(*) FROM l) + (SELECT count(*) FROM s)",
-            ) + count("SELECT count(*) FROM o, c, l WHERE c.id = o.cid AND l.oid = o.id");
+                ) + count("SELECT count(*) FROM o, c, l WHERE c.id = o.cid AND l.oid = o.id");
             conn.set_join_methods(JoinMethods::ByCost);
             // Loops in the FROM order, hash joins at `c` and `s`, and the run `o c l` built for `s`.
             PIN.with(|pin| pin.set(true));
