@@ -2084,8 +2084,8 @@ mod tests {
             *text("3.33333333333333300000e-01").get_value()
         );
         // printf.html: "26 significant digits if the "!" alternate-form-2 flag is used". 1/3 is
-        // 0.333333333333333314829616256...; its first 20 digits, rounded (SQLite 3.54.0 writes 19:
-        // 0.3333333333333333148).
+        // 0.333333333333333314829616256...; its first 20 digits, rounded (SQLite 3.54.0 writes 18:
+        // 0.333333333333333315).
         assert_eq!(
             exec_printf(&[text("%!.20f"), float(1.0 / 3.0)], FpDigits::DEFAULT).unwrap(),
             *text("0.33333333333333331483").get_value()
