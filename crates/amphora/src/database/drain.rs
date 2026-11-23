@@ -9,7 +9,13 @@
 //! 1/8 (Jacobson, "Congestion Avoidance and Control", SIGCOMM 1988), as the compaction's costs are
 //! (CT.1), the eighth taken rounded up so that a sum no sample feeds decays to nothing. An
 //! interval counts when the queue held work at its start or its reader took some in it: one with
-//! nothing to read and nothing read tells nothing of how fast it reads. The election timeout is
+//! nothing to read and nothing read tells nothing of how fast it reads. Nor does one in which the
+//! reader found the queue empty (`Drain::starved`): what it took then is what came, a floor under
+//! its rate, not its rate, and a bound learned from it refuses a burst the reader takes at once.
+//! Such an interval is application-limited, as a delivery-rate sample is in BBR, which never lets
+//! one lower its estimate (Cheng et al., "Delivery Rate Estimation", IETF ICCRG
+//! draft-cheng-iccrg-delivery-rate-estimation; Cardwell et al., "BBR: Congestion-Based Congestion
+//! Control", ACM Queue 14(5), 2016). The election timeout is
 //! learned too: `election_tick` periods of the owner's measured pace (TP.1). Each bound is the lesser of the rate times that
 //! timeout and the memory budget's room for queues (MB.1), no less than the least a queue can
 //! carry and still work (the outgoing queue's: a record to each peer, one broadcast); before
@@ -37,6 +43,8 @@ pub(super) struct Drain {
     pending: (u64, u64),
     /// The clock reading the interval under way began at, and whether the queue held work then.
     since: Option<(u64, bool)>,
+    /// The reader found the queue empty in the interval under way.
+    starved: bool,
 }
 
 impl Drain {
@@ -48,13 +56,19 @@ impl Drain {
         );
     }
 
+    /// The reader looked for work and found the queue empty: the interval under way tells only
+    /// what came, not how fast the reader reads.
+    pub(super) fn starved(&mut self) {
+        self.starved = true;
+    }
+
     /// The owner's clock reads `now`, the queue holding work (`busy`) or not: the interval since
     /// the last sample is weighed if the queue held work at its start or some was drained in it,
-    /// and a new one begins.
+    /// and its reader never found it empty; a new one begins.
     pub(super) fn sample(&mut self, now: u64, busy: bool) {
         match self.since {
             Some((at, held)) if now > at => {
-                if held || self.pending.1 > 0 {
+                if (held || self.pending.1 > 0) && !self.starved {
                     // RFC 6298 §2's gain: the old sums keep seven eighths, the eighth rounded up.
                     let decay = |sum: u64| sum.saturating_sub(sum.div_ceil(8));
                     self.nanos = decay(self.nanos).saturating_add(now.saturating_sub(at));
@@ -62,12 +76,14 @@ impl Drain {
                     self.messages = decay(self.messages).saturating_add(self.pending.1);
                 }
                 self.pending = (0, 0);
+                self.starved = false;
                 self.since = Some((now, busy));
             }
             // No time passed on the clock: below its resolution, the interval goes on.
             Some((at, held)) => self.since = Some((at, held || busy)),
             None => {
                 self.pending = (0, 0);
+                self.starved = false;
                 self.since = Some((now, busy));
             }
         }
@@ -249,6 +265,36 @@ mod tests {
         assert!((9_000..=11_000).contains(&bound.bytes), "{bound:?}");
         assert!((90..=110).contains(&bound.messages), "{bound:?}");
         assert_eq!(drain.bound(timeout, LEAST, 4000).bytes, 4000);
+    }
+
+    /// T-QB.1.15: do a reader take the one message that came in each 10 ms, finding the queue
+    /// empty each time, under a 100 ms election timeout; expect the room, as with nothing
+    /// measured, since what it took is what came. Then do it take 10 messages each 10 ms without
+    /// running out; expect about 100 messages, its rate.
+    #[test]
+    fn drain_learns_nothing_from_an_interval_its_reader_found_empty() {
+        let mut drain = Drain::default();
+        let timeout = Duration::from_millis(100);
+        let room = Bound {
+            bytes: 4000,
+            messages: u64::MAX,
+        };
+        drain.sample(0, true);
+        let mut now = 0;
+        for _ in 0..40 {
+            now += 10 * MS;
+            drain.drained(100, 1);
+            drain.starved();
+            drain.sample(now, true);
+        }
+        assert_eq!(drain.bound(timeout, LEAST, 4000), room);
+        for _ in 0..40 {
+            now += 10 * MS;
+            drain.drained(100, 10);
+            drain.sample(now, true);
+        }
+        let bound = drain.bound(timeout, LEAST, u64::MAX);
+        assert!((90..=110).contains(&bound.messages), "{bound:?}");
     }
 
     /// T-QB.1.3: the reader slows to a tenth: passes when the bound follows it down as the old

@@ -2896,6 +2896,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                 Err(mpsc::TryRecvError::Empty) if self.driving => None,
                 Err(mpsc::TryRecvError::Empty) => {
+                    // The intake waits for work: it reads faster than work comes (`Drain::starved`).
+                    self.intake.starved();
                     let deadline = self.deadline();
                     let wait = deadline.saturating_duration_since((self.clock)());
                     self.control.bell.wait(wait)?;
@@ -2983,6 +2985,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         // makes no raft step; what comes waits in order, its bytes still charged to the command
         // queue, so the queue's admission bound holds the callers back.
         let paused = self.paused()?;
+        // A step with no input found the command queue empty: its intake reads faster than work
+        // comes, so this interval tells nothing of its rate (`Drain::starved`).
+        if input.is_none() && self.paused_inputs.is_empty() {
+            self.intake.starved();
+        }
         let mut input = input;
         if let Some(envelope) = input.as_mut() {
             // Taken from the channel: its place there is free, its bytes still held (lane

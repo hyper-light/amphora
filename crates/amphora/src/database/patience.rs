@@ -263,8 +263,13 @@ mod tests {
 
     const ELECTION: usize = 20;
     const VOTERS: [u64; 3] = [1, 2, 3];
-    /// The members the tests' cores are opened for: as many as the voters.
-    const MEMBERS: usize = VOTERS.len();
+
+    /// The members the tests' cores are opened for: the bound a group of `VOTERS` starts with
+    /// (`replication::members::first`), as the owner opens its core and this measure. A joint
+    /// configuration names both of its sets, and a core holds only one within its bound.
+    fn members() -> usize {
+        crate::replication::members::first(VOTERS.len())
+    }
 
     fn leading(answers: &mut Answers, ticks: usize) {
         for _ in 0..ticks {
@@ -276,7 +281,7 @@ mod tests {
     /// patience of the smaller, 30 less the election timeout.
     #[test]
     fn the_patience_is_the_quorums_tail_less_the_election_timeout() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         leading(&mut answers, 1);
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -291,7 +296,7 @@ mod tests {
     /// election timeout as at fixed ticks.
     #[test]
     fn answers_within_the_election_timeout_give_no_patience() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         for _ in 0..100 {
             leading(&mut answers, 1);
             answers.heard(2, 7).unwrap();
@@ -305,7 +310,7 @@ mod tests {
     /// gap, unsuspected, learned.
     #[test]
     fn a_suspected_voters_gap_is_refused_and_not_learned() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         leading(&mut answers, 1);
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -328,7 +333,7 @@ mod tests {
     /// generation and forgotten within two.
     #[test]
     fn a_gap_is_believed_for_one_to_two_of_its_voters_own_recurrences() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         leading(&mut answers, 1);
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -374,7 +379,7 @@ mod tests {
     /// a new lead's first gap counted from the tick it began.
     #[test]
     fn only_the_term_it_leads_is_measured() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         for _ in 0..60 {
             answers.tick(None, &VOTERS, &[]).unwrap();
         }
@@ -393,7 +398,7 @@ mod tests {
     /// Do a voter answer late, then leave the configuration; expect it forgotten.
     #[test]
     fn a_voter_that_left_is_forgotten() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         leading(&mut answers, 1);
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -412,7 +417,7 @@ mod tests {
     fn a_joint_configuration_takes_the_larger_of_its_two_sets() {
         let incoming = [1, 4, 5];
         let joint = |answers: &mut Answers| answers.tick(Some(7), &incoming, &VOTERS).unwrap();
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         joint(&mut answers);
         for voter in [2, 3, 4, 5] {
             answers.heard(voter, 7).unwrap();
@@ -435,7 +440,7 @@ mod tests {
     #[test]
     fn a_leader_outside_a_set_needs_a_majority_of_its_members() {
         let incoming = [2, 3];
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         answers.tick(Some(7), &incoming, &VOTERS).unwrap();
         answers.heard(2, 7).unwrap();
         answers.heard(3, 7).unwrap();
@@ -453,7 +458,7 @@ mod tests {
     /// A single voter needs no one: no patience.
     #[test]
     fn a_lone_voter_has_no_patience() {
-        let mut answers = Answers::new(ELECTION, MEMBERS);
+        let mut answers = Answers::new(ELECTION, members());
         assert_eq!(answers.patience(&[1], &[], 1, ELECTION), 0);
     }
 

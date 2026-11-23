@@ -1280,6 +1280,7 @@ tests = [
   # lane constants-22
   { id = "T-QB.1.13", text = "A lock-release event, released before a wait and after: passes when a wait after a release it hadn't counted says try again, a waiting waker is woken once by the next release and let go, and one waker waiting twice is held once" },
   { id = "T-QB.1.14", text = "Two connections, one holding the write lock while the other's insert waits, then the holder commits, under each busy wake: passes when under the release wake nothing woke the waiter before the commit and the commit did, both inserts commit, and the time from commit to the waiter's insert done is printed for each" },
+  { id = "T-QB.1.15", text = "A reader that finds its queue empty in each interval, then one that never runs out: passes when the first leaves the bound the room, as with nothing measured, and the second learns its rate" },
 ]
 
 # lane many-writers
