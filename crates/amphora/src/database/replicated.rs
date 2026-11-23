@@ -18640,8 +18640,8 @@ mod tests {
     /// appends a write of its own on the same base, then let through; the follower's write made
     /// again, its forward held the same way while the leader is asked for a second write, then let
     /// through. Expect, with the slot off: the follower refused both times, stale. With the slot
-    /// on: refused once, then applied on its next try, the leader's second write held until it
-    /// lands and then applied too.
+    /// on: applied both times, its barrier beginning its slot from its first try (lane V8), the
+    /// leader's writes held until it lands and then applied too.
     #[test]
     fn todays_rule_refuses_a_follower_twice_in_a_row_where_the_slot_lands_its_retry() {
         for slot_off in [true, false] {
@@ -18719,8 +18719,10 @@ mod tests {
             if slot_off {
                 assert!(outcomes.iter().all(stale), "today's rule: {outcomes:?}");
             } else {
-                assert!(stale(&outcomes[0]), "the slot: {outcomes:?}");
-                assert_eq!(outcomes[1], Ok(Vec::new()), "the slot: {outcomes:?}");
+                assert!(
+                    outcomes.iter().all(|outcome| *outcome == Ok(Vec::new())),
+                    "the slot: {outcomes:?}"
+                );
             }
             driven.quiet(&mut pump);
             driven.drain(&mut pump);
