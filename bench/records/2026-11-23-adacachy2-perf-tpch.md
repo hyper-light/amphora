@@ -101,6 +101,21 @@ plan for a given set of statistics would take:
 - Test it: the same statement prepared twice over the same statistics and the same weights version
   gives the same plan.
 
+## Checks and why the fix is not on main yet
+
+- clippy (`cargo clippy -p amphora-engine --all-targets --locked -- -D warnings`) at 1bfe3b8f: clean.
+- `cargo test -p amphora-engine --lib -- pl_8 hash_join materializ bushy t_qt_5` at 1bfe3b8f: 65
+  passed, 1 failed, `t_pl_8_13_a_left_join_inside_a_bushy_run_keeps_its_null_rows`.
+- That test, A/B, the same two test binaries alternated three times on adacachy2 at load 17 to 62:
+  main 364266aa failed twice at mod.rs:4590 (`made_bushy > 0`, no bushy plan) and passed once; the
+  fix failed three times at mod.rs:4591 (`in_runs > 0`, bushy but no LEFT JOIN in the run). Its
+  asserts are plan shapes the learned weights choose after one timed run, so load moves them; but
+  the fix failing at the other assert every time may mean it changes what the first run does in one
+  of its queries. Not settled, so the fix stays on perf/tpch: the next step is that test with
+  `--nocapture` on both binaries (`~/.cache/amphora-perf-bin/tpch/engine-lib-test-{1bfe3b8f,364266aa}`
+  on adacachy2), reading which query fails and whether its first run's answer differs.
+- The post-merge check at 0566dd00 (r604) did not start in the hour.
+
 ## Not done this hour
 
 - The unit test for section 1; the cause and fix of section 2; the 22-query sweep against SQLite.
