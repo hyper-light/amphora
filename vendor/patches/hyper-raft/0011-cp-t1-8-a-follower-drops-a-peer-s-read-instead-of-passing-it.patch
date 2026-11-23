@@ -29,7 +29,7 @@ index 493c154146d0c2a2ce686eccbd2f366e8673c464..60dc4a990a9a116d0a520ee75e3f15b3
                  }
                  self.forward(message)
 diff --git a/crates/hyper-raft/src/tests.rs b/crates/hyper-raft/src/tests.rs
-index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..58f2f946a6cec03bfef343f54d81e67c058f48c1 100644
+index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..cd179b9f0a0c9b5d780daba88d54f91cd8df1709 100644
 --- a/crates/hyper-raft/src/tests.rs
 +++ b/crates/hyper-raft/src/tests.rs
 @@ -657,6 +657,34 @@ fn a_read_with_no_leader_to_ask_is_refused() {
@@ -43,7 +43,7 @@ index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..58f2f946a6cec03bfef343f54d81e67c
 +    let mut node = follower();
 +    node.step(answer(MessageType::MsgHeartbeat, 1, 2, 1)).unwrap();
 +    drain(&mut node);
-+    let mut relayed = answer(MessageType::MsgReadIndex, 3, 2, 1);
++    let mut relayed = answer(MessageType::MsgReadIndex, 3, 2, 0);
 +    relayed.entries = vec![Entry {
 +        data: b"peer".to_vec(),
 +        ..Entry::default()

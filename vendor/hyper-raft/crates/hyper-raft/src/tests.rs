@@ -664,7 +664,7 @@ fn a_follower_passes_on_its_own_read_and_drops_a_peers() {
     let mut node = follower();
     node.step(answer(MessageType::MsgHeartbeat, 1, 2, 1)).unwrap();
     drain(&mut node);
-    let mut relayed = answer(MessageType::MsgReadIndex, 3, 2, 1);
+    let mut relayed = answer(MessageType::MsgReadIndex, 3, 2, 0);
     relayed.entries = vec![Entry {
         data: b"peer".to_vec(),
         ..Entry::default()
