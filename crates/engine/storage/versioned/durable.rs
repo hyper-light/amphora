@@ -766,7 +766,7 @@ impl Database {
         stamp.encode(&mut body)?;
         let marker = PAGES_FLUSHED.to_le_bytes();
         // Preserve every root slot in the legacy page. A full page replays its journal on open.
-        if body.len() <= PAGE_SIZE - SEAL_LEN - marker.len() {
+        if body.len().saturating_add(SEAL_LEN).saturating_add(marker.len()) <= PAGE_SIZE {
             body.extend_from_slice(&marker);
         }
         let mut page = seal(HEADER_MAGIC, &body)?;
