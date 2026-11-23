@@ -2503,7 +2503,7 @@ mod chooser {
 
 /// Lane skip-8 (T-SKU.10): a measured summary's dropped method built again off the scan's path,
 /// one build per summary at a time, installed only when no write came in during it.
-mod builds {
+pub(super) mod builds {
     use super::super::{
         start_build, zone_map_of_table, BuildEnd, BuildMode, Chooser, CrackerColumn, Lead,
         RowWrite, SkipMethod, SkipRegistry, Skipping, Upkeep, ZoneMap, ZoneMapBuilder,
@@ -2541,7 +2541,7 @@ mod builds {
         chooser
     }
 
-    fn registry_due() -> SkipRegistry {
+    pub(in crate::skipping) fn registry_due() -> SkipRegistry {
         let registry = SkipRegistry::default();
         registry.set(ROOT, 0, Skipping::Measured(Box::new(cracker_due())));
         registry

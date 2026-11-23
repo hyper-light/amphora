@@ -189,15 +189,12 @@ fn build_cracker(
             return BuildEnd::Failed;
         }
     };
-    let Some((builder_pos, committed)) = conn.skipping_positions() else {
-        return BuildEnd::Failed;
-    };
-    if !held
+    if let Err(end) = held
         .db
         .skipping
-        .pin_build(claim, conn.skipping_id(), builder_pos, committed)
+        .pin_build_at(claim, conn.skipping_id(), || conn.skipping_positions())
     {
-        return BuildEnd::OlderSnapshot;
+        return end;
     }
     let cracker = match cursor.cracker(claim.column) {
         Ok(cracker) => cracker,
