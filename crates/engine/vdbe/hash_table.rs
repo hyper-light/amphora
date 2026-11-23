@@ -983,8 +983,12 @@ enum GracePartitionLoadState {
 pub struct HashTable {
     /// Initial bucket count used to reinitialize after spills.
     initial_buckets: usize,
-    /// The hash buckets (used when not spilled).
+    /// The hash buckets (used when not spilled). Their count is a power of two that doubles as
+    /// entries arrive (AUDIT 3.1, `grow_buckets`), indexed by the hash's low bits.
     buckets: Vec<HashBucket>,
+    /// Bytes of the bucket array past its initial size, counted against `mem_budget` with
+    /// `mem_used` so growing never passes the table's memory bound (AUDIT 3.1).
+    bucket_mem: usize,
     /// Number of entries in the table.
     num_entries: usize,
     /// Current memory usage in bytes.
@@ -1103,7 +1107,8 @@ impl HashTable {
                 "custom collations are not supported by hash tables".to_string(),
             ));
         }
-        let num_buckets = config.initial_buckets;
+        // A power of two, so a bucket is the hash's low bits and doubling splits each chain in two.
+        let num_buckets = config.initial_buckets.max(1).next_power_of_two();
         let buckets = (0..num_buckets).map(|_| HashBucket::new()).try_collect()?;
         let matched_bits = if config.track_matched {
             (0..num_buckets).map(|_| vec![]).try_collect()?
@@ -1111,8 +1116,9 @@ impl HashTable {
             vec![]
         };
         Ok(Self {
-            initial_buckets: config.initial_buckets,
+            initial_buckets: num_buckets,
             buckets,
+            bucket_mem: 0,
             num_entries: 0,
             mem_used: 0,
             mem_budget: config.mem_budget,
@@ -1162,7 +1168,7 @@ impl HashTable {
         let bytes = self
             .num_entries
             .saturating_mul(std::mem::size_of::<(usize, usize)>());
-        if self.mem_used.saturating_add(bytes) > self.mem_budget {
+        if self.mem_used.saturating_add(self.bucket_mem).saturating_add(bytes) > self.mem_budget {
             return Ok(false);
         }
         let mut order: Vec<(usize, usize)> = vec![];
@@ -1364,7 +1370,7 @@ impl HashTable {
         let entry_size = HashEntry::size_from_values(&pending.key_values, &pending.payload_values);
 
         // Check if we would exceed memory budget
-        if self.mem_used + entry_size > self.mem_budget {
+        if self.mem_used + self.bucket_mem + entry_size > self.mem_budget {
             if self.spill_state.is_none() {
                 tracing::debug!(
                     "Hash table memory budget exceeded (used: {}, budget: {}), spilling to disk",
@@ -1409,7 +1415,8 @@ impl HashTable {
             spill_state.partition_buffers[partition_idx].insert(entry)?;
         } else {
             // Normal mode, insert into hash bucket
-            let bucket_idx = (hash as usize) % self.buckets.len();
+            self.grow_buckets(entry_size)?;
+            let bucket_idx = Self::bucket_of(hash, self.buckets.len());
             if self.buckets[bucket_idx].entries.is_empty() {
                 self.non_empty_buckets.try_push(bucket_idx)?;
             }
@@ -1507,7 +1514,7 @@ impl HashTable {
         }
 
         // Non-spilled mode: check main buckets
-        let bucket_idx = (hash as usize) % self.buckets.len();
+        let bucket_idx = Self::bucket_of(hash, self.buckets.len());
         let bucket = &self.buckets[bucket_idx];
         for entry in &bucket.entries {
             if entry.hash == hash
@@ -1518,7 +1525,7 @@ impl HashTable {
         }
 
         let entry_size = HashEntry::size_from_values(key_values, &[]);
-        if self.mem_used + entry_size > self.mem_budget {
+        if self.mem_used + self.bucket_mem + entry_size > self.mem_budget {
             if self.spill_state.is_none() {
                 let partition_count = self.choose_partition_count(entry_size);
                 let partitioning = Partitioning::new(partition_count);
@@ -1529,6 +1536,11 @@ impl HashTable {
             return self.insert_distinct(key_values, key_refs, metrics);
         }
 
+        let bucket_idx = if self.grow_buckets(entry_size)? {
+            Self::bucket_of(hash, self.buckets.len())
+        } else {
+            bucket_idx
+        };
         if self.buckets[bucket_idx].entries.is_empty() {
             self.non_empty_buckets.try_push(bucket_idx)?;
         }
@@ -1540,6 +1552,74 @@ impl HashTable {
         self.num_entries += 1;
         self.mem_used += entry_size;
         Ok(IOResult::Done(true))
+    }
+
+    /// AUDIT 3.1: the main table's bucket for a hash. The bucket count is a power of two
+    /// (`new`, `grow_buckets`), so this is the hash's low bits; the spill partitions take its
+    /// high bits (`Partitioning::index`), so the two stay independent.
+    #[inline(always)]
+    const fn bucket_of(hash: u64, buckets: usize) -> usize {
+        (hash as usize) & (buckets - 1)
+    }
+
+    /// AUDIT 3.1: doubles the in-memory bucket array once the table holds as many entries as it
+    /// has buckets, so chains stay short however many rows arrive (the array was fixed at its
+    /// initial 1,024, and 1M rows made 1,000-entry chains). The load factor of 1 is Knuth's
+    /// separate chaining bound (TAOCP vol. 3, 6.4, Algorithm C analysis): at load factor a a
+    /// successful search visits 1 + a/2 entries and an unsuccessful one a + e^-a on average, so
+    /// at a <= 1 a probe visits at most 1.5 entries on a hit and 1.37 on a miss, while the array
+    /// costs at most two bucket headers an entry. The added array counts against the budget
+    /// (`bucket_mem`): a table whose growth wouldn't fit keeps its size and spills as before.
+    /// Returns whether the array grew (the caller's bucket index is then stale).
+    fn grow_buckets(&mut self, entry_size: usize) -> Result<bool> {
+        let len = self.buckets.len();
+        if self.num_entries < len || self.spill_state.is_some() || len == 0 {
+            return Ok(false);
+        }
+        let Some(new_len) = len.checked_mul(2) else {
+            return Ok(false);
+        };
+        let added = len.saturating_mul(std::mem::size_of::<HashBucket>());
+        if self
+            .mem_used
+            .saturating_add(self.bucket_mem)
+            .saturating_add(added)
+            .saturating_add(entry_size)
+            > self.mem_budget
+        {
+            return Ok(false);
+        }
+        let mut buckets: Vec<HashBucket> = Vec::new();
+        buckets.try_reserve_exact(new_len)?;
+        buckets.resize_with(new_len, HashBucket::new);
+        let mut matched_bits: Vec<Vec<bool>> = Vec::new();
+        if self.track_matched {
+            matched_bits.try_reserve_exact(new_len)?;
+            matched_bits.resize_with(new_len, Vec::new);
+        }
+        let old_bits = std::mem::take(&mut self.matched_bits);
+        let mut old_bits = old_bits.into_iter();
+        self.non_empty_buckets.clear();
+        for bucket in std::mem::take(&mut self.buckets) {
+            let bits = old_bits.next().unwrap_or_default();
+            for (i, entry) in bucket.entries.into_iter().enumerate() {
+                let idx = Self::bucket_of(entry.hash, new_len);
+                let Some(bucket) = buckets.get_mut(idx) else {
+                    return Err(LimboError::InternalError("hash bucket out of range".into()));
+                };
+                if bucket.is_empty() {
+                    self.non_empty_buckets.try_push(idx)?;
+                }
+                bucket.insert(entry)?;
+                if let Some(slot) = matched_bits.get_mut(idx) {
+                    slot.try_push(bits.get(i).copied().unwrap_or(false))?;
+                }
+            }
+        }
+        self.buckets = buckets;
+        self.matched_bits = matched_bits;
+        self.bucket_mem = self.bucket_mem.saturating_add(added);
+        Ok(true)
     }
 
     /// Clear all entries and reset spill state.
@@ -1567,6 +1647,7 @@ impl HashTable {
             self.spill_state = None;
             let bucket_count = self.initial_buckets.max(1);
             self.buckets = (0..bucket_count).map(|_| HashBucket::new()).try_collect()?;
+            self.bucket_mem = 0;
             self.non_empty_buckets.clear();
         } else {
             for &idx in &self.non_empty_buckets {
@@ -1606,6 +1687,8 @@ impl HashTable {
         }
         // Clear in-memory matched bits; spilled partitions will have their own.
         self.matched_bits.clear();
+        self.non_empty_buckets.clear();
+        self.bucket_mem = 0;
         Ok(())
     }
 
@@ -2151,7 +2234,7 @@ impl HashTable {
         } else {
             // Normal mode - search in hash buckets
             self.record_probe_call(metrics);
-            let bucket_idx = (hash as usize) % self.buckets.len();
+            let bucket_idx = Self::bucket_of(hash, self.buckets.len());
             self.probe_bucket_idx = bucket_idx;
             let match_idx = {
                 let key_refs: Vec<ValueRef> = self
@@ -3621,6 +3704,89 @@ mod hashtests {
         let collations = vec![CollationSeq::Binary, CollationSeq::Binary];
         assert!(keys_equal(&key1, &key2, &collations));
         assert!(!keys_equal(&key1, &key3, &collations));
+    }
+
+    /// AUDIT 3.1: the bucket array doubles as rows arrive, keeping every row findable, the
+    /// chains at most a load factor of 1, and a FULL OUTER join's matched bits beside their rows.
+    #[test]
+    fn audit_3_1_buckets_grow_and_keep_every_row() {
+        for track_matched in [false, true] {
+            let io = Arc::new(MemoryIO::new());
+            let config = HashTableConfig {
+                initial_buckets: 4,
+                mem_budget: 64 * 1024 * 1024,
+                num_keys: 1,
+                collations: vec![CollationSeq::Binary],
+                temp_store: crate::TempStore::Memory,
+                track_matched,
+                partition_count: None,
+            };
+            let mut ht = HashTable::new(config, io).unwrap();
+            let n = 10_000i64;
+            for i in 0..n {
+                let _ = ht.insert(vec![Value::from_i64(i)], i + 1, vec![], None).unwrap();
+            }
+            assert!(!ht.has_spilled());
+            assert!(ht.buckets.len() >= n as usize, "{}", ht.buckets.len());
+            assert!(ht.buckets.len().is_power_of_two());
+            assert!(ht.bucket_mem > 0);
+            if track_matched {
+                assert_eq!(ht.matched_bits.len(), ht.buckets.len());
+                for (b, bits) in ht.buckets.iter().zip(&ht.matched_bits) {
+                    assert_eq!(b.entries.len(), bits.len());
+                }
+            }
+            let _ = ht.finalize_build(None);
+            for i in (0..n).step_by(97) {
+                let entry = ht.probe(vec![Value::from_i64(i)], None).unwrap().unwrap();
+                assert_eq!(entry.rowid, i + 1);
+            }
+            assert!(ht.probe(vec![Value::from_i64(n)], None).unwrap().is_none());
+        }
+    }
+
+    /// AUDIT 3.1: a table whose bigger array wouldn't fit its budget keeps its size, so growing
+    /// never passes the memory bound; DISTINCT still sees each key once across a growth.
+    #[test]
+    fn audit_3_1_growth_stays_within_budget_and_distinct_holds() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Memory,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+        let mut inserted = 0;
+        for round in 0..2 {
+            for i in 0..2_000i64 {
+                let key = [Value::from_i64(i)];
+                let refs = [key[0].as_ref()];
+                if let IOResult::Done(true) = ht.insert_distinct(&key, &refs, None).unwrap() {
+                    inserted += 1;
+                }
+            }
+            assert_eq!(inserted, 2_000, "round {round}");
+            assert!(ht.mem_used + ht.bucket_mem <= ht.mem_budget);
+        }
+        assert!(ht.buckets.len() >= 2_000);
+        let small = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 4 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Memory,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(small, Arc::new(MemoryIO::new())).unwrap();
+        for i in 0..64i64 {
+            let _ = ht.insert(vec![Value::from_i64(i)], i, vec![], None).unwrap();
+            assert!(ht.has_spilled() || ht.mem_used + ht.bucket_mem <= ht.mem_budget);
+        }
     }
 
     #[test]
@@ -5261,7 +5427,10 @@ mod hashtests {
     fn test_unmatched_scan_preserves_in_memory_partitions_before_grace() {
         let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
-            initial_buckets: 4,
+            // Enough buckets that the table doesn't grow before it spills (AUDIT 3.1): the grown
+            // array's bytes are freed at the spill, and this test needs its first spill to write
+            // a partition to disk.
+            initial_buckets: 64,
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
