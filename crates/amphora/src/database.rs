@@ -323,7 +323,7 @@ pub(crate) struct Changed {
     locked_wakes: AtomicU64,
     /// [`LockedReads::WaitOnLock`]'s waiter lists: each row a get waits on, by its cross-group key
     /// (`xgroup::sql::record_key`), with its own bell, rung when a resolution here drops that
-    /// row's locks ([`Database::ring_locks`]). A row's entry lives while a get waits on it, so it
+    /// row's locks ([`Database::call_internal_ringing`]). A row's entry lives while a get waits on it, so it
     /// holds at most one entry per waiting get.
     lock_waiters: Mutex<BTreeMap<Vec<u8>, LockBell>>,
 }
@@ -366,7 +366,7 @@ pub enum LockedReads {
     /// As [`LockedReads::Wait`], but a waiting get waits on its own row's waiter list, rung when
     /// a resolution here drops that row's locks, not on every change in the group (T-T1.10.W9,
     /// lane xgroup-sql-11: Wait's thundering herd at scale). The step that resolves rings it in
-    /// the process that runs it (`Database::ring_locks`), and every replica of a replicated group
+    /// the process that commits it (`Database::call_internal_ringing`), and every replica of a replicated group
     /// rings its own lists as it applies the resolution, whichever process ran the step
     /// (`ring_unlocked`; T-T1.10.W13, lane xgroup-sql-12).
     WaitOnLock,
@@ -2218,6 +2218,55 @@ impl Database {
         database.call_db(until, f)
     }
 
+    /// [`Database::call_internal`] for a cross-group step, `f` answering its value and the
+    /// cross-group keys of the rows whose locks it dropped: once the step commits here, those
+    /// rows' waiter lists are rung ([`LockedReads::WaitOnLock`]) before its answer is handed
+    /// over, whether or not its caller still waits for it. A step answered too late for its
+    /// caller (`UnknownOutcome`) has dropped its locks all the same, and the step sent again finds
+    /// none left to drop, so a ring left to the caller never came (T-T1.10.W7, T-T1.10.W11). A
+    /// replicated group rings once answered, as its replicas ring their own lists on applying it
+    /// (`ring_unlocked`). A row no get waits on rings no one.
+    pub(crate) fn call_internal_ringing<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Db) -> anyhow::Result<(R, Vec<Vec<u8>>)> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        if !matches!(database.shared.writer, Writer::Local(_)) {
+            let (value, dropped) = database.call_internal(until, f)?;
+            ring(&database.shared.changed, &dropped)?;
+            return Ok(value);
+        }
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
+        let changed = Arc::clone(&database.shared.changed);
+        let (tx, rx) = mpsc::sync_channel(1);
+        database.submit_local(
+            "",
+            Operation::Call(Mutex::new(Some(call)), api::REQUEST_MAX),
+            until,
+            until,
+            move |result| {
+                let answer = result.and_then(|answer| match answer {
+                    Answer::Called(v) => v
+                        .downcast::<(R, Vec<Vec<u8>>)>()
+                        .map_err(|_| unavailable("wrong SQL session answer"))
+                        .and_then(|v| {
+                            let (value, dropped) = *v;
+                            ring(&changed, &dropped).map(|()| value)
+                        }),
+                    _ => Err(unavailable("wrong SQL session answer")),
+                });
+                // A caller whose deadline elapsed no longer waits; its rows were rung all the same.
+                let _ = tx.send(answer);
+            },
+        )?;
+        rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|_| Refusal::UnknownOutcome)?
+    }
+
     fn call_db<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
     where
         R: Send + 'static,
@@ -2524,13 +2573,6 @@ impl Database {
         self.shared.changed.locked_wakes.load(Ordering::Acquire)
     }
 
-    /// Rings the waiter list of each row a resolution here just dropped the locks of, by its
-    /// cross-group key ([`LockedReads::WaitOnLock`]): called once the resolving step answered, so
-    /// a get it wakes reads the resolution. A row no get waits on rings no one.
-    pub(crate) fn ring_locks(&self, keys: &[Vec<u8>]) -> Result<(), Refusal> {
-        ring(&self.shared.changed, keys)
-    }
-
     /// Records gets here that met a cross-group lock and waited for it ([`LockedReads::Wait`]),
     /// each counted once.
     pub fn locked_waits(&self) -> u64 {
@@ -2625,7 +2667,7 @@ impl Database {
 
     /// [`LockedReads::WaitOnLock`] (T-T1.10.W9, lane xgroup-sql-11): a locked read waits on the
     /// waiter list of the row it met, rung only by a resolution that drops that row's locks
-    /// ([`Database::ring_locks`]). It joins the list and tries once more before it first waits
+    /// ([`Database::call_internal_ringing`]). It joins the list and tries once more before it first waits
     /// there, so a resolution between its try and joining isn't missed; from then on the list's
     /// ring count, read before each try, says whether one landed since. Meeting another row, it
     /// moves to that row's list the same way. It leaves its list however it ends. It is counted
