@@ -21,7 +21,7 @@ fn open() -> (Arc<MemoryIO>, Arc<Connection>) {
     (io, db.connect(ConnectOpts::new()).unwrap())
 }
 
-fn row(io: &MemoryIO, conn: &Connection, sql: &str, bind: Option<Value>) -> Vec<Value> {
+fn row(io: &MemoryIO, conn: &Arc<Connection>, sql: &str, bind: Option<Value>) -> Vec<Value> {
     let mut stmt = conn.prepare(sql).unwrap();
     if let Some(v) = bind {
         stmt.bind_at(NonZero::new(1).unwrap(), v).unwrap();
@@ -35,7 +35,7 @@ fn row(io: &MemoryIO, conn: &Connection, sql: &str, bind: Option<Value>) -> Vec<
     }
 }
 
-fn texts(io: &MemoryIO, conn: &Connection, sql: &str) -> Vec<String> {
+fn texts(io: &MemoryIO, conn: &Arc<Connection>, sql: &str) -> Vec<String> {
     row(io, conn, sql, None)
         .iter()
         .map(ToString::to_string)
