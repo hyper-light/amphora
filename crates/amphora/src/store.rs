@@ -996,8 +996,8 @@ struct Readers<R> {
     /// The checkpointer: a connection of its own copying the log into the file, never in a
     /// commit's way. It goes and comes back with the readers.
     checkpointer: Mutex<Option<(mpsc::Sender<()>, std::thread::JoinHandle<()>)>>,
-    /// Held by each read and checkpoint as it runs, and by the writer alone while it starts the log
-    /// again.
+    /// Held by each checkpoint as it runs, and by the writer alone while it starts the log again.
+    /// Reads are held back by the pool's `held` instead, so a read touches one lock.
     gate: Arc<RwLock<()>>,
     /// The checkpointer found the log past its bound: the writer starts it again.
     restart: Arc<AtomicBool>,
@@ -1013,6 +1013,48 @@ struct Pool<R> {
     idle: Vec<R>,
     out: usize,
     generation: u64,
+    /// Threads waiting on `returned`: a reader given back wakes them only when there are some
+    /// (std's futex `Condvar` makes a `FUTEX_WAKE` syscall on every notify, waiters or none).
+    waiting: usize,
+    /// The writer is starting the log again: no reader is taken until it is done.
+    held: bool,
+}
+
+impl<R> Pool<R> {
+    /// Waits on `returned` until `until`, counted as a waiter meanwhile; false once it has passed.
+    fn wait<'a>(
+        mut pool: MutexGuard<'a, Self>,
+        returned: &Condvar,
+        until: Option<Instant>,
+    ) -> (MutexGuard<'a, Self>, bool) {
+        pool.waiting = pool.waiting.saturating_add(1);
+        let (mut pool, in_time) = match until {
+            None => (
+                returned.wait(pool).unwrap_or_else(PoisonError::into_inner),
+                true,
+            ),
+            Some(until) => {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    (pool, false)
+                } else {
+                    let (pool, _) = returned
+                        .wait_timeout(pool, left)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    (pool, true)
+                }
+            }
+        };
+        pool.waiting = pool.waiting.saturating_sub(1);
+        (pool, in_time)
+    }
+
+    /// Wakes the waiters, if any.
+    fn wake(&self, returned: &Condvar) {
+        if self.waiting > 0 {
+            returned.notify_all();
+        }
+    }
 }
 
 impl<R: Send + 'static> Readers<R> {
@@ -1027,6 +1069,8 @@ impl<R: Send + 'static> Readers<R> {
                 idle: Vec::new(),
                 out: 0,
                 generation: 0,
+                waiting: 0,
+                held: false,
             }),
             returned: Condvar::new(),
             most: most.max(1),
@@ -1140,10 +1184,7 @@ impl<R: Send + 'static> Readers<R> {
             pool.generation = pool.generation.wrapping_add(1);
             pool.idle.clear();
             while pool.out > 0 {
-                pool = self
-                    .returned
-                    .wait(pool)
-                    .unwrap_or_else(PoisonError::into_inner);
+                pool = Pool::wait(pool, &self.returned, None).0;
             }
         }
         // Each slot once its read is done: `open` is gone, so none is opened in it again.
@@ -1169,8 +1210,22 @@ impl<R: Send + 'static> Readers<R> {
         let _alone = self.gate.write().unwrap_or_else(PoisonError::into_inner);
         // Slot readers hold no gate: holding every slot holds them back.
         let _slots = self.slots.as_ref().map(checkout::Slots::take_all);
+        // Pool readers hold no gate either: none is taken while the pool is held, and the restart
+        // waits for those out to come back.
+        if self.slots.is_none() {
+            let mut pool = locked(&self.pool);
+            pool.held = true;
+            while pool.out > 0 {
+                pool = Pool::wait(pool, &self.returned, None).0;
+            }
+        }
         let began = Instant::now();
         let restarted = restart();
+        if self.slots.is_none() {
+            let mut pool = locked(&self.pool);
+            pool.held = false;
+            pool.wake(&self.returned);
+        }
         self.meter
             .restarted(began.saturating_duration_since(asked), began.elapsed());
         match restarted {
@@ -1195,6 +1250,14 @@ impl<R: Send + 'static> Readers<R> {
         let (mut reader, generation) = {
             let mut pool = locked(&self.pool);
             loop {
+                if pool.held {
+                    let (p, in_time) = Pool::wait(pool, &self.returned, Some(until));
+                    if !in_time {
+                        return Some(Err(Refused::Timeout.into()));
+                    }
+                    pool = p;
+                    continue;
+                }
                 if let Some(r) = pool.idle.pop() {
                     pool.out = pool.out.saturating_add(1);
                     break (r, pool.generation);
@@ -1212,21 +1275,14 @@ impl<R: Send + 'static> Readers<R> {
                         }
                     }
                 }
-                let left = until.saturating_duration_since(Instant::now());
-                if left.is_zero() {
+                let (p, in_time) = Pool::wait(pool, &self.returned, Some(until));
+                if !in_time {
                     return Some(Err(Refused::Timeout.into()));
                 }
-                pool = self
-                    .returned
-                    .wait_timeout(pool, left)
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
+                pool = p;
             }
         };
-        let answer = {
-            let _reading = self.gate.read().unwrap_or_else(PoisonError::into_inner);
-            f(&mut reader)
-        };
+        let answer = f(&mut reader);
         self.give_back(Some(reader), generation);
         Some(answer)
     }
@@ -1259,7 +1315,7 @@ impl<R: Send + 'static> Readers<R> {
         if let Some(r) = reader.filter(|_| pool.generation == generation) {
             pool.idle.push(r);
         }
-        self.returned.notify_all();
+        pool.wake(&self.returned);
     }
 }
 
