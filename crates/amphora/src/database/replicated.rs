@@ -17775,6 +17775,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn probe_three_writers_streaks() {
+        for keys in [2, 32] {
+            for seed in 1..=3 {
+                let run = list_append_run(&[0, 1, 2], false, seed, keys, 15);
+                eprintln!(
+                    "probe keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} turns {:?}",
+                    run.committed, run.refused, run.streak, run.turns
+                );
+            }
+        }
+    }
+
     /// T-T1.8.W1's control (non-vacuity), an interleaving the test makes itself. Do, with the slot
     /// off and then on: the follower's write forwarded and held in transit while the leader
     /// appends a write of its own on the same base, then let through; the follower's write made
