@@ -5,7 +5,9 @@
 //! `cargo run --release -p amphora-engine --example real_text -- <values per class> <passes>`: for
 //! each class, one warm-up pass, then `<passes>` timed passes; prints each pass's ns per value, the
 //! median, the share written with 15 or fewer significant digits, and an FNV-1a hash of every text,
-//! so two builds that write the same texts print the same hash.
+//! so two builds that write the same texts print the same hash. A third argument, a corpus of
+//! `0x<bits>\t<text>` lines (tests/floating_point_doc.rs's g10_real_text_corpus), counts the doubles
+//! whose text differs from the corpus's.
 
 use amphora_engine::numeric::format_float;
 use std::time::Instant;
@@ -74,6 +76,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let n: usize = args.next().ok_or("usage: real_text <n> <passes>")?.parse()?;
     let passes: usize = args.next().ok_or("usage: real_text <n> <passes>")?.parse()?;
+    if let Some(corpus) = args.next() {
+        let (mut total, mut differ) = (0usize, 0usize);
+        for line in std::fs::read_to_string(&corpus)?.lines() {
+            let (bits, text) = line.split_once('\t').ok_or("corpus line without a tab")?;
+            let r = f64::from_bits(u64::from_str_radix(bits.trim_start_matches("0x"), 16)?);
+            total += 1;
+            if format_float(r) != text {
+                differ += 1;
+                if differ <= 5 {
+                    println!("corpus differs: {bits} {text} -> {}", format_float(r));
+                }
+            }
+        }
+        println!("corpus: {total} doubles, {differ} texts differ");
+    }
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let classes = [
         ("q01-charge", charges(n, &mut rng)),
