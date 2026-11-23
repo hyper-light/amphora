@@ -5011,6 +5011,115 @@ pub(crate) mod bushy_search_tests {
             }
         }
 
+        #[test]
+        fn t10_probe_left_join_run_against_the_searched_plan() {
+            let Ok(rounds) = std::env::var("T10_ROUNDS") else {
+                return;
+            };
+            let rounds: usize = rounds.parse().unwrap();
+            let (db, searched_conn) = facts();
+            let start = db.learned_costs.weights().unwrap();
+            eprintln!("T10 start {start:?}");
+            let run_conn = db.connect(ConnectOpts::new()).unwrap();
+            searched_conn.pin_cost_weights(Some(start));
+            let select = "SELECT count(*), sum(f1.id), sum(f2.id), count(s.id), sum(s.cat)";
+            let queries = [
+                format!(
+                    "{select} FROM d1 LEFT JOIN d2 s ON s.id = d1.id * 12 \
+                     JOIN f1 ON f1.d1 = d1.id JOIN f2 ON f2.k = f1.k \
+                     JOIN d2 ON f2.d2 = d2.id WHERE d1.cat < 3 AND d2.id = 7"
+                ),
+                format!(
+                    "{select} FROM d2 LEFT JOIN d1 s ON s.id = d2.id * 6 \
+                     JOIN f2 ON f2.d2 = d2.id JOIN f1 ON f2.k = f1.k \
+                     JOIN d1 ON f1.d1 = d1.id WHERE d2.cat < 3 AND d1.id = 3"
+                ),
+            ];
+            let planned = |conn: &Arc<crate::Connection>, sql: &str| {
+                BUSHY_PLANS.with(|plans| plans.set(0));
+                LEFT_JOINS_IN_RUNS.with(|runs| runs.set(0));
+                LAST_JOIN_COST.with(|cost| cost.set(0.0));
+                drop(conn.prepare(sql).unwrap());
+                (
+                    BUSHY_PLANS.with(Cell::get),
+                    LEFT_JOINS_IN_RUNS.with(Cell::get),
+                    LAST_JOIN_COST.with(Cell::get),
+                    rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")),
+                )
+            };
+            for sql in &queries {
+                let searched = planned(&searched_conn, sql);
+                eprintln!(
+                    "T10 searched at start: bushy={} in_runs={} cost={:.0} {:?}",
+                    searched.0, searched.1, searched.2, searched.3
+                );
+                let mut found = None;
+                for share in [1.0, 0.9, 0.75, 0.5, 0.35, 0.25, 0.1] {
+                    let mut weights = start;
+                    weights.hash_build = start.hash_probe * share;
+                    run_conn.pin_cost_weights(Some(weights));
+                    let run = planned(&run_conn, sql);
+                    eprintln!(
+                        "T10 build {:.2} probe {:.2}: bushy={} in_runs={} cost={:.0} {:?}",
+                        weights.hash_build, weights.hash_probe, run.0, run.1, run.2, run.3
+                    );
+                    if run.0 > 0 && run.1 > 0 {
+                        found = Some(weights);
+                        break;
+                    }
+                }
+                if found.is_none() {
+                    eprintln!("T10 no weights tried put the LEFT JOIN in the run: {sql}");
+                    continue;
+                }
+                let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+                let mut answers: [Option<Vec<String>>; 2] = [None, None];
+                for round in 0..rounds {
+                    let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+                    for arm in order {
+                        let conn = if arm == 0 { &searched_conn } else { &run_conn };
+                        let mut stmt = conn.prepare(sql).unwrap();
+                        let began = std::time::Instant::now();
+                        let got = stmt.run_collect_rows().unwrap();
+                        let ms = began.elapsed().as_secs_f64() * 1e3;
+                        let got: Vec<String> = got
+                            .into_iter()
+                            .map(|row| {
+                                row.iter()
+                                    .map(|value| value.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .collect();
+                        match &answers[arm] {
+                            Some(answer) => assert_eq!(answer, &got),
+                            None => answers[arm] = Some(got),
+                        }
+                        times[arm].push(ms);
+                    }
+                }
+                assert_eq!(answers[0], answers[1]);
+                let after = [planned(&searched_conn, sql), planned(&run_conn, sql)];
+                for (arm, name) in ["searched", "left-join-in-run"].iter().enumerate() {
+                    let mut sorted = times[arm].clone();
+                    sorted.sort_by(f64::total_cmp);
+                    eprintln!(
+                        "T10 {name}: median {:.3} ms min {:.3} max {:.3} n {} answer {:?} after: bushy={} in_runs={} cost={:.0} {:?}",
+                        sorted[sorted.len() / 2],
+                        sorted[0],
+                        sorted[sorted.len() - 1],
+                        sorted.len(),
+                        answers[arm],
+                        after[arm].0,
+                        after[arm].1,
+                        after[arm].2,
+                        after[arm].3
+                    );
+                    eprintln!("T10 {name} runs ms: {:?}", times[arm]);
+                }
+            }
+        }
+
         /// The bushy tests' queries over `facts` (lanes pl8-14 to pl8-20): the fact queries, with
         /// LEFT JOINs after the core and inside it, with semi and anti joins, and (lane pl8-20) a
         /// LEFT JOIN of the second fact on the first fact and the outer dimension, followed by an
