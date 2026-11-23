@@ -42,7 +42,7 @@ mod tests {
     fn t_pg_4_1_longest_match_takes_scan_ls_lexemes() {
         assert_eq!(taken(INITIAL, "SELECT x"), 6);
         assert_eq!(taken(INITIAL, " \n\t x"), 4);
-        assert_eq!(taken(INITIAL, "-- c\nx"), 5);
+        assert_eq!(taken(INITIAL, "-- c\nx"), 4, "a comment is whitespace up to its newline");
         assert_eq!(taken(INITIAL, "123abc "), 6, "integer_junk takes the junk with the number");
         assert_eq!(taken(INITIAL, "$1abc "), 5, "param_junk");
         assert_eq!(taken(INITIAL, ":: int"), 2);
