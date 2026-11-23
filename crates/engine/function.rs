@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 use amphora_engine_ext::{
     ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
-    ValueDestructor,
+    ValueDestructor, ValueFunction,
 };
 use std::fmt;
 use std::fmt::{Debug, Display};
@@ -93,6 +93,7 @@ pub enum ExtFunc {
         init: InitAggFunction,
         step: StepFunction,
         finalize: FinalizeFunction,
+        window: Option<WindowCallbacks>,
         context_destructor: Option<ContextDestructor>,
         aggregate_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
@@ -107,6 +108,13 @@ pub enum ExtFunc {
         argc: i32,
         function: Arc<dyn crate::native_ext::AggregateFactory>,
     },
+}
+
+/// A window function's xValue and xInverse: sqlite3_create_window_function takes both or neither.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowCallbacks {
+    pub value: ValueFunction,
+    pub inverse: StepFunction,
 }
 
 #[derive(Debug)]
@@ -162,6 +170,17 @@ impl ExtFunc {
         matches!(self, Self::Aggregate { .. } | Self::NativeAggregate { .. })
     }
 
+    /// Whether the aggregate was registered with xValue and xInverse, so it runs over any frame.
+    pub fn is_window_aggregate(&self) -> bool {
+        matches!(
+            self,
+            Self::Aggregate {
+                window: Some(_),
+                ..
+            }
+        )
+    }
+
     pub fn with_aggregate_arg_count(&self, arg_count: usize) -> Self {
         match self {
             Self::Aggregate {
@@ -169,6 +188,7 @@ impl ExtFunc {
                 init,
                 step,
                 finalize,
+                window,
                 context_destructor,
                 aggregate_destructor,
                 value_destructor,
@@ -180,6 +200,7 @@ impl ExtFunc {
                 init: *init,
                 step: *step,
                 finalize: *finalize,
+                window: *window,
                 context_destructor: *context_destructor,
                 aggregate_destructor: *aggregate_destructor,
                 value_destructor: *value_destructor,
@@ -224,6 +245,7 @@ impl ExternalFunc {
         argc: i32,
         context: usize,
         func: (InitAggFunction, StepFunction, FinalizeFunction),
+        window: Option<WindowCallbacks>,
         context_destructor: Option<ContextDestructor>,
         aggregate_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
@@ -237,6 +259,7 @@ impl ExternalFunc {
                 init: func.0,
                 step: func.1,
                 finalize: func.2,
+                window,
                 context_destructor,
                 aggregate_destructor,
                 value_destructor,

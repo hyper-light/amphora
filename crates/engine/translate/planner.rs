@@ -784,14 +784,18 @@ fn link_with_window(
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
     }
-    if let AccumulatorFunc::Agg(AggFunc::External(_)) = &func {
-        let name = match expr {
-            Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => name.as_str(),
-            _ => "extension aggregate",
-        };
-        crate::bail_parse_error!(
-            "{name}() is an extension aggregate and cannot be used as a window function"
-        );
+    if let AccumulatorFunc::Agg(AggFunc::External(ext)) = &func {
+        if !ext.is_window_aggregate() {
+            let name = match expr {
+                Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => {
+                    name.as_str()
+                }
+                _ => "extension aggregate",
+            };
+            crate::bail_parse_error!(
+                "{name}() is an extension aggregate and cannot be used as a window function"
+            );
+        }
     }
     // FILTER decides which input rows contribute to a running aggregate, so
     // it is only meaningful for aggregating window functions. Non-aggregate
@@ -932,10 +936,12 @@ fn resolve_effective_frame(
     // any frame shape works as long as the frame-index counters are
     // tracked. last_value's inverse is the frame-row count decrement
     // (window.c:505-522).
+    // An extension aggregate reaches here only with xValue and xInverse (link_with_window).
     let supports_sliding = matches!(
         func,
         AccumulatorFunc::Agg(
-            AggFunc::Sum
+            AggFunc::External(_)
+                | AggFunc::Sum
                 | AggFunc::Total
                 | AggFunc::Count
                 | AggFunc::Count0

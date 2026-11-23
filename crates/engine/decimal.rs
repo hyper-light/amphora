@@ -5,7 +5,9 @@ use std::cmp::Ordering;
 
 use crate::ext::register_scalar_function;
 use crate::numeric::fp::real_to_text;
-use amphora_engine_ext::{scalar, AggFunc, AggregateDerive, ExtensionApi, Value, ValueType};
+use amphora_engine_ext::{
+    scalar, AggFunc, AggregateDerive, ExtensionApi, Value, ValueType, WindowAggFunc,
+};
 
 /// decimal_pow2(N)'s bound: "N must be an integer between -20000 and +20000"
 /// (floatingpoint.html 2.2.2; decimal.c's decimalPow2).
@@ -733,14 +735,71 @@ fn pow2_func(args: &[Value]) -> Value {
     }
 }
 
-#[derive(Default)]
+/// decimal.c's decimal_sum context: the running sum, from zero, and the out-of-memory mark
+/// decimal_add leaves once the sum outgrows MAX_DIGIT, reported by the next value or finalize as
+/// decimal_result reports it.
 struct DecimalSumState {
-    /// None until the first row: decimal_sum over no rows is NULL, over only NULLs '0'.
-    acc: Option<Decimal>,
+    acc: Decimal,
     out_of_memory: bool,
 }
 
+/// floatingpoint.html 2.2.5: decimal_sum is "an aggregate, like the built-in total() aggregate
+/// function", and total() of no rows is 0.0, so decimal_sum of no rows is "0" where sqlite3
+/// 3.54.0's decimalSumValue and decimalSumFinalize leave NULL (the page wins).
+impl Default for DecimalSumState {
+    fn default() -> Self {
+        Self {
+            acc: Decimal::zero(),
+            out_of_memory: false,
+        }
+    }
+}
+
+impl DecimalSumState {
+    /// decimal.c's decimalSumStep (`negate` false) and decimalSumInverse (true). A row decimal_new
+    /// cannot read fails at that row (sqlite3_result_error_nomem); a sum past MAX_DIGIT is only
+    /// marked, as decimal_add marks it.
+    fn add_row(&mut self, args: &[Value], negate: bool) -> Result<(), &'static str> {
+        let Some(arg) = args.first() else {
+            return Ok(());
+        };
+        if arg.value_type() == ValueType::Null {
+            return Ok(());
+        }
+        let x = match decimal_new(arg, true) {
+            Arg::Num(x) => x,
+            Arg::Absent => return Ok(()),
+            Arg::OutOfMemory => {
+                self.out_of_memory = true;
+                return Err("out of memory");
+            }
+        };
+        if self.out_of_memory {
+            return Ok(());
+        }
+        let sum = if negate {
+            decimal_sub(&self.acc, &x)
+        } else {
+            decimal_add(&self.acc, &x)
+        };
+        match sum {
+            Some(sum) => self.acc = sum,
+            None => self.out_of_memory = true,
+        }
+        Ok(())
+    }
+
+    /// decimal.c's decimalSumValue and decimalSumFinalize (decimal_result).
+    fn result(&self) -> Result<Value, &'static str> {
+        if self.out_of_memory {
+            return Err("out of memory");
+        }
+        Ok(Value::from_text(self.acc.to_text()))
+    }
+}
+
 #[derive(AggregateDerive)]
+#[window]
 struct DecimalSum;
 
 impl AggFunc for DecimalSum {
@@ -749,35 +808,23 @@ impl AggFunc for DecimalSum {
     const NAME: &'static str = "decimal_sum";
     const ARGS: i32 = 1;
 
-    fn step(state: &mut Self::State, args: &[Value]) {
-        if state.out_of_memory {
-            return;
-        }
-        let acc = state.acc.get_or_insert_with(Decimal::zero);
-        let Some(arg) = args.first() else {
-            return;
-        };
-        if arg.value_type() == ValueType::Null {
-            return;
-        }
-        let sum = match decimal_new(arg, true) {
-            Arg::Num(x) => decimal_add(acc, &x),
-            Arg::Absent | Arg::OutOfMemory => None,
-        };
-        match sum {
-            Some(sum) => *acc = sum,
-            None => state.out_of_memory = true,
-        }
+    fn step(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error> {
+        state.add_row(args, false)
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
-        if state.out_of_memory {
-            return Err("out of memory");
-        }
-        Ok(match state.acc {
-            Some(acc) => Value::from_text(acc.to_text()),
-            None => Value::null(),
-        })
+        state.result()
+    }
+}
+
+/// decimal.c registers decimal_sum with sqlite3_create_window_function, so it runs over any frame.
+impl WindowAggFunc for DecimalSum {
+    fn inverse(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error> {
+        state.add_row(args, true)
+    }
+
+    fn value(state: &Self::State) -> Result<Value, Self::Error> {
+        state.result()
     }
 }
 
@@ -830,7 +877,9 @@ mod tests {
     fn sum(rows: &[Value]) -> String {
         let mut state = DecimalSumState::default();
         for row in rows {
-            DecimalSum::step(&mut state, std::slice::from_ref(row));
+            if DecimalSum::step(&mut state, std::slice::from_ref(row)).is_err() {
+                return "OOM".to_string();
+            }
         }
         match DecimalSum::finalize(state) {
             Ok(v) => shown(v),
@@ -856,7 +905,8 @@ mod tests {
         assert_eq!(call(dec, &[Value::null(), Value::from_integer(2)]), "NULL");
         assert_eq!(call(pow2_func, &[Value::null()]), "NULL");
         assert_eq!(sum(&[Value::null()]), "0");
-        assert_eq!(sum(&[]), "NULL");
+        // floatingpoint.html 2.2.5, "like the built-in total()": "0" where 3.54.0 gives NULL.
+        assert_eq!(sum(&[]), "0");
     }
 
     #[test]
