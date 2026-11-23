@@ -523,8 +523,9 @@ fn t_t1_13_1_a_leaders_disk_hung_under_load_loses_no_acknowledged_write() {
         std::thread::spawn(move || serve::load(&c, "hang", 2, Duration::from_secs(3), &ledger))
     };
     leader.ask("disk hang").unwrap();
-    // The fault's length, not an assertion: the disk stays hung for one second of the load.
-    std::thread::sleep(Duration::from_secs(1));
+    // The hang holds the load: back only once a write of the load waits on the hung disk.
+    let held = leader.ask("disk held").unwrap();
+    assert!(held.starts_with("held=") && held != "held=0", "{held}");
     leader.ask("disk back").unwrap();
     let summary = load.join().unwrap().unwrap();
     healthy(&c);

@@ -2785,6 +2785,7 @@ impl Database {
             )?
             .map(|s| Arc::new(crate::storage::versioned::switch::Switch::new(s)));
         let conn = Arc::new(Connection {
+            cost_runs: Default::default(),
             versioned,
             versioned_attached: RwLock::new(HashMap::default()),
             db: self.clone(),

@@ -9,8 +9,9 @@
 //! descriptor the budget allowed (`EMFILE`).
 
 use amphora_api::Refusal;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::thread::Thread;
 
 /// The descriptors that may be held at once against what the system allows, and those held now.
 pub(crate) struct Descriptors {
@@ -21,6 +22,10 @@ pub(crate) struct Descriptors {
     /// The descriptors open that this budget doesn't hold, as last counted.
     outside: AtomicUsize,
     held: AtomicUsize,
+    /// Give-backs so far: what a waiter for a release compares against (AUDIT 6).
+    released: AtomicU64,
+    /// The threads waiting for a give-back ([`Self::wait_release`]), each woken by the next one.
+    waiters: Mutex<Vec<Thread>>,
 }
 
 /// Descriptors held against a budget, given back when this drops.
@@ -37,6 +42,8 @@ impl Descriptors {
             limit: AtomicUsize::new(limit()),
             outside: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
+            released: AtomicU64::new(0),
+            waiters: Mutex::new(Vec::new()),
         });
         budget.recount()?;
         Ok(budget)
@@ -50,6 +57,8 @@ impl Descriptors {
             limit: AtomicUsize::new(limit),
             outside: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
+            released: AtomicU64::new(0),
+            waiters: Mutex::new(Vec::new()),
         })
     }
 
@@ -100,10 +109,54 @@ impl Descriptors {
     /// The system refused a descriptor this budget allowed (`EMFILE`): more is open outside it
     /// than last counted, so it is counted again.
     pub(crate) fn refused_by_system(&self) -> Result<(), Refusal> {
-        if self.system {
-            self.recount().map_err(Refusal::Unavailable)?;
+        // At the process's limit the count itself can't open /dev/fd: refused for the same
+        // reason, the count waits for the next charge or refusal, and the refusal stands
+        // (AUDIT 6: it ended the owner's listener at the limit it was waiting out).
+        if self.system
+            && let Err(error) = self.recount()
+            && !error.contains(OUT_OF_DESCRIPTORS)
+        {
+            return Err(Refusal::Unavailable(error));
         }
         Ok(())
+    }
+
+    /// The give-backs so far, read before an open the system may refuse: [`Self::wait_release`]
+    /// waits for one past it.
+    pub(crate) fn releases(&self) -> u64 {
+        self.released.load(Ordering::SeqCst)
+    }
+
+    /// The threads waiting for a give-back now.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiters.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    /// Whether this budget holds any descriptor now, so that a give-back will come.
+    pub(crate) fn holds_any(&self) -> bool {
+        self.held.load(Ordering::Acquire) > 0
+    }
+
+    /// AUDIT 6 (event-driven accept): waits, parked, until a descriptor is given back after
+    /// `seen` ([`Self::releases`], read before the refused open) or `stopping` is set; its stopper
+    /// unparks this thread after setting it. No timer: the give-back is the event that frees a
+    /// descriptor this budget charged.
+    pub(crate) fn wait_release(&self, seen: u64, stopping: &AtomicBool) {
+        let me = std::thread::current();
+        self.waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(me.clone());
+        // Registered before the check: a give-back after it finds this thread among the waiters
+        // and unparks it, and a park after an unpark returns at once.
+        while self.released.load(Ordering::SeqCst) == seen && !stopping.load(Ordering::Acquire) {
+            std::thread::park();
+        }
+        self.waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|waiter| waiter.id() != me.id());
     }
 
     /// `count` more held if within the bound; else what the held would come to.
@@ -140,6 +193,19 @@ impl Drop for Held {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(self.count))
             });
+        // Counted before the waiters are taken: a waiter that registered after this count
+        // sees it moved and doesn't park; one registered before is unparked here.
+        self.budget.released.fetch_add(1, Ordering::SeqCst);
+        let waiters = std::mem::take(
+            &mut *self
+                .budget
+                .waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for waiter in waiters {
+            waiter.unpark();
+        }
     }
 }
 
@@ -156,6 +222,9 @@ pub(crate) fn process() -> Result<Arc<Descriptors>, Refusal> {
         .clone()
         .map_err(Refusal::Unavailable)
 }
+
+/// What a count refused for want of a descriptor says (`EMFILE`, `ENFILE`).
+const OUT_OF_DESCRIPTORS: &str = ", out of descriptors";
 
 /// The soft `RLIMIT_NOFILE` (POSIX `getrlimit`): the most descriptors the system lets this process
 /// hold. With none set (`RLIM_INFINITY`) nothing here bounds them, and the kernel's own ceiling
@@ -183,8 +252,13 @@ fn limit() -> usize {
 /// than it leaves.
 #[cfg(unix)]
 fn open() -> Result<usize, String> {
-    let entries = std::fs::read_dir("/dev/fd")
-        .map_err(|error| format!("this process's open descriptors (/dev/fd): {error}"))?;
+    let entries = std::fs::read_dir("/dev/fd").map_err(|error| {
+        let out = [rustix::io::Errno::MFILE, rustix::io::Errno::NFILE]
+            .iter()
+            .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()));
+        let why = if out { OUT_OF_DESCRIPTORS } else { "" };
+        format!("this process's open descriptors (/dev/fd){why}: {error}")
+    })?;
     Ok(entries.count())
 }
 
@@ -272,5 +346,63 @@ pub(crate) mod tests {
             budget.take("a connection", usize::MAX / 2),
             Err(Refusal::TooLarge { .. })
         ));
+    }
+
+    /// AUDIT 6 (event-driven accept): a refused open waits for the budget's give-back, not a
+    /// timer. Do: hold one of a budget of one; wait on another thread from the count read before;
+    /// give it back. Then: give one back before waiting from an older count. Expect: the waiter
+    /// returns after the give-back, and at once when one came after its count.
+    #[test]
+    fn audit6_a_waiter_wakes_on_a_give_back() {
+        let budget = Descriptors::fixed(1);
+        let held = budget.take("a connection", 1).unwrap();
+        let seen = budget.releases();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let budget = Arc::clone(&budget);
+            let stopping = Arc::clone(&stopping);
+            std::thread::spawn(move || {
+                budget.wait_release(seen, &stopping);
+                tx.send(budget.releases()).unwrap();
+            })
+        };
+        // Not woken while the descriptor is held (it waits for the event, so nothing arrives).
+        while budget.waiters.lock().unwrap().is_empty() {
+            std::thread::yield_now();
+        }
+        assert!(rx.try_recv().is_err(), "woke with nothing given back");
+        drop(held);
+        assert_eq!(rx.recv().unwrap(), seen + 1);
+        waiter.join().unwrap();
+        assert!(budget.waiters.lock().unwrap().is_empty());
+        // A give-back after the count read: no wait at all.
+        let older = budget.releases();
+        drop(budget.take("a connection", 1).unwrap());
+        budget.wait_release(older, &stopping);
+    }
+
+    /// AUDIT 6: a waiter for a give-back ends when its listener stops. Do: hold the only
+    /// descriptor; wait on another thread; set stopping and unpark it. Expect: it returns with no
+    /// give-back and leaves no waiter behind.
+    #[test]
+    fn audit6_a_waiter_ends_when_stopped() {
+        let budget = Descriptors::fixed(1);
+        let _held = budget.take("a connection", 1).unwrap();
+        let seen = budget.releases();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let budget = Arc::clone(&budget);
+            let stopping = Arc::clone(&stopping);
+            std::thread::spawn(move || budget.wait_release(seen, &stopping))
+        };
+        while budget.waiters.lock().unwrap().is_empty() {
+            std::thread::yield_now();
+        }
+        stopping.store(true, Ordering::Release);
+        waiter.thread().unpark();
+        waiter.join().unwrap();
+        assert_eq!(budget.releases(), seen);
+        assert!(budget.waiters.lock().unwrap().is_empty());
     }
 }

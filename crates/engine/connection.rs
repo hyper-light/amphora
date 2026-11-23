@@ -588,6 +588,9 @@ impl Drop for ExplicitCheckpointGuard {
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
+    /// Amphora (AUDIT 3.3): this connection's own count of its sampled seeks, hash builds and
+    /// hash probes (`LearnedCosts::sampled`), so no shared counter is written on every run.
+    pub(crate) cost_runs: crate::translate::optimizer::learned_costs::RunCounts,
     /// Amphora (G7 step 2, `AC-NS.2.1`): the versioned storage its B-trees are on, when switched
     /// on (`storage::versioned::switch`); else the pager's.
     pub(crate) versioned: Option<Arc<crate::storage::versioned::switch::Switch>>,
