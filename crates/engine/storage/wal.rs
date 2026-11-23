@@ -11053,6 +11053,68 @@ pub mod test {
         );
     }
 
+    /// Do: keep a database and its `-wal` from before a TRUNCATE checkpoint, write again, and put
+    /// the new `-wal` (its checkpoint sequence one higher) beside the kept one as `-wal2`; open
+    /// that copy. Expect: the second segment current and the first closing with nothing of it
+    /// copied, and each segment's last commit frame the one its file had.
+    #[test]
+    fn d45_open_recovers_both_segments_of_the_log() {
+        use crate::storage::log_segments::{Closing, Segment};
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let source = dir.path().join("source.db");
+        let copy = dir.path().join("copy.db");
+        let (source_path, copy_path) = (source.to_str().unwrap(), copy.to_str().unwrap());
+        let db = Database::open_file(io.clone(), source_path, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("pragma wal_autocheckpoint=0").unwrap();
+        conn.execute("create table t(id integer primary key, v text)")
+            .unwrap();
+        conn.execute("insert into t values(1, 'closing')").unwrap();
+        let segment_end = |db: &Database| {
+            let segment = db.shared_wal.current().read();
+            let sequence = segment.metadata.wal_header.lock().checkpoint_seq;
+            (sequence, segment.metadata.max_frame.load(Ordering::Acquire))
+        };
+        let (closing_seq, closing_frames) = segment_end(&db);
+        std::fs::copy(&source, &copy).unwrap();
+        std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal")).unwrap();
+        conn.execute("pragma wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("insert into t values(2, 'current')").unwrap();
+        let (current_seq, current_frames) = segment_end(&db);
+        assert_eq!(
+            current_seq,
+            closing_seq.wrapping_add(1),
+            "the log restarted after the checkpoint writes the next sequence"
+        );
+        assert!(closing_frames > 0 && current_frames > 0);
+        std::fs::copy(format!("{source_path}-wal"), format!("{copy_path}-wal2")).unwrap();
+
+        let reopened =
+            Database::open_file(io.clone(), copy_path, Arc::new(SqliteDialect)).unwrap();
+        let log = &reopened.shared_wal;
+        assert_eq!(log.current_id(), SegmentId::Second);
+        let segments = *log.segments.lock();
+        assert_eq!(segments.closing(), Some(SegmentId::First));
+        assert_eq!(
+            segments.state(SegmentId::First),
+            Segment::Closing(Closing {
+                reads: 0,
+                copied: false,
+                shipped: true
+            })
+        );
+        let frames = |id| {
+            log.segment(id)
+                .read()
+                .metadata
+                .max_frame
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(frames(SegmentId::First), closing_frames);
+        assert_eq!(frames(SegmentId::Second), current_frames);
+    }
+
     #[test]
     fn test_in_process_coordination_transaction_guards() {
         let (shared, _wal) = make_test_wal();

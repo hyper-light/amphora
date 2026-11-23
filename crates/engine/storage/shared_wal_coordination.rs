@@ -1279,7 +1279,7 @@ impl MappedSharedWalCoordination {
     /// its bits hold: the read is refused and tried again.
     pub(crate) fn count_read(&self, slot: SharedReaderSlot, span: &ReadSpan) -> bool {
         self.slot_reads(slot.slot_index as usize).is_some_and(|word| {
-            word.fetch_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+            word.try_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
                 SlotReads(reads).with(span).map(|reads| reads.0)
             })
             .is_ok()
@@ -1289,7 +1289,7 @@ impl MappedSharedWalCoordination {
     /// The read [`Self::count_read`] counted on `slot` with `span` is done.
     pub(crate) fn uncount_read(&self, slot: SharedReaderSlot, span: &ReadSpan) {
         if let Some(word) = self.slot_reads(slot.slot_index as usize) {
-            let _ = word.fetch_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+            let _ = word.try_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
                 Some(SlotReads(reads).without(span).0)
             });
         }
@@ -4520,5 +4520,92 @@ mod tests {
             mapped.find_frame(7, 0, boundary + 3, None),
             Some(boundary + 3)
         );
+    }
+
+    /// Do: count a read on both segments through one mapping of a shared memory file, look from
+    /// a second mapping of the same file, then end the read. Expect: the second mapping sees the
+    /// read on each segment while it is under way, and none once it has ended.
+    #[test]
+    fn d45_two_mappings_of_one_file_see_each_others_reads() {
+        use crate::storage::log_segments::{Closing, Segment, SegmentId};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let reading = create_mapping(&path);
+        let looking = create_mapping(&path);
+        let mut log = Segments::new(SegmentId::First);
+        assert_eq!(log.switch(false), Some(SegmentId::Second));
+        reading.seed_segments(log);
+        let span = log.begin_read();
+        let slot = reading
+            .register_reader(reading.owner_record(), 5)
+            .unwrap();
+        assert!(reading.count_read(slot, &span));
+        let closing = |reads| {
+            Segment::Closing(Closing {
+                reads,
+                copied: false,
+                shipped: true,
+            })
+        };
+
+        let seen = looking.segments();
+        assert_eq!(seen.current(), SegmentId::Second);
+        assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 1 });
+        assert_eq!(seen.state(SegmentId::First), closing(1));
+
+        reading.uncount_read(slot, &span);
+        reading.unregister_reader(slot);
+        let seen = looking.segments();
+        assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 0 });
+        assert_eq!(seen.state(SegmentId::First), closing(0));
+        assert_eq!(log.end_read(span), None);
+    }
+
+    /// Do: leave a read counted on the closing segment in a reader slot whose owner has died, as
+    /// a process that crashed mid-read leaves it, beside a live read on both segments in another
+    /// slot. Expect: counting the reads reclaims the dead slot and drops its read; the live read
+    /// still counts, and once it ends no read is left on either segment.
+    #[test]
+    fn d45_a_dead_readers_slot_is_reclaimed_and_its_read_stops_counting() {
+        use crate::storage::log_segments::{Closing, Segment, SegmentId};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+        let mut log = Segments::new(SegmentId::First);
+        let dead_span = log.begin_read();
+        assert_eq!(log.switch(false), Some(SegmentId::Second));
+        mapped.seed_segments(log);
+        let dead_owner = SharedOwnerRecord::new(exited_child_pid(), 43);
+        mapped.reader_bitmap_words()[0].fetch_and(!1u64, Ordering::Release);
+        mapped.reader_frames()[0].store(17, Ordering::Release);
+        mapped.reader_owners()[0].store(dead_owner.raw(), Ordering::Release);
+        mapped.reader_reads()[0].store(
+            SlotReads::default().with(&dead_span).unwrap().0,
+            Ordering::Release,
+        );
+        let live_span = log.begin_read();
+        let live = mapped.register_reader(mapped.owner_record(), 5).unwrap();
+        assert_ne!(live.slot_index, 0);
+        assert!(mapped.count_read(live, &live_span));
+        let closing = |reads| {
+            Segment::Closing(Closing {
+                reads,
+                copied: false,
+                shipped: true,
+            })
+        };
+
+        let seen = mapped.segments();
+        assert_eq!(mapped.reader_owner(0), None, "the dead reader's slot is reclaimed");
+        assert_eq!(seen.state(SegmentId::First), closing(1), "the dead read stops counting");
+        assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 1 });
+
+        mapped.uncount_read(live, &live_span);
+        mapped.unregister_reader(live);
+        let seen = mapped.segments();
+        assert_eq!(seen.state(SegmentId::First), closing(0));
+        assert_eq!(seen.state(SegmentId::Second), Segment::Current { reads: 0 });
+        assert_eq!(log.end_read(live_span), None);
+        assert_eq!(log.end_read(dead_span), None);
     }
 }
