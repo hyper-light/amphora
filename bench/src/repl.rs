@@ -407,6 +407,18 @@ fn send(
     s: &[(String, Vec<Arg>)],
     deadline: Duration,
 ) -> anyhow::Result<usize> {
+    send_counting(c, down, via, s, deadline, &Default::default())
+}
+
+/// [`send`], counting each node's `Serialization` refusals in `refused`.
+fn send_counting(
+    c: &dyn Cluster,
+    down: &[AtomicBool; NODES],
+    via: usize,
+    s: &[(String, Vec<Arg>)],
+    deadline: Duration,
+    refused: &[AtomicU64; NODES],
+) -> anyhow::Result<usize> {
     let until = Instant::now() + deadline;
     let mut n = via;
     let mut last = None;
@@ -419,10 +431,14 @@ fn send(
         match c.exec(node, s, until) {
             Ok(()) => return Ok(node),
             Err(e) => {
-                if !matches!(
+                if matches!(
                     e.downcast_ref::<amphora_api::Refusal>(),
                     Some(amphora_api::Refusal::Serialization { .. })
                 ) {
+                    if let Some(r) = refused.get(node) {
+                        r.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
                     n += 1;
                 }
                 last = Some(e);
@@ -493,22 +509,31 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     let down: [AtomicBool; NODES] = Default::default();
     let began = Instant::now();
     let (counting, ends) = (began + warmup, began + warmup + seconds);
-    let hists = std::thread::scope(|scope| -> anyhow::Result<Vec<(Hist, u64)>> {
+    // Each write's latency by the node that acknowledged it, and the `Serialization` refusals
+    // each node gave counted writes (lane W4: the leader's writes against the followers').
+    let refused: [AtomicU64; NODES] = Default::default();
+    let hists = std::thread::scope(|scope| -> anyhow::Result<Vec<([Hist; NODES], u64)>> {
         let handles: Vec<_> = (0..writers)
             .map(|w| {
-                let down = &down;
-                scope.spawn(move || -> anyhow::Result<(Hist, u64)> {
+                let (down, refused) = (&down, &refused);
+                scope.spawn(move || -> anyhow::Result<([Hist; NODES], u64)> {
                     let mut wr = Writer::new(w);
-                    let (mut h, mut writes) = (Hist::new(), 0u64);
+                    let (mut h, mut writes) = (std::array::from_fn(|_| Hist::new()), 0u64);
                     loop {
                         let t = Instant::now();
                         if t >= ends {
                             return Ok((h, writes));
                         }
                         let s = stmts(&wr.next(o.batch, o.text_bytes))?;
-                        send(c, down, w, &s, o.deadline)?;
+                        let mine: [AtomicU64; NODES] = Default::default();
+                        let node = send_counting(c, down, w, &s, o.deadline, &mine)?;
                         if t >= counting {
-                            h.record(us(t));
+                            if let Some(h) = h.get_mut(node) {
+                                h.record(us(t));
+                            }
+                            for (total, n) in refused.iter().zip(&mine) {
+                                total.fetch_add(n.load(Ordering::Relaxed), Ordering::Relaxed);
+                            }
                             writes += 1;
                         }
                     }
@@ -521,15 +546,26 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
             .collect()
     })?;
     let mut all = Hist::new();
+    let mut nodes: [Hist; NODES] = std::array::from_fn(|_| Hist::new());
     let mut writes = 0u64;
-    for (h, n) in &hists {
-        all.merge(h);
+    for (hs, n) in &hists {
+        for (node, h) in nodes.iter_mut().zip(hs) {
+            all.merge(h);
+            node.merge(h);
+        }
         writes += n;
     }
+    let by_node: Vec<_> = nodes
+        .into_iter()
+        .zip(&refused)
+        .map(|(h, r)| serde_json::json!({ "latency_ms": summary(h), "refused": r.load(Ordering::Relaxed) }))
+        .collect();
+    let leader = c.leader(Instant::now() + o.deadline).ok().flatten();
     let secs = seconds.as_secs_f64();
     Ok(serde_json::json!({
         "writers": writers, "warmup_s": warmup.as_secs_f64(), "seconds": secs, "latency_ms": summary(all),
         "writes_per_s": writes as f64 / secs, "events_per_s": (writes as f64) * (o.batch as f64) / secs,
+        "by_node": by_node, "leader": leader,
     }))
 }
 
