@@ -110,3 +110,12 @@ exact. Kept.
 
 Test that fails on the hang: `busy::tests::a5_a_steps_own_releases_never_end_its_wait` (the
 old `wait` says try again after the step's own release).
+
+Checked on 033edffd (the fix merged with main 486edca0), run r558 on adacachy2 (needs
+cpus=8,mem=24g; load 20-36 before, 18-33 after): `cargo clippy -p amphora-engine -p amphora
+--all-targets --locked -- -D warnings` clean; `cargo test -p amphora-engine --lib busy::` 16
+passed (the new test among them); `db::tests::constants_22_...` alone passed in 0.34 s,
+printing `wake=Release commit_to_done=588.852µs woken_before_release=Some(0) wakes=2` and
+`wake=Schedule commit_to_done=1.284473ms woken_before_release=Some(1) wakes=2` (before the fix it
+never finished); `cargo test -p amphora --lib db` 10 passed, the allocs tests among them. The
+wake latencies are one run each on a shared host, printed by the test, not asserted.
