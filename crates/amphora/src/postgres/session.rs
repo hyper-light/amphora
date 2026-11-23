@@ -62,6 +62,9 @@ pub enum Next {
     Cancel { process_id: i32, key: Vec<u8> },
     /// Send what was written, then close.
     Close,
+    /// Close with nothing sent, and log why: PostgreSQL's COMMERROR, which goes to the server's log
+    /// and never to the client (`src/backend/tcop/backend_startup.c:566-571`).
+    CloseLogged(PgError),
 }
 
 /// A step's result: the input bytes it used and what comes next.
@@ -125,6 +128,8 @@ pub struct Session {
     config: Config,
     seed: Seed,
     phase: Phase,
+    /// Why the server can't take this session, answered once its StartupMessage is read.
+    refused: Option<PgError>,
 }
 
 fn fatal(out: &mut Vec<u8>, consumed: usize, error: &PgError) -> Result<Step, PgError> {
@@ -365,7 +370,15 @@ impl Session {
                 ssl_done: false,
                 gss_done: false,
             },
+            refused: None,
         }
+    }
+
+    /// Refuses the session with `error` (FATAL) once its StartupMessage is read, where PostgreSQL
+    /// refuses a connection it has no room for (`src/backend/tcop/backend_startup.c:313-360`), so
+    /// the client sees what PostgreSQL's would.
+    pub fn refuse(&mut self, error: PgError) {
+        self.refused = Some(error);
     }
 
     /// The startup settings, once a StartupMessage has been read.
@@ -458,7 +471,12 @@ impl Session {
                     next: Next::Need(total),
                 });
             }
-            Err(error) => return fatal(out, 0, &error),
+            Err(error) => {
+                return Ok(Step {
+                    consumed: 0,
+                    next: Next::CloseLogged(error),
+                });
+            }
         };
         let mut reader = Reader::new(body);
         let code = reader.u32()?;
@@ -565,6 +583,9 @@ impl Session {
                     wire::put_cstr(out, option.as_bytes());
                 }
             })?;
+        }
+        if let Some(error) = self.refused.take() {
+            return fatal(out, len, &error);
         }
         let role = roles.role(&startup.user);
         let mechanisms = binding.mechanisms();
