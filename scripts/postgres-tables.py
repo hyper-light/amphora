@@ -24,7 +24,7 @@ def main() -> None:
         sys.exit(f"yy_transition: {len(pairs)} entries, declared {n}")
     # flex declares more entries than it writes; C zero-fills the rest (C11 6.7.9p21).
     pairs += [(0, 0)] * (int(n) - len(pairs))
-    sn, sbody = table(src, r"\*yy_start_state_list")
+    sn, sbody = table(src, "yy_start_state_list")
     starts = [int(i) for i in re.findall(r"&yy_transition\[(\d+)\]", sbody)]
     if len(starts) != int(sn):
         sys.exit(f"yy_start_state_list: {len(starts)} entries, declared {sn}")
