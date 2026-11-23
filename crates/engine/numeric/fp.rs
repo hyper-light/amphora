@@ -343,18 +343,19 @@ fn fifteen_digits(r: f64) -> Option<Decoded> {
 /// NaN as null): fixed notation for exponents from -4 to 16, else d.ddde±XX; trailing zeros dropped
 /// but one after the point.
 fn render(r: f64, zero_pad: bool) -> Option<String> {
-    let s = match fifteen_digits(r).map_or_else(|| decode(r, 17, 20), |s| Some(Decode::Finite(s)))? {
-        Decode::Finite(s) => s,
-        Decode::NaN => return Some(if zero_pad { "null" } else { "NaN" }.to_owned()),
-        Decode::Infinite { negative } if zero_pad => Decoded {
-            negative,
-            digits: vec![b'9'],
-            point: 1000,
-        },
-        Decode::Infinite { negative } => {
-            return Some(if negative { "-Inf" } else { "Inf" }.to_owned())
-        }
-    };
+    let s =
+        match fifteen_digits(r).map_or_else(|| decode(r, 17, 20), |s| Some(Decode::Finite(s)))? {
+            Decode::Finite(s) => s,
+            Decode::NaN => return Some(if zero_pad { "null" } else { "NaN" }.to_owned()),
+            Decode::Infinite { negative } if zero_pad => Decoded {
+                negative,
+                digits: vec![b'9'],
+                point: 1000,
+            },
+            Decode::Infinite { negative } => {
+                return Some(if negative { "-Inf" } else { "Inf" }.to_owned());
+            }
+        };
     let n = i32::try_from(s.digits.len()).ok()?;
     let exp = s.point.checked_sub(1)?;
     let mut precision: i32 = 16;
