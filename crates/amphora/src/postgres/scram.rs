@@ -191,7 +191,8 @@ impl ScramServer {
                 ));
             }
             ("y", Binding::TlsServerEndPoint(_)) => {
-                return Err(PgError::fatal(SqlState::PROTOCOL_VIOLATION, "SCRAM channel binding negotiation error")
+                // `auth-scram.c:1019-1024`.
+                return Err(PgError::fatal(SqlState::INVALID_AUTHORIZATION_SPECIFICATION, "SCRAM channel binding negotiation error")
                     .with_detail("The client supports SCRAM channel binding but thinks the server does not.  However, this server does support channel binding."));
             }
             ("y", Binding::None) => &[],
