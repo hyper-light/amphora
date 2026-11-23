@@ -4606,7 +4606,9 @@ impl<S: Storage> Raft<S> {
         answer.commit = self.durable_commit.min(self.log.committed());
         if self.config.heartbeat_answers == HeartbeatAnswers::Position {
             let durable = self.log.persisted();
-            if let Ok(term) = self.log.term(durable) {
+            if let Ok(term) = self.log.term(durable)
+                && term != 0
+            {
                 answer.index = durable;
                 answer.log_term = term;
             }

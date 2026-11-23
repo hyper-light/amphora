@@ -97,7 +97,11 @@ impl SkipHint {
         for term in terms {
             push_terms(term, table, &mut hint);
         }
-        (!hint.terms.is_empty() || !hint.lists.is_empty()).then_some(hint)
+        if hint.terms.is_empty() && hint.lists.is_empty() {
+            None
+        } else {
+            Some(hint)
+        }
     }
 
     /// `column`'s bounds from the hint's terms, intersected, each parameter's value read by
@@ -377,9 +381,11 @@ impl SkipWalk {
 
     /// Where to go from the row at `rowid`; rowids only ascend, so runs passed are dropped.
     pub fn target(&mut self, rowid: i64) -> WalkTarget {
-        while self.ranges.get(self.at).is_some_and(|r| r.last < rowid) {
-            self.at += 1;
-        }
+        let passed = self
+            .ranges
+            .get(self.at..)
+            .map_or(0, |rest| rest.iter().take_while(|r| r.last < rowid).count());
+        self.at = self.at.checked_add(passed).unwrap_or(self.ranges.len());
         match self.ranges.get(self.at) {
             None => WalkTarget::Past,
             Some(r) if rowid < r.first => WalkTarget::Seek(r.first),

@@ -1505,6 +1505,34 @@ fn a_followers_heartbeat_answer_names_only_what_its_disk_holds() {
     assert_eq!((said[0].index, said[0].log_term), (5, 1));
 }
 
+/// Under `Config::answer_beats_now`, a follower whose restored snapshot is not yet durable can't
+/// read the term of its disk's end (the log answers 0 below the snapshot), so its early heartbeat
+/// answer states no position (Amphora's lane V6, AC-T1.8.3).
+#[test]
+fn an_early_heartbeat_answer_names_no_position_below_an_unwritten_snapshot() {
+    let mut node = follower_with(Config {
+        answer_beats_now: true,
+        ..with_depth(2, 2)
+    });
+    let mut sent = answer(MessageType::MsgSnapshot, 1, 2, 1);
+    sent.snapshot = Some(Box::new(snapshot(7, 1, &[1, 2, 3])));
+    node.step(sent).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert!(ready.snapshot().is_some());
+    ready.take_persisted_messages();
+    node.advance_issued(ready).unwrap();
+    let durable = node.raft.log().persisted();
+    assert!(durable < 7);
+    assert_eq!(node.raft.log().term(durable).unwrap(), 0);
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
+    beat.commit = 2;
+    node.step(beat).unwrap();
+    let said = node.messages_now();
+    assert_eq!(said.len(), 1);
+    assert_eq!(said[0].msg_type, MessageType::MsgHeartbeatResponse);
+    assert_eq!((said[0].index, said[0].log_term), (0, 0));
+}
+
 /// Election Safety across a crash: a candidate counts its vote for itself only once the hard state
 /// naming it is durable, so a sole voter leads only from then. Counted at once, the sole voter led on
 /// a vote it could lose: hyper-durable's simulation, seed 206 of its first shape, had member 3 elected

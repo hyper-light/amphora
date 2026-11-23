@@ -1249,8 +1249,10 @@ fn null_beside_false_where_term(
 ) -> Result<()> {
     let mut settled = None;
     for (i, term) in where_clause.iter().enumerate() {
-        if matches!(term.origin, WhereTermOrigin::Where | WhereTermOrigin::Implied)
-            && literal_truth(simplified_and_or(&term.expr)) == Some(false)
+        if matches!(
+            term.origin,
+            WhereTermOrigin::Where | WhereTermOrigin::Implied
+        ) && literal_truth(simplified_and_or(&term.expr)) == Some(false)
             && !has_subquery(&term.expr)
             && !reads_a_row(&term.expr)?
             && !expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?

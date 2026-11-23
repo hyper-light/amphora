@@ -2470,7 +2470,11 @@ fn group_count_from_index_stats<'a>(
             let rows_per_group = *index_stats
                 .avg_rows_per_distinct_prefix
                 .get(columns.len().checked_sub(1)?)?;
-            (rows_per_group > 0).then_some((total_rows / rows_per_group as f64, rows_per_group))
+            if rows_per_group > 0 {
+                Some((total_rows / rows_per_group as f64, rows_per_group))
+            } else {
+                None
+            }
         })
         .fold(
             None,
@@ -2614,7 +2618,7 @@ pub(crate) fn group_count_error(plan: &SelectPlan, schema: &Schema) -> Option<f6
     }
     let stored_average = match rows_per_group {
         0 | 1 => 0.0,
-        a => ((a - 1) as f64).recip(),
+        a => a.checked_sub(1).map_or(0.0, |below| (below as f64).recip()),
     };
     let total_rows = table_stats
         .row_count
@@ -4396,7 +4400,11 @@ pub(crate) mod bushy_test_hook {
                 .collect();
             chosen.sort();
             let steps = stmt.stmt_status(crate::StatementStatusCounter::VmStep);
-            (chosen, steps, rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")))
+            (
+                chosen,
+                steps,
+                rows(conn, &format!("EXPLAIN QUERY PLAN {sql}")),
+            )
         }
 
         /// Lane T6 (TPC-H q05 at SF1 passed 10 s): the planner prices the late match's visits,

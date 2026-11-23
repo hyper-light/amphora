@@ -198,7 +198,11 @@ fn g10_displayed_text_converts_back_to_the_same_double() {
             wrong.push(format!("{r:e}"));
         }
     }
-    assert!(wrong.is_empty(), "{} don't read back: {wrong:?}", wrong.len());
+    assert!(
+        wrong.is_empty(),
+        "{} don't read back: {wrong:?}",
+        wrong.len()
+    );
 }
 
 /// Writes `bits<TAB>CAST(x AS TEXT)` for a seeded corpus to `$AMPHORA_REAL_TEXT_CORPUS`, for
