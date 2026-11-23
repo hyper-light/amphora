@@ -2,7 +2,7 @@
 //! TEXT)), over the values a query writes: TPC-H q01's charge `l_extendedprice * (1 - l_discount) *
 //! (1 + l_tax)` from dbgen's ranges, 2-place prices, and random finite doubles.
 //!
-//! `cargo run --release -p amphora-engine --example real_text -- <values per class> <passes>`: for
+//! `cargo run --release -p amphora-engine --features bench --example real_text -- <n> <passes>`: for
 //! each class, one warm-up pass, then `<passes>` timed passes; prints each pass's ns per value, the
 //! median, the share written with 15 or fewer significant digits, and an FNV-1a hash of every text,
 //! so two builds that write the same texts print the same hash. A third argument, a corpus of
