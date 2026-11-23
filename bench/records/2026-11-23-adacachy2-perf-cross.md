@@ -531,3 +531,42 @@ reads (these are the derivations; none is picked):
   `RESULT_MAX` (the page bound, lane perf-A6), a row `size_of::<Row>() + KEY_MAX + VALUE_MAX`, a stamp
   fixed; `Held::Locked` a key of `KEY_MAX`; the refusal `Compacted` (inline) or `unstamped`'s one format
   string with one `u64` (its literal length + 20 digits).
+
+## 2b built and merged; units 3 and 4 not reached (perf-A13)
+
+**Unit 2b (af9692f3, b72554f5; with main 9c0ece85 as bf9c2e43).** A12's WIP (60e63f8b) on main cfa0107c, whose
+K11 `call_internal_ringing` (a step's answer and its dropped keys, rung once committed) still submitted
+`Operation::Call(.., REQUEST_MAX)`: it now takes the step's `AnswerMax<(R, Vec<Vec<u8>>)>`, charged at admission
+and checked inside the call by `within`. `AnswerBytes` for `api::Page` and `api::Change`. across.rs
+`waiting(group, until, answer, read)`, each read's bound from `held_max(heap)`: the answer's heap (a scan page
+`page_bytes::<Row>(scan.limit)`, by `fits`; changes `page_bytes::<Change>(limit)`, by `whole`; a get its key and
+`VALUE_MAX`; `changed` none), or the locking row's key (`KEY_MAX`: every transaction key passes `api::key` in
+`coordinator::validate`), or the refusal (`Compacted` inline, or `unstamped`'s text at `Rev::MAX`), whichever
+is most.
+
+Coordinator's decision 2 (lists built a push at a time): `grown` (twice the entries) is gone; each answer list
+is trimmed before it answers and the bounds count entries exactly: `page_at`'s rows, `changes_in`'s changes
+(collected in place over the wider `(stamp, seq, Change)` list, so their capacity was the wider list's),
+`apply_step`'s reply lists (`Reply::trim`) and dropped keys, `one_group`'s reads (`trim_reads`), and
+`unstamped`'s text (`format!` reserves twice its literal pieces). The trim's cost is not measured (coordinator,
+11-23: after the deliverable works, rule 0).
+
+Coordinator's decision 1 (wide lock steps): not paged. A lock step can't be split per group without changing
+recovery: `Prevent` asks each participant whether it holds the transaction's locks and "all present" commits
+it implicitly (docs/design/xgroup.md:33-37, Parallel Commits), so a group holding one page of a split lock step
+would count as present with keys never locked. The lock step declares its real worst case instead: each key it
+reads with a `VALUE_MAX` value (`reads_bytes`), or the one key a conflict or condition names.
+
+Tests: `xgroup::sql::answers::a13_lock_reply_at_its_worst_case_holds_what_its_step_declares`,
+`database::across::tests::a13_unstamped_refusal_is_within_every_read_bound`,
+`database::across::tests::a13_page_at_its_worst_case_holds_what_a_scan_declares`. Script:
+`~/.cache/amphora-perf/cross-a13-scripts/check.sh` (adacachy2, needs linux/amd64,cpus=8,mem=24g):
+
+| run | commit | result |
+|---|---|---|
+| r1473 | af9692f3 | clippy: 2 `arithmetic_side_effects` in A12's restore.rs bounds (fixed in b72554f5) |
+| r1480 | b72554f5 | clippy -p amphora --all-targets clean; lib `a13_` 3/3, `database::across` 13/13 (1 ignored), `database::admission_charge` 3/3, `database::online` 6/6, `xgroup::` 34/34; load 20-31 on 32 cores |
+| r1485 | bf9c2e43 | the same, after merging main 9c0ece85 (V8): clippy clean; `a13_` 3/3, `database::across` 13/13 (1 ignored), `database::admission_charge` 3/3, `database::online` 6/6, `xgroup::` 34/34; load 26-34 |
+
+Not reached (next lane): unit 3 (`Database::query` takes a declared bound) and unit 4 (resharding charges by
+row; deletes `store::Config::queue`, `ROOM_LOOK`, bench `AMPHORA_QUEUE`).

@@ -23,7 +23,7 @@ use amphora_api::{self as api, Change, Changes, Consistency, Page, Refusal, Rev,
 
 use super::{blob, blob_len, bytes, fits, integer, rev, text, unavailable};
 use crate::backup::Hooks;
-use crate::database::{AnswerBytes, Database};
+use crate::database::{AnswerBytes, AnswerMax, Database};
 use crate::db::Db;
 use crate::xgroup::sql::Member;
 
@@ -465,6 +465,8 @@ fn page_at(
     for row in &mut rows {
         row.rev = stamp_of_version(db, ns, family, &row.key, row.rev)?.unwrap_or(0);
     }
+    // Grown one push at a time, the list holds the bytes its call declared once trimmed.
+    rows.shrink_to_fit();
     Ok(Ok(Held::Read(Page { rows, more })))
 }
 
@@ -567,16 +569,21 @@ fn held_whole<T>(
 /// resolution nor any other call in the group sends it reading again. `Timeout` at `until`. A
 /// read that waited is counted (`Database::locked_waits`, `locked_wakes`) and on the trace
 /// (`held_read`).
-fn waiting<T, F>(group: &Database, until: Instant, read: F) -> Result<T, Refusal>
+fn waiting<T, F>(
+    group: &Database,
+    until: Instant,
+    answer: AnswerMax<Result<Held<T>, Refusal>>,
+    read: F,
+) -> Result<T, Refusal>
 where
-    T: Send + 'static,
+    T: AnswerBytes + Send + 'static,
     F: Fn(&Db) -> anyhow::Result<Result<Held<T>, Refusal>> + Send + Sync + 'static,
 {
     let read = Arc::new(read);
     let mut traced = false;
     group.wait_locked(super::LockedReads::WaitOnLock, until, || {
         let try_read = Arc::clone(&read);
-        match group.call_internal(until, move |db| try_read(&*db))?? {
+        match group.call_internal(until, answer, move |db| try_read(&*db))?? {
             Held::Read(answer) => Ok(Ok(answer)),
             Held::Locked(row) => {
                 if !traced {
@@ -587,6 +594,19 @@ where
             }
         }
     })
+}
+
+/// The most bytes a read across groups answers ([`waiting`], AUDIT 2026-11-23 §1): its answer
+/// `T` with at most `heap` bytes on the heap; or the cross-group key of the row whose lock held
+/// it, a transaction's key of at most `KEY_MAX` (`coordinator::validate`); or the refusal it
+/// reads, [`Refusal::Compacted`] (inline) or [`unstamped`]'s, its text at a revision of the most
+/// digits.
+fn held_max<T>(heap: usize) -> AnswerMax<Result<Held<T>, Refusal>> {
+    let refused = unstamped_text(Rev::MAX).len();
+    AnswerMax::bytes(
+        std::mem::size_of::<Result<Held<T>, Refusal>>()
+            .saturating_add(heap.max(api::KEY_MAX).max(refused)),
+    )
 }
 
 /// The namespace's head across groups: the cut, a stamp every group has made all its revisions
@@ -601,7 +621,7 @@ pub(super) fn head(
     let cut = cut(&groups, point)?;
     // Each writer's commits that took their stamps before the cut end before this call runs.
     for (group, _) in &groups {
-        group.call_internal(until, |_| Ok(()))?;
+        group.call_internal(until, AnswerMax::fixed(), |_| Ok(()))?;
     }
     Ok(cut)
 }
@@ -629,9 +649,13 @@ pub(super) fn scan(
     let mut rows = Vec::new();
     let mut more = false;
     let mut bound: Option<Vec<u8>> = None;
+    // A page of at most `scan.limit` rows, cut to `RESULT_MAX` bytes of keys and values (`fits`).
+    let answer = held_max::<Page>(super::page_bytes::<api::Row>(scan.limit));
     for (group, _) in &groups {
         let (ns, family, scan) = (ns.to_owned(), family.to_owned(), scan.clone());
-        let page = waiting(group, until, move |db| page_at(db, &ns, &family, &scan, at))?;
+        let page = waiting(group, until, answer, move |db| {
+            page_at(db, &ns, &family, &scan, at)
+        })?;
         if page.more
             && let Some(last) = page.rows.last()
             && bound.as_ref().is_none_or(|bound| &last.key < bound)
@@ -768,7 +792,12 @@ fn changes_in(
     found.sort_by_key(|(stamp, seq, _)| (*stamp, *seq));
     let more = own_more || moved_more || found.len() > limit;
     let found: Vec<Change> = found.into_iter().map(|(_, _, change)| change).collect();
-    Ok(whole(found, limit).map(|changes| (changes, more)))
+    // Collected in place over the wider tuples' list and cut by `whole`: trimmed, it holds the
+    // bytes its call declared.
+    Ok(whole(found, limit).map(|mut changes| {
+        changes.shrink_to_fit();
+        (changes, more)
+    }))
 }
 
 /// The refusal a read of the changes after stamp `after` gets once compaction took them: `from`,
@@ -815,11 +844,16 @@ fn unstamped(db: &Db, ns: &str, family: &str) -> anyhow::Result<Option<Refusal>>
             Ok(false)
         },
     )?;
-    Ok(found.map(|at| {
-        Refusal::Unavailable(format!(
-            "a version at revision {at} moved in from another group without its commit stamp: the order across groups doesn't place it"
-        ))
-    }))
+    Ok(found.map(|at| Refusal::Unavailable(unstamped_text(at))))
+}
+
+/// [`unstamped`]'s refusal text for a version at revision `at`, trimmed to its length.
+fn unstamped_text(at: Rev) -> String {
+    let mut text = format!(
+        "a version at revision {at} moved in from another group without its commit stamp: the order across groups doesn't place it"
+    );
+    text.shrink_to_fit();
+    text
 }
 
 /// The stamp of `family`'s newest change here after stamp `after` through `cut`, its own or moved
@@ -879,7 +913,7 @@ pub(super) fn changed(
     let mut newest = None;
     for (group, _) in &groups {
         let (ns, family) = (ns.to_owned(), family.to_owned());
-        let found = waiting(group, until, move |db| {
+        let found = waiting(group, until, held_max::<Option<u64>>(0), move |db| {
             held_whole(db, &ns, &family, cut, |db| {
                 newest_in(db, &ns, &family, after, cut)
             })
@@ -1024,8 +1058,10 @@ pub(super) fn get(
     // so it sees a commit answered before it began even when that stamp came from a group whose
     // clock is ahead of this one's.
     let hooks = Arc::clone(hooks);
+    // The row: the key asked for and a value of at most `VALUE_MAX`.
+    let answer = held_max::<Option<api::Row>>(key.len().saturating_add(api::VALUE_MAX));
     let (ns, family, key) = (ns.to_owned(), family.to_owned(), key.to_vec());
-    waiting(database, until, move |db| {
+    waiting(database, until, answer, move |db| {
         let at = match asked {
             Some(at) => at,
             None => hooks.marks.next_micros()?,
@@ -1089,9 +1125,11 @@ pub(super) fn changes(
     }
     let mut all = Vec::new();
     let mut bound = cut;
+    // At most `limit` changes, cut to `RESULT_MAX` bytes of keys and values (`whole`).
+    let answer = held_max::<(Vec<Change>, bool)>(super::page_bytes::<Change>(limit));
     for (group, _) in &groups {
         let (ns, family) = (ns.to_owned(), family.to_owned());
-        let (found, more) = waiting(group, until, move |db| {
+        let (found, more) = waiting(group, until, answer, move |db| {
             held_whole(db, &ns, &family, cut, |db| {
                 changes_in(db, &ns, &family, after, cut, limit)
             })
@@ -1114,6 +1152,38 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    /// AUDIT 2026-11-23 §1, lane perf-A13: a read across groups refused for a version moved in
+    /// without its stamp, at a revision of the most digits, holds no more than any read declares.
+    #[test]
+    fn a13_unstamped_refusal_is_within_every_read_bound() {
+        let refused: Result<Held<Option<u64>>, Refusal> =
+            Err(Refusal::Unavailable(unstamped_text(Rev::MAX)));
+        let held = refused.answer_bytes();
+        let declared = held_max::<Option<u64>>(0).get();
+        assert!(held <= declared, "{held} > {declared}");
+    }
+
+    /// A page at its worst case, `limit` rows of a `KEY_MAX` key and a `VALUE_MAX` value pushed one
+    /// at a time and trimmed as `page_at` trims them, holds exactly what a scan declares for it.
+    #[test]
+    fn a13_page_at_its_worst_case_holds_what_a_scan_declares() {
+        let limit = 3;
+        let mut rows = Vec::new();
+        for k in 0u8..3 {
+            rows.push(api::Row {
+                key: vec![k; api::KEY_MAX],
+                value: vec![0u8; api::VALUE_MAX],
+                rev: 1,
+            });
+        }
+        rows.shrink_to_fit();
+        let page: Result<Held<Page>, Refusal> = Ok(Held::Read(Page { rows, more: true }));
+        assert_eq!(
+            page.answer_bytes(),
+            held_max::<Page>(super::super::page_bytes::<api::Row>(limit)).get()
+        );
+    }
+
     use amphora_api::Records;
     use amphora_api::blobs::Blobs;
 
@@ -1129,7 +1199,7 @@ mod tests {
 
     /// Each stamped revision of `ns` here, and each revision a version of it is kept at.
     fn stamps_and_versions(db: &Database, ns: &'static str) -> (Vec<Rev>, Vec<Rev>) {
-        db.call_internal(until(), move |db| {
+        db.call_internal(until(), AnswerMax::bytes(api::RESULT_MAX), move |db| {
             let (mut stamps, mut versions) = (Vec::new(), Vec::new());
             db.query(
                 "SELECT rev FROM __amphora_rev_stamps WHERE namespace = ?1 ORDER BY rev",
@@ -2104,7 +2174,7 @@ mod tests {
         let read = |g: usize, stamp: u64| {
             let k = key(g);
             dbs[g]
-                .call_internal(until(), move |db| {
+                .call_internal(until(), AnswerMax::fixed(), move |db| {
                     Ok(match row_at(db, "n", "f", &k, stamp)? {
                         Ok(Held::Read(row)) => Some(row.map(|r| r.rev)),
                         Ok(Held::Locked(_)) => None,
@@ -2156,7 +2226,7 @@ mod tests {
 
         put(&dbs[1], vec![1, b'z']);
         let later = dbs[1]
-            .call_internal(until(), |db| {
+            .call_internal(until(), AnswerMax::fixed(), |db| {
                 crate::database::newest_stamp(db, "n", "f", &[1, b'z'])
             })
             .unwrap()
