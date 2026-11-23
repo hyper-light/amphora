@@ -208,10 +208,11 @@ after the other in the lane's target dir. It then runs 5 alternated rounds of `p
 each run, and errors and rows per op. Run r836's first build of 76a62c3d failed in `amphora`: main's `bench/Cargo.toml`
 did not patch `hyper-rt`, which the postgres listener (f8f65110) uses, so cargo took crates.io's. Main has patched it
 since, and 639245cc has that patch. After that, adacachy2 refused the run for room five times between 14:25 and
-14:50Z, with 0-5 of 32 cores idle. Pass the script's body to `run` (needs `linux/amd64,cpus=16,mem=24g`, `on`
-adacachy2, sync false) and retry until it is placed.
+14:45Z, with 0-7 of 32 cores idle. It was placed at 14:46:39Z as run r902 (needs `linux/amd64,cpus=16,mem=24g`,
+load 64 at its start). Its numbers land in `~/.cache/amphora-perf-bin/pagepath/ab6-<HHMM>.jsonl` on adacachy2, with
+the summary at the end of r902's output. If it dies, pass the script's body to `run` again and retry until placed.
 
 **B4's fix alone on main.** 3a30e5f1 (branch `perf/pagepath-b4-pick`) is 4da616cf cherry-picked onto origin/main
-9a7b14bb, clean. It is not merged: its clippy and storage tests on that tree were refused for room (0 of 32 cores idle).
+9a7b14bb, clean. Its clippy and storage tests on that tree are run r901.
 
 **Decision 45** (docs/design/store.md, commit 4d0ead88) is the two-segment log's design. Nothing is built yet.
