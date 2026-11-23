@@ -266,3 +266,66 @@ Either alone leaves the other flush in the path. Neither changes what a commit o
     # on adacachy2: kiln run, on 00aad8daff2fa3c9daa65d53c425d450, sync false, cwd ~/.cache/amphora-perf/commits-remote
     (cd bench && CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits cargo build --release)   # r820, 8m46s
     python3 -I bench/thread_sample.py ~/.cache/amphora-perf-bin/commits/7f2650a9 29490 DIR W leader 5 2 3 replicated   # r851, cpus=4,mem=4g
+
+# Lane V3 (commits) on adacachy2: the barrier's two flushes removed on a branch, not merged (2026-11-23, 14:38Z to 15:33Z)
+
+Ada's goal is replicated commits about 10x faster than dqlite and rqlite. AC-T1.8.3 asks p99 at most 2 ms for 3
+nodes on a LAN. V2 found each write's ReadIndex barrier waiting on the leader's log write and one follower's.
+This hour built V2's two fixes and the red test, on branch `perf/commits-v3`.
+
+## Losses first
+
+1. **Nothing merged to main.** The fixes change vendored hyper-raft's consensus core. Their own crate's
+   invariant tests (`tests/pipeline.rs`, `tests/strategies.rs`, the lib tests) never ran: kiln refused this lane's
+   runs for room four times (0 to 3 of 32 cores idle). The new heartbeat-position oracle lives in those tests, so the
+   fix for (2) is unproven by its own test. It waits for that run.
+2. **The replicated suite has one failure, and it is main's.** At 6237d769: 136 passed, 1 failed, 4 ignored, 131 s,
+   load 36 to 71 (r926). The failure is `a_write_at_a_follower_is_answered_on_its_groups_commit`, at
+   `assert_eq!(taken.len(), 1)`. It fails the same way without the fix, at 4f2626de (main 9a7b14bb plus the new test
+   alone): 1 run of 1, 123 s (r939, stopped after that run). One run is not a rate. It is not this change's, by that
+   A/B.
+3. **Units 3 (the ladder against dqlite and rqlite) and 4 (batching) were not started.**
+
+## Unit 1, the red test: red on main, green with the fixes
+
+`v3_two_replicated_writes_in_a_row_answer_with_every_log_flush_held` (replicated.rs): three voters behind log gates,
+three fates, two to span. Warm writes run until each follower states a durable promise. Then every member's raft-log
+flushes are held, and two writes go to the leader one after the other.
+
+| commit | first write | second write | run |
+|---|---|---|---|
+| 4f2626de (main plus the test) | answered while held | answered only once the gates let the flushes go | r922 |
+| 6237d769 (the fixes) | answered while held | answered while held | r926, 2.88 s |
+
+## Unit 2, the fixes (6237d769, vendored hyper-raft change 0009)
+
+1. **Reads without a `Ready`.** `RawNode::light_now` asks the round for the reads that wait (`Raft::ask_reads`). It
+   gives the reads confirmed since the last `Ready` (`LightReady::read_states`). `Replica::take_light` queues them as
+   `take_ready` does, and they're released once applied, as before.
+2. **A heartbeat answer at once.** A member whose term and vote are durable answers a heartbeat beside the held
+   answers (`Raft::answer_beat_now`). Its position is `(Log::persisted, its term)`, the durable end of its log, not
+   `last_index`. Its commit is the durable commit. A leader takes a position of its term as an append's answer, for
+   the classic quorum and for the reads it confirms, so it never counts one past that member's durable log. Where
+   the persisted entry's term can't be read (a snapshot not yet durable), the answer names no position. The durable
+   term and vote moved from `RawNode` to `Raft` (`durable_vote`), so the answer is decided where it is made.
+   Answers made otherwise keep today's path and position.
+3. **The test for (2)** is an oracle in the lagged harness (`tests/support/lagged.rs`). Every heartbeat answer that
+   names a position of the current term must name an index the member's disk holds, whenever it leaves. The harness
+   also takes the reads a light ready gives. It runs under `pipeline.rs`'s random interleavings, including
+   `held_commits_across_fates_keep_every_invariant`, which also checks that every answered read saw what was
+   committed when it was asked. **Not run yet.**
+
+Checks at 6237d769: clippy `-p amphora --all-targets` clean, clippy `-p hyper-raft -p hyper-durable` (lib) clean
+(r926). `scripts/vendor.py check hyper-raft`: 8 recorded changes, 0 differences.
+
+A side effect to measure, a guess not seen: with positions at the durable end, a follower in the middle of a long
+flush answers heartbeats without news. A leader whose window to it is full then probes it after a beat
+(`Progress::heard_heartbeat`). That costs a resend, not correctness.
+
+## Commands
+
+    # on adacachy2: kiln run, on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false,
+    # cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits, CARGO_INCREMENTAL=0
+    cargo test -p amphora --lib --locked -- --exact database::replicated::tests::v3_two_replicated_writes_in_a_row_answer_with_every_log_flush_held   # r922, r926
+    cargo test -p amphora --lib --locked -- database::replicated:: --test-threads=8                                                                  # r926
+    cargo test --manifest-path vendor/hyper-raft/Cargo.toml -p hyper-raft --lib --test pipeline --test strategies -- --test-threads=8              # not run: refused for room
