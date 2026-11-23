@@ -54,10 +54,15 @@ docker run --rm -e JOBS="${JOBS:-1}" -e HU="$(id -u)" -e HG="$(id -g)" -v "$W":/
   mkdir -p "$OUT/include"
   ruby /w/libpg_query/scripts/extract_source.rb /w/postgres/ "$OUT/" > /w/extract.log 2>&1
   echo "extracted $(find "$OUT" -type f | wc -l) files into $OUT"
-  # An archive, so the link takes only what oracle.c reaches (not PL/pgSQL'"'"'s compiler).
-  CF="-O2 -I$OUT/include -I/w/libpg_query/src/include -fno-strict-aliasing -fwrapv -w"
+  # 19 builds its GUC tables from guc_parameters.dat into guc_tables.inc.c, included whole into
+  # guc_tables.c; the extraction keeps three of its variables and none of the options it names.
+  sed -i "/#include \"utils\/guc_tables.inc.c\"/d" "$OUT/src_backend_utils_misc_guc_tables.c"
+  # An archive and section GC, so the link takes only what oracle.c reaches: not PL/pgSQL'"'"'s
+  # compiler, nor namespace.c'"'"'s search-path cache (whose hash functions the extraction drops), nor
+  # bms_num_members'"'"'s popcount. -D_GNU_SOURCE as PostgreSQL builds on Linux (src/template/linux).
+  CF="-O2 -D_GNU_SOURCE -I$OUT/include -I/w/libpg_query/src/include -fno-strict-aliasing -fwrapv -ffunction-sections -fdata-sections -Wno-implicit-function-declaration -w"
   rm -rf /w/obj && mkdir -p /w/obj
   ls "$OUT"/*.c | xargs -P "$JOBS" -I{} sh -c "cc -c $CF {} -o /w/obj/\$(basename {} .c).o"
   rm -f /w/liboracle.a && ar rcs /w/liboracle.a /w/obj/*.o
-  cc $CF /w/oracle.c /w/liboracle.a -o /w/pg-oracle
+  cc $CF /w/oracle.c /w/liboracle.a -Wl,--gc-sections -o /w/pg-oracle
   echo "linked /w/pg-oracle"'

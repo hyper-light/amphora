@@ -20,7 +20,7 @@ fn t_pg_3_3_refuses_what_a_19_0_server_refuses_where_it_refuses_it() {
     let mut oracle = Oracle::spawn(&env("AMPHORA_PG_ORACLE")).unwrap();
     assert_eq!(
         oracle.parse(b"SELECT $1abc").unwrap(),
-        Verdict::Refused { sqlstate: "42601".into(), cursor: 8, message: "trailing junk after parameter".into() }
+        Verdict::Refused { sqlstate: "42601".into(), cursor: 8, message: "trailing junk after parameter at or near \"$1abc\"".into() }
     );
     match oracle.parse(b"NOTIFY ch, $1").unwrap() {
         Verdict::Refused { sqlstate, cursor, .. } => assert_eq!((sqlstate.as_str(), cursor), ("42601", 12)),
