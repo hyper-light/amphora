@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # libSQL's server (sqld), one primary and two replicas, each a process on this host (setup.sh's
-# release binary): HTTP (Hrana over HTTP, /v2/pipeline) on 127.0.0.1:54220-54222, the primary's
-# gRPC for its replicas on 54230, its admin API on 54223 (PORT+3: between the node ports and the
+# release binary): HTTP (Hrana over HTTP, /v2/pipeline) on 127.0.0.1:29220-29222, the primary's
+# gRPC for its replicas on 29230, its admin API on 29223 (PORT+3: between the node ports and the
 # gRPC ports, so it meets no other system's default range). Replicas forward writes to the
 # primary and follow it; there is no election, so node 0 is always the leader.
 #
@@ -29,7 +29,7 @@
 #   mode exists: one member's disk, not 2 of 3.
 set -euo pipefail
 SYS=libsql
-PORT=${AMPHORA_BENCH_REPL_PORT:-54220}
+PORT=${AMPHORA_BENCH_REPL_PORT:-29220}
 DURABILITY="acknowledged once the primary's SQLite WAL holds it, fsynced (durability_mode=strong, synchronous=FULL; sqld's default, relaxed, is synchronous=NORMAL and doesn't sync at commit); replicas pull it asynchronously and sqld has no mode that waits for one, so no quorum: one member's disk"
 # The comparability rule's column (lib.sh): a commit acknowledged by the primary alone; no mode waits for a replica (above).
 COLUMN="primary only"

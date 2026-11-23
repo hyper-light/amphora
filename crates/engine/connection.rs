@@ -746,7 +746,8 @@ pub struct Connection {
     pub(super) adaptive_handoffs: AtomicU64,
     /// Amphora (PL.13): the seek's, hash build's and hash probe's weights a test pins in place of
     /// the learned ones (`Connection::pin_cost_weights`, the simulator's); None: the learned ones.
-    pub(super) pinned_cost_weights: crate::sync::RwLock<Option<(f64, f64, f64)>>,
+    pub(super) pinned_cost_weights:
+        crate::sync::RwLock<Option<crate::translate::optimizer::learned_costs::LearnedWeights>>,
     /// Amphora: see [`Connection::set_automatic_indexes`].
     pub(super) automatic_indexes: AtomicBool,
     /// Amphora: see [`Connection::set_parallel_mode`].
@@ -1570,16 +1571,22 @@ impl Connection {
         self.adaptive_handoffs.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Amphora (PL.13, T-PL.13.1): plans newly prepared statements with these weights of a seek, a
-    /// hash table's build and its probe (in rows' visits) in place of the learned ones, so a test's
-    /// switch point does not move with the machine's timings. None: the learned ones again.
-    #[cfg(feature = "simulator")]
-    pub fn pin_cost_weights(&self, weights: Option<(f64, f64, f64)>) {
+    /// Amphora (PL.13, T-PL.13.1; lane T9, the versioned cost snapshot): plans newly prepared
+    /// statements with this whole set of weights in place of the learned ones, the page-miss ratio
+    /// included, so no cost input of a test's plans moves with the machine's timings, its cache or
+    /// the test's earlier runs. None: the learned ones again.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn pin_cost_weights(
+        &self,
+        weights: Option<crate::translate::optimizer::learned_costs::LearnedWeights>,
+    ) {
         *self.pinned_cost_weights.write() = weights;
         self.bump_prepare_context_generation();
     }
 
-    pub(crate) fn pinned_cost_weights(&self) -> Option<(f64, f64, f64)> {
+    pub(crate) fn pinned_cost_weights(
+        &self,
+    ) -> Option<crate::translate::optimizer::learned_costs::LearnedWeights> {
         *self.pinned_cost_weights.read()
     }
 
@@ -4386,13 +4393,13 @@ impl Connection {
     }
 
     fn database_has_existing_wal_state(db: &Database) -> bool {
-        let shared_wal = db.shared_wal.read();
+        let shared_wal = db.shared_wal.current().read();
         shared_wal.page_size() != 0 || shared_wal.last_checksum_and_max_frame().1 != 0
     }
 
     fn install_database_wal_on_pager(db: &Arc<Database>, pager: &mut Arc<Pager>) {
         let shared_wal = db.shared_wal.clone();
-        let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
+        let last_checksum_and_max_frame = shared_wal.current().read().last_checksum_and_max_frame();
         let wal = Arc::new(crate::storage::wal::WalFile::new(
             db.io.clone(),
             shared_wal,

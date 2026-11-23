@@ -148,6 +148,8 @@ pub use connection::{
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use translate::optimizer::learned_costs::WeightRule;
+#[cfg(feature = "simulator")]
+pub use translate::optimizer::learned_costs::LearnedWeights;
 pub use translate::optimizer::search_budget::JoinSearchStats;
 // Amphora (G6 step 3): learned plan hints, a prototype behind `HintSet::apply`.
 #[cfg(feature = "simulator")]
@@ -197,7 +199,7 @@ pub use storage::{
     packed::LogFormat,
     page_transform::{PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation},
     pager::{Access, Page, PagePath, PageRef, Pager},
-    wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
+    wal::{CheckpointMode, CheckpointResult, SharedLog, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use translate::optimizer::join::join_search_ns;

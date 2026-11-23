@@ -423,7 +423,7 @@ In replicated mode an answer waits twice:
 CP-T1.8 already names a faster class: a replicated-class commit, p99 at most 2 ms for 3 nodes on a LAN (AC-T1.8.3),
 beside the persisted quorum commit's 5 ms (AC-T1.8.2).
 
-**What hyper-raft already does.** The revision Amphora vendored when this was decided (4d72e19b; d5d5f8f since)
+**What hyper-raft already does.** The revision Amphora vendored when this was decided (4d72e19b; d5d5f8f, then 7d1c7be since)
 builds R-8, commits on entries held in memory across fates (raft.md §3.7):
 - A follower answers at once for entries its durable promises cover.
 - The leader counts itself by its disk alone.
@@ -548,7 +548,7 @@ goes, and its host reads the counts through `ReplicaHandle::counters`, a plain s
 - The flushing thread times its flushes on the real clock, not the owner's ("The owner's time"): it measures a
   disk's real I/O, and no decision of the owner reads it, so it is outside that rule.
 - Commits by quorum need hyper-raft's core to say which committed (`Raft::commit_stats`, upstream at hyper-raft
-  `d5d5f8f`, the revision Amphora vendors). Its commit takes the first of the classic quorum's index and the held
+  `d5d5f8f`; Amphora vendors `7d1c7be`, which holds it). Its commit takes the first of the classic quorum's index and the held
   quorum's, so what a commit moves through the classic index the classic quorum holds, and past it only the
   held quorum did. The fast track, which Amphora doesn't run, counts its own (`FastStats::committed`).
 - Labels: Amphora adds only `quorum`, two values. The host adds its own: kiln adds `db`, the record family's

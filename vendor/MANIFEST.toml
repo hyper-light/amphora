@@ -9,7 +9,7 @@ gate = ["bash scripts/gates.sh"]
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
-commit = "d5d5f8f66368bb8a08822518dd45d257e95e2dbf"
+commit = "7d1c7be3ca3f9e63eb03d54881e21fb2e60989f4"
 path = "vendor/hyper-raft"
 take = [
   "Cargo.toml",

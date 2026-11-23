@@ -227,3 +227,8 @@ required-features = ["simulator"]
 [[test]]
 name = "adaptive_joins"
 required-features = ["simulator"]
+
+# G11 reads numeric::format_float, public under `bench`.
+[[example]]
+name = "real_text"
+required-features = ["bench"]
