@@ -428,6 +428,10 @@ impl<T> Slots<T> {
         self.holding.as_ref().map(|holding| holding.until)
     }
 
+    #[cfg(test)]
+    pub(super) fn probe(&self) -> String {
+        format!("holder {:?} queue {:?} waiting {:?} read {:?} turn {} forwards {:?} ready {}", self.holding.as_ref().map(|h| (h.member, h.last)), self.queue, self.waiting.iter().map(|(m, _)| *m).collect::<Vec<_>>(), self.read.as_ref().map(|(m, _)| *m), self.turn, self.forwards.iter().map(|(m, _)| *m).collect::<Vec<_>>(), self.ready.len())
+    }
     /// Whether the holder's barrier is held: a test's view.
     #[cfg(test)]
     pub(super) fn holds_read(&self) -> bool {

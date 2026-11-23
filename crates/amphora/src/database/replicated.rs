@@ -4356,6 +4356,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                     // prepares on is passed before its write appends (CP-T1.8, lane V8).
                     self.slots.ask(from);
                     let read = self.slots.read(from, self.at, (message, reservation));
+                    #[cfg(test)]
+                    eprintln!("P13 L{} readindex from {from} step {} slots[{}]", self.replica.id(), read.step.is_some(), self.slots.probe());
                     self.slot_ended(read.ended);
                     let stepped = match read.step {
                         Some((message, _reservation)) => {
@@ -4549,6 +4551,8 @@ impl<F: BlockFile + 'static> Actor<F> {
     /// A write slot that ended, counted and told.
     fn slot_ended(&self, ended: Option<super::slot::Ended>) {
         if let Some(ended) = ended {
+            #[cfg(test)]
+            eprintln!("P13 L{} slot ended member {} how {:?}", self.replica.id(), ended.member, ended.how);
             self.control.meter.slot_ended(ended.how, ended.held);
             let held_seconds = ended.held.as_secs_f64();
             tracing::debug!(target: "amphora.replication", event = "replication.write_slot", member = ended.member, outcome = ended.how.outcome(), held_seconds, "a write slot ended");
@@ -4610,7 +4614,9 @@ impl<F: BlockFile + 'static> Actor<F> {
             .pending
             .as_ref()
             .is_some_and(|pending| matches!(pending.phase, Phase::Barrier(_)));
-        if let Some((_, length)) = self.slots.start(self.at, last, commit, own) {
+        if let Some((member, length)) = self.slots.start(self.at, last, commit, own) {
+            #[cfg(test)]
+            eprintln!("P13 L{} slot began member {member} length {length:?} last {last} commit {commit} own {own} slots[{}]", self.replica.id(), self.slots.probe());
             self.control.meter.slot_began(length);
         }
         Ok(())
@@ -5385,6 +5391,8 @@ impl<F: BlockFile + 'static> Actor<F> {
     }
     /// A follower's work in its slot ended: if it forwarded nothing, its second barrier.
     fn end_slot(&mut self) -> Result<(), Refusal> {
+        #[cfg(test)]
+        eprintln!("P13 M{} end_slot pending {} leader {} sends {}", self.replica.id(), self.pending.is_some(), self.replica.is_leader(), self.pending.is_none() && !self.replica.is_leader());
         if self.pending.is_none() && !self.replica.is_leader() {
             let context = self.context()?;
             self.replica.read(context).map_err(raft_error)?;
@@ -5602,6 +5610,8 @@ impl<F: BlockFile + 'static> Actor<F> {
             (ran, operation)
         }))?;
         self.replica.hold_apply(true);
+        #[cfg(test)]
+        eprintln!("P13 M{} hand_off leader {}", self.replica.id(), self.replica.is_leader());
         pending.phase = Phase::Running;
         self.pending = Some(pending);
         Ok(())
@@ -5615,6 +5625,8 @@ impl<F: BlockFile + 'static> Actor<F> {
         let Some((ran, operation)) = self.ran.take() else {
             return Ok(());
         };
+        #[cfg(test)]
+        eprintln!("P13 M{} decide ok {} entry {} pending {}", self.replica.id(), ran.is_ok(), ran.as_ref().is_ok_and(|(entry, _)| entry.is_some()), self.pending.is_some());
         let Some(mut pending) = self.pending.take() else {
             return Ok(());
         };
@@ -7123,7 +7135,7 @@ mod tests {
                         (phase, pending.term, pending.leader, pending.until > owner.at)
                     });
                     format!(
-                        "id {} term {} leader {} leads {} applied {} committed {} last {:?} in_flight {} driving {} pending {phase:?} tail {:?} slot_deferred {} slot_left {:?} slot_holds {} flush_out {} waiting {} floor_inflight {} changing {} transferring {}",
+                        "id {} term {} leader {} leads {} applied {} committed {} last {:?} in_flight {} driving {} pending {phase:?} tail {:?} slot_deferred {} slot_left {:?} slot_holds {} flush_out {} waiting {} floor_inflight {} changing {} transferring {} slots[{}]",
                         owner.replica.id(),
                         owner.replica.term(),
                         owner.replica.leader(),
@@ -7142,6 +7154,7 @@ mod tests {
                         owner.floor_inflight,
                         owner.changing.is_some(),
                         owner.transferring.is_some(),
+                        owner.slots.probe(),
                     )
                 })
                 .collect();
