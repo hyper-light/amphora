@@ -658,6 +658,34 @@ fn a_read_with_no_leader_to_ask_is_refused() {
     ));
 }
 
+/// A follower that knows its leader passes on its own reads and drops a peer's: passed on, the
+/// peer's read would reach the leader from this member under the peer's name.
+#[test]
+fn a_follower_passes_on_its_own_read_and_drops_a_peers() {
+    let mut node = follower();
+    node.step(answer(MessageType::MsgHeartbeat, 1, 2, 1)).unwrap();
+    drain(&mut node);
+    let mut relayed = answer(MessageType::MsgReadIndex, 3, 2, 0);
+    relayed.entries = vec![Entry {
+        data: b"peer".to_vec(),
+        ..Entry::default()
+    }];
+    node.step(relayed).unwrap();
+    assert!(drain(&mut node).is_empty());
+    node.read_index(b"own".to_vec()).unwrap();
+    let sent: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
+        .into_iter()
+        .map(|message| {
+            (
+                message.from,
+                message.to,
+                message.entries.first().map(|entry| entry.data.clone()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(sent, vec![(2, 1, b"own".to_vec())]);
+}
+
 /// A read, or a read's answer, without its one context contradicts what a read is, and is
 /// refused.
 #[test]
