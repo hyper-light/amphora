@@ -83,7 +83,20 @@ struct Admission {
 }
 impl Admission {
     fn reserve(bytes: &Arc<AtomicUsize>, operation: &Operation) -> Result<Self, Refusal> {
-        let charged = Self::bytes_for(operation);
+        Self::charge(bytes, Self::bytes_for(operation))
+    }
+
+    /// A call charged its command and `answer` bytes for its answer ([`AnswerCharge`]) in place
+    /// of the full `REQUEST_MAX`.
+    fn reserve_call(bytes: &Arc<AtomicUsize>, answer: usize) -> Result<Self, Refusal> {
+        Self::charge(bytes, Self::fixed().saturating_add(answer))
+    }
+
+    fn fixed() -> usize {
+        std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>())
+    }
+
+    fn charge(bytes: &Arc<AtomicUsize>, charged: usize) -> Result<Self, Refusal> {
         let request = u64::try_from(charged).unwrap_or(u64::MAX);
         let charge = crate::memory::process()
             .take(crate::memory::Use::Queues, request)
@@ -112,7 +125,7 @@ impl Admission {
     /// returns, which no API bound holds. Counts saturate: a sum past the address space is
     /// refused by the budget, never wrapped.
     fn bytes_for(operation: &Operation) -> usize {
-        let fixed = std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>());
+        let fixed = Self::fixed();
         let carried = match operation {
             Operation::Get(namespace, key, ..) => namespace
                 .len()
@@ -419,6 +432,190 @@ enum Operation {
 }
 
 type Call = Box<dyn FnOnce(&mut Db) -> anyhow::Result<Box<dyn Any + Send>> + Send>;
+
+/// How [`Database::call_charged`] charges its answer to the queues' memory budget (MB.1) at
+/// admission (Ada's A/B of the call charge, AUDIT 2026-11-23 §1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerCharge {
+    /// Today's charge of [`Database::call`]: the full `REQUEST_MAX`, its answer unchecked.
+    Flat,
+    /// The caller declares the most bytes its answer holds: charged that at admission, and an
+    /// answer past it is refused.
+    Declared(usize),
+    /// Charged its command alone at admission, then the answer's own bytes once the closure
+    /// has run, before it commits.
+    Measured,
+}
+
+/// The bytes an answer holds in memory, inline and on the heap, for its charge to the memory
+/// budget ([`Database::call_charged`]).
+pub trait AnswerBytes {
+    fn answer_bytes(&self) -> usize;
+}
+
+macro_rules! inline_answer {
+    ($($t:ty),*) => {$(
+        impl AnswerBytes for $t {
+            fn answer_bytes(&self) -> usize {
+                std::mem::size_of::<Self>()
+            }
+        }
+    )*};
+}
+inline_answer!((), bool, i32, i64, u32, u64, usize, f64);
+
+impl AnswerBytes for String {
+    fn answer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.capacity())
+    }
+}
+
+impl<T: AnswerBytes> AnswerBytes for Vec<T> {
+    fn answer_bytes(&self) -> usize {
+        let spare = self
+            .capacity()
+            .saturating_sub(self.len())
+            .saturating_mul(std::mem::size_of::<T>());
+        self.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(spare),
+            |n, item| n.saturating_add(item.answer_bytes()),
+        )
+    }
+}
+
+impl<T: AnswerBytes> AnswerBytes for Option<T> {
+    fn answer_bytes(&self) -> usize {
+        let outer = std::mem::size_of::<Self>().saturating_sub(std::mem::size_of::<T>());
+        outer.saturating_add(self.as_ref().map_or(std::mem::size_of::<T>(), T::answer_bytes))
+    }
+}
+
+impl<A: AnswerBytes, B: AnswerBytes> AnswerBytes for (A, B) {
+    fn answer_bytes(&self) -> usize {
+        let padding = std::mem::size_of::<Self>()
+            .saturating_sub(std::mem::size_of::<A>())
+            .saturating_sub(std::mem::size_of::<B>());
+        padding
+            .saturating_add(self.0.answer_bytes())
+            .saturating_add(self.1.answer_bytes())
+    }
+}
+
+/// The bytes a charged call's answer is charged at admission, `None` for the flat `REQUEST_MAX`.
+fn admitted_answer(charge: AnswerCharge) -> Option<usize> {
+    match charge {
+        AnswerCharge::Flat => None,
+        AnswerCharge::Declared(max) => Some(max),
+        AnswerCharge::Measured => Some(0),
+    }
+}
+
+/// A charged call on the writer: `f`, then its answer checked by `charge` inside the call's
+/// transaction, before it commits, so an answer past its bound rolls the call back. A measured
+/// answer's charge comes back with it.
+fn charged_body<R, F>(
+    charge: AnswerCharge,
+    f: F,
+) -> impl FnOnce(&mut Db) -> anyhow::Result<(R, Option<crate::memory::Charge>)> + Send + 'static
+where
+    R: AnswerBytes + Send + 'static,
+    F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+{
+    move |db| {
+        let mut connection = crate::sql::Connection::new(db);
+        let value = f(&mut connection)?;
+        let held = match charge {
+            AnswerCharge::Flat => None,
+            AnswerCharge::Declared(max) => {
+                api::bound("call answer bytes", value.answer_bytes(), max)?;
+                None
+            }
+            AnswerCharge::Measured => Some(
+                crate::memory::process()
+                    .take(
+                        crate::memory::Use::Queues,
+                        u64::try_from(value.answer_bytes()).unwrap_or(u64::MAX),
+                    )
+                    .map_err(|refusal| match refusal {
+                        Refusal::TooLarge { limit, .. } => Refusal::Full { limit },
+                        other => other,
+                    })?,
+            ),
+        };
+        connection.finish()?;
+        Ok((value, held))
+    }
+}
+
+/// A call queued by [`Database::call_nowait`]: a future of its answer, woken once, when the
+/// call has committed or with why it won't. A measured answer's charge is held until it is
+/// taken, or the `Calling` dropped.
+#[must_use = "a call's answer comes only through its Calling"]
+pub struct Calling<R> {
+    slot: Arc<Mutex<Slot<R>>>,
+}
+
+enum Slot<R> {
+    Waiting(Option<std::task::Waker>),
+    Answered(Result<(R, Option<crate::memory::Charge>), Refusal>),
+    Taken,
+}
+
+impl<R> std::future::Future for Calling<R> {
+    type Output = Result<R, Refusal>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut slot = match locked(&self.slot) {
+            Ok(slot) => slot,
+            Err(error) => return std::task::Poll::Ready(Err(error)),
+        };
+        match std::mem::replace(&mut *slot, Slot::Taken) {
+            Slot::Waiting(waker) => {
+                let waker = match waker {
+                    Some(waker) if waker.will_wake(cx.waker()) => waker,
+                    _ => cx.waker().clone(),
+                };
+                *slot = Slot::Waiting(Some(waker));
+                std::task::Poll::Pending
+            }
+            Slot::Answered(answer) => std::task::Poll::Ready(answer.map(|(value, _held)| value)),
+            Slot::Taken => {
+                std::task::Poll::Ready(Err(unavailable("this call's answer was already taken")))
+            }
+        }
+    }
+}
+
+/// The writer's side of a [`Calling`]: answers it once, `UnknownOutcome` if the store drops it
+/// unanswered, so no caller waits on a call nobody will answer.
+struct Answerer<R>(Option<Arc<Mutex<Slot<R>>>>);
+
+impl<R> Answerer<R> {
+    fn answer(&mut self, answer: Result<(R, Option<crate::memory::Charge>), Refusal>) {
+        let Some(slot) = self.0.take() else {
+            return;
+        };
+        let waker = match locked(&slot) {
+            Ok(mut slot) => match std::mem::replace(&mut *slot, Slot::Answered(answer)) {
+                Slot::Waiting(waker) => waker,
+                Slot::Answered(_) | Slot::Taken => None,
+            },
+            Err(_) => None,
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl<R> Drop for Answerer<R> {
+    fn drop(&mut self) {
+        self.answer(Err(Refusal::UnknownOutcome));
+    }
+}
 
 enum Answer {
     Done,
@@ -1795,7 +1992,12 @@ impl Database {
             }),
         };
         // Bootstrap DDL used the same WAL; the barrier makes it durable before open succeeds.
-        database.submit_selected("", Operation::Mutation(Mutation::Sql(Vec::new())), until)?;
+        database.submit_selected(
+            "",
+            Operation::Mutation(Mutation::Sql(Vec::new())),
+            None,
+            until,
+        )?;
         Ok(database)
     }
 
@@ -1862,12 +2064,76 @@ impl Database {
                 .map(|value| (value, None))
                 .map_err(Refusal::from);
         }
-        database.call_db_session(until, move |db| {
+        database.call_db_session(until, None, move |db| {
             let mut connection = crate::sql::Connection::new(db);
             let value = f(&mut connection)?;
             connection.finish()?;
             Ok(value)
         })
+    }
+
+    /// [`Database::call`] charged at admission by [`AnswerCharge`] in place of the full
+    /// `REQUEST_MAX` (AUDIT 2026-11-23 §1, MB.1; Ada's A/B of the call charge). Its answer's
+    /// bytes ([`AnswerBytes`]) are checked inside the call's transaction, before it commits: an
+    /// answer past its declared bound, or past the budget's room when measured, rolls the call
+    /// back and is refused. A measured answer's charge is held until the caller has it. An
+    /// attached client runs it as [`Database::call`].
+    pub fn call_charged<R, F>(&self, until: Instant, charge: AnswerCharge, f: F) -> Result<R, Refusal>
+    where
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        let database = self.resolve(until)?;
+        if let Some(client) = database.remote_client() {
+            return client.call(until, f).map_err(Refusal::from);
+        }
+        database
+            .call_db_session(until, admitted_answer(charge), charged_body(charge, f))
+            .map(|((value, _held), _)| value)
+    }
+
+    /// [`Database::call_charged`] without blocking its caller (lane perf-A7): admitted and queued
+    /// at once, its answer handed to the returned [`Calling`], a future woken once the call has
+    /// committed or with why it won't, so a pool of a few threads holds any number of calls in
+    /// flight. Admission refuses here, typed: past the budget's room, or at a writer queue already
+    /// full (`Full`, where `call` would wait for room). Only a local owner queues a call with no
+    /// thread waiting on it: an attached client or a replicated database is refused here
+    /// ([`Database::call_charged`] answers there). A dropped [`Calling`] leaves the call to run
+    /// and commit; its charge goes back with its answer.
+    pub fn call_nowait<R, F>(
+        &self,
+        until: Instant,
+        charge: AnswerCharge,
+        f: F,
+    ) -> Result<Calling<R>, Refusal>
+    where
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        if Instant::now() >= until {
+            return Err(Refusal::Timeout);
+        }
+        let body = charged_body(charge, f);
+        let call: Call = Box::new(move |db| body(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
+        let slot = Arc::new(Mutex::new(Slot::Waiting(None)));
+        let mut answerer = Answerer(Some(Arc::clone(&slot)));
+        self.submit_local(
+            "",
+            Operation::Call(Mutex::new(Some(call))),
+            admitted_answer(charge),
+            until,
+            Instant::now(),
+            move |result: Result<Answer, Refusal>| {
+                answerer.answer(result.and_then(|answer| match answer {
+                    Answer::Called(v) => v
+                        .downcast::<(R, Option<crate::memory::Charge>)>()
+                        .map(|v| *v)
+                        .map_err(|_| unavailable("wrong SQL session answer")),
+                    _ => Err(unavailable("wrong SQL session answer")),
+                }));
+            },
+        )?;
+        Ok(Calling { slot })
     }
 
     /// [`Database::call`] on the owner's own session, its SQL free to name Amphora's own tables
@@ -1893,16 +2159,27 @@ impl Database {
         R: Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
-        self.call_db_session(until, f).map(|(value, _)| value)
+        self.call_db_session(until, None, f).map(|(value, _)| value)
     }
 
-    fn call_db_session<R, F>(&self, until: Instant, f: F) -> Result<(R, Option<Token>), Refusal>
+    /// `answer`: the bytes the call's answer is charged at admission ([`AnswerCharge`]), `None`
+    /// for the full `REQUEST_MAX`.
+    fn call_db_session<R, F>(
+        &self,
+        until: Instant,
+        answer: Option<usize>,
+        f: F,
+    ) -> Result<(R, Option<Token>), Refusal>
     where
         R: Send + 'static,
         F: FnOnce(&mut Db) -> anyhow::Result<R> + Send + 'static,
     {
         let call: Call = Box::new(move |db| f(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
-        match self.submit_session("", Operation::Call(Mutex::new(Some(call))), until)? {
+        let operation = Operation::Call(Mutex::new(Some(call)));
+        match self
+            .resolve(until)?
+            .submit_selected("", operation, answer, until)?
+        {
             (Answer::Called(v), token) => v
                 .downcast::<R>()
                 .map(|v| (*v, token))
@@ -2460,13 +2737,16 @@ impl Database {
         until: Instant,
     ) -> Result<(Answer, Option<Token>), Refusal> {
         self.resolve(until)?
-            .submit_selected(namespace, operation, until)
+            .submit_selected(namespace, operation, None, until)
     }
 
+    /// `call_answer`: the bytes a call's answer is charged at admission, `None` for the
+    /// operation's own bound ([`Admission::bytes_for`]).
     fn submit_selected(
         &self,
         namespace: &str,
         operation: Operation,
+        call_answer: Option<usize>,
         until: Instant,
     ) -> Result<(Answer, Option<Token>), Refusal> {
         if Instant::now() >= until {
@@ -2476,7 +2756,7 @@ impl Database {
             self.namespace(namespace)?.compact(*before, until)?;
             return Ok((Answer::Done, None));
         }
-        let store = match &self.shared.writer {
+        match &self.shared.writer {
             Writer::Replicated { client, .. } => {
                 return client
                     .submit(
@@ -2487,7 +2767,7 @@ impl Database {
                     )
                     .map(|answered| (answered.answer, answered.token));
             }
-            Writer::Local(store) => store,
+            Writer::Local(_) => {}
             Writer::Client(backend) => {
                 return remote::submit(
                     &backend.client.for_application(self.application.clone()),
@@ -2497,10 +2777,45 @@ impl Database {
                 )
                 .map(|answer| (answer, None));
             }
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.submit_local(namespace, operation, call_answer, until, until, move |result| {
+            // A caller whose deadline elapsed no longer waits, but the committed result stands.
+            let _ = tx.send(result);
+        })?;
+        rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
+                    Refusal::UnknownOutcome
+                }
+            })?
+            .map(|answer| (answer, None))
+    }
+
+    /// Admits `operation` to the local writer's queue, waiting for room in it until `room_until`,
+    /// and hands `reply` its answer once durable, or why it won't be, on the store's notifier
+    /// thread. Refused here, `reply` is dropped untold: the refusal is the answer.
+    fn submit_local(
+        &self,
+        namespace: &str,
+        operation: Operation,
+        call_answer: Option<usize>,
+        until: Instant,
+        room_until: Instant,
+        reply: impl FnOnce(Result<Answer, Refusal>) + Send + 'static,
+    ) -> Result<(), Refusal> {
+        let Writer::Local(store) = &self.shared.writer else {
+            return Err(api::invalid(
+                "call_nowait",
+                "only a local owner queues a call without blocking; call_charged answers here",
+            ));
         };
-        let admission = Admission::reserve(&self.shared.admitted, &operation)?;
+        let admission = match call_answer {
+            Some(answer) => Admission::reserve_call(&self.shared.admitted, answer)?,
+            None => Admission::reserve(&self.shared.admitted, &operation)?,
+        };
         // In flight from here to its answer, as a backed-up writer's checks yield to it.
-        let _in_flight = self
+        let in_flight = self
             .shared
             .foreground
             .get()
@@ -2513,7 +2828,12 @@ impl Database {
             &self.application,
             until,
         )? {
-            ReadRoute::Answered(answer) => return answer.map(|answer| (answer, None)),
+            ReadRoute::Answered(answer) => {
+                drop(admission);
+                drop(in_flight);
+                reply(answer);
+                return Ok(());
+            }
             ReadRoute::Writer(operation) => operation,
         };
         let wake = matches!(&operation, Operation::Mutation(Mutation::Records { tx, .. }) if !tx.writes.is_empty())
@@ -2543,7 +2863,6 @@ impl Database {
         };
         let answer: Reply = Arc::new(Mutex::new(None));
         let publication = Arc::new(Mutex::new(None));
-        let (tx, rx) = mpsc::sync_channel(1);
         let changed = Arc::clone(&self.shared.changed);
         store
             .put_then(
@@ -2555,9 +2874,8 @@ impl Database {
                     publication: Arc::clone(&publication),
                     until,
                 }],
-                until,
+                room_until,
                 move |done| {
-                    let _admission = admission;
                     let mut result = match done {
                         Ok(()) => locked(&answer)
                             .and_then(|mut r| {
@@ -2651,18 +2969,15 @@ impl Database {
                             Err(error) => result = Err(error),
                         }
                     }
-                    // A caller whose deadline elapsed no longer waits, but the committed result stands.
-                    let _ = tx.send(result);
+                    // Its charge and its count in flight end before its answer is handed over,
+                    // so a caller holding the answer holds no charge but its answer's.
+                    drop(admission);
+                    drop(in_flight);
+                    reply(result);
                 },
             )
-            .map_err(admission_refusal)?;
-        rx.recv_timeout(until.saturating_duration_since(Instant::now()))
-            .map_err(|e| match e {
-                mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected => {
-                    Refusal::UnknownOutcome
-                }
-            })?
-            .map(|answer| (answer, None))
+            .map(|_| ())
+            .map_err(admission_refusal)
     }
 }
 

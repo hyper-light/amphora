@@ -264,6 +264,9 @@ version = "0.1.0"
 [[package]]
 name = "amphora-pg-parser"
 version = "0.1.0"
+dependencies = [
+ "amphora-pg-oracle",
+]
 
 [[package]]
 name = "android_system_properties"

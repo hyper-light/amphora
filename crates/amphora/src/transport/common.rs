@@ -166,6 +166,15 @@ fn stepped_answer(
         Answer::Stepped { reply, latest }
     }
 }
+/// `response` as a peer that agreed on `version` decodes it: [`Refusal::Serialization`] only from
+/// [`VERSION_SERIALIZATION`], before it the `Invalid` it was (local-owner-transport.md, "Version 10").
+fn spoken(version: u32, response: Response) -> Response {
+    if version >= VERSION_SERIALIZATION {
+        response
+    } else {
+        response.map_err(Refusal::without_serialization)
+    }
+}
 /// The version both ends use (local-owner-transport.md, "Negotiated versions"): the newest both
 /// speak, a peer speaking `oldest` to `newest` and this side [`VERSION_MIN`] to [`VERSION`]. None
 /// in common is refused, `Invalid`, naming both ranges.
@@ -1087,6 +1096,7 @@ fn compact_step_on(
 fn session(
     connection: &mut crate::sql::Connection<'_>,
     stream: &mut Stream,
+    version: u32,
     until: Instant,
 ) -> anyhow::Result<()> {
     write(stream, &Ok::<_, Refusal>(Answer::Ready), until)?;
@@ -1130,7 +1140,7 @@ fn session(
                 })
             }
         };
-        let response = sql_response(response);
+        let response = spoken(version, sql_response(response));
         write(stream, &response, until)?;
         // SQL errors can be handled by application savepoints; transport failures abort.
     }
@@ -1361,7 +1371,7 @@ fn serve(
         let local = matches!(request, Request::LocalSession);
         let mut final_stream = stream.try_clone().map_err(unavailable)?;
         let run = move |connection: &mut crate::sql::Connection<'_>| {
-            session(connection, &mut stream, until)
+            session(connection, &mut stream, version, until)
         };
         // A local read runs read-only on this owner's own state, asking no leader (replication.md,
         // "A local read on a replica"); a session otherwise is a call on its writer.
@@ -1371,7 +1381,7 @@ fn serve(
             database.call(until, run)
         }
         .map(|()| Answer::Done);
-        return write(&mut final_stream, &result, until);
+        return write(&mut final_stream, &spoken(version, result), until);
     }
     let watch_batch = matches!(&request, Request::WatchBatch(_));
     let result = match request {
@@ -1431,6 +1441,7 @@ fn serve(
         | Request::Pull(_)
         | Request::Blob(_) => Err(unavailable("unexpected session")),
     };
+    let result = spoken(version, result);
     if watch_batch {
         let encoded = match encode(&result, WATCH_REPLY_MAX) {
             Ok(encoded) => encoded,
@@ -2241,6 +2252,34 @@ mod tests {
 
     /// The rolling upgrade's greeting (local-owner-transport.md, "Negotiated versions"): the
     /// version both ends use is the newest both speak, and none in common is refused.
+    /// T-T1.8.W1, the wire's half of the stale-base refusal's type (local-owner-transport.md,
+    /// "Version 10"). Do: answer a Serialization refusal and a malformed request's Invalid at
+    /// version 9 and at 10. Expect: at 10 each as it is; at 9 the Serialization as the Invalid it
+    /// was, its text unchanged, and the Invalid as it is.
+    #[test]
+    fn a_peer_before_version_10_is_sent_serialization_as_invalid() {
+        let stale = || Refusal::Serialization {
+            what: "prepared transaction".into(),
+            why: "the database advanced since preparation".into(),
+        };
+        let malformed = || api::invalid("transaction", "no writes");
+        assert_eq!(spoken(VERSION_SERIALIZATION, Err(stale())).err(), Some(stale()));
+        assert_eq!(spoken(VERSION_SERIALIZATION, Err(malformed())).err(), Some(malformed()));
+        let old = spoken(VERSION_SERIALIZATION - 1, Err(stale())).err().unwrap();
+        assert_eq!(
+            old,
+            Refusal::Invalid {
+                what: "prepared transaction".into(),
+                why: "the database advanced since preparation".into(),
+            }
+        );
+        assert_eq!(old.to_string(), stale().to_string());
+        assert_eq!(spoken(VERSION_SERIALIZATION - 1, Err(malformed())).err(), Some(malformed()));
+        // A version-9 peer decodes what it is sent.
+        let bytes = postcard::to_allocvec(&spoken(VERSION_MIN, Err(stale()))).unwrap();
+        assert!(matches!(postcard::from_bytes::<Response>(&bytes), Ok(Err(Refusal::Invalid { .. }))));
+    }
+
     #[test]
     fn negotiated_versions_take_the_newest_both_speak() {
         assert_eq!(agree(VERSION_MIN, VERSION_MIN).unwrap(), VERSION_MIN);
