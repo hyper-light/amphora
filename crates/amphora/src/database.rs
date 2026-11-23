@@ -103,11 +103,11 @@ impl Admission {
     /// MB.1): its command and answer, the bytes it carries, and the most its answer can carry by
     /// the API's own bounds. A Records get answers one row (a key of at most `KEY_MAX`, a value of
     /// at most `VALUE_MAX`); a Records write, a head, a compaction's step and a holding answer a
-    /// revision or a fixed-size progress. A scan answers its limit's rows and reads one past them
-    /// to know whether more follow, each row a key and value at most `KEY_MAX` and `VALUE_MAX`;
-    /// an SQL batch carries its statements and parameters and answers a result per statement,
-    /// their rows' bytes at most `RESULT_MAX` (Ada, AUDIT §1: their real worst case, lane
-    /// perf-A5). The rest keep the full request bound, `REQUEST_MAX`: a migration, an import's
+    /// revision or a fixed-size progress. A scan's page and a page of the changes feed hold at
+    /// most their limit's rows and `RESULT_MAX` bytes of keys and values ([`fits`], lane
+    /// perf-A6); an SQL batch carries its statements and parameters and answers a result per
+    /// statement, their rows' bytes at most `RESULT_MAX` (Ada, AUDIT §1: their real worst case,
+    /// lane perf-A5). The rest keep the full request bound, `REQUEST_MAX`: a migration, an import's
     /// page and its publication up to `REQUEST_MAX`, and a call's answer is whatever its closure
     /// returns, which no API bound holds. Counts saturate: a sum past the address space is
     /// refused by the budget, never wrapped.
@@ -150,15 +150,13 @@ impl Admission {
             ) => namespace.len().saturating_mul(2),
             Operation::Mutation(Mutation::Holding(holding)) => holding.len(),
             Operation::Head => 0,
-            Operation::Scan(family, scan, _) => {
-                let row = std::mem::size_of::<Row>()
-                    .saturating_add(api::KEY_MAX)
-                    .saturating_add(api::VALUE_MAX);
-                family
-                    .len()
-                    .saturating_add(scan.prefix.len())
-                    .saturating_add(scan.after.as_ref().map_or(0, Vec::len))
-                    .saturating_add(scan.limit.saturating_add(1).saturating_mul(row))
+            Operation::Scan(family, scan, _) => family
+                .len()
+                .saturating_add(scan.prefix.len())
+                .saturating_add(scan.after.as_ref().map_or(0, Vec::len))
+                .saturating_add(page_bytes::<Row>(scan.limit)),
+            Operation::Changes(family, _, limit) => {
+                family.len().saturating_add(page_bytes::<Change>(*limit))
             }
             Operation::Mutation(Mutation::Sql(statements)) => {
                 let request = statements.iter().fold(0usize, |n, statement| {
@@ -179,7 +177,6 @@ impl Admission {
                     .saturating_add(api::RESULT_MAX)
             }
             Operation::Mutation(Mutation::Migrate(_))
-            | Operation::Changes(..)
             | Operation::Call(_)
             | Operation::Import(_)
             | Operation::ImportProgress => api::REQUEST_MAX,
@@ -187,6 +184,34 @@ impl Admission {
         fixed.saturating_add(carried)
     }
 }
+
+/// Whether a page of `rows` rows carrying `bytes` bytes of keys and values takes one more row
+/// carrying `payload`. A scan's page and a page of the changes feed end at their limit's rows or
+/// at `RESULT_MAX` bytes, whichever comes first, and say that more follow, so the answer and what
+/// admission charges for it are bounded whatever the limit (Ada, AUDIT 2026-11-23 §1: the real
+/// worst case; lane perf-A6). A page's first row always fits, so a continued read advances: a
+/// key and value the API admits are far under `RESULT_MAX`.
+fn fits(rows: usize, bytes: usize, payload: usize, limit: usize) -> bool {
+    rows < limit && (rows == 0 || bytes.saturating_add(payload) <= api::RESULT_MAX)
+}
+
+/// The most a page of up to `limit` rows of `T` holds by [`fits`]: each row's envelope, and keys
+/// and values of at most `KEY_MAX` and `VALUE_MAX` a row up to `RESULT_MAX` in all.
+fn page_bytes<T>(limit: usize) -> usize {
+    let payload = limit
+        .saturating_mul(api::KEY_MAX.saturating_add(api::VALUE_MAX))
+        .min(api::RESULT_MAX);
+    limit
+        .saturating_mul(std::mem::size_of::<T>())
+        .saturating_add(payload)
+}
+
+/// The bytes of column `n`'s blob, read in place (0 for a null), so a row past a page is weighed
+/// without being copied.
+fn blob_len(r: &amphora_engine::Row, n: usize) -> usize {
+    r.get_value(n).to_blob().map_or(0, <[u8]>::len)
+}
+
 /// The memory budget's room for queues now, what a full writer queue was refused at.
 fn queue_room() -> usize {
     crate::memory::process()
@@ -3185,8 +3210,14 @@ fn apply(
             if let Some(upper) = &upper {
                 params.push(blob(upper)?);
             }
-            let mut rows = Vec::new();
+            let (mut rows, mut carried, mut more) = (Vec::new(), 0usize, false);
             db.query(query, params, |r| {
+                let payload = blob_len(r, 0).saturating_add(blob_len(r, 2));
+                if !fits(rows.len(), carried, payload, scan.limit) {
+                    more = true;
+                    return Ok(false);
+                }
+                carried = carried.saturating_add(payload);
                 rows.push(Row {
                     key: bytes(r, 0)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
                     rev: rev(r, 1)?,
@@ -3194,8 +3225,6 @@ fn apply(
                 });
                 Ok(true)
             })?;
-            let more = rows.len() > scan.limit;
-            rows.truncate(scan.limit);
             // A scan of the latest rows waiting on a held lock (T-T1.10.W10) looks for one in
             // the range its page covers: to its last row when it stopped short, else the whole.
             if *locks != LockedReads::Committed && at == head {
@@ -3231,21 +3260,26 @@ fn apply(
                     head,
                 })));
             }
-            let mut changes = Vec::new();
-            db.query("SELECT rev, key, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND rev > ?3 ORDER BY rev, seq LIMIT ?4", [text(namespace), text(f), integer(*after)?, integer(u64::try_from(*limit)?.checked_add(1).ok_or_else(|| anyhow::anyhow!("limit overflow"))?)?], |r| { changes.push(Change { rev: rev(r, 0)?, key: bytes(r, 1)?.ok_or_else(|| anyhow::anyhow!("null key"))?, value: bytes(r, 2)? }); Ok(true) })?;
-            if changes.len() > *limit {
-                // The cursor is a revision, so a page must never cut a transaction's revision.
-                // Otherwise advancing to its last change would silently skip the remaining keys.
-                let next = changes.get(*limit).map(|c| c.rev);
-                changes.truncate(*limit);
-                if changes.last().map(|c| c.rev) == next {
-                    changes.retain(|c| Some(c.rev) != next);
-                    if changes.is_empty() {
-                        return Ok(Err(api::invalid(
-                            "change limit",
-                            "a transaction does not fit; request up to TX_MAX changes",
-                        )));
-                    }
+            let (mut changes, mut carried, mut next) = (Vec::new(), 0usize, None);
+            db.query("SELECT rev, key, value FROM __amphora_versions WHERE namespace = ?1 AND family = ?2 AND rev > ?3 ORDER BY rev, seq LIMIT ?4", [text(namespace), text(f), integer(*after)?, integer(u64::try_from(*limit)?.checked_add(1).ok_or_else(|| anyhow::anyhow!("limit overflow"))?)?], |r| {
+                let payload = blob_len(r, 1).saturating_add(blob_len(r, 2));
+                if !fits(changes.len(), carried, payload, *limit) {
+                    next = Some(rev(r, 0)?);
+                    return Ok(false);
+                }
+                carried = carried.saturating_add(payload);
+                changes.push(Change { rev: rev(r, 0)?, key: bytes(r, 1)?.ok_or_else(|| anyhow::anyhow!("null key"))?, value: bytes(r, 2)? });
+                Ok(true)
+            })?;
+            // The cursor is a revision, so a page must never cut a transaction's revision.
+            // Otherwise advancing to its last change would silently skip the remaining keys.
+            if next.is_some() && changes.last().map(|c| c.rev) == next {
+                changes.retain(|c| Some(c.rev) != next);
+                if changes.is_empty() {
+                    return Ok(Err(api::invalid(
+                        "change limit",
+                        "a transaction does not fit; request up to TX_MAX changes",
+                    )));
                 }
             }
             Ok(Ok(Answer::Changes(Changes { changes, head })))
@@ -3636,8 +3670,9 @@ mod admission_charge {
     /// a call, SQL batches and scans. Expect: a get charged its one row's bound (a largest key
     /// and value) and no more; a write charged what it carries, its value counted byte for byte;
     /// a head its command alone; a call, whose answer no API bound holds, the full `REQUEST_MAX`;
-    /// a scan its limit's rows and one more at their largest; an SQL batch what it carries and a
-    /// result per statement on top of `RESULT_MAX` (AUDIT 2026-11-23 §1, MB.1; lane perf-A5).
+    /// a scan and a page of changes their limit's rows' envelopes and keys and values at their
+    /// largest up to `RESULT_MAX` (lane perf-A6); an SQL batch what it carries and a result per
+    /// statement on top of `RESULT_MAX` (AUDIT 2026-11-23 §1, MB.1; lane perf-A5).
     #[test]
     fn mb1_a_request_is_charged_what_it_and_its_answer_can_hold() {
         let fixed = std::mem::size_of::<Command>() + std::mem::size_of::<Answer>();
@@ -3659,7 +3694,7 @@ mod admission_charge {
             Admission::bytes_for(&Operation::Call(Mutex::new(Some(call)))),
             fixed + api::REQUEST_MAX
         );
-        let row = std::mem::size_of::<Row>() + api::KEY_MAX + api::VALUE_MAX;
+        let row = std::mem::size_of::<Row>();
         let scan = |limit| {
             Admission::bytes_for(&Operation::Scan(
                 "ns".into(),
@@ -3672,13 +3707,26 @@ mod admission_charge {
                 LockedReads::Committed,
             ))
         };
-        assert_eq!(scan(1), fixed + 3 + 2 * row, "a one-row page and the row past it");
+        assert_eq!(
+            scan(1),
+            fixed + 3 + row + api::KEY_MAX + api::VALUE_MAX,
+            "a one-row page at its largest"
+        );
         assert_eq!(
             scan(api::SCAN_MAX),
-            fixed + 3 + (api::SCAN_MAX + 1) * row,
-            "the largest page: ~1 GiB, past the flat 32 MiB it was charged"
+            fixed + 3 + api::SCAN_MAX * row + api::RESULT_MAX,
+            "the largest page: its rows' envelopes and RESULT_MAX, not 1000 largest rows (~1 GiB)"
         );
-        assert!(scan(api::SCAN_MAX) > api::REQUEST_MAX);
+        let changes = |limit| Admission::bytes_for(&Operation::Changes("ns".into(), 0, limit));
+        let change = std::mem::size_of::<Change>();
+        assert_eq!(
+            changes(1),
+            fixed + 2 + change + api::KEY_MAX + api::VALUE_MAX
+        );
+        assert_eq!(
+            changes(api::SCAN_MAX),
+            fixed + 2 + api::SCAN_MAX * change + api::RESULT_MAX
+        );
         let empty = Admission::bytes_for(&Operation::Mutation(Mutation::Sql(Vec::new())));
         assert_eq!(empty, fixed + api::RESULT_MAX);
         let one = Admission::bytes_for(&Operation::Mutation(Mutation::Sql(vec![Statement {
@@ -3694,6 +3742,89 @@ mod admission_charge {
                 + std::mem::size_of::<SqlResult>(),
             "a statement's text and parameters byte for byte, and its result's envelope"
         );
+    }
+
+    /// Do: write 40 rows of `VALUE_MAX` values (40 MiB, five transactions of eight), then scan
+    /// them and read their changes at the largest limit, continuing from each page. Expect: the
+    /// first page of each ends before its limit, at `RESULT_MAX` bytes of keys and values, and
+    /// says more follow; no page carries more than that or cuts a transaction's revision; every
+    /// row is reached once, in order, by continuing, so the charge's `RESULT_MAX` bounds every
+    /// page (AUDIT 2026-11-23 §1; lane perf-A6).
+    #[test]
+    fn a6_a_page_ends_at_result_max_and_continuing_reaches_every_row() {
+        let until = || Instant::now() + Duration::from_secs(120);
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::open(&dir.path().join("records.db"), until()).unwrap();
+        let records = database.namespace("ns").unwrap();
+        let keys: Vec<Vec<u8>> = (0..40u8).map(|i| vec![b'k', i]).collect();
+        for tx in keys.chunks(8) {
+            let writes = tx
+                .iter()
+                .map(|key| Write::Put {
+                    family: "f".into(),
+                    key: key.clone(),
+                    value: vec![7; api::VALUE_MAX],
+                })
+                .collect();
+            records
+                .commit(
+                    Tx {
+                        conds: Vec::new(),
+                        writes,
+                    },
+                    until(),
+                )
+                .unwrap();
+        }
+        let (mut cursor, mut scanned, mut pages) = (None, Vec::new(), 0);
+        loop {
+            let page = records
+                .scan(
+                    "f",
+                    Scan {
+                        prefix: Vec::new(),
+                        after: cursor.clone(),
+                        limit: api::SCAN_MAX,
+                        at: Consistency::Linearizable,
+                    },
+                    until(),
+                )
+                .unwrap();
+            let carried: usize = page.rows.iter().map(|r| r.key.len() + r.value.len()).sum();
+            assert!(carried <= api::RESULT_MAX, "{carried}");
+            assert!(!page.rows.is_empty());
+            pages += 1;
+            cursor = page.rows.last().map(|r| r.key.clone());
+            scanned.extend(page.rows.into_iter().map(|r| r.key));
+            assert_eq!(page.more, scanned.len() < keys.len(), "exact continuation");
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(scanned, keys);
+        assert!(pages > 1, "a page of 40 MiB ended at RESULT_MAX, before its limit");
+        let (mut after, mut changed, mut pages) = (0, Vec::new(), 0);
+        loop {
+            let page = records.changes("f", after, api::SCAN_MAX, until()).unwrap();
+            let Some(last) = page.changes.last() else {
+                break;
+            };
+            let carried: usize = page
+                .changes
+                .iter()
+                .map(|c| c.key.len() + c.value.as_ref().map_or(0, Vec::len))
+                .sum();
+            assert!(carried <= api::RESULT_MAX, "{carried}");
+            assert_eq!(page.changes.len() % 8, 0, "whole transactions only");
+            after = last.rev;
+            pages += 1;
+            changed.extend(page.changes.into_iter().map(|c| c.key));
+            if after >= page.head {
+                break;
+            }
+        }
+        assert_eq!(changed, keys);
+        assert!(pages > 1, "a page of changes ended at RESULT_MAX, before its limit");
     }
 }
 
