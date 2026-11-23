@@ -70,6 +70,10 @@ for m in $MEASURES; do
     echo "FAILED amphora-procs-$CLASS $m" >&2
     failed=1
   fi
-  for p in "${pids[@]}"; do wait "$p" || { echo "a member of $m exited non-zero" >&2; failed=1; }; done
+  # failover and catchup kill -9 members (137); the driver starts each again as its own child and waits for it.
+  for p in "${pids[@]}"; do
+    wait "$p"; rc=$?
+    [[ $rc == 0 || ($rc == 137 && $m != commit) ]] || { echo "a member of $m exited $rc" >&2; failed=1; }
+  done
 done
 exit $failed
