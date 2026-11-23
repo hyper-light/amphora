@@ -9,7 +9,11 @@ Each input column gets three algorithms, each copied from its source:
           with its overflow checks, then Sx / N (float.c 3090-3160, 3254-3270). Inputs as float8.
   exact   the exact sum of the inputs, rounded once (to nearest, ties to even); AVG divides that.
 
-usage: python3 -I bench/real_sums_ref.py <dir with lineitem.tbl> > ref.json
+TPC-H q01 and q06 (bench/planner/tpch/queries) get the same three, cell by cell, over the rows
+their WHERE keeps, grouped as q01 groups and in q01's ORDER BY.
+
+usage: python3 -I bench/real_sums_ref.py <dir with lineitem.tbl> [query,...] > ref.json
+  the queries (q01..q09 of real_sums, tpch-q01, tpch-q06) default to all of them
 """
 import json
 import math
@@ -144,6 +148,7 @@ def columns(rows):
         "q06": [("sum", "oneinf"), ("avg", "oneinf"), ("sum", "bothinf"), ("total", "bothinf")],
         "q07": [("sum", "big"), ("avg", "big"), ("total", "big"), ("sum", "bigpairs")],
         "q08": [("sum", "ints"), ("avg", "ints"), ("total", "ints")],
+        "q09": [("sum", "kbnloss"), ("avg", "kbnloss"), ("total", "kbnloss")],
     }, {
         "disc": lambda r: r[3],
         "net": lambda r: r[2] * (1 - r[3]),
@@ -158,7 +163,32 @@ def columns(rows):
         "big": lambda r: 1e308,
         "bigpairs": lambda r: pick(r, {1: 1e308, 2: 1e308, 3: -1e308, 4: -1e308}, 0.0),
         "ints": lambda r: pick(r, {1: 9007199254740993}, 0.5),
+        "kbnloss": lambda r: {1: 1e36, 1500000: 1e18, 3000000: 1.0, 4500000: -1e36, 6000000: -1e18}.get(r[0], 0.0) if r[1] == 1 else 0.0,
     }
+
+
+def tpch(rows, only):
+    """TPC-H q01 and q06 as bench/planner/tpch/queries states them, each REAL aggregate three ways."""
+    out = {}
+    if "tpch-q01" in only:
+        groups = {}
+        for r in rows:
+            if r[7] <= "1998-09-02":
+                groups.setdefault((r[5], r[6]), []).append(r)
+        cells = []
+        for g in sorted(groups):
+            rs = groups[g]
+            net = [r[2] * (1 - r[3]) for r in rs]
+            charge = [r[2] * (1 - r[3]) * (1 + r[4]) for r in rs]
+            row = []
+            for agg, values in (("sum", [r[8] for r in rs]), ("sum", [r[2] for r in rs]), ("sum", net), ("sum", charge), ("avg", [r[8] for r in rs]), ("avg", [r[2] for r in rs]), ("avg", [r[3] for r in rs])):
+                row.append({alg: text(fn(values).get(agg, "n/a")) for alg, fn in (("sqlite", kbn), ("pg", pg), ("exact", exact))})
+            cells.append({"group": list(g), "count": len(rs), "cells": row})
+        out["tpch-q01"] = cells
+    if "tpch-q06" in only:
+        values = [r[2] * r[3] for r in rows if "1994-01-01" <= r[7] < "1995-01-01" and 0.05 <= r[3] <= 0.07 and r[8] < 24]
+        out["tpch-q06"] = [{"group": [], "count": len(values), "cells": [{alg: text(fn(values)["sum"]) for alg, fn in (("sqlite", kbn), ("pg", pg), ("exact", exact))}]}]
+    return out
 
 
 def text(v):
@@ -174,16 +204,18 @@ def main():
     with open(sys.argv[1] + "/lineitem.tbl") as f:
         for line in f:
             p = line.split("|")
-            rows.append((int(p[0]), int(p[3]), float(p[5]), float(p[6])))
+            rows.append((int(p[0]), int(p[3]), float(p[5]), float(p[6]), float(p[7]), p[8], p[9], p[10], float(p[4])))
     queries, inputs = columns(rows)
+    only = set(sys.argv[2].split(",")) if len(sys.argv) > 2 else set(queries) | {"tpch-q01", "tpch-q06"}
+    queries = {q: cols for q, cols in queries.items() if q in only}
     done = {}
-    for name, fn in inputs.items():
-        values = [fn(r) for r in rows]
-        done[name] = {"sqlite": kbn(values), "pg": pg(values), "exact": exact(values)}
+    for name in {inp for cols in queries.values() for _, inp in cols}:
+        values = [inputs[name](r) for r in rows]
+        done[name] = {"sqlite": kbn(values), "pg": pg(values), "exact": exact(values), "inputs other than 0.0": sum(1 for v in values if v != 0.0)}
     out = {}
     for q, cols in queries.items():
-        out[q] = [dict({alg: text(done[inp][alg].get(agg, "n/a")) for alg in ("sqlite", "pg", "exact")}, agg=agg, input=inp) for agg, inp in cols]
-    json.dump({"rows": len(rows), "answers": out}, sys.stdout, indent=1)
+        out[q] = [dict({alg: text(done[inp][alg].get(agg, "n/a")) for alg in ("sqlite", "pg", "exact")}, agg=agg, input=inp, nonzero=done[inp]["inputs other than 0.0"]) for agg, inp in cols]
+    json.dump({"rows": len(rows), "answers": out, "tpch": tpch(rows, only)}, sys.stdout, indent=1)
 
 
 main()
