@@ -3587,6 +3587,68 @@ fn g8_exact_real_sums_answer_as_the_serial_loop_at_every_worker_count() {
     }
 }
 
+/// Lane G9, arm (a) of the SUM-over-REAL A/B (`RealSums::RowOrder`): SUM, AVG and TOTAL over
+/// REALs, INTEGERs and both mixed run on the workers and answer bit for bit as today's serial loop
+/// (`RealSums::Serial`) at 1, 2, 4, 8 and 16 stated cores, grouped or not, on G8's data: prices,
+/// magnitudes from 1e-300 to 1e300, -0.0 and integers past 2^53 before and after the first REAL.
+#[test]
+fn g9_row_order_real_sums_answer_as_today_at_every_worker_count() {
+    if crate::storage::versioned::switch::pager_only(
+        "its subject is the morsel hook over the pager's leaf pages (that the workers ran)",
+    ) {
+        return;
+    }
+    let conn = open(":memory:g9-row-order");
+    conn.set_real_sums(crate::RealSums::RowOrder);
+    let mut rng = ChaCha8Rng::seed_from_u64(88);
+    let pad = "x".repeat(64);
+    let rows = 3000u64;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, r REAL, a INTEGER, p TEXT)")
+        .unwrap();
+    let reals = [
+        "NULL", "-0.0", "1e300", "-1e300", "1e-300", "5e-324", "0.1", "-0.3", "1e16",
+    ];
+    let integers = [
+        "NULL",
+        "0",
+        "1",
+        "-7",
+        "9007199254740993",
+        "-4611686018427387905",
+    ];
+    conn.execute("BEGIN").unwrap();
+    for _ in 0..rows {
+        let g = rng.random_range(0i64..4);
+        let r = if rng.random_range(0..3) == 0 {
+            reals[rng.random_range(0..reals.len())].to_string()
+        } else {
+            format!(
+                "{}.{:02}",
+                rng.random_range(-100_000i64..100_000),
+                rng.random_range(0..100)
+            )
+        };
+        let a = integers[rng.random_range(0..integers.len())];
+        conn.execute(format!(
+            "INSERT INTO t(g, r, a, p) VALUES ({g}, {r}, {a}, '{pad}')"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    for sql in [
+        "SELECT SUM(r), AVG(r), TOTAL(r) FROM t",
+        "SELECT g, SUM(r), AVG(r), TOTAL(r), COUNT(*) FROM t GROUP BY g",
+        "SELECT SUM(r * 3), AVG(r + a), TOTAL(r - g) FROM t WHERE g > 0",
+        "SELECT g, SUM(CASE WHEN id % 3 = 0 THEN a ELSE r END), TOTAL(a), AVG(a) FROM t GROUP BY g",
+    ] {
+        let row_order = g8_answers_at_every_core_count(&conn, sql, rows);
+        conn.set_real_sums(crate::RealSums::Serial);
+        let today = format!("{:?}", sql_rows(&conn, sql));
+        conn.set_real_sums(crate::RealSums::RowOrder);
+        assert_eq!(row_order, today, "{sql}: RowOrder against Serial");
+    }
+}
+
 /// Lane G8, arm (b): the exact sum rounded once, on the serial loop and the workers alike, on the
 /// cases a compensated sum can get wrong or that SQLite gives meaning to: cancellation, huge with
 /// tiny, subnormals, both signs of zero, infinities (both met: NULL).
