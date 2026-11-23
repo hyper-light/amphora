@@ -494,6 +494,8 @@ struct Sends {
     idle_since: AtomicU64,
     /// The times the writer went idle.
     idles: AtomicU64,
+    /// The writer is running a job ([`Store::run`]).
+    running_job: AtomicBool,
     began: Instant,
 }
 
@@ -531,6 +533,7 @@ impl Default for Sends {
             noticed: Condvar::new(),
             idle_since: AtomicU64::new(0),
             idles: AtomicU64::new(0),
+            running_job: AtomicBool::new(false),
             began: Instant::now(),
         }
     }
@@ -783,25 +786,12 @@ impl Sends {
         }
     }
 
-    /// How much longer a flusher gathering since `since` waits before it begins a flush, its
-    /// flushes taking `flush` (smoothed): none once the writer has been idle for a 32nd of a flush
-    /// (what the last flush's senders send next has come in by then) or half a flush has gone by
-    /// (what waits already waits no more than that again).
-    fn gathering(&self, since: Instant, flush: Duration) -> Option<Duration> {
-        let most = flush.checked_div(2).unwrap_or_default();
-        let left = most.checked_sub(since.elapsed()).filter(|d| !d.is_zero())?;
-        match self.idle_since.load(Ordering::Relaxed) {
-            0 => Some(left),
-            idle => {
-                let idle = Duration::from_nanos(self.now().saturating_sub(idle));
-                let quiet = flush
-                    .checked_div(32)
-                    .unwrap_or_default()
-                    .checked_sub(idle)
-                    .filter(|d| !d.is_zero())?;
-                Some(quiet.min(left))
-            }
-        }
+    /// The writer begins (true) or ends (false) a job: a flusher gathering stops waiting for the
+    /// batches queued behind it.
+    fn running(&self, job: bool) {
+        self.running_job.store(job, Ordering::Relaxed);
+        let _committed = locked(&self.committed);
+        self.done.notify_all();
     }
 
     /// A flush failed: whoever waits for a commit or a flush is told.
@@ -887,40 +877,36 @@ fn notifier(sends: &Sends) {
 /// Under load the writer never runs out of work, and flushes follow one another. When it ran out
 /// during a flush, what comes next is mostly what that flush's senders send once told, and a flush
 /// begun at the first of it would leave the rest to the flush after (each sender then waits two
-/// flushes, half of them during each other's): so the flusher first gathers, waiting until the
-/// writer has taken it all in ([`Sends::gathering`]).
+/// flushes, half of them during each other's): so the flusher first gathers, flushing at once when
+/// everything handed over is committed, and otherwise when the batches handed over as it began
+/// gathering are, woken by their commit (AUDIT 4.1: no timer), or by a job the writer begins.
 fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
     // The writer ran out of work during the last flush.
     let mut kept_up = false;
-    // Flushes' time, smoothed (the first, then an eighth of each new one).
-    let mut flush_time = Duration::ZERO;
     loop {
         let target = {
             let mut committed = locked(&sends.committed);
-            let mut gathering: Option<Instant> = None;
+            // The batches handed over when gathering began.
+            let mut gathering: Option<u64> = None;
             loop {
                 let stopping = sends.stopping.load(Ordering::Relaxed);
                 if committed.batches > *locked(&sends.claimed) {
-                    let since = *gathering.get_or_insert_with(Instant::now);
-                    match sends
-                        .gathering(since, flush_time)
-                        .filter(|_| kept_up && !stopping)
+                    let handed = *gathering.get_or_insert_with(|| sends.handed.load(Ordering::Relaxed));
+                    if kept_up
+                        && !stopping
+                        && committed.batches < handed
+                        && !sends.running_job.load(Ordering::Relaxed)
                     {
-                        Some(wait) => {
-                            committed = sends
-                                .done
-                                .wait_timeout(committed, wait)
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .0;
-                            continue;
-                        }
-                        None => {
-                            let mut claimed = locked(&sends.claimed);
-                            if committed.batches > *claimed {
-                                *claimed = committed.batches;
-                                break *committed;
-                            }
-                        }
+                        committed = sends
+                            .done
+                            .wait(committed)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        continue;
+                    }
+                    let mut claimed = locked(&sends.claimed);
+                    if committed.batches > *claimed {
+                        *claimed = committed.batches;
+                        break *committed;
                     }
                 }
                 if stopping || sends.disk_failed.load(Ordering::SeqCst) {
@@ -938,14 +924,6 @@ fn flusher(sends: &Sends, flush: &Flush, meter: &Meter) {
         match flush() {
             Ok(()) => {
                 let took = began.elapsed();
-                let eighth = |d: Duration| d.checked_div(8).unwrap_or_default();
-                flush_time = if flush_time.is_zero() {
-                    took
-                } else {
-                    flush_time
-                        .saturating_sub(eighth(flush_time))
-                        .saturating_add(eighth(took))
-                };
                 kept_up = sends.idle_since.load(Ordering::Relaxed) != 0
                     || sends.idles.load(Ordering::Relaxed) != idles;
                 meter.flushed(took);
@@ -1701,7 +1679,9 @@ fn writer<E: Engine>(
                 sends.went_busy();
                 sends.room.1.notify_all();
                 commit(&mut engine, &mut pending, &mut batches, &mut commits);
+                sends.running(true);
                 job(&mut engine);
+                sends.running(false);
                 meter.ran();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
