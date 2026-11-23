@@ -657,7 +657,7 @@ NOT on main. Main moved after r1582, so the merged tree was checked again (r1601
 - Test `store::tests::mb1_a_wait_for_room_is_woken_by_the_commit_that_gives_room_back` (room for one row; deadline an hour off; `Counters::room_waits`, new, as its non-vacuity count) replaces tests/store.rs's counted-queue test.
 - Main 4b2a9793 conflicts with 5e5ae655 in crates/amphora/src/store.rs (W3's flusher change): the next lane merges it.
 
-## Units 3 and 4 landed (perf-A17)
+## Unit 3 landed; unit 4 checked green, not on main (perf-A17)
 
 **Unit 3 on main (626b0a90).** While unit 3 waited, main's V11 (ad4c0922, CP-T1.8) changed `Database::query`: a replicated query runs past its group's barrier as `Operation::Query`, charged a flat `REQUEST_MAX`. The merge 96b83947 keeps both. The replicated arm submits `Operation::Query` charged `answer.get()`, and `within` checks the answer inside the call, as `call_nowait` does. The attached client's session takes `answer.get()` and `within`. Script `~/.cache/amphora-perf/cross-a17-scripts/check17.sh` (check16.sh with `JOBS`, `STORE` and `BENCH`; adacachy2):
 
@@ -668,7 +668,7 @@ NOT on main. Main moved after r1582, so the merged tree was checked again (r1601
 
 Pushed as 626b0a90: 848a16c2 + main 8c426f7b, which moved only crates/pg-parser and docs/requirements.toml. No crate in the workspace or bench depends on amphora-pg-parser, so no new run. A16's r1684 (macOS, b5738b12, never started) was stopped: r1712 had checked the newer merge.
 
-**Unit 4 on main.** 5e5ae655 merged with unit 3's landing (b7910c4a, cf13e776). store.rs conflicted with W3's flusher change (81fc0dca, via 6a3e8ebb) at the writer's take-off of `Msg::Rows` and `Msg::Run`: W3 deleted `Sends::went_busy`, unit 4 the lock-free `room.1.notify_all`. Both deletions are kept. Unit 4 compiled as A16 wrote it.
+**Unit 4, NOT on main.** 5e5ae655 merged with unit 3's landing (b7910c4a, cf13e776). store.rs conflicted with W3's flusher change (81fc0dca, via 6a3e8ebb) at the writer's take-off of `Msg::Rows` and `Msg::Run`: W3 deleted `Sends::went_busy`, unit 4 the lock-free `room.1.notify_all`. Both deletions are kept. Unit 4 compiled as A16 wrote it.
 
 | run | commit | result |
 |---|---|---|
@@ -690,3 +690,4 @@ Main moved inside `crates/` twice more before the push, so each merge was checke
 Seen on the way, not changed:
 - `Budget::hold` refuses `Unavailable` where the memory limit can't be read. `Store::charge` treats every refusal as no room, so on such a platform a batch with a nonzero `row_bytes` is refused `Full` at once, as `Admission::charge` already refuses a database's requests there.
 - r1740 (the first try of the 10/10 runs) ended and was collected before its output was read: the kiln server did not answer in time.
+- Unit 4's push of 99b67668 (3c9425d3 + records-only main) was rejected: main had moved inside `crates/` (B15's engine WAL, d0660c11). Its merge ff71d6f8 (on perf/cross-a13) is unchecked. adacachy2 refused its check at cpus=8 (0 of 32 cores idle); r1784 (cpus=4, check17.sh `JOBS=4 STORE=1 BENCH=0` with `store:: database:: xgroup::`) was submitted at 23:54Z, at the hour's end. Next lane: read r1784; if green and main moved only outside `crates/`, merge and push HEAD:main.
