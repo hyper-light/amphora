@@ -264,7 +264,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();
@@ -495,7 +495,7 @@ fn multiprocess_hold_open_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let last = db.shared_wal.read().last_checksum_and_max_frame();
+    let last = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db.build_wal(last, db.buffer_pool.clone()).unwrap();
     let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
@@ -580,7 +580,7 @@ fn database_open_selects_shm_wal_backend() {
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
 
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();
@@ -628,6 +628,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
         db_b.shared_wal
+            .current()
             .read()
             .metadata
             .loaded_from_disk_scan
@@ -684,6 +685,7 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
     assert!(
         !reopened
             .shared_wal
+            .current()
             .read()
             .metadata
             .loaded_from_disk_scan
@@ -766,6 +768,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
     assert!(
         reopened
             .shared_wal
+            .current()
             .read()
             .metadata
             .loaded_from_disk_scan
@@ -848,6 +851,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
     assert!(
         reopened
             .shared_wal
+            .current()
             .read()
             .metadata
             .loaded_from_disk_scan
@@ -918,6 +922,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     assert!(
         reopened
             .shared_wal
+            .current()
             .read()
             .metadata
             .loaded_from_disk_scan
@@ -978,7 +983,7 @@ fn multiprocess_shm_insert_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();
@@ -999,7 +1004,7 @@ fn multiprocess_shm_insert_and_close_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();
@@ -1025,7 +1030,7 @@ fn multiprocess_shm_count_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();
@@ -1062,7 +1067,7 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     } else {
         open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap()
     };
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();
@@ -1071,6 +1076,7 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
     assert_eq!(
         db.shared_wal
+            .current()
             .read()
             .metadata
             .loaded_from_disk_scan
@@ -1135,7 +1141,7 @@ fn multiprocess_shm_schema_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();
@@ -1157,7 +1163,7 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();
@@ -2273,6 +2279,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
         db_b.shared_wal
+            .current()
             .read()
             .metadata
             .loaded_from_disk_scan
@@ -2304,7 +2311,7 @@ fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
 
-    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let last_checksum_and_max_frame = db.shared_wal.current().read().last_checksum_and_max_frame();
     let wal = db
         .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
         .unwrap();

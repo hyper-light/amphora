@@ -7663,7 +7663,7 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let last_checksum_and_max_frame = wal_shared.current().read().last_checksum_and_max_frame();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
             wal_shared,
@@ -7857,7 +7857,7 @@ mod ptrmap_tests {
                 .unwrap(),
         )
         .unwrap();
-        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let last_checksum_and_max_frame = wal_shared.current().read().last_checksum_and_max_frame();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
             wal_shared,
@@ -8342,6 +8342,7 @@ mod checkpoint_phase_tests {
         conn.execute("commit").unwrap();
         assert!(
             db.shared_wal
+                .current()
                 .read()
                 .metadata
                 .max_frame

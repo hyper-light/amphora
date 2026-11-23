@@ -51,7 +51,7 @@ use crate::{
     Completion, CompletionError, Connection, DatabaseStorage, Dialect, EncryptionKey, IOResult,
     InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, PageCodec, PageCodecId,
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
-    TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
+    TransactionState, VirtualTable, SharedLog, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -755,7 +755,7 @@ pub struct Database<
     /// When set, MVCC will use this implementation for logical-log durability
     /// (commit, sync, checkpoint thresholds, etc.) instead of the built-in storage.
     pub(crate) durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-    pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
+    pub(crate) shared_wal: Arc<SharedLog>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     pub(crate) open_flags: OpenFlags,
@@ -819,7 +819,7 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("init_lock", &init_lock_status);
 
-        let wal_status = match self.shared_wal.try_read() {
+        let wal_status = match self.shared_wal.current().try_read() {
             Some(wal) if wal.metadata.enabled.load(Ordering::SeqCst) => "enabled",
             Some(_) => "disabled",
             None => "locked_for_write",
@@ -865,7 +865,7 @@ impl Database {
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
-        let shared_wal = WalFileShared::new_noop();
+        let shared_wal = SharedLog::new(WalFileShared::new_noop());
         let mv_store = ArcSwapOption::empty();
 
         let db_size = db_file.size()?;
@@ -1708,7 +1708,7 @@ impl Database {
                     #[cfg(debug_assertions)]
                     {
                         let wal_enabled =
-                            db.shared_wal.read().metadata.enabled.load(Ordering::SeqCst);
+                            db.shared_wal.current().read().metadata.enabled.load(Ordering::SeqCst);
                         let mv_store_enabled = db.get_mv_store().is_some();
                         assert!(
                             db.is_readonly() || wal_enabled || mv_store_enabled,
@@ -2463,9 +2463,9 @@ impl Database {
                         unreachable!("state is OpenWal");
                     };
 
-                    self.shared_wal = shared_wal;
+                    self.shared_wal = SharedLog::new(shared_wal);
                     let last_checksum_and_max_frame =
-                        self.shared_wal.read().last_checksum_and_max_frame();
+                        self.shared_wal.current().read().last_checksum_and_max_frame();
                     let wal =
                         self.build_wal(last_checksum_and_max_frame, pager.buffer_pool.clone())?;
                     pager.set_wal(wal);
@@ -2560,6 +2560,7 @@ impl Database {
             )
         })?;
         self.shared_wal
+            .current()
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
@@ -3240,7 +3241,7 @@ impl Database {
     pub(crate) fn shared_wal_coordination(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
-        let shared_wal = self.shared_wal.read();
+        let shared_wal = self.shared_wal.current().read();
         if !shared_wal.metadata.enabled.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -3325,7 +3326,7 @@ impl Database {
     /// No I/O is performed. The shared log guard excludes restart, restore and commit publication
     /// while its header identity, committed end and completed-flush proof are read together.
     pub fn wal_prefix(&self) -> WalPrefix {
-        let shared = self.shared_wal.read();
+        let shared = self.shared_wal.current().read();
         let generation = shared.metadata.wal_header.lock().checkpoint_seq;
         let frame = shared.metadata.max_frame.load(Ordering::Acquire);
         let durable = *shared.runtime.durable.lock();
@@ -3345,7 +3346,7 @@ impl Database {
         if self.opts.enable_multiprocess_wal {
             return;
         }
-        let shared = self.shared_wal.read();
+        let shared = self.shared_wal.current().read();
         if !Arc::ptr_eq(&shared.metadata.wal_header, &prefix.header)
             || shared.metadata.wal_header.lock().checkpoint_seq != prefix.generation
         {
@@ -3362,7 +3363,7 @@ impl Database {
     /// committed frame). A flush of the log's file begun after this makes every frame up to it
     /// durable ([`Database::wal_durable`]).
     pub fn wal_end(&self) -> (u32, u64) {
-        let shared = self.shared_wal.read();
+        let shared = self.shared_wal.current().read();
         let generation = shared.metadata.wal_header.lock().checkpoint_seq;
         (
             generation,
@@ -3374,7 +3375,7 @@ impl Database {
     /// file (its backfill), as checkpoints of this process left them. Amphora's checkpointer
     /// copies only once enough wait (`docs/design/store.md`, decision 35).
     pub fn wal_backfill(&self) -> (u64, u64) {
-        let shared = self.shared_wal.read();
+        let shared = self.shared_wal.current().read();
         (
             shared.metadata.max_frame.load(Ordering::Acquire),
             shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -3392,7 +3393,7 @@ impl Database {
     /// publications are also ignored. Use [`Database::wal_prefix`] and
     /// [`Database::wal_prefix_durable`] for identity-safe proof publication after reload.
     pub fn wal_durable(&self, generation: u32, frame: u64) {
-        let shared = self.shared_wal.read();
+        let shared = self.shared_wal.current().read();
         if self.opts.enable_multiprocess_wal
             || !shared.runtime.legacy_durable_allowed
             || shared.metadata.wal_header.lock().checkpoint_seq != generation
@@ -3427,6 +3428,7 @@ impl Database {
             ));
         }
         self.shared_wal
+            .current()
             .read()
             .runtime
             .format
@@ -3466,7 +3468,7 @@ impl Database {
         // was written; nothing asks again after a restart of the process). A mixed log's pages
         // are shared (decision 37).
         let packed = {
-            let shared = self.shared_wal.read();
+            let shared = self.shared_wal.current().read();
             let packed = |format| {
                 crate::storage::packed::LogFormat::of(format)
                     == Some(crate::storage::packed::LogFormat::Packed)
@@ -3495,14 +3497,14 @@ impl Database {
     /// After external reload or generation wrap, only identity-bearing prefix publications advance
     /// this hint; legacy tuple publications are ignored and checkpoints supply any missing sync.
     pub fn wal_durable_frame(&self) -> Option<u64> {
-        let shared = self.shared_wal.read();
+        let shared = self.shared_wal.current().read();
         let generation = shared.metadata.wal_header.lock().checkpoint_seq;
         let durable = *shared.runtime.durable.lock();
         durable.and_then(|(g, f)| if g == generation { Some(f) } else { None })
     }
 
     pub fn shared_wal_open_telemetry(&self) -> Result<SharedWalOpenTelemetry> {
-        let shared_wal = self.shared_wal.read();
+        let shared_wal = self.shared_wal.current().read();
         let loaded_from_disk_scan = shared_wal
             .metadata
             .loaded_from_disk_scan
@@ -3569,7 +3571,7 @@ impl Database {
 
     #[cfg(feature = "simulator")]
     pub fn local_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
-        let shared = self.shared_wal.read();
+        let shared = self.shared_wal.current().read();
         let max_frame = shared.metadata.max_frame.load(Ordering::Acquire);
         let frame_cache = shared.runtime.frame_cache.lock();
         Ok(frame_cache.get(&page_id).and_then(|frames| {
@@ -3584,6 +3586,7 @@ impl Database {
     pub fn local_wal_max_frame_for_testing(&self) -> Result<u64> {
         Ok(self
             .shared_wal
+            .current()
             .read()
             .metadata
             .max_frame
@@ -3619,6 +3622,7 @@ impl Database {
             // Amphora: other processes couldn't read a packed or mixed log's records.
             let format = self
                 .shared_wal
+                .current()
                 .read()
                 .metadata
                 .wal_header
@@ -3721,7 +3725,7 @@ impl Database {
             false
         };
         // Check if WAL is enabled
-        let shared_wal = self.shared_wal.read();
+        let shared_wal = self.shared_wal.current().read();
 
         let page_size =
             self.determine_actual_page_size(&shared_wal, requested_page_size, header_page_size)?;
