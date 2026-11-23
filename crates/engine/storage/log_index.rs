@@ -198,11 +198,16 @@ impl PageBits {
         Some((word, 1u64 << (page % 64)))
     }
 
-    /// None when the page is past the bits' reach (asked under the lock).
+    /// A page past the words is past every page the log holds: an append of one grows them before
+    /// its frame is published (AUDIT 2.1, perf-B4: asking those under the lock sent half the
+    /// lookup bench's reads there). None only for a page no word can number.
     fn holds(&self, page: u64) -> Option<bool> {
         let (word, bit) = Self::place(page)?;
-        let value = self.words.get(word)?.load(Ordering::Acquire);
-        Some(value & bit != 0)
+        Some(
+            self.words
+                .get(word)
+                .is_some_and(|value| value.load(Ordering::Acquire) & bit != 0),
+        )
     }
 
     /// False when the page is past their reach: the caller grows them.
