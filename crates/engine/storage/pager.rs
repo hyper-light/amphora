@@ -4800,7 +4800,8 @@ impl Pager {
         // the page enters this connection's cache; the pins after are this connection's
         // (PostgreSQL's private refcounts). The image was checked as it entered the process and is
         // trusted while the pool keeps it; a write copies it first (`Pager::add_dirty`).
-        if self.page_path() == PagePath::Plain {
+        let plain = self.page_path() == PagePath::Plain;
+        if plain {
             if let Some(buffer) = shared.pages().take_count(&key) {
                 page.get().set_buffer(buffer);
                 page.set_loaded();
@@ -4809,12 +4810,23 @@ impl Pager {
             }
         }
         // A copy of its own: no count on a buffer every reader of the page shares (decision 29).
-        let copy = self.buffer_pool.get_page();
-        if shared.pages().copy_into(&key, copy.as_mut_slice()) {
-            #[allow(clippy::arc_with_non_send_sync)]
-            page.get().set_buffer(Arc::new(copy));
-            page.set_loaded();
-            return Ok(Some((page, None)));
+        // Amphora (AUDIT 2.3): on the plain path `take_count` has just missed the shards, so only
+        // the frames read without a lock in front of them are left to look in, and only when the
+        // pool made them: a second look in the shards took the shard's lock again and a buffer
+        // for an image it couldn't find.
+        let front = shared.pages().front_made();
+        if !plain || front.is_some() {
+            let copy = self.buffer_pool.get_page();
+            let found = match front {
+                Some(front) if plain => front.read(&key, copy.as_mut_slice()),
+                _ => shared.pages().copy_into(&key, copy.as_mut_slice()),
+            };
+            if found {
+                #[allow(clippy::arc_with_non_send_sync)]
+                page.get().set_buffer(Arc::new(copy));
+                page.set_loaded();
+                return Ok(Some((page, None)));
+            }
         }
         // Amphora: what a writer reads isn't kept: it reads the pages it is about to change, whose
         // committed images its commit supersedes (a 10M-row load kept 8 GiB of them, every one

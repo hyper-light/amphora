@@ -68,8 +68,11 @@ struct Shard {
 
 /// A shard, and its lookups counted beside its lock (a lookup holds the lock to read, so it can't
 /// count under it): one count a shard, where one for the pool, written by every reader's every
-/// lookup, would move its line between their cores each time (decision 22).
+/// lookup, would move its line between their cores each time (decision 22). Alone on its
+/// cache-line pair (AUDIT 2.3): neighbouring shards' locks and counts shared lines, so readers of
+/// different shards still moved them between cores; 128 bytes as `optimistic_pages`' frames.
 #[derive(Default)]
+#[repr(align(128))]
 struct ShardCell {
     shard: RwLock<Shard>,
     hits: AtomicU64,
@@ -183,8 +186,13 @@ impl SharedPages {
         self.files.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn shard(&self, page: u64) -> Option<&ShardCell> {
-        let at = page.checked_rem(SHARDS_U64).unwrap_or(0);
+    /// Amphora (AUDIT 2.3): the shard of `file`'s `page`: its page number moved on by its file's
+    /// number. By the page alone, page 1 of every database (each schema root) and every low page all
+    /// files share fell on the same shards' locks; moved by the file's number (`join` hands them out
+    /// in turn) the first pages of 64 files fall on 64 shards, while one file's run of pages still
+    /// fills every shard evenly, as a hash wouldn't.
+    fn shard(&self, file: u64, page: u64) -> Option<&ShardCell> {
+        let at = page.wrapping_add(file).checked_rem(SHARDS_U64).unwrap_or(0);
         self.shards.get(usize::try_from(at).ok()?)
     }
 
@@ -193,7 +201,7 @@ impl SharedPages {
         if self.front_made().is_some_and(|front| front.read(key, dest)) {
             return true;
         }
-        let Some(cell) = self.shard(key.page) else {
+        let Some(cell) = self.shard(key.file, key.page) else {
             return false;
         };
         let found = {
@@ -224,7 +232,7 @@ impl SharedPages {
     /// later pins that connection's own (PostgreSQL's private refcounts). The image never changes
     /// while counted: a writer copies a shared buffer before it writes (`Pager::add_dirty`).
     pub fn take_count(&self, key: &Key) -> Option<Arc<Buffer>> {
-        let cell = self.shard(key.page)?;
+        let cell = self.shard(key.file, key.page)?;
         let found = {
             let shard = cell.shard.read();
             shard.map.get(key).map(|entry| {
@@ -254,7 +262,7 @@ impl SharedPages {
     /// Keeps `buffer` as the image of `key`, evicting by CLOCK if its shard is full. An image
     /// already kept under `key` stays (both are the same committed bytes).
     pub fn insert(&self, key: Key, buffer: Arc<Buffer>) {
-        let Some(cell) = self.shard(key.page) else {
+        let Some(cell) = self.shard(key.file, key.page) else {
             return;
         };
         // What a shard keeps while pages are charged: its slice of the bound less its slice of
@@ -335,7 +343,7 @@ impl SharedPages {
             page,
             version: Version::File,
         };
-        if let Some(cell) = self.shard(page) {
+        if let Some(cell) = self.shard(file, page) {
             let mut shard = cell.shard.write();
             if let Some(entry) = shard.map.remove(&key) {
                 if let Some(place) = shard.ring.get_mut(entry.at) {
@@ -653,6 +661,25 @@ mod tests {
     /// and 256 more inserted; the charges given back and 256 more inserted. Expect: at most 128
     /// kept while 128 are charged; a charge leaving less than a page a shard refused, charging
     /// nothing; a page a shard kept at the most charge; 256 kept once it is given back.
+    /// AUDIT 2.3: page 1 of 64 databases sharing a pool falls on 64 shards, not one, and one
+    /// file's run of 64 pages still falls on every shard once.
+    #[test]
+    fn audit_2_3_first_pages_of_files_fall_on_their_own_shards() {
+        let pool = SharedPages::new(256);
+        let mut distinct: Vec<*const ShardCell> = (0..SHARDS_U64)
+            .map(|file| std::ptr::from_ref(pool.shard(file, 1).unwrap()))
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), SHARDS);
+        let mut run: Vec<*const ShardCell> = (1..=SHARDS_U64)
+            .map(|page| std::ptr::from_ref(pool.shard(7, page).unwrap()))
+            .collect();
+        run.sort_unstable();
+        run.dedup();
+        assert_eq!(run.len(), SHARDS);
+    }
+
     #[test]
     fn a_charge_shrinks_what_the_pool_keeps() {
         let pool = Arc::new(SharedPages::new(256));
