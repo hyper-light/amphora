@@ -3150,9 +3150,12 @@ fn t_qt_6_32_having_over_aggregates_runs_on_morsels_as_the_serial_loop() {
 /// leaves that hold the range (`TableSource::restrict`), every term the search was made from
 /// tested on each row. Ranges open and closed at either end, through the INTEGER PRIMARY KEY and
 /// through rowid, with other terms, aggregates, groups, rows and a LIMIT, over a table with gaps,
-/// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores; the body ran over some rows but
-/// fewer than the table holds (the leaves were cut). A backward search, and a range of bounds that
-/// aren't integer literals, stay the serial loop's.
+/// answer as the serial loop at 1, 2, 3, 4 and 8 stated cores; the body ran over some rows, and
+/// no more than the leaves the range touches hold (`TableSource::restrict`: the first leaf whose
+/// greatest rowid reaches the lower bound, through the first that reaches the upper), fewer than
+/// the table holds where the range leaves whole leaves out. A range whose bound falls in the
+/// first or last leaf touches them all (`id > 100`: the first leaf holds ids to ~115). A backward
+/// search, and a range of bounds that aren't integer literals, stay the serial loop's.
 #[test]
 fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
     let conn = open(":memory:qt-6-33");
@@ -3177,58 +3180,103 @@ fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
         .unwrap();
     }
     conn.execute("COMMIT").unwrap();
-    // (statement, whether it returns rows, whether the hook takes it).
-    let queries: [(&str, bool, bool); 11] = [
+    // (statement, whether it returns rows, whether the hook takes it, its rowid bounds, each
+    // inclusive).
+    type Range = (Option<i64>, Option<i64>);
+    let queries: [(&str, bool, bool, Range); 11] = [
         (
             "SELECT count(*), sum(b), min(c), max(a) FROM t WHERE id > 4000",
             false,
             true,
+            (Some(4001), None),
         ),
         (
             "SELECT count(*), sum(a) FROM t WHERE id >= 1000 AND id <= 2000",
             false,
             true,
+            (Some(1000), Some(2000)),
         ),
         (
             "SELECT a % 5, count(*), avg(b) FROM t WHERE id BETWEEN 300 AND 5500 GROUP BY a % 5",
             false,
             true,
+            (Some(300), Some(5500)),
         ),
         (
             "SELECT count(*), total(b) FROM t WHERE rowid < 2500 AND a > 0",
             false,
             true,
+            (None, Some(2499)),
         ),
         (
             "SELECT c, count(*) FROM t WHERE id > 100 AND id < 7000 AND c IS NOT NULL GROUP BY c",
             false,
             true,
+            (Some(101), Some(6999)),
         ),
         (
             "SELECT id, a, b FROM t WHERE id > 6000 AND b > 0",
             true,
             true,
+            (Some(6001), None),
         ),
         (
             "SELECT id, c FROM t WHERE id >= 2500 AND id < 2600",
             true,
             true,
+            (Some(2500), Some(2599)),
         ),
         (
             "SELECT id, b FROM t WHERE id > 1234 LIMIT 20 OFFSET 5",
             true,
             true,
+            (Some(1235), None),
         ),
-        ("SELECT count(*) FROM t WHERE id > 100000", false, true),
+        (
+            "SELECT count(*) FROM t WHERE id > 100000",
+            false,
+            true,
+            (Some(100001), None),
+        ),
         // The serial loop's: a backward search, a bound that isn't a literal.
         (
             "SELECT id FROM t WHERE id > 8000 ORDER BY id DESC",
             true,
             false,
+            (Some(8001), None),
         ),
-        ("SELECT count(*) FROM t WHERE id > abs(-50)", false, false),
+        (
+            "SELECT count(*) FROM t WHERE id > abs(-50)",
+            false,
+            false,
+            (Some(51), None),
+        ),
     ];
-    for (sql, returns_rows, hooked) in queries {
+    let root = conn
+        .schema
+        .read()
+        .get_table("t")
+        .unwrap()
+        .get_root_page()
+        .unwrap();
+    // The rows of the leaves each range touches, as the hook cuts them.
+    conn.execute("BEGIN").unwrap();
+    let touched: Vec<u64> = queries
+        .iter()
+        .map(|(_, _, _, (lower, upper))| {
+            let mut leaves =
+                TableSource::open(conn.get_pager(), root, 5, Some(0), Vec::new()).unwrap();
+            leaves.restrict(*lower, *upper);
+            u64::try_from(leaves.rows().unwrap().len()).unwrap()
+        })
+        .collect();
+    conn.execute("COMMIT").unwrap();
+    // Non-vacuity: some ranges leave whole leaves out.
+    assert!(
+        touched.iter().any(|rows_touched| *rows_touched < rows),
+        "no range cut a leaf: {touched:?}"
+    );
+    for ((sql, returns_rows, hooked, _), touched) in queries.into_iter().zip(touched) {
         conn.set_parallel_mode(ParallelMode::Off);
         let serial = sql_rows(&conn, sql);
         conn.set_parallel_mode(ParallelMode::On);
@@ -3259,8 +3307,8 @@ fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
             let ran = after - before;
             if hooked {
                 assert!(
-                    ran < rows,
-                    "{sql} on {cores} cores: the body ran over {ran} rows of {rows}: the leaves weren't cut"
+                    ran <= touched,
+                    "{sql} on {cores} cores: the body ran over {ran} rows, its range's leaves hold {touched} of {rows}: the leaves weren't cut"
                 );
                 if !sql.contains("100000") {
                     assert!(ran > 0, "{sql} on {cores} cores: the hook didn't run");
