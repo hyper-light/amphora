@@ -132,6 +132,17 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 | planner | – | Decision (lane qs5-20): a sized filter's hashes grow within its bound, old and new together | [planner.md](design/planner.md#decision-lane-qs5-20-a-sized-filters-hashes-grow-within-its-bound-old-and-new-together) |
 | planner | – | Decision (lane qs5-20): a sort-merge join costed beside the hash join, traced until its operator lands | [planner.md](design/planner.md#decision-lane-qs5-20-a-sort-merge-join-costed-beside-the-hash-join-traced-until-its-operator-lands) |
 | planner | – | Decision (lane qs5-21): a sort-merge join is the hash join with its rows merged by key, behind a switch | [planner.md](design/planner.md#decision-lane-qs5-21-a-sort-merge-join-is-the-hash-join-with-its-rows-merged-by-key-behind-a-switch) |
+| postgres | 1 | The target is PostgreSQL 19.0 and protocol 3.2, and it moves with each major release | [postgres.md](design/postgres.md#1-the-target-is-postgresql-190-and-protocol-32-and-it-moves-with-each-major-release) |
+| postgres | 2 | A PostgreSQL listener on Amphora's execution path, event-driven, one session a state machine | [postgres.md](design/postgres.md#2-a-postgresql-listener-on-amphoras-execution-path-event-driven-one-session-a-state-machine) |
+| postgres | 3 | The parser is PostgreSQL 19's own grammar and scanner tables, driven by flat Rust loops | [postgres.md](design/postgres.md#3-the-parser-is-postgresql-19s-own-grammar-and-scanner-tables-driven-by-flat-rust-loops) |
+| postgres | 4 | PostgreSQL's semantics in a front end that lowers into Amphora's planner | [postgres.md](design/postgres.md#4-postgresqls-semantics-in-a-front-end-that-lowers-into-amphoras-planner) |
+| postgres | 5 | Every PostgreSQL value stored on SQLite's five types under a key the engine already orders | [postgres.md](design/postgres.md#5-every-postgresql-value-stored-on-sqlites-five-types-under-a-key-the-engine-already-orders) |
+| postgres | 6 | Sequences, serial and identity outside the caller's transaction, as PostgreSQL keeps them | [postgres.md](design/postgres.md#6-sequences-serial-and-identity-outside-the-callers-transaction-as-postgresql-keeps-them) |
+| postgres | 7 | Schemas and search_path resolved in analysis, statements lowered fully qualified | [postgres.md](design/postgres.md#7-schemas-and-search_path-resolved-in-analysis-statements-lowered-fully-qualified) |
+| postgres | 8 | Isolation: PostgreSQL's three levels exactly, with the engine work each needs | [postgres.md](design/postgres.md#8-isolation-postgresqls-three-levels-exactly-with-the-engine-work-each-needs) |
+| postgres | 9 | The catalog served from Amphora's schema, one source of truth | [postgres.md](design/postgres.md#9-the-catalog-served-from-amphoras-schema-one-source-of-truth) |
+| postgres | 10 | Done when: PostgreSQL's own suites pass, the drivers' suites pass, and 10x PostgreSQL at every scale | [postgres.md](design/postgres.md#10-done-when-postgresqls-own-suites-pass-the-drivers-suites-pass-and-10x-postgresql-at-every-scale) |
+| postgres | 11 | The order of delivery: one-hour units, each ending in its check | [postgres.md](design/postgres.md#11-the-order-of-delivery-one-hour-units-each-ending-in-its-check) |
 | records-compaction | – | Durable progress and retention | [records-compaction.md](design/records-compaction.md#durable-progress-and-retention) |
 | records-compaction | – | Dirty-page and serialized bounds | [records-compaction.md](design/records-compaction.md#dirty-page-and-serialized-bounds) |
 | records-compaction | – | Embedded owner compatibility | [records-compaction.md](design/records-compaction.md#embedded-owner-compatibility) |
@@ -273,6 +284,7 @@ SQLite is [p13] with one framed protocol between processes [p22] [p23], is
 - columnar: How the claims are checked ([columnar.md](design/columnar.md#how-the-claims-are-checked))
 - engine: The evidence that asks for it ([engine.md](design/engine.md#the-evidence-that-asks-for-it))
 - engine: Stages, each measured ([engine.md](design/engine.md#stages-each-measured))
+- postgres: Choices for Ada ([postgres.md](design/postgres.md#choices-for-ada))
 - store: Crash injection (T-T1.1.1) ([store.md](design/store.md#crash-injection-t-t111))
 - xgroup: Evidence so far ([xgroup.md](design/xgroup.md#evidence-so-far))
 - xgroup: Metrics (proposed; names to agree with kiln's Observe owner) ([xgroup.md](design/xgroup.md#metrics-proposed-names-to-agree-with-kilns-observe-owner))
