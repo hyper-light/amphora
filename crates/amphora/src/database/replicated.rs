@@ -5289,6 +5289,9 @@ impl<F: BlockFile + 'static> Actor<F> {
                 }
                 return Ok(());
             }
+            // The seed is a write: its entry's context is the request identity alone, never a
+            // read's barrier mark ([`READ_BARRIER`]).
+            pending.context.truncate(CONTEXT_BYTES);
             let room = self
                 .entry_room(pending.context.len())?
                 .min(crate::replication::COMMAND_BYTES);

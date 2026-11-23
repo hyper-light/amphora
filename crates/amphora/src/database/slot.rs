@@ -232,7 +232,8 @@ impl<T> Slots<T> {
     /// `member`'s barrier at `at` for work that writes nothing: a read, or the end of a write that
     /// forwarded nothing (CP-T1.8, lane V11). It asks for no slot and steps now. A slot `member`
     /// holds ends released, and its older barrier still waiting steps, its operation over (its
-    /// owner makes one at a time). A queue entry a refusal left waits for the member's next write.
+    /// owner makes one at a time, and its link delivers in order, as `read` takes it). A queue
+    /// entry a refusal left waits for the member's next write.
     pub(super) fn pass(&mut self, member: u64, at: Instant, message: T) -> Taken<T> {
         if let Some(position) = self.waiting.iter().position(|(m, _)| *m == member)
             && let Some(older) = self.waiting.remove(position)
