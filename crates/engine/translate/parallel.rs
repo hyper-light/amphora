@@ -704,6 +704,7 @@ fn emit_body(
         .chain(looped.on.iter())
         .chain(looped.filter.iter())
         .chain(looped.outs.iter())
+        .chain(looped.agg_filters.iter().map(|(_, filter)| filter))
     {
         walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
             match e {
