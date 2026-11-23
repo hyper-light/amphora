@@ -1,0 +1,135 @@
+Subject: CP-T1.8 a follower drops a peer's read instead of passing it on under the peer's name
+Why: A peer's ReadIndex reaches a follower only when the peer took it for the leader (it lost the lead since); passed on, the read reaches the new leader from the follower under the peer's name, which Amphora's authenticated sender check refuses (lane W4, the nemesis test's 1 in 16). Dropped, the peer's owner asks again as it does when its read is lost
+
+diff --git a/crates/hyper-raft/src/raft.rs b/crates/hyper-raft/src/raft.rs
+index 493c154146d0c2a2ce686eccbd2f366e8673c464..60dc4a990a9a116d0a520ee75e3f15b3240f0b31 100644
+--- a/crates/hyper-raft/src/raft.rs
++++ b/crates/hyper-raft/src/raft.rs
+@@ -4052,8 +4052,8 @@ impl<S: Storage> Raft<S> {
+         }
+     }
+ 
+-    /// A read with no leader to ask: refused when asked here, so its owner answers it now; one a
+-    /// peer forwarded is dropped, and that peer's owner answers its own.
++    /// A read this member does not take: refused when asked here, so its owner answers it now; one a
++    /// peer sent is dropped, and that peer's owner answers its own.
+     fn drop_read(message: &Message) -> Result<()> {
+         if message.from == 0 {
+             return Err(Error::ReadDropped);
+@@ -4178,7 +4178,10 @@ impl<S: Storage> Raft<S> {
+                 self.forward(message)
+             }
+             MessageType::MsgReadIndex => {
+-                if self.leader_id == 0 {
++                // A peer's read reaches a follower only when the peer took it for the leader. Passed
++                // on, it would reach the leader from this member under the peer's name, a record an
++                // authenticated transport refuses; dropped, the peer's owner asks again.
++                if self.leader_id == 0 || message.from != 0 {
+                     return Self::drop_read(&message);
+                 }
+                 self.forward(message)
+diff --git a/crates/hyper-raft/src/tests.rs b/crates/hyper-raft/src/tests.rs
+index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..cd179b9f0a0c9b5d780daba88d54f91cd8df1709 100644
+--- a/crates/hyper-raft/src/tests.rs
++++ b/crates/hyper-raft/src/tests.rs
+@@ -657,6 +657,34 @@ fn a_read_with_no_leader_to_ask_is_refused() {
+     ));
+ }
+ 
++/// A follower that knows its leader passes on its own reads and drops a peer's: passed on, the
++/// peer's read would reach the leader from this member under the peer's name.
++#[test]
++fn a_follower_passes_on_its_own_read_and_drops_a_peers() {
++    let mut node = follower();
++    node.step(answer(MessageType::MsgHeartbeat, 1, 2, 1)).unwrap();
++    drain(&mut node);
++    let mut relayed = answer(MessageType::MsgReadIndex, 3, 2, 0);
++    relayed.entries = vec![Entry {
++        data: b"peer".to_vec(),
++        ..Entry::default()
++    }];
++    node.step(relayed).unwrap();
++    assert!(drain(&mut node).is_empty());
++    node.read_index(b"own".to_vec()).unwrap();
++    let sent: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
++        .into_iter()
++        .map(|message| {
++            (
++                message.from,
++                message.to,
++                message.entries.first().map(|entry| entry.data.clone()).unwrap_or_default(),
++            )
++        })
++        .collect();
++    assert_eq!(sent, vec![(2, 1, b"own".to_vec())]);
++}
++
+ /// A read, or a read's answer, without its one context contradicts what a read is, and is
+ /// refused.
+ #[test]
+diff --git a/crates/hyper-raft/tests/differential.rs b/crates/hyper-raft/tests/differential.rs
+index edcf589e15ab1c8477eba99684516e411d648480..3c39303effe6fd3e4279d1a4c161061843028ca0 100644
+--- a/crates/hyper-raft/tests/differential.rs
++++ b/crates/hyper-raft/tests/differential.rs
+@@ -24,7 +24,10 @@
+ //! that runs past it, naming the committed entry at the commit, is taken past
+ //! the commit here (Raft §5.3: a receiver appends any new entries not already
+ //! in its log) and answered with the commit and dropped there: the schedule
+-//! loses that message for both too.
++//! loses that message for both too. A peer's read delivered to a follower that
++//! knows its leader is dropped here, where passed on it would reach the leader
++//! under the peer's name from another member, and passed on there: the
++//! schedule loses that message for both too.
+ #![allow(
+     clippy::panic,
+     clippy::unwrap_used,
+@@ -72,6 +75,8 @@ struct Reached {
+     older_rounds: u64,
+     /// Appends behind their member's commit that run past it, lost for both.
+     past_commits: u64,
++    /// Peers' reads delivered to a follower that knows its leader, lost for both.
++    relayed_reads: u64,
+     terms: u64,
+     committed: u64,
+     changes: u64,
+@@ -233,6 +238,25 @@ fn runs_past_the_commit(group: &Cluster<New>, op: &Op) -> bool {
+     })
+ }
+ 
++/// Whether `op` delivers a peer's read to a follower that knows its leader: this core drops it,
++/// where passed on it would reach the leader under the peer's name from another member; raft-rs
++/// passes it on, and the comparison loses it for both.
++fn relays_a_peers_read(group: &Cluster<New>, op: &Op) -> bool {
++    let Op::Deliver {
++        at, lose: false, ..
++    } = op
++    else {
++        return false;
++    };
++    let Some(message) = group.net.get(*at) else {
++        return false;
++    };
++    message.msg_type == MessageType::MsgReadIndex
++        && group.peek(message.to).is_some_and(|member| {
++            member.raw.raft.state() == StateRole::Follower && member.raw.raft.leader_id() != 0
++        })
++}
++
+ /// Whether `op` asks a read of a leader that has not committed an entry of its term, or delivers
+ /// to one a read a follower forwarded: this core holds the read until that commit (the thesis's
+ /// §6.4 step 1), raft-rs drops it, and the comparison loses it for both (`docs/raft.md` §3.3).
+@@ -466,6 +490,14 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
+                     lose: true,
+                 }
+             }
++            Op::Deliver { at, keep, .. } if relays_a_peers_read(&new, &op) => {
++                reached.relayed_reads += 1;
++                Op::Deliver {
++                    at,
++                    keep,
++                    lose: true,
++                }
++            }
+             Op::Deliver { at, keep, .. } if reads_before_first_commit(&new, &op) => {
+                 reached.held_reads += 1;
+                 Op::Deliver {
