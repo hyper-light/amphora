@@ -339,7 +339,11 @@ exit 0 (37 s, the lane's target dir warm). `cargo test -p amphora-engine --lib -
 (btree.rs 11226), `storage::versioned::columns_sql::tests::cb4_a_read_only_transaction_reads_the_copy_at_its_snapshot`
 (columns_sql.rs 1263) and `storage::versioned::columns_sql::tests::ab::cb4_ab_both_rebuy_policies_at_the_extremes`
 (columns_sql.rs 1875). `cargo test -p amphora --locked --test store` 15 passed. Nothing calls `log_segments`, so the
-three failures are main's own or the load's; they were not run against main alone in this hour. The `storage::`
+three failures are not this change's. Run r1184 (adacachy2, needs `linux/amd64,cpus=4,mem=16g`, load 22-23) ran
+the three alone on main 3f7624a3, one at a time: all three fail there, so they are main's own. The btree test panics
+"expected a row, got Yield"; 29cd28f4 ("The integrity check yields at each read from the file", T-T1.12.C8) is a
+lead, not checked. `cb4_a_…` panics "the copy didn't answer" (`unserved: 1`); `cb4_ab_…` reports 64 statements
+"column copy refused: no generation answers the statement's snapshot". The `storage::`
 filter is wider than B6's (`storage::wal storage::log_index`): it takes btree's and versioned's tests too. Run r1180
 (macOS, needs `macos/arm64,cpus=8,mem=24g`, rule 6's disk guard; cold) has the same clippy and storage tests on
-926c3003 (perf/pagepath-d45 with main 945b633a merged); queued at 16:16Z.
+perf/pagepath-d45 as synced when it is placed (478716f8: main 3f7624a3 with `log_segments`); queued at 16:16Z.
