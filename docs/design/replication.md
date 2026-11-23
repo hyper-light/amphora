@@ -2425,8 +2425,7 @@ A compaction still runs at once while the log stalls admission for room: it is w
 **The start state.** Before both costs are measured, and for a sample below the clock's resolution, the factor is
 one: with nothing measured a byte of log costs a byte of image, whose break-even is the log at its image's size.
 
-**What is left.** The image's bytes at open are its pages' (page count times page size); postcard's few bytes of
-framing a page are not counted. A configuration change's entry is not counted in the replay's bytes (it is applied
+**What is left.** A configuration change's entry is not counted in the replay's bytes (it is applied
 by `apply_change`, rarely).
 
 **Tests.** `compaction_the_factor_is_one_until_both_costs_are_measured` (T-CT.1.1),
