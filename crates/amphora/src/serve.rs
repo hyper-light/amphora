@@ -711,13 +711,22 @@ enum SqlRequest {
     Read(#[serde(deserialize_with = "crate::transport::bounded::statement")] Statement),
 }
 
+/// The tables of one answer at most: a request's statements, `TX_MAX` at most.
+fn bounded_tables<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Table>, D::Error> {
+    crate::transport::bounded::vector::<D, Table, { amphora_api::TX_MAX }>(d)
+}
+
+/// A table's column names: a row's values at most, as `transport::bounded` counts them.
+fn bounded_columns<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    crate::transport::bounded::vector::<D, String, { crate::transport::bounded::VALUE_COUNT }>(d)
+}
 
 /// A `Q` connection's answer to one request ([`SqlRequest`]); variants only appended.
 #[derive(Debug, Serialize, Deserialize)]
 enum SqlAnswer {
     Agreed(u32),
     /// Each statement's table, in the order asked: the answer's last frame.
-    Tables(Vec<Table>),
+    Tables(#[serde(deserialize_with = "bounded_tables")] Vec<Table>),
     /// The request refused, and why: a write's statements all rolled back, unless the refusal is
     /// `Timeout` or `UnknownOutcome`, whose write may have committed. The answer's last frame, its
     /// rows sent before it dropped. The connection goes on.
@@ -727,6 +736,7 @@ enum SqlAnswer {
     /// API's result bound, so none is refused for its size alone.
     Rows {
         statement: u32,
+        #[serde(deserialize_with = "crate::transport::bounded::rows")]
         rows: Vec<Vec<Value>>,
     },
 }
@@ -735,7 +745,9 @@ enum SqlAnswer {
 /// counts after it (the rows the last insert, update or delete changed, and the last rowid).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Table {
+    #[serde(deserialize_with = "bounded_columns")]
     pub columns: Vec<String>,
+    #[serde(deserialize_with = "crate::transport::bounded::rows")]
     pub rows: Vec<Vec<Value>>,
     pub affected: u64,
     pub last_insert_rowid: i64,
@@ -2324,6 +2336,48 @@ mod tests {
         for frame in &frames {
             let _ = write_frame(link.get_mut(), &frame.bytes);
         }
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2's bounds): do hand the client an answer of Nulls a byte
+    /// each whose rows, decoded, pass the result bound, as one table and as rows ahead of one;
+    /// expect both refused while decoding, as the transport's decoders refuse them, and the same
+    /// rows within the bound read.
+    #[test]
+    fn cp_t1_13_a_sql_client_decodes_answers_within_the_result_bound() {
+        let past = vec![vec![Value::Null]; amphora_api::RESULT_MAX / 32 + 2];
+        let table = |rows: Vec<Vec<Value>>| Table {
+            columns: vec!["n".into()],
+            rows,
+            affected: 0,
+            last_insert_rowid: 0,
+        };
+        for frames in [
+            vec![SqlAnswer::Tables(vec![table(past.clone())])],
+            vec![
+                SqlAnswer::Rows {
+                    statement: 0,
+                    rows: past,
+                },
+                SqlAnswer::Tables(vec![table(vec![])]),
+            ],
+        ] {
+            let mut wire = Vec::new();
+            for frame in &frames {
+                write_frame(&mut wire, &postcard::to_allocvec(frame).unwrap()).unwrap();
+            }
+            assert!(answer(&mut wire.as_slice(), 1).is_err(), "{} bytes decoded", wire.len());
+        }
+        let within = vec![vec![Value::Null]; 1000];
+        let mut wire = Vec::new();
+        write_frame(
+            &mut wire,
+            &postcard::to_allocvec(&SqlAnswer::Tables(vec![table(within.clone())])).unwrap(),
+        )
+        .unwrap();
+        let SqlAnswer::Tables(tables) = answer(&mut wire.as_slice(), 1).unwrap() else {
+            panic!("not tables");
+        };
+        assert_eq!(tables[0].rows, within);
     }
 
     /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do write a row and read back 40 rows of a MiB

@@ -553,14 +553,14 @@ impl<'db> Connection<'db> {
     fn request(&self, sql_bytes: usize, params: impl Params) -> Result<Vec<Value>> {
         self.finish()?;
         let params = params.values()?;
-        crate::bound("SQL parameters", params.len(), crate::TX_MAX).map_err(failed)?;
+        crate::bound("SQL parameters", params.len(), crate::TX_MAX)?;
         let mut bytes = sql_bytes;
         for value in &params {
             bytes = bytes
                 .checked_add(size(value))
                 .ok_or_else(|| failed("SQL request size overflow"))?;
         }
-        crate::bound("SQL request bytes", bytes, crate::RESULT_MAX).map_err(failed)?;
+        crate::bound("SQL request bytes", bytes, crate::RESULT_MAX)?;
         Ok(params)
     }
 }

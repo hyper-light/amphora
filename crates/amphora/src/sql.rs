@@ -411,6 +411,23 @@ mod tests {
         }
     }
 
+    /// CP-T1.13, AC-T1.2.3: do run a statement whose parameters pass the request bound; expect
+    /// the refusal typed TooLarge, not text.
+    #[test]
+    fn cp_t1_13_a_request_past_its_bound_is_refused_too_large_typed() {
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        let half = || amphora_api::Value::Blob(vec![0; amphora_api::RESULT_MAX / 2 + 1]);
+        db.call(until(), move |c| {
+            let refused = c.execute("SELECT ?1, ?2", [half(), half()]);
+            assert!(
+                matches!(refused, Err(super::Error::Refusal(Refusal::TooLarge { .. }))),
+                "{refused:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do step a statement's rows through
     /// `Statement::each`; expect each row handed over in order as stepped, the stream stopping
     /// when told, and a row past the result bound refused TooLarge after the rows before it.
