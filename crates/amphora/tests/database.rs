@@ -799,3 +799,43 @@ fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     assert!(wrote.is_err(), "a query wrote: {wrote:?}");
     assert_eq!(count(&db).unwrap(), 2);
 }
+
+/// AUDIT 2026-11-23 §1, MB.1: a call charged by its answer answers within its bound, and an
+/// answer past its declared bound is refused and rolled back, never committed.
+#[test]
+fn mb_1_a_charged_call_past_its_declared_answer_rolls_back() {
+    use amphora::database::{AnswerBytes, AnswerCharge};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("charged.db"), until()).unwrap();
+    db.call(until(), |c| {
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)")?;
+        Ok(())
+    })
+    .unwrap();
+    let write = |id: i64, charge: AnswerCharge| {
+        db.call_charged(until(), charge, move |c| {
+            c.execute(
+                "INSERT INTO t (id, v) VALUES (?1, 'x')",
+                vec![Value::Integer(id)],
+            )?;
+            Ok("y".repeat(100))
+        })
+    };
+    let answer = "y".repeat(100).answer_bytes();
+    assert_eq!(write(1, AnswerCharge::Declared(answer)).unwrap().len(), 100);
+    assert_eq!(write(2, AnswerCharge::Measured).unwrap().len(), 100);
+    assert!(matches!(
+        write(3, AnswerCharge::Declared(answer - 1)),
+        Err(Refusal::TooLarge { .. })
+    ));
+    let ids = db
+        .call(until(), |c| {
+            let mut s = c.prepare("SELECT id FROM t ORDER BY id")?;
+            let ids = s
+                .query_map(Vec::<Value>::new(), |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ids)
+        })
+        .unwrap();
+    assert_eq!(ids, vec![1, 2]);
+}
