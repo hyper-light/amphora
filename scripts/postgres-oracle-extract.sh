@@ -8,14 +8,20 @@
 # take no arguments to Index.new, which the script passes two) and an `xcrun` that answers `/` so
 # its SDK include path is /usr/include.
 #
+# The extraction also takes outfuncs.c's nodeToStringWithLocations, the tree printer, and links
+# scripts/postgres-oracle.c against what it took into <work dir>/pg-oracle.
+#
 # usage: scripts/postgres-oracle-extract.sh <work dir under ~/.cache>
 set -euo pipefail
 W=${1:?usage: postgres-oracle-extract.sh <work dir>}
 mkdir -p "$W"
+cp "$(dirname "$0")/postgres-oracle.c" "$W/oracle.c"
 cd "$W"
 [ -d postgres/.git ] || git clone -q --depth 1 --branch REL_19_0 https://github.com/postgres/postgres.git postgres
 [ -d libpg_query/.git ] || git clone -q https://github.com/pganalyze/libpg_query.git libpg_query
 git -C libpg_query checkout -q 7663e07
+grep -q "deep_resolve('nodeToStringWithLocations')" libpg_query/scripts/extract_source.rb ||
+  sed -i "/^runner.deep_resolve('raw_parser')/a runner.deep_resolve('nodeToStringWithLocations')" libpg_query/scripts/extract_source.rb
 # The one libpg_query patch taken: its 12 drops an ACL check from functioncmds.c, which the
 # extraction's walk reaches through PL/pgSQL's compiler (interpret_function_parameter_list) and
 # stops at (`ERROR: Hit blocklist entry object_aclcheck`). raw_parser never runs that file, so no
@@ -23,7 +29,7 @@ git -C libpg_query checkout -q 7663e07
 if ! patch -d postgres -p1 --dry-run -R -s < libpg_query/patches/12_remove_acl_check.patch >/dev/null 2>&1; then
   patch -d postgres -p1 -s < libpg_query/patches/12_remove_acl_check.patch
 fi
-docker run --rm -e HU="$(id -u)" -e HG="$(id -g)" -v "$W":/w ruby:3.3 bash -ec '
+docker run --rm -e JOBS="${JOBS:-1}" -e HU="$(id -u)" -e HG="$(id -g)" -v "$W":/w ruby:3.3 bash -ec '
   trap "chown -R $HU:$HG /w" EXIT
   apt-get -qq update >/dev/null
   apt-get -qq install -y bison flex libclang-dev >/dev/null 2>&1
@@ -47,4 +53,11 @@ docker run --rm -e HU="$(id -u)" -e HG="$(id -g)" -v "$W":/w ruby:3.3 bash -ec '
   rm -rf "${OUT:=/w/out}"
   mkdir -p "$OUT/include"
   ruby /w/libpg_query/scripts/extract_source.rb /w/postgres/ "$OUT/" > /w/extract.log 2>&1
-  echo "extracted $(find "$OUT" -type f | wc -l) files into $OUT"'
+  echo "extracted $(find "$OUT" -type f | wc -l) files into $OUT"
+  # An archive, so the link takes only what oracle.c reaches (not PL/pgSQL'"'"'s compiler).
+  CF="-O2 -I$OUT/include -I/w/libpg_query/src/include -fno-strict-aliasing -fwrapv -w"
+  rm -rf /w/obj && mkdir -p /w/obj
+  ls "$OUT"/*.c | xargs -P "$JOBS" -I{} sh -c "cc -c $CF {} -o /w/obj/\$(basename {} .c).o"
+  rm -f /w/liboracle.a && ar rcs /w/liboracle.a /w/obj/*.o
+  cc $CF /w/oracle.c /w/liboracle.a -o /w/pg-oracle
+  echo "linked /w/pg-oracle"'
