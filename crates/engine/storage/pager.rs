@@ -2009,10 +2009,46 @@ pub struct Pager {
 /// start of the epoch under way and of the one before it. An epoch is as many fetches as the
 /// connection's cache holds pages, a turnover of the cache, so the share follows the latest one to
 /// two turnovers and leaves older fetches behind as the working set moves.
+///
+/// Lane T13 (PL.13, the versioned cost snapshot; `docs/design/planner.md`): the share the planner
+/// reads is `standing`, the share of a closed epoch, replaced by a later epoch's only past the
+/// spread between epochs (`learned_costs::Batches`), as a learned weight is replaced. Between two
+/// such moves every plan is priced on one share, so plans don't follow its noise.
 #[derive(Debug, Clone, Copy, Default)]
 struct PageMissWindow {
     previous: (u64, u64),
     current: (u64, u64),
+    standing: Option<f64>,
+    batches: crate::translate::optimizer::learned_costs::Batches,
+}
+
+impl PageMissWindow {
+    /// The share the planner prices pages by at counts `now` (fetches, file reads): an epoch of
+    /// `epoch` fetches or more since the last one closes, and is judged against the standing share.
+    fn read(&mut self, now: (u64, u64), epoch: u64) -> Option<f64> {
+        if now.0.saturating_sub(self.current.0) >= epoch {
+            let closed = share(self.current, now);
+            self.previous = self.current;
+            self.current = now;
+            if let Some(closed) = closed {
+                let standing = self.standing;
+                let moved = self.batches.judge(standing, closed);
+                if moved {
+                    self.standing = Some(closed);
+                }
+                tracing::debug!(target: "amphora::join_search", closed, ?standing, moved, spread = ?self.batches.spread(), "the page-miss share's epoch closed");
+            }
+        }
+        self.standing.or_else(|| share(self.previous, now))
+    }
+}
+
+/// The share of the fetches between two counts (fetches, file reads) that read a file; None
+/// without a fetch between them.
+fn share(from: (u64, u64), to: (u64, u64)) -> Option<f64> {
+    let fetches = to.0.saturating_sub(from.0);
+    let reads = to.1.saturating_sub(from.1).min(fetches);
+    (fetches > 0).then(|| reads as f64 / fetches as f64)
 }
 
 /// Retired record buffers kept per pager. Each holds a page-sized allocation.
@@ -4377,20 +4413,14 @@ impl Pager {
         self.page_file_reads.load(Ordering::Relaxed)
     }
 
+    /// Lane T13: the standing share once an epoch has closed; before that, the share so far.
     pub(crate) fn page_miss_ratio(&self) -> Option<f64> {
         let now = (
             self.page_fetches.load(Ordering::Relaxed),
             self.page_file_reads.load(Ordering::Relaxed),
         );
         let epoch = u64::try_from(self.cached_page_capacity().max(1)).unwrap_or(u64::MAX);
-        let mut window = self.page_miss_window.lock();
-        if now.0.saturating_sub(window.current.0) >= epoch {
-            window.previous = window.current;
-            window.current = now;
-        }
-        let fetches = now.0.saturating_sub(window.previous.0);
-        let reads = now.1.saturating_sub(window.previous.1).min(fetches);
-        (fetches > 0).then(|| reads as f64 / fetches as f64)
+        self.page_miss_window.lock().read(now, epoch)
     }
 
     /// Amphora (QT.5): the database's cost estimator, which this pager's page reads inform. Set
@@ -7500,6 +7530,30 @@ mod tests {
         default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    /// Lane T13 (PL.13, the versioned cost snapshot; `docs/design/planner.md`): do close epochs of
+    /// fetches whose shares sit within the spread between epochs, then read inside an epoch whose
+    /// every fetch missed, then close epochs the cache answered whole; expect the share the plans
+    /// read to stand at the first epoch's through all of the first two, and to move once, to the
+    /// warm share, on the third.
+    #[test]
+    fn t13_a_page_miss_share_within_its_measured_noise_keeps_the_standing_share() {
+        let epoch = 1_000;
+        let mut window = super::PageMissWindow::default();
+        let mut now = (0_u64, 0_u64);
+        let mut read = |window: &mut super::PageMissWindow, fetches: u64, reads: u64| {
+            now = (now.0 + fetches, now.1 + reads);
+            window.read(now, epoch)
+        };
+        assert_eq!(read(&mut window, epoch, 500), Some(0.5), "the first epoch stands");
+        for reads in [520, 480, 510, 490, 505] {
+            assert_eq!(read(&mut window, epoch, reads), Some(0.5), "an epoch {reads} of {epoch} within the noise moved the share");
+        }
+        assert_eq!(read(&mut window, epoch - 1, epoch - 1), Some(0.5), "fetches inside an epoch moved the share");
+        assert_eq!(read(&mut window, epoch + 1, 1), Some(0.5), "that epoch's share, 0.5, moved the share");
+        let warm: Vec<_> = (0..4).map(|_| read(&mut window, epoch, 0)).collect();
+        assert_eq!(warm, vec![Some(0.0); 4], "the warm cache's share past the noise did not replace it once");
+    }
 
     /// CP-T1.8, T-T1.8.A6: a new page is all zeros even when the pool hands it a buffer an
     /// earlier page wrote. Do: take more pages than the test arena holds (so both the arena's
