@@ -6,8 +6,8 @@
 //! statement's plan states, and not before.
 
 use amphora_engine::{
-    ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, Numeric, OpenOptions, PlatformIO,
-    SqliteDialect, StepResult, Value,
+    ConnectOpts, Connection, Database, DatabaseOpts, JoinMethods, LearnedWeights, Numeric,
+    OpenOptions, PlatformIO, SqliteDialect, StepResult, Value,
 };
 use std::sync::Arc;
 
@@ -55,6 +55,21 @@ fn switch_point(conn: &Arc<Connection>, sql: &str) -> Option<u64> {
     })
 }
 
+/// Every cost weight pinned (lane T9): a seek, a hash table's build and its probe as given, every
+/// other step nothing and no page read timed, so no plan here moves with the machine's timings.
+fn pinned(seek: f64, hash_build: f64, hash_probe: f64) -> LearnedWeights {
+    LearnedWeights {
+        row_in_pages: None,
+        seek,
+        hash_build,
+        hash_probe,
+        sort: 0.0,
+        bloom_probe: 0.0,
+        where_step: 0.0,
+        page_miss: None,
+    }
+}
+
 fn open(name: &str) -> (tempfile::TempDir, Arc<Connection>) {
     let dir = tempfile::tempdir().unwrap();
     let io = Arc::new(PlatformIO::new().unwrap());
@@ -63,7 +78,7 @@ fn open(name: &str) -> (tempfile::TempDir, Arc<Connection>) {
     let conn = db.connect(ConnectOpts::new()).unwrap();
     // A seek four rows' visits, a hash table's build and probe one each: a break-even on any
     // machine, where the learned weights may have none (a probe timed at a seek's cost or more).
-    conn.pin_cost_weights(Some((4.0, 1.0, 1.0)));
+    conn.pin_cost_weights(Some(pinned(4.0, 1.0, 1.0)));
     (dir, conn)
 }
 
@@ -452,7 +467,7 @@ fn pl_13_a_chosen_hash_joins_build_past_the_estimate_plans_again() {
     // the machine's timed weights (a page's, the fitted ones) pick the side, b about one run in five,
     // whose count is right and plans nothing again. Priced apart, the plan builds the side it counts
     // smaller, a, whatever the machine.
-    conn.pin_cost_weights(Some((4.0, 3.0, 1.0)));
+    conn.pin_cost_weights(Some(pinned(4.0, 3.0, 1.0)));
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k)")
         .unwrap();
