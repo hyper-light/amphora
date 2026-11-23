@@ -408,3 +408,65 @@ func.c, PostgreSQL or exact reference.
 It exited 1 at every core count before opening the database: the bench wants `q02.sql` in the
 folder it is given (`limit-queries/q02.sql: No such file or directory`, in `limit.err`). It says
 nothing about the engine.
+
+# Lane R4 (reals), 2026-11-23 21:57Z to 22:52Z: parallel mode keeps every row; Exact stays exact past the double's range
+
+## Verdict, losses first
+
+- **The module suites after the fix did not finish in this lane.** r1639 ran `vdbe::morsel` and
+  `translate::parallel` for 17 min without ending and was stopped so clippy could run. Rule 5b puts
+  them after the merge. r1671 (Mac Studio 2, from 22:47Z, on main 4927f1aa) runs them and prints
+  each test as it ends, so a slow or stuck one shows by name: read it with kiln's `output`.
+- **No timings.** Parallel mode adds one Noop per row to each worker's body run (a fence `keep` is
+  placed after). Its cost is not measured.
+- **Done: the lost-row bug is fixed** (9a83c1eb). R2's test and the new constant-columns test pass.
+- **Done: Exact stays exact past the double's range** (199205b2). bigpairs answers +inf, as SQLite
+  does; a running sum that overflows and comes back answers the exact sum.
+- The default stays `Serial`; nothing here changes it.
+
+## The lost row (r1639, Mac Studio 2, load 1.7 to 3.5 on 32 cores)
+
+R3's trace held. `emit_body` placed `keep` with `preassign_label_to_next_insn` right after the
+outputs' code. A label resolves to the instruction after the one emitted before it, wherever that
+one moves (`resolve_labels`: anchor + 1 after `emit_constant_insns` remaps it). A constant output
+is hoisted to the program's end, so `keep` followed it there and every worker reached `skip` first.
+Fix: a Noop of the body's own before `keep`'s, so `keep`'s anchor is never hoisted.
+
+It was wider than R3 guessed: any statement whose **last** result column is a constant lost every
+row, not only all-constant ones.
+
+`r4_parallel_constant_columns_return_every_row`: 20,000 rows; `SELECT 1`, `SELECT 1, 'two', 3.5,
+NULL` and `SELECT a, 7`; parallel mode at 1, 2, 4, 8, 16 and 32 cores; in memory and on a file
+reopened by a fresh database; against the serial loop's rows.
+
+| commit | R2's one-row test | constant columns |
+|---|---|---|
+| 5dcb420a (test, no fix) | fails | fails: 0 rows for every statement, core count and storage |
+| 9a83c1eb (fix) | passes | passes |
+
+## Exact past the range (r1655, Mac Studio 2, load 1.5 to 2.6)
+
+`ExactSum` is now its partials plus a carry of 2^1021 units (an i64). Whole units move into the
+carry, so every partial stays below 2^1021 and no two-sum step reaches 2^1023. `value()` rounds
+once: with no carry as before; with 1 or 2 units the carry is the largest partial; with 3 to 9 at
+2^-1021 the scale (a partial that would vanish there keeps its sign, since it can only settle a tie),
+then scaled back; past 9 an infinity. The non-finite inputs are added after. R3's reason holds:
+dropping the infinite error terms alone would still answer NaN on bigpairs.
+
+| commit | `r4_exact_sum_stays_exact_past_the_range` | G8 hard cases (11, at every core count) |
+|---|---|---|
+| d25b53fd (tests, no fix) | fails: bigpairs, cut at 0, NaN | fails: bigpairs `[[Null, Null, Null]]`, expected `[[inf, inf, inf]]` |
+| f7162e53 (fix) | passes | passes |
+
+The unit test's cases, each cut in two at every place, merged both ways and through the payload's
+bytes: bigpairs (+inf), overflow and back (1.5), down and back (-0.25), max + max - max (max),
+max + 2^970 (the tie: +inf), max + 2^970 - 2^-1074 (the tiny term breaks the tie: max).
+
+## Side findings (not chased, rule 0)
+
+- `storage/versioned/columns/scan.rs` keeps its own `ExactSum` and moves an overflowed partial sum
+  into `special` the old way. Read from the code, not run: the column copy under `Exact` likely
+  answers NULL on bigpairs too.
+- Any label placed by `preassign_label_to_next_insn` right after an instruction that gets hoisted
+  follows it to the constant section. Only `keep` was found doing this in `parallel.rs`; the rest of
+  the translator was not searched.

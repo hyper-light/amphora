@@ -16,10 +16,18 @@ PORT=55432
 DATA=${AMPHORA_BENCH_DATA:-$HOME/.cache/amphora-bench-data-nocow}/postgres
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
+# Where the image keeps its data: from 18 on, the official image refuses a mount at
+# /var/lib/postgresql/data and wants one at /var/lib/postgresql (docker-library/postgres#1259).
+mount_point() {
+  local major=${IMAGE##*:}
+  major=${major%%[!0-9]*}
+  if [[ -n "$major" ]] && ((major >= 18)); then echo /var/lib/postgresql; else echo /var/lib/postgresql/data; fi
+}
+
 run() {
   # Parallel queries take their shared memory from /dev/shm: Docker's 64 MB can run out.
   docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" $(limits) --shm-size 256m \
-    -e POSTGRES_HOST_AUTH_METHOD=trust -v "$DATA:/var/lib/postgresql/data" \
+    -e POSTGRES_HOST_AUTH_METHOD=trust -v "$DATA:$(mount_point)" \
     "$IMAGE" postgres -c listen_addresses=127.0.0.1 -c port="$PORT" -c max_connections=1100
 }
 
