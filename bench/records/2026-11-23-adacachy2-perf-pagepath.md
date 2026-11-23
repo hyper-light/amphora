@@ -101,6 +101,25 @@ the node list) and the lines the ReadIndex's fields share. The fix to try next: 
 `ArcSwap::load` per lookup, then this bench again at 1-32 threads. Default left at `locked`: the
 graduation is Ada's decision (below), and the suite shows no end-to-end gain while its log is empty.
 
+## AUDIT 2.1, decision 40 revised (Ada): the default way reads the header lock-free (ae729b06, perf/pagepath only)
+
+Quick A/B (script `.git/perf-ab5.sh`, records `ab5-0229.jsonl`, load 59-90): ae729b06's bench binary
+against bench-after2 (a02e4b20: header under its lock). CONFOUNDED: the after binary also carries
+main's merges since (planner `learned_costs.rs`, vdbe). Median [reps]:
+
+| op | clients | header locked (a02e4b20) | header lock-free (ae729b06) |
+|---|---|---|---|
+| point_pk | 1 | 294,357 [294,357 327,192 254,550] | 331,801 [328,539 331,801 333,732] |
+| point_pk | 32 | 1,007,478 [1,040,832 912,363 1,007,478] | 948,410 [1,020,096 891,522 948,410] |
+| point_pk | 128 | 799,975 [908,250 762,278 799,975] | 843,650 [863,913 794,409 843,650] |
+| point_secondary | 1 | 265,780 [278,549 265,780 220,180] | 260,021 [260,021 215,147 272,757] |
+| point_secondary | 32 | 787,423 [810,096 752,693 787,423] | 682,090 [391,727 706,333 682,090] |
+| point_secondary | 128 | 578,757 [578,757 583,735 464,105] | 337,271 [380,134 307,379 337,271] |
+
+Reading: point_secondary at 128 clients falls 42%, outside the noise (after's best is below base's
+worst); A/B 3 above, one binary, also had every lock-free-header way under `locked` there (397-493k vs
+557k). Not landed on main until a same-tree A/B (`.git/perf-ab5.sh`, rewritten by perf-B3; see its section below)
+says whether the header or main's merge does it.
 ## The ~1 M/s ceiling from 32 clients on: the reader pool's std lock (perf-B3, AUDIT 2)
 
 Tool: `bench/syscall_sample.py`. It starts the bench itself, so Yama's `ptrace_scope=1` lets it read
@@ -140,6 +159,108 @@ spread over per-thread addresses, plus the host's load. Sample it next. Not yet 
 
 ## AUDIT 2.1 header, the fair A/B (perf-B3): running, not finished in the hour
 
-`.git/perf-ab5.sh` (rewritten): after = HEAD, base = HEAD's tree with only ae729b06's `crates/` diff
-reversed; 5 rounds, arm order alternated, load recorded; output `ab5-<HHMM>.jsonl`, written once both
-builds finish. Under load 90-136 the after build took 20m22s. Its kiln run is r211 on adacachy2.
+`.git/perf-ab5.sh` (rewritten): after = 4314cb0c's bench binary (`bench-hdr-after-4314`), base =
+4314cb0c's tree with only ae729b06's `crates/` diff reversed, so main's later merges can't confound
+it; 5 rounds, arm order alternated, load recorded; output `ab5-<HHMM>.jsonl`, written once the base
+build finishes. Under load 90-136 the after build took 20m22s (run r211). r211's base build then
+failed: `git archive` leaves out the untracked `bench/Cargo.lock`. Relaunched as run r266 with the
+lock files copied in.
+
+## perf-B4: the lock-free ways' "collapse past 4 threads" is the bitmap sending half the reads to the lock (AUDIT 2.1)
+
+`PageBits::holds` said "ask under the lock" for a page past its words. The bench reads pages
+1..2*pages; at 32,612 pages the bitmap's 512 words reach page 32,767, so 32,457 of the 32,612
+absent pages (half of all reads) took the shared `RwLock` and the frame index's lock. At 32,768
+pages the words double (1,024: to 65,535) and every read is answered lock-free. One binary (perf-B2's
+release test binary, copied to `lookup-old-2b58`), only the page count changed, alternated, threads
+pinned with `taskset -c 0..n-1`, kiln run r318 (needs cpus=16), records `b4-bits-0435.txt`, load
+78-100 on 32 cores. Lookups a second, all threads, reps:
+
+| threads | Published 32,612 | Published 32,768 | Optimistic 32,612 | Optimistic 32,768 | Locked (either) |
+|---|---|---|---|---|---|
+| 1 | 29.1 M, 28.9 M, 29.4 M | 36.6 M, 36.2 M, 33.2 M | 29.9 M, 30.9 M, 31.2 M | 39.0 M, 39.1 M, 37.5 M | 46-51 M |
+| 2 | 38.0 M, 36.7 M, 38.2 M | 73.9 M, 72.3 M, 71.4 M | 39.8 M, 39.7 M, 37.6 M | 76.2 M, 75.3 M, 74.9 M | 15.7-17.0 M |
+| 4 | 29.2 M, 29.7 M, 28.9 M | 136.6 M, 130.1 M, 128.5 M | 32.9 M, 34.9 M, 32.3 M | 92.3 M, 144.6 M, 145.3 M | 10.2-11.1 M |
+| 8 | 18.3 M, 18.2 M, 18.1 M | 196.1 M, 220.0 M, 208.2 M | 17.9 M, 17.6 M, 17.6 M | 203.2 M, 273.7 M, 195.4 M | 7.0-7.1 M |
+| 16 | 8.47 M, 8.37 M, 8.27 M | 407.8 M, 382.1 M, 382.9 M | 8.27 M, 8.24 M, 8.24 M | 370.1 M, 495.5 M, 388.4 M | 2.9-3.4 M |
+
+Reading: with every read answered lock-free, both ways scale with the threads (27-42 ns a lookup a
+thread from 1 to 16), 120-150x the lock at 16. So nothing a lookup writes is shared, and
+`ArcSwap::load` is not the collapse. What remains against the lock is one reader: 27-29 ns against
+20 ns, the three `ArcSwap` loads. The fix (4da616cf) answers a page past the words as absent; its
+own A/B (this bench, its binary against `lookup-old-2b58`, 32,612 pages) is still to run, as are its
+clippy and the release storage suite (run r335, queued at hand-over; r312/r314 died on a sync link error).
+
+## perf-B5: the header's A/B not yet run; B4's fix checked; decision 45 written (AUDIT 2.1, P4's finding)
+
+**Checks of 76a62c3d** (B4's 4da616cf and the header ae729b06, with origin/main merged; run r864, needs cpus=8):
+`cargo clippy -p amphora-engine --all-targets --locked -- -D warnings` exit 0, and `cargo test -p amphora-engine
+--lib -- storage::wal storage::log_index` 105 passed, 0 failed, 1 ignored. That run includes
+`audit_2_1_a_page_past_the_logs_highest_is_absent_without_the_lock`,
+`g3_2_lock_free_page_reads_find_the_frame_the_locked_index_finds` and
+`audit_2_1_default_header_reads_race_a_writer_and_stay_current`.
+
+**The header's A/B (5b: it lands only with its A/B): not run.** The script is `.git/perf-ab6.sh` in the pagepath
+clone. It builds after = 639245cc (perf/pagepath: the header, B4's fix, origin/main e56f44e7) and base = the same tree
+with only ae729b06's `crates/` diff reversed (checked: `git apply -R --check` holds on that tree). Both are built one
+after the other in the lane's target dir. It then runs 5 alternated rounds of `point_pk` and `point_secondary` at 1,
+32 and 128 clients, with one shared `XDG_CACHE_HOME` (5e), recording load and CPU and I/O pressure before and after
+each run, and errors and rows per op. Run r836's first build of 76a62c3d failed in `amphora`: main's `bench/Cargo.toml`
+did not patch `hyper-rt`, which the postgres listener (f8f65110) uses, so cargo took crates.io's. Main has patched it
+since, and 639245cc has that patch. After that, adacachy2 refused the run for room five times between 14:25 and
+14:45Z, with 0-7 of 32 cores idle. Run r902 (placed 14:46:39Z) built both arms: after in 1m44s, base in 1m25s,
+with the revert's diff stat 3 insertions and 72 deletions in `log_index.rs` and `wal.rs`. The binaries are on
+adacachy2 at `~/.cache/amphora-perf-bin/pagepath/b5-after-639245cc` and `b5-base-639245cc`. No number came out: every
+timed run stopped at `--reuse: no database`, because the data folder was new. The timed half alone is
+`.git/perf-ab6-timed.sh`: it loads the suite's database once without `--reuse`, then runs the 10 alternated runs. At
+14:53Z it was refused for room (11 of 32 cores idle). Run it with needs `linux/amd64,cpus=16,mem=24g`, `on` adacachy2,
+sync false, and retry until it is placed.
+
+**B4's fix alone on main.** 3a30e5f1 (branch `perf/pagepath-b4-pick`) is 4da616cf cherry-picked onto origin/main
+9a7b14bb, clean. On that tree (run r901) clippy exited 0 and `storage::wal storage::log_index` passed 104, failed 0,
+ignored 1. It is on main as e956abf0, pushed at 14:50Z, with the checks in its message. Its own binary A/B
+(the lookup bench, this binary against perf-B2's `lookup-old-2b58`) is still to run.
+
+**Decision 45** (docs/design/store.md, commit 4d0ead88) is the two-segment log's design. Nothing is built yet.
+
+## perf-B6 (2026-11-23, 15:13-16:13Z)
+
+**The header's A/B, timed: the lock-free header regresses at one client; not landed.** Run r950 (adacachy2, needs
+`linux/amd64,cpus=12,mem=24g`, placed 15:21Z with 25 of 32 cores idle) ran `.git/perf-ab6-cal.sh` in the pagepath
+clone: perf-ab6-timed.sh on r902's arms (after = 639245cc, base = 639245cc with ae729b06's `crates/` diff reversed),
+plus RULES 5e. The after arm loaded the suite's database (200,000 items) and measured its calibration; the base arm
+ran once to make its own file; the after arm's body was then written under both keys (sha256 3a6055409e46d1b2 in
+both before and after the timed runs). Then 5 rounds, arm order alternated, `point_pk` and `point_secondary` at 1,
+32 and 128 clients, 5 s each after 1 s of warm-up, `--reuse`. Errors 0 in every run, rows per op 1.0. Records:
+adacachy2 `~/.cache/amphora-perf-bin/pagepath/ab6-cal-1521.jsonl`.
+
+Ops/s, median of 5 [range], after against base:
+
+| op | clients | after | base | after/base |
+|---|---|---|---|---|
+| point_pk | 1 | 205,977 [194,875-255,343] | 243,986 [208,228-319,526] | 0.84 |
+| point_pk | 32 | 809,217 [445,461-890,909] | 708,804 [563,967-924,958] | 1.14 |
+| point_pk | 128 | 561,634 [312,712-632,921] | 524,428 [394,636-794,965] | 1.07 |
+| point_secondary | 1 | 167,428 [131,383-204,039] | 190,610 [181,014-270,593] | 0.88 |
+| point_secondary | 32 | 531,572 [277,713-606,997] | 534,746 [420,924-627,768] | 0.99 |
+| point_secondary | 128 | 289,239 [240,622-335,637] | 345,481 [262,280-419,937] | 0.84 |
+
+p99.9 at one client, per round (after / base, ms): `point_pk` 0.32/0.568, 0.048/0.013, 0.6/0.007, 0.162/0.008,
+0.296/0.182 (after worse in 4 of 5); `point_secondary` 0.428/0.022, 0.32/0.061, 0.512/0.01, 0.088/0.009, 0.728/0.085
+(after worse in 5 of 5, by 4x to 50x). At one client the after arm's throughput is below base's in all 5 rounds for
+both queries. At 32 and 128 clients the rounds disagree, and they follow the host more than the arm: load was 55-138
+on 32 cores and CPU pressure (some, avg10) 53-63%, except while base ran rounds 3 and 4, when it fell to 20-26% and
+base's 128-client p99.9 fell to 1.8-2.1 ms against 13-41 ms in every other run. The one-client regression is beyond
+the run-to-run noise; its cause is not found (no profile was taken: a guess is the seqlock's validation or its
+fallback under the lock, unmeasured). Per the brief, the header (ae729b06) stays on perf/pagepath and the design
+merges alone.
+
+**Decision 45, revised.** Ada (15:11Z): the two segments replace the one log outright, with no upgrade step, no
+reading of a one-segment format and no switch between the two, and the one-segment restart deleted. The doc now says
+so: each segment's header is today's log header, so a log with no valid `-wal2` is a state of the two-segment log;
+bytes 18 and 19 carry 3 (wal2's value) so SQLite without wal2 refuses the file rather than read `-wal` without
+`-wal2`'s commits. Found while checking the brief's bounded-log test against the shape: every read counted itself on
+the closing segment whole, so reads that overlap with no gap would never let its count reach zero, and the writer
+could never switch again. A read begun once the closing segment is copied into a flushed file now takes the current
+segment alone and reads the rest from the file. The reset's events are three: the last read's give-back, the copy
+with the file's flush, and a backed-up database's ship.
