@@ -174,7 +174,10 @@ fn refill_keys<'a>(
 ) -> Result<()> {
     let n = keys.len();
     buf.truncate(n);
-    buf.try_reserve(n - buf.len())?;
+    buf.try_reserve(
+        n.checked_sub(buf.len())
+            .ok_or(LimboError::IntegerOverflow)?,
+    )?;
     buf.resize(n, Value::Null);
     for (kept, key) in buf.iter_mut().zip(keys) {
         kept.try_clone_from(key)?;
@@ -360,7 +363,11 @@ impl HashEntry {
         };
         let key_size: usize = key_values.iter().map(value_size).sum();
         let payload_size: usize = payload_values.iter().map(value_size).sum();
-        key_size + payload_size + Self::FIXED_BYTES
+        // A budgeting estimate: held at usize::MAX, a size too large to count stays over every
+        // budget, so the entry spills as one that large would.
+        key_size
+            .saturating_add(payload_size)
+            .saturating_add(Self::FIXED_BYTES)
     }
 
     /// Calculate the serialized size of a single Value.
@@ -1276,9 +1283,10 @@ impl HashTable {
             if forward {
                 let mut pos = start;
                 while order.get(pos).is_some_and(below_probe) {
-                    pos += 1;
+                    pos = pos.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
                 }
-                (pos, u64::try_from(pos - start).unwrap_or(u64::MAX), false)
+                let steps = pos.checked_sub(start).ok_or(LimboError::IntegerOverflow)?;
+                (pos, u64::try_from(steps).unwrap_or(u64::MAX), false)
             } else {
                 (
                     order.partition_point(|position| below_probe(position)),
@@ -1314,9 +1322,14 @@ impl HashTable {
         if !matches {
             return Ok(None);
         }
-        self.merge_next += 1;
+        self.merge_next = self
+            .merge_next
+            .checked_add(1)
+            .ok_or(LimboError::IntegerOverflow)?;
         self.probe_bucket_idx = bucket_idx;
-        self.probe_entry_idx = entry_idx + 1;
+        self.probe_entry_idx = entry_idx
+            .checked_add(1)
+            .ok_or(LimboError::IntegerOverflow)?;
         Ok(self
             .buckets
             .get(bucket_idx)
@@ -1417,7 +1430,7 @@ impl HashTable {
         let entry_size = HashEntry::size_from_values(&pending.key_values, &pending.payload_values);
 
         // Check if we would exceed memory budget
-        if self.mem_used + self.bucket_mem + entry_size > self.mem_budget {
+        if self.over_budget(entry_size) {
             if self.spill_state.is_none() {
                 tracing::debug!(
                     "Hash table memory budget exceeded (used: {}, budget: {}), spilling to disk",
@@ -1572,7 +1585,7 @@ impl HashTable {
         }
 
         let entry_size = HashEntry::size_from_values(key_values, &[]);
-        if self.mem_used + self.bucket_mem + entry_size > self.mem_budget {
+        if self.over_budget(entry_size) {
             if self.spill_state.is_none() {
                 let partition_count = self.choose_partition_count(entry_size);
                 let partitioning = Partitioning::new(partition_count);
@@ -1605,8 +1618,19 @@ impl HashTable {
     /// (`new`, `grow_buckets`), so this is the hash's low bits; the spill partitions take its
     /// high bits (`Partitioning::index`), so the two stay independent.
     #[inline(always)]
-    const fn bucket_of(hash: u64, buckets: usize) -> usize {
-        (hash as usize) & (buckets - 1)
+    fn bucket_of(hash: u64, buckets: usize) -> usize {
+        let mask = buckets.wrapping_sub(1);
+        // The masked bits are at most `mask`, a usize, so they fit one.
+        usize::try_from(hash & u64::try_from(mask).unwrap_or(u64::MAX)).unwrap_or(mask)
+    }
+
+    /// Whether an entry of `entry_size` bytes would take the table past its memory budget. A sum
+    /// past usize::MAX is past every budget.
+    fn over_budget(&self, entry_size: usize) -> bool {
+        self.mem_used
+            .checked_add(self.bucket_mem)
+            .and_then(|used| used.checked_add(entry_size))
+            .is_none_or(|used| used > self.mem_budget)
     }
 
     /// AUDIT 3.1: doubles the in-memory bucket array once the table holds as many entries as it

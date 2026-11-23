@@ -1108,7 +1108,9 @@ impl Accumulator {
     fn finish(self) -> Result<Value, MorselError> {
         Ok(match self {
             Accumulator::Ordered { func, mut inputs } => {
-                use crate::vdbe::execute::{finalize_agg_payload, init_agg_payload, update_agg_payload};
+                use crate::vdbe::execute::{
+                    finalize_agg_payload, init_agg_payload, update_agg_payload,
+                };
                 let engine = |e: crate::LimboError| MorselError::Body(Box::new(e));
                 inputs.sort_unstable_by_key(|(position, _)| *position);
                 let mut payload = crate::alloc::vec![];
@@ -1439,7 +1441,14 @@ impl Partitioner {
         let count = u64::try_from(self.count.get()).map_err(|_| MorselError::Overflow {
             what: "the partition count",
         })?;
-        usize::try_from(self.hasher.hash_one(key) % count).map_err(|_| MorselError::Overflow {
+        let partition =
+            self.hasher
+                .hash_one(key)
+                .checked_rem(count)
+                .ok_or(MorselError::Overflow {
+                    what: "a key's partition",
+                })?;
+        usize::try_from(partition).map_err(|_| MorselError::Overflow {
             what: "a key's partition",
         })
     }

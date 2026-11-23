@@ -68,7 +68,7 @@ pub(crate) fn choose(
             continue;
         };
         let mut candidates = Vec::new();
-        for dim_member in join_order.iter().skip(fact_pos + 1) {
+        for dim_member in join_order.iter().skip(fact_pos).skip(1) {
             let dim_idx = dim_member.original_idx;
             let Some(dim) = joined.get(dim_idx) else {
                 continue;
@@ -135,7 +135,11 @@ pub(crate) fn choose(
             reaching *= pass;
         }
     }
-    let share = params.statement_memory / chosen.len().max(1);
+    // No filter chosen leaves the whole budget, as dividing by max(1) did.
+    let share = params
+        .statement_memory
+        .checked_div(chosen.len())
+        .unwrap_or(params.statement_memory);
     for filter in &mut chosen {
         filter.max_bytes = share;
     }
@@ -163,7 +167,10 @@ fn keys_between(
 ) -> Vec<HashJoinKey> {
     let mut keys = Vec::new();
     for (idx, term) in where_clause.iter().enumerate() {
-        if !matches!(term.origin, WhereTermOrigin::Where | WhereTermOrigin::Implied) {
+        if !matches!(
+            term.origin,
+            WhereTermOrigin::Where | WhereTermOrigin::Implied
+        ) {
             continue;
         }
         let Ok(Some((lhs, op, rhs))) = as_binary_components(&term.expr) else {
@@ -177,12 +184,18 @@ fn keys_between(
         }
         let side = match (column_of(lhs), column_of(rhs)) {
             (Some((l, lc)), Some((r, rc))) if l == fact.internal_id && r == dim.internal_id => {
-                { binary_collation(fact, lc) && binary_collation(dim, rc) }
-                    .then_some(BinaryExprSide::Rhs)
+                if binary_collation(fact, lc) && binary_collation(dim, rc) {
+                    Some(BinaryExprSide::Rhs)
+                } else {
+                    None
+                }
             }
             (Some((l, lc)), Some((r, rc))) if l == dim.internal_id && r == fact.internal_id => {
-                { binary_collation(dim, lc) && binary_collation(fact, rc) }
-                    .then_some(BinaryExprSide::Lhs)
+                if binary_collation(dim, lc) && binary_collation(fact, rc) {
+                    Some(BinaryExprSide::Lhs)
+                } else {
+                    None
+                }
             }
             _ => None,
         };
@@ -219,7 +232,10 @@ fn local_terms(where_clause: &[WhereTerm], dim: &JoinedTable) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, term)| {
-            matches!(term.origin, WhereTermOrigin::Where | WhereTermOrigin::Implied) && reads_only(&term.expr, dim)
+            matches!(
+                term.origin,
+                WhereTermOrigin::Where | WhereTermOrigin::Implied
+            ) && reads_only(&term.expr, dim)
         })
         .map(|(idx, _)| idx)
         .collect()

@@ -1777,7 +1777,8 @@ pub(super) fn merge_inputs_in_key_order(
                 read_in_key_order(probe_table, None, key.get_probe_expr(where_clause)),
             )
         })
-        .max_by_key(|&(build, probe)| u8::from(build) + u8::from(probe))
+        // Ordered as the count of sides in key order: both, then either, then neither.
+        .max_by_key(|&(build, probe)| (build && probe, build || probe))
         .unwrap_or((false, false))
 }
 

@@ -32,10 +32,9 @@ pub(crate) trait Id: Copy {
 /// an even slot, one at or above it at an odd one. Both stay dense, and distinct ids stay apart.
 const fn dense_slot(id: usize) -> usize {
     let base = crate::vdbe::builder::HASH_TABLE_ID_BASE;
-    if id >= base {
-        (id - base).saturating_mul(2).saturating_add(1)
-    } else {
-        id.saturating_mul(2)
+    match id.checked_sub(base) {
+        Some(above) => above.saturating_mul(2).saturating_add(1),
+        None => id.saturating_mul(2),
     }
 }
 
