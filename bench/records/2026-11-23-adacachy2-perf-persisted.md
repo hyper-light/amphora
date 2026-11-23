@@ -410,3 +410,77 @@ missed 5 to 11 deadlines on 5 to 11 writers and went on, where W4's r1158 ended 
 --manifest-path bench/Cargo.toml --all-targets -D warnings` (r1239) is not clean on main itself: 166 errors at main
 945b633a and 166 at 6043acfe, 9 of them in `repl.rs` at each (the same 9, moved by the added lines). r1241: `cargo check
 --release` on the bench after merging main (65c59f28). Not run: a 128-writer rung of this landing (r1218 runs it last).
+
+# Lane W6 (persisted) on adacachy2: poolable bench output; a member sends in its own name only (2026-11-23)
+
+Ada's goal: Amphora correct, about 10x faster than every competitor, decisions made on p50, p99 and p99.9 data.
+Branches perf/persisted-w6 (unit 1), perf/persisted-w6-ab (unit 2's bench), perf/persisted-w6-relay (unit 3).
+
+## 1. The commit rung's latencies pool across rounds (done, on main at 88054d7f)
+
+Each `by_node` entry of `--repl commit` now carries its histogram: `buckets_us`, the nonzero buckets of the bench's
+`Hist` as `[least µs, count]` pairs (64 to each power of two, so a sample reads back within 1/64 of itself, as the
+quantiles always did), and `max_us`. Summing counts by least value across runs gives the merged histogram
+(`w6_buckets_of_runs_pool_into_the_merged_histogram`). `bench/pool.py FILE...` pools one arm's runs (a JSON record a
+line) into its leader's histogram (the leader: the member with the most acknowledged writes in the run) and prints
+leader writes, p50, p99, p99.9, max and refusals per write. Checks: the test passed (r1266, release); bench clippy at
+cd7ce20d has 166 errors, as main has (W5's r1239), none in W6's lines (r1282).
+
+## 2. The leader-tail A/B (r1218 read; the pooled rerun r1266 still running at the hand-over)
+
+r1218 ended (17:19Z). Per run, the leader taken as the member with the most acknowledged writes (bench 78cf8028,
+90 s a run, rounds alternated, load 18-28, CPU pressure avg10 0.1-4.9%, I/O 3-10%):
+
+| writers | round | today: writes, p50 / p99 / p99.9 ms, refused per write | leader tail: writes, p50 / p99 / p99.9 ms, refused per write |
+|---|---|---|---|
+| 3 | 1 | 617, 118 / 524 / 680, 0.53 | 645, 111 / 532 / 844, 0.31 |
+| 3 | 2 | 682, 110 / 479 / 754, 0.44 | 599, 118 / 565 / 1024, 0.36 |
+| 3 | 3 | 568, 125 / 623 / 827, 0.54 | 519, 128 / 573 / 1229, 0.47 |
+| 3 | 4 | 661, 110 / 508 / 631, 0.43 | 564, 123 / 631 / 934, 0.32 |
+| 3 | 5 | 696, 104 / 500 / 819, 0.43 | 613, 111 / 598 / 999, 0.36 |
+| 32 | 1 | 484, 1245 / 7668 / 13500, 0.60 | 691, 1065 / 4096 / 6291, 0.37 |
+| 32 | 2 | 544, 1229 / 7406 / 23069, 0.45 | 520, 1442 / 6160 / 7274, 0.34 |
+| 32 | 3 | 500, 1327 / 7733 / 9306, 0.62 | 646, 1098 / 4325 / 7471, 0.30 |
+| 32 | 4 | 473, 1393 / 7274 / 9306, 0.54 | 583, 1212 / 5243 / 5898, 0.32 |
+| 32 | 5 | 517, 1245 / 5571 / 8126, 0.52 | 651, 1196 / 5112 / 6816, 0.30 |
+| 128 | 1 | 33 writes in 5 s, 1 deadline miss | 32 writes in 5 s, 2 deadline misses |
+
+Not pooled (r1218's bench gave quantiles only), so each run's p99.9 is its slowest write. What it shows so far: the
+tail rule cuts the leader's refusals per write at both sizes, every round. At 3 writers its slowest write is slower in
+5 of 5 rounds (844-1229 ms against 631-827), its p99 in 4 of 5 and its p50 in 4 of 5. At 32 writers it is faster in
+p99 and p99.9 in 5 of 5 rounds and p50 in 4 of 5, with more leader writes. So: worse at 3 writers on the slowest
+writes, better at 32. The coordinator's rule (adopt only if no worse at all three percentiles) can't be met unless
+the pooled 3-writer p99.9 says otherwise.
+
+The pooled rerun: r1266 (`persisted-scripts/w6-ab.sh e906eec9 95`: the bench at e906eec9, perf/persisted-w6-ab = W5's
+78cf8028 plus unit 1; one binary, one calibration measured by an untimed probe; 5 rounds alternated, 3 and 32
+writers, 95 s a run). Its wait for r1218 ran its 20-minute cap (r1218's last line was its `== done` header, which the
+wait didn't expect), so its rounds began about 17:51Z and end about 18:25Z, after this lane's hour. Its records are
+in `~/.cache/amphora-perf/persisted-w6ab/rec/t{0,1}-w{3,32}.jsonl` on adacachy2, and its last step writes
+`~/.cache/amphora-perf/persisted-w6ab/pooled.txt` (`python3 bench/pool.py` over the four files). The switch stays off
+main until that verdict.
+
+## 3. A member sends in its own name only (done; patch 0011 removed)
+
+The coordinator's ruling (after Ada's question): the refusal is Amphora's rule, not a hyper-raft fault. hyper-raft
+passes a peer's read or proposal on with the peer as `from`, as raft-rs does, and Amphora's `step` refuses any record
+whose `from` is not its authenticated sender ("replica sender"). So the fix is Amphora's: the owner's outgoing loop
+(`replicated.rs`, where `output.messages` become wire records) sends no record whose `from` is not its own id, reads
+and proposals alike. The peer's request is lost as on a lossy link, as before (the new leader refused it then), and
+its owner asks again on the leader change.
+
+- Vendored patch 0011, its `UPSTREAM.md` row, its hyper-raft test and the differential test's fifth difference are
+  removed: `python3 scripts/vendor.py check hyper-raft` reports 8 recorded changes (0001, 0003-0009), 0 differences,
+  after merging main's 0009.
+- Tests `a_deposed_leader_passes_no_peers_read_on_in_the_peers_name` and
+  `a_deposed_leader_passes_no_peers_proposal_on_in_the_peers_name`: three voters, the lead moves from the first leader
+  to another, the third member's record (MsgReadIndex, or MsgPropose of a prepared write) reaches the deposed one from
+  the third; every record the pump then relays must leave its sender in that sender's own name, and every receipt
+  must be answered (the pump fails a refusal). Red arm (the drop taken out, 8fcc7152, r1282): both fail at the pump,
+  `MsgReadIndex from 1 (wire 3) to 2 (wire 2), term 0 refused: Invalid { what: "replica sender", ... }` and the same
+  for `MsgPropose`: the relay the nemesis failed on. With the fix (ce479ab9, and merged with main as dc7fe71e) both
+  pass.
+- Checks at dc7fe71e (r1291, needs `linux/amd64,cpus=4,mem=16g`): clippy `-p amphora --all-targets --locked -D
+  warnings` clean (main's two vendored hyper-rt `fetch_update` deprecation warnings only); the two tests and
+  `a_forward_naming_another_member_as_its_origin_is_refused_and_applies_nowhere` pass; the `database::replicated`
+  suite 143 passed, 0 failed, 5 ignored.
