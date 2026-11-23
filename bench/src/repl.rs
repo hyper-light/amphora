@@ -4,7 +4,8 @@
 //! `crate::event`), `--batch` events a write, one write outstanding per writer.
 //!
 //! - `commit` (AC-T1.8.2, AC-T1.8.3): `--writers` closed-loop writers for `--seconds` after
-//!   `--warmup-s`; commit latency p50/p99/p99.9 and throughput.
+//!   `--warmup-s`; commit latency p50/p99/p99.9 and throughput, overall and by the node that
+//!   acknowledged, and the writes that missed `--deadline-s` (each sent again unchanged).
 //! - `failover` (AC-T1.8.4; step 3's "kill -9 of the leader 100 times under load"): writers run
 //!   throughout; `--kills` times the leader is killed and a probe writes through the survivors until
 //!   one write is acknowledged: the time from the kill to that acknowledgement. Every writer resends
@@ -512,21 +513,36 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     // Each write's latency by the node that acknowledged it, and the `Serialization` refusals
     // each node gave counted writes (lane W4: the leader's writes against the followers').
     let refused: [AtomicU64; NODES] = Default::default();
-    let hists = std::thread::scope(|scope| -> anyhow::Result<Vec<([Hist; NODES], u64)>> {
+    let hists = std::thread::scope(|scope| -> anyhow::Result<Vec<([Hist; NODES], u64, u64)>> {
         let handles: Vec<_> = (0..writers)
             .map(|w| {
                 let (down, refused) = (&down, &refused);
-                scope.spawn(move || -> anyhow::Result<([Hist; NODES], u64)> {
+                scope.spawn(move || -> anyhow::Result<([Hist; NODES], u64, u64)> {
                     let mut wr = Writer::new(w);
-                    let (mut h, mut writes) = (std::array::from_fn(|_| Hist::new()), 0u64);
+                    let (mut h, mut writes, mut missed) = (std::array::from_fn(|_| Hist::new()), 0u64, 0u64);
                     loop {
                         let t = Instant::now();
                         if t >= ends {
-                            return Ok((h, writes));
+                            return Ok((h, writes, missed));
                         }
                         let s = stmts(&wr.next(o.batch, o.text_bytes))?;
                         let mine: [AtomicU64; NODES] = Default::default();
-                        let node = send_counting(c, down, w, &s, o.deadline, &mine)?;
+                        // A write that misses its deadline is counted, not the run's end: it is sent
+                        // again unchanged (same ids), as `failover`'s writers do, and timed from its
+                        // first send once acknowledged; one unacknowledged when the run ends is untimed.
+                        let node = loop {
+                            match send_counting(c, down, w, &s, o.deadline, &mine) {
+                                Ok(node) => break Some(node),
+                                Err(_) if t >= counting => missed += 1,
+                                Err(_) => {}
+                            }
+                            if Instant::now() >= ends {
+                                break None;
+                            }
+                        };
+                        let Some(node) = node else {
+                            return Ok((h, writes, missed));
+                        };
                         if t >= counting {
                             if let Some(h) = h.get_mut(node) {
                                 h.record(us(t));
@@ -547,13 +563,15 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     })?;
     let mut all = Hist::new();
     let mut nodes: [Hist; NODES] = std::array::from_fn(|_| Hist::new());
-    let mut writes = 0u64;
-    for (hs, n) in &hists {
+    let (mut writes, mut missed, mut writers_missed) = (0u64, 0u64, 0u64);
+    for (hs, n, m) in &hists {
         for (node, h) in nodes.iter_mut().zip(hs) {
             all.merge(h);
             node.merge(h);
         }
         writes += n;
+        missed += m;
+        writers_missed += u64::from(*m > 0);
     }
     let by_node: Vec<_> = nodes
         .into_iter()
@@ -565,7 +583,7 @@ fn commit(c: &dyn Cluster, o: &Opts) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::json!({
         "writers": writers, "warmup_s": warmup.as_secs_f64(), "seconds": secs, "latency_ms": summary(all),
         "writes_per_s": writes as f64 / secs, "events_per_s": (writes as f64) * (o.batch as f64) / secs,
-        "by_node": by_node, "leader": leader,
+        "by_node": by_node, "leader": leader, "deadline_misses": missed, "writers_missed": writers_missed,
     }))
 }
 
