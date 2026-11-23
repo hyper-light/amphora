@@ -29,6 +29,40 @@ fn sql_rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
     conn.prepare(sql).unwrap().run_collect_rows().unwrap()
 }
 
+/// T-QT.5.18, T-QT.6.19: the kept-side outer join uses morsels for a hash plan.
+/// Forcing merge must execute the planned merge under the same parallel setting.
+#[test]
+fn a_kept_side_merge_join_stays_serial() {
+    let conn = open(":memory:merge-chain");
+    let mut rng = ChaCha8Rng::seed_from_u64(518);
+    fill(&conn, &mut rng, "t", 64);
+    fill(&conn, &mut rng, "u", 48);
+    conn.set_parallel_mode(ParallelMode::On);
+    conn.set_parallel_outer_probe(crate::OuterJoinProbe::Kept);
+    let sql = "SELECT count(*) FROM t LEFT JOIN u ON u.a = t.a";
+    for (method, morsels) in [
+        (crate::JoinMethods::HashJoinsOnly, true),
+        (crate::JoinMethods::MergeJoinsOnly, false),
+    ] {
+        conn.set_join_methods(method);
+        let plan = sql_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+        assert!(
+            plan.iter()
+                .flatten()
+                .any(|v| v
+                    .to_string()
+                    .contains(if morsels { "HASH JOIN" } else { "MERGE JOIN" })),
+            "{plan:?}"
+        );
+        let bytecode = sql_rows(&conn, &format!("EXPLAIN {sql}"));
+        let hooked = bytecode.iter().any(|r| {
+            r.get(1)
+                .is_some_and(|v| v.to_string().contains("MorselAggregate"))
+        });
+        assert_eq!(hooked, morsels, "{method:?}");
+    }
+}
+
 fn literal(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
