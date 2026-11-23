@@ -346,4 +346,6 @@ lead, not checked. `cb4_a_…` panics "the copy didn't answer" (`unserved: 1`); 
 "column copy refused: no generation answers the statement's snapshot". The `storage::`
 filter is wider than B6's (`storage::wal storage::log_index`): it takes btree's and versioned's tests too. Run r1180
 (macOS, needs `macos/arm64,cpus=8,mem=24g`, rule 6's disk guard; cold) has the same clippy and storage tests on
-perf/pagepath-d45 as synced when it is placed (478716f8: main 3f7624a3 with `log_segments`); queued at 16:16Z.
+perf/pagepath-d45 as synced when it is placed (478716f8: main 3f7624a3 with `log_segments`); queued at 16:16Z
+and stopped by the lane at 16:26Z before it started: no Mac had room, and a cold build would not have ended within the
+hour. The Mac target dir for this lane is still cold.
