@@ -3092,9 +3092,10 @@ store could run them. Three arms: no reader; a short view before each commit (th
 begun after the first commit and held across the rest (the push). The test asserts the premise: without a held
 view the log starts again after every commit and holds one commit's frames; with one, the checkpoint copies
 nothing past the view's mark, no restart happens, and the log grows by every commit's frames until the view
-ends. Its numbers are not in yet: the lane's runs on adacachy2 waited on that machine's disk (btrfs metadata
-full, every file write waiting for a reservation), and the record (`bench/records/2026-11-23-adacachy2-perf-snapshots.md`)
-takes them when the run ends.
+ends. Its numbers are not in yet. adacachy2's disk stalled (btrfs metadata full, every file write waiting for a
+reservation), and the coordinator paused measurement runs there (RULES.md 5d). The test counts frames and bytes,
+not time, so a stall can't change its numbers, but it runs only when the coordinator lifts the pause. The record
+(`bench/records/2026-11-23-adacachy2-perf-snapshots.md`) takes them then.
 
 The serving half, read in the code and not yet measured: past the log's room, the owner holds back every new
 local read of the replica until a restart (`database/replicated.rs`, `hold_due` and `hold_reads`); the restart
@@ -3107,7 +3108,12 @@ which the goal forbids. The A/B measures both halves under the order's write loa
 ### Units, in order, each merged with its tests
 
 Units B to E build on the design the A/B picks. Both arms share the descriptor, the chunked pages, the staged
-install and the resume record, so B builds the seam with both sources behind it.
+install and the resume record, so B builds the seam with both sources behind it: one trait that answers an ask
+(page ranges, a since-point per range, a byte budget) with pages, the point Q they were read at, its term and
+configuration, and where it stopped. The push's source opens one view at the descriptor's point and keeps it
+until the last range is sent; the pull's opens a view per ask and closes it with the answer. Who sends the next
+ask differs (the leader's stream for the push, the follower's staged answer for the pull), and nothing else does,
+so the A/B measures the view's lifetime and the direction alone.
 
 - B, the streamed path end to end: the descriptor and data split, the source reading pages from disk, the staged
   install. Tests: a follower catches up a database ten times the test's memory budget, with peak memory within one
