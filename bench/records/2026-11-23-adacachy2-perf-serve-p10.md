@@ -88,7 +88,7 @@ encoding), the followers' steps on the entry at 13-31 ms, and the apply, unchang
 - Small-write commit latency at 1 and 32 writers: not run.
 - P8's open items: the write slot's turn covering the holder's whole session, and the worker's reader taken on the
   worker thread: not started.
-- `a_raise_whose_base_is_joint_is_refused`, the state P9 named, printed where the group never settles (r1365, probe
+- `a_raise_whose_base_is_joint_is_refused`, the state P9 named, printed where the group never settles (a foreground kiln run at 18:29Z whose id was not returned; probe
   branch p10-probe-joint 73a2ebd3, not for main): owner 0, the leader, `applied 8 last 9 pending_conf 9
   has_pending_conf true`; owners 1 and 2 `applied 8 last 8`; all three `out false apply_held false`, configuration
   joint (`voters_outgoing [1, 2, 3]`). So P9's candidate (a), applies held after the session, is ruled out (measured):
