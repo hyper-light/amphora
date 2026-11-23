@@ -29,6 +29,22 @@ per round, so read them as the size of the gap, not a final figure; family a's T
    (perf, or wchan.py in bench/) in a run that isn't reported. Sample counts: Amphora's rungs have 65 to 108
    samples a run and dqlite's 657 to 794, so no p99.9 is quotable. rqlite's rungs at 32 and 128 writers have
    1945 to 6561.
+**Family a finished: all 5 rounds, committed as 5f312452** (`2026-11-23-adacachy2-repl/TABLE.md`). Medians of 5
+runs (min to max), commits/s:
+
+| rung | amphora persisted | amphora replicated | dqlite | rqlite |
+|---|---|---|---|---|
+| 1 writer | 19.8 (19.6-23.2) | 14.4 (13.0-17.0) | 145.4 (131.4-174.0) | 24.6 (23.8-27.4) |
+| 32 writers | 13.8 (12.2-16.0) | 19.0 (18.0-21.6) | 153.2 (129.6-196.4) | 372.8 (359.2-397.8) |
+| 128 writers | refused in every round | 17.3 (17.0-17.6), only 2 of 5 rounds answered | 187.8 (134.8-234.8) | 1389.8 (1194.6-1478.6) |
+
+Taking Amphora's better class at each rung, dqlite is 7.3x ahead at 1 writer, 8.1x at 32 and 10.9x at 128.
+rqlite is 1.24x ahead at 1 writer, 19.6x at 32 and 80x at 128. No range overlaps Amphora's. The only quotable
+p99.9s are rqlite's: 131 ms at 32 writers (at least 1796 samples a run) and 168 ms at 128 (at least 5973).
+Every other rung has fewer than 1000 samples a run, and the table withholds those. Why Amphora is slower is not
+yet known (benchmark checklist question 1): the limiter is unnamed, so this records a measured gap, not a
+diagnosis. libsql never came up. LiteFS came up in 3 of 15 rungs (1 writer, 15.4 commits/s, primary only).
+
 2. **Amphora persisted refuses writes under concurrency, and again after a real kill (Amphora, not the
    bench).** At 128 writers, with no kill at all, both rounds' persisted commit rung failed with
    `no live node acknowledged a write within --deadline-s: node 2: refused a write: Invalid { what:
