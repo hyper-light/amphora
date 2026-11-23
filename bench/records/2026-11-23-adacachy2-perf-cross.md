@@ -598,11 +598,12 @@ Records get's value). Test: `database::admission_charge::a14_a_query_at_its_wors
 | run | commit | result |
 |---|---|---|
 | r1550 | 254fc9d1 | clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13; `xgroup::` 33/34: `xgroup::lan::tests::ac_t1_10_5_seeded_histories_over_two_endpoints_show_no_anomaly` panicked at lan.rs:757 (`elle(..).unwrap()`, its `Err` not captured; lan.rs calls no query and no scan); bench not checked (`-p amphora-bench` matches no package: bench is outside the workspace); load 10-17 |
-| r1557 | 254fc9d1 and 5f511d8d lib binaries; 82c3e84e | the lan test alone, 3 runs a binary; then clippy `--manifest-path bench/Cargo.toml --all-targets`. Pending at hand-off |
+| r1557 | 254fc9d1 and 5f511d8d lib binaries | the lan test alone: 3/3 pass on each binary (0.42-0.48 s a run), so r1550's failure did not reproduce outside the suite; bench clippy `--locked` refused: bench has no committed Cargo.lock |
+| r1559 | a6dab53e | clippy `--manifest-path bench/Cargo.toml --all-targets` without `--locked`, offline. Pending at hand-off |
 
-Not merged: a touched suite is red with its cause unknown, and the bench crate is unchecked. Next lane: read
-r1557. If the lan test fails on main's binary too, or flakes on both, it is not this change. With bench
-clippy clean: merge origin/main, re-run clippy and the touched tests, push HEAD:main. Unit 4 is not started.
+Not merged: the bench crate, whose `query_session` callers changed, is unchecked. Next lane: read r1559;
+with bench clippy clean, merge origin/main, re-run clippy and the touched tests, push HEAD:main. Unit 4 is
+not started.
 
 Seen on the way, not changed:
 - A local query with no free reader runs on the writer through `Store::run`, the store's own bounded channel (`Config::queue`, unit 4), charged nothing at admission.
