@@ -180,7 +180,7 @@ share of busy samples (each frame counted once per sample; children inside their
 | `op_column` / `op_column_fetch` | 27% | reading a column out of the row's record: locate the payload, parse the serial type, decode into a register (`decode_serial_type_into_register` alone 5 to 6%) |
 | `op_next` / `next_row` | 14 to 16% | stepping the cursor, page reads included (`read_page` 12% in the 8-core run, `pread64` about 5%: the first of the two runs in a fresh process reads every page from the OS) |
 | `op_group_find` | 10 to 14% | the hash GROUP BY's lookup of (l_returnflag, l_linestatus) per row |
-| `op_agg_step` | 11% | the 8 aggregates, KBN sums (`kbn_step_finite`, `agg_step_fast`) |
+| `op_agg_step` | 11% (8-core run; under 13% in the 1-core run) | the 8 aggregates, KBN sums (`kbn_step_finite`, `agg_step_fast`) |
 | `dispatch_loop` self | 11 to 14% | the interpreter's own dispatch per instruction |
 | `op_real_affinity` | 3 to 4% | REAL affinity applied per column read |
 | `op_multiply` and `op_subtract` | 3 to 5% | `l_extendedprice * (1 - l_discount) * (1 + l_tax)` |
@@ -192,6 +192,22 @@ Interpretation per row (dispatch, group find, aggregate steps) is the next third
 not show as a separate cost (the unnamed frames under `alloc` are 3 to 6% of samples).
 
 Statistical error: with 250 samples a 27% share is plus or minus 3 points (one standard error).
+
+## Handover: what would move these numbers, in order
+
+1. Run Ada's SUM-over-REAL A/B (row-order KBN against an exact sum everywhere, her call of 02:50Z) and
+   land the winner. It is what keeps q01's and q09's sums off the workers.
+2. Let REAL columns that a loop body only filters on or computes with into `body_reads`, keeping
+   `no_real` for SUM outputs and GROUP BY keys (and MIN and MAX). The copied body runs the serial
+   loop's own RealAffinity, so the values are the serial loop's; t_qt_6_* plus a REAL-filter
+   differential would hold it. Without this, q06 stays serial even after step 1.
+3. Make the bench record the workers each Amphora run started (`RunStats.workers` is returned to
+   `op_morsel_aggregate` and dropped there), so a ladder can't again report cores it never used.
+4. Vectorized scans: decode a column only for rows the filter still keeps, and hand values on
+   without a clone each, then rerun `vecab.sh`; or retire QT.7 for compiled pipelines (G5 step 2), as
+   decision 9 allows.
+5. q09 timed out once at 1 core here and at 8 cores in M2's ladder, with the same serial code: a
+   planner question for lanes T2 and T3, not this lane's.
 
 ## How far to trust it
 
