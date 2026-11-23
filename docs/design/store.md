@@ -12,8 +12,8 @@ into `bench/`.
 
 **Decision.** One writer thread owns the engine and commits as soon as nothing more waits in its
 queue (or a commit reaches its row bound); what came while it committed shares the next commit.
-Nothing waits for a timer. (The flusher may wait, bounded by a flush's own time, before it begins a
-flush: decision 14.)
+Nothing waits for a timer. (The flusher may wait for commits under way before it begins a flush:
+decision 14.)
 
 **Sources.** Group commit in DeWitt et al., "Implementation Techniques for Main Memory Database
 Systems" (SIGMOD 1984); Helland et al., "Group Commit Timers and High Volume Transaction Systems"
@@ -360,10 +360,17 @@ log's `fdatasync` no faster than its `fsync`.
 ## 14. Gathering before a flush at low load
 
 **Decision.** When the writer ran out of work during a flush, the flusher doesn't begin the next
-flush at the first commit after it. It waits until the writer has been idle for a 32nd of a flush,
-or half a flush has gone by, whichever comes first (a flush's time smoothed: the first, then an
-eighth of each new one), and then flushes everything committed. When the writer never ran out of
-work, flushes follow one another as before.
+flush at the first commit after it. It notes how many batches had been handed to the writer when
+that commit came, and flushes once all of them are settled (committed, refused or let go), woken by
+their commit rather than a timer (AUDIT 4.1). It flushes at once when everything handed over is
+committed, when the writer begins a job (a batch queued behind a job doesn't hold back the flush of
+what is committed), and when the store stops. When the writer never ran out of work, flushes follow
+one another as before.
+
+Until AUDIT 4.1 the gather was timed: the flusher waited until the writer had been idle for a 32nd
+of a flush, or half a flush had gone by, whichever came first (a flush's time smoothed). Amphora
+wakes on events, not timers; the evidence below is that timed gather's, against flushing at the
+first commit, and the AUDIT 4.1 A/B is the event-driven gather's against it.
 
 **Why.** Writers that each wait for their write to be durable send their next write when told. A
 flush begun at the first commit after the last flush covers the first few of those writes and
@@ -373,7 +380,7 @@ and 5,700 writes a second, predicted; 5.1–5.8 ms and 5,134–5,608 a second, m
 
 **Sources.** Helland et al. (HPTS 1987; decision 1) on group commit timers: a fixed delay adds
 latency once commits arrive faster than they complete, which is why this one is taken only when the
-writer ran out of work, and is bounded by the flush's own time. PostgreSQL's `commit_delay` and
+writer ran out of work, and waits for commits under way rather than for a time. PostgreSQL's `commit_delay` and
 `commit_siblings`: a delay before the flush when other transactions are active.
 
 **Evidence.** fedora, 2026-10-20, 32 writers, one group, three runs each alternating with
@@ -388,8 +395,9 @@ chosen, not yet tuned: a 16th and a 64th of a flush are to be measured against t
 machine, and gathering at 1,000 writers and more against flushing at once.
 
 **Falsified by.** A workload where gathering lengthens a write's p50 or tails against flushing at
-the first commit (an open-loop trickle pays up to a 32nd of a flush a write), or more writers where
-flushes stop following one another.
+the first commit, or more writers where flushes stop following one another; for AUDIT 4.1, closed-loop
+writers whose next writes reach the writer after the batches noted are committed (each flush then
+covers only the first of them, as flushing at the first commit did).
 
 ## 15. The checkpoint copies what the flusher made durable
 
