@@ -92,20 +92,6 @@ pub enum CatchUp {
 pub struct Outbound {
     pub to: u64,
     pub bytes: Vec<u8>,
-    /// Which of its peer's two paths the record takes (CP-T1.13, replication.md "Decision (lane
-    /// P9)"): a host that carries both never holds a heartbeat or a vote behind the log.
-    pub route: Route,
-}
-
-/// A record's path to its peer. A host keeps each route's records in the order the member sent
-/// them; it may deliver one route's ahead of the other's, as Raft allows any network to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Route {
-    /// Appends and snapshots: the records that carry the log, as large as its entries.
-    Log,
-    /// Everything else: heartbeats, votes, their answers, appends' answers, read confirmations
-    /// and a hand-over's order to campaign, each bounded by its fields, never by an entry.
-    Control,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaStatus {
