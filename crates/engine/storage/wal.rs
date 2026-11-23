@@ -977,6 +977,12 @@ trait WalCoordination: Debug + Send + Sync {
     /// Return the WAL file used for durable reads and writes.
     fn wal_file(&self) -> Result<Arc<dyn File>>;
 
+    /// The file of one segment of the log (decision 45).
+    fn segment_file(&self, segment: SegmentId) -> Result<Arc<dyn File>>;
+
+    /// The segment the writer appends to (decision 45).
+    fn current_segment(&self) -> SegmentId;
+
     /// Clone the shared WAL state backing this coordination backend.
     fn shared_wal_state(&self) -> Arc<SharedLog>;
 
@@ -1037,6 +1043,14 @@ trait WalCoordination: Debug + Send + Sync {
 
 /// Write-ahead log (WAL).
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
+/// A frame of the log (decision 45): the segment it is in and its number there. Frame numbers
+/// start again in each segment, so a number alone names no frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameRef {
+    pub segment: SegmentId,
+    pub frame: u64,
+}
+
 pub trait Wal: Debug + Send + Sync {
     /// Amphora (lane constants-22): the event a statement busy on this log's locks waits on
     /// ([`LockRelease`]); None when a release may come from another process unseen.
@@ -1087,13 +1101,18 @@ pub trait Wal: Debug + Send + Sync {
     ///
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
     /// frame_watermark must be in range [last checkpointed frame, max_frame], otherwise method returns an error
-    fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>>;
+    fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<FrameRef>>;
+
+    /// The checkpoint sequence of the generation `frame`'s segment holds in this connection's
+    /// read. The shared pages key a frame's image by it, since frame numbers start again in each
+    /// segment (decision 45).
+    fn frame_generation(&self, frame: FrameRef) -> u32;
 
     /// Read a frame from the WAL. The read is added to `group`, when
     /// given, before it is submitted.
     fn read_frame(
         &self,
-        frame_id: u64,
+        at: FrameRef,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
         group: Option<&mut CompletionGroup>,
@@ -1112,7 +1131,7 @@ pub trait Wal: Debug + Send + Sync {
     /// The read is added to `group`, when given, before it is submitted.
     fn read_frames_batch(
         &self,
-        start_frame: u64,
+        start: FrameRef,
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
         scratch_buf: Option<Arc<Buffer>>,
@@ -1809,7 +1828,15 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn wal_file(&self) -> Result<Arc<dyn File>> {
-        let shared = self.log.current().read();
+        self.segment_file(self.log.current_id())
+    }
+
+    fn current_segment(&self) -> SegmentId {
+        self.log.current_id()
+    }
+
+    fn segment_file(&self, segment: SegmentId) -> Result<Arc<dyn File>> {
+        let shared = self.log.segment(segment).read();
         turso_assert!(
             shared.metadata.enabled.load(Ordering::Relaxed),
             "WAL must be enabled"
@@ -3034,6 +3061,14 @@ impl WalCoordination for ShmWalCoordination {
 
     fn wal_file(&self) -> Result<Arc<dyn File>> {
         self.fallback.wal_file()
+    }
+
+    fn segment_file(&self, segment: SegmentId) -> Result<Arc<dyn File>> {
+        self.fallback.segment_file(segment)
+    }
+
+    fn current_segment(&self) -> SegmentId {
+        self.fallback.current_segment()
     }
 
     fn shared_wal_state(&self) -> Arc<SharedLog> {
@@ -5428,7 +5463,7 @@ impl Wal for WalFile {
         verify = "full",
         parent = "wal_protocol_correctness"
     )]
-    fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>> {
+    fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<FrameRef>> {
         #[cfg(not(feature = "conn_raw_api"))]
         turso_assert!(
             frame_watermark.is_none(),
@@ -5495,6 +5530,7 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
+        let segment = self.coordination.current_segment();
         let frame = self
             .coordination
             .find_frame(page_id, min_frame, max_frame, frame_watermark);
@@ -5506,18 +5542,30 @@ impl Wal for WalFile {
                 frame
             );
         }
-        Ok(frame)
+        Ok(frame.map(|frame| FrameRef { segment, frame }))
+    }
+
+    fn frame_generation(&self, frame: FrameRef) -> u32 {
+        let current = self.checkpoint_seq.load(Ordering::Acquire);
+        // A switch writes the other segment's header with the current one's sequence plus one
+        // (decision 45), and the sequence wraps.
+        if frame.segment == self.coordination.current_segment() {
+            current
+        } else {
+            current.wrapping_sub(1)
+        }
     }
 
     /// Read a frame from the WAL.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_frame(
         &self,
-        frame_id: u64,
+        at: FrameRef,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
+        let frame_id = at.frame;
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
             page.get().id(),
@@ -5573,7 +5621,7 @@ impl Wal for WalFile {
         }
         // important not to hold shared state locks beyond this point to avoid deadlock with
         // completions that re-enter WAL state while a writer is waiting.
-        let file = self.coordination.wal_file()?;
+        let file = self.coordination.segment_file(at.segment)?;
         begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
@@ -5588,12 +5636,13 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_frames_batch(
         &self,
-        start_frame: u64,
+        start: FrameRef,
         pages: &[PageRef],
         buffer_pool: Arc<BufferPool>,
         scratch_buf: Option<Arc<Buffer>>,
         group: Option<&mut CompletionGroup>,
     ) -> Result<Completion> {
+        let start_frame = start.frame;
         self.refuse_records("read_frames_batch")?;
         turso_assert!(
             !pages.is_empty(),
@@ -5740,7 +5789,7 @@ impl Wal for WalFile {
         if let Some(group) = group {
             group.add(&c);
         }
-        let file = self.coordination.wal_file()?;
+        let file = self.coordination.segment_file(start.segment)?;
         file.pread(offset, c)
     }
 
@@ -8299,10 +8348,11 @@ pub mod test {
         AuthoritySnapshotValidation, ShmWalCoordination,
     };
     use super::{
-        CheckpointLocks, InProcessWalCoordination, ReadGuardKind, RollbackTo, SharedLog,
+        CheckpointLocks, FrameRef, InProcessWalCoordination, ReadGuardKind, RollbackTo, SharedLog,
         TryBeginReadResult, Wal, WalAutoActions, WalCommitState, WalConnectionState,
         WalCoordination, WalFile, WalSnapshot, NO_LOCK_HELD,
     };
+    use crate::storage::log_segments::SegmentId;
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
@@ -8328,6 +8378,13 @@ pub mod test {
         SyncMode, WalFileShared, IO,
     };
     use std::num::NonZeroUsize;
+
+    fn first(frame: u64) -> FrameRef {
+        FrameRef {
+            segment: SegmentId::First,
+            frame,
+        }
+    }
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     /// Returns an IO backend that supports shared WAL coordination on the host.
@@ -8953,7 +9010,7 @@ pub mod test {
         // buggy version cached the mapping at submission and returned Some(1)
         // here, exposing bytes that were not on disk yet.
         assert_eq!(
-            wal.find_frame(7, None).unwrap(),
+            wal.find_frame(7, None).unwrap().map(|found| found.frame),
             None,
             "frame must not be visible to readers before its write is durable"
         );
@@ -8964,7 +9021,7 @@ pub mod test {
         assert!(completion.succeeded());
 
         assert_eq!(
-            wal.find_frame(7, None).unwrap(),
+            wal.find_frame(7, None).unwrap().map(|found| found.frame),
             Some(1),
             "frame must be visible once its write is durable"
         );
@@ -9188,7 +9245,7 @@ pub mod test {
             Arc::new(crate::Page::new(5)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
+            .read_frames_batch(first(1), &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -9220,7 +9277,7 @@ pub mod test {
             Arc::new(crate::Page::new(33)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
+            .read_frames_batch(first(1), &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -9236,7 +9293,9 @@ pub mod test {
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let target_page = Arc::new(crate::Page::new(43));
 
-        let completion = wal.read_frame(1, target_page, buffer_pool, None).unwrap();
+        let completion = wal
+            .read_frame(first(1), target_page, buffer_pool, None)
+            .unwrap();
         let error = wait_for_completion_error(&io, completion);
 
         assert!(matches!(
@@ -9265,7 +9324,7 @@ pub mod test {
         let target_page = Arc::new(crate::Page::new(32));
         let completion = wal
             .read_frames_batch(
-                1,
+                first(1),
                 std::slice::from_ref(&target_page),
                 buffer_pool,
                 None,
@@ -9299,8 +9358,14 @@ pub mod test {
 
         assert!(err.to_string().contains("codec encode failed"));
         assert_eq!(wal.get_max_frame(), 0);
-        assert_eq!(wal.find_frame(32, None).unwrap(), None);
-        assert_eq!(wal.find_frame(33, None).unwrap(), None);
+        assert_eq!(
+            wal.find_frame(32, None).unwrap().map(|found| found.frame),
+            None
+        );
+        assert_eq!(
+            wal.find_frame(33, None).unwrap().map(|found| found.frame),
+            None
+        );
     }
 
     #[test]
@@ -9332,7 +9397,10 @@ pub mod test {
 
         assert!(err.to_string().contains("codec encode failed"));
         assert_eq!(wal.get_max_frame(), 0);
-        assert_eq!(wal.find_frame(44, None).unwrap(), None);
+        assert_eq!(
+            wal.find_frame(44, None).unwrap().map(|found| found.frame),
+            None
+        );
     }
 
     #[test]
@@ -9354,7 +9422,10 @@ pub mod test {
             .unwrap_err();
         assert!(matches!(err, LimboError::Conflict(_)));
         assert_eq!(wal.get_max_frame(), 1);
-        assert_eq!(wal.find_frame(44, None).unwrap(), Some(1));
+        assert_eq!(
+            wal.find_frame(44, None).unwrap().map(|found| found.frame),
+            Some(1)
+        );
     }
 
     #[test]
@@ -9398,7 +9469,10 @@ pub mod test {
             )
             .is_err());
         assert_eq!(wal.get_max_frame(), 0);
-        assert_eq!(wal.find_frame(43, None).unwrap(), None);
+        assert_eq!(
+            wal.find_frame(43, None).unwrap().map(|found| found.frame),
+            None
+        );
     }
 
     #[test]
@@ -9431,7 +9505,7 @@ pub mod test {
 
         let target = Arc::new(crate::Page::new(44));
         let completion = wal
-            .read_frame(1, target.clone(), buffer_pool, None)
+            .read_frame(first(1), target.clone(), buffer_pool, None)
             .unwrap();
         io.wait_for_completion(completion).unwrap();
         assert_eq!(
@@ -9468,7 +9542,7 @@ pub mod test {
 
         let target_page = Arc::new(crate::Page::new(43));
         let c = wal
-            .read_frames_batch(1, &[target_page], buffer_pool, None, None)
+            .read_frames_batch(first(1), &[target_page], buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -9504,7 +9578,7 @@ pub mod test {
         ];
 
         let completion = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
+            .read_frames_batch(first(1), &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, completion);
 
@@ -9537,7 +9611,7 @@ pub mod test {
             Arc::new(crate::Page::new(13)),
         ];
         let c = wal
-            .read_frames_batch(2, &target_pages, buffer_pool, None, None)
+            .read_frames_batch(first(2), &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -9572,7 +9646,7 @@ pub mod test {
             Arc::new(crate::Page::new(9)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
+            .read_frames_batch(first(1), &target_pages, buffer_pool, None, None)
             .unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -9603,7 +9677,7 @@ pub mod test {
             Arc::new(crate::Page::new(22)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
+            .read_frames_batch(first(1), &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -9641,7 +9715,7 @@ pub mod test {
             Arc::new(crate::Page::new(99)),
         ];
         let c = wal
-            .read_frames_batch(1, &target_pages, buffer_pool, None, None)
+            .read_frames_batch(first(1), &target_pages, buffer_pool, None, None)
             .unwrap();
         let err = wait_for_completion_error(&io, c);
 
@@ -9850,7 +9924,9 @@ pub mod test {
 
         let page = Arc::new(crate::storage::pager::Page::new(7));
         let issued_epoch = wal.coordination.checkpoint_epoch();
-        let completion = wal.read_frame(1, page.clone(), buffer_pool, None).unwrap();
+        let completion = wal
+            .read_frame(first(1), page.clone(), buffer_pool, None)
+            .unwrap();
 
         wal.increment_checkpoint_epoch();
         deferred_file.complete_pending_reads();

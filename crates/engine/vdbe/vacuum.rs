@@ -1521,16 +1521,22 @@ fn start_temp_batch_reads(
     let mut logical_pages: Vec<PageRef> = Vec::with_capacity(len);
     let mut pairs: Vec<(PageRef, u64)> = Vec::with_capacity(len);
 
+    let mut segment = None;
     for page_id in batch_start..batch_end {
         let page: PageRef = Arc::new(Page::new(page_id as i64));
         // todo: add find_frames at WAL where you can send batch of page ids and get all the frame ids
-        let frame_id = wal.find_frame(page_id as u64, None)?.ok_or_else(|| {
+        let frame = wal.find_frame(page_id as u64, None)?.ok_or_else(|| {
             LimboError::InternalError(format!(
                 "VACUUM: page {page_id} not found in target WAL (WAL-only invariant violated)"
             ))
         })?;
+        if *segment.get_or_insert(frame.segment) != frame.segment {
+            return Err(LimboError::InternalError(format!(
+                "VACUUM: page {page_id} is in another segment of the target WAL than the pages before it"
+            )));
+        }
         logical_pages.push(page.clone());
-        pairs.push((page, frame_id));
+        pairs.push((page, frame.frame));
     }
 
     // let's coalesce frame ids so that we can fetch maximum frames with a single pread
@@ -1559,8 +1565,14 @@ fn start_temp_batch_reads(
         } else {
             None
         };
+        let segment = segment.ok_or_else(|| {
+            LimboError::InternalError("VACUUM: a run of target WAL frames with no segment".into())
+        })?;
         let _c = wal.read_frames_batch(
-            *start_frame,
+            crate::storage::wal::FrameRef {
+                segment,
+                frame: *start_frame,
+            },
             run_pages,
             temp_pager.buffer_pool.clone(),
             run_scratch,
