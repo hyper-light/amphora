@@ -68,13 +68,28 @@ cores, other lanes' work beside it:
 
 The fix arm's three suite failures are in tests that no change here reaches: none holds a
 `FlushGate` (only a_held_database_flush_stalls_no_persisted_owner_step, a_host_waits and
-a_follower_past_its_room take one), so `Driven::movers` names for them what `moving()` did on main.
-Each passes alone on ccdaaa34, 3/3 (r657, load 69 to 92), and a_change_past_its_deadline failed in
-main's suite too. They are main's own, under the suite's contention:
+a_follower_past_its_room take one), so `Driven::movers` names for them what `moving()` did on main,
+and the waker and deadline changes are in other tests' bodies. Alone (`--exact
+--test-threads=1`; r657 at load 69 to 92, fix only; r673 at load 639 to 935, both arms; r657's
+script printed every rc as 0, so its counts are read from each log's result line):
+
+| test | main 1e874db1 alone | fix alone | suite failures, main / fix |
+|---|---|---|---|
+| a_change_past_its_deadline_answers_what_its_stage_knows | 2/3 | 4/6 | 1 of 2 / 1 of 3 |
+| every_falsifier_of_the_floor_holds_under_a_nemesis | 3/3 | 5/6 | 0 of 2 / 1 of 3 |
+| session_reads::t_t1_10_r1_a_session_reads_its_write_on_a_lagging_follower | 3/3 (r621) | 6/6 (r621, r657) | 0 of 2 / 1 of 3 |
+
+a_change_past_its_deadline fails on main alone with the fix arm's panic, so it is main's own. The
+other two are not yet seen failing on main in 5 runs each; at the fix arm's rates (about 1 in 5)
+five clean runs happen by chance about a third of the time, and no path from this lane's change
+reaches them. They are open for the next lane:
 
 - a_change_past_its_deadline_answers_what_its_stage_knows: `Pump::admit`'s `admit_receive(..)
-  .unwrap()` on `Err(Full { limit: 2 })` (fix arm); "the group settled not reached in 60000
-  driven rounds" (main arm). Two of its three lone passes also printed the `Full` panic.
+  .unwrap()` on `Err(Full { limit: 2 })`, alone on both arms and in the fix arm's suite; "the group
+  settled not reached in 60000 driven rounds" in main's suite. The limit is the member's command
+  queue bound (`Control::command_bound`, learned as `Bounds::commands`, lane constants-20) at 2:
+  the test pump unwraps a refusal of admission at that bound (not yet traced: why 2, and whether
+  the pump should hold the record as a host would).
 - every_falsifier_of_the_floor_holds_under_a_nemesis: the pump's admission panicked on
   "MsgPropose from 2 (wire 4) to 1 (wire 1), term 0 refused: Invalid { what: \"replica sender\",
   why: \"authenticated sender or destination differs from record\" }"; a lone pass printed a
