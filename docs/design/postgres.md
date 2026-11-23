@@ -321,6 +321,36 @@ columns carry no SQLite affinity, so SQLite never converts a value.
 Every encoder and decoder is a flat loop with an explicit stack bounded by the input's length
 (CLAUDE.md §11). Hostile input to every decoder is a test (CLAUDE.md §6).
 
+### Numbers as text: due when the frontend returns values (lane G11 note, not built)
+
+The SQLite dialect writes a REAL by floatingpoint.html (15 digits when they convert back, else 17;
+`crates/engine/numeric/fp.rs`). None of that may reach a PostgreSQL session (RULES 5f): each item
+below goes through the `Dialect` hook (`crates/engine/dialect/mod.rs`) once the frontend renders
+values, each with a test quoting PostgreSQL 19's sentence (datatype-numeric.html §8.1.2 and §8.1.3,
+runtime-config-client.html `extra_float_digits`) and a corpus run against PostgreSQL 19.
+
+- **float8 and float4 output follow `extra_float_digits`.** Its default (1) and any value above 0
+  write the shortest text that converts back to the same value exactly (float8 at most 17
+  significant digits, float4 at most 9); 0 and below round to 15 + n (float8) or 6 + n (float4)
+  significant digits. The setting is per session (`SET`, startup options, `ParameterStatus` only
+  where PostgreSQL reports it). The shortest digits are what fp.rs's normal-double path already asks
+  Rust's `{:e}` for (G11); the layout (where exponent form starts, `1e+16` where SQLite writes
+  `1.0e+16`, no `.0` on whole values) is PostgreSQL's own and is checked against it, not assumed.
+- **float4 is its own type.** Text in and out at single precision (shortest float4 digits, not the
+  float8 digits of the widened value); storage as REAL is lossless for it, its output is not.
+- **Special values in PostgreSQL's spelling.** `Infinity`, `-Infinity`, `NaN` on output (not
+  SQLite's `Inf`, `-Inf`, `9.0e+999`, `null`); input accepts them case-insensitively, with `inf`
+  and `+inf`; `-0` prints `-0`.
+- **float input errors.** Out-of-range text is `22003` ("is out of range for type double
+  precision"), malformed text `22P02`; never SQLite's longest-prefix CAST or its 0.0.
+- **numeric is exact decimal.** Arithmetic, rounding (half away from zero), division scale and
+  `numeric(p,s)` typmod coercion as PostgreSQL 19 computes them, output at the value's display scale
+  (the key's hidden scale above), with `NaN`, `Infinity`, `-Infinity`; overflow of the typmod is
+  `22003`. Never routed through binary64.
+- **Casts and comparisons between them.** float8 to int rounds half to even and errors out of range
+  (`22003`), unlike SQLite's truncating, saturating CAST; numeric compared with float8 compares as
+  PostgreSQL's cross-type operators do, not SQLite's int/real comparison.
+
 **Why not a new comparator (the other candidate).** The other design kept exact bytes and taught
 the record comparator PostgreSQL's operator classes, a `Pg(PgOpClass)` beside `CollationSeq`
 (`crates/engine/translate/collate.rs:27`). It must then reach every place the engine orders or equates
