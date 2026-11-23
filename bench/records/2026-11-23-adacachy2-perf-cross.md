@@ -487,3 +487,43 @@ the long write loses its leader before it answers (lanes P6-P10), not 3b's frame
 tested in r1350 (clippy clean, lib `serve::` 11/11, `database::admission_charge` 2/2, call_nowait_charge 1/1,
 tests/serve.rs 9/10 with this test the one red); main 66484d49..993d9346 changed no Rust, so the merge
 re-tests nothing.
+
+A second test went red once beside it: r1395 (clippy and the touched tests at the merge 5c28ad0a, load 13-20)
+had tests/serve.rs 8 of 9 with `t_t1_13_1_a_region_lost_is_replaced_by_a_spare` failing at :206 (`member add 4`:
+"no voter made the change: NotLeader { leader: Some(3) }", the cut member still the leader heard). Alone from
+the two binaries (r1403 3 runs each, r1415 12 each, load 13-60): 5c28ad0a 14 of 15 passed, main 57b584ee 14 of
+15 (its failure `member promote 4`: UnknownOutcome). The same membership race on both, so not 3b's.
+
+**Unit 2a (f0fff576).** The answers of `call_db` and `call_internal`'s callers count their bytes: `AnswerBytes`
+for `Result<T, E>`, `Refusal` (its strings' and key's capacity), `api::Row`, `ImportProgress`, across.rs's
+`Held<T>`, online.rs's `Stepped` (also `FixedAnswer`: a `u64` and a `Duration`), xgroup's `Reply`, the
+coordinator's `Answer`, `Application` and `FloorRefused`; `heap_bytes` gives a field's heap for a type that holds
+it. Nothing charges them yet: the callers still pass `REQUEST_MAX` (2b). Test:
+`database::admission_charge::a12_call_db_answers_count_their_heap`. r1414 at f0fff576 (adacachy2, needs cpus=4,mem=16g, load 35-54): clippy -p amphora --all-targets clean; lib
+`database::admission_charge` 3/3, `database::online` 6/6.
+
+**Unit 2b, not built (what the next lane does).** `call_db(until, answer: AnswerMax<R>, f)` and
+`call_internal(until, answer, f)` with `R: AnswerBytes`, the closure wrapped in `within(f(db)?, answer)` as
+`call_session` is, and `answer.get()` to `call_db_session`. Each caller's bound, derived from what its closure
+reads (these are the derivations; none is picked):
+
+- `AnswerMax::fixed()`: xgroup `prepare` and the tests' `put_lock`/`drop_locks_of`/`set_record` (`()`);
+  across.rs's stamp wait (`()`); online.rs's `step` (`Stepped`) and `abandon` (`()`); restore.rs's
+  `apply_page` (`()`); the across tests' `Option<Option<Rev>>` and `Option<u64>`. The across test's
+  `(Vec<Rev>, Vec<Rev>)` takes `RESULT_MAX`, as A9's test row lists do.
+- restore.rs `progress`/`restore_progress`: `size_of::<ImportProgress>()` (in an `Option` for the latter) + the
+  source's bound (restore.rs:58, 256) + `CURSOR_MAX`. `finish`: check its answer type (`()` expected).
+- application.rs `raise`: `Result<Application, FloorRefused>`: `size_of` + `FAMILY_MAX` (the name's grammar
+  bound, `Application::validate`) or the `FloorRefused` refusal's static text.
+- xgroup `step(group, carried, until, answer, f)`: `serve`/`step_on` declare `(Reply, Vec<Vec<u8>>)` from the
+  envelope before it moves into the closure: Begin/Decide*/Recover*/Prevent*/Resolve* the inline reply plus a
+  `Staging` list of at most `TX_MAX` `GroupId`s (participants are at most the transaction's keys,
+  `coordinator::validate`); Scan an `Open` page of `SCAN_MAX` `(TxnId, GroupId)`; Lock/LockIf `reads.len()`
+  entries of `key.len() + VALUE_MAX` or one key (`Conflict`/`Unmet`, `KEY_MAX`). The dropped list: at most the
+  transaction's `TX_MAX` keys of `KEY_MAX`. `commit`'s `one_group` (`Answer`): `txn.reads` with `VALUE_MAX`
+  each, or one key. Open question for that lane: a `Vec`'s spare capacity is counted by `AnswerBytes`, so a
+  spine grown by `push` needs its growth in the bound (or a shrunk spine before answering).
+- across.rs `waiting(group, until, answer, read)`: callers declare `Result<Held<T>, Refusal>`: a page
+  `RESULT_MAX` (the page bound, lane perf-A6), a row `size_of::<Row>() + KEY_MAX + VALUE_MAX`, a stamp
+  fixed; `Held::Locked` a key of `KEY_MAX`; the refusal `Compacted` (inline) or `unstamped`'s one format
+  string with one `u64` (its literal length + 20 digits).
