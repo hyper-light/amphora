@@ -60,7 +60,7 @@ fn add(a: usize, b: usize) -> Result<usize, ScanError> {
 /// ScanKeywordLookup: the keyword whose name is `text` with ASCII letters lowered.
 fn keyword(text: &[u8]) -> Option<(&'static str, i32)> {
     let lower: Vec<u8> = text.iter().map(u8::to_ascii_lowercase).collect();
-    KEYWORDS.binary_search_by(|(k, _)| k.as_bytes().cmp(&lower)).ok().and_then(|i| KEYWORDS.get(i)).copied()
+    KEYWORDS.binary_search_by(|(k, _)| k.as_bytes().cmp(lower.as_slice())).ok().and_then(|i| KEYWORDS.get(i)).copied()
 }
 
 /// truncate_identifier: at most NAMEDATALEN - 1 bytes, cut at a character boundary (pg_mbcliplen).
@@ -154,7 +154,7 @@ fn surrogate_second(c: u32) -> bool {
 }
 
 fn surrogate_pair(first: u32, second: u32) -> u32 {
-    ((first & 0x3FF) << 10).saturating_add(0x10000).saturating_add(second & 0x3FF)
+    (first & 0x3FF).saturating_mul(0x400).saturating_add(0x10000).saturating_add(second & 0x3FF)
 }
 
 fn hex_value(digits: &[u8]) -> Option<u32> {
@@ -241,7 +241,8 @@ impl<'a> Core<'a> {
 
     fn next(&mut self) -> Result<Option<Token>, ScanError> {
         loop {
-            let rest = self.input.get(self.pos..).ok_or_else(fault)?;
+            let input = self.input;
+            let rest = input.get(self.pos..).ok_or_else(fault)?;
             if rest.is_empty() {
                 return self.end_of_input();
             }
@@ -426,7 +427,8 @@ impl<'a> Core<'a> {
                 if text == self.dolqstart.as_slice() {
                     self.dolqstart.clear();
                     self.condition = INITIAL;
-                    return Ok(Some(self.token(SCONST, Value::Str(std::mem::take(&mut self.lit)))));
+                    let lit = std::mem::take(&mut self.lit);
+                    return Ok(Some(self.token(SCONST, Value::Str(lit))));
                 }
                 let keep = text.len().saturating_sub(1);
                 self.lit.extend_from_slice(text.get(..keep).ok_or_else(fault)?);
