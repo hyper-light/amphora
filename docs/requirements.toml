@@ -1280,6 +1280,11 @@ tests = [
   # lane constants-22
   { id = "T-QB.1.13", text = "A lock-release event, released before a wait and after: passes when a wait after a release it hadn't counted says try again, a waiting waker is woken once by the next release and let go, and one waker waiting twice is held once" },
   { id = "T-QB.1.14", text = "Two connections, one holding the write lock while the other's insert waits, then the holder commits, under each busy wake: passes when under the release wake nothing woke the waiter before the commit and the commit did, both inserts commit, and the time from commit to the waiter's insert done is printed for each" },
+  # lane constants-K3
+  { id = "T-QB.1.15", text = "Ten messages come to the command queue each 10 ms and its reader takes them in 1 ms, then finds the queue empty, under a 100 ms election timeout: passes when the bound is what the reader takes in the timeout, about 1000 messages, not the 100 that come in it; a stall then a reader that keeps up is not held to the least; what is taken within one tick of a driven clock is not weighed over the empty time after it" },
+  { id = "T-QB.1.16", text = "The outgoing queue's equivalent: a host that drains each burst and then finds the queue empty, under a 100 ms election timeout: passes when the bound is what the host drains in the timeout, not what comes in it, and a stall then a host that keeps up is not held to one broadcast" },
+  # lane replicated-K6
+  { id = "T-QB.1.17", text = "A leader whose change waits at its barrier takes a record at one reading of its clock, then the clock moves a second, three times: passes when it then admits a burst of three records, past the least its command queue carries, as a member whose clock stands still does" },
 ]
 
 # lane many-writers
