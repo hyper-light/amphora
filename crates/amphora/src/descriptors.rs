@@ -109,8 +109,14 @@ impl Descriptors {
     /// The system refused a descriptor this budget allowed (`EMFILE`): more is open outside it
     /// than last counted, so it is counted again.
     pub(crate) fn refused_by_system(&self) -> Result<(), Refusal> {
-        if self.system {
-            self.recount().map_err(Refusal::Unavailable)?;
+        // At the process's limit the count itself can't open /dev/fd: refused for the same
+        // reason, the count waits for the next charge or refusal, and the refusal stands
+        // (AUDIT 6: it ended the owner's listener at the limit it was waiting out).
+        if self.system
+            && let Err(error) = self.recount()
+            && !error.contains(OUT_OF_DESCRIPTORS)
+        {
+            return Err(Refusal::Unavailable(error));
         }
         Ok(())
     }
@@ -119,6 +125,12 @@ impl Descriptors {
     /// waits for one past it.
     pub(crate) fn releases(&self) -> u64 {
         self.released.load(Ordering::SeqCst)
+    }
+
+    /// The threads waiting for a give-back now.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiters.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
     /// Whether this budget holds any descriptor now, so that a give-back will come.
@@ -211,6 +223,9 @@ pub(crate) fn process() -> Result<Arc<Descriptors>, Refusal> {
         .map_err(Refusal::Unavailable)
 }
 
+/// What a count refused for want of a descriptor says (`EMFILE`, `ENFILE`).
+const OUT_OF_DESCRIPTORS: &str = ", out of descriptors";
+
 /// The soft `RLIMIT_NOFILE` (POSIX `getrlimit`): the most descriptors the system lets this process
 /// hold. With none set (`RLIM_INFINITY`) nothing here bounds them, and the kernel's own ceiling
 /// (Linux's `fs.nr_open`) refuses past it.
@@ -237,8 +252,13 @@ fn limit() -> usize {
 /// than it leaves.
 #[cfg(unix)]
 fn open() -> Result<usize, String> {
-    let entries = std::fs::read_dir("/dev/fd")
-        .map_err(|error| format!("this process's open descriptors (/dev/fd): {error}"))?;
+    let entries = std::fs::read_dir("/dev/fd").map_err(|error| {
+        let out = [rustix::io::Errno::MFILE, rustix::io::Errno::NFILE]
+            .iter()
+            .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()));
+        let why = if out { OUT_OF_DESCRIPTORS } else { "" };
+        format!("this process's open descriptors (/dev/fd){why}: {error}")
+    })?;
     Ok(entries.count())
 }
 
