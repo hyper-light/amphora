@@ -1,0 +1,386 @@
+{"host": "adacachy2", "kernel": "7.3.3-1-cachyos", "machine": "x86_64", "cpus": 32, "mem_kib": "128892108", "data_fs": "btrfs", "open_files": "1048576", "fetched": ["rqlite v10.7.4", "libsql libsql-server-v0.24.32", "litefs v0.5.14", "consul 2.1.0", "go go1.27.4", "dqlite v1.18.7", "go-dqlite v3.0.4 (libdqlite 1.18.7)"], "ladder": "1 32 128"}
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.50s
+== litefs writers 1
+Error: unavailable: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:
+==> Starting Consul agent...
+               Version: '2.1.0'
+            Build Date: '2026-10-21 07:34:22 +0000 UTC'
+               Node ID: '9c4e0cf4-6266-677c-3282-aed9f1a9e8ae'
+             Node name: 'adacachy2'
+            Datacenter: 'dc1' (Segment: '<all>')
+                Server: true (Bootstrap: false)
+           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)
+          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)
+     Gossip Encryption: false
+      Auto-Encrypt-TLS: false
+           ACL Enabled: false
+     Reporting Enabled: false
+    ACL Default Policy: allow
+             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2
+              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2
+      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2
+
+==> Log data will now stream in as it occurs:
+
+2026-11-23T05:03:21.731-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.9c4e0cf4-6266-677c-3282-aed9f1a9e8ae/server.dc1 from=<none> to=<none>
+2026-11-23T05:03:21.734-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:9c4e0cf4-6266-677c-3282-aed9f1a9e8ae Address:127.0.0.1:54283}]"
+2026-11-23T05:03:21.734-0800 [INFO]  agent.server.raft: entering follower state: follower="Node at 127.0.0.1:54283 [Follower]" leader-address= leader-id=
+2026-11-23T05:03:21.734-0800 [INFO]  agent.server: shutting down server
+2026-11-23T05:03:21.735-0800 [ERROR] agent: Error starting agent: error="Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \"127.0.0.1\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use"
+2026-11-23T05:03:21.735-0800 [INFO]  agent: Exit code: code=1
+refused litefs 1: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: '9c4e0cf4-6266-677c-3282-aed9f1a9e8ae'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T05:03:21.731-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.9c4e0cf4-6266-677c-3282-aed9f1a9e8ae/server.dc1 from=<none> to=<none>\n2026-11-23T05:03:21.734-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\
+== libsql writers 1
+Error: unavailable: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:
+           _     _ 
+ ___  __ _| | __| |
+/ __|/ _` | |/ _` |
+\__ \ (_| | | (_| |
+|___/\__, |_|\__,_|
+        |_|        
+
+Welcome to sqld!
+
+version: 0.24.32
+commit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1
+build date: 2025-02-14
+
+This software is in BETA version.
+If you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues
+
+config:
+	- mode: primary (127.0.0.1:54230)
+	- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data
+	- extensions path: <disabled>
+	- listening for HTTP requests on: 127.0.0.1:54220
+	- grpc_tls: no
+Error: Address already in use (os error 98)
+refused libsql 1: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\nError: Address already in use (os error 98)
+== dqlite writers 1
+ok dqlite 1
+== rqlite writers 1
+ok rqlite 1
+== amphora-procs-replicated writers 1
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.70s
+== amphora-procs-replicated commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-replicated commit
+== amphora-procs-persisted writers 1
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== amphora-procs-persisted commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-persisted commit
+== litefs writers 32
+Error: unavailable: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:
+==> Starting Consul agent...
+               Version: '2.1.0'
+            Build Date: '2026-10-21 07:34:22 +0000 UTC'
+               Node ID: 'bf71f77a-8405-9284-c61c-4bae1eee070e'
+             Node name: 'adacachy2'
+            Datacenter: 'dc1' (Segment: '<all>')
+                Server: true (Bootstrap: false)
+           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)
+          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)
+     Gossip Encryption: false
+      Auto-Encrypt-TLS: false
+           ACL Enabled: false
+     Reporting Enabled: false
+    ACL Default Policy: allow
+             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2
+              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2
+      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2
+
+==> Log data will now stream in as it occurs:
+
+2026-11-23T05:03:56.015-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.bf71f77a-8405-9284-c61c-4bae1eee070e/server.dc1 from=<none> to=<none>
+2026-11-23T05:03:56.018-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:bf71f77a-8405-9284-c61c-4bae1eee070e Address:127.0.0.1:54283}]"
+2026-11-23T05:03:56.018-0800 [INFO]  agent.server: shutting down server
+2026-11-23T05:03:56.018-0800 [ERROR] agent: Error starting agent: error="Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \"127.0.0.1\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use"
+2026-11-23T05:03:56.018-0800 [INFO]  agent: Exit code: code=1
+refused litefs 32: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: 'bf71f77a-8405-9284-c61c-4bae1eee070e'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T05:03:56.015-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.bf71f77a-8405-9284-c61c-4bae1eee070e/server.dc1 from=<none> to=<none>\n2026-11-23T05:03:56.018-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\
+== libsql writers 32
+Error: unavailable: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:
+           _     _ 
+ ___  __ _| | __| |
+/ __|/ _` | |/ _` |
+\__ \ (_| | | (_| |
+|___/\__, |_|\__,_|
+        |_|        
+
+Welcome to sqld!
+
+version: 0.24.32
+commit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1
+build date: 2025-02-14
+
+This software is in BETA version.
+If you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues
+
+config:
+	- mode: primary (127.0.0.1:54230)
+	- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data
+	- extensions path: <disabled>
+	- listening for HTTP requests on: 127.0.0.1:54220
+	- grpc_tls: no
+Error: Address already in use (os error 98)
+refused libsql 32: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\nError: Address already in use (os error 98)
+== dqlite writers 32
+ok dqlite 32
+== rqlite writers 32
+ok rqlite 32
+== amphora-procs-replicated writers 32
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.43s
+== amphora-procs-replicated commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-replicated commit
+== amphora-procs-persisted writers 32
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+== amphora-procs-persisted commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+ok amphora-procs-persisted commit
+== litefs writers 128
+Error: unavailable: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:
+==> Starting Consul agent...
+               Version: '2.1.0'
+            Build Date: '2026-10-21 07:34:22 +0000 UTC'
+               Node ID: 'ccec1625-b138-1b0e-9db6-ca66331dfacb'
+             Node name: 'adacachy2'
+            Datacenter: 'dc1' (Segment: '<all>')
+                Server: true (Bootstrap: false)
+           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)
+          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)
+     Gossip Encryption: false
+      Auto-Encrypt-TLS: false
+           ACL Enabled: false
+     Reporting Enabled: false
+    ACL Default Policy: allow
+             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2
+              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2
+      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2
+
+==> Log data will now stream in as it occurs:
+
+2026-11-23T05:04:33.635-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.ccec1625-b138-1b0e-9db6-ca66331dfacb/server.dc1 from=<none> to=<none>
+2026-11-23T05:04:33.639-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers="[{Suffrage:Voter ID:ccec1625-b138-1b0e-9db6-ca66331dfacb Address:127.0.0.1:54283}]"
+2026-11-23T05:04:33.639-0800 [INFO]  agent.server.raft: entering follower state: follower="Node at 127.0.0.1:54283 [Follower]" leader-address= leader-id=
+2026-11-23T05:04:33.640-0800 [INFO]  agent.server: shutting down server
+2026-11-23T05:04:33.640-0800 [ERROR] agent: Error starting agent: error="Failed to start Consul server: Failed to start WAN Serf: failed to start TCP listener on \"127.0.0.1\" port 54282: listen tcp 127.0.0.1:54282: bind: address already in use"
+2026-11-23T05:04:33.640-0800 [INFO]  agent: Exit code: code=1
+refused litefs 128: litefs's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/litefs.sh up: consul didn't take leadership; its log ends:\n==> Starting Consul agent...\n               Version: '2.1.0'\n            Build Date: '2026-10-21 07:34:22 +0000 UTC'\n               Node ID: 'ccec1625-b138-1b0e-9db6-ca66331dfacb'\n             Node name: 'adacachy2'\n            Datacenter: 'dc1' (Segment: '<all>')\n                Server: true (Bootstrap: false)\n           Client Addr: [127.0.0.1] (HTTP: 54280, HTTPS: -1, gRPC: -1, gRPC-TLS: 8503, DNS: -1)\n          Cluster Addr: 127.0.0.1 (LAN: 54281, WAN: 54282)\n     Gossip Encryption: false\n      Auto-Encrypt-TLS: false\n           ACL Enabled: false\n     Reporting Enabled: false\n    ACL Default Policy: allow\n             HTTPS TLS: Verify Incoming: false, Verify Outgoing: false, Min Version: TLSv1_2\n              gRPC TLS: Verify Incoming: false, Min Version: TLSv1_2\n      Internal RPC TLS: Verify Incoming: false, Verify Outgoing: false (Verify Hostname: false), Min Version: TLSv1_2\n\n==> Log data will now stream in as it occurs:\n\n2026-11-23T05:04:33.635-0800 [DEBUG] agent.grpc.balancer: switching server: target=consul://dc1.ccec1625-b138-1b0e-9db6-ca66331dfacb/server.dc1 from=<none> to=<none>\n2026-11-23T05:04:33.639-0800 [INFO]  agent.server.raft: initial configuration: index=1 servers=\
+== libsql writers 128
+Error: unavailable: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:
+           _     _ 
+ ___  __ _| | __| |
+/ __|/ _` | |/ _` |
+\__ \ (_| | | (_| |
+|___/\__, |_|\__,_|
+        |_|        
+
+Welcome to sqld!
+
+version: 0.24.32
+commit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1
+build date: 2025-02-14
+
+This software is in BETA version.
+If you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues
+
+config:
+	- mode: primary (127.0.0.1:54230)
+	- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data
+	- extensions path: <disabled>
+	- listening for HTTP requests on: 127.0.0.1:54220
+	- grpc_tls: no
+Error: Address already in use (os error 98)
+refused libsql 128: libsql's cluster didn't come up through /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh: /home/adalundhe/.cache/amphora-perf/bench-s/bench/servers/repl/libsql.sh up: libsql primary didn't come up to set its durability; its log ends:\n           _     _ \n ___  __ _| | __| |\n/ __|/ _` | |/ _` |\n\\__ \\ (_| | | (_| |\n|___/\\__, |_|\\__,_|\n        |_|        \n\nWelcome to sqld!\n\nversion: 0.24.32\ncommit SHA: 40c272de85ee4e62d722c5ccae5da2e76b4253a1\nbuild date: 2025-02-14\n\nThis software is in BETA version.\nIf you encounter any bug, please open an issue at https://github.com/tursodatabase/libsql/issues\n\nconfig:\n\t- mode: primary (127.0.0.1:54230)\n\t- database path: /home/adalundhe/.cache/amphora-repl-data/amphora-bench-repl-libsql/0/data\n\t- extensions path: <disabled>\n\t- listening for HTTP requests on: 127.0.0.1:54220\n\t- grpc_tls: no\nError: Address already in use (os error 98)
+== dqlite writers 128
+ok dqlite 128
+== rqlite writers 128
+ok rqlite 128
+== amphora-procs-replicated writers 128
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.41s
+== amphora-procs-replicated commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+Error: no live node acknowledged a write within --deadline-s: Some(node 1: refused a write: Invalid { what: "prepared transaction", why: "the database advanced since preparation" })
+FAILED amphora-procs-replicated commit
+== amphora-procs-persisted writers 128
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1033:14
+     |
+1033 |             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1033 -             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1033 +             .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> /home/adalundhe/.cache/amphora-perf/bench-s/vendor/hyper-raft/crates/hyper-rt/src/sync/mod.rs:1136:18
+     |
+1136 |                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |                  ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1136 -                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+1136 +                 .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+     |
+
+warning: `hyper-rt` (lib) generated 2 warnings (run `cargo fix --lib -p hyper-rt` to apply 2 suggestions)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.39s
+== amphora-procs-persisted commit on 127.0.0.1:29290,127.0.0.1:29291,127.0.0.1:29292
+Error: no live node acknowledged a write within --deadline-s: Some(node 2: refused a write: Timeout)
+FAILED amphora-procs-persisted commit

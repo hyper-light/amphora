@@ -1,0 +1,1 @@
+select l_returnflag, l_linestatus, sum(l_linenumber) as s, count(*) as count_order from lineitem where l_shipdate <= '1998-09-02' group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus

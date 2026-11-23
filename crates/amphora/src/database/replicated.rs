@@ -5090,7 +5090,25 @@ impl<F: BlockFile + 'static> Actor<F> {
         // The receive rule (Kulkarni et al., OPODIS 2014): past every stamp a step carried in.
         let observed = self.control.observed.load(Ordering::Acquire);
         let now = self.wall_now()?.max(observed.saturating_add(1));
-        let stamped = crate::replication::closed::stamp(now, &bytes);
+        let mut stamped = crate::replication::closed::stamp(now, &bytes);
+        // The leader's own write appends right after its last entry, as a member's forward does
+        // (`step_forward`), and prepared on its applied state, behind the forwards its log holds
+        // uncommitted: the same read-set check moves its base past them, or its apply refuses it
+        // round after round while followers write (the persisted class's longest, its commit
+        // waiting on a quorum's flush).
+        if self.replica.is_leader() {
+            let log = self.replica.core().raft.log();
+            let last = log.last_index().map_err(unavailable)?;
+            let before = Point {
+                index: last,
+                term: log.term(last).map_err(unavailable)?,
+            };
+            if let Ok(Err(_)) = crate::replication::verdict(&stamped, before)
+                && let Some(data) = self.rebase(&stamped, before)?
+            {
+                stamped = data;
+            }
+        }
         self.replica
             .propose(context.to_vec(), stamped)
             .map_err(raft_error)
@@ -5290,6 +5308,16 @@ impl<F: BlockFile + 'static> Actor<F> {
                 let _deadline = db.deadline_on(pending.until, move || clock());
                 if restore::incomplete(db)? {
                     return Err(api::invalid("database", "restore is incomplete").into());
+                }
+                // The floor its claim was checked against, read again inside the traced session:
+                // its pages join the write's read set, so a raise appended after its base
+                // conflicts in the leader's walk (`rebase`) and the exact base refuses it, as the
+                // claim's check above assumes.
+                if let Some(application) = &claim
+                    && let Some(refused) =
+                        super::application::claim_refused(db, application.as_ref(), &operation)?
+                {
+                    return Err(refused.refusal.into());
                 }
                 match &operation {
                     Operation::Call(call) => {
@@ -6241,8 +6269,8 @@ mod tests {
             *self.count.lock().unwrap()
         }
         /// Waits until something happens past `seen`, up to the transport tests' hang guard: a
-        /// hang, never a verdict.
-        fn wait_past(&self, seen: u64) {
+        /// hang, never a verdict, which names the work `out` it waited on ([`Driven::movers`]).
+        fn wait_past(&self, seen: u64, out: &[(usize, usize, bool)]) {
             let count = self.count.lock().unwrap();
             let (_count, waited) = self
                 .rang
@@ -6250,7 +6278,7 @@ mod tests {
                 .unwrap();
             assert!(
                 !waited.timed_out(),
-                "work was out off the driver's thread and none ended or came to a held gate in {:?}: a hang",
+                "work was out off the driver's thread and none ended or came to a held gate in {:?}: a hang; out (owner, log writes, database flush): {out:?}",
                 crate::transport::HANG
             );
         }
@@ -6431,28 +6459,46 @@ mod tests {
             assert!(told.is_ok(), "an owner's bell told twice");
             actor
         }
-        /// Whether work is out off the driver's thread that ends, or comes to a held gate, on its
-        /// own, and so rings [`OffThread`]: a log write or compaction on a member whose gate is
-        /// open, or held with no flush at it yet; or a flush of a member's database on its
-        /// flushing thread. Only such work can move a group whose round relayed nothing.
-        fn moving(&self) -> bool {
-            self.owners.iter().enumerate().any(|(at, owner)| {
-                owner.as_ref().is_some_and(|(owner, _)| {
+        /// Each owner with work out off the driver's thread that ends, or comes to a held gate, on
+        /// its own, and so rings [`OffThread`], as (owner, log writes out, database flush out): a
+        /// log write or compaction on a member whose gate is open, or held with no flush at it
+        /// yet; or a flush of a member's database on its flushing thread while the test doesn't
+        /// hold its flushes (`FlushGate`), as a held one ends only once the test lets it go and
+        /// rings nothing as it waits. Only such work can move a group whose round relayed nothing.
+        fn movers(&self) -> Vec<(usize, usize, bool)> {
+            self.owners
+                .iter()
+                .enumerate()
+                .filter_map(|(at, owner)| {
+                    let (owner, _) = owner.as_ref()?;
                     let parked = self
                         .gates
                         .get(&at)
                         .is_some_and(|gate| gate.is_held() && gate.waiting());
-                    (owner.replica.in_flight() != 0 && !parked)
-                        || matches!(owner.flushing, Flushing::Thread { out: true, .. })
+                    let writes = if parked { 0 } else { owner.replica.in_flight() };
+                    let flush = matches!(owner.flushing, Flushing::Thread { out: true, .. })
+                        && !owner.replica.machine().flush_gate().is_held();
+                    if writes != 0 || flush {
+                        Some((at, writes, flush))
+                    } else {
+                        None
+                    }
                 })
-            })
+                .collect()
+        }
+        /// Whether any work is out that [`Driven::movers`] names.
+        fn moving(&self) -> bool {
+            !self.movers().is_empty()
         }
         /// After a round that relayed nothing and left nothing in transit, the driver waits for
-        /// work out off its thread to end or come to a held gate ([`Driven::moving`]); with none
+        /// work out off its thread to end or come to a held gate ([`Driven::movers`]); with none
         /// out it waits for nothing, as only its own steps can move the group.
         fn wait_if_moving(&self, relayed: usize, pump: &Pump<'_>) {
-            if relayed == 0 && pump.records == 0 && self.moving() {
-                self.moved.wait_past(self.looked);
+            if relayed == 0 && pump.records == 0 {
+                let out = self.movers();
+                if !out.is_empty() {
+                    self.moved.wait_past(self.looked, &out);
+                }
             }
         }
         /// A call's or a record's budget on these clocks: it runs out only if the test moves a
@@ -10653,7 +10699,8 @@ mod tests {
     }
     /// T-QB.1.9 (QB.1, lane constants-21; replication.md, "The member bound stated once per group"):
     /// a group's member bound is its log's, so growth always works. Do: open one voter, and a
-    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running), and catch
+    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running, so every
+    /// record to them is lost: the pump has no owner to hand it to), and catch
     /// member 2 up; restart the voter from the configuration it first opened with. Expect: the
     /// voter opened for 2 (twice its first configuration); each change past the bound raised it
     /// first, to 4, then 8 by the fifth member, then 16 by the ninth, every change answered;
@@ -10679,6 +10726,7 @@ mod tests {
         };
         assert_eq!(bound(&driven, 0), 2);
         let mut pump = Pump::new(&clients);
+        pump.lost.extend(3..=9);
         driven.elect(&mut pump, &clients[..1], 0, 1);
         for member in 2..=9 {
             let until = driven.until();
@@ -12625,7 +12673,7 @@ mod tests {
         let fourth = waiter(&voter[0], term);
         let gate = lone.owner(0).replica.machine().flush_gate();
         gate.fill();
-        let written = submit(&voter[0], Instant::now() + HANG_READ, |db| {
+        let written = submit(&voter[0], lone.until(), |db| {
             db.exec("CREATE TABLE IF NOT EXISTS member_items(value)")?;
             Ok(Vec::new())
         });
@@ -13064,7 +13112,7 @@ mod tests {
             let now = owner.now().unwrap();
             owner
                 .replica
-                .compact(0, now, std::task::Waker::noop())
+                .compact(0, now, &owner.waker)
                 .unwrap();
             owner.replica.applied().index
         };
@@ -16052,7 +16100,7 @@ mod tests {
             let now = owner.now().unwrap();
             owner
                 .replica
-                .compact(0, now, std::task::Waker::noop())
+                .compact(0, now, &owner.waker)
                 .unwrap();
             owner.replica.applied().index
         };
@@ -16429,7 +16477,7 @@ mod tests {
             let now = owner.now().unwrap();
             let out = owner
                 .replica
-                .compact(0, now, std::task::Waker::noop())
+                .compact(0, now, &owner.waker)
                 .unwrap();
             assert!(out, "no compaction went out");
             driven.quiet(pump);
@@ -17773,6 +17821,130 @@ mod tests {
         }
     }
 
+    /// T-T1.8.W1, the leader's own writes (bench lane S4's persisted refusals at 128 writers,
+    /// bench/records/2026-11-23-adacachy2-bench-s4-handover.md): every member writes, the leader
+    /// too. Do: the leader and both followers each append 15 times to two hot lists, then to 32
+    /// spread over pages, every record delayed up to three relay rounds, three seeds each.
+    /// Expect: every write committed, none unknown, the history serializable; no follower refused
+    /// twice in a row; and over spread pages, where nothing a write read was written since its
+    /// base, not the leader either. Before the leader's own appends took the read-set check its
+    /// members' forwards take, its writes over spread pages were refused up to 5 times in a row
+    /// (11 to 17 refusals for 15 commits). On hot lists its writes outside its turn keep the
+    /// exact base (replication.md, "The leader's turn": the general tail rule is still open).
+    #[test]
+    fn no_writer_is_refused_twice_in_a_row_when_every_member_writes() {
+        for keys in [2, 32] {
+            for seed in 1..=3 {
+                let run = list_append_run(&[0, 1, 2], false, seed, keys, 15);
+                eprintln!(
+                    "three writers keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} moved {}",
+                    run.committed, run.refused, run.streak, run.moved
+                );
+                assert!(
+                    run.violations.is_empty(),
+                    "keys {keys} seed {seed}: {:?}",
+                    run.violations
+                );
+                assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
+                let checked = if keys == 2 { &run.streak[1..] } else { &run.streak[..] };
+                assert!(
+                    checked.iter().all(|streak| *streak <= 1),
+                    "keys {keys} seed {seed}: {:?}",
+                    run.streak
+                );
+            }
+        }
+    }
+
+    /// Bench lane S4's rung (bench/records/2026-11-23-adacachy2-bench-s4-handover.md): 128
+    /// writers at once on the persisted class, each one write outstanding, appending a row to one
+    /// table (its rowid's rightmost leaf and page 1's size: every write conflicts with every
+    /// other), a refused write made again at the next member as the bench does. Expect: every
+    /// write acknowledged, none answered anything but its rows or the stale base's refusal, each
+    /// acknowledged row on every replica once, and none left unanswered.
+    #[test]
+    fn a_hundred_and_twenty_eight_writers_each_land_and_every_acknowledged_row_is_held() {
+        const WRITERS: usize = 128;
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven
+            .call(&mut pump, &clients[leader], |db| {
+                db.exec("CREATE TABLE events(id INTEGER NOT NULL, body TEXT NOT NULL)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.tick(&mut pump, leader);
+        let write = |id: usize| {
+            move |db: &mut Db| {
+                db.exec(&format!(
+                    "INSERT INTO events VALUES ({id}, '{}')",
+                    "x".repeat(600)
+                ))?;
+                Ok(Vec::new())
+            }
+        };
+        let mut inflight: Vec<Option<(usize, Answering)>> = (0..WRITERS)
+            .map(|id| {
+                let via = id % 3;
+                Some((via, submit(&clients[via], driven.until(), write(id))))
+            })
+            .collect();
+        let mut refused = vec![0u64; WRITERS];
+        let mut rounds = 0;
+        while inflight.iter().any(Option::is_some) {
+            assert!(rounds < ROUNDS, "unanswered: {:?}", inflight.iter().filter(|w| w.is_some()).count());
+            for (id, slot) in inflight.iter_mut().enumerate() {
+                let Some((via, answer)) = slot.take() else {
+                    continue;
+                };
+                match answer.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => *slot = Some((via, answer)),
+                    Err(error) => panic!("owner ended: {error}"),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(Refusal::Invalid { what, .. })) if what == "prepared transaction" => {
+                        refused[id] += 1;
+                        let next = (via + 1) % 3;
+                        *slot = Some((next, submit(&clients[next], driven.until(), write(id))));
+                    }
+                    Ok(Err(other)) => panic!("writer {id} via {via}: {other:?}"),
+                }
+            }
+            driven.round(&mut pump);
+            rounds += 1;
+        }
+        eprintln!(
+            "128 writers: refused {} times in all, at most {} for one write, in {rounds} rounds",
+            refused.iter().sum::<u64>(),
+            refused.iter().max().unwrap()
+        );
+        driven.quiet(&mut pump);
+        driven.tick(&mut pump, leader);
+        driven.tick(&mut pump, leader);
+        for owner in 0..3 {
+            let ids = driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .read_db(|db| {
+                    let mut ids = Vec::new();
+                    db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                        ids.push(usize::try_from(row.get::<i64>(0)?).unwrap());
+                        Ok(true)
+                    })?;
+                    Ok(ids)
+                })
+                .unwrap();
+            assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "owner {owner}");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
+    }
+
     /// T-T1.8.W1's control (non-vacuity), an interleaving the test makes itself. Do, with the slot
     /// off and then on: the follower's write forwarded and held in transit while the leader
     /// appends a write of its own on the same base, then let through; the follower's write made
@@ -18069,8 +18241,9 @@ mod tests {
     /// slot's start lands on its next try. Do: the leader appends a write of its own, W, with one
     /// follower's answers held and its appends to the other, the slot's holder, lost, so W is
     /// neither committed nor sent to the holder; then the holder, queued by a refusal, writes,
-    /// its barrier beginning its slot with W the leader's last entry. Expect: its barrier held
-    /// while W is uncommitted, and its write, prepared on W once answers and appends flow again,
+    /// its barrier beginning its slot with W the leader's last entry; then answers and appends
+    /// flow again and the leader's clock moves until the holder has W, within an election
+    /// timeout. Expect: its barrier held while W is uncommitted, and its write, prepared on W,
     /// applied; W too. With the tail rule alone (the barrier answered at the older commit) the
     /// holder's write was refused: the commit's red run.
     #[test]
@@ -18137,6 +18310,16 @@ mod tests {
         }
         pump.held.clear();
         pump.losing = None;
+        // W's lost append fills the holder's window, learned from its path (`Window::Carried`),
+        // and holds back the commit's broadcast too: the leader asks where the holder is once a
+        // beat of its ticks passed with nothing out answered, and sends W again from there.
+        let election = driven.owner(0).replica.core().raft.config().election_tick;
+        for _ in 0..election {
+            if driven.owner(2).replica.applied().index >= w {
+                break;
+            }
+            driven.tick(&mut pump, leader);
+        }
         assert_eq!(
             driven.settle(&mut pump, &retry),
             Ok(Vec::new()),

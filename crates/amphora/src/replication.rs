@@ -330,6 +330,10 @@ impl FlushGate {
         self.state.lock().unwrap().held = false;
         self.opened.notify_all();
     }
+    /// Whether flushes are held: one from another thread than the holder's waits for the test.
+    pub(crate) fn is_held(&self) -> bool {
+        self.state.lock().unwrap().held
+    }
     /// Fails every flush from now with the error a full disk gives (`ENOSPC`).
     pub(crate) fn fill(&self) {
         self.state.lock().unwrap().full = true;
