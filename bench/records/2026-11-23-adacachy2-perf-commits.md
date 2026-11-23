@@ -560,3 +560,127 @@ Load on adacachy2 during r1216: 9 to 33 (1 min), CPU pressure "some" avg10 3 to 
     # the ladder: after arm built in a worktree at 2431406e (~/.cache/commits-ab/2431406e, release, 1 min 42 s),
     # copied to ~/.cache/amphora-perf-bin/commits/2431406e; bench/repl_ladder.sh and repl_members.sh take ARM_BIN
     # (a sed in that worktree, undone after); needs cpus=16                         # r1238
+
+# Lane V6 (commits) on adacachy2: r1238 collected, the term-0 guard merged, batching not started (2026-11-23, 17:22Z to 18:17Z)
+
+Ada's goal is replicated commits about 10x faster than dqlite and rqlite; AC-T1.8.3 asks p99 at most 2 ms for 3
+nodes on a LAN, never at the cost of safety. This hour read V5's ladder (r1238), merged the coordinator's term-0
+guard into change 0009, and left batching (V's unit 2) to the successor.
+
+## Losses first
+
+1. **At 128 writers Amphora fails every round, both classes, both arms.** All 20 Amphora runs at 128 writers
+   (persisted and replicated, `924fbe5c` and `2431406e`, rounds 1 to 5) end with "no live node acknowledged a write
+   within --deadline-s" (10 s), the last refusal "invalid prepared transaction: the database advanced since
+   preparation". That refusal is the follower's write slot losing to the leader's own queue (a write prepared on a
+   base that moved; the test near replicated.rs 7885 asserts it). The client retries it until the deadline. At 32
+   writers p99 is already 4.7 to 7.0 s, so at 128 a write at the back of the queue nears 10 s before any retry
+   (inferred from 128 / 13 to 16 commits/s, not measured). This is a functional failure, not only a slow rate:
+   writes are refused under load. rqlite runs the same 128-writer step at 1,195 to 2,459 commits/s.
+2. **Change 0009 made no measurable difference at 1 writer, and replicated at 32 writers is likely slower.**
+   Replicated at 32 writers: 16.0 commits/s before (14.8 to 17.0), 13.2 after (11.4 to 15.4), -18%, exact rank-sum
+   p = 0.016 over 5 rounds a side; without round 1 (it overlapped builds), 15.8 against 12.6, p = 0.057. The
+   limiter of that loss isn't named: no profile ran. So the verdict is a probable loss, cause unknown. At 1 writer
+   the replicated p50 is 71.7 ms before and 72.7 ms after: the barrier's two flushes that 0009 removes didn't
+   shorten a lone write on this disk.
+3. **No dqlite numbers.** dqlite's node 2 never started in any round: "create node: failed to set bind address
+   127.0.0.1:54252: 1". Nothing listened on 54252 when checked afterwards (`ss -ltn`), and the error is the same in
+   every round, so it is not a port left over from the round before (inferred). Not diagnosed this hour.
+4. **rqlite has 3 rounds, not 5.** Rounds 1 and 2 couldn't bind 127.0.0.1:54210 ("address already in use"), most
+   likely members the failing Amphora arm left running (round 1's own Amphora run hit "Address already in use"
+   too). Rounds 3 to 5 ran.
+5. **Round 1 overlapped builds.** Its first arm ran from 16:59:41Z to 17:08:31Z, about 9 minutes against about one
+   for every later arm, with I/O pressure "some" avg10 9.3%. Round 1's before arm has no persisted 1-writer row.
+6. **Batching (V's unit 2) was not started.** The hour went to the ladder, the guard and its proof. Its tests and
+   design are below for the successor, with one more test from loss 1.
+
+## r1238: the ladder (S4's family (a), 5 rounds, arm order reversed each round)
+
+Load (1 min) 19 to 31 across the rounds, CPU pressure "some" avg10 0 to 3.9%, I/O pressure "some" avg10 3.9 to
+10.2% (`rounds.txt`). 5 s windows, 1 s warmup, `--deadline-s 10`. Medians over the rounds that produced the row, range
+in brackets, exact two-sided rank-sum p for before against after:
+
+| system | writers | before `924fbe5c` commits/s | after `2431406e` commits/s | change, p | p50 ms before, after | p99 ms before, after |
+|---|---|---|---|---|---|---|
+| amphora persisted | 1 | 18.8 (16.4 to 22.2), 4 rounds | 19.2 (17.4 to 22.2) | +2%, 0.95 | 49.9, 49.7 | 102.9, 92.2 |
+| amphora persisted | 32 | 12.4 (10.8 to 13.0) | 13.6 (11.6 to 20.4) | +10%, 0.38 | 1,802, 1,458 | 5,898, 6,226 |
+| amphora persisted | 128 | refused, 5 of 5 | refused, 5 of 5 | | | |
+| amphora replicated | 1 | 14.0 (9.4 to 14.2) | 14.0 (12.2 to 15.6) | 0%, 0.48 | 71.7, 72.7 | 204.8, 159.7 |
+| amphora replicated | 32 | 16.0 (14.8 to 17.0) | 13.2 (11.4 to 15.4) | -18%, 0.016 | 885, 1,049 | 5,898, 6,291 |
+| amphora replicated | 128 | refused, 5 of 5 | refused, 5 of 5 | | | |
+| rqlite | 1 / 32 / 128 | 25.6 / 367.0 / 1,235.4 (3 rounds) | | | 38.4 / 79.9 / 90.1 | 58.4 / 249.9 / 237.6 |
+| dqlite | all | unavailable, 5 of 5 | | | | |
+
+Against rqlite, Amphora is 0.55x at 1 writer (14.0 against 25.6 commits/s) and 0.036x at 32 (13.2 against 367).
+The goal is 10x.
+
+Vetting (benchmark checklist):
+- Why not double: V's limiter (one write in flight, each waiting on the leader's and one follower's log flush on
+  btrfs) fits both arms' flat rate from 1 to 32 writers. 0009 changes neither, so equal rates at 1 writer are the
+  expected result. The 32-writer replicated loss has no named limiter.
+- Tuned: both arms are the release build of the same bench, same flags. Calibration (RULES 5e) wasn't copied across
+  arms. It feeds only the optimizer's access-method costs (`translate/optimizer/learned_costs.rs`), and the bench's
+  one statement, `INSERT INTO t VALUES (?1, ?2, ?3)` (`bench/src/repl.rs`), has no access method to choose. So
+  calibration can't change either arm's plan (inferred from the code), and no round was rerun for it.
+- Limits: 13 to 22 commits/s of 600-byte rows is far below any disk or network bound. The flush is the bound.
+- Errors: every Amphora 128-writer run refused (loss 1). The 1- and 32-writer rows report no refusals. n per window
+  is 47 to 111 commits, so p99 at 32 writers rests on fewer than 2 samples a window: read p99 there as the max.
+- Reproduces: 5 rounds a side, interleaved and reversed. Ranges overlap in every cell except replicated at 32 writers.
+- Happened: each row's `latency_ms.n` counts acknowledged commits. Rows were written by the members.
+
+## Unit 2: an early heartbeat answer names no position of term 0 (merged)
+
+The coordinator's decision on V5's question 2. With a snapshot restored and not yet durable, `Log::term` gives 0
+for the disk's end, and `Raft::answer_beat_now` named `(persisted, 0)`. No leader took it, but the comment said
+it states no position. Now it adds `&& term != 0` to the `if let` on `self.log.term(durable)`, so the code says
+what the comment says. The heartbeat oracle stays as V5 merged it.
+
+- Test `an_early_heartbeat_answer_names_no_position_below_an_unwritten_snapshot` (hyper-raft `src/tests.rs`): a
+  follower under `answer_beats_now` steps a snapshot at 7, issues its write without making it durable, and answers
+  a heartbeat. The answer leaves at once and names `(0, 0)`. Red with the guard removed (r1285: it named `(2, 0)`), green with it.
+- r1285 at `cd43a18e`: hyper-raft lib 164 of 164 (V5: 163), `pipeline.rs` 12 of 12 (1 ignored), `differential.rs` 8 of
+  8, clippy hyper-raft all targets clean. r1271 at `5ea5c95c` (the same code; `cd43a18e` changes only the new test's
+  setup): clippy `-p amphora --all-targets` clean, the `v3_` tests 2 of 2. Load on adacachy2 16 to 29 (1 min).
+- Recorded in `0009` (regenerated from upstream `d5d5f8f6` plus `0001` to `0008`). `vendor.py check hyper-raft`: 9
+  recorded changes, 0 differences. UPSTREAM.md's 0009 row says it.
+
+## Unit 3, batching, for the successor
+
+V's design stands (one Raft entry carrying several queued writes, each under its own savepoint with its own answer;
+a batch is what queued during the last flush, capped by `Actor::entry_room`, no timer; one writer stays one write an
+entry). V's four behaviour tests stand. Loss 1 adds a fifth: **at 128 writers spread over three members, every
+write is answered before its deadline** (today none is). Batching only the leader's own queue (V's step 3) won't
+pass it, because the refusals are the followers' write slots losing to the leader's queue. A follower's write has
+to join the leader's batch rather than race it.
+
+## Unit 4, for Ada's later decision (not acted on): machines for a fair replicated-class setup
+
+The fair setup is three machines on one LAN, a member on each, for Amphora, dqlite and rqlite alike. The one-host
+bench puts three "fates" on one disk and one kernel, so it fakes them. From `runners` at 17:40Z, every machine is
+on 192.168.1.0/24:
+
+| machine | what it is | can host | what it lacks |
+|---|---|---|---|
+| adacachy2 (`00aad8da…`) | Linux x86-64, 32 cores, 128 GB, btrfs | all three systems | it is the only free Linux machine: two more like it are needed |
+| adacachy (`451397fc…`) | Linux x86-64, 32 cores, 128 GB | all three | it runs production; RULES 6 forbids benchmarks there |
+| fedora | Linux | unknown | stale in kiln: "never said its machine id" |
+| jupiter (`f766f092…`) | Windows | rqlite natively, the rest through Docker Desktop | a Linux kernel and disk of its own (a VM's flush isn't the host's) |
+| Mac Studio 2 (`d1323898…`) | macOS arm64, 32 cores, 96 GB | Amphora, rqlite | dqlite (libdqlite builds for Linux only: from memory, not checked this hour); reserved for the competitor benchmark, alone |
+| Mac Studios `cec37f60…`, `b24c5c95…`, `2768d0d5…` | macOS arm64, 14 cores, 36 GB | Amphora, rqlite | dqlite; 0.06 to 7 GB of memory free at 17:40Z; `2768d0d5` is off limits |
+| MacBook Pros `e30189ea…`, `f3f618f2…`, `75694786…` | macOS arm64, 15 to 18 cores | Amphora, rqlite | dqlite; laptops (Wi-Fi or dock, power states) |
+
+No three alike machines here can host all three systems on equal terms. Three like Linux machines (adacachy2's
+class, wired) would. Three like Macs could compare Amphora with rqlite only.
+
+## Commands
+
+    # r1238 read in ~/.cache/commits-ab/ladder-v5/ on adacachy2 (one folder an arm, roundN/*-commit.jsonl, err.txt, rounds.txt)
+    # unit 2's proof: kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=4,mem=12g, sync false;
+    # ~/.cache/commits-v6/hr.sh SHA: the upstream clone at d5d5f8f6 overlaid with the commit's vendor/hyper-raft,
+    # RUSTUP_TOOLCHAIN=1.99.1; the new test with the guard removed (red), then restored:
+    cargo test -p hyper-raft --lib -- --test-threads=4
+    cargo test -p hyper-raft --test pipeline --test differential -- --test-threads=4
+    cargo clippy -p hyper-raft --all-targets -- -D warnings -A deprecated
+    # ~/.cache/commits-v6/am.sh SHA FILTER: cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits
+    cargo clippy -p amphora --all-targets --locked -- -D warnings
+    cargo test -p amphora --lib --locked -- --test-threads=4 database::replicated::tests::v3_
