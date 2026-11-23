@@ -469,3 +469,21 @@ What is left for the next cross lane (3a's rest above; 3b and 4 not started here
 - 4. `store::Config::queue`, `ROOM_LOOK` and its re-looks, and bench/src/store.rs's `AMPHORA_QUEUE` (bba65c73)
   are as A10 found them.
 
+
+## 3b's red serve test is main's own; 3b merged (perf-A12)
+
+**Unit 1.** r1374 (adacachy2, needs cpus=4,mem=16g, load 16-18 on 32 cores, 81-83 GB available): the
+`tests/serve.rs` binary built at 46f03fef (3b) and at 66484d49 (main before 3b), then
+`cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names --exact --test-threads=1` alone,
+three runs each. Script: `~/.cache/amphora-perf/cross-a12-scripts/u1.sh`.
+
+| commit | failed | error at tests/serve.rs:759 |
+|---|---|---|
+| 46f03fef (3b) | 3 of 3 (1.8-2.1 s) | `Err`: "the commit outcome is unknown; reconcile it before retrying the operation" |
+| 66484d49 (main) | 3 of 3 (1.8-2.5 s) | the same `Err` |
+
+The 20 MiB write's `unwrap` meets `Refusal::UnknownOutcome` on both, never a memory refusal (`Full`/`TooLarge`):
+the long write loses its leader before it answers (lanes P6-P10), not 3b's frame list. 3b merged as it was
+tested in r1350 (clippy clean, lib `serve::` 11/11, `database::admission_charge` 2/2, call_nowait_charge 1/1,
+tests/serve.rs 9/10 with this test the one red); main 66484d49..993d9346 changed no Rust, so the merge
+re-tests nothing.
