@@ -357,6 +357,21 @@ fn size(value: &Value) -> usize {
 pub trait Prepared {
     /// Runs it with `params`: every row, or the first alone.
     fn query(&mut self, params: Vec<Value>, first: bool) -> Result<Vec<Vec<Value>>>;
+    /// Runs it with `params`, handing each row to `each` as it's stepped, never all held at
+    /// once: `each` answers whether to go on. A session that can't step rows out one at a time
+    /// collects them first, within the result bound.
+    fn each(
+        &mut self,
+        params: Vec<Value>,
+        each: &mut dyn FnMut(Vec<Value>) -> Result<bool>,
+    ) -> Result<()> {
+        for row in self.query(params, false)? {
+            if !each(row)? {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A session's statement kept as its text, queried and validated again on every execute: what a
@@ -538,14 +553,14 @@ impl<'db> Connection<'db> {
     fn request(&self, sql_bytes: usize, params: impl Params) -> Result<Vec<Value>> {
         self.finish()?;
         let params = params.values()?;
-        crate::bound("SQL parameters", params.len(), crate::TX_MAX).map_err(failed)?;
+        crate::bound("SQL parameters", params.len(), crate::TX_MAX)?;
         let mut bytes = sql_bytes;
         for value in &params {
             bytes = bytes
                 .checked_add(size(value))
                 .ok_or_else(|| failed("SQL request size overflow"))?;
         }
-        crate::bound("SQL request bytes", bytes, crate::RESULT_MAX).map_err(failed)?;
+        crate::bound("SQL request bytes", bytes, crate::RESULT_MAX)?;
         Ok(params)
     }
 }
@@ -603,6 +618,16 @@ impl Statement<'_, '_> {
         Ok(MappedRows {
             rows: rows.iter().map(&mut map).collect::<Vec<_>>().into_iter(),
         })
+    }
+    /// Its rows, each handed to `each` as the session steps it, never all held at once: `each`
+    /// answers whether to go on.
+    pub fn each(
+        &mut self,
+        params: impl Params,
+        mut each: impl FnMut(Vec<Value>) -> Result<bool>,
+    ) -> Result<()> {
+        let params = self.connection.request(self.sql_bytes, params)?;
+        self.prepared.each(params, &mut each)
     }
     pub fn query(&mut self, params: impl Params) -> Result<Rows> {
         Ok(Rows {
