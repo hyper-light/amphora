@@ -68,11 +68,17 @@ pub enum Node {
         values_lists: Vec<NodeId>,
     },
     RangeVar {
-        relname: Option<String>,
+        catalogname: Option<String>,
+        schemaname: Option<String>,
+        relname: String,
+        inh: bool,
+        relpersistence: char,
+        alias: Option<NodeId>,
         location: i32,
     },
     ResTarget {
         name: Option<String>,
+        indirection: Vec<NodeId>,
         val: Option<NodeId>,
         location: i32,
     },
@@ -118,6 +124,8 @@ enum Piece<'t> {
     Int(i64),
     /// outToken: `<>` for NULL, `""` for empty, read.c's special characters backslashed.
     Token(Option<&'t str>),
+    /// outChar: `<>` for `'\0'`, else the character as outToken writes it.
+    Char(char),
     /// outNode on a node pointer: `<>` for NULL.
     Node(Option<NodeId>),
     /// outNode on a List field: `<>` for NIL.
@@ -154,6 +162,8 @@ impl Tree {
                 Piece::Text(s) => out.push_str(s),
                 Piece::Int(n) => out.push_str(&n.to_string()),
                 Piece::Token(s) => token(&mut out, s),
+                Piece::Char('\0') => out.push_str("<>"),
+                Piece::Char(c) => token(&mut out, Some(c.encode_utf8(&mut [0; 4]))),
                 Piece::Node(None) => out.push_str("<>"),
                 Piece::Node(Some(id)) => {
                     let mut pieces = Vec::new();
@@ -178,7 +188,7 @@ impl Tree {
 
     /// A node's pieces, field by field as outfuncs writes them (WRITE_*_FIELD: ` :name value`).
     fn pieces<'t>(&'t self, node: &'t Node, p: &mut Vec<Piece<'t>>) {
-        use Piece::{Int, List, Node as N, Text, Token};
+        use Piece::{Char, Int, List, Node as N, Text, Token};
         let location = |p: &mut Vec<Piece<'t>>, name: &'static str, at: i32| {
             p.push(Text(name));
             p.push(Int(i64::from(at)));
@@ -288,26 +298,42 @@ impl Tree {
                 Text(" :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :lockingClause <> :withClause <> :op 0 :all false :larg <> :rarg <>}"),
             ]),
             Node::RangeVar {
+                catalogname,
+                schemaname,
                 relname,
+                inh,
+                relpersistence,
+                alias,
                 location: at,
             } => {
                 p.extend([
-                    Text("{RANGEVAR :catalogname <> :schemaname <> :relname "),
-                    Token(relname.as_deref()),
-                    Text(" :inh true :relpersistence p :alias <>"),
+                    Text("{RANGEVAR :catalogname "),
+                    Token(catalogname.as_deref()),
+                    Text(" :schemaname "),
+                    Token(schemaname.as_deref()),
+                    Text(" :relname "),
+                    Token(Some(relname)),
+                    Text(if *inh { " :inh true" } else { " :inh false" }),
+                    Text(" :relpersistence "),
+                    Char(*relpersistence),
+                    Text(" :alias "),
+                    N(*alias),
                 ]);
                 location(p, " :location ", *at);
                 p.push(Text("}"));
             }
             Node::ResTarget {
                 name,
+                indirection,
                 val,
                 location: at,
             } => {
                 p.extend([
                     Text("{RESTARGET :name "),
                     Token(name.as_deref()),
-                    Text(" :indirection <> :val "),
+                    Text(" :indirection "),
+                    List(indirection),
+                    Text(" :val "),
                     N(*val),
                 ]);
                 location(p, " :location ", *at);
@@ -408,38 +434,10 @@ fn token(out: &mut String, s: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Node, NodeId, TransactionStmtKind, Tree, Val};
+    use super::{Node, NodeId, TransactionStmtKind, Tree};
 
     fn string(t: &mut Tree, s: &str) -> NodeId {
         t.push(Node::String(s.into())).unwrap()
-    }
-
-    fn column(t: &mut Tree, name: &str, location: i32) -> NodeId {
-        let field = string(t, name);
-        t.push(Node::ColumnRef {
-            fields: vec![field],
-            location,
-        })
-        .unwrap()
-    }
-
-    fn op(t: &mut Tree, name: &str, lexpr: NodeId, rexpr: NodeId, location: i32) -> NodeId {
-        let name = string(t, name);
-        t.push(Node::AExprOp {
-            name: vec![name],
-            lexpr: Some(lexpr),
-            rexpr: Some(rexpr),
-            location,
-        })
-        .unwrap()
-    }
-
-    fn int(t: &mut Tree, n: i32, location: i32) -> NodeId {
-        t.push(Node::AConst {
-            val: Val::Integer(n),
-            location,
-        })
-        .unwrap()
     }
 
     /// T-PG.6.2: BEGIN's tree prints as the oracle printed it for `BEGIN` (lane PG6's capture).
@@ -468,132 +466,6 @@ mod tests {
             "({RAWSTMT :stmt {TRANSACTIONSTMT :kind 0 :options <> :savepoint_name <> :gid <> :chain false :location -1} :stmt_location 0 :stmt_len 0})"
         );
         assert_eq!(t.to_text(&[]).unwrap(), "<>");
-    }
-
-    /// T-PG.6.2: pgbench's TPC-B UPDATE (simple protocol, a negative delta folded into its constant)
-    /// prints byte for byte as the oracle printed it on adacachy2 (lane PG7).
-    #[test]
-    fn t_pg_6_2_pgbench_update_prints_as_19_prints_it() {
-        let mut t = Tree::default();
-        let relation = t
-            .push(Node::RangeVar {
-                relname: Some("pgbench_accounts".into()),
-                location: 7,
-            })
-            .unwrap();
-        let l = column(&mut t, "abalance", 39);
-        let r = int(&mut t, -2741, 50);
-        let sum = op(&mut t, "+", l, r, 48);
-        let target = t
-            .push(Node::ResTarget {
-                name: Some("abalance".into()),
-                val: Some(sum),
-                location: 28,
-            })
-            .unwrap();
-        let l = column(&mut t, "aid", 62);
-        let r = int(&mut t, 34521, 68);
-        let filter = op(&mut t, "=", l, r, 66);
-        let stmt = t
-            .push(Node::UpdateStmt {
-                relation: Some(relation),
-                target_list: vec![target],
-                where_clause: Some(filter),
-                from_clause: vec![],
-                returning_clause: None,
-                with_clause: None,
-            })
-            .unwrap();
-        let raw = t
-            .push(Node::RawStmt {
-                stmt: Some(stmt),
-                stmt_location: 0,
-                stmt_len: 73,
-            })
-            .unwrap();
-        assert_eq!(
-            t.to_text(&[raw]).unwrap(),
-            "({RAWSTMT :stmt {UPDATESTMT :relation {RANGEVAR :catalogname <> :schemaname <> :relname pgbench_accounts :inh true :relpersistence p :alias <> :location 7} :targetList ({RESTARGET :name abalance :indirection <> :val {A_EXPR :name (\"+\") :lexpr {COLUMNREF :fields (\"abalance\") :location 39} :rexpr {A_CONST :val -2741 :location 50} :rexpr_list_start 0 :rexpr_list_end 0 :location 48} :location 28}) :whereClause {A_EXPR :name (\"=\") :lexpr {COLUMNREF :fields (\"aid\") :location 62} :rexpr {A_CONST :val 34521 :location 68} :rexpr_list_start 0 :rexpr_list_end 0 :location 66} :fromClause <> :returningClause <> :withClause <>} :stmt_location 0 :stmt_len 73})"
-        );
-    }
-
-    /// T-PG.6.2: pgbench's TPC-B INSERT (extended protocol): VALUES as a list of lists, $n as
-    /// PARAMREF, CURRENT_TIMESTAMP as SQLVALUEFUNCTION op 3, as the oracle printed it (lane PG7).
-    #[test]
-    fn t_pg_6_2_pgbench_insert_prints_as_19_prints_it() {
-        let mut t = Tree::default();
-        let relation = t
-            .push(Node::RangeVar {
-                relname: Some("pgbench_history".into()),
-                location: 12,
-            })
-            .unwrap();
-        let mut cols = vec![];
-        for (name, at) in [
-            ("tid", 29),
-            ("bid", 34),
-            ("aid", 39),
-            ("delta", 44),
-            ("mtime", 51),
-        ] {
-            cols.push(
-                t.push(Node::ResTarget {
-                    name: Some(name.into()),
-                    val: None,
-                    location: at,
-                })
-                .unwrap(),
-            );
-        }
-        let mut row = vec![];
-        for (number, at) in [(1, 66), (2, 70), (3, 74), (4, 78)] {
-            row.push(
-                t.push(Node::ParamRef {
-                    number,
-                    location: at,
-                })
-                .unwrap(),
-            );
-        }
-        row.push(
-            t.push(Node::SqlValueFunction {
-                op: 3,
-                typmod: -1,
-                location: 82,
-            })
-            .unwrap(),
-        );
-        let row = t.push(Node::List(row)).unwrap();
-        let select = t
-            .push(Node::SelectStmt {
-                target_list: vec![],
-                from_clause: vec![],
-                where_clause: None,
-                values_lists: vec![row],
-            })
-            .unwrap();
-        let stmt = t
-            .push(Node::InsertStmt {
-                relation: Some(relation),
-                cols,
-                select_stmt: Some(select),
-                on_conflict_clause: None,
-                returning_clause: None,
-                with_clause: None,
-                override_kind: 0,
-            })
-            .unwrap();
-        let raw = t
-            .push(Node::RawStmt {
-                stmt: Some(stmt),
-                stmt_location: 0,
-                stmt_len: 100,
-            })
-            .unwrap();
-        assert_eq!(
-            t.to_text(&[raw]).unwrap(),
-            "({RAWSTMT :stmt {INSERTSTMT :relation {RANGEVAR :catalogname <> :schemaname <> :relname pgbench_history :inh true :relpersistence p :alias <> :location 12} :cols ({RESTARGET :name tid :indirection <> :val <> :location 29} {RESTARGET :name bid :indirection <> :val <> :location 34} {RESTARGET :name aid :indirection <> :val <> :location 39} {RESTARGET :name delta :indirection <> :val <> :location 44} {RESTARGET :name mtime :indirection <> :val <> :location 51}) :selectStmt {SELECTSTMT :distinctClause <> :intoClause <> :targetList <> :fromClause <> :whereClause <> :groupClause <> :groupDistinct false :havingClause <> :windowClause <> :valuesLists (({PARAMREF :number 1 :location 66} {PARAMREF :number 2 :location 70} {PARAMREF :number 3 :location 74} {PARAMREF :number 4 :location 78} {SQLVALUEFUNCTION :op 3 :type 0 :typmod -1 :location 82})) :sortClause <> :limitOffset <> :limitCount <> :limitOption 0 :lockingClause <> :withClause <> :op 0 :all false :larg <> :rarg <>} :onConflictClause <> :returningClause <> :withClause <> :override 0} :stmt_location 0 :stmt_len 100})"
-        );
     }
 
     /// T-PG.6.2: outToken backslashes what read.c treats specially, as outfuncs.c does.

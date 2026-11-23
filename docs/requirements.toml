@@ -1705,6 +1705,7 @@ tests = [
   { id = "T-PG.5.1", text = "amphora-pg-parser gram::tests::t_pg_5_1_* — pass when 19's accepted strings are accepted and answered 0A000, syntax and scanner errors point where 19 points, and nesting past YYMAXDEPTH is refused memory exhausted" },
   { id = "T-PG.5.2", text = "amphora-pg-parser tests/parse_digest.rs t_pg_5_2_grammar_against_the_corpus_digest, tests/parse_oracle.rs t_pg_5_2_grammar_matches_19_on_the_regression_corpus (on demand) — pass when every verdict and cursor is 19's but at most REFUSED_IN_ACTIONS refused in gram.y's actions" },
   { id = "T-PG.6.1", text = "amphora-pg-parser gram::tests::t_pg_6_1_each_ported_action_is_current — passes when every ported action's named hash is gram_tables::ACTION_HASH's for its rule" },
-  { id = "T-PG.6.2", text = "amphora-pg-parser tree::tests::t_pg_6_2_* — pass when BEGIN and pgbench's TPC-B UPDATE and INSERT print as the oracle printed them, and strings escape as outToken escapes them" },
+  { id = "T-PG.6.2", text = "amphora-pg-parser tree::tests::t_pg_6_2_* — pass when BEGIN prints as the oracle printed it, and strings escape as outToken escapes them" },
   { id = "T-PG.6.3", text = "amphora-pg-parser gram::tests::t_pg_6_3_begin_and_end_parse_to_19s_trees, tests/parse_digest.rs (corpus.digest's tree hashes), tests/parse_oracle.rs (on demand, the oracle's texts) — pass when every fully ported statement's tree is 19's and at least TREES_EQUAL are" },
+  { id = "T-PG.6.4", text = "amphora-pg-parser tests/pgbench.rs::t_pg_6_4_pgbench_statements_parse_to_19s_trees — passes when each statement pgbench sends parses to the oracle's text for it, byte for byte" },
 ]
