@@ -1603,6 +1603,98 @@ mod tests {
         Instant::now() + HANG
     }
 
+    /// An owner answering each connection with one byte, at the loopback.
+    fn answering_owner() -> (Owner, std::net::SocketAddr) {
+        let listener = endpoint::listener(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let owner = Owner::accept(
+            listener,
+            (),
+            Arc::new(|mut stream: Stream, _waits: &Arc<AtomicUsize>| {
+                stream.write_all(&[1]).map_err(unavailable)
+            }),
+        )
+        .unwrap();
+        (owner, address)
+    }
+
+    /// One connection answered by `address`'s owner.
+    fn answered(address: std::net::SocketAddr) {
+        let mut client = std::net::TcpStream::connect_timeout(&address, HANG).unwrap();
+        client.set_read_timeout(Some(HANG)).unwrap();
+        let mut byte = [0];
+        client.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [1]);
+    }
+
+    #[test]
+    fn audit6_owner_accepts_each_connection_and_stops_when_idle_in_accept() {
+        // AUDIT 6: the owner blocks in accept (no poll), takes every connection, and stopping
+        // wakes that accept: dropping it returns, and the port no longer listens.
+        let (owner, address) = answering_owner();
+        for _ in 0..64 {
+            answered(address);
+        }
+        drop(owner);
+        assert!(std::net::TcpStream::connect_timeout(&address, HANG).is_err());
+    }
+
+    #[test]
+    fn audit6_owner_listening_everywhere_stops() {
+        // Stopping reaches an owner listening at every address through its loopback.
+        let listener = endpoint::listener(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        )))
+        .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let owner = Owner::accept(
+            listener,
+            (),
+            Arc::new(|_stream: Stream, _waits: &Arc<AtomicUsize>| Ok(())),
+        )
+        .unwrap();
+        drop(owner);
+        let loopback = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        assert!(std::net::TcpStream::connect_timeout(&loopback, HANG).is_err());
+    }
+
+    /// AUDIT 6 measurement (not a check): sequential connections' accept-to-answer latency,
+    /// printed as p50/p99/p99.9 in microseconds. `cargo test --release -p amphora --lib
+    /// audit6_measure_accept -- --ignored --nocapture`; AUDIT6_CONNECTIONS sets the count.
+    #[test]
+    #[ignore = "a measurement"]
+    fn audit6_measure_accept_latency() {
+        let count: usize = std::env::var("AUDIT6_CONNECTIONS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(2000);
+        let (owner, address) = answering_owner();
+        let mut taken: Vec<u128> = (0..count)
+            .map(|_| {
+                let started = Instant::now();
+                answered(address);
+                started.elapsed().as_micros()
+            })
+            .collect();
+        drop(owner);
+        taken.sort_unstable();
+        let at = |q: f64| taken[((taken.len() as f64 - 1.0) * q) as usize];
+        let total: u128 = taken.iter().sum();
+        println!(
+            "audit6 accept: n={count} p50={}us p99={}us p999={}us max={}us connections/s={:.0}",
+            at(0.5),
+            at(0.99),
+            at(0.999),
+            at(1.0),
+            count as f64 / (total as f64 / 1e6)
+        );
+    }
+
     /// Whether this is the child copy of the test binary that `test` runs alone, to be stopped
     /// and continued without stopping the tests beside it; the parent runs it and checks it passed.
     #[cfg(target_os = "linux")]
