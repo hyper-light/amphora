@@ -2053,6 +2053,9 @@ pub enum LogDisk {
 /// while hung, woken when it is set again.
 struct DiskSwitch {
     now: std::sync::atomic::AtomicU8,
+    /// The operations held by a hang since the disk was last set, counted under `set`: what a
+    /// drill waits for to know its hang holds the load ([`DiskSwitch::held`]).
+    held: AtomicU64,
     set: Mutex<()>,
     moved: Condvar,
 }
@@ -2072,6 +2075,7 @@ impl DiskSwitch {
             },
             Ordering::Release,
         );
+        self.held.store(0, Ordering::Relaxed);
         // Under the lock, so no operation that saw the disk hung misses its change.
         self.moved.notify_all();
         drop(held);
@@ -2097,6 +2101,11 @@ impl DiskSwitch {
             _ => {}
         }
         let mut held = self.set.lock().map_err(|_| poisoned())?;
+        if self.now.load(Ordering::Acquire) == Self::HUNG {
+            // Counted and told under the lock, so a drill waiting in `held` sees it.
+            self.held.fetch_add(1, Ordering::Relaxed);
+            self.moved.notify_all();
+        }
         while self.now.load(Ordering::Acquire) == Self::HUNG {
             held = self.moved.wait(held).map_err(|_| poisoned())?;
         }
@@ -2108,11 +2117,35 @@ impl DiskSwitch {
     }
 }
 
+impl DiskSwitch {
+    /// Waits until the disk is set otherwise or an operation is held by its hang, at most until
+    /// `until`, woken by the operation itself: the count held since the disk was last set.
+    fn held(&self, until: Instant) -> Result<u64, Refusal> {
+        let mut guard = locked(&self.set)?;
+        loop {
+            let held = self.held.load(Ordering::Relaxed);
+            if held > 0 || self.now.load(Ordering::Acquire) != Self::HUNG {
+                return Ok(held);
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Refusal::Timeout);
+            }
+            guard = self
+                .moved
+                .wait_timeout(guard, left)
+                .map_err(|_| unavailable("a disk switch's lock was poisoned"))?
+                .0;
+        }
+    }
+}
+
 fn disk_switch(log_path: &Path) -> Result<Arc<DiskSwitch>, Refusal> {
     let mut disks = locked(DISKS.get_or_init(Mutex::default))?;
     disks.retain(|_, disk| Arc::strong_count(&*disk) > 1);
     let disk = Arc::new(DiskSwitch {
         now: std::sync::atomic::AtomicU8::new(DiskSwitch::BACK),
+        held: AtomicU64::new(0),
         set: Mutex::new(()),
         moved: Condvar::new(),
     });
@@ -2132,6 +2165,21 @@ pub(super) fn set_disk(log_path: &Path, disk: LogDisk) -> Result<(), Refusal> {
             .ok_or_else(|| api::invalid("log path", "no replicated log is open there"))?
     };
     switch.set(disk)
+}
+
+/// The operations the hang of the log open at `log_path` holds, once there is one (CP-T1.13,
+/// T-T1.13.1): a drill's wait for its hung disk to hold the load, woken by the held operation,
+/// at most until `until`. Answers at once, with what was held, when the disk isn't hung.
+pub(super) fn disk_held(log_path: &Path, until: Instant) -> Result<u64, Refusal> {
+    let switch = {
+        let disks = locked(DISKS.get_or_init(Mutex::default))?;
+        disks
+            .get(log_path)
+            .filter(|switch| Arc::strong_count(*switch) > 1)
+            .cloned()
+            .ok_or_else(|| api::invalid("log path", "no replicated log is open there"))?
+    };
+    switch.held(until)
 }
 
 /// The system's device file under a member's log, and its disk switch ([`set_disk`]): every
@@ -6158,14 +6206,30 @@ mod tests {
     /// that rings an owner's bell (its log's write or compaction done, its database's flush done,
     /// an input queued, a handle dropped), or a flush come to a held gate. The driver reads the
     /// count before it steps and waits only for a count past it, so nothing that happens between
-    /// its look and its wait is lost; it waits on these events, never on a timer.
-    #[derive(Default)]
+    /// its look and its wait is lost; it waits on these events, never on a timer. A ring on the
+    /// driver's own thread (its steps queue inputs and wake owners) is no news of work off it, and
+    /// isn't counted: counted, it ended every wait at once, so the driver spun its rounds out
+    /// before a slow disk's log write or flush ended (macOS's F_FULLFSYNC; CP-T1.8, AC-T1.8.5).
     struct OffThread {
         count: Mutex<u64>,
         rang: std::sync::Condvar,
+        /// The thread that made the shell and steps it.
+        driver: std::thread::ThreadId,
+    }
+    impl Default for OffThread {
+        fn default() -> Self {
+            Self {
+                count: Mutex::new(0),
+                rang: std::sync::Condvar::new(),
+                driver: std::thread::current().id(),
+            }
+        }
     }
     impl OffThread {
         fn ring(&self) {
+            if std::thread::current().id() == self.driver {
+                return;
+            }
             // A poisoned count follows only a test thread's panic, which ends the test.
             if let Ok(mut count) = self.count.lock() {
                 *count += 1;

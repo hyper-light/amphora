@@ -72,27 +72,89 @@ CREATE INDEX IF NOT EXISTS __amphora_rev_stamps_order ON __amphora_rev_stamps(na
 CREATE TABLE IF NOT EXISTS __amphora_moved_stamps (namespace TEXT NOT NULL, family TEXT NOT NULL, key BLOB NOT NULL, rev INTEGER NOT NULL, stamp INTEGER, PRIMARY KEY(namespace, family, key, rev));
 CREATE INDEX IF NOT EXISTS __amphora_moved_stamps_order ON __amphora_moved_stamps(namespace, family, stamp);";
 const LIVE_MAX: u64 = 10_000_000;
-/// A request admitted to the writer's queue: a full API request's bytes, charged to the memory
-/// budget's room for queues (MB.1; replication.md, "Decision (lane constants): the queue bounds by
-/// drain rate"; QB.1), refused `Full` at that room.
+/// A request admitted to the writer's queue: what the request and its answer can hold
+/// ([`Admission::bytes_for`]), charged to the memory budget's room for queues (MB.1;
+/// replication.md, "Decision (lane constants): the queue bounds by drain rate"; QB.1), refused
+/// `Full` at that room.
 struct Admission {
     bytes: Arc<AtomicUsize>,
+    charged: usize,
     _charge: crate::memory::Charge,
 }
 impl Admission {
-    fn reserve(bytes: &Arc<AtomicUsize>) -> Result<Self, Refusal> {
-        let request = u64::try_from(api::REQUEST_MAX).unwrap_or(u64::MAX);
+    fn reserve(bytes: &Arc<AtomicUsize>, operation: &Operation) -> Result<Self, Refusal> {
+        let charged = Self::bytes_for(operation);
+        let request = u64::try_from(charged).unwrap_or(u64::MAX);
         let charge = crate::memory::process()
             .take(crate::memory::Use::Queues, request)
             .map_err(|refusal| match refusal {
                 Refusal::TooLarge { limit, .. } => Refusal::Full { limit },
                 other => other,
             })?;
-        bytes.fetch_add(api::REQUEST_MAX, Ordering::AcqRel);
+        bytes.fetch_add(charged, Ordering::AcqRel);
         Ok(Self {
             bytes: Arc::clone(bytes),
+            charged,
             _charge: charge,
         })
+    }
+
+    /// What `operation` and its answer can hold while queued and answered (AUDIT 2026-11-23 §1,
+    /// MB.1): its command and answer, the bytes it carries, and the most its answer can carry by
+    /// the API's own bounds. A Records get answers one row (a key of at most `KEY_MAX`, a value of
+    /// at most `VALUE_MAX`); a Records write, a head, a compaction's step and a holding answer a
+    /// revision or a fixed-size progress. The rest keep the full request bound, `REQUEST_MAX`:
+    /// SQL and scans answer up to `RESULT_MAX`/`SCAN_MAX` rows, an import's page and its
+    /// publication up to `REQUEST_MAX`, and a call's answer is whatever its closure returns,
+    /// which no API bound holds. Counts saturate: a sum past the address space is refused by the
+    /// budget, never wrapped.
+    fn bytes_for(operation: &Operation) -> usize {
+        let fixed = std::mem::size_of::<Command>().saturating_add(std::mem::size_of::<Answer>());
+        let carried = match operation {
+            Operation::Get(namespace, key, ..) => namespace
+                .len()
+                .saturating_add(key.len())
+                .saturating_add(std::mem::size_of::<Row>())
+                .saturating_add(api::KEY_MAX)
+                .saturating_add(api::VALUE_MAX),
+            Operation::Mutation(Mutation::Records { namespace, tx }) => {
+                let conds = tx.conds.iter().fold(0usize, |n, cond| {
+                    let (Cond::Absent { family, key } | Cond::At { family, key, .. }) = cond;
+                    n.saturating_add(std::mem::size_of::<Cond>())
+                        .saturating_add(family.len())
+                        .saturating_add(key.len())
+                });
+                // A write's family is carried twice: in the write, and in the families its
+                // publication names.
+                let writes = tx.writes.iter().fold(0usize, |n, write| {
+                    let (family, key, value) = match write {
+                        Write::Put { family, key, value } => (family, key, value.len()),
+                        Write::Delete { family, key } => (family, key, 0),
+                    };
+                    n.saturating_add(std::mem::size_of::<Write>())
+                        .saturating_add(family.len().saturating_mul(2))
+                        .saturating_add(key.len())
+                        .saturating_add(value)
+                });
+                namespace
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_add(conds)
+                    .saturating_add(writes)
+            }
+            Operation::Mutation(
+                Mutation::Compact { namespace, .. } | Mutation::CompactStep { namespace, .. },
+            ) => namespace.len().saturating_mul(2),
+            Operation::Mutation(Mutation::Holding(holding)) => holding.len(),
+            Operation::Head => 0,
+            Operation::Mutation(Mutation::Sql(_) | Mutation::Migrate(_))
+            | Operation::Scan(..)
+            | Operation::Changes(..)
+            | Operation::Call(_)
+            | Operation::Import(_)
+            | Operation::ImportProgress => api::REQUEST_MAX,
+        };
+        fixed.saturating_add(carried)
     }
 }
 /// The memory budget's room for queues now, what a full writer queue was refused at.
@@ -105,7 +167,7 @@ fn queue_room() -> usize {
 }
 impl Drop for Admission {
     fn drop(&mut self) {
-        self.bytes.fetch_sub(api::REQUEST_MAX, Ordering::AcqRel);
+        self.bytes.fetch_sub(self.charged, Ordering::AcqRel);
     }
 }
 
@@ -1597,6 +1659,14 @@ impl Database {
         replicated::set_disk(&resolved_path(log_path)?, disk)
     }
 
+    /// Waits until the hung disk under the replicated log at `log_path` holds an operation, at
+    /// most until `until`, and answers how many it holds (CP-T1.13, T-T1.13.1; `amphora serve`'s
+    /// `disk held`): a drill's sign that its hang holds the load, woken by the held operation.
+    /// Answers at once when the disk isn't hung.
+    pub fn log_disk_held(log_path: &Path, until: Instant) -> Result<u64, Refusal> {
+        replicated::disk_held(&resolved_path(log_path)?, until)
+    }
+
     pub fn replica(&self) -> Option<crate::replication::ReplicaHandle> {
         match &self.shared.writer {
             Writer::Replicated { client, .. } => Some(client.handle()),
@@ -2373,7 +2443,7 @@ impl Database {
                 .map(|answer| (answer, None));
             }
         };
-        let admission = Admission::reserve(&self.shared.admitted)?;
+        let admission = Admission::reserve(&self.shared.admitted, &operation)?;
         // In flight from here to its answer, as a backed-up writer's checks yield to it.
         let _in_flight = self
             .shared
@@ -3765,6 +3835,68 @@ mod owner_table {
         let second = second.unwrap().join().unwrap().unwrap();
         assert!(waited, "the second open did not wait for the first");
         assert!(Arc::ptr_eq(&first.shared, &second.shared));
+    }
+}
+
+#[cfg(test)]
+mod admission_charge {
+    use super::*;
+
+    fn put(value: usize) -> Operation {
+        Operation::Mutation(Mutation::Records {
+            namespace: "ns".into(),
+            tx: Tx {
+                conds: vec![Cond::Absent {
+                    family: "f".into(),
+                    key: b"k".to_vec(),
+                }],
+                writes: vec![Write::Put {
+                    family: "f".into(),
+                    key: b"k".to_vec(),
+                    value: vec![0; value],
+                }],
+            },
+        })
+    }
+
+    /// Do: size the admission charge of a Records get, small and largest Records writes, a head,
+    /// and a call, an SQL batch and a scan. Expect: a get charged its one row's bound (a
+    /// largest key and value) and no more; a write charged what it carries, its value counted
+    /// byte for byte; a head its command alone; a call, SQL and a scan, whose answers no tighter
+    /// bound holds, the full `REQUEST_MAX` as before (AUDIT 2026-11-23 §1, MB.1).
+    #[test]
+    fn mb1_a_request_is_charged_what_it_and_its_answer_can_hold() {
+        let fixed = std::mem::size_of::<Command>() + std::mem::size_of::<Answer>();
+        let get = Admission::bytes_for(&Operation::Get(
+            "ns".into(),
+            b"k".to_vec(),
+            Consistency::Linearizable,
+            LockedReads::Committed,
+        ));
+        assert!(get >= api::KEY_MAX + api::VALUE_MAX + fixed, "{get}");
+        assert!(get < api::VALUE_MAX + (64 << 10), "{get}");
+        let small = Admission::bytes_for(&put(100));
+        assert!(small >= 100 + fixed && small < 4096, "{small}");
+        let largest = Admission::bytes_for(&put(api::VALUE_MAX));
+        assert_eq!(largest - small, api::VALUE_MAX - 100);
+        assert_eq!(Admission::bytes_for(&Operation::Head), fixed);
+        let call: Call = Box::new(|_| Ok(Box::new(()) as Box<dyn Any + Send>));
+        for unbounded in [
+            Operation::Call(Mutex::new(Some(call))),
+            Operation::Mutation(Mutation::Sql(Vec::new())),
+            Operation::Scan(
+                "ns".into(),
+                Scan {
+                    prefix: Vec::new(),
+                    after: None,
+                    limit: 1,
+                    at: Consistency::Linearizable,
+                },
+                LockedReads::Committed,
+            ),
+        ] {
+            assert_eq!(Admission::bytes_for(&unbounded), fixed + api::REQUEST_MAX);
+        }
     }
 }
 

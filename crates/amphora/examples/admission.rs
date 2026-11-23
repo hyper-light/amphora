@@ -3,10 +3,11 @@
 //! request (`Database::call`, `execute`, Records) is admitted by charging the budget's room for
 //! queues (MB.1), which reads the process's limit and resident bytes ([`amphora::memory`]).
 //!
-//! cargo run --release -p amphora --example admission -- <dir> <reads> <seconds> <clients,...>
+//! cargo run --release -p amphora --example admission -- <dir> <reads> <seconds> <clients,...> [call|get]
 //!
 //! One line a measurement: the budget's `room` in ns a call (best of five rounds of <reads>), then,
-//! for each client count, `Database::call`s of an empty closure a second over <seconds> seconds.
+//! for each client count, requests a second over <seconds> seconds: `Database::call`s of an empty
+//! closure (`call`, the default), or Records gets of one absent key (`get`), and the refused ones.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -26,13 +27,14 @@ use std::time::{Duration, Instant};
 
 use amphora::database::Database;
 use amphora::memory::{self, Use};
+use amphora_api::{Consistency, Records};
 
 fn main() {
     let args: Vec<String> = std::env::args_os()
         .skip(1)
         .map(|a| a.into_string().expect("arguments are Unicode"))
         .collect();
-    let usage = "usage: admission <dir> <reads> <seconds> <clients,...>";
+    let usage = "usage: admission <dir> <reads> <seconds> <clients,...> [call|get]";
     let dir = std::path::PathBuf::from(args.first().expect(usage));
     let reads: u32 = args.get(1).expect(usage).parse().expect(usage);
     let seconds: f64 = args.get(2).expect(usage).parse().expect(usage);
@@ -42,6 +44,11 @@ fn main() {
         .split(',')
         .map(|n| n.parse().expect(usage))
         .collect();
+    let get = match args.get(4).map(String::as_str) {
+        None | Some("call") => false,
+        Some("get") => true,
+        Some(_) => panic!("{usage}"),
+    };
 
     let budget = memory::process();
     let mut best = f64::MAX;
@@ -68,8 +75,15 @@ fn main() {
                 let (db, stop, done, refused) =
                     (db.clone(), stop.clone(), done.clone(), refused.clone());
                 std::thread::spawn(move || {
+                    let ns = db.namespace("admission").expect("namespace");
                     while !stop.load(Ordering::Relaxed) {
-                        match db.call(Instant::now() + Duration::from_secs(60), |_| Ok(())) {
+                        let until = Instant::now() + Duration::from_secs(60);
+                        let answered = if get {
+                            ns.get("f", b"k", Consistency::Linearizable, until).map(drop)
+                        } else {
+                            db.call(until, |_| Ok(()))
+                        };
+                        match answered {
                             Ok(()) => done.fetch_add(1, Ordering::Relaxed),
                             Err(_) => refused.fetch_add(1, Ordering::Relaxed),
                         };
@@ -89,7 +103,8 @@ fn main() {
             t.join().expect("client");
         }
         println!(
-            "{{\"what\":\"call\",\"clients\":{clients},\"per_s\":{:.0},\"refused_per_s\":{:.0}}}",
+            "{{\"what\":\"{}\",\"clients\":{clients},\"per_s\":{:.0},\"refused_per_s\":{:.0}}}",
+            if get { "get" } else { "call" },
             (d1 - d0) as f64 / elapsed,
             (r1 - r0) as f64 / elapsed
         );
