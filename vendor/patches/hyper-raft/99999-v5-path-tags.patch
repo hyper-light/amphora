@@ -1,0 +1,36 @@
+diff --git a/crates/hyper-raft/src/raft.rs b/crates/hyper-raft/src/raft.rs
+index 35290125..6a2a273f 100644
+--- a/crates/hyper-raft/src/raft.rs
++++ b/crates/hyper-raft/src/raft.rs
+@@ -4572,6 +4572,7 @@ impl<S: Storage> Raft<S> {
+             // durable, as every answer of a member that does not lead is.
+             answer.index = self.log.last_index()?;
+             answer.log_term = self.log.last_term()?;
++            answer.reject_hint = 2_000_000 + self.log.persisted();
+         }
+         self.send(answer)
+     }
+@@ -4601,6 +4602,7 @@ impl<S: Storage> Raft<S> {
+                 answer.index = durable;
+                 answer.log_term = term;
+             }
++            answer.reject_hint = 1_000_000 + self.log.last_index()?;
+         }
+         self.beat_answers
+             .try_reserve(1)
+diff --git a/crates/hyper-raft/tests/support/lagged.rs b/crates/hyper-raft/tests/support/lagged.rs
+index f4903c81..4e3fcd79 100644
+--- a/crates/hyper-raft/tests/support/lagged.rs
++++ b/crates/hyper-raft/tests/support/lagged.rs
+@@ -206,9 +206,9 @@ fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
+         MessageType::MsgHeartbeatResponse if current && message.log_term != 0 => {
+             assert!(
+                 message.index <= disk.last_index(),
+-                "member {member}: a heartbeat's answer named {} with {} durable",
++                "member {member}: a heartbeat's answer named {} with {} durable; tag {} (1M+last_index: built now; 2M+persisted: old path) log_term {} term {} commit {} disk hard {:?}",
+                 message.index,
+-                disk.last_index()
++                disk.last_index(), message.reject_hint, message.log_term, message.term, message.commit, (disk.hard_state.term, disk.hard_state.vote, disk.hard_state.commit)
+             );
+         }
+         _ if current && kind == hyper_raft::fast::FAST_VOTE => {
