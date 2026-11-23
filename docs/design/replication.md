@@ -1058,9 +1058,8 @@ codex-notices/OWNER.md, section 7).
   joint configuration") before it proposes. A change appended but not applied at its base is not visible there; a
   raise beside it applies only if no change applied between its base and its index, since the stale-base rule
   refuses it otherwise, so it is never applied while a member it did not prove belongs to the configuration
-  (T-T1.8.A2). `writer_floor` answers that refusal `Unavailable`, the retry class, "the database advanced since
-  preparation: the group changed while the raise was proven; raise again"; a raise whose entry another lead replaces
-  stays `UnknownOutcome`. A learner that has not attested blocks a
+  (T-T1.8.A2). `writer_floor` answers that refusal as it is, `Serialization`, like any write whose base moved, to be asked
+  again; a raise whose entry another lead replaces stays `UnknownOutcome`. A learner that has not attested blocks a
   raise, and the refusal names it. Falsified by: a floor applied while a learner of the configuration at its index had
   no attestation at its version under its current join.
 - c) **One `u32`, the highest version the binary runs.** It is the claim U05's standalone floor already carries
@@ -1999,10 +1998,14 @@ pure core is `database/slot.rs`, driven by the owner (`Actor::keep_slots`, `star
   slot can only expire, and the late retry it then measures teaches a longer slot, feeding back toward the ceiling.
   Started at the barrier, a member that never comes back never holds the leader, and the measured gap is the retry
   alone: from its barrier's start to its forward. The holder's second barrier before any forward means its slot's
-  work was no write (a read, or a write that prepared nothing), and the slot ends `released`. A queued member whose
-  next command is a read, and then nothing, holds the leader once, until its learned slot expires: one slot, counted
-  `expired`, and it teaches nothing, since no forward follows (amphora-owner-t1-g-slot-878285a-20261111). Agreed
-  there, as better than the ruling it departs from.
+  work was no write (a read, or a write that prepared nothing), and the slot ends `released`. A member learns its
+  write was refused as stale from its own answer (`Actor::slotted`), the verdict the leader queued it by; when the
+  next barrier's work then ends forwarding nothing (a read, a write its caller or its SQL refused, its deadline), it
+  sends that second barrier at once, so the slot ends `released` on the leader's next step, not by its length
+  (lane W3; before it, a queued member whose next command was a read, and then nothing, held the leader until its
+  learned slot expired). A leader of any version reads the second barrier so, so this adds nothing to the wire; the
+  barrier's own read state matches nothing at the member and is dropped. Agreed there
+  (amphora-owner-t1-g-slot-878285a-20261111), as better than the ruling it departs from.
 - *What a slot holds* (Q1). Everything the leader would append between the holder's base and its retry: its own
   writes and floor sessions (`prepare` defers them, `slot_deferred`), its class entry (`propose_class`), and other
   members' forwarded proposals, held after the sender and origin checks. A change of members or a hand-off ends the

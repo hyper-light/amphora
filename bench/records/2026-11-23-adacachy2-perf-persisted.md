@@ -158,3 +158,67 @@ again, 153 rounds", one run (load 14-34); clippy `-p amphora --all-targets -D wa
 after a restart showed in this run; it stopped on `Full { limit: 2 }` before K6's fix and not after. The other W2
 checks after the merge (09f19c51, r861): clippy clean, the touched tests 36 of 36, `--test transport` 6 of 6. Not
 run: the module suites on main after the push (rule 5b), for the successor.
+
+# Lane W3 (persisted) on adacachy2: floor raises answer Serialization; a failed slot holder says so at once (2026-11-23)
+
+Ada's goal: Amphora correct, about 10x faster than every competitor, and at agentic Meta scale one failing or slow
+client never stalls everyone. The coordinator's rulings on W2's questions, in order. Branch perf/persisted-w3.
+
+## 1. A floor raise refused for a moved base answers `Serialization` (done)
+
+`writer_floor` passed the stale-base rule's refusal through `overtaken`, which turned it into `Unavailable` ("the
+group changed while the raise was proven; raise again"). Deleted: the raise is answered `Serialization`, like any
+write whose base moved, still counted `FloorRefusal::StaleBase`. Its text is the `Invalid` text it had, so a caller
+matching it still retries; a peer below transport 10 / SQL 3 is sent that `Invalid`. replication.md, "Raising the
+floor" b. The driven tests `a_raise_a_change_overtakes_is_refused_by_the_stale_base_rule` (Serialization) and
+`a_raise_another_lead_wrote_over_is_answered_unknown_outcome` (UnknownOutcome) lose their assertions on the deleted
+mapping. The driven tests reach the raise through the owner's queue, not `writer_floor`, so `writer_floor`'s
+pass-through is checked by its having no mapping left, not by a test.
+
+## 2. A slot holder whose write forwards nothing tells the leader at once (done)
+
+**The ruling asked for a new message at the end of the wire; this uses one every leader already reads.** The
+members' wire is hyper-raft's record format (vendor/hyper-raft `wire.rs`: a version byte, a kind byte, unknown kinds
+refused): Amphora has no member-to-member envelope of its own and no version agreed between members. A new kind
+there is a vendored hyper-raft change. But the slot core already ends a holder's slot, `released`, on its second
+barrier before any forward (`Slots::read`, slot.rs since amphora-owner-t1-g-slot-878285a): every leader, old or new,
+reads a second barrier as "my slot's work was no write". What was missing was a member that sends it.
+
+- `Actor::slotted`: the term in which one of this follower's writes was refused `Serialization` (learned from its
+  own answer, on the commit or at apply: the verdict the leader queued it by at its append).
+- `Actor::prepare`: when the barrier's work ends with nothing forwarded (a read through `call`, a claim or SQL
+  refusal, the deadline) and `slotted` names the current term, the member sends a fresh barrier (`replica.read`
+  with a new context). The leader ends the slot on its next step. The barrier's read state matches nothing at the
+  member and is dropped (`output.reads`). A forward clears `slotted` too.
+- Cost, not measured: one ReadIndex (the leader's heartbeat round to a quorum) per write that forwards nothing right
+  after its member was refused. Every other write sends nothing new.
+- Test `a_slot_holder_whose_write_fails_ends_its_slot_without_waiting_its_length`: three members; the holder, queued
+  and knowing it, writes to a missing table; then the leader and member 2 write. Both commit, the holder's slot
+  began, and `Driven::lapses` is 0: the harness never moved a clock past a slot's end. Red arm f5a2408b (the same
+  without the barrier, branch perf/persisted-w3-red): the test fails (r923).
+- replication.md, "When a slot starts".
+
+## 3. The leader's general tail rule A/B (not started)
+
+Not run: the hour went to items 1 and 2, with adacachy2 refusing runs for room (0 to 3 idle cores) for the first 20
+minutes. Where it stands is W2's note, unchanged.
+
+## 4. Read-or-write intent on barriers (not started)
+
+## Checks
+
+All on adacachy2 (runner 00aad8da...), needs `linux/amd64,cpus=8,mem=24g`, CARGO_INCREMENTAL=0, through
+`~/.cache/amphora-perf/persisted-scripts/t.sh SHA cargo-args`.
+
+- r931 at c5e4ba73 (load 54-68): clippy `-p amphora --all-targets --locked -D warnings` clean;
+  `a_slot_holder_whose_write_fails...`, `a_raise_a_change_overtakes...`, `every_falsifier_of_the_floor_holds_under_a_nemesis`
+  3 of 3; at base 9a7b14bb the nemesis test passed too.
+- r923 at 167cc8f9 (item 2 before the clippy fix, load 36-78): 37 of 38 of the floor, slot, raise, retry and
+  overlapping-write tests; `every_falsifier_of_the_floor_holds_under_a_nemesis` failed once, at its promote-while-the-
+  tail-is-unapplied assertion (replicated.rs, "At once, Unavailable, naming both indexes"), and passed in r931 on the
+  same code. Seen once in three runs (two with this change, one without): not settled whether this change or the
+  test's own timing (its flushes run off the driver's thread) caused it. For the successor: run it 10 times on both
+  arms. Red arm f5a2408b: the new test failed, as it should.
+- r951 at b3b4b6d8 (merged with origin/main 952f5766, load 55-128): clippy `-p amphora --all-targets --locked -D
+  warnings` clean; the floor, slot, raise, retry, overlapping-write and new tests 38 of 38 (the nemesis among them).
+- Not run: the module suites after the merge (rule 5b), and no timing of the extra barrier.

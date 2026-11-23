@@ -431,6 +431,30 @@ pub struct TableBodyAggregate<'a> {
     /// The body's direct reads when the connection's switch takes them (lane qs6-13,
     /// T-QT.6.21): a joined row's outputs copied from it, no code run.
     pub direct: Option<&'a [Option<usize>]>,
+    /// The outputs where a REAL sends the statement to the serial loop ([`no_real_outputs`]).
+    pub no_real: &'a [usize],
+}
+
+/// The outputs of `body` where a REAL sends the statement to the serial loop: its `no_real`,
+/// except under [`crate::RealSums::Exact`] (lane G8) the inputs of SUM, AVG and TOTAL, whose exact
+/// sums are the serial loop's in any order.
+pub fn no_real_outputs(
+    body: &crate::vdbe::insn::MorselBody,
+    sums: crate::RealSums,
+) -> Result<Vec<usize>, MorselError> {
+    use super::morsel::Aggregate;
+    let mut kept = Vec::new();
+    kept.try_reserve_exact(body.no_real.len())?;
+    for at in &body.no_real {
+        let summed = sums == crate::RealSums::Exact
+            && body.aggregates.iter().any(|aggregate| {
+                matches!(aggregate, Aggregate::Sum(x) | Aggregate::Avg(x) | Aggregate::Total(x) if x == at)
+            });
+        if !summed {
+            kept.push(*at);
+        }
+    }
+    Ok(kept)
 }
 
 /// A worker's own state for [`TableBodyAggregate`]: its registers, cursors and program counter,
@@ -681,7 +705,7 @@ impl TableBodyAggregate<'_> {
 
     /// A REAL where `no_real` names sends the statement to the serial loop.
     fn no_real(&self, worker: &BodyWorker) -> Result<(), MorselError> {
-        for at in &self.body.no_real {
+        for at in self.no_real {
             if let Some(Value::Numeric(crate::numeric::Numeric::Float(_))) = worker.out.get(*at) {
                 return Err(MorselError::Unsupported { kind: "REAL" });
             }
