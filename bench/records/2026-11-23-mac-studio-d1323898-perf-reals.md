@@ -124,8 +124,9 @@ dialect's docs exactly. SUM and AVG over REAL keep q01 and q06 on one thread. Ad
 - **Not done in this hour.**
   - The engine's answers on KBN's loss case (real_sums q09). The case, its references and the
     command are ready. It needs r1468's database, which r1468 holds until it ends.
-  - The twelve other REAL-summing TPC-H queries at 1, 4 and 8 workers. r1468 answers them at 16
-    only. Their timings are r1468's `timed-b`, still running when this was written.
+  - The twelve other REAL-summing TPC-H queries' answers at 1, 4 and 8 workers. r1468 answers them
+    at 16 only. r1544 runs them (and q09, and the LIMIT check on the real database); it was still
+    running when this was written. Their timings at every worker count are below (r1468 `timed-b`).
   - PostgreSQL 19 references for those twelve. Their joins feed SUM in plan order, so PostgreSQL's
     own answer depends on its plan. None computed.
 - **Exact (arm b) answers NULL where a sum overflows.** On R1's q07 (`sum(1e308)` over 6,001,215
@@ -158,8 +159,7 @@ over `lineitem.tbl` in row order (R1's ref.json, and r1515's ref-r2.json for q09
 | KBN's loss, q09, 3 columns | all | not run yet | not run yet | not run yet |
 | TPC-H q01, 4 groups x 7 REAL cells | all three | yes at 1, 4, 8, 16 | yes, all 28 | 8 of 28 (20 differ, up to 20,675 ulps) |
 | TPC-H q06, 1 cell | all three | yes at 1, 4, 8, 16 | yes | no (71 ulps) |
-| TPC-H q03 q05 q07 q08 q09 q10 q11 | all three | yes at 16 | yes at 16 | no reference |
-| TPC-H q14 q15 q17 q19 q22 | all three | yes at 16 | SQLite's answers were not written yet | no reference |
+| TPC-H q03 q05 q07 q08 q09 q10 q11 q14 q15 q17 q19 q22 | all three | yes at 16; 1, 4 and 8 in r1544 | yes at 16, all 12 (SQLite 3.53.2) | no reference |
 
 On every case measured, SQLite's KBN sum equals the exact sum rounded once. So these cases cannot
 tell Exact from SQLite except by Exact's overflow bug. q09 is the case that can.
@@ -230,6 +230,67 @@ first, 5 runs each. 0 failed. With 25 runs, p99 is the slowest run. ms; ranges a
   runs `SET threads = n`. One binary for the three arms, so one calibration (RULES 5e).
 - The answers above come from the same binary and SQL at each worker count, so the timed work is
   checked work. The limiters are not profiled.
+
+## Timings, the twelve other REAL-summing TPC-H queries (r1468 `timed-b`, 20:21Z to 20:25Z)
+
+One round, 3 runs per cell, 0 failed. With 3 runs, p99 is the slowest run, and a gap under the
+run-to-run spread (q03 and q05 at 1 to 4 workers spread by 0.5 to 0.9 s) is no measurable
+difference. Load 5.8 to 11 on 32 cores. p50 / p99 ms.
+
+| query | workers | Serial | Exact | RowOrder | DuckDB |
+|---|---|---|---|---|---|
+| q03 | 1 | 789.2 / 1533.8 | 781.4 / 1491.6 | 809.5 / 1583.0 | 83.6 / 107.8 |
+| q03 | 4 | 1250.7 / 1288.9 | 1131.6 / 1145.9 | 1154.1 / 1186.6 | 32.7 / 33.4 |
+| q03 | 8 | 1215.4 / 1236.5 | 1109.1 / 1123.7 | 1148.1 / 1179.5 | 23.2 / 23.7 |
+| q03 | 16 | 1217.5 / 1224.6 | 1134.7 / 1138.4 | 1157.6 / 1169.7 | 18.9 / 20.7 |
+| q05 | 1 | 1415.9 / 1703.3 | 1377.2 / 1652.6 | 1452.3 / 1760.1 | 108.2 / 121.5 |
+| q05 | 4 | 1365.7 / 1374.3 | 1003.6 / 1379.7 | 1363.3 / 1655.8 | 53.4 / 54.4 |
+| q05 | 8 | 1363.5 / 1374.8 | 1006.8 / 1362.6 | 1000.5 / 1351.6 | 44.1 / 44.6 |
+| q05 | 16 | 1420.3 / 1652.0 | 1041.1 / 1411.4 | 1007.0 / 1347.4 | 39.4 / 39.8 |
+| q07 | 1 | 1147.4 / 1160.1 | 1149.8 / 1176.3 | 1096.8 / 1171.4 | 110.1 / 110.4 |
+| q07 | 4 | 1111.8 / 1122.2 | 1140.3 / 1146.4 | 1083.8 / 1094.9 | 55.2 / 55.3 |
+| q07 | 8 | 1124.3 / 1128.1 | 1113.8 / 1120.4 | 1081.5 / 1088.5 | 44.7 / 44.7 |
+| q07 | 16 | 1112.6 / 1119.5 | 1102.1 / 1108.1 | 1112.0 / 1118.4 | 40.3 / 41.1 |
+| q08 | 1 | 169.9 / 183.3 | 169.8 / 184.0 | 158.0 / 174.6 | 110.5 / 126.2 |
+| q08 | 4 | 162.7 / 163.3 | 167.6 / 168.0 | 160.3 / 162.5 | 62.8 / 63.4 |
+| q08 | 8 | 163.2 / 164.0 | 162.3 / 166.0 | 165.1 / 165.4 | 55.6 / 55.8 |
+| q08 | 16 | 161.8 / 163.7 | 162.6 / 166.1 | 163.7 / 166.9 | 52.1 / 52.3 |
+| q09 | 1 | 1646.1 / 1693.5 | 1629.1 / 1658.0 | 1602.0 / 1609.3 | 258.5 / 271.0 |
+| q09 | 4 | 1580.6 / 1588.2 | 1606.4 / 1613.7 | 1551.9 / 1565.1 | 82.8 / 83.1 |
+| q09 | 8 | 1578.7 / 1596.5 | 1609.4 / 1632.7 | 1559.5 / 1571.0 | 65.6 / 66.4 |
+| q09 | 16 | 1576.8 / 1587.4 | 1605.7 / 1607.9 | 1554.7 / 1578.8 | 53.8 / 54.0 |
+| q10 | 1 | 562.3 / 575.0 | 563.4 / 563.4 | 545.4 / 563.7 | 145.9 / 158.9 |
+| q10 | 4 | 548.3 / 551.8 | 551.6 / 575.8 | 547.6 / 551.3 | 56.9 / 57.1 |
+| q10 | 8 | 549.6 / 552.5 | 552.1 / 559.7 | 539.1 / 554.9 | 45.9 / 47.2 |
+| q10 | 16 | 542.7 / 554.5 | 559.9 / 568.6 | 539.1 / 543.0 | 41.5 / 41.5 |
+| q11 | 1 | 68.2 / 93.5 | 73.8 / 100.2 | 65.0 / 91.6 | 92.5 / 94.6 |
+| q11 | 4 | 69.8 / 70.0 | 75.0 / 79.2 | 64.1 / 67.6 | 21.4 / 21.7 |
+| q11 | 8 | 65.0 / 71.2 | 81.4 / 81.9 | 64.6 / 67.5 | 17.7 / 17.7 |
+| q11 | 16 | 66.2 / 70.1 | 75.1 / 80.6 | 66.4 / 67.5 | 17.8 / 18.1 |
+| q14 | 1 | 470.9 / 473.5 | 491.9 / 494.3 | 468.0 / 468.8 | 57.2 / 57.6 |
+| q14 | 4 | 466.9 / 470.2 | 490.7 / 491.7 | 468.3 / 472.6 | 25.7 / 25.9 |
+| q14 | 8 | 469.3 / 470.8 | 489.2 / 490.4 | 466.1 / 472.4 | 20.6 / 21.0 |
+| q14 | 16 | 468.8 / 473.4 | 494.7 / 496.2 | 465.8 / 467.7 | 18.0 / 18.1 |
+| q15 | 1 | 900.8 / 904.4 | 956.6 / 963.8 | 892.8 / 893.2 | 444.3 / 454.4 |
+| q15 | 4 | 908.4 / 908.5 | 959.9 / 974.3 | 889.0 / 890.0 | 45.9 / 46.3 |
+| q15 | 8 | 900.3 / 902.4 | 960.3 / 973.4 | 891.0 / 904.3 | 28.6 / 29.0 |
+| q15 | 16 | 905.2 / 905.4 | 972.5 / 1003.5 | 888.2 / 892.3 | 19.9 / 20.3 |
+| q17 | 1 | 83.8 / 84.5 | 92.8 / 93.6 | 83.8 / 84.1 | 93.1 / 94.6 |
+| q17 | 4 | 83.7 / 84.2 | 93.0 / 93.5 | 84.0 / 84.3 | 34.3 / 34.8 |
+| q17 | 8 | 83.6 / 83.9 | 91.5 / 92.6 | 84.6 / 84.7 | 24.5 / 24.6 |
+| q17 | 16 | 83.2 / 84.0 | 95.7 / 96.2 | 86.0 / 86.1 | 20.8 / 20.9 |
+| q19 | 1 | 35.4 / 38.4 | 34.3 / 38.9 | 34.2 / 37.4 | 75.0 / 79.2 |
+| q19 | 4 | 34.4 / 36.9 | 35.1 / 38.2 | 35.8 / 36.2 | 34.4 / 34.5 |
+| q19 | 8 | 34.8 / 37.3 | 34.3 / 37.6 | 35.0 / 36.4 | 26.6 / 26.7 |
+| q19 | 16 | 33.8 / 36.7 | 36.0 / 39.8 | 34.1 / 36.8 | 23.0 / 23.2 |
+| q22 | 1 | 67.3 / 76.9 | 70.9 / 73.0 | 65.3 / 74.3 | 80.4 / 80.5 |
+| q22 | 4 | 66.3 / 66.3 | 70.7 / 71.3 | 66.6 / 67.0 | 55.2 / 56.3 |
+| q22 | 8 | 65.5 / 66.9 | 71.2 / 71.9 | 65.1 / 65.5 | 54.4 / 54.5 |
+| q22 | 16 | 64.9 / 66.1 | 74.0 / 74.5 | 65.2 / 65.5 | 53.6 / 53.8 |
+
+- On these twelve the arms sit within about 10% of Serial at every worker count. Exact is 7% to
+  15% slower than Serial at 16 workers on q11, q14, q15, q17 and q22, with no overlap in 3 runs.
+- DuckDB is faster than every arm at 16 workers on all twelve: 1.2x (q22) to 64x (q03).
 
 ## What each arm gives up
 
