@@ -285,6 +285,13 @@ mod amphora_target {
             reader.checkpoint()
         }
 
+        // As Amphora's own engine reports it (database.rs): the checkpointer then leaves a log
+        // within its bound uncopied (docs/design/store.md, decision 35). Without it the store can't
+        // tell and copies the log into the file every period, with a flush of the file each time.
+        fn uncopied(reader: &mut Db) -> anyhow::Result<Option<Checkpointed>> {
+            Ok(Some(reader.uncopied()))
+        }
+
         fn restart_log(&mut self) -> anyhow::Result<bool> {
             self.db.restart_log()
         }
