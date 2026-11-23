@@ -164,3 +164,13 @@ Test `database::admission_charge::a6_a_page_ends_at_result_max_and_continuing_re
 early with `more`, every page carries at most `RESULT_MAX`, and continuing reaches all 40 keys
 once, in order; the feed's pages hold whole transactions only and reach all 40. `mb1_...` asserts
 the charge equals the bound.
+
+Merged to main as be247a75 (merge of origin/main ce73cba1, which brought the replicated test
+fixes). Checked on be247a75 (r687, cpus=4,mem=16g, load 180 before, 89 after): clippy clean;
+database:: 225 passed, 1 failed, the known patience test
+(`a_joint_configuration_takes_the_larger_of_its_two_sets`). After the merge (r696, load 490 to
+1189): `tests/database.rs` 9 passed; `tests/records_conformance.rs` 5 passed and
+`the_records_suite_answers_alike_at_one_voter_and_three` failed ("one voter and three answered
+differently"); alone (r716, load 833 to 908) it passed on be247a75 and on main ce73cba1, so it is
+the host's load (an admission A/B of this lane's had ~8,400 threads up then, since stopped), not
+this change. Its pages are far under RESULT_MAX, where the new rule cuts exactly as the limit did.
