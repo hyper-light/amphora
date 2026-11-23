@@ -210,5 +210,5 @@ fn snapshots_a_view_held_across_writes_stops_the_checkpoint_and_grows_the_log() 
     assert!(grown.log_bytes > 100 * most_bounded, "the held view's log outgrows the bounded ones");
     db.checkpoint().unwrap();
     assert!(db.restart_log().unwrap(), "the view ended, the log starts again");
-    assert_eq!(db.uncopied().log, 0, "no frame in use after the restart");
+    assert_eq!(db.uncopied().left, 0, "every frame copied once the view ended");
 }
