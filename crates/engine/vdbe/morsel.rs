@@ -1299,13 +1299,13 @@ impl Partitioner {
         let count = u64::try_from(self.count.get()).map_err(|_| MorselError::Overflow {
             what: "the partition count",
         })?;
-        let partition = self
-            .hasher
-            .hash_one(key)
-            .checked_rem(count)
-            .ok_or(MorselError::Overflow {
-                what: "a key's partition",
-            })?;
+        let partition =
+            self.hasher
+                .hash_one(key)
+                .checked_rem(count)
+                .ok_or(MorselError::Overflow {
+                    what: "a key's partition",
+                })?;
         usize::try_from(partition).map_err(|_| MorselError::Overflow {
             what: "a key's partition",
         })

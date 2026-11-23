@@ -259,7 +259,8 @@ pub fn set_skipping(
                 .checked_add(std::time::Duration::from_millis(millis))
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(
-                        "skipping summary: the query timeout's deadline is past the clock's range".into(),
+                        "skipping summary: the query timeout's deadline is past the clock's range"
+                            .into(),
                     )
                 })?,
         ),
@@ -292,7 +293,8 @@ pub fn set_skipping_with(
                 .checked_add(std::time::Duration::from_millis(millis))
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(
-                        "skipping summary: the query timeout's deadline is past the clock's range".into(),
+                        "skipping summary: the query timeout's deadline is past the clock's range"
+                            .into(),
                     )
                 })?,
         ),

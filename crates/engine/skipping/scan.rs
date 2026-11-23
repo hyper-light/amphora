@@ -381,9 +381,10 @@ impl SkipWalk {
 
     /// Where to go from the row at `rowid`; rowids only ascend, so runs passed are dropped.
     pub fn target(&mut self, rowid: i64) -> WalkTarget {
-        let passed = self.ranges.get(self.at..).map_or(0, |rest| {
-            rest.iter().take_while(|r| r.last < rowid).count()
-        });
+        let passed = self
+            .ranges
+            .get(self.at..)
+            .map_or(0, |rest| rest.iter().take_while(|r| r.last < rowid).count());
         self.at = self.at.checked_add(passed).unwrap_or(self.ranges.len());
         match self.ranges.get(self.at) {
             None => WalkTarget::Past,

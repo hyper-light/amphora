@@ -810,6 +810,7 @@ pub(super) fn emit_close_switch(program: &mut ProgramBuilder, ctx: &AdaptiveJoin
 
 /// `a + b` for the join's register numbers and entry widths; past usize is refused.
 fn sum(a: usize, b: usize) -> Result<usize> {
-    a.checked_add(b)
-        .ok_or_else(|| crate::LimboError::InternalError("adaptive join: a register past usize".into()))
+    a.checked_add(b).ok_or_else(|| {
+        crate::LimboError::InternalError("adaptive join: a register past usize".into())
+    })
 }

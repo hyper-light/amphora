@@ -174,7 +174,10 @@ fn refill_keys<'a>(
 ) -> Result<()> {
     let n = keys.len();
     buf.truncate(n);
-    buf.try_reserve(n.checked_sub(buf.len()).ok_or(LimboError::IntegerOverflow)?)?;
+    buf.try_reserve(
+        n.checked_sub(buf.len())
+            .ok_or(LimboError::IntegerOverflow)?,
+    )?;
     buf.resize(n, Value::Null);
     for (kept, key) in buf.iter_mut().zip(keys) {
         kept.try_clone_from(key)?;
@@ -1319,9 +1322,14 @@ impl HashTable {
         if !matches {
             return Ok(None);
         }
-        self.merge_next = self.merge_next.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        self.merge_next = self
+            .merge_next
+            .checked_add(1)
+            .ok_or(LimboError::IntegerOverflow)?;
         self.probe_bucket_idx = bucket_idx;
-        self.probe_entry_idx = entry_idx.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        self.probe_entry_idx = entry_idx
+            .checked_add(1)
+            .ok_or(LimboError::IntegerOverflow)?;
         Ok(self
             .buckets
             .get(bucket_idx)
