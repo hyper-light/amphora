@@ -47,7 +47,9 @@ pub(crate) enum Work {
 /// for milliseconds lifted its batch's mean 20 to 40 times past the spread between batches, and under
 /// outside load the page read's rate swung 37x and q03's plans flipped (kiln run r1673). So the time
 /// the thread waited on a run queue is taken out, and the device's own latency, the read's work,
-/// stays in (the A/B against closing batches at their median: kiln run r1770, the record's lane T15).
+/// stays in. Against closing batches at their median (kiln run r1778, the record's lane T15), both
+/// chose q03's plans alike, quiet and under load; the median priced the reads' slow tail out, 10%
+/// under the reads' own time at steady state and 3.4x under it at the open's anchor.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PageReadTimer {
     wall: Instant,
@@ -797,7 +799,7 @@ impl LearnedCosts {
     /// (`Rate::close_runs`): a preempted read is one rank, not a share of the mean.
     pub(crate) fn observe_page_read(&self, read: TimedRead) {
         let mut rates = self.rates.lock();
-        let rate = &mut rates.page;
+        let rate = rates.rate_mut(Work::PageRead);
         let epoch = rate.epoch;
         match (rate.rule, read.less_waits()) {
             (WeightRule::BatchMeans, Some(nanos)) => {
