@@ -154,7 +154,6 @@ pub(crate) type FreeSpace = Box<dyn FnMut() -> std::io::Result<u64> + Send>;
 pub struct Prepared {
     base_index: u64,
     base_term: u64,
-    #[serde(with = "page_images")]
     pages: Vec<(u32, Vec<u8>)>,
     #[serde(skip)]
     baseline: Option<api::replication::Bootstrap>,
@@ -162,60 +161,6 @@ pub struct Prepared {
     /// read more than its entry could carry, and for what isn't a caller's write.
     #[serde(skip)]
     reads: Option<readsets::ReadSet>,
-}
-
-/// A write's pages, each image a byte string: postcard writes one as its varint length then its
-/// bytes, as it writes the same image as a sequence of `u8`, so an entry reads the same either
-/// side of this; serde handles a sequence a byte at a time, which was most of a large write's
-/// encode and every member's apply (lane P10's finding, CP-T1.13).
-mod page_images {
-    use serde::de::{Deserializer, Error, Visitor};
-    use serde::{Deserialize, Serialize, Serializer};
-
-    struct Image<'a>(&'a [u8]);
-    impl Serialize for Image<'_> {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.serialize_bytes(self.0)
-        }
-    }
-
-    struct Owned(Vec<u8>);
-    impl<'de> Deserialize<'de> for Owned {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            deserializer.deserialize_byte_buf(Bytes).map(Owned)
-        }
-    }
-
-    struct Bytes;
-    impl Visitor<'_> for Bytes {
-        type Value = Vec<u8>;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a page image")
-        }
-        fn visit_bytes<E: Error>(self, image: &[u8]) -> Result<Vec<u8>, E> {
-            Ok(image.to_vec())
-        }
-        fn visit_byte_buf<E: Error>(self, image: Vec<u8>) -> Result<Vec<u8>, E> {
-            Ok(image)
-        }
-    }
-
-    pub(super) fn serialize<S: Serializer>(
-        pages: &[(u32, Vec<u8>)],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(pages.iter().map(|(page, image)| (*page, Image(image))))
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<(u32, Vec<u8>)>, D::Error> {
-        let pages = Vec::<(u32, Owned)>::deserialize(deserializer)?;
-        Ok(pages
-            .into_iter()
-            .map(|(page, Owned(image))| (page, image))
-            .collect())
-    }
 }
 
 /// The state a session is prepared at (`Machine::session_base`).
@@ -1575,56 +1520,6 @@ mod envelope_tests {
         let bound = COMMAND_BYTES + COMMAND_ENVELOPE;
         assert_eq!(bound - bytes.len(), U64_MOST - varint_bytes(count));
         assert!(Prepared::decode(&bytes).is_ok());
-    }
-
-    /// Lane P11 (CP-T1.13): a write's pages encode as they did before they were byte strings, and
-    /// an entry from either side decodes the same on the other. Do: encode pages whose images
-    /// take a length of one, two and three varint bytes, empty and whole, as a `Prepared` and as
-    /// the same fields with plain pages; decode each with the other. Expect: identical bytes, and
-    /// the same pages back.
-    #[test]
-    fn pages_encode_as_before_and_decode_across() {
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
-        struct Before {
-            base_index: u64,
-            base_term: u64,
-            pages: Vec<(u32, Vec<u8>)>,
-        }
-        let pages: Vec<(u32, Vec<u8>)> = [0usize, 1, 127, 128, PAGE_BYTES, 16_383, 16_384]
-            .into_iter()
-            .zip(1u32..)
-            .map(|(len, page)| {
-                let image = (0..len).map(|at| u8::try_from(at % 251).unwrap());
-                (page, image.collect())
-            })
-            .collect();
-        let before = Before {
-            base_index: 7,
-            base_term: 3,
-            pages: pages.clone(),
-        };
-        let prepared = Prepared {
-            base_index: 7,
-            base_term: 3,
-            pages,
-            baseline: None,
-            reads: None,
-        };
-        let old = postcard::to_allocvec(&before).unwrap();
-        let new = prepared.encode().unwrap();
-        assert_eq!(new, old);
-        assert_eq!(postcard::from_bytes::<Before>(&new).unwrap(), before);
-        let read: Prepared = postcard::from_bytes(&old).unwrap();
-        assert_eq!(read.pages, before.pages);
-        let whole = widest_pages(64 * PAGE_BYTES);
-        let prepared = Prepared {
-            base_index: 1,
-            base_term: 1,
-            pages: whole.clone(),
-            baseline: Some(widest_declaration()),
-            reads: None,
-        };
-        assert_eq!(Prepared::decode(&prepared.encode().unwrap()).unwrap().pages, whole);
     }
 
     /// T-EN.1.2: the widest image of a lowered budget, and of the full one's arithmetic — passes when
