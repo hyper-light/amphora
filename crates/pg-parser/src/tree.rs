@@ -21,6 +21,7 @@ pub enum Val {
     Integer(i32),
     /// A numeric literal's text (FCONST), printed as it is.
     Float(String),
+    Boolean(bool),
     String(String),
 }
 
@@ -116,6 +117,49 @@ pub enum Node {
         coldeflist: Vec<NodeId>,
     },
     FuncCall(Box<FuncCall>),
+    JoinExpr {
+        jointype: i32,
+        is_natural: bool,
+        larg: Option<NodeId>,
+        rarg: Option<NodeId>,
+        using_clause: Vec<NodeId>,
+        join_using_alias: Option<NodeId>,
+        quals: Option<NodeId>,
+        alias: Option<NodeId>,
+        rtindex: i32,
+    },
+    RangeSubselect {
+        lateral: bool,
+        subquery: Option<NodeId>,
+        alias: Option<NodeId>,
+    },
+    /// primnodes.h's BoolExpr as the grammar makes it.
+    BoolExpr {
+        boolop: BoolOp,
+        args: Vec<NodeId>,
+        location: i32,
+    },
+    NullTest {
+        arg: Option<NodeId>,
+        nulltesttype: i32,
+        argisrow: bool,
+        location: i32,
+    },
+    SortBy {
+        node: Option<NodeId>,
+        sortby_dir: i32,
+        sortby_nulls: i32,
+        use_op: Vec<NodeId>,
+        location: i32,
+    },
+}
+
+/// primnodes.h's BoolExprType, printed by name as _outBoolExpr prints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolOp {
+    And,
+    Or,
+    Not,
 }
 
 /// parsenodes.h's FuncCall, fields in struct order; `default()` is makeNode's zeroed node, whose
@@ -472,6 +516,7 @@ impl Tree {
                 match val {
                     Val::Integer(n) => p.push(Int(i64::from(*n))),
                     Val::Float(s) => p.push(Raw(s)),
+                    Val::Boolean(b) => p.push(Text(truth(*b))),
                     Val::String(s) => {
                         p.push(Text("\""));
                         if !s.is_empty() {
@@ -537,6 +582,103 @@ impl Tree {
                 List(coldeflist),
                 Text("}"),
             ]),
+            Node::JoinExpr {
+                jointype,
+                is_natural,
+                larg,
+                rarg,
+                using_clause,
+                join_using_alias,
+                quals,
+                alias,
+                rtindex,
+            } => p.extend([
+                Text("{JOINEXPR :jointype "),
+                Int(i64::from(*jointype)),
+                Text(" :isNatural "),
+                Text(truth(*is_natural)),
+                Text(" :larg "),
+                N(*larg),
+                Text(" :rarg "),
+                N(*rarg),
+                Text(" :usingClause "),
+                List(using_clause),
+                Text(" :join_using_alias "),
+                N(*join_using_alias),
+                Text(" :quals "),
+                N(*quals),
+                Text(" :alias "),
+                N(*alias),
+                Text(" :rtindex "),
+                Int(i64::from(*rtindex)),
+                Text("}"),
+            ]),
+            Node::RangeSubselect {
+                lateral,
+                subquery,
+                alias,
+            } => p.extend([
+                Text("{RANGESUBSELECT :lateral "),
+                Text(truth(*lateral)),
+                Text(" :subquery "),
+                N(*subquery),
+                Text(" :alias "),
+                N(*alias),
+                Text("}"),
+            ]),
+            Node::BoolExpr {
+                boolop,
+                args,
+                location: at,
+            } => {
+                p.extend([
+                    Text(match boolop {
+                        BoolOp::And => "{BOOLEXPR :boolop and :args ",
+                        BoolOp::Or => "{BOOLEXPR :boolop or :args ",
+                        BoolOp::Not => "{BOOLEXPR :boolop not :args ",
+                    }),
+                    List(args),
+                ]);
+                location(p, " :location ", *at);
+                p.push(Text("}"));
+            }
+            Node::NullTest {
+                arg,
+                nulltesttype,
+                argisrow,
+                location: at,
+            } => {
+                p.extend([
+                    Text("{NULLTEST :arg "),
+                    N(*arg),
+                    Text(" :nulltesttype "),
+                    Int(i64::from(*nulltesttype)),
+                    Text(" :argisrow "),
+                    Text(truth(*argisrow)),
+                ]);
+                location(p, " :location ", *at);
+                p.push(Text("}"));
+            }
+            Node::SortBy {
+                node,
+                sortby_dir,
+                sortby_nulls,
+                use_op,
+                location: at,
+            } => {
+                p.extend([
+                    Text("{SORTBY :node "),
+                    N(*node),
+                    Text(" :sortby_dir "),
+                    Int(i64::from(*sortby_dir)),
+                    Text(" :sortby_nulls "),
+                    Int(i64::from(*sortby_nulls)),
+                    Text(" :useOp "),
+                    List(use_op),
+                ]);
+                location(p, " :location ", *at);
+                p.push(Text("}"));
+            }
             Node::FuncCall(n) => {
                 p.extend([
                     Text("{FUNCCALL :funcname "),
