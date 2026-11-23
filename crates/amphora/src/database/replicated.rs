@@ -3197,6 +3197,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                 .compact(0, nanos, &self.waker)
                 .map_err(raft_error)?;
             if imaged {
+                // An image made (a stall's among them) answers any wait for room to make one.
+                self.room_wait = None;
                 let bytes = self.replica.machine().imaged_bytes();
                 self.compacting
                     .imaged(bytes, nanos_between(began, (self.clock)()));
