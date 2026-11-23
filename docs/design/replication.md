@@ -2975,7 +2975,7 @@ differs from the one published only in its fence wakes the waiters; one that dif
 - a read with no token that waits for the log;
 - redirects above 1 in 100 under steady lag (the bound learned is too short).
 
-## Decision (lane snapshots): catch-up pulls pages, never a whole image (2026-11-23)
+## Decision (lane snapshots): catch-up streams pages, never a whole image; push or pull by A/B (2026-11-23)
 
 Ada's goal: replication holds at agentic Meta scale, millions of groups and thousands a host, with members joining,
 restarting and lagging all the time. A lagging member's catch-up never needs the whole database in memory, never
@@ -2994,7 +2994,29 @@ and a member that fences both accept the root problem, so neither is the answer.
 So one catch-up of an N-byte database holds several N-byte copies at once. SB.1 above can only refuse an image past
 the memory room, and a database past that room never catches a member up.
 
-### The decision (SS.1)
+### Ada's order: build push and pull, decide on the data (2026-11-23)
+
+Ada's order supersedes the coordinator's choice of the pull. Both designs are built behind one snapshot-source
+seam, and they share everything else: the descriptor-only Raft message, chunked pages, the staged install and the
+resume record.
+
+- Push: the leader streams pages from one read view held for the whole transfer.
+- Pull: the follower asks any member at or past the point for page ranges, and each answer comes from a fresh read
+  view that lasts that answer only.
+
+The A/B forces the extremes: a database ten times the memory budget; a steady write load on the source during
+catch-up, including writes faster than the link; 1, 10 and hundreds of concurrent catch-ups on one source host;
+kills of the sender and the receiver mid-transfer; and a slow follower link. Each design is measured for catch-up
+time and whether it converges, the source's WAL size and checkpoint progress over the transfer, peak memory on both
+sides, bytes sent, and serving p50, p99 and p99.9 on the source during catch-up, in five alternated runs with the
+load recorded beside each. The measured winner is recorded per metric below. If the metrics split, Ada decides from
+the data. The held-view measurement below is the A/B's first piece. Units B to E build on the design the A/B picks.
+
+The description that follows is the pull, as the lane wrote it before the order. The push differs only in point 2:
+the source opens one view at the descriptor's point and streams every page from it, so resume restarts the stream
+from the staged ranges against a new view.
+
+### The pull, as first written (SS.1)
 
 1. Raft carries which snapshot, not its bytes. `MsgSnapshot` keeps record kind 5 with empty `data` and a new
    presence bit for a descriptor: point, term, configuration, member bound, page count and page size.
@@ -3036,10 +3058,10 @@ Members that don't speak `VERSION` 10 keep today's whole-image path within SB.1'
 ### What it keeps from the coordinator's target, and what it changes
 
 - Raft carries metadata only: kept.
-- Pages pushed on a stream from a view pinned for the whole transfer: overturned. The source's read mark keeps a
-  checkpoint from copying past it and its WAL from restarting (`crates/engine/storage/wal.rs`, the checkpoint and
-  restart paths), so its WAL grows by every write it takes for as long as the slowest follower pulls. The follower
-  pulls instead, and each view lasts one answer.
+- Pages pushed on a stream from a view pinned for the whole transfer: built as the A/B's push arm (Ada's order
+  above). The source's read mark keeps a checkpoint from copying past it and its WAL from restarting
+  (`crates/engine/storage/wal.rs`, the checkpoint and restart paths), so its WAL grows by every write it takes for
+  as long as the slowest follower takes; measured below. The pull arm's views last one answer each.
 - Chunks sized from the measured window: kept, as each ask's budget, drawn from the member's one in-flight budget
   so catch-up and appends together never exceed what the path carries.
 - Staging, sync, verify, atomic swap, then I8: kept, with the journal as the durable progress.
@@ -3056,12 +3078,19 @@ Members that don't speak `VERSION` 10 keep today's whole-image path within SB.1'
 | Stay up and say "not yet" (the deferral on perf/coldstart) | None until it fits | Unaffected | No. A database past the room waits forever. |
 | Fence the member | None | Fenced | No. Churn fences members all the time. |
 | Chunks inside Raft's own message (an offset and a done flag, as etcd's raft and HashiCorp's InstallSnapshot carry) | One chunk on the wire | The leader still images and holds it per member, and a lost link restarts from zero | No. The leader's memory grows with the database and the number of lagging members. |
-| Push from a view pinned for the whole transfer | One window | Its WAL grows with the follower's slowness, and its checkpoint stops | No. Thousands of groups a host multiply the held WAL. |
+| Push from a view pinned for the whole transfer (A/B arm) | One window | Its WAL grows with the follower's slowness, and its checkpoint stops (measured below) | Inferred no: thousands of groups a host multiply the held WAL. The A/B decides. |
 | Pull against a hash manifest | One window plus the manifest | Reads its whole database to hash it at each catch-up | Partly. Memory is bounded, but every catch-up reads the database, even for a small delta. |
 | A fuzzy image, then the log replayed over it (ZooKeeper's fuzzy snapshot; whole pages make replay idempotent) | One window | Its log must reach back to where the pull began | No as the only path: the leader keeps its log for the slowest follower. Kept as the fallback if the final consistent answer fails to converge in the A/B. |
-| Chosen: pull, a view an answer long, page versions | One window a side | Holds a view for one answer | Yes, inferred, not yet measured. Nothing grows with database size or member count except the versions on disk, 8 bytes a page. |
+| Pull, a view an answer long, page versions (A/B arm) | One window a side | Holds a view for one answer | Inferred yes, not yet measured. Nothing grows with database size or member count except the versions on disk, 8 bytes a page. The A/B decides. |
+
+### The held view, measured (the A/B's first piece)
+
+PENDING
 
 ### Units, in order, each merged with its tests
+
+Units B to E build on the design the A/B picks. Both arms share the descriptor, the chunked pages, the staged
+install and the resume record, so B builds the seam with both sources behind it.
 
 - B, the streamed path end to end: the descriptor and data split, the source reading pages from disk, the staged
   install. Tests: a follower catches up a database ten times the test's memory budget, with peak memory within one
@@ -3074,10 +3103,17 @@ Members that don't speak `VERSION` 10 keep today's whole-image path within SB.1'
 
 ### The A/B (Ada's rule: build both, force the extremes, decide on the data)
 
-The pull against today's whole-image path: a database ten times the memory budget, many catch-ups at once on one host
-(`bench/repl_lab.sh`), kills mid-pull, and steady memory pressure. Measured: catch-up time, peak memory, bytes sent,
-and serving p50, p99 and p99.9 during catch-up, each side at least five runs alternated, with the load recorded beside
-each.
+Push against pull, behind the one seam, with today's whole-image path as the baseline where it fits its room: the
+extremes and metrics in Ada's order above, many catch-ups at once on one host (`bench/repl_lab.sh`), each side at
+least five runs alternated, with the load recorded beside each.
+
+| Metric | Push | Pull | Winner |
+|---|---|---|---|
+| Catch-up time, and whether it converges | not run | not run | open |
+| Source WAL size and checkpoint progress over the transfer | PENDING | PENDING | PENDING |
+| Peak memory, source and follower | not run | not run | open |
+| Bytes sent | not run | not run | open |
+| Serving p50, p99, p99.9 on the source during catch-up | not run | not run | open |
 
 ### Open
 
