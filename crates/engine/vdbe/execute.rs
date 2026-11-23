@@ -7954,7 +7954,11 @@ fn exact_avg_final(payload: &[Value]) -> Result<Value> {
 fn exact_sum_final(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let flag = |at: usize| payload.get(at).and_then(Value::as_int).unwrap_or(0) != 0;
     let (approx, ovrfl) = (flag(2), flag(3));
-    let acc = payload.first().unwrap_or(&Value::Null);
+    let Some(acc) = payload.first() else {
+        return Err(LimboError::InternalError(
+            "an exact sum's payload is empty".to_string(),
+        ));
+    };
     if matches!(func, AggFunc::Total) {
         return Ok(match acc {
             Value::Null if approx => Value::Null,
