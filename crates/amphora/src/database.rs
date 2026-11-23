@@ -1359,6 +1359,14 @@ impl Database {
         replicated::set_disk(&resolved_path(log_path)?, disk)
     }
 
+    /// Waits until the hung disk under the replicated log at `log_path` holds an operation, at
+    /// most until `until`, and answers how many it holds (CP-T1.13, T-T1.13.1; `amphora serve`'s
+    /// `disk held`): a drill's sign that its hang holds the load, woken by the held operation.
+    /// Answers at once when the disk isn't hung.
+    pub fn log_disk_held(log_path: &Path, until: Instant) -> Result<u64, Refusal> {
+        replicated::disk_held(&resolved_path(log_path)?, until)
+    }
+
     pub fn replica(&self) -> Option<crate::replication::ReplicaHandle> {
         match &self.shared.writer {
             Writer::Replicated { client, .. } => Some(client.handle()),
