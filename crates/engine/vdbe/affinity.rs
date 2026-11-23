@@ -2,7 +2,7 @@ use amphora_engine_parser::ast::{Expr, Literal};
 use either::Either;
 
 use crate::{
-    numeric::{format_float, DoubleDouble, Numeric},
+    numeric::{format_float, Numeric},
     types::AsValueRef,
     Value, ValueRef,
 };
@@ -399,6 +399,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         return (NumericParseResult::NotNumeric, ParsedNumber::None);
     }
 
+    let start = pos;
     let mut sign = 1i64;
 
     if bytes[pos] == b'-' {
@@ -457,6 +458,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
 
     // Check for exponent
     let mut exponent = 0i32;
+    let mantissa = bytes.get(start..pos).unwrap_or_default();
     if pos < len && (bytes[pos] == b'e' || bytes[pos] == b'E') {
         has_exponent = true;
         pos += 1;
@@ -464,6 +466,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         if pos >= len {
             // Incomplete exponent, but we have valid digits before
             return create_result_from_significand(
+                mantissa,
                 significand,
                 sign,
                 decimal_adjust,
@@ -484,6 +487,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         if pos >= len || !bytes[pos].is_ascii_digit() {
             // Incomplete exponent
             return create_result_from_significand(
+                mantissa,
                 significand,
                 sign,
                 decimal_adjust,
@@ -506,6 +510,8 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
         exponent *= exp_sign;
     }
 
+    let number = bytes.get(start..pos).unwrap_or_default();
+
     // Skip trailing whitespace
     while pos < len && is_space(bytes[pos]) {
         pos += 1;
@@ -524,6 +530,7 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
     };
 
     create_result_from_significand(
+        number,
         significand,
         sign,
         final_exponent,
@@ -533,7 +540,10 @@ pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
     )
 }
 
+/// `number` is the text the parse took (sign, digits, point, exponent), whose correctly rounded
+/// double a non-integer result is.
 fn create_result_from_significand(
+    number: &[u8],
     significand: u64,
     sign: i64,
     exponent: i32,
@@ -567,50 +577,13 @@ fn create_result_from_significand(
         return (parse_result, ParsedNumber::Integer(signed_val));
     }
 
-    // Convert to float using Dekker double-double arithmetic for precision
-    // This matches SQLite's sqlite3AtoF implementation
-    let mut result = DoubleDouble::from(significand);
-
-    let mut exp = exponent;
-    match exp.cmp(&0) {
-        std::cmp::Ordering::Greater => {
-            while exp >= 100 {
-                result *= DoubleDouble::E100;
-                exp -= 100;
-            }
-            while exp >= 10 {
-                result *= DoubleDouble::E10;
-                exp -= 10;
-            }
-            while exp >= 1 {
-                result *= DoubleDouble::E1;
-                exp -= 1;
-            }
-        }
-        std::cmp::Ordering::Less => {
-            while exp <= -100 {
-                result *= DoubleDouble::NEG_E100;
-                exp += 100;
-            }
-            while exp <= -10 {
-                result *= DoubleDouble::NEG_E10;
-                exp += 10;
-            }
-            while exp <= -1 {
-                result *= DoubleDouble::NEG_E1;
-                exp += 1;
-            }
-        }
-        std::cmp::Ordering::Equal => {}
-    }
-
-    let mut final_result: f64 = result.into();
-    if final_result.is_nan() {
-        final_result = f64::INFINITY;
-    }
-    if sign < 0 {
-        final_result = -final_result;
-    }
+    // Rust's parse rounds correctly over every digit; `number` is ASCII in its grammar.
+    let Some(final_result) = std::str::from_utf8(number)
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok())
+    else {
+        return (NumericParseResult::NotNumeric, ParsedNumber::None);
+    };
 
     (parse_result, ParsedNumber::Float(final_result))
 }
