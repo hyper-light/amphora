@@ -17873,6 +17873,7 @@ mod tests {
             .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
             .collect();
         let mut pump = Pump::new(&clients);
+        pump.refusals = Some(0);
         let mut leader = driven.elect(&mut pump, &clients, 0, 1);
         driven
             .call(&mut pump, &clients[leader], |db| {
@@ -17936,6 +17937,7 @@ mod tests {
                 let restarted = driven.restart(dir.path(), leader, vec![1, 2, 3], Vec::new());
                 clients[leader] = restarted;
                 pump = Pump::new(&clients);
+                pump.refusals = Some(0);
                 leader = driven.elect_after_cut(&mut pump, &clients, 1);
                 crashes += 1;
             }
