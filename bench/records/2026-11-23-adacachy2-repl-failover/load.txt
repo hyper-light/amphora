@@ -1,0 +1,9 @@
+amphora-procs-persisted start 2026-11-23T16:59:37Z load 21.63 24.03 24.21 | cpu some avg10=0.76 avg60=1.60 avg300=2.67 total=11687742510 | io some avg10=10.44 avg60=6.09 avg300=4.69 total=17884925938 / full avg10=8.82 avg60=4.56 avg300=3.31 total=15835315810
+amphora-procs-persisted exit 1
+amphora-procs-persisted end 2026-11-23T17:04:36Z load 26.65 26.04 25.04 | cpu some avg10=0.99 avg60=0.96 avg300=1.59 total=11691849420 | io some avg10=3.13 avg60=3.49 avg300=4.08 total=17897853031 / full avg10=2.22 avg60=2.60 avg300=2.96 total=15845210470
+amphora-procs-replicated start 2026-11-23T17:04:36Z load 26.65 26.04 25.04 | cpu some avg10=0.99 avg60=0.96 avg300=1.59 total=11691849429 | io some avg10=3.13 avg60=3.49 avg300=4.08 total=17897853299 / full avg10=2.22 avg60=2.60 avg300=2.96 total=15845210717
+amphora-procs-replicated exit 1
+amphora-procs-replicated end 2026-11-23T17:07:39Z load 22.32 24.40 24.58 | cpu some avg10=0.38 avg60=0.58 avg300=1.23 total=11694713738 | io some avg10=5.74 avg60=5.92 avg300=4.91 total=17909356438 / full avg10=4.11 avg60=4.38 avg300=3.61 total=15854044822
+competitors start 2026-11-23T17:07:39Z load 22.32 24.40 24.58 | cpu some avg10=0.38 avg60=0.58 avg300=1.23 total=11694713739 | io some avg10=5.74 avg60=5.92 avg300=4.91 total=17909356648 / full avg10=4.11 avg60=4.38 avg300=3.61 total=15854044987
+competitors exit 1
+competitors end 2026-11-23T17:09:40Z load 22.28 24.34 24.58 | cpu some avg10=2.38 avg60=2.25 avg300=1.91 total=11699475721 | io some avg10=5.28 avg60=5.20 avg300=5.01 total=17916385505 / full avg10=3.89 avg60=3.69 avg300=3.57 total=15858826568
