@@ -2927,6 +2927,7 @@ fn t_qt_6_29_short_rows_read_their_columns_defaults_as_the_serial_loop() {
 #[test]
 fn t_qt_6_30_avg_and_total_run_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-30");
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let mut rng = ChaCha8Rng::seed_from_u64(630);
     let pad = "x".repeat(64);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
@@ -3034,6 +3035,7 @@ fn an_aggregate_filter_can_read_a_column_absent_from_its_input() {
 #[test]
 fn t_qt_6_31_filtered_aggregates_run_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-31");
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let mut rng = ChaCha8Rng::seed_from_u64(631);
     let pad = "x".repeat(64);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
@@ -3113,6 +3115,7 @@ fn t_qt_6_31_filtered_aggregates_run_on_morsels_as_the_serial_loop() {
 #[test]
 fn t_qt_6_32_having_over_aggregates_runs_on_morsels_as_the_serial_loop() {
     let conn = open(":memory:qt-6-32");
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
     let mut rng = ChaCha8Rng::seed_from_u64(632);
     let pad = "x".repeat(64);
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, p TEXT)")
