@@ -475,13 +475,20 @@ impl TableBodyAggregate<'_> {
             worker.out.clear();
             for at in direct {
                 worker.out.push(match at {
-                    Some(at) => row
-                        .get(*at)
-                        .ok_or(MorselError::NoColumn {
+                    Some(at) => {
+                        let value = row.get(*at).ok_or(MorselError::NoColumn {
                             column: *at,
                             width: row.len(),
-                        })?
-                        .clone(),
+                        })?;
+                        match value {
+                            Value::Numeric(crate::numeric::Numeric::Integer(i))
+                                if self.body.reals.contains(at) =>
+                            {
+                                Value::from_f64(*i as f64)
+                            }
+                            _ => value.clone(),
+                        }
+                    }
                     None => Value::from_i64(rowid),
                 });
             }
@@ -559,6 +566,20 @@ impl TableBodyAggregate<'_> {
                 "the loop body's register is past the program's",
             ))?;
             *register = Register::Value(value.clone());
+        }
+        // A REAL column's INTEGER loads as a REAL, as the serial loop's `RealAffinity` makes it
+        // (audit 3, prototypes 2).
+        for at in &self.body.reals {
+            let reg = self
+                .body
+                .columns_start
+                .checked_add(*at)
+                .ok_or(MorselError::Overflow {
+                    what: "a column's register",
+                })?;
+            if let Some(register) = state.registers.get_mut(reg) {
+                crate::vdbe::execute::apply_real_affinity(register);
+            }
         }
         *state
             .registers
