@@ -41,7 +41,7 @@ reach = {(m, k): firsts(m, k) for m in ev for k in ("last", "persisted", "commit
 idx_of = {}
 for m in ev:
     for t, n, kv in ev[m]:
-        if n == "applied" and kv.get("ok") == "True":
+        if n == "applied" and kv.get("ok") == "true":
             idx_of.setdefault(kv["ctx"], int(kv["idx"]))
 writes = []
 for m in ev:
