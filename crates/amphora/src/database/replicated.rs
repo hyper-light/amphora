@@ -18444,13 +18444,15 @@ mod tests {
     /// Lane V6's fifth test, the acceptance test for lane V7's designs A and B
     /// (bench/records/2026-11-23-adacachy2-perf-commits.md, "Unit 2"): 128 writers at once in
     /// each class, writer w at member w % 3, each one write outstanding, appending a row to one
-    /// table (every write conflicts with every other). Expect: every write answered Ok before its
-    /// deadline, none refused for a stale base, the run ending within ROUNDS (no livelock), and
-    /// each row on every replica once. Red today: a follower prepares on its own base and loses to
-    /// the leader's log (V6's r1238, V7's r1312 and r1346).
+    /// table (every write conflicts with every other), a write refused for a stale base made again
+    /// at the same member, as the bench's driver does. Expect: every write answered Ok before its
+    /// deadline, the run ending within ROUNDS (no livelock), each row on every replica once, and in
+    /// neither class any write refused for a stale base. Red today: a follower prepares on its own
+    /// base and loses to the leader's log (V6's r1238, V7's r1312 and r1346).
     #[test]
     fn v7_a_hundred_and_twenty_eight_spread_writers_are_each_answered_with_no_stale_base() {
         const WRITERS: usize = 128;
+        let mut stale = Vec::new();
         for durability in [Durability::Persisted, three_fates()] {
             let dir = tempfile::tempdir().unwrap();
             let mut driven = Driven::new();
@@ -18478,6 +18480,7 @@ mod tests {
             let mut inflight: Vec<Option<Answering>> = (0..WRITERS)
                 .map(|id| Some(submit(&clients[id % 3], driven.until(), write(id))))
                 .collect();
+            let mut refused = vec![0u64; WRITERS];
             let mut rounds = 0;
             while inflight.iter().any(Option::is_some) {
                 assert!(
@@ -18493,6 +18496,10 @@ mod tests {
                         Err(mpsc::TryRecvError::Empty) => *slot = Some(answer),
                         Err(error) => panic!("owner ended: {error}"),
                         Ok(Ok(_)) => {}
+                        Ok(Err(Refusal::Serialization { .. })) => {
+                            refused[id] += 1;
+                            *slot = Some(submit(&clients[id % 3], driven.until(), write(id)));
+                        }
                         Ok(Err(refusal)) => {
                             panic!("{durability:?}: writer {id} at member {}: {refusal:?}", id % 3 + 1)
                         }
@@ -18522,7 +18529,14 @@ mod tests {
             }
             driven.drain(&mut pump);
             pump.finish();
+            let writes = refused.iter().filter(|n| **n > 0).count();
+            let most = refused.iter().max().copied().unwrap_or(0);
+            stale.push((
+                refused.iter().sum::<u64>(),
+                format!("{durability:?}: over {writes} writes, at most {most} for one, in {rounds} rounds"),
+            ));
         }
+        assert!(stale.iter().all(|(n, _)| *n == 0), "stale-base refusals: {stale:?}");
     }
 
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
