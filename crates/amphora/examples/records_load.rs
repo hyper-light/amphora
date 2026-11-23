@@ -3,6 +3,7 @@
 //! One line of JSON a (operation, clients): calls answered, seconds, calls a second.
 //!
 //! `cargo run --release -p amphora --example records_load -- <empty folder> <seconds> <clients,...> [get|commit|both]`
+#![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 use std::io::Write as _;
 use std::path::PathBuf;

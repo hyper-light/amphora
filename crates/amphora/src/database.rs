@@ -4527,4 +4527,51 @@ mod records_reads {
             "every reader stopped once none waited"
         );
     }
+
+    /// Do: release 8x as many gets as the store has readers at once, so readers finish their
+    /// batches together and hand their places to the same first waiting reads; a quarter of them
+    /// with deadlines short enough to run out while waiting, so some leave with places handed to
+    /// them. Fifty rounds. Expect: after every round no read waits and no reader is counted (each
+    /// hand-over gives back exactly one place, AUDIT 2.5), every get either answers the row or is
+    /// refused for its deadline, and a get afterwards still finds a reader.
+    #[test]
+    fn audit_2_5_readers_finishing_together_lose_no_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let until = || Instant::now() + Duration::from_secs(60);
+        let db = Database::open(&dir.path().join("r.db"), until()).unwrap();
+        let ns = db.namespace("t").unwrap();
+        ns.commit(put(b"k", b"v"), until()).unwrap();
+        let clients = 8 * match &db.shared.writer {
+            Writer::Local(store) => store.readers(),
+            _ => panic!("a local database"),
+        };
+        let start = std::sync::Barrier::new(clients);
+        for round in 0..50 {
+            std::thread::scope(|s| {
+                for c in 0..clients {
+                    let (ns, start) = (&ns, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        let deadline = if c % 4 == 0 {
+                            Instant::now() + Duration::from_micros(200)
+                        } else {
+                            until()
+                        };
+                        match ns.get("f", b"k", Consistency::Linearizable, deadline) {
+                            Ok(row) => assert_eq!(row.expect("the row").value, b"v", "round {round} client {c}"),
+                            Err(refusal) => assert!(
+                                c % 4 == 0 && matches!(refusal, Refusal::Timeout),
+                                "round {round} client {c}: {refusal:?}"
+                            ),
+                        }
+                    });
+                }
+            });
+            let queue = locked(&db.shared.reads.queue).unwrap();
+            assert!(queue.waiting.is_empty(), "round {round}: no read left waiting");
+            assert_eq!(queue.reading, 0, "round {round}: every place given back");
+        }
+        let row = ns.get("f", b"k", Consistency::Linearizable, until()).unwrap();
+        assert_eq!(row.expect("the row").value, b"v");
+    }
 }
