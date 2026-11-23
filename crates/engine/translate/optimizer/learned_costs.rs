@@ -1276,7 +1276,8 @@ fn page_read_place(db_path: &str, io: &dyn crate::io::IO) -> Option<PageReadPlac
 /// the place (`PageReadPlace`): (reads, nanoseconds), as `time_page_read` gives them. Bounded by
 /// the IO backends compiled in times the devices the process opens databases on (the mounted
 /// filesystems); an entry is never evicted, as a device's read cost is the same all process long.
-type PageReads = FxHashMap<(&'static str, PageReadPlace), (f64, f64)>;
+type PageReads =
+    FxHashMap<(&'static str, PageReadPlace), std::sync::Arc<Mutex<Option<(f64, f64)>>>>;
 
 fn page_reads() -> &'static Mutex<PageReads> {
     static PAGE_READS: OnceLock<Mutex<PageReads>> = OnceLock::new();
@@ -1296,22 +1297,22 @@ pub(crate) fn page_read_anchor(
     most_reads: usize,
     writable: bool,
 ) -> Option<(f64, f64)> {
-    let key = io
-        .page_read_backend()
-        .zip(page_read_place(db_path, io.as_ref()));
     if !writable {
         return None;
     }
-    if let Some(key) = &key {
-        if let Some(timed) = page_reads().lock().get(key) {
-            return Some(*timed);
-        }
+    let Some(key) = io
+        .page_read_backend()
+        .and_then(|backend| page_read_place(db_path, io.as_ref()).map(|place| (backend, place)))
+    else {
+        return time_page_read(db_path, io, page_size, most_reads);
+    };
+    // Scratch IO on another device can proceed while the first open on this device measures.
+    let slot = page_reads().lock().entry(key).or_default().clone();
+    let mut sample = slot.lock();
+    if sample.is_none() {
+        *sample = time_page_read(db_path, io, page_size, most_reads);
     }
-    let timed = time_page_read(db_path, io, page_size, most_reads)?;
-    if let Some(key) = key {
-        page_reads().lock().entry(key).or_insert(timed);
-    }
-    Some(timed)
+    *sample
 }
 
 /// Times page reads at a database's open, before it has read a page of its own (QT.5): a scratch
@@ -1960,6 +1961,32 @@ mod tests {
         let again = page_read_anchor(":memory:", &second_io, 4096, 8, true).unwrap();
         assert_eq!(second.opened.load(Ordering::SeqCst), 0);
         assert_eq!(again, timed);
+    }
+
+    /// T-QT.5.5. Simultaneous first opens on one backend and device all share one measurement.
+    #[test]
+    fn review_concurrent_first_opens_share_one_page_read() {
+        let workers = 8;
+        let io = counting(Some("review-concurrent-first-open"));
+        let ready = std::sync::Barrier::new(workers);
+        let times = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let dyn_io: crate::sync::Arc<dyn crate::io::IO> = io.clone();
+                    let ready = &ready;
+                    scope.spawn(move || {
+                        ready.wait();
+                        page_read_anchor(":memory:", &dyn_io, 4096, 8, true).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(io.opened.load(Ordering::SeqCst), 1);
+        assert!(times.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     /// Do: take the open's page read twice through an IO that names no backend. Expect: each
