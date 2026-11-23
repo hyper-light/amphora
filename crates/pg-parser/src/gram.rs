@@ -477,7 +477,7 @@ mod tests {
         let mut n = 0;
         for rule in 0..=NRULES {
             if let Some((from, _)) = ported(rule) {
-                assert_eq!(ACTION_HASH[rule as usize], Some(from), "rule {rule}");
+                assert_eq!(ACTION_HASH[usize::try_from(rule).unwrap()], Some(from), "rule {rule}");
                 n += 1;
             }
         }
