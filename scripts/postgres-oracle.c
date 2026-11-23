@@ -7,6 +7,9 @@
  *   T <bytes>\n<nodeToStringWithLocations of raw_parser's List of RawStmt>\n
  *   E <SQLSTATE> <cursor> <bytes>\n<message>\n
  * The cursor is the error's character position, 1-based, 0 for none (ErrorResponse's P field).
+ * With `--tokens` a T frame's body is instead the tokens raw_parser's grammar reads (base_yylex,
+ * parser.c's lookahead filter over the scanner), a line each: `<token> <byte offset> <bytes> <value>`,
+ * the token gram.h's number, the value its string, integer or keyword (empty for the others).
  */
 #include "postgres.h"
 
@@ -18,6 +21,8 @@
 #include "miscadmin.h"
 #include "nodes/nodes.h"
 #include "parser/parser.h"
+#include "common/keywords.h"
+#include "gramparse.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 
@@ -31,15 +36,61 @@ frame(char kind, const char *head, const char *body)
 	putchar('\n');
 }
 
+static char *
+tokens(const char *sql)
+{
+	base_yy_extra_type yyextra;
+	core_yyscan_t yyscanner = scanner_init(sql, &yyextra.core_yy_extra, &ScanKeywords, ScanKeywordTokens);
+	StringInfoData out;
+	YYSTYPE		lval;
+	YYLTYPE		loc;
+	int			tok;
+	char		num[16];
+
+	yyextra.have_lookahead = false;
+	initStringInfo(&out);
+	while ((tok = base_yylex(&lval, &loc, yyscanner)) != 0)
+	{
+		const char *v = "";
+
+		switch (tok)
+		{
+			case IDENT:
+			case UIDENT:
+			case FCONST:
+			case SCONST:
+			case USCONST:
+			case BCONST:
+			case XCONST:
+			case Op:
+				v = lval.str;
+				break;
+			case ICONST:
+			case PARAM:
+				snprintf(num, sizeof(num), "%d", lval.ival);
+				v = num;
+				break;
+			default:
+				/* gram.y declares the keywords, then the filter's _LA tokens, in one run. */
+				if (tok >= ABORT_P && tok <= WITHOUT_LA)
+					v = lval.keyword;
+				break;
+		}
+		appendStringInfo(&out, "%d %d %zu %s\n", tok, (int) loc, strlen(v), v);
+	}
+	scanner_finish(yyscanner);
+	return out.data;
+}
+
 static void
-parse_one(const char *sql)
+parse_one(const char *sql, bool scan)
 {
 	MemoryContext stmt = AllocSetContextCreate(TopMemoryContext, "oracle statement", ALLOCSET_DEFAULT_SIZES);
 	MemoryContext old = MemoryContextSwitchTo(stmt);
 
 	PG_TRY();
 	{
-		frame('T', "", nodeToStringWithLocations(raw_parser(sql, RAW_PARSE_DEFAULT)));
+		frame('T', "", scan ? tokens(sql) : nodeToStringWithLocations(raw_parser(sql, RAW_PARSE_DEFAULT)));
 	}
 	PG_CATCH();
 	{
@@ -68,8 +119,9 @@ parse_one(const char *sql)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	bool		scan = argc == 2 && strcmp(argv[1], "--tokens") == 0;
 	size_t		cap = 1 << 16;
 	size_t		len = 0;
 	char	   *buf = malloc(cap);
@@ -95,7 +147,7 @@ main(void)
 		buf[len++] = (char) c;
 		if (c != '\0')
 			continue;
-		parse_one(buf);
+		parse_one(buf, scan);
 		fflush(stdout);
 		len = 0;
 	}
