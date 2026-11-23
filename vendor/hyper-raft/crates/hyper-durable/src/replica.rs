@@ -634,8 +634,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// on a connection of its own, lent the database's one write lock). Committed entries given to
     /// apply wait behind the fence, the core gives out no more (`RawNode::pause_apply`), and
     /// everything else goes on: ticks, votes, appends and their writes. Lifted, what waits is
-    /// applied by the fence's own rule at the next drive: once the durable commit covers its first
-    /// entry, or at once when it waits past a drive's page.
+    /// walked at the next drive as a range past a drive's page is, the commit fence's rule kept.
     pub fn hold_apply(&mut self, held: bool) {
         self.held = held;
         if held {
@@ -2339,9 +2338,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 self.fence = Some((held, last));
                 Ok(())
             }
+            // Held as a range past a drive's page is: once the hold lifts, the next drive walks it
+            // by the walk's own rule, the commit fence included, and asks nothing more of it.
             None if self.held => {
                 self.fence = Some((first, last));
-                self.paged = false;
+                self.paged = true;
                 self.node.pause_apply();
                 Ok(())
             }
