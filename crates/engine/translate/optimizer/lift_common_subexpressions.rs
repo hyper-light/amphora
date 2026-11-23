@@ -50,7 +50,9 @@ pub(crate) fn rewrite_or_terms(
             branch_parentheses.push(parenthesis_count);
         }
 
-        for expr in in_filters_implied_by_or_branches(&branch_terms, available_indexes) {
+        for expr in
+            in_filters_implied_by_or_branches(&branch_terms, available_indexes, column_can_raise)
+        {
             if !where_clause
                 .iter()
                 .any(|term| exprs_are_equivalent(&term.expr, &expr))
@@ -151,9 +153,12 @@ pub(crate) fn rewrite_or_terms(
 ///
 /// If several columns belong to one table, it returns one filter only when one column starts an index.
 /// If a compound index starts with two candidate columns, it returns no filter for that table.
+/// A filter runs on rows the `OR` may never reach, so a column whose read can raise
+/// (`column_can_raise`) gets none (lane T10, as [table_shares_of_or_branches]).
 fn in_filters_implied_by_or_branches(
     or_branches: &[Vec<Expr>],
     available_indexes: &AvailableIndexes,
+    column_can_raise: &dyn Fn(TableInternalId, usize) -> bool,
 ) -> Vec<Expr> {
     // A filter that is true for every branch must use a column from the first branch.
     let mut candidate_columns = Vec::new();
@@ -161,6 +166,16 @@ fn in_filters_implied_by_or_branches(
         let Some((column, _)) = column_literal_equality(term) else {
             continue;
         };
+        if let Expr::Column {
+            table,
+            column: position,
+            ..
+        } = column
+        {
+            if column_can_raise(*table, *position) {
+                continue;
+            }
+        }
         if !candidate_columns
             .iter()
             .any(|other| exprs_are_equivalent(other, column))
