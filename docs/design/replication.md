@@ -2492,7 +2492,10 @@ interval in which the reader found the queue empty does not count (lane constant
 what came, a floor under its rate, and a bound learned from it refused bursts the reader takes at once (driven tests'
 wire records `Full` at 10 inputs, a nemesis's at 2). Such a sample is application-limited, as BBR's delivery-rate
 samples are (Cheng et al., draft-cheng-iccrg-delivery-rate-estimation; Cardwell et al., ACM Queue 14(5), 2016). The
-command queue's intake marks it (`Drain::starved`); the outgoing queue's host drain does not yet.
+command queue's intake marks it (`Drain::starved`), and the host's drain of the outgoing queue marks it when it asks for
+more records than wait (`ReplicaHandle::drain`, lane constants-K2), the owner passing the mark on at its next rebound.
+Each member's path drain is not marked: a path carries what its window lets out, and the window grows from what it
+carried (`Actor::carry`).
 The election timeout is learned too: `election_tick` periods of the owner's measured pace (TP.1). The bounds are read
 again at each tick of the pace (`Actor::rebound`), where the queues' bytes are charged to the budget (`Budget::take`).
 - The outgoing queue holds the lesser of its host's rate times that timeout and the memory budget's room for queues

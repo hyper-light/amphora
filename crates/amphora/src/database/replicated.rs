@@ -742,6 +742,9 @@ struct Outgoing {
     messages: VecDeque<Outbound>,
     /// Bytes and messages the host drained since the owner last weighed them (QB.1).
     drained: (u64, u64),
+    /// The host asked for more than waited since the owner last weighed its drain: what it took
+    /// then is what came, not how fast it drains (`Drain::starved`).
+    starved: bool,
     /// The same, to each member: what its path carried (lane constants-21). At most one a member
     /// of the configuration, the owner weighing them at each rebound.
     drained_to: std::collections::BTreeMap<u64, (u64, u64)>,
@@ -1618,6 +1621,7 @@ impl ReplicaHandle {
         let mut messages = Vec::with_capacity(limit.min(outgoing.messages.len()));
         for _ in 0..limit {
             let Some(message) = outgoing.messages.pop_front() else {
+                outgoing.starved = true;
                 break;
             };
             outgoing.bytes = outgoing
@@ -3389,6 +3393,11 @@ impl<F: BlockFile + 'static> Actor<F> {
         let mut outgoing = locked(&self.control.outgoing)?;
         let (bytes, messages) = std::mem::take(&mut outgoing.drained);
         self.outgo.drained(bytes, messages);
+        // The paths' drains are not marked: a path carries what its window lets out, and the
+        // window grows from what it carried (`carry`).
+        if std::mem::take(&mut outgoing.starved) {
+            self.outgo.starved();
+        }
         let busy = !outgoing.messages.is_empty();
         self.outgo.sample(now, busy);
         let drained_to = std::mem::take(&mut outgoing.drained_to);
