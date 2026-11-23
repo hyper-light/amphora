@@ -2459,6 +2459,68 @@ mod tests {
         assert_eq!(third[0].rows, vec![vec![Value::Integer(40)]]);
     }
 
+    /// CP-T1.13, AC-T1.2.3 (decision 2: a streamed read never runs on the writer): do hold every
+    /// reader with a session, stream a 40 MiB read to a client that doesn't read yet, write, let
+    /// the readers go, then write again while the read is held on its client; expect both writes
+    /// committed within their own deadlines (the read waits for a reader, and a read held on its
+    /// client on the writer would hold every write back past them) and the read answered whole
+    /// once its client reads.
+    #[test]
+    fn cp_t1_13_a_streamed_read_waits_for_a_reader_and_never_holds_a_write_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = blobs(dir.path(), 40, MIB);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut parked = Vec::new();
+        for _ in 0..crate::store::Config::default().readers {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            releases.push(release);
+            let (db, entered_tx) = (db.clone(), entered_tx.clone());
+            parked.push(std::thread::spawn(move || {
+                db.query_local(sql_until(), move |_| {
+                    entered_tx.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(())
+                })
+            }));
+        }
+        for _ in &parked {
+            entered.recv().unwrap();
+        }
+        let (answering, mut client) = link();
+        // Past every write's deadline here: a read held on the writer would refuse the writes
+        // Timeout rather than end before them.
+        let reading = Instant::now() + Duration::from_secs(120);
+        let streamed = {
+            let (db, answering) = (db.clone(), Arc::clone(&answering));
+            std::thread::spawn(move || serve_read(&db, &answering, reading, "SELECT id, v FROM t ORDER BY id"))
+        };
+        let write = |id: i64| {
+            db.call(sql_until(), move |c| {
+                c.execute("INSERT INTO t VALUES (?1, ?2)", [Value::Integer(id), Value::Blob(vec![])])?;
+                Ok(())
+            })
+        };
+        let wrote = write(41);
+        assert!(wrote.is_ok(), "a write while every reader is busy and a read waits: {wrote:?}");
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for p in parked {
+            p.join().unwrap().unwrap();
+        }
+        client.peek(&mut [0u8; 1]).unwrap();
+        let wrote = write(42);
+        assert!(wrote.is_ok(), "a write while a read is held on its client: {wrote:?}");
+        let got = answer(&mut BufReader::new(&mut client), 1).unwrap();
+        streamed.join().unwrap();
+        let SqlAnswer::Tables(tables) = got else {
+            panic!("{got:?}");
+        };
+        let ids: Vec<_> = tables[0].rows.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(ids, (1..=41).map(Value::Integer).collect::<Vec<_>>(), "whole, read once the first write committed");
+    }
+
     /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do read an answer of 40 MiB through a link
     /// whose client never reads; expect the read refused Timeout at its deadline, never TooLarge
     /// (its frames go out one at a time, none held past the one waiting on the client), and the
