@@ -10335,7 +10335,10 @@ pub mod test {
     /// `cargo test -p amphora-engine --release --lib g3_2_log_lookup_bench -- --ignored --nocapture`
     /// (`AMPHORA_LOOKUP_BENCH_PAGES`, the database's pages the log holds, default the suite's
     /// 200,000-item database: 32,612 pages; `_LOOKUPS`, a thread's). Half the pages read aren't in
-    /// the log (the filter's case). It prints lookups a second, each way; it asserts nothing about
+    /// the log (the filter's case); `_THREADS`, the reader counts, default 1 and every core). It
+    /// prints lookups a second, each way, and what each lookup cost a thread on its CPU and waiting
+    /// for one (`/proc/thread-self/schedstat`): a line every reader writes raises the first as
+    /// readers are added; a host short of CPUs raises only the second. It asserts nothing about
     /// time, only that every way answers as the lock does.
     #[test]
     #[ignore = "micro-benchmark: run on a quiet machine, release"]
@@ -10356,7 +10359,17 @@ pub mod test {
         let cores = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
-        for threads in [1, cores] {
+        let thread_counts: Vec<usize> = std::env::var("AMPHORA_LOOKUP_BENCH_THREADS")
+            .ok()
+            .map(|list| list.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, cores]);
+        // This thread's nanoseconds on a CPU and waiting in its run queue (Linux; zeros elsewhere).
+        let schedstat = || -> (u64, u64) {
+            let text = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
+            let mut fields = text.split_whitespace().map(|field| field.parse().unwrap_or(0));
+            (fields.next().unwrap_or(0), fields.next().unwrap_or(0))
+        };
+        for threads in thread_counts {
             for mode in [
                 LogReadIndex::Locked,
                 LogReadIndex::Filtered,
@@ -10376,26 +10389,37 @@ pub mod test {
                 }
                 let max_frame = frame;
                 let began = std::time::Instant::now();
-                std::thread::scope(|scope| {
-                    for reader in 0..threads {
-                        let coordination = &coordination;
-                        scope.spawn(move || {
-                            let mut rng = ChaCha8Rng::seed_from_u64(reader as u64);
-                            for _ in 0..lookups {
-                                let page = 1 + rng.next_u64() % (2 * pages);
-                                let found = coordination.find_frame(page, 1, max_frame, None);
-                                let expected = (page <= pages).then_some(page + pages);
-                                assert_eq!(found, expected, "{mode:?} page {page}");
-                            }
-                        });
-                    }
+                let (on_cpu, waiting) = std::thread::scope(|scope| {
+                    let readers: Vec<_> = (0..threads)
+                        .map(|reader| {
+                            let coordination = &coordination;
+                            scope.spawn(move || {
+                                let mut rng = ChaCha8Rng::seed_from_u64(reader as u64);
+                                let (cpu_before, wait_before) = schedstat();
+                                for _ in 0..lookups {
+                                    let page = 1 + rng.next_u64() % (2 * pages);
+                                    let found = coordination.find_frame(page, 1, max_frame, None);
+                                    let expected = (page <= pages).then_some(page + pages);
+                                    assert_eq!(found, expected, "{mode:?} page {page}");
+                                }
+                                let (cpu_after, wait_after) = schedstat();
+                                (cpu_after - cpu_before, wait_after - wait_before)
+                            })
+                        })
+                        .collect();
+                    readers
+                        .into_iter()
+                        .map(|reader| reader.join().unwrap())
+                        .fold((0u64, 0u64), |(cpu, wait), (c, w)| (cpu + c, wait + w))
                 });
                 let seconds = began.elapsed().as_secs_f64();
                 let total = lookups as f64 * threads as f64;
                 println!(
-                    "g3_2_log_lookup_bench threads={threads} way={mode:?} lookups_per_s={:.0} ns_per_lookup_per_thread={:.1}",
+                    "g3_2_log_lookup_bench threads={threads} way={mode:?} lookups_per_s={:.0} ns_per_lookup_per_thread={:.1} on_cpu_ns_per_lookup={:.1} runqueue_ns_per_lookup={:.1}",
                     total / seconds,
-                    seconds * 1e9 / lookups as f64
+                    seconds * 1e9 / lookups as f64,
+                    on_cpu as f64 / total,
+                    waiting as f64 / total
                 );
             }
         }
