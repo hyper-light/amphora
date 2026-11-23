@@ -90,7 +90,7 @@ fn t_pg_4_3_scanner_matches_19_on_the_regression_corpus() {
     }
     println!("statements {total} (skipped {skipped} not UTF-8 or with NUL), tokens match exactly {matched} of {total}");
     let mut by_count: Vec<_> = kinds.into_iter().collect();
-    by_count.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    by_count.sort_by_key(|k| std::cmp::Reverse(k.1.0));
     for (kind, (n, first)) in &by_count {
         println!("[{n}] {kind}: first {first}");
     }
