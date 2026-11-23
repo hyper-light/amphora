@@ -43,6 +43,10 @@ impl Clock for UnixIO {
 }
 
 impl IO for UnixIO {
+    fn page_read_backend(&self) -> Option<&'static str> {
+        Some("unix")
+    }
+
     fn supports_shared_wal_coordination(&self) -> bool {
         true
     }

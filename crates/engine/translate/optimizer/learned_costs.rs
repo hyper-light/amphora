@@ -925,6 +925,86 @@ fn median_se(samples: &mut [f64]) -> Option<f64> {
     }
 }
 
+/// Where a page read was timed (AUDIT §7.1, perf/coldstart): the device a database's file is on,
+/// or memory. A page read costs what its device and the IO reading it make it cost, so one timed
+/// there stands for every database the process opens there, until the database's own reads replace
+/// it (`LearnedCosts::anchor_page_read`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PageReadPlace {
+    /// Files an IO keeps in memory (`IO::is_memory`) or a database named as memory.
+    Memory,
+    /// The device (`st_dev`) of the directory the database's file is in. A device the process
+    /// hasn't timed (another filesystem mounted, a database moved to another disk) is a new place,
+    /// timed at its first open.
+    #[cfg(unix)]
+    Device(u64),
+}
+
+/// The place a page read beside `db_path` through `io` is timed at; None where the place can't be
+/// told (no device read, or a platform that gives none here), whose opens each time their own.
+fn page_read_place(db_path: &str, io: &dyn crate::io::IO) -> Option<PageReadPlace> {
+    if io.is_memory() || crate::database::is_memory_like(db_path) {
+        return Some(PageReadPlace::Memory);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = std::path::Path::new(db_path)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::metadata(parent)
+            .ok()
+            .map(|meta| PageReadPlace::Device(meta.dev()))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// The page reads this process timed, by the IO's way of reading (`IO::page_read_backend`) and
+/// the place (`PageReadPlace`): (reads, nanoseconds), as `time_page_read` gives them. Bounded by
+/// the IO backends compiled in times the devices the process opens databases on (the mounted
+/// filesystems); an entry is never evicted, as a device's read cost is the same all process long.
+type PageReads = FxHashMap<(&'static str, PageReadPlace), (f64, f64)>;
+
+fn page_reads() -> &'static Mutex<PageReads> {
+    static PAGE_READS: OnceLock<Mutex<PageReads>> = OnceLock::new();
+    PAGE_READS.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+/// AUDIT §7.1 (perf/coldstart): the page read a database opened at `db_path` through `io` starts
+/// from: the one this process already timed on the same IO backend and device, else one timed now
+/// beside it (`time_page_read`), and kept for the next open there. A database opened read-only
+/// (`writable` false) takes none, as before: its open reads its own file. An IO that names
+/// no backend (`IO::page_read_backend`), or a place that can't be told, times its own each open,
+/// as every open did before.
+pub(crate) fn page_read_anchor(
+    db_path: &str,
+    io: &crate::sync::Arc<dyn crate::io::IO>,
+    page_size: usize,
+    most_reads: usize,
+    writable: bool,
+) -> Option<(f64, f64)> {
+    let key = io
+        .page_read_backend()
+        .zip(page_read_place(db_path, io.as_ref()));
+    if !writable {
+        return None;
+    }
+    if let Some(key) = &key {
+        if let Some(timed) = page_reads().lock().get(key) {
+            return Some(*timed);
+        }
+    }
+    let timed = time_page_read(db_path, io, page_size, most_reads)?;
+    if let Some(key) = key {
+        page_reads().lock().entry(key).or_insert(timed);
+    }
+    Some(timed)
+}
+
 /// Times page reads at a database's open, before it has read a page of its own (QT.5): a scratch
 /// page of `page_size` bytes, written beside the database through its own IO and read back as its
 /// pager reads (`read_through_io`). (reads, nanoseconds), or None if no scratch page could be
@@ -1377,6 +1457,91 @@ mod tests {
         let (reads, nanos) = time_page_read(":memory:", &io, 4096, 8).unwrap();
         assert!((1.0..=8.0).contains(&reads), "{reads}");
         assert!(nanos.is_finite() && nanos > 0.0, "{nanos}");
+    }
+
+    /// An IO over memory that counts the files it opens and names `backend` as its way of
+    /// reading (`IO::page_read_backend`), for AUDIT §7.1's page-read cache.
+    struct Counting {
+        inner: crate::MemoryIO,
+        opened: std::sync::atomic::AtomicUsize,
+        backend: Option<&'static str>,
+    }
+
+    impl crate::io::clock::Clock for Counting {
+        fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl crate::io::IO for Counting {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: crate::io::OpenFlags,
+            direct: bool,
+        ) -> crate::Result<crate::sync::Arc<dyn crate::io::File>> {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            self.inner.open_file(path, flags, direct)
+        }
+        fn remove_file(&self, path: &str) -> crate::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn is_memory(&self) -> bool {
+            true
+        }
+        fn page_read_backend(&self) -> Option<&'static str> {
+            self.backend
+        }
+    }
+
+    fn counting(backend: Option<&'static str>) -> crate::sync::Arc<Counting> {
+        crate::sync::Arc::new(Counting {
+            inner: crate::MemoryIO::new(),
+            opened: std::sync::atomic::AtomicUsize::new(0),
+            backend,
+        })
+    }
+
+    /// Do: take the open's page read twice in one process, through two IOs of one backend on one
+    /// place. Expect (AUDIT §7.1): the first writes and times a scratch page, the second writes
+    /// none and starts from the first's time.
+    #[test]
+    fn audit_7_1_a_second_open_on_a_device_reuses_its_page_read() {
+        let first = counting(Some("audit-7-1-reuse"));
+        let second = counting(Some("audit-7-1-reuse"));
+        let first_io: crate::sync::Arc<dyn crate::io::IO> = first.clone();
+        let second_io: crate::sync::Arc<dyn crate::io::IO> = second.clone();
+        let timed = page_read_anchor(":memory:", &first_io, 4096, 8, true).unwrap();
+        assert_eq!(first.opened.load(Ordering::SeqCst), 1);
+        let again = page_read_anchor(":memory:", &second_io, 4096, 8, true).unwrap();
+        assert_eq!(second.opened.load(Ordering::SeqCst), 0);
+        assert_eq!(again, timed);
+    }
+
+    /// Do: take the open's page read twice through an IO that names no backend. Expect: each
+    /// open times its own scratch page, as every open did before AUDIT §7.1.
+    #[test]
+    fn audit_7_1_an_io_naming_no_backend_times_each_open() {
+        let io = counting(None);
+        let dyn_io: crate::sync::Arc<dyn crate::io::IO> = io.clone();
+        page_read_anchor(":memory:", &dyn_io, 4096, 8, true).unwrap();
+        page_read_anchor(":memory:", &dyn_io, 4096, 8, true).unwrap();
+        assert_eq!(io.opened.load(Ordering::SeqCst), 2);
+    }
+
+    /// Do: take the open's page read for a read-only open after the backend's place was timed.
+    /// Expect: none and no scratch written, as before AUDIT §7.1.
+    #[test]
+    fn audit_7_1_a_read_only_open_takes_no_page_read() {
+        let timer_io: crate::sync::Arc<dyn crate::io::IO> = counting(Some("audit-7-1-read-only"));
+        page_read_anchor(":memory:", &timer_io, 4096, 8, true).unwrap();
+        let reader = counting(Some("audit-7-1-read-only"));
+        let reader_io: crate::sync::Arc<dyn crate::io::IO> = reader.clone();
+        assert_eq!(page_read_anchor(":memory:", &reader_io, 4096, 8, false), None);
+        assert_eq!(reader.opened.load(Ordering::SeqCst), 0);
     }
 
     /// Do: open a new, empty database file and ask for its weights before any query. Expect: the
