@@ -31,8 +31,9 @@ const SHARDS_U64: u64 = 64;
 /// Which version of a page an image is.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Version {
-    /// The image a frame of the log holds. A generation's frames number from 1 again after the
-    /// log restarts, so the generation (the header's `checkpoint_seq`) is part of the version.
+    /// The image a frame of the log holds. Frames number from 1 again in each segment of the log
+    /// and each generation of it (decision 45), so the generation (its header's `checkpoint_seq`)
+    /// is part of the version.
     Frame { generation: u32, frame: u64 },
     /// The database file's.
     File,
