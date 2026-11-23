@@ -1292,24 +1292,19 @@ pub trait Wal: Debug + Send + Sync {
 #[derive(Debug)]
 struct InProcessWalCoordination {
     log: Arc<SharedLog>,
-    /// Amphora: the log's lookups without the shared state's lock (G3 step 2, decision 40). None
-    /// where another process writes the log too (the shared-memory backend's fallback): its index
-    /// is filled from the other processes' frames by paths this one doesn't see.
-    read_index: Option<Arc<ReadIndex>>,
+    /// Amphora: the log's lookups without the shared state's lock (G3 step 2, decision 40), through
+    /// the index of the segment they search ([`SharedLog::read_index`]). False where another
+    /// process writes the log too (the shared-memory backend's fallback): its index is filled from
+    /// the other processes' frames by paths this one doesn't see.
+    lock_free: bool,
 }
 
 impl InProcessWalCoordination {
     /// Build the in-process coordination backend over the existing shared WAL state.
     fn new(log: Arc<SharedLog>) -> Self {
-        let read_index = {
-            let guard = log.current().read();
-            let read_index = guard.runtime.read_index.clone();
-            read_index.set_header(guard.metadata.wal_header.clone());
-            read_index
-        };
         Self {
             log,
-            read_index: Some(read_index),
+            lock_free: true,
         }
     }
 
@@ -1318,18 +1313,19 @@ impl InProcessWalCoordination {
     fn fallback(log: Arc<SharedLog>) -> Self {
         Self {
             log,
-            read_index: None,
+            lock_free: false,
         }
     }
 
     fn find_frame_locked(
         &self,
+        segment: SegmentId,
         page_id: u64,
         min_frame: u64,
         max_frame: u64,
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
-        let shared = self.log.current().read();
+        let shared = self.log.segment(segment).read();
         let frame_cache = shared.runtime.frame_cache.lock();
         let range = frame_watermark
             .map(|x| 0..=x)
@@ -1473,11 +1469,14 @@ impl WalCoordination for InProcessWalCoordination {
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
         // Amphora: without the shared state's lock or the index's where the switch says (G3 step 2,
-        // decision 40); what that path can't answer is answered under them.
-        if let Some(read_index) = &self.read_index {
+        // decision 40); what that path can't answer is answered under them. Frame numbers start
+        // again in each segment, so the index searched is the segment's (decision 45).
+        let segment = self.log.current_id();
+        if self.lock_free {
+            let read_index = self.log.read_index(segment);
             let (low, high) = frame_watermark.map_or((min_frame, max_frame), |x| (0, x));
             let index = |build: &mut super::log_index::FromIndex<'_>| {
-                let shared = self.log.current().read();
+                let shared = self.log.segment(segment).read();
                 let frame_cache = shared.runtime.frame_cache.lock();
                 let high_water = shared
                     .runtime
@@ -1491,7 +1490,7 @@ impl WalCoordination for InProcessWalCoordination {
                 Lookup::Ask => {}
             }
         }
-        self.find_frame_locked(page_id, min_frame, max_frame, frame_watermark)
+        self.find_frame_locked(segment, page_id, min_frame, max_frame, frame_watermark)
     }
 
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
@@ -1794,8 +1793,10 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn wal_header(&self) -> WalHeader {
         // Amphora: the header's copy, without the shared state's lock or the header's (decision 40).
-        if let Some(header) = self.read_index.as_ref().and_then(|index| index.header()) {
-            return header;
+        if self.lock_free {
+            if let Some(header) = self.log.read_index(self.log.current_id()).header() {
+                return header;
+            }
         }
         *self.log.current().read().metadata.wal_header.lock()
     }
@@ -3835,6 +3836,9 @@ pub struct WalFileShared {
 pub struct SharedLog {
     first: Arc<RwLock<WalFileShared>>,
     second: Arc<RwLock<WalFileShared>>,
+    /// Each segment's lock-free frame index (decision 40), the `Arc` its runtime holds and never
+    /// replaces, kept here so a lookup reaches it without the segment's lock: first, then second.
+    read_indexes: [Arc<ReadIndex>; 2],
     pub(crate) segments: SpinLock<Segments>,
     /// Whether `segments` says the second segment is current, published so that every access to
     /// the current segment's state reads it without that lock. Written only with `segments`.
@@ -3860,9 +3864,18 @@ impl SharedLog {
     /// The log whose first segment is `first`, the second free and empty: a log with no valid
     /// `-wal2` is this state (decision 45, on disk).
     pub fn new(first: Arc<RwLock<WalFileShared>>) -> Arc<Self> {
+        let second = WalFileShared::new_noop();
+        let read_index = |segment: &Arc<RwLock<WalFileShared>>| {
+            let guard = segment.read();
+            let read_index = guard.runtime.read_index.clone();
+            read_index.set_header(guard.metadata.wal_header.clone());
+            read_index
+        };
+        let read_indexes = [read_index(&first), read_index(&second)];
         Arc::new(Self {
             first,
-            second: WalFileShared::new_noop(),
+            second,
+            read_indexes,
             segments: SpinLock::new(Segments::new(SegmentId::First)),
             second_current: AtomicBool::new(false),
             vacuum_lock: PaddedLock::new(TursoRwLock::new()),
@@ -3881,10 +3894,22 @@ impl SharedLog {
 
     /// The segment the writer appends to.
     pub fn current(&self) -> &Arc<RwLock<WalFileShared>> {
+        self.segment(self.current_id())
+    }
+
+    pub fn current_id(&self) -> SegmentId {
         if self.second_current.load(Ordering::Acquire) {
-            &self.second
+            SegmentId::Second
         } else {
-            &self.first
+            SegmentId::First
+        }
+    }
+
+    pub(crate) fn read_index(&self, id: SegmentId) -> &Arc<ReadIndex> {
+        let [first, second] = &self.read_indexes;
+        match id {
+            SegmentId::First => first,
+            SegmentId::Second => second,
         }
     }
 
