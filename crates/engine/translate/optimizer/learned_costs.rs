@@ -121,7 +121,11 @@ impl Batches {
     /// difference was counted: the noise a later batch is judged by.
     pub(crate) fn spread(&self) -> Option<f64> {
         let spread = (self.squares / self.differences).sqrt();
-        (self.differences >= 1.0 && spread.is_finite()).then_some(spread)
+        if self.differences >= 1.0 && spread.is_finite() {
+            Some(spread)
+        } else {
+            None
+        }
     }
 
     /// Whether `seen` sits from `standing` (one scale) past the spread between batches. The

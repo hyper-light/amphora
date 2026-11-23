@@ -357,7 +357,8 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
 }
 
 /// Define an aggregate function for your extension by deriving
-/// AggregateDerive on a struct that implements the AggFunc trait.
+/// AggregateDerive on a struct that implements the AggFunc trait. With `#[window]` the struct
+/// also implements WindowAggFunc and registers as a window function.
 /// ```ignore
 /// use amphora_engine_ext::{register_extension, Value, AggregateDerive, AggFunc};
 ///
@@ -369,18 +370,19 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
 ///   type Error = &'static str;
 ///   const NAME: &'static str = "sum_plus_one";
 ///   const ARGS: i32 = 1;
-///   fn step(state: &mut Self::State, args: &[Value]) {
+///   fn step(state: &mut Self::State, args: &[Value]) -> Result<(), Self::Error> {
 ///      let Some(val) = args[0].to_integer() else {
-///        return;
+///        return Ok(());
 ///     };
 ///     *state += val;
+///     Ok(())
 ///     }
 ///     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
 ///        Ok(Value::from_integer(state + 1))
 ///     }
 ///}
 /// ```
-#[proc_macro_derive(AggregateDerive)]
+#[proc_macro_derive(AggregateDerive, attributes(window))]
 pub fn derive_agg_func(input: TokenStream) -> TokenStream {
     ext::derive_agg_func(input)
 }
