@@ -2073,6 +2073,31 @@ list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
 `mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
 (T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.
 
+## Decision (lane perf-A9): a call is charged the answer bound its caller declares (2026-11-23)
+
+A request admitted to a database's writer is charged what it and its answer can hold (MB.1, `Admission::bytes_for`).
+A call's answer is whatever its closure returns, which no API bound holds, so `Database::call` was charged the full
+`REQUEST_MAX` (32 MiB): about 25 calls filled a 1 GiB scope.
+
+**The decision.** `Database::call`, `call_session` and `call_nowait` take the caller's bound on its answer,
+`AnswerMax<R>`: charged at admission, and checked inside the call's transaction before it commits (`AnswerBytes`, its
+bytes inline and on the heap), so an answer past it rolls the call back, refused `TooLarge`. A caller derives the bound:
+`AnswerMax::fixed()` for an answer that holds nothing on the heap (its type's size, checked by the type,
+`FixedAnswer`), a count of rows for a bounded read, or the API's own `RESULT_MAX` for an answer only it bounds (an SQL
+write's frames over the wire, as an SQL batch is charged, lane perf-A5).
+
+**Evidence.** Lane perf-A8's A/B (bench/records/2026-11-23-adacachy2-perf-cross.md, r949): 1k and 10k calls in
+flight, unconstrained and in a `MemoryMax=1G` scope, against the flat `REQUEST_MAX` and the answer's measured bytes
+charged on the writer. The flat charge refused 86-98k calls per 3 s in the scope; the declared bound beat the measured
+one on p50 (13-62%) and calls a second (10-36%) in all four cells and on the tails in three. Ada's decision: the
+declared bound, the only call charge.
+
+**What is left.** The cross-group steps' calls on the owner's own session (`call_internal`) and a replicated owner's
+command queue (replication.md, "A call is charged its worst case") still charge a call `REQUEST_MAX`.
+
+**Falsified if** a caller's derived bound refuses an answer its type or its read allows, or the declared bound loses
+p50, calls a second or the tails to another charge at 1k-10k calls in flight on the same machine.
+
 ## 44. A commit lays its chains' pages out in the buffer pool's frames, and finds its deltas in one buffer it reuses
 
 **Decision.** A mixed log's commit (`WalFile::lay_out`, decision 39) takes no buffer of its own for
@@ -2219,14 +2244,15 @@ segment `Current`, the other `Free`), read by the same recovery.
 **What plain SQLite sees (the coordinator, 2026-11-23, on lane B6's question).** Three rules.
 - *Amphora opens the WAL-mode files SQLite writes.* Such a file is the one-segment state above, read at no cost.
 - *Plain SQLite refuses an open Amphora database, and one a crash left.* Bytes 18 and 19 of the database header carry
-  3, the value SQLite's wal2 writes. SQLite refuses a read version above 2 ("If the read version is greater than 2,
-  then that database cannot be read or written", sqlite.org/fileformat2.html, file format version numbers; wal2.md:
-  "Attempting to use any other version of SQLite results in an SQLITE_NOTADB error"), so it never reads `-wal`
-  without `-wal2`'s commits. The open writes 3 where it rewrites a rollback file's 1 to 2 today
+  3, the value SQLite's wal2 writes. SQLite refuses a read version above 2 ("If a database file with a read version
+  greater than 2 is encountered, then that database cannot be read or written", sqlite.org/fileformat2.html, 1.3.3;
+  `btree.c` `lockBtree` returns `SQLITE_NOTADB` for `page1[19]>2`; wal2.md: "Attempting to use any other version of
+  SQLite results in an SQLITE_NOTADB error"), so it never reads `-wal` without `-wal2`'s commits. The open writes 3 where it rewrites a rollback file's 1 to 2 today
   (`crates/engine/database.rs`, 2272-2287), for a 1 and a 2 alike, in the database's first commit, before any other
-  frame. The header in memory then carries 3, so every later frame of page 1 does too. SQLite reads page 1 through
-  `-wal` whenever that file exists, so the mark must be in the log's frames of page 1 as well as in the file, and from
-  that first commit on it is in both. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
+  frame. The header in memory then carries 3, so every later frame of page 1 does too. Whenever `-wal` exists and the
+  file is not empty, SQLite opens `-wal` before it reads page 1 (`pager.c` `pagerOpenWalIfPresent`, called from
+  `sqlite3PagerSharedLock`) and takes page 1 from its frame there if it has one, so the mark must be in the log's
+  frames of page 1 as well as in the file. From that first commit on it is in both. Any other value stays `Corrupt("Invalid read_version: …")` at open (2184-2190).
 - *A cleanly closed Amphora database is a plain SQLite file.* The last connection's close (`Connection::close`,
   `Pager::checkpoint_shutdown`) folds both segments into the file. It copies the closing segment, then the current
   one, syncs the file, truncates both segments to nothing and syncs them. Only then does it write 2 into bytes 18 and

@@ -246,6 +246,10 @@ pub enum RealSums {
     /// Arm (b): every path sums exactly and rounds once (`morsel::ExactSum`), the serial loop
     /// included, so the workers' answer is the serial loop's at any worker count.
     Exact = 1,
+    /// Arm (a), lane G9: the workers keep each SUM, AVG and TOTAL input with its row's position,
+    /// and the serial loop's own steps fold them in row order, so the answer is the serial loop's
+    /// bit for bit at any worker count.
+    RowOrder = 2,
 }
 
 /// Amphora (QT.6, lane qs6-16): how a join's table that the planner reads by a seek per row of
