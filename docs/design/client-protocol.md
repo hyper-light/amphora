@@ -59,9 +59,13 @@ is `serve::SqlClient`.
 (`amphora_api::REQUEST_MAX`) and an answer at most its result bound (`amphora_api::RESULT_MAX`):
 the bounds an embedded caller of Amphora's API already has, so a caller on another machine gets
 the same. A request's bytes are charged to the process's memory budget (`Use::Queues`) before they
-are read; an answer's rows are charged by their real size in memory as the engine steps them (each
-value and what it points to), and its frame by its length, each given back once written. Past a
-bound or the budget's room the answer is a typed `TooLarge`, a write rolled back whole, and the
+are read, and decoded with the counts a `C` connection's are (`transport::bounded`: at most
+`TX_MAX` statements, each at most `TX_MAX` parameters), its decoded size charged while it runs. An
+answer's values are charged as the engine steps them, before each is kept: by their real size in
+memory (each value and what it points to) against the budget's room, and by their encoded size
+against the result bound; its frame is encoded and charged by its length inside the request's
+session, so a write commits only once its answer is held, and each is given back once written. Past
+a bound or the budget's room the answer is a typed `TooLarge`, a write rolled back whole, and the
 connection goes on; a frame refused is read past through a fixed buffer, never held. The result
 bound fits one frame, so an answer never spans frames: nothing below the bound needs streaming,
 and nothing past it is answered.
