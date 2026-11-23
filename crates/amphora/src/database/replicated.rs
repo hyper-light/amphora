@@ -10639,7 +10639,8 @@ mod tests {
     }
     /// T-QB.1.9 (QB.1, lane constants-21; replication.md, "The member bound stated once per group"):
     /// a group's member bound is its log's, so growth always works. Do: open one voter, and a
-    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running), and catch
+    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running, so every
+    /// record to them is lost: the pump has no owner to hand it to), and catch
     /// member 2 up; restart the voter from the configuration it first opened with. Expect: the
     /// voter opened for 2 (twice its first configuration); each change past the bound raised it
     /// first, to 4, then 8 by the fifth member, then 16 by the ninth, every change answered;
@@ -10665,6 +10666,7 @@ mod tests {
         };
         assert_eq!(bound(&driven, 0), 2);
         let mut pump = Pump::new(&clients);
+        pump.lost.extend(3..=9);
         driven.elect(&mut pump, &clients[..1], 0, 1);
         for member in 2..=9 {
             let until = driven.until();
@@ -18055,8 +18057,9 @@ mod tests {
     /// slot's start lands on its next try. Do: the leader appends a write of its own, W, with one
     /// follower's answers held and its appends to the other, the slot's holder, lost, so W is
     /// neither committed nor sent to the holder; then the holder, queued by a refusal, writes,
-    /// its barrier beginning its slot with W the leader's last entry. Expect: its barrier held
-    /// while W is uncommitted, and its write, prepared on W once answers and appends flow again,
+    /// its barrier beginning its slot with W the leader's last entry; then answers and appends
+    /// flow again and the leader's clock moves until the holder has W, within an election
+    /// timeout. Expect: its barrier held while W is uncommitted, and its write, prepared on W,
     /// applied; W too. With the tail rule alone (the barrier answered at the older commit) the
     /// holder's write was refused: the commit's red run.
     #[test]
@@ -18123,6 +18126,16 @@ mod tests {
         }
         pump.held.clear();
         pump.losing = None;
+        // W's lost append fills the holder's window, learned from its path (`Window::Carried`),
+        // and holds back the commit's broadcast too: the leader asks where the holder is once a
+        // beat of its ticks passed with nothing out answered, and sends W again from there.
+        let election = driven.owner(0).replica.core().raft.config().election_tick;
+        for _ in 0..election {
+            if driven.owner(2).replica.applied().index >= w {
+                break;
+            }
+            driven.tick(&mut pump, leader);
+        }
         assert_eq!(
             driven.settle(&mut pump, &retry),
             Ok(Vec::new()),
