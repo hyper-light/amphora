@@ -677,10 +677,7 @@ impl<B: Block> CopyScan<B> for OnCores<'_> {
         let plan = Plan { granules, query: q };
         // The costs are taken for the run and put back after, so a statement learns from the last.
         let taken = self.costs.lock().take();
-        let mut costs = match taken {
-            Some(costs) => costs,
-            None => MachineCosts::measure().map_err(morsel)?,
-        };
+        let mut costs = MachineCosts::for_mode(taken, self.mode).map_err(morsel)?;
         let ran = plan.run_on_cores(self.mode, &mut costs, self.budget);
         *self.costs.lock() = Some(costs);
         match ran {

@@ -155,6 +155,24 @@ impl MachineCosts {
         Ok(costs)
     }
 
+    /// The costs a run in `mode` needs, from those a connection kept (`kept`). Off, every run is
+    /// serial and reads no cost ([`execute`] and [`choose_degree`] return before reading one), so
+    /// nothing is measured: no worker is started for a connection whose switch is off (audit
+    /// 7.7). On, costs whose worker start was never timed are measured first.
+    pub fn for_mode(kept: Option<Self>, mode: ParallelMode) -> Result<Self, MorselError> {
+        match (kept, mode) {
+            (Some(costs), ParallelMode::Off) => Ok(costs),
+            (Some(costs), ParallelMode::On) if costs.worker_start.samples() > 0 => Ok(costs),
+            (_, ParallelMode::On) => Self::measure(),
+            (None, ParallelMode::Off) => Ok(MachineCosts {
+                cores: NonZeroUsize::MIN,
+                machine: NonZeroUsize::MIN,
+                worker_start: MeanNanos::default(),
+                dispatch: MeanNanos::default(),
+            }),
+        }
+    }
+
     /// Costs stated by the caller: a model fed from elsewhere, or a test's fixed machine.
     pub fn stated(cores: NonZeroUsize, worker_start_nanos: f64, dispatch_nanos: f64) -> Self {
         let mut costs = MachineCosts {
@@ -1866,6 +1884,28 @@ mod tests {
             );
             assert!(budget.used() <= limit);
         }
+    }
+
+    /// Audit 7.7: costs for a run with the switch off start no worker and time nothing; once the
+    /// switch is on, costs never timed are measured, and costs already timed are kept as they are.
+    #[test]
+    fn audit_7_7_costs_off_start_no_worker() {
+        let off = MachineCosts::for_mode(None, ParallelMode::Off).unwrap();
+        assert_eq!(off.worker_start().samples(), 0);
+        assert_eq!(off.dispatch().samples(), 0);
+        assert_eq!(
+            choose_degree(ParallelMode::Off, 10_000_000, 50.0, &off),
+            Degree::Serial
+        );
+        let kept = MachineCosts::for_mode(Some(off), ParallelMode::Off).unwrap();
+        assert_eq!(kept.worker_start().samples(), 0);
+        let on = MachineCosts::for_mode(Some(kept), ParallelMode::On).unwrap();
+        assert_eq!(on.worker_start().samples(), 1);
+        assert_eq!(on.dispatch().samples(), 1);
+        let stated = MachineCosts::stated(NonZeroUsize::new(16).unwrap(), 50_000.0, 20.0);
+        let again = MachineCosts::for_mode(Some(stated), ParallelMode::On).unwrap();
+        assert_eq!(again.cores().get(), 16);
+        assert_eq!(again.worker_start().mean(), Some(50_000.0));
     }
 
     /// T-QT.6.5: the degree comes from the costs: off is serial, a short statement is serial, a long

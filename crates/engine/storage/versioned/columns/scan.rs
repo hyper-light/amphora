@@ -672,8 +672,13 @@ impl ExactSum {
             self.special = Some(self.special.unwrap_or(0.0) + x);
             return;
         }
-        let mut kept = Vec::with_capacity(self.parts.len().saturating_add(1));
-        for mut y in self.parts.drain(..) {
+        // The parts are compacted in place (audit 3, columnar: no Vec per float): the k-th kept
+        // part is written at k, never past the part being read, so no read sees a write.
+        let mut kept = 0usize;
+        for j in 0..self.parts.len() {
+            let Some(mut y) = self.parts.get(j).copied() else {
+                break;
+            };
             if x.abs() < y.abs() {
                 std::mem::swap(&mut x, &mut y);
             }
@@ -685,12 +690,15 @@ impl ExactSum {
             }
             let lo = y - (hi - x);
             if lo != 0.0 {
-                kept.push(lo);
+                if let Some(slot) = self.parts.get_mut(kept) {
+                    *slot = lo;
+                }
+                kept = kept.saturating_add(1);
             }
             x = hi;
         }
-        kept.push(x);
-        self.parts = kept;
+        self.parts.truncate(kept);
+        self.parts.push(x);
     }
 
     fn merge(&mut self, other: &ExactSum) {
@@ -2455,6 +2463,71 @@ mod tests {
             s.add(v);
         }
         assert_eq!(s.value(), 1.25);
+    }
+
+    /// Do: add reals spanning the double's exponents (overflow to infinity, cancellations, NaN
+    /// and infinities among them) to the in-place sum and to the copy-per-add sum it replaced
+    /// (audit 3, columnar). Expect: the same parts, the same special and the same value.
+    #[test]
+    fn audit_3_exact_sum_in_place_matches_copying() {
+        fn copying(sum: &mut ExactSum, mut x: f64) {
+            if !x.is_finite() {
+                sum.special = Some(sum.special.unwrap_or(0.0) + x);
+                return;
+            }
+            let mut kept = Vec::with_capacity(sum.parts.len().saturating_add(1));
+            for mut y in sum.parts.drain(..) {
+                if x.abs() < y.abs() {
+                    std::mem::swap(&mut x, &mut y);
+                }
+                let hi = x + y;
+                if !hi.is_finite() {
+                    sum.special = Some(sum.special.unwrap_or(0.0) + hi);
+                    x = 0.0;
+                    continue;
+                }
+                let lo = y - (hi - x);
+                if lo != 0.0 {
+                    kept.push(lo);
+                }
+                x = hi;
+            }
+            kept.push(x);
+            sum.parts = kept;
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..200 {
+            let mut fast = ExactSum::default();
+            let mut slow = ExactSum::default();
+            for i in 0..500 {
+                let bits = next();
+                let x = match (round + i) % 9 {
+                    0 => f64::MAX,
+                    1 => -f64::MAX,
+                    2 if round % 50 == 0 => f64::NAN,
+                    3 if round % 70 == 0 => f64::INFINITY,
+                    4 => (bits % 1_000_000) as f64 * 1e-3 - 500.0,
+                    _ => f64::from_bits(bits),
+                };
+                fast.add(x);
+                copying(&mut slow, x);
+                assert_eq!(
+                    fast.parts.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+                    slow.parts.iter().map(|p| p.to_bits()).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    fast.special.map(f64::to_bits),
+                    slow.special.map(f64::to_bits)
+                );
+                assert_eq!(fast.value().to_bits(), slow.value().to_bits());
+            }
+        }
     }
 
     /// Do: group rows whose keys mix integers with equal reals, nulls and text, under every

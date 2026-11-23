@@ -21537,10 +21537,8 @@ pub fn op_morsel_aggregate(
     }
     // The costs are taken for the run and put back after, so a statement learns from the last.
     let taken = connection.morsel_costs.lock().take();
-    let mut costs = match taken {
-        Some(costs) => costs,
-        None => MachineCosts::measure().map_err(refused)?,
-    };
+    let mut costs =
+        MachineCosts::for_mode(taken, connection.parallel_mode()).map_err(refused)?;
     // The scaling harness's ladder of cores caps them (lane qs6-12).
     costs.cap(connection.parallel_cores());
     // Each worker's registers start as the statement's are now (the constants the program's
