@@ -892,8 +892,10 @@ classes with no stale-base refusals. Measurement stopped at that order.
 
 ## Losses first
 
-1. **Test 5's verdict on the change is r1460's** (8600350e, `cargo test -p amphora --lib` filtered to test 5 and
-   `slot`, then clippy). If r1460 is red or did not finish by 19:42Z, the change is on `perf/commits-v8`, not main.
+1. **Only test 5 and the 18 tests named `slot` ran, not the module's suite.** Every follower barrier now takes a
+   slot, so other `database::replicated::` tests may move. Green at 6f072bef, 9521643c and 9c0ece85 (main): 19 of 19,
+   clippy `-p amphora --all-targets` clean. r1460 at 8600350e failed one: the slot's control test expected the old
+   first-try refusal, and now expects each try applied (6f072bef).
 2. **0009's split was measured in part and decided nothing.** Cell 1 ran (below) and is inside its noise. Cell 3's
    point reads all failed with "no such table: t", so it measured nothing (the driver's table is not where the
    member's `get` read looks; not traced). Cell 2 (20 MiB writes, beats on and off) never ran. Rule 0 parks all of it.
@@ -939,3 +941,89 @@ V7's 6 of 6 with 0009 (V7 sampled threads during its runs and ran an older main)
     # r1460 at 8600350e, same needs and folders
     cargo test -p amphora --lib --locked -- --test-threads=8 v7_a_hundred_and_twenty_eight_spread_writers slot
     cargo clippy -p amphora --all-targets --locked -- -D warnings
+
+# Lane V9 (commits) on adacachy2: V8's slot change made robust, half done (2026-11-23, 20:02Z to 21:05Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, never refusing writes under load. This
+lane's one deliverable: V8's slot change made robust on main, (1) the `database::replicated::` and `replication::`
+suites passing as before V8, and (2) a follower's read taking no write slot.
+
+## Losses first
+
+1. **Part 2 is not built.** V8's reading is right (traced below): every follower barrier takes a slot, reads
+   included. The fix is designed below, not coded, and its test is not written.
+2. **Three tests still fail now and then after V8, never before it.** Over V8's two arms (9c0ece85 and a8f1d857,
+   whose product code is the same), 3 runs each: `writers_through_five_leader_crashes_each_land_and_every_acknowledged_row_is_held`
+   2 of 6 ("the writers all landed before the crashes ran", 3 crashes of 5), `seed_and_delta_hold_through_an_election_at_each_step`
+   1 of 6, `a_read_on_a_wholly_copied_log_holds_passes_off_and_a_busy_pass_holds_reads` 1 of 6. eb365f3d: 0 of 6
+   each. Not traced.
+3. **Lane P12's six were not traced.** They passed 3 of 3 here on 9c0ece85 (r1500), so V8 alone doesn't fail them.
+   P12's post-V8 binaries (e931b6dd, f5d1208b) also hold B11's 416fe658 (pages keyed by segment generation) and P12's
+   own pages merge (a52a337a); its pre-V8 ones (10d19e4e, 11725d28) hold neither, so P12's A/B doesn't isolate V8.
+   Of the six, only `seed_and_delta_hold_through_an_election_at_each_step` failed here, once (loss 2).
+4. **The merge with origin/main went to main without a run on the merged tree** (the hour's end). Clippy and the
+   five tests passed on a8f1d857 before it.
+5. **The brief's base was read as the commit without V8.** 9c0ece85's first parent, 9521643c, already holds V8
+   (8600350e). Main just before V8 is its second parent, eb365f3d: eb365f3d..9c0ece85 is V7's test 5 and V8's two
+   commits.
+
+## Part 1: the suites before and after V8 (r1500, r1545)
+
+`database::replicated:: replication::`, 8 threads, debug test binaries built in turn in one target dir, arm order
+reversed each round, needs cpus=8,mem=24g; load (1 min) 17 to 40, CPU "some" avg10 4 to 31%, I/O under 2%.
+
+| arm | rounds | failures per round | time per round |
+|---|---|---|---|
+| eb365f3d, main before V8 | 6 (r1500, r1545) | 0, 0, 0, 0, 0, 0 (167 passed, 5 ignored) | 33 to 42 s |
+| 9c0ece85, V8 on main | 3 (r1500) | 5, 5, 6 | 131 to 135 s |
+| a8f1d857, the five tests' fix | 3 (r1545) | 0, 2, 1 | 35 to 39 s |
+
+The five that failed 3 of 3 on 9c0ece85 build a state the slot now prevents, so each turns the slot off on the
+leaders where it builds it (a8f1d857), and asserts what it did:
+
+| test | failure on 9c0ece85 | why (V8's slot from the first try) |
+|---|---|---|
+| `a_write_at_a_follower_is_answered_on_its_groups_commit` | `[Ok([1]), Ok([2])]`, no refusal | the follower's write takes the slot, so no two writes share a base |
+| `an_overlapping_write_is_refused_serialization_and_a_malformed_one_invalid` | "no append was refused Serialization" in 20 rounds | the same |
+| `follower_origin_captures_once_and_reads_after_local_durable_apply` | `Option::unwrap()` on None | the second follower's barrier waits behind the first's slot, whose forward the test holds; driven time never expires the slot |
+| `follower_origin_captures_hold_through_an_election_at_each_step` | the same | the same |
+| `a_floor_session_waits_for_its_log_as_it_was_not_for_writes_behind_it` | "not reached in 60000 driven rounds" | the slot's barrier steps once the leader's commit reaches its last entry, which the test's losses never let commit |
+
+**The 3x slowdown is those five tests, not the product.** a8f1d857's product code is 9c0ece85's; only the five
+tests' bodies differ. Its suite runs in 35 to 39 s, eb365f3d's time, against 131 to 135 s at 9c0ece85. So the extra
+time was the five tests spinning to their round budgets (60000 driven rounds) before failing.
+
+## Part 2: V8's reading is right (traced, not built)
+
+- At the leader, `Actor::step` (replicated.rs, the `MsgReadIndex` arm under "The write slot holds...") calls
+  `self.slots.ask(from)` for every follower barrier, then `Slots::read`, which queues it behind the slot held.
+- At a follower, `Input::Submit` sends a barrier for every operation: Records reads (`Get`, `Scan`, `Changes`,
+  `Head`, `ImportProgress`) and `Database::query`, which on a replicated database runs as `Operation::Call`
+  (`query` to `session` to `call_db_session`), as writable as `call`.
+- After any operation that forwarded nothing, `prepare()` sends a second barrier to end the slot.
+
+So a follower's read waits behind other members' slots, and holds the leader's writes for its own round trip.
+
+**The fix, for the successor.** The barrier says whether a write follows; nothing new on the wire.
+- Follower: an operation that writes nothing marks its barrier's context, the 32 bytes plus one. These are `Get`,
+  `Scan`, `Changes`, `Head`, `ImportProgress`, and a new `Operation::Query` that `Database::query` sends on a
+  replicated database, run with the connection query-only as `run_query` runs it locally (its documented
+  contract). A read never proposes, so its context never becomes an entry's. Old leaders echo it unread.
+- Leader: a marked barrier doesn't `ask`. A new `Slots::pass(member, at, message)` ends a slot the member holds
+  (released), steps the member's older waiting barrier, and steps this one now. A queue entry left by `refused`
+  waits for the member's next write.
+- The ending barrier goes only after a write's barrier whose work forwarded nothing, and is marked.
+- Design: replication.md's write slot says the slot is for "a member's writes"; its section needs V8's rule (every
+  write's barrier asks) and this one (a read's never does).
+- Test: member 3 holds the slot, its forward held (`begin_captures`); member 2 reads (`Head`, and a query). Expect
+  member 2's read answered while `slots.holds()` and the capture is held, `driven.lapses` 0. Red on V8.
+
+## Commands
+
+    # kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false
+    # ~/.cache/commits-v9/suites.sh ROUNDS SHA...: cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=
+    # ~/.cache/amphora-perf-target/commits, CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=8; binaries copied to
+    # ~/.cache/amphora-perf-bin/commits/v9-tests-<sha>, logs ~/.cache/amphora-perf/commits-v9-logs/<time>/
+    cargo test -p amphora --lib --locked --no-run
+    v9-tests-<sha> --test-threads=8 database::replicated:: replication::      # r1500: eb365f3d 9c0ece85; r1545: eb365f3d a8f1d857
+    ~/.cache/commits-v6/am.sh a8f1d857   # cargo clippy -p amphora --all-targets --locked -- -D warnings: clean (r1546)
