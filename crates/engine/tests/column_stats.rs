@@ -451,14 +451,11 @@ fn wide_notes(conn: &Arc<Connection>) {
     insert(conn, "notes", &rows);
 }
 
-/// Do: ANALYZE the notes table, then estimate `note IS NULL` and `note IS NOT NULL`. Expect: each
-/// within 1.1 of its count (1,000 and 2,000), the NULLs ANALYZE counted, where a fixed tenth
-/// (300 rows) and nine tenths (2,700) were estimated (AUDIT 5.1).
-///
-/// Not the postfix forms: `note ISNULL` / `note NOTNULL` make no constraint at all
-/// (`as_binary_components` takes no `Expr::IsNull`), so with no sample they are estimated as
-/// cutting nothing (3,000 rows, kiln run on adacachy2); that gap is the wide-table sample's
-/// (AUDIT 5.1 item 1) and the constraint builder's, not the NULL share's.
+/// Do: ANALYZE the notes table, then estimate `note IS NULL` and `note IS NOT NULL`, and the
+/// postfix forms `note ISNULL`, `note NOTNULL` and `note NOT NULL`. Expect: each within 1.1 of its
+/// count (1,000 NULLs, 2,000 not), the NULLs ANALYZE counted, where a fixed tenth (300 rows) and
+/// nine tenths (2,700) were estimated, and the postfix forms, which made no constraint, cut
+/// nothing (3,000 rows) (AUDIT 5.1).
 #[test]
 fn audit_5_1_is_null_takes_the_nulls_analyze_counted() {
     let dir = tempfile::tempdir().unwrap();
@@ -468,8 +465,54 @@ fn audit_5_1_is_null_takes_the_nulls_analyze_counted() {
     for sql in [
         "SELECT id FROM notes WHERE note IS NULL",
         "SELECT id FROM notes WHERE note IS NOT NULL",
+        "SELECT id FROM notes WHERE note ISNULL",
+        "SELECT id FROM notes WHERE note NOTNULL",
+        "SELECT id FROM notes WHERE note NOT NULL",
     ] {
         let (e, c) = (estimate(&conn, sql), count(&conn, sql));
         assert!(q_error(e, c) <= 1.1, "{sql}: estimated {e}, counted {c}");
+    }
+}
+
+/// Each step of the plan of `sql`, as EXPLAIN QUERY PLAN words it.
+fn plan_details(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(format!("EXPLAIN QUERY PLAN FORMAT=JSON {sql}"))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    let json: serde_json::Value = serde_json::from_str(&rows[0][0].to_string()).unwrap();
+    json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["detail"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Do: a partial index on notes(note) WHERE `note NOTNULL`, then one WHERE `note IS NOT NULL OR
+/// id < 0`, and plan `SELECT note FROM notes WHERE <test>` for each spelling of the test. Expect:
+/// every spelling reads the index and returns the 2,000 rows that aren't NULL, the query's terms
+/// and the index's predicate rewritten alike (AUDIT 5.1).
+#[test]
+fn audit_5_1_every_not_null_spelling_reads_a_partial_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open(dir.path());
+    wide_notes(&conn);
+    for predicate in ["note NOTNULL", "note IS NOT NULL OR id < 0"] {
+        conn.execute(format!(
+            "CREATE INDEX notes_set ON notes(note) WHERE {predicate}"
+        ))
+        .unwrap();
+        conn.execute("ANALYZE").unwrap();
+        for test in ["note NOTNULL", "note NOT NULL", "note IS NOT NULL"] {
+            let sql = format!("SELECT note FROM notes WHERE {test}");
+            let plan = plan_details(&conn, &sql);
+            assert!(
+                plan.iter().any(|d| d.contains("notes_set")),
+                "index WHERE {predicate}, {sql}: {plan:?}"
+            );
+            assert_eq!(count(&conn, &sql), 2000.0, "{sql}");
+        }
+        conn.execute("DROP INDEX notes_set").unwrap();
     }
 }

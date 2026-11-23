@@ -2581,6 +2581,7 @@ pub fn parse_where(
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
             rewrite_between_exprs(&mut expr.expr)?;
+            rewrite_postfix_null_tests(&mut expr.expr)?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2669,6 +2670,27 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
                 )
             };
             *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+/// `x ISNULL` / `x NOTNULL` (and `x NOT NULL`) rewritten to `x IS NULL` / `x IS NOT NULL`, the
+/// form constraint extraction takes (`as_binary_components`): the postfix forms made no
+/// constraint, so ANALYZE's null share and an index on `x` never served them (AUDIT 5.1). Every
+/// subexpression is rewritten, a partial index's predicate as its query's terms, so the two still
+/// compare as equal (`partial_index_predicate_terms`).
+pub fn rewrite_postfix_null_tests(expr: &mut Expr) -> Result<()> {
+    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+        let op = match e {
+            Expr::IsNull(_) => ast::Operator::Is,
+            Expr::NotNull(_) => ast::Operator::IsNot,
+            _ => return Ok(WalkControl::Continue),
+        };
+        if let Expr::IsNull(operand) | Expr::NotNull(operand) = e {
+            let operand = std::mem::take(operand);
+            *e = Expr::Binary(operand, op, Box::new(Expr::Literal(ast::Literal::Null)));
         }
         Ok(WalkControl::Continue)
     })?;
@@ -3084,6 +3106,7 @@ fn parse_join(
                 for predicate in out_where_clause[start_idx..].iter_mut() {
                     predicate.origin = WhereTermOrigin::Join(join_origin);
                     rewrite_between_exprs(&mut predicate.expr)?;
+                    rewrite_postfix_null_tests(&mut predicate.expr)?;
                     bind_and_rewrite_expr(
                         &mut predicate.expr,
                         Some(table_references),
