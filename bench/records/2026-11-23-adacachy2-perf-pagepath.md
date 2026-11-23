@@ -100,3 +100,46 @@ the node list) and the lines the ReadIndex's fields share. The fix to try next: 
 `Arc<PageBits>`/`Arc<Latest>` and checks them against `generation` (one plain load) instead of an
 `ArcSwap::load` per lookup, then this bench again at 1-32 threads. Default left at `locked`: the
 graduation is Ada's decision (below), and the suite shows no end-to-end gain while its log is empty.
+
+## The ~1 M/s ceiling from 32 clients on: the reader pool's std lock (perf-B3, AUDIT 2)
+
+Tool: `bench/syscall_sample.py`. It starts the bench itself, so Yama's `ptrace_scope=1` lets it read
+`/proc/<pid>/task/*/syscall`. It samples each thread's state, syscall and futex address, plus CPU
+and context switches over the span. Binary: `bench-hdr-after` (ae729b06 merged with main 369141e8).
+Records on adacachy2 are in `~/.cache/amphora-perf-bin/pagepath/`: `b3-sample-0256.jsonl`,
+`b3-sample2-0305.jsonl` and `b3-checkout-0307.jsonl`. Load was 73-95 on 32 cores throughout.
+
+Sampled at 32 clients (`point_pk`, 6 s span): 975k ops/s, 47.0 s system CPU against 48.2 s user,
+676k voluntary context switches a second (0.69 an op) and 160k involuntary. The threads that sleep
+wait in `futex(FUTEX_WAIT_BITSET_PRIVATE)`. That is Rust std's `Mutex`/`RwLock`/`Condvar` wait. The
+engine's locks are parking_lot, which park each thread on its own address with `FUTEX_WAIT_PRIVATE`;
+those addresses show 0.02% each. One heap address took 22,610 of the futex samples, from every
+client thread. At 1 client: 308k ops/s and 48 voluntary switches a second.
+
+Source: every read goes `Groups::read_committed` -> `Store::read_committed` -> `Readers::with`
+(`crates/amphora/src/store.rs` 1152-1228) on the default checkout, `ReadCheckout::Pool`. Each read
+takes the std `Mutex` `pool` twice (take, `give_back`), reads the std `RwLock` `gate`, and calls
+`returned.notify_all()`. std's futex `Condvar` makes a `FUTEX_WAKE` syscall on every `notify_all`,
+waiters or none.
+
+A/B, one binary, `AMPHORA_READ_CHECKOUT=pool` against `slots` (the prototype already on main),
+`point_pk` at 32 clients, alternating, 3 reps each, 0 errors in every run:
+
+| checkout | ops/s (reps) | median | system share | voluntary switches/s | hot heap futex samples | p99 ms |
+|---|---|---|---|---|---|---|
+| pool (default) | 957,586 577,739 956,953 | 956,953 | 0.585 0.455 0.546 | 805,905 660,209 781,451 | 30,608 262,180 30,247 | 0.164 0.276 0.172 |
+| slots | 1,660,041 1,677,008 1,535,603 | 1,660,041 | 0.143 0.135 0.190 | 427,106 381,198 643,297 | none | 0.260 0.264 0.224 |
+
+Reading: the ceiling is the reader pool's std `Mutex` and `Condvar`. The sampler names it, and the
+switch moves it: 1.73x at the median (slots' worst is above pool's best), with the kernel's share
+falling from 46-59% to 14-19%. It is not in the storage engine (`crates/amphora`), so this lane did
+not change it. Making `slots` the default is the decision (store.md's checkout decision). Left with
+`slots`: 0.23-0.42 voluntary switches an op with no single hot address. That fits parking_lot waits
+spread over per-thread addresses, plus the host's load. Sample it next. Not yet measured:
+`point_secondary` and 128 clients under `slots`.
+
+## AUDIT 2.1 header, the fair A/B (perf-B3): running, not finished in the hour
+
+`.git/perf-ab5.sh` (rewritten): after = HEAD, base = HEAD's tree with only ae729b06's `crates/` diff
+reversed; 5 rounds, arm order alternated, load recorded; output `ab5-<HHMM>.jsonl`, written once both
+builds finish. Under load 90-136 the after build took 20m22s. Its kiln run is r211 on adacachy2.
