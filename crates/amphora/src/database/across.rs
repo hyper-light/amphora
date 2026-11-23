@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use amphora_api::{self as api, Change, Changes, Consistency, Page, Refusal, Rev, Scan};
 
-use super::{blob, bytes, integer, rev, text, unavailable};
+use super::{blob, blob_len, bytes, fits, integer, rev, text, unavailable};
 use crate::backup::Hooks;
 use crate::database::Database;
 use crate::db::Db;
@@ -447,8 +447,14 @@ fn page_at(
     if let Some(upper) = upper {
         params.push(blob(&upper)?);
     }
-    let mut rows = Vec::new();
+    let (mut rows, mut carried, mut more) = (Vec::new(), 0usize, false);
     db.query(query, params, |row| {
+        let payload = blob_len(row, 0).saturating_add(blob_len(row, 2));
+        if !fits(rows.len(), carried, payload, scan.limit) {
+            more = true;
+            return Ok(false);
+        }
+        carried = carried.saturating_add(payload);
         rows.push(api::Row {
             key: bytes(row, 0)?.ok_or_else(|| anyhow::anyhow!("null key"))?,
             rev: rev(row, 1)?,
@@ -456,8 +462,6 @@ fn page_at(
         });
         Ok(true)
     })?;
-    let more = rows.len() > scan.limit;
-    rows.truncate(scan.limit);
     for row in &mut rows {
         row.rev = stamp_of_version(db, ns, family, &row.key, row.rev)?.unwrap_or(0);
     }
@@ -612,17 +616,37 @@ pub(super) fn scan(
     };
     let mut rows = Vec::new();
     let mut more = false;
+    let mut bound: Option<Vec<u8>> = None;
     for (group, _) in &groups {
         let (ns, family, scan) = (ns.to_owned(), family.to_owned(), scan.clone());
         let page = waiting(group, until, move |db| page_at(db, &ns, &family, &scan, at))?;
+        if page.more
+            && let Some(last) = page.rows.last()
+            && bound.as_ref().is_none_or(|bound| &last.key < bound)
+        {
+            bound = Some(last.key.clone());
+        }
         more |= page.more;
         rows.extend(page.rows);
     }
-    // Each group's keys are its own, and each page its smallest after the cursor, so the union's
-    // first `limit` keys are all among them.
+    // Each group's keys are its own, and each page its smallest after the cursor. A group with
+    // more, its page ended by its limit or by `RESULT_MAX` bytes, bounds the union at its last
+    // key: past it that group's next rows are unread. The union then ends as a group's page does.
     rows.sort_by(|a, b| a.key.cmp(&b.key));
-    more |= rows.len() > scan.limit;
-    rows.truncate(scan.limit);
+    if let Some(bound) = &bound {
+        rows.retain(|row| &row.key <= bound);
+    }
+    let (mut taken, mut carried) = (0usize, 0usize);
+    for row in &rows {
+        let payload = row.key.len().saturating_add(row.value.len());
+        if !fits(taken, carried, payload, scan.limit) {
+            break;
+        }
+        carried = carried.saturating_add(payload);
+        taken = taken.saturating_add(1);
+    }
+    more |= taken < rows.len();
+    rows.truncate(taken);
     Ok(Page { rows, more })
 }
 
@@ -998,14 +1022,27 @@ pub(super) fn get(
     })
 }
 
-/// `changes` cut to `limit`, never through a stamp: a cursor is a stamp, so advancing to the last
-/// change of a cut one would skip the rest of its keys.
+/// `changes` cut to `limit` and to `RESULT_MAX` bytes of keys and values ([`fits`]), never through
+/// a stamp: a cursor is a stamp, so advancing to the last change of a cut one would skip the rest
+/// of its keys.
 fn whole(mut changes: Vec<Change>, limit: usize) -> Result<Vec<Change>, Refusal> {
-    if changes.len() <= limit {
+    let (mut taken, mut carried) = (0usize, 0usize);
+    for change in &changes {
+        let payload = change
+            .key
+            .len()
+            .saturating_add(change.value.as_ref().map_or(0, Vec::len));
+        if !fits(taken, carried, payload, limit) {
+            break;
+        }
+        carried = carried.saturating_add(payload);
+        taken = taken.saturating_add(1);
+    }
+    if taken == changes.len() {
         return Ok(changes);
     }
-    let next = changes.get(limit).map(|c| c.rev);
-    changes.truncate(limit);
+    let next = changes.get(taken).map(|c| c.rev);
+    changes.truncate(taken);
     if changes.last().map(|c| c.rev) == next {
         changes.retain(|c| Some(c.rev) != next);
         if changes.is_empty() {

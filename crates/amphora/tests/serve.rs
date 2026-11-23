@@ -13,7 +13,8 @@
 
 use std::time::{Duration, Instant};
 
-use amphora::serve::{self, Client, Config, Keys};
+use amphora::serve::{self, Client, Config, Keys, SqlClient, Table};
+use amphora_api::{Refusal, Statement, Value};
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -648,4 +649,104 @@ fn t_t1_13_1_a_member_without_drills_refuses_the_disk_request() {
         member.ask("count SELECT count(*) FROM t").unwrap().trim(),
         "1"
     );
+}
+
+/// CP-T1.13, AC-T1.2.3 (docs/design/client-protocol.md, decision 2): rows from `amphora serve`.
+/// Do: three members; on the leader's `Q` connection, create a table and insert a row of every
+/// SQLite type through bound parameters; then a write whose second statement the engine refuses;
+/// then read back, once with a bound parameter. Expect: each statement's table, the insert's
+/// count and rowid; the refused write typed as its statement, with its first statement rolled
+/// back too; the rows typed as written with their columns' names; the connection answering after
+/// the refusal; a read and a write whose answers pass one frame answered whole (version 2); and a
+/// link without the cluster's secret refused before its first request.
+#[test]
+fn cp_t1_13_sql_takes_bound_parameters_and_answers_typed_rows_with_their_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let configs = three(dir.path());
+    start(&configs);
+    let c = &configs[0];
+    healthy(c);
+    let keys = c.keys().unwrap();
+    let (_, leader) = Client::connect(&c.members[0].addr, &keys, c.deadline)
+        .unwrap()
+        .leader(Duration::from_secs(60))
+        .unwrap();
+    let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
+    let st = |text: &str, params: Vec<Value>| Statement {
+        sql: text.to_owned(),
+        params,
+    };
+    let row = vec![
+        Value::Integer(7),
+        Value::Real(2.5),
+        Value::Text("seven".into()),
+        Value::Blob(vec![0, 255]),
+        Value::Null,
+    ];
+
+    let made = sql
+        .write(vec![st("CREATE TABLE t (id INTEGER PRIMARY KEY, r REAL, s TEXT, b BLOB, n)", vec![])])
+        .unwrap();
+    assert_eq!(made.len(), 1, "{made:?}");
+    let wrote = sql
+        .write(vec![st("INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)", row.clone())])
+        .unwrap();
+    assert_eq!((wrote[0].affected, wrote[0].last_insert_rowid), (1, 7), "{wrote:?}");
+
+    let refused = sql
+        .write(vec![
+            st("INSERT INTO t (id) VALUES (8)", vec![]),
+            st("INSERT INTO nowhere VALUES (1)", vec![]),
+        ])
+        .unwrap_err();
+    match refused.downcast_ref::<Refusal>() {
+        Some(Refusal::Invalid { what, .. }) => assert_eq!(what, "statement 1"),
+        other => panic!("refused as {other:?}: {refused:#}"),
+    }
+
+    let read = sql
+        .read(st("SELECT id, r, s, b, n FROM t ORDER BY id", vec![]))
+        .unwrap();
+    assert_eq!(
+        read,
+        Table {
+            columns: ["id", "r", "s", "b", "n"].map(String::from).to_vec(),
+            rows: vec![row],
+            affected: read.affected,
+            last_insert_rowid: read.last_insert_rowid,
+        }
+    );
+    let one = sql
+        .read(st("SELECT s AS name FROM t WHERE id = ?1", vec![Value::Integer(7)]))
+        .unwrap();
+    assert_eq!(
+        (one.columns, one.rows),
+        (vec!["name".to_owned()], vec![vec![Value::Text("seven".into())]])
+    );
+
+    // Version 2: a read and a write whose answers pass one frame come whole, in order.
+    sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])])
+        .unwrap();
+    let mib = 1 << 20;
+    for half in 0..2i64 {
+        let rows = (1..=20i64)
+            .map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(half * 20 + n), Value::Blob(vec![9; mib])]))
+            .collect();
+        sql.write(rows).unwrap();
+    }
+    let ids = |table: &Table| table.rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>();
+    let every = (1..=40).map(Value::Integer).collect::<Vec<_>>();
+    let big = sql.read(st("SELECT id, v FROM big ORDER BY id", vec![])).unwrap();
+    assert_eq!(ids(&big), every);
+    assert!(big.rows.iter().all(|row| row[1] == Value::Blob(vec![9; mib])));
+    let held = sql
+        .write(vec![
+            st("INSERT INTO t (id) VALUES (9)", vec![]),
+            st("SELECT id, v FROM big ORDER BY id", vec![]),
+        ])
+        .unwrap();
+    assert_eq!((held[0].affected, ids(&held[1])), (1, every));
+
+    let wrong = Keys::plain(b"not-the-cluster-secret-not-the-cluster-secret".to_vec());
+    assert!(SqlClient::connect(&leader, &wrong, c.deadline).is_err());
 }

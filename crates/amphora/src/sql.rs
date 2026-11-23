@@ -238,6 +238,12 @@ impl Session for Db {
         self.give_back(held).map_err(failed)?;
         Ok(columns)
     }
+    fn column_names(&self, sql: &str) -> Result<Vec<String>> {
+        let held = held(self, sql)?;
+        let names = held.column_names();
+        self.give_back(held).map_err(failed)?;
+        Ok(names)
+    }
     fn changes(&self) -> i64 {
         Db::changes(self)
     }
@@ -262,6 +268,22 @@ impl Prepared for Kept<'_> {
             db.run_held(held, params, each)
         })
     }
+    fn each(
+        &mut self,
+        params: Vec<Value>,
+        each: &mut dyn FnMut(Vec<Value>) -> Result<bool>,
+    ) -> Result<()> {
+        let db = self.db;
+        let held = self
+            .held
+            .as_mut()
+            .ok_or_else(|| failed("a prepared statement ran after it was given back"))?;
+        stream(
+            params,
+            |params, row| db.run_held(held, params, row),
+            each,
+        )
+    }
 }
 impl Drop for Kept<'_> {
     fn drop(&mut self) {
@@ -274,8 +296,26 @@ impl Drop for Kept<'_> {
     }
 }
 
-/// A validated statement's rows, each value owned, within the transport's result bounds: `run`
-/// steps the statement with its parameters, handing each row on.
+/// The memory `values` take once owned: each value and what it points to, and the row's vector.
+/// The transport's decoders count a row the same way (`transport::bounded::rows`).
+pub(crate) fn row_bytes(values: &[Value]) -> Option<usize> {
+    values.iter().try_fold(std::mem::size_of::<Vec<Value>>(), |bytes, value| {
+        bytes
+            .checked_add(std::mem::size_of::<Value>())?
+            .checked_add(payload(value))
+    })
+}
+
+fn payload(value: &Value) -> usize {
+    match value {
+        Value::Text(text) => text.len(),
+        Value::Blob(bytes) => bytes.len(),
+        Value::Null | Value::Integer(_) | Value::Real(_) => 0,
+    }
+}
+
+/// A validated statement's rows, every row, or the first alone, within the transport's result
+/// bounds: `run` steps the statement with its parameters, handing each row on.
 fn rows(
     params: Vec<Value>,
     first: bool,
@@ -284,16 +324,40 @@ fn rows(
         &mut dyn FnMut(&NativeRow) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()>,
 ) -> Result<Vec<Vec<Value>>> {
-    let params = params.into_iter().map(native).collect::<Result<Vec<_>>>()?;
     let mut rows = Vec::new();
     let mut bytes = 0usize;
-    run(params, &mut |row| {
+    stream(params, run, &mut |values| {
         // Match the transport decoder's owned-allocation budget before acknowledging
         // a write with RETURNING: a locally accepted result must fit remotely too.
-        bytes = bytes
-            .checked_add(std::mem::size_of::<Vec<Value>>())
-            .ok_or_else(|| anyhow::anyhow!("SQL result size overflow"))?;
-        let mut values = Vec::new();
+        bytes = row_bytes(&values)
+            .and_then(|row| bytes.checked_add(row))
+            .ok_or_else(|| failed("SQL result size overflow"))?;
+        amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
+        let count = rows
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| failed("SQL result row count overflow"))?;
+        amphora_api::bound("SQL result rows", count, amphora_api::RESULT_MAX / 32)?;
+        rows.push(values);
+        Ok(!first)
+    })?;
+    Ok(rows)
+}
+
+/// A validated statement's rows, each handed to `each` as `run` steps it, its values copied out
+/// of the engine once. A row past the result bound, which no answer could carry, is refused
+/// before its values are copied.
+fn stream(
+    params: Vec<Value>,
+    run: impl FnOnce(
+        Vec<Native>,
+        &mut dyn FnMut(&NativeRow) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()>,
+    each: &mut dyn FnMut(Vec<Value>) -> Result<bool>,
+) -> Result<()> {
+    let params = params.into_iter().map(native).collect::<Result<Vec<_>>>()?;
+    run(params, &mut |row| {
+        let mut bytes = std::mem::size_of::<Vec<Value>>();
         for value in row.get_values() {
             let payload = match value {
                 Native::Text(s) => s.as_str().len(),
@@ -305,19 +369,16 @@ fn rows(
                 .and_then(|n| n.checked_add(payload))
                 .ok_or_else(|| anyhow::anyhow!("SQL result size overflow"))?;
             amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
-            values.push(owned(value));
         }
-        amphora_api::bound("SQL result bytes", bytes, amphora_api::RESULT_MAX)?;
-        let count = rows
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("SQL result row count overflow"))?;
-        amphora_api::bound("SQL result rows", count, amphora_api::RESULT_MAX / 32)?;
-        rows.push(values);
-        Ok(!first)
+        Ok(each(row.get_values().map(owned).collect())?)
     })
-    .map_err(failed)?;
-    Ok(rows)
+    .map_err(|e| match e.downcast::<Error>() {
+        Ok(e) => e,
+        Err(e) => match e.downcast::<amphora_api::Refusal>() {
+            Ok(refusal) => Error::Refusal(refusal),
+            Err(e) => failed(e),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -348,6 +409,73 @@ mod tests {
                 value: value.to_vec(),
             }],
         }
+    }
+
+    /// CP-T1.13, AC-T1.2.3: do run a statement whose parameters pass the request bound; expect
+    /// the refusal typed TooLarge, not text.
+    #[test]
+    fn cp_t1_13_a_request_past_its_bound_is_refused_too_large_typed() {
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        let half = || amphora_api::Value::Blob(vec![0; amphora_api::RESULT_MAX / 2 + 1]);
+        db.call(until(), move |c| {
+            let refused = c.execute("SELECT ?1, ?2", [half(), half()]);
+            assert!(
+                matches!(refused, Err(super::Error::Refusal(Refusal::TooLarge { .. }))),
+                "{refused:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// CP-T1.13, AC-T1.2.3 (decision 2, version 2): do step a statement's rows through
+    /// `Statement::each`; expect each row handed over in order as stepped, the stream stopping
+    /// when told, and a row past the result bound refused TooLarge after the rows before it.
+    #[test]
+    fn cp_t1_13_each_hands_rows_over_as_stepped() {
+        use amphora_api::Value;
+        let db = crate::database::Database::in_memory(until()).unwrap();
+        db.call(until(), |c| {
+            c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")?;
+            for id in 1..=3i64 {
+                c.execute("INSERT INTO t VALUES (?1, ?2)", [Value::Integer(id), Value::Blob(vec![1; 8])])?;
+            }
+            c.execute(
+                "INSERT INTO t VALUES (4, ?1)",
+                [Value::Blob(vec![1; amphora_api::RESULT_MAX / 2 + 1])],
+            )?;
+            let mut statement = c.prepare("SELECT id, v FROM t WHERE id < 4 ORDER BY id")?;
+            let mut seen = Vec::new();
+            statement.each([(); 0], |row| {
+                seen.push(row);
+                Ok(true)
+            })?;
+            assert_eq!(
+                seen,
+                (1..=3)
+                    .map(|id| vec![Value::Integer(id), Value::Blob(vec![1; 8])])
+                    .collect::<Vec<_>>()
+            );
+            let mut first = Vec::new();
+            statement.each([(); 0], |row| {
+                first.push(row);
+                Ok(false)
+            })?;
+            assert_eq!(first.len(), 1, "stopped when told");
+            let mut before = 0;
+            let mut wide = c.prepare("SELECT id, v, v FROM t ORDER BY id")?;
+            let refused = wide.each([(); 0], |_| {
+                before += 1;
+                Ok(true)
+            });
+            assert!(
+                matches!(refused, Err(super::Error::Refusal(Refusal::TooLarge { .. }))),
+                "{refused:?}"
+            );
+            assert_eq!(before, 3, "the rows before it");
+            Ok(())
+        })
+        .unwrap();
     }
 
     // U05/U06: public SQL cannot alter the metadata that enforces Records and commit fences.

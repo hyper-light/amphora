@@ -98,6 +98,7 @@ dependencies = [
  "hyper-durable",
  "hyper-log",
  "hyper-raft",
+ "hyper-rt",
  "hyper-timing",
  "hyper-tls",
  "memory-stats",
@@ -255,6 +256,14 @@ dependencies = [
  "strum_macros",
  "thiserror",
 ]
+
+[[package]]
+name = "amphora-pg-oracle"
+version = "0.1.0"
+
+[[package]]
+name = "amphora-pg-parser"
+version = "0.1.0"
 
 [[package]]
 name = "android_system_properties"

@@ -985,7 +985,8 @@ mod stored {
     }
 
     /// The first record of a `/proc/cpuinfo`, its fields that don't move, one a line; None without
-    /// a whole record.
+    /// a whole record. Linux's alone: no other platform has the file.
+    #[cfg(any(target_os = "linux", test))]
     pub(super) fn cpu_record(text: &str) -> Option<String> {
         let (record, _) = text.split_once("\n\n")?;
         let kept: Vec<&str> = record

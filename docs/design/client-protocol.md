@@ -38,3 +38,68 @@ WebSocket or HTTP [p17] [p18], each judged first on whether it can carry an unkn
 
 **Needs Ada's word.** This record states what Amphora is today and keeps the network choice open;
 it is proposed, not approved. Reversible: nothing outside this file depends on it.
+
+## 2. SQL with bound parameters and typed rows on serve's connections (proposed 2026-11-23)
+
+**The decision.** `amphora serve` answers SQL from other machines on its own listener, taking up
+the network choice the first decision left open. A connection whose first byte is `Q` carries frames, each
+a little-endian length and a postcard value, under the same proof of the cluster's secret, the same
+mutual TLS and the same descriptor budget as its `C` and `R` connections, and is kept between
+requests. A request is `Write` (statements with bound parameters, run in order as one transaction
+on the group's writer: all of them or none) or `Read` (one statement on the member's own state,
+asking no leader, as `count` reads). Its answer is each statement's table: the columns' names, rows
+of SQLite's own types (NULL, INTEGER, REAL, TEXT and BLOB, as `amphora_api::Value`), the rows the
+last change touched and the last rowid; or a typed `Refusal`, a statement the engine refuses named
+by its place in the request, the statements before it rolled back with it. The first request is
+`Hello`, the oldest and newest versions the client speaks, answered with the newest both speak;
+variants are only appended, each raising the version, as the local protocol's do [p23]. The client
+is `serve::SqlClient`.
+
+**Bounds, derived, never picked.** A request frame is at most the API's request bound
+(`amphora_api::REQUEST_MAX`) and an answer at most its result bound (`amphora_api::RESULT_MAX`):
+the bounds an embedded caller of Amphora's API already has, so a caller on another machine gets
+the same. A request's bytes are charged to the process's memory budget (`Use::Queues`) before they
+are read, and decoded with the counts a `C` connection's are (`transport::bounded`: at most
+`TX_MAX` statements, each at most `TX_MAX` parameters), its decoded size charged while it runs. An
+answer's values are charged as the engine steps them, before each is kept: by their real size in
+memory (each value and what it points to) against the budget's room, and by their encoded size
+against the result bound; its frame is encoded and charged by its length inside the request's
+session, so a write commits only once its answer is held, and each is given back once written. Past
+a bound or the budget's room the answer is a typed `TooLarge`, a write rolled back whole, and the
+connection goes on; a frame refused is read past through a fixed buffer, never held.
+
+**Answers past one frame (version 2, 2026-11-23).** The engine hands a statement's rows over one
+at a time as it steps them (`Statement::each`), each value copied out of the engine once, never
+the whole result first. A frame ends when its next row would carry its rows past the result bound
+as the transport's decoders count it (each value's size in memory and what it points to,
+`transport::bounded::rows`), so every frame decodes within the bound on the client too. At version
+2 the rows before the last frame go as `Rows` frames (the statement's place in the request and its
+rows), ahead of the last frame, `Tables` or `Refused`; the client puts them ahead of each table's
+own rows, and drops them on a refusal. A read's frames go out on its link as each fills: the read
+holds the frame being written or the rows of the next, never the answer, and a client that stops
+reading holds the read only until its deadline, when the read is refused `Timeout` and the
+connection ends (a frame cut partway can't be followed by another). A write's frames are held,
+each charged by its length, until its transaction commits, so no write waits on a client's network
+and none commits unanswerable; past the budget's room it is refused and rolled back whole. A row
+past the bound by itself is refused `TooLarge`, midway or not, and the connection goes on. A client
+at version 1 gets version 1's answer: one frame, past the bound `TooLarge`.
+
+**Why, from the evidence.**
+- The benchmark drives every server from one program through that server's own client (MySQL's
+  protocol for MySQL, ClickHouse's for ClickHouse), so Amphora's own protocol is as fair as
+  theirs. A PostgreSQL listener would map SQLite's types onto PostgreSQL's and still leave
+  PostgreSQL's tools broken on what Amphora lacks: its catalog and its dialect.
+- The owner transport's network endpoint already carries typed statements and rows, but opens a
+  connection and a TLS handshake for each request and has no session client across machines;
+  serve's connections are kept, so a benchmark measures the database, not handshakes.
+- A transaction is one request, as Hrana's batches make one a single round trip [p19] and
+  Amphora's own call is one batch [p28]: no client holds a member's writer open across round
+  trips, so no write waits on a client's network.
+
+**What would falsify it.** A client whose transaction needs its own logic between statements
+across round trips; a write whose answer passes the memory budget's room and must still commit; a
+read too large to send within its deadline (a cursor kept across requests would take that up); or a
+measured class where serve's thread for each connection, not the engine, holds clients back.
+
+**Needs Ada's word.** Proposed, not approved. Left out, a variant appended later: a transaction
+held open across round trips.

@@ -217,10 +217,18 @@ fn bench(o: &Opts) -> anyhow::Result<Bench> {
     })
 }
 
-/// Linux's one-minute load average.
+/// The one-minute load average, from getloadavg(3), which Linux's and macOS's C libraries both
+/// have. /proc/loadavg, read before, is Linux's alone: on macOS every run's load was null and
+/// `--max-load` never held a run back (bench lane M, Mac Studio 2, 2026-11-23).
 #[cfg(not(windows))]
 pub(crate) fn load_average() -> Option<f64> {
-    std::fs::read_to_string("/proc/loadavg").ok()?.split_whitespace().next()?.parse().ok()
+    unsafe extern "C" {
+        fn getloadavg(loadavg: *mut f64, nelem: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    let mut one = [0f64; 1];
+    // SAFETY: getloadavg writes at most `nelem` (1) samples into `one`, which holds 1.
+    let got = unsafe { getloadavg(one.as_mut_ptr(), 1) };
+    if got == 1 { one.first().copied() } else { None }
 }
 
 /// Windows keeps no load average. Its nearest: the cores busy (`% Processor Time` of every
@@ -530,22 +538,31 @@ pub fn main() -> anyhow::Result<()> {
                 record["warmup"] = outcome_json(&target.run(&sql, o.timeout, None), load);
                 record["warmed_by"] = "warmup".into();
             }
-            // Under --answers the first timed run writes its rows; the runs after it are timed as
-            // without.
-            let mut answer = answers_dir.as_ref().map(|_| Answer::new(answers::MAX_ROWS, answers::MAX_BYTES));
+            // Under --answers every timed run writes its rows, the first as <target>.tsv and each
+            // after it as <target>-run<i>.tsv, so answers.py holds every run to the others' answer:
+            // Amphora plans each prepare on learned weights that move, and one run's plan can answer
+            // wrong where the first's answered right (lane T3, q05 at SF0.1).
             let mut runs = Vec::new();
-            for _ in 0..o.runs {
+            for i in 0..o.runs {
+                // The plan this run prepares, read on its connection just before it.
+                let plan = target.amphora().map(|amphora| match amphora.plan_json(&sql) {
+                    Ok(plan) => serde_json::from_str(&plan).unwrap_or(serde_json::Value::String(plan)),
+                    Err(e) => serde_json::json!({ "error": e.to_string() }),
+                });
                 let load = quiet(o.max_load, o.load_wait);
-                let mut capture = answer.take();
+                let mut capture = answers_dir.as_ref().map(|_| Answer::new(answers::MAX_ROWS, answers::MAX_BYTES));
                 let outcome = target.run(&sql, o.timeout, capture.as_mut());
                 let stop = !matches!(outcome, Outcome::Done(_));
                 let mut run = outcome_json(&outcome, load);
+                if let (Some(plan), Some(fields)) = (plan, run.as_object_mut()) {
+                    fields.insert("plan".into(), plan);
+                }
                 if let (Some(capture), Some(dir)) = (capture, &answers_dir) {
                     // This run's time holds the writing of its rows.
                     if let Some(fields) = run.as_object_mut() {
                         fields.insert("captured".into(), true.into());
                     }
-                    let path = dir.join(format!("{}.tsv", target.name()));
+                    let path = dir.join(if i == 0 { format!("{}.tsv", target.name()) } else { format!("{}-run{i}.tsv", target.name()) });
                     match &outcome {
                         Outcome::Done(_) => capture.write(&path)?,
                         Outcome::TimedOut => answers::write_refusal(&path, &Refusal::TimedOut)?,
