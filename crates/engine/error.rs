@@ -140,14 +140,23 @@ pub enum LimboError {
     /// refused whole and nothing is kept; its caller rolls back, and may run it again once the
     /// oldest snapshot closes and collection gives the memory back.
     #[error(
-        "versioned storage memory budget full: {what} asked {asked} bytes, {held} of {limit} held"
+        "versioned storage memory budget full: {} asked {} bytes, {} of {} held",
+        .0.what,
+        .0.asked,
+        .0.held,
+        .0.limit
     )]
-    MemoryBudget {
-        what: &'static str,
-        asked: u64,
-        held: u64,
-        limit: u64,
-    },
+    MemoryBudget(Box<BudgetFull>),
+}
+
+/// What a refused take of the versioned storage's memory budget asked for
+/// ([`LimboError::MemoryBudget`]), boxed so the error stays small (`limbo_error_stays_small`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetFull {
+    pub what: &'static str,
+    pub asked: u64,
+    pub held: u64,
+    pub limit: u64,
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes
