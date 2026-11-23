@@ -4582,6 +4582,56 @@ pub(crate) mod bushy_test_hook {
             assert_eq!(outcome(&sql), unshared, "{:?}", outcome(&format!("EXPLAIN QUERY PLAN {sql}")));
         }
 
+        /// Lane T10 (T9's open edge): the `IN` filter an OR's `column = literal` terms imply
+        /// (`in_filters_implied_by_or_branches`) runs on rows the OR never reaches, as a share
+        /// does. Here the column is of a custom type whose DECODE overflows on 13, and each table
+        /// holds one such row no row of the other joins, so whichever table a plan reads first
+        /// decodes one if it filters by the IN: the query answers as the same OR inside a CASE
+        /// (which no filter is taken from) does, rather than raising the decode's error.
+        #[test]
+        fn t10_an_in_filter_of_an_or_raises_no_error_the_or_would_not() {
+            let db = Database::open(
+                Arc::new(MemoryIO::new()),
+                ":memory:",
+                crate::OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(crate::DatabaseOpts::new().with_custom_types(true)),
+            )
+            .unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            for sql in [
+                "CREATE TYPE picky(value any) BASE integer ENCODE value \
+                 DECODE CASE WHEN value = 13 THEN abs(value - 9223372036854775807 - 14) ELSE value END",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, c picky) STRICT",
+                "CREATE TABLE u(id INTEGER PRIMARY KEY, d picky) STRICT",
+                "CREATE INDEX t_x ON t(x)",
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 300) \
+                 INSERT INTO t SELECT i, i, i % 3 FROM n",
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 300) \
+                 INSERT INTO u SELECT i, i % 3 FROM n",
+                "INSERT INTO t VALUES (1000, 99999, 13)",
+                "INSERT INTO u VALUES (5000, 13)",
+                "ANALYZE",
+            ] {
+                conn.execute(sql).unwrap();
+            }
+            let outcome = |sql: &str| -> std::result::Result<Vec<String>, String> {
+                let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+                let rows = stmt.run_collect_rows().map_err(|e| e.to_string())?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
+                    .collect())
+            };
+            let branches = "(t.c = 1 AND u.d = 1) OR (t.c = 2 AND u.d = 2)";
+            let unfiltered = outcome(&format!(
+                "SELECT count(*) FROM t, u WHERE u.id = t.x \
+                 AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
+            ));
+            assert_eq!(unfiltered, Ok(vec!["200".to_string()]));
+            let sql = format!("SELECT count(*) FROM t, u WHERE u.id = t.x AND ({branches})");
+            assert_eq!(outcome(&sql), unfiltered, "{:?}", outcome(&format!("EXPLAIN QUERY PLAN {sql}")));
+        }
+
         /// PL.8 (T-PL.8.13, lane pl8-19): the hand-built bushy tree `(a ((b l c) p))` whose run
         /// holds a LEFT JOIN of `q` (as `l`) on `b`, the run's table its ON reads, matching some
         /// of `b`'s rows and not others; with an ON term no index reads, and WHERE terms on the
