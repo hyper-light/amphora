@@ -6434,8 +6434,9 @@ mod tests {
         /// Each owner with work out off the driver's thread that ends, or comes to a held gate, on
         /// its own, and so rings [`OffThread`], as (owner, log writes out, database flush out): a
         /// log write or compaction on a member whose gate is open, or held with no flush at it
-        /// yet; or a flush of a member's database on its flushing thread. Only such work can move
-        /// a group whose round relayed nothing.
+        /// yet; or a flush of a member's database on its flushing thread while the test doesn't
+        /// hold its flushes (`FlushGate`), as a held one ends only once the test lets it go and
+        /// rings nothing as it waits. Only such work can move a group whose round relayed nothing.
         fn movers(&self) -> Vec<(usize, usize, bool)> {
             self.owners
                 .iter()
@@ -6447,7 +6448,8 @@ mod tests {
                         .get(&at)
                         .is_some_and(|gate| gate.is_held() && gate.waiting());
                     let writes = if parked { 0 } else { owner.replica.in_flight() };
-                    let flush = matches!(owner.flushing, Flushing::Thread { out: true, .. });
+                    let flush = matches!(owner.flushing, Flushing::Thread { out: true, .. })
+                        && !owner.replica.machine().flush_gate().is_held();
                     (writes != 0 || flush).then_some((at, writes, flush))
                 })
                 .collect()
