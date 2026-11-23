@@ -4,6 +4,10 @@
 # members (bench/repl_members.sh) are processes, so its competitors are too. Linux only (setsid,
 # pidfds, GNU tail; LiteFS's FUSE).
 #
+# Every PORT sits below 32768, outside the ephemeral ranges (Linux 32768-60999, macOS and Windows
+# 49152-65535): there a loopback client's local port can take a node's address and refuse its bind
+# (lane V6: dqlite's "failed to set bind address 127.0.0.1:54252" in 5 of 5 rounds).
+#
 # Each script sets SYS and PORT (node n's client port is PORT+n on 127.0.0.1; a system with a
 # second port a node takes PORT+10+n, and a third PORT+20+n) and READY (an ERE for the line the
 # node's own process prints once it takes requests: its ready signal), defines `run_node N` (starts

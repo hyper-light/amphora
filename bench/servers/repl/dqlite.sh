@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dqlite, three voters over Raft, through go-dqlite's app package: the bench's shim (shim/main.go,
 # built by setup.sh against the host's libdqlite) a process on this host for each node, /exec and
-# /count on 127.0.0.1:54240-54242, dqlite's own protocol on 54250-54252. go-dqlite sends every
+# /count on 127.0.0.1:29240-29242, dqlite's own protocol on 29250-29252. go-dqlite sends every
 # statement to the leader; a commit is acknowledged once a quorum's Raft logs hold it.
 #
 # Durability, from libdqlite v1.18.7's source (setup.sh's build when the host has none):
@@ -17,7 +17,7 @@
 # So the defaults already are "2 of 3 members' logs hold it, fsynced".
 set -euo pipefail
 SYS=dqlite
-PORT=${AMPHORA_BENCH_REPL_PORT:-54240}
+PORT=${AMPHORA_BENCH_REPL_PORT:-29240}
 DURABILITY="acknowledged once a quorum (2 of 3) of Raft logs hold it, each written O_DSYNC; libdqlite's and go-dqlite app's defaults, which no setting changes"
 # The comparability rule's column (lib.sh): a commit acknowledged by a quorum's Raft logs (above).
 COLUMN="quorum"
