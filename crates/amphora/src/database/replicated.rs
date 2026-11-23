@@ -19063,6 +19063,68 @@ mod tests {
         pump.finish();
     }
 
+    #[test]
+    fn p11_slot_scenario_on_a_running_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        assert_eq!(leader, 0);
+        driven
+            .call(&mut pump, &clients[0], |db| {
+                db.exec("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.quiet(&mut pump);
+        driven.owner_mut(0).slots.refused(3);
+        let failed = submit(&clients[2], driven.until(), |db| {
+            db.exec("INSERT INTO missing VALUES (1)")?;
+            Ok(Vec::new())
+        });
+        let mut holder = None;
+        for _ in 0..ROUNDS {
+            if let Ok(result) = failed.try_recv() {
+                holder = Some(result);
+                break;
+            }
+            for owner in 0..3 {
+                driven.advance_tick(owner);
+            }
+            driven.round(&mut pump);
+        }
+        let own = submit(&clients[0], driven.until(), |db| {
+            db.exec("INSERT INTO t VALUES (1, 'leader')")?;
+            Ok(Vec::new())
+        });
+        let other = submit(&clients[1], driven.until(), |db| {
+            db.exec("INSERT INTO t VALUES (2, 'member 2')")?;
+            Ok(Vec::new())
+        });
+        let (mut a, mut b) = (None, None);
+        let mut rounds = 0;
+        for _ in 0..ROUNDS {
+            if a.is_none() {
+                a = own.try_recv().ok();
+            }
+            if b.is_none() {
+                b = other.try_recv().ok();
+            }
+            if a.is_some() && b.is_some() {
+                break;
+            }
+            for owner in 0..3 {
+                driven.advance_tick(owner);
+            }
+            driven.round(&mut pump);
+            rounds += 1;
+        }
+        eprintln!("P11REAL holder {:?} leader {:?} member2 {:?} lapses {} rounds {rounds}", holder.map(|r| r.map(|_| ())), a.map(|r| r.map(|_| ())), b.map(|r| r.map(|_| ())), driven.lapses);
+    }
+
     /// Lane W3 (lane W2's finding, r831; replication.md, "the write slot"): a slot's holder whose
     /// write fails before it forwards anything tells its leader at once. Do, in a group of three:
     /// the holder (member 3), queued by an earlier refusal and knowing it, writes to a table that
