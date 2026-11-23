@@ -360,8 +360,8 @@ compile as they are; nothing to fix. Script: `~/.cache/amphora-perf/cross-a10-sc
 the two commits' lib test binaries have one path there, so r1235's `cargo test` rebuilt main's over r1245's
 binary after r1245's first runs: only runs whose log says `449 filtered out` (7c303299's test count; main's is
 452) are counted for 7c303299. r1265 re-runs w7 and w11 five more times each from a copy of 7c303299's binary
-(`~/.cache/amphora-perf-bin/cross/amphora-lib-7c303299`, logs `a10-pre2-*` on adacachy2); its numbers were not
-in when this lane ended. 7c303299..54a8bdf7 holds only A9's five commits.
+(`~/.cache/amphora-perf-bin/cross/amphora-lib-7c303299`, logs `a10-pre2-*` on adacachy2); its numbers are in
+the r1265 table below (lane perf-A11). 7c303299..54a8bdf7 holds only A9's five commits.
 
 | test | main 5e6c619f | before A9 7c303299 |
 |---|---|---|
@@ -400,3 +400,54 @@ What is left for lane A11 (decisions 3a, 3b and unit 4; not started here, so no 
 - 4. `store::Config::queue` (`Some(4096)` by default, `Groups` and tests/store.rs's `Some(1)`) and
   `ROOM_LOOK` (store.rs:516, the 5 ms re-look at :1452 and :1549) remain; bench/src/store.rs:195
   (`AMPHORA_QUEUE`, V4's bba65c73) sets the count and must go with it. The `Engine` trait has no row size yet.
+
+**r1265, added by lane perf-A11.** From the copied 7c303299 lib test binary (every log says `449 filtered out`,
+that commit's count), w7 and w11 each alone in its own process, runs 2-6, both tests at once (A10's
+`cross-a10/pre2.sh`; logs `~/.cache/amphora-perf/a10-pre2-7c303299-*` on adacachy2, 09:26-09:34 PST):
+
+| test | passed | failed (read's 120 s deadline) | cut off |
+|---|---|---|---|
+| w7 | 0 | 4 (runs 2-5; sql.rs:2952 then 3005) | 1 (run 6: only `running 1 test`, started 09:34:46 as the run ended) |
+| w11 | 1 (run 3, 0.42 s) | 4 (runs 2, 4, 5, 6; sql.rs:3281, `Err(Timeout)` vs `Ok(Some([8]))`) | 0 |
+
+With r1245's one run each, before A9 w7 failed 5 of 5 complete runs and w11 5 of 6, in the same places as on
+main (w7 11 of 11, w11 10 of 11). A9 did not make them fail.
+
+## A call's charge carried in Operation::Call; the replicated owner admits calls by their bytes (perf-A11)
+
+The coordinator's decisions on A10's questions: a replicated owner's queue admits by the declared sizes of the
+calls actually waiting, in bytes, not a count and not the largest bound seen; no fixed reserve for replication
+messages (votes, heartbeats and their answers get their own path, lane P9; log appends charged their real
+size like calls).
+
+**Unit 3a, part 1 (f2ff9b58, 4c529b66).** `Operation::Call(Mutex<Option<Call>>, usize)` carries the bytes its
+caller declared its answer holds, so `Admission::bytes_for` charges a call that. `Admission::reserve_call` and the
+`answer: Option<usize>` threaded through `session`, `call_db_session`, `submit_selected` and `submit_local` are
+gone. A replicated owner's `submit` charges `Admission::bytes_for(&operation)` (a Records operation its real
+size, a call its declared bytes), not `REQUEST_MAX` a request. The owner's queue no longer counts calls apart:
+its call count was what the intake took in an election timeout at `REQUEST_MAX` a call (`command_counts`), so
+with calls charged their declared bytes the count, not the bytes, would have bound them. Calls are now held by
+the bytes those waiting hold (`called` against `applications`) and take any of the queue's inputs but the
+last, which stays a wire record's. Codemods: `~/.cache/amphora-perf/cross-a11-scripts/*.py`.
+
+Tests: `a11_replicated_queue_admits_waiting_calls_by_their_declared_bytes` (two calls declaring a third of the
+calls' room admitted, the third refused `Full` at the calls' bytes through `submit`, typed; one more small
+declared call than the room held at `REQUEST_MAX` each, all admitted);
+`unknown_leader_application_pressure_keeps_wire_admission_available` rewritten to bytes (calls declaring an
+eighth of the room: 7 admitted, the 8th refused `Full` at the calls' bytes, a heartbeat still admitted and
+processed); `t_qb_1_6` counts inputs only; `mb1_*` asserts a call is charged its declared bytes.
+
+Still at `REQUEST_MAX`, so not done (the rest of 3a):
+
+- `call_db`/`call_internal`'s 19 callers (xgroup/sql.rs 6, across.rs 5, restore.rs 4, online.rs 2,
+  application.rs 1, call_internal itself) and `Database::query` on a replicated database. Their answers
+  (`Reply` and its dropped locks, `Held<T>`, `Stepped`, `ImportProgress`, `Option<Rev>` lists) have no
+  `AnswerBytes` impl, and a declared bound without the `within` check would be a charge nothing holds the
+  answer to. Next: `AnswerBytes` for those types, then `AnswerMax<R>` on `call_db`/`call_internal` (and on
+  `query`, ~280 lines name it), each bound derived from what the closure reads.
+- The wire record's byte room held back from calls (`queue_bounds`: `applications = queued - wire - envelope`;
+  `owner_image_room`: `room - REQUEST_MAX`; the record's `min(room - REQUEST_MAX)`) and the queue's last
+  input kept for a wire record. The decision removes them once votes and heartbeats have P9's own path; P9 is
+  not on main at 4c529b66, and removing them first would let waiting calls refuse the heartbeat that finds a
+  leader (the pressure test above). Log appends (`Input::Receive`) are already charged their bytes.
+
