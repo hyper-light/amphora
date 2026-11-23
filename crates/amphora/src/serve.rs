@@ -41,11 +41,12 @@
 //! clients reach it by, and the protocol agreed is [`ALPN`]. A client (`amphora ask`, `health`,
 //! `drill`) presents the chain of the config it reads. Without them the link is not encrypted.
 //!
-//! A connection's first byte says what it carries: `R` (a peer's Raft records), `C` (a client's
-//! requests) or `Q` (a client's SQL). The member answers with a challenge (32 random bytes) and the
+//! A connection's first byte says what it carries: `R` (a peer's Raft records that carry its log:
+//! appends and snapshots), `H` (a peer's other Raft records: heartbeats, votes and every answer),
+//! `C` (a client's requests) or `Q` (a client's SQL). The member answers with a challenge (32 random bytes) and the
 //! other side proves it holds the cluster's secret with HMAC-SHA256(secret, challenge || kind)
 //! (RFC 2104); the secret never crosses the link.
-//! Then `R`: the sender's node ID (u64, little endian) and records, each its length (u32, little
+//! Then `R` and `H`: the sender's node ID (u64, little endian) and records, each its length (u32, little
 //! endian, at most the replica's own record bound) and its bytes; `C`: requests, one line each,
 //! each answered by one line, `ok …` or `err …`, a line at most the API's request bound; `Q`:
 //! frames, each its length (u32, little endian) and a postcard value, a request at most the API's
@@ -53,7 +54,8 @@
 //! parameters, answered with typed rows and their columns' names, an answer past one frame in
 //! several from version 2 ([`SqlClient`]; docs/design/client-protocol.md, decision 2).
 //!
-//! Bounds: one records connection per peer (a new one from the same peer closes the old); each
+//! Bounds: one connection of each records kind per peer (a new one of that kind from the same
+//! peer closes the old); each
 //! client connection takes a descriptor from the process's budget ([`crate::descriptors`]) and is
 //! refused when there is none; each peer's queue holds at most the replica's own outgoing bound, past
 //! which records are lost as a congested link loses them, and Raft sends again what it needs.
@@ -66,7 +68,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use amphora_api::replication::{Durability, Fates, MemberChange, ReplicaConfig};
+use amphora_api::replication::{Durability, Fates, MemberChange, ReplicaConfig, Route};
 use amphora_api::{Refusal, Statement, Value};
 use anyhow::{Context, anyhow, bail, ensure};
 use hmac::{Hmac, Mac};
@@ -85,6 +87,10 @@ const OUTGOING_MESSAGES: usize = 4096;
 const RECORDS: u8 = b'R';
 const CLIENT: u8 = b'C';
 const SQL: u8 = b'Q';
+/// A peer's control records (`Route::Control`), on a connection of their own beside its
+/// `RECORDS` (CP-T1.13, replication.md "Decision (lane P9)"): a heartbeat, a vote and their answers
+/// are never written, read or stepped behind an append. A kind appended; framed as `RECORDS` is.
+const CONTROL: u8 = b'H';
 /// The newest version of a `Q` connection's frames this side speaks. A variant appended to
 /// [`SqlRequest`] or [`SqlAnswer`] raises it and is sent only at a version agreed that takes it
 /// (docs/design/client-protocol.md, decision 2). A format value. 3: Refusal gained
@@ -483,8 +489,9 @@ struct Shared {
     log: PathBuf,
     /// Each member's address as the config names it, for the `leader` request's answer.
     addrs: BTreeMap<u64, String>,
-    /// Each peer's records connection, to close it when the peer opens another.
-    links: Mutex<BTreeMap<u64, TcpStream>>,
+    /// Each peer's connection of each kind (`RECORDS`, `CONTROL`), to close it when the peer
+    /// opens another of that kind.
+    links: Mutex<BTreeMap<(u64, u8), TcpStream>>,
 }
 
 /// Runs the member `config` describes until its replica stops; `ready` is told its address once
@@ -535,19 +542,25 @@ pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
             .collect(),
         links: Mutex::new(BTreeMap::new()),
     });
-    let mut peers: BTreeMap<u64, mpsc::SyncSender<Vec<u8>>> = BTreeMap::new();
+    // Each peer's two paths, one sender each: its log's records and its control records.
+    let mut peers: BTreeMap<(u64, Route), mpsc::SyncSender<Vec<u8>>> = BTreeMap::new();
     for m in config.members.iter().filter(|m| m.node != config.node) {
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTGOING_MESSAGES);
-        let (addr, node, keys, deadline) = (
-            m.addr.clone(),
-            config.node,
-            shared.keys.clone(),
-            config.deadline,
-        );
-        std::thread::Builder::new()
-            .name(format!("amphora-peer-{}", m.node))
-            .spawn(move || to_peer(node, &addr, &keys, deadline, &rx))?;
-        peers.insert(m.node, tx);
+        for (route, kind, name) in [
+            (Route::Log, RECORDS, "peer"),
+            (Route::Control, CONTROL, "peer-control"),
+        ] {
+            let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTGOING_MESSAGES);
+            let (addr, node, keys, deadline) = (
+                m.addr.clone(),
+                config.node,
+                shared.keys.clone(),
+                config.deadline,
+            );
+            std::thread::Builder::new()
+                .name(format!("amphora-{name}-{}", m.node))
+                .spawn(move || to_peer(node, &addr, &keys, deadline, kind, &rx))?;
+            peers.insert((m.node, route), tx);
+        }
     }
     {
         let shared = Arc::clone(&shared);
@@ -565,7 +578,7 @@ pub fn serve(config: &Config, ready: impl FnOnce(&str)) -> anyhow::Result<()> {
             if shared.cut.load(Ordering::Relaxed) {
                 continue;
             }
-            if let Some(tx) = peers.get(&record.to) {
+            if let Some(tx) = peers.get(&(record.to, record.route)) {
                 let _ = tx.try_send(record.bytes);
             }
         }
@@ -618,7 +631,7 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
     // pooled client between requests. A dead peer's link is closed when it opens its next.
     socket.set_read_timeout(None)?;
     match kind {
-        [RECORDS] => {
+        [RECORDS] | [CONTROL] => {
             let mut from = [0u8; 8];
             r.read_exact(&mut from)?;
             let from = u64::from_le_bytes(from);
@@ -631,7 +644,7 @@ fn connection(shared: &Shared, s: TcpStream) -> anyhow::Result<()> {
                 .links
                 .lock()
                 .map_err(|_| anyhow!("links poisoned"))?
-                .insert(from, link)
+                .insert((from, kind[0]), link)
             {
                 let _ = old.shutdown(std::net::Shutdown::Both);
             }
@@ -1361,19 +1374,21 @@ impl Shared {
     }
 }
 
-/// A peer's records, in the order the member sent them, over one connection opened when the first
-/// comes and again after a failure: a record that can't be written is lost, as a network loses it.
+/// A peer's records of one route, in the order the member sent them, over one connection of
+/// `kind` opened when the first comes and again after a failure: a record that can't be written
+/// is lost, as a network loses it.
 fn to_peer(
     node: u64,
     addr: &str,
     keys: &Keys,
     deadline: Duration,
+    kind: u8,
     records: &mpsc::Receiver<Vec<u8>>,
 ) {
     let mut conn: Option<BufReader<Link>> = None;
     for bytes in records {
         if conn.is_none() {
-            conn = open(addr, keys, deadline, RECORDS)
+            conn = open(addr, keys, deadline, kind)
                 .and_then(|(mut s, _)| {
                     s.get_mut().write_all(&node.to_le_bytes())?;
                     Ok(s)
