@@ -2073,6 +2073,31 @@ list: `QUEUED_BYTES`, `OUTGOING_BYTES`, `OUTGOING_MESSAGES`).
 `mb1_unread_resident_bytes_fall_to_the_charges_counted` (T-MB.1.3), `mb1_this_process_reads_its_limit_and_resident_bytes`
 (T-MB.1.4, on Linux, macOS and Windows); the engine's `io::system_memory::tests::the_platform_says_its_physical_memory`.
 
+## Decision (lane perf-A9): a call is charged the answer bound its caller declares (2026-11-23)
+
+A request admitted to a database's writer is charged what it and its answer can hold (MB.1, `Admission::bytes_for`).
+A call's answer is whatever its closure returns, which no API bound holds, so `Database::call` was charged the full
+`REQUEST_MAX` (32 MiB): about 25 calls filled a 1 GiB scope.
+
+**The decision.** `Database::call`, `call_session` and `call_nowait` take the caller's bound on its answer,
+`AnswerMax<R>`: charged at admission, and checked inside the call's transaction before it commits (`AnswerBytes`, its
+bytes inline and on the heap), so an answer past it rolls the call back, refused `TooLarge`. A caller derives the bound:
+`AnswerMax::fixed()` for an answer that holds nothing on the heap (its type's size, checked by the type,
+`FixedAnswer`), a count of rows for a bounded read, or the API's own `RESULT_MAX` for an answer only it bounds (an SQL
+write's frames over the wire, as an SQL batch is charged, lane perf-A5).
+
+**Evidence.** Lane perf-A8's A/B (bench/records/2026-11-23-adacachy2-perf-cross.md, r949): 1k and 10k calls in
+flight, unconstrained and in a `MemoryMax=1G` scope, against the flat `REQUEST_MAX` and the answer's measured bytes
+charged on the writer. The flat charge refused 86-98k calls per 3 s in the scope; the declared bound beat the measured
+one on p50 (13-62%) and calls a second (10-36%) in all four cells and on the tails in three. Ada's decision: the
+declared bound, the only call charge.
+
+**What is left.** The cross-group steps' calls on the owner's own session (`call_internal`) and a replicated owner's
+command queue (replication.md, "A call is charged its worst case") still charge a call `REQUEST_MAX`.
+
+**Falsified if** a caller's derived bound refuses an answer its type or its read allows, or the declared bound loses
+p50, calls a second or the tails to another charge at 1k-10k calls in flight on the same machine.
+
 ## 44. A commit lays its chains' pages out in the buffer pool's frames, and finds its deltas in one buffer it reuses
 
 **Decision.** A mixed log's commit (`WalFile::lay_out`, decision 39) takes no buffer of its own for
