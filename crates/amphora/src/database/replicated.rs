@@ -10653,7 +10653,8 @@ mod tests {
     }
     /// T-QB.1.9 (QB.1, lane constants-21; replication.md, "The member bound stated once per group"):
     /// a group's member bound is its log's, so growth always works. Do: open one voter, and a
-    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running), and catch
+    /// learner 2 running beside it; add learner 2, then learners 3 to 9 (not running, so every
+    /// record to them is lost: the pump has no owner to hand it to), and catch
     /// member 2 up; restart the voter from the configuration it first opened with. Expect: the
     /// voter opened for 2 (twice its first configuration); each change past the bound raised it
     /// first, to 4, then 8 by the fifth member, then 16 by the ninth, every change answered;
@@ -10679,6 +10680,7 @@ mod tests {
         };
         assert_eq!(bound(&driven, 0), 2);
         let mut pump = Pump::new(&clients);
+        pump.lost.extend(3..=9);
         driven.elect(&mut pump, &clients[..1], 0, 1);
         for member in 2..=9 {
             let until = driven.until();
