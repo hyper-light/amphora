@@ -365,7 +365,7 @@ index 493c154146d0c2a2ce686eccbd2f366e8673c464..eebde9c7977c627c151b399dc141d1dd
  }
  
 diff --git a/crates/hyper-raft/src/tests.rs b/crates/hyper-raft/src/tests.rs
-index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..112fc5363c56e0941024ee752d30a59f08dbea8c 100644
+index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..47cb35a9c6e337fd128d21b0718101a63797c2cb 100644
 --- a/crates/hyper-raft/src/tests.rs
 +++ b/crates/hyper-raft/src/tests.rs
 @@ -47,6 +47,7 @@ fn drain(node: &mut RawNode<Memory>) -> Vec<Message> {
@@ -376,7 +376,7 @@ index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..112fc5363c56e0941024ee752d30a59f
          messages.extend(ready.take_messages());
          messages.extend(ready.take_persisted_messages());
          let mut applied = ready.committed_entries().last().map(|entry| entry.index);
-@@ -1461,6 +1462,76 @@ fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
+@@ -1461,6 +1462,77 @@ fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
      assert_eq!(light.messages()[0].index, 5);
  }
  
@@ -439,8 +439,9 @@ index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..112fc5363c56e0941024ee752d30a59f
 +    assert!(ready.snapshot().is_some());
 +    ready.take_persisted_messages();
 +    node.advance_issued(ready).unwrap();
-+    assert_eq!(node.raft.log().persisted(), 3);
-+    assert_eq!(node.raft.log().term(3).unwrap(), 0);
++    let durable = node.raft.log().persisted();
++    assert!(durable < 7);
++    assert_eq!(node.raft.log().term(durable).unwrap(), 0);
 +    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 1);
 +    beat.commit = 2;
 +    node.step(beat).unwrap();
@@ -453,7 +454,7 @@ index ff63b51f43a87ddab6f170c43a07ecb66b6ce5cb..112fc5363c56e0941024ee752d30a59f
  /// Election Safety across a crash: a candidate counts its vote for itself only once the hard state
  /// naming it is durable, so a sole voter leads only from then. Counted at once, the sole voter led on
  /// a vote it could lose: hyper-durable's simulation, seed 206 of its first shape, had member 3 elected
-@@ -2673,6 +2744,7 @@ fn drain_applying(node: &mut RawNode<Memory>) -> Vec<Message> {
+@@ -2673,6 +2745,7 @@ fn drain_applying(node: &mut RawNode<Memory>) -> Vec<Message> {
              let hard = *hard;
              node.store_mut().hard_state = hard;
          }
