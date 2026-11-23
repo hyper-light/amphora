@@ -13,7 +13,7 @@ use tracing::{instrument, Level};
 use crate::plan_cache::{CustomRun, PlanCacheMode, PlanChoice, PlanKind, PlanValues};
 use crate::{alloc::TursoIteratorExt, connection::PrepareOptions};
 use crate::{
-    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease},
+    busy::{BusyHandler, BusyHandlerState, BusyWake, LockRelease, OwnReleases},
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -935,7 +935,7 @@ impl Statement {
                 }
             }
         };
-        self.finish_step(res, waker)
+        self.finish_step(res, waker, own)
     }
 
     /// Amphora (PL.13, the in-run hand-off; `docs/design/planner.md`, "Decision (lane pl13)"): an
@@ -1086,6 +1086,7 @@ impl Statement {
         &mut self,
         mut res: std::result::Result<StepResult, Box<LimboError>>,
         waker: Option<&Waker>,
+        own: Option<OwnReleases>,
     ) -> Result<StepResult> {
         const MAX_SCHEMA_RETRY: usize = 50;
         for attempt in 0..MAX_SCHEMA_RETRY {
