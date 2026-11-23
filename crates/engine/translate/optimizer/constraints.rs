@@ -16,8 +16,8 @@ use crate::{
             WhereTermOrigin,
         },
         planner::{
-            break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
-            TableMask, ROWID_STRS,
+            break_predicate_at_and_boundaries, rewrite_between_exprs, rewrite_postfix_null_tests,
+            table_mask_from_expr, TableMask, ROWID_STRS,
         },
         Resolver,
     },
@@ -2116,6 +2116,7 @@ pub(super) fn partial_index_predicate_terms(
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
     rewrite_between_exprs(&mut bound).ok()?;
+    rewrite_postfix_null_tests(&mut bound).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     // A WHERE term had its BETWEENs rewritten when it was parsed (`parse_where`), as `bound` has;
