@@ -1965,7 +1965,6 @@ impl Driver {
 #[cfg(test)]
 mod answers {
     use super::*;
-    use crate::database::AnswerBytes;
 
     /// AUDIT 2026-11-23 §1, lane perf-A13: a lock step's reply at its real worst case, each key it
     /// reads at `KEY_MAX` with a value of `VALUE_MAX`, its list grown a push at a time and trimmed

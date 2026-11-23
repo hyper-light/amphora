@@ -42,7 +42,9 @@ impl Database {
         }
         database.call_db(
             until,
-            AnswerMax::bytes(std::mem::size_of::<Option<ImportProgress>>() + PROGRESS_HEAP_MAX),
+            AnswerMax::bytes(
+                std::mem::size_of::<Option<ImportProgress>>().saturating_add(PROGRESS_HEAP_MAX),
+            ),
             |db| progress(db),
         )
     }
@@ -91,7 +93,10 @@ impl Restore {
     }
 
     pub fn progress(&self, until: Instant) -> Result<ImportProgress, Refusal> {
-        self.database.call_db(until, AnswerMax::bytes(std::mem::size_of::<ImportProgress>() + PROGRESS_HEAP_MAX), |db| {
+        let answer = AnswerMax::bytes(
+            std::mem::size_of::<ImportProgress>().saturating_add(PROGRESS_HEAP_MAX),
+        );
+        self.database.call_db(until, answer, |db| {
             progress(db)?.ok_or_else(|| anyhow::anyhow!("restore metadata missing"))
         })
     }
