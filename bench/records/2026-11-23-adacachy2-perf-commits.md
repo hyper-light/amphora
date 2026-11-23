@@ -892,8 +892,10 @@ classes with no stale-base refusals. Measurement stopped at that order.
 
 ## Losses first
 
-1. **Test 5's verdict on the change is r1460's** (8600350e, `cargo test -p amphora --lib` filtered to test 5 and
-   `slot`, then clippy). If r1460 is red or did not finish by 19:42Z, the change is on `perf/commits-v8`, not main.
+1. **Only test 5 and the 18 tests named `slot` ran, not the module's suite.** Every follower barrier now takes a
+   slot, so other `database::replicated::` tests may move. Green at 6f072bef, 9521643c and 9c0ece85 (main): 19 of 19,
+   clippy `-p amphora --all-targets` clean. r1460 at 8600350e failed one: the slot's control test expected the old
+   first-try refusal, and now expects each try applied (6f072bef).
 2. **0009's split was measured in part and decided nothing.** Cell 1 ran (below) and is inside its noise. Cell 3's
    point reads all failed with "no such table: t", so it measured nothing (the driver's table is not where the
    member's `get` read looks; not traced). Cell 2 (20 MiB writes, beats on and off) never ran. Rule 0 parks all of it.
