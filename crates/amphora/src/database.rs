@@ -86,8 +86,7 @@ impl Admission {
         Self::charge(bytes, Self::bytes_for(operation))
     }
 
-    /// A call charged its command and `answer` bytes for its answer ([`AnswerCharge`]) in place
-    /// of the full `REQUEST_MAX`.
+    /// A call charged its command and the `answer` bytes its caller declared ([`AnswerMax`]).
     fn reserve_call(bytes: &Arc<AtomicUsize>, answer: usize) -> Result<Self, Refusal> {
         Self::charge(bytes, Self::fixed().saturating_add(answer))
     }
@@ -433,25 +432,65 @@ enum Operation {
 
 type Call = Box<dyn FnOnce(&mut Db) -> anyhow::Result<Box<dyn Any + Send>> + Send>;
 
-/// How [`Database::call_charged`] charges its answer to the queues' memory budget (MB.1) at
-/// admission (Ada's A/B of the call charge, AUDIT 2026-11-23 §1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnswerCharge {
-    /// Today's charge of [`Database::call`]: the full `REQUEST_MAX`, its answer unchecked.
-    Flat,
-    /// The caller declares the most bytes its answer holds: charged that at admission, and an
-    /// answer past it is refused.
-    Declared(usize),
-    /// Charged its command alone at admission, then the answer's own bytes once the closure
-    /// has run, before it commits.
-    Measured,
+/// The most bytes a call's answer `R` holds in memory ([`AnswerBytes`]), declared by its caller
+/// (AUDIT 2026-11-23 §1, MB.1): the call is charged it at admission, to the memory budget's room
+/// for queues, and an answer past it is refused inside the call's transaction, before it
+/// commits, so the call rolls back. The only charge a call takes: lane perf-A8's A/B (r949)
+/// against a flat `REQUEST_MAX` and the answer's measured bytes, Ada's decision (lane perf-A9).
+pub struct AnswerMax<R> {
+    bytes: usize,
+    answer: std::marker::PhantomData<fn() -> R>,
 }
 
-/// The bytes an answer holds in memory, inline and on the heap, for its charge to the memory
-/// budget ([`Database::call_charged`]).
+impl<R> Clone for AnswerMax<R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for AnswerMax<R> {}
+
+impl<R> std::fmt::Debug for AnswerMax<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AnswerMax").field(&self.bytes).finish()
+    }
+}
+
+impl<R> AnswerMax<R> {
+    /// An answer of at most `bytes`, a bound the caller derives from what it reads: a count of
+    /// rows, or the API's own bound on a result (`RESULT_MAX`).
+    #[must_use]
+    pub const fn bytes(bytes: usize) -> Self {
+        Self {
+            bytes,
+            answer: std::marker::PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.bytes
+    }
+}
+
+impl<R: FixedAnswer> AnswerMax<R> {
+    /// An answer whose type holds nothing on the heap: its type's own size, exactly what it
+    /// holds.
+    #[must_use]
+    pub const fn fixed() -> Self {
+        Self::bytes(std::mem::size_of::<R>())
+    }
+}
+
+/// The bytes an answer holds in memory, inline and on the heap, checked against the bound its
+/// call declared ([`AnswerMax`]).
 pub trait AnswerBytes {
     fn answer_bytes(&self) -> usize;
 }
+
+/// An answer that holds nothing on the heap, so its bytes are its type's size
+/// ([`AnswerMax::fixed`]).
+pub trait FixedAnswer: AnswerBytes {}
 
 macro_rules! inline_answer {
     ($($t:ty),*) => {$(
@@ -460,9 +499,24 @@ macro_rules! inline_answer {
                 std::mem::size_of::<Self>()
             }
         }
+        impl FixedAnswer for $t {}
     )*};
 }
-inline_answer!((), bool, i32, i64, u32, u64, usize, f64);
+inline_answer!(
+    (),
+    bool,
+    i8,
+    i16,
+    i32,
+    i64,
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    f64,
+    Duration
+);
 
 impl AnswerBytes for String {
     fn answer_bytes(&self) -> usize {
@@ -493,66 +547,55 @@ impl<T: AnswerBytes> AnswerBytes for Option<T> {
     }
 }
 
-impl<A: AnswerBytes, B: AnswerBytes> AnswerBytes for (A, B) {
-    fn answer_bytes(&self) -> usize {
-        let padding = std::mem::size_of::<Self>()
-            .saturating_sub(std::mem::size_of::<A>())
-            .saturating_sub(std::mem::size_of::<B>());
-        padding
-            .saturating_add(self.0.answer_bytes())
-            .saturating_add(self.1.answer_bytes())
-    }
-}
+impl<T: FixedAnswer> FixedAnswer for Option<T> {}
 
-/// The bytes a charged call's answer is charged at admission, `None` for the flat `REQUEST_MAX`.
-fn admitted_answer(charge: AnswerCharge) -> Option<usize> {
-    match charge {
-        AnswerCharge::Flat => None,
-        AnswerCharge::Declared(max) => Some(max),
-        AnswerCharge::Measured => Some(0),
-    }
-}
-
-/// A charged call on the writer: `f`, then its answer checked by `charge` inside the call's
-/// transaction, before it commits, so an answer past its bound rolls the call back. A measured
-/// answer's charge comes back with it.
-fn charged_body<R, F>(
-    charge: AnswerCharge,
-    f: F,
-) -> impl FnOnce(&mut Db) -> anyhow::Result<(R, Option<crate::memory::Charge>)> + Send + 'static
-where
-    R: AnswerBytes + Send + 'static,
-    F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
-{
-    move |db| {
-        let mut connection = crate::sql::Connection::new(db);
-        let value = f(&mut connection)?;
-        let held = match charge {
-            AnswerCharge::Flat => None,
-            AnswerCharge::Declared(max) => {
-                api::bound("call answer bytes", value.answer_bytes(), max)?;
-                None
+macro_rules! tuple_answer {
+    ($($name:ident . $index:tt),+) => {
+        impl<$($name: AnswerBytes),+> AnswerBytes for ($($name,)+) {
+            fn answer_bytes(&self) -> usize {
+                let padding = std::mem::size_of::<Self>()
+                    $(.saturating_sub(std::mem::size_of::<$name>()))+;
+                padding $(.saturating_add(self.$index.answer_bytes()))+
             }
-            AnswerCharge::Measured => Some(
-                crate::memory::process()
-                    .take(
-                        crate::memory::Use::Queues,
-                        u64::try_from(value.answer_bytes()).unwrap_or(u64::MAX),
-                    )
-                    .map_err(|refusal| match refusal {
-                        Refusal::TooLarge { limit, .. } => Refusal::Full { limit },
-                        other => other,
-                    })?,
-            ),
-        };
-        connection.finish()?;
-        Ok((value, held))
+        }
+        impl<$($name: FixedAnswer),+> FixedAnswer for ($($name,)+) {}
+    };
+}
+tuple_answer!(A.0, B.1);
+tuple_answer!(A.0, B.1, C.2);
+tuple_answer!(A.0, B.1, C.2, D.3);
+
+impl<T: AnswerBytes, const N: usize> AnswerBytes for [T; N] {
+    fn answer_bytes(&self) -> usize {
+        let inline = std::mem::size_of::<Self>()
+            .saturating_sub(std::mem::size_of::<T>().saturating_mul(N));
+        self.iter()
+            .fold(inline, |n, item| n.saturating_add(item.answer_bytes()))
     }
+}
+
+impl<T: FixedAnswer, const N: usize> FixedAnswer for [T; N] {}
+
+impl AnswerBytes for Value {
+    fn answer_bytes(&self) -> usize {
+        let heap = match self {
+            Value::Text(s) => s.capacity(),
+            Value::Blob(b) => b.capacity(),
+            _ => 0,
+        };
+        std::mem::size_of::<Self>().saturating_add(heap)
+    }
+}
+
+/// `value`, the answer of a call that declared `answer`; past it, refused, so the session that
+/// made it rolls back.
+fn within<R: AnswerBytes>(value: R, answer: AnswerMax<R>) -> Result<R, Refusal> {
+    api::bound("call answer bytes", value.answer_bytes(), answer.bytes)?;
+    Ok(value)
 }
 
 /// A call queued by [`Database::call_nowait`]: a future of its answer, woken once, when the
-/// call has committed or with why it won't. A measured answer's charge is held until it is
-/// taken, or the `Calling` dropped.
+/// call has committed or with why it won't.
 #[must_use = "a call's answer comes only through its Calling"]
 pub struct Calling<R> {
     slot: Arc<Mutex<Slot<R>>>,
@@ -560,7 +603,7 @@ pub struct Calling<R> {
 
 enum Slot<R> {
     Waiting(Option<std::task::Waker>),
-    Answered(Result<(R, Option<crate::memory::Charge>), Refusal>),
+    Answered(Result<R, Refusal>),
     Taken,
 }
 
@@ -584,7 +627,7 @@ impl<R> std::future::Future for Calling<R> {
                 *slot = Slot::Waiting(Some(waker));
                 std::task::Poll::Pending
             }
-            Slot::Answered(answer) => std::task::Poll::Ready(answer.map(|(value, _held)| value)),
+            Slot::Answered(answer) => std::task::Poll::Ready(answer),
             Slot::Taken => {
                 std::task::Poll::Ready(Err(unavailable("this call's answer was already taken")))
             }
@@ -597,7 +640,7 @@ impl<R> std::future::Future for Calling<R> {
 struct Answerer<R>(Option<Arc<Mutex<Slot<R>>>>);
 
 impl<R> Answerer<R> {
-    fn answer(&mut self, answer: Result<(R, Option<crate::memory::Charge>), Refusal>) {
+    fn answer(&mut self, answer: Result<R, Refusal>) {
         let Some(slot) = self.0.take() else {
             return;
         };
@@ -2053,12 +2096,14 @@ impl Database {
     /// Runs one adaptive SQL session atomically on the writer. The closure runs exactly once;
     /// an error rolls back the session, and a successful answer waits for the durable callback.
     /// A caller whose deadline expires after submission must treat the outcome as unknown.
-    pub fn call<R, F>(&self, until: Instant, f: F) -> Result<R, Refusal>
+    /// `answer`: the most bytes its answer holds, charged at admission; an answer past it rolls
+    /// the call back, refused ([`AnswerMax`]).
+    pub fn call<R, F>(&self, until: Instant, answer: AnswerMax<R>, f: F) -> Result<R, Refusal>
     where
-        R: Send + 'static,
+        R: AnswerBytes + Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
     {
-        self.call_session(until, f).map(|(value, _)| value)
+        self.call_session(until, answer, f).map(|(value, _)| value)
     }
 
     /// [`Database::call`], answered with its write's own session token (replication.md,
@@ -2068,7 +2113,30 @@ impl Database {
     /// else writes. A session keeps the latest of its tokens (`Token::after`). None standalone,
     /// for an attached client (whose reads all see every write) and for a session that wrote
     /// nothing.
-    pub fn call_session<R, F>(&self, until: Instant, f: F) -> Result<(R, Option<Token>), Refusal>
+    pub fn call_session<R, F>(
+        &self,
+        until: Instant,
+        answer: AnswerMax<R>,
+        f: F,
+    ) -> Result<(R, Option<Token>), Refusal>
+    where
+        R: AnswerBytes + Send + 'static,
+        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
+    {
+        self.session(until, Some(answer.bytes), move |connection| {
+            Ok(within(f(connection)?, answer)?)
+        })
+    }
+
+    /// One SQL session on the writer, or on an attached client's owner. `answer`: the bytes its
+    /// answer is charged at admission on a local writer, `None` for the operation's own bound
+    /// ([`Database::query`] on a replicated or attached database, which admits nothing here).
+    fn session<R, F>(
+        &self,
+        until: Instant,
+        answer: Option<usize>,
+        f: F,
+    ) -> Result<(R, Option<Token>), Refusal>
     where
         R: Send + 'static,
         F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
@@ -2080,7 +2148,7 @@ impl Database {
                 .map(|value| (value, None))
                 .map_err(Refusal::from);
         }
-        database.call_db_session(until, None, move |db| {
+        database.call_db_session(until, answer, move |db| {
             let mut connection = crate::sql::Connection::new(db);
             let value = f(&mut connection)?;
             connection.finish()?;
@@ -2088,43 +2156,18 @@ impl Database {
         })
     }
 
-    /// [`Database::call`] charged at admission by [`AnswerCharge`] in place of the full
-    /// `REQUEST_MAX` (AUDIT 2026-11-23 §1, MB.1; Ada's A/B of the call charge). Its answer's
-    /// bytes ([`AnswerBytes`]) are checked inside the call's transaction, before it commits: an
-    /// answer past its declared bound, or past the budget's room when measured, rolls the call
-    /// back and is refused. A measured answer's charge is held until the caller has it. An
-    /// attached client runs it as [`Database::call`].
-    pub fn call_charged<R, F>(
-        &self,
-        until: Instant,
-        charge: AnswerCharge,
-        f: F,
-    ) -> Result<R, Refusal>
-    where
-        R: AnswerBytes + Send + 'static,
-        F: FnOnce(&mut crate::sql::Connection<'_>) -> anyhow::Result<R> + Send + 'static,
-    {
-        let database = self.resolve(until)?;
-        if let Some(client) = database.remote_client() {
-            return client.call(until, f).map_err(Refusal::from);
-        }
-        database
-            .call_db_session(until, admitted_answer(charge), charged_body(charge, f))
-            .map(|((value, _held), _)| value)
-    }
-
-    /// [`Database::call_charged`] without blocking its caller (lane perf-A7): admitted and queued
-    /// at once, its answer handed to the returned [`Calling`], a future woken once the call has
+    /// [`Database::call`] without blocking its caller (lane perf-A7): admitted and queued at
+    /// once, its answer handed to the returned [`Calling`], a future woken once the call has
     /// committed or with why it won't, so a pool of a few threads holds any number of calls in
     /// flight. Admission refuses here, typed: past the budget's room for queues (`Full`), the only
     /// bound on the writer's queue (lane perf-A8). Only a local owner queues a call with no
     /// thread waiting on it: an attached client or a replicated database is refused here
-    /// ([`Database::call_charged`] answers there). A dropped [`Calling`] leaves the call to run
-    /// and commit; its charge goes back with its answer.
+    /// ([`Database::call`] answers there). A dropped [`Calling`] leaves the call to run and
+    /// commit.
     pub fn call_nowait<R, F>(
         &self,
         until: Instant,
-        charge: AnswerCharge,
+        answer: AnswerMax<R>,
         f: F,
     ) -> Result<Calling<R>, Refusal>
     where
@@ -2134,25 +2177,27 @@ impl Database {
         if Instant::now() >= until {
             return Err(Refusal::Timeout);
         }
-        let body = charged_body(charge, f);
-        let call: Call = Box::new(move |db| body(db).map(|v| Box::new(v) as Box<dyn Any + Send>));
+        let call: Call = Box::new(move |db| {
+            let mut connection = crate::sql::Connection::new(db);
+            let value = within(f(&mut connection)?, answer)?;
+            connection.finish()?;
+            Ok(Box::new(value) as Box<dyn Any + Send>)
+        });
         let slot = Arc::new(Mutex::new(Slot::Waiting(None)));
         let mut answerer = Answerer(Some(Arc::clone(&slot)));
         self.submit_local(
             "",
             Operation::Call(Mutex::new(Some(call))),
-            admitted_answer(charge),
+            Some(answer.bytes),
             until,
             Instant::now(),
             move |result: Result<Answer, Refusal>| {
-                answerer.answer(result.and_then(|answer| {
-                    match answer {
-                        Answer::Called(v) => v
-                            .downcast::<(R, Option<crate::memory::Charge>)>()
-                            .map(|v| *v)
-                            .map_err(|_| unavailable("wrong SQL session answer")),
-                        _ => Err(unavailable("wrong SQL session answer")),
-                    }
+                answerer.answer(result.and_then(|answer| match answer {
+                    Answer::Called(v) => v
+                        .downcast::<R>()
+                        .map(|v| *v)
+                        .map_err(|_| unavailable("wrong SQL session answer")),
+                    _ => Err(unavailable("wrong SQL session answer")),
                 }));
             },
         )?;
@@ -2185,7 +2230,7 @@ impl Database {
         self.call_db_session(until, None, f).map(|(value, _)| value)
     }
 
-    /// `answer`: the bytes the call's answer is charged at admission ([`AnswerCharge`]), `None`
+    /// `answer`: the bytes the call's answer is charged at admission ([`AnswerMax`]), `None`
     /// for the full `REQUEST_MAX`.
     fn call_db_session<R, F>(
         &self,
@@ -2222,7 +2267,7 @@ impl Database {
     {
         let database = self.resolve(until)?;
         let Writer::Local(store) = &database.shared.writer else {
-            return database.call(until, f);
+            return database.session(until, None, f).map(|(value, _)| value);
         };
         let _in_flight = database
             .shared
@@ -2837,7 +2882,7 @@ impl Database {
         let Writer::Local(store) = &self.shared.writer else {
             return Err(api::invalid(
                 "call_nowait",
-                "only a local owner queues a call without blocking; call_charged answers here",
+                "only a local owner queues a call without blocking; call answers here",
             ));
         };
         let admission = match call_answer {

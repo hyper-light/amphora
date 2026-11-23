@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 use amphora::database::online::{self, Plan, Stepped};
 use amphora::db::Db;
 use amphora_api::{Migration, Refusal};
@@ -253,7 +253,7 @@ fn t_t1_12_1_rows_that_break_a_unique_index_leave_the_old_schema() {
     );
     // The index is gone; its state and change rows too, or the same name couldn't stage again.
     let left = database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             let index: i64 = c.query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE name = 'ix'",
                 [],
@@ -318,7 +318,7 @@ fn t_t1_12_1_a_column_is_added_in_one_catalog_change_and_its_constraints_hold_fr
     );
     let read = |sql: &'static str| {
         database
-            .call(until(), move |c| {
+            .call(until(), AnswerMax::fixed(), move |c| {
                 let n: i64 = c.query_row(sql, [], |r| r.get(0usize))?;
                 Ok(n)
             })
@@ -326,7 +326,7 @@ fn t_t1_12_1_a_column_is_added_in_one_catalog_change_and_its_constraints_hold_fr
     };
     assert_eq!(read("SELECT count(*) FROM t WHERE c = 7"), 300);
     let write = |sql: &'static str| {
-        database.call(until(), move |c| {
+        database.call(until(), AnswerMax::fixed(), move |c| {
             c.execute(sql, [])?;
             Ok(())
         })
@@ -551,7 +551,7 @@ fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint()
     };
     let table_sql = || {
         database
-            .call(until(), |c| {
+            .call(until(), AnswerMax::fixed(), |c| {
                 let sql: String =
                     c.query_row("SELECT sql FROM sqlite_schema WHERE name = 't'", [], |r| {
                         r.get(0usize)
@@ -577,7 +577,7 @@ fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint()
         assert_eq!(table_sql(), before, "{name} changed the table");
     }
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute("UPDATE t SET a = NULL WHERE id = 150", [])?;
             Ok(())
         })
@@ -588,7 +588,7 @@ fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint()
         "{broken:?}"
     );
     let a_not_null = database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             let n: i64 = c.query_row(
                 "SELECT \"notnull\" FROM pragma_table_info('t') WHERE name = 'a'",
                 [],
@@ -607,7 +607,7 @@ fn t_t1_12_1_a_constraint_change_is_refused_unless_it_only_adds_the_constraint()
         added.applied && added.cutover.is_some() && added.rows >= 300,
         "{added:?}"
     );
-    let refused_write = database.call(until(), |c| {
+    let refused_write = database.call(until(), AnswerMax::fixed(), |c| {
         c.execute("INSERT INTO t (a, b) VALUES (1, NULL)", [])?;
         Ok(())
     });
@@ -770,7 +770,7 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
     };
     let schema = || {
         database
-            .call(until(), |c| {
+            .call(until(), AnswerMax::fixed(), |c| {
                 let sql: String = c.query_row(
                     "SELECT group_concat(sql, ';') FROM sqlite_schema WHERE name NOT LIKE '__amphora%'",
                     [],
@@ -782,7 +782,7 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
     };
     let star = |database: &Database| {
         database
-            .call(until(), |c| {
+            .call(until(), AnswerMax::fixed(), |c| {
                 let n: i64 =
                     c.query_row("SELECT count(*) FROM pragma_table_info('t')", [], |r| {
                         r.get(0usize)
@@ -816,12 +816,12 @@ fn t_t1_12_1_a_drop_is_refused_where_the_engine_refuses_it_and_its_slot_keeps_th
     let dropped = change("c", "ALTER TABLE t DROP COLUMN c").unwrap();
     assert!(dropped.applied && dropped.rows >= 300, "{dropped:?}");
     database
-        .call(until(), |c| {
+        .call(until(), AnswerMax::fixed(), |c| {
             c.execute("INSERT INTO t (a, b, d) VALUES (1, 'x', 2)", [])?;
             Ok(())
         })
         .unwrap();
-    let readd = database.call(until(), |c| {
+    let readd = database.call(until(), AnswerMax::fixed(), |c| {
         c.execute("ALTER TABLE t ADD COLUMN c INTEGER", [])?;
         Ok(())
     });

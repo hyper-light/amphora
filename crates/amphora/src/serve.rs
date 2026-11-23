@@ -815,6 +815,19 @@ struct Encoded {
     _held: Option<memory::Charge>,
 }
 
+/// A frame in a call's answer ([`crate::database::AnswerMax`]): its bytes count only when no
+/// charge of its own holds them, so the budget is never charged them twice.
+impl crate::database::AnswerBytes for Encoded {
+    fn answer_bytes(&self) -> usize {
+        let unheld = if self._held.is_some() {
+            0
+        } else {
+            self.bytes.capacity()
+        };
+        std::mem::size_of::<Self>().saturating_add(unheld)
+    }
+}
+
 /// `refusal`'s frame: a few bytes, written at once, uncharged.
 fn refused_frame(refusal: Refusal) -> anyhow::Result<Encoded> {
     Ok(Encoded {
@@ -1161,7 +1174,13 @@ impl Shared {
                 } else {
                     Spill::None
                 };
-                self.db.call(until, move |c| answered(c, statements, spill))
+                // A write's tables are at most the API's result bound a frame, as an SQL batch's
+                // are (lane perf-A5); each frame's bytes are charged as it's built (`frame`).
+                self.db.call(
+                    until,
+                    crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX),
+                    move |c| answered(c, statements, spill),
+                )
             }
             SqlRequest::Read(statement) => {
                 let spill = if streams {
@@ -1237,7 +1256,7 @@ impl Shared {
                 );
                 let sql = rest.to_owned();
                 self.db
-                    .call(until, move |c| {
+                    .call(until, crate::database::AnswerMax::fixed(), move |c| {
                         c.execute_batch(&sql)?;
                         Ok(())
                     })
@@ -2196,7 +2215,7 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("q.db"), sql_until()).unwrap();
-        db.call(sql_until(), |c| {
+        db.call(sql_until(), crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
             answered(
                 c,
                 vec![statement("CREATE TABLE t (id INTEGER PRIMARY KEY)", vec![])],
@@ -2217,7 +2236,7 @@ mod tests {
             "{:?}",
             read.map(|e| e.len())
         );
-        let write = db.call(sql_until(), move |c| {
+        let write = db.call(sql_until(), crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX), move |c| {
             answered(
                 c,
                 vec![
@@ -2315,7 +2334,7 @@ mod tests {
     /// A database of `rows` rows `(id, v)`, each `v` a blob of a MiB but the last, of `last` bytes.
     fn blobs(dir: &Path, rows: i64, last: usize) -> Database {
         let db = Database::open(&dir.join("q.db"), sql_until()).unwrap();
-        db.call(sql_until(), move |c| {
+        db.call(sql_until(), crate::database::AnswerMax::fixed(), move |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")?;
             for id in 1..=rows {
                 let size = if id == rows { last } else { MIB };
@@ -2411,7 +2430,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = blobs(dir.path(), 40, MIB);
         let frames = db
-            .call(sql_until(), |c| {
+            .call(sql_until(), crate::database::AnswerMax::bytes(amphora_api::RESULT_MAX), |c| {
                 answered(
                     c,
                     vec![
@@ -2534,7 +2553,7 @@ mod tests {
             })
         };
         let write = |id: i64| {
-            db.call(sql_until(), move |c| {
+            db.call(sql_until(), crate::database::AnswerMax::fixed(), move |c| {
                 c.execute(
                     "INSERT INTO t VALUES (?1, ?2)",
                     [Value::Integer(id), Value::Blob(vec![])],

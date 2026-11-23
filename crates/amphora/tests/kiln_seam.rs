@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use amphora::database::Database;
+use amphora::database::{AnswerMax, Database};
 
 mod migrations {
     pub const SCHEMA_EPOCH: u32 = 7;
@@ -91,7 +91,7 @@ impl Store {
                 }
                 Err(error) => return Err(error.into()),
             };
-        self.inner.database.call(deadline(), move |conn| {
+        self.inner.database.call(deadline(), AnswerMax::fixed(), move |conn| {
             migrations::require_installed(conn, required)
         })?;
         Ok(StoreWriterBoundary {

@@ -415,7 +415,7 @@ mod tests {
     fn cp_t1_13_a_request_past_its_bound_is_refused_too_large_typed() {
         let db = crate::database::Database::in_memory(until()).unwrap();
         let half = || amphora_api::Value::Blob(vec![0; amphora_api::RESULT_MAX / 2 + 1]);
-        db.call(until(), move |c| {
+        db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
             let refused = c.execute("SELECT ?1, ?2", [half(), half()]);
             assert!(
                 matches!(
@@ -436,7 +436,7 @@ mod tests {
     fn cp_t1_13_each_hands_rows_over_as_stepped() {
         use amphora_api::Value;
         let db = crate::database::Database::in_memory(until()).unwrap();
-        db.call(until(), |c| {
+        db.call(until(), crate::database::AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)")?;
             for id in 1..=3i64 {
                 c.execute(
@@ -519,7 +519,7 @@ mod tests {
         }
 
         let db = crate::database::Database::in_memory(until()).unwrap();
-        db.call(until(), |c| {
+        db.call(until(), crate::database::AnswerMax::fixed(), |c| {
             c.execute_batch("CREATE TABLE ordinary(value TEXT)")?;
             c.execute("INSERT INTO ordinary VALUES (?1)", ["__amphora_versions"])?;
             assert!(matches!(c.execute("DELETE FROM __amphora_versions", []), Err(super::Error::Refusal(Refusal::Invalid { .. }))));
@@ -560,7 +560,7 @@ mod tests {
         {
             let db = crate::database::Database::open(&path, until()).unwrap();
             let first = db
-                .call(until(), |c| {
+                .call(until(), crate::database::AnswerMax::fixed(), |c| {
                     c.execute_batch("CREATE TABLE reservations(id INTEGER PRIMARY KEY)")?;
                     let rev = c.records_commit("tenant", policy(None, b"initial"))?;
                     assert_eq!(
@@ -574,7 +574,7 @@ mod tests {
             assert_eq!(records.wait("policy", 0, until()).unwrap(), first);
 
             committed = db
-                .call(until(), move |c| {
+                .call(until(), crate::database::AnswerMax::fixed(), move |c| {
                     let row = c.records_get("tenant", "policy", b"active")?.unwrap();
                     c.execute("INSERT INTO reservations VALUES (1)", [])?;
                     let next = c.records_commit("tenant", policy(Some(row.rev), b"reserved"))?;
@@ -584,7 +584,7 @@ mod tests {
                 .unwrap();
             assert_eq!(records.wait("policy", first, until()).unwrap(), committed);
 
-            let stale: std::result::Result<(), Refusal> = db.call(until(), move |c| {
+            let stale: std::result::Result<(), Refusal> = db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
                 c.execute("INSERT INTO reservations VALUES (2)", [])?;
                 c.records_commit("tenant", policy(Some(first), b"stale"))?;
                 Ok(())
@@ -593,14 +593,14 @@ mod tests {
                 matches!(stale, Err(Refusal::Conflict { at: Some(at), .. }) if at == committed)
             );
 
-            let failed: std::result::Result<(), Refusal> = db.call(until(), move |c| {
+            let failed: std::result::Result<(), Refusal> = db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
                 c.execute("INSERT INTO reservations VALUES (3)", [])?;
                 c.records_commit("tenant", policy(Some(committed), b"discarded"))?;
                 anyhow::bail!("policy decision refused")
             });
             assert!(failed.is_err());
             // A nested savepoint discards both APIs and must not publish its provisional revision.
-            db.call(until(), move |c| {
+            db.call(until(), crate::database::AnswerMax::fixed(), move |c| {
                 let nested = c.unchecked_transaction()?;
                 nested.execute("INSERT INTO reservations VALUES (4)", [])?;
                 nested.records_commit("tenant", policy(Some(committed), b"nested"))?;
@@ -613,7 +613,7 @@ mod tests {
                 records.wait("policy", committed, Instant::now()),
                 Err(Refusal::Timeout)
             ));
-            db.call(until(), |c| {
+            db.call(until(), crate::database::AnswerMax::fixed(), |c| {
                 let count: i64 =
                     c.query_row("SELECT count(*) FROM reservations", [], |r| r.get(0))?;
                 assert_eq!(count, 1);
@@ -636,7 +636,7 @@ mod tests {
                 .value,
             b"reserved"
         );
-        db.call(until(), |c| {
+        db.call(until(), crate::database::AnswerMax::fixed(), |c| {
             let ids: i64 = c.query_row("SELECT sum(id) FROM reservations", [], |r| r.get(0))?;
             assert_eq!(ids, 1);
             Ok(())
@@ -654,7 +654,7 @@ mod tests {
         use amphora_api::Value;
         let db = crate::database::Database::in_memory(until()).unwrap();
         let (columns, rows) = db
-            .call(until(), |c| {
+            .call(until(), crate::database::AnswerMax::fixed(), |c| {
                 c.execute_batch("CREATE TABLE held(a INTEGER); INSERT INTO held VALUES (1)")?;
                 let mut all = c.prepare_cached("SELECT * FROM held")?;
                 let before = all.query_row([], |r| Ok(r.column_count()))?;
@@ -701,7 +701,7 @@ mod tests {
         FROM ci_log_grams p WHERE p.gram=?1 AND (p.finished,p.leg_order,p.leg,p.block)<(?5,?6,?7,?8) ORDER BY p.finished DESC,p.leg_order DESC,p.leg DESC,p.block DESC LIMIT 8";
         let db = crate::database::Database::in_memory(until()).unwrap();
         let (pages, prepared, text) = db
-            .call(until(), |c| {
+            .call(until(), crate::database::AnswerMax::fixed(), |c| {
                 c.execute_batch(
                     "CREATE TABLE parsed_once(a INTEGER, b TEXT);
                      CREATE TABLE ci_log_grams(gram TEXT, finished INTEGER, leg_order INTEGER, leg TEXT, block INTEGER, bits BLOB);
@@ -777,7 +777,7 @@ mod tests {
         }
         let db = crate::database::Database::in_memory(until()).unwrap();
         let (texts, refusals) = db
-            .call(until(), |c| {
+            .call(until(), crate::database::AnswerMax::fixed(), |c| {
                 c.execute_batch("CREATE TABLE marked(a INTEGER)")?;
                 for i in 0..3i64 {
                     c.execute(INSERT, vec![Value::Integer(i)])?;
@@ -806,7 +806,7 @@ mod tests {
             "a refused text is parsed again each time: it's never marked"
         );
         let (count, after) = db
-            .call(until(), |c| {
+            .call(until(), crate::database::AnswerMax::fixed(), |c| {
                 c.execute(INSERT, vec![Value::Integer(3)])?;
                 let count = select(c)?;
                 let again = [super::parses(INSERT), super::parses(SELECT)];
@@ -887,7 +887,7 @@ mod tests {
         const SAVEPOINT: &str = "SAVEPOINT s /* marked by a session */";
         const RELEASE: &str = "RELEASE s /* marked by a session */";
         let db = crate::database::Database::in_memory(until()).unwrap();
-        db.call(until(), |c| {
+        db.call(until(), crate::database::AnswerMax::fixed(), |c| {
             for _ in 0..2 {
                 c.execute(SAVEPOINT, [])?;
                 c.execute(RELEASE, [])?;
