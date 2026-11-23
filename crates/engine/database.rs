@@ -2910,7 +2910,7 @@ impl Database {
             ),
             morsel_searched_links: AtomicU64::new(0),
             morsel_seek_links: AtomicU64::new(0),
-            vectorized_scans: AtomicBool::new(false),
+            vectorized_scans: AtomicBool::new(true),
             enable_load_extension: AtomicBool::new(self.can_load_extensions()),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
