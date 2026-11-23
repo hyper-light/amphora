@@ -39,10 +39,6 @@ impl Decimal {
         Self { digits: vec![0], ..Self::default() }
     }
 
-    pub fn is_null(&self) -> bool {
-        self.is_null
-    }
-
     fn int_len(&self) -> usize {
         self.digits.len().saturating_sub(self.frac)
     }
