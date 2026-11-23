@@ -2164,3 +2164,103 @@ buffer of a page; a row read back other than as committed (the tests above).
   could wait on the same event.
 - **Falsified by.** A busy statement that never wakes though the lock was released (a missed release); wake latency
   under `Release` above `Schedule`'s at any rung of the ladder.
+
+## 45. A restart switches the log to its second segment: no read holds a write back (decided 2026-11-23, not yet built)
+
+**What was there.** Decision 4 starts the log again (`Readers::restart_if_asked`, `crates/amphora/src/store.rs`) with
+the readers' gate taken for writing and every slot taken: the writer waits for every read under way, and a read that
+arrives meanwhile waits behind it. A read holds its snapshot, and the gate, until its answer is out; a streamed answer
+until its last frame is written to its client, which can take the request's whole deadline (`serve.rs`,
+`Answering::send`: each frame's write gets the request's time left and is refused past it). Lane P4 found the result:
+one slow streaming client holds every write, and every new read behind the waiting writer, for up to the deadline (5 s
+by default) at each restart. The writer waits because a restart writes the log again from its first frame: a read
+whose snapshot ends inside the log would read a later generation's frames in place of its own.
+
+**Decision (the coordinator, 2026-11-23).** The log is two segments, as in SQLite's wal2: the file it has today
+(`<db>-wal`) and a second (`<db>-wal2`). The writer appends to one of them, the current one. Where decision 4 starts
+the log again, the writer switches instead. It writes the other segment's header (new salts, the checkpoint sequence
+one past the current one's), syncs it before any frame follows (decision 13's rule), and appends there from its first
+frame. It takes no gate and waits for no read. The segment it left is now closing. Every frame in it was committed
+before any frame of the current one.
+
+- **The shape.** Each segment is `Current`, `Closing { reads, copied, shipped }` or `Free`. A switch turns the current
+  segment into `Closing` and a `Free` one into `Current`. A reset turns `Closing { reads: 0, copied: true, shipped:
+  true }` into `Free`. The writer switches only into a `Free` segment. A read's snapshot is the closing segment
+  whole, if there is one, plus the current one up to its last commit. A page is looked up in the current segment,
+  then the closing one, then the file. Each segment keeps its own frame index: the frame cache and decision 40's
+  lock-free index are per segment, because frame numbers start again in each.
+- **Checkpoints.** The checkpointer copies the closing segment first and the current one's frames only after it. The
+  other order is wrong: a frame copied from the current segment would be overwritten by an older one copied after it.
+  Its passive copy of the closing segment stops at the oldest snapshot inside it, and only reads begun before the
+  switch hold one there. Reads begun after the switch see the whole closing segment and hold nothing back. The copy
+  and the file's flush that decision 4's restart made on the writer move to the checkpointer. A switch costs the
+  writer one header write and its sync, against today's copy of what is left, the file's flush and the header's sync
+  (10-14 ms on fedora, decision 4).
+- **The reset, on an event.** The closing segment is reset (`Free`) once it is copied whole, the file is flushed, a
+  backup has shipped it (decision 31's backup rule moves from the restart to the reset), and no read can look into
+  it. Each read counts itself on the segments its snapshot reaches. The reset is made by whichever of two events
+  comes last: the give-back of the last read counted on the segment (its count reaching zero), or the checkpointer's
+  pass that copies its last frame. Each already happens, so the reset needs no timer and no poll. It writes nothing.
+  The segment's frames stay until the next switch writes a new header over them (decision 13). Decision 31's cut of
+  a log past twice its bound applies to a segment at its reset.
+- **Bounded.** A read holds a segment for at most its request's deadline D. Reads begun before the switch end by D
+  after it. Reads begun before the closing segment's copy finished end by D after that. So a closing segment is free
+  within 2D plus one copy of it after the switch. If the current segment reaches its bound first, the writer keeps
+  appending to it past the bound and switches at its first turn after the reset. It waits for nothing either way.
+  Each segment then holds at most its bound plus what the writer appends in 2D plus one copy. The A/B below measures
+  that against today's twice-the-bound.
+
+**On disk.** Old files open. A database whose header says one-segment WAL opens and recovers as today. The new code
+upgrades it at its first restart, in a step that is safe to crash in. Once the log is copied whole and the file
+flushed (the moment today's restart already reaches), the file's header is written with the two-segment version and
+flushed, before the second segment exists. The version lives in the database header's read and write version bytes
+(18 and 19), where SQLite marks WAL against rollback. Each segment's header also carries a new log-format version, so
+a `-wal` of the new format is refused by code that knows only the old one. New files carry both versions from their
+first write. Old code refuses a two-segment database cleanly: an unknown version is an error at open, never a panic
+or an assert. SQLite's wal2 does the same ("Attempting to use any other version of SQLite results in an SQLITE_NOTADB
+error"). Not yet checked: how the engine's open path treats an unknown value in those bytes today. A database can't
+return to the old code after its upgrade. That is the format's price, and it is Ada's to accept.
+
+**Crash recovery across a switch.** Recovery reads both segments' headers. A segment whose header checksum fails is
+empty. Of two valid segments, the one with the higher checkpoint sequence is current and the other closing. Each
+segment's frames are recovered as one log's are today (salts and checksums, up to the last valid commit frame), the
+closing one's first. A recovered database has copied nothing of either segment, as one log's recovery does today, so
+the checkpointer copies the closing segment and then the current one. A crash at each step of a switch leaves:
+
+1. Before the other segment's header is synced: that segment holds its old header (two sequences back) or a torn
+   one. Nothing was appended after the switch began, so every commit is in the current segment.
+2. After the header's sync, before any frame: two valid segments, the new one empty. Every commit is in the closing
+   one.
+3. Frames in the new segment: its valid prefix, as one log's recovery finds today.
+4. After a reset: the reset wrote nothing, so recovery finds the closing segment valid and recovers its frames again.
+   They are already in the file, and copying them again writes the same pages before the current segment's newer
+   frames are copied.
+5. During the upgrade: a one-segment database whose log is copied, or a two-segment one with one segment.
+
+**Sources.** SQLite's wal2 branch, `doc/wal2.md` (github.com/sqlite/sqlite, branch `wal2`): the files are
+"<database>-wal" and "<database>-wal2"; "Once the first wal file has grown large enough, writers switch to appending
+data to the second wal file"; "At this point the first wal file can be checkpointed (after which it can be
+overwritten)"; "once the second wal file has grown large enough and the first wal file has been checkpointed,
+writers switch back to the first wal file". Checkpoint starvation under overlapping readers, which the writer's wait
+prevents today: sqlite.org/wal.html, "Avoiding Excessively Large WAL Files". Decisions 4, 13, 15 and 31 here.
+
+**Tests (behaviour, none on elapsed time).**
+- `d45_a_write_commits_while_a_read_holds_the_closing_segment`: a read holds its snapshot across a switch (its closure
+  blocked on a channel). A write handed over then is acknowledged durable while the read still holds, and the read
+  then answers its snapshot's rows, without the write's.
+- `d45_the_closing_segment_is_reset_when_its_last_read_leaves`: copied whole and held by one read, the closing segment
+  is not reset. The read gives back, and it is reset with no other event between.
+- `d45_a_crash_at_each_step_of_a_switch_loses_no_commit`: `tests/crash.rs`'s power cut at each I/O of a switch, a
+  reset and the upgrade (steps 1-5). After reopening, every acknowledged batch is present, nothing refused is found,
+  and nothing is torn.
+- `d45_a_one_segment_database_opens_and_upgrades_at_its_first_restart`, and
+  `d45_a_two_segment_database_is_refused_by_one_segment_code` (an unknown version is an error at open).
+
+**The A/B (main against the two segments, one binary each).** Writers at 32 and 128 clients with one slow reader
+present: a streamed read to a client that reads nothing (P4's test in `serve.rs`), held for its deadline and started
+again each time it ends. Commit p50, p99 and p99.9; read p50, p99 and p99.9; the log's largest size on disk; switches
+or restarts counted. 5 alternated rounds, cpus=16, load and pressure recorded beside each run.
+
+**Falsified by.** A write that waits for a read (the first test failing, or the A/B's commit p99.9 still at the
+deadline); a closing segment never reset while reads come and go (the log growing without bound in the A/B); an
+acknowledged commit lost, or a database refused, after a crash in a switch.
