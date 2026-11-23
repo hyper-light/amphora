@@ -1091,6 +1091,15 @@ impl Db {
         Ok((count, size))
     }
 
+    /// The pages of the database as this connection's open read sees it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "unit B wires the snapshot source to Request::Pages")
+    )]
+    pub(crate) fn page_count(&self) -> anyhow::Result<u32> {
+        self.image_extent().map(|(count, _)| count)
+    }
+
     /// The bytes an image of this database would hold now, as `image_pages` counts them.
     pub(crate) fn image_bytes(&mut self) -> anyhow::Result<usize> {
         self.exec("BEGIN")?;

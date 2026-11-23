@@ -28,6 +28,7 @@ pub(crate) mod closed;
 pub(crate) mod floor;
 pub(crate) mod members;
 pub(crate) mod readsets;
+pub(crate) mod source;
 
 const BASELINE_DELTA: &[u8] = b"amphora.delta.v1\0";
 const BASELINE_SNAPSHOT: &[u8] = b"amphora.snapshot.v1\0";
