@@ -288,6 +288,14 @@ pub struct Config {
     /// What a member says when it answers a heartbeat, and what its leader
     /// makes of a full window.
     pub heartbeat_answers: HeartbeatAnswers,
+    /// A member whose term and vote are durable answers a heartbeat at once, whatever its writes
+    /// out, stating only what its disk holds: the durable commit and, under
+    /// [`HeartbeatAnswers::Position`], the durable end of its log (`Raft::answer_beat_now`).
+    /// Its owner's flush then no longer holds the leader's read round, nor the read barrier of
+    /// the leader's next write. Off, as raft-rs's rule: the answer waits for the write that holds
+    /// what it says, and states the commit that write made durable, so the two cores compare
+    /// under one setting.
+    pub answer_beats_now: bool,
     /// What a member does with a leader's entries that arrive ahead of a
     /// hole in its log.
     pub ahead: Ahead,
@@ -375,6 +383,7 @@ impl Config {
             raft_rs_precedence: false,
             read_rounds: ReadRounds::Shared,
             heartbeat_answers: HeartbeatAnswers::Position,
+            answer_beats_now: false,
             ahead: Ahead::Kept,
             fast: false,
             skip_bcast_commit: false,
@@ -773,6 +782,13 @@ pub struct Raft<S> {
     /// with. Its answers state no more when they leave
     /// (`RawNode::durable_commit`).
     pub(crate) durable_commit: u64,
+    /// The term and vote storage holds durably: as the member opened, then as the last write
+    /// known durable stated them (`RawNode`'s notices). A member whose term and vote are durable
+    /// answers a heartbeat at once ([`Raft::answer_beat_now`]).
+    pub(crate) durable_vote: (u64, NodeId),
+    /// Heartbeats' answers that wait for no write ([`Raft::answer_beat_now`]): they leave at once,
+    /// beside the held answers.
+    beat_answers: Vec<Message>,
     /// What this member's durable log may lack of what it acknowledged ([`Lost`]).
     lost: Option<Lost>,
     /// Commits on entries held in memory (core step R-8): what a member keeps for them, behind a
@@ -1436,6 +1452,8 @@ impl<S: Storage> Raft<S> {
             priority: config.priority,
             priority_in_force: 0,
             durable_commit: 0,
+            durable_vote: (0, 0),
+            beat_answers: Vec::new(),
             lost: config.lost,
             held_commit: Box::default(),
             conf_before: Configuration::default(),
@@ -4557,6 +4575,9 @@ impl<S: Storage> Raft<S> {
         }
         let mut answer = proto::message(message.from, MessageType::MsgHeartbeatResponse);
         answer.context = std::mem::take(&mut message.context);
+        if self.config.answer_beats_now && self.vote_durable() {
+            return self.answer_beat_now(answer);
+        }
         answer.commit = self.log.committed();
         if self.config.heartbeat_answers == HeartbeatAnswers::Position {
             // How far this log goes. It is sent once what the log holds is
@@ -4565,6 +4586,39 @@ impl<S: Storage> Raft<S> {
             answer.log_term = self.log.last_term()?;
         }
         self.send(answer)
+    }
+    /// Whether the term and vote this member holds are durable.
+    #[inline]
+    pub(crate) fn vote_durable(&self) -> bool {
+        self.durable_vote == (self.term, self.vote)
+    }
+    /// A heartbeat's answer that waits for no write of this member's: its term and vote are
+    /// durable (I1), and it states no commit and no position its disk doesn't hold, so it leaves
+    /// at once, whatever writes are out. Its position is the durable end of the log, not its last
+    /// index: the leader takes a position of its term as an append's answer and counts it toward
+    /// the classic quorum and the reads it confirms. Where that entry's term can't be read (a
+    /// snapshot taken and not yet durable) it states no position. Without it, a follower's write
+    /// out held its leader's read round, and with it the read barrier of the leader's next write,
+    /// behind that write's flush (Amphora's lane V2, AC-T1.8.3).
+    fn answer_beat_now(&mut self, mut answer: Message) -> Result<()> {
+        answer.from = self.id;
+        answer.term = self.term;
+        // As `Raft::send` states it on every answer: marked through a promise of its term, the
+        // member asks its leader where its log ends (R-8).
+        answer.incarnation = self.held_asking();
+        answer.commit = self.durable_commit.min(self.log.committed());
+        if self.config.heartbeat_answers == HeartbeatAnswers::Position {
+            let durable = self.log.persisted();
+            if let Ok(term) = self.log.term(durable) {
+                answer.index = durable;
+                answer.log_term = term;
+            }
+        }
+        self.beat_answers
+            .try_reserve(1)
+            .map_err(|_| Error::Memory)?;
+        self.beat_answers.push(answer);
+        Ok(())
     }
     fn handle_snapshot(&mut self, mut message: Message) -> Result<()> {
         let snapshot = message
@@ -5316,13 +5370,20 @@ impl<S: Storage> Raft<S> {
                 .iter()
                 .all(|(_, promise, _)| promise.term == 0)
     }
-    /// The held answers waiting to be taken, to send at once (R-8).
-    pub(crate) fn take_held_answers(&mut self) -> Vec<Message> {
-        std::mem::take(&mut self.held_commit.out)
+    /// The answers waiting to be taken that leave at once, whatever the writes out: the held
+    /// answers (R-8), then the heartbeats' answered on a durable term and vote
+    /// ([`Raft::answer_beat_now`]).
+    pub(crate) fn take_answers_now(&mut self) -> Vec<Message> {
+        let mut answers = std::mem::take(&mut self.held_commit.out);
+        if answers.is_empty() {
+            return std::mem::take(&mut self.beat_answers);
+        }
+        answers.append(&mut self.beat_answers);
+        answers
     }
-    /// Whether held answers wait to be taken.
-    pub(crate) fn has_held_answers(&self) -> bool {
-        !self.held_commit.out.is_empty()
+    /// Whether answers that leave at once wait to be taken.
+    pub(crate) fn has_answers_now(&self) -> bool {
+        !self.held_commit.out.is_empty() || !self.beat_answers.is_empty()
     }
 }
 
