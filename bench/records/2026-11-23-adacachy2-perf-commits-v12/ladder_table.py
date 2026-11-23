@@ -10,7 +10,6 @@ for line in open(os.path.join(out, "cells.log")):
         env[(int(m[1]), m[2], int(m[3]), m[4])] = (m[5].split(",")[0], m[6][6:], m[7][6:], m[8][6:])
     m = re.match(r"\S+ end r(\d) (\S+) (\d+) (\S+) rc=(\d+)", line)
     if m:
-        env.setdefault(("rc",) + (int(m[1]), m[2], int(m[3]), m[4]), m[5])
         env[("rc", int(m[1]), m[2], int(m[3]), m[4])] = m[5]
 rows = {}
 for f in sorted(glob.glob(os.path.join(out, "r*", "*-commit.jsonl"))):
@@ -27,7 +26,7 @@ for f in sorted(glob.glob(os.path.join(out, "r*", "*-commit.jsonl"))):
 f2 = lambda v, d=1: "-" if v is None else (f"{v:.{d}f}" if isinstance(v, (int, float)) else str(v))
 print("| system | writers | route | commits/s per round | median | p50 ms per round | p99 ms per round | stale-base refusals | deadline misses | run refused | load1, cpu some, io some per round |")
 print("|---|---|---|---|---|---|---|---|---|---|---|")
-for s in sorted({k[0] for k in env if k[0] != "rc"} | {k[0] for k in rows}):
+for s in sorted({k[1] for k in env if k[0] != "rc"} | {k[0] for k in rows}):
     for w in (1, 32, 128):
         for rt in ("spread", "leader"):
             per = rows.get((s, w, rt), {})
