@@ -1,0 +1,28 @@
+{"record":"load","rows":5,"s":0.01037304,"table":"region","target":"amphora"}
+{"record":"load","rows":25,"s":0.005361272,"table":"nation","target":"amphora"}
+{"record":"load","rows":200000,"s":0.447081321,"table":"part","target":"amphora"}
+{"record":"load","rows":10000,"s":0.051558568,"table":"supplier","target":"amphora"}
+{"record":"load","rows":800000,"s":4.026578385,"table":"partsupp","target":"amphora"}
+{"record":"load","rows":150000,"s":0.605562846,"table":"customer","target":"amphora"}
+{"record":"load","rows":1500000,"s":4.984086838,"table":"orders","target":"amphora"}
+{"record":"load","rows":6001215,"s":34.948633249,"table":"lineitem","target":"amphora"}
+{"record":"load","s":36.191053037,"table":"indexes and statistics","target":"amphora"}
+{"record":"load","rows":5,"s":0.001235389,"table":"region","target":"sqlite"}
+{"record":"load","rows":25,"s":0.000126316,"table":"nation","target":"sqlite"}
+{"record":"load","rows":200000,"s":0.27279195,"table":"part","target":"sqlite"}
+{"record":"load","rows":10000,"s":0.014010619,"table":"supplier","target":"sqlite"}
+{"record":"load","rows":800000,"s":1.178311272,"table":"partsupp","target":"sqlite"}
+{"record":"load","rows":150000,"s":0.208405006,"table":"customer","target":"sqlite"}
+{"record":"load","rows":1500000,"s":1.985563668,"table":"orders","target":"sqlite"}
+{"record":"load","rows":6001215,"s":17.993161415,"table":"lineitem","target":"sqlite"}
+{"record":"load","s":19.540367738,"table":"indexes and statistics","target":"sqlite"}
+{"record":"load","rows":5,"s":0.019882996,"table":"region","target":"duckdb"}
+{"record":"load","rows":25,"s":0.01398415,"table":"nation","target":"duckdb"}
+{"record":"load","rows":200000,"s":0.435934741,"table":"part","target":"duckdb"}
+{"record":"load","rows":10000,"s":0.03816609,"table":"supplier","target":"duckdb"}
+{"record":"load","rows":800000,"s":1.8957532879999999,"table":"partsupp","target":"duckdb"}
+{"record":"load","rows":150000,"s":1.548441851,"table":"customer","target":"duckdb"}
+{"record":"load","rows":1500000,"s":2.794652456,"table":"orders","target":"duckdb"}
+{"record":"load","rows":6001215,"s":15.420482447,"table":"lineitem","target":"duckdb"}
+{"record":"load","s":22.488275433,"table":"indexes and statistics","target":"duckdb"}
+{"args":"--planner --bench tpch --sf 1 --data /home/adalundhe/.cache/planner-bench/tpch-sf1 --queries /home/adalundhe/.cache/amphora-perf/bench-s/bench/planner/tpch/queries --dir /home/adalundhe/.cache/amphora-perf/bench-s6-run/db/tpch-sf1 --targets amphora,sqlite,duckdb --max-load 100000 --load-wait-s 0 --only - --out /home/adalundhe/.cache/amphora-perf/bench-s6-run/out/tpch-load.jsonl","bench":"tpch","client":"amphora-bench --planner, one process, each engine through its own library, one connection each, timed by one Instant around prepare and every row read","commit":"cfa0107c5e45833823fc4f52e9bd238159ae9293","cores":32,"cores_ladder":[],"count_timeout_s":1800,"date":"2026-11-23T19:59:44Z","dirty_files":0,"engines":[{"adaptive_joins":false,"cache_kib":2097152,"engine":"amphora","threads":1,"vectorized_scans":false},{"cache_kib":2097152,"engine":"sqlite","mmap_size":2147418112,"temp_store":2,"threads":1,"version":"3.53.2"},{"engine":"duckdb","memory_limit":"98.3 GiB","threads":"1","version":"v2.0.0"}],"host":{"cpu":"AMD Ryzen 9 9950X3D2 16-Core Processor","disk":"Samsung SSD 9100 PRO 2TB","fs":"btrfs","host":"adacachy2","kernel":"Linux 7.3.3-1-cachyos","load_kind":"Linux's one-minute load average","mem_gib":"122.9"},"limit":null,"max_load":100000.0,"phase":"warm","platform":{"arch":"x86_64","container":null,"cpu":"AMD Ryzen 9 9950X3D2 16-Core Processor","data_dir":"/home/adalundhe/.cache/amphora-perf/bench-s6-run/db/tpch-sf1","disk":"Samsung SSD 9100 PRO 2TB","engine_runs":"in the driver's process","fs":"btrfs","host":"adacachy2","kernel":"Linux 7.3.3-1-cachyos","os":"linux"},"queries":22,"record":"run","runs":3,"sf":1.0,"source_revision":"32f1c1b92d1664dba542e927d23d86ffa57aa253","timeout_s":600}

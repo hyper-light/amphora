@@ -79,6 +79,9 @@ mod pragma;
 mod progress;
 mod pseudo;
 mod regexp;
+// floatingpoint.html §2: the CLI's ieee754 and decimal extensions (lane G13).
+mod decimal;
+mod ieee754;
 mod row_changes;
 #[cfg(feature = "series")]
 mod series;
