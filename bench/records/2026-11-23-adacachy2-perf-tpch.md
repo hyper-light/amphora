@@ -1240,3 +1240,6 @@ amphora-engine --lib --locked -- learned_costs t13_ storage::pager::tests`.
   only on counts below the ratchet, from G16's work: panic 198 (199 held), indexing_slicing 3,184 (3,186),
   cast_possible_truncation 549 (550), cast_possible_wrap 685 (686). `scripts/engine-ratchet.toml` is lowered
   to those, as B13 did. disallowed_methods holds at 40 with the rewrite.
+- r1718 (79a9cde4, the lowered ratchet): check-production passed ("10908 left in the engine's production code
+  across 17 lints, as the ratchet holds"), clippy clean, tests 43 of 43. Main then moved by bench records
+  only (lane Q1), merged without a new run.
