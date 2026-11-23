@@ -4473,8 +4473,9 @@ pub(crate) mod bushy_test_hook {
         /// `p` was priced at every row (the branches' brands are all of them, so the IN filter
         /// on brand keeps every part) and the plan read all 60,000 of `l`. Each table's share of
         /// the OR now filters it alone, so the plan starts from `p`'s few rows and seeks `l` by
-        /// its index. Expect: full-scan steps fewer than `l`'s rows, and the answer of the same
-        /// OR inside a CASE, which no share is taken from.
+        /// its index. Expect: fewer VM steps than reading `l` whole with its own filters (work
+        /// any plan reading all of `l` does), and the answer of the same OR inside a CASE, which
+        /// no share is taken from.
         #[test]
         fn t8_q19_each_tables_share_of_an_or_filters_it_before_the_join() {
             let io = Arc::new(MemoryIO::new());
@@ -4513,27 +4514,16 @@ pub(crate) mod bushy_test_hook {
                      WHERE p.id = l.pk AND CASE WHEN {branches} THEN 1 ELSE 0 END = 1"
                 ),
             );
-            let count = |sql: &str| -> u64 { rows(&conn, sql)[0].parse().unwrap() };
-            let lines = count("SELECT count(*) FROM l");
-            let mut stmt = conn.prepare(&sql).unwrap();
-            let answer: Vec<String> = stmt
-                .run_collect_rows()
-                .unwrap()
-                .into_iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|value| value.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .collect();
-            let full_scan_steps = stmt.stmt_status(crate::StatementStatusCounter::FullscanStep);
-            let plan = rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"));
+            let (_, whole_l, _) = by_cost(
+                &conn,
+                "SELECT count(*), sum(l.price) FROM l WHERE l.mode IN (0, 1) AND l.instr = 0",
+            );
+            let (answer, steps, plan) = by_cost(&conn, &sql);
             assert_ne!(unshared, vec!["0,".to_string()], "no row passes the OR");
             assert_eq!(answer, unshared, "{plan:?}");
             assert!(
-                full_scan_steps < lines,
-                "{full_scan_steps} full-scan steps, {lines} rows of l: {plan:?}"
+                steps < whole_l,
+                "{steps} steps, reading l whole with its own filters takes {whole_l}: {plan:?}"
             );
         }
 
