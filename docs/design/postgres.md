@@ -128,9 +128,28 @@ PostgreSQL sends a result as DataRow messages with no cap on their number or tot
 Amphora streams them too: rows go out as the statement steps, each chunk of output charged to the
 session's memory budget at its real size while it waits for the socket and released when the socket
 takes it. A reader slower than its result stops its own statement's stepping until its socket can
-take more (a writability event, never a timer); it slows nothing else, and there is no fixed
-result-size refusal. A snapshot held open by a long result keeps its versions as PostgreSQL's
+take more (a writability event, never a timer); while stopped, the statement holds no reader (the
+next subsection), so it slows nothing else, and there is no fixed result-size refusal. A snapshot held open by a long result keeps its versions as PostgreSQL's
 would, charged to the engine's version budget and spilled as engine.md §10 and §14 say.
+
+### Portals and long reads hold no connection between fetches
+
+A requirement (the coordinator, 2026-11-23): a read that spans round trips runs on a snapshot
+cursor that holds no connection between fetches, no reader and never the writer, so a slow or
+pausing client can't stall anyone else. That covers Execute with a row limit and the
+PortalSuspended that follows it, `DECLARE ... CURSOR` with `FETCH` and `MOVE` (in a transaction,
+and `WITH HOLD` past it), and a result stopped on a slow socket. Between fetches the cursor keeps
+only its snapshot, pinned and charged to the engine's version budget as a long result's is today,
+and its place in the plan: where each scan resumes, and the output of any blocking step (a sort,
+an aggregate, a hash join's build) spilled and charged to the session's budget. Each fetch takes a
+reader, resumes on the same snapshot, steps until the row limit or the session's output budget,
+records its place and gives the reader back. The rows are 19's, in 19's order, as if the portal had
+held its connection. The same cursor serves Amphora's own protocol for a read that outlives a
+request deadline (lane P4 left that to this record). Section 11's unit 9b builds it.
+
+**Falsified by.** A session whose portal is suspended, or whose client has stopped reading, holding
+a reader or the writer between fetches; or a fetch resumed on another snapshot, or at another row,
+than the one the portal stopped at.
 
 **The client-protocol record's condition.** client-protocol.md §1 left the network listener open,
 to be "judged first on whether it can carry an unknown outcome typed". PostgreSQL carries it in its
@@ -533,6 +552,7 @@ correctly. A unit that outgrows its hour splits at its check.
 | 7 | The catalog core: the vendored `.dat` tables, `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, OIDs, `search_path` | Built-in `pg_type` rows equal 19's; name resolution tests |
 | 8 | Analysis for int4, int8, text, char(n), `"char"`, timestamp, timestamptz (and the assignment cast between them under the session's `TimeZone`), `regclass`, and their operators and casts, with SQLSTATEs | `SELECT 1` is int4; `2147483647 + 1` is `22003`; `$1::pg_catalog.regclass` resolves a table; results typed as 19 types them |
 | 9 | Lowering into the planner and the keys of section 5 for those types; RowDescription and DataRow in text | TPC-B's statements on a small table give 19's rows |
+| 9b | Snapshot cursors (section 2, "Portals and long reads hold no connection between fetches"): a statement's read parked between fetches on its pinned snapshot and its place, with no reader and never the writer; resume by re-seek, blocking steps spilled; serving Execute's row limit, `DECLARE`/`FETCH`, a result stopped on a slow socket, and Amphora's own reads past a request deadline | More sessions than the process has readers, each with its client stopped mid-result or its portal suspended, and another session's `SELECT` still runs; each parked read then resumes to 19's rows in 19's order on its own snapshot |
 | 10 | The extended protocol and binary formats for those types | pgbench `-M extended` and `-M prepared` statement flows, and step `g`'s `PQexecParams` relkind query (`pgbench.c:868`), through the test client |
 | 11 | COPY FROM STDIN with `FREEZE` (sent to servers reporting 14 or later, `pgbench.c:5050-5052`), TRUNCATE, VACUUM, `ALTER TABLE ADD PRIMARY KEY`, `CREATE TABLE ... WITH (fillfactor)`, `generate_series` in FROM | `pgbench -i` (steps `dtgvp`, and `G`) leaves the tables 19 leaves |
 | 12 | The start-up query's catalog: `pg_partitioned_table`, `pg_inherits`, LATERAL, `current_schemas`, `array_position`, text[] | pgbench's partition query returns 19's row; TPC-B at one client runs with no failure and the balances agree (milestone one at one client) |
