@@ -2,7 +2,7 @@
 //! No retry replays application closures or submitted writes. Every platform uses a protected
 //! owner record and a local listener; Windows additionally requires an exclusive address bind.
 mod auth;
-mod bounded;
+pub(crate) mod bounded;
 mod common;
 mod endpoint;
 pub mod network;
