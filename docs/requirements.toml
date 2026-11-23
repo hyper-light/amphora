@@ -1692,5 +1692,6 @@ tests = [
   { id = "T-PG.3.2", text = "amphora-pg-oracle split::tests::t_pg_3_2_* — pass when semicolons in quotes, parentheses and routine bodies, backslash commands and COPY data split as psql splits them, and hostile scripts end" },
   { id = "T-PG.3.3", text = "amphora-pg-oracle tests/oracle.rs t_pg_3_3_refuses_what_a_19_0_server_refuses_where_it_refuses_it (on demand) — SELECT $1abc is 42601 at 8, NOTIFY ch, $1 is 42601 at 12, as 19.0 answers" },
   { id = "T-PG.3.4", text = "amphora-pg-oracle tests/oracle.rs t_pg_3_4_every_regression_statement_gets_a_verdict (on demand), over vendor/postgres/src/test/regress/sql" },
+  { id = "T-PG.4.2", text = "amphora-pg-oracle t_pg_4_2_token_lines_read_back, tests/oracle.rs t_pg_4_2_tokens_are_what_19s_grammar_receives (on demand)" },
   { id = "T-PG.4.1", text = "amphora-pg-parser scan::tests::t_pg_4_1_longest_match_takes_scan_ls_lexemes, t_pg_4_1_every_byte_matches_a_rule_in_initial — pass when the tables' longest match takes scan.l's lexemes and no byte jams the start condition" },
 ]
