@@ -481,7 +481,12 @@ hour closed both on `perf/commits-v5` (`2431406e`).
    of the answer's own term to the disk: V3's stated rule and the leader's (`handle_heartbeat_response` takes a
    position only when `log_term == term`). The coordinator said not to loosen the check; this is the evidence for
    doing it, and the stricter alternative is in "Decisions".
-2. LADDER_PLACEHOLDER
+2. **No A/B numbers yet.** The replication ladder (S4's family (a): Amphora persisted and replicated at
+   `924fbe5c` and at `2431406e`, dqlite and rqlite, writers 1/32/128, 5 rounds, order reversed each round) was
+   queued as r1238 at 16:59Z with cpus=16, behind this lane's checks. Its records land on adacachy2 under
+   `~/.cache/commits-ab/ladder-v5/` (one folder an arm, `rounds.txt` with load and pressure beside each round); its
+   output ends with a median table. The successor reads them. Each arm's CPU cost calibration (RULES 5e) was not
+   copied across arms; the commit path is plain inserts, so a guess is that it doesn't matter, not checked.
 
 ## Where the named positions came from (diagnostics, branch `diag/commits-v5-watch`)
 
@@ -523,5 +528,34 @@ harness doesn't.
 | clippy `-p amphora --all-targets -D warnings`; `-p hyper-raft -p hyper-durable` (lib) | clean | r1217 |
 | amphora replicated suite and the `v3_` tests | 140 of 141, 5 ignored, 131.7 s; both `v3_` tests pass. The one failure is main's own, `a_write_at_a_follower_is_answered_on_its_groups_commit` (V4: 6 of 6 on main; unchanged on main `5e6c619f`) | r1217 |
 | `scripts/vendor.py check hyper-raft` | 8 recorded changes, 0 differences | local |
+| merged with origin/main (`faaf2a7d`): clippy `-p amphora --all-targets`, clippy `-p hyper-raft -p hyper-durable`, the `v3_` tests | clean, clean, 2 of 2 | r1236 |
 
 Load on adacachy2 during r1216: 9 to 33 (1 min), CPU pressure "some" avg10 3 to 7%, I/O under 5%.
+
+## Decisions for Ada (plain choices)
+
+1. **The heartbeat oracle's scope.** It now checks every position of the answer's own term, the only positions a
+   leader counts. The stricter form (every nonzero position) fails on the default path, which names its log's last
+   index and can leave after a new leader's entries replaced that tail. To keep the stricter form, the default
+   path would have to name no position of an older term. That changes the core's default answers, and no leader
+   reads those positions today. Recommended: keep it as merged.
+2. **A position of term 0.** With a snapshot restored and not yet durable, `answer_beat_now` names `persisted` with
+   log term 0 (`Log::term` gives 0 below the snapshot). No leader takes it, but its comment says it "states no
+   position". A one-line `term != 0` guard would make the code say what the comment says. Not changed here.
+
+## Commands
+
+    # hyper-raft's proof: kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=8,mem=24g, sync false;
+    # upstream clone ~/.cache/amphora-perf/commits-hyper-raft at d5d5f8f6 plus vendor/patches/hyper-raft/*.patch of
+    # the commit named, RUSTUP_TOOLCHAIN=1.99.1, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits-hyper-raft
+    cargo test -p hyper-raft --test pipeline --no-fail-fast -- --test-threads=8 faults_at_rest held_commits_across_fates members_of_one_fate random_interleavings_by_suspicion   # r1205 and the 16:34Z and 16:36Z runs, diag/commits-v5-watch
+    cargo test -p hyper-raft --lib --tests --no-fail-fast -- --test-threads=8        # r1216 at 2431406e
+    cargo test -p hyper-durable --lib --tests --no-fail-fast -- --test-threads=8     # r1216
+    cargo clippy -p hyper-raft -p hyper-durable --all-targets -- -D warnings -A deprecated   # r1216
+    # Amphora: cwd ~/.cache/amphora-perf/commits-remote, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits
+    cargo clippy -p amphora --all-targets --locked -- -D warnings                    # r1217, r1236
+    cargo test -p amphora --lib --locked -- database::replicated:: --test-threads=8  # r1217
+    cargo test -p amphora --lib --locked -- database::replicated::tests::v3_ --test-threads=2   # r1236 at faaf2a7d
+    # the ladder: after arm built in a worktree at 2431406e (~/.cache/commits-ab/2431406e, release, 1 min 42 s),
+    # copied to ~/.cache/amphora-perf-bin/commits/2431406e; bench/repl_ladder.sh and repl_members.sh take ARM_BIN
+    # (a sed in that worktree, undone after); needs cpus=16                         # r1238
