@@ -4469,8 +4469,9 @@ pub(crate) mod bushy_test_hook {
 
         /// Lane T8 (TPC-H q19 at SF1, 17x SQLite's time): q19's shape at small scale, an OR of
         /// three branches each joining `p` to `l` with terms on each table alone. `p`'s terms
-        /// keep 120 of its 2,000 rows, yet they stayed inside the OR, which also reads `l`, so
-        /// `p` was priced at every row and the plan read all 60,000 of `l`. Each table's share of
+        /// keep 239 of its 2,000 rows, yet they stayed inside the OR, which also reads `l`, so
+        /// `p` was priced at every row (the branches' brands are all of them, so the IN filter
+        /// on brand keeps every part) and the plan read all 60,000 of `l`. Each table's share of
         /// the OR now filters it alone, so the plan starts from `p`'s few rows and seeks `l` by
         /// its index. Expect: full-scan steps fewer than `l`'s rows, and the answer of the same
         /// OR inside a CASE, which no share is taken from.
@@ -4484,10 +4485,10 @@ pub(crate) mod bushy_test_hook {
                 "CREATE TABLE l(id INTEGER PRIMARY KEY, pk INT, qty INT, mode INT, instr INT, \
                  price INT)",
                 "CREATE INDEX l_pk ON l(pk)",
-                // One part for each brand, container and size; each part's 30 lines take each
+                // Brand, container and size independent; each part's 30 lines take each
                 // quantity once, and every mode and instruction in turn.
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2000) \
-                 INSERT INTO p SELECT i, i % 5, i / 5 % 10, i / 50 % 50 + 1 FROM x",
+                 INSERT INTO p SELECT i, i % 3, i / 3 % 10, i / 30 % 50 + 1 FROM x",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
                  INSERT INTO l SELECT i, i % 2000 + 1, i / 2000 % 50 + 1, (i * 3 + i / 2000) % 7, \
                  (i + i / 2000) % 4, i % 1000 FROM x",
@@ -4495,13 +4496,13 @@ pub(crate) mod bushy_test_hook {
             ] {
                 conn.execute(sql).unwrap();
             }
-            let branches = "(p.id = l.pk AND p.brand = 1 AND p.container IN (0, 1, 2, 3) \
+            let branches = "(p.id = l.pk AND p.brand = 0 AND p.container IN (0, 1, 2, 3) \
                  AND l.qty >= 1 AND l.qty <= 11 AND p.size BETWEEN 1 AND 5 \
                  AND l.mode IN (0, 1) AND l.instr = 0) \
-                 OR (p.id = l.pk AND p.brand = 2 AND p.container IN (4, 5, 6, 7) \
+                 OR (p.id = l.pk AND p.brand = 1 AND p.container IN (4, 5, 6, 7) \
                  AND l.qty >= 10 AND l.qty <= 20 AND p.size BETWEEN 1 AND 10 \
                  AND l.mode IN (0, 1) AND l.instr = 0) \
-                 OR (p.id = l.pk AND p.brand = 3 AND p.container IN (6, 7, 8, 9) \
+                 OR (p.id = l.pk AND p.brand = 2 AND p.container IN (6, 7, 8, 9) \
                  AND l.qty >= 20 AND l.qty <= 30 AND p.size BETWEEN 1 AND 15 \
                  AND l.mode IN (0, 1) AND l.instr = 0)";
             let sql = format!("SELECT count(*), sum(l.price) FROM l, p WHERE {branches}");
