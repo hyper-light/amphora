@@ -643,3 +643,16 @@ NOT on main. Main moved after r1582, so the merged tree was checked again (r1601
   on_writer)` when `readers.with` gives `None` (store.rs:1484, :1521), queuing a `Msg::Run` on the unbounded
   queue with no charge; `Database::query_reader`'s writer fallback is the place to charge it at admission (its
   `AnswerMax` plus the closure).
+
+## Unit 3's landing re-checked; unit 4 built, unchecked (perf-A16)
+
+**Unit 3.** r1629 (adacachy2, needs linux/amd64,cpus=4,mem=12g, `~/.cache/amphora-perf/cross-a16-scripts/check16.sh`: check15.sh held to 4 jobs and 4 test threads) at c79b2d53 (e0fcbc82 + main 98bd0fa9: pg-parser tests): clippy -p amphora --all-targets clean; lib `a14_` 2/2, `database::admission_charge` 5/5, `database::across` 13/13 (1 ignored), `database::online` 6/6, `database::guards` 13/13, `xgroup::` 34/34; bench clippy 164 findings (main's own), 0 compile errors, none on A14's lines; load 42-49. Clippy's `Finished` took 8.67 s after replicated.rs changed: not explained. Main then moved inside `crates/` (engine sums and morsel scans, store.rs and bench suite_db.rs by lanes R4 and W3), so the landing merge b5738b12 (c79b2d53 + main 4b2a9793, branch perf/cross-a16-land) is checked again in r1680's first half. NOT on main.
+
+**Unit 4 (5e5ae655 on perf/cross-a13, unchecked).** r1680's second half: clippy, lib `store::`, `database::`, `xgroup::`, and `--test store`.
+- `Config::queue` and bench's `AMPHORA_QUEUE` deleted; the writer's channel counts nothing. A batch is charged `Engine::row_bytes` (new, required: each engine's inline size plus owned capacity) to the memory budget's room for queues until its commit ends, refused `Full` past it, counted.
+- The room's state (this store's charged bytes) is under `room.0`: a sender holds and checks under the lock and waits on the condvar only until its deadline; `Queued`'s drop gives a batch's bytes back under the lock, then notifies. `ROOM_LOOK` and the two lock-free `notify_all` at take-off are deleted.
+- A sender refused while nothing of its store holds a charge is refused at once: none of its commits could wake the wait, and the budget's other holders (other stores, admissions, caches, resident bytes) signal nothing.
+- `Local::row_bytes` is 0: a Database command is charged at admission until answered.
+- `query_reader`'s writer fallback is charged at admission before it is queued (`Store::on_reader` splits the reader attempt from `read_committed`): its job, its session and `query`'s declared answer. `query_local` and `query_closed` declare no answer, so their fallback charges only the job and session.
+- Test `store::tests::mb1_a_wait_for_room_is_woken_by_the_commit_that_gives_room_back` (room for one row; deadline an hour off; `Counters::room_waits`, new, as its non-vacuity count) replaces tests/store.rs's counted-queue test.
+- Main 4b2a9793 conflicts with 5e5ae655 in crates/amphora/src/store.rs (W3's flusher change): the next lane merges it.
