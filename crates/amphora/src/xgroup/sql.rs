@@ -724,8 +724,8 @@ pub fn prepare(group: &Database, until: Instant) -> Result<(), Refusal> {
 /// newest stamp after it (none: the group makes no stamps), and its clock after it, the one
 /// cross-group clock's microseconds ([`Database::cross_clock`]: a replicated group's closed time, a
 /// backed-up group's writer clock; none: it keeps neither; AC-T1.10.1, T-T1.10.W4). Taken after
-/// the step answered, the clock is at or past the step's own commit, as a token taken after a
-/// write's answer is ([`Database::session_token`]).
+/// the step answered, the clock covers the step's own commit: an internal call waits
+/// for its write's index to apply here before answering.
 pub(crate) fn serve(
     group: &Database,
     here: GroupId,

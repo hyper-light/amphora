@@ -273,11 +273,16 @@ impl Client {
         }
         self.handle.shared.local.with(until, f)
     }
-    /// Waits until this replica's published closed time is at least `at_least` and past `seen`
+    /// Waits until this replica has applied `token` and its closed time is past `seen`
     /// (the time a read found too old, if one did), on the caller's thread, until `until`
     /// (replication.md, "Follower reads at a closed time"). Refused Timeout at the deadline, and
     /// Fenced once the owner ended or is fenced.
-    fn wait_closed(&self, at_least: u64, seen: Option<u64>, until: Instant) -> Result<(), Refusal> {
+    pub(super) fn wait_closed(
+        &self,
+        token: Token,
+        seen: Option<u64>,
+        until: Instant,
+    ) -> Result<u64, Refusal> {
         let shared = &self.handle.shared;
         let mut closed = locked(&shared.closed)?;
         loop {
@@ -297,11 +302,12 @@ impl Client {
                     }
                 }
             }
-            if closed
-                .time
-                .is_some_and(|time| time >= at_least && seen.is_none_or(|seen| time > seen))
+            if let Some(time) = closed.time
+                && closed.applied >= token.index
+                && time >= token.micros
+                && seen.is_none_or(|seen| time > seen)
             {
-                return Ok(());
+                return Ok(time);
             }
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -328,7 +334,7 @@ impl Client {
     ) -> Result<R, Refusal> {
         let mut seen = None;
         loop {
-            self.wait_closed(at_least, seen, until)?;
+            self.wait_closed(Token::at(at_least), seen, until)?;
             match self.read_local(until, &mut read)? {
                 Ok(answer) => return Ok(answer),
                 Err(found) => seen = found.or(Some(0)),
@@ -7485,6 +7491,36 @@ mod tests {
             "the follower answered at its apply ({at}), not on the commit of {index}"
         );
         (leader, follower, index)
+    }
+
+    /// T-T1.9.R28, AC-T1.10.R4: with its flush held, a follower answers a committed
+    /// entry before applying it. A step waiting for that index can publish its clock
+    /// only once application resumes, even if its timestamp lower bound is already met.
+    #[test]
+    fn a_step_clock_covers_its_acknowledged_follower_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut driven, _powers, gates, clients) = gated(dir.path());
+        let mut pump = Pump::new(&clients);
+        let (_, follower, index) = answered_at_a_follower(&mut driven, &mut pump, &clients, &gates);
+        let client = &clients[follower];
+        let before = client.closed_token().unwrap();
+        assert!(before.index < index);
+        let write = Token {
+            index,
+            micros: before.micros,
+        };
+        let early = client.wait_closed(write, None, Instant::now());
+        gates[follower].release();
+        driven.follow(&mut pump, &clients, index);
+        let applied = client.wait_closed(write, None, Instant::now()).unwrap();
+        driven.drain(&mut pump);
+        pump.finish();
+        assert_eq!(
+            early,
+            Err(Refusal::Timeout),
+            "applied {before:?}, write {write:?}"
+        );
+        assert!(applied > before.micros);
     }
 
     /// CP-T1.8 (AC-T1.8.5), a follower's answer on its group's commit (replication.md, "A write
