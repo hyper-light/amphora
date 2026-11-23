@@ -4356,11 +4356,11 @@ pub(crate) mod bushy_test_hook {
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 2500) \
                  INSERT INTO s SELECT i, i % 25 + 1 FROM x",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 1500) \
-                 INSERT INTO c SELECT i, i % 25 + 1 FROM x",
+                 INSERT INTO c SELECT i, i / 7 % 25 + 1 FROM x",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 15000) \
                  INSERT INTO o SELECT i, i % 1500 + 1, i % 7 FROM x",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 60000) \
-                 INSERT INTO l SELECT i, i % 15000 + 1, i * 7 % 2500 + 1 FROM x",
+                 INSERT INTO l SELECT i, i % 15000 + 1, i * 7919 % 2500 + 1 FROM x",
                 "ANALYZE",
             ] {
                 conn.execute(sql).unwrap();

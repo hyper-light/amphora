@@ -2329,7 +2329,13 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     // `prune_join_order_for_materialized_inputs`), so it cuts the join's rows but
                     // not the rows the match visits: each outer row's probe rows times the run's
                     // rows each of them matches.
-                    let visited = {
+                    let after_match = where_terms.iter().any(|term| {
+                        term.table_mask.intersects(build_mask)
+                            && term.table_mask.intersects(&outer_mask)
+                    });
+                    let visited = if !after_match {
+                        rows
+                    } else {
                         let mut outer_and_probe = outer_mask.try_clone()?;
                         outer_and_probe.set(probe)?;
                         let mut run_and_probe = build_mask.try_clone()?;
