@@ -211,3 +211,41 @@ likely limiter): at 10k, flat refused about half the calls as Full and kept 36-4
 declared and measured admitted every call and fell to 120-900 calls/s with p50 7-12 s. Measuring
 1k/10k fairly needs a call submitted without blocking (a submit that answers through a callback,
 as the writer's `put_then` already does inside), so a core-sized pool keeps that many queued.
+
+## The call charge at 1k and 10k calls in flight (perf-A7, NOT decided: mixed)
+
+`Database::call_nowait(until, AnswerCharge, f) -> Result<Calling<R>, Refusal>` (on main since
+bc3f2b9d): a charged call admitted and queued without blocking; its answer reaches the returned
+`Calling` (a `Future`) on the store's notifier thread, waking its task. Refused at submit, typed:
+the budget's room, or a full writer queue (`Full`, where `call` waits for room). `AnswerCharge::Flat`
+is today's `REQUEST_MAX` as the control. Tests (tests/database.rs, tests/call_nowait_charge.rs):
+`a7_a_nowait_call_answers_exactly_once`, `a7_a_refused_or_oversize_nowait_call_is_typed_and_rolls_back`,
+`a7_a_dropped_calling_gives_back_its_charge`; r883: clippy -p amphora --all-targets clean, 13 passed.
+
+Command (r879, adacachy2, needs cpus=16,mem=48g, release, binary admission-4535a304):
+
+    admission <dir> 1000 3 1000,10000 nowait 5 16
+
+16 pool threads keep N calls in flight (a call ends, the pool submits the next; a refused submit
+waits for the next answer); each call `SELECT id, v ... LIMIT 8` over 1000 rows; latency from
+submit to answer, every call timed; arms alternated in one process, 5 rounds of 3 s after 1 s
+warm-up. Load 45 rising to 92 on 32 cores, CPU pressure avg10 34-50%. Median [range] of 5 rounds:
+
+| arm | in flight | p50 ms | p99 ms | p99.9 ms | calls/s | refused at submit / 3 s |
+|---|---|---|---|---|---|---|
+| flat | 1k | 15.7 [14.8-19.3] | 48.8 [37.2-83.0] | 59.2 [39.9-101.6] | 48,704 [43,463-55,772] | 0 |
+| declared | 1k | 16.1 [14.3-24.7] | 87.2 [39.6-104.3] | 95.7 [47.7-162.5] | 46,992 [30,784-55,824] | 0 |
+| measured | 1k | 19.0 [18.5-34.6] | 66.6 [51.7-82.1] | 75.8 [58.9-92.1] | 33,074 [25,527-42,793] | 0 |
+| flat | 10k | 62.1 [58.6-84.3] | 137.8 [120.6-399.7] | 144.0 [127.5-423.3] | 53,245 [32,425-55,113] | 13,241 [6,928-16,341] |
+| declared | 10k | 90.7 [68.0-232.0] | 233.5 [145.3-447.9] | 242.0 [152.2-455.8] | 45,054 [19,455-54,783] | 11,938 [4,430-17,030] |
+| measured | 10k | 86.5 [84.3-232.1] | 344.9 [183.0-414.9] | 366.3 [191.6-427.8] | 37,167 [19,626-52,904] | 7,912 [3,608-11,984] |
+
+No call failed or was refused after admission. Verdict: mixed, no winner. Flat and declared are
+alike at 1k p50; every tail range overlaps. Measured is slower at 1k in every round's p50 and in
+throughput (-32% median), A6's sign again; not profiled, so its cause (the second budget take on
+the writer) is still a guess and was not moved. At 10k the arms did not hold 10k in flight: every
+arm was refused at submit, and by Little's law (p50 x calls/s) about 3-5k were in flight, so the
+10k rows measure the writer's queue (store `Config::queue`, 4,096 messages), not the charge. The
+bench counts `Full` at submit without its cause (budget room or queue), so it can't say that the
+charge never bound; on a host with ~98 GB free it most likely did not. The charge's purpose,
+admitting more under a memory limit, was not exercised (no `MemoryMax` scope this run).
