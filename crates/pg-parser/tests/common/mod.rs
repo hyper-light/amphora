@@ -6,6 +6,6 @@
 pub const REFUSED_IN_ACTIONS: usize = 35;
 
 /// Regression statements whose every rule has a ported action and whose tree is 19's (FNV-1a 64 of
-/// the oracle's text, corpus.digest): 738 measured on fde510b6 (r1674) with BEGIN and END ported; raise
-/// it as actions are ported, never lower it.
-pub const TREES_EQUAL: usize = 738;
+/// the oracle's text, corpus.digest): 857 measured on 3d1be598 (r1731) with pgbench's UPDATE ported
+/// (738 with BEGIN and END only); raise it as actions are ported, never lower it.
+pub const TREES_EQUAL: usize = 857;

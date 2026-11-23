@@ -3932,3 +3932,309 @@ fn r4_parallel_constant_columns_return_every_row() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Lane R5: the constant-column sweep's tables, as its SQLite probe builds them
+/// (`r5-scripts/sweep_sqlite.py`): `t` of 5,000 rows, `u` of 300, and `w`, an INSERT's target.
+fn r5_tables(name: &str) -> Arc<Connection> {
+    let conn = open(name);
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, c TEXT)",
+        "CREATE TABLE w (x, y, z)",
+        "INSERT INTO t SELECT value, value % 97, (value * 37) % 1000, 'k' || (value % 11) \
+         FROM generate_series(1, 5000)",
+        "INSERT INTO u SELECT value, (value * 7) % 97, 'c' || (value % 13) \
+         FROM generate_series(1, 300)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn
+}
+
+/// Rows as SQLite's shell lists them (`|` between columns, NULL empty), sorted unless the
+/// statement orders them: their count and FNV-1a 64 hash, as the probe takes SQLite's.
+fn r5_digest(rows: &[Vec<Value>], ordered: bool) -> (usize, u64) {
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    if !ordered {
+        lines.sort();
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in lines.join("\n").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (lines.len(), hash)
+}
+
+/// Lane R5: each statement (SQL, ordered, SQLite 3.54.0's count and hash from the probe on
+/// adacachy2) serially and in parallel mode on a machine stated as 1, 2, 4 and 8 cores, against
+/// SQLite's answer; an INSERT's answer is what `w` then holds. Returns the rows the workers ran
+/// the loop body over.
+fn r5_sweep(cases: &[(&str, bool, usize, u64)]) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let conn = r5_tables(":memory:r5-sweep");
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let answer = |sql: &str, ordered: bool| -> Result<(usize, u64), String> {
+        let rows = if sql.starts_with("INSERT") {
+            conn.execute("DELETE FROM w").map_err(|e| e.to_string())?;
+            conn.execute(sql).map_err(|e| e.to_string())?;
+            sql_rows(&conn, "SELECT x, y, z FROM w")
+        } else {
+            conn.prepare(sql)
+                .and_then(|mut s| s.run_collect_rows())
+                .map_err(|e| e.to_string())?
+        };
+        Ok(r5_digest(&rows, ordered))
+    };
+    let mut wrong = Vec::new();
+    let mut body = 0u64;
+    for &(sql, ordered, count, hash) in cases {
+        let sqlite = Ok((count, hash));
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = answer(sql, ordered);
+        if serial != sqlite {
+            wrong.push(format!("{sql} serially: {serial:x?}, SQLite {sqlite:x?}"));
+        }
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [1usize, 2, 4, 8] {
+            conn.set_parallel_cores(NonZeroUsize::new(cores));
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let before = conn.morsel_body_rows.load(Relaxed);
+            let parallel = answer(sql, ordered);
+            body += conn.morsel_body_rows.load(Relaxed) - before;
+            if parallel != sqlite {
+                wrong.push(format!(
+                    "{sql} at {cores} cores: {parallel:x?}, SQLite {sqlite:x?}"
+                ));
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    body
+}
+
+/// Lane R5: a constant result column first, in the middle and last, over a plain scan. Do: run
+/// each serially and in parallel mode. Expect SQLite's rows, with the workers running the body.
+#[test]
+fn r5_constant_columns_over_a_scan_answer_as_sqlite() {
+    let body = r5_sweep(&[
+        ("SELECT 7, a, s FROM t", false, 5000, 0xd0dcdf34374d0a58),
+        ("SELECT a, 'x', s FROM t", false, 5000, 0x0bc780edde2ba5c0),
+        ("SELECT a, s, 2.5 FROM t", false, 5000, 0x6daca8fafe52c888),
+    ]);
+    assert!(body > 0, "no worker ran the body");
+}
+
+/// Lane R5: the same over a filtered scan.
+#[test]
+fn r5_constant_columns_over_a_filtered_scan_answer_as_sqlite() {
+    let body = r5_sweep(&[
+        (
+            "SELECT 7, a, s FROM t WHERE b < 300",
+            false,
+            1500,
+            0x0332bba8c11f5ac9,
+        ),
+        (
+            "SELECT a, 'x', s FROM t WHERE b < 300",
+            false,
+            1500,
+            0xdf7afb91c5df82f1,
+        ),
+        (
+            "SELECT a, s, 2.5 FROM t WHERE b < 300",
+            false,
+            1500,
+            0x26c32b876e4bad13,
+        ),
+    ]);
+    assert!(body > 0, "no worker ran the body");
+}
+
+/// Lane R5: the same over a hash join.
+#[test]
+fn r5_constant_columns_over_a_join_answer_as_sqlite() {
+    let body = r5_sweep(&[
+        (
+            "SELECT 7, t.id, u.c FROM t JOIN u ON t.a = u.a",
+            false,
+            15466,
+            0xfc3c2e2ce9a1f670,
+        ),
+        (
+            "SELECT t.id, 'x', u.c FROM t JOIN u ON t.a = u.a",
+            false,
+            15466,
+            0x66e20388227c40a0,
+        ),
+        (
+            "SELECT t.id, u.c, 2.5 FROM t JOIN u ON t.a = u.a",
+            false,
+            15466,
+            0xa947bd667b1dd3e6,
+        ),
+    ]);
+    assert!(body > 0, "no worker ran the body");
+}
+
+/// Lane R5: the same beside GROUP BY's aggregates.
+#[test]
+fn r5_constant_columns_beside_group_by_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "SELECT 7, a, count(*) FROM t GROUP BY a",
+            false,
+            97,
+            0xe1f7c10968cb8970,
+        ),
+        (
+            "SELECT a, 'x', sum(b) FROM t GROUP BY a",
+            false,
+            97,
+            0x26276f59c3027b09,
+        ),
+        (
+            "SELECT a, count(*), 2.5 FROM t WHERE b < 500 GROUP BY a",
+            false,
+            97,
+            0x670ea407ffae021b,
+        ),
+    ]);
+}
+
+/// Lane R5: the same under ORDER BY with LIMIT, in order.
+#[test]
+fn r5_constant_columns_under_order_by_limit_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "SELECT 7, id, s FROM t ORDER BY b, id LIMIT 1000",
+            true,
+            1000,
+            0xc9689f7ab1e72f0e,
+        ),
+        (
+            "SELECT id, 'x', s FROM t ORDER BY b DESC, id LIMIT 1000",
+            true,
+            1000,
+            0x1cf4d7104ab7c83c,
+        ),
+        (
+            "SELECT id, s, 2.5 FROM t WHERE b < 700 ORDER BY s, id LIMIT 1000",
+            true,
+            1000,
+            0xfd75b0a963e7378b,
+        ),
+    ]);
+}
+
+/// Lane R5: the same in each arm of a compound SELECT, UNION ALL and UNION.
+#[test]
+fn r5_constant_columns_in_a_compound_select_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "SELECT 7, a, s FROM t WHERE b < 100 UNION ALL SELECT 8, a, c FROM u",
+            false,
+            800,
+            0x799eb35b14b8e082,
+        ),
+        (
+            "SELECT a, 'x', s FROM t WHERE b < 100 UNION ALL SELECT a, 'y', c FROM u",
+            false,
+            800,
+            0x55575c8b0d78681a,
+        ),
+        (
+            "SELECT a, s, 2.5 FROM t WHERE b < 100 UNION ALL SELECT a, c, 3.5 FROM u",
+            false,
+            800,
+            0xacb474c2deb3d47c,
+        ),
+        (
+            "SELECT a, s, 2.5 FROM t UNION SELECT a, c, 2.5 FROM u",
+            false,
+            1367,
+            0x1466c9c5ba51a191,
+        ),
+    ]);
+}
+
+/// Lane R5: the same inside a subquery in FROM, and outside one the planner can't flatten.
+#[test]
+fn r5_constant_columns_with_a_subquery_in_from_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "SELECT k, a, s FROM (SELECT 7 AS k, a, s FROM t WHERE b < 500)",
+            false,
+            2500,
+            0x68b803b21717e29c,
+        ),
+        (
+            "SELECT a, k, s FROM (SELECT a, 'x' AS k, s FROM t WHERE b < 500)",
+            false,
+            2500,
+            0xac9b4169d497366a,
+        ),
+        (
+            "SELECT a, s, k FROM (SELECT a, s, 2.5 AS k FROM t WHERE b < 500)",
+            false,
+            2500,
+            0x27f2aef530eed638,
+        ),
+        (
+            "SELECT 7, q.a, q.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) AS q",
+            false,
+            97,
+            0xe1f7c10968cb8970,
+        ),
+        (
+            "SELECT q.a, 'x', q.n FROM (SELECT a, count(*) AS n FROM t GROUP BY a) AS q",
+            false,
+            97,
+            0x3bec3e691717cd55,
+        ),
+        (
+            "SELECT q.a, q.n, 2.5 FROM (SELECT a, count(*) AS n FROM t GROUP BY a) AS q",
+            false,
+            97,
+            0xc1abb5df4e49981a,
+        ),
+    ]);
+}
+
+/// Lane R5: the same in INSERT ... SELECT. Expect the target to hold SQLite's rows.
+#[test]
+fn r5_constant_columns_in_insert_select_answer_as_sqlite() {
+    r5_sweep(&[
+        (
+            "INSERT INTO w SELECT 7, a, s FROM t WHERE b < 600",
+            false,
+            3000,
+            0x4f30bb65bd3b3791,
+        ),
+        (
+            "INSERT INTO w SELECT a, 'x', s FROM t WHERE b < 600",
+            false,
+            3000,
+            0x03bf73a80161d1a3,
+        ),
+        (
+            "INSERT INTO w SELECT a, s, 2.5 FROM t WHERE b < 600",
+            false,
+            3000,
+            0x4b0ee3eddba05fc1,
+        ),
+    ]);
+}

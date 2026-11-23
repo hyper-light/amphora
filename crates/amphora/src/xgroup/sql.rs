@@ -2890,15 +2890,21 @@ mod sessions {
     /// through Records, as a client would: the session's SQL refuses the `__amphora_*` tables that
     /// hold them (product metadata).
     fn head(db: &Database, token: Option<Token>) -> Result<Option<i64>, Refusal> {
-        db.query_session(crate::database::ReadMode::Session, token, until(), |c| {
-            let mut newest = None;
-            for key in 0..2u8 {
-                if let Some(row) = c.records_get("ns", "rows", &[key])? {
-                    newest = newest.max(Some(i64::try_from(row.rev)?));
+        db.query_session(
+            crate::database::ReadMode::Session,
+            token,
+            until(),
+            AnswerMax::fixed(),
+            |c| {
+                let mut newest = None;
+                for key in 0..2u8 {
+                    if let Some(row) = c.records_get("ns", "rows", &[key])? {
+                        newest = newest.max(Some(i64::try_from(row.rev)?));
+                    }
                 }
-            }
-            Ok(newest)
-        })
+                Ok(newest)
+            },
+        )
     }
 
     /// T-T1.10.W4 (AC-T1.10.1, lane xgroup-sql-9): a group on a second node adds its closed time
@@ -3372,8 +3378,12 @@ mod sessions {
                     "{reads:?}: {answer:?}"
                 );
                 let reader = &dbs[1];
+                // One row's value, as a Records get answers it.
+                let value = AnswerMax::bytes(
+                    std::mem::size_of::<Option<Vec<u8>>>() + amphora_api::VALUE_MAX,
+                );
                 let today = reader
-                    .query(until(), |c| {
+                    .query(until(), value, |c| {
                         Ok(c.records_get("ns", "rows", &[1])?.map(|r| r.value))
                     })
                     .unwrap();
@@ -3383,7 +3393,7 @@ mod sessions {
                 let waiting = {
                     let runs = Arc::clone(&runs);
                     scope.spawn(move || {
-                        reader.query_waiting(until(), move |c| {
+                        reader.query_waiting(until(), value, move |c| {
                             runs.fetch_add(1, Ordering::AcqRel);
                             Ok(c.records_get("ns", "rows", &[1])?.map(|r| r.value))
                         })

@@ -11,7 +11,7 @@ use crate::gram_tables::{
     R1, R2, TABLE, TABLE_ERROR, TRANSLATE,
 };
 use crate::lex::{self, Lexer, ScanError, cursor};
-use crate::tree::{Node, NodeId, TransactionStmtKind, Tree, TreeFault};
+use crate::tree::{Node, NodeId, TransactionStmtKind, Tree, TreeFault, Val};
 
 /// yacc.c's YYMAXDEPTH, 10000 when the grammar doesn't define it (gram.y doesn't): a parse whose
 /// stack would hold that many states is refused "memory exhausted", as 19 refuses it.
@@ -53,6 +53,15 @@ fn fault() -> Refusal {
         sqlstate: "XX000",
         cursor: 0,
         message: "parser tables fault",
+    }
+}
+
+/// A name that isn't UTF-8: 19 refuses such bytes when the query arrives (pg_verify_mbstr).
+fn not_utf8() -> Refusal {
+    Refusal {
+        sqlstate: "22021",
+        cursor: 0,
+        message: "invalid byte sequence for encoding \"UTF8\"",
     }
 }
 
@@ -152,6 +161,33 @@ impl Reduce<'_> {
             _ => Err(fault()),
         }
     }
+
+    /// `char *` from a token: an identifier's or literal's bytes, or a keyword's name.
+    fn string(&mut self, n: usize) -> Result<String, Refusal> {
+        match self.take(n) {
+            Value::Token(lex::Value::Str(bytes)) => {
+                String::from_utf8(bytes).map_err(|_| not_utf8())
+            }
+            Value::Token(lex::Value::Keyword(name)) => Ok(name.to_owned()),
+            _ => Err(fault()),
+        }
+    }
+
+    /// `int` from a token (ICONST, PARAM).
+    fn int(&mut self, n: usize) -> Result<i32, Refusal> {
+        match self.take(n) {
+            Value::Token(lex::Value::Int(v)) => Ok(v),
+            _ => Err(fault()),
+        }
+    }
+
+    fn push(&mut self, node: Node) -> Result<NodeId, Refusal> {
+        Ok(self.tree.push(node)?)
+    }
+
+    fn make(&mut self, node: Node) -> Result<Value, Refusal> {
+        Ok(Value::Node(Some(self.push(node)?)))
+    }
 }
 
 /// A ported action: what the rule's C action computes as `$$`.
@@ -180,6 +216,52 @@ fn ported(rule: i32) -> Option<(u64, Action)> {
         1516 => (0xcafd_31ef_0f34_4799, |_| Ok(Value::Bool(true))),
         // opt_transaction_chain: AND NO CHAIN | /* EMPTY */
         1517 | 1518 => (0xc7dd_6751_cbba_2e22, |_| Ok(Value::Bool(false))),
+        // returning_clause: /* EMPTY */
+        1663 => (0x90e3_6cac_3351_2d39, null),
+        // UpdateStmt: opt_with_clause UPDATE relation_expr_opt_alias
+        1690 => (0x3f00_fe1f_c4fc_070d, update_stmt),
+        // set_clause_list: set_clause
+        1691 => (0x1509_2582_214f_28d3, top),
+        // set_clause: set_target '=' a_expr
+        1693 => (0x4bef_6d70_91a3_86ad, set_clause),
+        // set_target: ColId opt_indirection
+        1695 => (0x5914_3a79_afda_e407, column_target),
+        // opt_with_clause: /* EMPTY */
+        1768 => (0xf8ee_ad8a_b545_1b54, null),
+        // from_clause: /* EMPTY */
+        1857 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // relation_expr: qualified_name
+        1899 => (0x0f6f_0ebf_dca7_954d, relation_expr),
+        // relation_expr_opt_alias: relation_expr
+        1906 => (0x85ed_2683_fbb2_8bba, top),
+        // where_or_current_clause: WHERE a_expr
+        1923 => (0x9113_5026_c13a_e4a7, top),
+        // a_expr: c_expr
+        2048 => (0x9113_5026_c13a_e4a7, top),
+        // a_expr: '-' a_expr
+        2054 => (0x50eb_9947_0f67_cd77, negate),
+        // a_expr: a_expr '+' a_expr
+        2055 => (0x34ef_b0cc_0323_8888, |r| a_expr_op(r, "+")),
+        // a_expr: a_expr '=' a_expr
+        2063 => (0x8a20_32d0_a75b_2e2e, |r| a_expr_op(r, "=")),
+        // c_expr: columnref
+        2140 => (0x9113_5026_c13a_e4a7, top),
+        // c_expr: AexprConst
+        2141 => (0x9113_5026_c13a_e4a7, top),
+        // c_expr: PARAM opt_indirection
+        2142 => (0x251d_c253_e0dc_bc54, param),
+        // columnref: ColId
+        2372 => (0xe7f0_4492_1ba8_ebf2, columnref),
+        // opt_indirection: /* EMPTY */
+        2382 => (0x1e2a_fd0a_a524_9ce8, nil),
+        // qualified_name: ColId
+        2464 => (0x74ff_14c1_e4b9_74b6, qualified_name),
+        // AexprConst: Iconst
+        2473 => (0xedd7_3fba_5686_550f, int_const),
+        // Iconst: ICONST
+        2486 => (0x35a8_92e8_20e5_a06b, top),
+        // ColId: IDENT
+        2504 => (0xa007_892c_3e21_a49b, top),
         _ => return None,
     })
 }
@@ -255,6 +337,161 @@ fn begin(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
 fn end(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
     let chain = r.boolean(3)?;
     transaction(r, TransactionStmtKind::Commit, Vec::new(), chain)
+}
+
+/// `$$ = $n` of the rule's last symbol: gram.c reads it as `yyvsp[0]` whatever `n` is, so every
+/// rule with that C text shares one hash.
+fn top(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(r.rhs.pop().unwrap_or(Value::Token(lex::Value::None)))
+}
+
+fn null(_: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(Value::Node(None))
+}
+
+fn nil(_: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    Ok(Value::List(Vec::new()))
+}
+
+fn update_stmt(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let with_clause = r.node(1)?;
+    let relation = r.node(3)?;
+    let target_list = r.list(5)?;
+    let from_clause = r.list(6)?;
+    let where_clause = r.node(7)?;
+    let returning_clause = r.node(8)?;
+    r.make(Node::UpdateStmt {
+        relation,
+        target_list,
+        where_clause,
+        from_clause,
+        returning_clause,
+        with_clause,
+    })
+}
+
+fn set_clause(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let target = r.node(1)?.ok_or_else(fault)?;
+    let value = r.node(3)?;
+    let Node::ResTarget { val, .. } = r.tree.get_mut(target)? else {
+        return Err(fault());
+    };
+    *val = value;
+    Ok(Value::List(vec![target]))
+}
+
+/// set_target and insert_column_item: a ResTarget naming a column. check_indirection's refusal
+/// needs an `A_Star`, which only indirection_el's unported rules make.
+fn column_target(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(1)?;
+    let indirection = r.list(2)?;
+    let location = r.at(1)?;
+    r.make(Node::ResTarget {
+        name: Some(name),
+        indirection,
+        val: None,
+        location,
+    })
+}
+
+fn relation_expr(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let relation = r.node(1)?.ok_or_else(fault)?;
+    let Node::RangeVar { inh, alias, .. } = r.tree.get_mut(relation)? else {
+        return Err(fault());
+    };
+    *inh = true;
+    *alias = None;
+    Ok(Value::Node(Some(relation)))
+}
+
+/// makeRangeVar.
+fn range_var(schemaname: Option<String>, relname: String, location: i32) -> Node {
+    Node::RangeVar {
+        catalogname: None,
+        schemaname,
+        relname,
+        inh: true,
+        relpersistence: 'p',
+        alias: None,
+        location,
+    }
+}
+
+fn qualified_name(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let relname = r.string(1)?;
+    let location = r.at(1)?;
+    r.make(range_var(None, relname, location))
+}
+
+/// makeSimpleA_Expr(AEXPR_OP, name, lexpr, rexpr, location).
+fn simple_a_expr(
+    r: &mut Reduce<'_>,
+    name: &str,
+    lexpr: Option<NodeId>,
+    rexpr: Option<NodeId>,
+    location: i32,
+) -> Result<Value, Refusal> {
+    let name = r.push(Node::String(name.to_owned()))?;
+    r.make(Node::AExprOp {
+        name: vec![name],
+        lexpr,
+        rexpr,
+        location,
+    })
+}
+
+/// `a_expr <op> a_expr`: makeSimpleA_Expr at the operator.
+fn a_expr_op(r: &mut Reduce<'_>, name: &str) -> Result<Value, Refusal> {
+    let lexpr = r.node(1)?;
+    let rexpr = r.node(3)?;
+    let location = r.at(2)?;
+    simple_a_expr(r, name, lexpr, rexpr, location)
+}
+
+/// doNegate: a numeric constant takes the minus and the '-' sign's location; any other constant
+/// still takes the location, then is negated by a '-' operator, as anything else is.
+fn negate(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let n = r.node(2)?.ok_or_else(fault)?;
+    let location = r.at(1)?;
+    if let Node::AConst { val, location: at } = r.tree.get_mut(n)? {
+        *at = location;
+        if let Val::Integer(v) = val {
+            *v = v.checked_neg().ok_or_else(fault)?;
+            return Ok(Value::Node(Some(n)));
+        }
+    }
+    simple_a_expr(r, "-", None, Some(n), location)
+}
+
+/// `PARAM opt_indirection`: a ParamRef; one with indirection takes A_Indirection, not ported.
+fn param(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let number = r.int(1)?;
+    if !r.list(2)?.is_empty() {
+        return Ok(Value::Unported);
+    }
+    let location = r.at(1)?;
+    r.make(Node::ParamRef { number, location })
+}
+
+/// makeColumnRef(colname, NIL, location).
+fn columnref(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let name = r.string(1)?;
+    let location = r.at(1)?;
+    let field = r.push(Node::String(name))?;
+    r.make(Node::ColumnRef {
+        fields: vec![field],
+        location,
+    })
+}
+
+/// makeIntConst.
+fn int_const(r: &mut Reduce<'_>) -> Result<Value, Refusal> {
+    let v = r.int(1)?;
+    let location = r.at(1)?;
+    r.make(Node::AConst {
+        val: Val::Integer(v),
+        location,
+    })
 }
 
 /// The rule's `$$`: bison's default (`$$ = $1`, before any action) for a rule with no action, the
@@ -430,7 +667,7 @@ mod tests {
         for sql in [
             "SELECT 1",
             "select a, b from t where a not in (1, 2) order by 1 nulls first",
-            "BEGIN; UPDATE pgbench_accounts SET abalance = abalance + 1 WHERE aid = $1; END;",
+            "BEGIN; DELETE FROM pgbench_accounts WHERE aid = $1; END;",
             "WITH x AS (SELECT 1) SELECT * FROM x",
         ] {
             assert_eq!(accepts(sql.as_bytes()), Ok(()), "{sql}");
@@ -485,7 +722,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 10);
+        assert_eq!(n, 33);
     }
 
     /// T-PG.5.1: a syntax error is 42601 at the token 19 names (1-based characters), the end of

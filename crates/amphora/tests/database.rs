@@ -764,7 +764,7 @@ fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     })
     .unwrap();
     let count = |db: &Database| -> Result<i64, Refusal> {
-        db.query(until(), |c| {
+        db.query(until(), AnswerMax::fixed(), |c| {
             Ok(c.query_row("SELECT count(*) FROM t", [], |r| r.get(0usize))?)
         })
     };
@@ -792,7 +792,7 @@ fn a_query_answers_beside_a_held_writer_and_writes_nothing() {
     release.send(()).unwrap();
     writer.join().unwrap().unwrap();
     assert_eq!(count(&db).unwrap(), 2);
-    let wrote = db.query(until(), |c| {
+    let wrote = db.query(until(), AnswerMax::fixed(), |c| {
         c.execute("INSERT INTO t VALUES (3)", [])?;
         Ok(())
     });
