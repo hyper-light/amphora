@@ -824,3 +824,36 @@ fn cp_t1_13_a_replicated_write_past_an_election_timeout_commits_and_keeps_its_le
     let count = sql.read(st("SELECT count(*) FROM big", vec![])).unwrap();
     assert_eq!(count.rows, vec![vec![Value::Integer(16)]]);
 }
+
+#[test]
+fn p5_probe_large_replicated_writes() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_ansi(false).with_writer(std::io::stderr).try_init();
+    let sizes: Vec<i64> = std::env::var("P5_SIZES").unwrap_or("1,2,4,8".into()).split(',').map(|s| s.parse().unwrap()).collect();
+    for count in sizes {
+        let dir = tempfile::tempdir().unwrap();
+        let configs = three(dir.path());
+        start(&configs);
+        let c = &configs[0];
+        healthy(c);
+        let keys = c.keys().unwrap();
+        let (_, leader) = Client::connect(&c.members[0].addr, &keys, c.deadline).unwrap().leader(Duration::from_secs(60)).unwrap();
+        let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
+        let st = |text: &str, params: Vec<Value>| Statement { sql: text.to_owned(), params };
+        sql.write(vec![st("CREATE TABLE big (id INTEGER PRIMARY KEY, v BLOB)", vec![])]).unwrap();
+        let mib = 1 << 20;
+        let status = |when: &str| for m in &c.members { eprintln!("P5PROBE {when} {}: {:?}", m.addr, Client::connect(&m.addr, &keys, c.deadline).and_then(|mut k| k.ask("status")).map(|s| s.replace('\n', " | "))); };
+        status("before");
+        eprintln!("P5PROBE begin {count} MiB at leader {leader}");
+        let rows = (0..count).map(|n| st("INSERT INTO big VALUES (?1, ?2)", vec![Value::Integer(n), Value::Blob(vec![9; mib])])).collect();
+        let began = Instant::now();
+        let got = sql.write(rows);
+        eprintln!("P5PROBE write {count} MiB: {:?} after {:?}", got.as_ref().map(|t| t.len()).map_err(|e| format!("{e:#}")), began.elapsed());
+        status("after");
+        let mut sql = SqlClient::connect(&leader, &keys, c.deadline).unwrap();
+        let began = Instant::now();
+        let held = sql.write(vec![st("INSERT INTO big (id) VALUES (100000)", vec![]), st("SELECT id, v FROM big ORDER BY id", vec![])]);
+        eprintln!("P5PROBE then write+select: {:?} after {:?}", held.as_ref().map(|t| t.len()).map_err(|e| format!("{e:#}")), began.elapsed());
+        let (_, now) = Client::connect(&c.members[0].addr, &keys, c.deadline).unwrap().leader(Duration::from_secs(60)).unwrap();
+        eprintln!("P5PROBE end {count} MiB leader now {now}");
+    }
+}
