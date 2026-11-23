@@ -23,7 +23,7 @@ use amphora_api::{self as api, Change, Changes, Consistency, Page, Refusal, Rev,
 
 use super::{blob, blob_len, bytes, fits, integer, rev, text, unavailable};
 use crate::backup::Hooks;
-use crate::database::Database;
+use crate::database::{AnswerBytes, Database};
 use crate::db::Db;
 use crate::xgroup::sql::Member;
 
@@ -517,6 +517,18 @@ enum Held<T> {
     /// the transaction's commit stamp may be too, so its rows may belong in the read. The read
     /// waits for it to resolve, on that row's waiter list.
     Locked(Vec<u8>),
+}
+
+impl<T: AnswerBytes> AnswerBytes for Held<T> {
+    fn answer_bytes(&self) -> usize {
+        let (inline, held) = match self {
+            Held::Read(value) => (std::mem::size_of::<T>(), value.answer_bytes()),
+            Held::Locked(row) => (std::mem::size_of::<Vec<u8>>(), row.answer_bytes()),
+        };
+        std::mem::size_of::<Self>()
+            .saturating_sub(inline)
+            .saturating_add(held)
+    }
 }
 
 #[cfg(test)]
