@@ -288,8 +288,9 @@ difference. Load 5.8 to 11 on 32 cores. p50 / p99 ms.
 | q22 | 8 | 65.5 / 66.9 | 71.2 / 71.9 | 65.1 / 65.5 | 54.4 / 54.5 |
 | q22 | 16 | 64.9 / 66.1 | 74.0 / 74.5 | 65.2 / 65.5 | 53.6 / 53.8 |
 
-- On these twelve the arms sit within about 10% of Serial at every worker count. Exact is 7% to
-  15% slower than Serial at 16 workers on q11, q14, q15, q17 and q22, with no overlap in 3 runs.
+- With 3 runs per cell, most gaps between arms sit inside the run-to-run spread. The clear ones (no
+  overlap between ranges) at 16 workers: Exact is slower than Serial on q11 (13%), q14 (6%), q15
+  (7%), q17 (15%) and q22 (14%).
 - DuckDB is faster than every arm at 16 workers on all twelve: 1.2x (q22) to 64x (q03).
 
 ## What each arm gives up
