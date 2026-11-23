@@ -180,6 +180,19 @@ impl<T> Slots<T> {
         }
     }
 
+    /// `member`'s barrier asks for a slot before its first try (CP-T1.8, lane V8): it joins the
+    /// queue's tail unless it holds the slot, whose second barrier ends it (`Slots::read`).
+    pub(super) fn ask(&mut self, member: u64) {
+        if self
+            .holding
+            .as_ref()
+            .is_some_and(|holding| holding.member == member)
+        {
+            return;
+        }
+        self.refused(member);
+    }
+
     /// `member`'s barrier (its ReadIndex) at `at`. A queued member's waits for its slot. The
     /// holder's second barrier before any forward means its slot's work was no write (a read, or
     /// a write that prepared nothing), so its slot ends released and the barrier steps. Anything

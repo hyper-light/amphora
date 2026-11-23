@@ -2943,7 +2943,8 @@ pub fn op_type_check(
                 return Ok(());
             }
             if let Some(expected_type) = col.strict_value_type() {
-                let _applied = apply_affinity_char(reg, col.affinity(), program.connection.fp_digits());
+                let _applied =
+                    apply_affinity_char(reg, col.affinity(), program.connection.fp_digits());
                 let value_type = reg.get_value().value_type();
                 if value_type != expected_type {
                     bail_constraint_error!(
@@ -3074,7 +3075,11 @@ pub fn op_array_encode(
 
         // Apply affinity coercion — same as STRICT's TypeCheck
         let mut reg_tmp = Register::Value(elem);
-        apply_affinity_char(&mut reg_tmp, *element_affinity, program.connection.fp_digits());
+        apply_affinity_char(
+            &mut reg_tmp,
+            *element_affinity,
+            program.connection.fp_digits(),
+        );
         let coerced = reg_tmp.get_value().clone();
 
         // Check value type matches the declared element type — same as STRICT's TypeCheck
@@ -6690,7 +6695,11 @@ pub fn op_idx_row_id(
 fn seek_rowid_key(key: &Value) -> Option<i64> {
     let mut numeric = Register::Value(key.clone());
     if matches!(key, Value::Text(_)) {
-        apply_affinity_char(&mut numeric, Affinity::Numeric, crate::numeric::fp::FpDigits::DEFAULT);
+        apply_affinity_char(
+            &mut numeric,
+            Affinity::Numeric,
+            crate::numeric::fp::FpDigits::DEFAULT,
+        );
     }
     match numeric.get_value() {
         Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
@@ -10840,8 +10849,10 @@ pub fn op_function(
             ScalarFunc::Coalesce => {}
             ScalarFunc::Concat => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result =
-                    Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()), program.connection.fp_digits());
+                let result = Value::exec_concat_strings(
+                    reg_values.iter().map(|reg| reg.get_value()),
+                    program.connection.fp_digits(),
+                );
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::ConcatWs => {
@@ -10963,7 +10974,9 @@ pub fn op_function(
                             _ => {
                                 let escape_cow = match escape_value {
                                     Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                                    v => match v.exec_cast("TEXT", program.connection.fp_digits())? {
+                                    v => match v
+                                        .exec_cast("TEXT", program.connection.fp_digits())?
+                                    {
                                         Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                         _ => unreachable!("Cast to TEXT should yield Text"),
                                     },
@@ -17142,9 +17155,10 @@ pub fn op_concat(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Concat { lhs, rhs, dest }, insn);
-    let value = state.registers[*lhs]
-        .get_value()
-        .exec_concat(state.registers[*rhs].get_value(), program.connection.fp_digits())?;
+    let value = state.registers[*lhs].get_value().exec_concat(
+        state.registers[*rhs].get_value(),
+        program.connection.fp_digits(),
+    )?;
     state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -17667,10 +17681,10 @@ pub fn op_affinity(
     let registers = &mut state.registers[*start_reg..*start_reg + count.get()];
     for (register, &affinity_code) in registers.iter_mut().zip(affinities.as_bytes()) {
         apply_affinity_char(
-                register,
-                Affinity::from_char_code(affinity_code),
-                program.connection.fp_digits(),
-            );
+            register,
+            Affinity::from_char_code(affinity_code),
+            program.connection.fp_digits(),
+        );
     }
 
     state.pc += 1;
@@ -22854,7 +22868,11 @@ mod tests {
 
         for (input, expected_int) in ascii_whitespace_cases {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer, crate::numeric::fp::FpDigits::DEFAULT);
+            apply_affinity_char(
+                &mut register,
+                Affinity::Integer,
+                crate::numeric::fp::FpDigits::DEFAULT,
+            );
 
             match register {
                 Register::Value(Value::Numeric(Numeric::Integer(i))) => {
@@ -22882,7 +22900,11 @@ mod tests {
 
         for (input, _expected_type, expected_len) in test_strings {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer, crate::numeric::fp::FpDigits::DEFAULT);
+            apply_affinity_char(
+                &mut register,
+                Affinity::Integer,
+                crate::numeric::fp::FpDigits::DEFAULT,
+            );
 
             match register {
                 Register::Value(Value::Text(t)) => {
@@ -22906,7 +22928,11 @@ mod tests {
 
         for input in cases {
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Integer, crate::numeric::fp::FpDigits::DEFAULT);
+            apply_affinity_char(
+                &mut register,
+                Affinity::Integer,
+                crate::numeric::fp::FpDigits::DEFAULT,
+            );
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
@@ -22917,7 +22943,11 @@ mod tests {
             }
 
             let mut register = Register::Value(Value::Text(input.into()));
-            apply_affinity_char(&mut register, Affinity::Numeric, crate::numeric::fp::FpDigits::DEFAULT);
+            apply_affinity_char(
+                &mut register,
+                Affinity::Numeric,
+                crate::numeric::fp::FpDigits::DEFAULT,
+            );
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
