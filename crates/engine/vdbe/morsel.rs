@@ -2079,9 +2079,21 @@ mod tests {
         let half_ulp = 2f64.powi(970);
         let tiny = f64::from_bits(1);
         let cases: [(&str, &[f64], f64); 6] = [
-            ("bigpairs", &[1e308, 1e308, -1e308, -1e308, 1e308, 1e308], f64::INFINITY),
-            ("overflow and back", &[1e308, 1e308, -1e308, -1e308, 1.5], 1.5),
-            ("down and back", &[-max, -max, -max, max, max, max, -0.25], -0.25),
+            (
+                "bigpairs",
+                &[1e308, 1e308, -1e308, -1e308, 1e308, 1e308],
+                f64::INFINITY,
+            ),
+            (
+                "overflow and back",
+                &[1e308, 1e308, -1e308, -1e308, 1.5],
+                1.5,
+            ),
+            (
+                "down and back",
+                &[-max, -max, -max, max, max, max, -0.25],
+                -0.25,
+            ),
             ("max again", &[max, max, -max], max),
             ("the tie past max", &[max, half_ulp], f64::INFINITY),
             ("a tiny term breaks the tie", &[max, half_ulp, -tiny], max),
@@ -2102,7 +2114,12 @@ mod tests {
                 let read = ExactSum::read_from(&bytes).unwrap();
                 for (way, sum) in [("a+b", &ab), ("b+a", &ba), ("bytes", &read)] {
                     assert!(!sum.is_nan(), "{name}, cut at {cut}, {way}");
-                    assert_eq!(sum.value().to_bits(), expected.to_bits(), "{name}, cut at {cut}, {way}: {}", sum.value());
+                    assert_eq!(
+                        sum.value().to_bits(),
+                        expected.to_bits(),
+                        "{name}, cut at {cut}, {way}: {}",
+                        sum.value()
+                    );
                 }
             }
         }

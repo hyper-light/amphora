@@ -3737,12 +3737,16 @@ fn g8_exact_real_sums_hold_the_hard_cases() {
         }),
         // Lane R4: R1's bigpairs, a short order's +1e308s unmatched: past the range, +inf, as
         // SQLite answers; and a running sum that passes the range and comes back, exactly.
-        ("bigpairs", &["1e308", "1e308", "-1e308", "-1e308", "1e308", "1e308"], |_| {
-            Some(f64::INFINITY)
-        }),
-        ("overflow and back", &["1e308", "1e308", "-1e308", "-1e308", "1.5"], |v| {
-            Some(v[4])
-        }),
+        (
+            "bigpairs",
+            &["1e308", "1e308", "-1e308", "-1e308", "1e308", "1e308"],
+            |_| Some(f64::INFINITY),
+        ),
+        (
+            "overflow and back",
+            &["1e308", "1e308", "-1e308", "-1e308", "1.5"],
+            |v| Some(v[4]),
+        ),
     ];
     for (at, (name, values, exact)) in cases.iter().enumerate() {
         let table = format!("h{at}");
@@ -3795,19 +3799,29 @@ fn r2_parallel_limit_finds_a_one_row_tables_row() {
     let path = dir.path().join("r2.db").to_str().unwrap().to_string();
     let file = |path: &str| {
         let io = Arc::new(crate::io::PlatformIO::new().unwrap());
-        Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None, Arc::new(SqliteDialect))
-            .unwrap()
-            .connect(ConnectOpts::new())
-            .unwrap()
+        Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+        .connect(ConnectOpts::new())
+        .unwrap()
     };
     let fill = |conn: &Arc<Connection>| {
-        conn.execute("CREATE TABLE big (a INTEGER, b TEXT)").unwrap();
+        conn.execute("CREATE TABLE big (a INTEGER, b TEXT)")
+            .unwrap();
         conn.execute("BEGIN").unwrap();
         for i in 0..20000 {
-            conn.execute(format!("INSERT INTO big VALUES ({i}, 'row {i}')")).unwrap();
+            conn.execute(format!("INSERT INTO big VALUES ({i}, 'row {i}')"))
+                .unwrap();
         }
         conn.execute("COMMIT").unwrap();
-        conn.execute("CREATE TABLE bench_loaded (done INTEGER)").unwrap();
+        conn.execute("CREATE TABLE bench_loaded (done INTEGER)")
+            .unwrap();
         conn.execute("INSERT INTO bench_loaded VALUES (1)").unwrap();
     };
     let memory = open(":memory:r2-limit");
@@ -3817,20 +3831,30 @@ fn r2_parallel_limit_finds_a_one_row_tables_row() {
     let mut wrong = Vec::new();
     for (name, conn) in [("memory", &memory), ("file reopened", &reopened)] {
         conn.set_parallel_mode(ParallelMode::Off);
-        let control = conn.prepare("SELECT 1 FROM bench_loaded LIMIT 1").and_then(|mut s| s.run_collect_rows());
-        let all = conn.prepare("SELECT count(*) FROM bench_loaded").and_then(|mut s| s.run_collect_rows());
+        let control = conn
+            .prepare("SELECT 1 FROM bench_loaded LIMIT 1")
+            .and_then(|mut s| s.run_collect_rows());
+        let all = conn
+            .prepare("SELECT count(*) FROM bench_loaded")
+            .and_then(|mut s| s.run_collect_rows());
         eprintln!("r2 {name} serial control: {control:?}, count(*) {all:?}");
         conn.set_parallel_mode(ParallelMode::On);
         conn.set_parallel_limit(false);
         conn.set_parallel_cores(NonZeroUsize::new(4));
-        let no_limit_switch = conn.prepare("SELECT 1 FROM bench_loaded LIMIT 1").and_then(|mut s| s.run_collect_rows());
-        let no_limit = conn.prepare("SELECT 1 FROM bench_loaded").and_then(|mut s| s.run_collect_rows());
+        let no_limit_switch = conn
+            .prepare("SELECT 1 FROM bench_loaded LIMIT 1")
+            .and_then(|mut s| s.run_collect_rows());
+        let no_limit = conn
+            .prepare("SELECT 1 FROM bench_loaded")
+            .and_then(|mut s| s.run_collect_rows());
         eprintln!("r2 {name} parallel on, LIMIT switch off, 4 cores: {no_limit_switch:?}; no LIMIT: {no_limit:?}");
         for cores in [1usize, 2, 4, 8, 16, 32] {
             conn.set_parallel_mode(ParallelMode::On);
             conn.set_parallel_limit(true);
             conn.set_parallel_cores(NonZeroUsize::new(cores));
-            let got = conn.prepare("SELECT 1 FROM bench_loaded LIMIT 1").and_then(|mut s| s.run_collect_rows());
+            let got = conn
+                .prepare("SELECT 1 FROM bench_loaded LIMIT 1")
+                .and_then(|mut s| s.run_collect_rows());
             eprintln!("r2 {name} at {cores} cores: {got:?}");
             if !matches!(&got, Ok(rows) if rows.len() == 1) {
                 wrong.push(format!("{name} at {cores} cores: {got:?}"));
@@ -3851,16 +3875,25 @@ fn r4_parallel_constant_columns_return_every_row() {
     let path = dir.path().join("r4.db").to_str().unwrap().to_string();
     let file = |path: &str| {
         let io = Arc::new(crate::io::PlatformIO::new().unwrap());
-        Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None, Arc::new(SqliteDialect))
-            .unwrap()
-            .connect(ConnectOpts::new())
-            .unwrap()
+        Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+        .connect(ConnectOpts::new())
+        .unwrap()
     };
     let fill = |conn: &Arc<Connection>| {
-        conn.execute("CREATE TABLE big (a INTEGER, b TEXT)").unwrap();
+        conn.execute("CREATE TABLE big (a INTEGER, b TEXT)")
+            .unwrap();
         conn.execute("BEGIN").unwrap();
         for i in 0..20000 {
-            conn.execute(format!("INSERT INTO big VALUES ({i}, 'row {i}')")).unwrap();
+            conn.execute(format!("INSERT INTO big VALUES ({i}, 'row {i}')"))
+                .unwrap();
         }
         conn.execute("COMMIT").unwrap();
     };
@@ -3875,7 +3908,11 @@ fn r4_parallel_constant_columns_return_every_row() {
     };
     let mut wrong = Vec::new();
     for (name, conn) in [("memory", &memory), ("file reopened", &reopened)] {
-        for sql in ["SELECT 1 FROM big", "SELECT 1, 'two', 3.5, NULL FROM big", "SELECT a, 7 FROM big"] {
+        for sql in [
+            "SELECT 1 FROM big",
+            "SELECT 1, 'two', 3.5, NULL FROM big",
+            "SELECT a, 7 FROM big",
+        ] {
             conn.set_parallel_mode(ParallelMode::Off);
             let serial = sorted(sql_rows(conn, sql));
             assert_eq!(serial.len(), 20000, "{name}: {sql} serially");
@@ -3884,7 +3921,10 @@ fn r4_parallel_constant_columns_return_every_row() {
                 conn.set_parallel_cores(NonZeroUsize::new(cores));
                 match conn.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
                     Ok(rows) if sorted(rows.clone()) == serial => {}
-                    Ok(rows) => wrong.push(format!("{name}: {sql} at {cores} cores: {} rows", rows.len())),
+                    Ok(rows) => wrong.push(format!(
+                        "{name}: {sql} at {cores} cores: {} rows",
+                        rows.len()
+                    )),
                     Err(error) => wrong.push(format!("{name}: {sql} at {cores} cores: {error}")),
                 }
             }
