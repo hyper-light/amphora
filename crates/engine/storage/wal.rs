@@ -10125,7 +10125,8 @@ pub mod test {
                     for _ in 0..4 {
                         let max_frame = rng.next_u64() % next;
                         let min_frame = first.min(max_frame.max(1));
-                        for page in 0..48u64 {
+                        // Past the bitmap's words too: 64 and up are past every page written.
+                        for page in (0..48u64).chain([64, 200, 1 << 40]) {
                             let locked =
                                 coordination.find_frame_locked(page, min_frame, max_frame, None);
                             let index = |build: &mut super::super::log_index::FromIndex<'_>| {
@@ -10162,6 +10163,36 @@ pub mod test {
                 answered * 6 > reads,
                 "{mode:?} answered {answered} of {reads}"
             );
+        }
+    }
+
+    /// AUDIT 2.1 (perf-B4): a page past every page the log holds, past the bitmap's words, is
+    /// answered absent by each lock-free way itself, not asked under the lock; one the log holds
+    /// still finds its frame.
+    #[test]
+    fn audit_2_1_a_page_past_the_logs_highest_is_absent_without_the_lock() {
+        use super::super::log_index::Lookup;
+        for mode in LOCK_FREE_WAYS {
+            let shared = WalFileShared::new_noop();
+            shared.read().runtime.read_index.set_mode(mode);
+            let coordination = make_test_coordination(&shared);
+            for page in 1..=100u64 {
+                coordination.cache_frame(page, page);
+            }
+            let read_index = shared.read().runtime.read_index.clone();
+            let index = |build: &mut super::super::log_index::FromIndex<'_>| {
+                let guard = shared.read();
+                let frame_cache = guard.runtime.frame_cache.lock();
+                let high_water = guard.runtime.frame_cache_high_water.load(Ordering::Acquire);
+                build(&frame_cache, high_water);
+            };
+            for page in [101, 128, 4096, 1 << 40] {
+                assert_eq!(read_index.find(page, 1, 100, &index), Lookup::Absent, "{mode:?} page {page}");
+                assert_eq!(coordination.find_frame(page, 1, 100, None), None, "{mode:?} page {page}");
+            }
+            let held = read_index.find(100, 1, 100, &index);
+            assert!(matches!(held, Lookup::Frame(100) | Lookup::Ask), "{mode:?}: {held:?}");
+            assert_eq!(coordination.find_frame(100, 1, 100, None), Some(100), "{mode:?}");
         }
     }
 
