@@ -17775,17 +17775,125 @@ mod tests {
         }
     }
 
+    /// T-T1.8.W1, the leader's own writes (bench lane S4's persisted refusals at 128 writers,
+    /// bench/records/2026-11-23-adacachy2-bench-s4-handover.md): every member writes, the leader
+    /// too. Do: the leader and both followers each append 15 times to two hot lists, then to 32
+    /// spread over pages, every record delayed up to three relay rounds, three seeds each.
+    /// Expect: no writer refused twice in a row, the leader included, every write committed, none
+    /// unknown, the history serializable. Before the leader's own appends took the read-set check
+    /// its members' forwards take, its writes over spread pages were refused up to 5 times in a
+    /// row (11 to 17 refusals for 15 commits), the followers' at most once.
     #[test]
-    fn probe_three_writers_streaks() {
+    fn no_writer_is_refused_twice_in_a_row_when_every_member_writes() {
         for keys in [2, 32] {
             for seed in 1..=3 {
                 let run = list_append_run(&[0, 1, 2], false, seed, keys, 15);
                 eprintln!(
-                    "probe keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} turns {:?}",
-                    run.committed, run.refused, run.streak, run.turns
+                    "three writers keys {keys} seed {seed}: committed {:?} refused {:?} in a row {:?} moved {}",
+                    run.committed, run.refused, run.streak, run.moved
+                );
+                assert!(
+                    run.violations.is_empty(),
+                    "keys {keys} seed {seed}: {:?}",
+                    run.violations
+                );
+                assert_eq!(run.unknown, 0, "keys {keys} seed {seed}");
+                assert!(
+                    run.streak.iter().all(|streak| *streak <= 1),
+                    "keys {keys} seed {seed}: {:?}",
+                    run.streak
                 );
             }
         }
+    }
+
+    /// Bench lane S4's rung (bench/records/2026-11-23-adacachy2-bench-s4-handover.md): 128
+    /// writers at once on the persisted class, each one write outstanding, appending a row to one
+    /// table (its rowid's rightmost leaf and page 1's size: every write conflicts with every
+    /// other), a refused write made again at the next member as the bench does. Expect: every
+    /// write acknowledged, none answered anything but its rows or the stale base's refusal, each
+    /// acknowledged row on every replica once, and none left unanswered.
+    #[test]
+    fn a_hundred_and_twenty_eight_writers_each_land_and_every_acknowledged_row_is_held() {
+        const WRITERS: usize = 128;
+        let dir = tempfile::tempdir().unwrap();
+        let mut driven = Driven::new();
+        let clients: Vec<Client> = (1..=3)
+            .map(|n| driven.open(dir.path(), n, vec![1, 2, 3], None))
+            .collect();
+        let mut pump = Pump::new(&clients);
+        let leader = driven.elect(&mut pump, &clients, 0, 1);
+        driven
+            .call(&mut pump, &clients[leader], |db| {
+                db.exec("CREATE TABLE events(id INTEGER NOT NULL, body TEXT NOT NULL)")?;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        driven.tick(&mut pump, leader);
+        let write = |id: usize| {
+            move |db: &mut Db| {
+                db.exec(&format!(
+                    "INSERT INTO events VALUES ({id}, '{}')",
+                    "x".repeat(600)
+                ))?;
+                Ok(Vec::new())
+            }
+        };
+        let mut inflight: Vec<Option<(usize, Answering)>> = (0..WRITERS)
+            .map(|id| {
+                let via = id % 3;
+                Some((via, submit(&clients[via], driven.until(), write(id))))
+            })
+            .collect();
+        let mut refused = vec![0u64; WRITERS];
+        let mut rounds = 0;
+        while inflight.iter().any(Option::is_some) {
+            assert!(rounds < ROUNDS, "unanswered: {:?}", inflight.iter().filter(|w| w.is_some()).count());
+            for (id, slot) in inflight.iter_mut().enumerate() {
+                let Some((via, answer)) = slot.take() else {
+                    continue;
+                };
+                match answer.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => *slot = Some((via, answer)),
+                    Err(error) => panic!("owner ended: {error}"),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(Refusal::Invalid { what, .. })) if what == "prepared transaction" => {
+                        refused[id] += 1;
+                        let next = (via + 1) % 3;
+                        *slot = Some((next, submit(&clients[next], driven.until(), write(id))));
+                    }
+                    Ok(Err(other)) => panic!("writer {id} via {via}: {other:?}"),
+                }
+            }
+            driven.round(&mut pump);
+            rounds += 1;
+        }
+        eprintln!(
+            "128 writers: refused {} times in all, at most {} for one write, in {rounds} rounds",
+            refused.iter().sum::<u64>(),
+            refused.iter().max().unwrap()
+        );
+        driven.quiet(&mut pump);
+        driven.tick(&mut pump, leader);
+        driven.tick(&mut pump, leader);
+        for owner in 0..3 {
+            let ids = driven
+                .owner_mut(owner)
+                .replica
+                .machine_mut()
+                .read_db(|db| {
+                    let mut ids = Vec::new();
+                    db.query_owned("SELECT id FROM events ORDER BY id", [], |row| {
+                        ids.push(usize::try_from(row.get::<i64>(0)?).unwrap());
+                        Ok(true)
+                    })?;
+                    Ok(ids)
+                })
+                .unwrap();
+            assert_eq!(ids, (0..WRITERS).collect::<Vec<_>>(), "owner {owner}");
+        }
+        driven.drain(&mut pump);
+        pump.finish();
     }
 
     /// T-T1.8.W1's control (non-vacuity), an interleaving the test makes itself. Do, with the slot
