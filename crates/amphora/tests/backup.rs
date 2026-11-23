@@ -1108,9 +1108,9 @@ fn t_t1_12_c5_checks_competing_with_foreground_load() {
             meter.paused.load(Ordering::Relaxed),
             meter.waited_ns.load(Ordering::Relaxed),
             meter.forced.load(Ordering::Relaxed),
-            meter.cost_quantile(0.5),
-            meter.cost_quantile(0.99),
-            meter.cost_quantile(0.999),
+            meter.cost_quantile(1, 2),
+            meter.cost_quantile(99, 100),
+            meter.cost_quantile(999, 1000),
         );
     }
 }
