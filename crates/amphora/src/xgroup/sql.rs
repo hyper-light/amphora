@@ -304,8 +304,7 @@ pub(crate) struct SqlTablet<'a> {
     db: &'a Db,
     /// Each namespace's revision this step writes its Records rows at, and the next row's place.
     revs: BTreeMap<String, (amphora_api::Rev, u64)>,
-    /// The Records rows whose locks this step dropped, by key: once it answered, their waiter
-    /// lists are rung (`Database::ring_locks`, `LockedReads::WaitOnLock`; T-T1.10.W9).
+    /// Records keys to publish when this step commits (T-T1.10.W9).
     dropped: Vec<Vec<u8>>,
 }
 
@@ -330,15 +329,20 @@ impl<'a> SqlTablet<'a> {
     }
 }
 
-/// Applies one step on a group's database, and answers the Records rows whose locks it dropped.
-fn apply_step(
-    db: &Db,
-    here: GroupId,
-    envelope: &Envelope,
-) -> anyhow::Result<(Reply, Vec<Vec<u8>>)> {
+/// A group's private writer result. The durable callback publishes the released rows even if
+/// the coordinator has stopped waiting for this answer (T-T1.10.W9–W11).
+pub(crate) struct AppliedStep {
+    reply: Reply,
+    pub(crate) dropped: Vec<Vec<u8>>,
+}
+
+fn apply_step(db: &Db, here: GroupId, envelope: &Envelope) -> anyhow::Result<AppliedStep> {
     let mut tablet = SqlTablet::new(db);
     let reply = apply(here, &mut tablet, envelope)?;
-    Ok((reply, tablet.dropped))
+    Ok(AppliedStep {
+        reply,
+        dropped: tablet.dropped,
+    })
 }
 
 impl Tablet for SqlTablet<'_> {
@@ -733,15 +737,18 @@ pub(crate) fn serve(
     until: Instant,
 ) -> Result<(Reply, Option<u64>, Option<u64>), Refusal> {
     let stamp = AtomicU64::new(carried);
-    let (reply, dropped) = step(group, &stamp, until, move |db| {
+    let applied = step(group, &stamp, until, move |db| {
         apply_step(db, here, &envelope)
     })?;
-    group.ring_locks(&dropped)?;
     // The group's clock after the step, the one cross-group clock as it keeps it (lane
     // split-merge-22, as `step_on` reads a local group's): a backed-up group's writer clock, which
     // a standalone group's session token never had, so its lock replies carry a stamp too.
     let clock = group.cross_clock(until)?;
-    Ok((reply, clock.map(|_| stamp.load(Ordering::Acquire)), clock))
+    Ok((
+        applied.reply,
+        clock.map(|_| stamp.load(Ordering::Acquire)),
+        clock,
+    ))
 }
 
 /// Runs one step on `member`, its stamps carried either way. A group on a node answers its closed
@@ -757,16 +764,15 @@ fn step_on(
 ) -> Result<(Reply, Option<u64>), Refusal> {
     match member {
         Member::Local(group) => {
-            let (reply, dropped) = step(group, carried, until, move |db| {
+            let applied = step(group, carried, until, move |db| {
                 apply_step(db, here, &envelope)
             })?;
-            group.ring_locks(&dropped)?;
             // Read after the step answered, the group's clock is at or past the step's commit:
             // the one cross-group clock as this group keeps it (lane split-merge-21,
             // `Database::cross_clock`), so a standalone backed-up group's lock reply carries its
             // writer's clock, which a session token never had.
             let clock = group.cross_clock(until)?;
-            Ok((reply, clock))
+            Ok((applied.reply, clock))
         }
         Member::Node { nodes, node } => {
             let (reply, latest, micros) = nodes
@@ -3130,6 +3136,62 @@ mod sessions {
                 eprintln!("{reads:?}: {wakes} wakes, {OTHERS} other commits in the group");
             });
         }
+    }
+
+    /// T-T1.10.W9–W11: discard the first resolving call's answer, then deliver the retry.
+    /// It finds a done row. The first commit must still have rung a reader already asleep.
+    #[test]
+    fn t_t1_10_w9_a_resolutions_lost_reply_does_not_lose_the_wake() {
+        use crate::database::LockedReads;
+        use crate::xgroup::Step;
+        use amphora_api::{Consistency, Records};
+
+        let dir = tempfile::tempdir().unwrap();
+        let group = Database::open(&dir.path().join("group.db"), until()).unwrap();
+        group.set_locked_reads(LockedReads::WaitOnLock);
+        let txn = TxnId {
+            coordinator: 1,
+            epoch: 1,
+            seq: 0,
+        };
+        let lock = Lock {
+            txn,
+            anchor: 0,
+            intent: Intent::Put(vec![7]),
+        };
+        group
+            .call_internal(until(), move |db| {
+                SqlTablet::new(db).put_lock(&row(1), &lock)
+            })
+            .unwrap();
+        let resolution = Envelope {
+            coordinator: txn.coordinator,
+            epoch: txn.epoch,
+            floor: None,
+            step: Step::Resolve {
+                txn,
+                outcome: Outcome::Committed,
+            },
+        };
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                group
+                    .namespace("ns")
+                    .unwrap()
+                    .get("rows", &[1], Consistency::Linearizable, until())
+            });
+            group.locked_waits_reach(1, until()).unwrap();
+            let first = resolution.clone();
+            drop(
+                group
+                    .call_internal(until(), move |db| apply_step(db, 0, &first))
+                    .unwrap(),
+            );
+            let (reply, _, _) = serve(&group, 0, 0, resolution, until()).unwrap();
+            assert_eq!(reply, Reply::Resolved);
+            assert_eq!(reader.join().unwrap().unwrap().unwrap().value, [7]);
+            assert_eq!(group.locked_wakes(), 1);
+        });
     }
 
     /// T-T1.10.W10 (AC-T1.10.1, lane xgroup-sql-11): a Records scan waits on a held lock in the
