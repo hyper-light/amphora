@@ -2209,10 +2209,20 @@ before any frame of the current one.
   rest from the file, where every closing frame now is, and counts itself on the current one only. Without that
   rule, reads that overlap with no gap between them would keep the closing segment's count above zero for ever, and
   the writer could never switch again (revised 2026-11-23, lane B6). A page is looked up in the current segment,
-  then the closing one if the read counts on it, then the file. Each segment keeps its own frame index: the frame cache and decision 40's
+  then the closing one if the read counts on it, then the file. A read takes read mark 0 (the file alone) only
+  when it counts on no closing segment (lane B10). Right after a switch the current segment is empty, so its
+  frames are all copied (0 of 0), and the one-log test would send the read to the file alone, which lacks the
+  closing segment's frames not yet copied. Each segment keeps its own frame index: the frame cache and decision 40's
   lock-free index are per segment, because frame numbers start again in each.
 - **Checkpoints.** The checkpointer copies the closing segment first and the current one's frames only after it. The
   other order is wrong: a frame copied from the current segment would be overwritten by an older one copied after it.
+  It copies the current segment only once the closing one is reset (the coordinator, 2026-11-23, of lane B10's two
+  ways). A read begun before the switch searches the closing segment up to its mark and then the file, never the
+  current segment. When its mark is the closing segment's last frame, the closing segment's copy goes whole while it
+  reads, and a page of the current segment copied then would reach the file, where the read would find a version
+  newer than its snapshot. One log has no such case, because a read mark bounds every copy. Waiting for the reset
+  needs no new state, delays that copy by at most the bound below (2D plus one copy), and keeps the order above.
+  Counting the reads begun before the switch would allow it sooner, at the cost of one more counter.
   Its passive copy of the closing segment stops at the oldest snapshot inside it, and only reads begun before the
   switch hold one there. Reads begun after the switch see the whole closing segment and hold nothing back. The copy
   and the file's flush that decision 4's restart made on the writer move to the checkpointer. A switch costs the
