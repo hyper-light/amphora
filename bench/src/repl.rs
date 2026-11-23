@@ -1146,6 +1146,14 @@ mod procs {
                     let status = self.db.replica().ok_or_else(|| anyhow::anyhow!("no replica"))?.status().map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     Ok(serde_json::json!({ "leader": status.leader }))
                 }
+                Some("counters") => {
+                    let c = self.db.replica().ok_or_else(|| anyhow::anyhow!("no replica"))?.counters();
+                    Ok(serde_json::json!({
+                        "commits_held": c.commits_held, "commits_classic": c.commits_classic,
+                        "flushes": c.flushes.iter().sum::<u64>(), "flush_ms": c.flush_time.as_secs_f64() * 1e3,
+                        "flush_backlog": c.flush_backlog, "write_slot_holds": c.write_slot_holds,
+                    }))
+                }
                 Some("cut") => {
                     self.cut.store(r.get("to").and_then(|t| t.as_bool()).ok_or_else(|| anyhow::anyhow!("cut takes to"))?, Ordering::Relaxed);
                     Ok(serde_json::json!({ "ok": true }))
