@@ -40,6 +40,28 @@ session. That second stall is not in P6's design; its cause is not yet traced (c
 encoding and sending a 20 MiB entry to two followers, a follower's inbound admission bound refusing the record and
 the heartbeats behind it, the log write of the entry under I/O pressure).
 
+## The replicated suite and tests/serve.rs on eb0d3741 (r1103, load average 80-96)
+
+`run.sh eb0d3741 test --lib database::replicated`: 130 passed, 8 failed, 4 ignored (main: 134 of 134). Not
+mergeable. Each failure and what it shows:
+
+| Test | Failure | What it shows |
+|---|---|---|
+| `a_write_at_a_follower_is_answered_on_its_groups_commit` | one of two follower writes refused `Serialization` ("the database advanced since preparation") | a follower's session now spans steps; an entry committed meanwhile makes its base stale and its forward is refused at apply, where before it prepared on the tail and proposed in one step |
+| `a_refused_follower_write_lands_on_its_next_try_under_the_slot` | refused twice in a row (keys 2, seed 2: [3, 2]) | the write slot's turn no longer covers the holder's preparation, which now takes steps of its own |
+| `no_writer_is_refused_twice_in_a_row_when_every_member_writes` | refused twice in a row (keys 2, seed 3: [2, 2, 1]) | the same |
+| `seed_and_delta_hold_through_an_election_at_each_step` | `Err(NotLeader { leader: Some(1) })` | a lead lost while a session runs is refused `NotLeader` as the design says; the test expects the write requeued and retried as a write lost before its preparation is. A `Mutation` is data, not a spent closure, so the worker could hand it back for a requeue; only an `Operation::Call` is spent |
+| `a_raise_beside_a_change_holds_through_a_lost_lead` | "the change was never proposed" | a promotion's floor check while a session is out is refused `Busy` (`admits_voter`); it should wait for the session, as a raise waits in `Stage::Raising` |
+| `a_raise_another_lead_wrote_over_is_answered_unknown_outcome` | `Option::unwrap()` on `None` at replicated.rs:14218 | not traced |
+| `a_raise_whose_base_is_joint_is_refused` | "the group settled not reached in 60000 driven rounds" | not traced |
+| `receive_receipts::admission_is_bounded_while_processed_receive_waits_and_errors_remain_observable` | the test's session asserted the admitted bytes (33554704 against 33572176) on the worker thread, which panicked; the driver then hung 120 s | the test reads admission from inside its session, which ran on the owner's step before; and a session that unwound left the owner waiting on a bell that never rang (fixed in 4ff28e52: the worker rings as it ends and the owner fences, unverified) |
+
+`run.sh eb0d3741 test --lib serve::`: 11 of 11 ok. `run.sh eb0d3741 testargs --test serve -- --skip p5_probe`:
+9 passed, 2 failed: both `cp_t1_13` tests, P5's 16 MiB one included, which passed at r1060 (load average 70).
+At load average 90 the 16 MiB write fails as the 20 MiB one does: after its proposal.
+
+`run.sh eb0d3741 clippy` (r1101): exit 0.
+
 ## Not measured
 
 Commit latency at 1 and 32 writers on the replicated rung, before and after (RULES 5e calibration copied): not run
