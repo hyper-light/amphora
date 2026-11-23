@@ -397,7 +397,7 @@ pub struct VersionedCursor {
 /// process-wide count it replaces was, without every copy on every thread taking that count's
 /// cache line (AUDIT 2.4): only a thread's first copy, and one whose count would overflow, take a
 /// new thread number.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CopyId {
     thread: u64,
     n: u64,
