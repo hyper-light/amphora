@@ -4268,7 +4268,9 @@ pub(crate) mod bushy_test_hook {
                 "CREATE TABLE l(id INTEGER PRIMARY KEY, oid INT, sk INT)",
                 "CREATE TABLE s(id INTEGER PRIMARY KEY, k INT)",
                 "CREATE INDEX l_oid ON l(oid)",
-                "INSERT INTO r VALUES (1), (2), (3)",
+                // Enough rows that `r.id = 1` seeks: one row, so `c`'s hash join stays unmaterialized.
+                "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 1000) \
+                 INSERT INTO r SELECT i FROM x",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 200) \
                  INSERT INTO o SELECT i, i % 50 + 1 FROM x",
                 "WITH RECURSIVE x(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM x WHERE i < 50) \
