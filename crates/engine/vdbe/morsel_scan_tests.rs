@@ -3228,6 +3228,13 @@ fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
         .unwrap();
     }
     conn.execute("COMMIT").unwrap();
+    // The filter must exclude complete leaves. A bound in the first leaf and an
+    // upper bound beyond the last row can legitimately visit every leaf.
+    let grouped_range = format!(
+        "SELECT c, count(*) FROM t WHERE id > {} AND id < {} AND c IS NOT NULL GROUP BY c",
+        id / 3,
+        id - id / 3
+    );
     // (statement, whether it returns rows, whether the hook takes it).
     let queries: [(&str, bool, bool); 11] = [
         (
@@ -3250,11 +3257,7 @@ fn t_qt_6_33_a_rowid_range_runs_on_the_morsels_of_its_leaves() {
             false,
             true,
         ),
-        (
-            "SELECT c, count(*) FROM t WHERE id > 100 AND id < 7000 AND c IS NOT NULL GROUP BY c",
-            false,
-            true,
-        ),
+        (grouped_range.as_str(), false, true),
         (
             "SELECT id, a, b FROM t WHERE id > 6000 AND b > 0",
             true,
