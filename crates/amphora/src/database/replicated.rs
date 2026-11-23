@@ -4674,9 +4674,8 @@ impl<F: BlockFile + 'static> Actor<F> {
                     "replica outgoing queue is past the memory budget's room for queues; drain and reopen from durable state",
                 ));
             }
-            // Past what the host drains in an election timeout (QB.1): a bound that starts at one
-            // message grows as the host's drain is measured, so only a host that stays behind it
-            // for a whole election timeout fences the owner.
+            // Under the fence policy, the queue may exceed its learned rate for one election
+            // timeout. Its cold byte bound is the memory room (QB.1).
             let count = u64::try_from(outgoing.messages.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(1);
