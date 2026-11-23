@@ -24,11 +24,11 @@ tail -n 2 "$OUT/after.log" "$OUT/before.log"
 cp "$HOME/.cache/amphora-perf-target/versioned-rel/release/examples/versioned_point_reads" "$OUT/after"
 cp "$HOME/.cache/amphora-perf-target/versioned-base/release/examples/versioned_point_reads" "$OUT/before"
 echo "base $BASE_SHA head $(git rev-parse HEAD) dirty $(git status --porcelain | wc -l) host $(hostname -s) $(sysctl -n machdep.cpu.brand_string 2>/dev/null) load $(sysctl -n vm.loadavg 2>/dev/null) $(cat /proc/loadavg 2>/dev/null) cpus $(nproc 2>/dev/null)"
-for rep in 1 2 3; do
+for rep in $(seq 1 "${REPS:-3}"); do
   echo "rep=$rep load $(cat /proc/loadavg 2>/dev/null)$(sysctl -n vm.loadavg 2>/dev/null)"
-  for c in 1 8 32 64; do
-    n=$((20000 / c + 200))
-    for storage in versioned default; do
+  for c in ${CLIENTS:-1 8 32 64}; do
+    n=$((${READS:-20000} / c + 200))
+    for storage in ${STORAGES:-versioned default}; do
       for v in before after; do
         printf '%s rep=%s ' "$v" "$rep"; "$OUT/$v" "$storage" "$OUT/data" 10000 "$c" "$n"
       done

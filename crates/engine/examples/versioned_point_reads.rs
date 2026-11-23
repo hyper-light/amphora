@@ -26,7 +26,8 @@ fn main() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
-    let _ = std::fs::remove_dir_all(format!("{}.versioned", path.display()));
+    // The versioned storage keeps its files in `<path>-versioned` (`switch::open`).
+    let _ = std::fs::remove_dir_all(format!("{}-versioned", path.display()));
     let io = Arc::new(PlatformIO::new().unwrap());
     let options = OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new());
     let db = Database::open(io, path.to_str().unwrap(), options).unwrap();
