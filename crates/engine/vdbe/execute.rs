@@ -13000,22 +13000,17 @@ fn skipping_integer(value: Option<&Value>) -> Option<i64> {
 
 /// Hands the write hook the summarized column's value of the written row and, if it overwrote one,
 /// of the old row (captured before the write).
-fn skipping_hand(program: &Program, root: i64, write: crate::skipping::RowWrite) {
+fn skipping_hand(program: &Program, root: i64, column: usize, write: crate::skipping::RowWrite) {
     let registry = &program.connection.db.skipping;
-    match program.connection.skipping_write_base() {
-        Some((committed, told)) => {
-            // Lane skip-5 (T-SKU.5): each measured summary's write upkeep is timed.
-            let origin = std::time::Instant::now();
-            let mut now = || crate::skipping::nanos_since(origin);
-            let writer = program.connection.skipping_id();
-            if told {
-                registry.on_write_told(root, writer, committed, write, &mut now)
-            } else {
-                registry.on_write(root, writer, committed, write, &mut now)
-            }
-        }
-        None => registry.mark_stale(root),
-    }
+    let origin = std::time::Instant::now();
+    registry.write_checked(
+        root,
+        program.connection.skipping_id(),
+        Some(column),
+        write,
+        &mut || crate::skipping::nanos_since(origin),
+        || program.connection.skipping_write_base(),
+    );
 }
 
 fn skipping_on_insert(
@@ -13054,7 +13049,7 @@ fn skipping_on_insert(
         Some(old) => crate::skipping::RowWrite::Update { rowid, old, new },
         None => crate::skipping::RowWrite::Insert { rowid, value: new },
     };
-    skipping_hand(program, root, write);
+    skipping_hand(program, root, column, write);
 }
 
 /// Amphora (G7 step 2, `AC-NS.2.1`): a write that found no summary of its table before its row
@@ -13099,7 +13094,7 @@ fn skipping_on_delete(
             return;
         }
     };
-    skipping_hand(program, root, write);
+    skipping_hand(program, root, column, write);
 }
 
 pub fn op_insert(

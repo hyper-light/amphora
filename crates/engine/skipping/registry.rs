@@ -480,7 +480,9 @@ impl SkipRegistry {
         write: RowWrite,
         now: &mut dyn FnMut() -> u64,
     ) {
-        self.write_by(root_page, writer, committed, false, write, now)
+        self.write_checked(root_page, writer, None, write, now, || {
+            Some((committed, false))
+        })
     }
 
     /// The write hook on the versioned storage (G7 step 2, `AC-NS.2.1`): as
@@ -496,23 +498,32 @@ impl SkipRegistry {
         write: RowWrite,
         now: &mut dyn FnMut() -> u64,
     ) {
-        self.write_by(root_page, writer, committed, true, write, now)
+        self.write_checked(root_page, writer, None, write, now, || {
+            Some((committed, true))
+        })
     }
 
-    fn write_by(
+    /// The VM decoded the write for `column`. Sample its writer position under the same lock
+    /// that records commits and installs summaries, before admitting the write to this entry.
+    pub(crate) fn write_checked(
         &self,
         root_page: i64,
         writer: usize,
-        committed: WalPos,
-        told: bool,
+        column: Option<usize>,
         write: RowWrite,
         now: &mut dyn FnMut() -> u64,
+        base: impl FnOnce() -> Option<(WalPos, bool)>,
     ) {
         let mut entries = self.entries.lock();
         let Some(entry) = entries
             .iter_mut()
             .find(|entry| entry.root_page == root_page)
         else {
+            return;
+        };
+        let Some((committed, told)) = base().filter(|_| column.is_none_or(|c| c == entry.column))
+        else {
+            entry.stale = true;
             return;
         };
         if entry
@@ -942,5 +953,81 @@ fn held_rows(skipping: &Skipping) -> u64 {
         (Some(zones), _) => zones.rows().unwrap_or(0),
         (None, Some(cracker)) => cracker.row_count(),
         (None, None) => 0,
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    /// AC-NS.2.1. The first writer deletes row 1. Schedule its commit between the second
+    /// writer's clock sample and its feed if those operations allow it. The second writer's
+    /// snapshot still contains row 1, so the summary must either return it or decline the scan.
+    #[test]
+    fn review_versioned_write_samples_its_base_with_the_summary_locked() {
+        let registry = SkipRegistry::default();
+        let (root, first, second) = (5, 1, 2);
+        let (old, latest) = ((0, 3), (0, 4));
+        registry.set(
+            root,
+            0,
+            Skipping::Cracking(CrackerColumn::new([(1, Some(7))])),
+        );
+        registry.on_write_told(
+            root,
+            first,
+            old,
+            RowWrite::Delete {
+                rowid: 1,
+                old: Some(7),
+            },
+            &mut || 0,
+        );
+        registry.write_checked(
+            root,
+            second,
+            Some(0),
+            RowWrite::Insert {
+                rowid: 2,
+                value: Some(9),
+            },
+            &mut || 0,
+            || {
+                if registry.entries.try_lock().is_some() {
+                    registry.committed(first);
+                }
+                Some((old, true))
+            },
+        );
+        registry.committed(first);
+        let result = registry.candidates(root, second, old, latest, 7, 7);
+        assert!(
+            matches!(result, Err(SkipRefusal::Stale | SkipRefusal::OlderSnapshot))
+                || result == Ok(Candidates::Rowids(vec![1])),
+            "missed the old row: {result:?}"
+        );
+    }
+
+    /// T-SKU.14. An insert decoded column zero just before the summary was replaced by one
+    /// for column one. That summary cannot use the decoded value to prune a subsequent scan.
+    #[test]
+    fn review_a_write_for_a_replaced_column_invalidates_the_summary() {
+        let registry = SkipRegistry::default();
+        registry.set(5, 1, Skipping::Cracking(CrackerColumn::new([])));
+        registry.write_checked(
+            5,
+            1,
+            Some(0),
+            RowWrite::Insert {
+                rowid: 1,
+                value: Some(9),
+            },
+            &mut || 0,
+            || Some(((0, 3), true)),
+        );
+        assert_eq!(
+            registry.candidates(5, 1, (0, 3), (0, 3), 7, 7),
+            Err(SkipRefusal::Stale)
+        );
     }
 }
