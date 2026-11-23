@@ -59,6 +59,13 @@ on 18 cores during the hour), in `~/.cache/amphora-perf/tpch-remote` at origin/m
   Amphora's plan and the rows each step counted beside SQLite's EXPLAIN QUERY PLAN, and compares
   answers. Its output lands in `~/.cache/amphora-perf/tpch-out/q05-main/` on the Mac.
 
+It reproduces at SF0.1 (inferred from the run, not yet read from a record): run r414 at origin/main
+78fa9fdb loaded both engines (SQLite's lineitem in 3.0 s, its indexes and statistics in 2.3 s) and
+Amphora's counted q05 was still running 4 min 43 s into the process at 05:43Z. The October plan's
+work at SF0.1 is about a tenth of SF1's 0.64 s. The record (plan and the rows counted at the
+300 s deadline) lands in `~/.cache/amphora-perf/tpch-out/q05-main/rec.jsonl` on the Mac when r414
+ends.
+
 ## Next
 
 1. Read q05's plan and counts at SF0.1 from that run against the October plan above. The step
