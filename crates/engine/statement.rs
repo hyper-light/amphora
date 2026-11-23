@@ -2856,7 +2856,9 @@ mod tests {
         let mut flips = 0;
         for i in 0..40 {
             let build = if i % 2 == 0 { 15.0 * 1.1 } else { 15.0 / 1.1 };
-            conn.pin_cost_weights(Some((10.0, build, 15.0)));
+            conn.pin_cost_weights(Some(crate::translate::optimizer::adaptive::weights(
+                10.0, build, 15.0,
+            )));
             stmt.reprepare().unwrap();
             let now = order(&stmt);
             if now != last {

@@ -226,7 +226,7 @@ fn g7s4_the_pool_model_test_with_eviction_under_32_threads() {
                                     }
                                     break;
                                 }
-                                Err(LimboError::MemoryBudget { .. }) => std::thread::yield_now(),
+                                Err(LimboError::MemoryBudget(_)) => std::thread::yield_now(),
                                 Err(e) => panic!("write {p}: {e}"),
                             }
                         }
@@ -238,7 +238,7 @@ fn g7s4_the_pool_model_test_with_eviction_under_32_threads() {
                                     assert_eq!(whole(p, &r), Some(round), "own page {p}");
                                     break;
                                 }
-                                Err(LimboError::MemoryBudget { .. }) => std::thread::yield_now(),
+                                Err(LimboError::MemoryBudget(_)) => std::thread::yield_now(),
                                 Err(e) => panic!("read {p}: {e}"),
                             }
                         }
@@ -247,7 +247,7 @@ fn g7s4_the_pool_model_test_with_eviction_under_32_threads() {
                     let other = pages[usize::try_from((seed >> 33) % 64).unwrap()];
                     match pool.read(other) {
                         Ok(r) => assert!(whole(other, &r).is_some(), "torn page {other}"),
-                        Err(LimboError::MemoryBudget { .. }) => {}
+                        Err(LimboError::MemoryBudget(_)) => {}
                         Err(e) => panic!("read {other}: {e}"),
                     }
                 }
