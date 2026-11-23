@@ -373,15 +373,8 @@ fn sole_table(
             | Expr::Collate(..) => {}
             Expr::Like {
                 op: LikeOperator::Like | LikeOperator::Glob,
-                rhs,
-                escape: None,
                 ..
-            } => {
-                sole &= matches!(
-                    unwrap_parens(rhs)?,
-                    Expr::Literal(Literal::String(pattern)) if pattern.len() <= MAX_LIKE_PATTERN_LENGTH
-                );
-            }
+            } => {}
             _ => sole = false,
         }
         Ok(if sole {
