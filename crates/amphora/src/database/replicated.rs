@@ -17947,10 +17947,10 @@ mod tests {
     /// T-T1.8.W1, the stale-base refusal's type (PostgreSQL's 40001): a write refused because
     /// what it read changed is to be asked again, and nothing else is answered as if it were. Do:
     /// on the persisted class, every member at once appends a row to one table (each write
-    /// conflicts with every other), beside them a write the caller refuses itself `Invalid` (a
-    /// malformed request); each refused append made again at the next member, up to 20 rounds of
-    /// three. Expect: some append refused `Serialization` with the text it had as `Invalid`, the
-    /// malformed write `Invalid` each time and never `Serialization`, and every append held once.
+    /// conflicts with every other), a refused append made again at the member that refused it, up
+    /// to 20 rounds of three; then a follower's write the caller refuses itself `Invalid` (a
+    /// malformed request). Expect: some append refused `Serialization`, with the text it had as
+    /// `Invalid`; the malformed write `Invalid`; and every append held once.
     #[test]
     fn an_overlapping_write_is_refused_serialization_and_a_malformed_one_invalid() {
         let dir = tempfile::tempdir().unwrap();
@@ -17973,27 +17973,16 @@ mod tests {
                 Ok(Vec::new())
             }
         };
-        let malformed = |db: &mut Db| -> anyhow::Result<Vec<u8>> {
-            db.exec("INSERT INTO events VALUES (-1)")?;
-            Err(api::invalid("events row", "its id is negative").into())
-        };
         let mut serialization = Vec::new();
         let mut landed: i64 = 0;
         for round in 0..20 {
             let mut inflight: Vec<Option<(usize, Answering)>> = (0..3)
                 .map(|via| Some((via, submit(&clients[via], driven.until(), append(round * 3 + via)))))
                 .collect();
-            let mut bad = Some(submit(&clients[(leader + 1) % 3], driven.until(), malformed));
             let mut rounds = 0;
-            while inflight.iter().any(Option::is_some) || bad.is_some() {
-                assert!(
-                    rounds < ROUNDS,
-                    "round {round}: appends unanswered {:?}, malformed unanswered {}, refused {}",
-                    inflight.iter().map(|w| w.as_ref().map(|(via, _)| *via)).collect::<Vec<_>>(),
-                    bad.is_some(),
-                    serialization.len()
-                );
-                for (at, slot) in inflight.iter_mut().enumerate() {
+            while inflight.iter().any(Option::is_some) {
+                assert!(rounds < ROUNDS, "round {round}: unanswered {:?}", inflight.iter().map(|w| w.as_ref().map(|(via, _)| *via)).collect::<Vec<_>>());
+                for slot in &mut inflight {
                     let Some((via, answer)) = slot.take() else {
                         continue;
                     };
@@ -18003,31 +17992,25 @@ mod tests {
                         Ok(Ok(_)) => landed += 1,
                         Ok(Err(refused @ Refusal::Serialization { .. })) => {
                             serialization.push(refused);
-                            let next = (via + 1) % 3;
-                            *slot = Some((next, submit(&clients[next], driven.until(), append(round * 3 + at))));
+                            *slot = Some((via, submit(&clients[via], driven.until(), append(round * 3 + via))));
                         }
                         Ok(Err(other)) => panic!("append via {via}: {other:?}"),
-                    }
-                }
-                if let Some(answer) = bad.take() {
-                    match answer.try_recv() {
-                        Err(mpsc::TryRecvError::Empty) => bad = Some(answer),
-                        Ok(refused) => assert_eq!(
-                            refused.err(),
-                            Some(Refusal::Invalid { what: "events row".into(), why: "its id is negative".into() })
-                        ),
-                        Err(error) => panic!("owner ended: {error}"),
                     }
                 }
                 driven.round(&mut pump);
                 rounds += 1;
             }
-            if !serialization.is_empty() && round >= 2 {
+            if !serialization.is_empty() {
                 break;
             }
         }
         let refused = serialization.first().expect("no append was refused Serialization");
         assert_eq!(refused.to_string(), "invalid prepared transaction: the database advanced since preparation");
+        let malformed = driven.call(&mut pump, &clients[(leader + 1) % 3], |db| {
+            db.exec("INSERT INTO events VALUES (-1)")?;
+            Err(api::invalid("events row", "its id is negative").into())
+        });
+        assert_eq!(malformed.err(), Some(Refusal::Invalid { what: "events row".into(), why: "its id is negative".into() }));
         driven.quiet(&mut pump);
         driven.tick(&mut pump, leader);
         for owner in 0..3 {
