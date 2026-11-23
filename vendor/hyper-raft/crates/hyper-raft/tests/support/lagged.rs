@@ -199,6 +199,17 @@ fn check_message(disk: &Disk, message: &Message, member: u64) -> bool {
                 disk.last_index()
             );
         }
+        // A heartbeat's answer naming a position (`HeartbeatAnswers::Position`) is taken by its
+        // leader as an append's answer, for the classic quorum and the reads it confirms, and it
+        // may leave while writes are out: the disk holds what it names.
+        MessageType::MsgHeartbeatResponse if current && message.log_term != 0 => {
+            assert!(
+                message.index <= disk.last_index(),
+                "member {member}: a heartbeat's answer named {} with {} durable",
+                message.index,
+                disk.last_index()
+            );
+        }
         _ if current && kind == hyper_raft::fast::FAST_VOTE => {
             for entry in &message.entries {
                 // Once the log reaches the index, what it holds there was the
@@ -227,13 +238,14 @@ impl Lagged {
         let id = raw.raft.id();
         let leads = raw.raft.state() == hyper_raft::StateRole::Leader;
         let messages = light.take_messages();
+        let reads = light.take_read_states();
         let committed = committed_of(
             raw,
             in_place,
             light.take_committed_entries(),
             light.committed_range(),
         );
-        if messages.is_empty() && committed.is_empty() {
+        if messages.is_empty() && committed.is_empty() && reads.is_empty() {
             return false;
         }
         for message in messages.iter().filter(|_| !self.judged) {
@@ -257,6 +269,11 @@ impl Lagged {
             }
         }
         self.output.messages.extend(messages);
+        self.output.reads.extend(
+            reads
+                .into_iter()
+                .map(|read| (read.index, read.request_ctx)),
+        );
         self.apply(committed);
         self.node
             .raw
