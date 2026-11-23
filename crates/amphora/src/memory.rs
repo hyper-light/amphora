@@ -9,8 +9,10 @@
 //! The parsers are pure, so tests give them each file's text; [`limit`] reads the files.
 
 use amphora_api::Refusal;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Waker;
 
 /// A cgroup v1 limit at or past this is "no limit" (the kernel reports its page-rounded
 /// `LONG_MAX`, 9,223,372,036,854,771,712 on 4 KiB pages).
@@ -401,6 +403,17 @@ pub struct Budget {
     held: [AtomicU64; 4],
     /// The streams of each use open now, each of which may hold a charge at once ([`Stream`]).
     streams: [AtomicU64; 4],
+    /// Who waits for room, oldest first ([`Budget::when_room`]), and how many: a release with no
+    /// one waiting takes no lock.
+    waiting: Mutex<VecDeque<Waiter>>,
+    waiters: AtomicU64,
+}
+
+/// One wait for room: `bytes` more of `used`'s, woken once by the release that frees them.
+struct Waiter {
+    used: Use,
+    bytes: u64,
+    wake: Waker,
 }
 
 /// One stream of a use's that may hold a charge at any moment while it lives (a backup's base copy,
@@ -486,6 +499,8 @@ impl Budget {
             readings,
             held: Default::default(),
             streams: Default::default(),
+            waiting: Mutex::default(),
+            waiters: AtomicU64::new(0),
         })
     }
 
@@ -545,7 +560,11 @@ impl Budget {
     /// (the larger of its resident bytes and every charge counted, `used`'s own given back).
     /// Refused, typed and naming the platform, when the limit can't be read.
     pub fn room(&self, used: Use) -> Result<u64, Refusal> {
-        let reading = self.readings.read();
+        self.room_in(self.readings.read(), used)
+    }
+
+    /// [`Budget::room`] as of `reading`.
+    fn room_in(&self, reading: Reading, used: Use) -> Result<u64, Refusal> {
         let limit = reading.limit.ok_or_else(|| unread("memory limit"))?;
         let charged = Use::ALL
             .iter()
@@ -583,13 +602,85 @@ impl Budget {
             })
     }
 
-    /// `bytes` held by `used` ([`Budget::hold`]) given back.
+    /// `bytes` held by `used` ([`Budget::hold`]) given back: room freed, which wakes those waiting
+    /// for it that now fit ([`Budget::when_room`]).
     pub fn give(&self, used: Use, bytes: u64) {
         let _ = self
             .slot(used)
             .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                 Some(held.saturating_sub(bytes))
             });
+        // Pairs with the fence in `when_room`: a waiter added after this release reads the room it
+        // freed, and one added before is counted here.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.waiters.load(Ordering::Relaxed) > 0 {
+            self.wake_fitting();
+        }
+    }
+
+    /// Wakes `wake` once `used` has room for `bytes` more: at once if it has it now, else at the
+    /// release of a charge that frees it ([`Budget::give`]), the oldest waiters that fit first. A
+    /// room that can't be read wakes it too, for the waiter to meet the refusal. Woken once; a
+    /// waiter that still finds no room asks again.
+    pub fn when_room(&self, used: Use, bytes: u64, wake: &Waker) {
+        {
+            let mut waiting = self.waiting_now();
+            waiting.push_back(Waiter {
+                used,
+                bytes,
+                wake: wake.clone(),
+            });
+            self.waiters.store(
+                u64::try_from(waiting.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        // Pairs with the fence in `give`.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.wake_fitting();
+    }
+
+    /// The waiting queue, whatever a waker that panicked left it as.
+    fn waiting_now(&self) -> std::sync::MutexGuard<'_, VecDeque<Waiter>> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Wakes, oldest first, every waiter whose bytes fit its use's room beside those woken before
+    /// it in this pass, and keeps the rest in order.
+    fn wake_fitting(&self) {
+        let woken: Vec<Waker> = {
+            let mut waiting = self.waiting_now();
+            let reading = self.readings.read();
+            let mut granted = 0u64;
+            let mut woken = Vec::new();
+            let mut kept = VecDeque::with_capacity(waiting.len());
+            for waiter in waiting.drain(..) {
+                let fits = match self.room_in(reading, waiter.used) {
+                    Ok(room) => {
+                        self.held(waiter.used)
+                            .saturating_add(granted)
+                            .saturating_add(waiter.bytes)
+                            <= room
+                    }
+                    Err(_) => true,
+                };
+                if fits {
+                    granted = granted.saturating_add(waiter.bytes);
+                    woken.push(waiter.wake);
+                } else {
+                    kept.push_back(waiter);
+                }
+            }
+            self.waiters
+                .store(u64::try_from(kept.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
+            *waiting = kept;
+            woken
+        };
+        for wake in woken {
+            wake.wake();
+        }
     }
 
     /// The room for one image: [`Use::Images`]' room, in the `usize` an image's bytes are
@@ -670,6 +761,66 @@ pub(crate) mod tests {
         let budget = Budget::new(Box::new(fed.clone()));
         BUDGET.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&budget)));
         (budget, Unset)
+    }
+
+    /// A waker that counts its wakes.
+    struct Count(AtomicU64);
+
+    impl std::task::Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counter() -> (Arc<Count>, Waker) {
+        let count = Arc::new(Count(AtomicU64::new(0)));
+        (Arc::clone(&count), Waker::from(count))
+    }
+
+    fn woken(count: &Count) -> u64 {
+        count.0.load(Ordering::SeqCst)
+    }
+
+    /// Room freed (lane snapshots, coordinator decision 2): a release wakes the oldest waiters
+    /// that fit, an event and never a poll. Do: a budget fed 1 MiB and nothing resident, all of it
+    /// held for images; two waits for 256 KiB of queues; give back 128 KiB, 128 KiB more, then
+    /// 256 KiB; then a third wait with room to spare; then a wait on a budget whose limit can't be
+    /// read. Expect: no wake until a release frees room; the release that frees 256 KiB wakes the
+    /// older wait alone, as the younger doesn't fit beside it; the next wakes the younger; each
+    /// woken once; a wait with room now, or no room reading, woken at once.
+    #[test]
+    fn snapshots_room_freed_wakes_the_oldest_waits_that_fit() {
+        const KIB: u64 = 1 << 10;
+        let budget = Budget::new(Box::new(Fed::new(Some(1024 * KIB), Some(0))));
+        budget.hold(Use::Images, 1024 * KIB).unwrap();
+        let (older, older_wake) = counter();
+        let (younger, younger_wake) = counter();
+        budget.when_room(Use::Queues, 256 * KIB, &older_wake);
+        budget.when_room(Use::Queues, 256 * KIB, &younger_wake);
+        assert_eq!((woken(&older), woken(&younger)), (0, 0), "no room, no wake");
+        budget.give(Use::Images, 128 * KIB);
+        assert_eq!((woken(&older), woken(&younger)), (0, 0), "128 KiB fits neither");
+        budget.give(Use::Images, 128 * KIB);
+        assert_eq!(
+            (woken(&older), woken(&younger)),
+            (1, 0),
+            "256 KiB freed wakes the older alone"
+        );
+        budget.give(Use::Images, 256 * KIB);
+        assert_eq!((woken(&older), woken(&younger)), (1, 1), "the next release the younger");
+        let (now, now_wake) = counter();
+        budget.when_room(Use::Queues, 256 * KIB, &now_wake);
+        assert_eq!(woken(&now), 1, "room there already wakes at once");
+        budget.give(Use::Images, 512 * KIB);
+        assert_eq!(
+            (woken(&older), woken(&younger), woken(&now)),
+            (1, 1, 1),
+            "each woken once"
+        );
+        let unread = Budget::new(Box::new(Fed::new(None, Some(0))));
+        let (refused, refused_wake) = counter();
+        unread.when_room(Use::Images, 1, &refused_wake);
+        assert_eq!(woken(&refused), 1, "an unread room wakes the wait to meet its refusal");
     }
 
     /// T-T1.12.M1: a use's streams share its room. Do: open one stream of chunks, then a second,

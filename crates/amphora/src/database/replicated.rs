@@ -992,6 +992,9 @@ struct Actor<F: BlockFile + 'static = LogDevice> {
     compacting: super::compacting::Costs,
     // While the database's log is past its room: why, for the submits this member refuses.
     log_full: Option<String>,
+    // While a due compaction's image waits for the memory budget's room: rung by the release that
+    // frees it (`memory::Budget::when_room`), and not measured again before.
+    room_wait: Option<Arc<RoomWait>>,
     // The input queued as this step began, its own envelope among it: what a restart in the
     // step found, on the basis each later step reads its queue.
     step_queued: u64,
@@ -1109,6 +1112,23 @@ const CHECKPOINT_EVERY: Duration = Duration::from_millis(25);
 /// due, once a pass copied every durable frame (the restart waits only for the reads out), or
 /// once a pass found the log busy: a read that began on a log wholly copied reads the file alone
 /// and holds every pass off, so only holding reads back lets the passes copy again.
+/// A wait for the memory budget's room (`memory::Budget::when_room`): rung once, it wakes the owner.
+struct RoomWait {
+    rang: std::sync::atomic::AtomicBool,
+    owner: std::task::Waker,
+}
+
+impl std::task::Wake for RoomWait {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.rang.store(true, Ordering::Release);
+        self.owner.wake_by_ref();
+    }
+}
+
 fn hold_due(pass: &Pass, due: bool, past: bool) -> bool {
     past || (due && (pass.caught_up || pass.busy))
 }
@@ -2473,6 +2493,7 @@ fn open_on<F: BlockFile + 'static>(
         spacing: log_bound::Spacing::default(),
         compacting: super::compacting::Costs::default(),
         log_full: None,
+        room_wait: None,
         step_queued: 0,
         answers: patience::Answers::new(election, members),
         pace: super::pace::Pace::new(TICK, 0),
@@ -2747,6 +2768,38 @@ impl<F: BlockFile + 'static> Drop for Actor<F> {
     }
 }
 impl<F: BlockFile + 'static> Actor<F> {
+    /// Whether a due compaction's image fits its room now. One past the memory budget's room alone
+    /// waits for the budget's room-freed event and isn't measured again until it rings (lane
+    /// snapshots, coordinator decision 2); one past its carrier's or its disk share is measured at
+    /// each step, as the flushing thread's passes move the disk's.
+    fn image_fits_now(&mut self) -> Result<bool, Refusal> {
+        if self
+            .room_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.rang.load(Ordering::Acquire))
+        {
+            return Ok(false);
+        }
+        self.room_wait = None;
+        match self.replica.machine_mut().image_fit()? {
+            crate::replication::ImageFit::Fits => Ok(true),
+            crate::replication::ImageFit::Memory(bytes) => {
+                let wait = Arc::new(RoomWait {
+                    rang: std::sync::atomic::AtomicBool::new(false),
+                    owner: self.waker.clone(),
+                });
+                self.room_wait = Some(Arc::clone(&wait));
+                crate::memory::process().when_room(
+                    crate::memory::Use::Images,
+                    bytes,
+                    &std::task::Waker::from(wait),
+                );
+                Ok(false)
+            }
+            crate::replication::ImageFit::Other => Ok(false),
+        }
+    }
+
     fn now(&self) -> Result<u64, Refusal> {
         u64::try_from(self.at.saturating_duration_since(self.started).as_nanos())
             .map_err(unavailable)
@@ -3135,7 +3188,7 @@ impl<F: BlockFile + 'static> Actor<F> {
         let ready = !self.replica.machine().bootstrap_pending();
         let due = ready
             && self.replica.compaction_due(self.compacting.rule())
-            && self.replica.machine_mut().image_fits()?;
+            && self.image_fits_now()?;
         if due || (ready && self.replica.is_stalled()) {
             let nanos = self.now()?;
             let began = (self.clock)();

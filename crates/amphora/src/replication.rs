@@ -45,6 +45,17 @@ pub const COMMAND_BYTES: usize = api::REQUEST_MAX;
 /// bounds it; docs/design/replication.md, "Decision (lane constants): an image is bounded by the
 /// memory budget's room for one"; SB.1). Read again at every image made or installed; refused,
 /// typed, where the process's memory can't be read.
+/// Whether an image fits its room ([`Machine::image_fit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageFit {
+    Fits,
+    /// Past the memory budget's room for one alone: the bytes the image takes, which a release
+    /// of the budget's may free room for (`memory::Budget::when_room`).
+    Memory(u64),
+    /// Past its carrier's most or its share of the disk.
+    Other,
+}
+
 pub(crate) fn image_room() -> Result<usize, Refusal> {
     crate::memory::process().image_room()
 }
@@ -609,9 +620,16 @@ impl Machine {
     /// is refused before it is added, never left unable to catch up.
     /// Whether an image of the database now is within this machine's image budget: past it,
     /// `image` refuses, and a compaction, which needs one, waits (CT.1).
-    pub(crate) fn image_fits(&mut self) -> Result<bool, Refusal> {
+    /// Whether an image of this machine fits its room now, and if not, what bounds it.
+    pub(crate) fn image_fit(&mut self) -> Result<ImageFit, Refusal> {
         let size = self.db.image_bytes().map_err(unavailable)?;
-        Ok(size <= self.snapshot_bytes()?)
+        if size <= self.snapshot_bytes()? {
+            Ok(ImageFit::Fits)
+        } else if size <= self.image_cap.min(self.image_disk) {
+            Ok(ImageFit::Memory(u64::try_from(size).unwrap_or(u64::MAX)))
+        } else {
+            Ok(ImageFit::Other)
+        }
     }
     /// The bytes of the last image this machine made (CT.1).
     pub(crate) fn imaged_bytes(&self) -> u64 {
@@ -1520,11 +1538,11 @@ mod image_room_tests {
             .unwrap();
         let fed = Fed::new(Some(1 << 30), Some(1 << 20));
         let (_budget, _unset) = budget(&fed);
-        assert!(machine.image_fits().unwrap());
+        assert_eq!(machine.image_fit().unwrap(), ImageFit::Fits);
         machine.admits_joiner().unwrap();
 
         fed.set(Some((1 << 20) + (64 << 10)), Some(1 << 20));
-        assert!(!machine.image_fits().unwrap());
+        assert!(matches!(machine.image_fit().unwrap(), ImageFit::Memory(size) if size > 128 << 10));
         let refused = machine.admits_joiner();
         assert!(
             matches!(&refused, Err(Refusal::TooLarge { what, size, limit })
@@ -1533,7 +1551,7 @@ mod image_room_tests {
         );
 
         fed.set(None, Some(1 << 20));
-        assert!(matches!(machine.image_fits(), Err(Refusal::Unavailable(_))));
+        assert!(matches!(machine.image_fit(), Err(Refusal::Unavailable(_))));
         assert!(matches!(
             machine.admits_joiner(),
             Err(Refusal::Unavailable(_))
@@ -1541,6 +1559,7 @@ mod image_room_tests {
 
         fed.set(Some(1 << 30), Some(1 << 20));
         machine.set_snapshot_bytes(32 << 10);
+        assert_eq!(machine.image_fit().unwrap(), ImageFit::Other);
         let refused = machine.admits_joiner();
         assert!(
             matches!(&refused, Err(Refusal::TooLarge { limit, .. }) if *limit == 32 << 10),
