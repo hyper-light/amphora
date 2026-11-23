@@ -2668,12 +2668,12 @@ impl Database {
             };
             let row = match try_read()? {
                 Ok(v) => {
-                    eprintln!("K9 wait_joined read ok changed={:p}", changed as *const Changed);
+                    eprintln!("K9 wait_joined read ok changed={:p}", std::sync::Arc::as_ptr(changed));
                     return Ok(v);
                 }
                 Err(row) => row,
             };
-            eprintln!("K9 wait_joined try met row={row:?} before={before:?} joined={:?} changed={:p}", joined.as_ref().map(|j| j.0.clone()), changed as *const Changed);
+            eprintln!("K9 wait_joined try met row={row:?} before={before:?} joined={:?} changed={:p}", joined.as_ref().map(|j| j.0.clone()), std::sync::Arc::as_ptr(changed));
             let mut lists = locked(&changed.lock_waiters)?;
             match (joined.as_ref(), before) {
                 (Some((at, bell)), Some(before)) if *at == row => {
