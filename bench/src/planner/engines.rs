@@ -177,7 +177,8 @@ impl Amphora {
         let sums = match std::env::var("AMPHORA_REAL_SUMS").as_deref() {
             Err(_) | Ok("serial") => amphora_engine::RealSums::Serial,
             Ok("exact") => amphora_engine::RealSums::Exact,
-            Ok(other) => anyhow::bail!("AMPHORA_REAL_SUMS takes serial or exact, not {other}"),
+            Ok("roworder") => amphora_engine::RealSums::RowOrder,
+            Ok(other) => anyhow::bail!("AMPHORA_REAL_SUMS takes serial, exact or roworder, not {other}"),
         };
         conn.set_real_sums(sums);
         counted.set_real_sums(sums);
