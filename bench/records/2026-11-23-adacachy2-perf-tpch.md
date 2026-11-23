@@ -1232,3 +1232,7 @@ The open's anchor needs the same answer: it is timed the same way.
 from T13's 9ac9687b. r1696: `SHA=44515444 bash ~/.cache/tpch-t14/check.sh` runs `scripts/check-production.sh`,
 then `cargo clippy -p amphora-engine --all-targets --locked -- -D warnings`, then `cargo test -p
 amphora-engine --lib --locked -- learned_costs t13_ storage::pager::tests`.
+- r1696 (44515444): check-production passed ("engine-ratchet: 10913 left in the engine's production code
+  across 17 lints, as the ratchet holds"), clippy clean, tests 43 of 43.
+- r1705 (59d6e2cd, the merge with main, whose new commits touched `crates/amphora` only): the same three, at
+  `cpus=4,mem=12g`.
