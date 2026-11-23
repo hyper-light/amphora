@@ -8,6 +8,9 @@ at member w % 3 ("spread", the ladder's routing) or every writer at the leader (
 and each member's I/O over the sampled span. Prints one JSON object a phase.
 
     bench/thread_sample.py BIN PORT DIR WRITERS ROUTE SECONDS AFTER SPAN [CLASS]
+
+DIR is one folder (members in DIR/m1..m3) or three, comma-separated, one a member: a member on a
+RAM disk beside two on disk tells whose flush a commit waits for.
 """
 import collections
 import json
@@ -97,10 +100,13 @@ def main():
     port, writers, seconds, after, span = int(port), int(writers), float(seconds), float(after), float(span)
     peers = [f"127.0.0.1:{port + i}" for i in range(3)]
     flags = ["--deadline-s", "10", "--relay-records", "128"] + (["--spanning", "2"] if klass == "replicated" else [])
+    folders = folder.split(",")
+    folders = folders if len(folders) == 3 else [f"{folder}/m{i + 1}" for i in range(3)]
+    folder = folders[0]
     members = []
     for i in range(3):
         members.append(subprocess.Popen(
-            [binary, "--repl-member", "--node", str(i + 1), "--peers", ",".join(peers), "--dir", f"{folder}/m{i + 1}",
+            [binary, "--repl-member", "--node", str(i + 1), "--peers", ",".join(peers), "--dir", folders[i],
              "--class", klass] + flags, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True))
     for m in members:
         m.stdout.readline()
@@ -168,7 +174,7 @@ def main():
             sig = (th["comm"], th["top"][0][0] if th["top"] else "-")
             groups[sig]["threads"] += 1
             groups[sig]["cpu"] = round(groups[sig]["cpu"] + th["cpu"], 3)
-        busy = [th for th in threads if th["cpu"] >= 0.02 or (th["top"] and not th["top"][0][0].startswith("S futex"))]
+        busy = [th for th in threads if th["cpu"] >= 0.02 or th["comm"] == "hyper-log-io" or (th["top"] and not th["top"][0][0].startswith("S futex"))]
         d = {k: io1[p].get(k, 0) - io0[p].get(k, 0) for k in ("syscr", "syscw", "write_bytes", "wchar")}
         per_member.append({"node": i + 1, "is_leader": i + 1 == leader, "io_per_s": {k: round(v / elapsed) for k, v in d.items()},
                            "cpu_total": round(sum(th["cpu"] for th in threads), 3),
