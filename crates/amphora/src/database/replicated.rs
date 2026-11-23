@@ -7771,7 +7771,7 @@ mod tests {
     /// forward held until the leader's own is appended); the follower's log
     /// flushes held once its write is in the leader's log. Expect: the follower's answer while it
     /// hasn't applied its write; of the two writes one taken and the other refused as its apply
-    /// refuses it; once the flushes go, the follower applies as it answered and reads the write
+    /// refuses it, `Serialization` (local-owner-transport.md, "Version 10"); once the flushes go, the follower applies as it answered and reads the write
     /// that took.
     #[test]
     fn a_write_at_a_follower_is_answered_on_its_groups_commit() {
@@ -7879,7 +7879,7 @@ mod tests {
         assert!(
             results.iter().any(|result| matches!(
                 result,
-                Err(Refusal::Invalid { why, .. }) if why.contains("advanced since preparation")
+                Err(Refusal::Serialization { why, .. }) if why.contains("advanced since preparation")
             )),
             "{results:?}"
         );
