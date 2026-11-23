@@ -1137,3 +1137,246 @@ Focused tests: `database::slot::`, the two new tests, and every test named `slot
     cargo test -p amphora --lib --locked --no-run
     v9-tests-<sha> --test-threads=8 database::slot:: a_follower_read_completes_while_another_member_holds_the_write_slot \
       a_replicated_query_that_writes_is_refused_and_writes_nothing slot
+
+# Lane V12 (commits) on adacachy2: where a replicated commit's time goes on main dd9c3ce7 (2026-11-23, 23:05Z to 00:00Z)
+
+Ada's goal is replicated commits about 10x faster than rqlite and dqlite, never refusing writes under load. This
+lane's deliverable is a measurement, with nothing fixed: (1) the ladder on current main against rqlite and dqlite on
+one machine, and (2) a per-stage trace of one commit at 1 writer and of the writes at 32 spread writers, naming the
+top limiter at each from the breakdown.
+
+## Losses first
+
+1. **The apply stage isn't split.** It is 11.2 ms, 47% of a 1-writer persisted commit. The shim's records carry no
+   file for a write or a flush (it names a file only on `open`), and no fdatasync was attributed to a stage by its
+   thread and time. The raw records (`stages-m*.log`, `shim-m*.rec` with thread ids) are on adacachy2 under
+   `~/.cache/amphora-perf/commits-v12-out/trace-233603/` for the next lane.
+2. **One traced run a cell, not alternated rounds,** and the traced members ran under the shim and the stage log.
+   Their rates sit inside or just under the ladder's rounds: persisted 1 writer leader-routed 41.4 (ladder 44.0 to
+   50.0), spread 38.2 (34.8 to 47.0), 32 spread 35.8 (14.2 to 38.2). The traced 1-writer leader-routed p50 is 24.1 ms
+   against the ladder's 18.7 to 21.0 ms, so the tracing costs some of each commit (not split).
+3. **128 writers were not traced** (the brief traces 1 and 32), so the limiter there is inferred from the ladder.
+4. **A shared machine.** Load (1 min) 24.6 to 54.0 over the ladder, CPU "some" up to 41.3%. Competitor rounds spread
+   up to 2.6x (dqlite at 1 writer leader-only, 178.2 to 467.8). At 1 writer spread, Amphora against rqlite is inside
+   that noise.
+5. **Leader-only isn't strictly leader-only.** A write the leader fails for any reason but a stale base moves to the
+   next node, as spread writes do. In one Amphora run (replicated, 128 leader) 14 of 221 writes were acknowledged by
+   a follower.
+6. **Stale-base refusals remain on main** at 32 and 128 spread writers (9 to 41 a run, both classes). Not traced.
+7. **The replicated class's slow follower path at 1 writer** (slot wait 7.9 ms, forward 10.0 ms) is measured, not
+   explained.
+
+## The ladder (r1716): main dd9c3ce7 against rqlite and dqlite
+
+`ladder.sh` (this folder) at `dcdf192d` (main dd9c3ce7 plus the driver's `--route`, below). One host, adacachy2 (32
+cores, btrfs `~/.cache`), every system's three nodes as processes on 127.0.0.1, S6's flags (`--batch 1 --text-bytes
+600 --deadline-s 10 --relay-records 128 --spanning 2 --warmup-s 1 --seconds 5`). 1, 32 and 128 writers, "spread"
+(writer w at node w % 3, the ladder's routing) and "leader" (every writer at the node the cluster names its leader
+once the schema is in), 3 rounds with the cell order reversed in round 2. Amphora's two classes: persisted
+(acknowledged once a quorum's disks hold it, as rqlite's and dqlite's are) and replicated (`--spanning 2`). rqlite
+and dqlite have one class each. needs cpus=16; each cell's load (1 min), CPU "some" and I/O "some" avg10 at its
+start are in the last column, one triple a round. Stale-base refusals are the driver's `Serialization` count, each
+retried at the same node; a deadline miss is a write not acknowledged within 10 s, sent again.
+
+r1716 ran 23:22:24Z to 23:32:41Z: 72 cells, each with a record, none refused as a whole, every driver exit 0.
+Load (1 min) 24.6 to 54.0 on 32 cores, CPU "some" avg10 3.2 to 41.3%, I/O "some" 1.6 to 11.1%. Other lanes ran
+beside it.
+
+Medians of the 3 rounds, commits/s. The ratios are against Amphora's persisted class, the class whose acknowledgement
+matches rqlite's and dqlite's. "Goal" is the factor Amphora's persisted class must gain to be 10x the faster competitor
+in that cell.
+
+| writers | route | Amphora persisted | Amphora replicated | rqlite | dqlite | rqlite / Amphora | dqlite / Amphora | goal |
+|---|---|---|---|---|---|---|---|---|
+| 1 | spread | 41.2 | 27.4 | 62.6 | 241.0 | 1.5x | 5.8x | 58x |
+| 1 | leader | 46.0 | 46.2 | 66.8 | 214.4 | 1.5x | 4.7x | 47x |
+| 32 | spread | 31.8 | 30.4 | 623.4 | 183.2 | 19.6x | 5.8x | 196x |
+| 32 | leader | 36.8 | 45.4 | 668.0 | 293.4 | 18.2x | 8.0x | 182x |
+| 128 | spread | 34.4 | 38.6 | 2,528.4 | 291.4 | 73.5x | 8.5x | 735x |
+| 128 | leader | 46.4 | 46.2 | 2,386.2 | 233.0 | 51.4x | 5.0x | 514x |
+
+Every cell, each round's value. Latencies are the driver's, from a write's first send to its acknowledgement. The last
+column is load (1 min) / CPU "some" avg10 % / I/O "some" avg10 % at the cell's start, one triple a round.
+
+| system | writers | route | commits/s per round | median | p50 ms per round | p99 ms per round | stale-base refusals | deadline misses | run refused | load1 / cpu some / io some per round |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Amphora persisted | 1 | spread | 34.8, 47.0, 41.2 | 41.2 | 27.9, 20.5, 22.5 | 48.6, 39.4, 46.6 | 0, 0, 0 | 0, 0, 0 | none | 29.02/13.31/5.22; 31.65/21.09/2.47; 30.95/13.35/2.58 |
+| Amphora persisted | 1 | leader | 44.0, 50.0, 46.0 | 46.0 | 21.0, 18.7, 18.9 | 63.5, 28.7, 44.0 | 0, 0, 0 | 0, 0, 0 | none | 27.35/5.79/1.74; 24.91/3.62/2.51; 30.84/9.65/5.55 |
+| Amphora persisted | 32 | spread | 38.2, 31.8, 14.2 | 31.8 | 557.1, 786.4, 1310.7 | 2621.4, 3342.3, 4718.6 | 41, 27, 9 | 0, 0, 0 | none | 31.84/20.08/2.19; 26.82/5.30/3.09; 29.85/5.20/7.33 |
+| Amphora persisted | 32 | leader | 36.8, 40.2, 10.2 | 36.8 | 868.4, 778.2, 2359.3 | 1114.1, 901.1, 3768.3 | 0, 0, 0 | 0, 0, 0 | none | 36.15/18.35/2.22; 30.92/5.58/3.01; 25.90/13.06/2.73 |
+| Amphora persisted | 128 | spread | 30.4, 46.4, 34.4 | 34.4 | 2359.3, 1622.0, 2588.7 | 7405.6, 5898.2, 7274.5 | 26, 40, 31 | 0, 0, 0 | none | 43.96/41.25/2.91; 34.38/7.04/4.03; 25.48/13.29/5.43 |
+| Amphora persisted | 128 | leader | 46.4, 51.4, 31.0 | 46.4 | 2752.5, 2490.4, 4128.8 | 2883.6, 2588.7, 4587.5 | 0, 0, 0 | 0, 0, 0 | none | 47.73/20.79/3.36; 40.42/8.30/3.94; 29.98/19.70/5.74 |
+| Amphora replicated | 1 | spread | 27.4, 32.2, 25.8 | 27.4 | 35.8, 30.0, 35.3 | 51.2, 48.1, 88.1 | 0, 0, 0 | 0, 0, 0 | none | 30.54/15.37/4.09; 33.84/34.63/2.25; 30.32/12.40/2.48 |
+| Amphora replicated | 1 | leader | 45.6, 50.6, 46.2 | 46.2 | 16.6, 14.7, 15.5 | 78.8, 42.0, 200.7 | 0, 0, 0 | 0, 0, 0 | none | 27.70/7.08/2.19; 24.56/3.20/2.33; 30.21/8.84/4.52 |
+| Amphora replicated | 32 | spread | 34.4, 30.4, 25.0 | 30.4 | 475.1, 512.0, 1228.8 | 3276.8, 3538.9, 4194.3 | 38, 38, 16 | 0, 0, 11 | none | 32.73/19.39/1.98; 27.32/6.67/2.37; 28.04/3.43/11.14 |
+| Amphora replicated | 32 | leader | 47.8, 45.4, 26.2 | 45.4 | 679.9, 679.9, 827.4 | 778.2, 794.6, 1671.2 | 0, 0, 0 | 0, 0, 0 | none | 37.20/19.48/4.05; 32.74/7.25/2.80; 25.90/9.72/3.58 |
+| Amphora replicated | 128 | spread | 38.6, 35.8, 43.4 | 38.6 | 1753.1, 1851.4, 1753.1 | 6815.7, 7405.6, 6357.0 | 29, 30, 41 | 0, 0, 0 | none | 47.44/32.83/6.37; 35.97/11.33/5.56; 24.85/10.21/5.17 |
+| Amphora replicated | 128 | leader | 52.4, 46.2, 44.2 | 46.2 | 1884.2, 2457.6, 2818.0 | 3080.2, 3014.7, 3014.7 | 2, 2, 4 | 0, 0, 0 | none | 46.46/15.41/3.97; 43.19/9.03/3.87; 34.31/25.22/5.32 |
+| dqlite | 1 | spread | 287.2, 240.6, 241.0 | 241.0 | 3.2, 3.9, 3.8 | 6.8, 10.6, 10.2 | 0, 0, 0 | 0, 0, 0 | none | 28.08/6.82/2.86; 26.43/4.09/2.61; 33.16/14.91/2.28 |
+| dqlite | 1 | leader | 178.2, 214.4, 467.8 | 214.4 | 5.2, 4.4, 1.9 | 10.9, 7.2, 4.8 | 0, 0, 0 | 0, 0, 0 | none | 30.14/14.75/4.25; 26.84/4.70/3.55; 30.19/6.64/7.15 |
+| dqlite | 32 | spread | 160.2, 183.2, 424.2 | 183.2 | 133.1, 128.0, 52.2 | 827.4, 720.9, 360.4 | 0, 0, 0 | 0, 0, 0 | none | 36.36/12.29/2.77; 30.36/5.20/3.33; 25.66/7.78/5.67 |
+| dqlite | 32 | leader | 164.8, 293.4, 410.0 | 293.4 | 131.1, 73.7, 55.8 | 925.7, 499.7, 331.8 | 0, 0, 0 | 0, 0, 0 | none | 43.05/39.34/4.77; 32.93/5.73/3.24; 25.25/7.97/5.60 |
+| dqlite | 128 | spread | 224.6, 291.4, 340.4 | 291.4 | 344.1, 303.1, 260.1 | 2293.8, 1835.0, 1671.2 | 0, 0, 0 | 0, 0, 0 | none | 49.82/24.50/5.56; 38.74/6.69/3.56; 29.65/12.07/4.89 |
+| dqlite | 128 | leader | 233.0, 201.8, 337.2 | 233.0 | 385.0, 413.7, 266.2 | 2162.7, 2654.2, 1654.8 | 0, 0, 0 | 0, 0, 0 | none | 45.96/13.97/5.63; 44.53/12.35/2.70; 34.52/16.15/3.26 |
+| rqlite | 1 | spread | 62.6, 43.0, 70.8 | 62.6 | 14.6, 21.5, 13.1 | 54.3, 52.7, 29.7 | 0, 0, 0 | 0, 0, 0 | none | 29.54/12.94/3.60; 29.82/12.30/1.69; 34.82/28.07/2.14 |
+| rqlite | 1 | leader | 51.2, 66.8, 72.2 | 66.8 | 17.4, 13.4, 12.8 | 59.4, 63.0, 23.8 | 0, 0, 0 | 0, 0, 0 | none | 27.73/11.04/4.73; 25.04/3.29/1.92; 30.73/8.52/6.98 |
+| rqlite | 32 | spread | 647.8, 623.4, 403.2 | 623.4 | 45.1, 46.1, 41.0 | 126.0, 172.0, 933.9 | 0, 0, 0 | 0, 0, 0 | none | 37.70/14.69/2.38; 30.00/10.23/1.85; 26.53/6.64/4.72 |
+| rqlite | 32 | leader | 391.0, 668.0, 708.8 | 668.0 | 59.4, 47.1, 38.9 | 974.8, 67.6, 231.4 | 0, 0, 0 | 0, 0, 0 | none | 39.43/32.07/3.25; 34.19/10.36/1.59; 25.18/8.94/5.14 |
+| rqlite | 128 | spread | 2528.4, 2933.6, 2347.4 | 2528.4 | 42.5, 37.9, 48.1 | 256.0, 186.4, 161.8 | 0, 0, 0 | 0, 0, 0 | none | 53.98/38.52/3.93; 38.12/13.11/2.47; 29.54/11.40/6.72 |
+| rqlite | 128 | leader | 2386.2, 2014.0, 2662.2 | 2386.2 | 44.5, 60.4, 44.5 | 516.1, 182.3, 89.1 | 0, 0, 0 | 0, 0, 0 | none | 48.59/16.14/6.54; 44.95/13.39/1.88; 34.87/20.96/3.65 |
+
+What the numbers say:
+
+- **Amphora doesn't grow with writers.** Both classes' medians sit at 27.4 to 46.4 commits/s in every cell, 1 to 128
+  writers, either route (rounds 10.2 to 52.4; the two lowest are the persisted class's third round at 32 writers). rqlite grows 40x from 1 to 128 writers (62.6 to 2,528.4), and dqlite about 1.2x.
+- **At 1 writer the gap is smallest, and it is still a loss.** rqlite is 1.5x faster on both routes. Leader-routed, no
+  round overlaps: Amphora 44.0 to 50.0, rqlite 51.2 to 72.2. Spread, the ranges overlap (Amphora's 47.0 above
+  rqlite's 43.0), so that cell's 1.5x is inside 3 rounds' noise. dqlite is 4.7x to 5.8x faster, with no overlap.
+- **From 32 writers on, every round of every competitor is above every round of Amphora** (Amphora's best 52.4,
+  rqlite's worst 391.0 and dqlite's worst 160.2).
+- **Writes are still refused for a stale base on main, spread over the three members.** Each run at 32 and 128 spread
+  writers had 9 to 41 `Serialization` refusals in both classes, and the replicated class 2 to 4 at 128 leader-only.
+  The driver resends each refusal at the same node, so every write landed, but 11 writes in one replicated run at 32
+  spread missed their 10 s deadline before landing. Leader-only, the persisted class had none. V8's test 5 has no
+  stale-base refusal on driven time; these members on real time still have them (not traced, one line for the
+  successor).
+- **Against S6 (cfa0107c, the same flags, load 23 to 37).** S6 had Amphora persisted at 6.8, 6.4 and 10.8 commits/s
+  (spread, 1, 32 and 128) against today's 41.2, 31.8 and 34.4, and refusals at 32 and 128 there too. The competitors'
+  own rates moved as much between the runs (rqlite at 128: 452 then 2,528), so only ratios within one run compare:
+  rqlite over Amphora 4.4x, 104x and 42x in S6, 1.5x, 19.6x and 73.5x now.
+
+## One commit's stages (r1728, branch `diag/commits-v12-stages`, never for main)
+
+`diag/commits-v12-stages` (d1c80fb0) adds an env-gated stage log to `replicated.rs`: with `AMPHORA_STAGES` set, the
+owner writes one line an event with std's `Instant` as CLOCK_MONOTONIC nanoseconds (the shim's clock): a write's
+arrival (`submit`), its barrier sent, prepare's start and end, its proposal, each drive's log `last`, `persisted`,
+`committed` and `applied` index when one moves, each applied entry's context and index, and the answer. Lane W2's
+LD_PRELOAD shim (`2026-11-23-adacachy2-perf-oltp/stages.c`) timestamps each log write and flush syscall. Members are
+started by `trace.py` (port 29490), the driver runs untraced, S6's flags, 5 s after a 1 s warmup; `stages_table.py`
+joins each write's events across the three members by its context and its entry's index, and drops the warmup.
+
+How each stage is measured, per write:
+
+| stage | from | to |
+|---|---|---|
+| request queue | the owner takes the write (`submit`) | its barrier is sent |
+| slot wait | barrier sent | prepare starts (the barrier's read index answered, the slot held, the tail applied) |
+| prepare | `prepare_db` starts | it returns |
+| propose | prepare's end | `propose` returned |
+| to the leader's log | proposed | the leader's drive first shows `last` at or past the entry (a follower's forward hop) |
+| leader append + fsync | the leader's log holds it | the leader's `persisted` covers it |
+| follower append | the leader's log holds it | the quorum follower's log holds it (the follower whose `persisted` covered it first) |
+| follower fsync | that follower's log holds it | its `persisted` covers it |
+| commit | the leader's log holds it | the leader's `committed` covers it |
+| commit known at the origin | the leader's commit | the origin member's `committed` covers it |
+| apply | the origin knows it committed | the origin's `applied` covers it |
+| answer | the origin applied it | the answer is sent (a follower answers on the commit when `fates` is set) |
+
+Each "first shows" is the drive that saw it, so a stage includes the wait for the owner's next drive.
+
+r1758's traced runs ran 23:39:57Z to about 23:40:40Z (load 1 min 26.0 to 29.4, CPU "some" 5.0 to 8.5%, I/O "some" 3.6 to 5.1%), one run a
+cell, members on btrfs. Its own tables were printed by the diag branch's first `stages_table.py`; the numbers below
+are `stages_table.py` at b67ea4df (two fixes: Rust's `true`, and the warmup cut at the run's first write) on the same
+logs. Medians in ms; each run's p10 and p90 are in r1758's output.
+
+**Persisted class** (acknowledged once a quorum's disks hold it; rqlite's and dqlite's class):
+
+| stage | 1 writer, leader (n=210) | 1 writer, spread: a follower's write (n=193) | 32 spread, all (n=185) | 32 spread, the leader's own (n=97) | 32 spread, followers' (n=88) |
+|---|---|---|---|---|---|
+| request queue | 0.008 | 0.006 | **489.0** | 451.7 | 847.7 |
+| slot wait | 0.128 | 0.183 | 32.5 | 25.3 | 44.6 |
+| prepare | 0.220 | 0.222 | 0.205 | 0.212 | 0.199 |
+| propose | 0.021 | 0.014 | 0.019 | 0.022 | 0.014 |
+| to the leader's log | 0.018 | 1.384 | 0.105 | 0.043 | 0.243 |
+| leader append + fsync | 11.92 | 11.48 | 12.08 | 11.92 | 12.15 |
+| follower append | 0.061 | 0.062 | 0.067 | 0.069 | 0.065 |
+| follower fsync | 12.01 | 11.12 | 11.76 | 11.85 | 11.23 |
+| **commit** (log holds it to the leader's commit) | **12.24** | **11.52** | 12.16 | 12.12 | 12.18 |
+| commit known at the origin | 0 | 0.058 | 0 | 0 | 0.061 |
+| **apply** | **11.20** | **11.34** | 11.31 | 11.09 | 11.39 |
+| answer | 0.159 | 0.145 | 0.159 | 0.159 | 0.157 |
+| total in the member | 24.06 | 25.14 | 535.0 | 501.6 | 925.6 |
+| the run's driver p50, commits/s | 24.06, 41.4 | 25.09, 38.2 | 565.2, 35.8 | | |
+
+**Replicated class** (`--spanning 2`):
+
+| stage | 1 writer, leader (n=215) | 1 writer, spread (n=138) | 32 spread, all (n=161) |
+|---|---|---|---|
+| request queue | 0.008 | 0.007 | 501.0 |
+| slot wait | 0.119 | 7.931 | 41.1 |
+| prepare | 0.211 | 0.259 | 0.213 |
+| propose | 0.017 | 0.015 | 0.017 |
+| to the leader's log | 0.028 | 9.988 | 0.540 |
+| leader append + fsync | 12.80 | 10.98 | 11.91 |
+| follower append | 6.874 | 0.075 | 0.154 |
+| follower fsync | 19.44 | 10.62 | 15.72 |
+| commit | 16.00 | 13.54 | 13.47 |
+| commit known at the origin | 0 | 2.901 | 0 |
+| apply | 0 | 0 | 0 |
+| answer | 0.152 | 0.155 | 0.150 |
+| total in the member | 16.97 | 35.21 | 559.4 |
+| the run's driver p50, commits/s | 16.64, 42.4 | 34.82, 27.2 | 565.2, 30.6 |
+
+**Syscalls (lane W2's shim, each member over the measured window).** In the persisted class the three members agree
+within 10%. In the replicated class the leader flushes about half as often as its followers. The shim names a file only
+on `open`, so writes and flushes are not split by file.
+
+| syscall | calls a second, each member | median ms | p90 ms |
+|---|---|---|---|
+| fdatasync | 196 to 210 (persisted), 85 to 216 (replicated; the leader's are the lower) | 5.25 to 6.24 | 6.8 to 7.9 |
+| fsync | 22 to 39 | 5.45 to 6.25 | 7.7 to 8.5 |
+| pwrite | 309 to 590 | 0.003 to 0.004 | 0.007 to 0.011 |
+| write | 103 to 449 | 0.002 to 0.004 | 0.004 to 0.006 |
+| pwritev | 87 to 106 | 0.005 to 0.007 | 0.008 to 0.013 |
+
+What the trace says:
+
+- **The trace covers the commit.** At 1 writer the in-member total equals the driver's p50 within 0.1 ms (24.06 against
+  24.06, 25.14 against 25.09). At 32 writers the driver's p50 is 30 ms above it (565 against 535): time before the
+  owner takes the write, not split here.
+- **Appends cost microseconds, flushes milliseconds.** pwrite takes 3 to 4 us. Each fdatasync takes 5.3 ms, and each
+  member runs about 5.1 a commit (209.5 a second on the leader at 41.4 commits/s, 1 writer leader-routed).
+- **The leader's and the follower's log flushes run side by side** (11.9 and 12.0 ms) and the commit waits for both
+  (12.2 ms). The follower's append arrives 0.06 ms after the leader's.
+- **The commit isn't the end.** The persisted class applies 11.2 ms after its commit, as long again. The replicated
+  class applies in the same drive as its commit (0 ms), and its commit takes longer and spreads wider (16.0 ms,
+  p10 2.9, p90 39.2).
+- **Everything that isn't a flush or a queue is 0.55 ms** at 1 writer leader-routed (queue, barrier, prepare,
+  propose, the hop, answer): 2.3% of the commit. A follower's write adds its forward, 1.4 ms in the persisted class.
+- **In the replicated class a follower's write waits more before it reaches the leader** at 1 writer: slot wait 7.9 ms
+  and forward 10.0 ms, against 0.18 and 1.4 ms in the persisted class. Not explained by this trace.
+- A replicated follower answers on the commit, before its apply (`fates`), so "answer" can be negative at its p10.
+
+## The top limiter at each writer count
+
+- **1 writer: the commit's flushes, in two serial halves.** Of the 24.1 ms a persisted commit spends in the member
+  (leader-routed), 12.2 ms (51%) is the commit: the leader's log flush and the quorum follower's, side by side. Then
+  11.2 ms (47%) passes between the commit and the leader's apply. The other stages total 0.55 ms (2.3%). The CPU is
+  idle meanwhile: these are waits. The commit's half is measured as flushes (appends take 4 us). What fills the
+  apply's 11.2 ms is not split by this trace. Each member runs 5.1 fdatasyncs a commit at 5.3 ms, enough for two in
+  each half, but no call was attributed to a stage (inferred, not traced). The top limiter at 1 writer is the commit
+  stage, 12.2 ms of log flush, with the apply stage, 11.2 ms, second and within 1 ms of it.
+- **32 spread writers: one write at a time.** 489 of 535 ms (91%) is the request queue: a write waits at its member
+  before its barrier is sent, because the owner holds one write (`pending`) and queues the rest behind it. The slot
+  wait is another 32.5 ms (6%). Each write's own service is the 1-writer commit and apply (12.2 + 11.3 ms), and the
+  group commits 35.8 a second, one write each 28 ms. No two writes share an entry or a flush. The top limiter at 32
+  writers is that serialization: the queue's length is the 24 ms of flushes a write times the writes ahead of it.
+  A follower's write waits longer (848 ms against the leader's own 452 ms).
+- **128 writers: not traced.** The ladder's flat 34 to 46 commits/s, with p50 1.6 to 4.1 s, is of the order of the same
+  one-at-a-time service (128 writes at 24 to 28 ms each is 3.1 to 3.6 s). That is inferred from the ladder, not traced.
+
+## Commands
+
+    # r1716: kiln run on 00aad8daff2fa3c9daa65d53c425d450, needs linux/amd64,cpus=16,mem=24g, sync false,
+    # cwd ~/.cache/amphora-perf/commits-remote at dcdf192d, CARGO_TARGET_DIR=~/.cache/amphora-perf-target/commits
+    # (cold: the release build took 10 min 24 s), CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=8
+    nice -n 10 bash bench/records/2026-11-23-adacachy2-perf-commits-v12/ladder.sh ~/.cache/amphora-perf/commits-v12-out/ladder-231200
+    python3 -I bench/records/2026-11-23-adacachy2-perf-commits-v12/ladder_table.py ~/.cache/amphora-perf/commits-v12-out/ladder-231200
+    # r1758: the same runner and folders at d1c80fb0 (diag/commits-v12-stages), needs linux/amd64,cpus=4,mem=12g
+    # (cpus=8 refused twice: 3 and 4 of 32 cores idle), CARGO_BUILD_JOBS=4; the diag build took 3 min 54 s
+    bash bench/records/2026-11-23-adacachy2-perf-commits-v12/trace.sh ~/.cache/amphora-perf/commits-v12-out/trace-233603
+    python3 -I bench/records/2026-11-23-adacachy2-perf-commits-v12/stages_table.py ~/.cache/amphora-perf/commits-v12-out/trace-233603/<class>-<writers>-<route>
+    # clippy on the bench crate (the one this lane changed: --route in bench/src/repl.rs), needs linux/amd64,cpus=4,mem=12g:
+    # red on main dd9c3ce7 itself, 166 errors (disallowed println/args/temp_dir, items after a test module, ...); the
+    # same 166 at b67ea4df and at the merged 2e662d8b, the 9 in repl.rs main's own, none in the lines changed (r1766, r1771)
+    cargo clippy --release --manifest-path bench/Cargo.toml --all-targets --locked -- -D warnings
